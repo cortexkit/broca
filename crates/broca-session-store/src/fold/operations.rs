@@ -40,7 +40,6 @@ const NOT_FOLDED: &[&str] = &[
     "approval_recorded",
     "awaiting_approval",
     "input_token_budget_exhausted",
-    "model_step_refused",
     "recovery_call_closed",
     "recovery_cut",
     "tool_call_deferred",
@@ -394,6 +393,14 @@ state! {
             reset: "run_start",
             bound: Bound::Fixed,
         },
+        /// The step the run's own model refused, now being re-sent to the refusal-fallback
+        /// model: a resume sends it there again, and it is never refused a second time. Only the
+        /// step in progress can be one; cleared when a step ends.
+        29 opt pub refused_step: u64 => {
+            owner: "run loop",
+            reset: "a step's end",
+            bound: Bound::Fixed,
+        },
     }
 }
 
@@ -473,6 +480,7 @@ impl Run {
             structured_downgraded: false,
             refrozen_render: None,
             refrozen_auth: None,
+            refused_step: None,
             warms: Vec::new(),
             keep_warm: start.keep_warm.clone(),
             on_restart: start.on_restart.clone(),
@@ -1022,6 +1030,9 @@ impl Operations {
             });
             return Ok(());
         }
+        if let Record::StepRefused(refused) = record {
+            self.refusal_schedule = Some(refused.schedule.clone());
+        }
         if let Record::StepEnd(step) = record {
             if let Some(next) = step
                 .fallback
@@ -1052,6 +1063,7 @@ impl Operations {
             }
             Record::StepEnd(step) => {
                 run.output_cap = None;
+                run.refused_step = None;
                 let usage = step.total_usage.or(step.usage).unwrap_or_default();
                 run.usage.accumulate(&usage);
                 run.last_step_usage = Some(usage);
@@ -1157,6 +1169,11 @@ impl Operations {
             // Today's replay keeps the latest decision of the run still going.
             Record::CeilingDecided(decided) if run.finished.is_none() => {
                 run.context_ceiling = decided.detail.clone();
+            }
+            // The refused call was billed: today's replay counts it toward the run.
+            Record::StepRefused(refused) if refused.run_id == run.run_id => {
+                run.usage.accumulate(&refused.usage);
+                run.refused_step = Some(refused.step_id);
             }
             Record::StructuredDowngraded(downgraded) if downgraded.run_id == run.run_id => {
                 run.structured_downgraded = true;

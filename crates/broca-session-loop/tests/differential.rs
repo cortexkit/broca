@@ -62,6 +62,8 @@ struct ScriptedProvider {
     /// Whether this provider renders with another config than the run froze, as one rebuilt
     /// from a changed catalog would.
     drifted: Arc<std::sync::atomic::AtomicBool>,
+    /// Where the loop sends the next step, when the run froze a refusal fallback.
+    route: Arc<Mutex<Option<broca_core::refusal_fallback::StepRoute>>>,
 }
 
 /// Whether `script` is the provider refusing the strict schema's grammar.
@@ -83,12 +85,21 @@ impl ScriptedProvider {
             downgraded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             refused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             drifted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            route: Arc::new(Mutex::new(None)),
         }
     }
 
     /// The render config the run freezes: the stateless default, or a real config for a cache
     /// comparison, carrying the run's structured output, downgraded once refused.
     fn frozen_blob(&self) -> Value {
+        let mut blob = self.frozen_blob_without_fallback();
+        if let Some(script) = fallback() {
+            blob["refusal_fallback"] = json!({ "model": script.model });
+        }
+        blob
+    }
+
+    fn frozen_blob_without_fallback(&self) -> Value {
         // A comparison of cache expiry freezes a real first-party Anthropic config, whose cache
         // markers ask for a lifetime; this provider still renders requests its own way.
         if cache() {
@@ -132,6 +143,18 @@ impl Provider for ScriptedProvider {
 
     /// The session's last accepted send on an account is now, when the comparison routes one,
     /// so the session's cache on it outlives a pause until a reset that comes now.
+    fn refusal_fallback_model(&self) -> Option<ModelHandle> {
+        fallback().map(|script| script.model)
+    }
+
+    fn refusal_fallback_context_limit(&self) -> Option<u64> {
+        fallback().and_then(|script| script.context_limit)
+    }
+
+    fn set_step_route(&self, route: broca_core::refusal_fallback::StepRoute) {
+        *self.route.lock().unwrap() = Some(route);
+    }
+
     fn last_accepted_at_ms(&self, _: &str) -> Option<u64> {
         account().map(|_| harness_now())
     }
@@ -164,6 +187,13 @@ impl Provider for ScriptedProvider {
     }
 
     async fn step(&self, _step_id: StepId, opts: &CallOptions) -> mpsc::Receiver<NormalizedEvent> {
+        // The route the loop told the provider rides with each sent request, so a loop that
+        // sends a fallback step without saying so sends a different request.
+        let mut opts = opts.clone();
+        if let Some(route) = *self.route.lock().unwrap() {
+            opts.provider_options = Arc::new(json!({"routed": format!("{route:?}")}));
+        }
+        let opts = &opts;
         self.sent.lock().unwrap().push(opts.clone());
         let rendered = self.render_request(opts);
         let script = {
@@ -812,7 +842,7 @@ fn provider_id() -> &'static str {
 /// The time the new loop reads: today's loop reads the wall clock, so a comparison whose result
 /// depends on it does too; every other comparison reads 0 and normalizes the times recorded.
 fn harness_now() -> u64 {
-    if cache() || account().is_some() {
+    if cache() || account().is_some() || fallback().is_some() {
         broca_core::clock::Clock::default().now_ms()
     } else {
         0
@@ -935,6 +965,48 @@ fn new_warmer() -> Option<Arc<dyn broca_core::keep_warm_wait::KeepWarmDriver<Adm
         Arc::new(NewWarmer(Arc::clone(&script.new)))
             as Arc<dyn broca_core::keep_warm_wait::KeepWarmDriver<Admission>>
     })
+}
+
+tokio::task_local! {
+    /// The refusal-fallback model the run froze, with its context window. `None` freezes none.
+    static FALLBACK: Option<FallbackScript>;
+}
+
+#[derive(Clone)]
+struct FallbackScript {
+    model: ModelHandle,
+    context_limit: Option<u64>,
+}
+
+fn fallback() -> Option<FallbackScript> {
+    FALLBACK.try_with(Clone::clone).ok().flatten()
+}
+
+/// Runs `compare` with a run whose provider froze `fallback-model` as its refusal fallback.
+async fn compare_with_fallback<F: std::future::Future<Output = ()>>(
+    context_limit: Option<u64>,
+    compare: F,
+) {
+    FALLBACK
+        .scope(
+            Some(FallbackScript {
+                model: ModelHandle::new(provider_id(), "fallback-model"),
+                context_limit,
+            }),
+            compare,
+        )
+        .await;
+}
+
+/// The run's own model refusing a step with a content filter.
+fn refusal(id: &str) -> Vec<NormalizedEvent> {
+    answer(
+        id,
+        vec![ContentBlock::Text {
+            text: "I can't help with that.".into(),
+        }],
+        FinishReason::ContentFilter,
+    )
 }
 
 tokio::task_local! {
@@ -1892,6 +1964,9 @@ const NORMALIZED: &[&str] = &[
     "paused_at_ms",
     "resets_at_ms",
     "resume_not_before_ms",
+    // When a refusal-fallback schedule last changed: a wall-clock time each loop takes at its
+    // own moment. A schedule that records no time stays null and is still compared.
+    "updated_at_ms",
 ];
 
 /// Records as the comparison reads them. Message ids differ by design: today's are
@@ -2062,6 +2137,26 @@ fn scrub(value: &mut Value) {
         Value::Array(items) => items.iter_mut().for_each(scrub),
         _ => {}
     }
+}
+
+/// `new`, with the one difference allowed between a resume of each loop. When today's loop
+/// resumes a tool turn the refusal-fallback model answered, it commits the turn's message
+/// under the run's own model (`complete_pending_turn` stamps `cfg.model`), although its live
+/// path and its replay both name the fallback model. The new loop names the fallback model on
+/// both paths. Only a message where the new loop names the fallback and today names the run's
+/// model is aligned; every other difference still fails.
+fn resumed_as_today(new: &CallOptions, today: &CallOptions) -> CallOptions {
+    let mut new = new.clone();
+    let Some(script) = fallback() else {
+        return new;
+    };
+    let run_model = ModelHandle::new(provider_id(), "m");
+    for (new, today) in new.prompt.iter_mut().zip(today.prompt.iter()) {
+        if new.origin.as_ref() == Some(&script.model) && today.origin.as_ref() == Some(&run_model) {
+            new.origin = today.origin.clone();
+        }
+    }
+    new
 }
 
 /// Runs [`compare_in`] in both layouts.
@@ -2315,7 +2410,8 @@ async fn compare_every_cut_in(scenario: Scenario) {
             "{context}: request count"
         );
         for (index, (new, today)) in new.requests.iter().zip(&today.requests).enumerate() {
-            assert_eq!(new, today, "{context}: request {index}");
+            let new = resumed_as_today(new, today);
+            assert_eq!(&new, today, "{context}: request {index}");
         }
         for (index, (new, today)) in new.records.iter().zip(today_appended).enumerate() {
             assert_eq!(new, today, "{context}: record {index}");
@@ -6182,5 +6278,129 @@ async fn every_cut_of_a_step_with_a_cut_call_resumes_alike() {
         ],
         &["c2"],
     ))
+    .await;
+}
+
+/// The run's own model refuses a step: the refusal is durable, the same step goes to the
+/// fallback model, and the schedule sends the following steps there too, in both loops.
+#[tokio::test]
+async fn a_refused_step_is_resent_to_the_fallback_and_the_schedule_routes_the_next() {
+    compare_with_fallback(
+        None,
+        compare(Scenario {
+            input: vec![user("read a")],
+            tools: vec![tool("read", ExecutionMode::Parallel)],
+            manifest: None,
+            stop_when: Vec::new(),
+            steps: vec![
+                refusal("a0"),
+                answer(
+                    "a1",
+                    vec![call("c1", "read", json!({"path": "a"}))],
+                    FinishReason::ToolCalls,
+                ),
+                text_step("a2", "done"),
+            ],
+        }),
+    )
+    .await;
+}
+
+/// Resumed at every cut, a durable refusal sends the step to the fallback exactly once, and a
+/// cut before it sends the step to the run's own model again.
+#[tokio::test]
+async fn every_cut_of_a_refused_step_resumes_alike() {
+    compare_with_fallback(
+        None,
+        compare_every_cut(Scenario {
+            input: vec![user("read a")],
+            tools: vec![tool("read", ExecutionMode::Parallel)],
+            manifest: None,
+            stop_when: Vec::new(),
+            steps: vec![
+                refusal("a0"),
+                answer(
+                    "a1",
+                    vec![call("c1", "read", json!({"path": "a"}))],
+                    FinishReason::ToolCalls,
+                ),
+                text_step("a2", "done"),
+            ],
+        }),
+    )
+    .await;
+}
+
+/// A refusal after a completed tool call commits as a tool step, its calls run once, and the
+/// schedule sends the next step to the fallback.
+#[tokio::test]
+async fn a_refusal_after_a_tool_call_commits_and_arms_the_schedule() {
+    compare_with_fallback(
+        None,
+        compare(Scenario {
+            input: vec![user("read a")],
+            tools: vec![tool("read", ExecutionMode::Parallel)],
+            manifest: None,
+            stop_when: Vec::new(),
+            steps: vec![
+                answer(
+                    "a1",
+                    vec![call("c1", "read", json!({"path": "a"}))],
+                    FinishReason::ContentFilter,
+                ),
+                text_step("a2", "done"),
+            ],
+        }),
+    )
+    .await;
+}
+
+/// When the prompt already fills the fallback model's window, a refusal commits as it is.
+#[tokio::test]
+async fn a_refusal_too_large_for_the_fallback_commits() {
+    compare_with_fallback(
+        Some(50),
+        compare(Scenario {
+            input: vec![user("read a")],
+            tools: vec![tool("read", ExecutionMode::Parallel)],
+            manifest: None,
+            stop_when: Vec::new(),
+            steps: vec![
+                answer(
+                    "a1",
+                    vec![call("c1", "read", json!({"path": "a"}))],
+                    FinishReason::ToolCalls,
+                ),
+                refusal("a2"),
+            ],
+        }),
+    )
+    .await;
+}
+
+/// The schedule carries into the session's next run under the same model, so its first step
+/// goes to the fallback.
+#[tokio::test]
+async fn a_refusal_schedule_carries_into_the_next_run() {
+    compare_with_fallback(
+        None,
+        compare_runs(
+            Scenario {
+                input: Vec::new(),
+                tools: vec![tool("read", ExecutionMode::Parallel)],
+                manifest: None,
+                stop_when: Vec::new(),
+                steps: vec![
+                    refusal("a0"),
+                    text_step("a1", "ok"),
+                    text_step("a2", "again"),
+                ],
+            },
+            &[
+                ("r1", vec![user("first task")]),
+                ("r2", vec![user("second task")]),
+            ],
+        ),
+    )
     .await;
 }

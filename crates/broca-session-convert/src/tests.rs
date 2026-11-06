@@ -288,3 +288,69 @@ fn a_tool_waits_warms_are_priced_as_todays_restart_prices_them() {
     assert_eq!(today, f64::INFINITY);
     assert_eq!(new, today);
 }
+
+/// A step the run's own model refused converts to a typed record and folds as today's replay
+/// reads it: the refusal's schedule applies to the session, its billed usage counts toward the
+/// run, and the step it names is the one a resume sends to the fallback model. Once the step
+/// ends, nothing is pending.
+#[test]
+fn a_refused_step_folds_as_todays_replay_reads_it() {
+    use broca_session_store::fold::operations::Operations;
+    let schedule = |remaining: u64| {
+        serde_json::json!({
+            "source": {"provider_module_id": "p", "model_id": "m"},
+            "fallback": {"provider_module_id": "p", "model_id": "fallback"},
+            "phase": {"kind": "fallback", "remaining": remaining},
+            "re_refusals": 0,
+            "updated_at_ms": 7,
+        })
+    };
+    let refused = format!(
+        r#"{{"type":"model_step_refused","step_id":1,"usage":{{"input_tokens":50,"output_tokens":4}},"discarded_blocks":2,"schedule":{},"ts_ms":7}}"#,
+        schedule(10)
+    );
+    let finished = format!(
+        r#"{{"type":"model_step_finished","step_id":1,"assistant_message":{{"message_id":"a","content":[{{"type":"text","text":"ok"}}]}},"usage":{{"input_tokens":60,"output_tokens":5}},"retries_used":0,"route":{{"model":{{"provider_module_id":"p","model_id":"fallback"}},"reason":"refusal"}},"refusal_fallback":{}}}"#,
+        schedule(9)
+    );
+    let run = RUN.replace("RUN", "r1");
+    let started = r#"{"type":"step_started","step_id":1}"#;
+    for (lines, pending) in [
+        (vec![run.as_str(), started, refused.as_str()], Some(1)),
+        (
+            vec![run.as_str(), started, refused.as_str(), finished.as_str()],
+            None,
+        ),
+    ] {
+        let old = log(&lines);
+        let records: Vec<broca_wal::WalRecord> =
+            old.iter().map(|frame| frame.record.clone()).collect();
+        let today = broca_core::replay::replay(&records).expect("today's replay reads it");
+        let converted = convert(&old, None).unwrap();
+        assert!(converted.lost.is_empty(), "{:?}", converted.lost);
+        assert!(converted
+            .records
+            .iter()
+            .any(|record| matches!(record, Record::StepRefused(refused) if refused.step_id == 1)));
+        let mut operations = Operations::default();
+        for record in &converted.records {
+            if record.stream() == broca_session_store::record::Stream::Ledger {
+                operations.apply(record).expect("the fold reads it");
+            }
+        }
+        assert_eq!(
+            operations.refusal_schedule,
+            Some(serde_json::to_value(&today.refusal_fallback).unwrap())
+        );
+        let run = operations.run.expect("a run");
+        assert_eq!(run.usage, today.usage, "the refused call's usage counts");
+        assert_eq!(run.refused_step, pending);
+        assert_eq!(
+            run.refused_step.is_some(),
+            today
+                .refused_steps
+                .contains(&broca_protocol::StepId(run.completed_steps + 1)),
+            "the step a resume sends to the fallback"
+        );
+    }
+}

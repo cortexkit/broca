@@ -9,7 +9,7 @@ use broca_protocol::{ProviderError, StepId};
 use broca_session_store::fold::operations::Operations;
 use broca_session_store::record::{OutputCapLowered, Record};
 
-use crate::run::{Admission, LoopError};
+use crate::run::LoopError;
 use crate::writer::Writer;
 
 /// What a step sends after its output reservation is decided.
@@ -22,32 +22,35 @@ pub enum Reserved {
 }
 
 /// Decides step `step_id`'s output cap before its request is sent, as today's loop does: the
-/// estimated input plus the frozen cap must stay inside the run's context limit, or the cap is
+/// estimated input plus the frozen cap must stay inside the step's context limit, or the cap is
 /// lowered, or the run ends without sending when even the provider's floor doesn't fit. The
-/// input is estimated only from a measured earlier step on the run's model. A cap the step
+/// input is estimated only from a measured earlier step on the step's model. A cap the step
 /// already recorded (an earlier attempt, before a crash) is what the provider saw, so it is sent
 /// again, and only a fresh estimate that needs less lowers it further. A lowered cap is durable
 /// before the request goes out.
+///
+/// `model` and `context_limit` are the step's: the run's own, or the refusal-fallback model's
+/// on a step sent there.
 pub async fn reserve<W: Writer, P: Provider>(
     writer: &mut W,
     provider: &P,
-    admission: &Admission,
     step_id: u64,
     mut opts: CallOptions,
+    model: &broca_protocol::request::ModelHandle,
+    context_limit: Option<u64>,
 ) -> Result<Reserved, LoopError> {
     let history = history(writer.operations());
     let recorded = history.recorded_for(StepId(step_id));
     let mut fresh = None;
-    if let (Some(limits), Some(context_limit)) = (provider.output_limits(), admission.context_limit)
-    {
+    if let (Some(limits), Some(context_limit)) = (provider.output_limits(), context_limit) {
         // The estimate costs a render of the whole request, so it is made only when a measured
         // earlier step on this model makes one possible.
-        let estimate = if history.has_measurement(&admission.model) {
+        let estimate = if history.has_measurement(model) {
             let bytes = provider
                 .try_render_request(&opts)
                 .map_err(|error| LoopError::Parts(error.message))?
                 .len();
-            history.estimate(bytes, &admission.model)
+            history.estimate(bytes, model)
         } else {
             None
         };

@@ -875,6 +875,28 @@ message! {
 }
 
 message! {
+    /// The run's own model refused a step with a content filter, and the step goes to the
+    /// run's refusal-fallback model instead. The refused answer is not kept. Its billed usage
+    /// counts toward the run, and the schedule the refusal armed applies to the session. Durable
+    /// before the step is sent to the fallback, and a resume sends the step there again.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct StepRefused {
+        1 req run_id: String,
+        2 req step_id: u64,
+        3 req usage: Usage,
+        /// Owned by the provider layer: the model that answered and each model's usage, when
+        /// the provider handed the request on itself.
+        4 opt served_model: String,
+        5 opt usage_iterations: serde_json::Value,
+        /// How many content blocks the refused answer held.
+        6 req discarded_blocks: u32,
+        /// Owned by the run loop: the refusal-fallback schedule after this refusal.
+        7 req schedule: serde_json::Value,
+        8 opt ts_ms: u64,
+    }
+}
+
+message! {
     /// A paused run resumed before any provider call, and its provider now renders with a
     /// different config than the run froze: the run renders with this one from here on. Only
     /// before the first call is that safe, since no request bytes depend on the old config.
@@ -1215,6 +1237,7 @@ records! {
         97 Warmed,
         98 ConfigRefrozen,
         99 AuthRefrozen,
+        100 StepRefused,
     }
 }
 

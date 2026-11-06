@@ -26,8 +26,9 @@ use broca_session_store::record::{
     CancelPoint, CancelRequest, CeilingDecided, Compaction, ConfigRefrozen, Delivery,
     DeliveryOrdered, Event, Input, Marker, Notice, OutputCapLowered, PartKind, PartRef, Pause,
     Placement, QueuedSend, Record, Redo, ResultAppend, Resumed, Retraction, RunEnd, RunStart,
-    SendEnded, SessionRefresh, SetupStub, Steer, StepEnd, StepStart, Stream, StructuredDowngraded,
-    StructuredResult, ToolHeld, ToolIntent, ToolOutcome, ToolReply, View, ViewApplied, Warmed,
+    SendEnded, SessionRefresh, SetupStub, Steer, StepEnd, StepRefused, StepStart, Stream,
+    StructuredDowngraded, StructuredResult, ToolHeld, ToolIntent, ToolOutcome, ToolReply, View,
+    ViewApplied, Warmed,
 };
 use broca_wal::{FramedRecord, WalRecord};
 use serde::de::DeserializeOwned;
@@ -614,6 +615,16 @@ fn convert_one(
             step_id: f.req_u64("step_id"),
             detail: f.take("detail"),
         })),
+        "model_step_refused" => out.records.push(Record::StepRefused(StepRefused {
+            run_id: state.run_id.clone(),
+            step_id: f.req_u64("step_id"),
+            usage: f.parse("usage")?.unwrap_or_default(),
+            served_model: f.string("served_model"),
+            usage_iterations: f.take("usage_iterations"),
+            discarded_blocks: f.req_u64("discarded_blocks") as u32,
+            schedule: f.take("schedule").unwrap_or(Value::Null),
+            ts_ms: f.u64("ts_ms"),
+        })),
         // Today's refreezes name no run: they belong to the run whose resume wrote them.
         "run_config_refrozen" => out.records.push(Record::ConfigRefrozen(ConfigRefrozen {
             run_id: state.run_id.clone(),
@@ -1105,6 +1116,25 @@ fn model_step_finished(
     let speed_used = f.string("speed_used");
     let hooks = f.take("hooks");
     let fallback = f.rest();
+    // A step routed to the refusal-fallback model is that model's message, as today's replay
+    // reads it: rendering decides by a message's model which reasoning it may echo.
+    if let Some(routed) = fallback
+        .as_ref()
+        .and_then(|fallback| fallback.get("route"))
+        .and_then(|route| route.get("model"))
+    {
+        let routed: broca_protocol::request::ModelHandle =
+            serde_json::from_value(routed.clone())
+                .map_err(|e| err(format!("model_step_finished.route.model: {e}")))?;
+        if let Some(Record::Assistant(assistant)) = out
+            .records
+            .iter_mut()
+            .rev()
+            .find(|record| matches!(record, Record::Assistant(_)))
+        {
+            assistant.message.origin = Some(routed);
+        }
+    }
     // A provider fallback inside the step served several model calls; `usage` holds the last
     // one's and the fallback's iterations hold each. The step's whole usage is their sum.
     let iterations: Option<Vec<broca_protocol::usage::UsageIteration>> = fallback

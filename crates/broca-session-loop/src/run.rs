@@ -909,15 +909,6 @@ fn refuse_first_protocol_compaction<W: Writer>(writer: &W) -> Result<(), LoopErr
 /// rather than running it without that part: an input-token budget (no live session has one),
 /// and the client-side refusal fallback. Each is read from what the run froze.
 fn refuse_unbuilt(admission: &Admission) -> Result<(), LoopError> {
-    let frozen = &admission.render_config;
-    if frozen
-        .get("refusal_fallback")
-        .is_some_and(|fallback| !fallback.is_null())
-    {
-        return Err(LoopError::Unsupported(
-            "a run with the client-side refusal fallback",
-        ));
-    }
     if admission
         .budget
         .as_ref()
@@ -1344,23 +1335,15 @@ where
                     .await?;
             }
         }
-        let opts = match crate::output::reserve(writer, seams.provider, admission, step_id, opts)
-            .await?
-        {
-            crate::output::Reserved::Send(opts) => *opts,
-            crate::output::Reserved::Overflow(error) => {
-                let now = (seams.now_ms)();
-                let mut record = run_end(writer, &admission.run_id, RunFinishReason::Error, now);
-                if let Record::RunEnd(end) = &mut record {
-                    end.error = Some(
-                        serde_json::to_value(&*error)
-                            .map_err(|e| LoopError::Parts(e.to_string()))?,
-                    );
-                }
-                append_end(writer, &admission.run_id, vec![record]).await?;
-                return Ok(finished(writer, RunFinishReason::Error));
-            }
-        };
+        // Client-side refusal fallback: the step goes to the run's refusal-fallback model while
+        // the session's schedule says so, or when it is a step already refused and re-sent.
+        let mut route = crate::refusal::Route::decide(writer, seams.provider, step_id)?;
+        let prepared = opts;
+        let mut opts =
+            match reserve_for(writer, seams, admission, step_id, &prepared, &route).await? {
+                Some(opts) => opts,
+                None => return Ok(finished(writer, RunFinishReason::Error)),
+            };
         // The step a timed account pause resumes is sent again only if it renders the request
         // the provider refused, byte for byte, as today's resume checks it: anything else ends
         // the run interrupted rather than send a request the pause wasn't for.
@@ -1391,6 +1374,8 @@ where
         // today's loop does.
         let mut downgraded_now = false;
         let mut prior_retries = 0;
+        // The retries of an attempt the run's own model refused, which the re-sent step's count.
+        let mut refusal_retries = 0u32;
         let outcome = loop {
             let outcome = model_step(
                 writer,
@@ -1424,14 +1409,72 @@ where
                     continue;
                 }
             }
+            // The run's own model refused the step: the refusal's billed usage and the schedule
+            // it arms are durable before the same step is re-sent to the fallback model. The
+            // refused answer is not kept. A resume after that barrier sends the step there.
+            if let Ok(step) = &outcome {
+                if let Some(fallback) = route
+                    .resend_to(
+                        &step.message,
+                        step.finish_reason == FinishReason::ContentFilter,
+                    )
+                    .cloned()
+                {
+                    let now = Some((seams.now_ms)()).filter(|at| *at != 0);
+                    let schedule = broca_core::refusal_fallback::on_source_refusal(
+                        crate::refusal::schedule(writer)?.as_ref(),
+                        &admission.model,
+                        &fallback,
+                        now,
+                    );
+                    writer
+                        .append(
+                            &[Record::StepRefused(
+                                broca_session_store::record::StepRefused {
+                                    run_id: admission.run_id.clone(),
+                                    step_id,
+                                    usage: step.served.total(step.usage),
+                                    served_model: step.served.served_model.clone(),
+                                    usage_iterations: step
+                                        .served
+                                        .usage_iterations
+                                        .as_ref()
+                                        .map(serde_json::to_value)
+                                        .transpose()
+                                        .map_err(|e| LoopError::Parts(e.to_string()))?,
+                                    discarded_blocks: step.message.content.len() as u32,
+                                    schedule: serde_json::to_value(&schedule)
+                                        .map_err(|e| LoopError::Parts(e.to_string()))?,
+                                    ts_ms: now,
+                                },
+                            )],
+                            true,
+                        )
+                        .await?;
+                    refusal_retries = step.retries_used;
+                    route.reroute(seams.provider);
+                    opts = match reserve_for(writer, seams, admission, step_id, &prepared, &route)
+                        .await?
+                    {
+                        Some(opts) => opts,
+                        None => return Ok(finished(writer, RunFinishReason::Error)),
+                    };
+                    continue;
+                }
+            }
             break match outcome {
                 Ok(mut step) => {
-                    step.retries_used = step.retries_used.saturating_add(prior_retries);
+                    step.retries_used = step
+                        .retries_used
+                        .saturating_add(prior_retries)
+                        .saturating_add(refusal_retries);
                     Ok(step)
                 }
                 Err(StepFailure::Error(error, retries, limited)) => Err(StepFailure::Error(
                     error,
-                    retries.saturating_add(prior_retries),
+                    retries
+                        .saturating_add(prior_retries)
+                        .saturating_add(refusal_retries),
                     limited,
                 )),
                 Err(failure) => Err(failure),
@@ -1518,12 +1561,28 @@ where
                 step.finish_reason = FinishReason::Stop;
             }
         }
+        // What the step records about the refusal fallback. A refusal after a completed tool
+        // call commits as a tool step and arms the schedule, as today's loop commits it.
+        let refusal = route.committed(
+            writer,
+            &admission.model,
+            &step.message,
+            step.finish_reason == FinishReason::ContentFilter,
+            step.served.served_model.as_deref(),
+            Some((seams.now_ms)()).filter(|at| *at != 0),
+        )?;
+        if refusal.after_tool_use {
+            step.finish_reason = FinishReason::ToolCalls;
+        }
         let calls: Vec<ToolCall> = step.message.tool_calls().cloned().collect();
         let stop = stop_satisfied(&stop_when, completed_steps + 1, &step.message).cloned();
         let limiting = limiting_stop_satisfied(&stop_when, completed_steps + 1, &step.message);
         let now = (seams.now_ms)();
-        let assistant =
-            Message::assistant_from(step.message.content.clone(), admission.model.clone());
+        // On a step the fallback model answered, the message is the fallback's.
+        let assistant = Message::assistant_from(
+            step.message.content.clone(),
+            route.model(&admission.model).clone(),
+        );
         // The step's whole usage, over every model that ran when the provider handed the
         // request on itself, as today's loop records it on both the message and the step.
         let whole = step.served.total(step.usage);
@@ -1589,7 +1648,7 @@ where
                         service_tier_used: step.served.service_tier_used.clone(),
                         speed_used: step.served.speed_used.clone(),
                         call_count: calls.len() as u32,
-                        fallback: step.served.members()?,
+                        fallback: step.served.members(refusal)?,
                         hooks: step_hooks,
                         budget_finalize: finalizing.then_some(true),
                         // As the converter fills it from today's record: what the iterations
@@ -1727,6 +1786,16 @@ async fn admit<W: Writer>(
     parts: &mut dyn Parts,
     admission: &Admission,
 ) -> Result<u64, LoopError> {
+    // The session's refusal-fallback schedule carries into the run only under the same model
+    // and within a day of its last change, as today's admission decides it.
+    let refusal_schedule = broca_core::refusal_fallback::on_episode_admitted(
+        crate::refusal::schedule(writer)?,
+        &admission.model,
+        admission.ts_ms,
+    )
+    .map(serde_json::to_value)
+    .transpose()
+    .map_err(|e| LoopError::Parts(e.to_string()))?;
     let mut setup = Vec::new();
     // A planned run's system text is part of its manifest; any other run's is its own part.
     let global_system = (admission.manifest.is_none() && !admission.global_system.is_empty())
@@ -1845,7 +1914,7 @@ async fn admit<W: Writer>(
             .transpose()
             .map_err(|e| LoopError::Parts(e.to_string()))?,
         seeded: None,
-        refusal_schedule: None,
+        refusal_schedule,
     })));
     for message in &admission.input {
         records.push(Record::Input(Input {
@@ -2148,21 +2217,26 @@ struct Served {
 }
 
 impl Served {
-    /// The step end's `fallback` members these facts fill, as the converter carries today's
-    /// record's remaining members. `None` when the provider reported none of them.
-    fn members(&self) -> Result<Option<Value>, LoopError> {
-        let mut members = serde_json::Map::new();
+    /// The step end's `fallback` members, as the converter carries today's record's remaining
+    /// members: these facts and what the step records about the refusal fallback, in today's
+    /// own `StepFallback` shape. `None` when there are none.
+    fn members(&self, refusal: crate::refusal::Committed) -> Result<Option<Value>, LoopError> {
+        let fallback = broca_wal::StepFallback {
+            served_model: self.served_model.clone(),
+            usage_iterations: self.usage_iterations.clone(),
+            route: refusal.route,
+            refusal_fallback: refusal.schedule,
+            refusal_after_tool_use: refusal.after_tool_use,
+        };
+        let Value::Object(mut members) =
+            serde_json::to_value(&fallback).map_err(|e| LoopError::Parts(e.to_string()))?
+        else {
+            return Err(LoopError::Parts(
+                "step fallback facts are not an object".into(),
+            ));
+        };
         if let Some(reason) = &self.raw_finish_reason {
             members.insert("raw_finish_reason".into(), json!(reason));
-        }
-        if let Some(model) = &self.served_model {
-            members.insert("served_model".into(), json!(model));
-        }
-        if let Some(iterations) = &self.usage_iterations {
-            members.insert(
-                "usage_iterations".into(),
-                serde_json::to_value(iterations).map_err(|e| LoopError::Parts(e.to_string()))?,
-            );
         }
         Ok((!members.is_empty()).then_some(Value::Object(members)))
     }
@@ -3257,6 +3331,43 @@ fn run_selection<'a, P, T>(
         .auth_selection
         .as_ref()
         .or(admission.auth_selection.as_ref())
+}
+
+/// The step's request with its output cap reserved for the model it goes to: the run's own, or
+/// the refusal-fallback model, with that model's window. `None` when even the provider's floor
+/// doesn't fit: the run's end with the overflow error is then durable.
+async fn reserve_for<W: Writer, P: Provider, T>(
+    writer: &mut W,
+    seams: &Seams<'_, P, T>,
+    admission: &Admission,
+    step_id: u64,
+    prepared: &CallOptions,
+    route: &crate::refusal::Route,
+) -> Result<Option<CallOptions>, LoopError> {
+    let mut opts = prepared.clone();
+    let mut context_limit = admission.context_limit;
+    if route.route == broca_core::refusal_fallback::StepRoute::Fallback {
+        // A fallback step tells the renderer which model it renders for.
+        opts.target_model = route.fallback.clone();
+        context_limit = seams.provider.refusal_fallback_context_limit();
+    }
+    let model = route.model(&admission.model).clone();
+    match crate::output::reserve(writer, seams.provider, step_id, opts, &model, context_limit)
+        .await?
+    {
+        crate::output::Reserved::Send(opts) => Ok(Some(*opts)),
+        crate::output::Reserved::Overflow(error) => {
+            end_with_error(
+                writer,
+                seams,
+                &admission.run_id,
+                RunFinishReason::Error,
+                &error,
+            )
+            .await?;
+            Ok(None)
+        }
+    }
 }
 
 /// The timed same-account pause the run's state holds, if it is paused on one.

@@ -771,6 +771,18 @@ pub fn invert(records: &[Record], parts: &BTreeMap<Digest, Vec<u8>>) -> Result<V
                         set(&mut object, "failure", retraction.failure.as_ref());
                         Value::Object(object)
                     }
+                    Record::StepRefused(refused) => {
+                        let mut object = Map::new();
+                        object.insert("type".into(), json("model_step_refused"));
+                        object.insert("step_id".into(), json(refused.step_id));
+                        object.insert("usage".into(), json(refused.usage));
+                        set(&mut object, "served_model", refused.served_model.as_ref());
+                        set(&mut object, "usage_iterations", refused.usage_iterations.as_ref());
+                        object.insert("discarded_blocks".into(), json(refused.discarded_blocks));
+                        object.insert("schedule".into(), refused.schedule.clone());
+                        set(&mut object, "ts_ms", refused.ts_ms);
+                        Value::Object(object)
+                    }
                     Record::ConfigRefrozen(refrozen) => {
                         let mut object = Map::new();
                         object.insert("type".into(), json("run_config_refrozen"));
