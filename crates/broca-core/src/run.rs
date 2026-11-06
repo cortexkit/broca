@@ -896,7 +896,7 @@ fn remember_warm_config(
 }
 
 impl RunControl {
-    fn now_ms(&self) -> Option<u64> {
+    pub(crate) fn now_ms(&self) -> Option<u64> {
         self.clock
             .as_ref()
             .map_or_else(epoch_millis, |clock| Some(clock.now_ms()))
@@ -5420,91 +5420,28 @@ where
         // compare the schedule against the same value replay will.
         let admitted_at_ms = control.now_ms();
         output_history.start_run(&cfg.model);
-        let (run_started_seq, input_tags) = writer.record_tagged(WalRecord::RunStarted {
-            compaction_plan_version: mode3.then_some(cortexkit_compaction_view::PLAN_VERSION),
-            sent_by: control.display_sent_by.clone(),
-            written_at_ms: req
-                .input_written_at_ms
-                .or_else(|| {
-                    req.submission_id
-                        .is_none()
-                        .then(|| control.now_ms())
-                        .flatten()
-                })
-                .filter(|at| *at != 0),
-            tags: None,
-            session_class: req.session_class.clone(),
-            retention: req.retention,
-            hooks: control.input_hooks.clone().map(|mut hooks| {
-                // RunStarted.input holds the rendered final value, unlike Queued.request.
-                hooks.final_value = None;
-                hooks
-            }),
-            on_restart: req.on_restart,
-            keep_warm: req.keep_warm,
-            marker_order_version,
-            // Must-understand: a manifest makes this a gated frame requiring `plan-manifest/v1`,
-            // and the WAL raises the feature floor to that name before writing it.
-            manifest: control.manifest.as_deref().cloned().map(Box::new),
-            // Must-understand: the WAL raises the feature floor before this frame is written,
-            // and a scoped record is always framed as a gated frame requiring `scope/v1`.
-            scope: req.scope.clone(),
-            send_id: req.send_id.clone(),
-            request_identity_digest: req.request_identity_digest.clone(),
-            // Informational: recorded for dashboards and never read back into a request.
-            title: req.title.clone(),
-            project_id: req.project_id.clone(),
-            principal: req.principal.clone(),
-            ts_ms: admitted_at_ms,
-            run_id: resolved_run_id.clone(),
-            session: req.session.clone(),
-            config: remember_warm_config(
-                RunConfig {
-                    global_system: (mode3 && frozen_plan.is_none() && !v2_globals.is_empty())
-                        .then(|| Arc::new(v2_globals.clone())),
-                    route_decision_id: req.route_decision_id.clone(),
-                    account_limit_pause: account_limit_pause_enabled,
-                    turn_directives_v1: req.directives.clone(),
-                    render_tags,
-                    computed_tags,
-                    model: cfg.model.clone(),
-                    tools: Arc::clone(&tools),
-                    tool_choice: cfg.tool_choice.clone(),
-                    generation: cfg.generation.clone(),
-                    response_format: cfg.response_format.clone(),
-                    provider_options: cfg.provider_options.clone(),
-                    cache_tiers: serde_json::Value::Null,
-                    context_epoch: 0,
-                    renderer_version: provider.renderer_version(),
-                    frozen_render_config: provider.render_config_blob(),
-                    // Freeze the resolved credential id so a resume retrieves the same credential,
-                    // never choosing its method again from configuration or account routing.
-                    // The frozen credential id is metadata, not a provider render input.
-                    auth_selection: control.auth_selection.clone(),
-                    tools_were_omitted: control.tools_were_omitted,
-                    budget: cfg.budget.clone(),
-                    context_limit,
-                    work_class,
-                    variant: variant.clone(),
-                    service_tier,
-                    stop_when: cfg.stop_when.clone(),
-                    // Before any record is written, accepting the send resolves context management
-                    // into req.context_management: the session's inherited mode, or on its
-                    // first send the caller's choice, project/global broca.jsonc defaults,
-                    // then "none", in that order.
-                    context_management: req.context_management.clone(),
-                },
-                &mut warm_config,
-                control.keep_warm.is_some(),
-            ),
-            input: Arc::clone(&episode_input),
-            origin: broca_wal::RunOrigin::Fresh,
-            // If this run consumes a durable queued submission, record its id so the
-            // submission is provably marked CONSUMED (the pending-queue derivation excludes
-            // a submission once a RunStarted references it — so a crash after this barrier
-            // never re-drains it). `None` for a directly-started run.
-            submission_id: req.submission_id.clone(),
-        });
+        let config = crate::fresh_start::run_config(
+            req,
+            control,
+            provider,
+            &cfg,
+            Arc::clone(&tools),
+            (mode3 && frozen_plan.is_none() && !v2_globals.is_empty())
+                .then(|| Arc::new(v2_globals.clone())),
+            (render_tags, computed_tags),
+        );
+        let (run_started_seq, input_tags) = writer.record_tagged(crate::fresh_start::run_started(
+            req,
+            control,
+            crate::fresh_start::EpisodeStart {
+                run_id: resolved_run_id.clone(),
+                mode3,
+                marker_order_version,
+                admitted_at_ms,
+                config: remember_warm_config(config, &mut warm_config, control.keep_warm.is_some()),
+                input: Arc::clone(&episode_input),
+            },
+        ));
         if input_cap_changed {
             writer.record(WalRecord::InputTokenCapFrozen {
                 limit: input_budget.limit.expect("changed cap is finite"),

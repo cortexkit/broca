@@ -88,7 +88,8 @@ fn retention_writes_are_limited_to_the_core_and_actor() {
     }
     let expected = std::collections::BTreeMap::from([
         (
-            "crates/broca-core/src/run.rs".to_owned(),
+            // Where a new episode's `RunStarted` is built, for today's loop and the new storage.
+            "crates/broca-core/src/fresh_start.rs".to_owned(),
             vec!["RunStarted.retention".to_owned()],
         ),
         (
