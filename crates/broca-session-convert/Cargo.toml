@@ -31,4 +31,5 @@ zstd = "0.14"
 futures = { workspace = true, features = ["executor"] }
 
 [dev-dependencies]
+async-trait.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

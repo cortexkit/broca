@@ -27,7 +27,7 @@ use broca_session_store::record::{
     Notice, OutputCapLowered, PartKind, PartRef, Pause, Placement, QueuedSend, Record, Redo,
     ResultAppend, Resumed, Retraction, RunEnd, RunStart, SendEnded, SessionRefresh, SetupStub,
     Steer, StepEnd, StepStart, Stream, StructuredDowngraded, StructuredResult, ToolHeld,
-    ToolIntent, ToolOutcome, ToolReply, View, ViewApplied,
+    ToolIntent, ToolOutcome, ToolReply, View, ViewApplied, Warmed,
 };
 use broca_wal::{FramedRecord, WalRecord};
 use serde::de::DeserializeOwned;
@@ -614,6 +614,43 @@ fn convert_one(
             step_id: f.req_u64("step_id"),
             detail: f.take("detail"),
         })),
+        "cache_warmed" => {
+            let mut billing = Map::new();
+            for key in ["reservation", "envelope"] {
+                if let Some(value) = f.take(key) {
+                    billing.insert(key.into(), value);
+                }
+            }
+            // Decided by today's rule, which the new format records instead of working out
+            // again.
+            let reached_cache = broca_core::cache_warm::warm_reached_the_cache(
+                billing
+                    .get("envelope")
+                    .map(|envelope| serde_json::from_value(envelope.clone()))
+                    .transpose()
+                    .map_err(|e| err(format!("cache_warmed envelope: {e}")))?
+                    .as_ref(),
+            );
+            out.records.push(Record::Warmed(Warmed {
+                run_id: f.req_string("run_id"),
+                step_id: f.req_u64("step_id"),
+                trigger: f.string("trigger"),
+                request_body_sha256: digest_field(&mut f, "request_body_sha256"),
+                warm_body_sha256: digest_field(&mut f, "warm_body_sha256"),
+                usage: f
+                    .parse::<Usage>("usage")?
+                    .ok_or_else(|| err("cache_warmed without usage"))?,
+                served_account_ref: f.string("served_account_ref"),
+                sent_at_ms: f.req_u64("sent_at_ms"),
+                ttl_ms: f.u64("ttl_ms"),
+                expires_at_ms: f.u64("expires_at_ms"),
+                attempt_id: f.string("attempt_id"),
+                billing: (!billing.is_empty()).then_some(Value::Object(billing)),
+                ratelimit_headers: f.take("ratelimit_headers"),
+                reached_cache: reached_cache.then_some(true),
+                requested_cache_ttl_ms: state.requested_cache_ttl.filter(|_| reached_cache),
+            }))
+        }
         "structured_output_downgraded" => {
             out.records
                 .push(Record::StructuredDowngraded(StructuredDowngraded {

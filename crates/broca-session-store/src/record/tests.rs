@@ -163,6 +163,7 @@ fn one_of_each() -> Vec<Record> {
             billing: None,
             telemetry: Some(serde_json::json!({"max_content_gap_ms": 613})),
             reached_cache: Some(true),
+            requested_cache_ttl_ms: Some(300_000),
         }),
         Record::BatchStart(BatchStart {
             run_id: "run-1".into(),

@@ -771,6 +771,37 @@ pub fn invert(records: &[Record], parts: &BTreeMap<Digest, Vec<u8>>) -> Result<V
                         set(&mut object, "failure", retraction.failure.as_ref());
                         Value::Object(object)
                     }
+                    Record::Warmed(warmed) => {
+                        let mut object = members(warmed.billing.as_ref())?;
+                        object.insert("type".into(), json("cache_warmed"));
+                        set(&mut object, "attempt_id", warmed.attempt_id.as_ref());
+                        set(&mut object, "trigger", warmed.trigger.as_ref());
+                        object.insert("run_id".into(), json(&warmed.run_id));
+                        object.insert("step_id".into(), json(warmed.step_id));
+                        object.insert(
+                            "request_body_sha256".into(),
+                            json(hex(&warmed.request_body_sha256)),
+                        );
+                        object.insert(
+                            "warm_body_sha256".into(),
+                            json(hex(&warmed.warm_body_sha256)),
+                        );
+                        object.insert("usage".into(), json(warmed.usage));
+                        set(
+                            &mut object,
+                            "served_account_ref",
+                            warmed.served_account_ref.as_ref(),
+                        );
+                        set(
+                            &mut object,
+                            "ratelimit_headers",
+                            warmed.ratelimit_headers.as_ref(),
+                        );
+                        object.insert("sent_at_ms".into(), json(warmed.sent_at_ms));
+                        set(&mut object, "ttl_ms", warmed.ttl_ms);
+                        set(&mut object, "expires_at_ms", warmed.expires_at_ms);
+                        Value::Object(object)
+                    }
                     Record::StructuredDowngraded(downgraded) => serde_json::json!({
                         "type": "structured_output_downgraded",
                         "run_id": downgraded.run_id,

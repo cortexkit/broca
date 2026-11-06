@@ -187,3 +187,104 @@ fn a_run_start_records_the_refusal_schedule_admission_carried() {
         .collect();
     assert_eq!(schedules, [None, Some(schedule), None]);
 }
+
+/// A tool wait's warms, read back from the new format, are priced to the same spend as today's
+/// loop prices them from today's records after a restart: warms that reached the cache at their
+/// recorded price, the run's own keep-warm only, this step only, and a failed warm that reported
+/// usage but carries no reservation as unaffordable.
+#[test]
+fn a_tool_waits_warms_are_priced_as_todays_restart_prices_them() {
+    use broca_core::keep_warm_wait::{KeepWarmDriver, WarmTick, WarmTiming, WarmWait};
+    use broca_session_store::fold::operations::Operations;
+
+    /// Prices a warm by its reported input tokens, so each warm counts its own amount.
+    struct Priced;
+    #[async_trait::async_trait]
+    impl KeepWarmDriver for Priced {
+        fn timing(&self, _: &broca_wal::RunConfig) -> Result<WarmTiming, String> {
+            Err("not warming".into())
+        }
+        fn last_sent_at_ms(&self) -> Option<u64> {
+            None
+        }
+        fn costs(
+            &self,
+            _: &broca_wal::RunConfig,
+        ) -> Result<broca_core::keep_warm::WarmCosts, String> {
+            Err("priced from usage".into())
+        }
+        fn recorded_cost(
+            &self,
+            _: &broca_wal::RunConfig,
+            usage: &broca_protocol::usage::Usage,
+        ) -> Result<f64, String> {
+            Ok(usage.input_tokens.unwrap_or(0) as f64)
+        }
+        async fn warm(&self, _: &broca_wal::RunConfig, _: &broca_protocol::RunId) -> WarmTick {
+            WarmTick::Skipped
+        }
+    }
+    let warm = |run: &str, step: u64, trigger: &str, tokens: u64, extra: &str| {
+        format!(
+            r#"{{"type":"cache_warmed","trigger":"{trigger}","run_id":"{run}","step_id":{step},"request_body_sha256":"{d}","warm_body_sha256":"{d}","usage":{{"input_tokens":{tokens}}},"sent_at_ms":5,"ttl_ms":300000{extra}}}"#,
+            d = "a".repeat(64),
+        )
+    };
+    let failed = r#","envelope":{"sent":true,"response_bytes":0,"outcome":"eof_before_completion","http_status":500,"usage":{"input_tokens":9}}"#;
+    let tool_step = r#"{"type":"model_step_finished","step_id":1,"assistant_message":{"message_id":"m1","content":[{"type":"tool_call","tool_call_id":"c1","tool_name":"bash","input":{}}]},"usage":{"input_tokens":3},"finish_reason":"tool_calls","retries_used":0}"#;
+    let run = RUN.replace("RUN", "r1");
+    let lines = [
+        run.as_str(),
+        r#"{"type":"step_started","step_id":1}"#,
+        tool_step,
+        r#"{"type":"tool_batch_started","batch_id":"b1","step_id":1,"planned_calls":["c1"]}"#,
+        r#"{"type":"tool_dispatch_intent","batch_id":"b1","tool_call_id":"c1","args":{}}"#,
+    ];
+    let priced = |extra_warms: &[String]| {
+        let mut all: Vec<&str> = lines.to_vec();
+        all.extend(extra_warms.iter().map(String::as_str));
+        let old = log(&all);
+        let config = match &old[0].record {
+            broca_wal::WalRecord::RunStarted { config, .. } => (**config).clone(),
+            _ => unreachable!("the log starts with its run"),
+        };
+        let driver: std::sync::Arc<dyn KeepWarmDriver> = std::sync::Arc::new(Priced);
+        let run_id = broca_protocol::RunId("r1".into());
+        let flags = (Default::default(), Default::default());
+        let wait = WarmWait {
+            driver: &driver,
+            config: &config,
+            run_id: &run_id,
+            cancel: None,
+            unsupported_logged: &flags.0,
+            warm_missed: &flags.1,
+        };
+        let today =
+            broca_core::keep_warm_wait::batch_spend(Some(&wait), broca_protocol::StepId(1), &old);
+        let mut operations = Operations::default();
+        for record in &convert(&old, None).unwrap().records {
+            if record.stream() == broca_session_store::record::Stream::Ledger {
+                operations.apply(record).unwrap();
+            }
+        }
+        let new = broca_session_loop::run::warm_spend(driver.as_ref(), &config, &operations, 1);
+        (today, new)
+    };
+    let counted = [
+        warm("r1", 1, "keep_warm", 4, ""),
+        warm("r1", 1, "keep_warm", 6, ""),
+        // Not this wait's: another run's, another step's, or not the run's own keep-warm.
+        warm("r0", 1, "keep_warm", 100, ""),
+        warm("r1", 7, "keep_warm", 100, ""),
+        warm("r1", 1, "source_keep_warm", 100, ""),
+    ];
+    let (today, new) = priced(&counted);
+    assert_eq!(today, 10.0, "today's spend counts this wait's own warms");
+    assert_eq!(new, today);
+    // A failed warm that reported usage but can't be priced stops the wait.
+    let mut with_failed = counted.to_vec();
+    with_failed.push(warm("r1", 1, "keep_warm", 9, failed));
+    let (today, new) = priced(&with_failed);
+    assert_eq!(today, f64::INFINITY);
+    assert_eq!(new, today);
+}

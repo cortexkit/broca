@@ -875,6 +875,42 @@ message! {
 }
 
 message! {
+    /// The runner sent a request to keep the session's prompt cache warm: the prefix a step's
+    /// request wrote, read again so it outlives the wait. Billed, and counted toward how long
+    /// the cache lives.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct Warmed {
+        1 req run_id: String,
+        /// The step whose request was refreshed.
+        2 req step_id: u64,
+        /// What asked for it: `keep_warm` for a run's own tool wait, `source_keep_warm`, or
+        /// absent for a caller's manual warm.
+        3 opt trigger: String,
+        /// The step's request whose prefix was refreshed.
+        4 req request_body_sha256: Digest,
+        /// The warm request's own body.
+        5 req warm_body_sha256: Digest,
+        6 req usage: Usage,
+        7 opt served_account_ref: String,
+        8 req sent_at_ms: u64,
+        /// The cache lifetime the warm was scheduled by, and when the cache then expires.
+        9 opt ttl_ms: u64,
+        10 opt expires_at_ms: u64,
+        11 opt attempt_id: String,
+        /// Owned by billing: the reservation and envelope of a billed warm.
+        12 opt billing: serde_json::Value,
+        /// Owned by account routing: the provider's rate-limit headers on the warm's answer.
+        13 opt ratelimit_headers: serde_json::Value,
+        /// Whether the warm reached the provider's cache, as decided when it was recorded.
+        /// Absent means it didn't, or isn't known to have.
+        14 opt reached_cache: bool,
+        /// For a warm that reached the cache: the lifetime the run's requests ask for, when
+        /// they ask for one the provider honours, as on `Attempt`.
+        15 opt requested_cache_ttl_ms: u64,
+    }
+}
+
+message! {
     /// A caller asked to cancel a run.
     #[derive(Debug, Clone, PartialEq, Serialize)]
     pub struct CancelRequest {
@@ -1148,6 +1184,7 @@ records! {
         94 CeilingDecided,
         95 OutputCapLowered,
         96 StructuredDowngraded,
+        97 Warmed,
     }
 }
 

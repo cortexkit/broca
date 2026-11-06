@@ -1450,6 +1450,21 @@ fn send_differences(
             (false, true) => "last_cache_send (an attempt without a send time)".into(),
             (false, false) => "last_cache_send".into(),
         });
+    } else {
+        // The lifetime that send asked for, by today's rule: the config it was sent under.
+        let today_ttl = broca_core::cache_warm::last_cache_send(records).and_then(|(_, config)| {
+            broca_session_convert::requested_cache_ttl(
+                &config.model.provider_module_id,
+                &config.frozen_render_config,
+            )
+        });
+        let folded_ttl = operations
+            .last_cache_send
+            .as_ref()
+            .and_then(|send| send.requested_ttl_ms);
+        if today_ttl != folded_ttl {
+            differs.push("last_cache_send.requested_ttl_ms".into());
+        }
     }
     differs
 }

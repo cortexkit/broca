@@ -507,6 +507,10 @@ impl ToolPlane for Spy {
         if call.tool_name == "photo" {
             return photo(ctx, call).await;
         }
+        // A call slow enough that keep-warm sends its warms while it runs.
+        if call.tool_name == "slow" {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        }
         // A result big enough that the next request goes over a small window.
         if call.tool_name == "big" {
             return DispatchResult::Completed(ToolResult {
@@ -733,6 +737,112 @@ fn harness_now() -> u64 {
     } else {
         0
     }
+}
+
+tokio::task_local! {
+    /// The keep-warm both loops' runs ask for, with each loop's scripted driver. `None` runs
+    /// without keep-warm.
+    static WARM: Option<Arc<WarmPair>>;
+}
+
+/// One scripted driver per loop, so a comparison can check both sent the same warms.
+#[derive(Default)]
+struct WarmPair {
+    today: Arc<WarmScript>,
+    new: Arc<WarmScript>,
+}
+
+fn warm_script() -> Option<Arc<WarmPair>> {
+    WARM.try_with(Clone::clone).ok().flatten()
+}
+
+/// A scripted keep-warm driver both loops get. The cache clock says the last request went out
+/// at time 0 and a warm is due a millisecond after it, so every warm is due at once; each costs
+/// one unit against a cache rewrite of three and a half, so one tool wait sends exactly three
+/// warms and stops on its spending cap. It logs every warm with the run and model it was
+/// asked to refresh.
+#[derive(Default)]
+struct WarmScript {
+    log: Mutex<Vec<String>>,
+}
+
+impl WarmScript {
+    fn timing(&self) -> Result<broca_core::keep_warm_wait::WarmTiming, String> {
+        Ok(broca_core::keep_warm_wait::WarmTiming {
+            ttl_ms: 300_000,
+            lead_ms: 30_000,
+            after_send_ms: Some(1),
+        })
+    }
+    fn costs(&self) -> Result<broca_core::keep_warm::WarmCosts, String> {
+        Ok(broca_core::keep_warm::WarmCosts {
+            warm: 1.0,
+            bust: 3.5,
+        })
+    }
+    fn warm(&self, run_id: &RunId, model: &ModelHandle) -> broca_core::keep_warm_wait::WarmTick {
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("warm {} {}", run_id.0, model.model_id));
+        broca_core::keep_warm_wait::WarmTick::Sent
+    }
+}
+
+/// The script as today's loop calls it: with the run's `RunConfig`.
+struct TodayWarmer(Arc<WarmScript>);
+
+#[async_trait::async_trait]
+impl broca_core::keep_warm_wait::KeepWarmDriver for TodayWarmer {
+    fn timing(
+        &self,
+        _: &broca_wal::RunConfig,
+    ) -> Result<broca_core::keep_warm_wait::WarmTiming, String> {
+        self.0.timing()
+    }
+    fn last_sent_at_ms(&self) -> Option<u64> {
+        Some(0)
+    }
+    fn costs(&self, _: &broca_wal::RunConfig) -> Result<broca_core::keep_warm::WarmCosts, String> {
+        self.0.costs()
+    }
+    async fn warm(
+        &self,
+        config: &broca_wal::RunConfig,
+        run_id: &RunId,
+    ) -> broca_core::keep_warm_wait::WarmTick {
+        self.0.warm(run_id, &config.model)
+    }
+}
+
+/// The script as the new loop calls it: with the run's admission.
+struct NewWarmer(Arc<WarmScript>);
+
+#[async_trait::async_trait]
+impl broca_core::keep_warm_wait::KeepWarmDriver<Admission> for NewWarmer {
+    fn timing(&self, _: &Admission) -> Result<broca_core::keep_warm_wait::WarmTiming, String> {
+        self.0.timing()
+    }
+    fn last_sent_at_ms(&self) -> Option<u64> {
+        Some(0)
+    }
+    fn costs(&self, _: &Admission) -> Result<broca_core::keep_warm::WarmCosts, String> {
+        self.0.costs()
+    }
+    async fn warm(
+        &self,
+        admission: &Admission,
+        run_id: &RunId,
+    ) -> broca_core::keep_warm_wait::WarmTick {
+        self.0.warm(run_id, &admission.model)
+    }
+}
+
+fn new_warmer() -> Option<Arc<dyn broca_core::keep_warm_wait::KeepWarmDriver<Admission>>> {
+    warm_script().map(|script| {
+        Arc::new(NewWarmer(Arc::clone(&script.new)))
+            as Arc<dyn broca_core::keep_warm_wait::KeepWarmDriver<Admission>>
+    })
 }
 
 /// Today's loop reads the cache lifetime a run's requests ask for from its keep-warm driver,
@@ -1027,7 +1137,7 @@ impl Scenario {
             retention: None,
             title: None,
             on_restart: None,
-            keep_warm: None,
+            keep_warm: warm_script().map(|_| broca_protocol::request::KeepWarm::Auto),
             scope: None,
             send_id: None,
             request_identity_digest: None,
@@ -1085,6 +1195,7 @@ impl Scenario {
             compaction_plan_version: layout(),
             render_tags: false,
             budget: budget(),
+            keep_warm: warm_script().map(|_| broca_protocol::request::KeepWarm::Auto),
             context_limit: frozen_context_limit(),
         }
     }
@@ -1157,9 +1268,13 @@ async fn today_from(
                 .clone()
                 .map(|spy| spy as Arc<dyn broca_core::CompactionPlane>),
             admitted_context_limit: frozen_context_limit(),
-            keep_warm: cache().then(|| {
-                Arc::new(CacheLifetime) as Arc<dyn broca_core::keep_warm_wait::KeepWarmDriver>
-            }),
+            keep_warm: match warm_script() {
+                Some(script) => Some(Arc::new(TodayWarmer(Arc::clone(&script.today)))
+                    as Arc<dyn broca_core::keep_warm_wait::KeepWarmDriver>),
+                None => cache().then(|| {
+                    Arc::new(CacheLifetime) as Arc<dyn broca_core::keep_warm_wait::KeepWarmDriver>
+                }),
+            },
             ..Default::default()
         },
         &tx,
@@ -1402,6 +1517,7 @@ async fn new_from(
             .as_deref()
             .map(|spy| spy as &dyn broca_core::CompactionPlane),
         compaction_session: None,
+        keep_warm: new_warmer(),
     };
     if resuming {
         resume(&mut writer, &parts, &seams).await
@@ -2103,6 +2219,10 @@ async fn compare_runs_in(scenario: Scenario, runs: &[(&str, Vec<Message>)]) {
     let control = || RunControl {
         manifest: scenario.manifest.clone(),
         compaction_session: Some(Arc::clone(&compaction_session)),
+        keep_warm: warm_script().map(|script| {
+            Arc::new(TodayWarmer(Arc::clone(&script.today)))
+                as Arc<dyn broca_core::keep_warm_wait::KeepWarmDriver>
+        }),
         new_log_compaction_plan_version: layout(),
         compaction_plane: spy
             .clone()
@@ -2216,6 +2336,7 @@ async fn compare_runs_in(scenario: Scenario, runs: &[(&str, Vec<Message>)]) {
             .map(|spy| spy as &dyn broca_core::CompactionPlane),
         // One session state for the session's life, as the actor keeps it across runs.
         compaction_session: Some(Arc::default()),
+        keep_warm: new_warmer(),
     };
     for (index, (run_id, input)) in runs.iter().enumerate() {
         run(
@@ -2763,6 +2884,7 @@ async fn compare_actions_in(
         session_address: Some(broca_core::wal_writer::session_addr(&bind)),
         compaction_plane: None,
         compaction_session: None,
+        keep_warm: new_warmer(),
     };
     let mut admission = scenario.admission(&provider.inner);
     admission.on_restart = on_restart;
@@ -3091,6 +3213,7 @@ async fn compare_auth_pause_in(scenario: Scenario) {
         session_address: Some(broca_core::wal_writer::session_addr(&bind)),
         compaction_plane: None,
         compaction_session: None,
+        keep_warm: new_warmer(),
     };
     let first = run(
         &mut writer,
@@ -5132,4 +5255,67 @@ async fn every_cut_of_a_cache_expired_ride_resumes_alike() {
             ),
         )
         .await;
+}
+
+/// Runs `compare` with keep-warm on in both loops, then checks both sent the same warms, and
+/// that they sent some: `expect` is how many today's loop sent.
+async fn compare_warmed<F: std::future::Future<Output = ()>>(expect: usize, compare: F) {
+    let pair = Arc::new(WarmPair::default());
+    WARM.scope(Some(Arc::clone(&pair)), compare).await;
+    let today = pair.today.log.lock().unwrap().clone();
+    let new = pair.new.log.lock().unwrap().clone();
+    assert_eq!(today.len(), expect, "today's warms: {today:?}");
+    assert_eq!(new, today, "the new loop's warms");
+}
+
+fn slow_scenario(steps: Vec<Vec<NormalizedEvent>>) -> Scenario {
+    Scenario {
+        input: vec![user("run it")],
+        manifest: None,
+        tools: vec![
+            tool("slow", ExecutionMode::Parallel),
+            tool("read", ExecutionMode::Parallel),
+        ],
+        stop_when: Vec::new(),
+        steps,
+    }
+}
+
+/// A slow call's wait sends warms until its spending cap stops them, in both loops.
+#[tokio::test]
+async fn a_slow_call_is_waited_on_with_the_cache_kept_warm() {
+    compare_warmed(
+        6,
+        compare(slow_scenario(vec![
+            answer(
+                "a1",
+                vec![call("c1", "slow", json!({}))],
+                FinishReason::ToolCalls,
+            ),
+            text_step("a2", "done"),
+        ])),
+    )
+    .await;
+}
+
+/// Each wait has its own cap: two slow batches send two rounds of warms.
+#[tokio::test]
+async fn each_tool_wait_has_its_own_spending_cap() {
+    compare_warmed(
+        12,
+        compare(slow_scenario(vec![
+            answer(
+                "a1",
+                vec![call("c1", "slow", json!({}))],
+                FinishReason::ToolCalls,
+            ),
+            answer(
+                "a2",
+                vec![call("c2", "slow", json!({}))],
+                FinishReason::ToolCalls,
+            ),
+            text_step("a3", "done"),
+        ])),
+    )
+    .await;
 }

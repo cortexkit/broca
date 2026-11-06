@@ -372,6 +372,27 @@ state! {
             reset: "run_start",
             bound: Bound::Fixed,
         },
+        /// The warms the run's own keep-warm sent during the tool wait after its newest step,
+        /// which that wait's spending cap counts after a restart. Bounded by the cap: a wait
+        /// stops warming before it spends what one cache rewrite costs.
+        26 rep pub warms: WarmSpend => {
+            owner: "run loop",
+            reset: "a step's start",
+            bound: Bound::OpenWork("the warms of one tool wait"),
+        },
+    }
+}
+
+crate::message! {
+    /// One warm a tool wait sent, with what its price is read from.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct WarmSpend {
+        1 req step_id: u64,
+        2 req reached_cache: bool,
+        3 req usage: broca_protocol::usage::Usage,
+        /// Owned by billing: the warm's reservation and envelope, when it carries them.
+        4 opt billing: serde_json::Value,
+        5 opt ttl_ms: u64,
     }
 }
 
@@ -436,6 +457,7 @@ impl Run {
             context_ceiling: None,
             output_cap: None,
             structured_downgraded: false,
+            warms: Vec::new(),
             keep_warm: start.keep_warm.clone(),
             on_restart: start.on_restart.clone(),
             start: Some(start.clone()),
@@ -682,6 +704,14 @@ state! {
             reset: "run_start",
             bound: Bound::Fixed,
         },
+        /// The request digest of the newest attempt that reached the cache. A warm of the
+        /// source model's cache counts as reaching the cache only when it refreshed that
+        /// request, as today's cache clock reads it.
+        18 opt pub last_cache_attempt_digest: crate::codec::Digest => {
+            owner: "compaction",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
     }
 }
 
@@ -807,6 +837,7 @@ impl Operations {
                     .get_or_insert_with(Estimate::default)
                     .current_request_bytes = Some(attempt.request_body_len);
                 if attempt.reached_cache == Some(true) {
+                    self.last_cache_attempt_digest = Some(attempt.request_body_sha256);
                     self.last_send_run = Some(attempt.run_id.clone());
                     if let Some(sent_at_ms) = attempt.sent_at_ms {
                         if self
@@ -821,6 +852,28 @@ impl Operations {
                             });
                         }
                     }
+                }
+            }
+            Record::Warmed(warmed) => {
+                // A warm that reached the cache restarts its lifetime, as today's cache clock
+                // dates it; a warm of the source model's cache only if it refreshed the newest
+                // request that reached the cache.
+                let refreshed_newest = warmed.trigger.as_deref() != Some("source_keep_warm")
+                    || self
+                        .last_cache_attempt_digest
+                        .is_none_or(|digest| digest == warmed.request_body_sha256);
+                if warmed.reached_cache == Some(true)
+                    && refreshed_newest
+                    && self
+                        .last_cache_send
+                        .as_ref()
+                        .is_none_or(|latest| warmed.sent_at_ms >= latest.sent_at_ms)
+                {
+                    self.last_cache_send = Some(CacheSend {
+                        sent_at_ms: warmed.sent_at_ms,
+                        run_id: warmed.run_id.clone(),
+                        requested_ttl_ms: warmed.requested_cache_ttl_ms,
+                    });
                 }
             }
             Record::StepEnd(step) => {
@@ -974,6 +1027,7 @@ impl Operations {
         };
         match record {
             Record::StepStart(_) => {
+                run.warms.clear();
                 run.provider_call_started = true;
                 run.account_limit_pause = None;
                 run.paused = None;
@@ -1090,6 +1144,18 @@ impl Operations {
             }
             Record::StructuredDowngraded(downgraded) if downgraded.run_id == run.run_id => {
                 run.structured_downgraded = true;
+            }
+            Record::Warmed(warmed)
+                if warmed.trigger.as_deref() == Some("keep_warm")
+                    && warmed.run_id == run.run_id =>
+            {
+                run.warms.push(WarmSpend {
+                    step_id: warmed.step_id,
+                    reached_cache: warmed.reached_cache == Some(true),
+                    usage: warmed.usage,
+                    billing: warmed.billing.clone(),
+                    ttl_ms: warmed.ttl_ms,
+                });
             }
             Record::OutputCapLowered(lowered) => {
                 run.output_cap = Some(OutputCap {
