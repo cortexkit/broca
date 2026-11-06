@@ -76,6 +76,9 @@ pub enum SessionError {
     },
     /// The open log's checkpoint is damaged, and rebuilding it isn't built yet.
     CheckpointLost,
+    /// The session belongs to an actor that has stopped, so a run writing through it can't
+    /// append or read anything more. Nothing of the request was appended.
+    OwnerGone,
 }
 
 impl From<BackendError> for SessionError {
@@ -106,7 +109,9 @@ fn log_bind(session: &Id128, log: &Id128) -> Vec<u8> {
     bind
 }
 
-fn apply(
+/// Folds one record, at `seq`, into whichever fold its stream belongs to. Appending uses it, and
+/// so does a copy of the folds that must stay equal to a session's own.
+pub fn apply(
     conversation: &mut Conversation,
     operations: &mut Operations,
     seq: u64,

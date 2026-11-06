@@ -34,10 +34,12 @@ use broca_protocol::request::{
     CallOptions, ExecutionMode, ModelHandle, OnRestart, StopCondition, Tool, ToolChoice,
 };
 use broca_protocol::{FinishReason, GenerationConfig, MessageId, RunId, StepId, ToolCallId, Usage};
+use broca_session_loop::shared::{ActorWriter, Request};
 use broca_session_loop::{
     resume, run, AccountReports, Admission, MemoryParts, PendingMedia, Seams, Writer,
 };
 use broca_session_store::backend::{MemoryBackend, SessionAddr};
+use broca_session_store::codec::Message as _;
 use broca_session_store::fold::conversation::Conversation;
 use broca_session_store::fold::operations::Operations;
 use broca_session_store::head::SessionTriple;
@@ -1455,6 +1457,87 @@ tokio::task_local! {
     static LAYOUT: Option<u32>;
 }
 
+tokio::task_local! {
+    /// Whether the new loop writes through an `ActorWriter`, as it does in the module, instead of
+    /// holding the session itself. Every comparison runs once each way.
+    static ACTOR: bool;
+}
+
+fn actor_mode() -> bool {
+    ACTOR.try_with(|actor| *actor).unwrap_or(false)
+}
+
+/// Runs `body` once with the new loop holding the session and once writing through an actor.
+/// Every comparison body runs through this, whatever layout its caller chose.
+async fn with_each_writer<F: std::future::Future<Output = ()>>(body: impl Fn() -> F) {
+    for actor in [false, true] {
+        ACTOR.scope(actor, body()).await;
+    }
+}
+
+/// Runs one call of the new loop, `$call`, with `$w` bound to its writer. That's the recording
+/// itself, or in actor mode an `ActorWriter` whose actor owns the recording for the call. The
+/// actor appends what other appenders injected as its own records, before each request that
+/// appends or reads queued sends: the same points the recording appends them when the loop holds
+/// it, so both modes write the same records in the same order.
+macro_rules! through {
+    ($recording:expr, |$w:ident| $call:expr) => {{
+        if actor_mode() {
+            let recording = &mut $recording;
+            let (mut client, mut link) = ActorWriter::new(&*recording, Writer::media(&*recording));
+            let injected = Arc::clone(&recording.injected);
+            let call = async {
+                let $w = &mut client;
+                $call
+            };
+            let actor = async {
+                while let Some(request) = link.next().await {
+                    if matches!(
+                        request,
+                        Request::Append { .. } | Request::Hold { .. } | Request::SendRecords { .. }
+                    ) {
+                        let pending: Vec<Record> = std::mem::take(&mut *injected.lock().unwrap());
+                        if !pending.is_empty() {
+                            let first = recording
+                                .append(&pending, true)
+                                .await
+                                .expect("the actor appends what was injected");
+                            link.note_own(first, &pending);
+                        }
+                    }
+                    link.serve(&mut *recording, request).await;
+                }
+            };
+            let output = {
+                tokio::pin!(call);
+                tokio::pin!(actor);
+                tokio::select! {
+                    biased;
+                    output = &mut call => output,
+                    () = &mut actor => unreachable!("the actor serves until the run's writer is gone"),
+                }
+            };
+            // The run's copy of the folds must end equal to the session's own: requests and
+            // records alone can match while the copy has drifted, for instance keeping a window
+            // that a seal shortened.
+            assert_eq!(
+                client.conversation().encode(),
+                recording.session.conversation.encode(),
+                "the run's copy of the conversation drifted from the session's"
+            );
+            assert_eq!(
+                client.operations().encode(),
+                recording.session.operations.encode(),
+                "the run's copy of the run state drifted from the session's"
+            );
+            output
+        } else {
+            let $w = &mut $recording;
+            $call
+        }
+    }};
+}
+
 /// The layout the comparison running in this task uses.
 fn layout() -> Option<u32> {
     LAYOUT.try_with(|layout| *layout).unwrap_or(None)
@@ -1906,17 +1989,11 @@ async fn new_from(
         max_same_account_wait: account().map_or_else(Default::default, |script| script.wait),
         auth_selection: account_selection(),
     };
-    if resuming {
-        resume(&mut writer, &parts, &seams).await
+    through!(writer, |w| if resuming {
+        resume(w, &parts, &seams).await
     } else {
-        run(
-            &mut writer,
-            &mut parts,
-            scenario.admission(&provider),
-            &seams,
-        )
-        .await
-    }
+        run(w, &mut parts, scenario.admission(&provider), &seams).await
+    })
     .expect("the new loop runs");
     let records = writer.records.clone();
     keys_match(writer.session, &plane).await;
@@ -2169,6 +2246,10 @@ async fn compare(scenario: Scenario) {
 }
 
 async fn compare_in(scenario: Scenario) {
+    with_each_writer(|| Box::pin(compare_in_once(scenario.clone()))).await;
+}
+
+async fn compare_in_once(scenario: Scenario) {
     let today = today(&scenario).await;
     let dump = std::env::var_os("DIFFERENTIAL_DUMP").is_some();
     if dump {
@@ -2359,6 +2440,10 @@ async fn compare_every_cut(scenario: Scenario) {
 }
 
 async fn compare_every_cut_in(scenario: Scenario) {
+    with_each_writer(|| Box::pin(compare_every_cut_in_once(scenario.clone()))).await;
+}
+
+async fn compare_every_cut_in_once(scenario: Scenario) {
     // The whole log the cuts are taken from. Only the resumes are compared, so its run's warms
     // and account reports go to a driver and reporter of their own; the run still freezes the
     // keep-warm its resumes read back.
@@ -2636,6 +2721,10 @@ async fn compare_runs(scenario: Scenario, runs: &[(&str, Vec<Message>)]) {
 }
 
 async fn compare_runs_in(scenario: Scenario, runs: &[(&str, Vec<Message>)]) {
+    with_each_writer(|| Box::pin(compare_runs_in_once(scenario.clone(), runs))).await;
+}
+
+async fn compare_runs_in_once(scenario: Scenario, runs: &[(&str, Vec<Message>)]) {
     // Today's loop.
     let dir = broca_test_support::scratch_root().join(format!(
         "session-loop-differential-{}-{}",
@@ -2784,13 +2873,13 @@ async fn compare_runs_in(scenario: Scenario, runs: &[(&str, Vec<Message>)]) {
         auth_selection: account_selection(),
     };
     for (index, (run_id, input)) in runs.iter().enumerate() {
-        run(
-            &mut writer,
+        through!(writer, |w| run(
+            w,
             &mut parts,
             scenario.admission_for(&provider, run_id, input),
             &seams,
         )
-        .await
+        .await)
         .expect("the new loop runs");
         // A scenario may seal the new loop's ledger between runs, which today's loop never
         // does; the next run must still send the same requests.
@@ -3155,6 +3244,21 @@ async fn compare_actions_in(
     steers: Vec<(usize, Action)>,
     on_restart: Option<OnRestart>,
 ) {
+    with_each_writer(|| {
+        Box::pin(compare_actions_in_once(
+            scenario.clone(),
+            steers.clone(),
+            on_restart,
+        ))
+    })
+    .await;
+}
+
+async fn compare_actions_in_once(
+    scenario: Scenario,
+    steers: Vec<(usize, Action)>,
+    on_restart: Option<OnRestart>,
+) {
     // Today's loop, on a writer this test owns so its actor side can write steers.
     let dir = broca_test_support::scratch_root().join(format!(
         "session-loop-differential-{}-{}",
@@ -3357,9 +3461,9 @@ async fn compare_actions_in(
         cancel,
         ..seams
     };
-    let first = finishes(run(&mut writer, &mut parts, admission, &seams))
-        .await
-        .expect("the new loop runs");
+    let first = through!(writer, |w| finishes(run(w, &mut parts, admission, &seams))
+        .await)
+    .expect("the new loop runs");
     let mut reports = vec![(first.reason, first.paused)];
     if first.paused.is_some() {
         if first.paused == Some(PauseReason::ToolHeld) {
@@ -3369,8 +3473,7 @@ async fn compare_actions_in(
             stop: Default::default(),
             ..seams
         };
-        let second = finishes(resume(&mut writer, &parts, &restarted))
-            .await
+        let second = through!(writer, |w| finishes(resume(w, &parts, &restarted)).await)
             .expect("the new loop resumes");
         reports.push((second.reason, second.paused));
     }
@@ -3590,6 +3693,19 @@ async fn compare_auth_pause_in(
     scenario: Scenario,
     resume_account: Option<broca_wal::AuthSelection>,
 ) {
+    with_each_writer(|| {
+        Box::pin(compare_auth_pause_in_once(
+            scenario.clone(),
+            resume_account.clone(),
+        ))
+    })
+    .await;
+}
+
+async fn compare_auth_pause_in_once(
+    scenario: Scenario,
+    resume_account: Option<broca_wal::AuthSelection>,
+) {
     // Today's loop, pausing and resuming on one writer.
     let dir = broca_test_support::scratch_root().join(format!(
         "session-loop-differential-{}-{}",
@@ -3710,13 +3826,13 @@ async fn compare_auth_pause_in(
         max_same_account_wait: account().map_or_else(Default::default, |script| script.wait),
         auth_selection: account_selection(),
     };
-    let first = run(
-        &mut writer,
+    let first = through!(writer, |w| run(
+        w,
         &mut parts,
         scenario.admission(&provider),
-        &seams,
+        &seams
     )
-    .await
+    .await)
     .expect("the new loop runs");
     reset_passes().await;
     provider.resuming();
@@ -3725,9 +3841,8 @@ async fn compare_auth_pause_in(
         auth_selection: resume_account.or(seams.auth_selection.clone()),
         ..seams
     };
-    let second = resume(&mut writer, &parts, &seams)
-        .await
-        .expect("the new loop resumes");
+    let second =
+        through!(writer, |w| resume(w, &parts, &seams).await).expect("the new loop resumes");
     keys_match(writer.session, &plane).await;
     pause_names_its_attempt(&writer);
     // A run the resume refroze onto another account keeps naming it when nobody routes one,
@@ -5773,7 +5888,8 @@ async fn every_cut_of_a_cache_expired_ride_resumes_alike() {
 }
 
 /// Runs `compare` with keep-warm on in both loops, then checks both sent the same warms, and
-/// that they sent some: `expect` is how many today's loop sent, when the comparison knows.
+/// that they sent some: `expect` is how many today's loop sent in each of the comparison's
+/// modes, when the comparison knows.
 async fn compare_warmed<F: std::future::Future<Output = ()>>(expect: Option<usize>, compare: F) {
     let pair = Arc::new(WarmPair::default());
     WARM.scope(Some(Arc::clone(&pair)), compare).await;
@@ -5781,7 +5897,12 @@ async fn compare_warmed<F: std::future::Future<Output = ()>>(expect: Option<usiz
     let new = pair.new.log.lock().unwrap().clone();
     assert!(!today.is_empty(), "today's loop sent no warm");
     if let Some(expect) = expect {
-        assert_eq!(today.len(), expect, "today's warms: {today:?}");
+        assert_eq!(
+            today.len(),
+            // Each layout runs once per writer.
+            expect * LAYOUTS.len() * 2,
+            "today's warms: {today:?}"
+        );
     }
     assert_eq!(new, today, "the new loop's warms");
 }
@@ -5803,7 +5924,7 @@ fn slow_scenario(steps: Vec<Vec<NormalizedEvent>>) -> Scenario {
 #[tokio::test]
 async fn a_slow_call_is_waited_on_with_the_cache_kept_warm() {
     compare_warmed(
-        Some(6),
+        Some(3),
         compare(slow_scenario(vec![
             answer(
                 "a1",
@@ -5820,7 +5941,7 @@ async fn a_slow_call_is_waited_on_with_the_cache_kept_warm() {
 #[tokio::test]
 async fn each_tool_wait_has_its_own_spending_cap() {
     compare_warmed(
-        Some(12),
+        Some(6),
         compare(slow_scenario(vec![
             answer(
                 "a1",

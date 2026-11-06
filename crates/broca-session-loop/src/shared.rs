@@ -1,0 +1,598 @@
+//! The run's writer when the session belongs to an actor.
+//!
+//! A session actor owns its `Session` for its whole life, and appends to it while a run is
+//! active: a steer or a queued send is durable before its sender hears back, and that can't
+//! wait for a model step to end. So a run doesn't hold the session. It writes through an
+//! [`ActorWriter`], which sends each call to the actor and keeps its own copy of the two folds.
+//!
+//! **The copy.** It's cloned from the actor's folds when the run starts. Every reply the actor
+//! sends carries the records the actor appended on its own since the copy was last brought up
+//! to date, in seq order, and the copy folds them before anything else. So after each writer
+//! call the copy equals the session's folds. Between calls it may lag them, as a snapshot would.
+//! The actor tells the link which records were its own through [`RunLink::note_own`].
+//!
+//! **`append_with`.** Its batch is built from the folds as they stand, and must not miss a
+//! record another appender added just before it. So the writer first asks the actor to hold:
+//! the actor sends the records the copy lacks and then waits for the batch, appending nothing
+//! else meanwhile. The writer brings its copy up to date, builds the batch and sends it. The
+//! hold lasts only for that synchronous build.
+//!
+//! **Seals** run in the actor on the session itself, and replace the copy, since the window
+//! changes at a cut. Reads that go past the folds are requests to the actor.
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use broca_core::tool_media::MediaCapture;
+use broca_session_store::fold::conversation::Conversation;
+use broca_session_store::fold::operations::Operations;
+use broca_session_store::record::{Record, RunStart};
+use broca_session_store::session::{Carry, SessionError, StoredEntry};
+use tokio::sync::{mpsc, oneshot};
+
+use crate::writer::Writer;
+
+/// Records the actor appended on its own, with their seqs, oldest first: what a run's copy of
+/// the folds hasn't folded yet.
+pub type Missed = Vec<(u64, Record)>;
+
+/// The folds and next seq as a seal left them.
+pub struct Snapshot {
+    pub conversation: Conversation,
+    pub operations: Operations,
+    pub next_seq: u64,
+    pub message_id_prefix: String,
+}
+
+type Reply<T> = oneshot::Sender<Result<T, SessionError>>;
+
+/// One call a run's writer makes to the actor that owns the session.
+pub enum Request {
+    Append {
+        records: Vec<Record>,
+        barrier: bool,
+        reply: Reply<(Missed, u64)>,
+    },
+    /// Starts a hold: the actor answers with what the copy lacks, then appends nothing until it
+    /// gets the [`Request::Held`] that follows.
+    Hold {
+        reply: Reply<Missed>,
+    },
+    /// The batch built during a hold, which ends it. An empty batch appends nothing.
+    Held {
+        records: Vec<Record>,
+        barrier: bool,
+        reply: Reply<u64>,
+    },
+    SendRecords {
+        submission_id: String,
+        reply: Reply<(Missed, Vec<Record>)>,
+    },
+    OpenLogRecords {
+        reply: Reply<Vec<(u64, Record)>>,
+    },
+    RunStart {
+        run_id: String,
+        reply: Reply<Option<RunStart>>,
+    },
+    EntryByMid {
+        mid: String,
+        reply: Reply<Option<StoredEntry>>,
+    },
+    Seal {
+        /// `Some` for a cut before the entry with this ordinal, `None` for a ledger seal.
+        ordinal: Option<u64>,
+        carry: Vec<Record>,
+        window_repetition: Option<serde_json::Value>,
+        now_ms: u64,
+        reply: Reply<Snapshot>,
+    },
+}
+
+/// The run's writer: a client of the actor that owns the session.
+pub struct ActorWriter {
+    requests: mpsc::Sender<Request>,
+    conversation: Conversation,
+    operations: Operations,
+    session_id: String,
+    next_seq: u64,
+    message_id_prefix: String,
+    media: Option<Arc<dyn MediaCapture>>,
+}
+
+/// The actor's end of a run's writer.
+pub struct RunLink {
+    requests: mpsc::Receiver<Request>,
+    /// What the actor appended on its own since the run's copy last caught up.
+    missed: Missed,
+}
+
+impl ActorWriter {
+    /// A writer for a run, starting from the session's folds as they stand, and the actor's end
+    /// of it. `media` is where a tool result's media is captured while its call runs; the actor
+    /// stores those bytes when it appends the result's record.
+    pub fn new<W: Writer>(session: &W, media: Option<Arc<dyn MediaCapture>>) -> (Self, RunLink) {
+        // One request at a time: the writer waits for each reply before sending the next.
+        let (sender, receiver) = mpsc::channel(1);
+        (
+            Self {
+                requests: sender,
+                conversation: session.conversation().clone(),
+                operations: session.operations().clone(),
+                session_id: session.session_id(),
+                next_seq: session.next_seq(),
+                message_id_prefix: session.message_id_prefix(),
+                media,
+            },
+            RunLink {
+                requests: receiver,
+                missed: Vec::new(),
+            },
+        )
+    }
+
+    async fn ask<T>(&self, make: impl FnOnce(Reply<T>) -> Request) -> Result<T, SessionError> {
+        let (reply, answer) = oneshot::channel();
+        self.requests
+            .send(make(reply))
+            .await
+            .map_err(|_| SessionError::OwnerGone)?;
+        answer.await.map_err(|_| SessionError::OwnerGone)?
+    }
+
+    /// Folds what the actor appended since the copy last caught up.
+    fn catch_up(&mut self, missed: Missed) -> Result<(), SessionError> {
+        for (seq, record) in &missed {
+            self.fold(*seq, record)?;
+        }
+        Ok(())
+    }
+
+    fn fold(&mut self, seq: u64, record: &Record) -> Result<(), SessionError> {
+        broca_session_store::session::apply(
+            &mut self.conversation,
+            &mut self.operations,
+            seq,
+            record,
+        )
+        .map_err(SessionError::Fold)?;
+        self.next_seq = seq + 1;
+        Ok(())
+    }
+
+    /// Folds the run's own batch, appended at `first`.
+    fn fold_own(&mut self, first: u64, records: &[Record]) -> Result<(), SessionError> {
+        for (position, record) in records.iter().enumerate() {
+            self.fold(first + position as u64, record)?;
+        }
+        Ok(())
+    }
+
+    fn replace(&mut self, snapshot: Snapshot) {
+        self.conversation = snapshot.conversation;
+        self.operations = snapshot.operations;
+        self.next_seq = snapshot.next_seq;
+        self.message_id_prefix = snapshot.message_id_prefix;
+    }
+
+    async fn seal(
+        &mut self,
+        ordinal: Option<u64>,
+        carry: &Carry<'_>,
+        now_ms: u64,
+    ) -> Result<(), SessionError> {
+        let snapshot = self
+            .ask(|reply| Request::Seal {
+                ordinal,
+                carry: carry.records.to_vec(),
+                window_repetition: carry.window_repetition.clone(),
+                now_ms,
+                reply,
+            })
+            .await?;
+        self.replace(snapshot);
+        Ok(())
+    }
+}
+
+#[async_trait(?Send)]
+impl Writer for ActorWriter {
+    async fn append(&mut self, records: &[Record], barrier: bool) -> Result<u64, SessionError> {
+        let (missed, first) = self
+            .ask(|reply| Request::Append {
+                records: records.to_vec(),
+                barrier,
+                reply,
+            })
+            .await?;
+        self.catch_up(missed)?;
+        self.fold_own(first, records)?;
+        Ok(first)
+    }
+
+    async fn send_records(&mut self, submission_id: &str) -> Result<Vec<Record>, SessionError> {
+        let (missed, records) = self
+            .ask(|reply| Request::SendRecords {
+                submission_id: submission_id.to_owned(),
+                reply,
+            })
+            .await?;
+        self.catch_up(missed)?;
+        Ok(records)
+    }
+
+    async fn append_with(
+        &mut self,
+        build: &mut (dyn for<'s> FnMut(&'s Conversation, &'s Operations, u64) -> Vec<Record>
+                  + Send),
+        barrier: bool,
+    ) -> Result<Vec<Record>, SessionError> {
+        let missed = self.ask(|reply| Request::Hold { reply }).await?;
+        self.catch_up(missed)?;
+        let records = build(&self.conversation, &self.operations, self.next_seq);
+        let barrier = barrier || crate::writer::ends_run(&records);
+        let first = self
+            .ask(|reply| Request::Held {
+                records: records.clone(),
+                barrier,
+                reply,
+            })
+            .await?;
+        self.fold_own(first, &records)?;
+        Ok(records)
+    }
+
+    fn conversation(&self) -> &Conversation {
+        &self.conversation
+    }
+
+    fn operations(&self) -> &Operations {
+        &self.operations
+    }
+
+    fn session_id(&self) -> String {
+        self.session_id.clone()
+    }
+
+    fn next_seq(&self) -> u64 {
+        self.next_seq
+    }
+
+    fn message_id_prefix(&self) -> String {
+        self.message_id_prefix.clone()
+    }
+
+    async fn open_log_records(&self) -> Result<Vec<(u64, Record)>, SessionError> {
+        self.ask(|reply| Request::OpenLogRecords { reply }).await
+    }
+
+    async fn run_start(&self, run_id: &str) -> Result<Option<RunStart>, SessionError> {
+        self.ask(|reply| Request::RunStart {
+            run_id: run_id.to_owned(),
+            reply,
+        })
+        .await
+    }
+
+    async fn seal_at_entry(
+        &mut self,
+        ordinal: u64,
+        carry: &Carry<'_>,
+        now_ms: u64,
+    ) -> Result<(), SessionError> {
+        self.seal(Some(ordinal), carry, now_ms).await
+    }
+
+    async fn seal_ledger(&mut self, carry: &Carry<'_>, now_ms: u64) -> Result<(), SessionError> {
+        self.seal(None, carry, now_ms).await
+    }
+
+    async fn entry_by_mid(&self, mid: &str) -> Result<Option<StoredEntry>, SessionError> {
+        self.ask(|reply| Request::EntryByMid {
+            mid: mid.to_owned(),
+            reply,
+        })
+        .await
+    }
+
+    fn media(&self) -> Option<Arc<dyn MediaCapture>> {
+        self.media.clone()
+    }
+}
+
+impl RunLink {
+    /// Records that the actor appended `records` on its own, starting at `first`, so the run's
+    /// copy folds them at its next call.
+    pub fn note_own(&mut self, first: u64, records: &[Record]) {
+        self.missed.extend(
+            records
+                .iter()
+                .enumerate()
+                .map(|(position, record)| (first + position as u64, record.clone())),
+        );
+    }
+
+    /// The run's next request, or `None` once its writer is gone.
+    pub async fn next(&mut self) -> Option<Request> {
+        self.requests.recv().await
+    }
+
+    /// Answers one request against `session`, the actor's own writer. A hold is answered whole
+    /// here: this waits for the batch that ends it, so nothing else is appended meanwhile.
+    pub async fn serve<W: Writer>(&mut self, session: &mut W, request: Request) {
+        match request {
+            Request::Append {
+                records,
+                barrier,
+                reply,
+            } => {
+                let result = session.append(&records, barrier).await;
+                let _ = reply.send(result.map(|first| (std::mem::take(&mut self.missed), first)));
+            }
+            Request::Hold { reply } => {
+                let _ = reply.send(Ok(std::mem::take(&mut self.missed)));
+                match self.requests.recv().await {
+                    Some(Request::Held {
+                        records,
+                        barrier,
+                        reply,
+                    }) => {
+                        let result = if records.is_empty() {
+                            Ok(session.next_seq())
+                        } else {
+                            session.append(&records, barrier).await
+                        };
+                        let _ = reply.send(result);
+                    }
+                    // The writer sends nothing else during a hold; a run that dropped its
+                    // writer mid-hold has nothing more to append.
+                    Some(other) => drop(other),
+                    None => {}
+                }
+            }
+            Request::Held { reply, .. } => {
+                // Only a hold may be followed by its batch.
+                let _ = reply.send(Err(SessionError::OwnerGone));
+            }
+            Request::SendRecords {
+                submission_id,
+                reply,
+            } => {
+                let result = session.send_records(&submission_id).await;
+                let _ =
+                    reply.send(result.map(|records| (std::mem::take(&mut self.missed), records)));
+            }
+            Request::OpenLogRecords { reply } => {
+                let _ = reply.send(session.open_log_records().await);
+            }
+            Request::RunStart { run_id, reply } => {
+                let _ = reply.send(session.run_start(&run_id).await);
+            }
+            Request::EntryByMid { mid, reply } => {
+                let _ = reply.send(session.entry_by_mid(&mid).await);
+            }
+            Request::Seal {
+                ordinal,
+                carry,
+                window_repetition,
+                now_ms,
+                reply,
+            } => {
+                let carry = Carry {
+                    records: &carry,
+                    window_repetition,
+                };
+                let sealed = match ordinal {
+                    Some(ordinal) => session.seal_at_entry(ordinal, &carry, now_ms).await,
+                    None => session.seal_ledger(&carry, now_ms).await,
+                };
+                // The copy is replaced whole, so what it missed is in the snapshot.
+                self.missed.clear();
+                let _ = reply.send(sealed.map(|()| Snapshot {
+                    conversation: session.conversation().clone(),
+                    operations: session.operations().clone(),
+                    next_seq: session.next_seq(),
+                    message_id_prefix: session.message_id_prefix(),
+                }));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use broca_protocol::content::{ContentBlock, Message, Role};
+    use broca_session_store::backend::{MemoryBackend, SessionAddr};
+    use broca_session_store::codec::Message as _;
+    use broca_session_store::head::SessionTriple;
+    use broca_session_store::keys::DeploymentKey;
+    use broca_session_store::record::{Input, Placement, Record};
+    use broca_session_store::session::Session;
+
+    use super::{ActorWriter, RunLink};
+    use crate::writer::Writer;
+
+    fn input(text: &str) -> Record {
+        Record::Input(Input {
+            run_id: "r".into(),
+            placement: Placement::RunInput,
+            message: Message::new(Role::User, vec![ContentBlock::Text { text: text.into() }]),
+            written_at_ms: None,
+            submission_id: None,
+            notice: None,
+            tags_v1: None,
+            receipt_seq: None,
+            pruned: Vec::new(),
+        })
+    }
+
+    fn texts(writer: &impl Writer) -> Vec<String> {
+        writer
+            .conversation()
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    async fn session(backend: &MemoryBackend) -> Session<'_, MemoryBackend> {
+        Session::create(
+            backend,
+            SessionAddr("0123456789abcdef".into()),
+            SessionTriple {
+                project_root: "/project".into(),
+                harness: "broca".into(),
+                session: "s".into(),
+            },
+            &DeploymentKey::new(1, &[5; 32]),
+            false,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Serves the run's requests. Before each request it appends `own(request number)` as the
+    /// actor's own records, the way a steer arrives while the run is waiting on its model or
+    /// its tools.
+    async fn actor(
+        session: &mut Session<'_, MemoryBackend>,
+        link: &mut RunLink,
+        own: impl Fn(usize) -> Vec<Record>,
+    ) {
+        let mut served = 0;
+        while let Some(request) = link.next().await {
+            let records = own(served);
+            if !records.is_empty() {
+                let first = session.append(&records, true).await.unwrap();
+                link.note_own(first, &records);
+            }
+            link.serve(&mut *session, request).await;
+            served += 1;
+        }
+    }
+
+    /// A plain append catches the run's copy up on what the actor appended first, so after the
+    /// call the copy equals the session's folds and the next seq follows both.
+    #[tokio::test]
+    async fn an_append_folds_the_actors_records_first() {
+        let backend = MemoryBackend::default();
+        let mut session = session(&backend).await;
+        let (mut writer, mut link) = ActorWriter::new(&session, None);
+        let run = async {
+            writer.append(&[input("run")], true).await.unwrap();
+            assert_eq!(texts(&writer), ["steer", "run"]);
+            writer.next_seq()
+        };
+        let next = tokio::select! {
+            biased;
+            next = run => next,
+            () = actor(&mut session, &mut link, |n| if n == 0 { vec![input("steer")] } else { Vec::new() }) => unreachable!(),
+        };
+        assert_eq!(texts(&session), ["steer", "run"]);
+        assert_eq!(next, session.next_seq());
+        assert_eq!(
+            writer.conversation().encode(),
+            session.conversation().encode()
+        );
+        assert_eq!(writer.operations().encode(), session.operations().encode());
+    }
+
+    /// A batch built during a hold sees what the actor appended just before it: the property
+    /// that makes `append_with` safe when another appender shares the session.
+    #[tokio::test]
+    async fn a_batch_built_during_a_hold_sees_the_actors_records() {
+        let backend = MemoryBackend::default();
+        let mut session = session(&backend).await;
+        let (mut writer, mut link) = ActorWriter::new(&session, None);
+        let run = async {
+            let mut seen = Vec::new();
+            let mut next = 0;
+            writer
+                .append_with(
+                    &mut |conversation, _, first_seq| {
+                        seen = conversation
+                            .messages
+                            .iter()
+                            .flat_map(|message| &message.content)
+                            .filter_map(|block| match block {
+                                ContentBlock::Text { text } => Some(text.clone()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>();
+                        next = first_seq;
+                        vec![input("built")]
+                    },
+                    false,
+                )
+                .await
+                .unwrap();
+            (seen, next)
+        };
+        let ((seen, next), after) = {
+            let before = session.next_seq();
+            let result = tokio::select! {
+                biased;
+                result = run => result,
+                () = actor(&mut session, &mut link, |n| if n == 0 { vec![input("steer")] } else { Vec::new() }) => unreachable!(),
+            };
+            (result, before)
+        };
+        assert_eq!(
+            seen,
+            ["steer"],
+            "the batch was built without the actor's record"
+        );
+        assert_eq!(next, after + 1, "the batch was built for the wrong seq");
+        assert_eq!(texts(&session), ["steer", "built"]);
+        assert_eq!(
+            writer.conversation().encode(),
+            session.conversation().encode()
+        );
+    }
+
+    /// A seal runs on the session itself and replaces the run's copy, so the window the run sees
+    /// after a cut is the session's.
+    #[tokio::test]
+    async fn a_seal_replaces_the_runs_copy() {
+        let backend = MemoryBackend::default();
+        let mut session = session(&backend).await;
+        let (mut writer, mut link) = ActorWriter::new(&session, None);
+        let run = async {
+            writer.append(&[input("one")], true).await.unwrap();
+            let carry = broca_session_store::session::Carry {
+                records: &[],
+                window_repetition: None,
+            };
+            writer.seal_ledger(&carry, 0).await.unwrap();
+        };
+        tokio::select! {
+            biased;
+            () = run => {}
+            () = actor(&mut session, &mut link, |n| if n == 1 { vec![input("steer")] } else { Vec::new() }) => unreachable!(),
+        }
+        assert_eq!(
+            writer.conversation().encode(),
+            session.conversation().encode()
+        );
+        assert_eq!(writer.operations().encode(), session.operations().encode());
+        assert_eq!(writer.next_seq(), session.next_seq());
+        assert_eq!(texts(&writer), ["one", "steer"]);
+    }
+
+    /// Once the actor is gone, the run's writer refuses by name instead of hanging.
+    #[tokio::test]
+    async fn a_run_whose_actor_stopped_gets_owner_gone() {
+        let backend = MemoryBackend::default();
+        let session = session(&backend).await;
+        let (mut writer, link) = ActorWriter::new(&session, None);
+        drop(link);
+        match writer.append(&[input("late")], true).await {
+            Err(broca_session_store::session::SessionError::OwnerGone) => {}
+            other => panic!("expected OwnerGone: {other:?}"),
+        }
+    }
+}

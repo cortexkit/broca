@@ -37,6 +37,7 @@ pub mod output;
 pub mod parts;
 mod refusal;
 pub mod run;
+pub mod shared;
 pub mod writer;
 
 pub use media::PendingMedia;
