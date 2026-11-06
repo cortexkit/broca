@@ -3234,7 +3234,7 @@ fn admit(
     }
 }
 
-fn first_system_index(messages: &[Message]) -> Option<usize> {
+pub(crate) fn first_system_index(messages: &[Message]) -> Option<usize> {
     messages
         .iter()
         .position(|message| message.role == Role::System)
@@ -3243,7 +3243,7 @@ fn first_system_index(messages: &[Message]) -> Option<usize> {
 /// Whether every system message in `input` repeats, in order, the lineage's system message at the
 /// same position among its system messages. Repeating only the first few is accepted; a changed
 /// or additional system message is not.
-fn repeats_prefix_system_messages(prefix: &[Message], input: &[Message]) -> bool {
+pub(crate) fn repeats_prefix_system_messages(prefix: &[Message], input: &[Message]) -> bool {
     let mut prefix_systems = prefix.iter().filter(|message| message.role == Role::System);
     input
         .iter()
@@ -3255,7 +3255,7 @@ fn repeats_prefix_system_messages(prefix: &[Message], input: &[Message]) -> bool
         })
 }
 
-fn first_system_message(messages: &[Message]) -> Option<&Message> {
+pub(crate) fn first_system_message(messages: &[Message]) -> Option<&Message> {
     first_system_index(messages).and_then(|index| messages.get(index))
 }
 
@@ -4204,24 +4204,14 @@ where
     };
     // A frozen plan the hook runtime cannot read is refused like a missing plane: the waiting
     // admission caller hears the error, and nothing is written or dispatched.
-    let hook_plan = match frozen_hooks
-        .filter(|manifest| crate::hooks::has_transforms(manifest))
-        .map(|manifest| crate::hooks::HookPlan::from_manifest(manifest))
-        .transpose()
-    {
-        Ok(plan) => plan,
-        Err(detail) => {
-            let error = RunError::Wal(detail);
-            admit(&mut on_admitted, Err(error.clone()));
-            return Err(error);
-        }
-    };
-    if hook_plan.is_some() && control.hook_plane.is_none() {
-        let error =
-            RunError::Wal("plan.step_transform_items requires an installed hook plane".into());
-        admit(&mut on_admitted, Err(error.clone()));
-        return Err(error);
-    }
+    let hook_plan =
+        match crate::fresh_start::admitted_hook_plan(frozen_hooks, control.hook_plane.is_some()) {
+            Ok(plan) => plan,
+            Err(error) => {
+                admit(&mut on_admitted, Err(error.clone()));
+                return Err(error);
+            }
+        };
     let hook_bind = req.session.clone();
     let hook_scope = req.scope.clone();
     let hooks = hook_plan
@@ -4358,15 +4348,9 @@ where
             // A held resume's prompt shows only part of the transcript's numbers; it carries
             // the highest the whole transcript shows.
             .max(prior.held.as_ref().map_or(0, |held| held.tag_high));
-        (
-            control
-                .manifest
-                .as_deref()
-                .or(prior.manifest.as_deref())
-                .is_some_and(crate::tags::plan_renders_tags),
-            Some(broca_wal::ComputedTagRules {
-                checkpoint: ledger_high.max(broca_protocol::tags::high_after(&prior.prompt)),
-            }),
+        crate::fresh_start::admitted_tags(
+            control.manifest.as_deref().or(prior.manifest.as_deref()),
+            ledger_high.max(broca_protocol::tags::high_after(&prior.prompt)),
         )
     };
     let defer_media_tags = provider.defer_media_tags(render_tags);
@@ -4428,14 +4412,10 @@ where
     } else {
         BudgetState::default()
     };
-    let prior_is_import = prior.run_config.as_ref().is_some_and(|config| {
-        config.model.provider_module_id == "import"
-            && config.model.model_id == "import"
-            && config
-                .provider_options
-                .get("import_request_digest")
-                .is_some_and(serde_json::Value::is_string)
-    });
+    let prior_is_import = prior
+        .run_config
+        .as_ref()
+        .is_some_and(crate::fresh_start::is_import);
     let prior_last_step_finish_reason = prior.last_step_finish_reason;
     let mut compaction_state = prior.compaction.state().cloned();
     #[cfg(test)]
@@ -4635,67 +4615,43 @@ where
     // this moved vector before any append-only system-message normalization can apply.
     let mut episode_input = std::mem::take(&mut req.input);
     if !is_resume || append_episode {
-        if let Some(final_input) = control
-            .input_hooks
-            .as_ref()
-            .and_then(|hooks| hooks.final_value.as_ref())
-        {
-            episode_input = serde_json::from_value(final_input.clone())
-                .map_err(|error| RunError::Wal(format!("invalid recorded input hooks: {error}")))?;
-        }
+        episode_input = crate::fresh_start::episode_input(
+            episode_input,
+            control
+                .input_hooks
+                .as_ref()
+                .and_then(|hooks| hooks.final_value.as_ref()),
+        )?;
     }
-    let v2_globals = if mode3 {
-        let supplied = crate::compaction_v2::systems::take_globals(&mut episode_input);
-        if is_resume && !append_episode {
-            crate::compaction_v2::systems::frozen(
-                true,
-                prior.run_config.as_ref().expect("resumed config"),
-                frozen_plan.map(AsRef::as_ref),
-            )
-            .map_err(RunError::Wal)?
-        } else if let Some(manifest) = frozen_plan {
-            crate::compaction_v2::systems::from_manifest(manifest)
-        } else if supplied.is_empty() {
+    let v2_globals = if !mode3 {
+        Vec::new()
+    } else if is_resume && !append_episode {
+        crate::compaction_v2::systems::take_globals(&mut episode_input);
+        crate::compaction_v2::systems::frozen(
+            true,
+            prior.run_config.as_ref().expect("resumed config"),
+            frozen_plan.map(AsRef::as_ref),
+        )
+        .map_err(RunError::Wal)?
+    } else {
+        crate::fresh_start::new_episode_globals(
+            &mut episode_input,
+            frozen_plan.map(AsRef::as_ref),
             prior
                 .run_config
                 .as_ref()
                 .and_then(|config| config.global_system.as_deref())
-                .cloned()
-                .unwrap_or_default()
-        } else {
-            if prior
-                .run_config
-                .as_ref()
-                .and_then(|config| config.global_system.as_deref())
-                .is_some_and(|old| old != &supplied)
-            {
-                return Err(RunError::SystemPromptChanged);
-            }
-            supplied
-        }
-    } else {
-        Vec::new()
+                .map(Vec::as_slice),
+        )?
     };
-    if !mode3 && append_episode && first_system_index(&episode_input).is_some() {
-        match first_system_message(lineage_prefix) {
-            Some(_) if repeats_prefix_system_messages(lineage_prefix, &episode_input) => {
-                // A client naturally re-sends the session's system prompt on every turn.
-                // Strip the byte-identical repeat BEFORE it reaches the WAL so replay and
-                // resume reconstruct the same single-instruction lineage and keep later
-                // rendered prefixes cache-stable. Every system message renders into the
-                // top-level system field, so ALL of them must be repeats: one extra would
-                // change that field for every later request.
-                episode_input.retain(|message| message.role != Role::System);
-            }
-            None if prior_is_import => {
-                // Imports intentionally discard foreign system instructions. The first
-                // continuing harness therefore establishes its own durable system prompt.
-            }
-            Some(_) | None => {
-                let err = RunError::SystemPromptChanged;
-                admit(&mut on_admitted, Err(err.clone()));
-                return Err(err);
-            }
+    if !mode3 && append_episode {
+        if let Err(err) = crate::fresh_start::append_system_messages(
+            &mut episode_input,
+            lineage_prefix,
+            prior_is_import,
+        ) {
+            admit(&mut on_admitted, Err(err.clone()));
+            return Err(err);
         }
     }
 
