@@ -145,6 +145,39 @@ impl Today {
         panic!("today's session never went idle");
     }
 
+    /// What each run's start recorded about its send, in the shape [`store_starts`] reads from
+    /// the store session.
+    fn starts(&self) -> Vec<serde_json::Value> {
+        self.wal
+            .read_records(&self.key)
+            .unwrap()
+            .into_iter()
+            .filter_map(|frame| match frame.record {
+                broca_wal::WalRecord::RunStarted {
+                    run_id,
+                    submission_id,
+                    send_id,
+                    request_identity_digest,
+                    title,
+                    sent_by,
+                    principal,
+                    config,
+                    ..
+                } => Some(serde_json::json!({
+                    "run_id": run_id.0,
+                    "submission_id": submission_id.map(|id| id.0),
+                    "send_id": send_id,
+                    "request_identity_digest": request_identity_digest,
+                    "title": title,
+                    "sent_by": sent_by,
+                    "principal": principal,
+                    "model": config.model,
+                })),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The text of every user input and assistant message today's log recorded, in order, as
     /// [`texts`] reads the store session's conversation.
     fn texts(&self) -> Vec<String> {
@@ -193,6 +226,8 @@ enum Step {
         text: &'static str,
         key: Option<&'static str>,
         route_decision: Option<&'static str>,
+        /// Changes the request before it is sent, the same on both sides.
+        tweak: Option<fn(&mut SubmissionRequest)>,
         expect: Expect,
     },
     /// Lets the gated first model step through on both sides.
@@ -207,6 +242,7 @@ fn send(run_id: &'static str, text: &'static str) -> Step {
         text,
         key: None,
         route_decision: None,
+        tweak: None,
         expect: Expect::Same,
     }
 }
@@ -219,46 +255,30 @@ fn keyed(key: &'static str, text: &'static str) -> Step {
         text,
         key: Some(key),
         route_decision: None,
+        tweak: None,
         expect: Expect::Same,
     }
 }
 
-fn expecting(step: Step, expect: Expect) -> Step {
-    match step {
-        Step::Send {
-            run_id,
-            text,
-            key,
-            route_decision,
-            ..
-        } => Step::Send {
-            run_id,
-            text,
-            key,
-            route_decision,
-            expect,
-        },
-        other => other,
+fn expecting(mut step: Step, expected: Expect) -> Step {
+    if let Step::Send { expect, .. } = &mut step {
+        *expect = expected;
     }
+    step
 }
 
-fn routed(step: Step, decision: &'static str) -> Step {
-    match step {
-        Step::Send {
-            run_id,
-            text,
-            key,
-            expect,
-            ..
-        } => Step::Send {
-            run_id,
-            text,
-            key,
-            route_decision: Some(decision),
-            expect,
-        },
-        other => other,
+fn routed(mut step: Step, decision: &'static str) -> Step {
+    if let Step::Send { route_decision, .. } = &mut step {
+        *route_decision = Some(decision);
     }
+    step
+}
+
+fn tweaked(mut step: Step, change: fn(&mut SubmissionRequest)) -> Step {
+    if let Step::Send { tweak, .. } = &mut step {
+        *tweak = Some(change);
+    }
+    step
 }
 
 /// Runs `steps` on both sides over the same provider script, the first model step gated when
@@ -277,10 +297,14 @@ async fn compare(script: Vec<Vec<NormalizedEvent>>, gated: bool, steps: Vec<Step
                 text,
                 key,
                 route_decision,
+                tweak,
                 expect,
             } => {
                 let mut sent = request(text);
                 sent.route_decision_id = route_decision.map(str::to_owned);
+                if let Some(tweak) = tweak {
+                    tweak(&mut sent);
+                }
                 let send_key = || match key {
                     Some(key) => SendKey::SendId(key.into()),
                     None => SendKey::Minted,
@@ -318,8 +342,42 @@ async fn compare(script: Vec<Vec<NormalizedEvent>>, gated: bool, steps: Vec<Step
     let session: Session<&'static MemoryBackend> = served.await.unwrap();
     if all_same {
         assert_eq!(texts(&session), today.texts(), "the conversations differ");
+        assert_eq!(
+            store_starts(&session).await,
+            today.starts(),
+            "the run starts record the sends differently"
+        );
     }
     assert!(today.registry.stop_and_seal().await);
+}
+
+/// What each run's start in `session` recorded about its send, in the shape [`Today::starts`]
+/// reads from today's log.
+async fn store_starts(session: &Session<&'static MemoryBackend>) -> Vec<serde_json::Value> {
+    use broca_session_store::record::Record;
+    session
+        .open_log_records()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|(_, record)| match record {
+            Record::RunStart(start) => Some(serde_json::json!({
+                "run_id": start.run_id,
+                "submission_id": start.submission_id,
+                "send_id": start.send_id,
+                "request_identity_digest": start.request_identity_digest,
+                "title": start.title,
+                "sent_by": start
+                    .run_choices
+                    .as_ref()
+                    .and_then(|choices| choices.pointer("/record/sent_by"))
+                    .cloned(),
+                "principal": start.principal,
+                "model": start.model,
+            })),
+            _ => None,
+        })
+        .collect()
 }
 
 fn hello() -> Vec<Vec<NormalizedEvent>> {
@@ -411,24 +469,135 @@ async fn a_running_runs_routing_decision_is_fixed_alike() {
     .await;
 }
 
-/// A run paused for sign-in: today's actor queues a new send behind it and drives the paused run
-/// again on its own retry. The store actor serves neither yet.
+/// A run paused for sign-in owns the session: a new send is refused naming it, alike. Today's
+/// actor drives the paused run again on its own retry, which the store actor doesn't serve yet.
 #[tokio::test]
-async fn sends_on_a_paused_session_are_refused_by_the_store_actor_only() {
+async fn a_send_behind_a_sign_in_pause_is_refused_alike() {
     compare(
         vec![auth_failure()],
         false,
         vec![
             keyed("k1", "first"),
             Step::Idle,
-            expecting(
-                send("r2", "second"),
-                Expect::StoreRefuses("a send while a run is paused"),
-            ),
+            send("r2", "second"),
             expecting(
                 keyed("k1", "first"),
                 Expect::StoreRefuses("driving an unfinished run again by its retry"),
             ),
+        ],
+    )
+    .await;
+}
+
+/// A send while a run runs is queued, answered `pending`, and runs after that run, alike.
+#[tokio::test]
+async fn a_send_while_a_run_runs_is_queued_alike() {
+    compare(
+        hello(),
+        true,
+        vec![
+            send("r1", "first"),
+            send("r2", "second"),
+            Step::Release,
+            Step::Release,
+            Step::Idle,
+        ],
+    )
+    .await;
+}
+
+/// A queued send's retry is `pending`, and one with another payload is refused naming what
+/// differs, alike; once it ran, its retry is answered from its run.
+#[tokio::test]
+async fn a_queued_sends_retry_is_answered_alike() {
+    compare(
+        hello(),
+        true,
+        vec![
+            keyed("k1", "first"),
+            keyed("k2", "second"),
+            keyed("k2", "second"),
+            keyed("k2", "changed"),
+            Step::Release,
+            Step::Release,
+            Step::Idle,
+            keyed("k2", "second"),
+        ],
+    )
+    .await;
+}
+
+fn leaves_its_model(request: &mut SubmissionRequest) {
+    request.model = broca_protocol::request::ModelHandle::new("stub", "another");
+    request.inherit_frozen = [broca_protocol::request::InheritedParam::Model]
+        .into_iter()
+        .collect();
+}
+
+/// A plain send that leaves its model to the session is refused, before and after the session's
+/// first run, alike: only a plan's model selection lets a send leave it out, and these sessions
+/// have no plan.
+#[tokio::test]
+async fn a_send_leaving_its_model_to_the_session_runs_alike() {
+    compare(
+        vec![
+            super::tests::text_step("a1", "hello"),
+            super::tests::text_step("a2", "again"),
+            super::tests::text_step("a3", "once more"),
+        ],
+        false,
+        vec![
+            tweaked(send("r0", "too early"), leaves_its_model),
+            send("r1", "first"),
+            Step::Idle,
+            tweaked(send("r2", "second"), leaves_its_model),
+            Step::Idle,
+        ],
+    )
+    .await;
+}
+
+fn refused_at_admission(request: &mut SubmissionRequest) {
+    request.stop_when = vec![broca_protocol::request::StopCondition::StepCount { n: 0 }];
+}
+
+/// A queued send whose run admission refuses ends, and the send behind it still runs, alike.
+#[tokio::test]
+async fn a_queued_send_refused_at_its_drain_ends_alike() {
+    compare(
+        hello(),
+        true,
+        vec![
+            send("r1", "first"),
+            tweaked(send("r2", "refused"), refused_at_admission),
+            send("r3", "third"),
+            Step::Release,
+            Step::Release,
+            Step::Idle,
+        ],
+    )
+    .await;
+}
+
+fn from_core(request: &mut SubmissionRequest) {
+    request.principal = Some(broca_protocol::BindPrincipal::Reserved {
+        module_id: "prefrontal-core".into(),
+    });
+}
+
+/// A send's principal is recorded as its run's sender and principal, for a run started directly
+/// and one drained from the queue, alike.
+#[tokio::test]
+async fn a_sends_principal_is_recorded_alike() {
+    compare(
+        hello(),
+        true,
+        vec![
+            tweaked(keyed("k1", "first"), from_core),
+            tweaked(keyed("k2", "second"), from_core),
+            Step::Release,
+            Step::Release,
+            Step::Idle,
         ],
     )
     .await;

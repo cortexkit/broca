@@ -687,11 +687,11 @@ async fn a_retry_of_an_earlier_run_is_answered_from_its_end() {
     assert_eq!(texts(&session), ["first", "hello", "second", "again"]);
 }
 
-/// While the latest run is paused, a new send would have to wait behind it, which this actor
-/// doesn't serve yet: it is refused by name. The paused run's own retry is refused too, since
-/// today's actor drives a run paused for sign-in again on its retry.
+/// A run paused for sign-in owns the session: a new send is refused naming it, as today's actor
+/// refuses it. The paused run's own retry is refused by name, since today's actor drives a run
+/// paused for sign-in again on its retry.
 #[tokio::test]
-async fn sends_on_a_paused_session_are_refused_by_name() {
+async fn a_send_behind_a_sign_in_pause_is_refused_as_paused() {
     let (commands, served, _) = actor(executor(vec![auth_failure()], None)).await;
     assert!(matches!(
         keyed(&commands, "k1", "first").await,
@@ -700,11 +700,10 @@ async fn sends_on_a_paused_session_are_refused_by_name() {
     idle(&commands).await;
     assert_eq!(
         send(&commands, "r2", "second").await,
-        SendOutcome::Error(
-            "a send while a run is paused is not served yet for a session kept in the new \
-             storage"
-                .into()
-        )
+        SendOutcome::RunPaused {
+            run_id: RunId("r-k1".into()),
+            reason: broca_protocol::PauseReason::AuthRequired,
+        }
     );
     assert_eq!(
         keyed(&commands, "k1", "first").await,
@@ -725,6 +724,7 @@ async fn sends_on_a_paused_session_are_refused_by_name() {
         "the refused sends started nothing"
     );
     assert_eq!(texts(&session), ["first"]);
+    assert!(session.operations().queue.is_empty(), "nothing was queued");
 }
 
 /// While a run is running, a send naming another routing decision is refused as today's actor
@@ -753,4 +753,86 @@ async fn a_running_runs_routing_decision_is_fixed() {
     idle(&commands).await;
     drop(commands);
     assert_eq!(texts(&served.await.unwrap()), ["first", "hello"]);
+}
+
+/// A send while a run runs is queued durably, answered `pending`, and starts when that run ends,
+/// consuming its queued send. The actor starts the drained run before it reads its next command,
+/// so the session reads idle only once both runs ended.
+#[tokio::test]
+async fn a_queued_send_runs_when_the_run_before_it_ends() {
+    let gate = Arc::new(Notify::new());
+    let (commands, served, _) = actor(executor(
+        vec![text_step("a1", "hello"), text_step("a2", "again")],
+        Some(Arc::clone(&gate)),
+    ))
+    .await;
+    assert!(matches!(
+        send(&commands, "r1", "first").await,
+        SendOutcome::Active { .. }
+    ));
+    assert_eq!(
+        send(&commands, "r2", "second").await,
+        SendOutcome::Pending {
+            submission_id: broca_protocol::SubmissionId("sub-r2".into())
+        }
+    );
+    gate.notify_one();
+    gate.notify_one();
+    idle(&commands).await;
+    drop(commands);
+    let session = served.await.unwrap();
+    assert_eq!(texts(&session), ["first", "hello", "second", "again"]);
+    let start = session
+        .operations()
+        .run
+        .as_ref()
+        .and_then(|run| run.start.as_ref())
+        .unwrap();
+    assert_eq!(start.run_id, "r2");
+    assert_eq!(start.submission_id.as_deref(), Some("sub-r2"));
+    assert!(session.operations().queue.is_empty());
+}
+
+/// A queued send whose run admission refuses ends with a retraction carrying the refusal, and
+/// the send behind it still runs.
+#[tokio::test]
+async fn a_refused_queued_send_ends_and_the_next_one_runs() {
+    let gate = Arc::new(Notify::new());
+    let (commands, served, _) = actor(executor(
+        vec![text_step("a1", "hello"), text_step("a2", "again")],
+        Some(Arc::clone(&gate)),
+    ))
+    .await;
+    assert!(matches!(
+        send(&commands, "r1", "first").await,
+        SendOutcome::Active { .. }
+    ));
+    let mut refused = request("refused");
+    refused.stop_when = vec![StopCondition::StepCount { n: 0 }];
+    assert!(matches!(
+        send_with(&commands, "r2", refused, SendKey::Minted).await,
+        SendOutcome::Pending { .. }
+    ));
+    assert!(matches!(
+        send(&commands, "r3", "third").await,
+        SendOutcome::Pending { .. }
+    ));
+    gate.notify_one();
+    gate.notify_one();
+    idle(&commands).await;
+    drop(commands);
+    let session = served.await.unwrap();
+    assert_eq!(texts(&session), ["first", "hello", "third", "again"]);
+    let records = session.open_log_records().await.unwrap();
+    let failure = records
+        .iter()
+        .find_map(|(_, record)| match record {
+            Record::Retraction(retraction) if retraction.submission_id == "sub-r2" => {
+                retraction.failure.clone()
+            }
+            _ => None,
+        })
+        .expect("the refused send's retraction carries its refusal");
+    assert_eq!(failure["run_id"], "r2");
+    assert!(session.operations().queue.is_empty());
 }

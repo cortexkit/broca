@@ -36,6 +36,7 @@ pub mod entries;
 pub mod media;
 pub mod output;
 pub mod parts;
+pub mod queue;
 mod refusal;
 pub mod run;
 pub mod shared;

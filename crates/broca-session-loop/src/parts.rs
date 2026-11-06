@@ -60,3 +60,32 @@ impl Parts for MemoryParts {
         serde_json::from_slice(bytes).map_err(|e| e.to_string())
     }
 }
+
+/// One parts store shared by several holders: a session's actor and its run both store parts
+/// in it, the actor while the run holds its own handle. Each call takes the lock for that call
+/// only, and parts calls never wait on anything else, so neither holder blocks the other for
+/// long.
+#[derive(Clone)]
+pub struct SharedParts(pub std::sync::Arc<std::sync::Mutex<Box<dyn Parts>>>);
+
+impl SharedParts {
+    pub fn new(parts: Box<dyn Parts>) -> Self {
+        Self(std::sync::Arc::new(std::sync::Mutex::new(parts)))
+    }
+
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, Box<dyn Parts>>, String> {
+        self.0
+            .lock()
+            .map_err(|_| "a holder of the parts store panicked while using it".to_owned())
+    }
+}
+
+impl Parts for SharedParts {
+    fn put(&mut self, kind: PartKind, value: &Value) -> Result<PartRef, String> {
+        self.lock()?.put(kind, value)
+    }
+
+    fn get(&self, part: &PartRef) -> Result<Value, String> {
+        self.lock()?.get(part)
+    }
+}

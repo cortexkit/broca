@@ -398,7 +398,8 @@ impl RunLink {
 }
 
 /// A run over an [`ActorWriter`] can be spawned on a multi-threaded runtime: its future is
-/// `Send` when the provider and tool plane are. This fails to compile if anything the loop holds
+/// `Send` when the provider and the tool plane (the `ToolPlane` that dispatches its tool calls)
+/// are. This fails to compile if anything the loop holds
 /// across an await stops being `Send`.
 #[allow(dead_code)]
 fn a_run_through_an_actor_writer_is_send(

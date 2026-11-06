@@ -3248,8 +3248,7 @@ pub fn render_identity_error<P: Provider + ?Sized>(
              run start, and the provider does not reproduce the recorded version's bytes",
             "renderer_version_drift",
         )
-    } else if provider.render_config_blob_for_version(renderer_version) != *frozen_render_config
-    {
+    } else if provider.render_config_blob_for_version(renderer_version) != *frozen_render_config {
         (
             "resume refused: the provider frozen render config differs from the config recorded \
              at run start",

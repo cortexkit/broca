@@ -11,6 +11,8 @@
 //! - a plain send that starts a run on an idle session;
 //! - a keyed send's retry, answered from the records of the run it started, and a different
 //!   payload under a used key, refused naming what differs;
+//! - a send while the latest run is running or paused, queued durably and started when that run
+//!   ends, and a queued send's retry;
 //! - the session's status;
 //! - cancelling the active run, now or at its next step boundary;
 //! - going away when idle.
@@ -23,12 +25,13 @@ use std::sync::Arc;
 
 use broca_core::{RunControl, RunRequest};
 use broca_protocol::{BindIdentity, RunId, SubmissionRequest};
-use broca_session_loop::parts::Parts;
+use broca_session_loop::parts::{Parts, SharedParts};
+use broca_session_loop::queue;
 use broca_session_loop::shared::{ActorWriter, RunLink};
 use broca_session_loop::writer::Writer;
 use broca_session_store::backend::SessionBackend;
 use broca_session_store::idindex::IdKind;
-use broca_session_store::record::{CancelPoint, CancelRequest, Record};
+use broca_session_store::record::{CancelPoint, CancelRequest, QueuedSend, Record, Retraction};
 use broca_session_store::session::Session;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -48,8 +51,9 @@ pub struct StoreActor<B: SessionBackend> {
     key: BindIdentity,
     session: Session<B>,
     executor: Arc<dyn RunExecutor>,
-    /// The session's setup parts, lent to the active run and handed back when it ends.
-    parts: Option<Box<dyn Parts>>,
+    /// The setup parts store. The actor stores a queued send's tool list in it while the active
+    /// run holds its own handle.
+    parts: SharedParts,
     run: Option<ActiveRun>,
 }
 
@@ -62,9 +66,33 @@ struct ActiveRun {
     writer_gone: bool,
     cancel: CancellationToken,
     /// The reply of the send that started the run, held until the run's start is durable, so
-    /// the sender hears `active` only for a run that exists.
+    /// the sender hears `active` only for a run that exists. A run drained from the queue has no
+    /// sender waiting.
     admitting: Option<oneshot::Sender<SendOutcome>>,
+    /// The queued send the run started from, when it drained from the queue.
+    submission: Option<broca_protocol::SubmissionId>,
     done: JoinHandle<StoreRunEnd>,
+}
+
+/// A run to start: the send's request and what the run's start records about the send.
+struct Start {
+    run_id: RunId,
+    request: SubmissionRequest,
+    title: Option<String>,
+    /// A keyed send's key and identity digest, which the run's start records so a retry can be
+    /// answered from it.
+    send_id: Option<String>,
+    identity: Option<String>,
+    /// Who sent the input, which the run's start records: today's actor names the request's
+    /// principal.
+    sent_by: Option<broca_protocol::BindPrincipal>,
+}
+
+/// What a run drained from the queue starts from.
+struct Drained {
+    submission: broca_protocol::SubmissionId,
+    /// When the queued send's message was accepted, which the message keeps.
+    written_at_ms: Option<u64>,
 }
 
 /// How a keyed send is answered.
@@ -93,7 +121,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             key,
             session,
             executor,
-            parts: Some(parts),
+            parts: SharedParts::new(parts),
             run: None,
         }
     }
@@ -127,7 +155,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                         active.writer_gone = true;
                     }
                 }
-                Event::Done(end) => self.finish_run(end),
+                Event::Done(end) => self.finish_run(end).await,
                 Event::Command(None) => break,
                 Event::Command(Some(command)) => {
                     if self.handle(command).await {
@@ -139,8 +167,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         if let Some(active) = self.run.take() {
             // Nobody is left to send commands: the run is cut, as a module stop would cut it.
             active.cancel.cancel();
-            let end = active.done.await;
-            self.parts = end.ok().map(|end| end.parts);
+            let _ = active.done.await;
         }
         self.session
     }
@@ -218,11 +245,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                         }
                     }
                 }
-                let unserved_part = if self.run.is_some() {
-                    Some("a send while a run is active")
-                } else if self.running().is_some() {
-                    Some("a send while a run is paused")
-                } else if retention.is_some() {
+                let unserved_part = if retention.is_some() {
                     Some("a send setting retention")
                 } else if session_class.is_some() {
                     Some("a send setting a session class")
@@ -235,8 +258,60 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                     let _ = reply.send(SendOutcome::Error(unserved(what)));
                     return false;
                 }
-                let send_id = key.send_id().map(str::to_owned);
-                self.start_run(run_id, *request, title, send_id, identity, reply);
+                let request = *request;
+                // Today's actor lets a plain send leave its model to the session only when a
+                // plan selected the session's next-run model, and a store session has no plan.
+                if request
+                    .inherit_frozen
+                    .contains(&broca_protocol::request::InheritedParam::Model)
+                {
+                    let _ = reply.send(SendOutcome::DeliveryRefused {
+                        code: "invalid_params",
+                        field: "model",
+                        message: "model is required unless plan.model selected the session's \
+                                  next-run model"
+                            .into(),
+                    });
+                    return false;
+                }
+                // A run paused for sign-in or an account limit still owns the session: today's
+                // actor neither queues another send behind it nor drives it again for one.
+                if self.run.is_none() {
+                    if let Some((paused, reason)) = self.paused().filter(|(_, reason)| {
+                        matches!(
+                            reason,
+                            broca_protocol::PauseReason::AuthRequired
+                                | broca_protocol::PauseReason::AccountLimit
+                        )
+                    }) {
+                        let _ = reply.send(SendOutcome::RunPaused {
+                            run_id: paused,
+                            reason,
+                        });
+                        return false;
+                    }
+                }
+                let start = Start {
+                    run_id,
+                    sent_by: request.principal.clone(),
+                    request,
+                    title,
+                    send_id: key.send_id().map(str::to_owned),
+                    identity,
+                };
+                if self.running().is_some() {
+                    let outcome = self.queue(start).await;
+                    let _ = reply.send(outcome);
+                } else if !self.session.operations().queue.is_empty() {
+                    // The queue drains at a run's end, so an idle session with sends still queued
+                    // holds sends this actor doesn't drain yet (see `drain`); today's actor would
+                    // start them first.
+                    let _ = reply.send(SendOutcome::Error(unserved(
+                        "a send while sends are queued on an idle session",
+                    )));
+                } else {
+                    self.start_run(start, None, Some(reply));
+                }
                 false
             }
             LineageCmd::Status { reply } => {
@@ -267,20 +342,23 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         }
     }
 
-    /// Starts a run of `request` on the idle session. The sender's reply waits for the run's
-    /// start to be durable, or for its refusal.
-    /// `send_id` and `identity` are a keyed send's key and identity digest, which the run's start
-    /// records so a retry can be answered from it.
+    /// Starts a run of `start` on the idle session: a send's own run, whose sender's `reply`
+    /// waits for the run's start to be durable or for its refusal, or one `drained` from the
+    /// queue, which no sender waits on.
     fn start_run(
         &mut self,
-        run_id: RunId,
-        request: SubmissionRequest,
-        title: Option<String>,
-        send_id: Option<String>,
-        identity: Option<String>,
-        reply: oneshot::Sender<SendOutcome>,
+        start: Start,
+        drained: Option<Drained>,
+        reply: Option<oneshot::Sender<SendOutcome>>,
     ) {
-        let mut request = request;
+        let Start {
+            run_id,
+            mut request,
+            title,
+            send_id,
+            identity,
+            sent_by,
+        } = start;
         // The executor resolves the send's credential selection; only the result is frozen.
         let auth = request.auth.take();
         let mut req = RunRequest::from_submission(
@@ -289,9 +367,18 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             self.key.clone(),
             broca_protocol::SubmissionId(String::new()),
         );
-        // A run started directly consumes no queued send; its input was written now.
-        req.submission_id = None;
-        req.input_written_at_ms = broca_core::run::epoch_millis();
+        match &drained {
+            // The run consumes the queued send, whose message keeps the time it was accepted.
+            Some(drained) => {
+                req.submission_id = Some(drained.submission.clone());
+                req.input_written_at_ms = drained.written_at_ms;
+            }
+            // A run started directly consumes no queued send; its input was written now.
+            None => {
+                req.submission_id = None;
+                req.input_written_at_ms = broca_core::run::epoch_millis();
+            }
+        }
         req.title = title;
         req.send_id = send_id;
         req.request_identity_digest = identity;
@@ -301,13 +388,11 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             hook_plane: self.executor.hook_plane(),
             provider_held_lifecycle: self.executor.provider_held_lifecycle(),
             compaction_plane: self.executor.compaction_plane(),
+            display_sent_by: sent_by,
             ..Default::default()
         };
         let (writer, link) = ActorWriter::new(&self.session, None);
-        let parts = self
-            .parts
-            .take()
-            .expect("the session holds its parts while idle");
+        let parts: Box<dyn Parts> = Box::new(self.parts.clone());
         let executor = Arc::clone(&self.executor);
         let (out, mut events) = mpsc::channel(256);
         // Nothing subscribes to a store session's events yet; they're drained so the run never
@@ -327,9 +412,17 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             link,
             writer_gone: false,
             cancel,
-            admitting: Some(reply),
+            admitting: reply,
+            submission: drained.map(|drained| drained.submission),
             done,
         });
+    }
+
+    /// The session's latest run and why it paused, while it is paused.
+    fn paused(&self) -> Option<(RunId, broca_protocol::PauseReason)> {
+        let run = self.session.operations().run.as_ref()?;
+        let reason = run.paused.filter(|_| run.finished.is_none())?;
+        Some((RunId(run.run_id.clone()), reason))
     }
 
     /// The session's latest run while it is unfinished and either running here or paused: the
@@ -367,17 +460,29 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             Record::RunStart(start) => Some(start),
             _ => None,
         }) else {
-            // Today's actor answers a key a queued send or a steer holds from that send's own
-            // records, which this actor can't read yet.
             let mut holders = submission;
             if let Some(send_id) = key.send_id() {
                 holders.extend(find(IdKind::SendId, send_id.to_owned()).await?);
             }
-            return Ok(if holders.is_empty() {
+            // A key whose send is still queued is answered by the queue (`queue`), as in today's
+            // actor. Today's actor also answers a key held by a steer, a retraction or an ended
+            // send, from records this actor doesn't read yet.
+            let queued_id = format!("sub-{}", run_id.0);
+            let still_queued = !holders.is_empty()
+                && holders
+                    .iter()
+                    .all(|(_, record)| matches!(record, Record::QueuedSend(_)))
+                && self
+                    .session
+                    .operations()
+                    .queue
+                    .iter()
+                    .any(|pending| pending.submission_id == queued_id);
+            return Ok(if holders.is_empty() || still_queued {
                 Keyed::Fresh(digest)
             } else {
                 Keyed::Answered(SendOutcome::Error(unserved(
-                    "a retry of a queued or steered send",
+                    "a retry of a steered, retracted or ended send",
                 )))
             });
         };
@@ -473,30 +578,52 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         }
     }
 
-    /// The run's task ended: take the parts back, and answer a sender still waiting, whose run
-    /// never started.
-    fn finish_run(&mut self, end: Result<StoreRunEnd, tokio::task::JoinError>) {
+    /// The run's task ended: answer a sender still waiting, whose run never started, and start
+    /// the next queued send. A drained run refused at admission ends its queued send with the
+    /// refusal, as today's actor ends it, and the next one is tried.
+    async fn finish_run(&mut self, end: Result<StoreRunEnd, tokio::task::JoinError>) {
         let Some(active) = self.run.take() else {
             return;
         };
-        let (parts, result) = match end {
-            Ok(end) => (Some(end.parts), end.result),
-            // A run task that panicked took the parts with it. The session can't start
-            // another run, and its sends say why.
-            Err(error) => (
-                None,
-                Err(StoreRunError::Admission(broca_core::RunError::Config(
-                    format!("the run's task ended without finishing: {error}"),
-                ))),
-            ),
+        let result = match end {
+            Ok(end) => end.result,
+            Err(error) => Err(StoreRunError::Admission(broca_core::RunError::Config(
+                format!("the run's task ended without finishing: {error}"),
+            ))),
         };
-        self.parts = parts;
+        let started = self
+            .session
+            .operations()
+            .run
+            .as_ref()
+            .and_then(|run| run.start.as_ref())
+            .is_some_and(|start| start.run_id == active.run_id.0);
         if let Some(reply) = active.admitting {
             let _ = reply.send(match result {
                 Ok(_) => SendOutcome::Error("the run ended without writing its start".into()),
                 Err(StoreRunError::Admission(error)) => SendOutcome::Error(error.to_string()),
                 Err(StoreRunError::Loop(error)) => SendOutcome::Error(format!("{error:?}")),
             });
+        } else if let (Some(submission), false, Err(error)) = (&active.submission, started, &result)
+        {
+            let error = match error {
+                StoreRunError::Admission(error) => error.clone(),
+                StoreRunError::Loop(error) => broca_core::RunError::Config(format!("{error:?}")),
+            };
+            if let Err(error) = self
+                .end_refused_drain(submission, &active.run_id, error)
+                .await
+            {
+                // The send stays queued, and the queue behind it waits.
+                tracing::error!(
+                    target: "broca.store_actor",
+                    session = %self.key.session,
+                    submission_id = %submission.0,
+                    error = %error,
+                    "a refused queued send could not be ended",
+                );
+                return;
+            }
         } else if let Err(error) = result {
             tracing::error!(
                 target: "broca.store_actor",
@@ -506,6 +633,193 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 "a run on the new storage stopped without a recorded end",
             );
         }
+        self.drain().await;
+    }
+
+    /// Ends a queued send whose run was refused at admission: its retraction carries the
+    /// refusal, as today's actor writes it, so the sender's status reads why.
+    async fn end_refused_drain(
+        &mut self,
+        submission: &broca_protocol::SubmissionId,
+        run_id: &RunId,
+        error: broca_core::RunError,
+    ) -> Result<(), String> {
+        let failure = broca_wal::record::QueuedAdmissionFailure {
+            run_id: run_id.clone(),
+            error: crate::serve::admission_refusal::queued_admission_error(error),
+        };
+        let record = Record::Retraction(Retraction {
+            submission_id: submission.0.clone(),
+            failure: Some(serde_json::to_value(failure).map_err(|error| error.to_string())?),
+        });
+        Writer::append(&mut self.session, std::slice::from_ref(&record), true)
+            .await
+            .map(drop)
+            .map_err(|error| format!("{error:?}"))
+    }
+
+    /// Starts the first queued send when the session is idle and its latest run ended, as
+    /// today's actor drains its queue at a run's end. A paused run holds the queue. The run's
+    /// end comes back through `finish_run`, which drains again.
+    async fn drain(&mut self) {
+        if self.run.is_some()
+            || self
+                .session
+                .operations()
+                .run
+                .as_ref()
+                .is_some_and(|run| run.finished.is_none())
+        {
+            return;
+        }
+        let Some(first) = self.session.operations().queue.first().cloned() else {
+            return;
+        };
+        // This actor never queues either, so only a session written elsewhere can hold one; it
+        // is left queued, and the sends behind it wait.
+        if first.interrupt || first.ordered {
+            tracing::warn!(
+                target: "broca.store_actor",
+                session = %self.key.session,
+                submission_id = %first.submission_id,
+                "a queued interrupt or ordered send is not drained on the new storage yet",
+            );
+            return;
+        }
+        match self.drained_start(&first.submission_id).await {
+            Ok((start, drained)) => self.start_run(start, Some(drained), None),
+            Err(error) => tracing::error!(
+                target: "broca.store_actor",
+                session = %self.key.session,
+                submission_id = %first.submission_id,
+                error = %error,
+                "a queued send could not be read back to start its run",
+            ),
+        }
+    }
+
+    /// The run a queued send drains into, as today's actor builds it from the queued entry: the
+    /// request it was queued with, under the principal, sender, title and key its record kept.
+    async fn drained_start(&self, submission_id: &str) -> Result<(Start, Drained), String> {
+        let send = self
+            .queued(submission_id)
+            .await?
+            .ok_or_else(|| format!("the queued send {submission_id} has no record"))?;
+        let principal = |name: &str| {
+            queue::receipt_field(&send, name)
+                .map(|value| serde_json::from_value(value.clone()))
+                .transpose()
+                .map_err(|error| format!("the queued send's {name}: {error}"))
+        };
+        let mut request = queue::request_of(&send, &self.parts)?;
+        request.principal = principal("principal")?;
+        let identity = match queue::receipt_field(&send, "request_identity_digest") {
+            Some(serde_json::Value::String(digest)) => digest.clone(),
+            // A send queued without a digest gets one computed from its request, as today.
+            _ => broca_core::submission_identity_digest(&request),
+        };
+        let submission = broca_protocol::SubmissionId(submission_id.to_owned());
+        let start = Start {
+            run_id: crate::actor::run_id_of_queued(&submission),
+            title: queue::receipt_field(&send, "title")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            send_id: send.send_id.clone(),
+            identity: Some(identity),
+            sent_by: principal("sent_by")?,
+            request,
+        };
+        Ok((
+            start,
+            Drained {
+                submission,
+                written_at_ms: send.written_at_ms,
+            },
+        ))
+    }
+
+    /// The record of `submission_id` while it waits in the queue.
+    async fn queued(&self, submission_id: &str) -> Result<Option<QueuedSend>, String> {
+        if !self
+            .session
+            .operations()
+            .queue
+            .iter()
+            .any(|pending| pending.submission_id == submission_id)
+        {
+            return Ok(None);
+        }
+        let records = self
+            .session
+            .find_id(IdKind::SubmissionId, submission_id)
+            .await
+            .map_err(|error| format!("{error:?}"))?;
+        Ok(records
+            .into_iter()
+            .rev()
+            .find_map(|(_, record)| match record {
+                Record::QueuedSend(send) => Some(send),
+                _ => None,
+            }))
+    }
+
+    /// Queues `start` behind the latest run, which is running or paused, as today's actor
+    /// queues it: durable before the reply, which is `pending`. A retry of a send still queued
+    /// is compared with its record instead.
+    async fn queue(&mut self, start: Start) -> SendOutcome {
+        let Start {
+            run_id,
+            request,
+            title,
+            send_id,
+            identity,
+            sent_by,
+        } = start;
+        let submission_id = broca_protocol::SubmissionId(format!("sub-{}", run_id.0));
+        match self.queued(&submission_id.0).await {
+            Err(error) => return SendOutcome::Error(error),
+            Ok(Some(existing)) => {
+                return retry_of_queued(
+                    &existing,
+                    request,
+                    identity.as_deref(),
+                    &self.parts,
+                    submission_id,
+                )
+            }
+            Ok(None) => {}
+        }
+        let receipt = queue::Receipt {
+            sent_by,
+            principal: request.principal.clone(),
+            request_identity_digest: identity,
+            title,
+            ..queue::Receipt::default()
+        };
+        let at = queue::Queued {
+            written_at_ms: broca_core::run::epoch_millis(),
+            ..queue::Queued::default()
+        };
+        let record = match queue::queued_send(
+            &submission_id.0,
+            send_id.as_deref(),
+            &request,
+            &receipt,
+            at,
+            &mut self.parts,
+        ) {
+            Ok(send) => Record::QueuedSend(send),
+            Err(error) => return SendOutcome::Error(error),
+        };
+        match Writer::append(&mut self.session, std::slice::from_ref(&record), true).await {
+            Ok(seq) => {
+                if let Some(active) = self.run.as_mut() {
+                    active.link.note_own(seq, &[record]);
+                }
+            }
+            Err(error) => return SendOutcome::Error(format!("{error:?}")),
+        }
+        SendOutcome::Pending { submission_id }
     }
 
     /// Cancels the active run `run_id`. The request is durable before the run is told, so a
@@ -534,6 +848,51 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             active.cancel.cancel();
         }
         CancelOutcome::Ack
+    }
+}
+
+/// A retry of a send still queued, compared with its record as today's actor compares it with
+/// the queued entry: the same payload is `pending`, and anything else is refused naming what
+/// differs. A retry that omits the routing decision or tier its first send fixed takes them
+/// from the record, when the two sends' identities are the same.
+fn retry_of_queued(
+    existing: &QueuedSend,
+    mut request: SubmissionRequest,
+    identity: Option<&str>,
+    parts: &dyn Parts,
+    submission_id: broca_protocol::SubmissionId,
+) -> SendOutcome {
+    let reuse = |differing| SendOutcome::SendIdReuse { differing };
+    if queue::receipt_field(existing, "conversation_key").is_some() {
+        return reuse("conversation_key");
+    }
+    if existing.delivery.is_some() {
+        return reuse("delivery");
+    }
+    let stored = queue::receipt_field(existing, "request_identity_digest")
+        .and_then(serde_json::Value::as_str);
+    // The queued request doesn't keep the client message id; the digest does.
+    if stored.and_then(broca_core::digest_client_message_id) != request.client_message_id {
+        return reuse("client_message_id");
+    }
+    let queued = match queue::request_of(existing, parts) {
+        Ok(queued) => queued,
+        Err(error) => return SendOutcome::Error(error),
+    };
+    let same_send = identity.is_some() && stored == identity;
+    if same_send && request.route_decision_id.is_none() {
+        request
+            .route_decision_id
+            .clone_from(&queued.route_decision_id);
+    }
+    if same_send && broca_protocol::service_tier_enabled() && request.service_tier_level.is_none() {
+        request
+            .service_tier_level
+            .clone_from(&queued.service_tier_level);
+    }
+    match broca_core::submission_difference(&queued, &request) {
+        None => SendOutcome::Pending { submission_id },
+        Some(differing) => reuse(differing),
     }
 }
 

@@ -1282,7 +1282,7 @@ fn permanent_queued_refusal(message: String, provider_code: &'static str) -> Pro
 }
 
 /// The run id a queued submission starts under: `queue_submission` names it `sub-<run_id>`.
-fn run_id_of_queued(submission_id: &broca_protocol::SubmissionId) -> RunId {
+pub(crate) fn run_id_of_queued(submission_id: &broca_protocol::SubmissionId) -> RunId {
     RunId(
         submission_id
             .0
