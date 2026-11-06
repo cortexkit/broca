@@ -182,7 +182,7 @@ pub use wal_writer::{
     SESSION_PROJECTION_INCOMPLETE,
 };
 
-mod account_limit_pause;
+pub mod account_limit_pause;
 pub use account_limit_pause::{
     account_limit_pause_declined, account_limit_stale_resets, session_account_cache_expiry_ms,
     SameAccountWait,

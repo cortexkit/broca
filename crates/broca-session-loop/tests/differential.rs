@@ -97,6 +97,12 @@ impl Provider for ScriptedProvider {
         );
     }
 
+    /// The session's last accepted send on an account is now, when the comparison routes one,
+    /// so the session's cache on it outlives a pause until a reset that comes now.
+    fn last_accepted_at_ms(&self, _: &str) -> Option<u64> {
+        account().map(|_| harness_now())
+    }
+
     fn output_limits(&self) -> Option<broca_core::output_reservation::OutputLimits> {
         output().map(|script| script.limits)
     }
@@ -136,6 +142,7 @@ impl Provider for ScriptedProvider {
 
     async fn step(&self, _step_id: StepId, opts: &CallOptions) -> mpsc::Receiver<NormalizedEvent> {
         self.sent.lock().unwrap().push(opts.clone());
+        let rendered = self.render_request(opts);
         let script = {
             let mut scripts = self.scripts.lock().unwrap();
             let downgraded = self.downgraded.load(std::sync::atomic::Ordering::SeqCst);
@@ -161,6 +168,27 @@ impl Provider for ScriptedProvider {
                 script
             }
         };
+        // An attempt scripted as `RENDERED` reports the request this call actually rendered,
+        // as a live provider does; a resume that checks the request it sends again compares
+        // against it.
+        let script = script.into_iter().map(|mut event| {
+            if let NormalizedEvent::Control(ProviderControl::AttemptFinished { attempt }) =
+                &mut event
+            {
+                if attempt.request_body_sha256 == RENDERED {
+                    use sha2::Digest as _;
+                    attempt.request_body_len = rendered.len() as u64;
+                    attempt.request_body_sha256 = format!("{:x}", sha2::Sha256::digest(&rendered));
+                    // An account limit is observed when it is refused, and resets shortly after.
+                    if let Some(limit) = attempt.account_observation.limit.as_mut() {
+                        limit.observed_at_ms = harness_now();
+                        limit.resets_at_ms = Some(limit.observed_at_ms + RESETS_AFTER_MS);
+                    }
+                }
+            }
+            event
+        });
+        let script: Vec<_> = script.collect();
         let (tx, rx) = mpsc::channel(64);
         tokio::spawn(async move {
             for event in script {
@@ -170,6 +198,12 @@ impl Provider for ScriptedProvider {
         rx
     }
 }
+
+/// How long after a scripted account-limit refusal the account resets.
+const RESETS_AFTER_MS: u64 = 200;
+
+/// The request digest a scripted attempt carries to report the request it was sent with.
+const RENDERED: &str = "rendered";
 
 fn sent_requests(provider: &ScriptedProvider) -> Vec<CallOptions> {
     let sent = provider.sent.lock().unwrap();
@@ -743,7 +777,7 @@ fn provider_id() -> &'static str {
 /// The time the new loop reads: today's loop reads the wall clock, so a comparison whose result
 /// depends on it does too; every other comparison reads 0 and normalizes the times recorded.
 fn harness_now() -> u64 {
-    if cache() {
+    if cache() || account().is_some() {
         broca_core::clock::Clock::default().now_ms()
     } else {
         0
@@ -866,6 +900,111 @@ fn new_warmer() -> Option<Arc<dyn broca_core::keep_warm_wait::KeepWarmDriver<Adm
         Arc::new(NewWarmer(Arc::clone(&script.new)))
             as Arc<dyn broca_core::keep_warm_wait::KeepWarmDriver<Admission>>
     })
+}
+
+tokio::task_local! {
+    /// The provider account a comparison routes, with the boot cap on same-account waits.
+    /// `None` routes no account, and no run may pause on one.
+    static ACCOUNT: Option<AccountScript>;
+}
+
+#[derive(Clone)]
+struct AccountScript {
+    selection: broca_wal::AuthSelection,
+    wait: broca_core::SameAccountWait,
+}
+
+fn account() -> Option<AccountScript> {
+    ACCOUNT.try_with(Clone::clone).ok().flatten()
+}
+
+fn account_selection() -> Option<broca_wal::AuthSelection> {
+    account().map(|script| script.selection)
+}
+
+fn routed(account: &str) -> broca_wal::AuthSelection {
+    serde_json::from_value(json!({
+        "credential_id": "oauth:anthropic",
+        "account_ref": account,
+    }))
+    .expect("an auth selection decodes")
+}
+
+/// An attempt the provider refused because the account's limit is reached; the provider stamps
+/// when, and the reset shortly after.
+fn limited_attempt(number: u32) -> NormalizedEvent {
+    let NormalizedEvent::Control(ProviderControl::AttemptFinished { mut attempt }) =
+        attempt(number, 429, "http_error")
+    else {
+        unreachable!("attempt builds an attempt")
+    };
+    attempt.request_body_sha256 = RENDERED.into();
+    attempt.account_observation.limit = Some(broca_protocol::provider::AttemptAccountLimit {
+        disposition: broca_protocol::provider::AccountLimitDisposition {
+            kind: broca_protocol::provider::AccountLimitKind::AccountLimit,
+            scope: broca_protocol::provider::AccountLimitScope::Account,
+        },
+        observed_at_ms: harness_now(),
+        resets_at_ms: Some(harness_now()),
+        resets_at_source: None,
+        limit_window: None,
+    });
+    NormalizedEvent::Control(ProviderControl::AttemptFinished { attempt })
+}
+
+/// A step the provider refused for the account's limit.
+fn account_limited() -> Vec<NormalizedEvent> {
+    vec![
+        limited_attempt(1),
+        NormalizedEvent::Control(ProviderControl::Error {
+            error: serde_json::from_value(json!({
+                "class": "transient",
+                "message": "the account's usage limit is reached",
+                "status": 429
+            }))
+            .unwrap(),
+            retries_used: 0,
+        }),
+    ]
+}
+
+/// Every account-limit pause the new loop wrote names, by seq, the attempt record the provider
+/// refused for the account's limit (the one recording the limit's disposition), as a resume's
+/// timer reads it back. The comparison masks the
+/// seq, since each format numbers its own records.
+fn pause_names_its_attempt(writer: &Recording<'_, '_>) {
+    let first_seq = writer.session.next_seq() - writer.records.len() as u64;
+    for record in &writer.records {
+        let Record::Pause(pause) = record else {
+            continue;
+        };
+        let Some(limit) = &pause.account_limit else {
+            continue;
+        };
+        let seq = limit["failed_attempt_seq"]
+            .as_u64()
+            .expect("a pause names its attempt");
+        let named = &writer.records[(seq - first_seq) as usize];
+        assert!(
+            matches!(named, Record::Attempt(attempt)
+            if attempt.billing.as_ref().is_some_and(|billing| {
+                !billing["account_limit_disposition"].is_null()
+            })),
+            "the pause names {named:?}"
+        );
+    }
+}
+
+/// Waits until a scripted account limit has reset, when the comparison routes an account.
+async fn reset_passes() {
+    if account().is_some() {
+        tokio::time::sleep(std::time::Duration::from_millis(RESETS_AFTER_MS + 50)).await;
+    }
+}
+
+/// Runs `compare` with `script` routing both loops' account.
+async fn compare_routed<F: std::future::Future<Output = ()>>(script: AccountScript, compare: F) {
+    ACCOUNT.scope(Some(script), compare).await;
 }
 
 tokio::task_local! {
@@ -1292,6 +1431,8 @@ impl Scenario {
             budget: budget(),
             keep_warm: warm_script().map(|_| broca_protocol::request::KeepWarm::Auto),
             context_limit: frozen_context_limit(),
+            auth_selection: account_selection(),
+            account_limit_pause: account().is_some(),
         }
     }
 }
@@ -1354,6 +1495,9 @@ async fn today_from(
         &wal,
         None,
         RunControl {
+            auth_selection: account_selection(),
+            account_limit_pause: account().is_some(),
+            max_same_account_wait: account().map_or_else(Default::default, |script| script.wait),
             provider_held_lifecycle: Some(plane.lifecycle()),
             manifest: scenario.manifest.clone(),
             cancel: Some(cancel.clone()),
@@ -1620,6 +1764,8 @@ async fn new_from(
         account_reports: reports().map(|reports| {
             Arc::new(NewReports(Arc::clone(&reports.new))) as Arc<dyn AccountReports>
         }),
+        max_same_account_wait: account().map_or_else(Default::default, |script| script.wait),
+        auth_selection: account_selection(),
     };
     if resuming {
         resume(&mut writer, &parts, &seams).await
@@ -1670,6 +1816,15 @@ const NORMALIZED: &[&str] = &[
     "resumed_from_seq",
     // The seq of the record that accepted a steered message, in each format's own numbering.
     "receipt_seq",
+    // An account-limit pause names its failed attempt's record by seq, in each format's own
+    // numbering; `pause_names_its_attempt` checks the new loop's names the right record.
+    "failed_attempt_seq",
+    // When an account limit was observed, paused on and resets: wall-clock times the two loops
+    // take at different moments, computed by the same function from them.
+    "observed_at_ms",
+    "paused_at_ms",
+    "resets_at_ms",
+    "resume_not_before_ms",
 ];
 
 /// Records as the comparison reads them. Message ids differ by design: today's are
@@ -2332,6 +2487,9 @@ async fn compare_runs_in(scenario: Scenario, runs: &[(&str, Vec<Message>)]) {
     // One compaction session state for the session's life, as the actor keeps it across runs.
     let compaction_session: Arc<broca_core::compaction_v2::session::Session> = Arc::default();
     let control = || RunControl {
+        auth_selection: account_selection(),
+        account_limit_pause: account().is_some(),
+        max_same_account_wait: account().map_or_else(Default::default, |script| script.wait),
         manifest: scenario.manifest.clone(),
         compaction_session: Some(Arc::clone(&compaction_session)),
         keep_warm: warm_script().map(|script| {
@@ -2459,6 +2617,8 @@ async fn compare_runs_in(scenario: Scenario, runs: &[(&str, Vec<Message>)]) {
         account_reports: reports().map(|reports| {
             Arc::new(NewReports(Arc::clone(&reports.new))) as Arc<dyn AccountReports>
         }),
+        max_same_account_wait: account().map_or_else(Default::default, |script| script.wait),
+        auth_selection: account_selection(),
     };
     for (index, (run_id, input)) in runs.iter().enumerate() {
         run(
@@ -2874,6 +3034,9 @@ async fn compare_actions_in(
         })
     }));
     let control = RunControl {
+        auth_selection: account_selection(),
+        account_limit_pause: account().is_some(),
+        max_same_account_wait: account().map_or_else(Default::default, |script| script.wait),
         steer: Some(Arc::clone(&inbox)),
         stop_requested: Some(stop),
         provider_held_lifecycle: Some(plane.lifecycle()),
@@ -2912,6 +3075,10 @@ async fn compare_actions_in(
             &wal,
             None,
             RunControl {
+                auth_selection: account_selection(),
+                account_limit_pause: account().is_some(),
+                max_same_account_wait: account()
+                    .map_or_else(Default::default, |script| script.wait),
                 provider_held_lifecycle: Some(plane.lifecycle()),
                 new_log_compaction_plan_version: layout(),
                 ..Default::default()
@@ -3010,6 +3177,8 @@ async fn compare_actions_in(
         account_reports: reports().map(|reports| {
             Arc::new(NewReports(Arc::clone(&reports.new))) as Arc<dyn AccountReports>
         }),
+        max_same_account_wait: account().map_or_else(Default::default, |script| script.wait),
+        auth_selection: account_selection(),
     };
     let mut admission = scenario.admission(&provider.inner);
     admission.on_restart = on_restart;
@@ -3253,6 +3422,9 @@ async fn compare_auth_pause_in(scenario: Scenario) {
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
     let mut summaries = Vec::new();
     for mode in [StartMode::FreshOrResume, StartMode::ResumeAfterAuth] {
+        if mode == StartMode::ResumeAfterAuth {
+            reset_passes().await;
+        }
         let summary = run_loop_on_writer(
             request.clone(),
             &writer,
@@ -3263,6 +3435,10 @@ async fn compare_auth_pause_in(scenario: Scenario) {
             &wal,
             None,
             RunControl {
+                auth_selection: account_selection(),
+                account_limit_pause: account().is_some(),
+                max_same_account_wait: account()
+                    .map_or_else(Default::default, |script| script.wait),
                 new_log_compaction_plan_version: layout(),
                 ..Default::default()
             },
@@ -3342,6 +3518,8 @@ async fn compare_auth_pause_in(scenario: Scenario) {
         account_reports: reports().map(|reports| {
             Arc::new(NewReports(Arc::clone(&reports.new))) as Arc<dyn AccountReports>
         }),
+        max_same_account_wait: account().map_or_else(Default::default, |script| script.wait),
+        auth_selection: account_selection(),
     };
     let first = run(
         &mut writer,
@@ -3351,10 +3529,12 @@ async fn compare_auth_pause_in(scenario: Scenario) {
     )
     .await
     .expect("the new loop runs");
+    reset_passes().await;
     let second = resume(&mut writer, &parts, &seams)
         .await
         .expect("the new loop resumes");
     keys_match(writer.session, &plane).await;
+    pause_names_its_attempt(&writer);
     let new = Outcome {
         records: normalized(&writer.records),
         requests: sent_requests(&provider),
@@ -5529,6 +5709,53 @@ async fn keep_warm_is_told_every_attempt() {
             ),
             text_step("a2", "done"),
         ])),
+    )
+    .await;
+}
+
+/// The provider refuses the account's limit, which resets before the session's cache on it
+/// expires: both loops pause on the same account, then resume and send the step again.
+#[tokio::test]
+async fn an_account_limit_pauses_on_the_same_account_and_resumes() {
+    compare_routed(
+        AccountScript {
+            selection: routed("acct-1"),
+            wait: broca_core::SameAccountWait::default(),
+        },
+        compare_auth_pause(Scenario {
+            input: vec![user("read a")],
+            tools: vec![tool("read", ExecutionMode::Parallel)],
+            manifest: None,
+            stop_when: Vec::new(),
+            steps: vec![
+                answer(
+                    "a1",
+                    vec![call("c1", "read", json!({"path": "a"}))],
+                    FinishReason::ToolCalls,
+                ),
+                account_limited(),
+                text_step("a2", "done"),
+            ],
+        }),
+    )
+    .await;
+}
+
+/// With same-account waits switched off, both loops end the run on the account's limit.
+#[tokio::test]
+async fn an_account_limit_ends_the_run_when_waits_are_off() {
+    compare_routed(
+        AccountScript {
+            selection: routed("acct-1"),
+            wait: broca_core::SameAccountWait::Minutes(0),
+        },
+        compare(Scenario {
+            input: vec![user("hello")],
+            tools: Vec::new(),
+            manifest: None,
+            stop_when: Vec::new(),
+            steps: vec![account_limited()],
+        }),
     )
     .await;
 }

@@ -115,6 +115,12 @@ pub struct Admission {
     /// Whether the run keeps the prompt cache warm while it waits on tool calls. Absent is
     /// off, as today's run start reads it.
     pub keep_warm: Option<broca_protocol::request::KeepWarm>,
+    /// The provider account the run was admitted to, frozen so a resume uses the same one.
+    pub auth_selection: Option<broca_wal::AuthSelection>,
+    /// Whether the run may pause on its own account when the provider says the account's limit
+    /// is reached and resets soon, rather than end, as today's admission freezes it from the
+    /// boot setting.
+    pub account_limit_pause: bool,
 }
 
 /// The seams a run calls. None of them is owned by the run.
@@ -155,6 +161,12 @@ pub struct Seams<'a, P, T> {
     /// Receives what the run saw about its provider account, for account routing: the run's
     /// start once it is durable, and each provider attempt as its record is appended.
     pub account_reports: Option<Arc<dyn AccountReports>>,
+    /// The boot setting that bounds how long a run may wait on its own account after the
+    /// provider says the account's limit is reached.
+    pub max_same_account_wait: broca_core::SameAccountWait,
+    /// The account routing gives the session now. A run paused on its account resumes only
+    /// on the account it froze; `None` when the caller didn't route one.
+    pub auth_selection: Option<broca_wal::AuthSelection>,
 }
 
 /// The run loop's account reports, as today's `broca_core::AccountReporter` receives them. Each
@@ -311,6 +323,30 @@ where
         return Ok(finished(writer, reason));
     }
     let resolution = run.resolution();
+    // A run paused on its account's limit resumes on that same account, and only once the
+    // account has reset, as today's resume decides it. Until then nothing is written and the
+    // run stays paused; on another account it ends interrupted, saying why.
+    if resolution == Resolution::Paused(PauseReason::AccountLimit) {
+        let frozen = admission.auth_selection.as_ref();
+        if seams.auth_selection.as_ref().is_some_and(|current| {
+            !broca_core::account_limit_pause::same_selection(current, frozen)
+        }) {
+            let error = broca_core::account_limit_pause::selection_changed_error();
+            return end_with_error(
+                writer,
+                seams,
+                &admission.run_id,
+                RunFinishReason::Interrupted,
+                &error,
+            )
+            .await;
+        }
+        let ready = account_limit_of(writer)?
+            .is_some_and(|pause| (seams.now_ms)() >= pause.resume_not_before_ms);
+        if !ready {
+            return Ok(finished(writer, RunFinishReason::Interrupted));
+        }
+    }
     let mut placed = Placed {
         facts: admission
             .compaction_plan_version
@@ -344,6 +380,9 @@ where
             drive(writer, parts, &admission, seams, compaction.as_ref()).await
         }
         Resolution::Paused(PauseReason::AuthRequired | PauseReason::Restart) => {
+            drive(writer, parts, &admission, seams, compaction.as_ref()).await
+        }
+        Resolution::Paused(PauseReason::AccountLimit) => {
             drive(writer, parts, &admission, seams, compaction.as_ref()).await
         }
         Resolution::Paused(_) => Err(LoopError::Unsupported("a paused run")),
@@ -713,6 +752,8 @@ pub(crate) fn admission_of_start(
         stop_when: decode(member("stop_when"))?.unwrap_or_default(),
         on_restart: decode(start.on_restart.clone())?,
         keep_warm: decode(start.keep_warm.clone())?,
+        auth_selection: decode(start.auth_selection.clone())?,
+        account_limit_pause: decode::<bool>(member("account_limit_pause"))?.unwrap_or(false),
         ts_ms: start.ts_ms,
         written_at_ms: start.written_at_ms,
         global_system: match (
@@ -878,6 +919,8 @@ where
     T: ToolPlane,
 {
     let warming = Warming::of(admission, seams);
+    // The pause a timed same-account wait left, which the step it resumes must match.
+    let mut account_limit_replay = account_limit_of(writer)?;
     // Each window run's place in the prompt and render config. A run adds no episode once
     // its input is placed, so these hold for the whole run.
     let episodes = render_episodes(writer, parts)?;
@@ -1134,6 +1177,12 @@ where
             step_id,
             compaction.is_some(),
         )?;
+        // The step names the account routing gives the run now, as today's does.
+        if let Some(context) = opts.step_context.as_mut() {
+            let selection = run_selection(seams, admission);
+            context.credential_id = selection.map(|selection| selection.credential_id.clone());
+            context.account_ref = selection.and_then(|selection| selection.account_ref.clone());
+        }
         // The budget's finalize step keeps the declared tools byte for byte and disables calls
         // through the tool choice, as today's loop does: dropping the tools would change the
         // request's cached prefix on the run's last step.
@@ -1198,6 +1247,30 @@ where
                 return Ok(finished(writer, RunFinishReason::Error));
             }
         };
+        // The step a timed account pause resumes is sent again only if it renders the request
+        // the provider refused, byte for byte, as today's resume checks it: anything else ends
+        // the run interrupted rather than send a request the pause wasn't for.
+        if let Some(pause) = account_limit_replay.take() {
+            use sha2::Digest as _;
+            let bytes = seams
+                .provider
+                .try_render_request(&opts)
+                .map_err(|error| LoopError::Parts(error.message))?;
+            if pause.failed_step != StepId(step_id)
+                || pause.request_body_len != bytes.len() as u64
+                || pause.request_body_sha256 != format!("{:x}", sha2::Sha256::digest(&bytes))
+            {
+                let error = broca_core::account_limit_pause::request_changed_error();
+                return end_with_error(
+                    writer,
+                    seams,
+                    &admission.run_id,
+                    RunFinishReason::Interrupted,
+                    &error,
+                )
+                .await;
+            }
+        }
         // A strict structured-output schema the provider refuses as too large a grammar is
         // downgraded once: the downgrade is durable, the provider renders without the strict
         // flag, and the same step is sent again, its retries counting the refused attempt's, as
@@ -1212,9 +1285,10 @@ where
                 step_id,
                 opts.clone(),
                 requested_cache_ttl(admission),
+                admission.account_limit_pause,
             )
             .await?;
-            if let Err(StepFailure::Error(error, retries_used)) = &outcome {
+            if let Err(StepFailure::Error(error, retries_used, _)) = &outcome {
                 // The provider decides: it answers yes only for its own strict schema's refusal.
                 if !downgraded_now && seams.provider.structured_output_grammar_rejection(error) {
                     writer
@@ -1241,9 +1315,10 @@ where
                     step.retries_used = step.retries_used.saturating_add(prior_retries);
                     Ok(step)
                 }
-                Err(StepFailure::Error(error, retries)) => Err(StepFailure::Error(
+                Err(StepFailure::Error(error, retries, limited)) => Err(StepFailure::Error(
                     error,
                     retries.saturating_add(prior_retries),
+                    limited,
                 )),
                 Err(failure) => Err(failure),
             };
@@ -1253,7 +1328,15 @@ where
             Err(StepFailure::Cancelled) => {
                 return finish(writer, seams, &admission.run_id, RunFinishReason::Cancelled).await;
             }
-            Err(StepFailure::Error(error, retries)) => {
+            Err(StepFailure::Error(error, retries, limited)) => {
+                // The error names the run's account or credential where it is scoped to one, as
+                // today's does before deciding anything on it.
+                let selection = run_selection(seams, admission);
+                let error = Box::new(broca_core::run::stamp_credential(
+                    *error,
+                    selection.and_then(|selection| selection.account_ref.as_deref()),
+                    selection.map(|selection| selection.credential_id.as_str()),
+                ));
                 // A failed sign-in pauses the run: after the credential is refreshed, it resumes
                 // as the same run, asking for this step again.
                 if error.class == broca_protocol::ErrorClass::Auth {
@@ -1263,6 +1346,23 @@ where
                         &admission.run_id,
                         PauseReason::AuthRequired,
                         Some(*error),
+                        None,
+                    )
+                    .await;
+                }
+                // The provider refused the account's limit, which resets soon enough that the
+                // session's cache on that account outlives the wait: the run pauses on the same
+                // account until then, as today's loop decides it.
+                if let Some(pause_on) = limited.and_then(|limited| {
+                    account_limit_pause(seams, admission, step_id, &limited, &error)
+                }) {
+                    return pause(
+                        writer,
+                        seams,
+                        &admission.run_id,
+                        PauseReason::AccountLimit,
+                        Some(*error),
+                        Some(pause_on),
                     )
                     .await;
                 }
@@ -1516,6 +1616,9 @@ async fn admit<W: Writer>(
     if let Some(budget) = &admission.budget {
         config.insert("budget".into(), json!(budget));
     }
+    if admission.account_limit_pause {
+        config.insert("account_limit_pause".into(), json!(true));
+    }
     let mut choices = serde_json::Map::new();
     choices.insert("config".into(), Value::Object(config));
     if let Some(rest) = manifest_rest {
@@ -1553,7 +1656,12 @@ async fn admit<W: Writer>(
         service_tier: None,
         route_decision_id: None,
         compaction_plan_version: admission.compaction_plan_version,
-        auth_selection: None,
+        auth_selection: admission
+            .auth_selection
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|e| LoopError::Parts(e.to_string()))?,
         run_choices: Some(Value::Object(choices)),
         origin: Some(json!({ "kind": "fresh" })),
         principal: None,
@@ -1762,8 +1870,14 @@ fn call_options<W: Writer>(
         run_id: admission.run_id.clone(),
         step_index: step_id,
         session_address,
-        credential_id: None,
-        account_ref: None,
+        credential_id: admission
+            .auth_selection
+            .as_ref()
+            .map(|selection| selection.credential_id.clone()),
+        account_ref: admission
+            .auth_selection
+            .as_ref()
+            .and_then(|selection| selection.account_ref.clone()),
         max_output_tokens: None,
     });
     // A run with a compaction provider renders its prompt from the provider's view
@@ -1872,9 +1986,17 @@ fn incomplete_stream() -> ProviderError {
 
 enum StepFailure {
     Cancelled,
-    /// The step failed, after this many retries.
-    Error(Box<ProviderError>, u32),
+    /// The step failed, after this many retries. `limited` is its last attempt the provider
+    /// refused because the account's limit was reached, with its record's seq: the evidence a
+    /// timed pause on the same account may rest on.
+    Error(
+        Box<ProviderError>,
+        u32,
+        Option<Box<FailedAccountLimitAttempt>>,
+    ),
 }
+
+use broca_core::account_limit_pause::FailedAccountLimitAttempt;
 
 /// Runs one model call and assembles its answer. Display events go straight to the listener.
 /// Asks the provider for one step. Each HTTP attempt's evidence is appended as the attempt
@@ -1887,7 +2009,9 @@ async fn model_step<W: Writer, P: Provider, T>(
     step_id: u64,
     opts: CallOptions,
     requested_ttl_ms: Option<u64>,
+    account_limit_pause: bool,
 ) -> Result<Result<Step, StepFailure>, LoopError> {
+    let mut limited: Option<Box<FailedAccountLimitAttempt>> = None;
     let runtime = StepRuntime {
         cancel: seams.cancel.clone(),
         deadline: None,
@@ -1924,6 +2048,7 @@ async fn model_step<W: Writer, P: Provider, T>(
                     return Ok(Err(StepFailure::Error(
                         Box::new(incomplete_stream()),
                         retries_used,
+                        limited,
                     )));
                 };
                 return Ok(Ok(Step {
@@ -1936,7 +2061,13 @@ async fn model_step<W: Writer, P: Provider, T>(
             Some(NormalizedEvent::Control(ProviderControl::Error {
                 error,
                 retries_used,
-            })) => return Ok(Err(StepFailure::Error(Box::new(error), retries_used))),
+            })) => {
+                return Ok(Err(StepFailure::Error(
+                    Box::new(error),
+                    retries_used,
+                    limited,
+                )))
+            }
             // Each attempt's record, around the same hooks today's loop calls: keep-warm learns
             // its send time and rate-limit headers, its input transformations are reported, and
             // the provider adds its cache evidence before the record is written and learns which
@@ -1962,10 +2093,17 @@ async fn model_step<W: Writer, P: Provider, T>(
                             step_id,
                             attempt.clone(),
                             requested_ttl_ms,
+                            account_limit_pause,
                         )?],
                         durable,
                     )
                     .await?;
+                limited = attempt.account_observation.limit.is_some().then(|| {
+                    Box::new(FailedAccountLimitAttempt {
+                        seq,
+                        attempt: attempt.clone(),
+                    })
+                });
                 seams
                     .provider
                     .cache_attempt_recorded(Some(event_id(writer, seq)));
@@ -1973,7 +2111,13 @@ async fn model_step<W: Writer, P: Provider, T>(
                     reports.attempt_recorded(&event_id(writer, seq), seq, &attempt);
                 }
             }
-            None => return Ok(Err(StepFailure::Error(Box::new(incomplete_stream()), 0))),
+            None => {
+                return Ok(Err(StepFailure::Error(
+                    Box::new(incomplete_stream()),
+                    0,
+                    limited,
+                )))
+            }
             Some(NormalizedEvent::Control(_)) => {}
         }
     }
@@ -2324,7 +2468,7 @@ where
         if !records.is_empty() {
             writer.append(&records, true).await?;
         }
-        let finished = pause(writer, seams, run_id, PauseReason::ToolHeld, None).await?;
+        let finished = pause(writer, seams, run_id, PauseReason::ToolHeld, None, None).await?;
         return Ok(BatchOutcome::Held(finished));
     }
     // A batch that closed held calls isn't finished on the plane: the provider still holds them
@@ -2855,6 +2999,78 @@ pub fn warm_spend<C: ?Sized + Sync>(
             }
         })
         .sum()
+}
+
+/// The account the run uses: the one routing gives it now, else the one it froze at admission,
+/// as today's loop chooses it.
+fn run_selection<'a, P, T>(
+    seams: &'a Seams<'_, P, T>,
+    admission: &'a Admission,
+) -> Option<&'a broca_wal::AuthSelection> {
+    seams
+        .auth_selection
+        .as_ref()
+        .or(admission.auth_selection.as_ref())
+}
+
+/// The timed same-account pause the run's state holds, if it is paused on one.
+fn account_limit_of<W: Writer>(
+    writer: &W,
+) -> Result<Option<broca_wal::AccountLimitPause>, LoopError> {
+    run_state(writer)
+        .account_limit_pause
+        .clone()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|e| LoopError::Parts(format!("account-limit pause: {e}")))
+}
+
+/// Ends the run as `reason` with `error` on its end, as today ends a run that can't go on.
+async fn end_with_error<W: Writer, P, T>(
+    writer: &mut W,
+    seams: &Seams<'_, P, T>,
+    run_id: &str,
+    reason: RunFinishReason,
+    error: &ProviderError,
+) -> Result<Finished, LoopError> {
+    let mut record = run_end(writer, run_id, reason, (seams.now_ms)());
+    if let Record::RunEnd(end) = &mut record {
+        end.error = Some(serde_json::to_value(error).map_err(|e| LoopError::Parts(e.to_string()))?);
+    }
+    append_end(writer, run_id, vec![record]).await?;
+    Ok(finished(writer, reason))
+}
+
+/// The timed pause on the run's own account that `limited`, the step's attempt the provider
+/// refused for the account's limit, allows, as today's loop decides it: only for a transient
+/// error, only when the run consented at admission, and only when the account resets before
+/// the session's cache on it expires and within the boot cap.
+fn account_limit_pause<P: Provider, T>(
+    seams: &Seams<'_, P, T>,
+    admission: &Admission,
+    step_id: u64,
+    limited: &FailedAccountLimitAttempt,
+    error: &ProviderError,
+) -> Option<Box<broca_wal::AccountLimitPause>> {
+    let selection = run_selection(seams, admission);
+    let last_accepted = limited
+        .attempt
+        .served_account_ref
+        .as_deref()
+        .or_else(|| selection.and_then(|selection| selection.account_ref.as_deref()))
+        .and_then(|account| seams.provider.last_accepted_at_ms(account));
+    let budget = broca_core::account_limit_pause::PauseBudget {
+        setting: if admission.account_limit_pause {
+            seams.max_same_account_wait
+        } else {
+            broca_core::SameAccountWait::Minutes(0)
+        },
+        cache_expiry_ms: broca_core::session_account_cache_expiry_ms(
+            last_accepted,
+            &admission.render_config,
+        ),
+    };
+    limited.pause(StepId(step_id), (seams.now_ms)(), error, selection, &budget)
 }
 
 /// The cache lifetime the run's requests ask the provider for, when they ask for one it
@@ -3881,6 +4097,7 @@ async fn pause<W: Writer, P, T>(
     run_id: &str,
     reason: PauseReason,
     error: Option<ProviderError>,
+    account_limit: Option<Box<broca_wal::AccountLimitPause>>,
 ) -> Result<Finished, LoopError> {
     let error = error
         .map(|error| serde_json::to_value(error).map_err(|e| LoopError::Parts(e.to_string())))
@@ -3895,9 +4112,16 @@ async fn pause<W: Writer, P, T>(
     let mut pause = Some(Record::Pause(Pause {
         run_id: run_id.into(),
         reason,
-        ts_ms: Some((seams.now_ms)()),
+        // An account-limit pause is dated by when it decided to pause, as today's is.
+        ts_ms: Some(
+            account_limit
+                .as_ref()
+                .map_or_else(|| (seams.now_ms)(), |pause| pause.paused_at_ms),
+        ),
         error,
-        account_limit: None,
+        account_limit: account_limit
+            .map(|pause| serde_json::to_value(pause).map_err(|e| LoopError::Parts(e.to_string())))
+            .transpose()?,
     }));
     let owned_run_id = run_id.to_string();
     let batch = writer
@@ -3996,12 +4220,25 @@ fn placed_copies(operations: &Operations, run_id: &str) -> Vec<Record> {
 /// is billed through a reservation yet.
 /// `requested_ttl_ms` is the cache lifetime the run's requests ask for, recorded on an attempt
 /// that reached the cache.
+/// `account_limit_pause` is the run's frozen consent to a timed same-account pause: with it, an
+/// attempt the provider refused for the account's limit records that limit's disposition, as
+/// today's `account_limit_pause::attempt_record` does.
 fn attempt_record(
     run_id: &str,
     step_id: u64,
     attempt: ModelAttempt,
     requested_ttl_ms: Option<u64>,
+    account_limit_pause: bool,
 ) -> Result<Record, LoopError> {
+    let disposition = account_limit_pause
+        .then(|| {
+            attempt
+                .account_observation
+                .limit
+                .as_ref()
+                .map(|limit| limit.disposition)
+        })
+        .flatten();
     let invalid = |what: &str| LoopError::Parts(format!("attempt evidence: {what}"));
     let mut value = serde_json::to_value(&attempt).map_err(|e| invalid(&e.to_string()))?;
     let fields = value
@@ -4047,7 +4284,13 @@ fn attempt_record(
         last_content_at_ms: attempt.content_progress.last_content_at_ms,
         transport: attempt.transport.clone(),
         served_account_ref: attempt.served_account_ref.clone(),
-        billing: None,
+        billing: disposition
+            .map(|disposition| {
+                serde_json::to_value(disposition)
+                    .map(|disposition| json!({ "account_limit_disposition": disposition }))
+            })
+            .transpose()
+            .map_err(|e| invalid(&e.to_string()))?,
         telemetry,
         reached_cache: reached.then_some(true),
         requested_cache_ttl_ms: requested_ttl_ms.filter(|_| reached),

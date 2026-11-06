@@ -8811,7 +8811,7 @@ pub(crate) async fn project_committed<W: WalStore>(
 ///   so it never changes a retry decision.
 ///
 /// Every other error is returned unchanged.
-fn stamp_credential(
+pub fn stamp_credential(
     mut error: ProviderError,
     account_ref: Option<&str>,
     credential_id: Option<&str>,
