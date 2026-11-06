@@ -311,20 +311,16 @@ fn mapping_error(message: String) -> ProviderReply {
     }
 }
 
+/// The error for a non-2xx answer. Its code is the shared OpenAI mapping (`cortexkit-model-batch`
+/// `RULES.md` §15): an account out of credit or over its billing limit is the permanent
+/// `account_not_entitled`, since it ends only when someone pays, and every other status maps as
+/// for any provider. Its class follows the code, except that a sign-in failure asks for
+/// authentication.
 fn http_error(status: u16, retry_after_ms: Option<u64>, body: &[u8]) -> ProviderReply {
     let value: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
     let provider_code = value["error"]["code"].as_str().map(str::to_owned);
-    let code = match (status, provider_code.as_deref()) {
-        (401, _) => errors::AUTH_FAILED,
-        // Out of credit, or over a billing hard limit: it ends only when someone pays, so it is
-        // the permanent account refusal, not a rate limit that a retry outlasts.
-        (429, Some("credit_balance_exhausted" | "insufficient_quota")) => {
-            errors::ACCOUNT_NOT_ENTITLED
-        }
-        (429, _) => errors::RATE_LIMITED,
-        (400..=499, _) => errors::INVALID_ITEM,
-        _ => errors::PROVIDER_ERROR,
-    };
+    let code = cortexkit_model_batch::status::openai_item_code(status, provider_code.as_deref())
+        .unwrap_or(errors::PROVIDER_ERROR);
     let mut error = ItemError::for_code(
         code,
         format!(
@@ -332,17 +328,17 @@ fn http_error(status: u16, retry_after_ms: Option<u64>, body: &[u8]) -> Provider
             provider_code.as_deref().unwrap_or("unreported")
         ),
     );
-    error.class = match status {
-        _ if code == errors::ACCOUNT_NOT_ENTITLED => ErrorClass::Permanent,
-        401 => ErrorClass::Other("auth_required".into()),
-        429 | 500..=599 => ErrorClass::Transient,
-        _ => ErrorClass::Permanent,
-    };
+    if code == errors::AUTH_FAILED {
+        error.class = ErrorClass::Other("auth_required".into());
+    }
     error.retry_after_ms = retry_after_ms;
     ProviderReply::ClassifiedError {
         error,
         provider_code,
-        may_have_spent: status >= 500,
+        // Only a provider error (a timeout or a server failure) may have reached a billed
+        // model, so only then may the call have cost money; every other refusal came before any
+        // model ran.
+        may_have_spent: code == errors::PROVIDER_ERROR,
     }
 }
 

@@ -753,6 +753,7 @@ impl FileWalStore {
         if let Some(guard) = &self.session_guard {
             guard(session).map_err(|error| WalError::Io(io::Error::other(error)))?;
         }
+        self.check_session_storage(session)?;
         // A cut file may name the session by its folder-based v1 reference (recorded before
         // the v2 switch) or by its v2 reference. Check both in one pass, so a pending release
         // under either reference outranks a moved tombstone for writes.
@@ -778,6 +779,24 @@ impl FileWalStore {
             }
         }
         broca_wal::migration::guard_refs(&wal, &[&legacy, &current], write)
+    }
+
+    /// Refuses a session kept in the new session storage: it has no WAL here, and this build
+    /// doesn't serve it. Every read and write of a session checks this first, so no path
+    /// answers for it from an absent WAL or creates one, which would fork the session in two.
+    /// A head that can't be checked refuses too, rather than reading as absent.
+    fn check_session_storage(&self, session: &BindIdentity) -> Result<(), WalError> {
+        let state_root = self.root.parent().unwrap_or_else(|| Path::new(""));
+        let head = broca_wal::session_storage_head(state_root, &session_addr(session));
+        match std::fs::symlink_metadata(head) {
+            Ok(_) => Err(WalError::NewerWriter {
+                offset: 0,
+                ver: 0,
+                missing: vec![broca_wal::SESSION_STORAGE_FEATURE.to_owned()],
+            }),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(WalError::Io(error)),
+        }
     }
 
     fn check_authorization_move(&self, session: &BindIdentity) -> Result<(), WalError> {
@@ -6588,6 +6607,53 @@ mod tests {
             wal.check_move(&session, true).is_err(),
             "the unreadable-cut control must reject a lookup"
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A session with a head in the new session storage is refused by name for reads and
+    /// writes, so no path serves it from an absent WAL or creates one beside it. Other sessions
+    /// at the same state root are untouched. A head path that can't be checked refuses too,
+    /// instead of reading as no head.
+    #[test]
+    fn a_session_on_the_new_storage_is_refused_for_reads_and_writes() {
+        let root = broca_test_support::scratch_root()
+            .join(format!("session-storage-guard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("wal")).unwrap();
+        let wal = super::FileWalStore::new(root.join("wal"));
+        let session = broca_protocol::BindIdentity::new("/project", "runner", "stored");
+        let other = broca_protocol::BindIdentity::new("/project", "runner", "other");
+        wal.check_move(&session, true).unwrap();
+        let head = broca_wal::session_storage_head(&root, &super::session_addr(&session));
+        std::fs::create_dir_all(head.parent().unwrap()).unwrap();
+        std::fs::write(&head, b"head").unwrap();
+        for write in [false, true] {
+            match wal.check_move(&session, write) {
+                Err(error @ broca_wal::WalError::NewerWriter { .. }) => {
+                    let broca_wal::WalError::NewerWriter { missing, .. } = &error else {
+                        unreachable!()
+                    };
+                    assert_eq!(missing, &[broca_wal::SESSION_STORAGE_FEATURE]);
+                    assert!(
+                        error.to_string().contains("newer session storage"),
+                        "{error}"
+                    );
+                }
+                other => panic!("write={write}: expected the session-storage refusal: {other:?}"),
+            }
+        }
+        wal.check_move(&other, true).unwrap();
+        // A file where the head's folder belongs makes the head uncheckable on unix, which
+        // reports it as `NotADirectory`; Windows reports the same path as not found.
+        #[cfg(unix)]
+        {
+            let blocked = broca_wal::session_storage_head(&root, &super::session_addr(&other));
+            std::fs::write(blocked.parent().unwrap(), b"not a folder").unwrap();
+            match wal.check_move(&other, false) {
+                Err(broca_wal::WalError::Io(_)) => {}
+                other => panic!("an uncheckable head read as no head: {other:?}"),
+            }
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 

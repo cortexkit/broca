@@ -28,9 +28,8 @@ use broca_protocol::{
         ToolResult,
     },
     request::{
-        BudgetConfig, BudgetKind, CacheRequest, CacheTail, CallOptions, ExecutionMode,
-        GenerationConfig, ModelHandle, ResponseFormat, StopCondition, SubmissionRequest, Tool,
-        ToolChoice,
+        BudgetConfig, BudgetKind, CacheRequest, CallOptions, ExecutionMode, GenerationConfig,
+        ModelHandle, StopCondition, SubmissionRequest, Tool, ToolChoice,
     },
     ApprovalResponse, BatchId, DisplayEvent, ErrorClass, ModelAttempt, NormalizedEvent,
     ProviderControl, ProviderError, RunId, StepId, ToolCallId, Usage,
@@ -897,7 +896,7 @@ fn remember_warm_config(
 }
 
 impl RunControl {
-    fn now_ms(&self) -> Option<u64> {
+    pub(crate) fn now_ms(&self) -> Option<u64> {
         self.clock
             .as_ref()
             .map_or_else(epoch_millis, |clock| Some(clock.now_ms()))
@@ -3075,19 +3074,7 @@ async fn append_budget_firings(
     }
 }
 
-struct RequestConfig {
-    /// The run's model — authoritative on resume (the frozen `run_config.model`), so the
-    /// per-message cross-model reasoning gate compares against the SAME model identity
-    /// that stamped each assistant turn's origin.
-    model: ModelHandle,
-    budget: Option<BudgetConfig>,
-    stop_when: Vec<StopCondition>,
-    tools: Arc<Vec<Tool>>,
-    tool_choice: ToolChoice,
-    generation: GenerationConfig,
-    response_format: ResponseFormat,
-    provider_options: serde_json::Value,
-}
+use crate::fresh_start::RequestConfig;
 
 /// The workload class this episode is admitted under: the caller's on a fresh run or a new
 /// episode, the FROZEN one on a resume.
@@ -3147,78 +3134,7 @@ fn request_config<P: Provider>(
             provider_options: rc.provider_options.clone(),
         });
     }
-    // Fresh run: req ∩ policy, req ORDER preserved.
-    if req
-        .stop_when
-        .iter()
-        .any(|condition| matches!(condition, StopCondition::StepCount { n: 0 }))
-    {
-        return Err(RunError::Config(
-            "stop_when[].n must be at least 1 for type 'step_count'".into(),
-        ));
-    }
-    if req.context_limit == Some(0) {
-        return Err(RunError::Config(
-            "context_limit=0 is invalid; omit context_limit to use the catalog value, or supply a value of at least 1"
-                .into(),
-        ));
-    }
-    if let Some(message) = provider.fresh_admission_config_error(&req.generation, &req.tool_choice)
-    {
-        return Err(RunError::Config(message));
-    }
-    let mut tools = std::mem::take(&mut req.tools);
-    tools.retain(|tool| req.policy_allowed.contains(&tool.name));
-    if matches!(&req.tool_choice, ToolChoice::Required) && tools.is_empty() {
-        return Err(RunError::Config(
-            "tool_choice 'required' needs at least one policy-allowed tool".into(),
-        ));
-    }
-    if let ToolChoice::Tool { name } = &req.tool_choice {
-        if !tools.iter().any(|t| t.name == *name) {
-            return Err(RunError::Config(format!(
-                "tool_choice names '{name}' which is not among the policy-allowed tools"
-            )));
-        }
-    }
-    // `cache.tail = volatile` tells the renderer to withhold the cache breakpoint on the final
-    // message. On a run that can call tools that breakpoint is not waste, it is the entire
-    // mechanism: each step re-sends the previous step's messages, so the anchor one step plants
-    // on its last message is exactly what the next step reads back. Honouring the declaration
-    // there would quietly make caching WORSE on the one leg where it already pays off, and
-    // quietly is the problem -- so refuse, and name which of the two the caller should drop.
-    //
-    // Judged on the tools actually admitted (after the policy intersection) rather than the
-    // ones requested: a run whose tools were all filtered out makes exactly one provider call,
-    // and the declaration is sound for it.
-    if tail_is_volatile(req.cache.as_ref()) && !tools.is_empty() {
-        return Err(RunError::Config(
-            "cache.tail 'volatile' conflicts with tools: a tool-bearing run re-sends each step's \
-             messages, so the final-message breakpoint it withholds is what the next step reads \
-             back; drop cache.tail or drop tools"
-                .into(),
-        ));
-    }
-    Ok(RequestConfig {
-        model: std::mem::replace(&mut req.model, ModelHandle::new("", "")),
-        budget: std::mem::take(&mut req.budget),
-        stop_when: std::mem::take(&mut req.stop_when),
-        tools: Arc::new(tools),
-        tool_choice: std::mem::take(&mut req.tool_choice),
-        generation: std::mem::take(&mut req.generation),
-        response_format: ResponseFormat::default(),
-        provider_options: serde_json::Value::Null,
-    })
-}
-
-/// Whether the caller declared its final message varies between requests. The refusal above is
-/// the only consumer in the loop; the placement it implies is resolved and frozen by the module
-/// before the run starts, so nothing here reads it again on a resume.
-fn tail_is_volatile(cache: Option<&CacheRequest>) -> bool {
-    matches!(
-        cache.and_then(|cache| cache.tail),
-        Some(CacheTail::Volatile)
-    )
+    crate::fresh_start::request_config(req, provider)
 }
 
 /// Fire the admission-ack exactly once (no-op if already fired). `take()` ensures a second
@@ -3234,7 +3150,7 @@ fn admit(
     }
 }
 
-fn first_system_index(messages: &[Message]) -> Option<usize> {
+pub(crate) fn first_system_index(messages: &[Message]) -> Option<usize> {
     messages
         .iter()
         .position(|message| message.role == Role::System)
@@ -3243,7 +3159,7 @@ fn first_system_index(messages: &[Message]) -> Option<usize> {
 /// Whether every system message in `input` repeats, in order, the lineage's system message at the
 /// same position among its system messages. Repeating only the first few is accepted; a changed
 /// or additional system message is not.
-fn repeats_prefix_system_messages(prefix: &[Message], input: &[Message]) -> bool {
+pub(crate) fn repeats_prefix_system_messages(prefix: &[Message], input: &[Message]) -> bool {
     let mut prefix_systems = prefix.iter().filter(|message| message.role == Role::System);
     input
         .iter()
@@ -3255,7 +3171,7 @@ fn repeats_prefix_system_messages(prefix: &[Message], input: &[Message]) -> bool
         })
 }
 
-fn first_system_message(messages: &[Message]) -> Option<&Message> {
+pub(crate) fn first_system_message(messages: &[Message]) -> Option<&Message> {
     first_system_index(messages).and_then(|index| messages.get(index))
 }
 
@@ -4204,24 +4120,14 @@ where
     };
     // A frozen plan the hook runtime cannot read is refused like a missing plane: the waiting
     // admission caller hears the error, and nothing is written or dispatched.
-    let hook_plan = match frozen_hooks
-        .filter(|manifest| crate::hooks::has_transforms(manifest))
-        .map(|manifest| crate::hooks::HookPlan::from_manifest(manifest))
-        .transpose()
-    {
-        Ok(plan) => plan,
-        Err(detail) => {
-            let error = RunError::Wal(detail);
-            admit(&mut on_admitted, Err(error.clone()));
-            return Err(error);
-        }
-    };
-    if hook_plan.is_some() && control.hook_plane.is_none() {
-        let error =
-            RunError::Wal("plan.step_transform_items requires an installed hook plane".into());
-        admit(&mut on_admitted, Err(error.clone()));
-        return Err(error);
-    }
+    let hook_plan =
+        match crate::fresh_start::admitted_hook_plan(frozen_hooks, control.hook_plane.is_some()) {
+            Ok(plan) => plan,
+            Err(error) => {
+                admit(&mut on_admitted, Err(error.clone()));
+                return Err(error);
+            }
+        };
     let hook_bind = req.session.clone();
     let hook_scope = req.scope.clone();
     let hooks = hook_plan
@@ -4358,15 +4264,9 @@ where
             // A held resume's prompt shows only part of the transcript's numbers; it carries
             // the highest the whole transcript shows.
             .max(prior.held.as_ref().map_or(0, |held| held.tag_high));
-        (
-            control
-                .manifest
-                .as_deref()
-                .or(prior.manifest.as_deref())
-                .is_some_and(crate::tags::plan_renders_tags),
-            Some(broca_wal::ComputedTagRules {
-                checkpoint: ledger_high.max(broca_protocol::tags::high_after(&prior.prompt)),
-            }),
+        crate::fresh_start::admitted_tags(
+            control.manifest.as_deref().or(prior.manifest.as_deref()),
+            ledger_high.max(broca_protocol::tags::high_after(&prior.prompt)),
         )
     };
     let defer_media_tags = provider.defer_media_tags(render_tags);
@@ -4428,14 +4328,10 @@ where
     } else {
         BudgetState::default()
     };
-    let prior_is_import = prior.run_config.as_ref().is_some_and(|config| {
-        config.model.provider_module_id == "import"
-            && config.model.model_id == "import"
-            && config
-                .provider_options
-                .get("import_request_digest")
-                .is_some_and(serde_json::Value::is_string)
-    });
+    let prior_is_import = prior
+        .run_config
+        .as_ref()
+        .is_some_and(crate::fresh_start::is_import);
     let prior_last_step_finish_reason = prior.last_step_finish_reason;
     let mut compaction_state = prior.compaction.state().cloned();
     #[cfg(test)]
@@ -4635,67 +4531,43 @@ where
     // this moved vector before any append-only system-message normalization can apply.
     let mut episode_input = std::mem::take(&mut req.input);
     if !is_resume || append_episode {
-        if let Some(final_input) = control
-            .input_hooks
-            .as_ref()
-            .and_then(|hooks| hooks.final_value.as_ref())
-        {
-            episode_input = serde_json::from_value(final_input.clone())
-                .map_err(|error| RunError::Wal(format!("invalid recorded input hooks: {error}")))?;
-        }
+        episode_input = crate::fresh_start::episode_input(
+            episode_input,
+            control
+                .input_hooks
+                .as_ref()
+                .and_then(|hooks| hooks.final_value.as_ref()),
+        )?;
     }
-    let v2_globals = if mode3 {
-        let supplied = crate::compaction_v2::systems::take_globals(&mut episode_input);
-        if is_resume && !append_episode {
-            crate::compaction_v2::systems::frozen(
-                true,
-                prior.run_config.as_ref().expect("resumed config"),
-                frozen_plan.map(AsRef::as_ref),
-            )
-            .map_err(RunError::Wal)?
-        } else if let Some(manifest) = frozen_plan {
-            crate::compaction_v2::systems::from_manifest(manifest)
-        } else if supplied.is_empty() {
+    let v2_globals = if !mode3 {
+        Vec::new()
+    } else if is_resume && !append_episode {
+        crate::compaction_v2::systems::take_globals(&mut episode_input);
+        crate::compaction_v2::systems::frozen(
+            true,
+            prior.run_config.as_ref().expect("resumed config"),
+            frozen_plan.map(AsRef::as_ref),
+        )
+        .map_err(RunError::Wal)?
+    } else {
+        crate::fresh_start::new_episode_globals(
+            &mut episode_input,
+            frozen_plan.map(AsRef::as_ref),
             prior
                 .run_config
                 .as_ref()
                 .and_then(|config| config.global_system.as_deref())
-                .cloned()
-                .unwrap_or_default()
-        } else {
-            if prior
-                .run_config
-                .as_ref()
-                .and_then(|config| config.global_system.as_deref())
-                .is_some_and(|old| old != &supplied)
-            {
-                return Err(RunError::SystemPromptChanged);
-            }
-            supplied
-        }
-    } else {
-        Vec::new()
+                .map(Vec::as_slice),
+        )?
     };
-    if !mode3 && append_episode && first_system_index(&episode_input).is_some() {
-        match first_system_message(lineage_prefix) {
-            Some(_) if repeats_prefix_system_messages(lineage_prefix, &episode_input) => {
-                // A client naturally re-sends the session's system prompt on every turn.
-                // Strip the byte-identical repeat BEFORE it reaches the WAL so replay and
-                // resume reconstruct the same single-instruction lineage and keep later
-                // rendered prefixes cache-stable. Every system message renders into the
-                // top-level system field, so ALL of them must be repeats: one extra would
-                // change that field for every later request.
-                episode_input.retain(|message| message.role != Role::System);
-            }
-            None if prior_is_import => {
-                // Imports intentionally discard foreign system instructions. The first
-                // continuing harness therefore establishes its own durable system prompt.
-            }
-            Some(_) | None => {
-                let err = RunError::SystemPromptChanged;
-                admit(&mut on_admitted, Err(err.clone()));
-                return Err(err);
-            }
+    if !mode3 && append_episode {
+        if let Err(err) = crate::fresh_start::append_system_messages(
+            &mut episode_input,
+            lineage_prefix,
+            prior_is_import,
+        ) {
+            admit(&mut on_admitted, Err(err.clone()));
+            return Err(err);
         }
     }
 
@@ -5548,91 +5420,28 @@ where
         // compare the schedule against the same value replay will.
         let admitted_at_ms = control.now_ms();
         output_history.start_run(&cfg.model);
-        let (run_started_seq, input_tags) = writer.record_tagged(WalRecord::RunStarted {
-            compaction_plan_version: mode3.then_some(cortexkit_compaction_view::PLAN_VERSION),
-            sent_by: control.display_sent_by.clone(),
-            written_at_ms: req
-                .input_written_at_ms
-                .or_else(|| {
-                    req.submission_id
-                        .is_none()
-                        .then(|| control.now_ms())
-                        .flatten()
-                })
-                .filter(|at| *at != 0),
-            tags: None,
-            session_class: req.session_class.clone(),
-            retention: req.retention,
-            hooks: control.input_hooks.clone().map(|mut hooks| {
-                // RunStarted.input holds the rendered final value, unlike Queued.request.
-                hooks.final_value = None;
-                hooks
-            }),
-            on_restart: req.on_restart,
-            keep_warm: req.keep_warm,
-            marker_order_version,
-            // Must-understand: a manifest makes this a gated frame requiring `plan-manifest/v1`,
-            // and the WAL raises the feature floor to that name before writing it.
-            manifest: control.manifest.as_deref().cloned().map(Box::new),
-            // Must-understand: the WAL raises the feature floor before this frame is written,
-            // and a scoped record is always framed as a gated frame requiring `scope/v1`.
-            scope: req.scope.clone(),
-            send_id: req.send_id.clone(),
-            request_identity_digest: req.request_identity_digest.clone(),
-            // Informational: recorded for dashboards and never read back into a request.
-            title: req.title.clone(),
-            project_id: req.project_id.clone(),
-            principal: req.principal.clone(),
-            ts_ms: admitted_at_ms,
-            run_id: resolved_run_id.clone(),
-            session: req.session.clone(),
-            config: remember_warm_config(
-                RunConfig {
-                    global_system: (mode3 && frozen_plan.is_none() && !v2_globals.is_empty())
-                        .then(|| Arc::new(v2_globals.clone())),
-                    route_decision_id: req.route_decision_id.clone(),
-                    account_limit_pause: account_limit_pause_enabled,
-                    turn_directives_v1: req.directives.clone(),
-                    render_tags,
-                    computed_tags,
-                    model: cfg.model.clone(),
-                    tools: Arc::clone(&tools),
-                    tool_choice: cfg.tool_choice.clone(),
-                    generation: cfg.generation.clone(),
-                    response_format: cfg.response_format.clone(),
-                    provider_options: cfg.provider_options.clone(),
-                    cache_tiers: serde_json::Value::Null,
-                    context_epoch: 0,
-                    renderer_version: provider.renderer_version(),
-                    frozen_render_config: provider.render_config_blob(),
-                    // Freeze the resolved credential id so a resume retrieves the same credential,
-                    // never choosing its method again from configuration or account routing.
-                    // The frozen credential id is metadata, not a provider render input.
-                    auth_selection: control.auth_selection.clone(),
-                    tools_were_omitted: control.tools_were_omitted,
-                    budget: cfg.budget.clone(),
-                    context_limit,
-                    work_class,
-                    variant: variant.clone(),
-                    service_tier,
-                    stop_when: cfg.stop_when.clone(),
-                    // Before any record is written, accepting the send resolves context management
-                    // into req.context_management: the session's inherited mode, or on its
-                    // first send the caller's choice, project/global broca.jsonc defaults,
-                    // then "none", in that order.
-                    context_management: req.context_management.clone(),
-                },
-                &mut warm_config,
-                control.keep_warm.is_some(),
-            ),
-            input: Arc::clone(&episode_input),
-            origin: broca_wal::RunOrigin::Fresh,
-            // If this run consumes a durable queued submission, record its id so the
-            // submission is provably marked CONSUMED (the pending-queue derivation excludes
-            // a submission once a RunStarted references it — so a crash after this barrier
-            // never re-drains it). `None` for a directly-started run.
-            submission_id: req.submission_id.clone(),
-        });
+        let config = crate::fresh_start::run_config(
+            req,
+            control,
+            provider,
+            &cfg,
+            Arc::clone(&tools),
+            (mode3 && frozen_plan.is_none() && !v2_globals.is_empty())
+                .then(|| Arc::new(v2_globals.clone())),
+            (render_tags, computed_tags),
+        );
+        let (run_started_seq, input_tags) = writer.record_tagged(crate::fresh_start::run_started(
+            req,
+            control,
+            crate::fresh_start::EpisodeStart {
+                run_id: resolved_run_id.clone(),
+                mode3,
+                marker_order_version,
+                admitted_at_ms,
+                config: remember_warm_config(config, &mut warm_config, control.keep_warm.is_some()),
+                input: Arc::clone(&episode_input),
+            },
+        ));
         if input_cap_changed {
             writer.record(WalRecord::InputTokenCapFrozen {
                 limit: input_budget.limit.expect("changed cap is finite"),
@@ -7126,11 +6935,14 @@ where
                 (provider.output_limits(), step_context_limit)
             {
                 // The estimate costs a render of the whole request, so it is made only when a
-                // measured earlier step on this model makes one possible. A compaction boundary
-                // already rendered the request, unless refusal fallback changed its route.
+                // measured earlier step on this model makes one possible. A first-protocol
+                // compaction boundary already rendered the request and recorded its size, unless
+                // refusal fallback changed its route. On the current compaction contract nothing
+                // records that size (`notice_request_bytes` belongs to the first protocol and
+                // stays 0 or holds an earlier step's), so the request is rendered here.
                 let estimate = if output_history.has_measurement(step_model) {
                     let bytes = match &model_opts {
-                        Some(_) if fallback_model.is_none() => notice_request_bytes,
+                        Some(_) if fallback_model.is_none() && !mode3 => notice_request_bytes,
                         _ => provider
                             .try_render_request(&step_opts)
                             .map_err(|error| RunError::Wal(error.message))?

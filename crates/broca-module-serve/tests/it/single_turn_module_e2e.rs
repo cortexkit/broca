@@ -561,6 +561,15 @@ struct Daemon {
 
 impl Drop for Daemon {
     fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!(
+                "{}",
+                broca_test_support::rig_log_diagnostics(
+                    &self.dir.join("runtime/data-home/cortexkit"),
+                    &self.dir.join("runtime/broca-state"),
+                )
+            );
+        }
         broca_test_support::kill_and_reap_tree(self.child.get_mut());
         if !std::thread::panicking() {
             broca_test_support::remove_rig_dir(&self.dir);

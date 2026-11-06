@@ -45,6 +45,7 @@ pub struct FakeExecutor {
     panic_after_start: bool,
     /// Optional scripted outcomes for tests that need specific WAL/index transitions.
     scripted: Mutex<VecDeque<RunScript>>,
+    admission_refusal: Option<RunError>,
     /// `true` ⇒ an unscripted run takes one step boundary (through the run's steer inbox, as the
     /// real loop does) before it finishes, so ordered sends can be delivered into it.
     step_boundary: bool,
@@ -74,9 +75,17 @@ pub enum RunScript {
     ResumeInterrupted,
     AdmissionPermanent,
     AdmissionTransient,
+    AdmissionRoutingUnavailable,
 }
 
 impl FakeExecutor {
+    pub fn refusing_admission(error: RunError) -> Arc<Self> {
+        Arc::new(Self {
+            admission_refusal: Some(error),
+            ..Default::default()
+        })
+    }
+
     /// Runs finish immediately — for tests that don't need to hold a run open.
     pub fn auto() -> Arc<Self> {
         Arc::new(Self {
@@ -395,6 +404,14 @@ impl FakeExecutor {
                 }
                 Err(error)
             }
+            RunScript::AdmissionRoutingUnavailable => {
+                let error =
+                    RunError::RoutingUnavailable(broca_core::RoutingUnavailable::unreachable());
+                if let Some(ack) = job.on_admitted.take() {
+                    let _ = ack.send(Err(error.clone()));
+                }
+                Err(error)
+            }
         }
     }
 
@@ -442,7 +459,7 @@ impl FakeExecutor {
 impl RunExecutor for FakeExecutor {
     async fn execute(
         &self,
-        job: RunJob,
+        mut job: RunJob,
         out: mpsc::Sender<OutputEvent>,
     ) -> Result<RunSummary, RunError> {
         self.started.fetch_add(1, Ordering::SeqCst);
@@ -451,6 +468,12 @@ impl RunExecutor for FakeExecutor {
             principal: job.req.principal.clone(),
             scope: job.req.scope.clone(),
         });
+        if let Some(error) = &self.admission_refusal {
+            if let Some(ack) = job.on_admitted.take() {
+                let _ = ack.send(Err(error.clone()));
+            }
+            return Err(error.clone());
+        }
         if let Some(script) = self.scripted.lock().await.pop_front() {
             return self.execute_script(script, job, out).await;
         }

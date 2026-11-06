@@ -24,6 +24,11 @@
 //!   [`classify_refusal`]. An account refusal writes no run records; the session's lineage
 //!   record may still be initialized.
 //!
+//! API keys opt into routing when the send carries a pool, credential hint or decision id.
+//! Their vault listing need not carry a login account id. Only active, readable API keys for
+//! the credential provider (or legacy rows with no provider ids) can satisfy the answer.
+//! An unpooled API-key send keeps its configured static credential without a routing call.
+//!
 //! A caller that names an account keeps it and routing is not asked: routing's
 //! `requested_account` is a preference it may overrule, and a caller's pin must win.
 //!
@@ -292,6 +297,12 @@ pub trait RoutingTransport: Send + Sync {
     async fn service_tier_supported(&self) -> Result<bool, String> {
         Ok(false)
     }
+    async fn observe_backoff_supported(&self) -> Result<bool, String> {
+        Ok(false)
+    }
+    async fn observe_credential_refused_supported(&self) -> Result<bool, String> {
+        Ok(false)
+    }
     async fn request(&self, body: Vec<u8>) -> RoutingReply;
 }
 
@@ -310,7 +321,7 @@ pub struct SubcRoutingTransport {
     module_id: String,
     identity: BindIdentity,
     route: Arc<Mutex<RouteSlot>>,
-    tier_support: tokio::sync::Mutex<Option<(broca_subc::RouteHandle, bool)>>,
+    capabilities: tokio::sync::Mutex<Option<(broca_subc::RouteHandle, Vec<String>)>>,
 }
 
 impl SubcRoutingTransport {
@@ -324,7 +335,7 @@ impl SubcRoutingTransport {
             module_id,
             identity,
             route: Arc::new(Mutex::new(RouteSlot::Empty)),
-            tier_support: tokio::sync::Mutex::new(None),
+            capabilities: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -371,16 +382,12 @@ impl SubcRoutingTransport {
             *slot = RouteSlot::Empty;
         }
     }
-}
-
-#[async_trait::async_trait]
-impl RoutingTransport for SubcRoutingTransport {
-    async fn service_tier_supported(&self) -> Result<bool, String> {
+    async fn supports(&self, capability: &str) -> Result<bool, String> {
         let route = self.route().await?;
-        let mut cached = self.tier_support.lock().await;
-        if let Some((known, supported)) = *cached {
-            if known == route {
-                return Ok(supported);
+        let mut cached = self.capabilities.lock().await;
+        if let Some((known, capabilities)) = cached.as_ref() {
+            if *known == route {
+                return Ok(capabilities.iter().any(|name| name == capability));
             }
         }
         let response = self
@@ -395,15 +402,32 @@ impl RoutingTransport for SubcRoutingTransport {
                 self.forget(route);
                 error.to_string()
             })?;
-        let supported = match response {
+        let capabilities = match response {
             Ok(body) => serde_json::from_slice::<Value>(&body)
                 .ok()
                 .and_then(|value| value["result"]["capabilities"].as_array().cloned())
-                .is_some_and(|capabilities| capabilities.iter().any(|name| name == "service_tier")),
-            Err(_) => false,
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|name| name.as_str().map(str::to_owned))
+                .collect::<Vec<_>>(),
+            Err(_) => vec![],
         };
-        *cached = Some((route, supported));
+        let supported = capabilities.iter().any(|name| name == capability);
+        *cached = Some((route, capabilities));
         Ok(supported)
+    }
+}
+
+#[async_trait::async_trait]
+impl RoutingTransport for SubcRoutingTransport {
+    async fn service_tier_supported(&self) -> Result<bool, String> {
+        self.supports("service_tier").await
+    }
+    async fn observe_backoff_supported(&self) -> Result<bool, String> {
+        self.supports("observe_backoff").await
+    }
+    async fn observe_credential_refused_supported(&self) -> Result<bool, String> {
+        self.supports("observe_credential_refused").await
     }
     async fn request(&self, body: Vec<u8>) -> RoutingReply {
         let route = self.route().await?;
@@ -428,6 +452,7 @@ pub enum AccountForOutcome {
     Chosen {
         account_id: String,
         credential_id: String,
+        method: Option<String>,
         decision_id: Option<String>,
         service_tier_chosen: Option<String>,
     },
@@ -486,6 +511,8 @@ pub fn classify_refusal(code: &str) -> ErrorClass {
 struct ErrorBodyView {
     code: String,
     #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
     detail: Option<Value>,
 }
 
@@ -520,6 +547,7 @@ fn classify_account_for_reply_at(
                     AccountForOutcome::Chosen {
                         account_id: account_id.to_string(),
                         credential_id: credential_id.to_string(),
+                        method: result["account"]["method"].as_str().map(str::to_owned),
                         decision_id: result["reason"]["decision_id"].as_str().map(str::to_string),
                         service_tier_chosen: result["service_tier_chosen"]
                             .as_str()
@@ -540,6 +568,13 @@ fn classify_account_for_reply_at(
                     ))
                 }
             };
+            // Routing's message names which of its checks refused; broca keeps no other copy.
+            tracing::info!(
+                target: "accounts",
+                code = %error.code,
+                message = error.message.as_deref().unwrap_or("<none>"),
+                "route.account_for refusal"
+            );
             let detail = error.detail.unwrap_or(Value::Null);
             let decision_id = detail["decision_id"].as_str().map(str::to_string);
             match error.code.as_str() {
@@ -593,6 +628,31 @@ pub struct Candidate {
 }
 
 impl Candidates {
+    /// Only keys the runner can read and send with are eligible. When the vault has no
+    /// account metadata, routing identifies the pool account by the public credential id.
+    pub fn api_keys(listing: &ScopedList, provider: &str) -> Self {
+        let mut accounts: Vec<_> = listing
+            .credentials
+            .iter()
+            .filter(|row| {
+                row.state == "active"
+                    && row.operations.iter().any(|op| op == "read")
+                    && row.auth_method.as_deref() == Some("apikey")
+                    && (row.provider_ids.is_empty()
+                        || row.provider_ids.iter().any(|id| id == provider))
+            })
+            .map(|row| Candidate {
+                account_id: row.account_id.clone().unwrap_or_else(|| row.id.clone()),
+                credential_id: row.id.clone(),
+            })
+            .collect();
+        accounts.sort_by(|a, b| a.credential_id.cmp(&b.credential_id));
+        Self {
+            view_digest: listing.view.clone(),
+            accounts,
+        }
+    }
+
     /// The rows of `listing` that are credentials of `method` for `provider` and name a
     /// provider account, sorted by credential id so identical listings give identical requests.
     ///
@@ -645,7 +705,8 @@ impl Candidates {
 /// provider ids and a recognized authentication method.
 /// `auth_method` is derived by the vault for every LLM credential; `provider_ids` is set by the
 /// operator. A credential without either cannot be matched to a provider and method without
-/// guessing from its id, so it is not routed at all.
+/// guessing from its id, so it is not offered for subscription account selection. API-key
+/// pools use [`Candidates::api_keys`], which permits legacy provider-unmapped rows.
 pub fn unmapped_field(row: &ScopedCredential) -> Option<&'static str> {
     if row
         .auth_method
@@ -671,10 +732,12 @@ pub fn unmapped_field(row: &ScopedCredential) -> Option<&'static str> {
 const NON_MODEL_REFRESH_ADAPTERS: &[&str] = &["cursor"];
 
 pub fn metadata_in_chooser_scope(row: &ScopedCredential) -> bool {
+    // API-key pool candidates can lack provider ids, so this subscription metadata check
+    // must not mark a loadable, provider-unmapped key as ineligible for routing.
     row.auth_method
         .as_deref()
         .and_then(AuthMethod::from_token)
-        .map(selects_accounts)
+        .map(|method| matches!(method, AuthMethod::Oauth | AuthMethod::Chatgpt))
         .unwrap_or(true)
         && !row
             .refresh_adapter
@@ -723,10 +786,12 @@ impl UnmappedCredentials {
     }
 }
 
-/// Whether credentials of `method` belong to provider subscription accounts (OAuth logins, as
-/// opposed to API keys), the kind routing chooses between.
+/// Whether broca owns account admission for this sign-in method.
 pub fn selects_accounts(method: AuthMethod) -> bool {
-    matches!(method, AuthMethod::Oauth | AuthMethod::Chatgpt)
+    matches!(
+        method,
+        AuthMethod::Oauth | AuthMethod::Chatgpt | AuthMethod::ApiKey
+    )
 }
 
 /// The admission id a run is known by in routing. It is the run id, which is itself derived
@@ -1017,6 +1082,36 @@ impl RoutingClient {
     /// retried: a lost report only costs routing that one observation, and routing expires on
     /// its own the lease of a run whose `run_finished` never arrived.
     pub async fn observe(&self, params: Value) {
+        let deadline = tokio::time::Instant::now() + OBSERVE_BUDGET;
+        if params["kind"] == "transient_backoff" || params["kind"] == "credential_refused" {
+            match tokio::time::timeout_at(deadline, self.transport.observe_backoff_supported())
+                .await
+            {
+                Ok(Ok(true)) => {}
+                Ok(Ok(false)) => return,
+                failed => {
+                    self.counters.bump("observe_failed");
+                    tracing::warn!(target: "accounts", ?failed, "cannot discover routing's observe_backoff group; backoff report dropped");
+                    return;
+                }
+            }
+        }
+        if params["kind"] == "credential_refused" {
+            match tokio::time::timeout_at(
+                deadline,
+                self.transport.observe_credential_refused_supported(),
+            )
+            .await
+            {
+                Ok(Ok(true)) => {}
+                Ok(Ok(false)) => return,
+                failed => {
+                    self.counters.bump("observe_failed");
+                    tracing::warn!(target: "accounts", ?failed, "cannot discover routing's observe_credential_refused group; credential report dropped");
+                    return;
+                }
+            }
+        }
         let body =
             match serde_json::to_vec(&json!({ "method": ACCOUNT_OBSERVE_OP, "params": params })) {
                 Ok(body) => body,
@@ -1026,7 +1121,7 @@ impl RoutingClient {
                 }
             };
         let kind = params["kind"].as_str().unwrap_or("?").to_string();
-        match tokio::time::timeout(OBSERVE_BUDGET, self.transport.request(body)).await {
+        match tokio::time::timeout_at(deadline, self.transport.request(body)).await {
             Ok(Ok(Ok(_))) => self.counters.bump("observe_sent"),
             Ok(Ok(Err(error)))
                 if serde_json::from_slice::<ErrorBodyView>(&error)
@@ -1064,8 +1159,8 @@ impl RoutingClient {
 /// How a fresh run's account was chosen, before its credential is read.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AccountChoice {
-    /// Routing has nothing to say about this run: no vault, or a credential method that is not
-    /// a subscription account. No decision is recorded.
+    /// Routing has nothing to say about this run: no vault, an unlisted method, or an API key
+    /// without a pool, hint or decision. No decision is recorded.
     NotApplicable,
     /// Use the static pick; record `decision`.
     Static(AccountDecision),
@@ -1224,6 +1319,11 @@ where
             None,
         )));
     }
+    // Unpooled API keys retain the configured mapping, even if other keys are listed.
+    // A routing decision or an explicit hint is what opts an API-key run into allocation.
+    if method == AuthMethod::ApiKey && !hinted && inputs.decision_id.is_none() {
+        return Ok(AccountChoice::NotApplicable);
+    }
     let Ok(Some(listing)) = tokio::time::timeout_at(deadline, listing).await else {
         if inputs.decision_id.is_some() || hinted {
             return Err(ChoiceRefusal::Unavailable(RoutingUnavailable::unreachable()));
@@ -1241,7 +1341,11 @@ where
             None,
         )));
     };
-    let candidates = Candidates::from_listing(&listing, method, provider);
+    let candidates = if method == AuthMethod::ApiKey {
+        Candidates::api_keys(&listing, provider)
+    } else {
+        Candidates::from_listing(&listing, method, provider)
+    };
     if candidates.distinct_accounts() <= 1 && inputs.decision_id.is_none() && !hinted {
         client.counters.bump("single_candidate");
         return Ok(AccountChoice::Static(decision(
@@ -1266,18 +1370,23 @@ where
     if inputs.hold_cap.evidence_unknown {
         HOLD_CAP_UNKNOWN.fetch_add(1, Ordering::Relaxed);
     }
+    // Kept for the refusal log: routing writes nothing for an `account_for` it refuses before
+    // admission, so the request broca sent is the only record of what was refused. It carries
+    // routing identifiers and sizes, never a credential.
+    let sent = params.to_string();
     match client.account_for(params, deadline).await {
         AccountForOutcome::Chosen {
             account_id,
             credential_id,
+            method: answered_method,
             decision_id,
             service_tier_chosen,
         } => {
-            // Routing returns the vault credential id verbatim, and it must be one broca offered:
-            // those, and only those, are credentials whose vault metadata names this run's
-            // provider and method, so the frozen wire family and the token agree. Anything else
-            // is a defect in routing, and the send is refused rather than run on it.
-            if !candidates.offers(&account_id, &credential_id) {
+            // Every answer must name an offered account/credential pair. API-key pool
+            // answers must also confirm the auth method of the offered key.
+            let valid_pick = candidates.offers(&account_id, &credential_id)
+                && (method != AuthMethod::ApiKey || answered_method.as_deref() == Some("apikey"));
+            if !valid_pick {
                 client.counters.bump("invalid_pick");
                 tracing::error!(
                     target: "accounts",
@@ -1388,6 +1497,8 @@ where
                 retry_after_s = ?refusal.retry_after_s,
                 resets_at_ms = ?refusal.resets_at_ms,
                 decision_id = refusal.decision_id.as_deref().unwrap_or("<none>"),
+                routing_detail = ?refusal.routing_detail,
+                params = %sent,
                 "routing refused account selection"
             );
             if matches!(
@@ -1526,6 +1637,23 @@ pub fn run_finished_body(
     Value::Object(body)
 }
 
+/// A provider refusal that makes the admitted credential unusable for every runner.
+pub fn credential_refused_body(
+    event_id: &str,
+    admission_id: &str,
+    credential_id: Option<&str>,
+    provider_code: Option<&str>,
+) -> Value {
+    let mut body = report("credential_refused", event_id, admission_id);
+    if let Some(credential_id) = credential_id {
+        body.insert("credential_id".into(), json!(credential_id));
+    }
+    if let Some(provider_code) = provider_code {
+        body.insert("provider_code".into(), json!(provider_code));
+    }
+    Value::Object(body)
+}
+
 /// `scoped_not_found`: the vault did not serve the credential routing chose. Routing excludes
 /// that account for this admission only.
 pub fn scoped_not_found_body(
@@ -1555,6 +1683,17 @@ enum ReportEvent {
         wal_seq: u64,
         reason: RunFinishReason,
     },
+    Backoff {
+        lineage: Option<WalLineageId>,
+        wal_seq: u64,
+        retry_after_secs: f64,
+    },
+    CredentialRefused {
+        lineage: Option<WalLineageId>,
+        wal_seq: u64,
+        credential_id: Option<String>,
+        provider_code: Option<String>,
+    },
 }
 
 /// One run's reports. The run loop's hooks queue events here; a task of its own sends them, in
@@ -1577,6 +1716,7 @@ impl RunReporter {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ReportEvent>();
         tokio::spawn(async move {
             let mut latest_headers: Option<BTreeMap<String, String>> = None;
+            let mut last_attempt_at_ms: Option<u64> = None;
             while let Some(event) = rx.recv().await {
                 match event {
                     ReportEvent::Started { lineage, wal_seq } => {
@@ -1586,6 +1726,48 @@ impl RunReporter {
                         client
                             .observe(admission_started_body(&id, &admission_id, &run_id))
                             .await;
+                    }
+                    ReportEvent::Backoff {
+                        lineage,
+                        wal_seq,
+                        retry_after_secs,
+                    } => {
+                        let Some(observed_at_ms) = last_attempt_at_ms else {
+                            continue;
+                        };
+                        let delay_ms = (retry_after_secs * 1000.0).ceil();
+                        if !delay_ms.is_finite() || delay_ms < 0.0 || delay_ms >= u64::MAX as f64 {
+                            continue;
+                        }
+                        let Some(retry_at_ms) = observed_at_ms.checked_add(delay_ms as u64) else {
+                            continue;
+                        };
+                        if let Some(id) = event_id_or_count(&client, lineage, wal_seq) {
+                            let mut body = report(
+                                "transient_backoff",
+                                &format!("{id}:backoff"),
+                                &admission_id,
+                            );
+                            body.insert("retry_at_ms".into(), json!(retry_at_ms));
+                            client.observe(Value::Object(body)).await;
+                        }
+                    }
+                    ReportEvent::CredentialRefused {
+                        lineage,
+                        wal_seq,
+                        credential_id,
+                        provider_code,
+                    } => {
+                        if let Some(id) = event_id_or_count(&client, lineage, wal_seq) {
+                            client
+                                .observe(credential_refused_body(
+                                    &format!("{id}:credential_refused"),
+                                    &admission_id,
+                                    credential_id.as_deref(),
+                                    provider_code.as_deref(),
+                                ))
+                                .await;
+                        }
                     }
                     ReportEvent::Attempt {
                         lineage,
@@ -1608,6 +1790,7 @@ impl RunReporter {
                         let Some(id) = event_id_or_count(&client, lineage, wal_seq) else {
                             continue;
                         };
+                        last_attempt_at_ms = Some(attempt.ts_ms);
                         client
                             .observe(attempt_body(
                                 &id,
@@ -1648,6 +1831,60 @@ impl RunReporter {
             wal_seq,
             reason,
         });
+    }
+
+    /// Report a terminal rate limit using the final attempt's receipt time. A rate limit
+    /// cleared by the provider's own retries never reaches this hook and is not reported.
+    /// The executor calls this only for an API-key run admitted by routing.
+    pub fn terminal_rate_limit(
+        &self,
+        lineage: Option<WalLineageId>,
+        wal_seq: u64,
+        error: &broca_protocol::ProviderError,
+    ) {
+        if error.is_rate_limited() {
+            if let Some(retry_after_secs) = error.retry_after_secs {
+                let _ = self.tx.send(ReportEvent::Backoff {
+                    lineage,
+                    wal_seq,
+                    retry_after_secs,
+                });
+            }
+        }
+    }
+
+    /// Report an unrecovered refusal of the admitted credential, not a resettable limit.
+    /// Subscription auth failures need sign-in instead; only API-key auth failures block a key.
+    /// The executor calls this only for a routed admission's error terminal or API-key auth pause.
+    pub fn terminal_credential_refused(
+        &self,
+        lineage: Option<WalLineageId>,
+        wal_seq: u64,
+        error: &broca_protocol::ProviderError,
+        auth_method: Option<&str>,
+        credential_id: Option<&str>,
+    ) {
+        let refused = matches!(
+            error.provider_code.as_deref(),
+            Some(
+                "billing_exhausted"
+                    | "credit_insufficient"
+                    | "account_not_entitled"
+                    | "usage_not_included"
+            )
+        ) || (auth_method == Some("apikey")
+            && error.class == ErrorClass::Auth
+            && matches!(error.status, Some(401 | 403)));
+        if refused {
+            let _ = self.tx.send(ReportEvent::CredentialRefused {
+                lineage,
+                wal_seq,
+                credential_id: credential_id
+                    .or(error.credential_id.as_deref())
+                    .map(str::to_owned),
+                provider_code: error.provider_code.clone(),
+            });
+        }
     }
 }
 
@@ -1823,4 +2060,4 @@ impl ListingCache {
 
 #[cfg(test)]
 #[path = "account_routing_tests.rs"]
-mod tests;
+pub(crate) mod tests;

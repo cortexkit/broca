@@ -1258,6 +1258,42 @@ async fn a_never_written_session_has_an_unwritten_page_and_head() {
     rig.finish().await;
 }
 
+/// A session kept in the new session storage is refused by name on every operation this build
+/// serves for a session: it reports the storage it needs, and never answers from an absent log
+/// or creates one, which would fork the session in two.
+#[tokio::test]
+async fn a_session_on_the_new_storage_is_refused_by_name_and_never_gets_a_log() {
+    let mut rig = Rig::start("newer-storage").await;
+    let head = broca_wal::session_storage_head(&rig.dir, &broca_core::session_addr(&rig.session));
+    std::fs::create_dir_all(head.parent().unwrap()).unwrap();
+    std::fs::write(&head, b"head").unwrap();
+    for (method, params) in [
+        (
+            "session.send",
+            serde_json::json!({"prompt": "hi", "send_id": "s1", "model": {"provider": "fake", "model": "fake"}}),
+        ),
+        ("session.read", serde_json::json!({})),
+        ("session.head", serde_json::json!({})),
+        ("send.status", serde_json::json!({"send_id": "s1"})),
+        ("session.send_status", serde_json::json!({"send_id": "s1"})),
+        ("run.status", serde_json::json!({"run_id": "run-1"})),
+        ("run.result", serde_json::json!({"run_id": "run-1"})),
+    ] {
+        let body = refusal(&call(&mut rig, method, params).await);
+        assert_eq!(body["code"], "wal_newer_writer", "{method}: {body}");
+        assert_eq!(
+            body["detail"],
+            serde_json::json!({"kind": "newer_writer", "missing": ["session-storage/v1"]}),
+            "{method}: {body}"
+        );
+    }
+    assert!(
+        !rig.wal_path.exists(),
+        "a refused operation created a log beside the new storage's session"
+    );
+    rig.finish().await;
+}
+
 /// The tail is the newest page, a range stops at its limit with a cursor, and `after_mid` reads
 /// strictly after the message it names; every page carries the same snapshot identity.
 #[tokio::test]

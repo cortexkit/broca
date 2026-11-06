@@ -649,6 +649,8 @@ async fn head_selection_missing_sign_in_is_unsupported_model_without_write() {
     assert!(matches!(broca_core::WalStore::read_records(live.wal_store.as_ref(), &session),
         Err(broca_wal::WalError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound));
     subc.abort();
+    // The executor owns the SQLite store; Windows cannot delete its open database files.
+    drop(live);
     std::fs::remove_dir_all(root).unwrap();
 }
 

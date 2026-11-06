@@ -216,6 +216,16 @@ pub(crate) fn recorded_send_outcome(
         }
     }
     let submission_id = SubmissionId(format!("sub-{}", own_run.0));
+    // A Retracted record with a failure consumes the queue entry, but its send ended in error
+    // rather than being withdrawn by its caller. Keep that distinction on status/retry.
+    if records.iter().any(|record| {
+        matches!(
+            record, WalRecord::Retracted { submission_id: id, failure: Some(failure) }
+                if id == &submission_id && &failure.run_id == own_run
+        )
+    }) {
+        return Some(run_outcome(records, own_run, None, false));
+    }
     match queued_send_fate(records, &own_run.0)? {
         QueuedSendFate::Pending => Some(SendOutcome::Pending { submission_id }),
         QueuedSendFate::Ended(reason) => Some(SendOutcome::SendEnded {
@@ -352,5 +362,38 @@ mod tests {
         ] {
             assert!(qualified_sender_run_id(&RunId("run-sid-shared".into()), &principal).is_err());
         }
+    }
+
+    #[test]
+    fn failed_queued_admission_is_finished_while_plain_retraction_stays_retracted() {
+        let run = RunId("queued".into());
+        let queued: WalRecord = serde_json::from_value(serde_json::json!({
+            "type": "queued", "submission_id": "sub-queued", "send_id": "send",
+            "request": {"model": {"provider_module_id": "fake", "model_id": "fake"}, "input": []}
+        }))
+        .unwrap();
+        let tombstone: WalRecord = serde_json::from_value(serde_json::json!({
+            "type": "retracted", "submission_id": "sub-queued", "failure": {
+                "run_id": "queued", "error": {
+                    "class": "transient", "message": "routing unavailable", "provider_code": "routing_unavailable"
+                }
+            }
+        })).unwrap();
+        assert!(matches!(
+            recorded_send_outcome(&[queued.clone(), tombstone], &run, "send", false, None),
+            Some(SendOutcome::Finished {
+                reason: broca_protocol::caller::RunFinishReason::Error,
+                delivered: None,
+                ..
+            })
+        ));
+        let retracted = WalRecord::Retracted {
+            submission_id: SubmissionId("sub-queued".into()),
+            failure: None,
+        };
+        assert!(matches!(
+            recorded_send_outcome(&[queued, retracted], &run, "send", false, None),
+            Some(SendOutcome::Retracted { .. })
+        ));
     }
 }

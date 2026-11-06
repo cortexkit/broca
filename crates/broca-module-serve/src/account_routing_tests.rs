@@ -18,7 +18,10 @@ fn routed_accounts_discovery_lists_only_self_routed_sign_in_methods() {
         let value = serde_json::to_value(&describe).unwrap();
         let checked = cortexkit_role_llm_runner::describe::check_describe(&value).unwrap();
         assert!(checked.declares(cortexkit_role_llm_runner::capabilities::ROUTED_ACCOUNTS));
-        assert_eq!(value["routed_accounts"], json!(["oauth", "chatgpt"]));
+        assert_eq!(
+            value["routed_accounts"],
+            json!(["oauth", "chatgpt", "apikey"])
+        );
         for method in [
             AuthMethod::ApiKey,
             AuthMethod::Oauth,
@@ -46,12 +49,15 @@ const NOW: i64 = 1_790_683_200_000;
 #[derive(Default)]
 struct FakeRouting {
     requests: Mutex<Vec<Value>>,
+    request_bytes: Mutex<Vec<Vec<u8>>>,
     reply: Mutex<Option<RoutingReply>>,
     /// Never answer, as a hung routing module would.
     hang: bool,
     answered: AtomicUsize,
     tiers: bool,
     tier_probes: AtomicUsize,
+    backoff: bool,
+    credential_refused: bool,
 }
 
 impl FakeRouting {
@@ -116,11 +122,18 @@ impl FakeRouting {
 
 #[async_trait::async_trait]
 impl RoutingTransport for FakeRouting {
+    async fn observe_credential_refused_supported(&self) -> Result<bool, String> {
+        Ok(self.credential_refused)
+    }
+    async fn observe_backoff_supported(&self) -> Result<bool, String> {
+        Ok(self.backoff)
+    }
     async fn service_tier_supported(&self) -> Result<bool, String> {
         self.tier_probes.fetch_add(1, Ordering::SeqCst);
         Ok(self.tiers)
     }
     async fn request(&self, body: Vec<u8>) -> RoutingReply {
+        self.request_bytes.lock().unwrap().push(body.clone());
         self.requests
             .lock()
             .unwrap()
@@ -536,6 +549,20 @@ async fn routing_unreachable_refuses_the_send_routing_unavailable() {
     assert_eq!(client.counters.snapshot()["unreachable"], 1);
 }
 
+pub(crate) async fn unavailable_admission_error() -> broca_core::RunError {
+    let routing = FakeRouting::answering(Err("route.open refused: target_unavailable".into()));
+    let refusal = choose(
+        &client(&routing),
+        "oauth:anthropic",
+        false,
+        Some(two_accounts()),
+    )
+    .await
+    .expect_err("unreachable routing refuses admission");
+    assert_eq!(routing.methods(), vec![ACCOUNT_FOR_OP]);
+    refusal.into()
+}
+
 #[tokio::test]
 async fn a_malformed_routing_reply_is_refused_as_unreachable() {
     for reply in [
@@ -682,7 +709,7 @@ async fn one_candidate_account_asks_nothing() {
 }
 
 #[tokio::test]
-async fn an_api_key_run_is_not_an_account_choice() {
+async fn an_api_key_run_without_hints_is_not_an_account_choice() {
     let routing = FakeRouting::choosing("acct-b", "oauth:anthropic:acct-b");
     let client = client(&routing);
     let choice = choose(&client, "apikey:anthropic", false, Some(two_accounts()))
@@ -690,6 +717,302 @@ async fn an_api_key_run_is_not_an_account_choice() {
         .unwrap();
     assert_eq!(choice, AccountChoice::NotApplicable);
     assert!(routing.methods().is_empty());
+}
+
+fn api_keys() -> Arc<ScopedList> {
+    let mut a = row("key-a", None, "anthropic", "apikey");
+    a.refresh_adapter = None;
+    let mut b = a.clone();
+    b.id = "key-b".into();
+    listing(vec![a, b])
+}
+
+async fn choose_api_key(
+    client: &RoutingClient,
+    pool: Option<&str>,
+    credential_id: Option<&str>,
+    pinned: bool,
+    rows: Option<Arc<ScopedList>>,
+) -> Result<AccountChoice, ChoiceRefusal> {
+    choose_api_key_with_decision(client, pool, credential_id, pinned, rows, None).await
+}
+
+async fn choose_api_key_with_decision(
+    client: &RoutingClient,
+    pool: Option<&str>,
+    credential_id: Option<&str>,
+    pinned: bool,
+    rows: Option<Arc<ScopedList>>,
+    decision_id: Option<&str>,
+) -> Result<AccountChoice, ChoiceRefusal> {
+    let key = CredentialId::parse("apikey:anthropic:configured").unwrap();
+    choose_account(
+        client,
+        ChoiceInputs {
+            static_credential: &key,
+            caller_named_account: pinned,
+            pool,
+            credential_id,
+            decision_id,
+            service_tier: None,
+            conversation_key: None,
+            inherited_conversation_key: None,
+            hold_cap: Default::default(),
+            model: "claude-opus-5-5",
+            session: &session(),
+            send_id: None,
+            run_id: "run-1",
+            initial_input_bytes: 42,
+        },
+        async { rows },
+        tokio::time::Instant::now() + ADMISSION_BUDGET,
+    )
+    .await
+}
+
+fn api_key_router(method: &str, credential_id: &str) -> Arc<FakeRouting> {
+    FakeRouting::answering(Ok(Ok(serde_json::to_vec(&json!({"result":{
+        "account":{"account_id":credential_id,"credential_id":credential_id,"method":method}
+    }}))
+    .unwrap())))
+}
+
+#[tokio::test]
+async fn apikey_pool_routes_the_answered_key_not_the_hint() {
+    let routing = api_key_router("apikey", "key-b");
+    let result = choose_api_key(
+        &client(&routing),
+        Some("keys"),
+        Some("key-a"),
+        false,
+        Some(api_keys()),
+    )
+    .await;
+    if let Some(dir) = std::env::var_os("BROCA_APIKEY_SAMPLE_DIR") {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("role.describe.json"),
+            serde_json::to_vec(&broca_wire::broca_role_describe("sample")).unwrap(),
+        )
+        .unwrap();
+        let requests = routing.requests.lock().unwrap();
+        let params = requests
+            .iter()
+            .find(|request| request["method"] == ACCOUNT_FOR_OP)
+            .map(|request| &request["params"]);
+        std::fs::write(
+            dir.join("route.account_for.params.json"),
+            params
+                .map(|params| serde_json::to_vec(params).unwrap())
+                .unwrap_or_default(),
+        )
+        .unwrap();
+    }
+    let choice = result.unwrap();
+    assert!(
+        matches!(choice, AccountChoice::Routed { credential_id, method: AuthMethod::ApiKey, .. } if credential_id == "key-b")
+    );
+    let requests = routing.requests.lock().unwrap();
+    assert_eq!(requests[0]["params"]["pool"], "keys");
+    assert_eq!(
+        requests[0]["params"]["requested_account"],
+        json!({"credential_id":"key-a"})
+    );
+    assert_eq!(requests[0]["params"]["mode"], "admit");
+    assert_eq!(
+        requests[0]["params"]["candidates"]["accounts"],
+        json!([
+            {"account_id":"key-a","credential_id":"key-a"},
+            {"account_id":"key-b","credential_id":"key-b"}
+        ])
+    );
+}
+
+#[tokio::test]
+async fn apikey_vault_account_identity_is_offered_and_checked_with_the_key() {
+    let mut rows = (*api_keys()).clone();
+    rows.credentials[1].account_id = Some("key-owner".into());
+    let rows = Some(Arc::new(rows));
+    let wrong_account = api_key_router("apikey", "key-b");
+    assert_eq!(
+        choose_api_key(
+            &client(&wrong_account),
+            Some("keys"),
+            None,
+            false,
+            rows.clone()
+        )
+        .await,
+        Err(ChoiceRefusal::Unavailable(
+            RoutingUnavailable::invalid_pick()
+        ))
+    );
+    let routing = FakeRouting::answering(Ok(Ok(serde_json::to_vec(&json!({"result":{
+        "account":{"method":"apikey","account_id":"key-owner","credential_id":"key-b"}
+    }}))
+    .unwrap())));
+    assert!(
+        matches!(choose_api_key(&client(&routing), Some("keys"), None, false, rows).await.unwrap(),
+        AccountChoice::Routed { account_id, credential_id, .. } if account_id == "key-owner" && credential_id == "key-b")
+    );
+}
+
+#[tokio::test]
+async fn apikey_decision_without_hints_still_requires_routing() {
+    let routing = api_key_router("apikey", "key-a");
+    assert!(matches!(
+        choose_api_key_with_decision(
+            &client(&routing),
+            None,
+            None,
+            false,
+            Some(api_keys()),
+            Some("route-decision")
+        )
+        .await
+        .unwrap(),
+        AccountChoice::Routed { .. }
+    ));
+    assert_eq!(
+        routing.requests.lock().unwrap()[0]["params"]["decision_id"],
+        "route-decision"
+    );
+}
+
+#[tokio::test]
+async fn apikey_routing_refuses_wrong_method_or_unloadable_pick() {
+    for (method, id) in [("oauth", "key-b"), ("apikey", "unknown"), ("", "key-b")] {
+        let routing = api_key_router(method, id);
+        assert_eq!(
+            choose_api_key(
+                &client(&routing),
+                Some("keys"),
+                None,
+                false,
+                Some(api_keys())
+            )
+            .await,
+            Err(ChoiceRefusal::Unavailable(
+                RoutingUnavailable::invalid_pick()
+            ))
+        );
+    }
+    for field in ["state", "operations", "auth_method", "provider_ids"] {
+        let mut rows = (*api_keys()).clone();
+        let picked = &mut rows.credentials[1];
+        match field {
+            "state" => picked.state = "needs_reauth".into(),
+            "operations" => picked.operations.clear(),
+            "auth_method" => picked.auth_method = Some("oauth".into()),
+            "provider_ids" => picked.provider_ids = vec!["openai".into()],
+            _ => unreachable!(),
+        }
+        let routing = api_key_router("apikey", "key-b");
+        assert_eq!(
+            choose_api_key(
+                &client(&routing),
+                Some("keys"),
+                None,
+                false,
+                Some(Arc::new(rows))
+            )
+            .await,
+            Err(ChoiceRefusal::Unavailable(
+                RoutingUnavailable::invalid_pick()
+            )),
+            "{field}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn apikey_legacy_unhinted_and_pinned_keep_the_configured_vault_record() {
+    use crate::auth_routing::{resolve_credential_id, MethodConfig};
+    use crate::vault_config::{VaultAddressing, VaultCredentialIds};
+    let root = broca_test_support::scratch_root().join("apikey-static-mapping");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("auth-methods.json");
+    std::fs::write(&path, br#"{"defaults":{"anthropic":"apikey"}}"#).unwrap();
+    let methods = MethodConfig::load(&path).unwrap();
+    let addressing = VaultAddressing::new(VaultCredentialIds::from_pairs([
+        ("apikey:anthropic", "operator-default"),
+        ("apikey:anthropic:work", "operator-work"),
+    ]));
+    for (account, expected) in [(None, "operator-default"), (Some("work"), "operator-work")] {
+        let key = resolve_credential_id("anthropic", None, account, &methods, AuthMethod::Oauth);
+        let routing = FakeRouting::refusing(SELECTION_DISABLED, json!({}));
+        let choice = choose_account(
+            &client(&routing),
+            ChoiceInputs {
+                static_credential: &key,
+                caller_named_account: account.is_some(),
+                pool: None,
+                credential_id: None,
+                decision_id: None,
+                service_tier: None,
+                conversation_key: None,
+                inherited_conversation_key: None,
+                hold_cap: Default::default(),
+                model: "claude-opus-5-5",
+                session: &session(),
+                send_id: None,
+                run_id: "run-1",
+                initial_input_bytes: 42,
+            },
+            async { Some(api_keys()) },
+            tokio::time::Instant::now() + ADMISSION_BUDGET,
+        )
+        .await
+        .unwrap();
+        assert!(!matches!(choice, AccountChoice::Routed { .. }));
+        assert_eq!(addressing.vault_id_for(&key), expected);
+        assert!(routing.methods().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn apikey_hint_requires_listing_but_not_multiple_keys_or_provider_metadata() {
+    let routing = api_key_router("apikey", "key-a");
+    assert!(matches!(
+        choose_api_key(&client(&routing), Some("keys"), None, false, None).await,
+        Err(ChoiceRefusal::Unavailable(_))
+    ));
+    assert!(routing.methods().is_empty());
+    let mut rows = (*api_keys()).clone();
+    rows.credentials.truncate(1);
+    rows.credentials[0].provider_ids.clear();
+    let choice = choose_api_key(
+        &client(&routing),
+        None,
+        Some("key-a"),
+        false,
+        Some(Arc::new(rows)),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(choice, AccountChoice::Routed { credential_id, .. } if credential_id == "key-a")
+    );
+    let disabled = FakeRouting::refusing(SELECTION_DISABLED, json!({}));
+    assert!(
+        matches!(choose_api_key(&client(&disabled), Some("keys"), None, false, Some(api_keys())).await,
+        Err(ChoiceRefusal::Refused(refusal)) if refusal.routing_code == SELECTION_DISABLED)
+    );
+}
+
+#[tokio::test]
+async fn apikey_pin_with_pool_or_hint_is_refused_before_routing() {
+    for (pool, hint) in [(Some("keys"), None), (None, Some("key-a"))] {
+        let routing = api_key_router("apikey", "key-b");
+        let result = choose_api_key(&client(&routing), pool, hint, true, Some(api_keys())).await;
+        assert!(
+            matches!(result, Err(ChoiceRefusal::Refused(refusal)) if refusal.routing_detail.as_deref() == Some(&json!({"field":"auth.account"})))
+        );
+        assert!(routing.methods().is_empty());
+    }
 }
 
 #[tokio::test]
@@ -1802,6 +2125,376 @@ async fn run_finished_is_sent_once_for_every_terminal_reason() {
 }
 
 #[tokio::test]
+async fn terminal_apikey_backoff_is_gated_and_precedes_release() {
+    for supported in [false, true] {
+        let routing = Arc::new(FakeRouting {
+            backoff: supported,
+            ..FakeRouting::default()
+        });
+        let client = Arc::new(client(&routing));
+        let reporter = RunReporter::start(
+            client,
+            "adm-key".into(),
+            "run-key".into(),
+            None,
+            Arc::new(AtomicU64::new(10)),
+        );
+        let lineage = lineage();
+        let observed = attempt(Some(429), AttemptAccountObservation::default());
+        broca_core::AccountReporter::attempt_recorded(
+            reporter.as_ref(),
+            Some(lineage),
+            2,
+            &observed,
+        );
+        let error = serde_json::from_value(
+            json!({"class":"transient","message":"slow down","status":429,
+            "retry_after_secs":1.125,"provider_code":"rate_limited"}),
+        )
+        .unwrap();
+        reporter.terminal_rate_limit(Some(lineage), 3, &error);
+        reporter.finish(Some(lineage), 3, RunFinishReason::Error);
+        broca_test_support::wait_until("API-key release report", || async {
+            let observed = routing.observed();
+            if observed
+                .last()
+                .is_some_and(|body| body["kind"] == "run_finished")
+            {
+                Ok(observed)
+            } else {
+                Err(format!("reports: {observed:?}"))
+            }
+        })
+        .await;
+        let reports = routing.observed();
+        assert_eq!(reports.len(), if supported { 3 } else { 2 });
+        if supported {
+            assert_eq!(
+                reports[1],
+                json!({"event_id":format!("{lineage}:3:backoff"),"kind":"transient_backoff",
+                "caller":{"runner":"broca"},"admission_id":"adm-key","retry_at_ms":NOW + 1125})
+            );
+            assert_ne!(reports[1]["event_id"], reports[2]["event_id"]);
+        }
+        assert_eq!(reports.last().unwrap()["admission_id"], "adm-key");
+    }
+}
+
+#[tokio::test]
+async fn terminal_apikey_backoff_requires_a_timed_rate_limit() {
+    for extra in [
+        json!({"provider_code":"rate_limited"}),
+        json!({"status":503,"retry_after_secs":1.0}),
+        json!({"provider_code":"account_limit_exhausted","status":429,"retry_after_secs":1.0}),
+        json!({"provider_code":"rate_limited","retry_after_secs":-1.0}),
+    ] {
+        let routing = Arc::new(FakeRouting {
+            backoff: true,
+            ..FakeRouting::default()
+        });
+        let reporter = RunReporter::start(
+            Arc::new(client(&routing)),
+            "adm-key".into(),
+            "run-key".into(),
+            None,
+            Arc::new(AtomicU64::new(10)),
+        );
+        let lineage = lineage();
+        broca_core::AccountReporter::attempt_recorded(
+            reporter.as_ref(),
+            Some(lineage),
+            2,
+            &attempt(Some(429), AttemptAccountObservation::default()),
+        );
+        let mut error = json!({"class":"transient","message":"refused"});
+        error
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        reporter.terminal_rate_limit(Some(lineage), 3, &serde_json::from_value(error).unwrap());
+        reporter.finish(Some(lineage), 3, RunFinishReason::Error);
+        let reports = broca_test_support::wait_until("untimed API-key release report", || async {
+            let observed = routing.observed();
+            if observed
+                .last()
+                .is_some_and(|body| body["kind"] == "run_finished")
+            {
+                Ok(observed)
+            } else {
+                Err(format!("reports: {observed:?}"))
+            }
+        })
+        .await;
+        assert_eq!(reports.len(), 2);
+    }
+}
+
+async fn terminal_credential_reports(
+    error: broca_protocol::ProviderError,
+    method: &str,
+    credential_id: Option<&str>,
+) -> Vec<Value> {
+    let routing = Arc::new(FakeRouting {
+        backoff: true,
+        credential_refused: true,
+        ..FakeRouting::default()
+    });
+    let reporter = RunReporter::start(
+        Arc::new(client(&routing)),
+        "adm-refused".into(),
+        "run-refused".into(),
+        None,
+        Arc::new(AtomicU64::new(10)),
+    );
+    let lineage = lineage();
+    broca_core::AccountReporter::run_started(reporter.as_ref(), Some(lineage), 1);
+    let observation = AttemptAccountObservation {
+        limit: error
+            .is_account_limit_exhausted()
+            .then(|| AttemptAccountLimit {
+                disposition: broca_protocol::provider::AccountLimitDisposition::ACCOUNT,
+                observed_at_ms: NOW as u64,
+                resets_at_ms: Some((NOW + 60_000) as u64),
+                resets_at_source: Some("header".into()),
+                limit_window: None,
+            }),
+        ..Default::default()
+    };
+    broca_core::AccountReporter::attempt_recorded(
+        reporter.as_ref(),
+        Some(lineage),
+        2,
+        &attempt(error.status, observation),
+    );
+    reporter.terminal_credential_refused(Some(lineage), 3, &error, Some(method), credential_id);
+    if method == "apikey" {
+        reporter.terminal_rate_limit(Some(lineage), 3, &error);
+    }
+    reporter.finish(Some(lineage), 3, RunFinishReason::Error);
+    broca_test_support::wait_until("credential refusal release report", || async {
+        let reports = routing.observed();
+        if reports
+            .last()
+            .is_some_and(|body| body["kind"] == "run_finished")
+        {
+            Ok(reports)
+        } else {
+            Err(format!("reports: {reports:?}"))
+        }
+    })
+    .await
+}
+
+fn terminal_error(extra: Value) -> broca_protocol::ProviderError {
+    let mut error = json!({"class":"permanent","message":"refused"});
+    error
+        .as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().unwrap().clone());
+    serde_json::from_value(error).unwrap()
+}
+
+#[tokio::test]
+async fn credential_refused_billing_precedes_finish_for_every_routed_method() {
+    for method in ["apikey", "oauth", "chatgpt"] {
+        for code in [
+            "billing_exhausted",
+            "credit_insufficient",
+            "account_not_entitled",
+            "usage_not_included",
+        ] {
+            let reports = terminal_credential_reports(
+                terminal_error(json!({"provider_code":code,"status":402,"retry_after_secs":60.0})),
+                method,
+                Some("vault-key"),
+            )
+            .await;
+            assert_eq!(
+                reports
+                    .iter()
+                    .map(|body| body["kind"].clone())
+                    .collect::<Vec<_>>(),
+                vec![
+                    json!("admission_started"),
+                    json!("attempt"),
+                    json!("credential_refused"),
+                    json!("run_finished")
+                ],
+                "{method}: {code}"
+            );
+            assert_eq!(reports[2]["admission_id"], "adm-refused");
+            assert_eq!(reports[2]["credential_id"], "vault-key");
+            assert_eq!(reports[2]["provider_code"], code);
+            assert!(reports[2].get("retry_at_ms").is_none());
+            assert_ne!(reports[2]["event_id"], reports[3]["event_id"]);
+            assert_eq!(
+                reports[2]["event_id"],
+                format!(
+                    "{}:credential_refused",
+                    reports[3]["event_id"].as_str().unwrap()
+                )
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn credential_refused_requires_router_group() {
+    for (backoff, supported) in [(true, false), (false, true), (false, false), (true, true)] {
+        let routing = Arc::new(FakeRouting {
+            backoff,
+            credential_refused: supported,
+            ..FakeRouting::default()
+        });
+        client(&routing)
+            .observe(json!({"kind":"credential_refused","admission_id":"adm-refused"}))
+            .await;
+        assert_eq!(routing.observed().len(), usize::from(backoff && supported));
+    }
+}
+
+#[tokio::test]
+async fn credential_refused_auth_is_only_for_api_keys() {
+    for method in ["apikey", "oauth", "chatgpt"] {
+        for status in [401, 403] {
+            let reports = terminal_credential_reports(
+                terminal_error(json!({"class":"auth_required","status":status,"provider_code":"invalid_api_key"})),
+                method,
+                Some("vault-key"),
+            ).await;
+            let refused: Vec<_> = reports
+                .iter()
+                .filter(|body| body["kind"] == "credential_refused")
+                .collect();
+            assert_eq!(
+                refused.len(),
+                usize::from(method == "apikey"),
+                "{method}: {status}"
+            );
+            if method == "apikey" {
+                assert_eq!(refused[0]["provider_code"], "invalid_api_key");
+            }
+        }
+    }
+    for extra in [
+        json!({"class":"permanent","status":403}),
+        json!({"class":"auth_required","status":500}),
+    ] {
+        let reports =
+            terminal_credential_reports(terminal_error(extra), "apikey", Some("vault-key")).await;
+        assert_eq!(reports.len(), 3);
+    }
+}
+
+#[tokio::test]
+async fn credential_refused_auth_without_provider_code_still_blocks_key() {
+    let reports = terminal_credential_reports(
+        terminal_error(json!({"class":"auth_required","status":401})),
+        "apikey",
+        Some("vault-key"),
+    )
+    .await;
+    assert_eq!(reports.len(), 4);
+    assert_eq!(reports[2]["kind"], "credential_refused");
+    assert_eq!(reports[2]["admission_id"], "adm-refused");
+    assert_eq!(reports[2]["credential_id"], "vault-key");
+    assert!(reports[2].get("provider_code").is_none());
+    assert!(reports[2].get("retry_at_ms").is_none());
+}
+
+#[tokio::test]
+async fn credential_refused_excludes_resettable_and_transient_limits() {
+    for (code, class, refused, attempt_kind, backoff) in [
+        ("billing_exhausted", "permanent", true, "attempt", false),
+        (
+            "account_limit_exhausted",
+            "transient",
+            false,
+            "account_limit_exhausted",
+            false,
+        ),
+        ("rate_limited", "transient", false, "attempt", true),
+    ] {
+        let reports = terminal_credential_reports(
+            terminal_error(
+                json!({"class":class,"provider_code":code,"status":429,"retry_after_secs":1.0}),
+            ),
+            "apikey",
+            None,
+        )
+        .await;
+        assert_eq!(reports[1]["kind"], attempt_kind);
+        assert_eq!(
+            reports
+                .iter()
+                .filter(|body| body["kind"] == "credential_refused")
+                .count(),
+            usize::from(refused),
+            "{code}"
+        );
+        assert_eq!(
+            reports
+                .iter()
+                .filter(|body| body["kind"] == "transient_backoff")
+                .count(),
+            usize::from(backoff),
+            "{code}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn credential_refused_request_bytes_preserve_code_and_absence() {
+    let routing = Arc::new(FakeRouting {
+        backoff: true,
+        credential_refused: true,
+        ..FakeRouting::default()
+    });
+    for (name, code) in [
+        ("billing", Some("billing_exhausted")),
+        ("auth-no-code", None),
+    ] {
+        client(&routing)
+            .observe(credential_refused_body(
+                "lineage:3:credential_refused",
+                "adm-refused",
+                Some("vault-key"),
+                code,
+            ))
+            .await;
+        let bytes = routing
+            .request_bytes
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        let parsed: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed["method"], "route.account_observe");
+        let mut expected = json!({"event_id":"lineage:3:credential_refused","caller":{"runner":"broca"},"kind":"credential_refused","admission_id":"adm-refused","credential_id":"vault-key"});
+        if let Some(code) = code {
+            expected["provider_code"] = json!(code);
+        }
+        assert_eq!(parsed["params"], expected);
+        let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        println!("credential-refused-sample {name} {hex}");
+    }
+    assert!(credential_refused_body("event", "adm", None, None)
+        .get("credential_id")
+        .is_none());
+}
+
+#[tokio::test]
+async fn backoff_reports_never_reach_router_without_its_group() {
+    let routing = Arc::new(FakeRouting::default());
+    client(&routing)
+        .observe(json!({"kind":"transient_backoff","event_id":"end:backoff",
+        "admission_id":"run-key","retry_at_ms":NOW + 1000}))
+        .await;
+    assert!(routing.requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn an_attempt_is_reported_only_once_its_record_is_durable_and_in_order() {
     let routing = FakeRouting::refusing(SELECTION_DISABLED, json!({}));
     let client = Arc::new(client(&routing));
@@ -2124,14 +2817,12 @@ async fn auth_routing_hints_cannot_fall_back_when_selection_is_disabled() {
 
 #[tokio::test]
 async fn auth_routing_hints_are_ignored_for_unlisted_methods() {
-    for method in ["apikey:anthropic", "antigravity:google"] {
-        let routing = FakeRouting::choosing("acct-a", "oauth:anthropic");
-        assert_eq!(
-            choose_with_auth_hints(&client(&routing), method, None)
-                .await
-                .unwrap(),
-            AccountChoice::NotApplicable
-        );
-        assert!(routing.requests.lock().unwrap().is_empty());
-    }
+    let routing = FakeRouting::choosing("acct-a", "oauth:anthropic");
+    assert_eq!(
+        choose_with_auth_hints(&client(&routing), "antigravity:google", None)
+            .await
+            .unwrap(),
+        AccountChoice::NotApplicable
+    );
+    assert!(routing.requests.lock().unwrap().is_empty());
 }

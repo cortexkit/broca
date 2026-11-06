@@ -951,18 +951,43 @@ fn inherit_frozen_parameters(request: &mut SubmissionRequest, frozen: &broca_wal
     }
 }
 
+/// The settings a running run froze that a joining steer must agree with. Today's actor reads
+/// them from the episode's `RunConfig`; an actor over another storage builds them from what it
+/// keeps of the run's start, so both refuse the same steers.
+pub(crate) struct SteerFrozen<'a> {
+    pub model: &'a broca_protocol::request::ModelHandle,
+    pub variant: Option<&'a str>,
+    pub generation: &'a broca_protocol::request::GenerationConfig,
+    pub stop_when: &'a [broca_protocol::request::StopCondition],
+    pub directives: Option<&'a [broca_protocol::request::DirectiveName]>,
+    pub auth_selection: Option<&'a broca_wal::AuthSelection>,
+}
+
+impl<'a> From<&'a broca_wal::RunConfig> for SteerFrozen<'a> {
+    fn from(config: &'a broca_wal::RunConfig) -> Self {
+        Self {
+            model: &config.model,
+            variant: config.variant.as_deref(),
+            generation: &config.generation,
+            stop_when: &config.stop_when,
+            directives: config.turn_directives_v1.as_deref(),
+            auth_selection: config.auth_selection.as_ref(),
+        }
+    }
+}
+
 /// Compare only named settings: a joining steer inherits every setting it omits. The order
 /// is stable so a send changing several settings always gets the same first field in its reply.
-fn steer_settings_conflict(
+pub(crate) fn steer_settings_conflict(
     request: &SubmissionRequest,
-    frozen: &broca_wal::RunConfig,
+    frozen: SteerFrozen<'_>,
     stop_sequences_named: bool,
 ) -> Option<&'static str> {
     use broca_protocol::request::InheritedParam;
-    if !request.inherit_frozen.contains(&InheritedParam::Model) && request.model != frozen.model {
+    if !request.inherit_frozen.contains(&InheritedParam::Model) && request.model != *frozen.model {
         return Some("model");
     }
-    if request.variant.is_some() && request.variant != frozen.variant {
+    if request.variant.is_some() && request.variant.as_deref() != frozen.variant {
         return Some("model.variant");
     }
     let generation = &request.generation;
@@ -984,19 +1009,21 @@ fn steer_settings_conflict(
         return Some("generation.stop_sequences");
     }
     if !request.inherit_frozen.contains(&InheritedParam::StopWhen)
-        && request.stop_when != frozen.stop_when
+        && request.stop_when.as_slice() != frozen.stop_when
     {
         return Some("stop_when.max_steps");
     }
-    if request.directives.as_ref().is_some_and(|names| {
-        names.as_slice() != frozen.turn_directives_v1.as_deref().unwrap_or_default()
-    }) {
+    if request
+        .directives
+        .as_ref()
+        .is_some_and(|names| names.as_slice() != frozen.directives.unwrap_or_default())
+    {
         return Some("directives");
     }
     // Checked last, so a send that also conflicts on an earlier setting still reports that
     // setting rather than `auth`.
     if let Some(pin) = &request.auth {
-        if !steer_auth_pin_matches(pin, frozen.auth_selection.as_ref()) {
+        if !steer_auth_pin_matches(pin, frozen.auth_selection) {
             return Some("auth");
         }
     }
@@ -1260,6 +1287,25 @@ pub(crate) fn steer_delivery(records: &[WalRecord], send_id: &str) -> Option<Del
         }
     }
     None
+}
+
+fn permanent_queued_refusal(message: String, provider_code: &'static str) -> ProviderError {
+    ProviderError {
+        provider_details: None,
+        provider_subcode: None,
+        refusal: None,
+        class: ErrorClass::Permanent,
+        message,
+        status: None,
+        retry_after_secs: None,
+        provider_code: Some(provider_code.into()),
+        resets_at_ms: None,
+        resets_at_source: None,
+        limit_window: None,
+        account_ref: None,
+        credential_id: None,
+        affordable_max_tokens: None,
+    }
 }
 
 /// The run id a queued submission starts under: `queue_submission` names it `sub-<run_id>`.
@@ -1634,14 +1680,8 @@ thread_local! {
     static AGENT_RUN_WRITER_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Why an episode is being sealed `Interrupted` outside the run loop.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SealCause {
-    /// A graceful stop of a run this process is still running.
-    Shutdown,
-    /// The startup pass sealing a run a crashed process left running: a resume of the episode.
-    CrashOrphan,
-}
+// Why an episode is sealed `Interrupted` outside the run loop, shared with the seal plan.
+use broca_core::resume::SealCause;
 
 /// Whether an unfinished episode a crashed process left behind is sealed `Interrupted` by the
 /// startup crash-orphan pass.
@@ -3846,11 +3886,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 .is_some_and(|first| first.manifest.is_some())
                 || planned
             {
-                return SendOutcome::DeliveryRefused {
-                    code: "invalid_params",
-                    field: "tools",
-                    message: "tools are frozen by the session's fetch plan".into(),
-                };
+                return crate::plan_episode::tools_frozen_refusal();
             }
         }
 
@@ -4265,7 +4301,20 @@ impl<W: WalStore + 'static> LineageActor<W> {
             }
             if !already_pending {
                 match self.submission_was_retracted(&submission_id).await {
-                    Ok(true) => return SendOutcome::Retracted { submission_id },
+                    Ok(true) => {
+                        let records = match self.read_wal_records().await {
+                            Ok(records) => records,
+                            Err(error) => return SendOutcome::Error(error),
+                        };
+                        return crate::send_fate::recorded_send_outcome(
+                            &records,
+                            &run_id,
+                            identity.send_id.as_deref().unwrap_or(""),
+                            false,
+                            self.writer.as_ref().and_then(|writer| writer.lineage_id()),
+                        )
+                        .unwrap_or(SendOutcome::Retracted { submission_id });
+                    }
                     Ok(false) => {}
                     Err(error) => return SendOutcome::Error(error),
                 }
@@ -4984,7 +5033,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 episode.config.model.provider_module_id, episode.config.model.model_id
             );
             if let Some(field) =
-                steer_settings_conflict(&request, &episode.config, stop_sequences_named)
+                steer_settings_conflict(&request, (&episode.config).into(), stop_sequences_named)
             {
                 // The inbox lock linearizes this refusal against the run's decision to end.
                 // A closed inbox sends the message to a new turn instead, which can honour it.
@@ -5495,18 +5544,8 @@ impl<W: WalStore + 'static> LineageActor<W> {
         // Every path that starts an episode passes here (a direct send, a drained queue, a
         // queue rebuilt after a crash), so an episode whose plan asks a provider to confine its
         // tools never starts without the scope that confinement is keyed on.
-        if episode_scope.is_none()
-            && manifest.as_ref().is_some_and(|manifest| {
-                serde_json::from_str::<serde_json::Value>(manifest.plan.as_json_text())
-                    .is_ok_and(|plan| broca_fetch_plan::names_confined_preset(&plan))
-            })
-        {
-            return Err(StartRunFailure::Scope(
-                broca_core::ScopeRefusal::ScopeRequired {
-                    preset: broca_fetch_plan::CONFINED_TOOL_PRESET,
-                },
-            ));
-        }
+        crate::plan_episode::require_confining_scope(manifest.as_deref(), episode_scope.as_ref())
+            .map_err(StartRunFailure::Scope)?;
         if let Some(manifest) = &manifest {
             // The session's first episode, new or re-driven: only its input holds the system
             // text, exactly as its `RunStarted` recorded it.
@@ -5515,51 +5554,13 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     .first_episode
                     .as_ref()
                     .is_some_and(|first| first.run_id == run_id);
-            let is_system = |message: &&broca_protocol::content::Message| {
-                message.role == broca_protocol::content::Role::System
-            };
-            let frozen_system = vec![broca_protocol::content::ContentBlock::Text {
-                text: manifest.system_text.clone(),
-            }];
-            let systems: Vec<_> = resolved_request.input.iter().filter(is_system).collect();
-            // A send carries neither tools nor system text: the manifest supplies both. An
-            // episode re-driven from its own `RunStarted` carries the manifest's tools and, in
-            // the first episode, the manifest's system text first; exactly those are accepted.
-            let system_frozen = match systems.as_slice() {
-                [] => true,
-                [only] => {
-                    first_episode_input
-                        && std::ptr::eq(*only, &resolved_request.input[0])
-                        && only.content == frozen_system
-                }
-                _ => false,
-            };
-            let tools_frozen = tools_were_omitted
-                || resolved_request.tools.as_deref() == Some(manifest.tools.as_slice());
-            if !system_frozen || !tools_frozen {
-                return Err(StartRunFailure::Admission(broca_core::RunError::Config(
-                    "this session's tools and system text are frozen from its fetch plan; a \
-                     later send carries neither `tools` nor `system`"
-                        .into(),
-                )));
-            }
-            let needs_system =
-                first_episode_input && systems.is_empty() && !manifest.system_text.is_empty();
-            resolved_request.tools = Some(manifest.tools.as_ref().clone());
-            resolved_request.policy_allowed = manifest
-                .tools
-                .iter()
-                .map(|tool| tool.name.clone())
-                .collect();
-            if needs_system {
-                resolved_request.input.insert(
-                    0,
-                    broca_protocol::content::Message::new(
-                        broca_protocol::content::Role::System,
-                        frozen_system,
-                    ),
-                );
-            }
+            crate::plan_episode::freeze_manifest(
+                manifest,
+                &mut resolved_request,
+                first_episode_input,
+                tools_were_omitted,
+            )
+            .map_err(StartRunFailure::Admission)?;
         }
         let first_tool_names: Vec<String> = resolved_request
             .tools
@@ -8546,20 +8547,13 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     }
                     return Ok(());
                 }
-                Err(StartRunFailure::Admission(error))
-                    if error.admission_error_class() == ErrorClass::Permanent =>
-                {
-                    // Tombstone only failures intrinsic to the durable request. A transient
-                    // dependency failure leaves the queue head intact for the next drain tick.
+                Err(StartRunFailure::Admission(error)) => {
+                    // End every refused send so the refusal reaches its caller, who may resend
+                    // with a new routing decision. Broca does not retry admission on its own.
                     self.persist_failed_queued_admission(
                         submission_id,
                         run_id,
-                        error.to_string(),
-                        match error {
-                            RunError::MediaUnsupported(_) => "media_unsupported",
-                            RunError::MediaTooLarge(_) => "media_too_large",
-                            _ => "queued_admission_failed",
-                        },
+                        crate::serve::admission_refusal::queued_admission_error(error),
                     )
                     .await?;
                 }
@@ -8571,8 +8565,10 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     self.persist_failed_queued_admission(
                         submission_id,
                         run_id,
-                        format!("scope refused: {refusal:?}"),
-                        "scope_required",
+                        permanent_queued_refusal(
+                            format!("scope refused: {refusal:?}"),
+                            "scope_required",
+                        ),
                     )
                     .await?;
                 }
@@ -8632,25 +8628,8 @@ impl<W: WalStore + 'static> LineageActor<W> {
         &mut self,
         submission_id: broca_protocol::SubmissionId,
         run_id: RunId,
-        message: String,
-        provider_code: &'static str,
+        terminal: ProviderError,
     ) -> Result<(), String> {
-        let terminal = ProviderError {
-            provider_details: None,
-            provider_subcode: None,
-            refusal: None,
-            class: ErrorClass::Permanent,
-            message,
-            status: None,
-            retry_after_secs: None,
-            provider_code: Some(provider_code.into()),
-            resets_at_ms: None,
-            resets_at_source: None,
-            limit_window: None,
-            account_ref: None,
-            credential_id: None,
-            affordable_max_tokens: None,
-        };
         let writer = self.writer.as_ref().expect("writer live while open");
         writer.record(WalRecord::Retracted {
             submission_id: submission_id.clone(),
@@ -9311,19 +9290,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
     ) -> Result<bool, String> {
         // Use the terminal's existing diagnostic field without changing its Interrupted reason.
         // Recovery knows the old process left this run unsealed, not how that process ended.
-        let error = (cause == SealCause::CrashOrphan).then(|| ProviderError { provider_details: None, provider_subcode: None,
-        class: broca_protocol::ErrorClass::Transient,
-        message: "the previous broca process ended without sealing this run: host crash, kill, or power loss".into(),
-        provider_code: Some("previous_process_ended_unsealed".into()),
-        status: None,
-        retry_after_secs: None,
-        refusal: None,
-        resets_at_ms: None,
-        resets_at_source: None,
-        limit_window: None,
-        account_ref: None,
-        credential_id: None,
-        affordable_max_tokens: None, });
+        let error = (cause == SealCause::CrashOrphan).then(broca_core::resume::crash_orphan_error);
         self.write_interrupted_seal_with_error(sealed_attempt, cause, error)
             .await
     }
@@ -9433,8 +9400,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 );
             }
         }
-        let held_close_reason = closing.unwrap_or(broca_protocol::RunFinishReason::Interrupted);
-        let seal_reason = held_close_reason;
+        let seal_reason = closing.unwrap_or(broca_protocol::RunFinishReason::Interrupted);
         let deferred_close =
             |id: &broca_protocol::ToolCallId| {
                 if self.executor.elicitation_plane().is_some() {
@@ -9461,55 +9427,35 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 }
                 broca_core::DeferredCloseKind::NotDispatched
             };
-        let close_out = if closing.is_some() {
-            broca_core::resume::close_out_open_batch_for(&prior, held_close_reason, deferred_close)
-        } else {
-            broca_core::close_out_open_batch(&prior, deferred_close)
-        };
         let resuming = cause == SealCause::CrashOrphan;
-        if resuming && !resumed_in_tenure {
-            writer.record(broca_core::resume_started_record(&prior, head, Vec::new()));
+        let seal = broca_core::resume::interrupted_seal(
+            &prior,
+            cause,
+            closing,
+            !held_replies.is_empty(),
+            (resuming && !resumed_in_tenure).then_some(head),
+            error,
+            deferred_close,
+        );
+        if let Some(record) = seal.resume_started {
+            writer.record(record);
         }
-        if !held_replies.is_empty() {
-            // Held close-out records share the terminal's barrier: a committed synthetic batch
-            // without its seal could otherwise read as a natural ending after a crash.
-            for record in close_out {
-                writer.record(record);
-            }
-        } else if !close_out.is_empty() {
-            for record in close_out {
-                writer.record(record);
-            }
+        for record in seal.close_out {
+            writer.record(record);
+        }
+        if seal.close_out_syncs_first {
             // Sync the close-out records that were actually enqueued. If the byte cap
             // rejected later records, leave them unclaimed and still write RunFinished
             // through its reserved space. Recovery only deduplicates records present on disk.
             writer.sync_for_seal().await.map_err(|e| e.to_string())?;
-        } else {
-            // Keep a durable tool turn whose calls were never dispatched as well, sharing
-            // the seal's barrier so it cannot look like a natural ending on its own.
-            for record in broca_core::close_out_pending_turn(&prior) {
-                writer.record(record);
-            }
         }
         let terminal_seq = writer
-            .record_terminal(WalRecord::RunFinished {
-                interrupt_reason: Some(
-                    match cause {
-                        SealCause::CrashOrphan => "runner_crash",
-                        _ => "runner_shutdown",
-                    }
-                    .into(),
+            .record_terminal(
+                seal.terminal.record(
+                    self.retention_timestamp()
+                        .or_else(broca_core::run::epoch_millis),
                 ),
-                reason: seal_reason,
-                // Timestamp this terminal so exported spend belongs to its billing period.
-                // A missing ts_ms becomes NULL occurred_at_ms and is omitted from period totals.
-                ts_ms: self
-                    .retention_timestamp()
-                    .or_else(broca_core::run::epoch_millis),
-                usage: prior.usage,
-                error,
-                retries_used: prior.retries_used,
-            })
+            )
             .map_err(|error| error.to_string())?;
         writer.sync().await.map_err(|e| e.to_string())?;
         broca_core::resume::withdraw_provider_held(
@@ -12997,16 +12943,25 @@ mod tests {
         let mut request = text_req(&key, "directives").to_submission();
         request.model = frozen.model.clone();
         request.stop_when = frozen.stop_when.clone();
-        assert_eq!(steer_settings_conflict(&request, &frozen, false), None);
+        assert_eq!(
+            steer_settings_conflict(&request, (&frozen).into(), false),
+            None
+        );
         request.directives = frozen.turn_directives_v1.clone();
-        assert_eq!(steer_settings_conflict(&request, &frozen, false), None);
+        assert_eq!(
+            steer_settings_conflict(&request, (&frozen).into(), false),
+            None
+        );
         request.directives = Some(vec![]);
         assert_eq!(
-            steer_settings_conflict(&request, &frozen, false),
+            steer_settings_conflict(&request, (&frozen).into(), false),
             Some("directives")
         );
         frozen.turn_directives_v1 = None;
-        assert_eq!(steer_settings_conflict(&request, &frozen, false), None);
+        assert_eq!(
+            steer_settings_conflict(&request, (&frozen).into(), false),
+            None
+        );
     }
 
     pub(super) fn min_config() -> broca_wal::RunConfig {
@@ -16456,7 +16411,7 @@ mod steer_auth_conflict_tests {
         pin: Option<serde_json::Value>,
         credential_id: Option<&str>,
     ) -> Option<&'static str> {
-        steer_settings_conflict(&steer(pin), &frozen(credential_id), false)
+        steer_settings_conflict(&steer(pin), (&frozen(credential_id)).into(), false)
     }
 
     #[test]
@@ -16523,7 +16478,11 @@ mod steer_auth_conflict_tests {
         let mut request = steer(Some(serde_json::json!({"method": "apikey"})));
         request.generation.stop_sequences = vec!["other".into()];
         assert_eq!(
-            steer_settings_conflict(&request, &frozen(Some("oauth:anthropic:work")), false),
+            steer_settings_conflict(
+                &request,
+                (&frozen(Some("oauth:anthropic:work"))).into(),
+                false
+            ),
             Some("generation.stop_sequences")
         );
     }
