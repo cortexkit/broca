@@ -22,8 +22,9 @@ use broca_protocol::request::ModelHandle;
 use broca_protocol::usage::Usage;
 
 use crate::codec::{
-    finish_req, put_nested, put_opt, put_rep, put_req, read_fields, skip_unknown, take_one,
-    take_rep, ByteBuf, DecodeError, DecodeErrorKind, Message as CodecMessage, Raw, Value, Wire,
+    finish_req, len_payload, put_nested, put_opt, put_rep, put_req, read_fields, skip_unknown,
+    take_one, take_rep, take_req, ByteBuf, DecodeError, DecodeErrorKind, Fields,
+    Message as CodecMessage, Raw, Value, Wire,
 };
 
 /// Implements `Value` for a field-less protocol enum as a varint, with an exhaustive match in
@@ -140,21 +141,66 @@ fn read_opaque(raw: Raw<'_>) -> Result<String, DecodeError> {
     let mut standard: Option<ByteBuf> = None;
     let mut url_safe: Option<ByteBuf> = None;
     let mut after: Option<String> = None;
-    read_fields(raw, AT, |field| match field.number {
-        1 => take_one(&mut before, field, AT),
-        2 => take_one(&mut standard, field, AT),
-        3 => take_one(&mut after, field, AT),
-        4 => take_one(&mut url_safe, field, AT),
-        _ => skip_unknown(field, AT),
-    })?;
-    let mut text = before.unwrap_or_default();
-    match (standard, url_safe) {
-        (Some(_), Some(_)) => return Err(DecodeError::new(AT, DecodeErrorKind::OneofMultiple)),
-        (Some(bytes), None) => text.push_str(&base64_encode(&bytes.0, Alphabet::Standard)),
-        (None, Some(bytes)) => text.push_str(&base64_encode(&bytes.0, Alphabet::UrlSafe)),
-        (None, None) => {}
+    // The writer's order is field 1, then 2 or 4, then 3, which isn't ascending, so this reader
+    // checks the order itself.
+    let mut place = 0;
+    for field in Fields::any_order(len_payload(raw, AT)?, AT) {
+        let field = field?;
+        let next = match field.number {
+            1 => 1,
+            2 | 4 => 2,
+            3 => 3,
+            _ => {
+                skip_unknown(field, AT)?;
+                continue;
+            }
+        };
+        if next < place {
+            return Err(DecodeError::new(
+                AT,
+                DecodeErrorKind::BadValue("fields out of order"),
+            ));
+        }
+        place = next;
+        match field.number {
+            1 => take_req(&mut before, field, AT)?,
+            2 => take_one(&mut standard, field, AT)?,
+            3 => take_req(&mut after, field, AT)?,
+            _ => take_one(&mut url_safe, field, AT)?,
+        }
     }
-    text.push_str(&after.unwrap_or_default());
+    let before = before.unwrap_or_default();
+    let after = after.unwrap_or_default();
+    let (run, alphabet) = match (standard, url_safe) {
+        (Some(_), Some(_)) => return Err(DecodeError::new(AT, DecodeErrorKind::OneofMultiple)),
+        (Some(bytes), None) => (Some(bytes), Alphabet::Standard),
+        (None, Some(bytes)) => (Some(bytes), Alphabet::UrlSafe),
+        (None, None) => (None, Alphabet::Standard),
+    };
+    let mut text = before;
+    let run_start = text.len();
+    if let Some(bytes) = &run {
+        text.push_str(&base64_encode(&bytes.0, alphabet));
+    }
+    let run_end = text.len();
+    text.push_str(&after);
+    // The writer splits the text around its longest base64 run when it has one, and only then,
+    // so any other split is a second encoding of the same text.
+    let canonical = match (longest_base64_run(&text), run) {
+        (None, None) => after.is_empty(),
+        (Some(longest), Some(bytes)) => {
+            longest.alphabet == alphabet
+                && (longest.start, longest.end) == (run_start, run_end)
+                && longest.bytes == bytes.0
+        }
+        _ => false,
+    };
+    if !canonical {
+        return Err(DecodeError::new(
+            AT,
+            DecodeErrorKind::BadValue("opaque text split where the writer wouldn't split it"),
+        ));
+    }
     Ok(text)
 }
 
@@ -325,8 +371,8 @@ impl Value for ModelHandle {
         const AT: &str = "ModelHandle";
         let (mut provider, mut model) = (None, None);
         read_fields(raw, AT, |field| match field.number {
-            1 => take_one(&mut provider, field, AT),
-            2 => take_one(&mut model, field, AT),
+            1 => take_req(&mut provider, field, AT),
+            2 => take_req(&mut model, field, AT),
             _ => skip_unknown(field, AT),
         })?;
         Ok(ModelHandle {
@@ -394,10 +440,10 @@ impl Value for MediaRef {
         let (mut kind, mut mime, mut size, mut sha) = (None, None, None, None);
         let (mut width, mut height) = (None, None);
         read_fields(raw, AT, |field| match field.number {
-            1 => take_one(&mut kind, field, AT),
-            2 => take_one(&mut mime, field, AT),
-            3 => take_one(&mut size, field, AT),
-            4 => take_one(&mut sha, field, AT),
+            1 => take_req(&mut kind, field, AT),
+            2 => take_req(&mut mime, field, AT),
+            3 => take_req(&mut size, field, AT),
+            4 => take_req(&mut sha, field, AT),
             5 => take_one(&mut width, field, AT),
             6 => take_one(&mut height, field, AT),
             _ => skip_unknown(field, AT),
@@ -440,13 +486,13 @@ impl Value for TextProviderState {
         let mut format = None;
         let mut data = None;
         read_fields(raw, AT, |field| match field.number {
-            1 => take_one(&mut format, field, AT),
+            1 => take_req(&mut format, field, AT),
             2 => take_opaque(&mut data, field, AT),
             _ => skip_unknown(field, AT),
         })?;
         Ok(TextProviderState {
             format: finish_req(format, AT)?,
-            data: data.unwrap_or_default(),
+            data: opaque_written(data, AT)?,
         })
     }
 }
@@ -456,11 +502,23 @@ fn take_opaque(
     field: crate::codec::FieldRef<'_>,
     at: &'static str,
 ) -> Result<(), DecodeError> {
+    if field.must {
+        return Err(DecodeError::new(
+            at,
+            DecodeErrorKind::BadValue("must-understand bit on a field declared without it"),
+        ));
+    }
     if slot.is_some() {
         return Err(DecodeError::new(at, DecodeErrorKind::Duplicate));
     }
     *slot = Some(read_opaque(field.raw)?);
     Ok(())
+}
+
+/// An opaque field the writer always writes, even empty: one that is absent wasn't written by
+/// it.
+fn opaque_written(slot: Option<String>, at: &'static str) -> Result<String, DecodeError> {
+    slot.ok_or_else(|| DecodeError::new(at, DecodeErrorKind::Missing))
 }
 
 impl Value for ToolCall {
@@ -485,8 +543,8 @@ impl Value for ToolCall {
         const AT: &str = "ToolCall";
         let (mut id, mut name, mut input, mut signature) = (None, None, None, None);
         read_fields(raw, AT, |field| match field.number {
-            1 => take_one(&mut id, field, AT),
-            2 => take_one(&mut name, field, AT),
+            1 => take_req(&mut id, field, AT),
+            2 => take_req(&mut name, field, AT),
             3 => take_one(&mut input, field, AT),
             4 => take_opaque(&mut signature, field, AT),
             _ => skip_unknown(field, AT),
@@ -517,7 +575,7 @@ impl Value for ToolOutputPart {
             1 => {
                 let mut text = None;
                 read_fields(raw, AT, |field| match field.number {
-                    1 => take_one(&mut text, field, AT),
+                    1 => take_req(&mut text, field, AT),
                     _ => skip_unknown(field, AT),
                 })?;
                 Ok(ToolOutputPart::Text {
@@ -575,7 +633,7 @@ impl Value for ToolOutput {
             1 => {
                 let mut text = None;
                 read_fields(raw, AT, |f| match f.number {
-                    1 => take_one(&mut text, f, AT),
+                    1 => take_req(&mut text, f, AT),
                     _ => skip_unknown(f, AT),
                 })?;
                 Ok(ToolOutput::Text {
@@ -603,7 +661,7 @@ impl Value for ToolOutput {
             4 => {
                 let mut reason = None;
                 read_fields(raw, AT, |f| match f.number {
-                    1 => take_one(&mut reason, f, AT),
+                    1 => take_req(&mut reason, f, AT),
                     _ => skip_unknown(f, AT),
                 })?;
                 Ok(ToolOutput::Denied {
@@ -614,7 +672,7 @@ impl Value for ToolOutput {
                 let (mut message, mut module, mut code) = (None, None, None);
                 let (mut detail, mut nothing_sent, mut retry) = (None, None, None);
                 read_fields(raw, AT, |f| match f.number {
-                    1 => take_one(&mut message, f, AT),
+                    1 => take_req(&mut message, f, AT),
                     2 => take_one(&mut module, f, AT),
                     3 => take_one(&mut code, f, AT),
                     4 => take_one(&mut detail, f, AT),
@@ -656,9 +714,9 @@ impl Value for ToolResult {
         const AT: &str = "ToolResult";
         let (mut id, mut output, mut is_error) = (None, None, None);
         read_fields(raw, AT, |f| match f.number {
-            1 => take_one(&mut id, f, AT),
+            1 => take_req(&mut id, f, AT),
             2 => take_one(&mut output, f, AT),
-            3 => take_one(&mut is_error, f, AT),
+            3 => take_req(&mut is_error, f, AT),
             _ => skip_unknown(f, AT),
         })?;
         Ok(ToolResult {
@@ -688,6 +746,13 @@ fn read_variant<T>(
         return Err(DecodeError::new(
             at,
             DecodeErrorKind::BadValue("variant payload is not a message"),
+        ));
+    }
+    // A variant is written without the must-understand bit.
+    if field.must {
+        return Err(DecodeError::new(
+            at,
+            DecodeErrorKind::BadValue("must-understand bit on a field declared without it"),
         ));
     }
     variant(field.number, field.raw)
@@ -742,7 +807,7 @@ impl Value for ContentBlock {
             2 => {
                 let mut text = None;
                 read_fields(raw, AT, |f| match f.number {
-                    1 => take_one(&mut text, f, AT),
+                    1 => take_req(&mut text, f, AT),
                     _ => skip_unknown(f, AT),
                 })?;
                 Ok(ContentBlock::Text {
@@ -752,7 +817,7 @@ impl Value for ContentBlock {
             3 => {
                 let (mut text, mut state) = (None, None);
                 read_fields(raw, AT, |f| match f.number {
-                    1 => take_one(&mut text, f, AT),
+                    1 => take_req(&mut text, f, AT),
                     2 => take_one(&mut state, f, AT),
                     _ => skip_unknown(f, AT),
                 })?;
@@ -764,7 +829,7 @@ impl Value for ContentBlock {
             4 => {
                 let (mut text, mut signature) = (None, None);
                 read_fields(raw, AT, |f| match f.number {
-                    1 => take_one(&mut text, f, AT),
+                    1 => take_req(&mut text, f, AT),
                     2 => take_opaque(&mut signature, f, AT),
                     _ => skip_unknown(f, AT),
                 })?;
@@ -781,7 +846,7 @@ impl Value for ContentBlock {
                     _ => skip_unknown(f, AT),
                 })?;
                 Ok(ContentBlock::RedactedReasoning {
-                    data: data.unwrap_or_default(),
+                    data: opaque_written(data, AT)?,
                     provider_format: format,
                 })
             }
@@ -790,8 +855,8 @@ impl Value for ContentBlock {
             8 => {
                 let (mut from, mut to, mut fallback_raw) = (None, None, None);
                 read_fields(raw, AT, |f| match f.number {
-                    1 => take_one(&mut from, f, AT),
-                    2 => take_one(&mut to, f, AT),
+                    1 => take_req(&mut from, f, AT),
+                    2 => take_req(&mut to, f, AT),
                     3 => take_one(&mut fallback_raw, f, AT),
                     _ => skip_unknown(f, AT),
                 })?;
@@ -834,9 +899,9 @@ impl Value for Message {
         let (mut role, mut content) = (None, Vec::new());
         let (mut turn_system, mut prefix, mut origin) = (None, None, None);
         read_fields(raw, AT, |f| match f.number {
-            1 => take_one(&mut role, f, AT),
+            1 => take_req(&mut role, f, AT),
             2 => take_rep(&mut content, f, AT),
-            3 => take_one(&mut turn_system, f, AT),
+            3 => take_req(&mut turn_system, f, AT),
             4 => take_one(&mut prefix, f, AT),
             5 => take_one(&mut origin, f, AT),
             _ => skip_unknown(f, AT),

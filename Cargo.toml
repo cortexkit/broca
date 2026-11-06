@@ -30,6 +30,9 @@ members = [
     "crates/broca-session-convert",
     "crates/broca-session-loop",
 ]
+# The session store's fuzz targets build on nightly with cargo-fuzz, in a workspace of their
+# own, so the normal build, the gate and CI never build them.
+exclude = ["crates/broca-session-store/fuzz"]
 
 # broca workspace.
 # - crates/broca-protocol : canonical types ONLY (no IO). The provider<->runner

@@ -72,6 +72,13 @@ impl DataKey {
         Self { id, bytes }
     }
 
+    /// A data key with fixed bytes, so tests and fuzz targets are deterministic. Never in a
+    /// shipping build.
+    #[cfg(any(test, fuzzing))]
+    pub fn from_bytes(id: u16, bytes: [u8; 32]) -> Self {
+        Self { id, bytes }
+    }
+
     /// The frame key that encrypts the session's frames under this data key.
     pub fn frame_key(&self) -> FrameKey {
         FrameKey::new(self.id, &self.bytes)

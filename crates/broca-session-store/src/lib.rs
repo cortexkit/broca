@@ -36,6 +36,10 @@ pub mod damage;
 pub mod directory;
 pub mod fold;
 pub mod frame;
+/// Decode entry points for the fuzz targets in `fuzz/` and the tests that replay their inputs.
+/// Built only for tests and under `cargo fuzz`, which sets `--cfg fuzzing`.
+#[cfg(any(test, fuzzing))]
+pub mod fuzzing;
 pub mod head;
 pub mod idindex;
 pub mod keys;
@@ -45,3 +49,9 @@ pub mod record;
 pub mod segment;
 pub mod session;
 pub mod setup;
+
+// The crate's tests count what each thread allocates, so the fuzzing checks can hold decoders to
+// allocations proportional to their input.
+#[cfg(test)]
+#[global_allocator]
+static ALLOCATOR: fuzzing::CountingAlloc = fuzzing::CountingAlloc;

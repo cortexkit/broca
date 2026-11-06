@@ -291,7 +291,7 @@ impl From<BackendError> for IndexError {
     }
 }
 
-fn aad(session: &Id128, name: &str) -> Vec<u8> {
+pub(crate) fn aad(session: &Id128, name: &str) -> Vec<u8> {
     let mut aad = PAGE_CONTEXT.to_vec();
     aad.extend_from_slice(&session.0);
     aad.extend_from_slice(&(name.len() as u32).to_le_bytes());
@@ -470,6 +470,18 @@ impl<B: SessionBackend> IndexPages<'_, B> {
         at: Version,
         share: u64,
     ) -> Result<Updated, IndexError> {
+        // A merge names the runs it reads by counting from its level's oldest, and a level's runs
+        // stay until its merge finishes, so a count past them wasn't written by this code.
+        if root.levels.iter().any(|level| {
+            level
+                .merge
+                .as_ref()
+                .is_some_and(|merge| merge.inputs as usize > level.runs.len())
+        }) {
+            return Err(IndexError::Corrupt(
+                "index root: a merge counts more runs than its level holds".into(),
+            ));
+        }
         entries.sort_unstable();
         entries.dedup();
         if root.levels.is_empty() {
@@ -586,10 +598,15 @@ impl<B: SessionBackend> IndexPages<'_, B> {
             cursors[at_cursor].advance(self).await?;
         }
         let finished = cursors.iter().all(|cursor| cursor.peek().is_none());
+        // The count so far comes from the stored root, so it is added to with a check, before
+        // anything is written.
+        let written = merge.written.checked_add(out.len() as u64).ok_or_else(|| {
+            IndexError::Corrupt("index root: a merge's count of entries written overflows".into())
+        })?;
         if let Some(info) = self.write_entries(&out, prefix, at).await? {
             merge.done.push(info);
         }
-        merge.written += out.len() as u64;
+        merge.written = written;
         Ok((out.len() as u64, finished))
     }
 

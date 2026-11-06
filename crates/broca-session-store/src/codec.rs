@@ -29,7 +29,13 @@
 //!
 //! Decoding is strict, because stored bytes are also an attack surface for a codec of our own:
 //! a field repeated where one is expected, a known field with the wrong wire type, an invalid
-//! bool or enum value, a truncated payload, an overlong varint and trailing bytes all refuse.
+//! bool or enum value, a truncated payload, an overlong varint and trailing bytes all refuse. So
+//! does anything that would give one value a second encoding: fields out of ascending order, a
+//! known field whose must-understand bit differs from its declaration, a required field written
+//! holding its default, a map entry missing a half, and JSON text other than the compact form the
+//! writer writes. Whatever decodes therefore encodes back to the bytes it was read from, unless it
+//! held an unknown field the reader skipped, or an `f32` NaN, whose payload bits a float
+//! conversion may change (no stored type has an `f32` field).
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -216,10 +222,16 @@ pub struct FieldRef<'a> {
 }
 
 /// Iterates over a message's fields. Stops at the first error, which it yields once.
+///
+/// Writers emit fields in ascending number order, every occurrence of a repeated field together,
+/// so a field numbered below the one before it refuses: bytes in any other order would be a
+/// second encoding of the same value.
 pub struct Fields<'a> {
     data: &'a [u8],
     at: &'static str,
     done: bool,
+    /// The number of the field read last, while the order is checked.
+    last: Option<u32>,
 }
 
 impl<'a> Fields<'a> {
@@ -228,6 +240,16 @@ impl<'a> Fields<'a> {
             data,
             at,
             done: false,
+            last: Some(0),
+        }
+    }
+
+    /// Fields in whatever order they come, for a message whose writer doesn't write them in
+    /// ascending order. Its reader checks the order itself.
+    pub fn any_order(data: &'a [u8], at: &'static str) -> Self {
+        Self {
+            last: None,
+            ..Self::new(data, at)
         }
     }
 
@@ -239,6 +261,16 @@ impl<'a> Fields<'a> {
         let number = key >> 4;
         if number == 0 || number > u64::from(MAX_FIELD_NUMBER) {
             return Err(DecodeError::new(at, DecodeErrorKind::BadKey));
+        }
+        let number = number as u32;
+        if let Some(last) = self.last.as_mut() {
+            if number < *last {
+                return Err(DecodeError::new(
+                    at,
+                    DecodeErrorKind::BadValue("fields out of order"),
+                ));
+            }
+            *last = number;
         }
         let raw = match wire {
             0 => Raw::Varint(take_varint(&mut self.data, at)?),
@@ -262,11 +294,7 @@ impl<'a> Fields<'a> {
             }
             _ => return Err(DecodeError::new(at, DecodeErrorKind::BadKey)),
         };
-        Ok(FieldRef {
-            number: number as u32,
-            must,
-            raw,
-        })
+        Ok(FieldRef { number, must, raw })
     }
 }
 
@@ -401,6 +429,40 @@ pub fn put_map<K: Value + Ord, V: Value>(
 }
 
 // Reading fields. Each decoder keeps one slot per declared field and fills it from `Fields`.
+//
+// Every field read through these functions is declared without the must-understand bit, which
+// is what hand-written decoders and one-of variants declare: a known field carrying the bit
+// wasn't written by a writer of this format. A field declared with it goes through `declared`
+// first.
+
+fn not_must(field: FieldRef<'_>, at: &'static str) -> Result<(), DecodeError> {
+    if field.must {
+        return Err(DecodeError::new(
+            at,
+            DecodeErrorKind::BadValue("must-understand bit on a field declared without it"),
+        ));
+    }
+    Ok(())
+}
+
+/// Checks a known field's must-understand bit against its declaration, and returns the field
+/// ready for the `take_` functions.
+pub fn declared<'a>(
+    field: FieldRef<'a>,
+    must: bool,
+    at: &'static str,
+) -> Result<FieldRef<'a>, DecodeError> {
+    if field.must != must {
+        return Err(DecodeError::new(
+            at,
+            DecodeErrorKind::BadValue("must-understand bit differs from the field's declaration"),
+        ));
+    }
+    Ok(FieldRef {
+        must: false,
+        ..field
+    })
+}
 
 /// Takes a single-valued field into its slot, refusing a second occurrence.
 pub fn take_one<V: Value>(
@@ -408,11 +470,29 @@ pub fn take_one<V: Value>(
     field: FieldRef<'_>,
     at: &'static str,
 ) -> Result<(), DecodeError> {
+    not_must(field, at)?;
     check_wire(field.raw, V::WIRE, at)?;
     if slot.is_some() {
         return Err(DecodeError::new(at, DecodeErrorKind::Duplicate));
     }
     *slot = Some(V::read(field.raw)?);
+    Ok(())
+}
+
+/// Takes a required field into its slot. Writers omit a required field holding its type's
+/// default, so one written with it is a second encoding of the same value and refuses.
+pub fn take_req<V: Value>(
+    slot: &mut Option<V>,
+    field: FieldRef<'_>,
+    at: &'static str,
+) -> Result<(), DecodeError> {
+    take_one(slot, field, at)?;
+    if slot.as_ref().is_some_and(Value::is_default) {
+        return Err(DecodeError::new(
+            at,
+            DecodeErrorKind::BadValue("required field written with its default value"),
+        ));
+    }
     Ok(())
 }
 
@@ -422,6 +502,7 @@ pub fn take_rep<V: Value>(
     field: FieldRef<'_>,
     at: &'static str,
 ) -> Result<(), DecodeError> {
+    not_must(field, at)?;
     check_wire(field.raw, V::WIRE, at)?;
     slot.push(V::read(field.raw)?);
     Ok(())
@@ -433,6 +514,7 @@ pub fn take_map<K: Value + Ord, V: Value>(
     field: FieldRef<'_>,
     at: &'static str,
 ) -> Result<(), DecodeError> {
+    not_must(field, at)?;
     let bytes = len_payload(field.raw, at)?;
     let mut key = None;
     let mut value = None;
@@ -444,8 +526,10 @@ pub fn take_map<K: Value + Ord, V: Value>(
             _ => skip_unknown(entry, at)?,
         }
     }
-    let key = finish_req(key, at)?;
-    let value = finish_req(value, at)?;
+    // Writers write both halves of every entry, defaults included.
+    let (Some(key), Some(value)) = (key, value) else {
+        return Err(DecodeError::new(at, DecodeErrorKind::Missing));
+    };
     // Writers emit keys in order, so anything else was not written by a writer of this format.
     if slot.keys().next_back().is_some_and(|last| *last >= key) {
         return Err(DecodeError::new(
@@ -467,8 +551,24 @@ pub fn skip_unknown(field: FieldRef<'_>, at: &'static str) -> Result<(), DecodeE
             },
         ))
     } else {
+        #[cfg(any(test, fuzzing))]
+        SKIPPED_UNKNOWN.with(|skipped| skipped.set(skipped.get() + 1));
         Ok(())
     }
+}
+
+// Test and fuzzing builds count the unknown fields decoders skip on each thread. Skipping one is
+// the only way bytes may decode without re-encoding to themselves exactly, so the canonical-bytes
+// check (see `crate::fuzzing`) holds a decode to its own bytes only when it skipped none.
+#[cfg(any(test, fuzzing))]
+thread_local! {
+    static SKIPPED_UNKNOWN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many unknown fields decoders have skipped on this thread so far.
+#[cfg(any(test, fuzzing))]
+pub fn skipped_unknown_fields() -> u64 {
+    SKIPPED_UNKNOWN.with(std::cell::Cell::get)
 }
 
 /// A required field's final value: what was read, else the type's default, else an error.
@@ -770,6 +870,8 @@ pub fn hex(bytes: &[u8]) -> String {
 
 /// A JSON value, stored as its serialized text. Decoding parses it back, so the value (and so
 /// everything rendered from it) is identical; serde_json's map is ordered, so the text is too.
+/// Only the compact text the writer writes is accepted: whitespace, escapes or number spellings
+/// it wouldn't write, or keys out of order, would be a second encoding of the same value.
 impl Value for serde_json::Value {
     const WIRE: Wire = Wire::Len;
     const NAME: &'static str = "json";
@@ -778,8 +880,36 @@ impl Value for serde_json::Value {
     }
     fn read(raw: Raw<'_>) -> Result<Self, DecodeError> {
         let bytes = len_payload(raw, Self::NAME)?;
-        serde_json::from_slice(bytes)
-            .map_err(|e| DecodeError::new(Self::NAME, DecodeErrorKind::BadJson(e.to_string())))
+        let value: serde_json::Value = serde_json::from_slice(bytes)
+            .map_err(|e| DecodeError::new(Self::NAME, DecodeErrorKind::BadJson(e.to_string())))?;
+        let mut written = Matches(bytes);
+        if serde_json::to_writer(&mut written, &value).is_err() || !written.0.is_empty() {
+            return Err(DecodeError::new(
+                Self::NAME,
+                DecodeErrorKind::BadValue("JSON text other than its compact form"),
+            ));
+        }
+        Ok(value)
+    }
+}
+
+/// A writer that accepts exactly the bytes it was made with, in order, and fails at the first
+/// byte that differs, so text can be compared with what serializing writes without a copy.
+struct Matches<'a>(&'a [u8]);
+
+impl std::io::Write for Matches<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self.0.strip_prefix(buf) {
+            Some(rest) => {
+                self.0 = rest;
+                Ok(buf.len())
+            }
+            None => Err(std::io::Error::other("differs")),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 

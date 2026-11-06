@@ -272,6 +272,23 @@ fn map_keys_out_of_order_refuse() {
 }
 
 #[test]
+fn a_map_entry_without_its_key_or_value_refuses() {
+    // Writers write both halves of every entry, defaults included, so an entry missing one is a
+    // second encoding of the entry holding the default.
+    let mut value = sample();
+    value.totals = BTreeMap::from([(String::new(), 1)]);
+    let bytes = value.encode();
+    let entry = [0x72, 0x04, 0x12, 0x00, 0x20, 0x01];
+    let at = bytes.windows(6).position(|w| w == entry).unwrap();
+    for half in [[0x72, 0x02, 0x20, 0x01], [0x72, 0x02, 0x12, 0x00]] {
+        let mut missing = bytes.clone();
+        missing.splice(at..at + 6, half);
+        assert!(Sample::decode(&missing).is_err(), "{missing:02x?}");
+    }
+    assert_eq!(Sample::decode(&bytes).unwrap().totals, value.totals);
+}
+
+#[test]
 fn f32_round_trips_exactly_and_refuses_a_wider_value() {
     for value in [0.1f32, -0.0, f32::MAX, f32::MIN_POSITIVE] {
         let mut out = Vec::new();
