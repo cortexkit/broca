@@ -1680,14 +1680,8 @@ thread_local! {
     static AGENT_RUN_WRITER_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Why an episode is being sealed `Interrupted` outside the run loop.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SealCause {
-    /// A graceful stop of a run this process is still running.
-    Shutdown,
-    /// The startup pass sealing a run a crashed process left running: a resume of the episode.
-    CrashOrphan,
-}
+// Why an episode is sealed `Interrupted` outside the run loop, shared with the seal plan.
+use broca_core::resume::SealCause;
 
 /// Whether an unfinished episode a crashed process left behind is sealed `Interrupted` by the
 /// startup crash-orphan pass.
@@ -9330,19 +9324,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
     ) -> Result<bool, String> {
         // Use the terminal's existing diagnostic field without changing its Interrupted reason.
         // Recovery knows the old process left this run unsealed, not how that process ended.
-        let error = (cause == SealCause::CrashOrphan).then(|| ProviderError { provider_details: None, provider_subcode: None,
-        class: broca_protocol::ErrorClass::Transient,
-        message: "the previous broca process ended without sealing this run: host crash, kill, or power loss".into(),
-        provider_code: Some("previous_process_ended_unsealed".into()),
-        status: None,
-        retry_after_secs: None,
-        refusal: None,
-        resets_at_ms: None,
-        resets_at_source: None,
-        limit_window: None,
-        account_ref: None,
-        credential_id: None,
-        affordable_max_tokens: None, });
+        let error = (cause == SealCause::CrashOrphan).then(broca_core::resume::crash_orphan_error);
         self.write_interrupted_seal_with_error(sealed_attempt, cause, error)
             .await
     }
@@ -9452,8 +9434,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 );
             }
         }
-        let held_close_reason = closing.unwrap_or(broca_protocol::RunFinishReason::Interrupted);
-        let seal_reason = held_close_reason;
+        let seal_reason = closing.unwrap_or(broca_protocol::RunFinishReason::Interrupted);
         let deferred_close =
             |id: &broca_protocol::ToolCallId| {
                 if self.executor.elicitation_plane().is_some() {
@@ -9480,55 +9461,35 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 }
                 broca_core::DeferredCloseKind::NotDispatched
             };
-        let close_out = if closing.is_some() {
-            broca_core::resume::close_out_open_batch_for(&prior, held_close_reason, deferred_close)
-        } else {
-            broca_core::close_out_open_batch(&prior, deferred_close)
-        };
         let resuming = cause == SealCause::CrashOrphan;
-        if resuming && !resumed_in_tenure {
-            writer.record(broca_core::resume_started_record(&prior, head, Vec::new()));
+        let seal = broca_core::resume::interrupted_seal(
+            &prior,
+            cause,
+            closing,
+            !held_replies.is_empty(),
+            (resuming && !resumed_in_tenure).then_some(head),
+            error,
+            deferred_close,
+        );
+        if let Some(record) = seal.resume_started {
+            writer.record(record);
         }
-        if !held_replies.is_empty() {
-            // Held close-out records share the terminal's barrier: a committed synthetic batch
-            // without its seal could otherwise read as a natural ending after a crash.
-            for record in close_out {
-                writer.record(record);
-            }
-        } else if !close_out.is_empty() {
-            for record in close_out {
-                writer.record(record);
-            }
+        for record in seal.close_out {
+            writer.record(record);
+        }
+        if seal.close_out_syncs_first {
             // Sync the close-out records that were actually enqueued. If the byte cap
             // rejected later records, leave them unclaimed and still write RunFinished
             // through its reserved space. Recovery only deduplicates records present on disk.
             writer.sync_for_seal().await.map_err(|e| e.to_string())?;
-        } else {
-            // Keep a durable tool turn whose calls were never dispatched as well, sharing
-            // the seal's barrier so it cannot look like a natural ending on its own.
-            for record in broca_core::close_out_pending_turn(&prior) {
-                writer.record(record);
-            }
         }
         let terminal_seq = writer
-            .record_terminal(WalRecord::RunFinished {
-                interrupt_reason: Some(
-                    match cause {
-                        SealCause::CrashOrphan => "runner_crash",
-                        _ => "runner_shutdown",
-                    }
-                    .into(),
+            .record_terminal(
+                seal.terminal.record(
+                    self.retention_timestamp()
+                        .or_else(broca_core::run::epoch_millis),
                 ),
-                reason: seal_reason,
-                // Timestamp this terminal so exported spend belongs to its billing period.
-                // A missing ts_ms becomes NULL occurred_at_ms and is omitted from period totals.
-                ts_ms: self
-                    .retention_timestamp()
-                    .or_else(broca_core::run::epoch_millis),
-                usage: prior.usage,
-                error,
-                retries_used: prior.retries_used,
-            })
+            )
             .map_err(|error| error.to_string())?;
         writer.sync().await.map_err(|e| e.to_string())?;
         broca_core::resume::withdraw_provider_held(
