@@ -2547,12 +2547,17 @@ mod executor {
         outcome: &Result<RunSummary, RunError>,
         wal_store: Arc<dyn WalStore>,
         session: BindIdentity,
+        cached_error: Option<&Option<ProviderError>>,
     ) -> Option<u16> {
         // A provider 401/403 reaches the loop only as an AuthRequired pause or a wire-error
         // terminal. Completed, limited, interrupted, and infrastructure-error outcomes cannot
         // carry a rejected-credential status, so do not replay their entire lineage WAL.
         if !should_check_wire_auth(outcome) {
             return None;
+        }
+        // Some(None) means routing already read an error-free terminal. Do not replay it again.
+        if let Some(error) = cached_error {
+            return error.as_ref().and_then(wire_auth_status);
         }
         terminal_wire_auth_status(wal_store, session).await
     }
@@ -2586,6 +2591,44 @@ mod executor {
             .ok()?
             .ok()?;
         latest_terminal_error(&records).cloned()
+    }
+
+    /// Share the durable terminal's error between routing and vault reporting. API-key auth
+    /// pauses block the rejected key without ending the paused run or releasing its admission.
+    async fn report_routed_terminal_error(
+        reporter: &broca_module_serve::account_routing::RunReporter,
+        selection: Option<&broca_core::AuthSelection>,
+        outcome: &Result<RunSummary, RunError>,
+        wal_store: Arc<dyn WalStore>,
+        session: BindIdentity,
+        terminal: (Option<broca_wal::WalLineageId>, u64),
+    ) -> Option<Option<ProviderError>> {
+        let selection = selection.filter(|selection| {
+            selection.account_decision.as_ref().is_some_and(|decision| {
+                decision.path == broca_wal::ACCOUNT_DECISION_ROUTED
+                    && decision.admission_id.is_some()
+            })
+        })?;
+        let summary = outcome.as_ref().ok()?;
+        let apikey = selection.auth_method.as_deref() == Some("apikey");
+        let finished_error = summary.paused.is_none() && summary.reason == RunFinishReason::Error;
+        if !(finished_error || (apikey && summary.paused == Some(PauseReason::AuthRequired))) {
+            return None;
+        }
+        let error = terminal_provider_error(wal_store, session).await;
+        if let Some(error) = &error {
+            reporter.terminal_credential_refused(
+                terminal.0,
+                terminal.1,
+                error,
+                selection.auth_method.as_deref(),
+                Some(&selection.credential_id),
+            );
+            if apikey && finished_error {
+                reporter.terminal_rate_limit(terminal.0, terminal.1, error);
+            }
+        }
+        Some(error)
     }
 
     /// Return the newest pause/finish record's error without crossing that terminal boundary.
@@ -5132,13 +5175,7 @@ mod executor {
             // Report this run's account evidence to routing when it has an admission id there:
             // every decision path except the `legacy_static` one older builds wrote (the removed
             // operator switch that bypassed routing), fresh or resumed alike.
-            let report_api_key_backoff = resolution.selection.as_ref().is_some_and(|selection| {
-                selection.auth_method.as_deref() == Some("apikey")
-                    && selection.account_decision.as_ref().is_some_and(|decision| {
-                        decision.path == broca_wal::ACCOUNT_DECISION_ROUTED
-                            && decision.admission_id.is_some()
-                    })
-            });
+            let report_selection = resolution.selection.clone();
             let account_reporter = match (
                 self.routing.as_ref(),
                 resolution
@@ -5223,24 +5260,26 @@ mod executor {
                 .await
             };
 
-            // A finished run (not a paused one) has made its terminal durable before the loop
-            // returned, and nothing has been appended since, so the durable head is the
-            // terminal's own sequence number.
+            // The loop made its pause or finish durable and nothing has been appended since:
+            // the durable head names that terminal, including a rejected API key's auth pause.
+            let terminal_error = if let Some(reporter) = &account_reporter {
+                report_routed_terminal_error(
+                    reporter,
+                    report_selection.as_ref(),
+                    &summary,
+                    self.wal_store.clone(),
+                    session.clone(),
+                    (
+                        job.writer.lineage_id(),
+                        job.writer.durable_head().load(Ordering::Acquire),
+                    ),
+                )
+                .await
+            } else {
+                None
+            };
             if let (Some(reporter), Ok(finished)) = (&account_reporter, &summary) {
                 if finished.paused.is_none() {
-                    if report_api_key_backoff
-                        && finished.reason == broca_protocol::RunFinishReason::Error
-                    {
-                        if let Some(error) =
-                            terminal_provider_error(self.wal_store.clone(), session.clone()).await
-                        {
-                            reporter.terminal_rate_limit(
-                                job.writer.lineage_id(),
-                                job.writer.durable_head().load(Ordering::Acquire),
-                                &error,
-                            );
-                        }
-                    }
                     reporter.finish(
                         job.writer.lineage_id(),
                         job.writer.durable_head().load(Ordering::Acquire),
@@ -5274,9 +5313,13 @@ mod executor {
             if let (Some(vault), Some((used_selection, admitted_version))) =
                 (self.vault.as_ref(), used_credential)
             {
-                if let Some(status) =
-                    post_run_wire_auth_status(&summary, self.wal_store.clone(), session.clone())
-                        .await
+                if let Some(status) = post_run_wire_auth_status(
+                    &summary,
+                    self.wal_store.clone(),
+                    session.clone(),
+                    terminal_error.as_ref(),
+                )
+                .await
                 {
                     self.provider_client
                         .chatgpt_connections()
@@ -7040,7 +7083,7 @@ mod executor {
             let outcome = run_outcome(RunFinishReason::Completed, None);
 
             assert_eq!(
-                post_run_wire_auth_status(&outcome, store.clone(), session.clone()).await,
+                post_run_wire_auth_status(&outcome, store.clone(), session.clone(), None).await,
                 None
             );
             assert_eq!(store.full_reads(), 0);
@@ -7064,10 +7107,154 @@ mod executor {
             );
 
             assert_eq!(
-                post_run_wire_auth_status(&outcome, store.clone(), session).await,
+                post_run_wire_auth_status(&outcome, store.clone(), session, None).await,
                 Some(401)
             );
             assert_eq!(store.full_reads(), 1);
+        }
+
+        #[tokio::test]
+        async fn routed_terminal_error_is_reused_for_vault_auth_report() {
+            for error in [Some(err_with_status(Some(401))), None] {
+                let session = BindIdentity::new("/tmp/project", "harness", "session");
+                let store = Arc::new(CountingWalStore::new(vec![run_finished(1, error.clone())]));
+                let outcome = run_outcome(RunFinishReason::Error, None);
+                let cached = terminal_provider_error(store.clone(), session.clone()).await;
+                assert_eq!(store.full_reads(), 1);
+                assert_eq!(
+                    post_run_wire_auth_status(&outcome, store.clone(), session, Some(&cached))
+                        .await,
+                    error.as_ref().and_then(wire_auth_status)
+                );
+                assert_eq!(
+                    store.full_reads(),
+                    1,
+                    "routing and vault share the terminal read"
+                );
+            }
+        }
+
+        struct TerminalRouting {
+            reports: std::sync::Mutex<Vec<serde_json::Value>>,
+            supported: bool,
+        }
+
+        #[async_trait::async_trait]
+        impl broca_module_serve::account_routing::RoutingTransport for TerminalRouting {
+            async fn observe_backoff_supported(&self) -> Result<bool, String> {
+                Ok(true)
+            }
+
+            async fn observe_credential_refused_supported(&self) -> Result<bool, String> {
+                Ok(self.supported)
+            }
+
+            async fn request(
+                &self,
+                body: Vec<u8>,
+            ) -> broca_module_serve::account_routing::RoutingReply {
+                let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                self.reports.lock().unwrap().push(body["params"].clone());
+                Ok(Ok(br#"{"result":{}}"#.to_vec()))
+            }
+        }
+
+        #[tokio::test]
+        async fn routed_apikey_auth_pause_reports_refused_without_finishing() {
+            use broca_module_serve::account_routing::{RoutingClient, RunReporter};
+            use broca_wal::Wal;
+            let mut wal = broca_wal::FileWal::open(broca_test_support::scratch_root().join(
+                format!("credential-refused-lineage-{}.wal", std::process::id()),
+            ))
+            .unwrap();
+            wal.append(1, &auth_pause(1, 401).record, true).unwrap();
+            let lineage = wal.lineage_id().unwrap();
+            for (method, path, admission, supported, expected) in [
+                ("apikey", "routed", Some("adm-key"), true, true),
+                ("apikey", "routed", Some("adm-key"), false, false),
+                ("oauth", "routed", Some("adm-key"), true, false),
+                ("chatgpt", "routed", Some("adm-key"), true, false),
+                ("apikey", "legacy_static", Some("adm-key"), true, false),
+                ("apikey", "routed", None, true, false),
+            ] {
+                // Replaying one pause keeps its id; a later pause in the same lineage gets a new id.
+                for seq in [7, 7, 11] {
+                    let routing = Arc::new(TerminalRouting {
+                        reports: Default::default(),
+                        supported,
+                    });
+                    let reporter = RunReporter::start(
+                        Arc::new(RoutingClient::new(routing.clone(), Default::default())),
+                        "adm-key".into(),
+                        "run-1".into(),
+                        None,
+                        Arc::new(std::sync::atomic::AtomicU64::new(seq)),
+                    );
+                    let selection: broca_core::AuthSelection =
+                        serde_json::from_value(serde_json::json!({
+                            "auth_method":method,"credential_id":"vault-key",
+                            "account_decision":{"path":path,"admission_id":admission}
+                        }))
+                        .unwrap();
+                    let store = Arc::new(CountingWalStore::new(vec![auth_pause(seq, 401)]));
+                    let outcome = run_outcome(
+                        RunFinishReason::Interrupted,
+                        Some(PauseReason::AuthRequired),
+                    );
+                    let session = BindIdentity::new("/tmp/project", "harness", "session");
+                    let cached = report_routed_terminal_error(
+                        &reporter,
+                        Some(&selection),
+                        &outcome,
+                        store.clone(),
+                        session.clone(),
+                        (Some(lineage), seq),
+                    )
+                    .await;
+                    assert_eq!(
+                        store.full_reads(),
+                        usize::from(method == "apikey" && path == "routed" && admission.is_some())
+                    );
+                    if cached.is_some() {
+                        assert_eq!(
+                            post_run_wire_auth_status(
+                                &outcome,
+                                store.clone(),
+                                session,
+                                cached.as_ref()
+                            )
+                            .await,
+                            Some(401)
+                        );
+                        assert_eq!(store.full_reads(), 1);
+                    }
+                    drop(reporter);
+                    broca_test_support::wait_until("auth pause reports drained", || async {
+                        if Arc::strong_count(&routing) == 1 {
+                            Ok(())
+                        } else {
+                            Err("report task still owns routing".into())
+                        }
+                    })
+                    .await;
+                    let reports = routing.reports.lock().unwrap();
+                    assert_eq!(
+                        reports.len(),
+                        usize::from(expected),
+                        "{method}: {path}: {supported}"
+                    );
+                    if expected {
+                        assert_eq!(
+                            reports[0],
+                            serde_json::json!({
+                                "event_id":format!("{lineage}:{seq}:credential_refused"),
+                                "kind":"credential_refused","caller":{"runner":"broca"},
+                                "admission_id":"adm-key","credential_id":"vault-key"
+                            })
+                        );
+                    }
+                }
+            }
         }
 
         #[test]
