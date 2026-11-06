@@ -167,7 +167,8 @@ pub fn run_config<P: Provider>(
 /// What a new episode's run start records beside its request and run control.
 pub struct EpisodeStart {
     pub run_id: RunId,
-    /// Whether the session follows the current compaction contract.
+    /// Whether the session follows the current compaction contract: its first run recorded a
+    /// compaction plan version (`RunStarted.compaction_plan_version`).
     pub mode3: bool,
     /// The cache marker order: the session's, or the current one on a session's first episode.
     pub marker_order_version: Option<u32>,
@@ -282,10 +283,11 @@ pub fn episode_input(
     }
 }
 
-/// On the current compaction contract, the system text a new episode runs with, taken out of
-/// `input`. A frozen plan supplies it. Otherwise it's the text the send supplied, or, when the
-/// send supplied none, the previous episode's. Different text from the previous episode's is
-/// refused, since it would change every later request.
+/// On a session under the current compaction contract (its first run recorded a compaction plan
+/// version), the system text a new episode runs with, taken out of `input`. A frozen plan
+/// supplies it. Otherwise it's the text the send supplied, or, when the send supplied none, the
+/// previous episode's. Different text from the previous episode's is refused, since it would
+/// change every later request.
 pub fn new_episode_globals(
     input: &mut Vec<Message>,
     plan: Option<&PlanManifest>,
@@ -304,9 +306,9 @@ pub fn new_episode_globals(
     Ok(supplied)
 }
 
-/// On a session outside the current compaction contract, the system messages a new episode
-/// appended to the session may carry. A client naturally sends the session's system prompt again
-/// on every turn, so a byte-identical repeat is stripped before it's written, keeping one
+/// On a session whose first run recorded no compaction plan version, the system messages a new
+/// episode appended to the session may carry. A client naturally sends the session's system prompt
+/// again on every turn, so a byte-identical repeat is stripped before it's written, keeping one
 /// instruction and a cache-stable prefix. Every system message renders into the top-level system
 /// field, so all of them must be repeats. A session whose earlier history is an import has no
 /// system prompt of its own yet, and the first client to continue the session sets it. Anything
