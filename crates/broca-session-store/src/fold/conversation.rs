@@ -525,6 +525,9 @@ impl Conversation {
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod generate;
+
 /// Appends `text` to the named result in the newest tool message, if it holds that result.
 /// Delivered text is only ever attached to a result of the batch that just finished.
 fn append_to_newest_result(messages: &mut [Message], id: &ToolCallId, text: &str) {

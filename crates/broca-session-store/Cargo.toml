@@ -27,3 +27,8 @@ sha2.workspace = true
 [dev-dependencies]
 proptest = { version = "1.11", default-features = false, features = ["std"] }
 futures = { workspace = true, features = ["executor"] }
+
+[lints.rust]
+# `cargo fuzz` builds with `--cfg fuzzing`, which exposes the `fuzzing` module to the targets in
+# `fuzz/` (a separate workspace, never built by the normal build).
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }

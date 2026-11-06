@@ -36,6 +36,8 @@ const ZSTD_LEVEL: i32 = 3;
 const UNIT_CONTEXT: &[u8] = b"broca-segment-v1";
 const INDEX_POSITION: u32 = u32::MAX;
 const FOOTER_LEN: usize = 8 + 4 + 4;
+/// The most a block may decompress to.
+pub const MAX_BLOCK: usize = 64 << 20;
 
 crate::message! {
     /// One record inside a block.
@@ -117,7 +119,7 @@ fn stream_code(stream: Stream) -> u32 {
     }
 }
 
-fn unit_aad(header: &[u8], key: &FrameKey, name: &[u8], position: u32) -> Vec<u8> {
+pub(crate) fn unit_aad(header: &[u8], key: &FrameKey, name: &[u8], position: u32) -> Vec<u8> {
     let mut aad = Vec::with_capacity(UNIT_CONTEXT.len() + name.len() + header.len() + 16);
     aad.extend_from_slice(UNIT_CONTEXT);
     aad.extend_from_slice(&key.id().to_le_bytes());
@@ -288,6 +290,14 @@ pub fn build(
     Ok(out)
 }
 
+/// The `len` bytes at `offset` in `bytes`, when they lie inside it. Offsets and lengths come from
+/// stored bytes, so they are checked, never added unchecked.
+fn range(bytes: &[u8], offset: u64, len: u64) -> Option<&[u8]> {
+    let start = usize::try_from(offset).ok()?;
+    let end = start.checked_add(usize::try_from(len).ok()?)?;
+    bytes.get(start..end)
+}
+
 /// A segment opened for reading: its header and index, decrypted. Blocks are read on demand.
 pub struct Segment<'a> {
     bytes: &'a [u8],
@@ -309,8 +319,9 @@ impl<'a> Segment<'a> {
             return Err(SegmentError::Malformed("unknown segment format"));
         }
         let header_len = u32::from_le_bytes(bytes[5..9].try_into().unwrap()) as usize;
-        let header_bytes = bytes
-            .get(9..9 + header_len)
+        let header_bytes = 9usize
+            .checked_add(header_len)
+            .and_then(|end| bytes.get(9..end))
             .ok_or(SegmentError::Malformed("header past the end"))?
             .to_vec();
         let header = SegmentHeader::decode(&header_bytes).map_err(SegmentError::Decode)?;
@@ -318,10 +329,9 @@ impl<'a> Segment<'a> {
         if &footer[12..] != SEGMENT_MAGIC {
             return Err(SegmentError::Malformed("no footer"));
         }
-        let index_offset = u64::from_le_bytes(footer[..8].try_into().unwrap()) as usize;
-        let index_len = u32::from_le_bytes(footer[8..12].try_into().unwrap()) as usize;
-        let sealed = bytes
-            .get(index_offset..index_offset + index_len)
+        let index_offset = u64::from_le_bytes(footer[..8].try_into().unwrap());
+        let index_len = u32::from_le_bytes(footer[8..12].try_into().unwrap());
+        let sealed = range(bytes, index_offset, u64::from(index_len))
             .ok_or(SegmentError::Malformed("index past the end"))?;
         let index = key
             .open_unit(&unit_aad(&header_bytes, key, name, INDEX_POSITION), sealed)
@@ -344,10 +354,7 @@ impl<'a> Segment<'a> {
             .blocks
             .get(position)
             .ok_or(SegmentError::Malformed("no such block"))?;
-        let start = entry.offset as usize;
-        let sealed = self
-            .bytes
-            .get(start..start + entry.len as usize)
+        let sealed = range(self.bytes, entry.offset, entry.len)
             .ok_or(SegmentError::Malformed("block past the end"))?;
         let compressed = self
             .key
@@ -356,8 +363,23 @@ impl<'a> Segment<'a> {
                 sealed,
             )
             .ok_or(SegmentError::Authentication)?;
-        let plain = zstd::bulk::decompress(&compressed, 64 << 20)
+        // The writer's frames state their decompressed size, so a block allocates what it holds;
+        // the largest a block may hold, allocated for every read, would cost 64 MiB a block.
+        let size = match zstd::zstd_safe::get_frame_content_size(&compressed) {
+            Ok(Some(size)) if size <= MAX_BLOCK as u64 => size as usize,
+            _ => {
+                return Err(SegmentError::Compression(
+                    "a block's frame doesn't state a size within the limit".into(),
+                ))
+            }
+        };
+        let plain = zstd::bulk::decompress(&compressed, size)
             .map_err(|e| SegmentError::Compression(e.to_string()))?;
+        if plain.len() != size {
+            return Err(SegmentError::Compression(
+                "a block decompressed to another size than its frame states".into(),
+            ));
+        }
         let body = BlockBody::decode(&plain).map_err(SegmentError::Decode)?;
         if body.records.len() as u64 != entry.records
             || body.records.first().map(|r| r.seq) != Some(entry.first_seq)

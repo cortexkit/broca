@@ -97,7 +97,7 @@ impl From<BackendError> for DirectoryError {
     }
 }
 
-fn aad(session: &Id128, name: &str) -> Vec<u8> {
+pub(crate) fn aad(session: &Id128, name: &str) -> Vec<u8> {
     let mut aad = PAGE_CONTEXT.to_vec();
     aad.extend_from_slice(&session.0);
     aad.extend_from_slice(&(name.len() as u32).to_le_bytes());
@@ -189,6 +189,16 @@ impl<B: SessionBackend> Pages<'_, B> {
         let decoded =
             Page::decode(&plain).map_err(|_| DirectoryError::Corrupt(page.object.clone()))?;
         if decoded.level != page.level {
+            return Err(DirectoryError::Corrupt(page.object.clone()));
+        }
+        // Every child sits one level below its page, so a walk down the tree ends at a leaf. A
+        // page naming itself, or a page at or above it, would make a walk loop forever.
+        let child_level = decoded.level.checked_sub(1);
+        if decoded
+            .children
+            .iter()
+            .any(|child| Some(child.level) != child_level)
+        {
             return Err(DirectoryError::Corrupt(page.object.clone()));
         }
         Ok(decoded)
@@ -429,8 +439,11 @@ impl<B: SessionBackend> Pages<'_, B> {
     ) -> Result<Abandoned, DirectoryError> {
         let mut out = Abandoned::default();
         let mut stack: Vec<PageRef> = old.into_iter().cloned().collect();
+        // A tree names each page once. Pages that name one page many times would otherwise make
+        // the walk read it once per path to it, which grows exponentially with the levels.
+        let mut seen = std::collections::HashSet::new();
         while let Some(page_ref) = stack.pop() {
-            if page_ref.last_seq < cut {
+            if page_ref.last_seq < cut || !seen.insert(page_ref.object.clone()) {
                 continue;
             }
             let page = self.read(&page_ref).await?;

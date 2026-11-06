@@ -15,7 +15,8 @@
 //!
 //! Reading a log reports how it ends:
 //! - **clean:** every batch is complete and every frame authenticates;
-//! - **a torn tail:** the last batch is incomplete, which a crash in the middle of a write leaves;
+//! - **a torn tail:** the last batch is incomplete, which a crash in the middle of a write leaves.
+//!   An empty log is one too: its checkpoint's write, cut short;
 //! - **damage:** a frame that fails its header checksum or authentication, a gap in the frame
 //!   indexes, or a seq or back-link that breaks the chain. Damage is never read as a torn tail.
 //!
@@ -541,6 +542,12 @@ pub fn read(
             damage,
         };
     };
+    if bytes.is_empty() {
+        // A log is created by writing and syncing its checkpoint, so an empty one is that write
+        // cut short: a torn tail at 0, which the durable bound judges, never a clean log.
+        log.end = LogEnd::TornTail { at: 0 };
+        return Ok(log);
+    }
     while offset < bytes.len() {
         let read = frame::open(&bytes[offset..], |id| (id == key.id()).then_some(key), bind);
         let (header, body, len) = match read {
