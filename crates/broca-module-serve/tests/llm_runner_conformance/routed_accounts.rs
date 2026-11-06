@@ -13,7 +13,7 @@ pub(super) fn runner_declaration() -> Value {
 pub(super) fn fixture(method: &str) -> Result<Value, HarnessError> {
     let provider = match method {
         "oauth" => "anthropic",
-        "chatgpt" => "openai",
+        "chatgpt" | "apikey" => "openai",
         _ => {
             return Err(HarnessError::new(format!(
                 "no routed-account fixture for {method}"
@@ -21,7 +21,7 @@ pub(super) fn fixture(method: &str) -> Result<Value, HarnessError> {
         }
     };
     Ok(
-        json!({"provider":provider,"account_id":format!("fixture-{method}"),
+        json!({"provider":provider,"account_id":if method == "apikey" { format!("fixture-credential-{method}") } else { format!("fixture-{method}") },
         "credential_id":format!("fixture-credential-{method}")}),
     )
 }
@@ -33,6 +33,9 @@ pub(super) fn send_fields(
 ) -> Map<String, Value> {
     let mut fields = json!({"model":{"provider":peer.fixture()["provider"],"model":format!("{PLAN_MODEL_PREFIX}{session}")},
         "auth":{"method":peer.method()},"cache":{"key":session}});
+    if peer.method() == "apikey" {
+        fields["auth"]["pool"] = json!("fixture-key-pool");
+    }
     if first {
         fields["system"] = json!(format!("{SESSION_MARKER}{session}"));
     }
@@ -248,13 +251,17 @@ impl subc_client_rs::ModuleHandler for Router {
 
 fn credentials() -> Vec<Value> {
     let mut rows = vec![];
-    for method in ["oauth", "chatgpt"] {
+    for method in ["oauth", "chatgpt", "apikey"] {
         let fixture = fixture(method).unwrap();
         for spare in [false, true] {
-            rows.push(json!({"id":format!("{}{}",fixture["credential_id"].as_str().unwrap(),if spare {"-spare"} else {""}),
-                "categories":["llm-provider"],"type":"oauth","serves":[fixture["provider"]],
+            let mut row = json!({"id":format!("{}{}",fixture["credential_id"].as_str().unwrap(),if spare {"-spare"} else {""}),
+                "categories":["llm-provider"],"type":if method == "apikey" {"apikey"} else {"oauth"},"serves":[fixture["provider"]],
                 "provider_ids":[fixture["provider"]],"auth_method":method,"state":"active","record_version":1,
-                "operations":["read"],"account_id":format!("{}{}",fixture["account_id"].as_str().unwrap(),if spare {"-spare"} else {""})}));
+                "operations":["read"],"account_id":format!("{}{}",fixture["account_id"].as_str().unwrap(),if spare {"-spare"} else {""})});
+            if method == "apikey" {
+                row.as_object_mut().unwrap().remove("account_id");
+            }
+            rows.push(row);
         }
     }
     rows
@@ -536,6 +543,114 @@ fn text_bytes(value: &Value) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cortexkit_role_llm_runner_conformance::ScriptedTurn;
+
+    /// Exercise the routed-account kit obligations without running unrelated crash cases.
+    /// The full kit still uses these same subject hooks and fixture for every listed method.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn routed_accounts_adapter_admits_and_releases_every_declared_method() {
+        for (name, env) in [
+            ("ck-subc", "SUBC_CORE_BIN"),
+            ("fake-aft-stub", "FAKE_AFT_STUB_BIN"),
+        ] {
+            assert!(sibling_bin(name, env).is_file(), "{name} is required");
+        }
+        let scratch = broca_test_support::scratch_root().join("routed-accounts-targeted");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let subject = BrocaSubject::new(&scratch).await;
+        let live = subject.start(&scratch.join("main")).await.unwrap();
+        let response = |reply| match reply {
+            Reply::Response(value) => value,
+            other => panic!("expected response, got {other:?}"),
+        };
+        let declaration = subject.routing_runner_declaration().await.unwrap();
+        assert_eq!(declaration["follows_account_choice"], true);
+        let discovery = broca_wire::broca_role_describe("targeted");
+        let value = serde_json::to_value(discovery).unwrap();
+        let checked = cortexkit_role_llm_runner::describe::check_describe(&value).unwrap();
+        let methods = checked.routed_accounts.unwrap();
+        assert!(methods.iter().any(|method| method == "apikey"));
+        for method in methods {
+            let fixture = subject.routed_account_fixture(&method).await.unwrap();
+            let peer = RecordingRoutingPeer::new(&method, fixture).unwrap();
+            let session = format!("routed-account-targeted-{method}");
+            subject
+                .install_script(
+                    &session,
+                    Script {
+                        turns: vec![ScriptedTurn::new(vec![ScriptedPart::Text(
+                            "routed account accepted".into(),
+                        )])],
+                    },
+                )
+                .await
+                .unwrap();
+            let route = subject
+                .session_route(&live, &session, &subject.owner_stamp())
+                .await
+                .unwrap();
+            subject
+                .install_routing_peer(&session, peer.clone())
+                .await
+                .unwrap();
+            let served = response(route.request("role.describe", json!({})).await.unwrap());
+            assert_eq!(served["routed_accounts"], value["routed_accounts"]);
+            let mut params = subject.send_fields(&session, true);
+            params.insert("prompt".into(), json!("answer briefly"));
+            params.insert("send_id".into(), json!(format!("first-{method}")));
+            let admitted = response(
+                route
+                    .request("session.send", Value::Object(params))
+                    .await
+                    .unwrap(),
+            );
+            let run_id = admitted["run_id"].as_str().unwrap();
+            broca_test_support::wait_until("routed-account completion", || async {
+                let result = response(
+                    route
+                        .request("run.result", json!({"run_id":run_id}))
+                        .await
+                        .unwrap(),
+                );
+                if result["state"] == "completed" {
+                    Ok(())
+                } else {
+                    Err(format!("{result}"))
+                }
+            })
+            .await;
+            let head = response(route.request("session.head", json!({})).await.unwrap());
+            assert_eq!(head["last_run_state"]["run_id"], run_id);
+            assert_eq!(head["last_run_state"]["state"], "completed");
+            assert!(subject.model_invocations(&session).await.unwrap() > 0);
+            broca_test_support::wait_until("routed-account release", || async {
+                let calls = peer.calls();
+                if calls.iter().any(|call| {
+                    call.method == "route.account_observe" && call.body["kind"] == "run_finished"
+                }) {
+                    Ok(calls)
+                } else {
+                    Err(format!("calls: {calls:?}"))
+                }
+            })
+            .await;
+            let calls = peer.calls();
+            let admission = calls
+                .iter()
+                .find(|call| call.method == "route.account_for")
+                .expect("every declared method must admit");
+            assert_eq!(admission.body["mode"], "admit");
+            assert_eq!(admission.body["provider"], peer.fixture()["provider"]);
+            let release = calls
+                .iter()
+                .find(|call| {
+                    call.method == "route.account_observe" && call.body["kind"] == "run_finished"
+                })
+                .unwrap();
+            assert_eq!(release.body["admission_id"], admission.body["admission_id"]);
+            assert!(release.body["event_id"].is_string());
+        }
+    }
 
     struct PeerTransport(RecordingRoutingPeer);
 
@@ -854,20 +969,21 @@ mod tests {
             Vault::request(&json!({"method":"credential.list_scoped"})).unwrap()["result"].clone(),
         )
         .unwrap();
-        for (method, provider, auth) in [
-            ("oauth", "anthropic", broca_catalog::live::AuthMethod::Oauth),
-            (
-                "chatgpt",
-                "openai",
-                broca_catalog::live::AuthMethod::Chatgpt,
-            ),
-        ] {
+        let describe = serde_json::to_value(broca_wire::broca_role_describe("fixtures")).unwrap();
+        let checked = cortexkit_role_llm_runner::describe::check_describe(&describe).unwrap();
+        for method in checked.routed_accounts.unwrap() {
+            let method = method.as_str();
             let ids = fixture(method).unwrap();
-            assert_eq!(ids["provider"], provider);
+            let provider = ids["provider"].as_str().unwrap();
+            let auth = broca_catalog::live::AuthMethod::from_token(method).unwrap();
             assert_eq!(ids.as_object().unwrap().len(), 3);
-            let candidates = broca_module_serve::account_routing::Candidates::from_listing(
-                &listing, auth, provider,
-            );
+            let candidates = if auth == broca_catalog::live::AuthMethod::ApiKey {
+                broca_module_serve::account_routing::Candidates::api_keys(&listing, provider)
+            } else {
+                broca_module_serve::account_routing::Candidates::from_listing(
+                    &listing, auth, provider,
+                )
+            };
             assert_eq!(candidates.distinct_accounts(), 2);
             assert!(candidates.offers(
                 ids["account_id"].as_str().unwrap(),
@@ -877,8 +993,15 @@ mod tests {
             let fields = send_fields("session", true, &peer);
             assert_eq!(fields["auth"]["method"], method);
             assert!(fields["auth"].get("account").is_none());
+            if method == "apikey" {
+                assert_eq!(fields["auth"]["pool"], "fixture-key-pool");
+                assert!(listing
+                    .credentials
+                    .iter()
+                    .filter(|row| row.auth_method.as_deref() == Some(method))
+                    .all(|row| row.account_id.is_none()));
+            }
         }
-        assert!(fixture("apikey").is_err());
         assert!(fixture("antigravity").is_err());
         assert_eq!(runner_declaration()["follows_account_choice"], true);
     }
