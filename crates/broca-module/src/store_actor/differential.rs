@@ -21,7 +21,7 @@ use broca_session_store::backend::MemoryBackend;
 use broca_session_store::session::Session;
 use tokio::sync::{mpsc, Notify};
 
-use super::tests::{actor, auth_failure, executor, request, send_with, texts, Gated};
+use super::tests::{actor, auth_failure, executor, request, send_as, texts, Gated};
 use crate::actor::{LineageStatus, SendKey, SendOutcome};
 use crate::executor::{RunExecutor, RunJob, RunKind};
 use crate::registry::LineageRegistry;
@@ -95,14 +95,19 @@ fn today(steps: Vec<Vec<NormalizedEvent>>, gate: Option<Arc<Notify>>) -> Today {
         },
         wal: Arc::clone(&wal),
     });
-    let registry = LineageRegistry::new(Arc::new(
-        crate::opener::DefaultOpener::new(
-            Arc::new(FileLeaseStore::new(dir.join("leases"))),
-            wal.clone(),
-            executor,
-        )
-        .with_idle_ttl(Duration::from_secs(60)),
-    ));
+    // A reader over the WAL alone: `session.read` serves from the log when no store is given.
+    let registry = LineageRegistry::new_with_reader(
+        Arc::new(
+            crate::opener::DefaultOpener::new(
+                Arc::new(FileLeaseStore::new(dir.join("leases"))),
+                wal.clone(),
+                executor,
+            )
+            .with_idle_ttl(Duration::from_secs(60)),
+        ),
+        wal.clone(),
+        None,
+    );
     let key = BindIdentity::new(dir.join("project"), "store-actor", "s1");
     Today {
         dir,
@@ -113,7 +118,13 @@ fn today(steps: Vec<Vec<NormalizedEvent>>, gate: Option<Arc<Notify>>) -> Today {
 }
 
 impl Today {
-    async fn send(&self, run_id: &str, request: SubmissionRequest, key: SendKey) -> SendOutcome {
+    async fn send(
+        &self,
+        run_id: &str,
+        request: SubmissionRequest,
+        key: SendKey,
+        delivery: broca_protocol::Delivery,
+    ) -> SendOutcome {
         self.registry
             .route_submission_with_order(
                 &self.key,
@@ -122,7 +133,7 @@ impl Today {
                 RunKind::FreshOrResume,
                 key,
                 false,
-                broca_protocol::Delivery::Queue,
+                delivery,
                 None,
                 None,
                 None,
@@ -178,35 +189,35 @@ impl Today {
             .collect()
     }
 
-    /// The text of every user input and assistant message today's log recorded, in order, as
-    /// [`texts`] reads the store session's conversation.
-    fn texts(&self) -> Vec<String> {
-        use broca_wal::WalRecord;
-        let text = |content: &[ContentBlock]| -> Vec<String> {
-            content
-                .iter()
-                .filter_map(|block| match block {
-                    ContentBlock::Text { text } => Some(text.clone()),
-                    _ => None,
-                })
-                .collect()
-        };
+    /// The text of every message today's served history holds, in order, as [`texts`] reads
+    /// the store session's conversation. Read through `session.read`'s own path, so a steer or a
+    /// queued send lands where today's actor places it.
+    async fn texts(&self) -> Vec<String> {
         let mut out = Vec::new();
-        for frame in self.wal.read_records(&self.key).unwrap() {
-            match frame.record {
-                WalRecord::RunStarted { input, .. } => {
-                    out.extend(input.iter().flat_map(|message| text(&message.content)));
-                }
-                WalRecord::SendDelivered {
-                    input: Some(input), ..
-                } => out.extend(input.iter().flat_map(|message| text(&message.content))),
-                WalRecord::ModelStepFinished {
-                    assistant_message, ..
-                } => out.extend(text(&assistant_message.content)),
-                _ => {}
+        let mut from = None;
+        loop {
+            let page = self
+                .registry
+                .route_read(&self.key, from, None)
+                .await
+                .expect("today's session reads");
+            for message in &page.messages {
+                out.extend(
+                    message
+                        .message
+                        .content
+                        .iter()
+                        .filter_map(|block| match block {
+                            ContentBlock::Text { text } => Some(text.clone()),
+                            _ => None,
+                        }),
+                );
+            }
+            match page.next_from_ordinal {
+                Some(next) if !page.messages.is_empty() => from = Some(next),
+                _ => return out,
             }
         }
-        out
     }
 }
 
@@ -228,6 +239,7 @@ enum Step {
         route_decision: Option<&'static str>,
         /// Changes the request before it is sent, the same on both sides.
         tweak: Option<fn(&mut SubmissionRequest)>,
+        delivery: broca_protocol::Delivery,
         expect: Expect,
     },
     /// Lets the gated first model step through on both sides.
@@ -243,6 +255,7 @@ fn send(run_id: &'static str, text: &'static str) -> Step {
         key: None,
         route_decision: None,
         tweak: None,
+        delivery: broca_protocol::Delivery::Queue,
         expect: Expect::Same,
     }
 }
@@ -256,6 +269,7 @@ fn keyed(key: &'static str, text: &'static str) -> Step {
         key: Some(key),
         route_decision: None,
         tweak: None,
+        delivery: broca_protocol::Delivery::Queue,
         expect: Expect::Same,
     }
 }
@@ -270,6 +284,13 @@ fn expecting(mut step: Step, expected: Expect) -> Step {
 fn routed(mut step: Step, decision: &'static str) -> Step {
     if let Step::Send { route_decision, .. } = &mut step {
         *route_decision = Some(decision);
+    }
+    step
+}
+
+fn steered(mut step: Step) -> Step {
+    if let Step::Send { delivery, .. } = &mut step {
+        *delivery = broca_protocol::Delivery::Steer;
     }
     step
 }
@@ -298,6 +319,7 @@ async fn compare(script: Vec<Vec<NormalizedEvent>>, gated: bool, steps: Vec<Step
                 key,
                 route_decision,
                 tweak,
+                delivery,
                 expect,
             } => {
                 let mut sent = request(text);
@@ -309,8 +331,8 @@ async fn compare(script: Vec<Vec<NormalizedEvent>>, gated: bool, steps: Vec<Step
                     Some(key) => SendKey::SendId(key.into()),
                     None => SendKey::Minted,
                 };
-                let old = today.send(run_id, sent.clone(), send_key()).await;
-                let new = send_with(&commands, run_id, sent, send_key()).await;
+                let old = today.send(run_id, sent.clone(), send_key(), delivery).await;
+                let new = send_as(&commands, run_id, sent, send_key(), delivery).await;
                 match expect {
                     Expect::Same => assert_eq!(new, old, "step {index}: replies differ"),
                     Expect::StoreRefuses(what) => {
@@ -341,7 +363,11 @@ async fn compare(script: Vec<Vec<NormalizedEvent>>, gated: bool, steps: Vec<Step
     drop(commands);
     let session: Session<&'static MemoryBackend> = served.await.unwrap();
     if all_same {
-        assert_eq!(texts(&session), today.texts(), "the conversations differ");
+        assert_eq!(
+            texts(&session),
+            today.texts().await,
+            "the conversations differ"
+        );
         assert_eq!(
             store_starts(&session).await,
             today.starts(),
@@ -598,6 +624,75 @@ async fn a_sends_principal_is_recorded_alike() {
             Step::Release,
             Step::Release,
             Step::Idle,
+        ],
+    )
+    .await;
+}
+
+/// A steer while a run runs joins it, answered `active` naming that run, and the run answers it
+/// at its next step, alike.
+#[tokio::test]
+async fn a_steer_joins_the_running_run_alike() {
+    compare(
+        hello(),
+        true,
+        vec![
+            send("r1", "first"),
+            steered(send("s1", "steered")),
+            Step::Release,
+            Step::Release,
+            Step::Idle,
+        ],
+    )
+    .await;
+}
+
+fn another_model(request: &mut SubmissionRequest) {
+    request.model = broca_protocol::request::ModelHandle::new("stub", "another");
+}
+
+/// A steer naming a model the running run didn't freeze is refused naming it, alike.
+#[tokio::test]
+async fn a_steer_with_another_model_is_refused_alike() {
+    compare(
+        hello(),
+        true,
+        vec![
+            send("r1", "first"),
+            tweaked(steered(send("s1", "steered")), another_model),
+            Step::Release,
+            Step::Idle,
+        ],
+    )
+    .await;
+}
+
+/// A steer on an idle session starts a run of its own, and a keyed one records its key, alike.
+#[tokio::test]
+async fn a_steer_on_an_idle_session_starts_a_run_alike() {
+    compare(
+        hello(),
+        false,
+        vec![
+            steered(send("s1", "steered")),
+            Step::Idle,
+            steered(keyed("k1", "again")),
+            Step::Idle,
+        ],
+    )
+    .await;
+}
+
+/// A steer behind a run paused for sign-in is refused naming that run, alike.
+#[tokio::test]
+async fn a_steer_behind_a_sign_in_pause_is_refused_alike() {
+    compare(
+        vec![auth_failure()],
+        false,
+        vec![
+            keyed("k1", "first"),
+            Step::Idle,
+            steered(send("s1", "steered")),
         ],
     )
     .await;

@@ -3,7 +3,7 @@ use broca_protocol::{BindPrincipal, SubmissionId};
 use broca_session_store::record::Record;
 use broca_wal::{FramedRecord, WalRecord};
 
-use super::{queued_send, request_of, Queued, Receipt};
+use super::{queued_send, request_of, steer, Queued, Receipt, SteerReceipt};
 use crate::parts::MemoryParts;
 
 fn request() -> SubmissionRequest {
@@ -103,4 +103,54 @@ fn a_queued_send_rebuilds_its_request() {
         serde_json::to_value(request_of(&send, &parts).unwrap()).unwrap(),
         serde_json::to_value(request()).unwrap()
     );
+}
+
+/// The record the store actor writes for a steer is the record the converter makes of today's
+/// `Steered` record for the same steer.
+#[test]
+fn a_steer_is_the_record_the_converter_makes_of_todays() {
+    let input = request().input;
+    let receipt = SteerReceipt {
+        sent_by: Some(BindPrincipal::Reserved {
+            module_id: "prefrontal-core".into(),
+        }),
+        send_id: Some("k1".into()),
+        request_identity_digest: Some("digest".into()),
+        title: Some("a title".into()),
+        delivery: Some(broca_protocol::Delivery::Steer),
+        ..SteerReceipt::default()
+    };
+    let built = steer(input.clone(), Some(1_000), &receipt).unwrap();
+    let today = WalRecord::Steered {
+        sent_by: receipt.sent_by.clone(),
+        written_at_ms: Some(1_000),
+        tags: None,
+        retention: None,
+        ts_ms: None,
+        send_id: receipt.send_id.clone(),
+        request_identity_digest: receipt.request_identity_digest.clone(),
+        title: receipt.title.clone(),
+        delivery: receipt.delivery,
+        input: std::sync::Arc::new(input),
+        hooks: None,
+    };
+    let converted = broca_session_convert::convert(
+        &[FramedRecord {
+            seq: 1,
+            fence: 0,
+            record: today,
+        }],
+        None,
+    )
+    .unwrap();
+    let converted_steer = converted
+        .records
+        .iter()
+        .find_map(|record| match record {
+            Record::Steer(steer) => Some(steer.clone()),
+            _ => None,
+        })
+        .expect("the converter makes a steer");
+    assert_eq!(built, converted_steer);
+    assert!(converted.lost.is_empty(), "{:?}", converted.lost);
 }

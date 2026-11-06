@@ -236,6 +236,24 @@ pub(super) async fn send_with(
     request: SubmissionRequest,
     key: SendKey,
 ) -> SendOutcome {
+    send_as(
+        commands,
+        run_id,
+        request,
+        key,
+        broca_protocol::Delivery::Queue,
+    )
+    .await
+}
+
+/// A send with the delivery mode `delivery`.
+pub(super) async fn send_as(
+    commands: &mpsc::UnboundedSender<LineageCmd>,
+    run_id: &str,
+    request: SubmissionRequest,
+    key: SendKey,
+    delivery: broca_protocol::Delivery,
+) -> SendOutcome {
     let (reply, answer) = oneshot::channel();
     commands
         .send(LineageCmd::Send {
@@ -249,7 +267,7 @@ pub(super) async fn send_with(
             kind: RunKind::FreshOrResume,
             key,
             skip_materialization: false,
-            delivery: broca_protocol::Delivery::Queue,
+            delivery,
             plan: None,
             order: None,
             reply,
@@ -835,4 +853,83 @@ async fn a_refused_queued_send_ends_and_the_next_one_runs() {
         .expect("the refused send's retraction carries its refusal");
     assert_eq!(failure["run_id"], "r2");
     assert!(session.operations().queue.is_empty());
+}
+
+/// A steer while a run runs joins it: it is answered `active` naming that run, and the run places
+/// it at its next step boundary, taking one more step to answer it.
+#[tokio::test]
+async fn a_steer_joins_the_running_run() {
+    let gate = Arc::new(Notify::new());
+    let (commands, served, _) = actor(executor(
+        vec![text_step("a1", "hello"), text_step("a2", "again")],
+        Some(Arc::clone(&gate)),
+    ))
+    .await;
+    assert!(matches!(
+        send(&commands, "r1", "first").await,
+        SendOutcome::Active { .. }
+    ));
+    assert_eq!(
+        send_as(
+            &commands,
+            "s1",
+            request("steered"),
+            SendKey::Minted,
+            broca_protocol::Delivery::Steer
+        )
+        .await,
+        SendOutcome::Active {
+            run_id: RunId("r1".into()),
+            delivered: None
+        }
+    );
+    gate.notify_one();
+    gate.notify_one();
+    idle(&commands).await;
+    drop(commands);
+    let session = served.await.unwrap();
+    assert_eq!(texts(&session), ["first", "hello", "steered", "again"]);
+    assert_eq!(starts(&session).await, 1, "the steer joined the run");
+    let run = session.operations().run.as_ref().unwrap();
+    assert_eq!(run.completed_steps, 2);
+}
+
+/// A steer naming a setting the running run froze otherwise is refused naming it, and writes
+/// nothing.
+#[tokio::test]
+async fn a_steer_with_another_model_is_refused_naming_it() {
+    let gate = Arc::new(Notify::new());
+    let (commands, served, _) = actor(executor(
+        vec![text_step("a1", "hello")],
+        Some(Arc::clone(&gate)),
+    ))
+    .await;
+    assert!(matches!(
+        send(&commands, "r1", "first").await,
+        SendOutcome::Active { .. }
+    ));
+    let mut other = request("steered");
+    other.model = broca_protocol::request::ModelHandle::new("stub", "another");
+    assert_eq!(
+        send_as(
+            &commands,
+            "s1",
+            other,
+            SendKey::Minted,
+            broca_protocol::Delivery::Steer
+        )
+        .await,
+        SendOutcome::SteerSettingsConflict { field: "model" }
+    );
+    gate.notify_one();
+    idle(&commands).await;
+    drop(commands);
+    let session = served.await.unwrap();
+    assert_eq!(texts(&session), ["first", "hello"]);
+    assert!(!session
+        .open_log_records()
+        .await
+        .unwrap()
+        .iter()
+        .any(|(_, record)| matches!(record, Record::Steer(_))));
 }

@@ -890,7 +890,7 @@ fn frozen_admission(
 
 /// The admission a run's start froze: its model, settings, tools and system text, read back from
 /// the setup parts the start names.
-pub(crate) fn admission_of_start(
+pub fn admission_of_start(
     start: &broca_session_store::record::RunStart,
     parts: &dyn Parts,
 ) -> Result<Admission, LoopError> {

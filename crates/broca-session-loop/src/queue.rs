@@ -1,5 +1,6 @@
 //! A queued send in the store's shape: built from the request a caller sent, and rebuilt into
-//! that request when the send drains into a run or a retry is compared with it.
+//! that request when the send drains into a run or a retry is compared with it. Also a steer's
+//! record, which keeps its messages and a receipt the same way.
 //!
 //! The record splits the request the way the converter splits today's `Queued` record, so a
 //! send queued by the store actor and one converted from today's log are the same record:
@@ -8,7 +9,7 @@
 //! digest and so on) is the record's receipt.
 
 use broca_protocol::request::SubmissionRequest;
-use broca_session_store::record::{PartKind, QueuedSend};
+use broca_session_store::record::{PartKind, QueuedSend, Steer};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -114,6 +115,47 @@ pub fn request_of(send: &QueuedSend, parts: &dyn Parts) -> Result<SubmissionRequ
         }
     }
     serde_json::from_value(Value::Object(request)).map_err(json)
+}
+
+/// Today's `Steered` record's fields beside its messages, time and part numbers, under the same
+/// names. Each is left out when absent, as today's record leaves it out.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SteerReceipt {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sent_by: Option<broca_protocol::BindPrincipal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retention: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ts_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub send_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_identity_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<broca_protocol::Delivery>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hooks: Option<Box<broca_wal::Hooks>>,
+}
+
+/// The record of a steer into a running run: its messages, accepted at `written_at_ms`. The run
+/// places them at its next step boundary, so the record carries no part numbers yet.
+pub fn steer(
+    input: Vec<broca_protocol::Message>,
+    written_at_ms: Option<u64>,
+    receipt: &SteerReceipt,
+) -> Result<Steer, String> {
+    let receipt = match serde_json::to_value(receipt).map_err(|e| format!("a steer: {e}"))? {
+        Value::Object(receipt) if receipt.is_empty() => None,
+        receipt => Some(receipt),
+    };
+    Ok(Steer {
+        input,
+        written_at_ms,
+        tags_v1: None,
+        receipt,
+    })
 }
 
 /// The receipt field `name` of `send`, if its receipt has it.

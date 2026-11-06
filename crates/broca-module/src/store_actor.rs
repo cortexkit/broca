@@ -13,6 +13,7 @@
 //!   payload under a used key, refused naming what differs;
 //! - a send while the latest run is running or paused, queued durably and started when that run
 //!   ends, and a queued send's retry;
+//! - a steer into the running run, placed at its next step boundary;
 //! - the session's status;
 //! - cancelling the active run, now or at its next step boundary;
 //! - going away when idle.
@@ -178,7 +179,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             LineageCmd::Send {
                 session_class,
                 retention,
-                stop_sequences_named: _,
+                stop_sequences_named,
                 conversation_key,
                 title,
                 run_id,
@@ -195,8 +196,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                     Some("a send carrying a fetch plan")
                 } else if order.is_some() {
                     Some("an ordered delivery")
-                } else if delivery != broca_protocol::Delivery::Queue {
-                    Some("a steer or interrupt")
+                } else if delivery == broca_protocol::Delivery::Interrupt {
+                    Some("an interrupt")
                 } else if conversation_key.is_some() {
                     // Routing reads it when it picks the run's account, which a store session's
                     // runs don't do yet.
@@ -259,11 +260,14 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                     return false;
                 }
                 let request = *request;
+                let steering = delivery == broca_protocol::Delivery::Steer;
                 // Today's actor lets a plain send leave its model to the session only when a
                 // plan selected the session's next-run model, and a store session has no plan.
-                if request
-                    .inherit_frozen
-                    .contains(&broca_protocol::request::InheritedParam::Model)
+                // A steer may leave it: it joins a run whose model is already frozen.
+                if !steering
+                    && request
+                        .inherit_frozen
+                        .contains(&broca_protocol::request::InheritedParam::Model)
                 {
                     let _ = reply.send(SendOutcome::DeliveryRefused {
                         code: "invalid_params",
@@ -275,20 +279,34 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                     return false;
                 }
                 // A run paused for sign-in or an account limit still owns the session: today's
-                // actor neither queues another send behind it nor drives it again for one.
+                // actor neither queues another send behind it nor drives it again for one. A
+                // steer can join no paused run but one paused for a restart, which today's actor
+                // steers into; this actor doesn't resume such a run, so it refuses that steer.
                 if self.run.is_none() {
-                    if let Some((paused, reason)) = self.paused().filter(|(_, reason)| {
-                        matches!(
-                            reason,
+                    if let Some((paused, reason)) = self.paused() {
+                        let refusal = match reason {
+                            broca_protocol::PauseReason::Restart if steering => {
+                                Some(SendOutcome::Error(unserved(
+                                    "a steer into a run paused for a restart",
+                                )))
+                            }
                             broca_protocol::PauseReason::AuthRequired
-                                | broca_protocol::PauseReason::AccountLimit
-                        )
-                    }) {
-                        let _ = reply.send(SendOutcome::RunPaused {
-                            run_id: paused,
-                            reason,
-                        });
-                        return false;
+                            | broca_protocol::PauseReason::AccountLimit => {
+                                Some(SendOutcome::RunPaused {
+                                    run_id: paused,
+                                    reason,
+                                })
+                            }
+                            _ if steering => Some(SendOutcome::RunPaused {
+                                run_id: paused,
+                                reason,
+                            }),
+                            _ => None,
+                        };
+                        if let Some(refusal) = refusal {
+                            let _ = reply.send(refusal);
+                            return false;
+                        }
                     }
                 }
                 let start = Start {
@@ -299,8 +317,11 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                     send_id: key.send_id().map(str::to_owned),
                     identity,
                 };
-                if self.running().is_some() {
-                    let outcome = self.queue(start).await;
+                if steering && self.run.is_some() {
+                    let outcome = self.steer(start, stop_sequences_named).await;
+                    let _ = reply.send(outcome);
+                } else if self.running().is_some() {
+                    let outcome = self.queue(start, delivery).await;
                     let _ = reply.send(outcome);
                 } else if !self.session.operations().queue.is_empty() {
                     // The queue drains at a run's end, so an idle session with sends still queued
@@ -763,10 +784,80 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             }))
     }
 
+    /// Joins `start` to the running run as a steer, as today's actor steers it: refused when it
+    /// names a setting the run froze otherwise, and queued as a steer when the run has already
+    /// written its end. Otherwise its record is written, durable before the reply, and the run
+    /// places its messages at its next step boundary. The actor writes nothing while the run
+    /// builds a batch, so the run either takes the steer or has ended before it.
+    async fn steer(&mut self, start: Start, stop_sequences_named: bool) -> SendOutcome {
+        let Some(active) = self.run.as_ref().map(|active| active.run_id.clone()) else {
+            return SendOutcome::Error("a steer needs a running run".into());
+        };
+        let run = self.session.operations().run.as_ref();
+        if run.is_some_and(|run| run.finished.is_some()) {
+            return self.queue(start, broca_protocol::Delivery::Steer).await;
+        }
+        let Some(run_start) = run.and_then(|run| run.start.as_ref()) else {
+            return SendOutcome::Transient("the running run has no start yet".into());
+        };
+        // This reads the run's start: a refreeze (`ConfigRefrozen`, `AuthRefrozen`) is written
+        // only when a paused run resumes, which this actor doesn't do.
+        let frozen = match broca_session_loop::run::admission_of_start(run_start, &self.parts) {
+            Ok(frozen) => frozen,
+            Err(error) => return SendOutcome::Error(format!("{error:?}")),
+        };
+        let settings = crate::actor::SteerFrozen {
+            model: &frozen.model,
+            variant: frozen.variant.as_deref(),
+            generation: &frozen.generation,
+            stop_when: &frozen.stop_when,
+            directives: frozen.directives.as_deref(),
+            auth_selection: frozen.auth_selection.as_ref(),
+        };
+        if let Some(field) =
+            crate::actor::steer_settings_conflict(&start.request, settings, stop_sequences_named)
+        {
+            return SendOutcome::SteerSettingsConflict { field };
+        }
+        // The running run already has its system prompt; a steer adds conversation only.
+        let input = start
+            .request
+            .input
+            .iter()
+            .filter(|message| message.role != broca_protocol::content::Role::System)
+            .cloned()
+            .collect();
+        let receipt = queue::SteerReceipt {
+            sent_by: start.sent_by,
+            send_id: start.send_id,
+            request_identity_digest: start.identity,
+            title: start.title,
+            delivery: Some(broca_protocol::Delivery::Steer),
+            ..queue::SteerReceipt::default()
+        };
+        let record = match queue::steer(input, broca_core::run::epoch_millis(), &receipt) {
+            Ok(steer) => Record::Steer(steer),
+            Err(error) => return SendOutcome::Error(error),
+        };
+        match Writer::append(&mut self.session, std::slice::from_ref(&record), true).await {
+            Ok(seq) => {
+                if let Some(running) = self.run.as_mut() {
+                    running.link.note_own(seq, &[record]);
+                }
+            }
+            Err(error) => return SendOutcome::Error(format!("{error:?}")),
+        }
+        SendOutcome::Active {
+            run_id: active,
+            delivered: None,
+        }
+    }
+
     /// Queues `start` behind the latest run, which is running or paused, as today's actor
     /// queues it: durable before the reply, which is `pending`. A retry of a send still queued
-    /// is compared with its record instead.
-    async fn queue(&mut self, start: Start) -> SendOutcome {
+    /// is compared with its record instead. A steer queues with its mode, which today's queued
+    /// record keeps; a plain send's record names none.
+    async fn queue(&mut self, start: Start, delivery: broca_protocol::Delivery) -> SendOutcome {
         let Start {
             run_id,
             request,
@@ -783,6 +874,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                     &existing,
                     request,
                     identity.as_deref(),
+                    delivery,
                     &self.parts,
                     submission_id,
                 )
@@ -798,6 +890,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         };
         let at = queue::Queued {
             written_at_ms: broca_core::run::epoch_millis(),
+            delivery: (delivery != broca_protocol::Delivery::Queue).then_some(delivery),
             ..queue::Queued::default()
         };
         let record = match queue::queued_send(
@@ -859,6 +952,7 @@ fn retry_of_queued(
     existing: &QueuedSend,
     mut request: SubmissionRequest,
     identity: Option<&str>,
+    delivery: broca_protocol::Delivery,
     parts: &dyn Parts,
     submission_id: broca_protocol::SubmissionId,
 ) -> SendOutcome {
@@ -866,7 +960,12 @@ fn retry_of_queued(
     if queue::receipt_field(existing, "conversation_key").is_some() {
         return reuse("conversation_key");
     }
-    if existing.delivery.is_some() {
+    // A plain send's record names no mode, as `queue` writes it.
+    let mode = (delivery != broca_protocol::Delivery::Queue)
+        .then(|| serde_json::to_value(delivery).ok())
+        .flatten()
+        .and_then(|mode| mode.as_str().map(str::to_owned));
+    if existing.delivery != mode {
         return reuse("delivery");
     }
     let stored = queue::receipt_field(existing, "request_identity_digest")
