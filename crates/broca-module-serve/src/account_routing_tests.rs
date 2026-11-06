@@ -49,6 +49,7 @@ const NOW: i64 = 1_790_683_200_000;
 #[derive(Default)]
 struct FakeRouting {
     requests: Mutex<Vec<Value>>,
+    request_bytes: Mutex<Vec<Vec<u8>>>,
     reply: Mutex<Option<RoutingReply>>,
     /// Never answer, as a hung routing module would.
     hang: bool,
@@ -56,6 +57,7 @@ struct FakeRouting {
     tiers: bool,
     tier_probes: AtomicUsize,
     backoff: bool,
+    credential_refused: bool,
 }
 
 impl FakeRouting {
@@ -120,6 +122,9 @@ impl FakeRouting {
 
 #[async_trait::async_trait]
 impl RoutingTransport for FakeRouting {
+    async fn observe_credential_refused_supported(&self) -> Result<bool, String> {
+        Ok(self.credential_refused)
+    }
     async fn observe_backoff_supported(&self) -> Result<bool, String> {
         Ok(self.backoff)
     }
@@ -128,6 +133,7 @@ impl RoutingTransport for FakeRouting {
         Ok(self.tiers)
     }
     async fn request(&self, body: Vec<u8>) -> RoutingReply {
+        self.request_bytes.lock().unwrap().push(body.clone());
         self.requests
             .lock()
             .unwrap()
@@ -2221,6 +2227,261 @@ async fn terminal_apikey_backoff_requires_a_timed_rate_limit() {
         .await;
         assert_eq!(reports.len(), 2);
     }
+}
+
+async fn terminal_credential_reports(
+    error: broca_protocol::ProviderError,
+    method: &str,
+    credential_id: Option<&str>,
+) -> Vec<Value> {
+    let routing = Arc::new(FakeRouting {
+        backoff: true,
+        credential_refused: true,
+        ..FakeRouting::default()
+    });
+    let reporter = RunReporter::start(
+        Arc::new(client(&routing)),
+        "adm-refused".into(),
+        "run-refused".into(),
+        None,
+        Arc::new(AtomicU64::new(10)),
+    );
+    let lineage = lineage();
+    broca_core::AccountReporter::run_started(reporter.as_ref(), Some(lineage), 1);
+    let observation = AttemptAccountObservation {
+        limit: error
+            .is_account_limit_exhausted()
+            .then(|| AttemptAccountLimit {
+                disposition: broca_protocol::provider::AccountLimitDisposition::ACCOUNT,
+                observed_at_ms: NOW as u64,
+                resets_at_ms: Some((NOW + 60_000) as u64),
+                resets_at_source: Some("header".into()),
+                limit_window: None,
+            }),
+        ..Default::default()
+    };
+    broca_core::AccountReporter::attempt_recorded(
+        reporter.as_ref(),
+        Some(lineage),
+        2,
+        &attempt(error.status, observation),
+    );
+    reporter.terminal_credential_refused(Some(lineage), 3, &error, Some(method), credential_id);
+    if method == "apikey" {
+        reporter.terminal_rate_limit(Some(lineage), 3, &error);
+    }
+    reporter.finish(Some(lineage), 3, RunFinishReason::Error);
+    broca_test_support::wait_until("credential refusal release report", || async {
+        let reports = routing.observed();
+        if reports
+            .last()
+            .is_some_and(|body| body["kind"] == "run_finished")
+        {
+            Ok(reports)
+        } else {
+            Err(format!("reports: {reports:?}"))
+        }
+    })
+    .await
+}
+
+fn terminal_error(extra: Value) -> broca_protocol::ProviderError {
+    let mut error = json!({"class":"permanent","message":"refused"});
+    error
+        .as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().unwrap().clone());
+    serde_json::from_value(error).unwrap()
+}
+
+#[tokio::test]
+async fn credential_refused_billing_precedes_finish_for_every_routed_method() {
+    for method in ["apikey", "oauth", "chatgpt"] {
+        for code in [
+            "billing_exhausted",
+            "credit_insufficient",
+            "account_not_entitled",
+            "usage_not_included",
+        ] {
+            let reports = terminal_credential_reports(
+                terminal_error(json!({"provider_code":code,"status":402,"retry_after_secs":60.0})),
+                method,
+                Some("vault-key"),
+            )
+            .await;
+            assert_eq!(
+                reports
+                    .iter()
+                    .map(|body| body["kind"].clone())
+                    .collect::<Vec<_>>(),
+                vec![
+                    json!("admission_started"),
+                    json!("attempt"),
+                    json!("credential_refused"),
+                    json!("run_finished")
+                ],
+                "{method}: {code}"
+            );
+            assert_eq!(reports[2]["admission_id"], "adm-refused");
+            assert_eq!(reports[2]["credential_id"], "vault-key");
+            assert_eq!(reports[2]["provider_code"], code);
+            assert!(reports[2].get("retry_at_ms").is_none());
+            assert_ne!(reports[2]["event_id"], reports[3]["event_id"]);
+            assert_eq!(
+                reports[2]["event_id"],
+                format!(
+                    "{}:credential_refused",
+                    reports[3]["event_id"].as_str().unwrap()
+                )
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn credential_refused_requires_router_group() {
+    for (backoff, supported) in [(true, false), (false, true), (false, false), (true, true)] {
+        let routing = Arc::new(FakeRouting {
+            backoff,
+            credential_refused: supported,
+            ..FakeRouting::default()
+        });
+        client(&routing)
+            .observe(json!({"kind":"credential_refused","admission_id":"adm-refused"}))
+            .await;
+        assert_eq!(routing.observed().len(), usize::from(backoff && supported));
+    }
+}
+
+#[tokio::test]
+async fn credential_refused_auth_is_only_for_api_keys() {
+    for method in ["apikey", "oauth", "chatgpt"] {
+        for status in [401, 403] {
+            let reports = terminal_credential_reports(
+                terminal_error(json!({"class":"auth_required","status":status,"provider_code":"invalid_api_key"})),
+                method,
+                Some("vault-key"),
+            ).await;
+            let refused: Vec<_> = reports
+                .iter()
+                .filter(|body| body["kind"] == "credential_refused")
+                .collect();
+            assert_eq!(
+                refused.len(),
+                usize::from(method == "apikey"),
+                "{method}: {status}"
+            );
+            if method == "apikey" {
+                assert_eq!(refused[0]["provider_code"], "invalid_api_key");
+            }
+        }
+    }
+    for extra in [
+        json!({"class":"permanent","status":403}),
+        json!({"class":"auth_required","status":500}),
+    ] {
+        let reports =
+            terminal_credential_reports(terminal_error(extra), "apikey", Some("vault-key")).await;
+        assert_eq!(reports.len(), 3);
+    }
+}
+
+#[tokio::test]
+async fn credential_refused_auth_without_provider_code_still_blocks_key() {
+    let reports = terminal_credential_reports(
+        terminal_error(json!({"class":"auth_required","status":401})),
+        "apikey",
+        Some("vault-key"),
+    )
+    .await;
+    assert_eq!(reports.len(), 4);
+    assert_eq!(reports[2]["kind"], "credential_refused");
+    assert_eq!(reports[2]["admission_id"], "adm-refused");
+    assert_eq!(reports[2]["credential_id"], "vault-key");
+    assert!(reports[2].get("provider_code").is_none());
+    assert!(reports[2].get("retry_at_ms").is_none());
+}
+
+#[tokio::test]
+async fn credential_refused_excludes_resettable_and_transient_limits() {
+    for (code, class, refused, attempt_kind, backoff) in [
+        ("billing_exhausted", "permanent", true, "attempt", false),
+        (
+            "account_limit_exhausted",
+            "transient",
+            false,
+            "account_limit_exhausted",
+            false,
+        ),
+        ("rate_limited", "transient", false, "attempt", true),
+    ] {
+        let reports = terminal_credential_reports(
+            terminal_error(
+                json!({"class":class,"provider_code":code,"status":429,"retry_after_secs":1.0}),
+            ),
+            "apikey",
+            None,
+        )
+        .await;
+        assert_eq!(reports[1]["kind"], attempt_kind);
+        assert_eq!(
+            reports
+                .iter()
+                .filter(|body| body["kind"] == "credential_refused")
+                .count(),
+            usize::from(refused),
+            "{code}"
+        );
+        assert_eq!(
+            reports
+                .iter()
+                .filter(|body| body["kind"] == "transient_backoff")
+                .count(),
+            usize::from(backoff),
+            "{code}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn credential_refused_request_bytes_preserve_code_and_absence() {
+    let routing = Arc::new(FakeRouting {
+        backoff: true,
+        credential_refused: true,
+        ..FakeRouting::default()
+    });
+    for (name, code) in [
+        ("billing", Some("billing_exhausted")),
+        ("auth-no-code", None),
+    ] {
+        client(&routing)
+            .observe(credential_refused_body(
+                "lineage:3:credential_refused",
+                "adm-refused",
+                Some("vault-key"),
+                code,
+            ))
+            .await;
+        let bytes = routing
+            .request_bytes
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        let parsed: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed["method"], "route.account_observe");
+        let mut expected = json!({"event_id":"lineage:3:credential_refused","caller":{"runner":"broca"},"kind":"credential_refused","admission_id":"adm-refused","credential_id":"vault-key"});
+        if let Some(code) = code {
+            expected["provider_code"] = json!(code);
+        }
+        assert_eq!(parsed["params"], expected);
+        let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        println!("credential-refused-sample {name} {hex}");
+    }
+    assert!(credential_refused_body("event", "adm", None, None)
+        .get("credential_id")
+        .is_none());
 }
 
 #[tokio::test]
