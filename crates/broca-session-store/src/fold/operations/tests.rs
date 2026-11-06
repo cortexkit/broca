@@ -375,3 +375,44 @@ fn records_it_does_not_fold_yet_refuse_by_name() {
         FoldError::NotFolded("recovery_cut".into())
     );
 }
+
+fn started_by(principal: Option<&str>, scope: Option<&str>) -> Record {
+    let Record::RunStart(mut start) = start() else {
+        unreachable!()
+    };
+    start.principal = principal.map(|module_id| serde_json::json!({ "reserved": module_id }));
+    start.scope = scope.map(|owner| serde_json::json!({ "owner": owner }));
+    Record::RunStart(start)
+}
+
+/// The owner summary keeps the first run's principal, the first two distinct principals in the
+/// order they appeared, whether any run recorded none, and the latest scope; a run start without
+/// a scope leaves the scope as it was.
+#[test]
+fn run_starts_fold_the_owner_summary() {
+    let mut ops = Operations::default();
+    for record in [
+        started_by(Some("a"), Some("first")),
+        started_by(Some("a"), None),
+        started_by(Some("b"), Some("second")),
+        started_by(None, None),
+        started_by(Some("c"), None),
+    ] {
+        ops.apply(&record).unwrap();
+    }
+    let owner = &ops.owner;
+    assert_eq!(owner.episodes, 5);
+    assert_eq!(
+        owner.first_principal,
+        Some(serde_json::json!({ "reserved": "a" }))
+    );
+    assert!(owner.any_unrecorded_principal);
+    assert_eq!(
+        owner.principals,
+        [
+            serde_json::json!({ "reserved": "a" }),
+            serde_json::json!({ "reserved": "b" })
+        ]
+    );
+    assert_eq!(owner.scope, Some(serde_json::json!({ "owner": "second" })));
+}

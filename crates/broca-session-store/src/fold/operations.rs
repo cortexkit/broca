@@ -736,6 +736,78 @@ state! {
             reset: "never",
             bound: Bound::Fixed,
         },
+        /// Who drove the session's runs, which decides who may act on it as its owner.
+        19 req pub owner: Owner => {
+            owner: "admission",
+            reset: "never",
+            bound: Bound::Declared,
+        },
+    }
+}
+
+state! {
+    /// The owner facts the session's run starts recorded, as today's admission summarises them
+    /// (`SessionOwnershipV1`). Principals and scopes stay in the run start's own JSON form.
+    #[derive(Debug, Clone, Default, PartialEq)]
+    pub struct Owner {
+        /// How many runs have started.
+        1 req pub episodes: u64 => {
+            owner: "admission",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
+        /// The principal the first run recorded, if it recorded one.
+        2 opt pub first_principal: serde_json::Value => {
+            owner: "admission",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
+        /// Whether any run recorded no principal.
+        3 req pub any_unrecorded_principal: bool => {
+            owner: "admission",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
+        /// The first two distinct principals the runs recorded, in the order each first
+        /// appeared. Today's summary keeps every distinct one, but its only reader asks for the
+        /// first that differs from one given principal, and the first two always answer that.
+        4 rep pub principals: serde_json::Value => {
+            owner: "admission",
+            reset: "never",
+            bound: Bound::Capped(2),
+        },
+        /// The scope the latest scoped run froze. A run start without a scope leaves it.
+        5 opt pub scope: serde_json::Value => {
+            owner: "admission",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
+    }
+}
+
+impl Owner {
+    /// Folds one run start's principal and scope, as `SessionOwnershipV1::fold_run_started`
+    /// folds them.
+    fn fold_run_start(
+        &mut self,
+        principal: Option<&serde_json::Value>,
+        scope: Option<&serde_json::Value>,
+    ) {
+        if self.episodes == 0 {
+            self.first_principal = principal.cloned();
+        }
+        self.episodes = self.episodes.saturating_add(1);
+        match principal {
+            None => self.any_unrecorded_principal = true,
+            Some(principal) => {
+                if self.principals.len() < 2 && !self.principals.contains(principal) {
+                    self.principals.push(principal.clone());
+                }
+            }
+        }
+        if let Some(scope) = scope {
+            self.scope = Some(scope.clone());
+        }
     }
 }
 
@@ -854,6 +926,8 @@ impl Operations {
                     .get_or_insert_with(Estimate::default)
                     .run_model = Some(start.model.clone());
                 self.output_attempt_bytes = None;
+                self.owner
+                    .fold_run_start(start.principal.as_ref(), start.scope.as_ref());
             }
             Record::Attempt(attempt) => {
                 self.output_attempt_bytes = Some(attempt.request_body_len);

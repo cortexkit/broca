@@ -35,6 +35,7 @@ pub mod compaction;
 pub mod entries;
 pub mod media;
 pub mod output;
+pub mod owner;
 pub mod parts;
 pub mod queue;
 mod refusal;

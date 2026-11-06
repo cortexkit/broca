@@ -1216,19 +1216,29 @@ fn compare_ops(old: &[FramedRecord], lineage: Option<&str>) -> OpsOutcome {
         .map(|pending| pending.submission_id.0)
         .collect();
     let output_reservation = broca_session_loop::output::history(&operations);
+    let owner_differs = owner_difference(old, &operations);
     let Some(run) = operations.run else {
         // Nothing to compare only when today's replay has no run either.
-        return if today.run_id.is_none() {
+        return if today.run_id.is_none() && owner_differs.is_none() {
             OpsOutcome::NoRun
         } else {
             OpsOutcome::Compared(
-                vec!["run (missing from the fold)".into()],
+                [
+                    today
+                        .run_id
+                        .is_some()
+                        .then(|| "run (missing from the fold)".to_owned()),
+                    owner_differs,
+                ]
+                .into_iter()
+                .flatten()
+                .collect(),
                 Vec::new(),
                 Vec::new(),
             )
         };
     };
-    let mut differs = Vec::new();
+    let mut differs: Vec<String> = owner_differs.into_iter().collect();
     let mut folded_resolution = run.resolution();
     if let Resolution::Interrupted(ids) | Resolution::ProviderHeld(ids) = &mut folded_resolution {
         ids.sort_by(|a, b| a.0.cmp(&b.0));
@@ -1407,6 +1417,42 @@ fn compare_ops(old: &[FramedRecord], lineage: Option<&str>) -> OpsOutcome {
 /// Two kinds of cache-send difference are expected and named apart: a cache warm, which the
 /// fold doesn't read yet, and an attempt without a send time, which today dates from a lower
 /// bound.
+/// Whether the folded owner summary differs from the one today's admission folds from the same
+/// log (`SessionOwnershipV1::fold_owner_records`), naming the first field that does. The fold
+/// keeps only the first two distinct principals, so those are compared with today's first two.
+fn owner_difference(
+    old: &[FramedRecord],
+    operations: &broca_session_store::fold::operations::Operations,
+) -> Option<String> {
+    let mut today = broca_core::admission::SessionOwnershipV1::default();
+    today.fold_owner_records(old);
+    let today = today.for_owner_access();
+    let folded = match broca_session_loop::owner::ownership(&operations.owner) {
+        Ok(folded) => folded,
+        Err(error) => return Some(format!("owner (unreadable: {error})")),
+    };
+    let first_two: Vec<_> = today.recorded_principals.iter().take(2).cloned().collect();
+    [
+        ("owner.episodes", today.episodes == folded.episodes),
+        (
+            "owner.first_principal",
+            today.first_principal == folded.first_principal,
+        ),
+        (
+            "owner.any_unrecorded_principal",
+            today.any_unrecorded_principal == folded.any_unrecorded_principal,
+        ),
+        (
+            "owner.recorded_principals",
+            first_two == folded.recorded_principals,
+        ),
+        ("owner.scope", today.scope == folded.scope),
+    ]
+    .into_iter()
+    .find(|(_, equal)| !equal)
+    .map(|(field, _)| field.to_owned())
+}
+
 fn send_differences(
     records: &[broca_wal::WalRecord],
     operations: &broca_session_store::fold::operations::Operations,

@@ -1030,7 +1030,15 @@ mod operations {
         first_protocol_compaction,
         output_measure,
         output_attempt_bytes,
-        last_cache_attempt_digest
+        last_cache_attempt_digest,
+        owner
+    });
+    crate::fuzzing::gen::fields!(Owner {
+        episodes,
+        first_principal,
+        any_unrecorded_principal,
+        principals,
+        scope
     });
     crate::fuzzing::gen::fields!(Estimate {
         run_model,
