@@ -152,6 +152,27 @@ pub struct Seams<'a, P, T> {
     /// Sends the warms that keep the prompt cache alive while a run whose keep-warm is `auto`
     /// waits on tool calls, scheduled by today's keep-warm scheduler. Without it no run warms.
     pub keep_warm: Option<Arc<dyn broca_core::keep_warm_wait::KeepWarmDriver<Admission>>>,
+    /// Receives what the run saw about its provider account, for account routing: the run's
+    /// start once it is durable, and each provider attempt as its record is appended.
+    pub account_reports: Option<Arc<dyn AccountReports>>,
+}
+
+/// The run loop's account reports, as today's `broca_core::AccountReporter` receives them. Each
+/// names the record it reports by `event_id`, the session's id and the record's seq. The hooks
+/// must not block: a reporter queues the event and returns. An attempt's record is appended
+/// without a barrier unless the attempt failed, so a reporter that must only report durable
+/// records waits for the session's durable bound to reach `seq`, as today's reporter waits for
+/// the log's durable head.
+pub trait AccountReports: Send + Sync {
+    /// A fresh run's start is durable. Not called on a resume, which writes no start.
+    fn run_started(&self, event_id: &str);
+    /// A provider attempt's record was appended at `seq`.
+    fn attempt_recorded(&self, event_id: &str, seq: u64, attempt: &ModelAttempt);
+}
+
+/// The id an account report names a record by: the session's id and the record's seq.
+fn event_id<W: Writer>(writer: &W, seq: u64) -> String {
+    format!("{}:{seq}", writer.session_id())
 }
 
 /// How a run ended.
@@ -221,7 +242,10 @@ where
             .then(|| Tags::for_run(admission.manifest.as_deref(), &admission.render_config)),
         inner: writer,
     };
-    admit(&mut placed, parts, &admission).await?;
+    let start_seq = admit(&mut placed, parts, &admission).await?;
+    if let Some(reports) = &seams.account_reports {
+        reports.run_started(&event_id(&placed, start_seq));
+    }
     let compaction = compaction_ctx(&placed, parts, &admission, seams, true).await?;
     drive(&mut placed, parts, &admission, seams, compaction.as_ref()).await
 }
@@ -1430,11 +1454,12 @@ where
 }
 
 /// Stores the run's setup parts and appends its start and input as one durable batch.
+/// Writes a fresh run's start; returns the seq of its `RunStart` record.
 async fn admit<W: Writer>(
     writer: &mut W,
     parts: &mut dyn Parts,
     admission: &Admission,
-) -> Result<(), LoopError> {
+) -> Result<u64, LoopError> {
     let mut setup = Vec::new();
     // A planned run's system text is part of its manifest; any other run's is its own part.
     let global_system = (admission.manifest.is_none() && !admission.global_system.is_empty())
@@ -1560,8 +1585,13 @@ async fn admit<W: Writer>(
             pruned: Vec::new(),
         }));
     }
+    let start_seq = writer.next_seq()
+        + records
+            .iter()
+            .position(|record| matches!(record, Record::RunStart(_)))
+            .expect("the batch holds the run's start") as u64;
     writer.append(&records, true).await?;
-    Ok(())
+    Ok(start_seq)
 }
 
 /// The highest part number the session's requests have shown, which a new run's numbering
@@ -1907,13 +1937,41 @@ async fn model_step<W: Writer, P: Provider, T>(
                 error,
                 retries_used,
             })) => return Ok(Err(StepFailure::Error(Box::new(error), retries_used))),
-            Some(NormalizedEvent::Control(ProviderControl::AttemptFinished { attempt })) => {
+            // Each attempt's record, around the same hooks today's loop calls: keep-warm learns
+            // its send time and rate-limit headers, its input transformations are reported, and
+            // the provider adds its cache evidence before the record is written and learns which
+            // record holds it after. A failed attempt is durable at once (it may have been billed
+            // and no step's end will follow it); a completed one rides the step's end.
+            Some(NormalizedEvent::Control(ProviderControl::AttemptFinished { mut attempt })) => {
+                if let Some(warm) = &seams.keep_warm {
+                    warm.note_attempt(&attempt);
+                }
+                broca_core::run::report_input_transformations(
+                    &seams.bind,
+                    &broca_protocol::RunId(run_id.into()),
+                    StepId(step_id),
+                    &attempt,
+                );
+                seams.provider.annotate_cache_evidence(&mut attempt);
+                let durable = attempt.outcome != broca_protocol::AttemptOutcome::Complete;
+                let seq = writer.next_seq();
                 writer
                     .append(
-                        &[attempt_record(run_id, step_id, attempt, requested_ttl_ms)?],
-                        false,
+                        &[attempt_record(
+                            run_id,
+                            step_id,
+                            attempt.clone(),
+                            requested_ttl_ms,
+                        )?],
+                        durable,
                     )
                     .await?;
+                seams
+                    .provider
+                    .cache_attempt_recorded(Some(event_id(writer, seq)));
+                if let Some(reports) = &seams.account_reports {
+                    reports.attempt_recorded(&event_id(writer, seq), seq, &attempt);
+                }
             }
             None => return Ok(Err(StepFailure::Error(Box::new(incomplete_stream()), 0))),
             Some(NormalizedEvent::Control(_)) => {}

@@ -34,7 +34,9 @@ use broca_protocol::request::{
     CallOptions, ExecutionMode, ModelHandle, OnRestart, StopCondition, Tool, ToolChoice,
 };
 use broca_protocol::{FinishReason, GenerationConfig, MessageId, RunId, StepId, ToolCallId, Usage};
-use broca_session_loop::{resume, run, Admission, MemoryParts, PendingMedia, Seams, Writer};
+use broca_session_loop::{
+    resume, run, AccountReports, Admission, MemoryParts, PendingMedia, Seams, Writer,
+};
 use broca_session_store::backend::{MemoryBackend, SessionAddr};
 use broca_session_store::fold::conversation::Conversation;
 use broca_session_store::fold::operations::Operations;
@@ -86,6 +88,15 @@ const GRAMMAR_REFUSED: &str = "scripted_grammar_too_large";
 
 #[async_trait]
 impl Provider for ScriptedProvider {
+    /// Adds the cache evidence a live provider would, so a loop that skips it records a
+    /// different attempt.
+    fn annotate_cache_evidence(&self, attempt: &mut broca_protocol::ModelAttempt) {
+        attempt.cache_evidence = Some(
+            serde_json::from_value(json!({"read": 7, "written": 3}))
+                .expect("cache evidence decodes"),
+        );
+    }
+
     fn output_limits(&self) -> Option<broca_core::output_reservation::OutputLimits> {
         output().map(|script| script.limits)
     }
@@ -780,6 +791,12 @@ impl WarmScript {
             bust: 3.5,
         })
     }
+    fn note(&self, attempt: &broca_protocol::ModelAttempt) {
+        self.log.lock().unwrap().push(format!(
+            "note attempt {} {:?}",
+            attempt.attempt, attempt.outcome
+        ));
+    }
     fn warm(&self, run_id: &RunId, model: &ModelHandle) -> broca_core::keep_warm_wait::WarmTick {
         self.log
             .lock()
@@ -802,6 +819,9 @@ impl broca_core::keep_warm_wait::KeepWarmDriver for TodayWarmer {
     }
     fn last_sent_at_ms(&self) -> Option<u64> {
         Some(0)
+    }
+    fn note_attempt(&self, attempt: &broca_protocol::ModelAttempt) {
+        self.0.note(attempt);
     }
     fn costs(&self, _: &broca_wal::RunConfig) -> Result<broca_core::keep_warm::WarmCosts, String> {
         self.0.costs()
@@ -826,6 +846,9 @@ impl broca_core::keep_warm_wait::KeepWarmDriver<Admission> for NewWarmer {
     fn last_sent_at_ms(&self) -> Option<u64> {
         Some(0)
     }
+    fn note_attempt(&self, attempt: &broca_protocol::ModelAttempt) {
+        self.0.note(attempt);
+    }
     fn costs(&self, _: &Admission) -> Result<broca_core::keep_warm::WarmCosts, String> {
         self.0.costs()
     }
@@ -843,6 +866,78 @@ fn new_warmer() -> Option<Arc<dyn broca_core::keep_warm_wait::KeepWarmDriver<Adm
         Arc::new(NewWarmer(Arc::clone(&script.new)))
             as Arc<dyn broca_core::keep_warm_wait::KeepWarmDriver<Admission>>
     })
+}
+
+tokio::task_local! {
+    /// Each loop's account reports, logged so a comparison can check both reported the same.
+    /// `None` runs without a reporter.
+    static REPORTS: Option<Arc<ReportPair>>;
+}
+
+#[derive(Default)]
+struct ReportPair {
+    today: Arc<Mutex<Vec<String>>>,
+    new: Arc<Mutex<Vec<String>>>,
+}
+
+fn reports() -> Option<Arc<ReportPair>> {
+    REPORTS.try_with(Clone::clone).ok().flatten()
+}
+
+/// What an attempt report says, without the record it names: the two formats number records
+/// differently.
+fn reported_attempt(attempt: &broca_protocol::ModelAttempt) -> String {
+    format!(
+        "attempt {} {:?} {:?}",
+        attempt.attempt, attempt.outcome, attempt.http_status
+    )
+}
+
+struct TodayReports(Arc<Mutex<Vec<String>>>);
+
+impl broca_core::AccountReporter for TodayReports {
+    fn run_started(&self, _: Option<broca_wal::WalLineageId>, _: u64) {
+        self.0.lock().unwrap().push("run started".into());
+    }
+    fn attempt_recorded(
+        &self,
+        _: Option<broca_wal::WalLineageId>,
+        _: u64,
+        attempt: &broca_protocol::ModelAttempt,
+    ) {
+        self.0.lock().unwrap().push(reported_attempt(attempt));
+    }
+}
+
+/// The new loop's reports, which also checks each names its own record.
+struct NewReports(Arc<Mutex<Vec<String>>>);
+
+impl AccountReports for NewReports {
+    fn run_started(&self, event_id: &str) {
+        assert!(
+            event_id.contains(':'),
+            "a start's event id names its record"
+        );
+        self.0.lock().unwrap().push("run started".into());
+    }
+    fn attempt_recorded(&self, event_id: &str, seq: u64, attempt: &broca_protocol::ModelAttempt) {
+        assert!(
+            event_id.ends_with(&format!(":{seq}")),
+            "an attempt's event id names its record"
+        );
+        self.0.lock().unwrap().push(reported_attempt(attempt));
+    }
+}
+
+/// Runs `compare` with an account reporter on both loops, then checks both reported the same,
+/// and that they reported at least `at_least` events.
+async fn compare_reported<F: std::future::Future<Output = ()>>(at_least: usize, compare: F) {
+    let pair = Arc::new(ReportPair::default());
+    REPORTS.scope(Some(Arc::clone(&pair)), compare).await;
+    let today = pair.today.lock().unwrap().clone();
+    let new = pair.new.lock().unwrap().clone();
+    assert!(today.len() >= at_least, "today's reports: {today:?}");
+    assert_eq!(new, today, "the new loop's reports");
 }
 
 /// Today's loop reads the cache lifetime a run's requests ask for from its keep-warm driver,
@@ -1268,6 +1363,10 @@ async fn today_from(
                 .clone()
                 .map(|spy| spy as Arc<dyn broca_core::CompactionPlane>),
             admitted_context_limit: frozen_context_limit(),
+            account_reporter: reports().map(|reports| {
+                Arc::new(TodayReports(Arc::clone(&reports.today)))
+                    as Arc<dyn broca_core::AccountReporter>
+            }),
             keep_warm: match warm_script() {
                 Some(script) => Some(Arc::new(TodayWarmer(Arc::clone(&script.today)))
                     as Arc<dyn broca_core::keep_warm_wait::KeepWarmDriver>),
@@ -1518,6 +1617,9 @@ async fn new_from(
             .map(|spy| spy as &dyn broca_core::CompactionPlane),
         compaction_session: None,
         keep_warm: new_warmer(),
+        account_reports: reports().map(|reports| {
+            Arc::new(NewReports(Arc::clone(&reports.new))) as Arc<dyn AccountReports>
+        }),
     };
     if resuming {
         resume(&mut writer, &parts, &seams).await
@@ -1941,12 +2043,17 @@ async fn compare_every_cut(scenario: Scenario) {
 
 async fn compare_every_cut_in(scenario: Scenario) {
     // The whole log the cuts are taken from. Only the resumes are compared, so its run's warms
-    // go to a driver of their own; the run still freezes the keep-warm its resumes read back.
+    // and account reports go to a driver and reporter of their own; the run still freezes the
+    // keep-warm its resumes read back.
     let source_warms = warm_script().map(|_| Arc::new(WarmPair::default()));
+    let source_reports = reports().map(|_| Arc::new(ReportPair::default()));
     let (_, full, name) = WARM
         .scope(
             source_warms,
-            today_from(&scenario, None, scenario.steps.clone()),
+            REPORTS.scope(
+                source_reports,
+                today_from(&scenario, None, scenario.steps.clone()),
+            ),
         )
         .await;
     let records = full.framed().len();
@@ -2231,6 +2338,10 @@ async fn compare_runs_in(scenario: Scenario, runs: &[(&str, Vec<Message>)]) {
             Arc::new(TodayWarmer(Arc::clone(&script.today)))
                 as Arc<dyn broca_core::keep_warm_wait::KeepWarmDriver>
         }),
+        account_reporter: reports().map(|reports| {
+            Arc::new(TodayReports(Arc::clone(&reports.today)))
+                as Arc<dyn broca_core::AccountReporter>
+        }),
         new_log_compaction_plan_version: layout(),
         compaction_plane: spy
             .clone()
@@ -2345,6 +2456,9 @@ async fn compare_runs_in(scenario: Scenario, runs: &[(&str, Vec<Message>)]) {
         // One session state for the session's life, as the actor keeps it across runs.
         compaction_session: Some(Arc::default()),
         keep_warm: new_warmer(),
+        account_reports: reports().map(|reports| {
+            Arc::new(NewReports(Arc::clone(&reports.new))) as Arc<dyn AccountReports>
+        }),
     };
     for (index, (run_id, input)) in runs.iter().enumerate() {
         run(
@@ -2893,6 +3007,9 @@ async fn compare_actions_in(
         compaction_plane: None,
         compaction_session: None,
         keep_warm: new_warmer(),
+        account_reports: reports().map(|reports| {
+            Arc::new(NewReports(Arc::clone(&reports.new))) as Arc<dyn AccountReports>
+        }),
     };
     let mut admission = scenario.admission(&provider.inner);
     admission.on_restart = on_restart;
@@ -3222,6 +3339,9 @@ async fn compare_auth_pause_in(scenario: Scenario) {
         compaction_plane: None,
         compaction_session: None,
         keep_warm: new_warmer(),
+        account_reports: reports().map(|reports| {
+            Arc::new(NewReports(Arc::clone(&reports.new))) as Arc<dyn AccountReports>
+        }),
     };
     let first = run(
         &mut writer,
@@ -5349,6 +5469,65 @@ async fn every_cut_of_a_warmed_wait_resumes_alike() {
                 FinishReason::ToolCalls,
             ),
             text_step("a3", "done"),
+        ])),
+    )
+    .await;
+}
+
+fn attempted_scenario() -> Scenario {
+    Scenario {
+        input: vec![user("read a")],
+        manifest: None,
+        tools: vec![tool("read", ExecutionMode::Parallel)],
+        stop_when: Vec::new(),
+        steps: vec![
+            attempted(
+                answer(
+                    "a1",
+                    vec![call("c1", "read", json!({"path": "a"}))],
+                    FinishReason::ToolCalls,
+                ),
+                vec![
+                    attempt(1, 529, "eof_before_completion"),
+                    attempt(2, 200, "complete"),
+                ],
+            ),
+            attempted(text_step("a2", "done"), vec![attempt(1, 200, "complete")]),
+        ],
+    }
+}
+
+/// Both loops report the run's start and each attempt, failed or completed, in order: four
+/// events per layout.
+#[tokio::test]
+async fn account_reports_name_the_start_and_every_attempt() {
+    compare_reported(8, compare(attempted_scenario())).await;
+}
+
+/// Resumed at every cut, both loops report the same attempts; a resume reports no start.
+#[tokio::test]
+async fn every_cut_reports_alike() {
+    compare_reported(1, compare_every_cut(attempted_scenario())).await;
+}
+
+/// Keep-warm learns every attempt in both loops.
+#[tokio::test]
+async fn keep_warm_is_told_every_attempt() {
+    compare_warmed(
+        None,
+        compare(slow_scenario(vec![
+            attempted(
+                answer(
+                    "a1",
+                    vec![call("c1", "slow", json!({}))],
+                    FinishReason::ToolCalls,
+                ),
+                vec![
+                    attempt(1, 529, "eof_before_completion"),
+                    attempt(2, 200, "complete"),
+                ],
+            ),
+            text_step("a2", "done"),
         ])),
     )
     .await;

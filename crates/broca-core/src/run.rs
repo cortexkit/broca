@@ -9248,7 +9248,7 @@ fn log_step_transition(
 /// Count and warn about every entry of an attempt's `input_transformations`, whatever its reason:
 /// on an account that is not enforced, a mismatched thinking block is dropped silently, so this
 /// log line and the counter are the only place the loss shows up.
-fn report_input_transformations(
+pub fn report_input_transformations(
     session: &BindIdentity,
     run_id: &RunId,
     step_id: StepId,

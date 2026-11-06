@@ -40,5 +40,5 @@ pub mod writer;
 
 pub use media::PendingMedia;
 pub use parts::{MemoryParts, Parts};
-pub use run::{resume, run, Admission, Finished, LoopError, Seams};
+pub use run::{resume, run, AccountReports, Admission, Finished, LoopError, Seams};
 pub use writer::Writer;
