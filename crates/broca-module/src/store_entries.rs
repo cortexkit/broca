@@ -55,10 +55,10 @@ fn internal(message: impl Into<String>) -> Refusal {
     Refusal::new("internal_error", message, None)
 }
 
-/// How many messages the session's transcript holds: the placed ones, and the assistant message
-/// whose tool calls are still running, at its reserved ordinal.
+/// How many messages the session's transcript holds as reads serve it
+/// (`store_read::transcript_len`).
 fn transcript_len<B: SessionBackend>(session: &Session<B>) -> u64 {
-    session.conversation.placed + u64::from(session.conversation.open_tool_turn().is_some())
+    crate::store_read::transcript_len(session)
 }
 
 /// Whether the session is on the current compaction contract: its first run froze a compaction
@@ -260,8 +260,7 @@ fn project(stored: &StoredEntry) -> Result<Entry, String> {
 
 /// Every compaction entry of the session, oldest first: what a view is checked against.
 pub async fn all_entries<B: SessionBackend>(session: &Session<B>) -> Result<Vec<Entry>, String> {
-    session
-        .entries(1, usize::MAX)
+    crate::store_read::served_entries(session, 1, usize::MAX)
         .await
         .map_err(|error| format!("{error:?}"))?
         .iter()
@@ -292,8 +291,7 @@ pub async fn entries_page<B: SessionBackend>(
         ),
         _ => (1, usize::MAX),
     };
-    let stored = session
-        .entries(from, count)
+    let stored = crate::store_read::served_entries(session, from, count)
         .await
         .map_err(|error| format!("{error:?}"))?;
     let entries = stored.iter().map(project).collect::<Result<Vec<_>, _>>()?;
@@ -301,8 +299,7 @@ pub async fn entries_page<B: SessionBackend>(
         Some(last) if last.ordinal >= len => Some(cursor(last)),
         _ if len == 0 => None,
         _ => {
-            let last = session
-                .entries(len, 1)
+            let last = crate::store_read::served_entries(session, len, 1)
                 .await
                 .map_err(|error| format!("{error:?}"))?;
             last.first().map(project).transpose()?.as_ref().map(cursor)

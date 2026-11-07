@@ -35,10 +35,64 @@ impl From<SessionError> for StoreReadError {
     }
 }
 
-/// How many messages the session's transcript holds: the placed ones, and the assistant
-/// message whose tool calls are still running, at its reserved ordinal.
-fn transcript_len<B: SessionBackend>(session: &Session<B>) -> u64 {
+/// How many messages reads serve of the session's transcript: the placed ones, and the
+/// assistant message whose tool calls are still running, at its reserved ordinal, but not the
+/// results of a batch that hasn't closed (see [`results_await_close`]).
+pub fn transcript_len<B: SessionBackend>(session: &Session<B>) -> u64 {
     session.conversation.placed + u64::from(session.conversation.open_tool_turn().is_some())
+        - u64::from(results_await_close(session))
+}
+
+/// Whether the newest placed message holds the results of a tool batch that hasn't closed. The
+/// session places a turn's results once every call has one, but its batch closes after: as it
+/// closes, a delivered note may still join the last result, and the note's facts land with it.
+/// Reads serve such results only once the batch is closed, as today's do, so no entry they
+/// served changes afterwards; until then the turn reads as still running.
+pub fn results_await_close<B: SessionBackend>(session: &Session<B>) -> bool {
+    let conversation = &session.conversation;
+    let Some(batch) = session
+        .operations
+        .run
+        .as_ref()
+        .and_then(|run| run.open_batch.as_ref())
+    else {
+        return false;
+    };
+    if conversation.open_tool_turn().is_some() {
+        return false;
+    }
+    conversation
+        .window_message(conversation.placed)
+        .is_some_and(|newest| {
+            newest.role == Role::Tool
+                && newest.content.iter().all(|block| match block {
+                    broca_protocol::ContentBlock::ToolResult(result) => batch
+                        .calls
+                        .iter()
+                        .any(|call| call.id == result.tool_call_id),
+                    _ => false,
+                })
+        })
+}
+
+/// Up to `limit` entries from ordinal `from` (counting from 1), as reads serve them: the
+/// results of a batch that hasn't closed held back, and the turn they answer served as still
+/// running (see [`results_await_close`]).
+pub async fn served_entries<B: SessionBackend>(
+    session: &Session<B>,
+    from: u64,
+    limit: usize,
+) -> Result<Vec<StoredEntry>, SessionError> {
+    let mut entries = session.entries(from, limit).await?;
+    if results_await_close(session) {
+        let held = session.conversation.placed;
+        entries.retain(|entry| entry.ordinal < held);
+        if let Some(turn) = entries.iter_mut().find(|entry| entry.ordinal + 1 == held) {
+            turn.next = None;
+            turn.open = true;
+        }
+    }
+    Ok(entries)
 }
 
 /// A `session.read` page, and each of its messages' stable id (`EntryFacts::mid`), in order.
@@ -71,7 +125,7 @@ pub async fn read_page<B: SessionBackend>(
     let wanted = usize::try_from(end - start)
         .unwrap_or(usize::MAX)
         .saturating_add(1);
-    let mut entries = session.entries(start + 1, wanted).await?;
+    let mut entries = served_entries(session, start + 1, wanted).await?;
     let after = (entries.len() as u64 > end - start)
         .then(|| entries.pop())
         .flatten();

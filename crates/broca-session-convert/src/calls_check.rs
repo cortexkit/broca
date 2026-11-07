@@ -479,10 +479,7 @@ mod tests {
             r#"{"type":"tool_batch_finished","batch_id":"b1"}"#,
         ];
         let old = log(&lines);
-        // Not after record 7: until the batch's end, today's read keeps the answered turn's
-        // results out of the transcript, while the store has placed them (a difference of the
-        // pages, not of the calls).
-        for end in [6, 8] {
+        for end in [6, 7, 8] {
             let framed = &old[..end];
             let today = today(framed, Some("l1"), 50).unwrap();
             let calls: Vec<&Value> = today
@@ -498,6 +495,68 @@ mod tests {
             assert_eq!(calls[1]["dispatched_to"], Value::Null);
             assert_eq!(calls[1]["indeterminate"], json!(false));
             assert_eq!(store_of(framed, "l1"), today, "after record {end}");
+        }
+    }
+
+    /// A batch's results enter the transcript only once the batch closes, on both storages:
+    /// broca may still join a delivered note to the last result as the batch closes, so a read
+    /// between the batch's last result and its end shows the assistant message without them,
+    /// and a read after the end shows them. Every page message and each page's state agree with
+    /// today's at each cut.
+    #[test]
+    fn a_batch_s_results_are_served_once_it_closes() {
+        let lines = [
+            RUN,
+            r#"{"type":"step_started","step_id":1}"#,
+            r#"{"type":"model_step_finished","step_id":1,"assistant_message":{"message_id":"m1","content":[{"type":"tool_call","tool_call_id":"c1","tool_name":"bash","input":{"cmd":"ls"}}]},"usage":{"input_tokens":3},"finish_reason":"tool_calls","retries_used":0}"#,
+            r#"{"type":"tool_batch_started","batch_id":"b1","step_id":1,"planned_calls":["c1"]}"#,
+            r#"{"type":"tool_dispatch_intent","batch_id":"b1","tool_call_id":"c1","args":{"cmd":"ls"},"module_id":"tools"}"#,
+            r#"{"type":"tool_result","batch_id":"b1","result":{"tool_call_id":"c1","output":{"kind":"text","text":"ok"},"is_error":false},"outcome":"completed"}"#,
+            r#"{"type":"tool_batch_finished","batch_id":"b1"}"#,
+        ];
+        let old = log(&lines);
+        // After the intent, after the batch's last result, after its end.
+        for (end, messages) in [(5, 2), (6, 2), (7, 3)] {
+            let framed = &old[..end];
+            let today = crate::walk_pages(
+                |from, limit| {
+                    broca_core::read_session_page(
+                        &broca_core::StorePageSnapshot::empty(),
+                        framed,
+                        Some(from),
+                        Some(limit),
+                    )
+                    .map_err(|e| e.to_string())
+                },
+                7,
+            )
+            .unwrap();
+            let converted = broca_session_convert::convert(framed, Some("l1")).unwrap();
+            let store = block_on(async {
+                let backend = MemoryBackend::default();
+                let mut session = Session::create(
+                    &backend,
+                    SessionAddr("s".into()),
+                    triple("s"),
+                    &DeploymentKey::new(1, &[0x5a; 32]),
+                    false,
+                )
+                .await
+                .unwrap();
+                for record in &converted.records {
+                    session
+                        .append(std::slice::from_ref(record), false)
+                        .await
+                        .unwrap();
+                }
+                crate::walk_store_pages(&session, 7).await.unwrap()
+            });
+            assert_eq!(
+                today.0.len(),
+                messages,
+                "today's messages after record {end}"
+            );
+            assert_eq!(store, today, "after record {end}");
         }
     }
 }
