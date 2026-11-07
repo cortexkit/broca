@@ -117,7 +117,7 @@ fn reply_frame_limit_refusal(
     })
 }
 
-fn cap_page_bytes(
+pub(crate) fn cap_page_bytes(
     page: &mut SessionReadResponse,
     cap: u64,
     tail: bool,
@@ -445,7 +445,37 @@ pub use broca_wire::{
     SessionReadResponse, SessionReadTool,
 };
 
-fn session_read_response(
+/// Shows each message's media as the read's `media` mode asks: `blocks` keeps stored media
+/// references, and `descriptors` serves large payloads as refs with content identities.
+pub(crate) fn apply_media_mode(
+    response: &mut SessionReadResponse,
+    media: cortexkit_role_llm_runner::read::MediaMode,
+    session: &str,
+) -> Result<(), ServeError> {
+    if media == cortexkit_role_llm_runner::read::MediaMode::Blocks {
+        for entry in &mut response.messages {
+            entry.show_media_blocks_with_identity();
+        }
+    }
+    if media == cortexkit_role_llm_runner::read::MediaMode::Descriptors {
+        for entry in &mut response.messages {
+            // Only structure that is not payload can outgrow the per-message budget.
+            if let Err(ordinal) = entry.describe() {
+                return Err(ServeError::ReplyTooLarge(ReplyTooLargeDetail::new(
+                    json_bytes(entry),
+                    cortexkit_role_llm_runner::read::descriptors::DESCRIPTOR_MESSAGE_MAX as u64,
+                    ReplyTooLargeSubject::Message {
+                        session: session.to_owned(),
+                        ordinal,
+                    },
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn session_read_response(
     page: broca_core::SessionReadPage,
     tools: Option<crate::registry::SessionReadTools>,
 ) -> SessionReadResponse {
@@ -3128,6 +3158,11 @@ impl ServeHandler for crate::LineageRegistry {
     }
 
     async fn read(&self, req: SessionReadRequest) -> Result<SessionReadResponse, ServeError> {
+        if let Some(store) = self.store_runtime() {
+            if store.holds(&req.session)? {
+                return crate::store_read::serve_read(&store, req).await;
+            }
+        }
         let before_history = self.history_read_version(&req.session).await?;
         let late_only = req.late_after.is_some();
         // A mid not of the form `m<ordinal>` names no message. The read still runs (from past
@@ -3363,26 +3398,7 @@ impl ServeHandler for crate::LineageRegistry {
         }
         self.attribute_tool_calls(&req.session, &mut response, &dispatches, prompt_len)
             .await?;
-        if req.media == cortexkit_role_llm_runner::read::MediaMode::Blocks {
-            for entry in &mut response.messages {
-                entry.show_media_blocks_with_identity();
-            }
-        }
-        if req.media == cortexkit_role_llm_runner::read::MediaMode::Descriptors {
-            for entry in &mut response.messages {
-                // Only structure that is not payload can outgrow the per-message budget.
-                if let Err(ordinal) = entry.describe() {
-                    return Err(ServeError::ReplyTooLarge(ReplyTooLargeDetail::new(
-                        json_bytes(entry),
-                        cortexkit_role_llm_runner::read::descriptors::DESCRIPTOR_MESSAGE_MAX as u64,
-                        ReplyTooLargeSubject::Message {
-                            session: req.session.session.clone(),
-                            ordinal,
-                        },
-                    )));
-                }
-            }
-        }
+        apply_media_mode(&mut response, req.media, &req.session.session)?;
         for entry in &mut response.messages {
             entry.mid =
                 broca_core::message_mid(mode3, response.lineage_id.as_deref(), entry.ordinal - 1)

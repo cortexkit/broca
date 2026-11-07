@@ -963,7 +963,8 @@ async fn walk_store_pages(
     loop {
         let read = broca_module::store_read::read_page(session, Some(from), Some(limit))
             .await
-            .map_err(|e| format!("{e:?}"))?;
+            .map_err(|e| format!("{e:?}"))?
+            .page;
         states.push(format!(
             "{:?} len {} next {:?}",
             read.lineage_state, read.prompt_len, read.next_from_ordinal

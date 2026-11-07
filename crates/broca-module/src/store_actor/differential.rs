@@ -1151,6 +1151,38 @@ impl Module {
             .unwrap_or_default()
     }
 
+    /// The id each message of the store session stored when it was placed, in order.
+    async fn stored_mids(&self) -> Vec<String> {
+        let session = self.load().await;
+        let placed = usize::try_from(session.conversation.placed).unwrap();
+        session
+            .entries(1, placed)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.state.facts.expect("every message has facts").mid)
+            .collect()
+    }
+
+    async fn load(&self) -> Session<broca_session_store::backend::LocalBackend> {
+        let backend = broca_session_store::backend::LocalBackend::new(
+            self.dir.join(broca_wal::SESSION_STORAGE_DIR),
+        );
+        let triple = broca_session_store::head::SessionTriple {
+            project_root: self.key.project_root.display().to_string(),
+            harness: self.key.harness.clone(),
+            session: self.key.session.clone(),
+        };
+        Session::load(
+            backend,
+            broca_session_store::backend::SessionAddr(broca_core::session_addr(&self.key)),
+            &triple,
+            &broca_session_store::keys::DeploymentKey::new(1, &[7; 32]),
+        )
+        .await
+        .unwrap()
+    }
+
     /// The text of every message the store session holds, read once its actor is gone.
     async fn store_texts(&self) -> Vec<String> {
         let backend = broca_session_store::backend::LocalBackend::new(
@@ -1245,4 +1277,105 @@ async fn sessions_stay_on_todays_storage_unless_the_switch_and_the_send_allow() 
         );
         assert!(!module.floor().contains(broca_wal::SESSION_STORAGE_FEATURE));
     }
+}
+
+/// One `session.read` reply as JSON, with what legitimately differs between the two storages
+/// taken out: the log identity (`incarnation`); the history version, which each storage counts
+/// for itself (a written WAL serves 1, a new store session 0, and either only rises); the
+/// subscribe cursor (`head`), a WAL position the new storage has none of; each message's id,
+/// which each storage mints in its own form; and wall-clock times, which each run stamps for
+/// itself. A time is kept as whether it's present.
+async fn read_json(
+    module: &Module,
+    from_ordinal: Option<u64>,
+    limit: Option<u64>,
+    after_mid: Option<String>,
+) -> (serde_json::Value, Vec<String>) {
+    use crate::serve::{ServeHandler, SessionReadRequest};
+    let mut request = SessionReadRequest::new(module.key.clone(), from_ordinal, limit);
+    if after_mid.is_some() {
+        request.history_version = Some(
+            module
+                .registry
+                .read(SessionReadRequest::new(module.key.clone(), None, Some(1)))
+                .await
+                .expect("the session reads")
+                .history_version,
+        );
+    }
+    request.after_mid = after_mid;
+    let reply = module
+        .registry
+        .read(request)
+        .await
+        .expect("the session reads");
+    let mids = reply
+        .messages
+        .iter()
+        .map(|message| message.mid.clone())
+        .collect();
+    let mut value = serde_json::to_value(&reply).unwrap();
+    for member in ["incarnation", "history_version", "head"] {
+        value.as_object_mut().unwrap().remove(member);
+    }
+    for message in value["messages"].as_array_mut().unwrap() {
+        let message = message.as_object_mut().unwrap();
+        message.remove("mid");
+        for time in ["written_at", "created_at", "completed_at"] {
+            if let Some(at) = message.get_mut(time) {
+                *at = serde_json::json!(!at.is_null());
+            }
+        }
+    }
+    (value, mids)
+}
+
+/// A session in the new storage reads as the same history on today's storage does: the newest
+/// page, a page from an ordinal, and a page after a message's id. Each storage's own message ids
+/// continue a read in that storage.
+#[tokio::test]
+async fn a_store_session_reads_as_the_same_history_on_todays_storage() {
+    let steps = || {
+        vec![
+            super::tests::text_step("a1", "hello"),
+            super::tests::text_step("a2", "again"),
+        ]
+    };
+    let today = module(false, steps()).await;
+    let store = module(true, steps()).await;
+    for module in [&today, &store] {
+        assert!(matches!(
+            module.send("r1", "first", None).await,
+            SendOutcome::Active { .. }
+        ));
+        module.closed().await;
+        assert!(matches!(
+            module.send("r2", "second", None).await,
+            SendOutcome::Active { .. }
+        ));
+        module.closed().await;
+    }
+    assert!(store.head().exists() && !today.head().exists());
+    for (from, limit) in [(None, None), (Some(1), Some(2)), (Some(3), Some(1))] {
+        let (old, _) = read_json(&today, from, limit, None).await;
+        let (new, _) = read_json(&store, from, limit, None).await;
+        assert_eq!(new, old, "page from {from:?} limit {limit:?}");
+    }
+    let (_, today_mids) = read_json(&today, Some(1), Some(1), None).await;
+    let (_, store_mids) = read_json(&store, Some(1), Some(1), None).await;
+    let (old, _) = read_json(&today, None, Some(2), Some(today_mids[0].clone())).await;
+    let (new, _) = read_json(&store, None, Some(2), Some(store_mids[0].clone())).await;
+    assert_eq!(new, old, "page after the first message");
+    // The ids served are the ones the session stored when it placed each message.
+    let (_, all) = read_json(&store, Some(1), None, None).await;
+    assert_eq!(all, store.stored_mids().await);
+    // A cursor naming another history version is refused, never answered.
+    use crate::serve::{ServeHandler, SessionReadRequest};
+    let mut stale = SessionReadRequest::new(store.key.clone(), None, Some(1));
+    stale.after_mid = Some(store_mids[0].clone());
+    stale.history_version = Some(7);
+    assert!(matches!(
+        store.registry.read(stale).await,
+        Err(crate::serve::ServeError::HistoryChanged)
+    ));
 }

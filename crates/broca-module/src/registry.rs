@@ -636,6 +636,10 @@ pub trait LineageOpener: Send + Sync {
         Ok(None)
     }
     /// Read-only access to the derived run index, without acquiring a session writer.
+    /// The runtime serving sessions kept in the new storage, when this opener has one.
+    fn store_runtime(&self) -> Option<Arc<crate::store_open::StoreRuntime>> {
+        None
+    }
     fn run_index_reader(&self) -> Option<Arc<dyn broca_core::RunIndex>> {
         None
     }
@@ -2248,6 +2252,11 @@ impl LineageRegistry {
 
     pub fn compaction_supported(&self) -> bool {
         self.inner.opener.compaction_supported()
+    }
+
+    /// The runtime serving sessions kept in the new storage, for reads that take no lease.
+    pub(crate) fn store_runtime(&self) -> Option<Arc<crate::store_open::StoreRuntime>> {
+        self.inner.opener.store_runtime()
     }
     pub fn backup_classes(&self) -> Vec<String> {
         self.inner.opener.backup_classes()

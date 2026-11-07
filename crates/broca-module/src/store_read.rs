@@ -41,6 +41,12 @@ fn transcript_len<B: SessionBackend>(session: &Session<B>) -> u64 {
     session.conversation.placed + u64::from(session.conversation.open_tool_turn().is_some())
 }
 
+/// A `session.read` page, and each of its messages' stable id (`EntryFacts::mid`), in order.
+pub struct StorePage {
+    pub page: SessionReadPage,
+    pub mids: Vec<String>,
+}
+
 /// A `session.read` page: up to `limit` messages from `from_ordinal` (counting from 0, as
 /// today's page builder takes it), or the newest `limit` without one. Its dispatch facts, head
 /// cursor and lineage id are left to the caller.
@@ -48,7 +54,7 @@ pub async fn read_page<B: SessionBackend>(
     session: &Session<B>,
     from_ordinal: Option<u64>,
     limit: Option<u64>,
-) -> Result<SessionReadPage, StoreReadError> {
+) -> Result<StorePage, StoreReadError> {
     let capped_limit = limit
         .unwrap_or(broca_core::SESSION_READ_DEFAULT_LIMIT)
         .clamp(1, broca_core::SESSION_READ_MAX_LIMIT);
@@ -68,12 +74,22 @@ pub async fn read_page<B: SessionBackend>(
         .flatten();
     let latest = session.operations.run.as_ref();
     let mut messages = Vec::with_capacity(entries.len());
+    let mut mids = Vec::with_capacity(entries.len());
     for (index, entry) in entries.iter().enumerate() {
         let next = entries.get(index + 1).or(after.as_ref());
         messages.push(page_message(entry, next, latest)?);
+        // `page_message` has refused an entry without facts.
+        mids.push(
+            entry
+                .state
+                .facts
+                .as_ref()
+                .map(|facts| facts.mid.clone())
+                .unwrap_or_default(),
+        );
     }
     let next_from_ordinal = (end < prompt_len).then_some(end);
-    Ok(SessionReadPage {
+    let page = SessionReadPage {
         messages,
         next_from_ordinal,
         head: None,
@@ -84,7 +100,124 @@ pub async fn read_page<B: SessionBackend>(
         late_approvals: Vec::new(),
         withdrawals_owed: false,
         tags_await_setup: false,
-    })
+    };
+    Ok(StorePage { page, mids })
+}
+
+/// Serves `session.read` for a session kept in the new storage. The reply is today's for the
+/// same history, built from the session's head, its folds and its entry facts, never from a WAL.
+///
+/// Until the store keeps per-call facts, a read that opts in to display facts, tools or Rich UI
+/// stamps is refused by name rather than answered without them, as is a late-approval cursor:
+/// the new storage takes no approval questions, so no cursor names one.
+pub async fn serve_read(
+    store: &crate::store_open::StoreRuntime,
+    req: crate::serve::SessionReadRequest,
+) -> Result<broca_wire::SessionReadResponse, crate::serve::ServeError> {
+    use crate::serve::ServeError;
+    if let Some(cursor) = req.late_after.as_deref() {
+        let refusal = broca_wire::InvalidLateCursor::new(cursor);
+        return Err(ServeError::InvalidParams {
+            field: refusal.detail.field,
+            message: refusal.message,
+        });
+    }
+    for (asked, field) in [
+        (req.include_display_facts, "include_display_facts"),
+        (req.include_tools, "include_tools"),
+        (req.include_rich_ui, "include_rich_ui"),
+    ] {
+        if asked {
+            return Err(ServeError::InvalidParams {
+                field: field.into(),
+                message: format!("{field} isn't served yet for a session kept in the new storage"),
+            });
+        }
+    }
+    let Some(session) = store.view(&req.session).await? else {
+        // The session's creation never committed, so it holds nothing: an empty transcript.
+        let mut response = crate::serve::session_read_response(empty_page(), None);
+        response.incarnation = "unwritten".into();
+        return Ok(response);
+    };
+    let head = session.head();
+    if req
+        .history_version
+        .is_some_and(|requested| requested != head.history_version)
+    {
+        return Err(ServeError::HistoryChanged);
+    }
+    let from_ordinal = match &req.after_mid {
+        Some(mid) => match session.find_message(mid).await.map_err(read_failed)? {
+            // The 1-based ordinal of the message named, which is the 0-based start after it.
+            Some(ordinal) => Some(ordinal),
+            None => return Err(ServeError::UnknownMid(mid.clone())),
+        },
+        None => req.from_ordinal.map(|at| at.saturating_sub(1)),
+    };
+    let StorePage { page, mids } =
+        read_page(&session, from_ordinal, req.limit)
+            .await
+            .map_err(|error| match error {
+                StoreReadError::Session(error) => read_failed(error),
+                other => ServeError::Open(
+                    format!("the session's stored facts can't be read: {other:?}"),
+                    Some(broca_protocol::ErrorClass::Permanent),
+                ),
+            })?;
+    let mut response = crate::serve::session_read_response(page, None);
+    response.history_version = head.history_version;
+    response.incarnation = broca_session_store::codec::hex(&head.incarnation.0);
+    for (entry, mid) in response.messages.iter_mut().zip(mids) {
+        entry.mid = mid;
+    }
+    crate::serve::apply_media_mode(&mut response, req.media, &req.session.session)?;
+    let cap = req
+        .max_bytes
+        .unwrap_or(broca_wire::READ_DEFAULT_MAX_BYTES)
+        .min(broca_wire::READ_MAXIMUM_MAX_BYTES);
+    crate::serve::cap_page_bytes(
+        &mut response,
+        cap,
+        from_ordinal.is_none(),
+        &req.session.session,
+    )?;
+    Ok(response)
+}
+
+/// The page of a session that holds nothing.
+fn empty_page() -> SessionReadPage {
+    SessionReadPage {
+        messages: Vec::new(),
+        next_from_ordinal: None,
+        head: None,
+        lineage_id: None,
+        lineage_state: SessionReadLineageState {
+            last_run_id: None,
+            state: SessionReadStateKind::Idle,
+            reason: None,
+            error: None,
+            usage: None,
+        },
+        prompt_len: 0,
+        deferred_calls: None,
+        late_approvals: Vec::new(),
+        withdrawals_owed: false,
+        tags_await_setup: false,
+    }
+}
+
+/// A store read that failed. Only a backend failure is worth a retry: anything else is the
+/// session's stored bytes or state being wrong, which reading again won't change.
+fn read_failed(error: SessionError) -> crate::serve::ServeError {
+    let class = match error {
+        SessionError::Backend(_) => broca_protocol::ErrorClass::Transient,
+        _ => broca_protocol::ErrorClass::Permanent,
+    };
+    crate::serve::ServeError::Open(
+        format!("the session could not be read from the new storage: {error:?}"),
+        Some(class),
+    )
 }
 
 /// One page message from its entry. `next` is the entry after it, if any; `latest` is the
