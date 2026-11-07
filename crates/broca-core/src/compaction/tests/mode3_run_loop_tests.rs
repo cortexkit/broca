@@ -621,6 +621,106 @@ async fn compaction_v2_notices_and_rides_state_the_newest_reported_prompt_size()
     );
 }
 
+/// A later step of the same run estimates its request from the previous step's measured input
+/// plus only the bytes added since that step's request, as a resumed run does from the log. The
+/// first request is about 60% of the window, and the first step reports that as its measured
+/// input. Counting the whole body again on top of the measured input would put the second request
+/// near 120% of the window: it would ride `over_limit` and then end at the context ceiling.
+#[tokio::test]
+async fn compaction_v2_a_later_step_estimates_from_the_bytes_added_since_the_measured_request() {
+    let shared = Shared::default();
+    let writer = shared.writer();
+    let (mut request, mut control, _) = history_request();
+    // About 60,000 tokens at the estimate's bytes per token.
+    let prompt = "x".repeat(60_000 * crate::compaction::ESTIMATE_BYTES_PER_TOKEN as usize);
+    request.input = vec![text(Role::User, &prompt)];
+    request.context_limit = Some(100_000);
+    request.generation.max_output_tokens = Some(10_000);
+    control.admitted_context_limit = request.context_limit;
+    request.tools = vec![serde_json::from_value(
+        json!({"name":"edit","description":"edit","input_schema":{"type":"object"}}),
+    )
+    .unwrap()];
+    request.policy_allowed.insert("edit".into());
+    control.new_log_compaction_plan_version = Some(cortexkit_compaction_view::PLAN_VERSION);
+    let plane = Arc::new(Plane::default());
+    control.compaction_plane = Some(plane.clone());
+    // Each step reports the attempt that sent it, as a real transport does: the estimate's
+    // measured request is that attempt's body, about the prompt's size.
+    let attempted = |body: usize, mut events: Vec<broca_protocol::NormalizedEvent>| {
+        let attempt = broca_protocol::ModelAttempt {
+            content_progress: Default::default(),
+            attempt: 0,
+            request_body_len: body as u64,
+            request_body_sha256: "aa".into(),
+            http_status: Some(200),
+            content_type: None,
+            response_body_len: 1,
+            response_body_sha256: "bb".into(),
+            response_body_cap: None,
+            outcome: broca_protocol::AttemptOutcome::Complete,
+            ts_ms: 0,
+            sent_at_ms: None,
+            transport: None,
+            websocket_request: None,
+            cache_evidence: None,
+            websocket_close_code: None,
+            input_transformations: None,
+            input_transformations_unmeasured: false,
+            credential_refresh: None,
+            served_account_ref: None,
+            account_observation: Default::default(),
+        };
+        events.insert(
+            0,
+            broca_protocol::NormalizedEvent::Control(
+                broca_protocol::ProviderControl::AttemptFinished { attempt },
+            ),
+        );
+        events
+    };
+    let model = PrefixBound(crate::StubProvider::new(vec![
+        attempted(prompt.len(), tool_call_events("edit", 60_000)),
+        attempted(prompt.len(), model_events()),
+    ]));
+    let tools = crate::StubToolPlane::new().with_tool("edit", |_| {
+        crate::StubReply::Output(broca_protocol::ToolOutput::Text { text: "ok".into() })
+    });
+    let (out, _events) = tokio::sync::mpsc::channel(256);
+    let summary = crate::run_loop_on_writer(
+        request,
+        &writer,
+        crate::StartMode::FreshOrResume,
+        &model,
+        &tools,
+        &crate::AllowAll,
+        &shared,
+        None,
+        control,
+        &out,
+    )
+    .await
+    .unwrap();
+    writer.shutdown().await.unwrap();
+    let calls = plane.calls.lock().unwrap();
+    let over_limit: Vec<&Value> = calls
+        .iter()
+        .filter(|(method, params)| {
+            method == "compaction.ride"
+                && params["causes"]
+                    .as_array()
+                    .is_some_and(|causes| causes.contains(&json!("over_limit")))
+        })
+        .map(|(_, params)| &params["request_tokens"])
+        .collect();
+    assert!(
+        over_limit.is_empty(),
+        "no step's request is over the window: rides claimed over_limit at {over_limit:?}"
+    );
+    assert_eq!(summary.reason, RunFinishReason::Completed);
+    assert_eq!(summary.steps, 2, "both steps ran");
+}
+
 #[tokio::test]
 async fn compaction_v2_crash_mid_step_does_not_adopt_a_newer_accepted_view() {
     let (records, expected) = live_view().await;

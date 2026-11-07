@@ -7312,15 +7312,18 @@ where
                 });
                 compaction_history.previous_native_usage = native.as_ref().map(|(_, usage)| *usage);
                 compaction_history.previous_model = native.map(|(model, _)| model);
-                if let Some(bytes) = sent_bytes {
-                    compaction_history.previous_provider_code = None;
-                    compaction_history.previous_error = false;
-                    compaction_history.previous_request_bytes = if fallback_model.is_some() {
-                        attempt_bytes.and_then(|bytes| usize::try_from(bytes).ok())
-                    } else {
-                        Some(bytes)
-                    };
-                }
+                // As `CompactionHistory::fold` does for a resumed run: the measured input belongs to
+                // the request this step's last attempt sent, so the next estimate adds only the
+                // bytes written since that request. Left at an older request's size, the next
+                // estimate would count everything this run added twice, once in the measured input
+                // and again as bytes. The retired notice runtime, used only to generate historical
+                // fixtures, measures the notice-rendered request instead.
+                compaction_history.previous_provider_code = None;
+                compaction_history.previous_error = false;
+                compaction_history.previous_request_bytes = match sent_bytes {
+                    Some(bytes) if fallback_model.is_none() => Some(bytes),
+                    _ => attempt_bytes.and_then(|bytes| usize::try_from(bytes).ok()),
+                };
                 if let Some(seal) = &control.shutdown_seal {
                     seal.note_usage(step_id, usage);
                 }
