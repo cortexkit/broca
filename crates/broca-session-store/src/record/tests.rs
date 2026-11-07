@@ -142,6 +142,12 @@ fn one_of_each() -> Vec<Record> {
             total_usage: None,
             stop_met: None,
             limiting_stop_met: None,
+            by_model: vec![ModelStepUsage {
+                provider: "anthropic".into(),
+                model: "claude".into(),
+                variant: Some("high".into()),
+                usage,
+            }],
         }),
         Record::Attempt(Attempt {
             run_id: "run-1".into(),

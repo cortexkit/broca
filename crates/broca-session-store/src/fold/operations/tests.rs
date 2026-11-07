@@ -67,6 +67,7 @@ fn step_end(calls: u32, stop_met: bool) -> Record {
         total_usage: None,
         stop_met: stop_met.then_some(true),
         limiting_stop_met: None,
+        by_model: Vec::new(),
     })
 }
 
@@ -415,4 +416,71 @@ fn run_starts_fold_the_owner_summary() {
         ]
     );
     assert_eq!(owner.scope, Some(serde_json::json!({ "owner": "second" })));
+}
+
+fn share(model: &str, variant: Option<&str>, input: Option<u64>) -> crate::record::ModelStepUsage {
+    crate::record::ModelStepUsage {
+        provider: "anthropic".into(),
+        model: model.into(),
+        variant: variant.map(str::to_owned),
+        usage: broca_protocol::usage::Usage {
+            input_tokens: input,
+            ..Default::default()
+        },
+    }
+}
+
+/// The session's usage counts every model share a step records, in order of first use: a step
+/// two models shared counts once under each and twice in the totals, a step with no counts is
+/// unreported, and a sum stays absent until a step reports it.
+#[test]
+fn session_usage_counts_each_steps_model_shares() {
+    let mut first = step_end(0, false);
+    let mut second = step_end(0, false);
+    let mut third = step_end(0, false);
+    if let Record::StepEnd(step) = &mut first {
+        step.run_id = "r1".into();
+        step.by_model = vec![share("opus", Some("high"), Some(10))];
+    }
+    if let Record::StepEnd(step) = &mut second {
+        step.run_id = "r2".into();
+        step.by_model = vec![
+            share("opus-4-8", None, Some(5)),
+            share("opus", Some("high"), None),
+        ];
+    }
+    if let Record::StepEnd(step) = &mut third {
+        step.run_id = "r2".into();
+        step.by_model = vec![share("opus", Some("high"), Some(1))];
+    }
+    let mut ops = Operations::default();
+    for record in [first, second, third] {
+        ops.apply(&record).unwrap();
+    }
+    let usage = ops.session_usage.expect("steps counted");
+    assert_eq!(usage.since, "r1");
+    assert_eq!(usage.totals.steps, 4);
+    assert_eq!(usage.totals.unreported_steps, 1);
+    assert_eq!(usage.totals.input_tokens, Some(16));
+    assert_eq!(usage.totals.output_tokens, None);
+    let models: Vec<_> = usage
+        .by_model
+        .iter()
+        .map(|entry| {
+            (
+                entry.model.as_str(),
+                entry.variant.as_deref(),
+                entry.totals.steps,
+                entry.totals.unreported_steps,
+                entry.totals.input_tokens,
+            )
+        })
+        .collect();
+    assert_eq!(
+        models,
+        [
+            ("opus", Some("high"), 3, 1, Some(11)),
+            ("opus-4-8", None, 1, 0, Some(5))
+        ]
+    );
 }

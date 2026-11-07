@@ -794,6 +794,148 @@ state! {
             reset: "never",
             bound: Bound::Declared,
         },
+        /// The session's usage over every step, by model. Absent until a step counted.
+        20 opt pub session_usage: SessionUsage => {
+            owner: "run loop",
+            reset: "never",
+            bound: Bound::Declared,
+        },
+    }
+}
+
+state! {
+    /// The session's usage summed over every step, as the runner contract's `SessionUsage`
+    /// serves it on `session.head`: one count per `by_model` entry a step records, so a step
+    /// two models shared counts once under each and twice in the totals, as today's head
+    /// counts it.
+    #[derive(Debug, Clone, Default, PartialEq)]
+    pub struct SessionUsage {
+        /// The run of the first counted step.
+        1 req pub since: String => {
+            owner: "run loop",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
+        2 req pub totals: UsageTotals => {
+            owner: "run loop",
+            reset: "never",
+            bound: Bound::Declared,
+        },
+        /// One entry per distinct (provider, model, variant), in order of first use.
+        3 rep pub by_model: ModelTotals => {
+            owner: "run loop",
+            reset: "never",
+            bound: Bound::Distinct("(provider, model, variant)"),
+        },
+    }
+}
+
+state! {
+    /// Step counts and token sums. A sum is absent until a step reported that count, so an
+    /// unmeasured count never reads as zero.
+    #[derive(Debug, Clone, Default, PartialEq)]
+    pub struct UsageTotals {
+        1 req pub steps: u64 => { owner: "run loop", reset: "never", bound: Bound::Fixed },
+        /// Steps whose provider reported no usage at all.
+        2 req pub unreported_steps: u64 => {
+            owner: "run loop",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
+        3 opt pub input_tokens: u64 => { owner: "run loop", reset: "never", bound: Bound::Fixed },
+        4 opt pub cached_input_tokens: u64 => {
+            owner: "run loop",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
+        5 opt pub cache_write_tokens: u64 => {
+            owner: "run loop",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
+        6 opt pub output_tokens: u64 => { owner: "run loop", reset: "never", bound: Bound::Fixed },
+        7 opt pub reasoning_tokens: u64 => {
+            owner: "run loop",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
+    }
+}
+
+state! {
+    /// One model's share of the session's usage.
+    #[derive(Debug, Clone, Default, PartialEq)]
+    pub struct ModelTotals {
+        1 req pub provider: String => { owner: "run loop", reset: "never", bound: Bound::Fixed },
+        2 req pub model: String => { owner: "run loop", reset: "never", bound: Bound::Fixed },
+        3 opt pub variant: String => { owner: "run loop", reset: "never", bound: Bound::Fixed },
+        4 req pub totals: UsageTotals => {
+            owner: "run loop",
+            reset: "never",
+            bound: Bound::Declared,
+        },
+    }
+}
+
+impl UsageTotals {
+    /// Counts one step, as the runner contract's `RunUsage::record_step` does.
+    fn record(&mut self, usage: &broca_protocol::usage::Usage) {
+        fn add(total: &mut Option<u64>, step: Option<u64>) {
+            if let Some(step) = step {
+                *total = Some(total.unwrap_or(0).saturating_add(step));
+            }
+        }
+        let counts = [
+            usage.input_tokens,
+            usage.cached_input_tokens,
+            usage.cache_write_tokens,
+            usage.output_tokens,
+            usage.reasoning_tokens,
+        ];
+        self.steps = self.steps.saturating_add(1);
+        if counts.iter().all(Option::is_none) {
+            self.unreported_steps = self.unreported_steps.saturating_add(1);
+        }
+        add(&mut self.input_tokens, usage.input_tokens);
+        add(&mut self.cached_input_tokens, usage.cached_input_tokens);
+        add(&mut self.cache_write_tokens, usage.cache_write_tokens);
+        add(&mut self.output_tokens, usage.output_tokens);
+        add(&mut self.reasoning_tokens, usage.reasoning_tokens);
+    }
+}
+
+impl SessionUsage {
+    /// Counts each of a step's model shares.
+    fn record_step(
+        usage: &mut Option<SessionUsage>,
+        run_id: &str,
+        shares: &[crate::record::ModelStepUsage],
+    ) {
+        for share in shares {
+            let session = usage.get_or_insert_with(|| SessionUsage {
+                since: run_id.to_owned(),
+                ..SessionUsage::default()
+            });
+            session.totals.record(&share.usage);
+            let position = session.by_model.iter().position(|entry| {
+                entry.provider == share.provider
+                    && entry.model == share.model
+                    && entry.variant == share.variant
+            });
+            let entry = match position {
+                Some(position) => &mut session.by_model[position],
+                None => {
+                    session.by_model.push(ModelTotals {
+                        provider: share.provider.clone(),
+                        model: share.model.clone(),
+                        variant: share.variant.clone(),
+                        totals: UsageTotals::default(),
+                    });
+                    session.by_model.last_mut().expect("just pushed")
+                }
+            };
+            entry.totals.record(&share.usage);
+        }
     }
 }
 
@@ -1164,8 +1306,10 @@ impl Operations {
         }
         if let Record::StepRefused(refused) = record {
             self.refusal_schedule = Some(refused.schedule.clone());
+            SessionUsage::record_step(&mut self.session_usage, &refused.run_id, &refused.by_model);
         }
         if let Record::StepEnd(step) = record {
+            SessionUsage::record_step(&mut self.session_usage, &step.run_id, &step.by_model);
             if let Some(next) = step
                 .fallback
                 .as_ref()

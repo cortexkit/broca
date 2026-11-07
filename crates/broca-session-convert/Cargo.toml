@@ -24,6 +24,9 @@ broca-session-loop = { path = "../broca-session-loop" }
 broca-session-store = { path = "../broca-session-store" }
 broca-wal = { path = "../broca-wal" }
 cortexkit-role-compaction.workspace = true
+# The runner contract's session usage: the `ops` check compares the new fold's usage with the
+# usage the WAL path's `HeadProjection` serves on `session.head`.
+cortexkit-role-llm-runner.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_jcs.workspace = true

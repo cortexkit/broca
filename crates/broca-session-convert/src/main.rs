@@ -1644,7 +1644,9 @@ fn compare_ops(old: &[FramedRecord], lineage: Option<&str>) -> OpsOutcome {
         .map(|pending| pending.submission_id.0)
         .collect();
     let output_reservation = broca_session_loop::output::history(&operations);
-    let owner_differs = owner_difference(old, &operations);
+    // Session-wide facts the head serves, compared whether or not the session has a run.
+    let owner_differs = owner_difference(old, &operations)
+        .or_else(|| session_usage_difference(&records, &operations));
     let Some(run) = operations.run else {
         // Nothing to compare only when today's replay has no run either.
         return if today.run_id.is_none() && owner_differs.is_none() {
@@ -1845,6 +1847,23 @@ fn compare_ops(old: &[FramedRecord], lineage: Option<&str>) -> OpsOutcome {
 /// Two kinds of cache-send difference are expected and named apart: a cache warm, which the
 /// fold doesn't read yet, and an attempt without a send time, which today dates from a lower
 /// bound.
+/// Whether the session's usage by model, summed from each step's recorded model shares,
+/// differs from the usage today's head folds from the same records (`HeadProjection`).
+fn session_usage_difference(
+    records: &[broca_wal::WalRecord],
+    operations: &broca_session_store::fold::operations::Operations,
+) -> Option<String> {
+    let mut today = broca_core::head::HeadProjection::default();
+    for record in records {
+        today.observe(record);
+    }
+    let folded = broca_module::store_read::session_usage(operations.session_usage.as_ref());
+    let json = |usage: &Option<cortexkit_role_llm_runner::usage::SessionUsage>| {
+        serde_json::to_value(usage).unwrap_or_default()
+    };
+    (json(&today.usage) != json(&folded)).then(|| "session_usage".to_owned())
+}
+
 /// Whether the folded owner summary differs from the one today's admission folds from the same
 /// log (`SessionOwnershipV1::fold_owner_records`), naming the first field that does. The fold
 /// keeps only the first two distinct principals, so those are compared with today's first two.

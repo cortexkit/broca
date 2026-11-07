@@ -1783,6 +1783,11 @@ where
                                     schedule: serde_json::to_value(&schedule)
                                         .map_err(|e| LoopError::Parts(e.to_string()))?,
                                     ts_ms: now,
+                                    by_model: step.served.shares(
+                                        admission,
+                                        None,
+                                        step.served.total(step.usage),
+                                    ),
                                 },
                             )],
                             true,
@@ -1911,6 +1916,9 @@ where
         if refusal.after_tool_use {
             step.finish_reason = FinishReason::ToolCalls;
         }
+        // Which model each part of the step's usage counts under. The route's model is read
+        // here because `Served::members` below moves the route into the step's fallback facts.
+        let route_model = refusal.route.as_ref().map(|route| route.model.clone());
         let calls: Vec<ToolCall> = step.message.tool_calls().cloned().collect();
         let stop = stop_satisfied(&stop_when, completed_steps + 1, &step.message).cloned();
         let limiting = limiting_stop_satisfied(&stop_when, completed_steps + 1, &step.message);
@@ -1993,6 +2001,7 @@ where
                         total_usage: Some(step.served.total(whole)).filter(|total| *total != whole),
                         stop_met: stop.is_some().then_some(true),
                         limiting_stop_met: limiting.then_some(true),
+                        by_model: step.served.shares(admission, route_model.as_ref(), whole),
                     }),
                 ]
                 .into_iter()
@@ -2608,6 +2617,36 @@ impl Served {
             members.insert("raw_finish_reason".into(), json!(reason));
         }
         Ok((!members.is_empty()).then_some(Value::Object(members)))
+    }
+
+    /// The step's usage split by the model each part counts under, by today's own rule
+    /// (`StepServing::usage_by_model`), as `StepEnd::by_model` and `StepRefused::by_model`
+    /// record it: `route_model` is the refusal fallback's model when the step was routed there.
+    fn shares(
+        &self,
+        admission: &Admission,
+        route_model: Option<&broca_protocol::request::ModelHandle>,
+        usage: Usage,
+    ) -> Vec<broca_session_store::record::ModelStepUsage> {
+        let serving = broca_core::refusal_fallback::StepServing {
+            route_model,
+            served_model: self.served_model.as_deref(),
+            usage,
+            iterations: self.usage_iterations.as_deref(),
+        };
+        let variant = admission.variant.as_deref().filter(|v| !v.is_empty());
+        serving
+            .usage_by_model(&admission.model, variant)
+            .into_iter()
+            .map(
+                |(provider, model, variant, usage)| broca_session_store::record::ModelStepUsage {
+                    provider: provider.to_owned(),
+                    model: model.to_owned(),
+                    variant: variant.map(str::to_owned),
+                    usage,
+                },
+            )
+            .collect()
     }
 
     /// The step's whole usage: the sum over the models that ran when the provider reported

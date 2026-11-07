@@ -1,5 +1,7 @@
 use super::conversation::Conversation;
-use super::operations::{Budget, OpenBatch, Operations, Owner, Run, SetupInForce};
+use super::operations::{
+    Budget, ModelTotals, OpenBatch, Operations, Owner, Run, SessionUsage, SetupInForce, UsageTotals,
+};
 use super::{Bound, FieldSpec};
 
 /// Every fold state, by name.
@@ -11,6 +13,9 @@ const STATES: &[(&str, &[FieldSpec])] = &[
     ("OpenBatch", OpenBatch::SCHEMA),
     ("SetupInForce", SetupInForce::SCHEMA),
     ("Owner", Owner::SCHEMA),
+    ("SessionUsage", SessionUsage::SCHEMA),
+    ("UsageTotals", UsageTotals::SCHEMA),
+    ("ModelTotals", ModelTotals::SCHEMA),
 ];
 
 /// Each field bounded as `Declared`, with the state struct whose own fields carry the bounds.
@@ -18,6 +23,9 @@ const DECLARED: &[(&str, &str, &str)] = &[
     ("Operations", "run", "Run"),
     ("Operations", "setup", "SetupInForce"),
     ("Operations", "owner", "Owner"),
+    ("Operations", "session_usage", "SessionUsage"),
+    ("SessionUsage", "totals", "UsageTotals"),
+    ("ModelTotals", "totals", "UsageTotals"),
     ("Run", "budget", "Budget"),
 ];
 

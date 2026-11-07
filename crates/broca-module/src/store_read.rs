@@ -286,6 +286,58 @@ fn delivery(
     }))
 }
 
+/// The session's usage by model, as `session.head` serves it, from the fold that sums each
+/// step's model shares. `None` until a step counted.
+pub fn session_usage(
+    fold: Option<&broca_session_store::fold::operations::SessionUsage>,
+) -> Option<cortexkit_role_llm_runner::usage::SessionUsage> {
+    use broca_session_store::fold::operations::UsageTotals;
+    use cortexkit_role_llm_runner::usage::{ModelUsage, RunUsage, SessionUsage};
+    let fold = fold?;
+    fn counts(totals: &UsageTotals) -> [Option<u64>; 5] {
+        [
+            totals.input_tokens,
+            totals.cached_input_tokens,
+            totals.cache_write_tokens,
+            totals.output_tokens,
+            totals.reasoning_tokens,
+        ]
+    }
+    let mut run = RunUsage::new();
+    run.steps = fold.totals.steps;
+    run.unreported_steps = fold.totals.unreported_steps;
+    [
+        run.input_tokens,
+        run.cached_input_tokens,
+        run.cache_write_tokens,
+        run.output_tokens,
+        run.reasoning_tokens,
+    ] = counts(&fold.totals);
+    run.by_model = fold
+        .by_model
+        .iter()
+        .map(|entry| {
+            let mut model = ModelUsage::new(&entry.provider, &entry.model);
+            if let Some(variant) = &entry.variant {
+                model = model.with_variant(variant);
+            }
+            model.steps = entry.totals.steps;
+            model.unreported_steps = entry.totals.unreported_steps;
+            [
+                model.input_tokens,
+                model.cached_input_tokens,
+                model.cache_write_tokens,
+                model.output_tokens,
+                model.reasoning_tokens,
+            ] = counts(&entry.totals);
+            model
+        })
+        .collect();
+    let mut usage = SessionUsage::new(&fold.since);
+    usage.totals = run;
+    Some(usage)
+}
+
 /// The session's lifecycle beside a page: its latest run's state, and for an ended or paused
 /// run the error and usage its end or pause recorded, which the operational fold keeps.
 fn lineage_state<B: SessionBackend>(session: &Session<B>) -> SessionReadLineageState {

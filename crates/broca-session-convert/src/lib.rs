@@ -24,9 +24,9 @@ use broca_session_store::fold::conversation::Conversation;
 use broca_session_store::record::{
     Assistant, Attempt, AuthRefrozen, BatchEnd, BatchStart, BudgetFire, BudgetFiring, CallOutcome,
     CancelPoint, CancelRequest, CeilingDecided, Compaction, ConfigRefrozen, Delivery,
-    DeliveryOrdered, Event, Input, Marker, Notice, OutputCapLowered, PartKind, PartRef, Pause,
-    Placement, QueuedSend, Record, Redo, ResultAppend, Resumed, Retraction, RunEnd, RunStart,
-    SendEnded, SessionRefresh, SetupStub, Steer, StepEnd, StepRefused, StepStart, Stream,
+    DeliveryOrdered, Event, Input, Marker, ModelStepUsage, Notice, OutputCapLowered, PartKind,
+    PartRef, Pause, Placement, QueuedSend, Record, Redo, ResultAppend, Resumed, Retraction, RunEnd,
+    RunStart, SendEnded, SessionRefresh, SetupStub, Steer, StepEnd, StepRefused, StepStart, Stream,
     StructuredDowngraded, StructuredResult, ToolHeld, ToolIntent, ToolOutcome, ToolReply, View,
     ViewApplied, Warmed,
 };
@@ -98,6 +98,9 @@ struct State {
     lineage: Option<String>,
     run_id: String,
     model: Option<ModelHandle>,
+    /// The current run's frozen variant; an empty value counts as none, as `HeadProjection`
+    /// treats it.
+    variant: Option<String>,
     setup: Vec<PartRef>,
     call_inputs: HashMap<String, Value>,
     /// Copies of steered and delivered messages accepted but not placed yet. Today's log
@@ -444,6 +447,57 @@ fn convert_one(
     state: &mut State,
     out: &mut Converted,
 ) -> Result<(), ConvertError> {
+    if let WalRecord::RunStarted { config, .. } = record {
+        state.variant = config.variant.clone().filter(|variant| !variant.is_empty());
+    }
+    convert_record(record, state, out)?;
+    record_model_shares(record, state, out);
+    Ok(())
+}
+
+/// Records which model each part of a step's usage counts under, by today's own rule
+/// (`refusal_fallback::usage_by_model`), on the step record just written. The new loop records
+/// the same split when it writes a step, so the session's usage by model folds from it.
+fn record_model_shares(record: &WalRecord, state: &State, out: &mut Converted) {
+    let Some(model) = state.model.as_ref() else {
+        return;
+    };
+    let shares: Vec<ModelStepUsage> =
+        broca_core::refusal_fallback::usage_by_model(model, state.variant.as_deref(), record)
+            .into_iter()
+            .map(|(provider, model, variant, usage)| ModelStepUsage {
+                provider: provider.to_owned(),
+                model: model.to_owned(),
+                variant: variant.map(str::to_owned),
+                usage,
+            })
+            .collect();
+    if shares.is_empty() {
+        return;
+    }
+    let step = out
+        .records
+        .iter_mut()
+        .rev()
+        .find_map(|written| match (record, written) {
+            (WalRecord::ModelStepFinished { .. }, Record::StepEnd(step)) => {
+                Some(&mut step.by_model)
+            }
+            (WalRecord::ModelStepRefused { .. }, Record::StepRefused(step)) => {
+                Some(&mut step.by_model)
+            }
+            _ => None,
+        });
+    if let Some(by_model) = step {
+        *by_model = shares;
+    }
+}
+
+fn convert_record(
+    record: &WalRecord,
+    state: &mut State,
+    out: &mut Converted,
+) -> Result<(), ConvertError> {
     if let WalRecord::ToolNoDispatch { .. } = record {
         return tool_no_dispatch(record, state, out);
     }
@@ -641,6 +695,8 @@ fn convert_one(
             discarded_blocks: f.req_u64("discarded_blocks") as u32,
             schedule: f.take("schedule").unwrap_or(Value::Null),
             ts_ms: f.u64("ts_ms"),
+            // Filled after this record is built, by `record_model_shares`.
+            by_model: Vec::new(),
         })),
         // Today's refreezes name no run: they belong to the run whose resume wrote them.
         "run_config_refrozen" => out.records.push(Record::ConfigRefrozen(ConfigRefrozen {
@@ -1176,6 +1232,8 @@ fn model_step_finished(
         total_usage: (Some(total) != usage).then_some(total),
         stop_met: std::mem::take(&mut state.stop_met).then_some(true),
         limiting_stop_met: std::mem::take(&mut state.limiting_stop_met).then_some(true),
+        // Filled after this record is built, by `record_model_shares`.
+        by_model: Vec::new(),
     }));
     Ok(())
 }

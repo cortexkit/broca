@@ -428,6 +428,23 @@ message! {
         /// Whether a stop condition other than "the loop finished" was met, which forbids an
         /// extra step to place a steer that arrived during this one.
         14 opt limiting_stop_met: bool,
+        /// The step's usage split by the model each part counts under, as the run loop decides
+        /// it when it writes the step: a refusal fallback's or a provider's own hand-off moves
+        /// usage off the run's model. The session's usage by model is the sum of these.
+        15 rep [must] by_model: ModelStepUsage,
+    }
+}
+
+message! {
+    /// One model's share of a step's usage, as `StepEnd::by_model` and `StepRefused::by_model`
+    /// record it. `variant` is the run's variant only when the run's own model answered the
+    /// whole step: another model doesn't run the caller's variant.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct ModelStepUsage {
+        1 req provider: String,
+        2 req model: String,
+        3 opt variant: String,
+        4 req usage: Usage,
     }
 }
 
@@ -912,6 +929,9 @@ message! {
         /// Owned by the run loop: the refusal-fallback schedule after this refusal.
         7 req schedule: serde_json::Value,
         8 opt ts_ms: u64,
+        /// The refused step's usage split by model, as `StepEnd::by_model`: a refused step was
+        /// billed, so it counts as a step of the model that refused.
+        9 rep [must] by_model: ModelStepUsage,
     }
 }
 

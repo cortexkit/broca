@@ -621,6 +621,7 @@ dependencies = [
  "broca-session-store",
  "broca-wal",
  "cortexkit-role-compaction",
+ "cortexkit-role-llm-runner 0.8.7",
  "futures",
  "serde",
  "serde_jcs",

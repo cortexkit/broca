@@ -171,73 +171,116 @@ pub fn route(schedule: Option<&RefusalFallbackSchedule>, eligible: bool) -> Step
     }
 }
 
-/// The model a step's usage is reported and billed under, as `(provider, model, variant)`:
-/// the client-side fallback model for a step routed there, the model a server-side fallback
-/// served the response with, or else the episode's model and variant. The variant is dropped
-/// in the first two cases, because the caller's variant is not what the other model ran.
+/// What a durable step records about how it was served: the client-side fallback route's
+/// model, if the step was routed there; the model a server-side fallback served the response
+/// with; the step's usage; and each model's iterations when the provider split it.
+#[derive(Debug, Clone, Copy)]
+pub struct StepServing<'a> {
+    pub route_model: Option<&'a ModelHandle>,
+    pub served_model: Option<&'a str>,
+    pub usage: broca_protocol::Usage,
+    pub iterations: Option<&'a [broca_protocol::usage::UsageIteration]>,
+}
+
+impl<'a> StepServing<'a> {
+    /// What a step record says about how it was served. `None` for a record that carries no
+    /// step usage.
+    pub fn of_record(record: &'a WalRecord) -> Option<Self> {
+        match record {
+            WalRecord::ModelStepFinished {
+                usage, fallback, ..
+            } => Some(Self {
+                route_model: fallback.route.as_ref().map(|route| &route.model),
+                served_model: fallback.served_model.as_deref(),
+                usage: *usage,
+                iterations: fallback.usage_iterations.as_deref(),
+            }),
+            WalRecord::ModelStepRefused {
+                usage,
+                served_model,
+                usage_iterations,
+                ..
+            } => Some(Self {
+                route_model: None,
+                served_model: served_model.as_deref(),
+                usage: *usage,
+                iterations: usage_iterations.as_deref(),
+            }),
+            _ => None,
+        }
+    }
+
+    /// The model this step's usage is reported and billed under, as
+    /// `(provider, model, variant)`: the client-side fallback model for a step routed there,
+    /// the model a server-side fallback served the response with, or else the episode's model
+    /// and variant. The variant is dropped in the first two cases, because the caller's variant
+    /// is not what the other model ran.
+    pub fn model(
+        &self,
+        episode_model: &'a ModelHandle,
+        episode_variant: Option<&'a str>,
+    ) -> (&'a str, &'a str, Option<&'a str>) {
+        match (self.route_model, self.served_model) {
+            (_, Some(served)) => (episode_model.provider_module_id.as_str(), served, None),
+            (Some(model), None) => (
+                model.provider_module_id.as_str(),
+                model.model_id.as_str(),
+                None,
+            ),
+            (None, None) => (
+                episode_model.provider_module_id.as_str(),
+                episode_model.model_id.as_str(),
+                episode_variant,
+            ),
+        }
+    }
+
+    /// This step's usage entries, with the identity of each serving model. The episode
+    /// variant applies only to an ordinary single-model response: the provider controls the
+    /// models and settings used in a server-side iteration split.
+    pub fn usage_by_model(
+        &self,
+        episode_model: &'a ModelHandle,
+        episode_variant: Option<&'a str>,
+    ) -> Vec<(&'a str, &'a str, Option<&'a str>, broca_protocol::Usage)> {
+        let (provider, model, variant) = self.model(episode_model, episode_variant);
+        broca_protocol::usage::model_usage(model, self.usage, self.iterations)
+            .into_iter()
+            .map(|(model, usage)| {
+                (
+                    provider,
+                    model,
+                    if self.iterations.is_some() {
+                        None
+                    } else {
+                        variant
+                    },
+                    usage,
+                )
+            })
+            .collect()
+    }
+}
+
+/// The model a step record's usage is reported and billed under (`StepServing::model`).
 /// `None` for a record that carries no step usage.
 pub fn usage_model<'a>(
     episode_model: &'a ModelHandle,
     episode_variant: Option<&'a str>,
     record: &'a WalRecord,
 ) -> Option<(&'a str, &'a str, Option<&'a str>)> {
-    let (route, served_model) = match record {
-        WalRecord::ModelStepFinished { fallback, .. } => (
-            fallback.route.as_ref().map(|route| &route.model),
-            fallback.served_model.as_deref(),
-        ),
-        WalRecord::ModelStepRefused { served_model, .. } => (None, served_model.as_deref()),
-        _ => return None,
-    };
-    Some(match (route, served_model) {
-        (_, Some(served)) => (episode_model.provider_module_id.as_str(), served, None),
-        (Some(model), None) => (
-            model.provider_module_id.as_str(),
-            model.model_id.as_str(),
-            None,
-        ),
-        (None, None) => (
-            episode_model.provider_module_id.as_str(),
-            episode_model.model_id.as_str(),
-            episode_variant,
-        ),
-    })
+    StepServing::of_record(record).map(|serving| serving.model(episode_model, episode_variant))
 }
 
-/// Usage entries for a durable step, with the identity of each serving model. The
-/// episode variant applies only to an ordinary single-model response: the provider
-/// controls the models and settings used in a server-side iteration split.
+/// Usage entries for a durable step record (`StepServing::usage_by_model`).
 pub fn usage_by_model<'a>(
     episode_model: &'a ModelHandle,
     episode_variant: Option<&'a str>,
     record: &'a WalRecord,
 ) -> Vec<(&'a str, &'a str, Option<&'a str>, broca_protocol::Usage)> {
-    let (usage, iterations) = match record {
-        WalRecord::ModelStepFinished {
-            usage, fallback, ..
-        } => (*usage, fallback.usage_iterations.as_deref()),
-        WalRecord::ModelStepRefused {
-            usage,
-            usage_iterations,
-            ..
-        } => (*usage, usage_iterations.as_deref()),
-        _ => return Vec::new(),
-    };
-    let Some((provider, model, variant)) = usage_model(episode_model, episode_variant, record)
-    else {
-        return Vec::new();
-    };
-    broca_protocol::usage::model_usage(model, usage, iterations)
-        .into_iter()
-        .map(|(model, usage)| {
-            (
-                provider,
-                model,
-                if iterations.is_some() { None } else { variant },
-                usage,
-            )
-        })
-        .collect()
+    StepServing::of_record(record)
+        .map(|serving| serving.usage_by_model(episode_model, episode_variant))
+        .unwrap_or_default()
 }
 
 /// Total usage of a durable step, including logs written before iteration totals
