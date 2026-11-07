@@ -2835,6 +2835,8 @@ mod executor {
             account_reports,
             max_same_account_wait,
             auth_selection,
+            // The actor's in-flight step, which `run.status` serves for its active run.
+            step_progress: control.step_progress.clone(),
         }
     }
 

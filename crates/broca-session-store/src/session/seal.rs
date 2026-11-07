@@ -696,6 +696,9 @@ impl<B: SessionBackend> Session<B> {
         // facts of messages that left the window are found through the directory.
         self.open_ids = created.open_ids;
         self.window = created.window;
+        // The new log's records up to here were copied or carried, not appended, so none is kept;
+        // a read asking for them reads the log.
+        self.kept = super::kept::KeptRecords::from_next(self.encoder.next_seq(), false);
         self.poisoned = false;
         Ok(created.sealed)
     }

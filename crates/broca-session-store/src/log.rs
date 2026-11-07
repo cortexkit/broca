@@ -354,6 +354,11 @@ impl LogEncoder {
         self.synced_through = self.offset;
     }
 
+    /// Whether bytes were written since the last barrier made the log durable.
+    pub fn unsynced(&self) -> bool {
+        self.offset > self.synced_through
+    }
+
     /// The log's length so far.
     pub fn offset(&self) -> u64 {
         self.offset

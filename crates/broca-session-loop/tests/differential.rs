@@ -2084,6 +2084,7 @@ async fn new_from(
         }),
         max_same_account_wait: account().map_or_else(Default::default, |script| script.wait),
         auth_selection: account_selection(),
+        step_progress: None,
     };
     let sealing = SEALING.try_with(|cause| *cause).ok();
     through!(
@@ -3144,6 +3145,7 @@ async fn compare_runs_in_once(scenario: Scenario, runs: &[(&str, Vec<Message>)])
         }),
         max_same_account_wait: account().map_or_else(Default::default, |script| script.wait),
         auth_selection: account_selection(),
+        step_progress: None,
     };
     for (index, (run_id, input)) in runs.iter().enumerate() {
         through!(writer, |w| run(
@@ -3774,6 +3776,7 @@ async fn compare_actions_in_once(
         }),
         max_same_account_wait: account().map_or_else(Default::default, |script| script.wait),
         auth_selection: account_selection(),
+        step_progress: None,
     };
     let mut admission = scenario.admission(&provider.inner);
     admission.on_restart = on_restart;
@@ -4154,6 +4157,7 @@ async fn compare_auth_pause_in_once(
         }),
         max_same_account_wait: account().map_or_else(Default::default, |script| script.wait),
         auth_selection: account_selection(),
+        step_progress: None,
     };
     let first = through!(writer, |w| run(
         w,

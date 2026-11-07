@@ -3334,7 +3334,7 @@ impl ServeHandler for crate::LineageRegistry {
     async fn read(&self, req: SessionReadRequest) -> Result<SessionReadResponse, ServeError> {
         if let Some(store) = self.store_runtime() {
             if store.holds(&req.session)? {
-                return crate::store_read::serve_read(&store, req).await;
+                return crate::store_read::serve_read(self, &store, req).await;
             }
         }
         let before_history = self.history_read_version(&req.session).await?;

@@ -82,6 +82,12 @@ pub enum SessionError {
     /// The session names an import's id map that is missing or doesn't read: damage, never an
     /// id the session doesn't hold.
     ImportedIdsDamaged(String),
+    /// A read made while reads come from memory only (see [`Session::in_memory`]) needs history
+    /// kept in storage. Nothing was read.
+    NotInMemory,
+    /// The session's head moved past the version a read was pinned at (see [`Session::view_at`]),
+    /// or its open log is no longer the one pinned. Nothing was read; read it again.
+    Moved,
 }
 
 impl From<BackendError> for SessionError {
@@ -183,6 +189,22 @@ pub struct Session<B: SessionBackend> {
     /// What the session keeps of its sealed history while it's open (see `entry_by_mid` and
     /// `keep_sealed_derived`).
     sealed_entries: read::SealedEntries,
+    /// The open log's records kept in memory (see `kept`).
+    kept: kept::KeptRecords,
+    /// Set while reads come from memory only (see [`Session::in_memory`]).
+    memory_only: std::sync::atomic::AtomicBool,
+    /// Set when a read refused for needing storage while reads came from memory only.
+    memory_refused: std::sync::atomic::AtomicBool,
+}
+
+/// Where a session stood when it was read: the head version, the open log, and how many of the
+/// log's bytes were read. A view loaded at a position never changes, so it can be kept and served
+/// again for as long as the session stays there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Position {
+    pub version: Version,
+    pub log: Id128,
+    pub len: u64,
 }
 
 impl<B: SessionBackend> Session<B> {
@@ -283,6 +305,7 @@ impl<B: SessionBackend> Session<B> {
         let version = backend
             .write_head(&addr, &head::seal(&head, key), Some(version), version + 1)
             .await?;
+        let head_next_seq = head.next_seq;
         Ok(Self {
             backend,
             addr,
@@ -298,6 +321,9 @@ impl<B: SessionBackend> Session<B> {
             window: OpenLogIndex::default(),
             imported: Default::default(),
             sealed_entries: Default::default(),
+            kept: kept::KeptRecords::from_next(head_next_seq, true),
+            memory_only: Default::default(),
+            memory_refused: Default::default(),
         })
     }
 
@@ -309,7 +335,7 @@ impl<B: SessionBackend> Session<B> {
         triple: &SessionTriple,
         deployment: &DeploymentKey,
     ) -> Result<Self, SessionError> {
-        match Self::read(backend, addr, triple, deployment).await? {
+        match Self::read(backend, addr, triple, deployment, None).await? {
             Loaded::Creating {
                 backend,
                 addr,
@@ -327,10 +353,14 @@ impl<B: SessionBackend> Session<B> {
             }
             Loaded::Open {
                 mut session,
-                read,
+                mut read,
                 end,
             } => {
                 let key = session.key.clone();
+                session.kept = kept::KeptRecords::writer_of(
+                    std::mem::take(&mut read.records),
+                    session.encoder.next_seq(),
+                );
                 session.open_writer_over(&key, &read, end).await?;
                 Ok(*session)
             }
@@ -348,27 +378,86 @@ impl<B: SessionBackend> Session<B> {
         triple: &SessionTriple,
         deployment: &DeploymentKey,
     ) -> Result<SessionView<B>, SessionError> {
-        match Self::read(backend, addr, triple, deployment).await? {
+        Self::loaded_view(Self::read(backend, addr, triple, deployment, None).await?)
+    }
+
+    /// Where the session at `addr` stands now (see [`Position`]), read from its head and its open
+    /// log's length, without reading the log: what [`Session::view_at`] would load. `None` for a
+    /// session that has no head or whose creation never committed.
+    pub async fn stored_position(
+        backend: &B,
+        addr: &SessionAddr,
+        deployment: &DeploymentKey,
+    ) -> Result<Option<Position>, SessionError> {
+        let Some((stored, version)) = backend.read_head(addr).await? else {
+            return Ok(None);
+        };
+        let (head, _) = head::open(&stored, deployment).map_err(SessionError::Head)?;
+        let Some(open) = head
+            .open_log
+            .as_ref()
+            .filter(|_| matches!(head.residence, Residence::Local(())))
+        else {
+            return match head.residence {
+                Residence::Recovering(_) => Err(SessionError::NeedsRecovery),
+                _ => Ok(None),
+            };
+        };
+        let len = backend.log_end(addr, &open.change).await?;
+        Ok(Some(Position {
+            version,
+            log: open.change,
+            len,
+        }))
+    }
+
+    /// Loads the session at `addr` for reading only, as [`Session::view`] does, exactly at
+    /// `position`: the head must still be at its version, and only the open log's first
+    /// `position.len` bytes are read, so what a writer appended since isn't seen. A head that
+    /// moved refuses [`SessionError::Moved`].
+    pub async fn view_at(
+        backend: B,
+        addr: SessionAddr,
+        triple: &SessionTriple,
+        deployment: &DeploymentKey,
+        position: &Position,
+    ) -> Result<SessionView<B>, SessionError> {
+        Self::loaded_view(Self::read(backend, addr, triple, deployment, Some(position)).await?)
+    }
+
+    fn loaded_view(loaded: Loaded<B>) -> Result<SessionView<B>, SessionError> {
+        match loaded {
             Loaded::Creating { .. } => Err(SessionError::Missing),
-            Loaded::Open { mut session, .. } => {
+            Loaded::Open {
+                mut session,
+                mut read,
+                ..
+            } => {
                 // No writer was opened, so nothing may be appended: every write checks this.
                 session.poisoned = true;
+                session.kept = kept::KeptRecords::whole_log(std::mem::take(&mut read.records));
                 Ok(SessionView(*session))
             }
         }
     }
 
-    /// Reads the session's head, checkpoint and open log and folds them, writing nothing.
+    /// Reads the session's head, checkpoint and open log and folds them, writing nothing. With
+    /// `at`, the head must be at that version and its open log the one named, and only the log's
+    /// first `at.len` bytes are read.
     async fn read(
         backend: B,
         addr: SessionAddr,
         triple: &SessionTriple,
         deployment: &DeploymentKey,
+        at: Option<&Position>,
     ) -> Result<Loaded<B>, SessionError> {
         let (stored, version) = backend
             .read_head(&addr)
             .await?
             .ok_or(SessionError::Missing)?;
+        if at.is_some_and(|at| at.version != version) {
+            return Err(SessionError::Moved);
+        }
         let (head, key) = head::open(&stored, deployment).map_err(SessionError::Head)?;
         if &head.triple != triple {
             return Err(SessionError::TripleMismatch);
@@ -392,7 +481,11 @@ impl<B: SessionBackend> Session<B> {
             .ok_or(SessionError::Backend(BackendError::Corrupt(
                 "local head without a log",
             )))?;
-        let end = backend.log_end(&addr, &open.change).await?;
+        let end = match at {
+            Some(at) if at.log != open.change => return Err(SessionError::Moved),
+            Some(at) => at.len,
+            None => backend.log_end(&addr, &open.change).await?,
+        };
         let bytes = backend.read_log(&addr, &open.change, 0..end).await?;
         let bind = log_bind(&head.session_id, &open.change);
         let frame_key = key.frame_key();
@@ -448,6 +541,11 @@ impl<B: SessionBackend> Session<B> {
             window,
             imported: Default::default(),
             sealed_entries: Default::default(),
+            // Set by whoever takes the loaded session: a view keeps every record, a writer its
+            // latest run's.
+            kept: kept::KeptRecords::default(),
+            memory_only: Default::default(),
+            memory_refused: Default::default(),
         };
         Ok(Loaded::Open {
             session: Box::new(session),
@@ -460,8 +558,15 @@ impl<B: SessionBackend> Session<B> {
     /// backend: one read of the open log. For a reader that needs whole records the folds keep only
     /// a summary of, such as the compaction views (the fold keeps their version and checksum, the
     /// records their edits). The writer appended every one of them, so a log that no longer reads
-    /// clean means something else wrote it, and the read refuses.
+    /// clean means something else wrote it, and the read refuses. A view, and a read from memory
+    /// only, are answered from the records kept when those are the whole log.
     pub async fn open_log_records(&self) -> Result<Vec<(u64, Record)>, SessionError> {
+        if self.reads_kept() {
+            if let Some(records) = self.kept.whole() {
+                return Ok(records.to_vec());
+            }
+        }
+        self.storage_read()?;
         let open =
             self.head
                 .open_log
@@ -601,6 +706,7 @@ impl<B: SessionBackend> Session<B> {
                 self.open_ids.add(first + position as u64, record);
             }
             self.window.note(first + position as u64, record);
+            self.kept.note(first + position as u64, record);
         }
         self.poisoned = false;
         Ok(first)
@@ -673,6 +779,8 @@ impl<B: SessionBackend> Session<B> {
     }
 }
 
+mod kept;
+pub use kept::InMemory;
 mod media;
 use media::OpenLogIndex;
 pub use media::{MediaError, NewMedia};

@@ -218,6 +218,7 @@ impl<B: SessionBackend> Session<B> {
         };
         let window = self.conversation.window_start();
         while next < window && out.len() < limit {
+            self.storage_read()?;
             let damaged = || SessionError::Fold(format!("no sealed segment places message {next}"));
             let entry = pages
                 .find_ordinal(self.head.transcript_dir.as_ref(), next)
@@ -339,6 +340,7 @@ impl<B: SessionBackend> Session<B> {
         if let Some(ordinal) = self.window.facts.get(&seq) {
             return Ok(Some(*ordinal));
         }
+        self.storage_read()?;
         let key = self.key.frame_key();
         let pages = Pages {
             backend: &self.backend,
@@ -377,6 +379,7 @@ impl<B: SessionBackend> Session<B> {
         if let Some(message) = self.conversation.window_message(ordinal) {
             return Ok(Some(message.clone()));
         }
+        self.storage_read()?;
         let key = self.key.frame_key();
         let pages = Pages {
             backend: &self.backend,
@@ -433,6 +436,7 @@ impl<B: SessionBackend> Session<B> {
     ) -> Result<Vec<(u64, Record)>, SessionError> {
         let mut found = self.open_ids.find(kind, id);
         if let Some(root_name) = &self.head.id_index {
+            self.storage_read()?;
             let key = self.key.frame_key();
             let index = IndexPages {
                 backend: &self.backend,
@@ -504,58 +508,14 @@ impl<B: SessionBackend> Session<B> {
     /// order: the sealed segments that reach `first`, every block of each, then the open log.
     /// A record a seal kept in the open log is read once.
     pub async fn records_from(&self, first: u64) -> Result<Vec<(u64, Record)>, SessionError> {
-        let key = self.key.frame_key();
-        let pages = Pages {
-            backend: &self.backend,
-            addr: &self.addr,
-            session: self.head.session_id,
-            key: &key,
-            fanout: crate::directory::FANOUT,
-        };
-        let mut records = BTreeMap::new();
-        for dir in [&self.head.ledger_dir, &self.head.transcript_dir] {
-            for entry in pages
-                .entries_from(dir.as_ref(), first)
-                .await
-                .map_err(SessionError::Directory)?
-            {
-                let bytes = self
-                    .backend
-                    .get_object(&self.addr, &entry.object)
-                    .await?
-                    .ok_or_else(|| {
-                        SessionError::Fold(format!(
-                            "the directory names a missing segment {}",
-                            entry.object
-                        ))
-                    })?;
-                let segment = Segment::open(&bytes, &key, entry.object.as_bytes())
-                    .map_err(SessionError::Segment)?;
-                for position in 0..segment.index.blocks.len() {
-                    // A block whose successor starts at or before `first` ends before it.
-                    let next = segment.index.blocks.get(position + 1);
-                    if next.is_some_and(|next| next.first_seq <= first) {
-                        continue;
-                    }
-                    for (seq, record) in segment.block(position).map_err(SessionError::Segment)? {
-                        if seq >= first && entry.keeps(seq) {
-                            records.insert(seq, record);
-                        }
-                    }
-                }
-            }
-        }
-        for (seq, record) in self.open_log_records().await? {
-            if seq >= first {
-                records.insert(seq, record);
-            }
-        }
-        Ok(records.into_iter().collect())
+        self.records_between(first, u64::MAX).await
     }
 
     /// Every record of both streams from seq `first` through seq `last`, sealed or in the open
     /// log, in seq order: [`Self::records_from`] bounded at `last`, reading only the sealed
-    /// segments that overlap the range.
+    /// segments that overlap the range. A directory whose records all end before `first` holds
+    /// none of the range, so it isn't read; the open log's records come from memory when the
+    /// session keeps them all from `first` on.
     pub async fn records_between(
         &self,
         first: u64,
@@ -571,6 +531,10 @@ impl<B: SessionBackend> Session<B> {
         };
         let mut records = BTreeMap::new();
         for dir in [&self.head.ledger_dir, &self.head.transcript_dir] {
+            if dir.as_ref().is_none_or(|root| root.last_seq < first) {
+                continue;
+            }
+            self.storage_read()?;
             for entry in pages
                 .entries_from(dir.as_ref(), first)
                 .await
@@ -607,7 +571,15 @@ impl<B: SessionBackend> Session<B> {
                 }
             }
         }
-        for (seq, record) in self.open_log_records().await? {
+        let kept = self
+            .reads_kept()
+            .then(|| self.kept.between(first, last))
+            .flatten();
+        let open = match kept {
+            Some(kept) => kept,
+            None => self.open_log_records().await?,
+        };
+        for (seq, record) in open {
             if (first..=last).contains(&seq) {
                 records.insert(seq, record);
             }

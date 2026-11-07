@@ -1,12 +1,13 @@
 //! Reads of a session kept in the new session storage.
 //!
-//! A read loads the session read-only (`Session::view`): it never takes the lease or writes, a
-//! torn tail reads as not yet written, and a log that needs a recovery refuses until a writer
-//! repairs it. Each reply is built from what the session decided when it placed each message
-//! (`EntryFacts`) and from its operational fold, so a read costs a load and the pages it serves,
-//! never a replay. A reply here equals the reply today's reader builds from a WAL for the same
-//! history, apart from the differences the stage-6 design names: no WAL lineage, and cursors
-//! on the store's own record seqs.
+//! A read is served by the session's store actor from the session it holds, or, for a session no
+//! actor holds, from a read-only view (`Session::view_at`) kept while the session stays where it
+//! was loaded (see `store_reads`). A view never takes the lease or writes, a torn tail reads as
+//! not yet written, and a log that needs a recovery refuses until a writer repairs it. Each reply
+//! is built from what the session decided when it placed each message (`EntryFacts`) and from its
+//! operational fold, never from a replay. A reply here equals the reply today's reader builds from
+//! a WAL for the same history, except that it has no WAL lineage and its cursors use the store's
+//! own record seqs.
 
 use broca_core::{
     RunAttribution, SessionReadLineageState, SessionReadMessage, SessionReadPage,
@@ -111,10 +112,12 @@ pub async fn read_page<B: SessionBackend>(
 /// stamps is refused by name rather than answered without them, as is a late-approval cursor:
 /// the new storage takes no approval questions, so no cursor names one.
 pub async fn serve_read(
+    registry: &crate::LineageRegistry,
     store: &crate::store_open::StoreRuntime,
     req: crate::serve::SessionReadRequest,
 ) -> Result<broca_wire::SessionReadResponse, crate::serve::ServeError> {
     use crate::serve::ServeError;
+    use crate::store_reads::{PageRequest, StoreReadReply, StoreReadRequest};
     if let Some(cursor) = req.late_after.as_deref() {
         let refusal = broca_wire::InvalidLateCursor::new(cursor);
         return Err(ServeError::InvalidParams {
@@ -134,41 +137,26 @@ pub async fn serve_read(
             });
         }
     }
-    let Some(session) = store.view(&req.session).await? else {
-        // The session's creation never committed, so it holds nothing: an empty transcript.
-        let mut response = crate::serve::session_read_response(empty_page(), None);
-        response.incarnation = "unwritten".into();
-        return Ok(response);
+    let request = StoreReadRequest::Page(PageRequest {
+        history_version: req.history_version,
+        after_mid: req.after_mid.clone(),
+        from_ordinal: req.from_ordinal,
+        limit: req.limit,
+    });
+    let answer = match store.read(registry, &req.session, request).await? {
+        Some(StoreReadReply::Page(answer)) => answer?,
+        Some(_) => return Err(crate::store_reads::mismatched()),
+        None => {
+            // The session's creation never committed, so it holds nothing: an empty transcript.
+            let mut response = crate::serve::session_read_response(empty_page(), None);
+            response.incarnation = "unwritten".into();
+            return Ok(response);
+        }
     };
-    let head = session.head();
-    if req
-        .history_version
-        .is_some_and(|requested| requested != head.history_version)
-    {
-        return Err(ServeError::HistoryChanged);
-    }
-    let from_ordinal = match &req.after_mid {
-        Some(mid) => match session.find_message(mid).await.map_err(read_failed)? {
-            // The 1-based ordinal of the message named, which is the 0-based start after it.
-            Some(ordinal) => Some(ordinal),
-            None => return Err(ServeError::UnknownMid(mid.clone())),
-        },
-        None => req.from_ordinal.map(|at| at.saturating_sub(1)),
-    };
-    let StorePage { page, mids } =
-        read_page(&session, from_ordinal, req.limit)
-            .await
-            .map_err(|error| match error {
-                StoreReadError::Session(error) => read_failed(error),
-                other => ServeError::Open(
-                    format!("the session's stored facts can't be read: {other:?}"),
-                    Some(broca_protocol::ErrorClass::Permanent),
-                ),
-            })?;
-    let mut response = crate::serve::session_read_response(page, None);
-    response.history_version = head.history_version;
-    response.incarnation = broca_session_store::codec::hex(&head.incarnation.0);
-    for (entry, mid) in response.messages.iter_mut().zip(mids) {
+    let mut response = crate::serve::session_read_response(answer.page.page, None);
+    response.history_version = answer.history_version;
+    response.incarnation = answer.incarnation;
+    for (entry, mid) in response.messages.iter_mut().zip(answer.page.mids) {
         entry.mid = mid;
     }
     crate::serve::apply_media_mode(&mut response, req.media, &req.session.session)?;
@@ -179,10 +167,49 @@ pub async fn serve_read(
     crate::serve::cap_page_bytes(
         &mut response,
         cap,
-        from_ordinal.is_none(),
+        answer.from_ordinal.is_none(),
         &req.session.session,
     )?;
     Ok(response)
+}
+
+/// The page `request` asks of `session`, and the session's history version and incarnation the
+/// reply carries beside it.
+pub(crate) async fn page<B: SessionBackend>(
+    session: &Session<B>,
+    request: &crate::store_reads::PageRequest,
+) -> Result<crate::store_reads::PageAnswer, crate::serve::ServeError> {
+    use crate::serve::ServeError;
+    let head = session.head();
+    if request
+        .history_version
+        .is_some_and(|requested| requested != head.history_version)
+    {
+        return Err(ServeError::HistoryChanged);
+    }
+    let from_ordinal = match &request.after_mid {
+        Some(mid) => match session.find_message(mid).await.map_err(read_failed)? {
+            // The 1-based ordinal of the message named, which is the 0-based start after it.
+            Some(ordinal) => Some(ordinal),
+            None => return Err(ServeError::UnknownMid(mid.clone())),
+        },
+        None => request.from_ordinal.map(|at| at.saturating_sub(1)),
+    };
+    let page = read_page(session, from_ordinal, request.limit)
+        .await
+        .map_err(|error| match error {
+            StoreReadError::Session(error) => read_failed(error),
+            other => ServeError::Open(
+                format!("the session's stored facts can't be read: {other:?}"),
+                Some(broca_protocol::ErrorClass::Permanent),
+            ),
+        })?;
+    Ok(crate::store_reads::PageAnswer {
+        page,
+        from_ordinal,
+        history_version: head.history_version,
+        incarnation: broca_session_store::codec::hex(&head.incarnation.0),
+    })
 }
 
 /// The page of a session that holds nothing.
@@ -209,7 +236,7 @@ fn empty_page() -> SessionReadPage {
 
 /// A store read that failed. Only a backend failure is worth a retry: anything else is the
 /// session's stored bytes or state being wrong, which reading again won't change.
-fn read_failed(error: SessionError) -> crate::serve::ServeError {
+pub(crate) fn read_failed(error: SessionError) -> crate::serve::ServeError {
     let class = match error {
         SessionError::Backend(_) => broca_protocol::ErrorClass::Transient,
         _ => broca_protocol::ErrorClass::Permanent,

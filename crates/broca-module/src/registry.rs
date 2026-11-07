@@ -2653,7 +2653,7 @@ impl LineageRegistry {
             return Ok(Some(sender));
         }
         if let Some(store) = self.store_holding(key)? {
-            let ownership = store_session_ownership(&store, key).await?;
+            let ownership = store_session_ownership(self, &store, key).await?;
             return Ok((ownership.episodes > 0).then_some(ownership.first_principal));
         }
         let reader = self.inner.reader.clone().ok_or_else(|| {
@@ -2902,7 +2902,7 @@ impl LineageRegistry {
         key: &LineageKey,
     ) -> Result<broca_core::SessionOwnershipV1, OpenError> {
         if let Some(store) = self.store_holding(key)? {
-            return store_session_ownership(&store, key).await;
+            return store_session_ownership(self, &store, key).await;
         }
         let reader = self.inner.reader.as_ref().ok_or_else(|| {
             OpenError::Open("sender authorization reader is not configured".into())
@@ -3110,7 +3110,7 @@ impl LineageRegistry {
             Ok(()) => {}
         }
         if let Some(store) = self.store_holding(key)? {
-            return Ok(store_session_ownership(&store, key).await?);
+            return Ok(store_session_ownership(self, &store, key).await?);
         }
         let (live, live_first) = {
             let slots = self.inner.slots.lock().unwrap();
@@ -3496,7 +3496,7 @@ impl LineageRegistry {
         // facts `durable_session_ownership` gathers from a WAL.
         if let Some(store) = self.store_runtime() {
             match store.holds(key) {
-                Ok(true) => return store_bind_ownership(&store, key).await,
+                Ok(true) => return store_bind_ownership(self, &store, key).await,
                 Ok(false) => {}
                 Err(error) => return BindOwnership::Unreadable(error.to_string()),
             }
@@ -3528,10 +3528,11 @@ impl LineageRegistry {
 /// The ownership of a session kept in the new storage, from a read-only view of it. A session
 /// whose creation never committed holds no run, so it has no owner yet.
 async fn store_bind_ownership(
+    registry: &LineageRegistry,
     store: &crate::store_open::StoreRuntime,
     key: &LineageKey,
 ) -> BindOwnership {
-    match store_session_ownership(store, key).await {
+    match store_session_ownership(registry, store, key).await {
         Ok(ownership) => BindOwnership::Known(ownership),
         Err(error) => BindOwnership::Unreadable(error.to_string()),
     }
@@ -3543,17 +3544,22 @@ async fn store_bind_ownership(
 /// `durable_session_ownership` gathers from a WAL. A session whose creation never committed
 /// holds no run, so it has no owner yet.
 async fn store_session_ownership(
+    registry: &LineageRegistry,
     store: &crate::store_open::StoreRuntime,
     key: &LineageKey,
 ) -> Result<broca_core::SessionOwnershipV1, OpenError> {
-    let Some(session) = store.view(key).await? else {
-        return Ok(broca_core::SessionOwnershipV1::default());
-    };
-    broca_session_loop::owner::ownership_with_first_episode(
-        &session.operations.owner,
-        store.parts(),
-    )
-    .map_err(|error| OpenError::Open(format!("the session's stored owner can't be read: {error}")))
+    use crate::store_reads::{StoreReadReply, StoreReadRequest};
+    match store
+        .read(registry, key, StoreReadRequest::Ownership)
+        .await
+        .map_err(crate::store_reads::open_error)?
+    {
+        None => Ok(broca_core::SessionOwnershipV1::default()),
+        Some(StoreReadReply::Ownership(ownership)) => ownership.map_err(OpenError::Open),
+        Some(_) => Err(crate::store_reads::open_error(
+            crate::store_reads::mismatched(),
+        )),
+    }
 }
 
 impl LineageRegistry {
@@ -6246,6 +6252,14 @@ impl LineageRegistry {
     }
 
     /// Test/inspection: the current slot state name for a key (None = absent/closed).
+    /// The actor of `key` when the registry holds it open, without opening one.
+    pub(crate) fn open_handle(&self, key: &LineageKey) -> Option<ActorHandle> {
+        match self.inner.slots.lock().unwrap().get(key) {
+            Some(Entry::Open { handle, .. }) => Some(handle.clone()),
+            _ => None,
+        }
+    }
+
     pub fn slot_state(&self, key: &LineageKey) -> Option<&'static str> {
         let slots = self.inner.slots.lock().unwrap();
         slots.get(key).map(|e| match e {

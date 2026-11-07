@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use broca_core::capability::AllowAll;
 use broca_core::provider::StubProvider;
 use broca_core::stub_plane::StubToolPlane;
 use broca_core::{OutputEvent, RunError, RunSummary};
@@ -106,6 +105,28 @@ pub(super) struct LoopExecutor {
     drain_gate: Option<(Arc<Notify>, Arc<Notify>)>,
     /// The planes the executor offers the session's runs.
     pub(super) planes: Planes,
+    /// When set, each tool call's approval signals the first `Notify` and waits on the second,
+    /// so a test can act after a step that called tools was appended and before its batch's
+    /// intents make it durable.
+    pub(super) approval_gate: Option<(Arc<Notify>, Arc<Notify>)>,
+    /// What the `read` tool answers.
+    pub(super) tool_text: String,
+}
+
+/// Allows every call, once the test lets it (see [`LoopExecutor::approval_gate`]).
+struct GatedApproval(Option<(Arc<Notify>, Arc<Notify>)>);
+
+#[async_trait]
+impl broca_core::capability::ApprovalPolicy for GatedApproval {
+    async fn decide(&self, call: &broca_protocol::ToolCall) -> broca_protocol::ApprovalResponse {
+        if let Some((reached, release)) = &self.0 {
+            reached.notify_one();
+            release.notified().await;
+        }
+        broca_protocol::ApprovalResponse::Allow {
+            tool_call_id: call.tool_call_id.clone(),
+        }
+    }
 }
 
 /// The hook and compaction planes a test executor offers, as the module's executor offers its
@@ -127,6 +148,8 @@ pub(super) fn executor(
         },
         drain_gate: None,
         planes: Planes::default(),
+        approval_gate: None,
+        tool_text: "file contents".into(),
     }
 }
 
@@ -183,8 +206,9 @@ impl RunExecutor for LoopExecutor {
                     .map_err(StoreRunError::Admission)?,
                 )
             };
-            let tools = StubToolPlane::new().with_canned_text("read", "file contents");
+            let tools = StubToolPlane::new().with_canned_text("read", &self.tool_text);
             let now = || 1;
+            let approval = GatedApproval(self.approval_gate.clone());
             let seams = Seams {
                 provider: &self.provider,
                 tools: &tools,
@@ -193,7 +217,7 @@ impl RunExecutor for LoopExecutor {
                 cancel: control.cancel.clone().unwrap_or_default(),
                 stop: Default::default(),
                 held: None,
-                approval: &AllowAll,
+                approval: &approval,
                 hook_plane: control.hook_plane.clone(),
                 now_ms: &now,
                 session_address: None,
@@ -206,6 +230,7 @@ impl RunExecutor for LoopExecutor {
                 account_reports: None,
                 max_same_account_wait: Default::default(),
                 auth_selection: None,
+                step_progress: control.step_progress.clone(),
             };
             // The test's credential is always ready, so a sign-in pause resumes.
             match (admission, mode) {

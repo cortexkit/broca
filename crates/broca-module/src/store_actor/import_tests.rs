@@ -630,6 +630,7 @@ async fn a_later_run_renders_the_imported_history_without_reasoning_payloads() {
         account_reports: None,
         max_same_account_wait: Default::default(),
         auth_selection: None,
+        step_progress: None,
     };
     let mut parts = MemoryParts::default();
     broca_session_loop::run::run(&mut session, &mut parts, admission, &seams)
@@ -1068,6 +1069,7 @@ async fn run_once<W: Writer>(
         account_reports: None,
         max_same_account_wait: Default::default(),
         auth_selection: None,
+        step_progress: None,
     };
     broca_session_loop::run::run(writer, parts, admission, &seams)
         .await
