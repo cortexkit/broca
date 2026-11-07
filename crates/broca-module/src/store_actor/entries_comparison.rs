@@ -1095,3 +1095,408 @@ async fn reads_clean_replies_where_todays_reads_clean_them() {
         assert_eq!(stored, raw, "renders {renders}");
     }
 }
+
+/// The input folder of [`dump_head_import_entries`]: `HEAD_IMPORT_EXPORT_DIR`, else Thalamus's
+/// first published exports.
+fn head_import_input() -> std::path::PathBuf {
+    std::env::var_os("HEAD_IMPORT_EXPORT_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../ck-session-import/tests/fixtures/thalamus-export-v1")
+        })
+}
+
+/// Checks every file `SHA256SUMS` in `folder` lists against its digest, and refuses on any
+/// mismatch or missing file, before anything else in the folder is read.
+fn check_sums(folder: &std::path::Path) {
+    use sha2::Digest as _;
+    let sums = std::fs::read_to_string(folder.join("SHA256SUMS"))
+        .unwrap_or_else(|e| panic!("{}: no SHA256SUMS: {e}", folder.display()));
+    for line in sums.lines().filter(|line| !line.trim().is_empty()) {
+        let (digest, name) = line
+            .split_once("  ")
+            .unwrap_or_else(|| panic!("a SHA256SUMS line without a name: {line}"));
+        let bytes = std::fs::read(folder.join(name))
+            .unwrap_or_else(|e| panic!("{name}, listed in SHA256SUMS: {e}"));
+        let actual = format!("{:x}", sha2::Sha256::digest(&bytes));
+        assert_eq!(
+            actual, digest,
+            "{name} doesn't match SHA256SUMS: refusing the folder"
+        );
+    }
+}
+
+/// One row of the comparison of Thalamus's entries with broca's: a source message id, the
+/// ordinal and part ids each side gives it.
+#[derive(Default)]
+struct Compared {
+    thalamus_ordinal: Option<u64>,
+    broca_ordinal: Option<u64>,
+    thalamus_parts: Option<Vec<String>>,
+    broca_parts: Option<Vec<String>>,
+}
+
+/// The ordinal and part ids of each entry of `session.entries` answers, by message id, in order.
+fn entries_by_mid(pages: &[Value]) -> Vec<(String, u64, Vec<String>)> {
+    pages
+        .iter()
+        .flat_map(|page| page["entries"].as_array().cloned().unwrap_or_default())
+        .map(|entry| {
+            (
+                entry["mid"].as_str().unwrap_or_default().to_owned(),
+                entry["ordinal"].as_u64().unwrap_or_default(),
+                entry["parts"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|part| part["id"].as_str().unwrap_or("?").to_owned())
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+/// A plain table of every source message id: Thalamus's entry ordinal and broca's, the part ids
+/// on each side, then any entry broca adds (one whose id no source row has).
+fn comparison(
+    reply: &broca_wire::head_import::FileImportReply,
+    thalamus: &[(String, u64, Vec<String>)],
+    broca: &[(String, u64, Vec<String>)],
+    broca_refused: Option<&str>,
+) -> String {
+    let mut rows: Vec<(String, Compared)> = Vec::new();
+    fn row(rows: &mut Vec<(String, Compared)>, mid: &str) -> usize {
+        match rows.iter().position(|(known, _)| known == mid) {
+            Some(at) => at,
+            None => {
+                rows.push((mid.to_owned(), Compared::default()));
+                rows.len() - 1
+            }
+        }
+    }
+    for moved in &reply.moves.rows {
+        let at = row(&mut rows, &moved.mid);
+        rows[at].1.broca_ordinal = moved.entry;
+    }
+    for (mid, ordinal, parts) in thalamus {
+        let at = row(&mut rows, mid);
+        rows[at].1.thalamus_ordinal = Some(*ordinal);
+        rows[at].1.thalamus_parts = Some(parts.clone());
+    }
+    let sources = rows.len();
+    let mut added = Vec::new();
+    for (mid, ordinal, parts) in broca {
+        match rows[..sources].iter().position(|(known, _)| known == mid) {
+            Some(at) => {
+                rows[at].1.broca_ordinal = Some(*ordinal);
+                rows[at].1.broca_parts = Some(parts.clone());
+            }
+            None => added.push((mid.clone(), *ordinal, parts.clone())),
+        }
+    }
+    let show = |value: &Option<u64>| value.map_or("-".to_owned(), |value| value.to_string());
+    let parts = |value: &Option<Vec<String>>| match value {
+        None => "-".to_owned(),
+        Some(parts) if parts.is_empty() => "(none)".to_owned(),
+        Some(parts) => parts.join(" "),
+    };
+    let mut out = String::new();
+    if let Some(refused) = broca_refused {
+        out.push_str(&format!(
+            "broca's compaction route refused session.entries: {refused}. broca's columns \
+             come from the import reply's move list and the `entries-unadmitted-<n>.json` \
+             pages: not route bytes, the page the route serves once the session's plan names \
+             the compaction provider.\n\n"
+        ));
+    }
+    out.push_str(
+        "| source mid | thalamus ordinal | broca ordinal | thalamus part ids | broca part ids |\n\
+         |---|---|---|---|---|\n",
+    );
+    for (mid, compared) in &rows {
+        out.push_str(&format!(
+            "| {mid} | {} | {} | {} | {} |\n",
+            show(&compared.thalamus_ordinal),
+            show(&compared.broca_ordinal),
+            parts(&compared.thalamus_parts),
+            parts(&compared.broca_parts),
+        ));
+    }
+    out.push_str("\nEntries broca adds (no source mid):\n\n");
+    if added.is_empty() {
+        out.push_str("(none)\n");
+    } else {
+        out.push_str("| broca mid | broca ordinal | broca part ids |\n|---|---|---|\n");
+        for (mid, ordinal, part_ids) in &added {
+            out.push_str(&format!(
+                "| {mid} | {ordinal} | {} |\n",
+                parts(&Some(part_ids.clone()))
+            ));
+        }
+    }
+    out
+}
+
+/// For each host folder (`opencode2`, `pi`) of a Thalamus export folder, imports the export
+/// through the module's real file import into a session in the new storage, then reads every
+/// page of `session.entries` through the module's `compaction-runner/v1` route, as the
+/// compaction provider `magic-context` would. Writes, under `HEAD_IMPORT_OUT_DIR/<host>/`:
+/// - `import-reply.json`, the import's reply, move list included;
+/// - `entries-<n>.json`, each page exactly as the route returns it, or, when the route refuses,
+///   `entries-1.refused.json` with its refusal and `entries-unadmitted-<n>.json`, the pages the
+///   route's own page function builds, which it serves once the session's plan names the
+///   compaction provider;
+/// - `comparison.md`, when the host folder holds Thalamus's own `entries-1.json`;
+/// - `README.md`, saying what each file is, and `SHA256SUMS` over them all.
+///
+/// The input folder's `SHA256SUMS` is checked before anything else is read. Run by hand:
+///
+/// ```text
+/// HEAD_IMPORT_EXPORT_DIR=<export folder> HEAD_IMPORT_OUT_DIR=<output folder> \
+///   cargo nextest run -p broca-module --run-ignored only \
+///   -E 'test(=store_actor::entries_comparison::dump_head_import_entries)'
+/// ```
+#[tokio::test]
+#[ignore = "writes files: run by hand with HEAD_IMPORT_EXPORT_DIR and HEAD_IMPORT_OUT_DIR"]
+async fn dump_head_import_entries() {
+    use broca_wire::head_import::{FileImportParams, ImportHarness, ImportOrigin, ImportSource};
+    use sha2::Digest as _;
+    let input = head_import_input();
+    let out = std::path::PathBuf::from(
+        std::env::var_os("HEAD_IMPORT_OUT_DIR").expect("HEAD_IMPORT_OUT_DIR names the output"),
+    );
+    check_sums(&input);
+    for (host, journal, harness) in [
+        ("opencode2", "export.json", ImportHarness::OpenCode2),
+        ("pi", "export.jsonl", ImportHarness::Pi),
+    ] {
+        let folder = input.join(host);
+        if !folder.exists() {
+            continue;
+        }
+        let export = std::fs::read(folder.join(journal)).unwrap();
+        // The session id the export names: OpenCode's `info.id`, Pi's header line's `id`.
+        let session_id = match harness {
+            ImportHarness::OpenCode2 => serde_json::from_slice::<Value>(&export).unwrap()["info"]
+                ["id"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+            _ => serde_json::from_str::<Value>(
+                std::str::from_utf8(&export)
+                    .unwrap()
+                    .lines()
+                    .next()
+                    .unwrap(),
+            )
+            .unwrap()["id"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        };
+        let thalamus_reply: Value =
+            serde_json::from_slice(&std::fs::read(folder.join("reply.json")).unwrap()).unwrap();
+        let side = side(true, Vec::new(), false, false).await;
+        // The export and its side file, in a folder the import may read and then delete.
+        let source = side.dir.join("import-source");
+        std::fs::create_dir_all(&source).unwrap();
+        let path = source.join(format!("head.{}", journal.rsplit('.').next().unwrap()));
+        std::fs::write(&path, &export).unwrap();
+        if let Ok(sends) = std::fs::read(folder.join("export.sends.json")) {
+            let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
+            std::fs::write(source.join(format!("{stem}.sends.json")), sends).unwrap();
+        }
+        let command = crate::store_import::StoreCommand::Import(Box::new(
+            crate::store_import::ImportCommand {
+                params: FileImportParams {
+                    import_id: format!("imp-{host}"),
+                    source: ImportSource {
+                        harness,
+                        path: path.display().to_string(),
+                        session: session_id.clone(),
+                        sha256: format!("{:x}", sha2::Sha256::digest(&export)),
+                    },
+                    origin: ImportOrigin {
+                        kind: "import".into(),
+                        source_ref: format!("thalamus:{session_id}"),
+                    },
+                    tag_floor: thalamus_reply["tag_floor"].as_u64(),
+                },
+                principal: broca_protocol::BindPrincipal::Reserved {
+                    module_id: "prefrontal-core".into(),
+                },
+                // The import refuses a route without a scope; Prefrontal sends one on the scope
+                // of the agent whose head it moves.
+                scope: Some(broca_protocol::SessionScope {
+                    owner: broca_protocol::BindPrincipal::Reserved {
+                        module_id: "prefrontal-core".into(),
+                    },
+                    scope_ref: "agent:a1".into(),
+                    scope_epoch: 1,
+                    flow_id: None,
+                    sender: None,
+                    agent_id: None,
+                    run_id: None,
+                    agent_id_frozen: false,
+                }),
+                roots: Arc::new(crate::store_import::ImportRoots::new(
+                    vec![source.clone()],
+                    Some(source.clone()),
+                )),
+                now_ms: 9_000,
+            },
+        ));
+        let reply = match side
+            .registry
+            .route_store_command(&side.key, command)
+            .await
+            .unwrap()
+        {
+            crate::store_import::StoreOutcome::Imported(reply) => reply,
+            other => panic!("{host}: the import was refused: {other:?}"),
+        };
+        let written = out.join(host);
+        let _ = std::fs::remove_dir_all(&written);
+        std::fs::create_dir_all(&written).unwrap();
+        let mut files = vec![(
+            "import-reply.json".to_owned(),
+            serde_json::to_vec_pretty(&reply).unwrap(),
+        )];
+        // Every page, from the first entry on, as Thalamus's own recording reads them.
+        let mut pages = Vec::new();
+        let mut refused = None;
+        let mut after: Option<u64> = None;
+        for page in 1.. {
+            let mut params = json!({"select": {"by": "after"}, "detail": "full"});
+            if let Some(after) = after {
+                params["select"]["after_ordinal"] = json!(after);
+            }
+            match side
+                .registry
+                .route_compaction_v2(
+                    &side.key,
+                    Some("magic-context".into()),
+                    "session.entries".into(),
+                    serde_json::value::to_raw_value(&params).unwrap(),
+                )
+                .await
+            {
+                Ok(served) => {
+                    files.push((
+                        format!("entries-{page}.json"),
+                        served.get().as_bytes().to_vec(),
+                    ));
+                    let served: Value = serde_json::from_str(served.get()).unwrap();
+                    let next = served["next_after"].as_u64();
+                    pages.push(served);
+                    match next {
+                        Some(next) => after = Some(next),
+                        None => break,
+                    }
+                }
+                Err(refusal) => {
+                    let refusal = serde_json::to_value(&refusal).unwrap();
+                    refused = Some(format!(
+                        "{} ({})",
+                        refusal["code"].as_str().unwrap_or("?"),
+                        refusal["detail"]["reason"].as_str().unwrap_or("no reason")
+                    ));
+                    files.push((
+                        format!("entries-{page}.refused.json"),
+                        serde_json::to_vec(&refusal).unwrap(),
+                    ));
+                    break;
+                }
+            }
+        }
+        if refused.is_some() {
+            // The pages the route's own page function builds for the session, which the route
+            // serves once the session's plan names the compaction provider.
+            let session = side
+                .registry
+                .store_runtime()
+                .unwrap()
+                .view(&side.key)
+                .await
+                .unwrap()
+                .expect("the import created the session");
+            let mut after: Option<u64> = None;
+            for page in 1.. {
+                let request: ReadRequest = serde_json::from_value(json!({
+                    "select": {"by": "after", "after_ordinal": after},
+                    "detail": "full",
+                }))
+                .unwrap();
+                let built = crate::store_entries::entries_page(&session, &request)
+                    .await
+                    .unwrap();
+                let bytes = serde_json::to_vec(&built).unwrap();
+                files.push((format!("entries-unadmitted-{page}.json"), bytes.clone()));
+                let built: Value = serde_json::from_slice(&bytes).unwrap();
+                let next = built["next_after"].as_u64();
+                pages.push(built);
+                match next {
+                    Some(next) => after = Some(next),
+                    None => break,
+                }
+            }
+        }
+        let mut readme = format!(
+            "What broca serves for Thalamus's `{host}` export after importing it into a session \
+             in the new storage, written by `dump_head_import_entries` in \
+             `crates/broca-module/src/store_actor/entries_comparison.rs`.\n\n\
+             - `import-reply.json`: the `session.import` reply, move list included.\n"
+        );
+        match &refused {
+            None => readme.push_str(
+                "- `entries-<n>.json`: each `session.entries` page exactly as the \
+                 `compaction-runner/v1` route returned it to `magic-context`, from the first \
+                 entry on in full detail, following `next_after`.\n",
+            ),
+            Some(refused) => readme.push_str(&format!(
+                "- `entries-1.refused.json`: the `compaction-runner/v1` route's refusal of \
+                 `session.entries` to `magic-context`, exactly as returned: {refused}. This is \
+                 expected: a moved head gets its plan, naming its compaction provider, from \
+                 core's adopt after the import, and until then the route has no compaction \
+                 provider to admit.\n\
+                 - `entries-unadmitted-<n>.json`: not route bytes: the page the route serves \
+                 once the session's plan names the compaction provider, built by the route's \
+                 own page function (`store_entries::entries_page`), from the first entry on in \
+                 full detail, following `next_after`.\n"
+            )),
+        }
+        readme.push_str(
+            "- `comparison.md`, when the export folder holds Thalamus's own `entries-<n>.json`: \
+             one row per source message id with each side's entry ordinal and part ids, then \
+             any entry broca adds.\n\
+             - `SHA256SUMS`: every file above.\n",
+        );
+        files.push(("README.md".into(), readme.into_bytes()));
+        if let Ok(theirs) = std::fs::read(folder.join("entries-1.json")) {
+            let mut thalamus = vec![serde_json::from_slice::<Value>(&theirs).unwrap()];
+            for page in 2.. {
+                match std::fs::read(folder.join(format!("entries-{page}.json"))) {
+                    Ok(bytes) => thalamus.push(serde_json::from_slice(&bytes).unwrap()),
+                    Err(_) => break,
+                }
+            }
+            files.push((
+                "comparison.md".into(),
+                comparison(
+                    &reply,
+                    &entries_by_mid(&thalamus),
+                    &entries_by_mid(&pages),
+                    refused.as_deref(),
+                )
+                .into_bytes(),
+            ));
+        }
+        let mut sums = String::new();
+        for (name, bytes) in &files {
+            std::fs::write(written.join(name), bytes).unwrap();
+            sums.push_str(&format!("{:x}  {name}\n", sha2::Sha256::digest(bytes)));
+        }
+        std::fs::write(written.join("SHA256SUMS"), sums).unwrap();
+    }
+}
