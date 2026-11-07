@@ -320,6 +320,25 @@ fn seed_approved_call(rig: &Rig) -> (String, String) {
 }
 
 fn seed_approved_call_with_legacy_notice(rig: &Rig, notice: bool) -> (String, String) {
+    seed_approved_call_with_ride(rig, notice, false, "synthetic result")
+}
+
+fn seed_approved_call_with_ride(
+    rig: &Rig,
+    notice: bool,
+    envelope: bool,
+    output: &str,
+) -> (String, String) {
+    seed_approved_call_with_ride_mode(rig, notice, envelope, output, false)
+}
+
+fn seed_approved_call_with_ride_mode(
+    rig: &Rig,
+    notice: bool,
+    envelope: bool,
+    output: &str,
+    mode3: bool,
+) -> (String, String) {
     use broca_core::{FileWalStore, WalStore};
     let run_id = "synthetic-approved-run".to_owned();
     let scope = json!({"owner":"reserved:sample-owner","ref":"approval-sample","scope_epoch":1});
@@ -339,6 +358,16 @@ fn seed_approved_call_with_legacy_notice(rig: &Rig, notice: bool) -> (String, St
     .unwrap();
     start["ts_ms"] = json!(500);
     start["written_at_ms"] = json!(500);
+    if mode3 {
+        // This fixture pins the published compaction-view render plan version.
+        start["compaction_plan_version"] = json!(3);
+        start["manifest"] = json!({
+            "plan":json!({"compaction_item":{"provider":"provider","preset":"head","params":{}},"composition":{},"render_tags":false}).to_string(),
+            "plan_identity":"plan", "composition_digest":"digest", "tools":[],
+            "system_text":"", "system_digest":"", "join_version":1,
+            "role_versions":{}, "fetches":[], "declarations":[]
+        });
+    }
     start["input"] = serde_json::to_value(vec![broca_protocol::Message::new(
         broca_protocol::Role::User,
         vec![broca_protocol::ContentBlock::Text {
@@ -384,7 +413,7 @@ fn seed_approved_call_with_legacy_notice(rig: &Rig, notice: bool) -> (String, St
     );
     assert_ne!(prepared_seq, intent_seq);
     append(
-        json!({"type":"tool_result","finished_at_ms":505,"batch_id":"approved-batch","result":{"tool_call_id":"approved-call","output":{"kind":"text","text":"synthetic result"},"is_error":false},"outcome":"completed"}),
+        json!({"type":"tool_result","finished_at_ms":505,"batch_id":"approved-batch","result":{"tool_call_id":"approved-call","output":{"kind":"text","text":output},"is_error":false},"outcome":"completed"}),
     );
     if notice {
         append(
@@ -393,9 +422,11 @@ fn seed_approved_call_with_legacy_notice(rig: &Rig, notice: bool) -> (String, St
     }
     append(json!({"type":"tool_batch_finished","batch_id":"approved-batch"}));
     if notice {
-        append(
-            json!({"type":"send_delivered","submission_id":"legacy-notice","run_id":run_id,"mode":"tool_result","tool_call_id":"approved-call","appended_text":"\n\nlegacy note"}),
-        );
+        let mut delivery = json!({"type":"send_delivered","submission_id":"legacy-notice","run_id":run_id,"mode":"tool_result","tool_call_id":"approved-call","appended_text":"\n\nlegacy note"});
+        if envelope {
+            delivery["ride"] = json!({"call_key":key,"send_id":"legacy-client-key","sender":"sender","forms":["tool_result"],"form":"append"});
+        }
+        append(delivery);
     }
     append(json!({"type":"turn_finished","step_id":1}));
     append(json!({"type":"step_started","step_id":2}));
@@ -728,7 +759,7 @@ async fn subscribe_resume_refuses_a_restored_legacy_frame_with_only_its_fence_ch
 async fn notices_and_sender_contract_samples() {
     use broca_core::{FileWalStore, WalStore};
     use broca_wal::WalRecord;
-    let mut rig = Rig::start("notices-and-sender-0811").await;
+    let mut rig = Rig::start_with_ride_writer("notices-and-sender-0811").await;
     rig.bind_as(
         7,
         Some(subc_protocol::Principal::Reserved {
@@ -785,9 +816,9 @@ async fn notices_and_sender_contract_samples() {
             _ => None,
         })
         .expect("notice delivery record");
-    assert_eq!(
+    assert!(
         envelope.is_some(),
-        broca_core::delivery_order::RIDES_V2_WRITER_ENABLED
+        "fixture explicitly enables the envelope writer"
     );
     if let Some(ride) = envelope {
         assert_eq!(ride.send_id, "sample-notice");
@@ -1260,7 +1291,7 @@ async fn imported_duplicate_synthesized_results_have_no_call_key() {
 
 #[tokio::test]
 async fn unkeyed_notice_collision_prefers_the_senders_keyed_send() {
-    let mut rig = Rig::start("unkeyed-notice-collision").await;
+    let mut rig = Rig::start_with_ride_writer("unkeyed-notice-collision").await;
     rig.bind_as(
         7,
         Some(subc_protocol::Principal::Reserved {
@@ -1367,4 +1398,336 @@ async fn undeclared_sender_attribution_refuses_send_and_refresh_before_writes() 
         assert_eq!(rig.wal_bytes(), before);
     }
     rig.finish().await;
+}
+
+fn output_texts(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(fields) => {
+            if fields.get("type").is_some_and(|kind| kind == "tool_result") {
+                if let Some(text) = fields.get("content").and_then(serde_json::Value::as_str) {
+                    out.push(text.to_owned());
+                }
+            }
+            if let Some(output) = fields.get("output") {
+                if let Some(text) = output.as_str().or_else(|| output["text"].as_str()) {
+                    out.push(text.to_owned());
+                }
+            }
+            for child in fields.values() {
+                output_texts(child, out);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for child in values {
+                output_texts(child, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+async fn recorded_ride_read_matrix(envelope: bool) {
+    use broca_core::{FileWalStore, WalStore};
+    let mut rig = Rig::start(if envelope {
+        "recorded-envelope-reads"
+    } else {
+        "recorded-legacy-reads"
+    })
+    .await;
+    let (_, _) = seed_approved_call_with_ride(&rig, true, envelope, "worked");
+    let mut failures = Vec::new();
+    let expected = if envelope {
+        "worked"
+    } else {
+        "worked\n\nlegacy note"
+    };
+    let mut history_version = None;
+    for (name, method, params) in [
+        ("default read", "session.read", json!({"from_ordinal":0})),
+        (
+            "fact read",
+            "session.read",
+            json!({"from_ordinal":0,"include_display_facts":true}),
+        ),
+        (
+            "raw history",
+            "session.history",
+            json!({"form":"raw","limit":100}),
+        ),
+        (
+            "display history",
+            "session.history",
+            json!({"form":"display","limit":100}),
+        ),
+        (
+            "warm default read",
+            "session.read",
+            json!({"from_ordinal":0}),
+        ),
+    ] {
+        let frame = rig
+            .request(7, json!({"method":method,"params":params}))
+            .await;
+        assert_eq!(
+            frame.header.ty,
+            subc_protocol::FrameType::Response,
+            "{name}: {frame:?}"
+        );
+        let body = result(&frame);
+        let mut outputs = Vec::new();
+        output_texts(&body, &mut outputs);
+        if outputs != [expected] {
+            failures.push(format!(
+                "{name}: outputs={outputs:?}, expected {expected:?}"
+            ));
+        }
+        if method == "session.read" {
+            if let Some(version) = &history_version {
+                assert_eq!(&body["history_version"], version);
+            } else {
+                history_version = Some(body["history_version"].clone());
+            }
+        }
+        if name == "fact read" || name == "display history" {
+            let encoded = body.to_string();
+            let notices = encoded.matches("\"delivered_as\":\"tool_result\"").count();
+            if notices != usize::from(envelope) {
+                failures.push(format!(
+                    "{name}: expected {} notice facts, got {notices}",
+                    usize::from(envelope)
+                ));
+            }
+        }
+    }
+    let frames = rig
+        .subscribe_collect_until(
+            8,
+            json!({"from":"start"}),
+            std::time::Duration::from_millis(20),
+            |frame| {
+                serde_json::from_slice::<serde_json::Value>(&frame.body)
+                    .is_ok_and(|value| value["event"]["type"] == "run_finished")
+            },
+        )
+        .await;
+    let values: Vec<serde_json::Value> = frames
+        .iter()
+        .map(|frame| serde_json::from_slice(&frame.body).unwrap())
+        .collect();
+    let mut outputs = Vec::new();
+    for value in &values {
+        output_texts(value, &mut outputs);
+    }
+    assert_eq!(
+        outputs,
+        ["worked"],
+        "subscribe keeps native results for both record formats"
+    );
+    let notices: Vec<_> = values
+        .iter()
+        .filter(|value| value["event"]["type"] == "notice_delivered")
+        .collect();
+    if notices.len() != usize::from(envelope) {
+        failures.push(format!(
+            "subscribe: expected {} notice events, got {}",
+            usize::from(envelope),
+            notices.len()
+        ));
+    }
+    if envelope && notices.len() == 1 {
+        assert_eq!(notices[0]["event"]["text"], "legacy note");
+        assert_eq!(notices[0]["event"]["send_id"], "legacy-client-key");
+    }
+    let store = FileWalStore::new(rig.dir.join("wal"));
+    let range = store
+        .read_records_range(&rig.session, 0, None, None)
+        .unwrap();
+    let transcript = broca_core::compaction_v2::transcript::project(
+        &store.read_records(&rig.session).unwrap(),
+        &range.lineage_id.unwrap().to_string(),
+    )
+    .unwrap();
+    let entries = serde_json::to_value(&transcript.entries).unwrap();
+    let mut entry_outputs = Vec::new();
+    output_texts(&entries, &mut entry_outputs);
+    assert_eq!(
+        entry_outputs,
+        ["worked"],
+        "session.entries preserves native output for both formats"
+    );
+    assert_eq!(
+        entries
+            .to_string()
+            .matches("\"text\":\"legacy note\"")
+            .count(),
+        1,
+        "session.entries retains separate Delivered metadata"
+    );
+    rig.finish().await;
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[tokio::test]
+async fn recorded_envelope_is_served_without_joining_notice_on_every_read() {
+    // Write the envelope directly so a reader build exercises a WAL produced by the writer build.
+    recorded_ride_read_matrix(true).await;
+}
+
+#[tokio::test]
+async fn recorded_legacy_ride_keeps_joined_reads_without_notice_facts_or_events() {
+    recorded_ride_read_matrix(false).await;
+}
+
+#[test]
+fn frozen_ride_model_body_equals_the_legacy_physical_append_body() {
+    let original: broca_protocol::ToolResult = serde_json::from_value(json!({
+        "tool_call_id":"call", "output":{"kind":"text","text":"worked"}, "is_error":false
+    }))
+    .unwrap();
+    let ride: broca_wal::record::RideMetadata = serde_json::from_value(json!({
+        "call_key":"fixture:1", "send_id":"notice", "sender":"sender", "forms":["tool_result"], "form":"append"
+    })).unwrap();
+    let mut frozen = original.clone();
+    broca_core::delivery_order::append_ride(&mut frozen, &ride, "\n\nsynthetic notice ☃");
+    let mut physical = original;
+    broca_core::delivery_order::append_to_result(&mut physical, "\n\nsynthetic notice ☃");
+    let body = |result: broca_protocol::ToolResult| {
+        serde_json::to_vec(&json!({"input":[{
+        "role":"tool", "message_id":"fixture-tool-message", "content":[broca_protocol::ContentBlock::ToolResult(result)]
+    }]})).unwrap()
+    };
+    let frozen = body(frozen);
+    let physical = body(physical);
+    capture("model.frozen-ride-request.json", &frozen);
+    capture("model.physical-append-request.json", &physical);
+    let pinned = "{\"input\":[{\"content\":[{\"is_error\":false,\"output\":{\"kind\":\"text\",\"text\":\"worked\\n\\nsynthetic notice ☃\"},\"tool_call_id\":\"call\",\"type\":\"tool_result\"}],\"message_id\":\"fixture-tool-message\",\"role\":\"tool\"}]}";
+    assert_eq!(frozen, pinned.as_bytes());
+    assert_eq!(physical, pinned.as_bytes());
+    assert_eq!(frozen, physical);
+}
+
+#[tokio::test]
+async fn core_reader_wire_samples() {
+    let mut rig = Rig::start("core-reader-wire-samples").await;
+    rig.script
+        .push(&[Step::Text("first answer"), Step::Text("second answer")]);
+    rig.script.hold_model(true);
+    let accepted = rig.send("core-first", "first prompt", None).await;
+    let run = result(&accepted)["run_id"].as_str().unwrap().to_owned();
+    capture("core.session.send.accepted.json", &accepted.body);
+    rig.wait_entered().await;
+    let pending = rig.send("core-pending", "queued prompt", None).await;
+    assert!(result(&pending)["submission_id"].is_string());
+    capture("core.session.send.pending.json", &pending.body);
+    let refused = rig.send("core-pending", "different prompt", None).await;
+    assert_eq!(refused.header.ty, subc_protocol::FrameType::Error);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&refused.body).unwrap()["code"],
+        "send_id_reuse"
+    );
+    capture("core.session.send.refused.json", &refused.body);
+    rig.script.hold_model(false);
+    rig.wait_for_finished(2).await;
+    rig.wait_idle().await;
+    for method in ["run.status", "run.result"] {
+        let frame = rig
+            .request(7, json!({"method":method,"params":{"run_id":run}}))
+            .await;
+        assert_eq!(result(&frame)["state"], "completed");
+        capture(&format!("core.{method}.json"), &frame.body);
+    }
+    let mut next = Some(0);
+    let mut pages = 0;
+    let mut ordinals = Vec::new();
+    while let Some(from) = next {
+        let frame = rig
+            .request(
+                7,
+                json!({"method":"session.read","params":{"from_ordinal":from,"limit":2}}),
+            )
+            .await;
+        capture(&format!("core.session.read.page.{pages}.json"), &frame.body);
+        let body = result(&frame);
+        ordinals.extend(
+            body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| entry["ordinal"].as_u64().unwrap()),
+        );
+        next = body["next_from_ordinal"].as_u64();
+        assert!(next.is_none_or(|next| next > from));
+        pages += 1;
+    }
+    assert_eq!(ordinals, [1, 2, 3, 4]);
+    assert_eq!(pages, 2);
+    for (name, from, code) in [
+        (
+            "cursor_expired",
+            json!({"wal_seq":1,"sub_index":0}),
+            "cursor_expired",
+        ),
+        ("invalid_params", json!({"wal_seq":1}), "invalid_params"),
+    ] {
+        let frames = rig
+            .subscribe_collect(
+                8,
+                json!({"from":from}),
+                std::time::Duration::from_millis(100),
+            )
+            .await;
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].header.ty, subc_protocol::FrameType::Error);
+        let body: serde_json::Value = serde_json::from_slice(&frames[0].body).unwrap();
+        assert_eq!(body["code"], code);
+        if code == "invalid_params" {
+            assert_eq!(body["detail"]["field"], "from");
+        }
+        capture(
+            &format!("core.session.subscribe.{name}.error.json"),
+            &frames[0].body,
+        );
+    }
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn recorded_rides_keep_native_output_on_the_compaction_entries_serve_path() {
+    use broca_core::compaction_v2::protocol::read::{Detail, ReadRequest, Select};
+    for envelope in [false, true] {
+        let mut rig = Rig::start(if envelope {
+            "entries-envelope"
+        } else {
+            "entries-legacy"
+        })
+        .await;
+        seed_approved_call_with_ride_mode(&rig, true, envelope, "worked", true);
+        rig.bind_compaction(9, "provider").await;
+        let params = serde_json::to_value(ReadRequest::new(
+            Select::After {
+                after_ordinal: None,
+                limit: Some(100),
+            },
+            Detail::Full,
+        ))
+        .unwrap();
+        let frame = rig
+            .request(9, json!({"method":"session.entries","params":params}))
+            .await;
+        assert_eq!(
+            frame.header.ty,
+            subc_protocol::FrameType::Response,
+            "{frame:?}"
+        );
+        let body: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
+        let mut outputs = Vec::new();
+        output_texts(&body, &mut outputs);
+        assert_eq!(outputs, ["worked"]);
+        assert_eq!(
+            body.to_string().matches("\"text\":\"legacy note\"").count(),
+            1,
+            "separate Delivered metadata remains served"
+        );
+        rig.finish().await;
+    }
 }

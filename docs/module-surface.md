@@ -843,10 +843,17 @@ Missing or null `from`
 means live. On either refusal, drop the cursor, reopen live, and read `session.head`.
 
 Broca declares `notices` with `read_display_facts`, `history_display` and `live_events`.
-A send carried by a tool result adds a `notices` list to that entry on opted-in reads and
+A send recorded with a `rides-v2/v1` envelope adds a `notices` list to its tool-result entry on opted-in reads and
 to its display row, never a new transcript entry. Each fact names its stored result `part`,
 carrying `call_key`, `send_id`, `sender`, exact `text` and `delivered_as: "tool_result"`.
 The corresponding `notice_delivered` live event names the same result and carrying call.
+Envelope carriers serve only the tool's own output on default and opt-in reads, raw and
+display history, compaction entries and subscribe frames. The shared renderer adds the
+recorded ride only when constructing model input; model request bytes do not change.
+A legacy delivery without the envelope keeps its joined read/history output and emits
+neither a notice fact nor a notice event. Its subscribe result and compaction entry still
+contain only the tool's own output, without riding text. Compaction's separate `delivered`
+list retains the recorded send text and attribution.
 An unkeyed send's notices name the submission ID broca's reply gave that send; client-supplied
 send IDs take precedence, and a colliding minted notice ID is not reported.
 A replay that cannot check earlier client-supplied send IDs refuses with
@@ -1766,8 +1773,9 @@ Calls remain in message order. `started_at` is the recorded dispatch time;
 `finished_at` is that call's recorded answer time, not the batch's closing time.
 `unanswered` names a recorded closure without an answer (`interrupted`, `cancelled`,
 `denied` or `not_executed`). Missing facts stay absent. Display-history tool parts
-expose the same times and closure reasons. Default transcript reads keep their bytes
-and do not load or build the display cache; raw history does not request these facts.
+expose the same times and closure reasons. Default transcript reads and raw history do
+not request these timing facts. Reads containing tools nevertheless load the sidecar's
+exact native outputs to keep envelope notices out of application message content.
 Because broca also declares `call_identity`, each call's opt-in timing item copies its
 projected `call_key` and `schema_pin` when known. The key identifies the durable call;
 the pin encodes the tool name, schema digest and semantics version frozen at dispatch.
@@ -1775,8 +1783,11 @@ Both read envelopes and display rows
 use the same stored strings, not a current tool catalog. A prepared call declined before
 dispatch keeps its key but has no dispatch schema pin.
 
-The first opt-in read lazily backfills only its own session's rebuildable display
-projection. Fact versions and a versioned continuation (the last processed log sequence
+The first opt-in read, or first default read containing a tool result, lazily backfills
+only its own session's rebuildable display projection. Native tool output is copied from
+WAL results, never recovered by splitting joined text. The overlay changes only response
+copies, not model-facing materialized rows or `history_version`. Fact versions and a
+versioned continuation (the last processed log sequence
 plus pending-message and tool-batch state) commit atomically, so a failed
 backfill remains incomplete and retries on demand. Later reads select only their page's
 rows and fold the bounded WAL suffix since that continuation. No boot-time sweep visits

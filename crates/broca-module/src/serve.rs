@@ -3209,6 +3209,7 @@ impl ServeHandler for crate::LineageRegistry {
             dispatches,
             open_batch,
             head_facts,
+            native_tool_outputs,
             ..
         } = read.map_err(|error| {
             if late_only && matches!(error, crate::registry::OpenError::Expired { .. }) {
@@ -3311,67 +3312,100 @@ impl ServeHandler for crate::LineageRegistry {
         let mut response = session_read_response(page, tools);
         response.history_version = snapshot.history_version;
         response.incarnation = snapshot.incarnation;
-        if req.include_display_facts {
-            if let Some(lineage) = &response.lineage_id {
-                let facts = self
-                    .display_facts_for_page(
-                        &req.session,
-                        lineage,
-                        at_seq,
-                        response
-                            .messages
-                            .iter()
-                            .map(|entry| entry.ordinal - 1)
-                            .collect(),
-                    )
-                    .await?;
-                for entry in &mut response.messages {
-                    entry.created_at = creations.get(&(entry.ordinal - 1)).copied();
-                    if entry.message.role == broca_protocol::Role::Assistant {
-                        entry.completed_at = completions.get(&(entry.ordinal - 1)).copied();
-                        entry.reasoning_summaries = entry
-                            .message
-                            .content
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(part, block)| {
-                                let stored = serde_json::to_value(block).ok()?;
-                                let text =
-                                    cortexkit_role_llm_runner::display::reasoning_summary(&stored)?;
-                                Some(cortexkit_role_llm_runner::read::ReasoningSummary::new(
-                                    u32::try_from(part).ok()?,
-                                    text,
-                                ))
-                            })
-                            .collect();
-                    }
-                    if let Some(facts) = facts.get(&(entry.ordinal - 1)) {
-                        entry.sender = facts.sender.clone();
-                        entry.notices = facts
-                            .notices
-                            .iter()
-                            .map(|notice| notice.fact.clone())
-                            .collect();
-                        if entry.message.role == broca_protocol::Role::User {
-                            entry.client_message_id = facts.client_message_id.clone();
+        let facts = if let Some(lineage) = response.lineage_id.as_deref().filter(|_| {
+            req.include_display_facts
+                || (native_tool_outputs.is_none()
+                    && response
+                        .messages
+                        .iter()
+                        .any(|entry| entry.message.role == broca_protocol::Role::Tool))
+        }) {
+            self.display_facts_for_page(
+                &req.session,
+                lineage,
+                at_seq,
+                response
+                    .messages
+                    .iter()
+                    .filter(|entry| {
+                        req.include_display_facts
+                            || entry.message.role == broca_protocol::Role::Tool
+                    })
+                    .map(|entry| entry.ordinal - 1)
+                    .collect(),
+            )
+            .await?
+        } else {
+            Default::default()
+        };
+        // The cache holds exact native outputs, not an inverse of the model renderer.
+        // Overlay only response copies; joined materialized rows still feed model resume.
+        for entry in &mut response.messages {
+            if let Some(outputs) = native_tool_outputs
+                .as_ref()
+                .and_then(|outputs| outputs.get(&(entry.ordinal - 1)))
+                .or_else(|| {
+                    facts
+                        .get(&(entry.ordinal - 1))
+                        .map(|facts| &facts.native_tool_outputs)
+                })
+            {
+                for (part, block) in entry.message.content.iter_mut().enumerate() {
+                    if let broca_protocol::ContentBlock::ToolResult(result) = block {
+                        if let Some(output) = outputs.get(&(part as u32)) {
+                            result.output = output.clone();
                         }
-                        entry.tool_times = facts.tool_times.clone();
                     }
-                    if entry.tool_times.is_empty() {
-                        entry.tool_times = entry
-                            .message
-                            .content
-                            .iter()
-                            .filter_map(|block| match block {
-                                broca_protocol::ContentBlock::ToolCall(call) => {
-                                    Some(cortexkit_role_llm_runner::read::ToolTime::new(
-                                        &call.tool_call_id.0,
-                                    ))
-                                }
-                                _ => None,
-                            })
-                            .collect();
+                }
+            }
+        }
+        if req.include_display_facts && response.lineage_id.is_some() {
+            for entry in &mut response.messages {
+                entry.created_at = creations.get(&(entry.ordinal - 1)).copied();
+                if entry.message.role == broca_protocol::Role::Assistant {
+                    entry.completed_at = completions.get(&(entry.ordinal - 1)).copied();
+                    entry.reasoning_summaries = entry
+                        .message
+                        .content
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(part, block)| {
+                            let stored = serde_json::to_value(block).ok()?;
+                            let text =
+                                cortexkit_role_llm_runner::display::reasoning_summary(&stored)?;
+                            Some(cortexkit_role_llm_runner::read::ReasoningSummary::new(
+                                u32::try_from(part).ok()?,
+                                text,
+                            ))
+                        })
+                        .collect();
+                }
+                if let Some(facts) = facts.get(&(entry.ordinal - 1)) {
+                    entry.sender = facts.sender.clone();
+                    entry.notices = facts
+                        .notices
+                        .iter()
+                        .map(|notice| notice.fact.clone())
+                        .collect();
+                    if entry.message.role == broca_protocol::Role::User {
+                        entry.client_message_id = facts.client_message_id.clone();
                     }
+                    entry.tool_times = facts.tool_times.clone();
+                }
+                if entry.tool_times.is_empty() {
+                    entry.tool_times = entry
+                        .message
+                        .content
+                        .iter()
+                        .filter_map(|block| match block {
+                            broca_protocol::ContentBlock::ToolCall(call) => {
+                                Some(cortexkit_role_llm_runner::read::ToolTime::new(
+                                    &call.tool_call_id.0,
+                                ))
+                            }
+                            _ => None,
+                        })
+                        .collect();
                 }
             }
         }

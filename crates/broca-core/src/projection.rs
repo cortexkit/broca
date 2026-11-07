@@ -1228,11 +1228,10 @@ fn project_control_record<S: ControlProjectionSink>(
             let part = carrier.map(|carrier| carrier.1);
             let key = carrier.and_then(|carrier| carrier.2.clone());
             let key = ride.as_ref().map(|ride| ride.call_key.clone()).or(key);
-            let queued_origin = state.notice_sends.remove(&submission_id.0);
+            state.notice_sends.remove(&submission_id.0);
             let origin = ride
                 .as_ref()
-                .map(|ride| (ride.send_id.clone(), ride.sender.clone()))
-                .or(queued_origin);
+                .map(|ride| (ride.send_id.clone(), ride.sender.clone()));
             if let (Some(ordinal), Some(part), Some((send_id, sender))) = (ordinal, part, origin) {
                 // The separator belongs to rendering, not to the sender's notice text.
                 if let Some(text) = text.strip_prefix("\n\n") {

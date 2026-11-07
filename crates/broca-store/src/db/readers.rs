@@ -38,6 +38,7 @@ pub struct RawPageSnapshot {
     pub retention_activity_ms: Option<u64>,
     pub tools: Option<(RunId, std::sync::Arc<Vec<broca_protocol::request::Tool>>)>,
     pub dispatches: BTreeMap<u64, Vec<broca_core::ToolCallDispatch>>,
+    pub native_tool_outputs: broca_core::display_facts::NativeToolOutputs,
 }
 
 /// Ephemeral media metadata from the raw page's authenticated log snapshot.
@@ -786,6 +787,7 @@ fn page(
         .unwrap_or_else(|| broca_core::is_mode3_log(first.iter().map(|frame| &frame.record)));
     let mut messages = Vec::new();
     let mut dispatches = BTreeMap::new();
+    let mut native_tool_outputs = BTreeMap::new();
     for (ordinal, source) in rows {
         if source.input_start.checked_add(1) != Some(source.input_end) {
             return Err(invalid("raw message sub-index range invalid"));
@@ -813,6 +815,17 @@ fn page(
             .transpose()?;
         let (mut message, written_at, completed_at, created_at, turn) =
             hydrate_message(&frames, &source, started.as_ref(), mode3)?;
+        // The disabled broca-state/2 indexed reader omits SendDelivered after ToolBatchFinished,
+        // so delivered_as is missing and deliveries without a ride envelope remain unjoined.
+        if message.role == Role::Tool {
+            if let Some(outputs) =
+                broca_core::display_facts::native_tool_outputs(&frames, &lineage.to_string())
+                    .map_err(invalid)?
+                    .remove(&source.input_start)
+            {
+                native_tool_outputs.insert(ordinal, outputs);
+            }
+        }
         if source.flags & 2 != 0 {
             let mut high = source
                 .tag_base
@@ -1031,6 +1044,7 @@ fn page(
         retention_activity_ms: seed.frozen_policy.and(seed.last_activity_ms),
         tools,
         dispatches,
+        native_tool_outputs,
     })
 }
 
@@ -1266,6 +1280,11 @@ fn full_page(
         .flatten();
     Ok(RawPageSnapshot {
         index_validated,
+        native_tool_outputs: broca_core::display_facts::native_tool_outputs(
+            &frames,
+            &publication.lineage().to_string(),
+        )
+        .map_err(invalid)?,
         page,
         dispatches,
         at_seq: publication.sequence(),

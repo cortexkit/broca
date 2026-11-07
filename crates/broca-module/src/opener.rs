@@ -47,6 +47,8 @@ pub struct DefaultOpener<L: LeaseStore, W: WalStore> {
     lease_root: Option<PathBuf>,
     #[cfg(feature = "test-clock")]
     test_fs: Option<Arc<dyn broca_wal::fs_ops::FsOps>>,
+    #[cfg(feature = "test-clock")]
+    ride_writer_for_test: bool,
 }
 
 /// Boot-selected read capabilities. Recovery still opens the writer and syncs
@@ -147,11 +149,20 @@ impl<L: LeaseStore, W: WalStore> DefaultOpener<L, W> {
             lease_root: None,
             #[cfg(feature = "test-clock")]
             test_fs: None,
+            #[cfg(feature = "test-clock")]
+            ride_writer_for_test: false,
         }
     }
 
     pub fn with_readers(mut self, readers: Arc<ActorReadSources>) -> Self {
         self.readers = Some(readers);
+        self
+    }
+
+    /// Exercise live envelope writes in tests without changing shipping writer behavior.
+    #[cfg(feature = "test-clock")]
+    pub fn with_ride_writer_for_test(mut self) -> Self {
+        self.ride_writer_for_test = true;
         self
     }
 
@@ -688,6 +699,10 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> DefaultOpener<L, W> {
             }
         }
         let (writer, lease) = opening;
+        #[cfg(feature = "test-clock")]
+        if self.ride_writer_for_test {
+            writer.enable_ride_writer_for_test();
+        }
         if retention.is_some() || writer.is_retention_lineage() == Some(true) {
             if let Some(service) = registry.retention_service() {
                 service.remember_session(key).map_err(OpenError::Open)?;

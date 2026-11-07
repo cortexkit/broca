@@ -1280,6 +1280,9 @@ pub struct RouteReadPage {
     /// The dispatch facts of every tool turn the snapshot's WAL tail commits, by ordinal. A
     /// turn already in the materialized prefix is not among them.
     pub dispatches: std::collections::BTreeMap<u64, Vec<broca_core::ToolCallDispatch>>,
+    /// `Some` attests that the raw reader inspected every returned message source span.
+    /// Even an empty map then avoids a separate historical native-output backfill.
+    pub native_tool_outputs: Option<broca_core::display_facts::NativeToolOutputs>,
     /// When the newest timestamped record of the snapshot's WAL tail was written, in
     /// milliseconds since the Unix epoch.
     pub newest_record_ms: Option<u64>,
@@ -1559,6 +1562,7 @@ impl RawPageSource {
                 .tools
                 .map(|(run_id, tools)| SessionReadTools { run_id, tools }),
             dispatches: raw.dispatches,
+            native_tool_outputs: Some(raw.native_tool_outputs),
             open_batch: None,
             newest_record_ms: Some(raw.last_write_ms.unwrap_or(0)),
             retention_activity_ms: raw.retention_activity_ms,
@@ -5646,6 +5650,7 @@ impl LineageRegistry {
             tools,
             dispatches,
             newest_record_ms,
+            native_tool_outputs: None,
             retention_activity_ms,
             last_title,
         })))

@@ -390,6 +390,7 @@ fn contains_notice(records: &[broca_wal::FramedRecord]) -> bool {
         matches!(
             &frame.record,
             broca_wal::WalRecord::SendDelivered {
+                ride: Some(_),
                 mode: broca_protocol::DeliveryMode::ToolResult,
                 appended_text: Some(text), ..
             } if text.starts_with("\n\n")

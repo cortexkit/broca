@@ -800,6 +800,21 @@ impl Rig {
         Self::start_with_idle_ttl(tag, broca_module::actor::IDLE_TTL).await
     }
 
+    pub async fn start_with_ride_writer(tag: &str) -> Self {
+        let dir = broca_test_support::scratch_root()
+            .join(format!("broca-send-delivery-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("proj")).unwrap();
+        Self::open_existing_as_with_ride_writer(
+            dir,
+            broca_module::actor::IDLE_TTL,
+            false,
+            "runner",
+            true,
+        )
+        .await
+    }
+
     /// Open a stable test root so two independently built releases can replay the same WAL.
     pub async fn open_fixture(dir: PathBuf) -> Self {
         std::fs::create_dir_all(&dir).unwrap();
@@ -852,6 +867,16 @@ impl Rig {
         daemon_scopes: bool,
         harness: &str,
     ) -> Self {
+        Self::open_existing_as_with_ride_writer(dir, idle_ttl, daemon_scopes, harness, false).await
+    }
+
+    async fn open_existing_as_with_ride_writer(
+        dir: PathBuf,
+        idle_ttl: Duration,
+        daemon_scopes: bool,
+        harness: &str,
+        ride_writer: bool,
+    ) -> Self {
         let wal = Arc::new(FileWalStore::new(dir.join("wal")));
         let store = Arc::new(broca_store::SqliteStore::open(dir.join("store.db")).unwrap());
         broca_store::session_refs::migrate(
@@ -867,16 +892,23 @@ impl Rig {
             script: script.clone(),
             hook_plane: hook_plane.clone(),
         });
-        let opener = Arc::new(
-            DefaultOpener::new(
-                Arc::new(FileLeaseStore::new(dir.join("leases"))),
-                wal.clone(),
-                exec,
-            )
-            .with_idle_ttl(idle_ttl)
-            .with_run_index(store.clone())
-            .with_materialized_store(store.clone()),
-        );
+        let opener = DefaultOpener::new(
+            Arc::new(FileLeaseStore::new(dir.join("leases"))),
+            wal.clone(),
+            exec,
+        )
+        .with_idle_ttl(idle_ttl)
+        .with_run_index(store.clone())
+        .with_materialized_store(store.clone());
+        #[cfg(feature = "test-clock")]
+        let opener = if ride_writer {
+            opener.with_ride_writer_for_test()
+        } else {
+            opener
+        };
+        #[cfg(not(feature = "test-clock"))]
+        assert!(!ride_writer, "live envelope fixtures require test-clock");
+        let opener = Arc::new(opener);
         let registry = Arc::new(LineageRegistry::new_with_reader(
             opener,
             wal.clone(),
@@ -1201,6 +1233,30 @@ impl Rig {
 
     pub async fn bind(&mut self, channel: u16) {
         self.bind_as(channel, None).await;
+    }
+
+    pub async fn bind_compaction(&mut self, channel: u16, provider: &str) {
+        let bind = ModuleControlRequest::RouteBind {
+            route_channel: channel,
+            epoch: 1,
+            target: RouteTarget::ManagementSurface {
+                module_id: "broca".into(),
+            },
+            identity: SubcBindIdentity::new(self.session.harness.clone(), "delivery"),
+            principal: Some(subc_protocol::Principal::Reserved {
+                module_id: provider.into(),
+            }),
+            consumer_capabilities: None,
+            admission_facts: None,
+            scope: None,
+            role_versions: Some(std::collections::BTreeMap::from([(
+                "compaction-runner".into(),
+                "v1".into(),
+            )])),
+            call_mode: None,
+        };
+        let reply = self.request(0, serde_json::to_value(bind).unwrap()).await;
+        assert_eq!(reply.header.ty, FrameType::Response, "{reply:?}");
     }
 
     /// The rig's session registry.

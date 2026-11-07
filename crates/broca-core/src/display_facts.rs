@@ -8,7 +8,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::placement::{AppendKind, Placement, PlacementAction};
 
-pub const DISPLAY_FACTS_VERSION: u32 = 4;
+pub const DISPLAY_FACTS_VERSION: u32 = 5;
+
+/// Exact response-only outputs by zero-based message ordinal and content part.
+pub type NativeToolOutputs = BTreeMap<u64, BTreeMap<u32, broca_protocol::ToolOutput>>;
 
 fn module_sender(principal: Option<&broca_protocol::BindPrincipal>) -> Option<String> {
     match principal {
@@ -27,6 +30,10 @@ pub struct DisplayFacts {
     pub client_message_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_times: Vec<ToolTime>,
+    /// Application-only `ToolResult` output with `SendDelivered.ride` text excluded.
+    /// Materialized messages remain model-facing and must not be rewritten by a read.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub native_tool_outputs: BTreeMap<u32, broca_protocol::ToolOutput>,
 }
 
 impl DisplayFacts {
@@ -74,6 +81,8 @@ pub struct DisplayFactsSeed {
     tool_row: Option<(u64, DisplayFacts)>,
     #[serde(default)]
     tool_calls: Vec<String>,
+    #[serde(default)]
+    tool_results: BTreeMap<String, broca_protocol::ToolResult>,
 }
 
 impl Default for DisplayFactsSeed {
@@ -94,6 +103,7 @@ impl Default for DisplayFactsSeed {
             pending_senders: Default::default(),
             tool_row: None,
             tool_calls: Vec::new(),
+            tool_results: BTreeMap::new(),
         }
     }
 }
@@ -166,6 +176,7 @@ impl DisplayFactsSeed {
                     self.pending_senders.clear();
                     self.tool_row = None;
                     self.tool_calls.clear();
+                    self.tool_results.clear();
                     self.assistant = None;
                     self.tool_names.clear();
                     if matches!(origin, broca_wal::RunOrigin::Fresh) {
@@ -269,6 +280,7 @@ impl DisplayFactsSeed {
                 assistant_message, ..
             } = record
             {
+                self.tool_results.clear();
                 self.tool_names = assistant_message
                     .tool_calls()
                     .map(|call| (call.tool_call_id.0.clone(), call.tool_name.clone()))
@@ -307,6 +319,10 @@ impl DisplayFactsSeed {
                     })
                     .collect();
             }
+            if let WalRecord::ToolResult { result, .. } = record {
+                self.tool_results
+                    .insert(result.tool_call_id.0.clone(), (**result).clone());
+            }
             if let WalRecord::SendDelivered {
                 submission_id,
                 ride,
@@ -318,30 +334,34 @@ impl DisplayFactsSeed {
             {
                 if let Some((ordinal, facts)) = &mut self.tool_row {
                     let part = self.tool_calls.iter().rposition(|id| id == &call.0);
-                    let key = ride.as_ref().map(|ride| ride.call_key.clone()).or_else(|| {
-                        self.call_anchors
-                            .slots()
-                            .iter()
-                            .rfind(|slot| &slot.id == call)
-                            .and_then(|slot| slot.key(Some(lineage)))
-                    });
-                    let origin = ride
-                        .as_ref()
-                        .map(|ride| (ride.send_id.clone(), Some(ride.sender.clone())))
-                        .or_else(|| self.send_keys.origin(&submission_id.0));
-                    if let (Some(part), Some(key), Some((send_id, sender)), Some(text)) =
-                        (part, key, origin, text.strip_prefix("\n\n"))
-                    {
-                        facts.notices.push(crate::projection::ProjectedNotice {
-                            submission_id: submission_id.0.clone(),
-                            fact: cortexkit_role_llm_runner::read::NoticeFact::new(
-                                part as u32,
-                                send_id,
-                                sender.unwrap_or_else(|| "broca".into()),
-                                text,
-                            )
-                            .with_call_key(key),
-                        });
+                    if let Some(part) = part {
+                        if ride.is_none() {
+                            if let Some(result) = self.tool_results.get_mut(&call.0) {
+                                crate::delivery_order::append_to_result(result, text);
+                            }
+                        }
+                        if ride.is_some() || facts.native_tool_outputs.contains_key(&(part as u32))
+                        {
+                            let result = self
+                                .tool_results
+                                .get(&call.0)
+                                .ok_or("ride carrier has no native result")?;
+                            facts
+                                .native_tool_outputs
+                                .insert(part as u32, result.output.clone());
+                        }
+                        if let (Some(ride), Some(text)) = (ride, text.strip_prefix("\n\n")) {
+                            facts.notices.push(crate::projection::ProjectedNotice {
+                                submission_id: submission_id.0.clone(),
+                                fact: cortexkit_role_llm_runner::read::NoticeFact::new(
+                                    part as u32,
+                                    &ride.send_id,
+                                    &ride.sender,
+                                    text,
+                                )
+                                .with_call_key(&ride.call_key),
+                            });
+                        }
                         versions.push(DisplayFactVersion {
                             ordinal: *ordinal,
                             seq: frame.seq,
@@ -519,6 +539,30 @@ impl DisplayFactsSeed {
     }
 }
 
+/// Reuse already-decoded message source spans without reading a historical prefix.
+/// Deliveries without `SendDelivered.ride` remain appended; deliveries with it are
+/// excluded from this response overlay.
+pub fn native_tool_outputs(
+    records: &[FramedRecord],
+    lineage: &str,
+) -> Result<NativeToolOutputs, String> {
+    if !records.iter().any(|frame| {
+        matches!(
+            &frame.record,
+            WalRecord::SendDelivered { ride: Some(_), .. }
+        )
+    }) {
+        return Ok(Default::default());
+    }
+    let mut outputs: NativeToolOutputs = DisplayFactsSeed::default()
+        .fold(records, lineage)?
+        .into_iter()
+        .map(|version| (version.ordinal, version.facts.native_tool_outputs))
+        .collect();
+    outputs.retain(|_, parts| !parts.is_empty());
+    Ok(outputs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -558,6 +602,62 @@ mod tests {
             seq,
             fence: 1,
             record: serde_json::from_value(value).unwrap(),
+        }
+    }
+
+    #[test]
+    fn native_output_sidecar_survives_every_cut_and_preserves_only_legacy_appends() {
+        use broca_protocol::{ToolOutput, ToolOutputPart};
+        for output in [
+            ToolOutput::Text {
+                text: "worked".into(),
+            },
+            ToolOutput::error("failed"),
+            ToolOutput::Json {
+                value: json!({"answer":42}),
+            },
+            ToolOutput::Parts {
+                parts: vec![ToolOutputPart::Text {
+                    text: "worked".into(),
+                }],
+            },
+        ] {
+            let mut result = broca_protocol::ToolResult {
+                tool_call_id: broca_protocol::ToolCallId("call".into()),
+                output: output.clone(),
+                is_error: false,
+            };
+            crate::delivery_order::append_to_result(&mut result, "\n\nold-before");
+            crate::delivery_order::append_to_result(&mut result, "\n\nold-after");
+            let values = vec![
+                json!({"type":"model_step_finished","step_id":0,"assistant_message":{"message_id":"m","content":[{"type":"tool_call","tool_call_id":"call","tool_name":"work","input":{}}]},"usage":{}}),
+                json!({"type":"tool_batch_started","step_id":0,"batch_id":"b","planned_calls":["call"]}),
+                json!({"type":"tool_result","batch_id":"b","result":{"tool_call_id":"call","output":output,"is_error":false},"outcome":"completed"}),
+                json!({"type":"tool_batch_finished","batch_id":"b"}),
+                json!({"type":"send_delivered","submission_id":"before","run_id":"r","mode":"tool_result","tool_call_id":"call","appended_text":"\n\nold-before"}),
+                json!({"type":"send_delivered","submission_id":"frozen","run_id":"r","mode":"tool_result","tool_call_id":"call","appended_text":"\n\nnew","ride":{"call_key":"lineage:1","send_id":"frozen","sender":"sender","forms":["tool_result"],"form":"append"}}),
+                json!({"type":"send_delivered","submission_id":"after","run_id":"r","mode":"tool_result","tool_call_id":"call","appended_text":"\n\nold-after"}),
+            ];
+            let frames: Vec<_> = values
+                .into_iter()
+                .enumerate()
+                .map(|(index, value)| frame(index as u64 + 1, value))
+                .collect();
+            for cut in 0..=frames.len() {
+                let mut seed = DisplayFactsSeed::default();
+                let mut versions = seed.fold(&frames[..cut], "lineage").unwrap();
+                let mut seed: DisplayFactsSeed =
+                    serde_json::from_slice(&serde_json::to_vec(&seed).unwrap()).unwrap();
+                versions.extend(seed.fold(&frames[cut..], "lineage").unwrap());
+                let facts = &versions.last().unwrap().facts;
+                assert_eq!(
+                    facts.native_tool_outputs.get(&0),
+                    Some(&result.output),
+                    "cut {cut}"
+                );
+                assert_eq!(facts.notices.len(), 1);
+                assert_eq!(facts.notices[0].fact.text, "new");
+            }
         }
     }
 

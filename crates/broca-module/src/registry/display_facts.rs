@@ -3,7 +3,7 @@ use broca_core::display_facts::{DisplayFacts, DisplayFactsCache};
 use std::collections::BTreeMap;
 
 impl LineageRegistry {
-    /// Only an opt-in read calls this path. The first request backfills one lineage; later
+    /// Application reads use this sidecar without changing model-facing rows. The first request backfills one lineage; later
     /// requests load their rows and fold only records beyond the atomically committed seed.
     pub(crate) async fn display_facts_for_page(
         &self,
