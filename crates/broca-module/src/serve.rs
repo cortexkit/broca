@@ -194,7 +194,8 @@ pub struct SessionImportRequest {
     pub principal: Option<broca_protocol::BindPrincipal>,
     /// What the importing route says about scopes. An import seeds a session's first episode,
     /// so a session whose address an owner's scoped bind reserved accepts it only over a route
-    /// stamped with that owner's scope. `Internal` (a caller inside broca) takes no such check.
+    /// stamped with that owner's reserving scope ref. `Internal` (a caller inside broca) takes no
+    /// such check.
     pub scope: broca_protocol::SendScope,
     pub session: LineageKey,
     pub run_id: broca_protocol::RunId,
@@ -1929,7 +1930,7 @@ pub trait ServeHandler: Send + Sync {
     /// The adoption check a stamped `route.bind` gets before it is acknowledged: `Ok(Some)` when
     /// the bound session was recorded without a scope and its history refuses the stamp. Only
     /// adoption is decided here, plus the reservation of a session with no episode yet: a stamp
-    /// whose owner is not the owner that reserved the session's address under a scope is
+    /// whose owner or ref differs from the scope that reserved the session's address is
     /// `Err(ServeError::ScopeRefused)`, the refusal its first send would get. Every other scope
     /// rule is decided on each send, since an episode can be written between the bind and the
     /// send. `Err` also when the history cannot be read, so whether it refuses the stamp is
@@ -2620,14 +2621,14 @@ impl ServeHandler for crate::LineageRegistry {
         if req.request.scope != broca_protocol::SendScope::Internal
             && self.wal_written(&req.session) == Some(false)
         {
-            let reserved_owner =
-                self.scope_reservation_owner(&req.session)
-                    .await
-                    .map_err(|error| {
-                        ServeError::Open(error, Some(broca_protocol::ErrorClass::Transient))
-                    })?;
+            // A reservation that cannot be read refuses the send as transient, never as "not
+            // reserved", which would let anyone start the session.
+            let reservation = self
+                .scope_reservation(&req.session)
+                .await
+                .map_err(ServeError::Transient)?;
             let ownership = broca_core::SessionOwnershipV1 {
-                reserved_owner,
+                reservation,
                 ..Default::default()
             };
             broca_core::scope_admission::check_scope_reservation(
@@ -3052,8 +3053,8 @@ impl ServeHandler for crate::LineageRegistry {
             // existing unreadable-history refusals keep their code and cause.
             self.check_session_log(session).await?;
         }
-        // A stamped stranger meets the refusal its first send would get, so the route is never
-        // acknowledged for a session whose address another owner's scoped bind reserved.
+        // A stamp of another scope meets the refusal its first send would get, so the route is
+        // never acknowledged for a session whose address another scope's bind reserved.
         let stamped = broca_protocol::SendScope::Stamped(scope.clone());
         broca_core::scope_admission::check_scope_reservation(&ownership, principal, &stamped)
             .map_err(ServeError::ScopeRefused)?;

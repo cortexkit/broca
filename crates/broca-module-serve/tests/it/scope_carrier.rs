@@ -8,7 +8,7 @@
 //! (with or without `scopes/v1`) and stamps each bind the way the daemon does.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -50,7 +50,12 @@ fn other() -> Principal {
 
 /// The stamp the daemon puts on a bind admitted under `owner`'s scope `head-1`.
 fn stamp(owner: Principal, epoch: u64) -> ScopeStamp {
-    ScopeStamp::new(owner, "head-1", epoch, ScopeKind::Head)
+    stamp_ref(owner, "head-1", epoch)
+}
+
+/// The stamp the daemon puts on a bind admitted under `owner`'s scope `scope_ref`.
+fn stamp_ref(owner: Principal, scope_ref: &str, epoch: u64) -> ScopeStamp {
+    ScopeStamp::new(owner, scope_ref, epoch, ScopeKind::Head)
         // Admission ignores agent_id and delegates: they do not authorize sends to broca.
         // This test uses an ordinary scope, with no flow id.
         .with_attributes(
@@ -176,6 +181,53 @@ impl RunExecutor for CoreExec {
     }
 }
 
+/// The rig's session address inventory: the real store, with a switch that makes reading a
+/// session's scope reservation fail as an unreadable store would.
+struct ReservationReads {
+    store: Arc<broca_store::SqliteStore>,
+    fail: Arc<AtomicBool>,
+}
+
+impl broca_store::SessionAddressResolver for ReservationReads {
+    fn resolve_session_address(
+        &self,
+        bind: &BindIdentity,
+        workdir: Option<&Path>,
+        reservation: Option<&broca_store::session_address::ScopeReservation>,
+    ) -> Result<BindIdentity, broca_store::session_address::SessionAddressError> {
+        self.store
+            .resolve_session_address(bind, workdir, reservation)
+    }
+
+    fn scope_reservation(
+        &self,
+        session: &BindIdentity,
+    ) -> Result<
+        Option<broca_store::session_address::ScopeReservation>,
+        broca_store::session_address::SessionAddressError,
+    > {
+        if self.fail.load(Ordering::SeqCst) {
+            return Err(
+                broca_store::session_address::SessionAddressError::store_error(
+                    "injected scope reservation read failure",
+                ),
+            );
+        }
+        self.store.scope_reservation(session)
+    }
+
+    fn session_log_state(
+        &self,
+        session: &BindIdentity,
+        wal: &dyn broca_core::WalStore,
+    ) -> Result<
+        broca_store::session_log_evidence::SessionLogState,
+        broca_store::session_log_evidence::SessionLogError,
+    > {
+        broca_store::SessionAddressResolver::session_log_state(self.store.as_ref(), session, wal)
+    }
+}
+
 struct Rig {
     dir: PathBuf,
     reader: tokio::io::ReadHalf<tokio::io::DuplexStream>,
@@ -187,6 +239,8 @@ struct Rig {
     /// The number of messages in each model step's prompt, in call order.
     prompts: Arc<std::sync::Mutex<Vec<usize>>>,
     registry: Arc<LineageRegistry>,
+    /// While set, reading a session's scope reservation fails as an unreadable store would.
+    fail_reservation_reads: Arc<AtomicBool>,
     corr: u64,
 }
 
@@ -208,6 +262,7 @@ impl Rig {
         let gate = Arc::new(Notify::new());
         let held = Arc::new(Notify::new());
         let prompts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let fail_reservation_reads = Arc::new(AtomicBool::new(false));
         let exec = Arc::new(CoreExec {
             wal_store: wal.clone(),
             store: store.clone(),
@@ -236,7 +291,10 @@ impl Rig {
             &broca_core::ReadOnlyWalReader::new(&dir),
         )
         .unwrap();
-        registry.set_session_address_inventory(store);
+        registry.set_session_address_resolver(Arc::new(ReservationReads {
+            store,
+            fail: fail_reservation_reads.clone(),
+        }));
         let (client, server) = tokio::io::duplex(64 * 1024);
         let (mut reader, mut writer) = tokio::io::split(client);
         let (server_read, server_write) = tokio::io::split(server);
@@ -286,6 +344,7 @@ impl Rig {
             held,
             prompts,
             registry,
+            fail_reservation_reads,
             corr: 1,
         }
     }
@@ -661,17 +720,8 @@ async fn a_scoped_bind_reserves_a_new_session_for_its_scope_owner() {
     let session = BindIdentity::new("broca-unscoped-v1", "runner", "scoped");
     rig.bind_ok(7, Some(core()), Some(stamp(core(), 3))).await;
     rig.bind_ok(8, Some(other()), None).await;
-    let reserved_for_core = |presented: &str| {
-        serde_json::json!({
-            "kind": "first_principal",
-            "first": "reserved:prefrontal-core",
-            "presented_principal": presented,
-        })
-    };
 
-    let (code, body) = error_body(&rig.send(8, "stranger-1").await);
-    assert_eq!(code, "scope_owner_mismatch", "{body}");
-    assert_eq!(body["detail"], reserved_for_core("reserved:other-agent"));
+    assert_reserved_for_core(&rig.send(8, "stranger-1").await, "reserved:other-agent");
     let import = rig
         .request(
             8,
@@ -682,18 +732,16 @@ async fn a_scoped_bind_reserves_a_new_session_for_its_scope_owner() {
             }}),
         )
         .await;
-    let (code, body) = error_body(&import);
-    assert_eq!(code, "scope_owner_mismatch", "{body}");
-    assert_eq!(body["detail"], reserved_for_core("reserved:other-agent"));
+    assert_reserved_for_core(&import, "reserved:other-agent");
     assert!(
         !rig.wal_path.exists(),
         "a refused first send or import must not create the session's log"
     );
 
-    let bind = rig.bind(9, Some(other()), Some(stamp(other(), 1))).await;
-    let (code, body) = error_body(&bind);
-    assert_eq!(code, "scope_owner_mismatch", "{body}");
-    assert_eq!(body["detail"], reserved_for_core("reserved:other-agent"));
+    assert_reserved_for_core(
+        &rig.bind(9, Some(other()), Some(stamp(other(), 1))).await,
+        "reserved:other-agent",
+    );
 
     // Opening the session's actor writes its log; the actor then makes the same decision.
     rig.registry.actor_for(&session).await.unwrap();
@@ -702,9 +750,7 @@ async fn a_scoped_bind_reserves_a_new_session_for_its_scope_owner() {
         "the open actor wrote the session's log"
     );
     let before = rig.wal_bytes();
-    let (code, body) = error_body(&rig.send(8, "stranger-2").await);
-    assert_eq!(code, "scope_owner_mismatch", "{body}");
-    assert_eq!(body["detail"], reserved_for_core("reserved:other-agent"));
+    assert_reserved_for_core(&rig.send(8, "stranger-2").await, "reserved:other-agent");
     assert_eq!(rig.wal_bytes(), before, "a refused send writes nothing");
     assert!(frozen_scopes(&rig.records()).is_empty(), "no run started");
     let ownership = rig
@@ -714,9 +760,12 @@ async fn a_scoped_bind_reserves_a_new_session_for_its_scope_owner() {
         .unwrap();
     assert_eq!(ownership.episodes, 0);
     assert_eq!(
-        ownership.reserved_owner,
-        Some(broca_protocol::BindPrincipal::Reserved {
-            module_id: "prefrontal-core".into()
+        ownership.reservation,
+        Some(broca_core::scope_admission::ScopeReservation {
+            owner: broca_protocol::BindPrincipal::Reserved {
+                module_id: "prefrontal-core".into()
+            },
+            scope_ref: "head-1".into(),
         })
     );
 
@@ -742,6 +791,111 @@ async fn a_scoped_bind_reserves_a_new_session_for_its_scope_owner() {
     assert_eq!(first["state"], "active", "{first}");
     let records = rig.wait_for_finished(1).await;
     assert_eq!(frozen_scopes(&records), [None]);
+    rig.finish().await;
+}
+
+/// The refusal `presented` gets from a session whose address core's scoped bind reserved:
+/// `scope_owner_mismatch` with the `first_principal` detail naming core, under the message
+/// that says the session was reserved, not started.
+fn assert_reserved_for_core(reply: &Frame, presented: &str) {
+    let (code, body) = error_body(reply);
+    assert_eq!(code, "scope_owner_mismatch", "{body}");
+    assert_eq!(
+        body["detail"],
+        serde_json::json!({
+            "kind": "first_principal",
+            "first": "reserved:prefrontal-core",
+            "presented_principal": presented,
+        }),
+        "{body}"
+    );
+    assert_eq!(
+        body["message"],
+        "this session's address was reserved by 'reserved:prefrontal-core' under a scope; only \
+         that owner's scoped first send can start it",
+        "{body}"
+    );
+}
+
+/// The reservation names core's scope by owner and ref, not by epoch: the scope's epoch can
+/// change between the bind that reserved the session (core's first route to it, which may only
+/// read the session) and core's first send. A route under a higher or a lower epoch of the same
+/// scope is bound and its first send admitted, and the run freezes that send's own stamp, epoch
+/// included. A route stamped with another of core's refs is refused at bind with the
+/// reservation refusal.
+#[tokio::test]
+async fn a_reservation_admits_its_scope_at_any_epoch_and_refuses_another_ref() {
+    for (tag, epoch) in [("reserved-later-epoch", 5), ("reserved-earlier-epoch", 2)] {
+        let mut rig = Rig::start(tag, true, false).await;
+        rig.bind_ok(7, Some(core()), Some(stamp(core(), 3))).await;
+        assert_reserved_for_core(
+            &rig.bind(8, Some(core()), Some(stamp_ref(core(), "head-2", 3)))
+                .await,
+            "reserved:prefrontal-core",
+        );
+        rig.bind_ok(9, Some(core()), Some(stamp(core(), epoch)))
+            .await;
+        rig.gate.notify_one();
+        let first = rig.send_ok(9, "moved-1").await;
+        assert_eq!(first["state"], "active", "{tag}: {first}");
+        let records = rig.wait_for_finished(1).await;
+        assert_eq!(
+            frozen_scopes(&records),
+            [Some((
+                "reserved:prefrontal-core".into(),
+                "head-1".into(),
+                epoch
+            ))],
+            "{tag}"
+        );
+        rig.finish().await;
+    }
+}
+
+/// A scope reservation that cannot be read refuses the session's first send as transient; it
+/// never reads as "not reserved", which would let any module start the session. That holds for
+/// the serve layer's check before the session has a log, and for the actor's check once it
+/// has one: the stranger's send is refused `transient`, no log is created or written, and no
+/// run starts. An import meets the same unreadable reservation and is refused as transient too.
+#[tokio::test]
+async fn an_unreadable_reservation_refuses_the_first_send_as_transient() {
+    let mut rig = Rig::start("reservation-unreadable", true, false).await;
+    let session = BindIdentity::new("broca-unscoped-v1", "runner", "scoped");
+    rig.bind_ok(7, Some(core()), Some(stamp(core(), 3))).await;
+    rig.bind_ok(8, Some(other()), None).await;
+    rig.fail_reservation_reads.store(true, Ordering::SeqCst);
+
+    let (code, body) = error_body(&rig.send(8, "stranger-1").await);
+    assert_eq!(code, "transient", "{body}");
+    let import = rig
+        .request(
+            8,
+            serde_json::json!({"method":"session.import", "params": {
+                "import_id":"stranger-import",
+                "origin":{"kind":"import","source_ref":"fixture:stranger"},
+                "messages":[{"role":"user","content":[{"type":"text","text":"mine"}]}]
+            }}),
+        )
+        .await;
+    let (code, body) = error_body(&import);
+    assert_eq!(code, "open_failed", "{body}");
+    assert_eq!(body["detail"]["class"], "transient", "{body}");
+    assert!(
+        !rig.wal_path.exists(),
+        "a send or import refused for an unreadable reservation must not create the log"
+    );
+
+    // Opening the session's actor writes its log, so the next send reaches the actor's check.
+    rig.registry.actor_for(&session).await.unwrap();
+    assert!(
+        rig.wal_path.exists(),
+        "the open actor wrote the session's log"
+    );
+    let before = rig.wal_bytes();
+    let (code, body) = error_body(&rig.send(8, "stranger-2").await);
+    assert_eq!(code, "transient", "{body}");
+    assert_eq!(rig.wal_bytes(), before, "a refused send writes nothing");
+    assert!(frozen_scopes(&rig.records()).is_empty(), "no run started");
     rig.finish().await;
 }
 

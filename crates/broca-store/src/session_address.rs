@@ -2,25 +2,14 @@
 
 use std::path::Path;
 
-use broca_protocol::{BindIdentity, BindPrincipal};
+use broca_protocol::BindIdentity;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
 use crate::{session_refs, SqliteStore};
 
-/// The scope a stamped `route.bind` carried when it reserved a new session address.
-///
-/// Until the session's first send is admitted its history names no owner, so the reservation
-/// is what says whose session it is: admission accepts a first send only over a route stamped
-/// with a scope `owner` owns. Recorded once, in the transaction that reserves the address, and
-/// only for a stamped bind; an unstamped reservation and every address reserved before this
-/// record existed have none, and keep the earlier admission rules.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ScopeReservation {
-    /// The scope's owner, as admission compares it against a stamp's owner.
-    pub owner: BindPrincipal,
-    /// The scope's `ref` at reservation time, kept for diagnosis.
-    pub scope_ref: String,
-}
+/// The owner and `ref` of the scope whose stamped `route.bind` reserved a new session address;
+/// admission defines and compares it, and this inventory records it.
+pub use broca_core::scope_admission::ScopeReservation;
 
 /// One row per address a stamped bind reserved. The owner is stored as the principal's JSON,
 /// which decodes back to the same `BindPrincipal`, including a kind this build does not know.

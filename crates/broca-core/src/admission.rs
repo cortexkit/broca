@@ -585,16 +585,16 @@ pub struct SessionOwnershipV1 {
     /// instead of building on it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub plan_manifest_folded: bool,
-    /// The owner whose scoped `route.bind` first reserved the session's storage address, read
-    /// from the session inventory, never from the WAL. Admission fills it in only while the
-    /// session has no episode, and only then does it apply: until a first send is admitted the
-    /// history names no owner, so without it any route naming the same harness and session
-    /// could become the session's first principal and lock the reserving owner out. `None`
-    /// when the address was reserved without a stamp, predates reservations, or the session
-    /// already has episodes. Never serialized: a checkpoint summarises history, and this is not
-    /// history.
+    /// The scope (owner and `ref`) whose `route.bind` first reserved the session's storage
+    /// address, read from the session inventory, never from the WAL. Admission fills it in only
+    /// while the session has no episode, and only then does it apply: until a first send is
+    /// admitted the history names no owner, so without it any route naming the same harness and
+    /// session could become the session's first principal and lock the reserving owner out.
+    /// `None` when the address was reserved without a stamp, predates reservations, or the
+    /// session already has episodes. Never serialized: a checkpoint summarises history, and this
+    /// is not history.
     #[serde(skip)]
-    pub reserved_owner: Option<BindPrincipal>,
+    pub reservation: Option<crate::scope_admission::ScopeReservation>,
 }
 
 impl Default for SessionOwnershipV1 {
@@ -611,7 +611,7 @@ impl Default for SessionOwnershipV1 {
             session_change_recorded: false,
             sender_admission: None,
             plan_manifest_folded: true,
-            reserved_owner: None,
+            reservation: None,
         }
     }
 }
@@ -688,7 +688,7 @@ impl SessionOwnershipV1 {
             plan_manifest_folded: false,
             // Cancel and retract never read the reservation, and this copy can outlive the
             // empty history the reservation applies to.
-            reserved_owner: None,
+            reservation: None,
         }
     }
 
@@ -6591,7 +6591,7 @@ mod tests {
                 session_change_recorded: false,
                 sender_admission: None,
                 plan_manifest_folded: true,
-                reserved_owner: None,
+                reservation: None,
             }
         );
     }

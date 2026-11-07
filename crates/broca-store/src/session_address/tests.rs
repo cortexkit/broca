@@ -1,5 +1,6 @@
 use super::*;
 use broca_core::SessionRefIndex;
+use broca_protocol::BindPrincipal;
 use std::sync::{Arc, Barrier};
 
 fn complete(store: &SqliteStore) {

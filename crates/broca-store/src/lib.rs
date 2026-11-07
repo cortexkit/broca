@@ -6503,7 +6503,7 @@ mod tests {
             session_change_recorded: false,
             sender_admission: None,
             plan_manifest_folded: true,
-            reserved_owner: None,
+            reservation: None,
         };
         let snapshot =
             broca_core::load_prior_wal_snapshot(&wal_store, &session, safe_head, Some(&store))

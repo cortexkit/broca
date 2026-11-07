@@ -24,9 +24,9 @@
 //!   its first send, when that first episode recorded one. A session whose first episode
 //!   recorded no principal (it predates principal recording) keeps accepting sends as before.
 //! - A session with no episode yet, whose storage address a scoped `route.bind` reserved,
-//!   accepts its first send only over a route stamped with a scope of the reserving owner (see
-//!   [`check_scope_reservation`]). Addresses reserved without a stamp, or before reservations
-//!   were recorded, keep the rules above.
+//!   accepts its first send only over a route stamped with the reserving scope's owner and
+//!   `ref`, at any epoch (see [`check_scope_reservation`]). Addresses reserved without a stamp,
+//!   or before reservations were recorded, keep the rules above.
 //!
 //! Admission compares scope identity. New flow sessions and agent-run sessions freeze
 //! `agent_id`; historical flow sessions and ordinary agent scopes keep their earlier rules.
@@ -134,16 +134,35 @@ pub fn decide_owner_access(
     )))
 }
 
-/// Refuse a caller's request that would become the first principal of a session whose storage
-/// address a scoped `route.bind` reserved for another owner.
+/// The scope a stamped `route.bind` carried when it reserved a new session address: its owner
+/// and `ref`, without its epoch.
 ///
-/// Applies only while the session has no episode and `ownership.reserved_owner` is set. The
-/// request must then arrive over a route stamped with a scope that owner owns; the opener may
-/// still be a carrier the daemon admitted under that scope, which the rest of admission judges
-/// as it always has. A request without a stamp, or stamped with another owner's scope, is
-/// refused as a send from someone other than the session's owner, naming the reserved owner.
-/// An `Internal` request is not a caller's and is never refused here. Once an episode exists,
-/// its recorded principal and scope decide instead.
+/// Until the session's first send is admitted its history names no owner, so the reservation
+/// says whose session it is. It is recorded once, by the session inventory, in the transaction
+/// that reserves the address, and only for a stamped bind; an unstamped reservation and every
+/// address reserved before reservations were recorded have none, and keep the earlier rules.
+/// The epoch is left out on purpose: the owner can start its scope again at another epoch
+/// between the bind that reserved the address and its first send (core does when an agent's
+/// head scope moves to a new residence), and the owner and ref still name the same scope.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScopeReservation {
+    /// The scope's owner, compared with a stamp's owner.
+    pub owner: BindPrincipal,
+    /// The scope's `ref`, compared with a stamp's `ref`.
+    pub scope_ref: String,
+}
+
+/// Refuse a caller's request that would become the first principal of a session whose storage
+/// address a scoped `route.bind` reserved for another scope.
+///
+/// Applies only while the session has no episode and `ownership.reservation` is set. The
+/// request must then arrive over a route stamped with a scope of the reserved owner and `ref`,
+/// at any epoch; the opener may still be a carrier the daemon admitted under that scope, which
+/// the rest of admission judges as it always has. A request without a stamp, or stamped with
+/// another owner's scope or another of the owner's refs, is refused as a send from someone other
+/// than the session's owner, naming the reserved owner. An `Internal` request is not a caller's
+/// and is never refused here. Once an episode exists, its recorded principal and scope decide
+/// instead.
 ///
 /// `session.send` meets this through [`decide_scope`]. Paths that establish ownership
 /// without scope admission (an inline `session.import`) and the stamped `route.bind` precheck
@@ -154,23 +173,25 @@ pub fn check_scope_reservation(
     send: &SendScope,
 ) -> Result<(), ScopeRefusal> {
     let Some(reserved) = ownership
-        .reserved_owner
+        .reservation
         .as_ref()
         .filter(|_| ownership.episodes == 0)
     else {
         return Ok(());
     };
-    let stamp_owner = match send {
+    let stamp = match send {
         SendScope::Internal => return Ok(()),
         SendScope::DaemonWithoutScopes | SendScope::Unstamped => None,
-        SendScope::Stamped(bind) => Some(&bind.scope.owner),
+        SendScope::Stamped(bind) => Some(&bind.scope),
     };
-    if stamp_owner == Some(reserved) {
+    if stamp
+        .is_some_and(|stamp| stamp.owner == reserved.owner && stamp.scope_ref == reserved.scope_ref)
+    {
         return Ok(());
     }
     Err(ScopeRefusal::OwnerMismatch(Box::new(
-        OwnerMismatch::FirstPrincipal {
-            first: reserved.clone(),
+        OwnerMismatch::Reserved {
+            owner: reserved.owner.clone(),
             presented_principal: principal.cloned(),
         },
     )))
@@ -269,10 +290,17 @@ pub enum OwnerMismatch {
         stamped: SessionScope,
         presented_principal: Option<BindPrincipal>,
     },
-    /// An unscoped session: only the principal of its first send. Also the refusal for a session
-    /// with no episode whose address a scoped bind reserved: `first` is then the reserving owner.
+    /// An unscoped session: only the principal of its first send.
     FirstPrincipal {
         first: BindPrincipal,
+        presented_principal: Option<BindPrincipal>,
+    },
+    /// A session with no episode yet whose storage address a scoped bind reserved for `owner`:
+    /// only a send stamped with that owner's reserving scope (same `ref`, any epoch) may start
+    /// it. On the wire it is the `first_principal` detail with `owner` as `first`, under a
+    /// message of its own, because no one has started the session yet.
+    Reserved {
+        owner: BindPrincipal,
         presented_principal: Option<BindPrincipal>,
     },
 }
@@ -985,9 +1013,14 @@ mod tests {
         );
     }
 
-    fn reserved_for(owner: BindPrincipal) -> SessionOwnershipV1 {
+    /// The ownership of an empty session whose address a scoped bind of `owner` reserved under
+    /// `scope_ref`.
+    fn reserved_for(owner: BindPrincipal, scope_ref: &str) -> SessionOwnershipV1 {
         SessionOwnershipV1 {
-            reserved_owner: Some(owner),
+            reservation: Some(ScopeReservation {
+                owner,
+                scope_ref: scope_ref.into(),
+            }),
             ..SessionOwnershipV1::default()
         }
     }
@@ -997,23 +1030,25 @@ mod tests {
         presented: Option<BindPrincipal>,
     ) -> Result<ScopeDecision, ScopeRefusal> {
         Err(ScopeRefusal::OwnerMismatch(Box::new(
-            OwnerMismatch::FirstPrincipal {
-                first: owner,
+            OwnerMismatch::Reserved {
+                owner,
                 presented_principal: presented,
             },
         )))
     }
 
-    /// A scoped bind reserved the address for core. Core's first send under its own stamp
-    /// freezes that stamp exactly as on an unreserved session, and so does a carrier the daemon
-    /// admitted under core's flow scope. Another module stamping its own scope cannot become the
-    /// session's first principal: the refusal names the reserving owner.
+    /// A scoped bind reserved the address for core's scope `head-1`. Core's first send under
+    /// that stamp freezes it exactly as on an unreserved session. So does a carrier the daemon
+    /// admitted under core's flow scope: the carrier's stamp names the owner's flow scope, and
+    /// that scope's owner and ref are the ones its own bind reserved (here `head-1`, the ref
+    /// `flow` builds on). Another module stamping its own scope cannot become the session's first
+    /// principal: the refusal names the reserving owner.
     #[test]
     fn a_reserved_session_admits_a_first_send_only_under_its_owners_scope() {
         let stamp = scope(core(), 3);
         assert_eq!(
             decide_scope(
-                &reserved_for(core()),
+                &reserved_for(core(), "head-1"),
                 Some(&core()),
                 &stamped(stamp.clone())
             ),
@@ -1021,7 +1056,7 @@ mod tests {
         );
         assert_eq!(
             decide_scope(
-                &reserved_for(core()),
+                &reserved_for(core(), "head-1"),
                 Some(&other()),
                 &stamped(flow(None, "flow-1"))
             ),
@@ -1029,7 +1064,7 @@ mod tests {
         );
         assert_eq!(
             decide_scope(
-                &reserved_for(core()),
+                &reserved_for(core(), "head-1"),
                 Some(&other()),
                 &stamped(scope(other(), 1))
             ),
@@ -1037,8 +1072,42 @@ mod tests {
         );
         // A send made inside broca is not a caller's and takes no reservation check.
         assert_eq!(
-            decide_scope(&reserved_for(core()), None, &SendScope::Internal),
+            decide_scope(&reserved_for(core(), "head-1"), None, &SendScope::Internal),
             Ok(ScopeDecision::Unscoped)
+        );
+    }
+
+    /// The reservation names the owner's scope by owner and ref, not by epoch: a head's epoch
+    /// can move between the bind that reserved its session and its first send. A higher or a
+    /// lower epoch of the same scope is admitted and freezes the send's own stamp, epoch
+    /// included. Another of the owner's refs is refused like any other stranger.
+    #[test]
+    fn a_reservation_matches_owner_and_ref_at_any_epoch() {
+        let reserved = reserved_for(core(), "head-1");
+        for epoch in [4, 2] {
+            let stamp = scope(core(), epoch);
+            assert_eq!(
+                decide_scope(&reserved, Some(&core()), &stamped(stamp.clone())),
+                Ok(ScopeDecision::Freeze(stamp)),
+                "epoch {epoch}"
+            );
+        }
+        let other_ref = SessionScope {
+            scope_ref: "head-2".into(),
+            ..scope(core(), 3)
+        };
+        assert_eq!(
+            decide_scope(&reserved, Some(&core()), &stamped(other_ref.clone())),
+            reservation_refusal(core(), Some(core()))
+        );
+        assert_eq!(
+            check_scope_reservation(&reserved, Some(&core()), &stamped(other_ref)),
+            Err(ScopeRefusal::OwnerMismatch(Box::new(
+                OwnerMismatch::Reserved {
+                    owner: core(),
+                    presented_principal: Some(core()),
+                }
+            )))
         );
     }
 
@@ -1051,7 +1120,7 @@ mod tests {
         for principal in [Some(other()), Some(core()), None] {
             for send in [SendScope::Unstamped, SendScope::DaemonWithoutScopes] {
                 assert_eq!(
-                    decide_scope(&reserved_for(core()), principal.as_ref(), &send),
+                    decide_scope(&reserved_for(core(), "head-1"), principal.as_ref(), &send),
                     reservation_refusal(core(), principal.clone()),
                     "{principal:?} {send:?}"
                 );
@@ -1068,7 +1137,7 @@ mod tests {
             Ok(ScopeDecision::Freeze(scope(other(), 1)))
         );
         let mut started = history(&[(Some(other()), None)]);
-        started.reserved_owner = Some(core());
+        started.reservation = reserved_for(core(), "head-1").reservation;
         assert_eq!(
             decide_scope(&started, Some(&other()), &SendScope::Unstamped),
             Ok(ScopeDecision::Unscoped)

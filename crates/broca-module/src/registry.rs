@@ -1936,14 +1936,14 @@ impl LineageRegistry {
         }
     }
 
-    /// The owner whose scoped `route.bind` reserved `key`'s address, if one did. `Ok(None)`
-    /// also when this registry has no session address inventory: no bind can have reserved an
-    /// address through it. An unreadable reservation is an error, never `None`, so a reserved
-    /// session is not opened to everyone because its row could not be read.
-    pub async fn scope_reservation_owner(
+    /// The scope (owner and ref) whose scoped `route.bind` reserved `key`'s address, if one did.
+    /// `Ok(None)` also when this registry has no session address inventory: no bind can have
+    /// reserved an address through it. An unreadable reservation is an error, never `None`, so
+    /// a reserved session is not opened to everyone because its row could not be read.
+    pub async fn scope_reservation(
         &self,
         key: &LineageKey,
-    ) -> Result<Option<broca_protocol::BindPrincipal>, String> {
+    ) -> Result<Option<broca_core::scope_admission::ScopeReservation>, String> {
         let Some(inventory) = self.inner.session_address_inventory.get().cloned() else {
             return Ok(None);
         };
@@ -1951,14 +1951,13 @@ impl LineageRegistry {
         spawn_blocking(JobKind::StoreRead, move || {
             inventory
                 .scope_reservation(&key)
-                .map(|reservation| reservation.map(|reservation| reservation.owner))
                 .map_err(|error| format!("cannot read the session's scope reservation: {error}"))
         })
         .await
         .map_err(|error| error.to_string())?
     }
 
-    /// `ownership` with [`broca_core::SessionOwnershipV1::reserved_owner`] filled in from the
+    /// `ownership` with [`broca_core::SessionOwnershipV1::reservation`] filled in from the
     /// inventory while the session has no episode. A session with episodes is returned as it
     /// is, without a read: its history decides who owns it.
     pub async fn with_scope_reservation(
@@ -1967,7 +1966,7 @@ impl LineageRegistry {
         mut ownership: broca_core::SessionOwnershipV1,
     ) -> Result<broca_core::SessionOwnershipV1, String> {
         if ownership.episodes == 0 {
-            ownership.reserved_owner = self.scope_reservation_owner(key).await?;
+            ownership.reservation = self.scope_reservation(key).await?;
         }
         Ok(ownership)
     }
@@ -6457,15 +6456,15 @@ impl RegistryHandle {
         .check_session_log(key)
         .await
     }
-    /// See [`LineageRegistry::scope_reservation_owner`].
-    pub(crate) async fn scope_reservation_owner(
+    /// See [`LineageRegistry::scope_reservation`].
+    pub(crate) async fn scope_reservation(
         &self,
         key: &LineageKey,
-    ) -> Result<Option<broca_protocol::BindPrincipal>, String> {
+    ) -> Result<Option<broca_core::scope_admission::ScopeReservation>, String> {
         LineageRegistry {
             inner: self.inner.clone(),
         }
-        .scope_reservation_owner(key)
+        .scope_reservation(key)
         .await
     }
     pub(crate) fn note_session_ownership(

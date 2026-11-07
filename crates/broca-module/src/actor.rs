@@ -9982,7 +9982,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         mut ownership: broca_core::SessionOwnershipV1,
     ) -> Result<broca_core::SessionOwnershipV1, String> {
         if ownership.episodes == 0 {
-            ownership.reserved_owner = self.registry.scope_reservation_owner(&self.key).await?;
+            ownership.reservation = self.registry.scope_reservation(&self.key).await?;
         }
         Ok(ownership)
     }

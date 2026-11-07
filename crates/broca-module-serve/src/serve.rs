@@ -2437,8 +2437,8 @@ async fn authorize_bind(
     mut completed: BindCompletion,
     registry: LineageRegistry,
 ) -> BindCompletion {
-    // A scoped bind that reserves a new session address records its scope's owner with it, so
-    // until the session's first send is admitted no other principal can start it.
+    // A scoped bind that reserves a new session address records its scope's owner and ref with
+    // it, so until the session's first send is admitted only that scope can start it.
     let reservation = match &completed.bind.scope {
         broca_protocol::SendScope::Stamped(stamp) => {
             Some(broca_store::session_address::ScopeReservation {
@@ -5718,7 +5718,19 @@ fn scope_error_bytes(err: &ServeError) -> Result<Vec<u8>, ServeIoError> {
             serde_json::to_vec(&adoption_refused(refusal))
         }
         ServeError::ScopeRefused(broca_core::ScopeRefusal::OwnerMismatch(mismatch)) => {
-            let mut body = broca_wire::ScopeOwnerMismatch::new(owner_mismatch_detail(mismatch));
+            let mut body = match &**mismatch {
+                // Same code and detail as a first-principal refusal; only the message differs.
+                broca_core::OwnerMismatch::Reserved {
+                    owner,
+                    presented_principal,
+                } => broca_wire::ScopeOwnerMismatch::reserved(
+                    owner.as_owner_string(),
+                    presented_principal
+                        .as_ref()
+                        .map(broca_protocol::BindPrincipal::as_owner_string),
+                ),
+                _ => broca_wire::ScopeOwnerMismatch::new(owner_mismatch_detail(mismatch)),
+            };
             if let broca_core::OwnerMismatch::OwnerOperation { first, mismatch } = &**mismatch {
                 let first = first.as_owner_string();
                 let accepted = match &**mismatch {
@@ -5857,6 +5869,10 @@ fn owner_mismatch_detail(
         },
         broca_core::OwnerMismatch::FirstPrincipal {
             first,
+            presented_principal,
+        }
+        | broca_core::OwnerMismatch::Reserved {
+            owner: first,
             presented_principal,
         } => broca_wire::ScopeOwnerMismatchDetail::FirstPrincipal {
             first: first.as_owner_string(),
