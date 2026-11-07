@@ -153,6 +153,8 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     broca_module_serve::config::warn_obsolete_media_default().map_err(ServeIoError)?;
     let service_tier =
         broca_module_serve::config::ServiceTierConfig::load_default().map_err(ServeIoError)?;
+    let classifier_routing = broca_module_serve::config::ClassifierRoutingConfig::load_default()
+        .map_err(ServeIoError)?;
     broca_protocol::configure_service_tier(service_tier.enabled)
         .map_err(|error| ServeIoError(error.into()))?;
     let archive_config = broca_module_serve::wal_archive::WalArchiveConfig::load_default_path()
@@ -569,6 +571,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
     let mut vault_gauge = broca_module_serve::serve::VaultGauge::not_in_use();
+    let mut classifier_router = None;
     // System One's provider credentials. Without a vault (the mock provider path) their
     // requests carry none, as every run's do there.
     let mut system_one_credential: Arc<
@@ -686,6 +689,14 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             &vault_bind,
             VAULT_READY_TIMEOUT,
         ));
+        // Owed reports still describe real runs after routed admission is switched off.
+        classifier_router = Some(broca_module_serve::system_one::Routing {
+            client: routing.clone(),
+            credentials: Arc::new(broca_module_serve::system_one::VaultRoutingCredentials(
+                system_one_vault.clone(),
+            )),
+            module_id: "broca".into(),
+        });
         let system_one_vault_credential = |credential_id: &str| {
             Arc::new(
                 broca_module_serve::system_one::credential::VaultCredential {
@@ -849,7 +860,10 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             broca_store::SystemOneStore::open(state_root.join("system-one.db"))
                 .map_err(|e| ServeIoError(format!("open System One batch store: {e}")))?,
         );
-        let config = broca_module_serve::system_one::Config::default();
+        let config = broca_module_serve::system_one::Config {
+            routed_models: classifier_routing.enabled,
+            ..Default::default()
+        };
         let openai_decisions =
             broca_module_serve::system_one::openai_decisions::OpenAiDecisions::new(
                 openai_decisions_base_url.as_deref(),
@@ -895,7 +909,13 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             },
             config,
             registry.batches_in_flight_gauge(),
-        );
+        )
+        .with_routing_content_retention(state_format.runs(BackgroundTask::RetentionSweeper));
+        let service = if let Some(routing) = classifier_router {
+            service.with_routing(routing)
+        } else {
+            service
+        };
         let service = if llm_tools_config.image_references {
             service.with_image_resolver(cerebellum.clone())
         } else {
@@ -916,6 +936,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         }
         service
     };
+    let _routing_recovery = system_one.spawn_routing_recovery(registry.stopping_signal());
     // System One's batch sweep deletes batches, so it counts as retention: an overhaul root runs
     // none.
     let _system_one_sweep = state_format.start(BackgroundTask::RetentionSweeper, || {
@@ -4217,6 +4238,7 @@ mod executor {
             broca_module_serve::account_routing::choose_account(
                 routing,
                 broca_module_serve::account_routing::ChoiceInputs {
+                    account_route: req.account_route.as_ref(),
                     decision_id: req.route_decision_id.as_deref(),
                     service_tier,
                     pool: preference.pool,
@@ -4878,6 +4900,34 @@ mod executor {
                 ),
                 &catalog.priced_modes(&request.model.provider_module_id, &request.model.model_id),
             )
+        }
+        fn check_account_route(
+            &self,
+            request: &broca_protocol::request::SubmissionRequest,
+        ) -> Result<(), String> {
+            let (pin, account) =
+                caller_auth_for_episode(request.auth.as_ref(), EpisodeAuthContext::FreshSession)
+                    .map_err(|error| format!("account_route: {error}"))?;
+            let method = self
+                .vault
+                .as_ref()
+                .map_or(pin.unwrap_or(FALLBACK_METHOD), |vault| {
+                    broca_module_serve::auth_routing::resolve_credential_id(
+                        &request.model.provider_module_id,
+                        pin,
+                        account,
+                        &vault.methods,
+                        FALLBACK_METHOD,
+                    )
+                    .method
+                });
+            if !broca_module_serve::account_routing::selects_accounts(method) {
+                return Err(format!(
+                    "account_route is not accepted for sign-in method {}",
+                    method.as_token()
+                ));
+            }
+            Ok(())
         }
         fn source_warm_enabled(&self) -> bool {
             self.anthropic_fallbacks.refusal_resend.is_enabled()
@@ -5697,6 +5747,7 @@ mod executor {
             frozen.prompt_cache_key = Some("frozen-key".into());
             let mut req = drift_request(std::path::Path::new("/inherit-cache"));
             let config = broca_wal::RunConfig {
+                account_route: None,
                 global_system: None,
                 route_decision_id: None,
                 account_limit_pause: false,
@@ -6906,6 +6957,7 @@ mod executor {
                     session: BindIdentity::new("/tmp/project", "harness", "session"),
                     ts_ms: None,
                     config: Box::new(broca_wal::RunConfig {
+                        account_route: None,
                         global_system: None,
                         route_decision_id: None,
                         account_limit_pause: false,

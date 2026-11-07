@@ -1879,10 +1879,14 @@ impl LineageRegistry {
             .clone()
     }
 
+    /// Resolve a bind's session address through the configured inventory. A scoped bind passes
+    /// its stamp as `reservation`, recorded only when the pair is new (see
+    /// [`broca_store::SessionAddressResolver::resolve_session_address`]).
     pub async fn resolve_session_address(
         &self,
         bind: &broca_protocol::BindIdentity,
         workdir: Option<&std::path::Path>,
+        reservation: Option<&broca_store::session_address::ScopeReservation>,
     ) -> Result<broca_protocol::BindIdentity, broca_store::session_address::SessionAddressError>
     {
         use broca_store::session_address::SessionAddressError;
@@ -1896,12 +1900,14 @@ impl LineageRegistry {
             })?;
         let bind = bind.clone();
         let workdir = workdir.map(std::path::Path::to_path_buf);
+        let reservation = reservation.cloned();
         let resolve = || {
             let inventory = inventory.clone();
             let bind = bind.clone();
             let workdir = workdir.clone();
+            let reservation = reservation.clone();
             spawn_blocking(broca_diagnostics::JobKind::StoreWrite, move || {
-                inventory.resolve_session_address(&bind, workdir.as_deref())
+                inventory.resolve_session_address(&bind, workdir.as_deref(), reservation.as_ref())
             })
         };
         let first = resolve().await.map_err(SessionAddressError::store_error)?;
@@ -1935,6 +1941,41 @@ impl LineageRegistry {
             }
             result => result,
         }
+    }
+
+    /// The scope (owner and ref) whose scoped `route.bind` reserved `key`'s address, if one did.
+    /// `Ok(None)` also when this registry has no session address inventory: no bind can have
+    /// reserved an address through it. An unreadable reservation is an error, never `None`, so
+    /// a reserved session is not opened to everyone because its row could not be read.
+    pub async fn scope_reservation(
+        &self,
+        key: &LineageKey,
+    ) -> Result<Option<broca_core::scope_admission::ScopeReservation>, String> {
+        let Some(inventory) = self.inner.session_address_inventory.get().cloned() else {
+            return Ok(None);
+        };
+        let key = key.clone();
+        spawn_blocking(JobKind::StoreRead, move || {
+            inventory
+                .scope_reservation(&key)
+                .map_err(|error| format!("cannot read the session's scope reservation: {error}"))
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    }
+
+    /// `ownership` with [`broca_core::SessionOwnershipV1::reservation`] filled in from the
+    /// inventory while the session has no episode. A session with episodes is returned as it
+    /// is, without a read: its history decides who owns it.
+    pub async fn with_scope_reservation(
+        &self,
+        key: &LineageKey,
+        mut ownership: broca_core::SessionOwnershipV1,
+    ) -> Result<broca_core::SessionOwnershipV1, String> {
+        if ownership.episodes == 0 {
+            ownership.reservation = self.scope_reservation(key).await?;
+        }
+        Ok(ownership)
     }
 
     /// Install the episode reader selected by the boot-time state format.
@@ -3436,6 +3477,19 @@ impl LineageRegistry {
     /// failed whole-log fallback, is [`BindOwnership::Unreadable`]; a validated-read error is
     /// never retried against any other source.
     pub async fn bind_ownership(&self, key: &LineageKey) -> BindOwnership {
+        let ownership = match self.bind_history_ownership(key).await {
+            BindOwnership::Known(ownership) => ownership,
+            other => return other,
+        };
+        // A session with no episode yet belongs to whoever reserved its address under a scope,
+        // if anyone did; every check that reads this ownership applies that reservation.
+        match self.with_scope_reservation(key, ownership).await {
+            Ok(ownership) => BindOwnership::Known(ownership),
+            Err(error) => BindOwnership::Unreadable(error),
+        }
+    }
+
+    async fn bind_history_ownership(&self, key: &LineageKey) -> BindOwnership {
         if matches!(
             self.check_expired(key, None).await,
             Err(OpenError::Expired { .. })
@@ -6477,6 +6531,17 @@ impl RegistryHandle {
         .check_session_log(key)
         .await
     }
+    /// See [`LineageRegistry::scope_reservation`].
+    pub(crate) async fn scope_reservation(
+        &self,
+        key: &LineageKey,
+    ) -> Result<Option<broca_core::scope_admission::ScopeReservation>, String> {
+        LineageRegistry {
+            inner: self.inner.clone(),
+        }
+        .scope_reservation(key)
+        .await
+    }
     pub(crate) fn note_session_ownership(
         &self,
         key: &LineageKey,
@@ -7973,6 +8038,7 @@ mod tests {
             session: session.clone(),
             config: Box::new(RunConfig {
                 global_system: None,
+                account_route: None,
                 route_decision_id: None,
                 account_limit_pause: false,
                 turn_directives_v1: None,
@@ -8670,6 +8736,7 @@ mod offset_page_tests {
     fn run_config() -> Box<RunConfig> {
         Box::new(RunConfig {
             global_system: None,
+            account_route: None,
             route_decision_id: None,
             account_limit_pause: false,
             turn_directives_v1: None,

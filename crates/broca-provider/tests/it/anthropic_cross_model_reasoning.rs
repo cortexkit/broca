@@ -345,6 +345,7 @@ fn imported_seed_replay_strips_foreign_signed_reasoning_on_cross_model_render() 
             run_id: RunId("run-import".into()),
             session: BindIdentity::new("/project", "runner", "imported"),
             config: Box::new(RunConfig {
+                account_route: None,
                 global_system: None,
                 route_decision_id: None,
                 account_limit_pause: false,

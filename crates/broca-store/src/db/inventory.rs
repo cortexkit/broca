@@ -26,7 +26,8 @@ pub(super) fn initialize(conn: &Connection) -> rusqlite::Result<()> {
             run_id TEXT NOT NULL, cut_id TEXT NOT NULL,
             PRIMARY KEY(project_root,harness,session_key,run_id)
          );",
-    )
+    )?;
+    conn.execute_batch(crate::session_address::SCOPE_RESERVATION_SCHEMA)
 }
 
 pub(super) fn insert(

@@ -15,13 +15,21 @@ use super::*;
 
 const JEV: &str = JEV_1_13_0;
 
+#[path = "tests/routed.rs"]
+mod routed;
+
 /// What the stand-in answers for one item, by its state.
 #[derive(Clone)]
 enum Script {
+    Credential,
+    AccountError,
+    AccountLimit(u64),
+    Attributed(String),
     Answer(String),
     Status(u16, Option<u64>),
     /// Wait for a permit on the semaphore, then answer.
     Held(Arc<Semaphore>, String),
+    TimedHeld(Arc<Semaphore>, String),
     Panic,
 }
 
@@ -84,6 +92,25 @@ impl ClassifierProvider for StandIn {
                 .map(|list| list[(n - 1).min(list.len() - 1)].clone())
         };
         match script {
+            Some(Script::Credential) => ProviderReply::Credential("vault offline".into()),
+            Some(Script::AccountError) => ProviderReply::ClassifiedError {
+                error: cortexkit_role_classifier::errors::ItemError::for_code(
+                    cortexkit_role_classifier::errors::ACCOUNT_NOT_ENTITLED,
+                    "insufficient quota",
+                ),
+                provider_code: Some("insufficient_quota".into()),
+                may_have_spent: false,
+            },
+            Some(Script::AccountLimit(wait)) => ProviderReply::WorkersAiError {
+                status: 429,
+                code: Some(3036),
+                retry_after_ms: Some(wait),
+            },
+            Some(Script::Attributed(body)) => ProviderReply::AttributedAnswer {
+                body: body.into_bytes(),
+                auth_selection: Some("apikey:a".into()),
+                account_ref: Some("provider-account-123".into()),
+            },
             None => ProviderReply::Status {
                 status: 500,
                 retry_after_ms: None,
@@ -99,6 +126,20 @@ impl ClassifierProvider for StandIn {
                 let _permit = gate.acquire().await.unwrap();
                 self.held.fetch_sub(1, Ordering::SeqCst);
                 ProviderReply::Answered(body.into_bytes())
+            }
+            Some(Script::TimedHeld(gate, body)) => {
+                self.held.fetch_add(1, Ordering::SeqCst);
+                self.entered.notify_waiters();
+                let reply = tokio::select! {
+                    biased;
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => ProviderReply::Transport("adapter response deadline elapsed".into()),
+                    permit = gate.acquire() => {
+                        drop(permit.unwrap());
+                        ProviderReply::Answered(body.into_bytes())
+                    }
+                };
+                self.held.fetch_sub(1, Ordering::SeqCst);
+                reply
             }
             Some(Script::Panic) => panic!("the stand-in provider panicked on purpose"),
         }
@@ -173,6 +214,60 @@ fn rig() -> Rig {
         Arc::new(SystemOneStore::open_in_memory().unwrap()),
         Config::default(),
     )
+}
+
+#[tokio::test]
+async fn classifier_switch_off_captured_bytes() {
+    let rig = rig();
+    rig.stand_in.script(
+        "legacy",
+        vec![Script::Answer(noul(
+            "0.50",
+            Some(r#"{"input_tokens":10,"output_tokens":0}"#),
+        ))],
+    );
+    let describe = serde_json::to_string(&rig.service.describe()).unwrap();
+    let reply = admitted(&rig, params("legacy", JEV, &["legacy"], None)).await;
+    let mut missing: Value =
+        serde_json::from_str(&params("missing", JEV, &["legacy"], None)).unwrap();
+    missing.as_object_mut().unwrap().remove("model");
+    let refusal = rig
+        .service
+        .clone()
+        .spawn_call(missing.to_string(), test_scope())
+        .await
+        .unwrap_err();
+    let stored = rig.store.lookup(STORE_ROLE, "legacy").unwrap().unwrap();
+    let row = serde_json::to_string(&json!({
+        "model": stored.model, "identity": stored.identity,
+        "body_digest": stored.args_digest, "frozen_row": stored.frozen_row,
+        "ceiling_nanos": stored.ceiling_nanos, "spent_nanos": stored.spent_nanos,
+        "outcome": match &stored.outcomes[0].outcome { broca_store::system_one::Outcome::Answered(body) => body, _ => panic!("not answered") },
+        "input_tokens": stored.outcomes[0].input_tokens, "output_tokens": stored.outcomes[0].output_tokens,
+    })).unwrap();
+    assert_eq!(
+        describe,
+        r#"{"role":"classifier/v1","limits":{"max_items":16,"max_request_bytes":1048576},"models":[{"model":"typesafe/jev-1.13.0","max_questions":64,"max_items":16,"images":null,"price":{"input_per_mtok_usd":0.042,"output_per_mtok_usd":0},"egress_host":"stand-in.invalid"}]}"#
+    );
+    assert_eq!(
+        reply,
+        r#"{"batch_id":"legacy","model":"typesafe/jev-1.13.0","items":[{"index":0,"answers":{"q":{"type":"noul","noul":0.50}},"usage":{"input_tokens":10,"output_tokens":0}}],"usage":{"input_tokens":10,"output_tokens":0},"cost_usd":4.2e-7}"#
+    );
+    let refusal: Value = serde_json::from_slice(&refusal).unwrap();
+    assert_eq!(refusal["code"], "invalid_params");
+    assert_eq!(
+        refusal["detail"],
+        json!({"class":"permanent","field":"model"})
+    );
+    // The missing-model message moved to the contract's wording in 0.6.0.
+    assert_eq!(
+        refusal["message"],
+        "model is required without routed_models"
+    );
+    assert_eq!(
+        row,
+        r#"{"body_digest":"a659464c0315a5d18658622688ba2230d6bc1686047b2db193f2bb8a80b3cafc","ceiling_nanos":null,"frozen_row":"{\"input_rate_nanos\":42000000,\"output_rate_nanos\":0}","identity":"{\"model\":\"typesafe/jev-1.13.0\",\"questions\":\"5e487dd1b0e0d97c4ba5ad2e74a59a2ad6d9a1135a40a3ae19cbb852dcebb017\",\"items\":[\"2b214277bf53050b2588f585fcd9ea30da86927860b5ac6d6047b3137b720d3a\"]}","input_tokens":10,"model":"typesafe/jev-1.13.0","outcome":"{\"q\":{\"type\":\"noul\",\"noul\":0.50}}","output_tokens":0,"spent_nanos":420}"#
+    );
 }
 
 fn noul(value: &str, usage: Option<&str>) -> String {
@@ -746,6 +841,24 @@ async fn the_catalog_row_decides_the_kind_refusals() {
     assert_eq!(unrouted["code"], "model_unavailable");
     assert_eq!(rig.stand_in.calls("a"), 0);
     assert_eq!(rig.store.ledger(STORE_ROLE, "k1").unwrap(), None);
+}
+
+#[tokio::test]
+async fn extraction_catalog_kind_is_refused_as_stated() {
+    let mut rig = rig();
+    Arc::get_mut(&mut rig.service).unwrap().catalog =
+        Arc::new(Rows(HashMap::from([(JEV.into(), row(Some("extraction")))])));
+    assert!(rig.service.describe().models.is_empty());
+    let refusal = refused(&rig, params("extraction", JEV, &["not-sent"], None)).await;
+    assert_eq!(refusal["code"], "model_not_classifier");
+    assert_eq!(refusal["detail"]["model"], JEV);
+    assert_eq!(refusal["detail"]["kind"], "extraction");
+    assert_eq!(rig.stand_in.calls("not-sent"), 0);
+    assert!(rig
+        .store
+        .lookup(STORE_ROLE, "extraction")
+        .unwrap()
+        .is_none());
 }
 
 #[tokio::test]

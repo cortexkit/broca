@@ -99,6 +99,7 @@ pub enum OutputEvent {
 #[derive(Clone, Debug, PartialEq)]
 pub struct RunRequest {
     pub route_decision_id: Option<String>,
+    pub account_route: Option<cortexkit_role_llm_runner::send::AccountRoute>,
     pub input_written_at_ms: Option<u64>,
     pub directives: Option<Vec<cortexkit_role_llm_runner::directives::DirectiveName>>,
     pub session_class: Option<String>,
@@ -199,6 +200,7 @@ impl RunRequest {
     pub fn to_submission(&self) -> SubmissionRequest {
         SubmissionRequest {
             route_decision_id: self.route_decision_id.clone(),
+            account_route: self.account_route.clone(),
             service_tier_level: None,
             staged_uploads: None,
             content: Vec::new(),
@@ -248,6 +250,7 @@ impl RunRequest {
     ) -> Self {
         RunRequest {
             route_decision_id: req.route_decision_id,
+            account_route: req.account_route,
             input_written_at_ms: None,
             directives: req.directives,
             session_class: None,
@@ -14042,6 +14045,7 @@ mod tests {
         prior.render_episodes = None;
         prior.run_config = Some(RunConfig {
             global_system: None,
+            account_route: None,
             route_decision_id: None,
             account_limit_pause: false,
             turn_directives_v1: None,
@@ -14174,6 +14178,7 @@ mod tests {
             reply: None,
         };
         let mut req = RunRequest {
+            account_route: None,
             route_decision_id: None,
             input_written_at_ms: None,
             directives: None,
@@ -16069,6 +16074,7 @@ mod tests {
 
         let config = RunConfig {
             global_system: None,
+            account_route: None,
             route_decision_id: None,
             account_limit_pause: false,
             turn_directives_v1: None,

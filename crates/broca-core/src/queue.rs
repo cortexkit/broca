@@ -376,6 +376,7 @@ mod tests {
             send_id: None,
             submission_id: SubmissionId(id.into()),
             request: Box::new(SubmissionRequest {
+                account_route: None,
                 route_decision_id: None,
                 service_tier_level: None,
                 staged_uploads: None,
@@ -481,6 +482,7 @@ mod tests {
             session: BindIdentity::new("/tmp/p", "h", "s"),
             config: Box::new(RunConfig {
                 global_system: None,
+                account_route: None,
                 route_decision_id: None,
                 account_limit_pause: false,
                 turn_directives_v1: None,

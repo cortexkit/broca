@@ -469,6 +469,7 @@ mod tests {
                     ts_ms: Some(now - age * DAY_MS),
                     config: Box::new(RunConfig {
                         global_system: None,
+                        account_route: None,
                         route_decision_id: None,
                         account_limit_pause: false,
                         turn_directives_v1: None,
@@ -845,6 +846,7 @@ mod identity_tests {
                 session: broca_protocol::BindIdentity::new("/old-location", "runner", "legacy"),
                 ts_ms: Some(1),
                 config: Box::new(broca_wal::RunConfig {
+                    account_route: None,
                     global_system: None,
                     route_decision_id: None,
                     account_limit_pause: false,

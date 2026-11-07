@@ -377,6 +377,7 @@ pub enum ImportOutcome {
 #[derive(Debug, Clone, PartialEq)]
 pub enum SendOutcome {
     RouteDecisionFixed,
+    AccountRouteFixed,
     SessionMoving {
         cut_id: String,
     },
@@ -1362,6 +1363,7 @@ fn submission_from_config(
     let policy_allowed = config.tools.iter().map(|tool| tool.name.clone()).collect();
     SubmissionRequest {
         route_decision_id: config.route_decision_id,
+        account_route: config.account_route,
         service_tier_level: None,
         staged_uploads: None,
         content: Vec::new(),
@@ -1390,6 +1392,35 @@ fn submission_from_config(
         inherit_frozen: Default::default(),
         structured_output: None,
         client_message_id: None,
+    }
+}
+
+#[cfg(test)]
+mod account_route_resume_tests {
+    #[test]
+    fn account_route_resume_reconstructs_the_frozen_route_not_render_names() {
+        let config: broca_wal::RunConfig = serde_json::from_value(serde_json::json!({
+            "model":{"provider_module_id":"vendor","model_id":"vendor-model"},
+            "tools":[],"tool_choice":{"type":"auto"},"generation":{},
+            "response_format":{"type":"text"},"context_epoch":0,"renderer_version":1,
+            "account_route":{"provider":"routing-provider","model":"routing-model"}
+        }))
+        .unwrap();
+        let request = super::submission_from_config(config, vec![]);
+        let run = broca_core::RunRequest::from_submission(
+            request,
+            broca_protocol::RunId("resume".into()),
+            broca_protocol::BindIdentity::new("/project", "runner", "session"),
+            broca_protocol::SubmissionId("sub-resume".into()),
+        );
+        assert_eq!(
+            run.account_route.as_ref().unwrap().provider,
+            "routing-provider"
+        );
+        assert_eq!(run.account_route.as_ref().unwrap().model, "routing-model");
+        assert_eq!(run.model.provider_module_id, "vendor");
+        assert_eq!(run.model.model_id, "vendor-model");
+        assert_eq!(run.to_submission().account_route, run.account_route);
     }
 }
 
@@ -3811,6 +3842,10 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     ))
                 }
             };
+            let ownership = match self.with_scope_reservation(ownership).await {
+                Ok(ownership) => ownership,
+                Err(error) => return SendOutcome::Transient(error),
+            };
             self.session_change_recorded |= ownership.session_change_recorded;
             if let Some(first) = &ownership.first_episode {
                 let _ = self.first_episode.set(first.clone());
@@ -3996,6 +4031,24 @@ impl<W: WalStore + 'static> LineageActor<W> {
             .as_ref()
             .filter(|_| running)
             .map(|episode| episode.config.route_decision_id.clone());
+        let joins_run = delivery == broca_protocol::Delivery::Steer
+            || self.admitting_order.as_ref().is_some_and(|order| {
+                order
+                    .modes
+                    .iter()
+                    .any(|mode| *mode != broca_protocol::request::DeliveryMode::IdleStart)
+            });
+        let fixed_account_route = checkpoint
+            .last_episode
+            .as_ref()
+            .filter(|episode| running && (joins_run || episode.run_id == run_id))
+            .map(|episode| episode.config.account_route.clone());
+        let joining_frozen_run = fixed_account_route.is_some();
+        if let (Some(requested), Some(fixed)) = (&request.account_route, &fixed_account_route) {
+            if Some(requested) != fixed.as_ref() {
+                return SendOutcome::AccountRouteFixed;
+            }
+        }
         if let (Some(requested), Some(fixed)) = (&request.route_decision_id, &fixed_route_decision)
         {
             if Some(requested) != fixed.as_ref() {
@@ -4324,6 +4377,9 @@ impl<W: WalStore + 'static> LineageActor<W> {
         if let Some(fixed) = fixed_route_decision {
             request.route_decision_id = fixed;
         }
+        if let Some(fixed) = fixed_account_route {
+            request.account_route = fixed;
+        }
         let selection = checkpoint
             .head
             .as_ref()
@@ -4385,6 +4441,19 @@ impl<W: WalStore + 'static> LineageActor<W> {
                         broca_protocol::ModelHandle::new(&selection.provider, &selection.model);
                     request.variant = selection.variant.clone();
                 }
+            }
+        }
+        if request.account_route.is_some() && !resume_indexed_run && !joining_frozen_run {
+            let mut effective = request.clone();
+            if let Some(episode) = &checkpoint.last_episode {
+                inherit_frozen_parameters(&mut effective, &episode.config);
+            }
+            if let Err(message) = self.executor.check_account_route(&effective) {
+                return SendOutcome::DeliveryRefused {
+                    code: "invalid_params",
+                    field: "account_route",
+                    message,
+                };
             }
         }
         if (broca_protocol::service_tier_enabled() || selection.is_some()) && !resume_indexed_run {
@@ -5406,6 +5475,19 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 "the admission snapshot carries no ownership summary".into(),
             ));
         };
+        // A caller's send that would open the session's first episode meets the scope
+        // reservation, if a scoped bind recorded one; sends made inside broca take none.
+        let reserved;
+        let ownership =
+            if ownership.episodes == 0 && request.scope != broca_protocol::SendScope::Internal {
+                reserved = self
+                    .with_scope_reservation(ownership.clone())
+                    .await
+                    .map_err(StartRunFailure::Infrastructure)?;
+                &reserved
+            } else {
+                ownership
+            };
         let episode_scope = self
             .decide_session_scope(ownership, request.principal.as_ref(), &request.scope)
             .map_err(StartRunFailure::Scope)?
@@ -9975,6 +10057,19 @@ impl<W: WalStore + 'static> LineageActor<W> {
         broca_core::scope_admission::AGENT_RUN_SCOPES_WRITER_ENABLED
     }
 
+    /// `ownership` with the session's scope reservation filled in while it has no episode, so
+    /// admission can refuse a first send from anyone but the owner whose scoped bind reserved
+    /// the address. A session with episodes is returned unchanged, without a read.
+    async fn with_scope_reservation(
+        &self,
+        mut ownership: broca_core::SessionOwnershipV1,
+    ) -> Result<broca_core::SessionOwnershipV1, String> {
+        if ownership.episodes == 0 {
+            ownership.reservation = self.registry.scope_reservation(&self.key).await?;
+        }
+        Ok(ownership)
+    }
+
     fn decide_session_scope(
         &self,
         ownership: &broca_core::SessionOwnershipV1,
@@ -12167,6 +12262,12 @@ mod tests {
 
     #[async_trait]
     impl RunExecutor for CancelPresenceExecutor {
+        fn check_account_route(
+            &self,
+            request: &broca_protocol::request::SubmissionRequest,
+        ) -> Result<(), String> {
+            self.gate.check_account_route(request)
+        }
         async fn execute(
             &self,
             job: RunJob,
@@ -12966,6 +13067,7 @@ mod tests {
 
     pub(super) fn min_config() -> broca_wal::RunConfig {
         broca_wal::RunConfig {
+            account_route: None,
             global_system: None,
             route_decision_id: None,
             account_limit_pause: false,
@@ -13058,6 +13160,7 @@ mod tests {
     pub(super) fn text_req(key: &BindIdentity, run: &str) -> RunRequest {
         use broca_protocol::content::{ContentBlock, Message, Role};
         RunRequest {
+            account_route: None,
             route_decision_id: None,
             input_written_at_ms: None,
             directives: None,
@@ -14216,6 +14319,12 @@ mod tests {
 
     #[async_trait]
     impl RunExecutor for HeldRetentionCompletion {
+        fn check_account_route(
+            &self,
+            request: &broca_protocol::request::SubmissionRequest,
+        ) -> Result<(), String> {
+            RetentionDone.check_account_route(request)
+        }
         async fn execute(
             &self,
             job: RunJob,

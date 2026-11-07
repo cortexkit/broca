@@ -157,6 +157,7 @@ impl Fixture {
                 ts_ms: ts,
                 config: Box::new(RunConfig {
                     global_system: None,
+                    account_route: None,
                     route_decision_id: None,
                     account_limit_pause: false,
                     turn_directives_v1: None,
@@ -1299,6 +1300,7 @@ async fn fold_send_age_refold_reads_post_append_member() {
         }),
     ]]);
     let req = RunRequest {
+        account_route: None,
         route_decision_id: None,
         input_written_at_ms: None,
         directives: None,

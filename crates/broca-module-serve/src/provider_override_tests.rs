@@ -206,7 +206,7 @@ async fn runtime_override_preserves_auth_billing_and_cache_predicates() {
         broca_core::ChargeBasis::MeteredApi
     );
     install_test_catalog();
-    let mut req = broca_core::RunRequest { route_decision_id: None,
+    let mut req = broca_core::RunRequest { route_decision_id: None, account_route: None,
     input_written_at_ms: None, directives: None, session_class: None, retention: None, title: None, on_restart: None, keep_warm: None, send_id: None, request_identity_digest: None,
         scope: None,
         project_id: None,
@@ -416,7 +416,7 @@ fn resolve_drift_revision(
 }
 
 fn drift_request(root: &std::path::Path) -> broca_core::RunRequest {
-    broca_core::RunRequest { route_decision_id: None,
+    broca_core::RunRequest { route_decision_id: None, account_route: None,
     input_written_at_ms: None, directives: None, session_class: None, retention: None, title: None, on_restart: None, keep_warm: None, send_id: None, request_identity_digest: None,
         scope: None,
         project_id: None,
@@ -450,7 +450,7 @@ fn drift_run_config(
     req: &broca_core::RunRequest,
     started: &broca_catalog::live::ProviderResolution,
 ) -> broca_wal::RunConfig {
-    broca_wal::RunConfig { global_system: None, route_decision_id: None, account_limit_pause: false, turn_directives_v1: None, render_tags: false, computed_tags: None,
+    broca_wal::RunConfig { account_route: None, global_system: None, route_decision_id: None, account_limit_pause: false, turn_directives_v1: None, render_tags: false, computed_tags: None,
         model: req.model.clone(),
         tools: req.tools.clone().into(),
         tool_choice: req.tool_choice.clone(),

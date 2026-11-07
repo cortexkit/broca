@@ -184,6 +184,13 @@ A consumer can be both. The surface is **session-centric**: consumers address
    `gap_marker`. Boot and on-demand repairs are single-flight and do not block serve
    startup. Existing-pair lookups use a read transaction; only absent pairs take the
    write lock, recheck discovery, and reserve a root before any actor or WAL opens.
+   A stamped bind that reserves a new pair also records its stamp's owner and scope `ref`
+   (not its epoch), in the same transaction. Until that session's first episode,
+   `session.send` and `session.import` are admitted only over a route stamped with a scope of
+   that owner and `ref`, at any epoch; any other send or import, and a later stamped bind
+   under another owner or `ref`, is refused `scope_owner_mismatch` (`detail.kind`
+   `first_principal`, `first` naming the reserving owner) before anything is written. Pairs
+   reserved without a stamp, or before this record existed, keep the earlier rules.
   Wire binds carry only `harness` and `session` on subc-protocol 0.34. Broca declares
   `bind-no-project/v1` and ignores stray legacy bind project members. Project attribution
   comes only from the daemon's scope stamp (`workdir`, optional `project_id`), never
@@ -271,6 +278,12 @@ session.subscribe { from?: "start" | "live" | cursor } (dedicated route; §9)
 
     session.send { session, prompt, system?, send_id?, session_class?, retention?, cache?, model?, tool_providers?, stop_when?, seed_from?, context_management?, delivery?, conversation_key?, title? }
     title?: 1-200 Unicode scalar values, not blank, no control characters; else invalid_params {field: "title"}
+    account_route?: {provider: nonempty string, model: nonempty string}, no other members;
+        accepted for the listed routed_accounts methods only. These are the routing select
+        answer's names for account admission, not the model-call names. Frozen per run:
+        joining omission inherits, an explicit different route refuses invalid_params
+        {field: "account_route"} before any write. An independently queued run freezes its
+        own route. Malformed or unsupported account_route also refuses before any write.
     → { state: "active" | "pending" | "finished", run_id?, submission_id?, reason?, baseline? } (DRIVER; §11)
 
 session.retract { session, submission_id }
@@ -1239,8 +1252,20 @@ The manifest lists `classifier/v1` in `capabilities.provides`.
   It contains no item content. Replayed facts and
   served cached outcomes do not increase item or spend counters.
 - **Catalog.** A row whose `model.kind` is `decision` is a classifier; another
-  stated kind, or no kind, is refused `model_not_classifier`; a model the catalog
+  serving kind, `classifier`, is accepted too, as defined by the classifier contract.
+  Any other stated kind, or no kind, is refused `model_not_classifier`; a model the catalog
   does not list is `model_unknown`.
+- **Routed models (opt-in).** `classifier_routing.enabled` defaults to `false`.
+  Off, the existing pinned-model/fixed-credential path remains in use and describe
+  omits `routed_models`. On, a successful live routing readiness check for consumer
+  `classifier` adds `routed_models: {}`; `classify.run.model` becomes optional and
+  a supplied model is a strict routing pin without fallback. One durable model,
+  account and decision is frozen before provider dispatch. Replies name the model
+  actually used and its `decision_id`, including on replay. Routing failures never
+  fall back to a fixed credential. See [System One routing](system-one.md) for
+  retry, admission and report recovery rules.
+  The OpenAI Decisions adapter stays behind its own serving gate, whatever the
+  classifier routing switch is.
 - **Providers.** Jev is called at `POST https://api.typesafe.ai/v1/systemone` with
   the vault credential `apikey:typesafe`. Clef and Clef-flash are called at `POST
   https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/@cf/cloudflare/{model}`
@@ -1259,8 +1284,10 @@ The manifest lists `classifier/v1` in `capabilities.provides`.
   in the message and provider health metric, and `Retry-After` is preserved.
   Workers AI errors map by their `errors[].code` first: a
   daily allocation used up (3036) or an account not entitled (5035, 5016, 3023)
-  ends the whole batch, is never recorded for an item, and is refused at admission
-  when the call's first provider call meets it.
+  ends the whole batch. On the default pinned path it is never recorded for an item
+  and is refused at admission when the call's first provider call meets it. A routed
+  batch instead retains account errors with its frozen choice, subject to the single
+  pre-answer reselection described in [System One routing](system-one.md).
 
 ## 5. Reliability model (the egress reality)
 

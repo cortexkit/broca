@@ -55,6 +55,7 @@ fn import_records(session: &BindIdentity) -> Vec<FramedRecord> {
                 run_id: RunId("maintenance-run".into()),
                 session: session.clone(),
                 config: Box::new(RunConfig {
+                    account_route: None,
                     global_system: None,
                     route_decision_id: None,
                     account_limit_pause: false,

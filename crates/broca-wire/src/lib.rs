@@ -72,6 +72,12 @@ fn deserialize_session_class<'de, D: serde::Deserializer<'de>>(
 pub struct SendParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route_decision_id: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_account_route"
+    )]
+    pub account_route: Option<cortexkit_role_llm_runner::send::AccountRoute>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub content: Vec<cortexkit_role_llm_runner::attachments::ContentPart>,
     #[serde(
@@ -285,6 +291,22 @@ pub struct SendParams {
 /// Check the shared run parameters before broca's legacy parameter decoder can lose a
 /// nested field name. Legacy stop-condition lists remain accepted beside the role object.
 pub fn check_run_parameters(params: &serde_json::Value) -> Result<(), String> {
+    for field in ["speaks_for", "notice"] {
+        if params.get(field).is_some() {
+            return Err(field.into());
+        }
+    }
+    if let Some(route) = params.get("account_route") {
+        serde_json::from_value::<cortexkit_role_llm_runner::send::AccountRoute>(route.clone())
+            .map_err(|_| "account_route".to_owned())?;
+        if params
+            .pointer("/auth/method")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|method| !matches!(method, "oauth" | "chatgpt" | "apikey"))
+        {
+            return Err("account_route".into());
+        }
+    }
     let mut request = cortexkit_role_llm_runner::send::SendRequest::new("", "");
     for field in ["stop_when", "generation", "tools", "directives"] {
         if let Some(value) = params.get(field) {
@@ -299,6 +321,17 @@ pub fn check_run_parameters(params: &serde_json::Value) -> Result<(), String> {
     request.no_tools()?;
     request.directives()?;
     Ok(())
+}
+
+fn deserialize_account_route<'de, D>(
+    deserializer: D,
+) -> Result<Option<cortexkit_role_llm_runner::send::AccountRoute>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde::Deserialize::deserialize(deserializer)
+        .map(Some)
+        .map_err(|error| serde::de::Error::custom(format!("account_route: {error}")))
 }
 
 /// A client supplies uploads, never stored media references inline.
@@ -3606,6 +3639,25 @@ impl ScopeOwnerMismatch {
             detail,
         }
     }
+
+    /// The refusal for a session with no episode yet whose storage address a scoped bind
+    /// reserved for `owner`: anything but that owner's scoped first send is refused. The detail
+    /// is the `first_principal` one, naming the reserving owner as `first`, exactly as readers
+    /// already decode it; only the human-readable message differs from [`Self::new`], because
+    /// no one has started this session yet.
+    pub fn reserved(owner: String, presented_principal: Option<String>) -> Self {
+        Self {
+            code: SCOPE_OWNER_MISMATCH.to_owned(),
+            message: format!(
+                "this session's address was reserved by '{owner}' under a scope; only that \
+                 owner's scoped first send can start it"
+            ),
+            detail: ScopeOwnerMismatchDetail::FirstPrincipal {
+                first: owner,
+                presented_principal,
+            },
+        }
+    }
 }
 
 /// The error code refusing a send into a scoped session on a daemon that does not advertise
@@ -3792,6 +3844,32 @@ pub(crate) mod scope_refusal_golden {
             }),
             "scope_owner_mismatch.scoped.json",
             OWNER_MISMATCH_SCOPED_SHA256,
+        );
+    }
+
+    /// A refusal on a session whose address a scoped bind reserved keeps the
+    /// `first_principal` detail readers decode, naming the reserving owner, and its message says
+    /// the session was reserved, not started. The ordinary first-principal refusal keeps its
+    /// own message and the same detail shape.
+    #[test]
+    fn owner_mismatch_reserved_bytes_are_pinned_and_first_principal_is_unchanged() {
+        let reserved = ScopeOwnerMismatch::reserved(
+            "reserved:prefrontal-core".into(),
+            Some("reserved:magic-context".into()),
+        );
+        assert_eq!(
+            serde_json::to_string(&reserved).unwrap(),
+            r#"{"code":"scope_owner_mismatch","message":"this session's address was reserved by 'reserved:prefrontal-core' under a scope; only that owner's scoped first send can start it","detail":{"kind":"first_principal","first":"reserved:prefrontal-core","presented_principal":"reserved:magic-context"}}"#
+        );
+        let started = ScopeOwnerMismatch::new(ScopeOwnerMismatchDetail::FirstPrincipal {
+            first: "reserved:prefrontal-core".into(),
+            presented_principal: Some("reserved:magic-context".into()),
+        });
+        assert_eq!(started.detail, reserved.detail);
+        assert_eq!(
+            started.message,
+            "this session was started by 'reserved:prefrontal-core' without a scope and accepts \
+             later sends only from that principal"
         );
     }
 
@@ -4419,6 +4497,7 @@ mod tests {
             send_params_keys(),
             &[
                 "route_decision_id",
+                "account_route",
                 "content",
                 "directives",
                 "session_class",

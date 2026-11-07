@@ -46,6 +46,7 @@ use tokio::sync::mpsc;
 fn run_config() -> RunConfig {
     RunConfig {
         global_system: None,
+        account_route: None,
         route_decision_id: None,
         account_limit_pause: false,
         turn_directives_v1: None,
@@ -705,6 +706,7 @@ fn tool_then_text() -> Vec<Vec<NormalizedEvent>> {
 
 fn demo_request(run: &str, dir: &std::path::Path) -> RunRequest {
     RunRequest {
+        account_route: None,
         route_decision_id: None,
         input_written_at_ms: None,
         directives: None,
@@ -931,6 +933,7 @@ async fn resume_completes_partial_batch_redispatching_only_missing_call() {
     });
     let lease = FileLeaseStore::new(dir.join("lease"));
     let req = RunRequest {
+        account_route: None,
         route_decision_id: None,
         input_written_at_ms: None,
         directives: None,
@@ -1524,6 +1527,7 @@ async fn provider_attempt_records_change_nothing_replay_reads() {
 /// A text-only request that runs one model step and ends `Completed`.
 fn text_request(run: &str, session: &broca_protocol::BindIdentity, prompt: &str) -> RunRequest {
     RunRequest {
+        account_route: None,
         route_decision_id: None,
         input_written_at_ms: None,
         directives: None,
@@ -2449,6 +2453,7 @@ async fn cross_episode_resume_is_exactly_once() {
 
     // A tool request whose model calls `edit` once, then answers.
     let req1 = RunRequest {
+        account_route: None,
         route_decision_id: None,
         input_written_at_ms: None,
         directives: None,
@@ -2940,6 +2945,7 @@ async fn append_episode_cannot_introduce_a_system_prompt_mid_lineage() {
 /// resume, so this id is only the caller's handle).
 fn req2(session: &BindIdentity) -> RunRequest {
     RunRequest {
+        account_route: None,
         route_decision_id: None,
         input_written_at_ms: None,
         directives: None,

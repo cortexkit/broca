@@ -196,7 +196,7 @@ fn legacy_run_ids_find_and_repair_a_lineage_only_fork_without_lineage_evidence()
     assert_eq!(
         fixture
             .store
-            .resolve_session_address(&fixture.stale, None)
+            .resolve_session_address(&fixture.stale, None, None)
             .unwrap(),
         fixture.live
     );

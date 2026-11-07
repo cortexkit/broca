@@ -154,6 +154,13 @@ pub trait RunExecutor: Send + Sync + 'static {
     ) -> Result<(), String> {
         Ok(())
     }
+    /// Validate the effective sign-in method before a routed send can be durably queued.
+    fn check_account_route(
+        &self,
+        _request: &broca_protocol::request::SubmissionRequest,
+    ) -> Result<(), String> {
+        Ok(())
+    }
     /// Current operator opt-in for source-cache maintenance, independent of durable routing.
     fn source_warm_enabled(&self) -> bool {
         false

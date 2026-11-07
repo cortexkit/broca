@@ -60,7 +60,7 @@ impl Fixture {
     ) -> tokio::task::JoinHandle<Result<BindIdentity, SessionAddressError>> {
         let bind = self.bind(name);
         let registry = self.registry.clone();
-        tokio::spawn(async move { registry.resolve_session_address(&bind, None).await })
+        tokio::spawn(async move { registry.resolve_session_address(&bind, None, None).await })
     }
 }
 
@@ -95,7 +95,7 @@ async fn held_migration_serves_known_pairs_and_signals_new_pairs_single_flight()
     assert_eq!(
         fixture
             .registry
-            .resolve_session_address(&known, None)
+            .resolve_session_address(&known, None, None)
             .await
             .unwrap(),
         known

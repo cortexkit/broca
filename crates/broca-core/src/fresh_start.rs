@@ -132,6 +132,7 @@ pub fn run_config<P: Provider>(
     RunConfig {
         global_system,
         route_decision_id: req.route_decision_id.clone(),
+        account_route: req.account_route.clone(),
         account_limit_pause: control.account_limit_pause,
         turn_directives_v1: req.directives.clone(),
         render_tags,

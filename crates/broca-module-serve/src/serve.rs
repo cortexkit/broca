@@ -2437,6 +2437,17 @@ async fn authorize_bind(
     mut completed: BindCompletion,
     registry: LineageRegistry,
 ) -> BindCompletion {
+    // A scoped bind that reserves a new session address records its scope's owner and ref with
+    // it, so until the session's first send is admitted only that scope can start it.
+    let reservation = match &completed.bind.scope {
+        broca_protocol::SendScope::Stamped(stamp) => {
+            Some(broca_store::session_address::ScopeReservation {
+                owner: stamp.scope.owner.clone(),
+                scope_ref: stamp.scope.scope_ref.clone(),
+            })
+        }
+        _ => None,
+    };
     match registry
         .resolve_session_address(
             &completed.identity,
@@ -2445,6 +2456,7 @@ async fn authorize_bind(
                 .stamped_project
                 .as_ref()
                 .and_then(|stamp| stamp.workdir.as_deref()),
+            reservation.as_ref(),
         )
         .await
     {
@@ -3625,6 +3637,7 @@ where
             let import_req = SessionImportRequest {
                 project_id: bind.project_id.clone(),
                 principal: bind.principal.clone(),
+                scope: bind.scope.clone(),
                 session: session.clone(),
                 run_id,
                 messages: params.messages,
@@ -5760,7 +5773,19 @@ fn scope_error_bytes(err: &ServeError) -> Result<Vec<u8>, ServeIoError> {
             serde_json::to_vec(&adoption_refused(refusal))
         }
         ServeError::ScopeRefused(broca_core::ScopeRefusal::OwnerMismatch(mismatch)) => {
-            let mut body = broca_wire::ScopeOwnerMismatch::new(owner_mismatch_detail(mismatch));
+            let mut body = match &**mismatch {
+                // Same code and detail as a first-principal refusal; only the message differs.
+                broca_core::OwnerMismatch::Reserved {
+                    owner,
+                    presented_principal,
+                } => broca_wire::ScopeOwnerMismatch::reserved(
+                    owner.as_owner_string(),
+                    presented_principal
+                        .as_ref()
+                        .map(broca_protocol::BindPrincipal::as_owner_string),
+                ),
+                _ => broca_wire::ScopeOwnerMismatch::new(owner_mismatch_detail(mismatch)),
+            };
             if let broca_core::OwnerMismatch::OwnerOperation { first, mismatch } = &**mismatch {
                 let first = first.as_owner_string();
                 let accepted = match &**mismatch {
@@ -5899,6 +5924,10 @@ fn owner_mismatch_detail(
         },
         broca_core::OwnerMismatch::FirstPrincipal {
             first,
+            presented_principal,
+        }
+        | broca_core::OwnerMismatch::Reserved {
+            owner: first,
             presented_principal,
         } => broca_wire::ScopeOwnerMismatchDetail::FirstPrincipal {
             first: first.as_owner_string(),
@@ -8198,6 +8227,7 @@ mod tests {
             run_id: broca_protocol::RunId("legacy".into()),
             session,
             config: Box::new(broca_wal::RunConfig {
+                account_route: None,
                 global_system: None,
                 route_decision_id: None,
                 account_limit_pause: false,
@@ -8767,6 +8797,7 @@ mod tests {
             let (writer, mut written) =
                 broca_diagnostics::channel::<Frame>(EGRESS_BUFFER, Arc::default());
             let large = serde_json::to_vec(&serde_json::json!({
+                "model":"typesafe/jev-1.13.0",
                 "answers":{"q":{"type":"noul","noul":0.5,"provider_extra":{"text":"x".repeat(broca_wire::SUBC_MAX_FRAME_BYTES as usize)}}},
                 "usage":{"input_tokens":0},"cost_usd":0,
             })).unwrap();

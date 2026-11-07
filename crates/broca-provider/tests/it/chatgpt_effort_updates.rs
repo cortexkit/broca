@@ -50,6 +50,7 @@ fn start(model: &str, effort: &str, admitted: bool, role: Option<Role>) -> WalRe
         session: BindIdentity::new("/tmp/p", "h", "s"),
         config: Box::new(RunConfig {
             global_system: None,
+            account_route: None,
             route_decision_id: None,
             account_limit_pause: false,
             turn_directives_v1: None,

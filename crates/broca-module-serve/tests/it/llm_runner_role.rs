@@ -1173,6 +1173,7 @@ async fn import_reply_too_large_session(rig: &mut Rig, channel: u16, final_text:
         .import(broca_module::serve::SessionImportRequest {
             project_id: None,
             principal: None,
+            scope: broca_protocol::SendScope::Internal,
             session,
             run_id: RunId("reply-too-large-import".into()),
             messages,

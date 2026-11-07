@@ -25,8 +25,10 @@
 
 mod classify;
 mod images;
+mod routed;
 pub use images::ImageResolver;
 pub(crate) use images::PreparedImages;
+pub use routed::{Routing, RoutingCredentials, VaultRoutingCredentials};
 pub mod credential;
 pub mod openai_decisions;
 pub mod typesafe;
@@ -83,6 +85,9 @@ pub const SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// The limits this build serves under.
 #[derive(Clone, Debug)]
 pub struct Config {
+    /// Opt in only after the router serves the classifier consumer. Missing configuration
+    /// keeps legacy pinned requests and fixed credentials unchanged.
+    pub routed_models: bool,
     /// Most items in one batch. A call is synchronous, so a batch has to fit the caller's call
     /// deadline: items are sent one after another; each provider attempt is bounded by
     /// `attempt_timeout`, and a retry the provider asked for adds its attempts and wait.
@@ -105,6 +110,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            routed_models: false,
             max_items: 16,
             max_request_bytes: 1024 * 1024,
             process_calls: 16,
@@ -133,7 +139,7 @@ impl BatchCatalog for LiveCatalog {
 }
 
 /// What one provider attempt came back with.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum ProviderReply {
     /// HTTP 200, with the body as received.
     Answered(Vec<u8>),
@@ -182,6 +188,13 @@ pub trait ClassifierProvider: Send + Sync {
     /// The id of the credential this provider presents, for `auth_failed`'s detail. Never a
     /// token.
     fn credential_id(&self) -> Option<String>;
+    /// Build a per-run adapter without mutating a credential shared with other batches.
+    fn with_credential(
+        &self,
+        _credential: Arc<dyn credential::CredentialSource>,
+    ) -> Option<Arc<dyn ClassifierProvider>> {
+        None
+    }
     /// Send one provider request body (`{model, state, questions, images?}`) and return what
     /// came back.
     async fn call(&self, body: String) -> ProviderReply;
@@ -290,6 +303,8 @@ impl ModelPin {
 
 /// The System One service: the batch store, the routing pins, and the concurrency caps.
 pub struct SystemOne {
+    routing_content_retention: bool,
+    routing: Option<Routing>,
     image_resolver: Option<Arc<dyn ImageResolver>>,
     store: Arc<SystemOneStore>,
     /// The store role every batch this service claims, records and releases is keyed under.
@@ -357,6 +372,8 @@ impl SystemOne {
         in_flight: Arc<AtomicUsize>,
     ) -> Self {
         Self {
+            routing_content_retention: true,
+            routing: None,
             image_resolver: None,
             store,
             role: STORE_ROLE.to_owned(),
@@ -471,6 +488,7 @@ impl SystemOne {
         service.export = self.export.clone();
         service.charge_basis = self.charge_basis.clone();
         service.image_resolver = self.image_resolver.clone();
+        service.routing_content_retention = self.routing_content_retention;
         service
     }
 
@@ -543,17 +561,35 @@ impl SystemOne {
     }
 
     /// The batch recorded under this service's role for `batch_id`, with its outcomes; `None`
-    /// when there is none. Reads only: nothing is claimed or written.
+    /// when there is none or its routed content expired. Cleanup uses a separate raw snapshot.
     pub async fn stored_batch(
         &self,
         batch_id: &str,
     ) -> Result<Option<broca_store::system_one::StoredBatch>, String> {
         let store = Arc::clone(&self.store);
         let (role, batch_id) = (self.role.clone(), batch_id.to_owned());
-        tokio::task::spawn_blocking(move || store.lookup(&role, &batch_id))
+        let now = (self.clock)();
+        tokio::task::spawn_blocking(move || store.lookup_live(&role, &batch_id, now))
             .await
             .map_err(|e| e.to_string())?
             .map_err(|e| e.to_string())
+    }
+
+    async fn stored_batch_for_routing_cleanup(
+        &self,
+        batch_id: &str,
+    ) -> Result<Option<broca_store::system_one::StoredBatch>, String> {
+        let (store, role, id) = (self.store.clone(), self.role.clone(), batch_id.to_owned());
+        tokio::task::spawn_blocking(move || store.lookup_for_routing_cleanup(&role, &id))
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())
+    }
+
+    /// Routing debt is drained on every root; only the existing retention policy permits deletion.
+    pub fn with_routing_content_retention(mut self, enabled: bool) -> Self {
+        self.routing_content_retention = enabled;
+        self
     }
 
     /// Replace the clock; tests drive retention with it.
@@ -570,6 +606,9 @@ impl SystemOne {
 
     /// Delete batches past retention. Returns how many batches went.
     pub async fn sweep(&self) -> Result<usize, String> {
+        if !self.routing_content_retention {
+            return Ok(0);
+        }
         let store = Arc::clone(&self.store);
         let now = (self.clock)();
         tokio::task::spawn_blocking(move || store.sweep(now))
@@ -671,6 +710,17 @@ impl SystemOne {
         }
     }
 
+    /// A fresh routing probe precedes the declaration. A previously reachable router is not
+    /// enough evidence to offer model-less calls after its route has closed.
+    pub async fn describe_live(&self) -> RoleDescribe {
+        let describe = self.describe();
+        if self.config.routed_models && self.routing_ready(None).await.is_ok() {
+            describe.with_routed_models()
+        } else {
+            describe
+        }
+    }
+
     /// Answer one request on a classifier route. The reply is the `result` text, or the body
     /// of the `ERROR` frame. `role.describe` is answered at once; `classify.run` on the
     /// caller's task (see [`Self::spawn_call`]).
@@ -706,7 +756,7 @@ impl SystemOne {
                         "role.describe takes no params",
                     )));
                 }
-                serde_json::value::to_raw_value(&self.describe())
+                serde_json::value::to_raw_value(&self.describe_live().await)
                     .map_err(|e| error_body(INTERNAL_ERROR, &e.to_string()))
             }
             OP_CLASSIFY_RUN => {
@@ -718,8 +768,15 @@ impl SystemOne {
                     refusal_body(&e)
                 })?;
                 let stored = if self.image_references() {
-                    let request = cortexkit_role_classifier::request::parse_request(params)
-                        .map_err(|e| refusal_body(&e))?;
+                    let request = if self.config.routed_models {
+                        cortexkit_role_classifier::request::parse_request(params)
+                    } else {
+                        cortexkit_role_classifier::request::parse_request_for(
+                            params,
+                            &self.describe(),
+                        )
+                    }
+                    .map_err(|e| refusal_body(&e))?;
                     self.stored_batch(&request.batch_id)
                         .await
                         .map_err(|_| {
@@ -791,8 +848,18 @@ impl SystemOne {
         let task = tokio::spawn(async move {
             let _lowered = lowered;
             let _slot = Arc::clone(&service.call_slots).acquire_owned().await;
+            if service.config.routed_models && service.role == STORE_ROLE {
+                if let Some(reply) = routed::run(&service, &params, &scope, admitted_at_ms, &images)
+                    .await
+                    .map_err(routed::Error::bytes)?
+                {
+                    return Ok(reply);
+                }
+            }
             if images.0.is_empty() {
-                classify::run(&service, &params, &scope, admitted_at_ms).await
+                classify::run(&service, &params, &scope, admitted_at_ms)
+                    .await
+                    .map_err(|error| refusal_body(&error))
             } else {
                 classify::run_inner(
                     &service,
@@ -804,11 +871,12 @@ impl SystemOne {
                     &mut false,
                 )
                 .await
+                .map_err(|error| refusal_body(&error))
             }
         });
         let result = match task.await {
             Ok(Ok(reply)) => Ok(reply),
-            Ok(Err(refusal)) => Err(refusal_body(&refusal)),
+            Ok(Err(refusal)) => Err(refusal),
             Err(error) => {
                 tracing::error!(target: "system_one", %error,
                     "a classify.run task ended abnormally; the call is answered internal_error");

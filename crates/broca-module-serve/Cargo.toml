@@ -42,6 +42,7 @@ cortexkit-role-tool-provider = { workspace = true }
 cortexkit-role-llm-runner = { workspace = true }
 # System One classification (classifier/v1) and the batch rules it implements.
 cortexkit-role-classifier = { workspace = true }
+cortexkit-role-routing = { workspace = true }
 cortexkit-model-batch = { workspace = true }
 cortexkit-llm-tools = { workspace = true }
 serde_jcs.workspace = true

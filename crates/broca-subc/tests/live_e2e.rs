@@ -119,6 +119,7 @@ async fn live_model_reads_a_real_file_through_real_aft() {
         reply: None,
     };
     let req = RunRequest {
+        account_route: None,
         route_decision_id: None,
         input_written_at_ms: None,
         directives: None,
@@ -260,7 +261,7 @@ async fn live_model_drives_a_real_subc_tool_call() {
         execution_mode: ExecutionMode::Parallel,
         reply: None,
     };
-    let req = RunRequest { route_decision_id: None,
+    let req = RunRequest { route_decision_id: None, account_route: None,
     input_written_at_ms: None, directives: None, session_class: None, retention: None, title: None, on_restart: None, keep_warm: None, send_id: None, request_identity_digest: None, project_id: None, principal: None, run_id: RunId("live-demo".into()),
     scope: None,
     session: BindIdentity::new(&rig.dir, "dogfood", "live-1"),
@@ -395,6 +396,7 @@ async fn live_interleaved_thinking_echo_back_survives_multiturn() {
         reply: None,
     };
     let req = RunRequest {
+        account_route: None,
         route_decision_id: None,
         input_written_at_ms: None,
         directives: None,

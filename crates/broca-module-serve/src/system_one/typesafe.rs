@@ -72,6 +72,17 @@ pub(crate) fn retry_after_ms(headers: &reqwest::header::HeaderMap) -> Option<u64
 
 #[async_trait]
 impl ClassifierProvider for TypeSafe {
+    fn with_credential(
+        &self,
+        credential: Arc<dyn CredentialSource>,
+    ) -> Option<Arc<dyn ClassifierProvider>> {
+        Some(Arc::new(Self {
+            http: self.http.clone(),
+            endpoint: self.endpoint.clone(),
+            credential,
+            attempt_timeout: self.attempt_timeout,
+        }))
+    }
     fn egress_host(&self) -> String {
         self.endpoint.host_str().unwrap_or_default().to_owned()
     }

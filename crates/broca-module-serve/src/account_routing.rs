@@ -815,6 +815,7 @@ pub fn conversation_key(session: &BindIdentity) -> String {
 
 /// One admission's request to routing.
 pub struct AccountForRequest<'a> {
+    pub account_route: Option<&'a broca_protocol::request::AccountRoute>,
     pub decision_id: Option<&'a str>,
     pub service_tier: Option<&'a str>,
     pub pool: Option<&'a str>,
@@ -925,10 +926,15 @@ fn check_account_tier(params: &Value, chosen: Option<&str>) -> Result<(), String
 
 /// The `route.account_for` params, in routing's field names.
 pub fn account_for_params(request: &AccountForRequest<'_>) -> Value {
+    let (provider, model) = request
+        .account_route
+        .map_or((request.provider, request.model), |route| {
+            (route.provider.as_str(), route.model.as_str())
+        });
     let mut params = json!({
-        "provider": request.provider,
-        "model": request.model,
-        "affinity_model": request.model,
+        "provider": provider,
+        "model": model,
+        "affinity_model": model,
         "conversation_key": request.conversation_key,
         "caller": { "runner": RUNNER },
         "admission_id": request.admission_id,
@@ -975,7 +981,122 @@ pub struct RoutingClient {
     config: AccountSelectionConfig,
 }
 
+/// An answered refusal is distinct from an unavailable route. Classifier admission must
+/// preserve the router's code rather than turning every failure into a retryable outage.
+#[derive(Clone, Debug)]
+pub enum RoutingCallError {
+    Refused {
+        code: String,
+        message: String,
+    },
+    Unavailable(String),
+    /// A response or locally constructed request violates the routing contract.
+    Invalid(String),
+}
+
 impl RoutingClient {
+    /// Extend an existing account pin without selecting a different account. The caller
+    /// retains the request until its answer is durable so a transport retry reuses its id.
+    pub async fn renew_account(
+        &self,
+        request: &cortexkit_role_routing::account::AccountForRequest,
+    ) -> Result<cortexkit_role_routing::account::AccountForAnswer, RoutingCallError> {
+        use cortexkit_role_routing::account::{parse_account_for_request, AccountMode};
+        if request.mode() != AccountMode::Renew || request.expected_pin.is_none() {
+            return Err(RoutingCallError::Invalid(
+                "renewal requires mode renew and expected_pin".into(),
+            ));
+        }
+        parse_account_for_request(
+            &serde_json::to_value(request)
+                .map_err(|error| RoutingCallError::Invalid(error.to_string()))?,
+        )
+        .map_err(|error| RoutingCallError::Invalid(format!("invalid renewal: {error:?}")))?;
+        self.classifier_rpc("route.account_for", request).await
+    }
+
+    /// Typed classifier operations share the LLM account client's transport and deadlines.
+    pub async fn classifier_rpc<T: serde::de::DeserializeOwned>(
+        &self,
+        method: &str,
+        params: &impl serde::Serialize,
+    ) -> Result<T, RoutingCallError> {
+        let body = serde_json::to_vec(&json!({"method":method,"params":params}))
+            .map_err(|error| RoutingCallError::Invalid(error.to_string()))?;
+        let reply = tokio::time::timeout(ADMISSION_BUDGET, self.transport.request(body))
+            .await
+            .map_err(|_| RoutingCallError::Unavailable("routing timed out".into()))?
+            .map_err(RoutingCallError::Unavailable)?;
+        match reply {
+            Ok(body) => {
+                #[derive(serde::Deserialize)]
+                struct Response<T> {
+                    result: T,
+                }
+                serde_json::from_slice::<Response<T>>(&body)
+                    .map(|answer| answer.result)
+                    .map_err(|error| {
+                        RoutingCallError::Invalid(format!("routing answer did not decode: {error}"))
+                    })
+            }
+            Err(body) => {
+                #[derive(serde::Deserialize)]
+                struct Refused {
+                    code: String,
+                    #[serde(default)]
+                    message: String,
+                }
+                let error: Refused = serde_json::from_slice(&body).map_err(|error| {
+                    RoutingCallError::Invalid(format!("routing refusal did not decode: {error}"))
+                })?;
+                Err(RoutingCallError::Refused {
+                    code: error.code,
+                    message: error.message,
+                })
+            }
+        }
+    }
+
+    pub async fn classifier_describe(
+        &self,
+    ) -> Result<cortexkit_role_routing::describe::RoleDescribe, RoutingCallError> {
+        let describe = self.classifier_rpc("role.describe", &json!({})).await?;
+        cortexkit_role_routing::describe::check_describe(&describe)
+            .map_err(|error| RoutingCallError::Invalid(error.to_string()))?;
+        Ok(describe)
+    }
+
+    pub async fn classifier_select(
+        &self,
+        request: &cortexkit_role_routing::select::SelectRequest,
+    ) -> Result<cortexkit_role_routing::select::SelectAnswer, RoutingCallError> {
+        let answer = self.classifier_rpc("route.select", request).await?;
+        cortexkit_role_routing::select::check_answer(request, &answer)
+            .map_err(|error| RoutingCallError::Invalid(error.to_string()))?;
+        Ok(answer)
+    }
+
+    pub async fn classifier_report(
+        &self,
+        request: &cortexkit_role_routing::report::ReportRequest,
+        capabilities: &[String],
+    ) -> Result<cortexkit_role_routing::report::ReportAnswer, RoutingCallError> {
+        cortexkit_role_routing::report::parse_report_request_serving(
+            &serde_json::to_value(request)
+                .map_err(|error| RoutingCallError::Invalid(error.to_string()))?,
+            capabilities,
+        )
+        .map_err(|error| RoutingCallError::Invalid(format!("invalid routing report: {error:?}")))?;
+        let answer: cortexkit_role_routing::report::ReportAnswer =
+            self.classifier_rpc("route.report", request).await?;
+        if answer.decision_id != request.decision_id || answer.outcome != request.outcome {
+            return Err(RoutingCallError::Invalid(
+                "routing acknowledged a different decision or report outcome".into(),
+            ));
+        }
+        Ok(answer)
+    }
+
     pub fn new(transport: Arc<dyn RoutingTransport>, config: AccountSelectionConfig) -> Self {
         Self {
             transport,
@@ -1195,6 +1316,7 @@ impl AccountChoice {
 
 /// Everything [`choose_account`] needs about one fresh run.
 pub struct ChoiceInputs<'a> {
+    pub account_route: Option<&'a broca_protocol::request::AccountRoute>,
     pub decision_id: Option<&'a str>,
     pub service_tier: Option<&'a str>,
     pub pool: Option<&'a str>,
@@ -1300,8 +1422,9 @@ where
         return Ok(AccountChoice::NotApplicable);
     }
     let admission = admission_id(inputs.run_id);
-    let hinted = inputs.pool.is_some() || inputs.credential_id.is_some();
-    if inputs.caller_named_account && hinted {
+    let hinted =
+        inputs.pool.is_some() || inputs.credential_id.is_some() || inputs.account_route.is_some();
+    if inputs.caller_named_account && (inputs.pool.is_some() || inputs.credential_id.is_some()) {
         return Err(ChoiceRefusal::Refused(AccountSelectionRefusal {
             routing_code: "invalid_request".into(),
             retry_after_s: None,
@@ -1355,6 +1478,7 @@ where
         )));
     }
     let params = account_for_params(&AccountForRequest {
+        account_route: inputs.account_route,
         decision_id: inputs.decision_id,
         service_tier: inputs.service_tier,
         pool: inputs.pool,

@@ -35,6 +35,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
 
+#[path = "classifier_conformance/routed.rs"]
+mod routed;
+
 const JEV: &str = "typesafe/jev-1.13.0";
 const CLEF: &str = "cloudflare-workers-ai/@cf/cloudflare/clef";
 const CLEF_FLASH: &str = "cloudflare-workers-ai/@cf/cloudflare/clef-flash";
@@ -52,6 +55,7 @@ fn require_subc() -> bool {
 
 #[derive(Default)]
 struct StandIn {
+    routing: Option<Arc<routed::State>>,
     scripts: Mutex<HashMap<String, Scripted>>,
     calls: Mutex<HashMap<String, usize>>,
     /// Keys whose next call waits; the notify releases it.
@@ -115,6 +119,9 @@ async fn serve_one(mut stream: tokio::net::TcpStream, state: Arc<StandIn>) -> st
         buffer.extend_from_slice(&chunk[..n]);
     }
     let request: Value = serde_json::from_slice(&buffer[body_start..]).unwrap_or(Value::Null);
+    if let Some(routing) = &state.routing {
+        routing.provider_request(&head, &path, &request);
+    }
     let key = state_key(&request["state"]);
     state
         .received
@@ -250,6 +257,7 @@ fn seed_catalog(state_root: &Path, served: Served) {
 }
 
 struct Rig {
+    routed: Option<routed::Services>,
     // Dropping the rig stops the supervised process tree, including the scope owner.
     _daemon: broca_test_support::RigChild,
     served: Served,
@@ -271,6 +279,15 @@ async fn start_rig_with_references(
     name: &str,
     served: Served,
     surface: Option<PathBuf>,
+) -> Option<Rig> {
+    start_rig_options(name, served, surface, false).await
+}
+
+async fn start_rig_options(
+    name: &str,
+    served: Served,
+    surface: Option<PathBuf>,
+    routing: bool,
 ) -> Option<Rig> {
     let subc = broca_test_support::subc_bin("ck-subc", "SUBC_CORE_BIN");
     if !subc.exists() {
@@ -301,7 +318,11 @@ async fn start_rig_with_references(
     std::fs::create_dir_all(&project_root).unwrap();
     let state_root = root.join("broca-state");
     seed_catalog(&state_root, served);
-    let state = Arc::new(StandIn::default());
+    let routing_state = routing.then(|| Arc::new(routed::State::default()));
+    let state = Arc::new(StandIn {
+        routing: routing_state.clone(),
+        ..Default::default()
+    });
     let stand_in = start_stand_in(state.clone()).await;
     let egress_host = url::Url::parse(&stand_in)
         .unwrap()
@@ -320,6 +341,9 @@ async fn start_rig_with_references(
         .unwrap(),
     )
     .unwrap();
+    if routing {
+        routed::configure(&broca_config);
+    }
     let connection_file = runtime_dir.join("subc-connection.json");
     let stub = broca_test_support::subc_bin("fake-aft-stub", "FAKE_AFT_STUB_BIN");
     assert!(
@@ -366,8 +390,8 @@ async fn start_rig_with_references(
                     "BROCA_STATE_ROOT": state_root,
                     "XDG_DATA_HOME": data_home,
                     "BROCA_CONFIG_PATH": broca_config,
-                    // The mock provider path: no vault is opened, so the stand-in is called
-                    // without a credential, as every run is on this path.
+                    // Legacy rigs bypass vault auth. The routed rig removes this override
+                    // before writing the daemon config so its real credential routes are used.
                     "BROCA_PROVIDER_BASE_URL": format!("{stand_in}/v1"),
                     "CK_LOG": "info",
                 },
@@ -389,11 +413,7 @@ async fn start_rig_with_references(
         });
         fixtures
     });
-    std::fs::write(
-        config_home.join("cortexkit/subc.jsonc"),
-        serde_json::to_vec_pretty(&config).unwrap(),
-    )
-    .unwrap();
+    routed::write_daemon_config(config_home.join("cortexkit/subc.jsonc"), config, routing);
     let daemon = broca_test_support::retry_executable_file_busy(|| {
         broca_test_support::tokio_rig_command(
             broca_test_support::ckdev_binary(&subc, broca_test_support::scratch_root()),
@@ -447,6 +467,11 @@ async fn start_rig_with_references(
         .await;
     }
     Some(Rig {
+        routed: if let Some(state) = routing_state {
+            Some(routed::register(&connection_file, state).await)
+        } else {
+            None
+        },
         _daemon: daemon,
         served,
         connection_file,
@@ -664,6 +689,32 @@ impl ClassifierSubject for Subject<'_> {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 
+    async fn script_routing(
+        &self,
+        outcomes: Vec<cortexkit_role_classifier_conformance::RoutingOutcome>,
+    ) -> bool {
+        let Some(services) = &self.rig.routed else {
+            return false;
+        };
+        services.state.script(outcomes);
+        true
+    }
+
+    async fn routing_observations(
+        &self,
+    ) -> Option<cortexkit_role_classifier_conformance::RoutingObservations> {
+        self.rig
+            .routed
+            .as_ref()
+            .map(|services| services.state.observations())
+    }
+
+    async fn finish_routing(&self) {
+        if let Some(services) = &self.rig.routed {
+            services.state.finish();
+        }
+    }
+
     async fn issue_image_reference(&self, content_type: &str, bytes: Vec<u8>) -> Option<String> {
         let path = self.rig.image_fixtures.as_ref()?;
         let mut fixtures: Vec<Value> =
@@ -730,8 +781,22 @@ async fn classifier_image_reference_conformance_uses_stand_in_cerebellum() {
     else {
         return;
     };
-    let report = run_suite(&Subject { rig: &rig }).await;
-    assert_eq!(report.verdict, SuiteVerdict::Passed, "{:#?}", report.checks);
+    let report = legacy_suite_report(run_suite(&Subject { rig: &rig }).await);
+    assert_eq!(
+        report.verdict,
+        SuiteVerdict::PassedExceptNotApplicable {
+            not_applicable: ROUTED_CASES.to_vec()
+        },
+        "{:#?}",
+        report.checks
+    );
+    for check in report
+        .checks
+        .iter()
+        .filter(|check| !ROUTED_CASES.contains(&check.check))
+    {
+        assert_eq!(check.outcome, CheckOutcome::Passed, "{check:?}");
+    }
     for check in report.checks.iter().filter(|check| {
         check.check.starts_with("image_reference_")
             || check.check == "image_source_down_refused_transient"
@@ -745,6 +810,30 @@ async fn classifier_image_reference_conformance_uses_stand_in_cerebellum() {
             .any(|(_, body)| body["images"][0]["base64"].is_string()),
         "resolved images reached Workers AI"
     );
+}
+
+const ROUTED_CASES: [&str; 6] = [
+    "routed_replay_keeps_decision",
+    "routed_partial_failure_keeps_model",
+    "routed_reply_has_decision_id",
+    "routed_pin_never_substituted",
+    "routed_admission_refusals",
+    "routed_initial_account_failure_bounded",
+];
+
+fn legacy_suite_report(
+    mut report: cortexkit_role_classifier_conformance::SuiteReport,
+) -> cortexkit_role_classifier_conformance::SuiteReport {
+    for check in &mut report.checks {
+        if ROUTED_CASES.contains(&check.check) {
+            let CheckOutcome::NotApplicable { reason } = &mut check.outcome else {
+                panic!("legacy route must not declare routed_models: {check:?}");
+            };
+            assert_eq!(reason, "provider does not declare routed_models");
+            *reason = "routed_models not declared".into();
+        }
+    }
+    report
 }
 
 fn assert_legacy_conformance(
@@ -762,7 +851,16 @@ fn assert_legacy_conformance(
                 | "image_source_down_refused_transient"
                 | "image_reference_identity_is_its_handle"
         );
-        if reference_only || (!images && check.check == "image_reference_follows_declaration") {
+        if ROUTED_CASES.contains(&check.check) {
+            assert_eq!(
+                check.outcome,
+                CheckOutcome::NotApplicable {
+                    reason: "routed_models not declared".into()
+                }
+            );
+        } else if reference_only
+            || (!images && check.check == "image_reference_follows_declaration")
+        {
             assert!(
                 matches!(check.outcome, CheckOutcome::NotApplicable { .. }),
                 "{check:?}"
@@ -778,7 +876,7 @@ async fn classifier_conformance_suite_passes_against_the_real_serve_path() {
     let Some(rig) = start_rig("suite", Served::Jev).await else {
         return;
     };
-    let report = run_suite(&Subject { rig: &rig }).await;
+    let report = legacy_suite_report(run_suite(&Subject { rig: &rig }).await);
     for check in &report.checks {
         println!("{}: {:?}", check.check, check.outcome);
     }
@@ -796,7 +894,7 @@ async fn classifier_conformance_suite_passes_through_workers_ai() {
     let Some(rig) = start_rig("workers-ai", Served::WorkersAi).await else {
         return;
     };
-    let report = run_suite(&Subject { rig: &rig }).await;
+    let report = legacy_suite_report(run_suite(&Subject { rig: &rig }).await);
     for check in &report.checks {
         println!("{}: {:?}", check.check, check.outcome);
     }

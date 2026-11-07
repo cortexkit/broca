@@ -583,6 +583,7 @@ mod tests {
                     session: broca_protocol::BindIdentity::new("/tmp/project", "harness", "s"),
                     ts_ms: Some(100),
                     config: Box::new(broca_wal::RunConfig {
+                        account_route: None,
                         global_system: None,
                         route_decision_id: None,
                         account_limit_pause: false,
