@@ -142,6 +142,13 @@ impl<W: Writer, S: PartStore> Writer for Durable<'_, W, S> {
         self.writer.run_start(run_id).await
     }
 
+    async fn tool_intent(
+        &self,
+        call_key: &str,
+    ) -> Result<Option<broca_session_store::record::ToolIntent>, SessionError> {
+        self.writer.tool_intent(call_key).await
+    }
+
     async fn seal_at_entry(
         &mut self,
         ordinal: u64,

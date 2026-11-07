@@ -208,6 +208,12 @@ crate::message! {
         5 opt tags_v1: serde_json::Value,
         /// The queued send a delivery came from.
         6 opt submission_id: String,
+        /// The attested module id of the send's sender, when a module sent it: a steer's
+        /// `sent_by`, or a delivered send's (see [`Pending::sender`]).
+        7 opt sender: String,
+        /// The send's request identity digest, as its record kept it, which names the
+        /// `client_message_id` the caller gave it.
+        8 opt request_identity_digest: String,
     }
 }
 
@@ -649,6 +655,11 @@ crate::message! {
         /// Queued with a delivery order (its `DeliveryOrdered` record): a running run may
         /// deliver it at a boundary, by the first mode in its order possible there.
         3 req ordered: bool,
+        /// The attested module id of the send's sender, when a module sent it: the principal
+        /// its receipt names as sender, else as owner, as today's reads name it.
+        4 opt sender: String,
+        /// The send's request identity digest, as its receipt kept it.
+        5 opt request_identity_digest: String,
     }
 }
 
@@ -1089,6 +1100,20 @@ fn receipt_title(receipt: Option<&serde_json::Value>) -> Option<String> {
     receipt?.get("title")?.as_str().map(str::to_owned)
 }
 
+/// The string field `name` of a receipt.
+fn receipt_string(receipt: Option<&serde_json::Value>, name: &str) -> Option<String> {
+    receipt?.get(name)?.as_str().map(str::to_owned)
+}
+
+/// The module id a principal names, when the principal is a module's (a reserved one): who reads
+/// name as a message's sender. A person's principal names none.
+fn receipt_module(principal: Option<&serde_json::Value>) -> Option<String> {
+    match serde_json::from_value(principal?.clone()).ok()? {
+        broca_protocol::BindPrincipal::Reserved { module_id } => Some(module_id),
+        _ => None,
+    }
+}
+
 impl Operations {
     /// A queued send joins the queue; a run that consumes it, a retraction, an ended send or a
     /// delivery into a running run removes it.
@@ -1101,11 +1126,19 @@ impl Operations {
             Record::QueuedSend(send) => {
                 let ordered =
                     self.ordered_next.take().as_deref() == Some(send.submission_id.as_str());
-                let pending = Pending {
-                    submission_id: send.submission_id.clone(),
-                    interrupt: send.delivery.as_deref() == Some("interrupt"),
-                    ordered,
-                };
+                let pending =
+                    Pending {
+                        submission_id: send.submission_id.clone(),
+                        interrupt: send.delivery.as_deref() == Some("interrupt"),
+                        ordered,
+                        sender: receipt_module(send.receipt.as_ref().and_then(|receipt| {
+                            receipt.get("sent_by").or(receipt.get("principal"))
+                        })),
+                        request_identity_digest: receipt_string(
+                            send.receipt.as_ref(),
+                            "request_identity_digest",
+                        ),
+                    };
                 let at = if pending.interrupt {
                     self.queue
                         .iter()
@@ -1303,6 +1336,20 @@ impl Operations {
         if record.stream() != Stream::Ledger {
             return Err(FoldError::TranscriptRecord(record.name()));
         }
+        // A delivery takes its send out of the queue; the messages it delivers keep who sent it.
+        let delivered_send = match record {
+            Record::Delivery(delivery) => self
+                .queue
+                .iter()
+                .find(|pending| pending.submission_id == delivery.submission_id)
+                .map(|pending| {
+                    (
+                        pending.sender.clone(),
+                        pending.request_identity_digest.clone(),
+                    )
+                }),
+            _ => None,
+        };
         self.apply_queue(record);
         match (record, self.open_change) {
             (Record::ChangeAborted(aborted), Some(open)) if aborted.change == open => {
@@ -1606,8 +1653,19 @@ impl Operations {
                 written_at_ms: steer.written_at_ms,
                 tags_v1: steer.tags_v1.clone(),
                 submission_id: None,
+                sender: receipt_module(
+                    steer
+                        .receipt
+                        .as_ref()
+                        .and_then(|receipt| receipt.get("sent_by")),
+                ),
+                request_identity_digest: receipt_string(
+                    steer.receipt.as_ref(),
+                    "request_identity_digest",
+                ),
             }),
             Record::Delivery(delivery) if !delivery.input.is_empty() => {
+                let (sender, request_identity_digest) = delivered_send.unwrap_or_default();
                 run.pending_steers.push(PendingInput {
                     seq,
                     placement: if delivery.mode == "turn_system" {
@@ -1619,6 +1677,8 @@ impl Operations {
                     written_at_ms: delivery.written_at_ms,
                     tags_v1: delivery.tags_v1.clone(),
                     submission_id: Some(delivery.submission_id.clone()),
+                    sender,
+                    request_identity_digest,
                 })
             }
             Record::BudgetFire(fire) => match fire.firing {

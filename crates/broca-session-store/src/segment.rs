@@ -147,7 +147,7 @@ pub struct SegmentMeta {
 
 /// Splits transcript records into groups that must share a block: each user input or assistant
 /// message starts a group, and the records after it (its tool results, text delivered with a tool
-/// result, markers, entry facts) join it. Ledger records are grouped one by one.
+/// result, its turn's facts, markers, entry facts) join it. Ledger records are grouped one by one.
 ///
 /// A message whose `EntryFacts` hasn't come yet keeps its group open. Messages placed together,
 /// such as a run's several input messages, are written before all their facts, and a block
@@ -175,6 +175,7 @@ pub fn groups(records: &[(u64, Record)]) -> Vec<Range<usize>> {
             }
             Record::ToolReply(_)
             | Record::ResultAppend(_)
+            | Record::TurnFacts(_)
             | Record::Marker(_)
             | Record::SetupStub(_)
             | Record::Compaction(_) => false,

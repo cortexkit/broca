@@ -19,6 +19,10 @@ broca-wal = { path = "../broca-wal" }
 cortexkit-compaction-view.workspace = true
 cortexkit-role-compaction.workspace = true
 cortexkit-role-step-transform-provider.workspace = true
+# llm-runner's reasoning summaries, which a message's entry facts record as reads serve them.
+cortexkit-role-llm-runner.workspace = true
+# llm-runner's encoded schema pin, which a tool turn's facts record as reads serve it.
+cortexkit-role-tool-provider.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_jcs.workspace = true

@@ -43,16 +43,64 @@ pub struct Legacy {
     /// By position: how a delivered send reached the message, as today's read names it beside
     /// the message's run (`message_runs`).
     pub deliveries: BTreeMap<u64, broca_protocol::tags::DeliveryAttribution>,
+    /// By position: what today's `include_display_facts` read names about the send that placed
+    /// the message (`broca_core::display_facts`), for the messages it names anything about.
+    pub display: BTreeMap<u64, SendDisplay>,
+}
+
+/// Who sent the send that placed a message, and the `client_message_id` it carried, as today's
+/// display facts name them: on every message of a run's input or of a steer or delivered send.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SendDisplay {
+    pub sender: Option<String>,
+    pub client_message_id: Option<String>,
+}
+
+/// Today's send display facts for `old`, by position, from the fold today's read runs over the
+/// whole log (`DisplayFactsSeed::fold`). The fold decides them when it places each message and
+/// never changes them after. A log the fold refuses has none: today's display read of it
+/// refuses too.
+fn send_display(old: &[FramedRecord], lineage: Option<&str>) -> BTreeMap<u64, SendDisplay> {
+    let Ok(versions) = broca_core::display_facts::DisplayFactsSeed::default()
+        .fold(old, lineage.unwrap_or_default())
+    else {
+        return BTreeMap::new();
+    };
+    let mut display = BTreeMap::new();
+    for version in versions {
+        let row = SendDisplay {
+            sender: version.facts.sender,
+            client_message_id: version.facts.client_message_id,
+        };
+        if row == SendDisplay::default() {
+            display.remove(&version.ordinal);
+        } else {
+            display.insert(version.ordinal, row);
+        }
+    }
+    display
 }
 
 /// Today's facts for `old`. `lineage` is the log's lineage id, which today's message ids carry;
 /// a mode-3 log without one can't keep its ids.
 pub fn legacy(old: &[FramedRecord], lineage: Option<&str>) -> Result<Option<Legacy>, String> {
     let raw: Vec<WalRecord> = old.iter().map(|frame| frame.record.clone()).collect();
-    if !broca_core::is_mode3_log(&raw) {
-        return page_only(&raw, lineage).map(Some);
-    }
-    let replayed = broca_core::replay(&raw).map_err(|error| error.to_string())?;
+    let mut legacy = if broca_core::is_mode3_log(&raw) {
+        contract(old, &raw, lineage)?
+    } else {
+        page_only(&raw, lineage)?
+    };
+    legacy.display = send_display(old, lineage);
+    Ok(Some(legacy))
+}
+
+/// Today's facts for a log on the current compaction contract.
+fn contract(
+    old: &[FramedRecord],
+    raw: &[WalRecord],
+    lineage: Option<&str>,
+) -> Result<Legacy, String> {
+    let replayed = broca_core::replay(raw).map_err(|error| error.to_string())?;
     let stored = replayed.prompt.len() as u64;
     let mut runs: BTreeMap<u64, String> = replayed
         .message_runs
@@ -169,7 +217,7 @@ pub fn legacy(old: &[FramedRecord], lineage: Option<&str>) -> Result<Option<Lega
         let mid = broca_core::message_mid(true, lineage, position)?;
         legacy.pending_results = Some((position, (metadata, Some(prior), mid)));
     }
-    Ok(Some(legacy))
+    Ok(legacy)
 }
 
 /// Today's `session.read` facts for a log off the current compaction contract, from the same
@@ -255,7 +303,7 @@ fn page_only(raw: &[WalRecord], lineage: Option<&str>) -> Result<Legacy, String>
 }
 
 /// The record for the message at `ordinal` (counting from 1), whose run and creation time are
-/// `run_id` and `created_at_ms`.
+/// `run_id` and `created_at_ms`, and whose send `display` names, if any.
 // Each argument is one fact of the record, from a different projection; grouping them would only
 // rename the record's own fields.
 #[allow(clippy::too_many_arguments)]
@@ -268,6 +316,7 @@ pub fn record(
     run_id: Option<String>,
     created_at_ms: Option<u64>,
     delivery: Option<&broca_protocol::tags::DeliveryAttribution>,
+    display: Option<&SendDisplay>,
 ) -> EntryFacts {
     let usage = metadata.usage.map(|usage| {
         // `StepUsage` can't be built field by field outside its crate; its JSON form is its
@@ -283,9 +332,13 @@ pub fn record(
         }
     });
     EntryFacts {
-        client_message_id: None,
-        sender: None,
+        client_message_id: display.and_then(|display| display.client_message_id.clone()),
+        sender: display.and_then(|display| display.sender.clone()),
         marks: None,
+        budget_finalize: None,
+        no_display_facts: None,
+        reasoning_summaries: Vec::new(),
+        rich_ui: None,
         ordinal,
         written_at_ms,
         tag_base: metadata.tag_base,

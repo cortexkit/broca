@@ -62,6 +62,48 @@ fn changed_dispatch_arguments_round_trip() {
 const STEP: &str = r#"{"type":"model_step_finished","step_id":1,"assistant_message":{"message_id":"m1","content":[{"type":"text","text":"ok"}]},"usage":{},"retries_used":0}"#;
 const STEER: &str = r#"{"type":"steered","input":[{"role":"user","content":[{"type":"text","text":"also this"}]}],"written_at_ms":7}"#;
 
+/// What a read's display facts are decided from round-trips: a steer's sender and request
+/// identity, a queued send's sender, principal and request identity, and why a call was never
+/// sent. The facts the conversion records from them name the steer's sender on the message it
+/// placed and the refused call's reason on its turn, as today's read serves them.
+#[test]
+fn what_display_facts_are_decided_from_round_trips() {
+    use broca_session_store::record::{Record, Unanswered};
+    let old = log(&[
+        &RUN.replace("RUN", "r"),
+        r#"{"type":"step_started","step_id":1}"#,
+        r#"{"type":"steered","input":[{"role":"user","content":[{"type":"text","text":"also this"}]}],"written_at_ms":7,"sent_by":{"kind":"reserved","module_id":"occipital"},"request_identity_digest":"digest-steer"}"#,
+        r#"{"type":"queued","submission_id":"q1","sent_by":{"kind":"reserved","module_id":"occipital"},"principal":{"kind":"reserved","module_id":"prefrontal-core"},"request_identity_digest":"digest-queued","request":{"model":{"provider_module_id":"p","model_id":"m"},"input":[]}}"#,
+        r#"{"type":"model_step_finished","step_id":1,"assistant_message":{"message_id":"m1","content":[{"type":"tool_call","tool_call_id":"c1","tool_name":"bash","input":{}}]},"usage":{},"finish_reason":"tool_calls","retries_used":0}"#,
+        r#"{"type":"tool_batch_started","batch_id":"b1","step_id":1,"planned_calls":["c1"]}"#,
+        r#"{"type":"tool_no_dispatch","batch_id":"b1","tool_call_id":"c1","reason":{"kind":"denied","reason":"not allowed"}}"#,
+        r#"{"type":"tool_batch_finished","batch_id":"b1"}"#,
+        r#"{"type":"step_started","step_id":2}"#,
+    ]);
+    assert_round_trip(&old);
+    let converted = convert(&old, Some("lineage-1")).unwrap();
+    let turn = converted
+        .records
+        .iter()
+        .find_map(|record| match record {
+            Record::TurnFacts(turn) => Some(turn),
+            _ => None,
+        })
+        .expect("the tool turn has facts");
+    assert_eq!(turn.ordinal, 2);
+    assert_eq!(turn.calls.len(), 1);
+    assert_eq!(turn.calls[0].unanswered, Some(Unanswered::Denied));
+    let steer = converted
+        .records
+        .iter()
+        .find_map(|record| match record {
+            Record::EntryFacts(facts) if facts.ordinal == 4 => Some(facts),
+            _ => None,
+        })
+        .expect("the steer's message has facts");
+    assert_eq!(steer.sender.as_deref(), Some("occipital"));
+}
+
 /// A steer arrives during a model step and is placed at the next step boundary: its entry moves
 /// there, names the steer's record, and both round-trip.
 #[test]

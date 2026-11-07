@@ -390,9 +390,9 @@ pub fn invert(records: &[Record], parts: &BTreeMap<Digest, Vec<u8>>) -> Result<V
         // A record's seq is its position in the log, from 1.
         let seq = index as u64;
         match record {
-            // Both are derived from today's records, and neither is one of its own: entry facts
-            // are what today's projection computes from the log.
-            Record::SetupStub(_) | Record::EntryFacts(_) => {}
+            // All three are derived from today's records, and none is one of its own: entry and
+            // turn facts are what today's reads compute from the log.
+            Record::SetupStub(_) | Record::EntryFacts(_) | Record::TurnFacts(_) => {}
             // A converted run's billing was settled by today's storage when the run ended; the
             // converter records that, and today's log has no record of it.
             Record::Billed(_) => {}
