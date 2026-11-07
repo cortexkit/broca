@@ -6737,7 +6737,9 @@ async fn assertion_wal_reader_uses_the_inventory_address_for_a_folderless_sessio
     inventory.rebuild_inventory(&state).unwrap();
     let session = "folderless";
     let claim = subject.raw_bind_identity(session);
-    let resolved = inventory.resolve_session_address(&claim, None).unwrap();
+    let resolved = inventory
+        .resolve_session_address(&claim, None, None)
+        .unwrap();
     assert_ne!(resolved.project_root, claim.project_root);
     subject
         .shared

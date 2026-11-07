@@ -184,6 +184,13 @@ A consumer can be both. The surface is **session-centric**: consumers address
    `gap_marker`. Boot and on-demand repairs are single-flight and do not block serve
    startup. Existing-pair lookups use a read transaction; only absent pairs take the
    write lock, recheck discovery, and reserve a root before any actor or WAL opens.
+   A stamped bind that reserves a new pair also records its stamp's owner, in the same
+   transaction. Until that session's first episode, `session.send` and `session.import`
+   are admitted only over a route stamped with a scope of that owner; any other send or
+   import, and a later stamped bind under another owner's scope, is refused
+   `scope_owner_mismatch` (`detail.kind` `first_principal`, `first` naming the reserving
+   owner) before anything is written. Pairs reserved without a stamp, or before this record
+   existed, keep the earlier rules.
   Wire binds carry only `harness` and `session` on subc-protocol 0.34. Broca declares
   `bind-no-project/v1` and ignores stray legacy bind project members. Project attribution
   comes only from the daemon's scope stamp (`workdir`, optional `project_id`), never

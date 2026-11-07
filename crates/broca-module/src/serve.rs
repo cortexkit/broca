@@ -192,6 +192,10 @@ pub struct SessionImportRequest {
     pub project_id: Option<String>,
     /// The principal the daemon stamped on the importing bind; recorded on the RunStarted.
     pub principal: Option<broca_protocol::BindPrincipal>,
+    /// What the importing route says about scopes. An import seeds a session's first episode,
+    /// so a session whose address an owner's scoped bind reserved accepts it only over a route
+    /// stamped with that owner's scope. `Internal` (a caller inside broca) takes no such check.
+    pub scope: broca_protocol::SendScope,
     pub session: LineageKey,
     pub run_id: broca_protocol::RunId,
     pub messages: Vec<broca_protocol::Message>,
@@ -1924,10 +1928,13 @@ pub trait ServeHandler: Send + Sync {
 
     /// The adoption check a stamped `route.bind` gets before it is acknowledged: `Ok(Some)` when
     /// the bound session was recorded without a scope and its history refuses the stamp. Only
-    /// adoption is decided here; every other scope rule is decided on each send, since an
-    /// episode can be written between the bind and the send. `Err` when the history cannot be
-    /// read, so whether it refuses the stamp is unknown: the bind is refused rather than
-    /// accepted. The default implementation has no history source and returns no refusal.
+    /// adoption is decided here, plus the reservation of a session with no episode yet: a stamp
+    /// whose owner is not the owner that reserved the session's address under a scope is
+    /// `Err(ServeError::ScopeRefused)`, the refusal its first send would get. Every other scope
+    /// rule is decided on each send, since an episode can be written between the bind and the
+    /// send. `Err` also when the history cannot be read, so whether it refuses the stamp is
+    /// unknown: the bind is refused rather than accepted. The default implementation has no
+    /// history source and returns no refusal.
     async fn bind_adoption_refusal(
         &self,
         _session: &LineageKey,
@@ -2606,6 +2613,30 @@ impl ServeHandler for crate::LineageRegistry {
 
     async fn send(&self, mut req: SendRequest) -> Result<SendResponse, ServeError> {
         use crate::actor::SendOutcome;
+        // A session with no WAL yet has no episode, and an owner's scoped bind may have reserved
+        // its address. Refuse anyone else's first send here, before staging media or opening the
+        // session's actor, which writes the WAL's first frame. The actor makes the same decision
+        // for a session whose WAL already exists.
+        if req.request.scope != broca_protocol::SendScope::Internal
+            && self.wal_written(&req.session) == Some(false)
+        {
+            let reserved_owner =
+                self.scope_reservation_owner(&req.session)
+                    .await
+                    .map_err(|error| {
+                        ServeError::Open(error, Some(broca_protocol::ErrorClass::Transient))
+                    })?;
+            let ownership = broca_core::SessionOwnershipV1 {
+                reserved_owner,
+                ..Default::default()
+            };
+            broca_core::scope_admission::check_scope_reservation(
+                &ownership,
+                req.request.principal.as_ref(),
+                &req.request.scope,
+            )
+            .map_err(ServeError::ScopeRefused)?;
+        }
         if !req.request.content.is_empty() && !self.session_written(&req.session)? {
             let mut request = (*req.request).clone();
             crate::person_media::stage(self.upload_store().as_ref(), &req.session, &mut request)
@@ -3021,11 +3052,12 @@ impl ServeHandler for crate::LineageRegistry {
             // existing unreadable-history refusals keep their code and cause.
             self.check_session_log(session).await?;
         }
-        match broca_core::decide_scope(
-            &ownership,
-            principal,
-            &broca_protocol::SendScope::Stamped(scope.clone()),
-        ) {
+        // A stamped stranger meets the refusal its first send would get, so the route is never
+        // acknowledged for a session whose address another owner's scoped bind reserved.
+        let stamped = broca_protocol::SendScope::Stamped(scope.clone());
+        broca_core::scope_admission::check_scope_reservation(&ownership, principal, &stamped)
+            .map_err(ServeError::ScopeRefused)?;
+        match broca_core::decide_scope(&ownership, principal, &stamped) {
             Err(broca_core::ScopeRefusal::AdoptionRefused(refusal)) => Ok(Some(refusal)),
             _ => Ok(None),
         }
@@ -3037,6 +3069,28 @@ impl ServeHandler for crate::LineageRegistry {
         // writes nothing: a person names media only through upload references.
         if let Err((field, message)) = broca_wire::check_supplied_media(&req.messages) {
             return Err(ServeError::InvalidParams { field, message });
+        }
+        // An import writes the session's first episode and records its principal, so on a
+        // session with no episode it meets the scope reservation exactly as a first send does,
+        // before the session is opened.
+        if req.scope != broca_protocol::SendScope::Internal {
+            match self.bind_ownership(&req.session).await {
+                crate::registry::BindOwnership::Known(ownership) => {
+                    broca_core::scope_admission::check_scope_reservation(
+                        &ownership,
+                        req.principal.as_ref(),
+                        &req.scope,
+                    )
+                    .map_err(ServeError::ScopeRefused)?;
+                }
+                crate::registry::BindOwnership::NoHistorySource => {}
+                crate::registry::BindOwnership::Unreadable(reason) => {
+                    return Err(ServeError::Open(
+                        format!("session.import owner check: session history unreadable: {reason}"),
+                        Some(broca_protocol::ErrorClass::Transient),
+                    ));
+                }
+            }
         }
         let request = broca_core::ImportRequest {
             project_id: req.project_id,

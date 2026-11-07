@@ -81,7 +81,7 @@ fn one_wrong_root_repoints_history_and_preserves_stub_aside_idempotently() {
         assert_eq!(
             fixture
                 .store
-                .resolve_session_address(&fixture.stale, None)
+                .resolve_session_address(&fixture.stale, None, None)
                 .unwrap(),
             fixture.live
         );

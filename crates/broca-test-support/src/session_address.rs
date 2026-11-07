@@ -36,7 +36,7 @@ pub fn register_legacy_session(root: &Path, seed: &BindIdentity) -> Result<BindI
     with_inventory(root, |resolver, index| {
         index.record_session(&broca_core::session_addr(seed), seed)?;
         resolver
-            .resolve_session_address(seed, None)
+            .resolve_session_address(seed, None, None)
             .map_err(|error| error.to_string())
     })
 }
@@ -73,7 +73,7 @@ mod tests {
         let store = broca_store::SqliteStore::open(root.join("run-index.db")).unwrap();
         broca_core::SessionInventory::rebuild_inventory(&store, &root).unwrap();
         let claim = BindIdentity::new(root.join("project"), "harness", "session");
-        let admitted = store.resolve_session_address(&claim, None).unwrap();
+        let admitted = store.resolve_session_address(&claim, None, None).unwrap();
         let resolved = resolve_session_address(&root, &claim).unwrap();
         assert_eq!(resolved, admitted);
         assert_eq!(resolved.project_root, Path::new("broca-unscoped-v1"));

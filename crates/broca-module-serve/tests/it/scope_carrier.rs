@@ -645,6 +645,106 @@ async fn a_scoped_session_refuses_a_send_under_a_different_identity_or_none() {
     rig.finish().await;
 }
 
+/// A scoped bind that reserves a new session's address makes the session its scope owner's
+/// before any send is admitted. Until the owner's first send, no other principal can start it:
+/// an unstamped send or import from another module is refused `scope_owner_mismatch` naming the
+/// reserving owner, both before the session has a WAL (the serve layer refuses it without
+/// opening the session) and once its actor has written one (the actor refuses it), and a bind
+/// stamped with another owner's scope is refused the same way. None of them starts a run or
+/// records an episode. The owner's first stamped send is then admitted and freezes its scope.
+///
+/// An address reserved by an unstamped bind has no reservation, as every address reserved
+/// before reservations were recorded: another module's unstamped first send starts it as before.
+#[tokio::test]
+async fn a_scoped_bind_reserves_a_new_session_for_its_scope_owner() {
+    let mut rig = Rig::start("reserved", true, false).await;
+    let session = BindIdentity::new("broca-unscoped-v1", "runner", "scoped");
+    rig.bind_ok(7, Some(core()), Some(stamp(core(), 3))).await;
+    rig.bind_ok(8, Some(other()), None).await;
+    let reserved_for_core = |presented: &str| {
+        serde_json::json!({
+            "kind": "first_principal",
+            "first": "reserved:prefrontal-core",
+            "presented_principal": presented,
+        })
+    };
+
+    let (code, body) = error_body(&rig.send(8, "stranger-1").await);
+    assert_eq!(code, "scope_owner_mismatch", "{body}");
+    assert_eq!(body["detail"], reserved_for_core("reserved:other-agent"));
+    let import = rig
+        .request(
+            8,
+            serde_json::json!({"method":"session.import", "params": {
+                "import_id":"stranger-import",
+                "origin":{"kind":"import","source_ref":"fixture:stranger"},
+                "messages":[{"role":"user","content":[{"type":"text","text":"mine"}]}]
+            }}),
+        )
+        .await;
+    let (code, body) = error_body(&import);
+    assert_eq!(code, "scope_owner_mismatch", "{body}");
+    assert_eq!(body["detail"], reserved_for_core("reserved:other-agent"));
+    assert!(
+        !rig.wal_path.exists(),
+        "a refused first send or import must not create the session's log"
+    );
+
+    let bind = rig.bind(9, Some(other()), Some(stamp(other(), 1))).await;
+    let (code, body) = error_body(&bind);
+    assert_eq!(code, "scope_owner_mismatch", "{body}");
+    assert_eq!(body["detail"], reserved_for_core("reserved:other-agent"));
+
+    // Opening the session's actor writes its log; the actor then makes the same decision.
+    rig.registry.actor_for(&session).await.unwrap();
+    assert!(
+        rig.wal_path.exists(),
+        "the open actor wrote the session's log"
+    );
+    let before = rig.wal_bytes();
+    let (code, body) = error_body(&rig.send(8, "stranger-2").await);
+    assert_eq!(code, "scope_owner_mismatch", "{body}");
+    assert_eq!(body["detail"], reserved_for_core("reserved:other-agent"));
+    assert_eq!(rig.wal_bytes(), before, "a refused send writes nothing");
+    assert!(frozen_scopes(&rig.records()).is_empty(), "no run started");
+    let ownership = rig
+        .registry
+        .session_ownership_for_bind(&session)
+        .await
+        .unwrap();
+    assert_eq!(ownership.episodes, 0);
+    assert_eq!(
+        ownership.reserved_owner,
+        Some(broca_protocol::BindPrincipal::Reserved {
+            module_id: "prefrontal-core".into()
+        })
+    );
+
+    rig.gate.notify_one();
+    let first = rig.send_ok(7, "owner-1").await;
+    assert_eq!(first["state"], "active", "{first}");
+    let records = rig.wait_for_finished(1).await;
+    assert_eq!(
+        frozen_scopes(&records),
+        [Some((
+            "reserved:prefrontal-core".into(),
+            "head-1".into(),
+            3
+        ))]
+    );
+    rig.finish().await;
+
+    let mut rig = Rig::start("unreserved", true, false).await;
+    rig.bind_ok(8, Some(other()), None).await;
+    rig.bind_ok(7, Some(core()), Some(stamp(core(), 3))).await;
+    rig.gate.notify_one();
+    let first = rig.send_ok(8, "unscoped-1").await;
+    assert_eq!(first["state"], "active", "{first}");
+    let records = rig.wait_for_finished(1).await;
+    assert_eq!(frozen_scopes(&records), [None]);
+    rig.finish().await;
+}
+
 /// A send into a scoped session over a daemon that does not advertise `scopes/v1` cannot carry
 /// the owner's stamp at all, so it is refused `scope_unsupported`, not as an owner mismatch.
 #[tokio::test]
@@ -665,7 +765,9 @@ async fn a_scoped_send_on_a_daemon_without_scopes_is_refused_as_unsupported() {
 
 /// Owner-matched adoption, on the send reply and on the bind, for the three histories an
 /// unscoped session can have. The stamped route is bound while the session is still empty (so
-/// the bind is admitted), then an unscoped first send records its principal, then:
+/// the bind is admitted), but after an unstamped route reserved the session's address: a stamped
+/// bind that reserved it would admit only its owner's stamped first send. Then an unscoped first
+/// send records its principal, then:
 /// - every episode recorded the stamp's owner: the stamped send adopts, and its `RunStarted`
 ///   freezes the scope in a gated frame;
 /// - an episode recorded no principal: `scope_adoption_refused {no_recorded_principal}`;
@@ -677,8 +779,8 @@ async fn a_scoped_send_on_a_daemon_without_scopes_is_refused_as_unsupported() {
 async fn adoption_follows_the_recorded_principals_on_the_send_reply_and_the_bind() {
     // Every episode recorded the stamp's owner.
     let mut rig = Rig::start("adopt-recorded", true, false).await;
-    rig.bind_ok(8, Some(core()), Some(stamp(core(), 3))).await;
     rig.bind_ok(7, Some(core()), None).await;
+    rig.bind_ok(8, Some(core()), Some(stamp(core(), 3))).await;
     rig.gate.notify_one();
     rig.send_ok(7, "unscoped-1").await;
     rig.wait_for_finished(1).await;
@@ -713,9 +815,9 @@ async fn adoption_follows_the_recorded_principals_on_the_send_reply_and_the_bind
         ),
     ] {
         let mut rig = Rig::start(tag, true, false).await;
+        rig.bind_ok(7, first_principal, None).await;
         rig.bind_ok(8, Some(owner.clone()), Some(stamp(owner.clone(), 3)))
             .await;
-        rig.bind_ok(7, first_principal, None).await;
         rig.gate.notify_one();
         rig.send_ok(7, "unscoped-1").await;
         rig.wait_for_finished(1).await;
@@ -767,8 +869,9 @@ async fn adoption_follows_the_recorded_principals_on_the_send_reply_and_the_bind
 #[tokio::test]
 async fn an_auth_paused_resend_meets_the_same_refusal_byte_for_byte() {
     let mut rig = Rig::start("paused-resend", true, true).await;
-    rig.bind_ok(8, Some(core()), Some(stamp(core(), 3))).await;
+    // Unstamped first, so the address is reserved without a stamp and the unscoped turn starts.
     rig.bind_ok(7, None, None).await;
+    rig.bind_ok(8, Some(core()), Some(stamp(core(), 3))).await;
     let paused = rig.send_ok(7, "paused-turn").await;
     assert_eq!(paused["state"], "active", "{paused}");
     let records = rig.wait_for_finished(1).await;
@@ -801,12 +904,14 @@ async fn an_auth_paused_resend_meets_the_same_refusal_byte_for_byte() {
 
 /// A send that would adopt its scope while the session's run is active is refused
 /// `scope_freeze_busy` with the active run named, in exactly the pinned wire type's bytes, and
-/// writes nothing (no `Queued` record). Once the session is idle the same send adopts.
+/// writes nothing (no `Queued` record). Once the session is idle the same send adopts. The
+/// unstamped route is bound first, so the session's address is reserved without a stamp: had
+/// the stamped bind reserved it, the unscoped first send would be refused instead.
 #[tokio::test]
 async fn a_send_that_would_freeze_while_a_run_is_active_is_refused_busy() {
     let mut rig = Rig::start("freeze-busy", true, false).await;
-    rig.bind_ok(8, Some(core()), Some(stamp(core(), 3))).await;
     rig.bind_ok(7, Some(core()), None).await;
+    rig.bind_ok(8, Some(core()), Some(stamp(core(), 3))).await;
     let held = rig.send_ok(7, "held").await;
     assert_eq!(held["state"], "active", "{held}");
     let run_id = held["run_id"].as_str().unwrap().to_owned();

@@ -3811,6 +3811,10 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     ))
                 }
             };
+            let ownership = match self.with_scope_reservation(ownership).await {
+                Ok(ownership) => ownership,
+                Err(error) => return SendOutcome::Transient(error),
+            };
             self.session_change_recorded |= ownership.session_change_recorded;
             if let Some(first) = &ownership.first_episode {
                 let _ = self.first_episode.set(first.clone());
@@ -5399,6 +5403,19 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 "the admission snapshot carries no ownership summary".into(),
             ));
         };
+        // A caller's send that would open the session's first episode meets the scope
+        // reservation, if a scoped bind recorded one; sends made inside broca take none.
+        let reserved;
+        let ownership =
+            if ownership.episodes == 0 && request.scope != broca_protocol::SendScope::Internal {
+                reserved = self
+                    .with_scope_reservation(ownership.clone())
+                    .await
+                    .map_err(StartRunFailure::Infrastructure)?;
+                &reserved
+            } else {
+                ownership
+            };
         let episode_scope = self
             .decide_session_scope(ownership, request.principal.as_ref(), &request.scope)
             .map_err(StartRunFailure::Scope)?
@@ -9955,6 +9972,19 @@ impl<W: WalStore + 'static> LineageActor<W> {
             return true;
         }
         broca_core::scope_admission::AGENT_RUN_SCOPES_WRITER_ENABLED
+    }
+
+    /// `ownership` with the session's scope reservation filled in while it has no episode, so
+    /// admission can refuse a first send from anyone but the owner whose scoped bind reserved
+    /// the address. A session with episodes is returned unchanged, without a read.
+    async fn with_scope_reservation(
+        &self,
+        mut ownership: broca_core::SessionOwnershipV1,
+    ) -> Result<broca_core::SessionOwnershipV1, String> {
+        if ownership.episodes == 0 {
+            ownership.reserved_owner = self.registry.scope_reservation_owner(&self.key).await?;
+        }
+        Ok(ownership)
     }
 
     fn decide_session_scope(

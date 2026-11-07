@@ -2437,6 +2437,17 @@ async fn authorize_bind(
     mut completed: BindCompletion,
     registry: LineageRegistry,
 ) -> BindCompletion {
+    // A scoped bind that reserves a new session address records its scope's owner with it, so
+    // until the session's first send is admitted no other principal can start it.
+    let reservation = match &completed.bind.scope {
+        broca_protocol::SendScope::Stamped(stamp) => {
+            Some(broca_store::session_address::ScopeReservation {
+                owner: stamp.scope.owner.clone(),
+                scope_ref: stamp.scope.scope_ref.clone(),
+            })
+        }
+        _ => None,
+    };
     match registry
         .resolve_session_address(
             &completed.identity,
@@ -2445,6 +2456,7 @@ async fn authorize_bind(
                 .stamped_project
                 .as_ref()
                 .and_then(|stamp| stamp.workdir.as_deref()),
+            reservation.as_ref(),
         )
         .await
     {
@@ -3592,6 +3604,7 @@ where
             let import_req = SessionImportRequest {
                 project_id: bind.project_id.clone(),
                 principal: bind.principal.clone(),
+                scope: bind.scope.clone(),
                 session: session.clone(),
                 run_id,
                 messages: params.messages,

@@ -23,6 +23,10 @@
 //! - An unscoped session sent to without a stamp accepts the send only from the principal of
 //!   its first send, when that first episode recorded one. A session whose first episode
 //!   recorded no principal (it predates principal recording) keeps accepting sends as before.
+//! - A session with no episode yet, whose storage address a scoped `route.bind` reserved,
+//!   accepts its first send only over a route stamped with a scope of the reserving owner (see
+//!   [`check_scope_reservation`]). Addresses reserved without a stamp, or before reservations
+//!   were recorded, keep the rules above.
 //!
 //! Admission compares scope identity. New flow sessions and agent-run sessions freeze
 //! `agent_id`; historical flow sessions and ordinary agent scopes keep their earlier rules.
@@ -130,6 +134,48 @@ pub fn decide_owner_access(
     )))
 }
 
+/// Refuse a caller's request that would become the first principal of a session whose storage
+/// address a scoped `route.bind` reserved for another owner.
+///
+/// Applies only while the session has no episode and `ownership.reserved_owner` is set. The
+/// request must then arrive over a route stamped with a scope that owner owns; the opener may
+/// still be a carrier the daemon admitted under that scope, which the rest of admission judges
+/// as it always has. A request without a stamp, or stamped with another owner's scope, is
+/// refused as a send from someone other than the session's owner, naming the reserved owner.
+/// An `Internal` request is not a caller's and is never refused here. Once an episode exists,
+/// its recorded principal and scope decide instead.
+///
+/// `session.send` meets this through [`decide_scope`]. Paths that establish ownership
+/// without scope admission (an inline `session.import`) and the stamped `route.bind` precheck
+/// call it directly.
+pub fn check_scope_reservation(
+    ownership: &SessionOwnershipV1,
+    principal: Option<&BindPrincipal>,
+    send: &SendScope,
+) -> Result<(), ScopeRefusal> {
+    let Some(reserved) = ownership
+        .reserved_owner
+        .as_ref()
+        .filter(|_| ownership.episodes == 0)
+    else {
+        return Ok(());
+    };
+    let stamp_owner = match send {
+        SendScope::Internal => return Ok(()),
+        SendScope::DaemonWithoutScopes | SendScope::Unstamped => None,
+        SendScope::Stamped(bind) => Some(&bind.scope.owner),
+    };
+    if stamp_owner == Some(reserved) {
+        return Ok(());
+    }
+    Err(ScopeRefusal::OwnerMismatch(Box::new(
+        OwnerMismatch::FirstPrincipal {
+            first: reserved.clone(),
+            presented_principal: principal.cloned(),
+        },
+    )))
+}
+
 /// What admission does with a send's scope.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScopeDecision {
@@ -223,7 +269,8 @@ pub enum OwnerMismatch {
         stamped: SessionScope,
         presented_principal: Option<BindPrincipal>,
     },
-    /// An unscoped session: only the principal of its first send.
+    /// An unscoped session: only the principal of its first send. Also the refusal for a session
+    /// with no episode whose address a scoped bind reserved: `first` is then the reserving owner.
     FirstPrincipal {
         first: BindPrincipal,
         presented_principal: Option<BindPrincipal>,
@@ -288,6 +335,7 @@ fn decide_scope_with_writer(
         SendScope::DaemonWithoutScopes | SendScope::Unstamped => None,
         SendScope::Stamped(bind) => Some(&bind.scope),
     };
+    check_scope_reservation(ownership, principal, send)?;
 
     // The discriminator describes stored policy, not an attested scope attribute. Historical
     // flow sessions discarded agent identity, so normalize only their comparison copy.
@@ -934,6 +982,100 @@ mod tests {
         assert_eq!(
             decide_scope(&legacy, Some(&other()), &SendScope::DaemonWithoutScopes),
             Ok(ScopeDecision::Unscoped)
+        );
+    }
+
+    fn reserved_for(owner: BindPrincipal) -> SessionOwnershipV1 {
+        SessionOwnershipV1 {
+            reserved_owner: Some(owner),
+            ..SessionOwnershipV1::default()
+        }
+    }
+
+    fn reservation_refusal(
+        owner: BindPrincipal,
+        presented: Option<BindPrincipal>,
+    ) -> Result<ScopeDecision, ScopeRefusal> {
+        Err(ScopeRefusal::OwnerMismatch(Box::new(
+            OwnerMismatch::FirstPrincipal {
+                first: owner,
+                presented_principal: presented,
+            },
+        )))
+    }
+
+    /// A scoped bind reserved the address for core. Core's first send under its own stamp
+    /// freezes that stamp exactly as on an unreserved session, and so does a carrier the daemon
+    /// admitted under core's flow scope. Another module stamping its own scope cannot become the
+    /// session's first principal: the refusal names the reserving owner.
+    #[test]
+    fn a_reserved_session_admits_a_first_send_only_under_its_owners_scope() {
+        let stamp = scope(core(), 3);
+        assert_eq!(
+            decide_scope(
+                &reserved_for(core()),
+                Some(&core()),
+                &stamped(stamp.clone())
+            ),
+            Ok(ScopeDecision::Freeze(stamp))
+        );
+        assert_eq!(
+            decide_scope(
+                &reserved_for(core()),
+                Some(&other()),
+                &stamped(flow(None, "flow-1"))
+            ),
+            Ok(ScopeDecision::Freeze(flow(Some(other()), "flow-1")))
+        );
+        assert_eq!(
+            decide_scope(
+                &reserved_for(core()),
+                Some(&other()),
+                &stamped(scope(other(), 1))
+            ),
+            reservation_refusal(core(), Some(other()))
+        );
+        // A send made inside broca is not a caller's and takes no reservation check.
+        assert_eq!(
+            decide_scope(&reserved_for(core()), None, &SendScope::Internal),
+            Ok(ScopeDecision::Unscoped)
+        );
+    }
+
+    /// Without a stamp nobody can start a reserved session, whatever principal the route
+    /// carries, and whether or not the daemon advertises scopes. An address with no reservation
+    /// row (reserved unstamped, or before reservations were recorded), and any session that
+    /// already has an episode, keep the existing rules.
+    #[test]
+    fn a_reserved_session_refuses_an_unstamped_first_send_and_others_are_unchanged() {
+        for principal in [Some(other()), Some(core()), None] {
+            for send in [SendScope::Unstamped, SendScope::DaemonWithoutScopes] {
+                assert_eq!(
+                    decide_scope(&reserved_for(core()), principal.as_ref(), &send),
+                    reservation_refusal(core(), principal.clone()),
+                    "{principal:?} {send:?}"
+                );
+            }
+        }
+
+        let empty = SessionOwnershipV1::default();
+        assert_eq!(
+            decide_scope(&empty, Some(&other()), &SendScope::Unstamped),
+            Ok(ScopeDecision::Unscoped)
+        );
+        assert_eq!(
+            decide_scope(&empty, Some(&other()), &stamped(scope(other(), 1))),
+            Ok(ScopeDecision::Freeze(scope(other(), 1)))
+        );
+        let mut started = history(&[(Some(other()), None)]);
+        started.reserved_owner = Some(core());
+        assert_eq!(
+            decide_scope(&started, Some(&other()), &SendScope::Unstamped),
+            Ok(ScopeDecision::Unscoped)
+        );
+        assert_eq!(
+            check_scope_reservation(&started, Some(&other()), &SendScope::Unstamped),
+            Ok(())
         );
     }
 

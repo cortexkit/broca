@@ -1840,7 +1840,7 @@ async fn stale_inventory_fixture() -> (Rig, BindIdentity, BindIdentity, Vec<u8>)
         .set_session_address_inventory(rig.store.clone());
     let resolved = rig
         .registry
-        .resolve_session_address(&real, None)
+        .resolve_session_address(&real, None, None)
         .await
         .unwrap();
     assert_eq!(resolved, old);
@@ -2014,7 +2014,7 @@ async fn interrupted_first_bind_reservation_can_subscribe_and_send_after_retry()
         .set_session_address_inventory(rig.store.clone());
     let retry = rig
         .registry
-        .resolve_session_address(&key, None)
+        .resolve_session_address(&key, None, None)
         .await
         .unwrap();
     assert!(!rig.wal_store.wal_path(&key).exists());
@@ -2348,6 +2348,7 @@ async fn imported_session_is_projected_before_the_ack() {
     let import_request = SessionImportRequest {
         project_id: None,
         principal: None,
+        scope: broca_protocol::SendScope::Internal,
         session: key.clone(),
         run_id: RunId("import-run".into()),
         messages: messages.clone(),
@@ -4892,6 +4893,7 @@ async fn transcript_reply_body_budget_applies_to_tail_range_and_large_requests()
         .import(SessionImportRequest {
             project_id: None,
             principal: None,
+            scope: broca_protocol::SendScope::Internal,
             session: key.clone(),
             run_id: RunId("import-budget".into()),
             messages: messages.clone(),
@@ -4939,6 +4941,7 @@ async fn imported_message_over_page_target_is_served_whole_when_frame_fits() {
         .import(SessionImportRequest {
             project_id: None,
             principal: None,
+            scope: broca_protocol::SendScope::Internal,
             session: key.clone(),
             run_id: RunId("import-oversized".into()),
             messages: vec![message.clone()],
@@ -4980,6 +4983,7 @@ async fn imported_message_over_frame_limit_is_refused_with_identity() {
         .import(SessionImportRequest {
             project_id: None,
             principal: None,
+            scope: broca_protocol::SendScope::Internal,
             session: key.clone(),
             run_id: RunId("import-over-frame".into()),
             messages: vec![message],
