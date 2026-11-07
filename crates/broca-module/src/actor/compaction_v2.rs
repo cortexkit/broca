@@ -99,7 +99,7 @@ impl<W: WalStore + 'static> super::LineageActor<W> {
             .then(|| self.materialized_store.clone())
             .flatten();
         let entries = self.all_compaction_entries(&writer, store).await?;
-        let conditions = v2::host::conditions(config, &entries, false)?;
+        let conditions = v2::host::conditions(config, &entries, false, None)?;
         let state = self.compaction_session.state.lock().await;
         v2::shown::next_request(&state, &entries, &conditions).map(Some)
     }
@@ -231,7 +231,8 @@ impl<W: WalStore + 'static> super::LineageActor<W> {
                     .all_compaction_entries(&writer, store)
                     .await
                     .map_err(internal)?;
-                let conditions = v2::host::conditions(config, &entries, false).map_err(internal)?;
+                let conditions =
+                    v2::host::conditions(config, &entries, false, None).map_err(internal)?;
                 let answer = match self
                     .compaction_session
                     .state

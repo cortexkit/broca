@@ -29,6 +29,63 @@ fn facts(count: usize) -> Vec<EntryFacts> {
         .collect()
 }
 
+#[test]
+fn compaction_v2_newest_imported_entry_keeps_its_reported_prompt() {
+    let messages = vec![
+        text(Role::Assistant, "fallback reply"),
+        text(Role::Assistant, "imported reply"),
+        text(Role::User, "next question"),
+    ];
+    let mut facts = facts(3);
+    for (fact, prompt) in facts.iter_mut().zip([2_100, 3_000]) {
+        let mut usage = cortexkit_role_compaction::read::StepUsage::new();
+        usage.prompt_tokens = Some(prompt);
+        fact.usage = Some(usage);
+    }
+    let entries = project(&messages, &facts, &Deliveries::new(), true);
+    let fallback = Some((entries[0].mid.as_str(), 1_000));
+    assert_eq!(
+        super::host::last_prompt_tokens(&entries, fallback),
+        Some(3_000)
+    );
+    assert_eq!(
+        super::host::last_prompt_tokens(&entries[..1], fallback),
+        Some(1_000)
+    );
+    assert_eq!(
+        super::host::last_prompt_tokens(&entries[..1], Some(("another-entry", 900))),
+        Some(2_100)
+    );
+}
+
+#[test]
+fn compaction_v2_fallback_fill_requires_distinct_serving_models() {
+    let usage = broca_protocol::Usage {
+        input_tokens: Some(1_300),
+        cached_input_tokens: Some(500),
+        cache_write_tokens: Some(300),
+        ..Default::default()
+    };
+    assert_eq!(super::host::fallback_fill("model", usage, None), None);
+    let mut iterations: Vec<broca_protocol::usage::UsageIteration> =
+        serde_json::from_value(json!([
+            {"model":"model", "input_tokens":600, "cache_read_input_tokens":300,
+             "cache_creation_input_tokens":200},
+            {"model":"model", "input_tokens":700, "cache_read_input_tokens":200,
+             "cache_creation_input_tokens":100}
+        ]))
+        .unwrap();
+    assert_eq!(
+        super::host::fallback_fill("model", usage, Some(&iterations)),
+        None
+    );
+    iterations[1].model = Some("fallback-model".into());
+    assert_eq!(
+        super::host::fallback_fill("fallback-model", usage, Some(&iterations)),
+        Some(1_000)
+    );
+}
+
 fn call() -> Message {
     Message::new(
         Role::Assistant,
@@ -1804,7 +1861,7 @@ fn the_output_reserve_falls_back_to_the_models_output_cap() {
         context_management: None,
     };
     let reserve = |config: RunConfig| {
-        super::host::conditions(&config, &[], false)
+        super::host::conditions(&config, &[], false, None)
             .unwrap()
             .output_reserve
     };

@@ -501,7 +501,7 @@ async fn compaction_v2_next_request_numbers_follow_the_view_the_next_request_ren
         let transcript =
             v2::transcript::project(&frames, &fixture_lineage_id().to_string()).unwrap();
         let (config, _) = v2::host::frozen(&frames).unwrap();
-        let conditions = v2::host::conditions(&config, &transcript.entries, false).unwrap();
+        let conditions = v2::host::conditions(&config, &transcript.entries, false, None).unwrap();
         (
             v2::shown::next_request(&state, &transcript.entries, &conditions).unwrap(),
             transcript.entries,
@@ -555,13 +555,9 @@ async fn compaction_v2_next_request_numbers_follow_the_view_the_next_request_ren
     assert_eq!(v2::shown::lookup(&pending, &question.mid, &part), Some(3));
 }
 
-/// The provider measures a session's fill only from `conditions.last_prompt_tokens`. It is
-/// absent before any request has reported its input, then every later notice and ride states
-/// the newest reported prompt: uncached input plus cache reads plus cache writes.
-#[tokio::test]
-async fn compaction_v2_notices_and_rides_state_the_newest_reported_prompt_size() {
+fn reported_prompt_events() -> Vec<broca_protocol::NormalizedEvent> {
     use broca_protocol::{NormalizedEvent, ProviderControl};
-    let reported = vec![
+    vec![
         NormalizedEvent::Control(ProviderControl::AssistantMessage {
             message: broca_protocol::AssistantMessage {
                 message_id: broca_protocol::MessageId("a".into()),
@@ -581,14 +577,57 @@ async fn compaction_v2_notices_and_rides_state_the_newest_reported_prompt_size()
             finish_reason: FinishReason::Stop,
             retries_used: 0,
         }),
-    ];
-    let prompt_sizes = |calls: &[(String, Value)]| -> Vec<Option<u64>> {
-        calls
-            .iter()
-            .filter(|(method, _)| method == "compaction.notice" || method == "compaction.ride")
-            .map(|(_, params)| params["conditions"]["last_prompt_tokens"].as_u64())
-            .collect()
-    };
+    ]
+}
+
+fn fallback_prompt_events() -> Vec<broca_protocol::NormalizedEvent> {
+    use broca_protocol::{NormalizedEvent, ProviderControl};
+    let mut events = reported_prompt_events();
+    events.insert(
+        1,
+        NormalizedEvent::Control(ProviderControl::StepFinished {
+            step_id: broca_protocol::StepId(0),
+            usage: Usage {
+                input_tokens: Some(700),
+                cached_input_tokens: Some(200),
+                cache_write_tokens: Some(100),
+                output_tokens: Some(5),
+                ..Usage::default()
+            },
+            finish_reason: FinishReason::Stop,
+            raw_finish_reason: None,
+            service_tier_used: None,
+            speed_used: None,
+            served_model: Some("fallback-model".into()),
+            usage_iterations: Some(
+                serde_json::from_value(json!([
+                    {"type":"message", "model":"model", "input_tokens":600,
+                     "cache_read_input_tokens":300, "cache_creation_input_tokens":200,
+                     "output_tokens":1},
+                    {"type":"fallback_message", "model":"fallback-model", "input_tokens":700,
+                     "cache_read_input_tokens":200, "cache_creation_input_tokens":100,
+                     "output_tokens":5}
+                ]))
+                .unwrap(),
+            ),
+        }),
+    );
+    events
+}
+
+fn prompt_sizes(calls: &[(String, Value)]) -> Vec<Option<u64>> {
+    calls
+        .iter()
+        .filter(|(method, _)| method == "compaction.notice" || method == "compaction.ride")
+        .map(|(_, params)| params["conditions"]["last_prompt_tokens"].as_u64())
+        .collect()
+}
+
+/// The provider measures a session's fill only from `conditions.last_prompt_tokens`. It is
+/// absent before any request has reported its input, then every later notice and ride states
+/// the newest reported prompt: uncached input plus cache reads plus cache writes.
+#[tokio::test]
+async fn compaction_v2_notices_and_rides_state_the_newest_reported_prompt_size() {
     let shared = Shared::default();
     let plane = Arc::new(Plane::default());
     let (first, _) = drive_events(
@@ -596,7 +635,7 @@ async fn compaction_v2_notices_and_rides_state_the_newest_reported_prompt_size()
         plane.clone(),
         "run-1",
         crate::StartMode::FreshOrResume,
-        reported,
+        reported_prompt_events(),
     )
     .await;
     first.unwrap();
@@ -824,6 +863,156 @@ async fn compaction_v2_no_plan_globals_are_frozen_outside_input_and_resume_byte_
     assert_eq!(
         crate::canonical_request_bytes(&model.0.calls()[0]),
         crate::canonical_request_bytes(&calls[0])
+    );
+}
+
+#[tokio::test]
+async fn compaction_v2_fallback_notices_and_rides_use_the_last_serving_prompt() {
+    let shared = Shared::default();
+    let plane = Arc::new(Plane::default());
+    let (first, _) = drive_events(
+        &shared,
+        plane.clone(),
+        "run-1",
+        crate::StartMode::FreshOrResume,
+        fallback_prompt_events(),
+    )
+    .await;
+    first.unwrap();
+    let before = plane.calls.lock().unwrap().len();
+    let (second, _) = drive_as(
+        &shared,
+        plane.clone(),
+        "run-2",
+        crate::StartMode::FreshOrResume,
+    )
+    .await;
+    second.unwrap();
+    let sizes = prompt_sizes(&plane.calls.lock().unwrap()[before..]);
+    assert!(!sizes.is_empty(), "the second run sends a notice or ride");
+    assert!(
+        sizes.iter().all(|size| *size == Some(1_000)),
+        "fallback fill must use the last serving prompt, not billed iterations: {sizes:?}"
+    );
+
+    let mut reported = reported_prompt_events();
+    for event in &mut reported {
+        if let broca_protocol::NormalizedEvent::Control(
+            broca_protocol::ProviderControl::Finished { usage, .. },
+        ) = event
+        {
+            usage.input_tokens = Some(1_700);
+        }
+    }
+    let before = plane.calls.lock().unwrap().len();
+    let (third, _) = drive_events(
+        &shared,
+        plane.clone(),
+        "run-3",
+        crate::StartMode::FreshOrResume,
+        reported,
+    )
+    .await;
+    third.unwrap();
+    let sizes = prompt_sizes(&plane.calls.lock().unwrap()[before..]);
+    assert_eq!(sizes.first(), Some(&Some(1_000)));
+    assert_eq!(
+        sizes.last(),
+        Some(&Some(2_000)),
+        "a later step's own input usage replaces the older fallback fill"
+    );
+}
+
+#[tokio::test]
+async fn compaction_v2_fallback_preserves_session_entries_bytes() {
+    let shared = Shared::default();
+    let (result, _) = drive_events(
+        &shared,
+        Arc::new(Plane::default()),
+        "run-1",
+        crate::StartMode::FreshOrResume,
+        fallback_prompt_events(),
+    )
+    .await;
+    result.unwrap();
+    let frames = shared.frames();
+    let lineage = fixture_lineage_id().to_string();
+    let entries = v2::transcript::project(&frames, &lineage).unwrap().entries;
+    let assistant = entries.last().unwrap();
+    assert_eq!(assistant.usage.as_ref().unwrap().prompt_tokens, Some(2_100));
+    let mut billed_only = frames;
+    for frame in &mut billed_only {
+        if let WalRecord::ModelStepFinished { fallback, .. } = &mut frame.record {
+            fallback.served_model = None;
+            fallback.usage_iterations = None;
+        }
+    }
+    let baseline = v2::transcript::project(&billed_only, &lineage).unwrap();
+    assert_eq!(
+        serde_json::to_vec(&entries).unwrap(),
+        serde_json::to_vec(&baseline.entries).unwrap(),
+        "fallback attribution must not change session.entries bytes or digests"
+    );
+}
+
+#[tokio::test]
+async fn compaction_v2_fallback_fill_survives_resume_after_step_completion() {
+    let shared = Shared::default();
+    let (result, _) = drive_events(
+        &shared,
+        Arc::new(Plane::default()),
+        "run-1",
+        crate::StartMode::FreshOrResume,
+        fallback_prompt_events(),
+    )
+    .await;
+    result.unwrap();
+    let records = shared.records();
+    let finished = records
+        .iter()
+        .position(|record| matches!(record, WalRecord::ModelStepFinished { .. }))
+        .unwrap();
+    let recovered = Shared::with_records(records[..=finished].to_vec());
+    let frames = recovered.frames();
+    let transcript = v2::transcript::project(&frames, &fixture_lineage_id().to_string()).unwrap();
+    let (config, _) = v2::host::frozen(&frames).unwrap();
+    let offline = v2::host::conditions(
+        &config,
+        &transcript.entries,
+        false,
+        transcript.newest_step_fill(),
+    )
+    .unwrap();
+    assert_eq!(offline.last_prompt_tokens, Some(1_000));
+    let plane = Arc::new(Plane::default());
+    let (result, model) = drive_as(
+        &recovered,
+        plane.clone(),
+        "run-1",
+        crate::StartMode::FreshOrResume,
+    )
+    .await;
+    result.unwrap();
+    assert!(
+        model.0.calls().is_empty(),
+        "the terminal step is already complete"
+    );
+    // Resume finishes the already-completed terminal step without a model request.
+    // The next send must still announce the step's recorded fill.
+    let (result, _) = drive_as(
+        &recovered,
+        plane.clone(),
+        "run-2",
+        crate::StartMode::FreshOrResume,
+    )
+    .await;
+    result.unwrap();
+    let calls = plane.calls.lock().unwrap();
+    let sizes = prompt_sizes(&calls);
+    assert!(!sizes.is_empty(), "resume sends a notice or ride");
+    assert!(
+        sizes.iter().all(|size| *size == Some(1_000)),
+        "resumed fill must use the recorded last serving prompt: {sizes:?}"
     );
 }
 
@@ -1195,7 +1384,7 @@ async fn compaction_v2_context_folds_refreezes_and_tracks_accepted_attempts_befo
             false,
             false,
             0,
-            &v2::host::conditions(&config, &[], false).unwrap()
+            &v2::host::conditions(&config, &[], false, None).unwrap()
         ),
         vec![
             v2::protocol::ride::RideCause::TierChange,
