@@ -181,6 +181,28 @@ impl SessionClient {
         session: BindIdentity,
         timeout: std::time::Duration,
     ) -> Result<Self, ConnError> {
+        Self::bind_route(conn, module_id, session, timeout, false).await
+    }
+
+    /// Like [`bind_with_timeout`](Self::bind_with_timeout), but the route declares the
+    /// `classifier/v1` role, so the module answers it as a classifier: `role.describe` is the
+    /// classifier's, and the session ops are refused.
+    pub async fn bind_classifier_with_timeout(
+        conn: SubcConnection,
+        module_id: &str,
+        session: BindIdentity,
+        timeout: std::time::Duration,
+    ) -> Result<Self, ConnError> {
+        Self::bind_route(conn, module_id, session, timeout, true).await
+    }
+
+    async fn bind_route(
+        conn: SubcConnection,
+        module_id: &str,
+        session: BindIdentity,
+        timeout: std::time::Duration,
+        classifier: bool,
+    ) -> Result<Self, ConnError> {
         session
             .validate_keyable()
             .map_err(|message| ConnError::Rejected(message.into()))?;
@@ -193,10 +215,14 @@ impl SessionClient {
             max_interval: ROUTE_OPEN_RETRY_INTERVAL,
         };
         let cmd_route = loop {
-            match conn
-                .route_open_management_within(module_id, &session, retry())
-                .await
-            {
+            let opened = if classifier {
+                conn.route_open_classifier_within(module_id, &session, retry())
+                    .await
+            } else {
+                conn.route_open_management_within(module_id, &session, retry())
+                    .await
+            };
+            match opened {
                 Ok(ch) => break ch,
                 Err(e) => {
                     if std::time::Instant::now() >= deadline {
@@ -390,8 +416,9 @@ impl SessionClient {
             from: Some(match from {
                 SubscribeFrom::Start => FromWire::Named("start".into()),
                 SubscribeFrom::Live => FromWire::Named("live".into()),
+                SubscribeFrom::Resume { cursor } => FromWire::Cursor(cursor),
                 SubscribeFrom::After { wal_seq, sub_index } => {
-                    FromWire::Cursor { wal_seq, sub_index }
+                    FromWire::Cursor(broca_wire::CursorWire::new(wal_seq, sub_index))
                 }
             }),
         };
@@ -644,6 +671,8 @@ mod tests {
             // An unframed legacy log has a minted snapshot incarnation, but no lineage frame.
             lineage_id: None,
             messages: vec![broca_wire::SessionReadMessage {
+                sender: None,
+                notices: Vec::new(),
                 created_at: None,
                 completed_at: None,
                 reasoning_summaries: Vec::new(),
@@ -668,10 +697,7 @@ mod tests {
                 part_digests: None,
             }],
             next_from_ordinal: Some(8),
-            head: Some(broca_wire::CursorWire {
-                wal_seq: 11,
-                sub_index: 2,
-            }),
+            head: Some(broca_wire::CursorWire::new(11, 2)),
             lineage_state: broca_wire::SessionReadLineageState {
                 last_run_id: Some("run-1".into()),
                 state: "idle".into(),

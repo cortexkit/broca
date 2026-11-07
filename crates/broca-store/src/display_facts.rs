@@ -144,6 +144,63 @@ mod tests {
     use broca_core::display_facts::DisplayFacts;
 
     #[test]
+    fn an_old_display_seed_is_not_served_and_is_lazily_replaced() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = BindIdentity::new("/project", "runner", "old-display-seed");
+        let mut old = DisplayFactsSeed::default();
+        old.version -= 1;
+        old.through_seq = 99;
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO display_fact_seed(session,lineage,state) VALUES(?1,'lineage',?2)",
+                params![
+                    SqliteStore::key(&session),
+                    serde_json::to_string(&old).unwrap()
+                ],
+            )
+            .unwrap();
+        store.conn.lock().unwrap().execute("INSERT INTO display_fact(session,lineage,ord,seq,facts) VALUES(?1,'lineage',0,1,?2)", params![SqliteStore::key(&session), r#"{"sender":"stale"}"#]).unwrap();
+        let stale = store
+            .display_cache_read(&session, "lineage", 99, &[0])
+            .unwrap();
+        assert!(stale.seed.is_none());
+        assert!(
+            stale.rows.is_empty(),
+            "old-version rows cannot be served as current"
+        );
+        let mut current = DisplayFactsSeed::default();
+        current.through_seq = 1;
+        store
+            .display_cache_publish(
+                &session,
+                "lineage",
+                None,
+                None,
+                &current,
+                &[DisplayFactVersion {
+                    ordinal: 0,
+                    seq: 1,
+                    facts: DisplayFacts {
+                        sender: Some("current".into()),
+                        ..Default::default()
+                    },
+                }],
+            )
+            .unwrap();
+        let rebuilt = store
+            .display_cache_read(&session, "lineage", 1, &[0])
+            .unwrap();
+        assert_eq!(
+            rebuilt.seed.unwrap().version,
+            broca_core::display_facts::DISPLAY_FACTS_VERSION
+        );
+        assert_eq!(rebuilt.rows[&0].sender.as_deref(), Some("current"));
+    }
+
+    #[test]
     fn display_rows_and_completion_marker_commit_atomically_and_keep_snapshot_versions() {
         let root = broca_test_support::scratch_root()
             .join(format!("display-cache-{}", std::process::id()));

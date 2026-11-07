@@ -57,6 +57,17 @@ pub enum StoreReadRequest {
     Entries { from: u64, limit: usize },
     /// The session's ownership, as every authorization path reads it.
     Ownership,
+    /// One `compaction-runner/v1` operation (see `store_entries::serve_compaction`), for the
+    /// session `key` and the daemon-attested route `caller`.
+    Compaction {
+        key: broca_protocol::BindIdentity,
+        caller: Option<String>,
+        method: String,
+        params: Box<serde_json::value::RawValue>,
+    },
+    /// What `session.history` reads about the session besides its pages, resolving the message
+    /// `mid` names when it names one (see `store_entries::HistoryHead`).
+    HistoryHead { mid: Option<String> },
 }
 
 /// What a `session.read` page asks of the session itself.
@@ -73,11 +84,10 @@ pub struct PageRequest {
 
 /// A `session.read` page and what the reply says about the session beside it.
 pub struct PageAnswer {
-    pub page: crate::store_read::StorePage,
+    /// The reply as far as the session decides it (see `store_read::page`).
+    pub response: broca_wire::SessionReadResponse,
     /// Where the page started, counting from 0; `None` for the newest page.
     pub from_ordinal: Option<u64>,
-    pub history_version: u64,
-    pub incarnation: String,
 }
 
 /// The answer to a [`StoreReadRequest`] of the same name.
@@ -90,6 +100,13 @@ pub enum StoreReadReply {
     Page(Result<PageAnswer, ServeError>),
     Entries(Result<Vec<StoredEntry>, ServeError>),
     Ownership(Result<broca_core::SessionOwnershipV1, String>),
+    Compaction(
+        Result<
+            Box<serde_json::value::RawValue>,
+            broca_core::compaction_v2::protocol::wire::Refusal,
+        >,
+    ),
+    HistoryHead(Result<crate::store_entries::HistoryHead, ServeError>),
 }
 
 /// How the session's store actor answered a read.
@@ -198,11 +215,10 @@ pub async fn execute<B: SessionBackend>(
                 .map_err(crate::store_head::head_failed),
         ),
         StoreReadRequest::Page(page) => {
-            StoreReadReply::Page(crate::store_read::page(session, page).await)
+            StoreReadReply::Page(crate::store_read::page(session, ctx.parts, page).await)
         }
         StoreReadRequest::Entries { from, limit } => StoreReadReply::Entries(
-            session
-                .entries(*from, *limit)
+            crate::store_read::served_entries(session, *from, *limit)
                 .await
                 .map_err(crate::store_read::read_failed),
         ),
@@ -212,6 +228,25 @@ pub async fn execute<B: SessionBackend>(
                 ctx.parts,
             )
             .map_err(|error| format!("the session's stored owner can't be read: {error}")),
+        ),
+        StoreReadRequest::Compaction {
+            key,
+            caller,
+            method,
+            params,
+        } => StoreReadReply::Compaction(
+            crate::store_entries::serve_compaction(
+                ctx.parts,
+                Some(session),
+                key,
+                caller.as_deref(),
+                method,
+                params,
+            )
+            .await,
+        ),
+        StoreReadRequest::HistoryHead { mid } => StoreReadReply::HistoryHead(
+            crate::store_entries::history_head_of(session, mid.as_deref()).await,
         ),
     }
 }

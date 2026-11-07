@@ -392,6 +392,7 @@ async fn collect_until_terminal(rx: &mut mpsc::Receiver<Delivery>) -> Vec<Contro
             Delivery::Error(error) => panic!("subscriber replay failed unexpectedly: {error}"),
             Delivery::Expired { .. } => panic!("forever subscriber expired"),
             Delivery::Detached => panic!("subscriber detached unexpectedly (a gap occurred)"),
+            Delivery::CursorExpired => panic!("subscriber cursor unexpectedly expired"),
         }
     }
     units

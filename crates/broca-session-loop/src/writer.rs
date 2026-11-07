@@ -66,6 +66,13 @@ pub trait Writer {
         run_id: &str,
     ) -> Result<Option<broca_session_store::record::RunStart>, SessionError>;
 
+    /// The dispatch intent that recorded the call key `call_key`, sealed or in the open log,
+    /// found through the session's id lookup. `None` when no intent of the session has it.
+    async fn tool_intent(
+        &self,
+        call_key: &str,
+    ) -> Result<Option<broca_session_store::record::ToolIntent>, SessionError>;
+
     /// Seals the session's history before the entry with ordinal `ordinal`, starting the new
     /// open log with `carry` (see `Session::seal_at_entry`).
     async fn seal_at_entry(
@@ -245,6 +252,20 @@ impl<B: SessionBackend> Writer for Session<B> {
             .into_iter()
             .find_map(|(_, record)| match record {
                 Record::RunStart(start) => Some(*start),
+                _ => None,
+            }))
+    }
+
+    async fn tool_intent(
+        &self,
+        call_key: &str,
+    ) -> Result<Option<broca_session_store::record::ToolIntent>, SessionError> {
+        Ok(self
+            .find_id(broca_session_store::idindex::IdKind::CallKey, call_key)
+            .await?
+            .into_iter()
+            .find_map(|(_, record)| match record {
+                Record::ToolIntent(intent) => Some(intent),
                 _ => None,
             }))
     }

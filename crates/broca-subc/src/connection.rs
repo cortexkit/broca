@@ -172,15 +172,15 @@ impl RejectedMessage {
         self
     }
 
-    pub(crate) fn message(&self) -> &str {
+    pub fn message(&self) -> &str {
         &self.message
     }
 
-    pub(crate) fn code(&self) -> &str {
+    pub fn code(&self) -> &str {
         self.code.as_deref().unwrap_or("")
     }
 
-    pub(crate) fn provider_detail(&self) -> Option<&serde_json::Value> {
+    pub fn provider_detail(&self) -> Option<&serde_json::Value> {
         self.detail.as_ref()
     }
 

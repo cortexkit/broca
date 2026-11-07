@@ -86,6 +86,12 @@ pub struct StoreActor<B: SessionBackend> {
     /// after that it carries what holds only for this actor's life, such as whether the
     /// compaction provider was sent Setup yet.
     compaction_session: Arc<broca_core::compaction_v2::session::Session>,
+    /// `session.apply_view` commands waiting for the compaction state, which a run holds while
+    /// it writes through this actor (see `apply_view`).
+    pending_views: Vec<(
+        crate::store_import::ApplyViewCommand,
+        oneshot::Sender<crate::store_import::StoreOutcome>,
+    )>,
     /// The module's stop, once the actor serves in a module: work a send waits on, such as its
     /// input transforms, gives up when it fires.
     seal: CancellationToken,
@@ -259,6 +265,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             stopping: false,
             billing: None,
             compaction_session: Arc::default(),
+            pending_views: Vec::new(),
             seal: CancellationToken::new(),
             settled: None,
         }
@@ -440,6 +447,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                     }
                 }
             }
+            self.retry_views().await;
         }
     }
 
@@ -897,6 +905,13 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 false
             }
             LineageCmd::IdleTick => self.run.is_none(),
+            LineageCmd::Store {
+                command: crate::store_import::StoreCommand::ApplyView(command),
+                reply,
+            } => {
+                self.apply_view_or_wait(*command, reply).await;
+                false
+            }
             LineageCmd::Store { command, reply } => {
                 let (outcome, exit) = self.store_command(command).await;
                 let _ = reply.send(outcome);
@@ -2380,12 +2395,15 @@ fn refuse(command: LineageCmd) {
     }
 }
 
+mod apply_view;
 mod import;
 
 #[cfg(test)]
 mod billing_tests;
 #[cfg(test)]
 mod differential;
+#[cfg(test)]
+mod entries_comparison;
 #[cfg(test)]
 mod import_tests;
 #[cfg(test)]

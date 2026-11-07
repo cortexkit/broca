@@ -448,8 +448,20 @@ impl Module {
     }
 
     /// Each read in `requests`, served and fresh, compared.
+    /// Each read in `requests`, served and fresh, compared; and the reads that don't depend on the
+    /// runs: `session.history`'s head, and the compaction route's `session.entries`.
     async fn compare(&self, requests: &[StoreReadRequest], when: &str) {
-        for request in requests {
+        let route = StoreReadRequest::Compaction {
+            key: self.key.clone(),
+            caller: Some("compactor".into()),
+            method: "session.entries".into(),
+            params: serde_json::value::RawValue::from_string(
+                r#"{"select": {"by": "after"}, "detail": "full"}"#.into(),
+            )
+            .unwrap(),
+        };
+        let session_wide = [StoreReadRequest::HistoryHead { mid: None }, route];
+        for request in requests.iter().chain(&session_wide) {
             let served = shape(self.served(request).await);
             let fresh = shape(self.fresh(request).await);
             assert_eq!(served, fresh, "{when}: {request:?}");
@@ -565,15 +577,17 @@ fn shape(reply: StoreReadReply) -> String {
         },
         StoreReadReply::Page(page) => match page {
             Ok(page) => format!(
-                "{:?} {:?} {:?} {} {}",
-                page.page.page,
-                page.page.mids,
+                "{} {:?}",
+                serde_json::to_value(&page.response).unwrap(),
                 page.from_ordinal,
-                page.history_version,
-                page.incarnation
             ),
             Err(error) => format!("{error:?}"),
         },
+        StoreReadReply::Compaction(answer) => match answer {
+            Ok(answer) => answer.get().to_owned(),
+            Err(refusal) => format!("{refusal:?}"),
+        },
+        StoreReadReply::HistoryHead(head) => format!("{head:?}"),
         StoreReadReply::Entries(entries) => format!("{entries:?}"),
         StoreReadReply::Ownership(ownership) => format!("{ownership:?}"),
         StoreReadReply::RunResult(reply) => match reply {

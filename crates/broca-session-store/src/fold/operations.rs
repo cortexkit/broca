@@ -55,7 +55,9 @@ crate::message! {
         /// A provider took the call to answer later; `Some(true)` when later calls wait for it.
         3 opt held: bool,
         4 opt terminal: CallOutcome,
-        /// The key its intent recorded, which a resume sends it again with.
+        /// The key its intent recorded, which a resume sends it again with. A call answered
+        /// without an intent takes the key its outcome recorded instead; it is bounded with the
+        /// batch's calls.
         5 opt key: String,
         /// The provider's held reply, which a resume rejoins the call's wait with.
         6 opt held_reply: crate::record::ToolHeld,
@@ -120,7 +122,8 @@ impl OpenBatch {
         &self.calls[position].id
     }
 
-    /// The key the intent of the planned call at `position` recorded, if it has one.
+    /// The key the intent of the planned call at `position` recorded, or for a call answered
+    /// without an intent the key its outcome recorded, if it has one.
     pub fn key(&self, position: usize) -> Option<&str> {
         self.calls[position].key.as_deref()
     }
@@ -1535,6 +1538,10 @@ impl Operations {
                     .and_then(|batch| batch.first_open(&outcome.tool_call_id))
                 {
                     call.terminal = Some(outcome.outcome);
+                    // A call answered without a dispatch intent has its key on its outcome.
+                    if call.key.is_none() {
+                        call.key.clone_from(&outcome.call_key);
+                    }
                 }
                 if outcome.outcome == CallOutcome::Unknown {
                     run.unknown.push(outcome.tool_call_id.clone());

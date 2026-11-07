@@ -2010,6 +2010,8 @@ pub enum WalRecord {
     /// consumes it (naming its `submission_id`) is its delivery.
     SendDelivered {
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        ride: Option<RideMetadata>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         written_at_ms: Option<u64>,
         submission_id: SubmissionId,
         run_id: RunId,
@@ -3310,6 +3312,10 @@ impl WalRecord {
             | WalRecord::LateApprovalRecorded { .. }
             | WalRecord::LateDispatchIntent { .. }
             | WalRecord::LateResult { .. } => &[DEFERRED_CALL_FEATURE],
+            WalRecord::SendDelivered { ride: Some(_), .. } => &[
+                crate::framing::DELIVERY_ORDER_FEATURE,
+                crate::framing::RIDES_V2_FEATURE,
+            ],
             WalRecord::DeliveryOrdered { .. }
             | WalRecord::SendEnded { .. }
             | WalRecord::SendDelivered { .. } => &[crate::framing::DELIVERY_ORDER_FEATURE],
@@ -7292,4 +7298,44 @@ mod bill_attempt_tests {
             std::fs::write(output.join("SHA256SUMS"), sums).unwrap();
         }
     }
+}
+
+#[cfg(test)]
+mod ride_record_bytes {
+    #[test]
+    fn legacy_send_delivered_bytes_are_frozen() {
+        let record = super::WalRecord::SendDelivered {
+            ride: None,
+            written_at_ms: Some(123),
+            submission_id: broca_protocol::SubmissionId("submission".into()),
+            run_id: broca_protocol::RunId("run".into()),
+            mode: broca_protocol::DeliveryMode::ToolResult,
+            input: None,
+            tool_call_id: Some(broca_protocol::ToolCallId("call".into())),
+            appended_text: Some("\n\n note\n☃ ".into()),
+            tags: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&record).unwrap(),
+            r#"{"type":"send_delivered","written_at_ms":123,"submission_id":"submission","run_id":"run","mode":"tool_result","tool_call_id":"call","appended_text":"\n\n note\n☃ "}"#
+        );
+    }
+}
+
+/// Rendering authority frozen on an individual riding send. Legacy deliveries omit the
+/// envelope and retain their historical renderer, even in a newly started run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RideMetadata {
+    pub call_key: String,
+    pub send_id: String,
+    pub sender: String,
+    pub forms: Vec<String>,
+    pub form: RideForm,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RideForm {
+    Append,
 }

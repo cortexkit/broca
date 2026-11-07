@@ -14,10 +14,7 @@ fn stored_snapshot() -> ProjectionSnapshot {
         watermark: 19,
         lineage_id: Some("old-lineage".into()),
         next_ord: 7,
-        previous_control_head: Some(Cursor {
-            wal_seq: 18,
-            sub_index: 2,
-        }),
+        previous_control_head: Some(Cursor::new(18, 2)),
     }
 }
 

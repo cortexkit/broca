@@ -2920,6 +2920,37 @@ pub fn replay_seeded_at_validated_boundary(
     tag_seed: crate::tags::TagSeed,
     held_steers: Vec<Message>,
 ) -> Result<ReplayState, SeedFallback> {
+    replay_seeded_at_validated_boundary_with_identity(
+        read_at,
+        boundary,
+        tail,
+        seed_origin,
+        seed_run_id,
+        seed_budget,
+        seed_budget_state,
+        ordinal_base,
+        require_caller_text,
+        tag_seed,
+        held_steers,
+    )
+    .map(|(state, _)| state)
+}
+
+/// Retain the source-frame identity from boundary verification for read-to-subscribe cursors.
+#[allow(clippy::too_many_arguments)]
+pub fn replay_seeded_at_validated_boundary_with_identity(
+    read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+    boundary: &SeedBoundary,
+    tail: &[PositionedFrame],
+    seed_origin: Option<broca_protocol::request::ModelHandle>,
+    seed_run_id: Option<RunId>,
+    seed_budget: Option<BudgetConfig>,
+    seed_budget_state: Option<crate::BudgetReplayStateV1>,
+    ordinal_base: u64,
+    require_caller_text: bool,
+    tag_seed: crate::tags::TagSeed,
+    held_steers: Vec<Message>,
+) -> Result<(ReplayState, broca_wal::framing::CursorFrameIdentity), SeedFallback> {
     if !boundary.qualified {
         return Err(SeedFallback::new("unqualified boundary"));
     }
@@ -3014,6 +3045,13 @@ pub fn replay_seeded_at_validated_boundary(
         tag_seed.into(),
         held_steers,
     )
+    .map(|state| {
+        (
+            state,
+            broca_wal::framing::cursor_frame_identity(frame_bytes)
+                .expect("verified boundary record"),
+        )
+    })
     .map_err(|_| SeedFallback::new("tail replay refused the seeded records"))
 }
 
@@ -3859,6 +3897,7 @@ fn replay_seeded_with_compaction<'a>(
             // message. The stored `ToolResult` record itself is never changed.
             WalRecord::SendDelivered {
                 submission_id,
+                ride,
                 input,
                 tool_call_id,
                 appended_text,
@@ -3895,7 +3934,16 @@ fn replay_seeded_with_compaction<'a>(
                 }
                 if let (Some(tool_call_id), Some(text)) = (tool_call_id, appended_text) {
                     if mode3 != Some(true) {
-                        crate::delivery_order::apply_to_prompt(&mut prompt, tool_call_id, text);
+                        if let Some(ride) = ride {
+                            crate::delivery_order::apply_ride_to_prompt(
+                                &mut prompt,
+                                tool_call_id,
+                                ride,
+                                text,
+                            );
+                        } else {
+                            crate::delivery_order::apply_to_prompt(&mut prompt, tool_call_id, text);
+                        }
                     }
                     if let Some(index) = prompt.iter().rposition(|message| {
                         message.content.iter().any(|block| matches!(block,

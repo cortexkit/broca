@@ -111,6 +111,7 @@ fn outcome(id: &str, outcome: CallOutcome) -> Record {
         finished_at_ms: None,
         detail: None,
         hooks: None,
+        call_key: None,
     })
 }
 
@@ -161,6 +162,40 @@ fn a_call_never_sent_resumes_and_an_unknown_outcome_interrupts() {
         }),
     ];
     assert_eq!(resolution(&unknown), Resolution::Interrupted(ids(&["a"])));
+}
+
+/// A call answered without a dispatch intent takes its key from its outcome; a dispatched call
+/// keeps its intent's key whatever its outcome carries.
+#[test]
+fn an_outcome_keys_only_a_call_without_an_intent() {
+    let keyed = |id: &str, key: &str| {
+        let mut record = outcome(id, CallOutcome::NotDispatched);
+        if let Record::ToolOutcome(outcome) = &mut record {
+            outcome.call_key = Some(key.into());
+        }
+        record
+    };
+    let mut dispatched = intent("a");
+    if let Record::ToolIntent(intent) = &mut dispatched {
+        intent.call_key = Some("intent-key".into());
+    }
+    let operations = fold(&[
+        start(),
+        step_start(),
+        step_end(3, false),
+        batch(&["a", "b", "c"]),
+        dispatched,
+        keyed("a", "outcome-key"),
+        keyed("b", "g1.9"),
+    ])
+    .unwrap();
+    let batch = operations.run.unwrap().open_batch.unwrap();
+    assert_eq!(
+        (0..3)
+            .map(|position| batch.key(position))
+            .collect::<Vec<_>>(),
+        [Some("intent-key"), Some("g1.9"), None]
+    );
 }
 
 #[test]

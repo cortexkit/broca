@@ -49,6 +49,7 @@ pub enum DbError {
     Sqlite(rusqlite::Error),
     Projection(broca_core::projection_plan::ProjectionPlanError),
     Invalid(String),
+    CursorIdentityUnavailable(String),
     SeedFallback(broca_core::replay::SeedFallback),
 }
 
@@ -60,6 +61,7 @@ impl std::fmt::Display for DbError {
             Self::Sqlite(e) => e.fmt(f),
             Self::Projection(e) => e.fmt(f),
             Self::Invalid(e) => f.write_str(e),
+            Self::CursorIdentityUnavailable(e) => write!(f, "cursor_identity_unavailable: {e}"),
             Self::SeedFallback(e) => f.write_str(e.reason),
         }
     }

@@ -38,6 +38,7 @@ pub struct RawPageSnapshot {
     pub retention_activity_ms: Option<u64>,
     pub tools: Option<(RunId, std::sync::Arc<Vec<broca_protocol::request::Tool>>)>,
     pub dispatches: BTreeMap<u64, Vec<broca_core::ToolCallDispatch>>,
+    pub native_tool_outputs: broca_core::display_facts::NativeToolOutputs,
 }
 
 /// Ephemeral media metadata from the raw page's authenticated log snapshot.
@@ -327,6 +328,127 @@ fn invalid(reason: impl Into<String>) -> DbError {
     DbError::Invalid(reason.into())
 }
 
+pub(super) fn optional_head_identity(
+    cursor: broca_core::Cursor,
+    qualify: impl FnOnce() -> Result<broca_core::Cursor, DbError>,
+) -> Result<broca_core::Cursor, DbError> {
+    match qualify() {
+        Err(DbError::CursorIdentityUnavailable(reason)) => {
+            static NOTICE: std::sync::Once = std::sync::Once::new();
+            NOTICE.call_once(|| tracing::warn!(target: "session", wal_seq = cursor.wal_seq, reason, "head cursor identity unavailable; serving the position without resume identity"));
+            Ok(cursor)
+        }
+        result => result,
+    }
+}
+
+pub(super) fn cursor_identity_in_tool_turn(
+    read: &ReadAt<'_>,
+    seq: u64,
+    lo_seq: u64,
+    lo_off: u64,
+    hi_off: u64,
+    durable_end: u64,
+) -> Result<broca_wal::framing::CursorFrameIdentity, DbError> {
+    use broca_wal::framing::{
+        cursor_frame_identity, decode_v4_header, HEADER_LEN, MAX_PAYLOAD_LEN,
+    };
+    let unavailable = |reason: &str| DbError::CursorIdentityUnavailable(reason.into());
+    if lo_off >= hi_off || hi_off > durable_end || lo_seq > seq {
+        return Err(unavailable(
+            "stored head is outside its indexed tool-turn span",
+        ));
+    }
+    // The stored-head reread is bounded by one tool turn's span: a message row
+    // keeps only (lo_seq, lo_off, hi_off), not an offset for every frame in the turn.
+    let mut off = lo_off;
+    let mut expected = lo_seq;
+    while off < hi_off {
+        if hi_off - off < HEADER_LEN as u64 {
+            return Err(unavailable("short tool-turn cursor header"));
+        }
+        let mut bytes = access_counter::read_at(read, off, HEADER_LEN as u64)?;
+        if bytes.len() != HEADER_LEN {
+            return Err(unavailable("short tool-turn cursor header"));
+        }
+        let payload = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as u64;
+        if payload > MAX_PAYLOAD_LEN as u64 {
+            return Err(unavailable("oversized tool-turn cursor frame"));
+        }
+        let v4 = bytes[4] == broca_wal::framing::V4_FRAMING_VERSION;
+        let header_len = if v4 {
+            83 + u16::from_le_bytes(bytes[45..47].try_into().unwrap()) as u64
+        } else {
+            HEADER_LEN as u64
+        };
+        let frame_len = header_len + payload;
+        if frame_len > hi_off - off {
+            return Err(unavailable("tool-turn cursor frame exceeds indexed span"));
+        }
+        let extra = if v4 {
+            header_len - HEADER_LEN as u64
+        } else {
+            payload
+        };
+        bytes.extend(access_counter::read_at(
+            read,
+            off + HEADER_LEN as u64,
+            extra,
+        )?);
+        if bytes.len() as u64 != HEADER_LEN as u64 + extra {
+            return Err(unavailable("short tool-turn cursor frame"));
+        }
+        let frame_seq = if v4 {
+            let header = decode_v4_header(&bytes)
+                .map_err(|_| unavailable("invalid tool-turn cursor header"))?
+                .ok_or_else(|| unavailable("short tool-turn cursor header"))?;
+            header.metadata.seq
+        } else {
+            // Legacy v1/v3 headers carry no checksum of their own, so verifying
+            // them needs their payloads too, still wholly within this turn's span.
+            match access_counter::decode_next(&bytes) {
+                DecodeStep::Record { framed, consumed } if consumed == bytes.len() => framed.seq,
+                DecodeStep::Lineage { consumed, .. } if consumed == bytes.len() => {
+                    off += frame_len;
+                    continue;
+                }
+                _ => return Err(unavailable("invalid legacy tool-turn cursor frame")),
+            }
+        };
+        if frame_seq != expected {
+            return Err(unavailable("tool-turn cursor sequence gap"));
+        }
+        if frame_seq == seq {
+            if v4 {
+                bytes.extend(access_counter::read_at(read, off + header_len, payload)?);
+            }
+            match access_counter::decode_next(&bytes) {
+                DecodeStep::Record { framed, consumed }
+                    if consumed as u64 == frame_len
+                        && framed.seq == seq
+                        && matches!(framed.record, WalRecord::ToolBatchFinished { .. }) =>
+                {
+                    return cursor_frame_identity(&bytes)
+                        .ok_or_else(|| unavailable("tool-turn cursor identity missing"));
+                }
+                _ => {
+                    return Err(unavailable(
+                        "stored tool-turn head does not name ToolBatchFinished",
+                    ))
+                }
+            }
+        }
+        if frame_seq > seq {
+            break;
+        }
+        expected += 1;
+        off += frame_len;
+    }
+    Err(unavailable(
+        "stored cursor frame is absent from indexed tool-turn span",
+    ))
+}
+
 /// The cache is operation-local: repeated metadata/message locators share one checked read.
 struct Sources<'a> {
     read: &'a ReadAt<'a>,
@@ -569,26 +691,27 @@ fn page(
         .ok_or_else(|| invalid("invalid raw locator seed"))?;
     // This is the only seeded replay entry. Even fully indexed pages authenticate
     // their qualified boundary and contiguous durable tail before exposing SQL rows.
-    let replayed = broca_core::replay::replay_seeded_at_validated_boundary(
-        read,
-        &boundary,
-        &tail,
-        current.as_ref().and_then(|f| match &f.record {
-            WalRecord::RunStarted { config, .. } => Some(config.model.clone()),
-            _ => None,
-        }),
-        current.as_ref().and_then(|f| match &f.record {
-            WalRecord::RunStarted { run_id, .. } => Some(run_id.clone()),
-            _ => None,
-        }),
-        budget,
-        None,
-        ordinal_base,
-        false,
-        tag_seed,
-        Vec::new(),
-    )
-    .map_err(DbError::SeedFallback)?;
+    let (replayed, boundary_identity) =
+        broca_core::replay::replay_seeded_at_validated_boundary_with_identity(
+            read,
+            &boundary,
+            &tail,
+            current.as_ref().and_then(|f| match &f.record {
+                WalRecord::RunStarted { config, .. } => Some(config.model.clone()),
+                _ => None,
+            }),
+            current.as_ref().and_then(|f| match &f.record {
+                WalRecord::RunStarted { run_id, .. } => Some(run_id.clone()),
+                _ => None,
+            }),
+            budget,
+            None,
+            ordinal_base,
+            false,
+            tag_seed,
+            Vec::new(),
+        )
+        .map_err(DbError::SeedFallback)?;
     let compaction_sources: u64 = tx.query_row(
         "SELECT count(*) FROM source_auth WHERE sid=?1",
         [key],
@@ -664,6 +787,7 @@ fn page(
         .unwrap_or_else(|| broca_core::is_mode3_log(first.iter().map(|frame| &frame.record)));
     let mut messages = Vec::new();
     let mut dispatches = BTreeMap::new();
+    let mut native_tool_outputs = BTreeMap::new();
     for (ordinal, source) in rows {
         if source.input_start.checked_add(1) != Some(source.input_end) {
             return Err(invalid("raw message sub-index range invalid"));
@@ -691,6 +815,17 @@ fn page(
             .transpose()?;
         let (mut message, written_at, completed_at, created_at, turn) =
             hydrate_message(&frames, &source, started.as_ref(), mode3)?;
+        // The disabled broca-state/2 indexed reader omits SendDelivered after ToolBatchFinished,
+        // so delivered_as is missing and deliveries without a ride envelope remain unjoined.
+        if message.role == Role::Tool {
+            if let Some(outputs) =
+                broca_core::display_facts::native_tool_outputs(&frames, &lineage.to_string())
+                    .map_err(invalid)?
+                    .remove(&source.input_start)
+            {
+                native_tool_outputs.insert(ordinal, outputs);
+            }
+        }
         if source.flags & 2 != 0 {
             let mut high = source
                 .tag_base
@@ -866,14 +1001,33 @@ fn page(
     } else {
         None
     };
+    let control_head = broca_core::last_control_cursor_through(&tail_frames, None).or(seed
+        .qualified_control_head
+        .map(|(seq, sub)| broca_core::Cursor::new(seq, sub)));
+    let control_head = control_head.map(|cursor| optional_head_identity(cursor, || {
+        let identity = if cursor.wal_seq == boundary.seq {
+            boundary_identity
+        } else if let Some(frame) = tail.iter().find(|frame| frame.framed.seq == cursor.wal_seq) {
+            let offset = (frame.off - boundary.frame_end) as usize;
+            broca_wal::framing::cursor_frame_identity(&tail_bytes[offset..]).ok_or_else(|| DbError::CursorIdentityUnavailable("verified tail frame has no identity".into()))?
+        } else {
+            // TurnFinished adds no control unit. Its stored head names an earlier
+            // ToolBatchFinished within the last tool turn's indexed source span.
+            let span: Option<(u64, u64, u64)> = tx.query_row(
+                "SELECT lo_seq,lo_off,hi_off FROM message WHERE sid=?1 AND lo_seq<=?2 ORDER BY ord DESC LIMIT 1",
+                params![key, cursor.wal_seq], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            ).optional()?;
+            let (lo_seq, lo_off, hi_off) = span.ok_or_else(|| DbError::CursorIdentityUnavailable("stored head has no indexed tool-turn span".into()))?;
+            cursor_identity_in_tool_turn(read, cursor.wal_seq, lo_seq, lo_off, hi_off, session.end)?
+        };
+        Ok::<_, DbError>(cursor.with_frame_identity(lineage, identity))
+    })).transpose()?;
     Ok(RawPageSnapshot {
         index_validated: true,
         page: SessionReadPage {
             messages,
             next_from_ordinal: (end < count).then_some(end),
-            head: broca_core::last_control_cursor_through(&tail_frames, None).or(seed
-                .qualified_control_head
-                .map(|(seq, sub)| broca_core::Cursor::new(seq, sub))),
+            head: control_head,
             lineage_id,
             lineage_state: state_page.lineage_state,
             prompt_len: count,
@@ -890,6 +1044,7 @@ fn page(
         retention_activity_ms: seed.frozen_policy.and(seed.last_activity_ms),
         tools,
         dispatches,
+        native_tool_outputs,
     })
 }
 
@@ -1044,6 +1199,10 @@ fn full_page(
 ) -> Result<RawPageSnapshot, DbError> {
     let bytes = access_counter::read_at(read, 0, publication.byte_end())?;
     let positioned = decode(&bytes, 0)?;
+    let offsets: Vec<_> = positioned
+        .iter()
+        .map(|frame| (frame.framed.seq, frame.off))
+        .collect();
     let frames: Vec<_> = positioned.into_iter().map(|p| p.framed).collect();
     let (mut page, dispatches) = broca_core::read_session_page_owned_with_dispatches(
         StorePageSnapshot::empty(),
@@ -1056,6 +1215,16 @@ fn full_page(
         DecodeStep::Lineage { lineage_id, .. } => Some(lineage_id),
         _ => None,
     };
+    if let (Some(cursor), Some(lineage)) = (page.head, page.lineage_id) {
+        let off = offsets
+            .iter()
+            .find(|(seq, _)| *seq == cursor.wal_seq)
+            .expect("projected cursor frame was decoded")
+            .1;
+        let identity = broca_wal::framing::cursor_frame_identity(&bytes[off as usize..])
+            .expect("verified record frame");
+        page.head = Some(cursor.with_frame_identity(lineage, identity));
+    }
     let mut head = broca_core::head::HeadProjection::default();
     for frame in &frames {
         head.observe(&frame.record);
@@ -1111,6 +1280,11 @@ fn full_page(
         .flatten();
     Ok(RawPageSnapshot {
         index_validated,
+        native_tool_outputs: broca_core::display_facts::native_tool_outputs(
+            &frames,
+            &publication.lineage().to_string(),
+        )
+        .map_err(invalid)?,
         page,
         dispatches,
         at_seq: publication.sequence(),
@@ -1121,4 +1295,130 @@ fn full_page(
         retention_activity_ms: None,
         tools,
     })
+}
+
+#[cfg(test)]
+mod cursor_span_tests {
+    use super::*;
+
+    #[test]
+    fn a_head_survives_an_unavailable_cursor_identity_but_not_other_read_errors() {
+        let cursor = broca_core::Cursor::new(12, 0);
+        let head = optional_head_identity(cursor, || {
+            Err(DbError::CursorIdentityUnavailable("missing span".into()))
+        })
+        .unwrap();
+        assert_eq!(head, cursor);
+        assert!(head.frame_identity().is_none());
+        assert!(matches!(
+            optional_head_identity(cursor, || Err(DbError::Invalid("corrupt page".into()))),
+            Err(DbError::Invalid(_))
+        ));
+    }
+
+    fn fixture(
+        prefix: usize,
+        v4: bool,
+    ) -> (Vec<u8>, u64, u64, broca_wal::framing::CursorFrameIdentity) {
+        let records = [
+            serde_json::from_value(serde_json::json!({"type":"tool_batch_finished","batch_id":"earlier"})).unwrap(),
+            serde_json::from_value(serde_json::json!({"type":"tool_result","batch_id":"b","outcome":"completed","result":{"tool_call_id":"c","output":{"kind":"text","text":"R".repeat(128 * 1024)},"is_error":false}})).unwrap(),
+            serde_json::from_value(serde_json::json!({"type":"tool_batch_finished","batch_id":"b"})).unwrap(),
+        ];
+        let mut bytes = vec![0x99; prefix];
+        let lo = bytes.len() as u64;
+        let mut identity = None;
+        for (i, record) in records.iter().enumerate() {
+            let seq = 10 + i as u64;
+            let encoded = if v4 {
+                broca_wal::framing::encode_v4(
+                    broca_wal::framing::V4FrameMetadata {
+                        seq,
+                        fence: 1,
+                        appended_ms: 1,
+                        writer_id: [1; 16],
+                    },
+                    &[],
+                    record,
+                )
+                .unwrap()
+            } else {
+                broca_wal::framing::encode(seq, 1, record).unwrap()
+            };
+            if seq == 12 {
+                identity = broca_wal::framing::cursor_frame_identity(&encoded);
+            }
+            bytes.extend(encoded);
+        }
+        let hi = bytes.len() as u64;
+        bytes.extend(vec![0x77; 4096]);
+        (bytes, lo, hi, identity.unwrap())
+    }
+
+    fn span_cost(v4: bool) {
+        let mut costs = Vec::new();
+        let mut lengths = Vec::new();
+        for prefix in [16 * 1024, 4 * 1024 * 1024] {
+            let (bytes, lo, hi, expected) = fixture(prefix, v4);
+            lengths.push(bytes.len());
+            let total = std::cell::Cell::new(0);
+            let read = |off: u64, len: u64| {
+                assert!(
+                    off >= lo && off + len <= hi,
+                    "cursor walk escaped indexed turn: {off}+{len}, span {lo}..{hi}"
+                );
+                total.set(total.get() + len);
+                Ok(bytes[off as usize..(off + len) as usize].to_vec())
+            };
+            let identity =
+                cursor_identity_in_tool_turn(&read, 12, 10, lo, hi, bytes.len() as u64).unwrap();
+            assert_eq!(
+                identity, expected,
+                "the digest must come from ToolBatchFinished, not the next boundary"
+            );
+            if v4 {
+                assert!(
+                    total.get() < (hi - lo) / 100,
+                    "v4 walk read the large result payload"
+                );
+            } else {
+                assert_eq!(
+                    total.get(),
+                    hi - lo,
+                    "legacy verification must read exactly the turn span"
+                );
+            }
+            costs.push(total.get());
+        }
+        assert!(lengths[1] >= lengths[0] * 10);
+        assert_eq!(costs[0], costs[1]);
+    }
+
+    #[test]
+    fn stored_head_v4_walk_skips_large_result_and_reads_only_indexed_turn_span() {
+        span_cost(true);
+    }
+
+    #[test]
+    fn stored_head_legacy_walk_verifies_payloads_only_within_indexed_turn_span() {
+        span_cost(false);
+    }
+
+    #[test]
+    fn stored_head_walk_refuses_missing_target_and_corrupt_header() {
+        let (mut bytes, lo, hi, _) = fixture(512, true);
+        let read = |off: u64, len: u64| Ok(bytes[off as usize..(off + len) as usize].to_vec());
+        let error =
+            cursor_identity_in_tool_turn(&read, 13, 10, lo, hi, bytes.len() as u64).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("cursor_identity_unavailable: stored cursor frame is absent"));
+        bytes[lo as usize + 20] ^= 1;
+        let read = |off: u64, len: u64| Ok(bytes[off as usize..(off + len) as usize].to_vec());
+        let error =
+            cursor_identity_in_tool_turn(&read, 12, 10, lo, hi, bytes.len() as u64).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("cursor_identity_unavailable: invalid tool-turn cursor header"));
+    }
 }

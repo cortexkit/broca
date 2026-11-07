@@ -372,6 +372,7 @@ impl<B: SessionBackend> Session<B> {
                         finished_at_ms: Some(now_ms),
                         detail: None,
                         hooks: None,
+                        call_key: None,
                     }));
                 }
                 if open_turn.contains(id) && !has_reply {
