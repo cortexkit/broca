@@ -167,6 +167,7 @@ impl From<HeadError> for ImportRefusal {
 pub enum StoreCommand {
     Import(Box<ImportCommand>),
     InstallView(Box<InstallViewCommand>),
+    ApplyView(Box<ApplyViewCommand>),
 }
 
 /// `session.import` with a file source, as the serve layer hands it over.
@@ -188,11 +189,21 @@ pub struct InstallViewCommand {
     pub principal: BindPrincipal,
 }
 
+/// `session.apply_view` on the `compaction-runner/v1` route, once the route admitted its caller
+/// as the session's compaction provider and read the view.
+#[derive(Clone)]
+pub struct ApplyViewCommand {
+    pub view: Box<serde_json::value::RawValue>,
+}
+
 /// How the store actor answered a [`StoreCommand`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StoreOutcome {
     Imported(FileImportReply),
     ViewInstalled(InstallViewReply),
+    /// `session.apply_view`'s answer, as the route returns it: the view accepted, or refused
+    /// with the provider rules' refusal.
+    ViewApplied(String),
     Refused(ImportRefusal),
     /// The session closed under the command: route it again.
     Reopen,

@@ -200,6 +200,8 @@ struct Side {
     registry: LineageRegistry,
     key: BindIdentity,
     gate: Option<Arc<Notify>>,
+    /// The scripted provider this side's runs call, which keeps the requests they sent.
+    provider: broca_core::provider::StubProvider,
 }
 
 impl Drop for Side {
@@ -219,6 +221,17 @@ async fn side(
     gated: bool,
     compaction: bool,
 ) -> Side {
+    side_idling(store, steps, gated, compaction, IDLE).await
+}
+
+/// [`side`], whose sessions close after `idle` without a command.
+async fn side_idling(
+    store: bool,
+    steps: Vec<Vec<NormalizedEvent>>,
+    gated: bool,
+    compaction: bool,
+    idle: Duration,
+) -> Side {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let dir = broca_test_support::scratch_root().join(format!(
@@ -229,8 +242,9 @@ async fn side(
     let _ = std::fs::remove_dir_all(&dir);
     let gate = gated.then(|| Arc::new(Notify::new()));
     let wal = Arc::new(FileWalStore::new(dir.join("wal")));
+    let provider = broca_core::provider::StubProvider::new(steps.clone());
     let scripted = || Gated {
-        inner: broca_core::provider::StubProvider::new(steps.clone()),
+        inner: provider.clone(),
         gate: gate.clone(),
     };
     let executor: Arc<dyn RunExecutor> = Arc::new(Loops {
@@ -243,7 +257,7 @@ async fn side(
         &dir,
         broca_session_store::keys::DeploymentKey::new(1, &[7; 32]),
         Arc::clone(&executor),
-        IDLE,
+        idle,
     )
     .await
     .unwrap();
@@ -254,7 +268,7 @@ async fn side(
                 wal.clone(),
                 executor,
             )
-            .with_idle_ttl(IDLE)
+            .with_idle_ttl(idle)
             .with_store_runtime(Arc::new(runtime)),
         ),
         wal,
@@ -271,6 +285,7 @@ async fn side(
         registry,
         key,
         gate,
+        provider,
     }
 }
 
@@ -775,13 +790,24 @@ fn untooled(text: &str) -> SubmissionRequest {
 /// `ck-mc` and, when `renders`, renders part numbers: two runs, the second with a tool turn, and
 /// replies carrying part-number notation.
 async fn contract_sessions(renders: bool) -> (Side, Side) {
-    let steps = vec![
+    contract_sessions_with(renders, Vec::new(), IDLE).await
+}
+
+/// [`contract_sessions`], with `more` steps scripted after its two runs' and sessions that
+/// close after `idle` without a command.
+async fn contract_sessions_with(
+    renders: bool,
+    more: Vec<Vec<NormalizedEvent>>,
+    idle: Duration,
+) -> (Side, Side) {
+    let mut steps = vec![
         text_step("a1", "§2§ Done."),
         tool_step("a2"),
         text_step("a3", "§5§ §6§ It says file contents."),
     ];
-    let today = side(false, steps.clone(), false, true).await;
-    let store = side(true, steps, false, true).await;
+    steps.extend(more);
+    let today = side_idling(false, steps.clone(), false, true, idle).await;
+    let store = side_idling(true, steps, false, true, idle).await;
     for side in [&today, &store] {
         assert!(matches!(
             side.send_request(
@@ -952,16 +978,16 @@ async fn the_compaction_route_serves_the_frozen_provider_alike() {
     );
     assert_eq!(new, old, "session.entries by ids");
     assert_eq!(new.unwrap()["entries"].as_array().unwrap().len(), 3);
-    // Accepting a pushed view is the session writer's, which the store actor doesn't take yet.
-    let apply = store
-        .compaction(Some("ck-mc"), "session.apply_view", json!({"view": {}}))
-        .await
-        .unwrap_err();
-    assert_eq!(
-        apply["code"],
-        json!(crate::store_entries::NOT_SERVED_ON_NEW_STORAGE)
-    );
-    assert_eq!(apply["detail"]["method"], json!("session.apply_view"));
+    // A view that isn't one is refused alike, before either storage reads the session.
+    let params = json!({"view": {}});
+    let old = today
+        .compaction(Some("ck-mc"), "session.apply_view", params.clone())
+        .await;
+    let new = store
+        .compaction(Some("ck-mc"), "session.apply_view", params)
+        .await;
+    assert_eq!(new, old);
+    assert_eq!(new.unwrap_err()["code"], json!("invalid_params"));
 }
 
 /// `session.entries` pages the session's entries exactly as today's paging pages the whole
@@ -1538,4 +1564,82 @@ async fn dump_head_import_entries() {
         }
         std::fs::write(written.join("SHA256SUMS"), sums).unwrap();
     }
+}
+
+/// A view the compaction provider applies while the session is idle between runs is accepted
+/// alike by both storages and answered alike on a retry, a view naming a message the session
+/// doesn't hold is refused alike, and the next run's first request renders the accepted view
+/// alike. The store session stays open from the apply to that run, so the view reaches it
+/// through the compaction state the actor keeps, not a reload.
+#[tokio::test]
+async fn an_idle_apply_view_reaches_the_next_runs_first_step_as_today() {
+    use broca_core::compaction_v2::protocol::view::{Edit, EditOp, View};
+    let (today, store) = contract_sessions_with(
+        false,
+        vec![text_step("a4", "after the view")],
+        Duration::from_secs(60),
+    )
+    .await;
+    let drop = |version: u64, mid: String| {
+        View::seal(
+            version,
+            vec![Edit::new(version, EditOp::Drop { mid, part: None })],
+        )
+    };
+    let mut answers = Vec::new();
+    for side in [&today, &store] {
+        let apply = |view: View| {
+            side.compaction(Some("ck-mc"), "session.apply_view", json!({ "view": view }))
+        };
+        // The first run's reply, entry 2.
+        let reply = entry_mids(side).await[&2].clone();
+        let first = apply(drop(1, reply.clone())).await;
+        let retry = apply(drop(1, reply)).await;
+        let unknown = apply(drop(2, "no-such-message".into())).await;
+        answers.push((first, retry, unknown));
+    }
+    assert_eq!(answers[1], answers[0], "the store answers as today's");
+    assert_eq!(answers[0].0, Ok(json!({"answer": "accepted"})));
+    for refused in [&answers[0].1, &answers[0].2] {
+        assert!(
+            matches!(refused, Ok(answer) if answer["answer"] == "refused"),
+            "{refused:?}"
+        );
+    }
+    for side in [&today, &store] {
+        assert!(matches!(
+            side.send_request("r3", untooled("again"), Some(planned("plan-1", None)))
+                .await,
+            SendOutcome::Active { .. } | SendOutcome::Pending { .. }
+        ));
+        side.settled("r3").await;
+        side.assert_completed("r3").await;
+    }
+    // r3's first step is the provider's fourth request.
+    let prompt = |side: &Side| serde_json::to_value(&side.provider.calls()[3].prompt).unwrap();
+    assert_eq!(prompt(&store), prompt(&today));
+    assert!(
+        !prompt(&store).to_string().contains("Done."),
+        "the view dropped the first reply: {}",
+        prompt(&store)
+    );
+    let session = store
+        .registry
+        .store_runtime()
+        .unwrap()
+        .view(&store.key)
+        .await
+        .unwrap()
+        .unwrap();
+    let applied: Vec<u64> = session
+        .open_log_records()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|(_, record)| match record {
+            broca_session_store::record::Record::ViewApplied(applied) => Some(applied.version),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(applied, [1], "r3's first step applied the view");
 }

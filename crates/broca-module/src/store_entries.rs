@@ -145,20 +145,7 @@ pub async fn serve_compaction<B: SessionBackend>(
     method: &str,
     params: &RawValue,
 ) -> Result<Box<RawValue>, Refusal> {
-    // A session whose creation never committed holds no run, so it isn't on the contract, as
-    // today's storage reads a session with no log.
-    let Some(session) = session else {
-        return Err(Refusal::compaction_not_permitted(
-            not_permitted_reasons::SESSION_NOT_HELD,
-        ));
-    };
-    let contract = on_contract(session);
-    let provider = if contract {
-        frozen_provider(parts, session).map_err(internal)?
-    } else {
-        None
-    };
-    broca_core::compaction_v2::authority::check_bind(contract, provider.as_deref(), caller)?;
+    let session = admit(parts, session, caller)?;
     match method {
         "bind" => to_raw_value(&serde_json::json!({})).map_err(|error| internal(error.to_string())),
         "session.entries" => {
@@ -188,12 +175,81 @@ pub async fn serve_compaction<B: SessionBackend>(
             };
             to_raw_value(&answer).map_err(|error| internal(error.to_string()))
         }
+        // Applied by the session's actor (`apply_view`): a caller that holds no actor, such as
+        // the converter's check over a session built in memory, can't apply one.
         "session.apply_view" => Err(Refusal::new(
             NOT_SERVED_ON_NEW_STORAGE,
-            "session.apply_view is not served yet for a session kept in the new storage",
+            "session.apply_view is applied by the session's actor",
             Some(serde_json::json!({ "method": method })),
         )),
         _ => Err(Refusal::unknown_method(method)),
+    }
+}
+
+/// The route's admission, as every method of it is admitted: only the compaction provider the
+/// plan in force names, on a session on the current compaction contract. The session, once
+/// admitted.
+fn admit<'s, B: SessionBackend>(
+    parts: &dyn Parts,
+    session: Option<&'s Session<B>>,
+    caller: Option<&str>,
+) -> Result<&'s Session<B>, Refusal> {
+    // A session whose creation never committed holds no run, so it isn't on the contract, as
+    // today's storage reads a session with no log.
+    let Some(session) = session else {
+        return Err(Refusal::compaction_not_permitted(
+            not_permitted_reasons::SESSION_NOT_HELD,
+        ));
+    };
+    let contract = on_contract(session);
+    let provider = if contract {
+        frozen_provider(parts, session).map_err(internal)?
+    } else {
+        None
+    };
+    broca_core::compaction_v2::authority::check_bind(contract, provider.as_deref(), caller)?;
+    Ok(session)
+}
+
+/// `session.apply_view` on the route, for the session `key` kept in the new storage: admitted
+/// and read as today's route reads it, then applied by the session's actor, which records the
+/// view and sets it in the compaction state it hands to every run (`StoreCommand::ApplyView`).
+pub async fn apply_view(
+    registry: &crate::registry::LineageRegistry,
+    store: &StoreRuntime,
+    key: &BindIdentity,
+    caller: Option<String>,
+    params: Box<RawValue>,
+) -> Result<Box<RawValue>, Refusal> {
+    #[derive(serde::Deserialize)]
+    struct RawApply {
+        view: Box<RawValue>,
+    }
+    let session = store
+        .view(key)
+        .await
+        .map_err(|error| internal(error.to_string()))?;
+    admit(store.parts(), session.as_deref(), caller.as_deref())?;
+    drop(session);
+    let request: RawApply = serde_json::from_str(params.get())
+        .map_err(|error| Refusal::invalid_params("", error.to_string()))?;
+    broca_core::compaction_v2::received::ReceivedView::parse(&request.view)
+        .map_err(|error| Refusal::invalid_params("view", error.to_string()))?;
+    let command = crate::store_import::StoreCommand::ApplyView(Box::new(
+        crate::store_import::ApplyViewCommand { view: request.view },
+    ));
+    use crate::store_import::StoreOutcome;
+    match registry.route_store_command(key, command).await {
+        Ok(StoreOutcome::ViewApplied(answer)) => {
+            RawValue::from_string(answer).map_err(|error| internal(error.to_string()))
+        }
+        Ok(StoreOutcome::Refused(refusal)) => {
+            Err(Refusal::new(refusal.code, refusal.message, None))
+        }
+        Ok(other) => Err(internal(format!(
+            "session.apply_view was answered {other:?}"
+        ))),
+        Err(error) => Err(internal(error.to_string())),
     }
 }
 

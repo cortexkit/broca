@@ -2562,6 +2562,10 @@ impl LineageRegistry {
                 .holds(key)
                 .map_err(|error| internal(error.to_string()))?
             {
+                if method == "session.apply_view" {
+                    return crate::store_entries::apply_view(self, &store, key, caller, params)
+                        .await;
+                }
                 return crate::store_entries::compaction_runner(
                     &store, key, caller, method, params,
                 )
