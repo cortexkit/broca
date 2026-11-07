@@ -1,6 +1,89 @@
 use super::*;
 
 #[tokio::test]
+async fn budget_finalize_answer_has_its_model_step_completion_time() {
+    let rig = Rig::new("budget-finalize-completion", Arc::new(NoopExec));
+    let key = rig.key("finalize");
+    let mut records = dispatch_module_episode(&key, "budget-run", "call-1");
+    // Keep the completed tool turn, replacing the ordinary final answer with a budget finalize.
+    records.truncate(records.len() - 2);
+    let WalRecord::RunStarted { config, .. } = &mut records[0] else {
+        unreachable!()
+    };
+    config.budget = Some(BudgetConfig {
+        max_input_tokens: None,
+        nudges: vec![],
+        finalize_at_tool_calls: 1,
+        finalize_text: "Finish now.".into(),
+    });
+    let WalRecord::ModelStepFinished { written_at_ms, .. } = &mut records[1] else {
+        unreachable!()
+    };
+    *written_at_ms = Some(110);
+    records.extend([
+        WalRecord::BudgetFired {
+            tags: None,
+            run_id: RunId("budget-run".into()),
+            kind: BudgetKind::Finalize,
+            threshold: 1,
+            ordinal: 3,
+            caller_text: Some("Finish now.".into()),
+        },
+        WalRecord::StepStarted { step_id: StepId(1) },
+        serde_json::from_value(serde_json::json!({
+            "type": "model_attempt_finished", "step_id": 1, "attempt": 0,
+            "outcome": "complete", "ts_ms": 210,
+            "request_body_len": 0, "request_body_sha256": "a",
+            "response_body_len": 0, "response_body_sha256": "b"
+        }))
+        .unwrap(),
+        serde_json::from_value(serde_json::json!({
+            "type": "model_step_finished", "step_id": 1, "written_at_ms": 220,
+            "assistant_message": {
+                "message_id": "finalize-answer",
+                "content": [
+                    {"type": "reasoning", "text": "The budget requires a final answer."},
+                    {"type": "text", "text": "Final answer."}
+                ]
+            },
+            "usage": {}, "retries_used": 0, "finish_reason": "stop"
+        }))
+        .unwrap(),
+        WalRecord::RunFinished {
+            interrupt_reason: None,
+            ts_ms: Some(230),
+            reason: RunFinishReason::Completed,
+            usage: usage(),
+            error: None,
+            retries_used: 0,
+        },
+    ]);
+    append_seed(&rig.wal_store, &key, &records);
+
+    let mut request = read_request(&key, Some(0), Some(32));
+    request.include_display_facts = true;
+    let assert_completions = |page: &broca_module::serve::SessionReadResponse| {
+        let ordinary = &page.messages[1];
+        assert_eq!(ordinary.message.role, Role::Assistant);
+        assert_eq!(ordinary.completed_at, Some(110));
+        let finalize = page.messages.last().unwrap();
+        assert_eq!(finalize.message.role, Role::Assistant);
+        assert!(matches!(
+            finalize.message.content.last(),
+            Some(ContentBlock::Text { text }) if text == "Final answer."
+        ));
+        assert_eq!(finalize.written_at, Some(220));
+        assert_eq!(finalize.completed_at, Some(220));
+    };
+    let tail = rig.registry.read(request.clone()).await.unwrap();
+    assert_completions(&tail);
+    materialize_all(&rig, &key);
+    let cached = rig.registry.read(request).await.unwrap();
+    assert_completions(&cached);
+    assert_eq!(tail, cached);
+}
+
+#[tokio::test]
 async fn old_display_seed_rebuilds_only_on_its_sessions_opt_in_read() {
     use broca_core::display_facts::{
         DisplayFactVersion, DisplayFacts, DisplayFactsSeed, DISPLAY_FACTS_VERSION,
