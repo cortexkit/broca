@@ -261,60 +261,203 @@ pub fn unavailable_error(message: &str) -> broca_protocol::ProviderError {
 ///
 /// The entries are the window's, in today's terms: the window, and the assistant message whose
 /// tool calls are still running. After a seal at a cut, the history before the window is sealed,
-/// and today's code still expects each view's cut target among the entries, so each target the
-/// views name before the window is read back and put in front, with its message. Every other
-/// edit naming a sealed entry is skipped by the renderer, which changes nothing: those entries
-/// are cut anyway, and the compaction provider never anchors an insert before an entry.
-struct Transcript {
-    entries: Vec<cortexkit_role_compaction::read::Entry>,
+/// but the views still name entries there: the cut's target, and the messages earlier edits drop,
+/// replace or anchor an insert before, which a provider may carry into every later view. Today's
+/// code checks each new view against the entries, and refuses one naming a message it doesn't
+/// hold, so each sealed entry the applied or the accepted view names is read back and put in
+/// front, with its message, as today's loop, which seals nothing, would hold it. Rendering
+/// changes nothing: every one of them is before the cut, which leaves it out.
+pub struct Transcript {
+    pub entries: Arc<Vec<cortexkit_role_compaction::read::Entry>>,
     /// The sealed messages put in front of the window's, for the stored prompt, with ordinals.
-    sealed: Vec<(u64, broca_protocol::Message)>,
+    pub sealed: Arc<Vec<(u64, broca_protocol::Message)>>,
 }
 
-async fn transcript<W: Writer>(writer: &W, ctx: &Ctx) -> Result<Transcript, LoopError> {
+/// What the transcript keeps, for the open session, of the sealed entries its views name: the
+/// session holds it while it's open and drops it when its history version moves (see
+/// `Session::keep_sealed_derived`). Sealed history never changes otherwise, so each named entry
+/// is read and projected once, and a later step with the same views and the same seal only
+/// replaces the window's entries behind the sealed ones it built before.
+#[derive(Default)]
+struct SealedTranscript(std::sync::Mutex<SealedParts>);
+
+#[derive(Default)]
+struct SealedParts {
+    /// Each sealed entry read so far, by message id: its projection, and its ordinal and message.
+    by_mid: std::collections::HashMap<
+        String,
+        (
+            cortexkit_role_compaction::read::Entry,
+            (u64, broca_protocol::Message),
+        ),
+    >,
+    /// The transcript last built.
+    built: Option<Built>,
+}
+
+/// A transcript as built for `key`: the sealed entries its views name, then the window's.
+struct Built {
+    key: BuiltFor,
+    /// How many of `entries` are sealed ones, in front.
+    sealed: usize,
+    entries: Arc<Vec<cortexkit_role_compaction::read::Entry>>,
+    messages: Arc<Vec<(u64, broca_protocol::Message)>>,
+}
+
+/// What decides which sealed entries a transcript holds: where the window starts, and the
+/// applied and accepted views, each by version and checksum.
+#[derive(Clone, PartialEq)]
+struct BuiltFor {
+    window_start: u64,
+    views: [Option<(u64, String)>; 2],
+}
+
+/// The session's [`SealedTranscript`], kept by the writer's session; a new one when it keeps
+/// none, or keeps nothing at all.
+async fn sealed_transcript<W: Writer>(writer: &W) -> Result<Arc<SealedTranscript>, LoopError> {
+    if let Some(kept) = writer.sealed_derived().await? {
+        if let Ok(kept) = kept.downcast::<SealedTranscript>() {
+            return Ok(kept);
+        }
+    }
+    let fresh = Arc::new(SealedTranscript::default());
+    writer.keep_sealed_derived(fresh.clone()).await?;
+    Ok(fresh)
+}
+
+/// The transcript a step's compaction reads (see [`Transcript`]). A sealed entry is read back
+/// through the session's id lookup, which finds broca's own ids and an import's source ids
+/// alike, named entries close together in one read. What it reads is kept for the open session
+/// (see [`SealedTranscript`]), so a view naming hundreds of sealed messages reads and projects
+/// them once, not at every step. A view's cut target the session doesn't hold fails the step;
+/// any other named message it doesn't hold is left out, and the check refuses a view naming it,
+/// by that id.
+pub async fn transcript<W: Writer>(writer: &W, ctx: &Ctx) -> Result<Transcript, LoopError> {
+    use cortexkit_role_compaction::view::{EditOp, InsertAt};
     let conversation = writer.conversation();
     let window = broca_session_store::session::served_window(conversation);
-    let mut stored = Vec::new();
-    if conversation.window_start() > 1 {
-        let mut targets: Vec<String> = {
-            let state = ctx.session.state.lock().await;
-            [state.applied(), state.latest()]
-                .into_iter()
-                .flatten()
-                .flat_map(|view| &view.edits)
-                .filter_map(|edit| match &edit.op {
-                    cortexkit_role_compaction::view::EditOp::Cut { through } => {
-                        Some(through.clone())
-                    }
-                    _ => None,
-                })
-                .collect()
-        };
-        targets.sort();
-        targets.dedup();
-        for mid in targets {
-            let entry = writer.entry_by_mid(&mid).await?.ok_or_else(|| {
-                LoopError::Parts(format!(
-                    "a compaction view cuts through {mid}, which the session doesn't hold"
-                ))
-            })?;
-            if entry.ordinal < conversation.window_start() {
-                stored.push(entry);
-            }
-        }
-        stored.sort_by_key(|entry| entry.ordinal);
-    }
-    let entries = stored
+    let window_entries = window
         .iter()
-        .chain(&window)
         .map(crate::entries::project)
         .collect::<Result<Vec<_>, _>>()
         .map_err(LoopError::Parts)?;
-    let sealed = stored
-        .into_iter()
-        .map(|entry| (entry.ordinal, entry.message))
+    let window_start = conversation.window_start();
+    if window_start <= 1 {
+        return Ok(Transcript {
+            entries: Arc::new(window_entries),
+            sealed: Arc::default(),
+        });
+    }
+    let key = {
+        let state = ctx.session.state.lock().await;
+        BuiltFor {
+            window_start,
+            views: [state.applied(), state.latest()]
+                .map(|view| view.map(|view| (view.version, view.checksum.clone()))),
+        }
+    };
+    let kept = sealed_transcript(writer).await?;
+    {
+        let mut parts = kept.0.lock().expect("sealed transcript");
+        if let Some(built) = parts.built.as_mut().filter(|built| built.key == key) {
+            // The entries the last transcript was built from are kept whole; once that
+            // transcript is gone, only the window's entries behind the sealed ones change.
+            let entries = Arc::make_mut(&mut built.entries);
+            entries.truncate(built.sealed);
+            entries.extend(window_entries);
+            return Ok(Transcript {
+                entries: built.entries.clone(),
+                sealed: built.messages.clone(),
+            });
+        }
+    }
+    // Every message the views name, each once: the cut targets, and the rest.
+    let (cuts, named) = {
+        let state = ctx.session.state.lock().await;
+        let mut cuts = std::collections::BTreeSet::new();
+        let mut named = std::collections::BTreeSet::new();
+        for edit in [state.applied(), state.latest()]
+            .into_iter()
+            .flatten()
+            .flat_map(|view| &view.edits)
+        {
+            match &edit.op {
+                EditOp::Cut { through } => {
+                    cuts.insert(through.clone());
+                }
+                EditOp::Drop { mid, .. }
+                | EditOp::Replace { mid, .. }
+                | EditOp::Insert {
+                    at: InsertAt::Before(mid),
+                    ..
+                } => {
+                    named.insert(mid.clone());
+                }
+                _ => {}
+            }
+        }
+        (cuts, named)
+    };
+    let in_window: std::collections::HashSet<&str> = window
+        .iter()
+        .filter_map(|entry| entry.state.facts.as_ref())
+        .map(|facts| facts.mid.as_str())
         .collect();
-    Ok(Transcript { entries, sealed })
+    let wanted: Vec<&String> = cuts
+        .union(&named)
+        .filter(|mid| !in_window.contains(mid.as_str()))
+        .collect();
+    let missing: Vec<String> = {
+        let parts = kept.0.lock().expect("sealed transcript");
+        wanted
+            .iter()
+            .filter(|mid| !parts.by_mid.contains_key(mid.as_str()))
+            .map(|mid| (*mid).clone())
+            .collect()
+    };
+    let mut read = Vec::new();
+    for stored in writer.entries_by_mid(&missing).await? {
+        if stored.ordinal >= window_start {
+            continue;
+        }
+        let Some(mid) = stored.state.facts.as_ref().map(|facts| facts.mid.clone()) else {
+            continue;
+        };
+        let entry = crate::entries::project(&stored).map_err(LoopError::Parts)?;
+        read.push((mid, (entry, (stored.ordinal, stored.message))));
+    }
+    let mut parts = kept.0.lock().expect("sealed transcript");
+    parts.by_mid.extend(read);
+    if let Some(mid) = cuts
+        .iter()
+        .find(|mid| !in_window.contains(mid.as_str()) && !parts.by_mid.contains_key(*mid))
+    {
+        return Err(LoopError::Parts(format!(
+            "a compaction view cuts through {mid}, which the session doesn't hold"
+        )));
+    }
+    let mut sealed: Vec<_> = wanted
+        .iter()
+        .filter_map(|mid| parts.by_mid.get(mid.as_str()))
+        .collect();
+    sealed.sort_by_key(|named| named.1 .0);
+    sealed.dedup_by_key(|named| named.1 .0);
+    let mut entries: Vec<_> = sealed.iter().map(|(entry, _)| entry.clone()).collect();
+    let messages: Vec<_> = sealed.iter().map(|(_, message)| message.clone()).collect();
+    let count = entries.len();
+    entries.extend(window_entries);
+    let built = Built {
+        key,
+        sealed: count,
+        entries: Arc::new(entries),
+        messages: Arc::new(messages),
+    };
+    let transcript = Transcript {
+        entries: built.entries.clone(),
+        sealed: built.messages.clone(),
+    };
+    parts.built = Some(built);
+    Ok(transcript)
 }
 
 /// `opts` with the sealed messages a [`Transcript`] put in front of the window's prepended to its

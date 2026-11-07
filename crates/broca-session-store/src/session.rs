@@ -180,6 +180,9 @@ pub struct Session<B: SessionBackend> {
     window: OpenLogIndex,
     /// The import's id map, once read (see `import`).
     imported: import::IdMapCache,
+    /// What the session keeps of its sealed history while it's open (see `entry_by_mid` and
+    /// `keep_sealed_derived`).
+    sealed_entries: read::SealedEntries,
 }
 
 impl<B: SessionBackend> Session<B> {
@@ -294,6 +297,7 @@ impl<B: SessionBackend> Session<B> {
             open_ids: OpenIds::default(),
             window: OpenLogIndex::default(),
             imported: Default::default(),
+            sealed_entries: Default::default(),
         })
     }
 
@@ -443,6 +447,7 @@ impl<B: SessionBackend> Session<B> {
             open_ids,
             window,
             imported: Default::default(),
+            sealed_entries: Default::default(),
         };
         Ok(Loaded::Open {
             session: Box::new(session),

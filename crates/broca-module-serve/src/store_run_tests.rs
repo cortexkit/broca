@@ -68,6 +68,9 @@ fn request_kind(request: &broca_session_loop::shared::Request) -> &'static str {
         Request::OpenLogRecords { .. } => "open log records",
         Request::RunStart { .. } => "run start",
         Request::EntryByMid { .. } => "entry by mid",
+        Request::EntriesByMid { .. } => "entries by mid",
+        Request::SealedDerived { .. } => "sealed derived",
+        Request::KeepSealedDerived { .. } => "keep sealed derived",
         Request::Seal { .. } => "seal",
     }
 }

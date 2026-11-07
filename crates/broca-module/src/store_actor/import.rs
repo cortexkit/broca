@@ -250,6 +250,13 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 "an installed view is the session's first, version 1",
             );
         }
+        // The view must fit the imported history as its provider read it: every message and
+        // part it names is one the import wrote, by its source id. Rendering filters out an edit
+        // naming a message it doesn't hold, so a view naming an id the import never had would
+        // otherwise lose that edit silently.
+        if let Err(message) = self.fits_history(view).await {
+            return refuse("invalid_params", &message);
+        }
         let reply = InstallViewReply {
             version: view.version,
             checksum: view.checksum.clone(),
@@ -293,5 +300,27 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 &format!("the view could not be written: {error:?}"),
             ),
         }
+    }
+
+    /// Whether `view` fits the session's history as a compaction provider reads it: each
+    /// message, part and anchor it names is one the history holds. The refusal names what
+    /// doesn't fit.
+    async fn fits_history(
+        &self,
+        view: &broca_core::compaction_v2::protocol::view::View,
+    ) -> Result<(), String> {
+        let placed = self.session.conversation.placed;
+        let stored = self
+            .session
+            .entries(1, placed as usize)
+            .await
+            .map_err(|error| format!("the imported history could not be read: {error:?}"))?;
+        let entries = stored
+            .iter()
+            .map(broca_session_loop::entries::project)
+            .collect::<Result<Vec<_>, _>>()?;
+        cortexkit_compaction_view::render::plan(&entries, &view.edits)
+            .map(|_| ())
+            .map_err(|refusal| format!("the view doesn't fit the imported history: {refusal:?}"))
     }
 }
