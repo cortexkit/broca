@@ -113,9 +113,8 @@ impl State {
             model, choice.model,
             "HTTP model differs from the credential's admitted decision"
         );
-        // Count every HTTP request, including the same-account retry permitted by routing
-        // 0.7.4 §9.3. Kit 0.8.1 checks/routed.rs:182-187 and :214-227 currently expect
-        // only one failed attempt per decision; do not hide the additional request here.
+        // Count every HTTP request, including the single same-account authentication
+        // retry permitted by classifier §6.8. Replay must add no request to this log.
         if inner.script.is_some() {
             inner.observations.provider_requests.push(RoutedDecision {
                 model,

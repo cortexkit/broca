@@ -1186,9 +1186,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-classifier"
-version = "0.6.1"
+version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cc1abbce8e1f542ca5df32552c6bbbc58834451fc2a8069c1afe7e0056b33faa"
+checksum = "747d8ae6234a5673b3378bf2d40fab0f159f6ab0323555b6423a818fd062293e"
 dependencies = [
  "cortexkit-model-batch",
  "indexmap",
@@ -1198,9 +1198,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-classifier-conformance"
-version = "0.8.1"
+version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e662cc55b591b61995a1f9d16a5244dae37f83f4f154d15d9ee4ac3d8549deef"
+checksum = "d308c08dcfb67045f4d55198c97a1aafbb7ddd54d1a95f905d025f4b232db644"
 dependencies = [
  "async-trait",
  "cortexkit-role-classifier",

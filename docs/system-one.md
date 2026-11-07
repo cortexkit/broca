@@ -1,7 +1,7 @@
 # System One classifier routing
 
 The `classifier/v1` route serves sessionless batches of decision-model requests.
-Its contract is `cortexkit-role-classifier` 0.6.1, using the shared model-batch
+Its contract is `cortexkit-role-classifier` 0.6.2, using the shared model-batch
 rules; routed operations use `cortexkit-role-routing` 0.7.4.
 
 ## Rollout switch
@@ -92,7 +92,7 @@ A committed selection survives a refused first account admission, so a resend re
 that decision instead of silently selecting again. Answered admission and re-admission
 refusals are permanent `routing_refused`, preserving routing's code and reason; no
 new run, provider request or account failure is invented. Stored outcomes stay intact.
-Classifier 0.6.1 CONTRACT.md §7 conservatively makes every answered routing refusal
+Classifier 0.6.2 CONTRACT.md §7 conservatively makes every answered routing refusal
 permanent, even when routing calls its own refusal transient.
 Invalid requests, conflicting admission ids and invalid routing answers are permanent
 internal errors. A failure to obtain an answer is transient `routing_unavailable`;
