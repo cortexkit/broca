@@ -89,6 +89,18 @@ pub(crate) fn freeze_manifest(
     Ok(())
 }
 
+/// The compaction plan version a brand-new log starts under when its first run is admitted
+/// under `manifest`: the current one (`compaction_v2::PLAN_VERSION`) when the plan names a
+/// compaction provider, so the session records and renders under the current compaction
+/// contract, and `None` otherwise, which keeps the established log layout. Both run loops read the mode an
+/// existing log's first run recorded before they read this, so a session already written in
+/// the established layout is never moved onto the contract by a later plan.
+pub(crate) fn new_log_compaction_plan_version(manifest: Option<&PlanManifest>) -> Option<u32> {
+    manifest
+        .is_some_and(|manifest| matches!(broca_core::compaction::item(manifest), Ok(Some(_))))
+        .then_some(broca_core::compaction_v2::PLAN_VERSION)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -98,7 +110,7 @@ mod tests {
     use broca_wal::{OpaqueJson, PlanManifest};
     use serde_json::json;
 
-    use super::{freeze_manifest, require_confining_scope};
+    use super::{freeze_manifest, new_log_compaction_plan_version, require_confining_scope};
 
     fn tool(name: &str) -> Tool {
         serde_json::from_value(json!({
@@ -217,5 +229,22 @@ mod tests {
                 send.input
             );
         }
+    }
+
+    /// Only a plan naming a compaction provider starts a new log under the current compaction
+    /// contract; a plan without one, or no plan, keeps the established layout.
+    #[test]
+    fn a_plan_naming_a_compaction_provider_starts_a_new_log_on_the_contract() {
+        let compacted = manifest(
+            json!({"compaction_item": {"provider": "compactor", "preset": "default"}}),
+            "",
+        );
+        assert_eq!(
+            new_log_compaction_plan_version(Some(&compacted)),
+            Some(broca_core::compaction_v2::PLAN_VERSION)
+        );
+        let uncompacted = manifest(json!({"compaction_item": null}), "");
+        assert_eq!(new_log_compaction_plan_version(Some(&uncompacted)), None);
+        assert_eq!(new_log_compaction_plan_version(None), None);
     }
 }

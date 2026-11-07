@@ -139,6 +139,12 @@ pub struct Admission {
     /// What the send said about itself. None of it changes a request; all of it is recorded
     /// on the run's start, where status, retries and reads find it.
     pub send: SendFacts,
+    /// Set when something decided before the run that it must not reach the model: a
+    /// `pre_user` input transform refused the run's input, or routing refused the caller's
+    /// decision. The run's start is still written, so the send has a run to report, and the run
+    /// then ends with this error before any step, as today's loop ends it. Unlike every other
+    /// field it isn't frozen into the start, and a run read back from its start has none.
+    pub pre_model_error: Option<ProviderError>,
 }
 
 /// What the send that started a run recorded about itself, as today's run start records it.
@@ -309,6 +315,16 @@ where
         reports.run_started(&event_id(&placed, start_seq), start_seq);
     }
     let compaction = compaction_ctx(&placed, parts, &admission, seams, true).await?;
+    if let Some(error) = &admission.pre_model_error {
+        return end_with_error(
+            &mut placed,
+            seams,
+            &admission.run_id,
+            RunFinishReason::Error,
+            error,
+        )
+        .await;
+    }
     drive(&mut placed, parts, &admission, seams, compaction.as_ref()).await
 }
 
@@ -1224,6 +1240,7 @@ pub fn admission_of_start(
             scope: decode(start.scope.clone())?,
             hooks: decode(start.hooks.clone())?,
         },
+        pre_model_error: None,
     })
 }
 
