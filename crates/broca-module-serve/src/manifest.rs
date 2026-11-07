@@ -24,6 +24,9 @@ pub const OP_SEND_STATUS: &str = broca_wire::OP_SEND_STATUS;
 pub const OP_SESSION_SEND_STATUS: &str = broca_wire::OP_SESSION_SEND_STATUS;
 pub const OP_SEND: &str = "session.send";
 pub const OP_IMPORT: &str = "session.import";
+/// Record a moved head's compaction view as its imported session's applied view, before the
+/// session's first step.
+pub const OP_INSTALL_VIEW: &str = broca_wire::head_import::OP_SESSION_INSTALL_VIEW;
 pub const OP_RETRACT: &str = "session.retract";
 pub const OP_CANCEL: &str = "run.cancel";
 pub const OP_STATUS: &str = "run.status";
@@ -198,6 +201,14 @@ pub(crate) fn management_operations() -> Vec<ManagementOperation> {
             kind: ManagementOperationKind::Mutate,
             description: Some(
                 "Seed an EMPTY lineage with transcript history from another harness; refuses a non-empty lineage."
+                    .to_string(),
+            ),
+        },
+        ManagementOperation {
+            name: OP_INSTALL_VIEW.to_string(),
+            kind: ManagementOperationKind::Mutate,
+            description: Some(
+                "Record the compaction view a moved head's provider applies as its imported session's view, before the session's first step."
                     .to_string(),
             ),
         },

@@ -280,6 +280,9 @@ pub fn with_facts(batch: Vec<Record>, at: &Placing<'_>) -> Result<Vec<Record>, S
                     own.filter(|at| *at != 0)
                 };
                 pending.push(EntryFacts {
+                    client_message_id: None,
+                    sender: None,
+                    marks: None,
                     ordinal,
                     written_at_ms,
                     tag_base: high,

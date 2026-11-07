@@ -3970,6 +3970,51 @@ impl LineageRegistry {
         }
     }
 
+    /// Route a command only the new storage serves to the session's store actor. An import may
+    /// create its session there; nothing else creates one. Refused by name unless the registry
+    /// creates sessions in the new storage (`with_store_new_sessions`).
+    pub async fn route_store_command(
+        &self,
+        key: &LineageKey,
+        command: crate::store_import::StoreCommand,
+    ) -> Result<crate::store_import::StoreOutcome, OpenError> {
+        use crate::actor::LineageCmd;
+        use crate::store_import::{ImportRefusal, StoreCommand, StoreOutcome};
+        if !self.inner.store_new_sessions.load(Ordering::SeqCst) {
+            return Ok(StoreOutcome::Refused(ImportRefusal::new(
+                "new_storage_unavailable",
+                "this module doesn't create sessions in the new storage",
+            )));
+        }
+        let creates = matches!(command, StoreCommand::Import(_));
+        loop {
+            if creates {
+                self.inner
+                    .store_eligible
+                    .lock()
+                    .unwrap()
+                    .insert(key.clone());
+            }
+            let handle = self.actor_for_mode(key, None, None, false).await;
+            // A mark the open didn't take, because the session was already open, must not
+            // decide a later open.
+            self.inner.store_eligible.lock().unwrap().remove(key);
+            let handle = handle?;
+            let (reply, rx) = tokio::sync::oneshot::channel();
+            let cmd = LineageCmd::Store {
+                command: command.clone(),
+                reply,
+            };
+            if handle.send(cmd).await.is_err() {
+                continue;
+            }
+            match rx.await {
+                Ok(StoreOutcome::Reopen) | Err(_) => continue,
+                Ok(other) => return Ok(other),
+            }
+        }
+    }
+
     /// Route a `run.cancel` to the lineage (same reopen-retry discipline as `send`).
     pub async fn route_cancel(
         &self,

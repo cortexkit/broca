@@ -547,6 +547,7 @@ fn convert_one(
             out.records.push(Record::BudgetFire(fire));
             if let (Some(text), true) = (text, state.budget_configured) {
                 out.records.push(Record::Input(Input {
+                    media: Vec::new(),
                     run_id: state.run_id.clone(),
                     placement: Placement::BudgetNudge,
                     message: Message::new(Role::User, vec![ContentBlock::Text { text }]),
@@ -900,6 +901,7 @@ fn copies_of(
         .iter()
         .enumerate()
         .map(|(index, message)| Input {
+            media: Vec::new(),
             run_id: String::new(),
             placement,
             message: message.clone(),
@@ -1015,6 +1017,7 @@ fn run_started(f: &mut Fields, state: &mut State, out: &mut Converted) -> Result
     let tags = f.take("tags");
 
     let mut start = RunStart {
+        imported_ids: None,
         run_id: run_id.clone(),
         model: model.clone(),
         setup: parts,
@@ -1068,6 +1071,7 @@ fn run_started(f: &mut Fields, state: &mut State, out: &mut Converted) -> Result
     out.records.push(Record::RunStart(Box::new(start)));
     for (index, message) in input.into_iter().enumerate() {
         out.records.push(Record::Input(Input {
+            media: Vec::new(),
             run_id: run_id.clone(),
             placement: Placement::RunInput,
             message,
@@ -1414,6 +1418,7 @@ fn send_delivered(
     };
     if let (Some(call), Some(text)) = (&delivery.tool_call_id, &delivery.appended_text) {
         out.records.push(Record::ResultAppend(ResultAppend {
+            send_id: None,
             run_id: state.run_id.clone(),
             tool_call_id: call.clone(),
             text: text.clone(),

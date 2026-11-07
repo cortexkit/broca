@@ -424,6 +424,7 @@ dependencies = [
  "broca-test-support",
  "broca-wal",
  "broca-wire",
+ "ck-session-import",
  "cortexkit-bus-trait",
  "cortexkit-role-llm-runner 0.7.48",
  "cortexkit-role-llm-runner 0.8.7",

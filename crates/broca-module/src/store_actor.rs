@@ -24,7 +24,9 @@
 //! - going away when idle: in a module, through the registry's close, so a command racing the
 //!   close is answered `Reopen` and re-routed;
 //! - a module stop: the running run is ended `Interrupted` with today's shutdown seal, never
-//!   cancelled, since a cancel records a decision no caller made.
+//!   cancelled, since a cancel records a decision no caller made;
+//! - a head's file-source import into the empty session, and installing its compaction
+//!   provider's first view before the session's first step (see `store_import`).
 //!
 //! Every other command, and every send that needs an admission rule not built here yet, is
 //! refused by name with nothing written. Today's actor is the reference for each rule still to
@@ -476,6 +478,15 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                     let _ = reply.send(SendOutcome::Error(unserved(what)));
                     return false;
                 }
+                // An imported session runs only once `session.adopt` gives it the plan its head
+                // ran under, which isn't built yet: without it, a run would start with none.
+                if self.session.operations().imported_ids.is_some() {
+                    let _ = reply.send(SendOutcome::Error(
+                        "an imported session takes no send until session.adopt gives it a plan"
+                            .into(),
+                    ));
+                    return false;
+                }
                 // As in today's actor, a send's label and its structured output are checked against
                 // the session before the owner check, so a retry naming another label is refused
                 // rather than answered.
@@ -782,6 +793,11 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 false
             }
             LineageCmd::IdleTick => self.run.is_none(),
+            LineageCmd::Store { command, reply } => {
+                let (outcome, exit) = self.store_command(command).await;
+                let _ = reply.send(outcome);
+                exit
+            }
             other => {
                 refuse(other);
                 false
@@ -1864,6 +1880,9 @@ fn reopen(command: LineageCmd) {
         LineageCmd::Import { reply, .. } => {
             let _ = reply.send(crate::actor::ImportOutcome::Reopen);
         }
+        LineageCmd::Store { reply, .. } => {
+            let _ = reply.send(crate::store_import::StoreOutcome::Reopen);
+        }
         LineageCmd::Cancel { reply, .. } | LineageCmd::CancelFrom { reply, .. } => {
             let _ = reply.send(CancelOutcome::Reopen);
         }
@@ -1924,6 +1943,10 @@ fn refuse(command: LineageCmd) {
         }
         LineageCmd::RepairRetention { reply } => {
             let _ = reply.send(Err(unserved("retention repair")));
+        }
+        // Served by `handle`; never refused here.
+        LineageCmd::Store { reply, .. } => {
+            let _ = reply.send(crate::store_import::StoreOutcome::Reopen);
         }
         LineageCmd::ResumeRestart { reply } => {
             let _ = reply.send(Err(unserved("resuming after a restart")));
@@ -2001,7 +2024,11 @@ fn refuse(command: LineageCmd) {
     }
 }
 
+mod import;
+
 #[cfg(test)]
 mod differential;
+#[cfg(test)]
+mod import_tests;
 #[cfg(test)]
 mod tests;

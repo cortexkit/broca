@@ -952,3 +952,80 @@ mod account_limit_pause_config_tests {
         assert!(!config.max_same_account_wait.enabled());
     }
 }
+
+/// Where a head's file-source import may read from: `import.roots` in `broca.jsonc`, each an
+/// absolute folder. Absent, broca's own import folder under the user's home is the only root,
+/// the folder Thalamus's `session.export` writes to. A source is read only under a root,
+/// resolved after symlinks, and deleted after its import only inside broca's own folder.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ImportConfig {
+    pub roots: Option<Vec<std::path::PathBuf>>,
+}
+
+impl ImportConfig {
+    pub fn load_default() -> Result<Self, String> {
+        use crate::config_home::ConfigHome;
+        match crate::config_home::config_file(crate::cache_routing::CONFIG_PATH_ENV, "broca.jsonc")
+        {
+            ConfigHome::Resolved { path, .. } => match std::fs::read_to_string(&path) {
+                Ok(text) => Self::parse(&text).map_err(|e| format!("{}: {e}", path.display())),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+                Err(e) => Err(format!("read import from {}: {e}", path.display())),
+            },
+            ConfigHome::Unresolvable => Ok(Self::default()),
+        }
+    }
+
+    pub fn parse(text: &str) -> Result<Self, String> {
+        #[derive(serde::Deserialize)]
+        struct File {
+            #[serde(default)]
+            import: Option<Section>,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Section {
+            #[serde(default)]
+            roots: Option<Vec<std::path::PathBuf>>,
+        }
+        let text = crate::cache_routing::strip_trailing_commas(
+            &crate::cache_routing::strip_jsonc_comments(text),
+        );
+        let file = serde_json::from_str::<File>(&text).map_err(|e| format!("parse import: {e}"))?;
+        let roots = file.import.and_then(|section| section.roots);
+        if let Some(root) = roots.iter().flatten().find(|root| !root.is_absolute()) {
+            return Err(format!(
+                "import.roots holds {}, which is not an absolute folder",
+                root.display()
+            ));
+        }
+        Ok(Self { roots })
+    }
+
+    /// The roots an import reads under, with broca's own import folder under `home` as the
+    /// default and as the only folder a source is deleted from.
+    pub fn import_roots(
+        &self,
+        home: Option<&std::path::Path>,
+    ) -> broca_module::store_import::ImportRoots {
+        broca_module::store_import::ImportRoots::with_default(self.roots.clone(), home)
+    }
+}
+
+#[cfg(test)]
+mod import_config_tests {
+    use super::ImportConfig;
+
+    #[test]
+    fn import_roots_default_to_brocas_import_folder() {
+        assert_eq!(ImportConfig::parse("{}").unwrap(), ImportConfig::default());
+        let config = ImportConfig::parse(
+            r#"{"import": {"roots": ["/srv/heads",],}, // a comment
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(config.roots, Some(vec!["/srv/heads".into()]));
+        assert!(ImportConfig::parse(r#"{"import": {"roots": ["heads"]}}"#).is_err());
+        assert!(ImportConfig::parse(r#"{"import": {"root": ["/x"]}}"#).is_err());
+    }
+}

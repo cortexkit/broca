@@ -33,6 +33,7 @@ fn one_of_each() -> Vec<Record> {
     };
     vec![
         Record::Input(Input {
+            media: Vec::new(),
             run_id: "run-1".into(),
             placement: Placement::RunInput,
             message: Message::new(Role::User, vec![ContentBlock::Text { text: "hi".into() }]),
@@ -70,6 +71,7 @@ fn one_of_each() -> Vec<Record> {
             media: Vec::new(),
         }),
         Record::ResultAppend(ResultAppend {
+            send_id: None,
             run_id: "run-1".into(),
             tool_call_id: ToolCallId("c1".into()),
             text: "reminder".into(),
@@ -87,6 +89,7 @@ fn one_of_each() -> Vec<Record> {
             body: serde_json::json!({"first_kept_ordinal": 12}),
         }),
         Record::RunStart(Box::new(RunStart {
+            imported_ids: None,
             run_id: "run-1".into(),
             model: model(),
             setup: vec![part],

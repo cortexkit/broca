@@ -35,6 +35,7 @@ fn model() -> ModelHandle {
 
 fn start(run: &str) -> Record {
     Record::RunStart(Box::new(RunStart {
+        imported_ids: None,
         run_id: run.into(),
         model: model(),
         setup: Vec::new(),
@@ -78,6 +79,7 @@ fn end(run: &str) -> Record {
 
 fn input(run: &str, text: &str) -> Record {
     Record::Input(Input {
+        media: Vec::new(),
         run_id: run.into(),
         placement: Placement::RunInput,
         message: Message::new(Role::User, vec![ContentBlock::Text { text: text.into() }]),

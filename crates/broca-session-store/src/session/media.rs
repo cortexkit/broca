@@ -44,6 +44,20 @@ impl OpenLogIndex {
                     }
                 }
             }
+            Record::Input(input) => {
+                for object in &input.media {
+                    if let Some(media) = input_medium(&input.message, object.block, object.part) {
+                        self.media
+                            .entry(media.sha256.clone())
+                            .or_insert_with(|| MediaObject {
+                                part: 0,
+                                log: object.log,
+                                generation: object.generation,
+                                seq: object.seq,
+                            });
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -83,8 +97,28 @@ fn media_part(result: &ToolResult, part: u32) -> Option<&MediaRef> {
     }
 }
 
+/// The medium an input message holds at content block `block`: the block itself, or with
+/// `part`, that media part of the tool result the block is.
+pub(super) fn input_medium(
+    message: &broca_protocol::content::Message,
+    block: u32,
+    part: Option<u32>,
+) -> Option<&MediaRef> {
+    use broca_protocol::content::ContentBlock;
+    match (message.content.get(block as usize)?, part) {
+        (ContentBlock::Media(media), None) => Some(media),
+        (ContentBlock::ToolResult(result), Some(part)) => media_part(result, part),
+        _ => None,
+    }
+}
+
 fn matches(media: &MediaRef, bytes: &[u8]) -> bool {
     media.byte_size == bytes.len() as u64 && media.sha256 == hex(&Sha256::digest(bytes))
+}
+
+/// Whether `bytes` are the bytes `media` names.
+pub(super) fn bytes_match(media: &MediaRef, bytes: &[u8]) -> bool {
+    matches(media, bytes)
 }
 
 impl<B: SessionBackend> Session<B> {
@@ -92,13 +126,25 @@ impl<B: SessionBackend> Session<B> {
     /// is hashed with a key derived from the session key, so a name says nothing about the
     /// content outside the session, and the same bytes always get the same name.
     fn media_name(&self, object: &MediaObject, sha256: &str) -> String {
+        self.media_name_at(&object.log, &object.generation, object.seq, sha256)
+    }
+
+    /// The name of the media object written under `log` by writer `generation`, named by the
+    /// record at `seq`, for bytes whose digest is `sha256`.
+    pub(super) fn media_name_at(
+        &self,
+        log: &crate::codec::Id128,
+        generation: &crate::codec::Id128,
+        seq: u64,
+        sha256: &str,
+    ) -> String {
         let key = self.key.derive(b"media-object-name");
         let h = crate::prune::keyed_digest(&key, sha256.as_bytes()).0;
         format!(
             "{}/a/{}.{}-media-{}",
-            hex(&object.log.0),
-            &hex(&object.generation.0)[..16],
-            object.seq,
+            hex(&log.0),
+            &hex(&generation.0)[..16],
+            seq,
             &hex(&h)[..32],
         )
     }
@@ -210,6 +256,43 @@ impl<B: SessionBackend> Session<B> {
         reference: &MediaRef,
     ) -> Result<Vec<u8>, SessionError> {
         let name = self.media_name(object, &reference.sha256);
+        self.read_named_media(name, reference).await
+    }
+
+    /// The bytes of a stored input message's medium at content block `block` (and, inside a
+    /// tool result there, part `part`), checked against its reference.
+    pub async fn input_media(
+        &self,
+        input: &crate::record::Input,
+        block: u32,
+        part: Option<u32>,
+    ) -> Result<Vec<u8>, SessionError> {
+        let not_media = || {
+            SessionError::Media(MediaError::NotMedia {
+                record: 0,
+                part: block as usize,
+            })
+        };
+        let reference = input_medium(&input.message, block, part).ok_or_else(not_media)?;
+        let object = input
+            .media
+            .iter()
+            .find(|object| object.block == block && object.part == part)
+            .ok_or_else(not_media)?;
+        let name = self.media_name_at(
+            &object.log,
+            &object.generation,
+            object.seq,
+            &reference.sha256,
+        );
+        self.read_named_media(name, reference).await
+    }
+
+    async fn read_named_media(
+        &self,
+        name: String,
+        reference: &MediaRef,
+    ) -> Result<Vec<u8>, SessionError> {
         let sealed = self
             .backend
             .get_object(&self.addr, &name)

@@ -6,6 +6,7 @@
 
 pub mod agent_data;
 pub mod diagnostics;
+pub mod head_import;
 pub mod role;
 pub use role::*;
 pub mod warm;

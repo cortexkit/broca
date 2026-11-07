@@ -77,6 +77,7 @@ pub fn due(
             nudge_index: firing.index.map(|index| index as u64),
         }));
         records.push(Record::Input(Input {
+            media: Vec::new(),
             run_id: run.run_id.clone(),
             placement: Placement::BudgetNudge,
             message: Message::new(Role::User, vec![ContentBlock::Text { text: firing.text }]),

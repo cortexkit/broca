@@ -794,6 +794,13 @@ state! {
             reset: "never",
             bound: Bound::Declared,
         },
+        /// Where an import's id map is stored, from the seeded run start that names it. Reads
+        /// resolve an imported message's source id through it.
+        20 opt pub imported_ids: crate::record::ImportedIds => {
+            owner: "import",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
     }
 }
 
@@ -1154,6 +1161,9 @@ impl Operations {
         if let Record::RunStart(start) = record {
             self.run = Some(Run::new(start));
             self.refusal_schedule = start.refusal_schedule.clone();
+            if let Some(ids) = &start.imported_ids {
+                self.imported_ids = Some(ids.clone());
+            }
             let mut parts = start.setup.clone();
             parts.sort();
             self.setup = Some(SetupInForce {
