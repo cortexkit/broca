@@ -492,7 +492,12 @@ enum Cmd {
     },
     /// `role.describe`: write the running daemon's exact reply bytes to stdout and their count
     /// and SHA-256 to stderr, so a consumer can check what the deployed build advertises.
-    Describe,
+    Describe {
+        /// Ask on a route bound to the `classifier/v1` role, the route a `classify.run` caller
+        /// opens, for the classifier description instead of the llm-runner one.
+        #[arg(long)]
+        classifier: bool,
+    },
     /// `run.event.get`: write the daemon's exact claim-check reply for one bus event to stdout and
     /// its byte count and SHA-256 to stderr. Bind to the session that owns the event; any other
     /// binding answers `absent`.
@@ -800,13 +805,18 @@ async fn run(args: Args) -> Result<i32, String> {
     let conn = SubcConnection::connect(subc_path(&args)?)
         .await
         .map_err(|_| "cannot connect subc".to_string())?;
-    let client = SessionClient::bind_with_timeout(
-        conn,
-        &args.module_id,
-        session.clone(),
-        std::time::Duration::from_millis(args.bind_timeout_ms),
-    )
-    .await
+    let bind_timeout = std::time::Duration::from_millis(args.bind_timeout_ms);
+    let client = if matches!(args.cmd, Cmd::Describe { classifier: true }) {
+        SessionClient::bind_classifier_with_timeout(
+            conn,
+            &args.module_id,
+            session.clone(),
+            bind_timeout,
+        )
+        .await
+    } else {
+        SessionClient::bind_with_timeout(conn, &args.module_id, session.clone(), bind_timeout).await
+    }
     .map_err(|e| format!("bind management surface '{}': {e}", args.module_id))?;
     // Show project_root/harness/session from local lookup or the caller's CLI flags.
     // The root is not transmitted in the wire bind: the server's inventory decides the address.
@@ -826,7 +836,7 @@ async fn run(args: Args) -> Result<i32, String> {
         Cmd::Status { raw: true, .. }
             | Cmd::Raw { .. }
             | Cmd::Result { raw: true, .. }
-            | Cmd::Describe
+            | Cmd::Describe { .. }
             | Cmd::EventGet { .. }
     );
     if !raw_output {
@@ -1067,7 +1077,7 @@ async fn run(args: Args) -> Result<i32, String> {
             }
             Ok(0)
         }
-        Cmd::Describe => {
+        Cmd::Describe { .. } => {
             let body = client
                 .role_describe_raw()
                 .await
