@@ -13,7 +13,9 @@
 //! |---|---|
 //! | `message`, role `user` | a user message: its text and images |
 //! | `message`, role `assistant` | an assistant message: text, reasoning text, tool calls |
+//! | `message`, role `assistant`, `stopReason` `error` or `aborted` | nothing: Pi never sends it, nor its calls |
 //! | `message`, role `toolResult` | a tool message with the call's result |
+//! | a call still without a result when the next user or assistant turn arrives, or at the end | a tool message with Pi's error result `No result provided`, under an id broca mints |
 //! | `message`, role `bashExecution` | a user message: Pi's shell text and its images; nothing when excluded from context |
 //! | `message`, role `system` | nothing; counted as a dropped system message |
 //! | `custom_message` | a user message with its content |
@@ -22,7 +24,7 @@
 //! | a `compaction` on the active path | refused by name |
 //! | control entries (model and thinking-level changes, labels, edits) | nothing, and no move-list row |
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use broca_protocol::{
     ContentBlock, Message, Role, ToolCall, ToolCallId, ToolOutput, ToolOutputPart, ToolResult,
@@ -32,7 +34,7 @@ use serde_json::Value;
 
 use super::{
     base64_bytes, pair_calls, Draft, HeadError, HeadHistory, HeadMedium, HeadUsage, MediaCheck,
-    SourceRow, PI_CARRIER,
+    OpenCalls, SourceRow, PI_CARRIER,
 };
 
 /// The journal's entries, header first, from its complete lines: a last line without its
@@ -86,6 +88,8 @@ pub fn read(
     let mut moves = Vec::new();
     let mut dropped_system_messages = 0;
     let mut ids = HashSet::new();
+    // The calls of turns Pi leaves out, by call id, with the turn that made them.
+    let mut skipped_calls: HashMap<String, String> = HashMap::new();
     for entry in &projection.entries {
         let mid = entry.entry_id.clone();
         if !ids.insert(mid.clone()) {
@@ -106,6 +110,20 @@ pub fn read(
             match role {
                 "system" => dropped_system_messages += 1,
                 "user" => drafts.extend(user(&mid, row, content, check)?),
+                // Pi never sends its model an assistant turn that errored or was aborted, nor
+                // that turn's calls (pi-ai's `transform-messages.ts`, Pi 1.5.0). The turn still
+                // ends the one before it, as any assistant turn does.
+                "assistant" if skipped(row) => {
+                    for call in blocks(&mid, content)?
+                        .into_iter()
+                        .filter(|block| block_type(block) == "toolCall")
+                    {
+                        if let Some(id) = call["id"].as_str() {
+                            skipped_calls.insert(id.to_owned(), mid.clone());
+                        }
+                    }
+                    drafts.push(Draft::boundary(&mid));
+                }
                 "assistant" => drafts.extend(assistant(&mid, row, content, session)?),
                 "toolResult" => drafts.push(tool_result(&mid, row, content, check)?),
                 other => {
@@ -115,17 +133,53 @@ pub fn read(
                     ))
                 }
             }
+            // A user or assistant turn that carries nothing to import is still a turn to Pi:
+            // it ends the turn before it.
+            if drafts.len() == first && matches!(role, "user" | "assistant") {
+                drafts.push(Draft::boundary(&mid));
+            }
         }
         moves.push(SourceRow {
             mid,
             message: (drafts.len() > first).then_some(first),
         });
     }
+    // Pi closes a call left without a result when the next user or assistant turn arrives, or
+    // at the conversation's end, with this error result (pi-ai's `transform-messages.ts`).
+    let paired = match pair_calls(drafts, PI_CARRIER, OpenCalls::Close(NO_RESULT)) {
+        Ok(paired) => paired,
+        Err(HeadError::OrphanResult {
+            mid,
+            call_id,
+            skipped_turn: None,
+        }) if skipped_calls.contains_key(&call_id) => {
+            return Err(HeadError::OrphanResult {
+                mid,
+                skipped_turn: skipped_calls.get(&call_id).cloned(),
+                call_id,
+            })
+        }
+        Err(error) => return Err(error),
+    };
+    for row in &mut moves {
+        row.message = row.message.and_then(|draft| paired.at[draft]);
+    }
     Ok(HeadHistory {
-        messages: pair_calls(drafts, PI_CARRIER)?,
+        messages: paired.messages,
         rows: moves,
         dropped_system_messages,
     })
+}
+
+/// The text of the result Pi gives a call left without one.
+pub const NO_RESULT: &str = "No result provided";
+
+/// Whether Pi leaves an assistant entry out of what it sends: its turn errored or was aborted.
+fn skipped(row: &Value) -> bool {
+    matches!(
+        row["message"]["stopReason"].as_str(),
+        Some("error" | "aborted")
+    )
 }
 
 /// The entry's timestamp in Unix milliseconds. Every Pi entry carries one in RFC 3339.
@@ -147,6 +201,7 @@ fn draft(mid: &str, row: &Value, message: Message) -> Result<Draft, HeadError> {
         media: Vec::new(),
         keys: Vec::new(),
         row: mid.to_owned(),
+        boundary: false,
     })
 }
 

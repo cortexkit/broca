@@ -503,20 +503,6 @@ fn pi_refusals() {
          "summary": "s", "firstKeptEntryId": "a"}
     ]));
     assert!(matches!(compacted, Err(HeadError::Row { mid, .. }) if mid == "c"));
-    // A call with no result.
-    let open = read(json!([pi_message(
-        "a",
-        None,
-        json!({"role": "assistant", "stopReason": "toolUse",
-            "content": [{"type": "toolCall", "id": "t", "name": "x", "arguments": {}}]})
-    )]));
-    assert_eq!(
-        open.unwrap_err(),
-        HeadError::OpenCall {
-            mid: "a".into(),
-            call_id: "t".into()
-        }
-    );
     // A call Pi never ran has no key, yet here it has a result.
     let keyless = read(json!([
         pi_message(
@@ -584,4 +570,183 @@ fn rfc3339_times() {
     ] {
         assert_eq!(pi::rfc3339_ms(bad), None, "{bad}");
     }
+}
+
+fn pi_read(entries: Value) -> Result<HeadHistory, HeadError> {
+    pi::read(&pi_journal(entries), "s", &mut accept)
+}
+
+fn said(role: &str, text: &str, stop: &str) -> Value {
+    json!({"role": role, "stopReason": stop, "content": [{"type": "text", "text": text}]})
+}
+
+fn calling(stop: &str, calls: &[&str]) -> Value {
+    let content: Vec<Value> = calls
+        .iter()
+        .map(|id| json!({"type": "toolCall", "id": id, "name": "read", "arguments": {}}))
+        .collect();
+    json!({"role": "assistant", "stopReason": stop, "content": content})
+}
+
+fn answering(call: &str) -> Value {
+    json!({"role": "toolResult", "toolCallId": call,
+           "content": [{"type": "text", "text": "ok"}], "isError": false})
+}
+
+/// The synthetic result Pi gives a call left without one.
+fn no_result(call: &str) -> ContentBlock {
+    ContentBlock::ToolResult(broca_protocol::ToolResult {
+        tool_call_id: broca_protocol::ToolCallId(call.into()),
+        output: ToolOutput::error("No result provided"),
+        is_error: true,
+    })
+}
+
+/// An errored or aborted assistant turn never reaches Pi's model, nor do its calls: it imports
+/// as no message, its calls aren't open, and the retry after it, Pi's own or the person's,
+/// imports as the host showed it.
+#[test]
+fn pi_skips_an_errored_or_aborted_turn_and_keeps_its_retry() {
+    let history = pi_read(json!([
+        pi_message("u1", None, json!({"role": "user", "content": "first"})),
+        pi_message("a1", Some("u1"), calling("error", &["t9"])),
+        pi_message("a2", Some("a1"), said("assistant", "retried by Pi", "stop")),
+        pi_message(
+            "u2",
+            Some("a2"),
+            json!({"role": "user", "content": "second"})
+        ),
+        pi_message("a3", Some("u2"), said("assistant", "cut off", "aborted")),
+        pi_message(
+            "u3",
+            Some("a3"),
+            json!({"role": "user", "content": "again"})
+        ),
+        pi_message("a4", Some("u3"), said("assistant", "answered", "stop")),
+    ]))
+    .unwrap();
+    assert_eq!(
+        mids(&history),
+        [Some("u1"), Some("a2"), Some("u2"), Some("u3"), Some("a4")]
+    );
+    assert_eq!(
+        moves(&history),
+        [
+            ("u1", Some(0)),
+            ("a1", None),
+            ("a2", Some(1)),
+            ("u2", Some(2)),
+            ("a3", None),
+            ("u3", Some(3)),
+            ("a4", Some(4)),
+        ]
+    );
+    assert!(history
+        .messages
+        .iter()
+        .all(|message| message.calls.is_empty()));
+}
+
+/// A kept assistant's call still without a result gets Pi's synthetic error result where Pi
+/// puts it: before the next user or assistant turn (an errored one included), or at the end,
+/// each in a tool message of its own under an id broca mints. A call Pi never ran keeps no key.
+#[test]
+fn pi_closes_an_open_call_with_pis_synthetic_result() {
+    // At the end of the conversation, after the result that did come.
+    let at_end = pi_read(json!([
+        pi_message("u1", None, json!({"role": "user", "content": "go"})),
+        pi_message("a1", Some("u1"), calling("toolUse", &["t1", "t2"])),
+        pi_message("r1", Some("a1"), answering("t1")),
+    ]))
+    .unwrap();
+    assert_eq!(mids(&at_end), [Some("u1"), Some("a1"), Some("r1"), None]);
+    let synthetic = &at_end.messages[3];
+    assert_eq!(synthetic.message.role, Role::Tool);
+    assert_eq!(synthetic.message.content, [no_result("t2")]);
+    assert_eq!(
+        (synthetic.written_at_ms, synthetic.created_at_ms),
+        (None, None)
+    );
+    assert_eq!(
+        at_end.messages[1].calls.len(),
+        2,
+        "both calls ran under keys"
+    );
+
+    // Before the next user turn, which moves along.
+    let before_user = pi_read(json!([
+        pi_message("u1", None, json!({"role": "user", "content": "go"})),
+        pi_message("a1", Some("u1"), calling("toolUse", &["t1"])),
+        pi_message("u2", Some("a1"), json!({"role": "user", "content": "next"})),
+    ]))
+    .unwrap();
+    assert_eq!(
+        mids(&before_user),
+        [Some("u1"), Some("a1"), None, Some("u2")]
+    );
+    assert_eq!(before_user.messages[2].message.content, [no_result("t1")]);
+    assert_eq!(
+        moves(&before_user),
+        [("u1", Some(0)), ("a1", Some(1)), ("u2", Some(3))]
+    );
+
+    // Before the next assistant turn, even one Pi leaves out.
+    let before_skipped = pi_read(json!([
+        pi_message("u1", None, json!({"role": "user", "content": "go"})),
+        pi_message("a1", Some("u1"), calling("toolUse", &["t1"])),
+        pi_message("a2", Some("a1"), said("assistant", "failed", "error")),
+        pi_message("a3", Some("a2"), said("assistant", "done", "stop")),
+    ]))
+    .unwrap();
+    assert_eq!(
+        mids(&before_skipped),
+        [Some("u1"), Some("a1"), None, Some("a3")]
+    );
+    assert_eq!(
+        before_skipped.messages[2].message.content,
+        [no_result("t1")]
+    );
+    assert_eq!(
+        moves(&before_skipped),
+        [
+            ("u1", Some(0)),
+            ("a1", Some(1)),
+            ("a2", None),
+            ("a3", Some(3))
+        ]
+    );
+
+    // A reply that didn't stop to use tools never ran its call: it has no key.
+    let unrun = pi_read(json!([
+        pi_message("u1", None, json!({"role": "user", "content": "go"})),
+        pi_message("a1", Some("u1"), calling("length", &["t1"])),
+    ]))
+    .unwrap();
+    assert!(unrun.messages[1].calls.is_empty());
+    assert_eq!(unrun.messages[2].message.content, [no_result("t1")]);
+}
+
+/// A result for a call of a turn Pi left out still refuses the import as an orphan, naming that
+/// turn as errored or aborted.
+#[test]
+fn pi_refuses_a_result_for_a_skipped_turns_call() {
+    let error = pi_read(json!([
+        pi_message("u1", None, json!({"role": "user", "content": "go"})),
+        pi_message("a1", Some("u1"), calling("aborted", &["t1"])),
+        pi_message("r1", Some("a1"), answering("t1")),
+    ]))
+    .unwrap_err();
+    assert_eq!(
+        error,
+        HeadError::OrphanResult {
+            mid: "r1".into(),
+            call_id: "t1".into(),
+            skipped_turn: Some("a1".into()),
+        }
+    );
+    assert_eq!(error.code(), "import_orphan_result");
+    assert!(
+        error.to_string().contains("errored or was aborted"),
+        "{error}"
+    );
 }

@@ -29,7 +29,7 @@ use serde_json::Value;
 
 use super::{
     base64_bytes, pair_calls, Draft, HeadError, HeadHistory, HeadMedium, HeadUsage, MediaCheck,
-    SourceRow, OPENCODE2_CARRIER,
+    OpenCalls, SourceRow, OPENCODE2_CARRIER,
 };
 
 /// The rows of an export file: its `messages`, after checking the file's top-level shape.
@@ -121,8 +121,14 @@ pub fn read(bytes: &[u8], check: &mut MediaCheck<'_>) -> Result<HeadHistory, Hea
             message: (drafts.len() > first).then_some(first),
         });
     }
+    // OpenCode 2 sends no call without its result, so a call left without one means the head
+    // wasn't idle.
+    let paired = pair_calls(drafts, OPENCODE2_CARRIER, OpenCalls::Refuse)?;
+    for row in &mut moves {
+        row.message = row.message.and_then(|draft| paired.at[draft]);
+    }
     Ok(HeadHistory {
-        messages: pair_calls(drafts, OPENCODE2_CARRIER)?,
+        messages: paired.messages,
         rows: moves,
         dropped_system_messages,
     })
@@ -165,6 +171,7 @@ fn draft(mid: &str, row: &Value, message: Message) -> Result<Draft, HeadError> {
         media: Vec::new(),
         keys: Vec::new(),
         row: mid.to_owned(),
+        boundary: false,
     })
 }
 
@@ -382,6 +389,7 @@ fn assistant(mid: &str, row: &Value, check: &mut MediaCheck<'_>) -> Result<Vec<D
             media,
             keys: Vec::new(),
             row: mid.to_owned(),
+            boundary: false,
         });
     }
     Ok(out)

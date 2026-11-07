@@ -145,11 +145,16 @@ pub enum HeadError {
     Unreadable(String),
     /// A source row holds something the import can't map.
     Row { mid: String, reason: String },
-    /// A call has no result. An import runs only while the head is idle, so an open call means
-    /// it wasn't.
+    /// A call has no result, in a history whose host sends no call without one (OpenCode 2).
+    /// An import runs only while the head is idle, so an open call means it wasn't.
     OpenCall { mid: String, call_id: String },
-    /// A tool result answers no call made before it.
-    OrphanResult { mid: String, call_id: String },
+    /// A tool result answers no call made before it. `skipped_turn` names the turn whose call it
+    /// answers when that turn errored or was aborted, so the host never sent the call.
+    OrphanResult {
+        mid: String,
+        call_id: String,
+        skipped_turn: Option<String>,
+    },
     /// A medium can't be stored.
     Media { mid: String, reason: String },
     /// The side file can't be applied.
@@ -186,9 +191,22 @@ impl fmt::Display for HeadError {
                 f,
                 "source row {mid}: call {call_id} has no result, so the head wasn't idle"
             ),
-            Self::OrphanResult { mid, call_id } => write!(
+            Self::OrphanResult {
+                mid,
+                call_id,
+                skipped_turn: None,
+            } => write!(
                 f,
                 "source row {mid}: the result for call {call_id} answers no call before it"
+            ),
+            Self::OrphanResult {
+                mid,
+                call_id,
+                skipped_turn: Some(turn),
+            } => write!(
+                f,
+                "source row {mid}: the result for call {call_id} answers a call of turn {turn}, \
+                 which errored or was aborted, so the host never sent that call to its model"
             ),
             Self::Media { mid, reason } => {
                 write!(f, "source row {mid}: a medium can't be stored: {reason}")
@@ -213,17 +231,62 @@ pub(crate) struct Draft {
     pub keys: Vec<Option<String>>,
     /// The source row the message came from, for refusals.
     pub row: String,
+    /// A turn the host leaves out of what it sends its model, which still ends the turn before
+    /// it: it becomes no message.
+    pub boundary: bool,
+}
+
+impl Draft {
+    /// A turn the host leaves out, from source row `row`.
+    pub(crate) fn boundary(row: &str) -> Self {
+        Self {
+            mid: None,
+            message: Message::new(Role::Assistant, Vec::new()),
+            written_at_ms: None,
+            created_at_ms: None,
+            usage: None,
+            media: Vec::new(),
+            keys: Vec::new(),
+            row: row.to_owned(),
+            boundary: true,
+        }
+    }
+}
+
+/// What a history does with a call still without a result when the turn that made it ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpenCalls {
+    /// Refuse the import ([`HeadError::OpenCall`]).
+    Refuse,
+    /// Close the call with an error result of this text, in a tool message of its own, as the
+    /// host does before it sends its model the conversation.
+    Close(&'static str),
+}
+
+/// The messages of a history, and where each draft went.
+pub(crate) struct Paired {
+    pub messages: Vec<HeadMessage>,
+    /// For each draft, in order, the index of the message it became; `None` for a boundary.
+    pub at: Vec<Option<usize>>,
 }
 
 /// Pairs every call with its result and makes a reused call id unique.
 ///
 /// - A call's result must come in the tool messages right after its assistant message, before
-///   any other message. A call without one refuses the history ([`HeadError::OpenCall`]).
+///   any other message. When the turn ends with a call still unanswered, `open_calls` decides:
+///   the import refuses, or the call is closed with a synthetic error result placed where the
+///   turn ends, under an id broca mints.
+/// - A call its runner gave no key never ran, so a real result for it refuses the import. Only
+///   a call with a key is listed with its identity.
 /// - A result answering no call refuses it ([`HeadError::OrphanResult`]).
 /// - A call id the history used before is renamed `<id>-<n>`, n counting the id's uses, with a
 ///   further `-<k>` while that collides with any call id in the history, as the shared
 ///   finalizer does; its result is renamed with it. The call keeps the key the source gave it.
-pub(crate) fn pair_calls(drafts: Vec<Draft>, carrier: &str) -> Result<Vec<HeadMessage>, HeadError> {
+pub(crate) fn pair_calls(
+    drafts: Vec<Draft>,
+    carrier: &str,
+    open_calls: OpenCalls,
+) -> Result<Paired, HeadError> {
     let reserved: HashSet<String> = drafts
         .iter()
         .flat_map(|draft| &draft.message.content)
@@ -239,12 +302,17 @@ pub(crate) fn pair_calls(drafts: Vec<Draft>, carrier: &str) -> Result<Vec<HeadMe
     // The open turn, for refusals once it closes.
     let mut open: Option<OpenTurn> = None;
     let mut out = Vec::with_capacity(drafts.len());
+    let mut at = Vec::with_capacity(drafts.len());
     for mut draft in drafts {
-        if draft.message.role != Role::Tool {
+        if draft.boundary || draft.message.role != Role::Tool {
             if let Some(turn) = open.take() {
-                turn.close()?;
+                out.extend(turn.close(open_calls)?);
             }
             pending.clear();
+        }
+        if draft.boundary {
+            at.push(None);
+            continue;
         }
         let mut calls = Vec::new();
         let mut keys = std::mem::take(&mut draft.keys).into_iter();
@@ -265,20 +333,19 @@ pub(crate) fn pair_calls(drafts: Vec<Draft>, carrier: &str) -> Result<Vec<HeadMe
                         unique(&format!("{source}-{count}"), &reserved, &mut used)
                     };
                     call.tool_call_id = ToolCallId(assigned.clone());
-                    let key = keys.next().flatten();
-                    if key.is_none() {
-                        keyless.push(source.clone());
+                    match keys.next().flatten() {
+                        Some(key) => calls.push(CallIdentity {
+                            tool_call_id: assigned.clone(),
+                            call_key: key,
+                            carrier: carrier.to_owned(),
+                        }),
+                        None => keyless.push(assigned.clone()),
                     }
-                    calls.push(CallIdentity {
-                        tool_call_id: assigned.clone(),
-                        call_key: key.unwrap_or_default(),
-                        carrier: carrier.to_owned(),
-                    });
                     pending
                         .entry(source.clone())
                         .or_default()
                         .push_back(assigned.clone());
-                    unanswered.push(source);
+                    unanswered.push((source, assigned));
                 }
                 ContentBlock::ToolResult(result) => {
                     let source = result.tool_call_id.0.clone();
@@ -287,13 +354,12 @@ pub(crate) fn pair_calls(drafts: Vec<Draft>, carrier: &str) -> Result<Vec<HeadMe
                         return Err(HeadError::OrphanResult {
                             mid: draft.row.clone(),
                             call_id: source,
+                            skipped_turn: None,
                         });
                     };
-                    result.tool_call_id = ToolCallId(assigned);
+                    result.tool_call_id = ToolCallId(assigned.clone());
                     if let Some(turn) = open.as_mut() {
-                        if let Some(at) = turn.unanswered.iter().position(|id| *id == source) {
-                            turn.unanswered.remove(at);
-                        }
+                        turn.answered(&assigned)?;
                     }
                 }
                 _ => {}
@@ -306,6 +372,7 @@ pub(crate) fn pair_calls(drafts: Vec<Draft>, carrier: &str) -> Result<Vec<HeadMe
                 keyless,
             });
         }
+        at.push(Some(out.len()));
         out.push(HeadMessage {
             mid: draft.mid,
             message: draft.message,
@@ -319,37 +386,70 @@ pub(crate) fn pair_calls(drafts: Vec<Draft>, carrier: &str) -> Result<Vec<HeadMe
         });
     }
     if let Some(turn) = open {
-        turn.close()?;
+        out.extend(turn.close(open_calls)?);
     }
-    Ok(out)
+    Ok(Paired { messages: out, at })
 }
 
 /// An assistant message's calls while their results come in.
 struct OpenTurn {
     row: String,
-    /// Calls without a result yet, by source id, in call order.
-    unanswered: Vec<String>,
-    /// Calls the source runner gave no key, by source id.
+    /// Calls without a result yet, by source id and assigned id, in call order.
+    unanswered: Vec<(String, String)>,
+    /// Calls the source runner gave no key, by assigned id.
     keyless: Vec<String>,
 }
 
 impl OpenTurn {
-    /// Every call must have its result, and a call that has one must have the key its runner
-    /// gave it when it ran: a call without a key never ran, yet has a result.
-    fn close(self) -> Result<(), HeadError> {
-        if let Some(call_id) = self.unanswered.into_iter().next() {
-            return Err(HeadError::OpenCall {
-                mid: self.row,
-                call_id,
-            });
+    /// The call with assigned id `assigned` has its result. A call without a key never ran, so
+    /// a result for it can't be the host's own.
+    fn answered(&mut self, assigned: &str) -> Result<(), HeadError> {
+        if let Some(at) = self.unanswered.iter().position(|(_, id)| id == assigned) {
+            self.unanswered.remove(at);
         }
-        if let Some(call_id) = self.keyless.into_iter().next() {
+        if self.keyless.iter().any(|id| id == assigned) {
             return Err(HeadError::row(
                 &self.row,
-                format!("call {call_id} has a result but no key from its runner"),
+                format!("call {assigned} has a result but no key from its runner"),
             ));
         }
         Ok(())
+    }
+
+    /// Ends the turn: each call still without a result refuses the import, or gets the
+    /// synthetic error result `open_calls` names, in call order.
+    fn close(self, open_calls: OpenCalls) -> Result<Vec<HeadMessage>, HeadError> {
+        match open_calls {
+            OpenCalls::Refuse => match self.unanswered.into_iter().next() {
+                Some((call_id, _)) => Err(HeadError::OpenCall {
+                    mid: self.row,
+                    call_id,
+                }),
+                None => Ok(Vec::new()),
+            },
+            OpenCalls::Close(text) => Ok(self
+                .unanswered
+                .into_iter()
+                .map(|(_, assigned)| HeadMessage {
+                    mid: None,
+                    message: Message::new(
+                        Role::Tool,
+                        vec![ContentBlock::ToolResult(broca_protocol::ToolResult {
+                            tool_call_id: ToolCallId(assigned),
+                            output: broca_protocol::ToolOutput::error(text),
+                            is_error: true,
+                        })],
+                    ),
+                    written_at_ms: None,
+                    created_at_ms: None,
+                    usage: None,
+                    media: Vec::new(),
+                    calls: Vec::new(),
+                    send: None,
+                    rides: Vec::new(),
+                })
+                .collect()),
+        }
     }
 }
 
