@@ -58,8 +58,7 @@ pub fn journal_entries(bytes: &[u8]) -> Result<Vec<Value>, HeadError> {
 }
 
 /// Reads a Pi journal's bytes as a head's history. `session` is the session the caller named,
-/// which the journal's header must hold; its call keys name it. `check` validates each
-/// medium's bytes.
+/// which the journal's header must hold. `check` validates each medium's bytes.
 pub fn read(
     bytes: &[u8],
     session: &str,
@@ -124,7 +123,7 @@ pub fn read(
                     }
                     drafts.push(Draft::boundary(&mid));
                 }
-                "assistant" => drafts.extend(assistant(&mid, row, content, session)?),
+                "assistant" => drafts.extend(assistant(&mid, row, content)?),
                 "toolResult" => drafts.push(tool_result(&mid, row, content, check)?),
                 other => {
                     return Err(HeadError::row(
@@ -296,13 +295,9 @@ fn user(
 
 /// An assistant message: its text, its reasoning text without Pi's `thinkingSignature`, and
 /// its tool calls. Thalamus's runner keys the calls of a reply that stopped to use tools
-/// `<session>/<entry id>/<call id>`; any other reply's calls were never run, and have no key.
-fn assistant(
-    mid: &str,
-    row: &Value,
-    content: &Value,
-    session: &str,
-) -> Result<Option<Draft>, HeadError> {
+/// `<entry id>/<call id>`, which the import keeps verbatim; any other reply's calls were never
+/// run, and have no key.
+fn assistant(mid: &str, row: &Value, content: &Value) -> Result<Option<Draft>, HeadError> {
     let tool_use = row["message"]["stopReason"] == "toolUse";
     let mut out = Vec::new();
     let mut keys = Vec::new();
@@ -333,7 +328,7 @@ fn assistant(
                 let name = block["name"]
                     .as_str()
                     .ok_or_else(|| HeadError::row(mid, format!("call {call_id} names no tool")))?;
-                keys.push(tool_use.then(|| format!("{session}/{mid}/{call_id}")));
+                keys.push(tool_use.then(|| format!("{mid}/{call_id}")));
                 out.push(ContentBlock::ToolCall(ToolCall {
                     tool_call_id: ToolCallId(call_id.to_owned()),
                     tool_name: name.to_owned(),
