@@ -29,13 +29,16 @@ use broca_wire::head_import::{
 use ck_session_import::head::{HeadError, HeadHistory, HeadMessage};
 use sha2::{Digest as _, Sha256};
 
-/// The import folder every configuration reads from by default, under the user's home:
-/// `~/.local/share/cortexkit/broca/import-sources/`. Thalamus's `session.export` writes there.
-pub const DEFAULT_IMPORT_FOLDER: &str = ".local/share/cortexkit/broca/import-sources";
+/// The folder under broca's state root that every configuration reads imports from by default,
+/// and the only folder an import deletes its source from. The state root resolves the way every
+/// CortexKit store's does (`XDG_DATA_HOME`, else the platform's data folder), so on a default
+/// Linux or macOS install this is `~/.local/share/cortexkit/broca/import-sources/`. Thalamus's
+/// `session.export` writes there.
+pub const IMPORT_SOURCES_DIR: &str = "import-sources";
 
-/// The import folder under `home`.
-pub fn default_import_folder(home: &Path) -> PathBuf {
-    home.join(DEFAULT_IMPORT_FOLDER)
+/// The import folder under broca's state root.
+pub fn default_import_folder(state_root: &Path) -> PathBuf {
+    state_root.join(IMPORT_SOURCES_DIR)
 }
 
 /// Where imports may read from, and the one folder whose files an import may delete.
@@ -56,8 +59,10 @@ impl ImportRoots {
     }
 
     /// The configured roots, broca's own import folder under `home` by default.
-    pub fn with_default(roots: Option<Vec<PathBuf>>, home: Option<&Path>) -> Self {
-        let folder = home.map(default_import_folder);
+    /// The configured `roots`, or broca's own import folder (`folder`) alone when none are
+    /// configured. `folder` is the only place a source is deleted from either way.
+    pub fn with_default(roots: Option<Vec<PathBuf>>, folder: Option<&Path>) -> Self {
+        let folder = folder.map(Path::to_path_buf);
         let roots = roots.unwrap_or_else(|| folder.iter().cloned().collect());
         Self::new(roots, folder)
     }

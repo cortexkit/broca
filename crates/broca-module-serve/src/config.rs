@@ -954,9 +954,10 @@ mod account_limit_pause_config_tests {
 }
 
 /// Where a head's file-source import may read from: `import.roots` in `broca.jsonc`, each an
-/// absolute folder. Absent, broca's own import folder under the user's home is the only root,
+/// absolute folder. Absent, broca's own import folder under its state root is the only root,
 /// the folder Thalamus's `session.export` writes to. A source is read only under a root,
-/// resolved after symlinks, and deleted after its import only inside broca's own folder.
+/// resolved after symlinks, and deleted after its import only inside broca's own folder. Loaded
+/// once at boot and handed to the new storage's runtime (`StoreRuntime::with_import_roots`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ImportConfig {
     pub roots: Option<Vec<std::path::PathBuf>>,
@@ -1000,15 +1001,6 @@ impl ImportConfig {
             ));
         }
         Ok(Self { roots })
-    }
-
-    /// The roots an import reads under, with broca's own import folder under `home` as the
-    /// default and as the only folder a source is deleted from.
-    pub fn import_roots(
-        &self,
-        home: Option<&std::path::Path>,
-    ) -> broca_module::store_import::ImportRoots {
-        broca_module::store_import::ImportRoots::with_default(self.roots.clone(), home)
     }
 }
 

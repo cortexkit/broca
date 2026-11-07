@@ -1975,6 +1975,26 @@ pub trait ServeHandler: Send + Sync {
         Err(ServeError::Import("session.import is unsupported".into()))
     }
 
+    /// `session.import` from a file source, and `session.install_view`: commands only a session
+    /// kept in the new storage serves. A handler without the new storage refuses them by name.
+    async fn store_command(
+        &self,
+        _session: &LineageKey,
+        _command: crate::store_import::StoreCommand,
+    ) -> Result<crate::store_import::StoreOutcome, ServeError> {
+        Ok(crate::store_import::StoreOutcome::Refused(
+            crate::store_import::ImportRefusal::new(
+                "new_storage_unavailable",
+                "this module doesn't create sessions in the new storage",
+            ),
+        ))
+    }
+
+    /// Where a file-source import may read from. `None` without the new storage.
+    fn import_roots(&self) -> Option<std::sync::Arc<crate::store_import::ImportRoots>> {
+        None
+    }
+
     /// `session.retract` — retract a still-pending queued submission.
     async fn retract(
         &self,
@@ -3059,6 +3079,18 @@ impl ServeHandler for crate::LineageRegistry {
             Err(broca_core::ScopeRefusal::AdoptionRefused(refusal)) => Ok(Some(refusal)),
             _ => Ok(None),
         }
+    }
+
+    async fn store_command(
+        &self,
+        session: &LineageKey,
+        command: crate::store_import::StoreCommand,
+    ) -> Result<crate::store_import::StoreOutcome, ServeError> {
+        Ok(self.route_store_command(session, command).await?)
+    }
+
+    fn import_roots(&self) -> Option<std::sync::Arc<crate::store_import::ImportRoots>> {
+        self.store_runtime().map(|runtime| runtime.import_roots())
     }
 
     async fn import(&self, req: SessionImportRequest) -> Result<SessionImportResponse, ServeError> {

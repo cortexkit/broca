@@ -3469,6 +3469,16 @@ impl LineageRegistry {
         ) {
             return BindOwnership::Known(broca_core::SessionOwnershipV1::default());
         }
+        // A session kept in the new storage has no WAL to read. Its ownership comes from the
+        // owner summary the stored session keeps (`Operations::owner`), which records the same
+        // facts `durable_session_ownership` gathers from a WAL.
+        if let Some(store) = self.store_runtime() {
+            match store.holds(key) {
+                Ok(true) => return store_bind_ownership(&store, key).await,
+                Ok(false) => {}
+                Err(error) => return BindOwnership::Unreadable(error.to_string()),
+            }
+        }
         let Some(reader) = self.inner.reader.clone() else {
             return BindOwnership::NoHistorySource;
         };
@@ -3491,7 +3501,29 @@ impl LineageRegistry {
             inner: self.inner.clone(),
         }
     }
+}
 
+/// The ownership of a session kept in the new storage, from a read-only view of it. A session
+/// whose creation never committed holds no run, so it has no owner yet.
+async fn store_bind_ownership(
+    store: &crate::store_open::StoreRuntime,
+    key: &LineageKey,
+) -> BindOwnership {
+    match store.view(key).await {
+        Ok(Some(session)) => {
+            match broca_session_loop::owner::ownership(&session.operations.owner) {
+                Ok(ownership) => BindOwnership::Known(ownership),
+                Err(error) => BindOwnership::Unreadable(format!(
+                    "the session's stored owner can't be read: {error}"
+                )),
+            }
+        }
+        Ok(None) => BindOwnership::Known(broca_core::SessionOwnershipV1::default()),
+        Err(error) => BindOwnership::Unreadable(error.to_string()),
+    }
+}
+
+impl LineageRegistry {
     /// Resolve `key` to a live actor handle, opening (or awaiting an in-flight open, or
     /// awaiting a close then re-opening) as needed. Exactly one actor per session.
     pub async fn actor_for(&self, key: &LineageKey) -> Result<ActorHandle, OpenError> {

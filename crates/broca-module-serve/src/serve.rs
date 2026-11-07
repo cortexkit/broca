@@ -57,8 +57,8 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::manifest::{
-    OP_BASELINE, OP_CANCEL, OP_FLUSH_PREFIX, OP_HEAD, OP_IMPORT, OP_READ, OP_REFRESH,
-    OP_REFRESH_POLICY, OP_RETRACT, OP_ROLE_DESCRIBE, OP_RUN_EVENT_GET, OP_RUN_RESULT,
+    OP_BASELINE, OP_CANCEL, OP_FLUSH_PREFIX, OP_HEAD, OP_IMPORT, OP_INSTALL_VIEW, OP_READ,
+    OP_REFRESH, OP_REFRESH_POLICY, OP_RETRACT, OP_ROLE_DESCRIBE, OP_RUN_EVENT_GET, OP_RUN_RESULT,
     OP_RUN_TOOL_CALLS, OP_SEND, OP_SEND_STATUS, OP_SESSION_SEND_STATUS, OP_STATUS, OP_SUBSCRIBE,
     OP_VAULT_AUDIT, OP_WARM,
 };
@@ -2776,7 +2776,7 @@ where
         }
         let write = matches!(
             method,
-            OP_SEND | OP_WARM | OP_IMPORT | OP_CANCEL | OP_RETRACT | OP_REFRESH | OP_REFRESH_POLICY | OP_FLUSH_PREFIX
+            OP_SEND | OP_WARM | OP_IMPORT | OP_INSTALL_VIEW | OP_CANCEL | OP_RETRACT | OP_REFRESH | OP_REFRESH_POLICY | OP_FLUSH_PREFIX
         );
         let write = write || matches!(method, "session.upload_begin" | "session.upload_append" | "session.upload_commit");
         let session_read = matches!(method, OP_READ | OP_HEAD | OP_RUN_RESULT | OP_RUN_TOOL_CALLS | OP_RUN_EVENT_GET | OP_STATUS | OP_SUBSCRIBE | OP_BASELINE | "session.upload_status" | cortexkit_role_llm_runner::ops::SESSION_HISTORY | cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REFS | cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REF_READ)
@@ -3559,6 +3559,120 @@ where
                     send_serve_error(writer, ver, channel, epoch, corr, &error).await
                 }
             }
+        }
+        OP_IMPORT if req.params.get("source").is_some() => {
+            // A head's history read from a file another host exported, into a session the new
+            // storage creates. An import carrying its messages inline is today's import, below.
+            let params: broca_wire::head_import::FileImportParams =
+                match serde_json::from_value(req.params) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        return send_error(
+                            writer,
+                            ver,
+                            channel,
+                            epoch,
+                            corr,
+                            "invalid_params",
+                            &error.to_string(),
+                        )
+                        .await
+                    }
+                };
+            let Some(principal) = bind.principal.clone() else {
+                return send_error(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    "principal_required",
+                    "an import needs the daemon's attested principal on its route",
+                )
+                .await;
+            };
+            let Some(roots) = handler.import_roots() else {
+                return send_error(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    "new_storage_unavailable",
+                    "this module doesn't create sessions in the new storage",
+                )
+                .await;
+            };
+            let command = broca_module::store_import::StoreCommand::Import(Box::new(
+                broca_module::store_import::ImportCommand {
+                    params,
+                    principal,
+                    scope: match &bind.scope {
+                        broca_protocol::SendScope::Stamped(stamped) => Some(stamped.scope.clone()),
+                        _ => None,
+                    },
+                    roots,
+                    now_ms: broca_diagnostics::now_ms(),
+                },
+            ));
+            send_store_outcome(
+                handler.as_ref(),
+                session,
+                command,
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+            )
+            .await
+        }
+        OP_INSTALL_VIEW => {
+            let params: broca_wire::head_import::InstallViewParams =
+                match serde_json::from_value(req.params) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        return send_error(
+                            writer,
+                            ver,
+                            channel,
+                            epoch,
+                            corr,
+                            "invalid_params",
+                            &error.to_string(),
+                        )
+                        .await
+                    }
+                };
+            let Some(principal) = bind.principal.clone() else {
+                return send_error(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    "principal_required",
+                    "installing a view needs the daemon's attested principal on its route",
+                )
+                .await;
+            };
+            let command = broca_module::store_import::StoreCommand::InstallView(Box::new(
+                broca_module::store_import::InstallViewCommand {
+                    view: params.view,
+                    principal,
+                },
+            ));
+            send_store_outcome(
+                handler.as_ref(),
+                session,
+                command,
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+            )
+            .await
         }
         OP_IMPORT => {
             let params: ImportParams = match serde_json::from_value(req.params) {
@@ -4910,6 +5024,46 @@ fn upload_error_body(error: &broca_core::media_uploads::UploadError, for_send: b
     ErrorBody::new(body.code, body.message).with_detail(body.detail.expect("upload detail"))
 }
 
+/// Routes a command only the new storage serves, and sends its answer: the reply, or its
+/// refusal under the refusal's own code.
+#[allow(clippy::too_many_arguments)]
+async fn send_store_outcome<H: ServeHandler + ?Sized>(
+    handler: &H,
+    session: &BrocaBindIdentity,
+    command: broca_module::store_import::StoreCommand,
+    writer: &EgressSender<Frame>,
+    ver: u8,
+    channel: u16,
+    epoch: u32,
+    corr: u64,
+) -> Result<(), ServeIoError> {
+    use broca_module::store_import::StoreOutcome;
+    match handler.store_command(session, command).await {
+        Ok(StoreOutcome::Imported(reply)) => {
+            send_json_response(writer, ver, channel, epoch, corr, &reply).await
+        }
+        Ok(StoreOutcome::ViewInstalled(reply)) => {
+            send_json_response(writer, ver, channel, epoch, corr, &reply).await
+        }
+        Ok(StoreOutcome::Refused(refusal)) => {
+            send_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                refusal.code,
+                &refusal.message,
+            )
+            .await
+        }
+        // The registry routes a command again when its session closes under it, so it never
+        // hands this back.
+        Ok(StoreOutcome::Reopen) => unreachable!("route_store_command reopens the session itself"),
+        Err(error) => send_serve_error(writer, ver, channel, epoch, corr, &error).await,
+    }
+}
+
 async fn send_serve_error(
     writer: &EgressSender<Frame>,
     ver: u8,
@@ -5919,6 +6073,7 @@ fn method_code(method: &str) -> u8 {
         OP_RUN_RESULT => 16,
         OP_WARM => 17,
         OP_RUN_TOOL_CALLS => 19,
+        OP_INSTALL_VIEW => 20,
         _ => 255,
     }
 }

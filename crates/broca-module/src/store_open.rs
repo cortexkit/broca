@@ -38,6 +38,9 @@ pub struct StoreRuntime {
     /// Where the spend facts of a session's runs are written. Without it, runs that end stay
     /// owed, and are billed when a module that has it opens their session.
     billing: Option<crate::store_billing::StoreBilling>,
+    /// Where a head's file-source import may read from. Broca's own import folder under the
+    /// state root unless the operator configured other roots (`with_import_roots`).
+    import_roots: Arc<crate::store_import::ImportRoots>,
 }
 
 impl StoreRuntime {
@@ -65,7 +68,29 @@ impl StoreRuntime {
             executor,
             idle_ttl,
             billing: None,
+            import_roots: Arc::new(crate::store_import::ImportRoots::with_default(
+                None,
+                Some(&crate::store_import::default_import_folder(state_root)),
+            )),
         })
+    }
+
+    /// Reads file-source imports from `roots` (`import.roots` in `broca.jsonc`, loaded at
+    /// boot) instead of broca's own import folder alone. That folder stays the only place an
+    /// import deletes its source from.
+    pub fn with_import_roots(mut self, roots: Option<Vec<PathBuf>>) -> Self {
+        self.import_roots = Arc::new(crate::store_import::ImportRoots::with_default(
+            roots,
+            Some(&crate::store_import::default_import_folder(
+                &self.state_root,
+            )),
+        ));
+        self
+    }
+
+    /// Where a file-source import may read from.
+    pub fn import_roots(&self) -> Arc<crate::store_import::ImportRoots> {
+        Arc::clone(&self.import_roots)
     }
 
     /// Writes the spend facts of every run on the new storage to `billing`, the deployment's
