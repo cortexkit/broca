@@ -24,6 +24,30 @@ pub(crate) fn clean_replies(render_tags: bool, frozen_render_config: &serde_json
         .is_some_and(|frozen| frozen.mode == broca_protocol::structured_output::Mode::FinalText)
 }
 
+fn renders_tag_numbers(render_tags: bool, manifest: Option<&broca_wal::PlanManifest>) -> bool {
+    render_tags
+        || manifest.is_some_and(|manifest| {
+            serde_json::from_str::<serde_json::Value>(manifest.plan.as_json_text())
+                .ok()
+                .is_some_and(|plan| {
+                    plan.get("compaction_item")
+                        .is_some_and(|item| !item.is_null())
+                })
+        })
+}
+
+/// The caller-facing reply policy frozen by a compaction run. Its view shows tag numbers
+/// independently of the legacy render bit. This policy must not replace request-rendering rules.
+pub fn clean_replies_for_run(
+    config: &broca_wal::RunConfig,
+    manifest: Option<&broca_wal::PlanManifest>,
+) -> bool {
+    clean_replies(
+        renders_tag_numbers(config.render_tags, manifest),
+        &config.frozen_render_config,
+    )
+}
+
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Metadata {
     pub tag_base: u64,
@@ -319,16 +343,8 @@ impl Fold {
                 self.assistant = None;
                 self.step = None;
                 self.step_view = None;
-                self.render_tags = config.render_tags
-                    || manifest.as_ref().is_some_and(|manifest| {
-                        serde_json::from_str::<serde_json::Value>(manifest.plan.as_json_text())
-                            .ok()
-                            .is_some_and(|plan| {
-                                plan.get("compaction_item")
-                                    .is_some_and(|item| !item.is_null())
-                            })
-                    });
-                self.clean_replies = clean_replies(self.render_tags, &config.frozen_render_config);
+                self.render_tags = renders_tag_numbers(config.render_tags, manifest.as_deref());
+                self.clean_replies = clean_replies_for_run(config, manifest.as_deref());
                 self.import_high = matches!(
                     origin,
                     broca_wal::RunOrigin::SeededFrom {

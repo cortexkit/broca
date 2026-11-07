@@ -644,6 +644,7 @@ pub fn scope_plan_opener(scope: &broca_protocol::SessionScope) -> Option<String>
 fn final_message_of(
     records: &[broca_wal::FramedRecord],
     run_id: &broca_protocol::RunId,
+    clean_reply: Option<bool>,
 ) -> Result<broca_wire::FinalMessage, ServeError> {
     // Missing records and replay failures do not expose a retryable I/O cause.
     let started = |framed: &broca_wal::FramedRecord| matches!(&framed.record, broca_wal::WalRecord::RunStarted { run_id: id, .. } if id == run_id);
@@ -659,12 +660,13 @@ fn final_message_of(
         .map_or(records.len(), |offset| start + 1 + offset);
     let transcript = broca_core::replay_transcript(&records[..end])
         .map_err(|error| ServeError::Open(format!("replay failed: {error}"), None))?;
-    final_message_from_prompt(&transcript, run_id)
+    final_message_from_prompt(&transcript, run_id, clean_reply)
 }
 
 fn final_message_from_prompt(
     transcript: &[broca_protocol::Message],
     run_id: &broca_protocol::RunId,
+    clean_reply: Option<bool>,
 ) -> Result<broca_wire::FinalMessage, ServeError> {
     let (ordinal, message) = transcript
         .iter()
@@ -678,16 +680,17 @@ fn final_message_from_prompt(
             )
         })?;
     let ordinal = message.ordinal.unwrap_or(ordinal as u64);
-    // The text as every exposure shows it: cleaned when a tag-rendering run under the computed
-    // rules wrote it, raw for any other run and for a structured-output run's final text.
-    let message = broca_protocol::tags::exposed_message(message);
+    // The reconstructed message's tag flags also drive provider requests. Caller text follows
+    // the run's frozen exposure policy, including compaction views that show numbers without
+    // legacy tags.
+    let clean = clean_reply.unwrap_or_else(|| broca_protocol::tags::cleans_model_text(message));
     let text: String = message
         .content
         .iter()
         .filter_map(|block| match block {
             broca_protocol::content::ContentBlock::Text { text }
             | broca_protocol::content::ContentBlock::TextWithState { text, .. } => {
-                Some(text.as_str())
+                Some(broca_protocol::tags::exposed_model_text(clean, text))
             }
             _ => None,
         })
@@ -3724,9 +3727,26 @@ impl ServeHandler for crate::LineageRegistry {
                 Some(records) => records,
                 None => self.read_durable_wal(session).await?.0,
             };
+            let clean_reply = records.iter().find_map(|frame| match &frame.record {
+                broca_wal::WalRecord::RunStarted {
+                    run_id: id,
+                    config,
+                    manifest,
+                    compaction_plan_version: Some(_),
+                    ..
+                } if id == &run_id => {
+                    Some(broca_core::compaction_v2::metadata::clean_replies_for_run(
+                        config,
+                        manifest.as_deref(),
+                    ))
+                }
+                _ => None,
+            });
             let mut message = match &row_read {
-                Some(read) => final_message_from_prompt(&read.replayed.prompt, &run_id)?,
-                None => final_message_of(&records, &run_id)?,
+                Some(read) => {
+                    final_message_from_prompt(&read.replayed.prompt, &run_id, clean_reply)?
+                }
+                None => final_message_of(&records, &run_id, clean_reply)?,
             };
             // A complete legacy snapshot already proves its original m<position> vocabulary.
             // Re-reading head would read the log again even though this snapshot already proves it.
@@ -4656,8 +4676,8 @@ impl ServeHandler for crate::LineageRegistry {
                 if wake_directive_requested(records, &run_id) =>
             {
                 *directives = match &row_read {
-                    Some(read) => final_message_from_prompt(&read.replayed.prompt, &run_id),
-                    None => final_message_of(records, &run_id),
+                    Some(read) => final_message_from_prompt(&read.replayed.prompt, &run_id, None),
+                    None => final_message_of(records, &run_id, None),
                 }
                 .ok()
                 .and_then(|message| completed_directives(records, &run_id, &message.text));

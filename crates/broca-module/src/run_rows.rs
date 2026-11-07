@@ -763,6 +763,105 @@ mod tests {
         assert!(!root.exists(), "fixture left its scratch directory behind");
     }
 
+    #[tokio::test]
+    async fn run_row_compaction_reply_cleaning_does_not_change_replay_tag_rules() {
+        let mut f = Fixture::new("compaction-reply");
+        let mut start: WalRecord = serde_json::from_str(
+            include_str!("../../broca-wal/tests/fixtures/compaction_v2_records.jsonl")
+                .lines()
+                .last()
+                .unwrap(),
+        )
+        .unwrap();
+        if let WalRecord::RunStarted {
+            session,
+            run_id,
+            config,
+            manifest,
+            input,
+            compaction_plan_version,
+            ..
+        } = &mut start
+        {
+            *session = f.key.clone();
+            *run_id = RunId("compaction-reply".into());
+            *compaction_plan_version = Some(broca_core::compaction_v2::PLAN_VERSION);
+            config.render_tags = false;
+            config.computed_tags = Some(broca_wal::ComputedTagRules { checkpoint: 0 });
+            *manifest = Some(Box::new(broca_wal::PlanManifest {
+                plan: broca_wal::OpaqueJson::from_json_text(
+                    json!({
+                        "compaction_item":{"provider":"provider","preset":"head","params":{}},
+                        "composition":{},"render_tags":false
+                    })
+                    .to_string(),
+                )
+                .unwrap(),
+                plan_identity: "plan".into(),
+                composition_digest: "digest".into(),
+                tools: Arc::new(vec![]),
+                system_text: String::new(),
+                system_digest: String::new(),
+                join_version: 1,
+                role_versions: Default::default(),
+                fetches: vec![],
+                declarations: vec![],
+                rich_ui: None,
+            }));
+            *input = Arc::new(vec![Message::new(
+                Role::User,
+                vec![ContentBlock::Text {
+                    text: "question".into(),
+                }],
+            )]);
+        }
+        f.append(start);
+        f.step(
+            1,
+            vec![
+                ContentBlock::Text {
+                    text: "§2§ first §99§".into(),
+                },
+                ContentBlock::Text {
+                    text: "§3§ second §99§".into(),
+                },
+            ],
+        );
+        f.finish(RunFinishReason::Completed);
+        let run_id = RunId("compaction-reply".into());
+        let indexed = f
+            .source
+            .read(&f.key, &run_id)
+            .unwrap()
+            .expect("indexed run");
+        let rules = indexed
+            .replayed
+            .prompt
+            .last()
+            .unwrap()
+            .part_tags()
+            .unwrap()
+            .computed
+            .unwrap();
+        assert!(!rules.render);
+        assert!(
+            !rules.clean,
+            "provider replay must keep the frozen legacy rule"
+        );
+        for indexed in [false, true] {
+            let result = f
+                .registry(indexed)
+                .run_result(&f.key, run_id.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                result.final_message.unwrap().text,
+                "firstsecond",
+                "indexed={indexed}"
+            );
+        }
+    }
+
     struct ReadPlan {
         ranges: Vec<(&'static str, access_counter::WalReadAccess)>,
         decodes: u64,
