@@ -150,7 +150,7 @@ async fn model(responses: Vec<String>) -> Model {
 }
 
 fn request(root: &Path) -> RunRequest {
-    RunRequest { route_decision_id: None,
+    RunRequest { route_decision_id: None, account_route: None,
     input_written_at_ms: None, directives: None, session_class: None,
     retention: None, on_restart: None, keep_warm: None, project_id: None,
     principal: None, run_id: RunId("run".into()),

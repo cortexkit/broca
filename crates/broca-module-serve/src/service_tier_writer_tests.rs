@@ -297,6 +297,12 @@ impl RunExecutor for TierFixtureExecutor {
     ) -> Result<(), String> {
         self.live.check_service_tier(request)
     }
+    fn check_account_route(
+        &self,
+        request: &broca_protocol::request::SubmissionRequest,
+    ) -> Result<(), String> {
+        self.live.check_account_route(request)
+    }
 
     fn compaction_plane(&self) -> Option<Arc<dyn broca_core::CompactionPlane>> {
         Some(self.plane.clone())

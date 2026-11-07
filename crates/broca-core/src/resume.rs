@@ -2290,6 +2290,7 @@ mod tests {
             drop(file);
             let before = std::fs::read(store.wal_path(&session)).unwrap();
             let request = RunRequest {
+                account_route: None,
                 route_decision_id: None,
                 input_written_at_ms: None,
                 directives: None,

@@ -815,6 +815,7 @@ pub fn conversation_key(session: &BindIdentity) -> String {
 
 /// One admission's request to routing.
 pub struct AccountForRequest<'a> {
+    pub account_route: Option<&'a broca_protocol::request::AccountRoute>,
     pub decision_id: Option<&'a str>,
     pub service_tier: Option<&'a str>,
     pub pool: Option<&'a str>,
@@ -925,10 +926,15 @@ fn check_account_tier(params: &Value, chosen: Option<&str>) -> Result<(), String
 
 /// The `route.account_for` params, in routing's field names.
 pub fn account_for_params(request: &AccountForRequest<'_>) -> Value {
+    let (provider, model) = request
+        .account_route
+        .map_or((request.provider, request.model), |route| {
+            (route.provider.as_str(), route.model.as_str())
+        });
     let mut params = json!({
-        "provider": request.provider,
-        "model": request.model,
-        "affinity_model": request.model,
+        "provider": provider,
+        "model": model,
+        "affinity_model": model,
         "conversation_key": request.conversation_key,
         "caller": { "runner": RUNNER },
         "admission_id": request.admission_id,
@@ -1195,6 +1201,7 @@ impl AccountChoice {
 
 /// Everything [`choose_account`] needs about one fresh run.
 pub struct ChoiceInputs<'a> {
+    pub account_route: Option<&'a broca_protocol::request::AccountRoute>,
     pub decision_id: Option<&'a str>,
     pub service_tier: Option<&'a str>,
     pub pool: Option<&'a str>,
@@ -1300,8 +1307,9 @@ where
         return Ok(AccountChoice::NotApplicable);
     }
     let admission = admission_id(inputs.run_id);
-    let hinted = inputs.pool.is_some() || inputs.credential_id.is_some();
-    if inputs.caller_named_account && hinted {
+    let hinted =
+        inputs.pool.is_some() || inputs.credential_id.is_some() || inputs.account_route.is_some();
+    if inputs.caller_named_account && (inputs.pool.is_some() || inputs.credential_id.is_some()) {
         return Err(ChoiceRefusal::Refused(AccountSelectionRefusal {
             routing_code: "invalid_request".into(),
             retry_after_s: None,
@@ -1355,6 +1363,7 @@ where
         )));
     }
     let params = account_for_params(&AccountForRequest {
+        account_route: inputs.account_route,
         decision_id: inputs.decision_id,
         service_tier: inputs.service_tier,
         pool: inputs.pool,

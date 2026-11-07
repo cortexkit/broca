@@ -3,6 +3,7 @@
 //! CallOptions, adapted to subc-routed tools.
 
 pub use cortexkit_role_llm_runner::directives::DirectiveName;
+pub use cortexkit_role_llm_runner::send::AccountRoute;
 use std::sync::Arc;
 
 /// Session classes are opaque labels, not paths or provider identities.
@@ -508,6 +509,8 @@ pub struct SubmissionRequest {
     /// Caller-owned routing decision, distinct from routing's allocated account decision.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route_decision_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_route: Option<AccountRoute>,
     /// Held by the server after read-only preflight; never supplied by a client or persisted.
     #[serde(skip)]
     pub staged_uploads: Option<Arc<StagedUploads>>,
@@ -854,6 +857,7 @@ mod tests {
     #[test]
     fn submission_request_tool_module_round_trips_when_present() {
         let request = SubmissionRequest {
+            account_route: None,
             route_decision_id: None,
             service_tier_level: None,
             staged_uploads: None,
@@ -948,6 +952,7 @@ mod budget_compat_tests {
     #[test]
     fn absent_submission_budget_is_omitted_and_defaults_to_none() {
         let request = SubmissionRequest {
+            account_route: None,
             route_decision_id: None,
             service_tier_level: None,
             staged_uploads: None,

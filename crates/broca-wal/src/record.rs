@@ -3941,6 +3941,9 @@ pub struct RunConfig {
     /// Caller-owned decision fixed for the run; AuthSelection holds routing's own decision.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route_decision_id: Option<String>,
+    /// Routing's account namespace, frozen independently of the model-call names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_route: Option<broca_protocol::request::AccountRoute>,
     /// Frozen operator consent to automatic same-selection recovery. Omitted on legacy runs.
     #[serde(default, skip_serializing_if = "is_false")]
     pub account_limit_pause: bool,
@@ -4511,6 +4514,7 @@ mod schema_tests {
     fn run_config_tools_arc_keeps_existing_wal_bytes() {
         let config = RunConfig {
             global_system: None,
+            account_route: None,
             route_decision_id: None,
             account_limit_pause: false,
             turn_directives_v1: None,
@@ -4627,6 +4631,7 @@ mod schema_tests {
     fn min_config() -> Box<RunConfig> {
         Box::new(RunConfig {
             global_system: None,
+            account_route: None,
             route_decision_id: None,
             account_limit_pause: false,
             turn_directives_v1: None,
@@ -5561,6 +5566,7 @@ mod schema_tests {
                 delivery: None,
                 submission_id: SubmissionId("sub2".into()),
                 request: Box::new(SubmissionRequest {
+                    account_route: None,
                     route_decision_id: None,
                     service_tier_level: None,
                     staged_uploads: None,

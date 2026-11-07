@@ -1775,6 +1775,7 @@ fn the_output_reserve_falls_back_to_the_models_output_cap() {
     use broca_wal::RunConfig;
     let config = |max_output_tokens: Option<u64>| RunConfig {
         global_system: None,
+        account_route: None,
         route_decision_id: None,
         account_limit_pause: false,
         turn_directives_v1: None,

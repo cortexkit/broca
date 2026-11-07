@@ -8198,6 +8198,7 @@ mod tests {
             run_id: broca_protocol::RunId("legacy".into()),
             session,
             config: Box::new(broca_wal::RunConfig {
+                account_route: None,
                 global_system: None,
                 route_decision_id: None,
                 account_limit_pause: false,

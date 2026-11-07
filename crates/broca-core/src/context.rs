@@ -3146,6 +3146,7 @@ mod tests {
                 session: BindIdentity::new("/tmp/p", "h", "s"),
                 ts_ms: None,
                 config: Box::new(RunConfig {
+                    account_route: None,
                     global_system: None,
                     route_decision_id: None,
                     account_limit_pause: false,
@@ -4211,6 +4212,7 @@ mod episode_merge_regression {
     fn config(model: &str) -> RunConfig {
         RunConfig {
             global_system: None,
+            account_route: None,
             route_decision_id: None,
             account_limit_pause: false,
             turn_directives_v1: None,

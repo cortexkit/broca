@@ -7914,6 +7914,7 @@ mod tests {
             session: session.clone(),
             config: Box::new(RunConfig {
                 global_system: None,
+                account_route: None,
                 route_decision_id: None,
                 account_limit_pause: false,
                 turn_directives_v1: None,
@@ -8611,6 +8612,7 @@ mod offset_page_tests {
     fn run_config() -> Box<RunConfig> {
         Box::new(RunConfig {
             global_system: None,
+            account_route: None,
             route_decision_id: None,
             account_limit_pause: false,
             turn_directives_v1: None,

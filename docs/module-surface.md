@@ -271,6 +271,12 @@ session.subscribe { from?: "start" | "live" | cursor } (dedicated route; §9)
 
     session.send { session, prompt, system?, send_id?, session_class?, retention?, cache?, model?, tool_providers?, stop_when?, seed_from?, context_management?, delivery?, conversation_key?, title? }
     title?: 1-200 Unicode scalar values, not blank, no control characters; else invalid_params {field: "title"}
+    account_route?: {provider: nonempty string, model: nonempty string}, no other members;
+        accepted for the listed routed_accounts methods only. These are the routing select
+        answer's names for account admission, not the model-call names. Frozen per run:
+        joining omission inherits, an explicit different route refuses invalid_params
+        {field: "account_route"} before any write. An independently queued run freezes its
+        own route. Malformed or unsupported account_route also refuses before any write.
     → { state: "active" | "pending" | "finished", run_id?, submission_id?, reason?, baseline? } (DRIVER; §11)
 
 session.retract { session, submission_id }

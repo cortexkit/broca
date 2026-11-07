@@ -200,6 +200,7 @@ fn run_started(session: &BindIdentity, run_id: &str, ts_ms: u64) -> WalRecord {
         session: session.clone(),
         ts_ms: Some(ts_ms),
         config: Box::new(broca_wal::RunConfig {
+            account_route: None,
             global_system: None,
             route_decision_id: None,
             account_limit_pause: false,

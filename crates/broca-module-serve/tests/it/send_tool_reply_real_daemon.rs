@@ -101,6 +101,7 @@ fn research(reply: Option<u64>) -> Tool {
 
 fn request(session: BindIdentity, tools: Vec<Tool>) -> RunRequest {
     RunRequest {
+        account_route: None,
         route_decision_id: None,
         input_written_at_ms: None,
         directives: None,

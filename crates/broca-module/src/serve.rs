@@ -2809,6 +2809,10 @@ impl ServeHandler for crate::LineageRegistry {
                 field: "route_decision_id".into(),
                 message: "route_decision_id is fixed for the active run".into(),
             }),
+            SendOutcome::AccountRouteFixed => Err(ServeError::InvalidParams {
+                field: "account_route".into(),
+                message: "account_route is fixed for the active run".into(),
+            }),
             SendOutcome::ServiceTierInvalid { reason, message } => {
                 Err(ServeError::ServiceTierInvalid { reason, message })
             }
@@ -5196,6 +5200,7 @@ mod offset_head_tests {
             session: BindIdentity::new("/tmp/project", "runner", "session"),
             config: Box::new(RunConfig {
                 global_system: None,
+                account_route: None,
                 route_decision_id: None,
                 account_limit_pause: false,
                 turn_directives_v1: None,

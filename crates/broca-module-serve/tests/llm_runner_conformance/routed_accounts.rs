@@ -771,6 +771,7 @@ mod tests {
         let chosen = broca_module_serve::account_routing::choose_account(
             &client,
             ChoiceInputs {
+                account_route: None,
                 decision_id: None,
                 service_tier: None,
                 pool: fields["auth"]["pool"].as_str(),

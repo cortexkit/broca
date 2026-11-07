@@ -72,6 +72,7 @@ pub fn submission_difference(
 ) -> Option<&'static str> {
     let SubmissionRequest {
         route_decision_id: existing_route_decision_id,
+        account_route: existing_account_route,
         staged_uploads: _,
         content: existing_content,
         directives: existing_directives,
@@ -104,6 +105,7 @@ pub fn submission_difference(
     } = existing;
     let SubmissionRequest {
         route_decision_id: requested_route_decision_id,
+        account_route: requested_account_route,
         staged_uploads: _,
         content: requested_content,
         directives: requested_directives,
@@ -137,6 +139,10 @@ pub fn submission_difference(
         (
             existing_route_decision_id != requested_route_decision_id,
             "route_decision_id",
+        ),
+        (
+            existing_account_route != requested_account_route,
+            "account_route",
         ),
         (existing_content != requested_content, "content"),
         (existing_directives != requested_directives, "directives"),
@@ -206,6 +212,8 @@ fn inherited_difference(
 struct SubmissionIdentityDigestV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     route_decision_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    account_route: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     directives: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -314,6 +322,7 @@ fn identity_digest_v1(
 ) -> SubmissionIdentityDigestV1 {
     let SubmissionRequest {
         route_decision_id,
+        account_route,
         staged_uploads: _,
         content,
         directives,
@@ -346,6 +355,9 @@ fn identity_digest_v1(
     policy_allowed.sort_unstable();
     SubmissionIdentityDigestV1 {
         route_decision_id: route_decision_id.clone(),
+        account_route: account_route
+            .as_ref()
+            .map(|route| digest_json(serde_json::json!(route))),
         content: (!content.is_empty()).then(|| digest_json(serde_json::json!(content))),
         directives: directives
             .as_ref()
@@ -424,6 +436,10 @@ pub fn send_identity_difference_with_conversation_key(
         (
             stored.route_decision_id != requested.route_decision_id,
             "route_decision_id",
+        ),
+        (
+            stored.account_route != requested.account_route,
+            "account_route",
         ),
         (
             stored.client_message_id != requested.client_message_id,
@@ -3191,6 +3207,7 @@ mod tests {
     fn config(model: &str) -> RunConfig {
         RunConfig {
             global_system: None,
+            account_route: None,
             route_decision_id: None,
             account_limit_pause: false,
             turn_directives_v1: None,
@@ -3380,6 +3397,7 @@ mod tests {
 
     fn request(text: &str) -> SubmissionRequest {
         SubmissionRequest {
+            account_route: None,
             route_decision_id: None,
             service_tier_level: None,
             staged_uploads: None,
@@ -3408,6 +3426,40 @@ mod tests {
             inherit_frozen: Default::default(),
             structured_output: None,
             client_message_id: None,
+        }
+    }
+
+    #[test]
+    fn account_route_identity_distinguishes_provider_model_and_absence() {
+        let base = request("hello");
+        let mut routed = base.clone();
+        routed.account_route = Some(broca_protocol::request::AccountRoute::new("pool", "model"));
+        assert_eq!(submission_difference(&routed, &routed.clone()), None);
+        assert_eq!(
+            submission_identity_digest(&routed),
+            submission_identity_digest(&routed.clone())
+        );
+        for route in [
+            None,
+            Some(broca_protocol::request::AccountRoute::new(
+                "other-pool",
+                "model",
+            )),
+            Some(broca_protocol::request::AccountRoute::new(
+                "pool",
+                "other-model",
+            )),
+        ] {
+            let mut different = base.clone();
+            different.account_route = route;
+            assert_eq!(
+                submission_difference(&routed, &different),
+                Some("account_route")
+            );
+            assert_ne!(
+                submission_identity_digest(&routed),
+                submission_identity_digest(&different)
+            );
         }
     }
 

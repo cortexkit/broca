@@ -2808,6 +2808,7 @@ impl LlmRunnerSubject for BrocaSubject {
             Capability::SessionUsage,
             Capability::HeadSelection,
             Capability::RoutedAccounts,
+            Capability::AccountRoute,
             Capability::RunCancel,
             Capability::Retract,
             Capability::DispatchAttribution,
@@ -4207,6 +4208,8 @@ fn check_routed_account_cases(
     for name in [
         "routed_accounts_follows_account_choice",
         "routed_accounts_account_for",
+        "account_route_names_the_route",
+        "account_route_fixed_per_run",
     ] {
         let case = cases
             .iter()
@@ -4224,14 +4227,16 @@ fn routed_accounts_cases_cannot_skip_or_claim_inapplicability() {
     use cortexkit_role_llm_runner_conformance::{CaseReport, CASES};
     let cases: Vec<_> = CASES
         .iter()
-        .filter(|case| case.name.starts_with("routed_accounts_"))
+        .filter(|case| {
+            case.name.starts_with("routed_accounts_") || case.name.starts_with("account_route_")
+        })
         .map(|case| CaseReport {
             case: case.name,
             requires: case.requires.to_vec(),
             outcome: CaseOutcome::Passed,
         })
         .collect();
-    assert_eq!(cases.len(), 2);
+    assert_eq!(cases.len(), 4);
     assert!(check_routed_account_cases(&cases).is_ok());
     for index in 0..cases.len() {
         for outcome in [
@@ -4331,6 +4336,66 @@ fn check_0811_cases(
     check_0811_cases_for_writer(cases, broca_core::delivery_order::RIDES_V2_WRITER_ENABLED)
 }
 
+fn check_0814_undeclared_cases(
+    cases: &[cortexkit_role_llm_runner_conformance::CaseReport],
+) -> Result<(), String> {
+    for line in include_str!("golden/llm_runner_0814.undeclared_applicability.txt").lines() {
+        let (name, reason) = line.strip_prefix("N/A ").unwrap().split_once(": ").unwrap();
+        let case = cases
+            .iter()
+            .find(|case| case.case == name)
+            .ok_or_else(|| format!("the suite has no case {name}"))?;
+        if case.outcome
+            != (CaseOutcome::Inapplicable {
+                reason: reason.into(),
+            })
+        {
+            return Err(format!("{name}: {:?}", case.outcome));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn account_route_undeclared_groups_report_exact_reasons_never_skips() {
+    use cortexkit_role_llm_runner_conformance::{CaseReport, CASES};
+    let cases: Vec<_> = include_str!("golden/llm_runner_0814.undeclared_applicability.txt")
+        .lines()
+        .map(|line| {
+            let (name, reason) = line.strip_prefix("N/A ").unwrap().split_once(": ").unwrap();
+            let spec = CASES
+                .iter()
+                .find(|case| case.name == name)
+                .expect("pinned case exists");
+            CaseReport {
+                case: spec.name,
+                requires: spec.requires.to_vec(),
+                outcome: CaseOutcome::Inapplicable {
+                    reason: reason.into(),
+                },
+            }
+        })
+        .collect();
+    assert_eq!(cases.len(), 7);
+    check_0814_undeclared_cases(&cases).unwrap();
+    for index in 0..cases.len() {
+        for outcome in [
+            CaseOutcome::Passed,
+            CaseOutcome::Skipped { missing: vec![] },
+            CaseOutcome::Inapplicable {
+                reason: "fixture unavailable".into(),
+            },
+        ] {
+            let mut changed = cases.clone();
+            changed[index].outcome = outcome;
+            assert!(check_0814_undeclared_cases(&changed).is_err());
+        }
+        let mut missing = cases.clone();
+        missing.remove(index);
+        assert!(check_0814_undeclared_cases(&missing).is_err());
+    }
+}
+
 fn check_0811_cases_for_writer(
     cases: &[cortexkit_role_llm_runner_conformance::CaseReport],
     notices_writer: bool,
@@ -4388,7 +4453,7 @@ fn check_0811_cases_for_writer(
 #[test]
 fn new_contract_cases_require_exact_declared_writer_prerequisites() {
     use cortexkit_role_llm_runner_conformance::{CaseReport, CASES};
-    // Kit 0.17.13's runner::gate is private. Pin its native SuiteReport::render rows
+    // The kit's runner::gate is private. Pin its native SuiteReport::render rows
     // instead of inferring applicability from CaseSpec::requires in this adapter.
     let reader: Vec<_> = include_str!("golden/llm_runner_0811.reader_applicability.txt")
         .lines()
@@ -4789,6 +4854,7 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         report.render()
     );
     check_0811_cases(&report.cases).unwrap();
+    check_0814_undeclared_cases(&report.cases).unwrap();
     let attachment_gaps = attachment_contract_gaps(&report);
     assert!(
         attachment_gaps.is_empty(),

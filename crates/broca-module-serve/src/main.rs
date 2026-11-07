@@ -4217,6 +4217,7 @@ mod executor {
             broca_module_serve::account_routing::choose_account(
                 routing,
                 broca_module_serve::account_routing::ChoiceInputs {
+                    account_route: req.account_route.as_ref(),
                     decision_id: req.route_decision_id.as_deref(),
                     service_tier,
                     pool: preference.pool,
@@ -4878,6 +4879,34 @@ mod executor {
                 ),
                 &catalog.priced_modes(&request.model.provider_module_id, &request.model.model_id),
             )
+        }
+        fn check_account_route(
+            &self,
+            request: &broca_protocol::request::SubmissionRequest,
+        ) -> Result<(), String> {
+            let (pin, account) =
+                caller_auth_for_episode(request.auth.as_ref(), EpisodeAuthContext::FreshSession)
+                    .map_err(|error| format!("account_route: {error}"))?;
+            let method = self
+                .vault
+                .as_ref()
+                .map_or(pin.unwrap_or(FALLBACK_METHOD), |vault| {
+                    broca_module_serve::auth_routing::resolve_credential_id(
+                        &request.model.provider_module_id,
+                        pin,
+                        account,
+                        &vault.methods,
+                        FALLBACK_METHOD,
+                    )
+                    .method
+                });
+            if !broca_module_serve::account_routing::selects_accounts(method) {
+                return Err(format!(
+                    "account_route is not accepted for sign-in method {}",
+                    method.as_token()
+                ));
+            }
+            Ok(())
         }
         fn source_warm_enabled(&self) -> bool {
             self.anthropic_fallbacks.refusal_resend.is_enabled()
@@ -5697,6 +5726,7 @@ mod executor {
             frozen.prompt_cache_key = Some("frozen-key".into());
             let mut req = drift_request(std::path::Path::new("/inherit-cache"));
             let config = broca_wal::RunConfig {
+                account_route: None,
                 global_system: None,
                 route_decision_id: None,
                 account_limit_pause: false,
@@ -6906,6 +6936,7 @@ mod executor {
                     session: BindIdentity::new("/tmp/project", "harness", "session"),
                     ts_ms: None,
                     config: Box::new(broca_wal::RunConfig {
+                        account_route: None,
                         global_system: None,
                         route_decision_id: None,
                         account_limit_pause: false,

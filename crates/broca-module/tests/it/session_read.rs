@@ -593,6 +593,7 @@ fn req(key: &BindIdentity, run: &str, text: &str) -> RunRequest {
     let tools = vec![tool("lookup")];
     let policy_allowed: HashSet<String> = tools.iter().map(|t| t.name.clone()).collect();
     RunRequest {
+        account_route: None,
         route_decision_id: None,
         input_written_at_ms: None,
         directives: None,
@@ -1695,6 +1696,7 @@ async fn idle_read_flush_failure_hides_the_unproven_tail() {
 fn min_config() -> RunConfig {
     RunConfig {
         global_system: None,
+        account_route: None,
         route_decision_id: None,
         account_limit_pause: false,
         turn_directives_v1: None,

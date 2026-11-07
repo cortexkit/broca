@@ -14,12 +14,12 @@ fn records_without_account_route_keep_their_bytes() {
 }
 
 #[test]
-fn old_reader_ignores_additive_account_route() {
+fn records_preserve_frozen_account_route() {
     for (bytes, member) in [(STARTED, "config"), (QUEUED, "request")] {
         let mut value: serde_json::Value = serde_json::from_str(bytes).unwrap();
         value[member]["account_route"] =
             serde_json::json!({"provider": "routing-provider", "model": "routing-model"});
-        let record: WalRecord = serde_json::from_value(value).unwrap();
-        assert_eq!(serde_json::to_string(&record).unwrap(), bytes);
+        let record: WalRecord = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(record).unwrap(), value);
     }
 }

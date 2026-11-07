@@ -72,6 +72,12 @@ fn deserialize_session_class<'de, D: serde::Deserializer<'de>>(
 pub struct SendParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route_decision_id: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_account_route"
+    )]
+    pub account_route: Option<cortexkit_role_llm_runner::send::AccountRoute>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub content: Vec<cortexkit_role_llm_runner::attachments::ContentPart>,
     #[serde(
@@ -285,6 +291,22 @@ pub struct SendParams {
 /// Check the shared run parameters before broca's legacy parameter decoder can lose a
 /// nested field name. Legacy stop-condition lists remain accepted beside the role object.
 pub fn check_run_parameters(params: &serde_json::Value) -> Result<(), String> {
+    for field in ["speaks_for", "notice"] {
+        if params.get(field).is_some() {
+            return Err(field.into());
+        }
+    }
+    if let Some(route) = params.get("account_route") {
+        serde_json::from_value::<cortexkit_role_llm_runner::send::AccountRoute>(route.clone())
+            .map_err(|_| "account_route".to_owned())?;
+        if params
+            .pointer("/auth/method")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|method| !matches!(method, "oauth" | "chatgpt" | "apikey"))
+        {
+            return Err("account_route".into());
+        }
+    }
     let mut request = cortexkit_role_llm_runner::send::SendRequest::new("", "");
     for field in ["stop_when", "generation", "tools", "directives"] {
         if let Some(value) = params.get(field) {
@@ -299,6 +321,17 @@ pub fn check_run_parameters(params: &serde_json::Value) -> Result<(), String> {
     request.no_tools()?;
     request.directives()?;
     Ok(())
+}
+
+fn deserialize_account_route<'de, D>(
+    deserializer: D,
+) -> Result<Option<cortexkit_role_llm_runner::send::AccountRoute>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde::Deserialize::deserialize(deserializer)
+        .map(Some)
+        .map_err(|error| serde::de::Error::custom(format!("account_route: {error}")))
 }
 
 /// A client supplies uploads, never stored media references inline.
@@ -4419,6 +4452,7 @@ mod tests {
             send_params_keys(),
             &[
                 "route_decision_id",
+                "account_route",
                 "content",
                 "directives",
                 "session_class",

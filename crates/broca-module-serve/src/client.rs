@@ -488,6 +488,7 @@ fn send_params(spec: SendSpec<'_>) -> SendRequest {
     SendRequest {
         plan: spec.plan,
         params: SendParams {
+            account_route: None,
             route_decision_id: None,
             content: Vec::new(),
             directives: None,
@@ -876,6 +877,7 @@ mod tests {
         assert_request_preserves_legacy_shape("session.import", &import);
 
         let send = SendParams {
+            account_route: None,
             route_decision_id: None,
             content: Vec::new(),
             directives: None,

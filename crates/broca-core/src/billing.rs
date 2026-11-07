@@ -935,6 +935,7 @@ mod tests {
     fn config(provider: &str, model: &str, credential_id: Option<&str>) -> RunConfig {
         RunConfig {
             global_system: None,
+            account_route: None,
             route_decision_id: None,
             account_limit_pause: false,
             turn_directives_v1: None,
