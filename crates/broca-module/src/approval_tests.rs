@@ -964,9 +964,16 @@ async fn operational_withdrawal_candidates_enter_the_existing_service_once() {
 struct UnknownRead {
     wal: Arc<FileWalStore>,
     fail_at: usize,
+    persistent: bool,
     reads: std::sync::atomic::AtomicUsize,
 }
 impl WalStore for UnknownRead {
+    fn flush_for_read(&self, key: &LineageKey) -> Result<Option<u64>, broca_wal::WalError> {
+        self.wal.flush_for_read(key)
+    }
+    fn file_identity(&self, key: &LineageKey) -> Result<Option<u64>, broca_wal::WalError> {
+        self.wal.file_identity(key)
+    }
     fn open(
         &self,
         key: &LineageKey,
@@ -987,7 +994,8 @@ impl WalStore for UnknownRead {
         anchor: Option<&broca_wal::WalByteAnchor>,
     ) -> Result<broca_wal::WalRangeRead, broca_wal::WalError> {
         let range = self.wal.read_records_range(key, after, through, anchor)?;
-        if self.reads.fetch_add(1, Ordering::Relaxed) == self.fail_at {
+        let read = self.reads.fetch_add(1, Ordering::Relaxed);
+        if read == self.fail_at || (self.persistent && read > self.fail_at) {
             Ok(broca_wal::WalRangeRead::without_anchors(
                 match range.into_records() {
                     broca_wal::WalRangeRecords::Complete(frames) => frames,
@@ -1014,6 +1022,7 @@ async fn an_unknown_full_wal_read_never_clears_the_discovery_flag() {
         let wal = Arc::new(UnknownRead {
             wal: rig.wal.clone(),
             fail_at,
+            persistent: false,
             reads: std::sync::atomic::AtomicUsize::new(0),
         });
         let lock = Arc::new(Mutex::new(()));
@@ -2111,6 +2120,7 @@ async fn an_incomplete_tail_explicitly_marks_approval_metadata_not_reported() {
     let unknown = Arc::new(UnknownRead {
         wal: rig.wal.clone(),
         fail_at: 0,
+        persistent: true,
         reads: std::sync::atomic::AtomicUsize::new(0),
     });
     let registry =
@@ -2122,6 +2132,38 @@ async fn an_incomplete_tail_explicitly_marks_approval_metadata_not_reported() {
     assert!(
         matches!(page.open_batch, Some(broca_wire::OpenBatchView::NotReported { reason }) if reason == "incomplete_tail")
     );
+}
+
+#[tokio::test]
+async fn a_one_shot_incomplete_tail_reports_approval_metadata_after_the_durable_recheck() {
+    use crate::serve::{ServeHandler, SessionReadRequest};
+    let rig = Rig::new(false);
+    rig.seed(true, false, false, true);
+    let opener = DefaultOpener::new(
+        Arc::new(FileLeaseStore::new(rig.root.join("leases"))),
+        rig.wal.clone(),
+        rig.executor.clone(),
+    );
+    let unknown = Arc::new(UnknownRead {
+        wal: rig.wal.clone(),
+        fail_at: 0,
+        persistent: false,
+        reads: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let registry = LineageRegistry::new_with_reader(
+        Arc::new(opener),
+        unknown.clone(),
+        Some(rig.store.clone()),
+    );
+    let page = registry
+        .read(SessionReadRequest::new(rig.key.clone(), None, None))
+        .await
+        .unwrap();
+    assert!(
+        unknown.reads.load(Ordering::Relaxed) >= 2,
+        "the durable read rechecks completeness"
+    );
+    assert_eq!(page.open_batch, Some(broca_wire::OpenBatchView::None));
 }
 
 #[tokio::test]

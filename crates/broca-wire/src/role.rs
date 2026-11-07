@@ -446,6 +446,14 @@ pub fn broca_role_describe_with_writers(
     ]
     .map(String::from)
     .to_vec();
+    if broca_core::delivery_order::RIDES_V2_WRITER_ENABLED {
+        // Historical envelope reads are supported before this build can record new notices.
+        let at = capabilities
+            .iter()
+            .position(|name| name == cortexkit_role_llm_runner::capabilities::CALL_IDENTITY)
+            .unwrap();
+        capabilities.insert(at, cortexkit_role_llm_runner::capabilities::NOTICES.into());
+    }
     if hook_writer {
         capabilities.push(cortexkit_role_llm_runner::capabilities::ORDERED_HOOK_PHASES.into());
     }
@@ -786,10 +794,7 @@ mod pinned_reply_bytes {
                 last_ordinal: Some(4),
                 first_ordinal: Some(1),
                 history_version: 1,
-                head: Some(CursorWire {
-                    wal_seq: 12,
-                    sub_index: 0,
-                }),
+                head: Some(CursorWire::new(12, 0)),
                 last_run_state: Some(LastRunState {
                     run_id: "run-1".into(),
                     state: "completed".into(),
@@ -823,10 +828,7 @@ mod pinned_reply_bytes {
                 last_ordinal: Some(4),
                 first_ordinal: Some(1),
                 history_version: 1,
-                head: Some(CursorWire {
-                    wal_seq: 12,
-                    sub_index: 0,
-                }),
+                head: Some(CursorWire::new(12, 0)),
                 last_run_state: Some(LastRunState {
                     run_id: "run-1".into(),
                     state: "completed".into(),
@@ -858,10 +860,7 @@ mod pinned_reply_bytes {
             last_ordinal: Some(4),
             first_ordinal: Some(1),
             history_version: 1,
-            head: Some(CursorWire {
-                wal_seq: 12,
-                sub_index: 0,
-            }),
+            head: Some(CursorWire::new(12, 0)),
             last_run_state: Some(LastRunState {
                 run_id: "run-1".into(),
                 state: "completed".into(),
@@ -1270,6 +1269,22 @@ mod pinned_reply_bytes {
     }
 
     #[test]
+    fn notice_declaration_follows_the_envelope_writer_without_disabling_delivery_order() {
+        let describe = broca_role_describe_with_writers("test", true, true, true);
+        assert_eq!(
+            describe
+                .capabilities
+                .iter()
+                .any(|name| name == cortexkit_role_llm_runner::capabilities::NOTICES),
+            broca_core::delivery_order::RIDES_V2_WRITER_ENABLED
+        );
+        assert!(describe
+            .capabilities
+            .iter()
+            .any(|name| name == DELIVERY_ORDER_GROUP));
+    }
+
+    #[test]
     fn retention_declaration_follows_only_its_writer_switch() {
         use cortexkit_role_llm_runner::describe::check_describe;
         for compaction_writer in [false, true] {
@@ -1390,10 +1405,7 @@ mod pinned_reply_bytes {
                 last_ordinal: Some(4),
                 first_ordinal: Some(1),
                 history_version: 1,
-                head: Some(CursorWire {
-                    wal_seq: 12,
-                    sub_index: 0,
-                }),
+                head: Some(CursorWire::new(12, 0)),
                 last_run_state: Some(LastRunState {
                     run_id: "run-1".into(),
                     state: "completed".into(),

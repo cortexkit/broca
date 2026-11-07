@@ -139,6 +139,12 @@ pub struct Admission {
     /// What the send said about itself. None of it changes a request; all of it is recorded
     /// on the run's start, where status, retries and reads find it.
     pub send: SendFacts,
+    /// Set when something decided before the run that it must not reach the model: a
+    /// `pre_user` input transform refused the run's input, or routing refused the caller's
+    /// decision. The run's start is still written, so the send has a run to report, and the run
+    /// then ends with this error before any step, as today's loop ends it. Unlike every other
+    /// field it isn't frozen into the start, and a run read back from its start has none.
+    pub pre_model_error: Option<ProviderError>,
 }
 
 /// What the send that started a run recorded about itself, as today's run start records it.
@@ -198,6 +204,12 @@ pub struct Seams<'a, P, T> {
     /// The session's compaction state, kept for the session's life by whoever owns the session
     /// (today's actor keeps it per session). Without it a run starts from the session's log.
     pub compaction_session: Option<Arc<broca_core::compaction_v2::session::Session>>,
+    /// Whether the run tells the session's compaction provider about the session's changes
+    /// outside its own steps, at the points today's actor has today's loop tell it
+    /// (`RunControl::compaction_changes`; see [`crate::compaction::Changes`]). Without it the
+    /// provider hears of them at the next step's notice, as from today's loop run without that
+    /// control.
+    pub compaction_changes: bool,
     /// Sends the warms that keep the prompt cache alive while a run whose keep-warm is `auto`
     /// waits on tool calls, scheduled by today's keep-warm scheduler. Without it no run warms.
     pub keep_warm: Option<Arc<dyn broca_core::keep_warm_wait::KeepWarmDriver<Admission>>>,
@@ -310,7 +322,27 @@ where
         reports.run_started(&event_id(&placed, start_seq), start_seq);
     }
     let compaction = compaction_ctx(&placed, parts, &admission, seams, true).await?;
-    drive(&mut placed, parts, &admission, seams, compaction.as_ref()).await
+    let finished = match &admission.pre_model_error {
+        Some(error) => {
+            end_with_error(
+                &mut placed,
+                seams,
+                &admission.run_id,
+                RunFinishReason::Error,
+                error,
+            )
+            .await?
+        }
+        None => drive(&mut placed, parts, &admission, seams, compaction.as_ref()).await?,
+    };
+    // Every end a run writes is followed by a notice of the session's changes, as today's
+    // loop follows each of its ends; a pause isn't an end.
+    if finished.paused.is_none() {
+        if let Some(changes) = crate::compaction::Changes::of(&admission, seams) {
+            changes.tell(&placed, seams).await;
+        }
+    }
+    Ok(finished)
 }
 
 /// Takes the system messages out of a run's input and decides the system text its requests
@@ -364,6 +396,40 @@ fn previous_is_import(run: &broca_session_store::fold::operations::Run) -> Resul
 /// restart. What happens next is what the operational fold says the run must do; a call that
 /// may have run is never sent again.
 pub async fn resume<W, P, T>(
+    writer: &mut W,
+    parts: &dyn Parts,
+    seams: &Seams<'_, P, T>,
+) -> Result<Finished, LoopError>
+where
+    W: Writer,
+    P: Provider,
+    T: ToolPlane,
+{
+    let unfinished = writer
+        .operations()
+        .run
+        .as_ref()
+        .is_some_and(|run| run.finished.is_none());
+    let finished = resume_run(writer, parts, seams).await?;
+    // A resume that wrote the run's end is followed by a notice of the session's changes, as
+    // today's loop follows each of its ends.
+    if unfinished && finished.paused.is_none() {
+        if let Some(Ok(admission)) = writer
+            .operations()
+            .run
+            .as_ref()
+            .map(|run| frozen_admission(run, parts))
+        {
+            if let Some(changes) = crate::compaction::Changes::of(&admission, seams) {
+                changes.tell(writer, seams).await;
+            }
+        }
+    }
+    Ok(finished)
+}
+
+/// [`resume`], up to the run's end or pause.
+async fn resume_run<W, P, T>(
     writer: &mut W,
     parts: &dyn Parts,
     seams: &Seams<'_, P, T>,
@@ -1239,6 +1305,7 @@ pub fn admission_of_start(
             scope: decode(start.scope.clone())?,
             hooks: decode(start.hooks.clone())?,
         },
+        pre_model_error: None,
     })
 }
 
@@ -1375,6 +1442,7 @@ where
     T: ToolPlane,
 {
     let warming = Warming::of(admission, seams);
+    let changes = crate::compaction::Changes::of(admission, seams);
     // The pause a timed same-account wait left, which the step it resumes must match.
     let mut account_limit_replay = account_limit_of(writer)?;
     // Each window run's place in the prompt and render config. A run adds no episode once
@@ -1455,6 +1523,7 @@ where
             hooks.as_ref(),
             started,
             warming.as_ref(),
+            changes.as_ref(),
         )
         .await?
         {
@@ -2118,6 +2187,7 @@ where
             hooks.as_ref(),
             !step.cuts.is_empty(),
             warming.as_ref(),
+            changes.as_ref(),
         )
         .await?
         {
@@ -2900,7 +2970,8 @@ enum BatchOutcome {
 /// Dispatches one assistant message's tool calls and records every result. `planned` is every
 /// call the message asked for, which the plane is told of; `calls` are the ones still to be
 /// answered, all of them unless the batch is resumed. `known` names those that already have
-/// intents; every other call gets its intent here.
+/// intents; every other call gets its intent here. Once the batch's results are durable, and
+/// once a held call's result is, `changes` tells the compaction provider, when the run has it.
 #[allow(clippy::too_many_arguments)]
 async fn batch<W, P, T>(
     writer: &mut W,
@@ -2916,6 +2987,7 @@ async fn batch<W, P, T>(
     hooks: Option<&broca_core::hooks::HookRuntime<'_>>,
     started: bool,
     warming: Option<&Warming<'_>>,
+    changes: Option<&crate::compaction::Changes<'_>>,
 ) -> Result<BatchOutcome, LoopError>
 where
     W: Writer,
@@ -3103,6 +3175,9 @@ where
         .await?;
     if !dispatching {
         let _ = seams.tools.batch_finished(&ctx).await;
+        if let Some(changes) = changes {
+            changes.tell(writer, seams).await;
+        }
         return Ok(BatchOutcome::Closed { unknown: false });
     }
     // The calls that are sent, with their keys: a known call's from its intent, a new call's
@@ -3159,6 +3234,7 @@ where
         sequential,
         hooks,
         step_id,
+        changes,
     };
     // While the calls run, the run's keep-warm refreshes the prompt cache, as today's loop
     // does around the same wait. A wait resumed after a restart counts the warms it already
@@ -3254,6 +3330,9 @@ where
             true,
         )
         .await?;
+    if let Some(changes) = changes {
+        changes.tell(writer, seams).await;
+    }
     if !closed.is_empty() {
         return Ok(BatchOutcome::Cancelled(closed));
     }
@@ -4257,6 +4336,8 @@ struct DispatchPlan<'p> {
     sequential: bool,
     hooks: Option<&'p broca_core::hooks::HookRuntime<'p>>,
     step_id: u64,
+    /// Tells the compaction provider once a held call's result is durable.
+    changes: Option<&'p crate::compaction::Changes<'p>>,
 }
 
 /// What a call resolved to, before the batch takes it: the result and outcome, the code the
@@ -4531,6 +4612,9 @@ async fn settle<W: Writer, P, T: ToolPlane>(
         );
         writer.append(&records, true).await?;
         open_held.retain(|held| *held != id);
+        if let Some(changes) = plan.changes {
+            changes.tell(writer, seams).await;
+        }
         if let Some(lifecycle) = seams.held {
             lifecycle.terminal_synced(plan.ctx, &id).await;
         }

@@ -623,7 +623,8 @@ pub struct SenderAdmissionV1 {
     pub accepted_senders: Option<Vec<cortexkit_role_llm_runner::delivery_order::PlanSender>>,
 }
 
-pub(crate) fn manifest_senders(
+/// The senders a session's frozen plan manifest grants, as admission reads them.
+pub fn manifest_senders(
     manifest: &broca_wal::PlanManifest,
 ) -> Vec<cortexkit_role_llm_runner::delivery_order::PlanSender> {
     serde_json::from_str::<serde_json::Value>(manifest.plan.as_json_text())

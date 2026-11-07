@@ -41,7 +41,7 @@ use broca_module::serve::{
 };
 use broca_module::{Delivery, LineageRegistry};
 use broca_protocol::BindIdentity as BrocaBindIdentity;
-use broca_wire::{encode_live_subscribe_control, encode_live_subscribe_display};
+use broca_wire::encode_live_subscribe_display;
 use subc_protocol::session::{
     ModuleControlCommand, ModuleControlRequest, ModuleControlResponse,
     MODULE_CONTROL_OP_HEALTH_CHECK,
@@ -2634,6 +2634,23 @@ fn subscribe_from(
     ),
     (Option<String>, String),
 > {
+    if params
+        .get("from")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|cursor| {
+            cursor.keys().any(|field| {
+                !matches!(
+                    field.as_str(),
+                    "wal_seq" | "sub_index" | "incarnation" | "digest"
+                )
+            })
+        })
+    {
+        return Err((
+            Some("from".into()),
+            "subscribe cursor has an unknown member".into(),
+        ));
+    }
     let params: SubscribeParams = decode_params(params)?;
     let from = match params.from {
         None => SubscribeFrom::Live,
@@ -2960,6 +2977,22 @@ where
                 &ServeError::ScopeRefused(refusal),
             )
             .await;
+        }
+    }
+    if matches!(
+        req.method.as_str(),
+        OP_SEND | cortexkit_role_llm_runner::ops::SESSION_REFRESH
+    ) {
+        if let Some(plan) = req
+            .params
+            .get("plan")
+            .and_then(serde_json::Value::as_object)
+        {
+            if let Err(field) =
+                cortexkit_role_llm_runner::attribution::check_plan(plan, &[] as &[&str])
+            {
+                return send_invalid_params(writer, ver, channel, epoch, corr, Some(field), "sender_attribution is not declared; the plan's attribution member is unsupported").await;
+            }
         }
     }
     match req.method.as_str() {
@@ -4421,6 +4454,11 @@ where
                             None => break, // the coordinator's subscriber task ended (sink closed)
                         },
                     };
+                    if matches!(delivery, Delivery::CursorExpired) {
+                        let _ = send_subscribe_error_body(&writer, (ver, channel, epoch, corr), next_seq,
+                            ErrorBody::new("cursor_expired", "the subscribe cursor is not held in this session log")).await;
+                        return;
+                    }
                     if let Delivery::Expired { expired_at_ms } = &delivery {
                         let error = ServeError::Expired {
                             expired_at_ms: *expired_at_ms,
@@ -4593,6 +4631,7 @@ fn delivery_has_mid(delivery: &Delivery) -> bool {
                     | LiveEvent::MessageFinished(_)
                     | LiveEvent::ToolStarted(_)
                     | LiveEvent::ToolFinished(_)
+                    | LiveEvent::NoticeDelivered(_)
             )
         }
         Delivery::Display(event) => match event.as_ref() {
@@ -4636,6 +4675,7 @@ fn public_delivery_mids(
                 }
                 LiveEvent::ToolStarted(event) => translate(&mut event.mid)?,
                 LiveEvent::ToolFinished(event) => translate(&mut event.mid)?,
+                LiveEvent::NoticeDelivered(event) => translate(&mut event.mid)?,
                 _ => {}
             }
         }
@@ -4695,15 +4735,27 @@ fn limit_live_arguments(
     delivery
 }
 
+/// Mint the control delivery's opaque resume cursor from its durable source evidence.
+pub async fn control_cursor_for_delivery<H: ServeHandler + ?Sized>(
+    _handler: &H,
+    _session: &BrocaBindIdentity,
+    delivery: &Delivery,
+) -> Result<Option<broca_wire::CursorWire>, ServeError> {
+    let Delivery::Control(event) = delivery else {
+        return Ok(None);
+    };
+    // Historical logs without retained cursor identity still stream; position-only cursors cannot resume.
+    Ok(Some(event.0.into()))
+}
+
 fn encode_delivery(delivery: &Delivery, seq: u64) -> EncodedDelivery {
     let (priority, encoded) = match delivery {
         Delivery::Control(event) => {
             let (cursor, unit, live_event) = event.as_ref();
             (
                 Priority::Interactive,
-                encode_live_subscribe_control(
-                    cursor.wal_seq,
-                    cursor.sub_index,
+                broca_wire::encode_live_subscribe_control_with_cursor(
+                    (*cursor).into(),
                     unit,
                     seq,
                     live_event,
@@ -4714,9 +4766,10 @@ fn encode_delivery(delivery: &Delivery, seq: u64) -> EncodedDelivery {
             Priority::Background,
             encode_live_subscribe_display(event.as_ref(), seq),
         ),
-        Delivery::Expired { .. } | Delivery::Error(_) | Delivery::Detached => {
-            return EncodedDelivery::Detached
-        }
+        Delivery::CursorExpired
+        | Delivery::Expired { .. }
+        | Delivery::Error(_)
+        | Delivery::Detached => return EncodedDelivery::Detached,
     };
     match encoded {
         Ok(body) => EncodedDelivery::Data(priority, body),
@@ -4975,6 +5028,7 @@ fn refused_send_code(error: &ServeError) -> String {
         ServeError::ImportBusy => "import_busy".into(),
         ServeError::HistoryRewriting => broca_core::served_history::HISTORY_REWRITING.into(),
         ServeError::HistoryChanged => broca_wire::HISTORY_CHANGED.into(),
+        ServeError::CursorExpired => "cursor_expired".into(),
         ServeError::UnknownMid(_) => broca_wire::UNKNOWN_MID.into(),
         ServeError::UnknownRun(_) => broca_wire::UNKNOWN_RUN.into(),
         ServeError::ScopeRefused(_) | ServeError::ScopeFreezeBusy { .. } => {
@@ -5056,6 +5110,8 @@ fn served_on_new_storage(method: &str, params: &serde_json::Value) -> bool {
     match method {
         // Reads served from the store (`store_read`, `store_head`).
         OP_READ | OP_HEAD => true,
+        // Run and send facts built from the store's own records (`store_status`).
+        OP_STATUS | OP_RUN_RESULT | OP_SEND_STATUS | OP_SESSION_SEND_STATUS => true,
         // The store actor serves sends, cancels and retractions.
         OP_SEND | OP_CANCEL | OP_RETRACT => true,
         // A head import from a file creates the session in the new storage. An import carrying
@@ -5225,6 +5281,7 @@ async fn send_serve_error(
         ServeError::ImportBusy => "import_busy",
         ServeError::HistoryRewriting => broca_core::served_history::HISTORY_REWRITING,
         ServeError::HistoryChanged => broca_wire::HISTORY_CHANGED,
+        ServeError::CursorExpired => "cursor_expired",
         ServeError::UnknownMid(_) => broca_wire::UNKNOWN_MID,
         ServeError::UnknownSend => cortexkit_role_llm_runner::errors::UNKNOWN_SEND,
         ServeError::UnknownRun(_) => broca_wire::UNKNOWN_RUN,
@@ -6935,6 +6992,8 @@ mod tests {
             lineage_id: None,
             messages: vec![
                 SessionReadMessage {
+                    sender: None,
+                    notices: Vec::new(),
                     created_at: None,
                     completed_at: None,
                     reasoning_summaries: Vec::new(),
@@ -6959,6 +7018,8 @@ mod tests {
                     part_digests: None,
                 },
                 SessionReadMessage {
+                    sender: None,
+                    notices: Vec::new(),
                     created_at: None,
                     completed_at: None,
                     reasoning_summaries: Vec::new(),
@@ -6984,10 +7045,7 @@ mod tests {
                 },
             ],
             next_from_ordinal: Some(2),
-            head: Some(CursorWire {
-                wal_seq: 7,
-                sub_index: 1,
-            }),
+            head: Some(CursorWire::new(7, 1)),
             lineage_state: SessionReadLineageState {
                 last_run_id: Some("run-1".into()),
                 state: "idle".into(),
@@ -7126,10 +7184,7 @@ mod tests {
             },
         };
         sink.send(Delivery::Control(Arc::new((
-            broca_core::Cursor {
-                wal_seq: 42,
-                sub_index: 1,
-            },
+            broca_core::Cursor::new(42, 1),
             unit,
             cortexkit_role_llm_runner::live::LiveEvent::DisplayReset,
         ))))
@@ -7939,6 +7994,28 @@ mod tests {
 
     struct RefusingOpener;
 
+    #[tokio::test]
+    async fn headerless_control_deliveries_keep_streaming_without_a_resume_proof() {
+        let handler = LineageRegistry::new(Arc::new(RefusingOpener));
+        let session = BrocaBindIdentity::new("project", "runner", "headerless");
+        let delivery = Delivery::Control(Arc::new((
+            broca_core::Cursor::new(1, 0),
+            broca_protocol::caller::ControlUnit::StepStarted {
+                step_id: broca_protocol::StepId(1),
+            },
+            serde_json::from_value(serde_json::json!({"type":"message_started","mid":"m1"}))
+                .unwrap(),
+        )));
+        let cursor = control_cursor_for_delivery(&handler, &session, &delivery)
+            .await
+            .expect("a headerless legacy log remains readable")
+            .expect("control delivery retains its position");
+        assert_eq!(
+            serde_json::to_value(cursor).unwrap(),
+            serde_json::json!({"wal_seq":1,"sub_index":0})
+        );
+    }
+
     #[async_trait::async_trait]
     impl broca_module::registry::LineageOpener for RefusingOpener {
         async fn open(
@@ -7972,6 +8049,13 @@ mod tests {
     }
 
     impl broca_core::WalStore for HeldBindRead {
+        fn flush_for_read(
+            &self,
+            _: &BrocaBindIdentity,
+        ) -> Result<Option<u64>, broca_wal::WalError> {
+            // The fixture's immutable records are already durable; only their read timing is held.
+            Ok(None)
+        }
         fn wal_present(&self, _: &BrocaBindIdentity) -> Option<bool> {
             Some(true)
         }

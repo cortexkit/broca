@@ -47,7 +47,7 @@ pub(super) fn text_step(id: &str, text: &str) -> Vec<NormalizedEvent> {
 }
 
 /// A step that calls the `read` tool and asks for its result.
-fn read_step(id: &str) -> Vec<NormalizedEvent> {
+pub(super) fn read_step(id: &str) -> Vec<NormalizedEvent> {
     vec![
         NormalizedEvent::Control(ProviderControl::AssistantMessage {
             message: AssistantMessage {
@@ -99,11 +99,21 @@ impl broca_core::provider::Provider for Gated {
 
 /// Runs each store job through the new loop's admission and run, over a scripted provider.
 pub(super) struct LoopExecutor {
-    provider: Gated,
+    pub(super) provider: Gated,
     /// When set, a run drained from the queue signals the first `Notify` and waits on the second
     /// before its admission, so a test can act while the drain has started a run whose start
     /// isn't durable yet.
     drain_gate: Option<(Arc<Notify>, Arc<Notify>)>,
+    /// The planes the executor offers the session's runs.
+    pub(super) planes: Planes,
+}
+
+/// The hook and compaction planes a test executor offers, as the module's executor offers its
+/// subc planes; none by default.
+#[derive(Clone, Default)]
+pub(super) struct Planes {
+    pub(super) hooks: Option<Arc<dyn broca_core::HookPlane>>,
+    pub(super) compaction: Option<Arc<dyn broca_core::CompactionPlane>>,
 }
 
 pub(super) fn executor(
@@ -116,6 +126,7 @@ pub(super) fn executor(
             gate,
         },
         drain_gate: None,
+        planes: Planes::default(),
     }
 }
 
@@ -129,6 +140,14 @@ impl RunExecutor for LoopExecutor {
         unreachable!("a store session's runs come through execute_on_store")
     }
 
+    fn hook_plane(&self) -> Option<Arc<dyn broca_core::HookPlane>> {
+        self.planes.hooks.clone()
+    }
+
+    fn compaction_plane(&self) -> Option<Arc<dyn broca_core::CompactionPlane>> {
+        self.planes.compaction.clone()
+    }
+
     async fn execute_on_store(
         &self,
         job: StoreRunJob,
@@ -136,12 +155,15 @@ impl RunExecutor for LoopExecutor {
     ) -> StoreRunEnd {
         let StoreRunJob {
             mut req,
-            control,
+            mut control,
             mut writer,
             mut parts,
             mode,
             ..
         } = job;
+        // The module's executor admits a run's context limit from the caller's override when
+        // the send names one.
+        control.admitted_context_limit = control.admitted_context_limit.or(req.context_limit);
         if let (Some((reached, release)), Some(_)) = (&self.drain_gate, &req.submission_id) {
             reached.notify_one();
             release.notified().await;
@@ -172,11 +194,14 @@ impl RunExecutor for LoopExecutor {
                 stop: Default::default(),
                 held: None,
                 approval: &AllowAll,
-                hook_plane: None,
+                hook_plane: control.hook_plane.clone(),
                 now_ms: &now,
                 session_address: None,
-                compaction_plane: None,
-                compaction_session: None,
+                compaction_plane: control.compaction_plane.as_deref(),
+                compaction_session: control.compaction_session.clone(),
+                // The module's executor has every store run tell the compaction provider of
+                // the session's changes outside its steps (`Seams::compaction_changes`).
+                compaction_changes: true,
                 keep_warm: None,
                 account_reports: None,
                 max_same_account_wait: Default::default(),

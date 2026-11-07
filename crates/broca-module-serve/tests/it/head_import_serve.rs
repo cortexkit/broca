@@ -418,7 +418,7 @@ async fn a_store_session_refuses_unbuilt_ops_by_name_and_checks_owners_from_the_
     let params = rig.import_params("imp-1");
     rig.result(1, "session.import", params).await;
 
-    for method in ["run.status", "run.result", "session.baseline"] {
+    for method in ["run.tool_calls", "session.baseline"] {
         assert_eq!(
             rig.refused(1, method, serde_json::json!({"run_id": "r1"}))
                 .await,
@@ -426,6 +426,10 @@ async fn a_store_session_refuses_unbuilt_ops_by_name_and_checks_owners_from_the_
             "{method}"
         );
     }
+    // Run status is served from the store. With no run named it is the session's status, idle
+    // once the import's own run has ended.
+    let idle = rig.result(1, "run.status", serde_json::json!({})).await;
+    assert_eq!(idle, serde_json::json!({"state": "idle"}));
     // An import carrying its messages inline is today's import, which writes a WAL.
     assert_eq!(
         rig.refused(
@@ -459,6 +463,12 @@ async fn a_store_session_refuses_unbuilt_ops_by_name_and_checks_owners_from_the_
         (1.into(), 4.into()),
         "{head}"
     );
+    // The import's run, named, answers from the store as completed.
+    let run_id = head["last_run_state"]["run_id"].clone();
+    let status = rig
+        .result(1, "run.status", serde_json::json!({"run_id": run_id}))
+        .await;
+    assert_eq!(status["state"], "completed", "{status}");
 
     rig.bind(2, stranger(), Some(stamp(stranger()))).await;
     let cancel = serde_json::json!({"run_id": "r-none"});

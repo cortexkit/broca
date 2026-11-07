@@ -12,6 +12,7 @@ use super::{metadata, protocol::read::Entry};
 pub struct Transcript {
     pub stored: Vec<Message>,
     pub entries: Vec<Entry>,
+    pub rides: super::entries::RideEnvelopes,
 }
 
 pub fn project(records: &[FramedRecord], lineage: &str) -> Result<Transcript, String> {
@@ -122,6 +123,7 @@ fn finish(
         rows.insert(position, metadata.clone());
     }
     let mut entries = Vec::with_capacity(stored.len());
+    let mut rides = super::entries::RideEnvelopes::default();
     let mut prior_time = 0;
     for (index, message) in stored.iter_mut().enumerate() {
         let position = first + index as u64;
@@ -132,6 +134,17 @@ fn finish(
         metadata::attach_native_tags(message, metadata)?;
         prior_time = times.get(&position).copied().unwrap_or(prior_time);
         let mid = crate::message_mid(true, Some(lineage), position)?;
+        for origin in &metadata.deliveries {
+            let ride = records
+                .iter()
+                .find(|frame| frame.seq == origin.seq)
+                .and_then(|frame| match &frame.record {
+                    broca_wal::WalRecord::SendDelivered { ride, .. } => Some(ride.clone()),
+                    _ => None,
+                })
+                .ok_or("compaction delivered source is missing")?;
+            rides.push(&mid, &origin.part, ride);
+        }
         entries.push(metadata::project_entry(
             message,
             metadata,
@@ -141,5 +154,9 @@ fn finish(
             metadata::source_frames(metadata, records)?,
         )?);
     }
-    Ok(Transcript { stored, entries })
+    Ok(Transcript {
+        stored,
+        entries,
+        rides,
+    })
 }

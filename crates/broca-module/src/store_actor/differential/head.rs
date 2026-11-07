@@ -44,6 +44,7 @@ async fn gated_module(
                 gate: gate.clone(),
             },
             wal: Arc::clone(&wal),
+            planes: Default::default(),
         },
         store: executor(steps, gate),
     });

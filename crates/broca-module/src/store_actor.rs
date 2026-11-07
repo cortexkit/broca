@@ -26,7 +26,10 @@
 //! - a module stop: the running run is ended `Interrupted` with today's shutdown seal, never
 //!   cancelled, since a cancel records a decision no caller made;
 //! - a head's file-source import into the empty session, and installing its compaction
-//!   provider's first view before the session's first step (see `store_import`).
+//!   provider's first view before the session's first step (see `store_import`);
+//! - a plan's `pre_user` input transforms, on a send that starts a run, a steer and a queued
+//!   send, as today's actor runs them; a queued send's run reuses what they did when it
+//!   drains.
 //!
 //! Every other command, and every send that needs an admission rule not built here yet, is
 //! refused by name with nothing written. Today's actor is the reference for each rule still to
@@ -78,6 +81,14 @@ pub struct StoreActor<B: SessionBackend> {
     /// Where the session's spend facts are written. Without it, a run that ends stays owed
     /// until an actor that has it opens the session.
     billing: Option<crate::store_billing::StoreBilling>,
+    /// The session's compaction state, kept for the actor's whole life and handed to every run,
+    /// as today's actor keeps it. A run restores it from the session's records the first time;
+    /// after that it carries what holds only for this actor's life, such as whether the
+    /// compaction provider was sent Setup yet.
+    compaction_session: Arc<broca_core::compaction_v2::session::Session>,
+    /// The module's stop, once the actor serves in a module: work a send waits on, such as its
+    /// input transforms, gives up when it fires.
+    seal: CancellationToken,
 }
 
 /// How an actor lives in the module's registry. Tests serve an actor without one.
@@ -179,6 +190,24 @@ struct Start {
     /// The session's label its start records: the one the session's first run froze, or, for
     /// that first run, the send's.
     session_class: Option<String>,
+    /// What happened to the run's input before the run.
+    prepared: Prepared,
+}
+
+/// What happened to a run's input before the run, which the run's control hands the loop, as
+/// today's actor hands it to today's loop.
+#[derive(Default)]
+struct Prepared {
+    /// Whether the send named no tools of its own, before a plan filled them in. The run's
+    /// start records it.
+    tools_were_omitted: bool,
+    /// When a fresh run's input was accepted: the time its `pre_user` transforms were told, and
+    /// the one its message keeps. `None` takes the time the run starts.
+    at_ms: Option<u64>,
+    /// What the input transforms did to the run's input, which its start records.
+    hooks: Option<Box<broca_wal::Hooks>>,
+    /// The error the run ends with before any model call, when a transform refused its input.
+    pre_model_error: Option<broca_protocol::ProviderError>,
 }
 
 /// What a run drained from the queue starts from.
@@ -186,6 +215,8 @@ struct Drained {
     submission: broca_protocol::SubmissionId,
     /// When the queued send's message was accepted, which the message keeps.
     written_at_ms: Option<u64>,
+    /// What the send's input transforms did when it was queued, as its record kept it.
+    hooks: Option<Box<broca_wal::Hooks>>,
 }
 
 /// How a keyed send is answered.
@@ -222,6 +253,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             run: None,
             stopping: false,
             billing: None,
+            compaction_session: Arc::default(),
+            seal: CancellationToken::new(),
         }
     }
 
@@ -314,9 +347,10 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         idle_ttl: Option<std::time::Duration>,
         gauge: Option<&Arc<std::sync::atomic::AtomicU64>>,
     ) -> Exit {
-        self.recover().await;
         let never = CancellationToken::new();
         let seal = seal.unwrap_or(&never);
+        self.seal = seal.clone();
+        self.recover().await;
         let idle_after = |now: tokio::time::Instant| idle_ttl.map(|ttl| now + ttl);
         let mut idle_deadline = idle_after(tokio::time::Instant::now());
         loop {
@@ -385,6 +419,14 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
 
     /// Serves the active run, and nothing else, until no run is active.
     async fn run_to_end(&mut self) {
+        while self.run.is_some() {
+            self.run_current_to_end().await;
+        }
+    }
+
+    /// Serves the active run, and nothing else, until it ends and its end is recorded. A run the
+    /// queue then starts is left for the command loop.
+    async fn run_current_to_end(&mut self) {
         loop {
             let Some(active) = self.run.as_mut() else {
                 return;
@@ -400,7 +442,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                         active.writer_gone = true;
                     }
                 }
-                Event::Done(end) => self.finish_run(end).await,
+                Event::Done(end) => return self.finish_run(end).await,
                 Event::Command(_) => unreachable!("no command is read here"),
             }
         }
@@ -482,7 +524,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 delivery,
                 plan,
                 order,
-                reply,
+                mut reply,
             } => {
                 if let Some(what) =
                     unserved_delivery(order.is_some(), delivery, conversation_key.is_some())
@@ -625,6 +667,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                                 scope,
                                 manifest: None,
                                 session_class: None,
+                                prepared: Prepared::default(),
                             };
                             self.start_run(start, None, Some(reply), StoreRunMode::Resume);
                             return false;
@@ -752,12 +795,13 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                     scope,
                     manifest,
                     session_class,
+                    prepared: Prepared::default(),
                 };
                 if steering && self.run.is_some() {
-                    let outcome = self.steer(start, stop_sequences_named).await;
+                    let outcome = self.steer(start, stop_sequences_named, &mut reply).await;
                     let _ = reply.send(outcome);
                 } else if self.running().is_some() {
-                    let outcome = self.queue(start, delivery).await;
+                    let outcome = self.queue(start, delivery, &mut reply).await;
                     let _ = reply.send(outcome);
                 } else if !self.session.operations().queue.is_empty() {
                     // The queue drains at a run's end, so an idle session with sends still queued
@@ -768,7 +812,14 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                     )));
                 } else {
                     let mut start = start;
-                    match self.freeze_plan(&mut start) {
+                    let admitted = match self.freeze_plan(&mut start) {
+                        Ok(()) => {
+                            self.transform_fresh_input(&mut start, delivery, &mut reply)
+                                .await
+                        }
+                        Err(outcome) => Err(outcome),
+                    };
+                    match admitted {
                         Ok(()) => self.start_run(start, None, Some(reply), StoreRunMode::Fresh),
                         Err(outcome) => {
                             let _ = reply.send(outcome);
@@ -839,6 +890,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             scope,
             manifest,
             session_class,
+            prepared,
         } = start;
         // The executor resolves the send's credential selection; only the result is frozen.
         let auth = request.auth.take();
@@ -854,10 +906,11 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 req.submission_id = Some(drained.submission.clone());
                 req.input_written_at_ms = drained.written_at_ms;
             }
-            // A run started directly consumes no queued send; its input was written now.
+            // A run started directly consumes no queued send; its input was written when it
+            // was accepted, now unless its transforms were told another time.
             None => {
                 req.submission_id = None;
-                req.input_written_at_ms = broca_core::run::epoch_millis();
+                req.input_written_at_ms = prepared.at_ms.or_else(broca_core::run::epoch_millis);
             }
         }
         req.title = title;
@@ -871,8 +924,17 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             hook_plane: self.executor.hook_plane(),
             provider_held_lifecycle: self.executor.provider_held_lifecycle(),
             compaction_plane: self.executor.compaction_plane(),
+            compaction_session: Some(Arc::clone(&self.compaction_session)),
             display_sent_by: sent_by,
+            // By the rule today's actor applies: a new log whose plan names a compaction
+            // provider starts on the compaction contract; an existing log keeps its own mode.
+            new_log_compaction_plan_version: crate::plan_episode::new_log_compaction_plan_version(
+                manifest.as_deref(),
+            ),
             manifest,
+            tools_were_omitted: prepared.tools_were_omitted,
+            input_hooks: prepared.hooks,
+            pre_model_error: prepared.pre_model_error,
             ..Default::default()
         };
         let (writer, link) = ActorWriter::new(&self.session, None);
@@ -928,19 +990,14 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     /// restart, the account-limit pause's timer, and calls a provider holds aren't recovered on
     /// this storage yet, so nothing is written for them.
     async fn recover(&mut self) {
-        use broca_session_store::fold::operations::Resolution;
         self.bill_owed().await;
         let operations = self.session.operations();
         let Some(run) = operations.run.as_ref().filter(|run| run.finished.is_none()) else {
             return self.drain().await;
         };
-        let mode = match run.resolution() {
-            Resolution::Resume | Resolution::Interrupted(_) => match run.cancel {
-                None => StoreRunMode::Seal(broca_core::resume::SealCause::CrashOrphan),
-                Some(_) => StoreRunMode::Resume,
-            },
-            Resolution::Idle(_) => StoreRunMode::Resume,
-            Resolution::ProviderHeld(_) | Resolution::Paused(_) => {
+        let mode = match recovery_mode(run) {
+            Some(mode) => mode,
+            None => {
                 if !matches!(run.paused, Some(broca_protocol::PauseReason::AuthRequired)) {
                     tracing::warn!(
                         target: "broca.store_actor",
@@ -954,7 +1011,14 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             }
         };
         match self.recovery_start(run) {
-            Ok(start) => self.start_run(start, None, None, mode),
+            Ok(start) => {
+                self.start_run(start, None, None, mode);
+                // Today's actor seals a crash's orphan before it takes any command, so no caller
+                // sees the orphan as running; the seal sends nothing, so it ends at once.
+                if matches!(mode, StoreRunMode::Seal(_)) {
+                    self.run_current_to_end().await;
+                }
+            }
             Err(error) => tracing::error!(
                 target: "broca.store_actor",
                 session = %self.key.session,
@@ -1040,6 +1104,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             // The run renders from its own start, which recorded any manifest and label.
             manifest: None,
             session_class: None,
+            prepared: Prepared::default(),
         })
     }
 
@@ -1113,8 +1178,13 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     /// Freezes the session's fetch plan into a run about to start, by the rules today's actor
     /// applies on every path that starts an episode (`crate::plan_episode`): a plan that confines
     /// its tools needs a scope, and the run takes the manifest's tools and, as the session's
-    /// first run, its system text first. Answers the refusal a sender gets otherwise.
+    /// first run, its system text first. Answers the refusal a sender gets otherwise. Whether
+    /// the send named tools of its own is noted first, for the run's start to record.
     fn freeze_plan(&self, start: &mut Start) -> Result<(), SendOutcome> {
+        // Today's actor records whether the send named tools as the send arrived, before its
+        // plan's tools fill them in.
+        let tools_were_omitted = start.request.tools.is_none();
+        start.prepared.tools_were_omitted = tools_were_omitted;
         crate::plan_episode::require_confining_scope(
             start.manifest.as_deref(),
             start.scope.as_ref(),
@@ -1124,7 +1194,6 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             return Ok(());
         };
         let first_run = self.session.operations().owner.episodes == 0;
-        let tools_were_omitted = start.request.tools.is_none();
         crate::plan_episode::freeze_manifest(
             &manifest,
             &mut start.request,
@@ -1135,6 +1204,89 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             class: error.admission_error_class(),
             reason: error.to_string(),
         })
+    }
+
+    /// Runs a fresh run's own input through the session's `pre_user` transforms, as today's
+    /// actor does before it starts a run that consumes no queued send: the run sends what they
+    /// left and its start records what they did. A transform that refuses the input doesn't
+    /// stop the run from starting: the run ends with that refusal before any model call, as
+    /// today's does. A failure to run them refuses the send.
+    async fn transform_fresh_input(
+        &self,
+        start: &mut Start,
+        delivery: broca_protocol::Delivery,
+        reply: &mut oneshot::Sender<SendOutcome>,
+    ) -> Result<(), SendOutcome> {
+        let at_ms = broca_core::run::epoch_millis();
+        let prepared = self
+            .transform_input(
+                start.request.input.clone(),
+                delivery,
+                start.manifest.as_deref(),
+                start.scope.as_ref(),
+                at_ms,
+                reply,
+            )
+            .await
+            .map_err(|outcome| {
+                SendOutcome::Error(format!("input preparation failed: {outcome:?}"))
+            })?;
+        start.prepared.at_ms = at_ms;
+        if let Some(provider) = &prepared.refused {
+            start.prepared.pre_model_error = Some(crate::actor::pre_user::refusal_error(provider));
+        }
+        start.request.input = prepared.input;
+        start.prepared.hooks = prepared.hooks;
+        Ok(())
+    }
+
+    /// `input`, a send delivered as `delivery` and accepted at `at_ms`, through the `pre_user`
+    /// transforms `manifest`'s plan declares, by the rules today's actor runs them
+    /// (`crate::actor::pre_user`). They run under `scope`, the scope a session's first send
+    /// freezes, else under the one the session froze. They give up, with today's answers, when
+    /// the module stops or the sender waiting on `reply` stops waiting.
+    async fn transform_input(
+        &self,
+        input: Vec<broca_protocol::Message>,
+        delivery: broca_protocol::Delivery,
+        manifest: Option<&broca_wal::PlanManifest>,
+        scope: Option<&broca_protocol::SessionScope>,
+        at_ms: Option<u64>,
+        reply: &mut oneshot::Sender<SendOutcome>,
+    ) -> Result<crate::actor::pre_user::PreparedInput, SendOutcome> {
+        use crate::actor::pre_user;
+        let prepared = pre_user::PreparedInput {
+            at_ms,
+            input,
+            hooks: None,
+            refused: None,
+        };
+        let Some((plan, plane)) = pre_user::input_transforms(manifest, self.executor.hook_plane())?
+        else {
+            return Ok(prepared);
+        };
+        let scope = match scope {
+            Some(scope) => Some(scope.clone()),
+            None => self.ownership().map_err(SendOutcome::Transient)?.scope,
+        };
+        let seal = self.seal.clone();
+        let abandon = async move {
+            tokio::select! {
+                biased;
+                _ = seal.cancelled() => SendOutcome::Transient("module is stopping".into()),
+                _ = reply.closed() => SendOutcome::Transient("send cancelled".into()),
+            }
+        };
+        pre_user::transform_input(
+            &plan,
+            &plane,
+            &self.key,
+            scope.as_ref(),
+            delivery,
+            prepared,
+            abandon,
+        )
+        .await
     }
 
     /// The session's owner summary, from its run starts, as today's admission rules read it.
@@ -1472,8 +1624,14 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             return;
         }
         match self.drained_start(&first.submission_id).await {
-            Ok((mut start, drained)) => match self.freeze_plan(&mut start) {
-                Ok(()) => self.start_run(start, Some(drained), None, StoreRunMode::Fresh),
+            Ok((mut start, mut drained)) => match self.freeze_plan(&mut start) {
+                Ok(()) => {
+                    start.prepared.hooks = crate::actor::pre_user::drained_hooks(
+                        drained.hooks.take(),
+                        &start.request.input,
+                    );
+                    self.start_run(start, Some(drained), None, StoreRunMode::Fresh)
+                }
                 Err(outcome) => {
                     // The send can't start under the session's plan: it ends with the refusal,
                     // as a drained send refused at admission ends, and the next one is tried.
@@ -1538,12 +1696,20 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             scope: self.ownership()?.scope,
             manifest: self.frozen_manifest()?,
             session_class: self.frozen_session_class(),
+            prepared: Prepared::default(),
         };
+        // The send's transforms ran when it was queued; its record keeps what they did, and
+        // their final value is the input the run sends.
+        let hooks = queue::receipt_field(&send, "hooks")
+            .map(|hooks| serde_json::from_value(hooks.clone()))
+            .transpose()
+            .map_err(|error| format!("the queued send's hooks: {error}"))?;
         Ok((
             start,
             Drained {
                 submission,
                 written_at_ms: send.written_at_ms,
+                hooks,
             },
         ))
     }
@@ -1623,16 +1789,25 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
 
     /// Joins `start` to the running run as a steer, as today's actor steers it: refused when it
     /// names a setting the run froze otherwise, and queued as a steer when the run has already
-    /// written its end. Otherwise its record is written, durable before the reply, and the run
-    /// places its messages at its next step boundary. The actor writes nothing while the run
-    /// builds a batch, so the run either takes the steer or has ended before it.
-    async fn steer(&mut self, start: Start, stop_sequences_named: bool) -> SendOutcome {
+    /// written its end. Otherwise its input goes through the session's `pre_user` transforms,
+    /// and its record is written, durable before the reply, and the run places its messages at
+    /// its next step boundary. The actor writes nothing while the run builds a batch, so the run
+    /// either takes the steer or has ended before it. `reply` is the sender's, which the
+    /// transforms stop for when it stops waiting.
+    async fn steer(
+        &mut self,
+        start: Start,
+        stop_sequences_named: bool,
+        reply: &mut oneshot::Sender<SendOutcome>,
+    ) -> SendOutcome {
         let Some(active) = self.run.as_ref().map(|active| active.run_id.clone()) else {
             return SendOutcome::Error("a steer needs a running run".into());
         };
         let run = self.session.operations().run.as_ref();
         if run.is_some_and(|run| run.finished.is_some()) {
-            return self.queue(start, broca_protocol::Delivery::Steer).await;
+            return self
+                .queue(start, broca_protocol::Delivery::Steer, reply)
+                .await;
         }
         let Some(run_start) = run.and_then(|run| run.start.as_ref()) else {
             return SendOutcome::Transient("the running run has no start yet".into());
@@ -1664,15 +1839,37 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             .filter(|message| message.role != broca_protocol::content::Role::System)
             .cloned()
             .collect();
+        let manifest = match self.frozen_manifest() {
+            Ok(manifest) => manifest,
+            Err(error) => return SendOutcome::Error(error),
+        };
+        let prepared = match self
+            .transform_input(
+                input,
+                broca_protocol::Delivery::Steer,
+                manifest.as_deref(),
+                None,
+                broca_core::run::epoch_millis(),
+                reply,
+            )
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(outcome) => return outcome,
+        };
+        if let Some(provider) = prepared.refused {
+            return SendOutcome::PreUserUnavailable { provider };
+        }
         let receipt = queue::SteerReceipt {
             sent_by: start.sent_by,
             send_id: start.send_id,
             request_identity_digest: start.identity,
             title: start.title,
             delivery: Some(broca_protocol::Delivery::Steer),
+            hooks: prepared.hooks,
             ..queue::SteerReceipt::default()
         };
-        let record = match queue::steer(input, broca_core::run::epoch_millis(), &receipt) {
+        let record = match queue::steer(prepared.input, prepared.at_ms, &receipt) {
             Ok(steer) => Record::Steer(steer),
             Err(error) => return SendOutcome::Error(error),
         };
@@ -1693,8 +1890,16 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     /// Queues `start` behind the latest run, which is running or paused, as today's actor
     /// queues it: durable before the reply, which is `pending`. A retry of a send still queued
     /// is compared with its record instead. A steer queues with its mode, which today's queued
-    /// record keeps; a plain send's record names none.
-    async fn queue(&mut self, start: Start, delivery: broca_protocol::Delivery) -> SendOutcome {
+    /// record keeps; a plain send's record names none. A new send's input goes through the
+    /// session's `pre_user` transforms first; the record keeps the request as sent, and what
+    /// they did, with their final input, in its receipt. `reply` is the sender's, which the
+    /// transforms stop for when it stops waiting.
+    async fn queue(
+        &mut self,
+        start: Start,
+        delivery: broca_protocol::Delivery,
+        reply: &mut oneshot::Sender<SendOutcome>,
+    ) -> SendOutcome {
         let Start {
             run_id,
             request,
@@ -1707,6 +1912,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             // drains, as today's queue freezes it at the episode's start.
             manifest: _,
             session_class: _,
+            prepared: _,
         } = start;
         let submission_id = broca_protocol::SubmissionId(format!("sub-{}", run_id.0));
         match self.queued(&submission_id.0).await {
@@ -1723,15 +1929,37 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             }
             Ok(None) => {}
         }
+        let manifest = match self.frozen_manifest() {
+            Ok(manifest) => manifest,
+            Err(error) => return SendOutcome::Error(error),
+        };
+        let prepared = match self
+            .transform_input(
+                request.input.clone(),
+                delivery,
+                manifest.as_deref(),
+                None,
+                broca_core::run::epoch_millis(),
+                reply,
+            )
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(outcome) => return outcome,
+        };
+        if let Some(provider) = prepared.refused.clone() {
+            return SendOutcome::PreUserUnavailable { provider };
+        }
         let receipt = queue::Receipt {
             sent_by,
             principal: request.principal.clone(),
             request_identity_digest: identity,
             title,
+            hooks: prepared.queued_hooks(),
             ..queue::Receipt::default()
         };
         let at = queue::Queued {
-            written_at_ms: broca_core::run::epoch_millis(),
+            written_at_ms: prepared.at_ms,
             delivery: (delivery != broca_protocol::Delivery::Queue).then_some(delivery),
             ..queue::Queued::default()
         };
@@ -1841,6 +2069,25 @@ fn retry_of_queued(
     match broca_core::submission_difference(&queued, &request) {
         None => SendOutcome::Pending { submission_id },
         Some(differing) => reuse(differing),
+    }
+}
+
+/// What opening the session does with its unfinished latest run `run` before it takes any
+/// command: seal it as a crash's orphan, or resume it to its end. `None` leaves it as it is: a
+/// run paused, or waiting on calls a provider holds, whose recovery isn't built for this storage
+/// yet. A read of the session that no actor holds predicts the run's end from this same decision
+/// (`store_status`), so what it serves is what the next open records.
+pub(crate) fn recovery_mode(
+    run: &broca_session_store::fold::operations::Run,
+) -> Option<StoreRunMode> {
+    use broca_session_store::fold::operations::Resolution;
+    match run.resolution() {
+        Resolution::Resume | Resolution::Interrupted(_) => Some(match run.cancel {
+            None => StoreRunMode::Seal(broca_core::resume::SealCause::CrashOrphan),
+            Some(_) => StoreRunMode::Resume,
+        }),
+        Resolution::Idle(_) => Some(StoreRunMode::Resume),
+        Resolution::ProviderHeld(_) | Resolution::Paused(_) => None,
     }
 }
 
@@ -2089,5 +2336,7 @@ mod differential;
 mod entries_comparison;
 #[cfg(test)]
 mod import_tests;
+#[cfg(test)]
+mod status_tests;
 #[cfg(test)]
 mod tests;

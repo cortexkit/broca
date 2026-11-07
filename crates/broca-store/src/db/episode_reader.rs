@@ -90,6 +90,10 @@ impl DatabaseEpisodeReader {
         self.publication.byte_end()
     }
 
+    pub fn lineage_id(&self) -> broca_wal::WalLineageId {
+        self.publication.lineage()
+    }
+
     pub fn read_at(&self, off: u64, len: u64) -> std::io::Result<Vec<u8>> {
         let mut file = broca_wal::fs_ops::File::open(self.publication.path())?;
         file.seek(SeekFrom::Start(off))?;
@@ -109,6 +113,17 @@ impl DatabaseEpisodeReader {
 
     /// Callers name and count the fallback decision before entering this full-read route.
     pub fn complete_read(&self) -> Result<Vec<FramedRecord>, DbError> {
+        Ok(self
+            .complete_read_with_identities()?
+            .frames
+            .into_iter()
+            .map(|positioned| positioned.framed)
+            .collect())
+    }
+
+    pub fn complete_read_with_identities(
+        &self,
+    ) -> Result<broca_core::projection::VerifiedPositionedFrames, DbError> {
         // Falling back discards index state, not the publication's identity.
         // A new log at the same path must not be served with the old lineage.
         let (_, lineage) =
@@ -118,10 +133,17 @@ impl DatabaseEpisodeReader {
                 "episode publication lineage changed".into(),
             ));
         }
-        let records: Vec<_> = self
-            .read_range(0, self.byte_end())?
-            .into_iter()
-            .map(|p| p.framed)
+        let decoded = broca_core::projection::decode_positioned_frames_with_identities(
+            &|off, len| self.read_at(off, len),
+            0,
+            self.byte_end(),
+            None,
+        )
+        .map_err(|_| bad("episode frames unreadable"))?;
+        let records: Vec<_> = decoded
+            .frames
+            .iter()
+            .map(|positioned| &positioned.framed)
             .collect();
         if records.first().is_some_and(|first| first.seq != 1)
             || records.last().map_or(0, |last| last.seq) != self.sequence()
@@ -133,7 +155,7 @@ impl DatabaseEpisodeReader {
                 "full episode replay does not cover publication".into(),
             ));
         }
-        Ok(records)
+        Ok(decoded)
     }
 
     fn seed(
@@ -225,21 +247,29 @@ impl DatabaseEpisodeReader {
         let continuation =
             ProjectionContinuation::decode_for_execution(&tail).map_err(DbError::SeedFallback)?;
         let seed = EpisodeSeed::from_continuation(&continuation);
-        let frames = self.read_range(seed.boundary.frame_end, end)?;
-        broca_core::replay::replay_seeded_at_validated_boundary(
+        let verified = broca_core::projection::decode_positioned_frames_with_identities(
             &|off, len| self.read_at(off, len),
-            &seed.boundary,
-            &frames,
+            seed.boundary.frame_end,
+            end,
             None,
-            None,
-            None,
-            None,
-            seed.ordinal_base,
-            false,
-            seed.tag_seed,
-            Vec::new(),
         )
-        .map_err(DbError::SeedFallback)?;
+        .map_err(|_| bad("episode frames unreadable"))?;
+        let frames = verified.frames;
+        let (_, boundary_identity) =
+            broca_core::replay::replay_seeded_at_validated_boundary_with_identity(
+                &|off, len| self.read_at(off, len),
+                &seed.boundary,
+                &frames,
+                None,
+                None,
+                None,
+                None,
+                seed.ordinal_base,
+                false,
+                seed.tag_seed,
+                Vec::new(),
+            )
+            .map_err(DbError::SeedFallback)?;
         let locator = OffsetSeed::decode(&locator, None)
             .ok_or_else(|| bad("episode locator continuation unsupported"))?;
         let head = broca_core::last_control_cursor_through(
@@ -248,7 +278,22 @@ impl DatabaseEpisodeReader {
         )
         .or(locator
             .qualified_control_head
-            .map(|(wal_seq, sub_index)| Cursor { wal_seq, sub_index }));
+            .map(|(wal_seq, sub_index)| Cursor::new(wal_seq, sub_index)));
+        let head = head.map(|cursor| super::readers::optional_head_identity(cursor, || {
+            let identity = if cursor.wal_seq == seed.boundary.seq {
+                boundary_identity
+            } else if let Some(identity) = verified.identities.iter().find(|identity| identity.seq == cursor.wal_seq) {
+                *identity
+            } else {
+                let span: Option<(u64, u64, u64)> = tx.query_row(
+                    "SELECT lo_seq,lo_off,hi_off FROM message WHERE sid=?1 AND lo_seq<=?2 ORDER BY ord DESC LIMIT 1",
+                    params![key, cursor.wal_seq], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                ).optional()?;
+                let (lo_seq, lo_off, hi_off) = span.ok_or_else(|| DbError::CursorIdentityUnavailable("stored model head has no indexed tool-turn span".into()))?;
+                super::readers::cursor_identity_in_tool_turn(&|off, len| self.read_at(off, len), cursor.wal_seq, lo_seq, lo_off, hi_off, end)?
+            };
+            Ok::<_, DbError>(cursor.with_frame_identity(self.lineage_id(), identity))
+        })).transpose()?;
         let episodes = tx.prepare("SELECT run_started_seq,run_started_off,first_ord,end_ord FROM episode WHERE sid=?1 ORDER BY n")?
             .query_map([key], |r| Ok(IndexedEpisode{run_started_seq:r.get(0)?,run_started_off:r.get(1)?,first_ord:r.get(2)?,end_ord:r.get(3)?}))?.collect::<rusqlite::Result<Vec<_>>>()?;
         let mut metadata = Vec::new();
@@ -328,7 +373,12 @@ impl DatabaseEpisodeReader {
         request: &ModelPageRequest,
         reason: Option<&'static str>,
     ) -> Result<EpisodeModelPage, DbError> {
-        let records = self.complete_read()?;
+        let verified = self.complete_read_with_identities()?;
+        let records: Vec<_> = verified
+            .frames
+            .into_iter()
+            .map(|frame| frame.framed)
+            .collect();
         let mut page = broca_core::read_session_model_page(
             &broca_core::StorePageSnapshot::empty(),
             &records,
@@ -337,6 +387,14 @@ impl DatabaseEpisodeReader {
         )
         .map_err(|e| DbError::Invalid(e.to_string()))?;
         page.lineage_id = Some(self.publication.lineage().to_string());
+        if let Some(cursor) = page.head {
+            let identity = verified
+                .identities
+                .iter()
+                .find(|identity| identity.seq == cursor.wal_seq)
+                .expect("full replay cursor names a verified frame");
+            page.head = Some(cursor.with_frame_identity(self.lineage_id(), *identity));
+        }
         Ok(EpisodeModelPage {
             page,
             fallback: reason,

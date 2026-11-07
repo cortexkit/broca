@@ -8,14 +8,52 @@ use serde::{Deserialize, Serialize};
 
 use crate::placement::{AppendKind, Placement, PlacementAction};
 
-pub const DISPLAY_FACTS_VERSION: u32 = 2;
+pub const DISPLAY_FACTS_VERSION: u32 = 5;
+
+/// Exact response-only outputs by zero-based message ordinal and content part.
+pub type NativeToolOutputs = BTreeMap<u64, BTreeMap<u32, broca_protocol::ToolOutput>>;
+
+fn module_sender(principal: Option<&broca_protocol::BindPrincipal>) -> Option<String> {
+    match principal {
+        Some(broca_protocol::BindPrincipal::Reserved { module_id }) => Some(module_id.clone()),
+        _ => None,
+    }
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DisplayFacts {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notices: Vec<crate::projection::ProjectedNotice>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_message_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_times: Vec<ToolTime>,
+    /// Application-only `ToolResult` output with `SendDelivered.ride` text excluded.
+    /// Materialized messages remain model-facing and must not be rewritten by a read.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub native_tool_outputs: BTreeMap<u32, broca_protocol::ToolOutput>,
+}
+
+impl DisplayFacts {
+    pub fn resolve_notices(
+        &mut self,
+        keys: &crate::notice_keys::NoticeSendKeys,
+    ) -> Result<(), String> {
+        let mut notices = Vec::new();
+        for notice in std::mem::take(&mut self.notices) {
+            if keys.allows(
+                &notice.submission_id,
+                &notice.fact.sender,
+                &notice.fact.send_id,
+            )? {
+                notices.push(notice);
+            }
+        }
+        self.notices = notices;
+        Ok(())
+    }
 }
 
 /// A versioned continuation, committed atomically with every fact row it covers. It retains
@@ -31,6 +69,20 @@ pub struct DisplayFactsSeed {
     pending: VecDeque<Option<String>>,
     assistant: Option<(u64, DisplayFacts)>,
     tool_names: BTreeMap<String, String>,
+    #[serde(default)]
+    call_anchors: crate::call_identity::CallAnchors,
+    #[serde(default)]
+    pub send_keys: crate::notice_keys::NoticeSendKeys,
+    #[serde(default)]
+    queued_senders: BTreeMap<String, Option<String>>,
+    #[serde(default)]
+    pending_senders: VecDeque<Option<String>>,
+    #[serde(default)]
+    tool_row: Option<(u64, DisplayFacts)>,
+    #[serde(default)]
+    tool_calls: Vec<String>,
+    #[serde(default)]
+    tool_results: BTreeMap<String, broca_protocol::ToolResult>,
 }
 
 impl Default for DisplayFactsSeed {
@@ -45,6 +97,13 @@ impl Default for DisplayFactsSeed {
             pending: VecDeque::new(),
             assistant: None,
             tool_names: BTreeMap::new(),
+            call_anchors: Default::default(),
+            send_keys: Default::default(),
+            queued_senders: Default::default(),
+            pending_senders: Default::default(),
+            tool_row: None,
+            tool_calls: Vec::new(),
+            tool_results: BTreeMap::new(),
         }
     }
 }
@@ -80,13 +139,22 @@ impl DisplayFactsSeed {
                 continue;
             }
             let record = &frame.record;
+            self.send_keys.observe(std::slice::from_ref(frame));
+            let current_call = self.call_anchors.observe(record, frame.seq);
             let mut client = None;
+            let mut input_sender = None;
             match record {
                 WalRecord::Queued {
                     submission_id,
                     request_identity_digest,
                     ..
                 } => {
+                    self.queued_senders.insert(
+                        submission_id.0.clone(),
+                        self.send_keys
+                            .origin(&submission_id.0)
+                            .and_then(|(_, sender)| sender),
+                    );
                     self.queued.insert(
                         submission_id.0.clone(),
                         request_identity_digest
@@ -99,13 +167,24 @@ impl DisplayFactsSeed {
                     request_identity_digest,
                     submission_id,
                     origin,
+                    sent_by,
+                    principal,
                     ..
                 } => {
                     self.budget = config.budget.clone();
                     self.pending.clear();
+                    self.pending_senders.clear();
+                    self.tool_row = None;
+                    self.tool_calls.clear();
+                    self.tool_results.clear();
                     self.assistant = None;
                     self.tool_names.clear();
                     if matches!(origin, broca_wal::RunOrigin::Fresh) {
+                        input_sender = submission_id
+                            .as_ref()
+                            .and_then(|id| self.queued_senders.remove(&id.0))
+                            .flatten()
+                            .or_else(|| module_sender(sent_by.as_ref().or(principal.as_ref())));
                         client = submission_id
                             .as_ref()
                             .and_then(|id| self.queued.remove(&id.0))
@@ -120,12 +199,17 @@ impl DisplayFactsSeed {
                 WalRecord::Steered {
                     request_identity_digest,
                     input,
+                    sent_by,
                     ..
                 } => {
                     let id = request_identity_digest
                         .as_deref()
                         .and_then(crate::digest_client_message_id);
                     self.pending.extend(std::iter::repeat_n(id, input.len()));
+                    self.pending_senders.extend(std::iter::repeat_n(
+                        module_sender(sent_by.as_ref()),
+                        input.len(),
+                    ));
                 }
                 WalRecord::SendDelivered {
                     submission_id,
@@ -134,10 +218,14 @@ impl DisplayFactsSeed {
                 } => {
                     let id = self.queued.remove(&submission_id.0).flatten();
                     self.pending.extend(std::iter::repeat_n(id, input.len()));
+                    let sender = self.queued_senders.remove(&submission_id.0).flatten();
+                    self.pending_senders
+                        .extend(std::iter::repeat_n(sender, input.len()));
                 }
                 WalRecord::Retracted { submission_id, .. }
                 | WalRecord::SendEnded { submission_id, .. } => {
                     self.queued.remove(&submission_id.0);
+                    self.queued_senders.remove(&submission_id.0);
                 }
                 _ => {}
             }
@@ -145,9 +233,13 @@ impl DisplayFactsSeed {
             for action in &actions {
                 match *action {
                     PlacementAction::Append { first, count, kind } => {
+                        if kind == AppendKind::ToolTurn {
+                            self.tool_row = Some((first + 1, DisplayFacts::default()));
+                        }
                         for ordinal in first..first + count {
                             let facts = if kind == AppendKind::Input {
                                 DisplayFacts {
+                                    sender: input_sender.clone(),
                                     client_message_id: client.clone(),
                                     ..Default::default()
                                 }
@@ -174,6 +266,7 @@ impl DisplayFactsSeed {
                                 ordinal,
                                 seq: frame.seq,
                                 facts: DisplayFacts {
+                                    sender: self.pending_senders.pop_front().flatten(),
                                     client_message_id: id,
                                     ..Default::default()
                                 },
@@ -187,6 +280,7 @@ impl DisplayFactsSeed {
                 assistant_message, ..
             } = record
             {
+                self.tool_results.clear();
                 self.tool_names = assistant_message
                     .tool_calls()
                     .map(|call| (call.tool_call_id.0.clone(), call.tool_name.clone()))
@@ -210,9 +304,72 @@ impl DisplayFactsSeed {
                                 .tool_calls()
                                 .map(|call| ToolTime::new(&call.tool_call_id.0))
                                 .collect(),
+                            ..Default::default()
                         },
                     )
                 });
+                self.tool_calls = assistant_message
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        broca_protocol::ContentBlock::ToolCall(call) => {
+                            Some(call.tool_call_id.0.clone())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+            }
+            if let WalRecord::ToolResult { result, .. } = record {
+                self.tool_results
+                    .insert(result.tool_call_id.0.clone(), (**result).clone());
+            }
+            if let WalRecord::SendDelivered {
+                submission_id,
+                ride,
+                tool_call_id: Some(call),
+                appended_text: Some(text),
+                mode: broca_protocol::DeliveryMode::ToolResult,
+                ..
+            } = record
+            {
+                if let Some((ordinal, facts)) = &mut self.tool_row {
+                    let part = self.tool_calls.iter().rposition(|id| id == &call.0);
+                    if let Some(part) = part {
+                        if ride.is_none() {
+                            if let Some(result) = self.tool_results.get_mut(&call.0) {
+                                crate::delivery_order::append_to_result(result, text);
+                            }
+                        }
+                        if ride.is_some() || facts.native_tool_outputs.contains_key(&(part as u32))
+                        {
+                            let result = self
+                                .tool_results
+                                .get(&call.0)
+                                .ok_or("ride carrier has no native result")?;
+                            facts
+                                .native_tool_outputs
+                                .insert(part as u32, result.output.clone());
+                        }
+                        if let (Some(ride), Some(text)) = (ride, text.strip_prefix("\n\n")) {
+                            facts.notices.push(crate::projection::ProjectedNotice {
+                                submission_id: submission_id.0.clone(),
+                                fact: cortexkit_role_llm_runner::read::NoticeFact::new(
+                                    part as u32,
+                                    &ride.send_id,
+                                    &ride.sender,
+                                    text,
+                                )
+                                .with_call_key(&ride.call_key),
+                            });
+                        }
+                        versions.push(DisplayFactVersion {
+                            ordinal: *ordinal,
+                            seq: frame.seq,
+                            facts: facts.clone(),
+                        });
+                    }
+                }
+                self.queued_senders.remove(&submission_id.0);
             }
             if let Some((ordinal, facts)) = &mut self.assistant {
                 match record {
@@ -351,6 +508,12 @@ impl DisplayFactsSeed {
                     }
                     _ => {}
                 }
+                if let Some((index, anchor)) = current_call {
+                    if let Some(call) = facts.tool_times.get_mut(index) {
+                        call.call_key = anchor.key(Some(lineage));
+                        call.schema_pin = anchor.schema_pin;
+                    }
+                }
                 if !facts.tool_times.is_empty()
                     && matches!(
                         record,
@@ -376,16 +539,125 @@ impl DisplayFactsSeed {
     }
 }
 
+/// Reuse already-decoded message source spans without reading a historical prefix.
+/// Deliveries without `SendDelivered.ride` remain appended; deliveries with it are
+/// excluded from this response overlay.
+pub fn native_tool_outputs(
+    records: &[FramedRecord],
+    lineage: &str,
+) -> Result<NativeToolOutputs, String> {
+    if !records.iter().any(|frame| {
+        matches!(
+            &frame.record,
+            WalRecord::SendDelivered { ride: Some(_), .. }
+        )
+    }) {
+        return Ok(Default::default());
+    }
+    let mut outputs: NativeToolOutputs = DisplayFactsSeed::default()
+        .fold(records, lineage)?
+        .into_iter()
+        .map(|version| (version.ordinal, version.facts.native_tool_outputs))
+        .collect();
+    outputs.retain(|_, parts| !parts.is_empty());
+    Ok(outputs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    #[ignore = "set BROCA_DISPLAY_REBUILD_WAL to a copied WAL to time a cold display seed rebuild"]
+    fn time_cold_display_seed_rebuild_from_wal() {
+        use std::io::{Read, Seek, SeekFrom};
+        let path = std::env::var_os("BROCA_DISPLAY_REBUILD_WAL")
+            .expect("BROCA_DISPLAY_REBUILD_WAL is required");
+        let file = std::sync::Mutex::new(std::fs::File::open(&path).unwrap());
+        let bytes = file.lock().unwrap().metadata().unwrap().len();
+        let (_, lineage) = crate::projection::log_header_info(&|off, len| {
+            let mut file = file.lock().unwrap();
+            file.seek(SeekFrom::Start(off))?;
+            let mut bytes = Vec::new();
+            file.by_ref().take(len).read_to_end(&mut bytes)?;
+            Ok(bytes)
+        })
+        .unwrap();
+        let started = std::time::Instant::now();
+        let records = broca_wal::replay_file(path, u64::MAX).unwrap();
+        let decoded = started.elapsed();
+        let mut seed = DisplayFactsSeed::default();
+        let facts = seed
+            .fold(
+                &records,
+                &lineage.expect("WAL needs an incarnation").to_string(),
+            )
+            .unwrap();
+        eprintln!("cold display rebuild: bytes={bytes} records={} fact_versions={} seed_bytes={} decode_ms={} total_ms={}", records.len(), facts.len(), serde_json::to_vec(&seed).unwrap().len(), decoded.as_millis(), started.elapsed().as_millis());
+    }
 
     fn frame(seq: u64, value: serde_json::Value) -> FramedRecord {
         FramedRecord {
             seq,
             fence: 1,
             record: serde_json::from_value(value).unwrap(),
+        }
+    }
+
+    #[test]
+    fn native_output_sidecar_survives_every_cut_and_preserves_only_legacy_appends() {
+        use broca_protocol::{ToolOutput, ToolOutputPart};
+        for output in [
+            ToolOutput::Text {
+                text: "worked".into(),
+            },
+            ToolOutput::error("failed"),
+            ToolOutput::Json {
+                value: json!({"answer":42}),
+            },
+            ToolOutput::Parts {
+                parts: vec![ToolOutputPart::Text {
+                    text: "worked".into(),
+                }],
+            },
+        ] {
+            let mut result = broca_protocol::ToolResult {
+                tool_call_id: broca_protocol::ToolCallId("call".into()),
+                output: output.clone(),
+                is_error: false,
+            };
+            crate::delivery_order::append_to_result(&mut result, "\n\nold-before");
+            crate::delivery_order::append_to_result(&mut result, "\n\nold-after");
+            let values = vec![
+                json!({"type":"model_step_finished","step_id":0,"assistant_message":{"message_id":"m","content":[{"type":"tool_call","tool_call_id":"call","tool_name":"work","input":{}}]},"usage":{}}),
+                json!({"type":"tool_batch_started","step_id":0,"batch_id":"b","planned_calls":["call"]}),
+                json!({"type":"tool_result","batch_id":"b","result":{"tool_call_id":"call","output":output,"is_error":false},"outcome":"completed"}),
+                json!({"type":"tool_batch_finished","batch_id":"b"}),
+                json!({"type":"send_delivered","submission_id":"before","run_id":"r","mode":"tool_result","tool_call_id":"call","appended_text":"\n\nold-before"}),
+                json!({"type":"send_delivered","submission_id":"frozen","run_id":"r","mode":"tool_result","tool_call_id":"call","appended_text":"\n\nnew","ride":{"call_key":"lineage:1","send_id":"frozen","sender":"sender","forms":["tool_result"],"form":"append"}}),
+                json!({"type":"send_delivered","submission_id":"after","run_id":"r","mode":"tool_result","tool_call_id":"call","appended_text":"\n\nold-after"}),
+            ];
+            let frames: Vec<_> = values
+                .into_iter()
+                .enumerate()
+                .map(|(index, value)| frame(index as u64 + 1, value))
+                .collect();
+            for cut in 0..=frames.len() {
+                let mut seed = DisplayFactsSeed::default();
+                let mut versions = seed.fold(&frames[..cut], "lineage").unwrap();
+                let mut seed: DisplayFactsSeed =
+                    serde_json::from_slice(&serde_json::to_vec(&seed).unwrap()).unwrap();
+                versions.extend(seed.fold(&frames[cut..], "lineage").unwrap());
+                let facts = &versions.last().unwrap().facts;
+                assert_eq!(
+                    facts.native_tool_outputs.get(&0),
+                    Some(&result.output),
+                    "cut {cut}"
+                );
+                assert_eq!(facts.notices.len(), 1);
+                assert_eq!(facts.notices[0].fact.text, "new");
+            }
         }
     }
 
@@ -447,8 +719,8 @@ mod tests {
             {"tool_call_id":"a","started_at":100,"finished_at":150,"call_key":"lineage:2"},
             {"tool_call_id":"b","started_at":101,"finished_at":125,"call_key":"lineage:3"},
             {"tool_call_id":"c","unanswered":"cancelled","call_key":"lineage:4"},
-            {"tool_call_id":"d","unanswered":"denied"},
-            {"tool_call_id":"e","unanswered":"not_executed"},
+            {"tool_call_id":"d","unanswered":"denied","call_key":"lineage:8"},
+            {"tool_call_id":"e","unanswered":"not_executed","call_key":"lineage:9"},
             {"tool_call_id":"f"},
             {"tool_call_id":"g","unanswered":"denied","call_key":"lineage:10"}
         ]);

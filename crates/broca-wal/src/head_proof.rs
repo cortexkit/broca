@@ -41,6 +41,10 @@ pub struct SyncedPrefix<'a> {
 }
 
 impl<'a> SyncedPrefix<'a> {
+    pub fn last_cursor_frame_identity(&self) -> Option<framing::CursorFrameIdentity> {
+        self.wal.last_cursor_frame_identity()
+    }
+
     pub fn sync(wal: &'a dyn Wal) -> Result<Self, WalError> {
         wal.sync()?;
         Ok(Self { wal })

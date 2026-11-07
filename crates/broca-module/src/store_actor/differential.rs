@@ -28,18 +28,31 @@ use crate::registry::LineageRegistry;
 
 /// Today's executor in this harness: today's loop over the scripted provider, on the writer the
 /// actor hands it.
-struct TodayLoop {
-    provider: Gated,
-    wal: Arc<FileWalStore>,
+pub(super) struct TodayLoop {
+    pub(super) provider: Gated,
+    pub(super) wal: Arc<FileWalStore>,
+    /// The planes the executor offers the session's runs, the same ones the store side's offers.
+    pub(super) planes: super::tests::Planes,
 }
 
 #[async_trait]
 impl RunExecutor for TodayLoop {
+    fn hook_plane(&self) -> Option<Arc<dyn broca_core::HookPlane>> {
+        self.planes.hooks.clone()
+    }
+
+    fn compaction_plane(&self) -> Option<Arc<dyn broca_core::CompactionPlane>> {
+        self.planes.compaction.clone()
+    }
+
     async fn execute(
         &self,
-        job: RunJob,
+        mut job: RunJob,
         out: mpsc::Sender<OutputEvent>,
     ) -> Result<RunSummary, RunError> {
+        // As the store side's executor does: the caller's context limit is the admitted one.
+        job.control.admitted_context_limit =
+            job.control.admitted_context_limit.or(job.req.context_limit);
         // As the serve executor picks it (`start_mode_after_auth`) when the run's credential
         // resolves, which this harness's always does: an ordinary caller's send, which arrives
         // as `FreshOrResume`, resumes a sign-in pause.
@@ -72,6 +85,8 @@ struct Today {
     registry: LineageRegistry,
     wal: Arc<FileWalStore>,
     key: BindIdentity,
+    /// The module's executor, whose provider records what each model call was sent.
+    executor: Arc<TodayLoop>,
 }
 
 impl Drop for Today {
@@ -81,6 +96,15 @@ impl Drop for Today {
 }
 
 fn today(steps: Vec<Vec<NormalizedEvent>>, gate: Option<Arc<Notify>>) -> Today {
+    today_with(steps, gate, super::tests::Planes::default())
+}
+
+/// [`today`] with an executor that offers `planes`.
+fn today_with(
+    steps: Vec<Vec<NormalizedEvent>>,
+    gate: Option<Arc<Notify>>,
+    planes: super::tests::Planes,
+) -> Today {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let dir = broca_test_support::scratch_root().join(format!(
@@ -96,6 +120,7 @@ fn today(steps: Vec<Vec<NormalizedEvent>>, gate: Option<Arc<Notify>>) -> Today {
             gate,
         },
         wal: Arc::clone(&wal),
+        planes,
     });
     // A reader over the WAL alone: `session.read` serves from the log when no store is given.
     let registry = LineageRegistry::new_with_reader(
@@ -103,7 +128,7 @@ fn today(steps: Vec<Vec<NormalizedEvent>>, gate: Option<Arc<Notify>>) -> Today {
             crate::opener::DefaultOpener::new(
                 Arc::new(FileLeaseStore::new(dir.join("leases"))),
                 wal.clone(),
-                executor,
+                executor.clone(),
             )
             .with_idle_ttl(Duration::from_secs(60)),
         ),
@@ -116,6 +141,7 @@ fn today(steps: Vec<Vec<NormalizedEvent>>, gate: Option<Arc<Notify>>) -> Today {
         registry,
         wal,
         key,
+        executor,
     }
 }
 
@@ -1011,9 +1037,9 @@ async fn a_steer_naming_structured_output_the_run_did_not_freeze_is_refused_alik
 
 /// Both loops behind one executor, as the module's executor will be: a session on today's
 /// storage runs through today's loop, a session in the new storage through the new one.
-struct BothLoops {
-    today: TodayLoop,
-    store: super::tests::LoopExecutor,
+pub(super) struct BothLoops {
+    pub(super) today: TodayLoop,
+    pub(super) store: super::tests::LoopExecutor,
 }
 
 #[async_trait]
@@ -1050,7 +1076,7 @@ impl Drop for Module {
     }
 }
 
-const IDLE: Duration = Duration::from_millis(100);
+pub(super) const IDLE: Duration = Duration::from_millis(100);
 
 async fn module(on: bool, steps: Vec<Vec<NormalizedEvent>>) -> Module {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1070,6 +1096,7 @@ async fn module(on: bool, steps: Vec<Vec<NormalizedEvent>>) -> Module {
                 gate: None,
             },
             wal: Arc::clone(&wal),
+            planes: Default::default(),
         },
         store: executor(steps, None),
     });
@@ -1380,4 +1407,5 @@ async fn a_store_session_reads_as_the_same_history_on_todays_storage() {
     ));
 }
 
+mod controls;
 mod head;

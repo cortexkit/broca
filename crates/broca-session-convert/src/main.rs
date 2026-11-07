@@ -55,6 +55,7 @@ use serde::Serialize;
 mod calls_check;
 mod entries_check;
 mod heads;
+mod serve_check;
 
 /// Measurements encrypt with a fixed throwaway key: only the cost matters, not secrecy.
 fn measurement_key() -> FrameKey {
@@ -265,6 +266,7 @@ fn main() {
         "render" => run_render(&args),
         "entries-check" => entries_check::run(&args),
         "calls-check" => calls_check::run(&args),
+        "serve-check" => serve_check::run(&args),
         _ => usage(),
     }
 }
@@ -2412,6 +2414,19 @@ enum Item {
 struct OldLog {
     records: Vec<FramedRecord>,
     lineage: Option<String>,
+    /// The same lineage id, for today's code that takes it typed.
+    lineage_id: Option<broca_wal::WalLineageId>,
+}
+
+impl OldLog {
+    fn new(records: Vec<FramedRecord>, path: &Path) -> Self {
+        let lineage_id = read_lineage(path);
+        Self {
+            records,
+            lineage: lineage_id.map(|id| id.to_string()),
+            lineage_id,
+        }
+    }
 }
 
 impl std::ops::Deref for OldLog {
@@ -2429,14 +2444,12 @@ fn convert_log(
 }
 
 /// The lineage id a log's lineage frames name, or `None` for a log written before they existed.
-fn read_lineage(path: &Path) -> Option<String> {
+fn read_lineage(path: &Path) -> Option<broca_wal::WalLineageId> {
     let bytes = std::fs::read(path).ok()?;
     let mut rest = bytes.as_slice();
     while !rest.is_empty() {
         rest = match broca_wal::framing::decode_next(rest) {
-            broca_wal::framing::DecodeStep::Lineage { lineage_id, .. } => {
-                return Some(lineage_id.to_string())
-            }
+            broca_wal::framing::DecodeStep::Lineage { lineage_id, .. } => return Some(lineage_id),
             broca_wal::framing::DecodeStep::Record { consumed, .. } => &rest[consumed..],
             _ => return None,
         };
@@ -2457,10 +2470,7 @@ fn each_log(args: &Args, mut visit: impl FnMut(Item)) {
     let read = |path: &Path| {
         let started = Instant::now();
         let old = broca_wal::replay_file(path, u64::MAX)
-            .map(|records| OldLog {
-                records,
-                lineage: read_lineage(path),
-            })
+            .map(|records| OldLog::new(records, path))
             .map_err(|e| format!("read: {e}"));
         (old, started.elapsed().as_millis())
     };
@@ -2650,10 +2660,7 @@ fn run_append(args: &Args) {
     let mut id_lookups = Vec::new();
     for (index, file) in chosen.iter().enumerate() {
         let old = match broca_wal::replay_file(file, u64::MAX) {
-            Ok(records) => OldLog {
-                records,
-                lineage: read_lineage(file),
-            },
+            Ok(records) => OldLog::new(records, file),
             Err(e) => {
                 eprintln!("{}: {e}", file.display());
                 continue;
