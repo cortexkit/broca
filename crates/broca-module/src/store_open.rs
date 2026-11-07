@@ -41,6 +41,9 @@ pub struct StoreRuntime {
     /// Where a head's file-source import may read from. Broca's own import folder under the
     /// state root unless the operator configured other roots (`with_import_roots`).
     import_roots: Arc<crate::store_import::ImportRoots>,
+    /// The facts of runs that have ended, which `run.status` and `run.result` serve again
+    /// without reading the runs' records.
+    settled: crate::store_status::SettledRuns,
 }
 
 impl StoreRuntime {
@@ -72,6 +75,7 @@ impl StoreRuntime {
                 None,
                 Some(&crate::store_import::default_import_folder(state_root)),
             )),
+            settled: crate::store_status::SettledRuns::default(),
         })
     }
 
@@ -91,6 +95,16 @@ impl StoreRuntime {
     /// Where a file-source import may read from.
     pub fn import_roots(&self) -> Arc<crate::store_import::ImportRoots> {
         Arc::clone(&self.import_roots)
+    }
+
+    /// The deployment's setup parts, which a run's start names.
+    pub fn parts(&self) -> &SharedParts {
+        &self.parts
+    }
+
+    /// The facts of runs that have ended, kept for `run.status` and `run.result`.
+    pub fn settled_runs(&self) -> &crate::store_status::SettledRuns {
+        &self.settled
     }
 
     /// Writes the spend facts of every run on the new storage to `billing`, the deployment's

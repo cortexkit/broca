@@ -28,9 +28,9 @@ use crate::registry::LineageRegistry;
 
 /// Today's executor in this harness: today's loop over the scripted provider, on the writer the
 /// actor hands it.
-struct TodayLoop {
-    provider: Gated,
-    wal: Arc<FileWalStore>,
+pub(super) struct TodayLoop {
+    pub(super) provider: Gated,
+    pub(super) wal: Arc<FileWalStore>,
 }
 
 #[async_trait]
@@ -1011,9 +1011,9 @@ async fn a_steer_naming_structured_output_the_run_did_not_freeze_is_refused_alik
 
 /// Both loops behind one executor, as the module's executor will be: a session on today's
 /// storage runs through today's loop, a session in the new storage through the new one.
-struct BothLoops {
-    today: TodayLoop,
-    store: super::tests::LoopExecutor,
+pub(super) struct BothLoops {
+    pub(super) today: TodayLoop,
+    pub(super) store: super::tests::LoopExecutor,
 }
 
 #[async_trait]
@@ -1050,7 +1050,7 @@ impl Drop for Module {
     }
 }
 
-const IDLE: Duration = Duration::from_millis(100);
+pub(super) const IDLE: Duration = Duration::from_millis(100);
 
 async fn module(on: bool, steps: Vec<Vec<NormalizedEvent>>) -> Module {
     use std::sync::atomic::{AtomicU64, Ordering};

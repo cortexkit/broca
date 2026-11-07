@@ -5873,6 +5873,15 @@ impl LineageRegistry {
                 if let Some(probe) = self.inner.status_open_probe.lock().unwrap().take() {
                     probe();
                 }
+                if let Some(store) = self.store_holding(key)? {
+                    // A session kept in the new storage has no WAL to read: its actor answers,
+                    // opened first when the session needs recovering.
+                    if crate::store_status::status_needs_actor(&store, key).await? {
+                        self.actor_for_mode(key, None, None, true).await?;
+                        continue;
+                    }
+                    return Ok(LineageStatus::Idle);
+                }
                 if self.status_needs_actor(key).await? {
                     if self.crash_orphan_pending(key) {
                         return Err(OpenError::Classified {

@@ -64,7 +64,10 @@ fn run_sender(records: &[WalRecord], run: &RunId) -> Option<Option<BindPrincipal
     })
 }
 
-fn qualified_sender_run_id(base: &RunId, sender: &BindPrincipal) -> Result<RunId, String> {
+pub(crate) fn qualified_sender_run_id(
+    base: &RunId,
+    sender: &BindPrincipal,
+) -> Result<RunId, String> {
     use sha2::Digest;
     let module_id = match sender {
         BindPrincipal::Reserved { module_id } => module_id,

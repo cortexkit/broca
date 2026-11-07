@@ -29,22 +29,49 @@ pub fn content_timing_intervals(
     )
 }
 
+/// What a finished step reports about how it was served: its id, and the service tier and speed
+/// the provider said it used. A refused step reports none and takes no generation sample.
+#[derive(Debug, Clone, Copy)]
+pub struct StepServed<'a> {
+    pub step_id: StepId,
+    pub service_tier_used: Option<&'a str>,
+    pub speed_used: Option<&'a str>,
+}
+
+impl<'a> StepServed<'a> {
+    pub(super) fn of(record: &'a WalRecord) -> Option<Self> {
+        let WalRecord::ModelStepFinished {
+            step_id,
+            service_tier_used,
+            speed_used,
+            ..
+        } = record
+        else {
+            return None;
+        };
+        Some(Self {
+            step_id: *step_id,
+            service_tier_used: service_tier_used.as_deref(),
+            speed_used: speed_used.as_deref(),
+        })
+    }
+}
+
 pub(super) fn record(
     entries: &mut Vec<GenerationUsage>,
     attempt: Option<AttemptTiming>,
-    record: &WalRecord,
+    served: Option<StepServed<'_>>,
     by_model: &[(&str, &str, Option<&str>, Usage)],
 ) {
-    let WalRecord::ModelStepFinished {
+    let Some(StepServed {
         step_id,
         service_tier_used,
         speed_used,
-        ..
-    } = record
+    }) = served
     else {
         return;
     };
-    let Some(attempt) = attempt.filter(|attempt| attempt.step_id == *step_id) else {
+    let Some(attempt) = attempt.filter(|attempt| attempt.step_id == step_id) else {
         return;
     };
     let (Some(sent), Some(first), Some(last)) = (attempt.sent, attempt.first, attempt.last) else {
@@ -74,8 +101,8 @@ pub(super) fn record(
     });
     if let Some(entry) = entries.iter_mut().find(|entry| {
         entry.model == *model
-            && entry.service_tier == *service_tier_used
-            && entry.speed == *speed_used
+            && entry.service_tier.as_deref() == service_tier_used
+            && entry.speed.as_deref() == speed_used
     }) {
         entry.model_calls += 1;
         entry.output_tokens += output_tokens;
@@ -88,8 +115,8 @@ pub(super) fn record(
     } else {
         entries.push(GenerationUsage {
             model: (*model).to_owned(),
-            service_tier: service_tier_used.clone(),
-            speed: speed_used.clone(),
+            service_tier: service_tier_used.map(str::to_owned),
+            speed: speed_used.map(str::to_owned),
             model_calls: 1,
             output_tokens,
             reasoning_tokens,
