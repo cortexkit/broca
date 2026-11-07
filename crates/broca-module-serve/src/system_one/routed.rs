@@ -105,18 +105,26 @@ fn contract_error(message: impl Into<String>) -> Error {
     refusal.into()
 }
 
-fn routing_error(error: RoutingCallError, pin: Option<&str>) -> Error {
+fn routing_error(error: RoutingCallError, pin: Option<&str>, now_ms: u64) -> Error {
     match error {
         RoutingCallError::Invalid(message) => contract_error(message),
         RoutingCallError::Unavailable(message) => unavailable(message),
-        RoutingCallError::Refused { code, message }
-            if matches!(code.as_str(), "invalid_request" | "admission_conflict") =>
-        {
-            contract_error(format!("routing contract error: {code}: {message}"))
+        RoutingCallError::Refused {
+            code,
+            message,
+            detail,
+        } => {
+            if matches!(code.as_str(), "invalid_request" | "admission_conflict") {
+                tracing::warn!(routing_code = %code, routing_reason = %message, "routing refused a classifier request");
+            }
+            Error::Routing(Box::new(RoutingRefusal::refused_with_detail(
+                code,
+                Some(message),
+                pin.map(str::to_owned),
+                &detail,
+                now_ms,
+            )))
         }
-        RoutingCallError::Refused { code, message } => Error::Routing(Box::new(
-            RoutingRefusal::refused(code, Some(message), pin.map(str::to_owned)),
-        )),
     }
 }
 
@@ -334,7 +342,7 @@ impl SystemOne {
             .client
             .classifier_describe()
             .await
-            .map_err(|error| routing_error(error, pin))?;
+            .map_err(|error| routing_error(error, pin, (self.clock)().max(0) as u64))?;
         if describe.consumer("classifier").is_none() {
             return Err(unavailable("routing does not serve consumer classifier"));
         }
@@ -413,7 +421,13 @@ async fn select(
         .client
         .classifier_select(&query)
         .await
-        .map_err(|error| routing_error(error, request.model.as_deref()))?;
+        .map_err(|error| {
+            routing_error(
+                error,
+                request.model.as_deref(),
+                (service.clock)().max(0) as u64,
+            )
+        })?;
     let model = answer.runner.model.route_key();
     let mut refusal = if service.pin(&model).is_none()
         || request.model.as_ref().is_some_and(|pin| pin != &model)
@@ -870,11 +884,11 @@ async fn flush(
         .await;
         match result {
             Ok(()) => journal.outbox[index].closed = true,
-            Err(RoutingCallError::Refused { code, message }) if code == "unknown_decision" => {
+            Err(RoutingCallError::Refused { code, message, .. }) if code == "unknown_decision" => {
                 tracing::warn!(target: "system_one", %code, %message, "closing routing report for an unknown decision");
                 journal.outbox[index].closed = true;
             }
-            Err(RoutingCallError::Refused { code, message }) if code == "report_conflict" => {
+            Err(RoutingCallError::Refused { code, message, .. }) if code == "report_conflict" => {
                 tracing::error!(target: "system_one", %code, %message, "routing report conflict closed; immutable body cannot be retried");
                 journal.outbox[index].closed = true;
             }
@@ -882,7 +896,7 @@ async fn flush(
                 tracing::error!(target: "system_one", %message, "routing RPC was not confirmed; keeping its immutable debt");
                 break;
             }
-            Err(RoutingCallError::Refused { code, message })
+            Err(RoutingCallError::Refused { code, message, .. })
                 if matches!(
                     code.as_str(),
                     "invalid_request" | "account_not_authorized" | "admission_conflict"
@@ -1030,12 +1044,16 @@ async fn recover_claimed(
             Err(RoutingCallError::Unavailable(message)) => return Err(unavailable(message)),
             Err(RoutingCallError::Invalid(message)) => {
                 release_pending(service, batch_id, journal, &pending, None).await?;
-                return Err(routing_error(RoutingCallError::Invalid(message), None));
+                return Err(routing_error(
+                    RoutingCallError::Invalid(message),
+                    None,
+                    (service.clock)().max(0) as u64,
+                ));
             }
             Err(error @ RoutingCallError::Refused { .. }) => {
                 // A refusal of a replay is not proof that an earlier unknown grant never
                 // happened. Only a definitive grant or explicit cleanup clears the intent.
-                return Err(routing_error(error, None));
+                return Err(routing_error(error, None, (service.clock)().max(0) as u64));
             }
         }
     }
@@ -1882,9 +1900,13 @@ async fn dispatch(
             release_pending(service, &request.batch_id, journal, &pending, None).await?;
         }
         let refused = matches!(&admission, Err(RoutingCallError::Refused { .. }));
-        let account = match admission
-            .map_err(|error| routing_error(error, request.model.as_deref()))
-        {
+        let account = match admission.map_err(|error| {
+            routing_error(
+                error,
+                request.model.as_deref(),
+                (service.clock)().max(0) as u64,
+            )
+        }) {
             Ok(account) => {
                 if let Err(error) = check_admission(&pending, &account) {
                     release_pending(
@@ -2129,17 +2151,7 @@ async fn refuse_admission(
         .as_deref()
         .unwrap_or("unknown_refusal");
     if !matches!(routing_code, "auth_required" | "account_not_authorized") {
-        return Err(routing_error(
-            RoutingCallError::Refused {
-                code: routing_code.into(),
-                message: refusal
-                    .detail
-                    .routing_reason
-                    .clone()
-                    .unwrap_or_else(|| refusal.message.clone()),
-            },
-            request.model.as_deref(),
-        ));
+        return Err(Error::Routing(Box::new(refusal)));
     }
     journal.admission_refusal = Some(refusal.clone());
     journal.admission_refusal_pending = true;
@@ -2520,19 +2532,22 @@ mod refusal_tests {
     use super::*;
 
     #[test]
-    fn invalid_request_and_admission_conflict_are_always_contract_errors() {
+    fn answered_request_contract_refusals_preserve_routing_code() {
         for code in ["invalid_request", "admission_conflict"] {
             let bytes = routing_error(
                 RoutingCallError::Refused {
                     code: code.into(),
                     message: "the runner violated the request contract".into(),
+                    detail: json!({}),
                 },
                 Some("typesafe/jev-1.13.0"),
+                0,
             )
             .bytes();
             let refusal: Value = serde_json::from_slice(&bytes).unwrap();
-            assert_eq!(refusal["code"], "internal_error", "{code}");
+            assert_eq!(refusal["code"], "routing_refused", "{code}");
             assert_eq!(refusal["detail"]["class"], "permanent", "{code}");
+            assert_eq!(refusal["detail"]["routing_code"], code);
         }
     }
 }
@@ -2668,9 +2683,7 @@ async fn renew(
         Err(error) => {
             run.renew_failed = true;
             let message = match &error {
-                RoutingCallError::Refused { code, message } => {
-                    format!("routing refused renewal: {code}; {message}")
-                }
+                RoutingCallError::Refused { .. } => "routing refused the batch".into(),
                 RoutingCallError::Unavailable(message) => {
                     format!("routing renewal unavailable: {message}")
                 }
@@ -2683,16 +2696,21 @@ async fn renew(
                 Some(cortexkit_role_routing::select::PinOutcome::Pinned)
             )
             .then_some(run.choice.model.as_str());
-            run.renewal_refusal = Some(
-                serde_json::from_slice(&routing_error(error, pin).bytes()).expect("refusal JSON"),
-            );
+            let refusal = routing_error(error, pin, now);
+            let item_error = match &refusal {
+                Error::Routing(refusal) => refusal.as_ref().clone().into_item_error(),
+                _ => None,
+            };
+            run.renewal_refusal =
+                Some(serde_json::from_slice(&refusal.bytes()).expect("refusal JSON"));
             // The request may have committed even when its answer was lost or invalid.
             // Finish the original admission first, then this possibly granted renewal.
             run.cleanup_admissions.push(request.admission_id.clone());
             if let Some(id) = answered_admission.filter(|id| *id != request.admission_id) {
                 run.cleanup_admissions.push(id);
             }
-            let error = ItemError::for_code(errors::PROVIDER_ERROR, message);
+            let error =
+                item_error.unwrap_or_else(|| ItemError::for_code(errors::PROVIDER_ERROR, message));
             run.note_error(error.clone());
             Some(error)
         }

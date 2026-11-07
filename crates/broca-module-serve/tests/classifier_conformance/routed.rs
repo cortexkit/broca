@@ -49,6 +49,9 @@ struct Admission {
 
 #[derive(Default)]
 struct Inner {
+    admission_refusal: Option<cortexkit_role_classifier_conformance::RoutingRefusalFixture>,
+    renewal_refusal: Option<cortexkit_role_classifier_conformance::RoutingRefusalFixture>,
+    renewal_due: Option<u64>,
     script: Option<Vec<RoutingOutcome>>,
     cursor: usize,
     next_decision: usize,
@@ -70,10 +73,64 @@ impl State {
         inner.script = Some(outcomes);
         inner.cursor = 0;
         inner.observations = RoutingObservations::default();
+        inner.admission_refusal = None;
+        inner.renewal_refusal = None;
+        inner.renewal_due = None;
+    }
+
+    pub(super) fn admission_refusal(
+        &self,
+        refusal: cortexkit_role_classifier_conformance::RoutingRefusalFixture,
+    ) {
+        self.script(vec![RoutingOutcome::Refused {
+            code: refusal.code.clone(),
+            message: refusal.message.clone(),
+        }]);
+        self.0.lock().unwrap().admission_refusal = Some(refusal);
+    }
+
+    pub(super) fn renewal_refusal(
+        &self,
+        refusal: cortexkit_role_classifier_conformance::RoutingRefusalFixture,
+    ) {
+        let mut inner = self.0.lock().unwrap();
+        assert!(inner.script.is_some());
+        inner.renewal_refusal = Some(refusal);
+    }
+
+    fn renewal_deadline(&self, request: &Value) -> Option<u64> {
+        let mut inner = self.0.lock().unwrap();
+        if request["method"] == "route.account_observe"
+            && request["params"]["kind"] == "attempt"
+            && inner.observations.provider_requests.len() == 1
+        {
+            inner.renewal_due.take()
+        } else {
+            None
+        }
+    }
+
+    async fn await_renewal_window(&self, request: &Value) {
+        if let Some(due) = self.renewal_deadline(request) {
+            // Attempt observations are flushed after the paid answer commits. Hold its
+            // acknowledgement until the lease expires, so the next item must renew before dispatch.
+            broca_test_support::wait_until("fixture lease renewal window", || async {
+                if now() >= due {
+                    Ok(())
+                } else {
+                    Err(format!("renewal due at {due}, now {}", now()))
+                }
+            })
+            .await;
+        }
     }
 
     pub(super) fn finish(&self) {
-        self.0.lock().unwrap().script = None;
+        let mut inner = self.0.lock().unwrap();
+        inner.script = None;
+        inner.admission_refusal = None;
+        inner.renewal_refusal = None;
+        inner.renewal_due = None;
     }
 
     pub(super) fn observations(&self) -> RoutingObservations {
@@ -157,7 +214,10 @@ impl State {
                 let choice = match outcome {
                     RoutingOutcome::Selected(choice) => choice,
                     RoutingOutcome::Refused { code, message } => {
-                        return FixtureReply::Error { code, message }
+                        if let Some(refusal) = &inner.admission_refusal {
+                            return FixtureReply::Refused(refusal.clone());
+                        }
+                        return FixtureReply::Error { code, message };
                     }
                     RoutingOutcome::Unavailable => return FixtureReply::Unavailable,
                 };
@@ -211,6 +271,11 @@ impl State {
                 );
                 assert_eq!(params["method"], "apikey");
                 let renewing = params["mode"] == "renew";
+                if renewing {
+                    if let Some(refusal) = &inner.renewal_refusal {
+                        return FixtureReply::Refused(refusal.clone());
+                    }
+                }
                 let pin_id = if renewing {
                     let old = inner
                         .admissions
@@ -238,9 +303,18 @@ impl State {
                 let generation = params["expected_pin"]["generation"]
                     .as_u64()
                     .map_or(1, |old| old + 1);
+                let lease_ms = if inner.renewal_refusal.is_some() {
+                    1_200
+                } else {
+                    120_000
+                };
+                let admitted_at = now();
+                if inner.renewal_refusal.is_some() {
+                    inner.renewal_due = Some(admitted_at + lease_ms);
+                }
                 let answer = json!({"admission":{"id":id,"state":"admitted"},
                     "account":{"provider":"typesafe","method":"apikey","account_id":choice.account,"credential_id":choice.account},
-                    "pin":{"id":pin_id,"generation":generation,"affinity_expires_at_ms":now()+3_600_000,"admission_valid_until_ms":now()+120_000,"lease_valid_until_ms":now()+120_000,"mode":if renewing {"renew"} else {"admit"}},
+                    "pin":{"id":pin_id,"generation":generation,"affinity_expires_at_ms":admitted_at+3_600_000,"admission_valid_until_ms":admitted_at+120_000,"lease_valid_until_ms":admitted_at+lease_ms,"mode":if renewing {"renew"} else {"admit"}},
                     "reason":{"code":if renewing {"renewed"} else {"headroom"},"decision_id":decision,"policy_version":"fixture","quota_age_band":"fresh"}});
                 let _: cortexkit_role_routing::account::AccountForAnswer =
                     serde_json::from_value(answer.clone()).unwrap();
@@ -312,6 +386,7 @@ impl State {
 }
 
 enum FixtureReply {
+    Refused(cortexkit_role_classifier_conformance::RoutingRefusalFixture),
     Response(Value),
     Error { code: String, message: String },
     Unavailable,
@@ -417,11 +492,18 @@ impl ModuleHandler for Router {
                 .get(&(route.channel, route.epoch)),
             Some(&true)
         );
-        match self.state.request(serde_json::from_slice(&body).unwrap()) {
+        let request: Value = serde_json::from_slice(&body).unwrap();
+        self.state.await_renewal_window(&request).await;
+        match self.state.request(request) {
             FixtureReply::Response(result) => {
                 HandlerOutcome::Response(serde_json::to_vec(&json!({"result":result})).unwrap())
             }
             FixtureReply::Error { code, message } => HandlerOutcome::Error { code, message },
+            FixtureReply::Refused(refusal) => HandlerOutcome::ErrorWithDetail {
+                code: refusal.code,
+                message: refusal.message,
+                detail: refusal.detail,
+            },
             // Not answering is a real transport timeout, not an answered routing refusal.
             // The fixture's service task is aborted when the rig is dropped.
             FixtureReply::Unavailable => std::future::pending().await,
@@ -512,6 +594,7 @@ mod tests {
         match state.request(json!({"method":method,"params":params})) {
             FixtureReply::Response(result) => result,
             FixtureReply::Error { code, message } => panic!("{code}: {message}"),
+            FixtureReply::Refused(refusal) => panic!("{}: {}", refusal.code, refusal.message),
             FixtureReply::Unavailable => panic!("unexpected timeout"),
         }
     }
@@ -608,6 +691,78 @@ mod tests {
             .admissions
             .values()
             .all(|admission| admission.finished));
+    }
+
+    #[test]
+    fn routed_fixture_refusal_hooks_preserve_detail_and_renew_after_paid_item() {
+        use cortexkit_role_classifier_conformance::RoutingRefusalFixture;
+        let refusal =
+            RoutingRefusalFixture::new("account_hold", "held").with_detail(json!({"until_ms":123}));
+        let state = Arc::new(scripted_state());
+        state.admission_refusal(refusal.clone());
+        let reply = state.request(json!({"method":"route.select","params":{"consumer":"classifier","requirements":{"iq":0},"runners":["broca"]}}));
+        let FixtureReply::Refused(answer) = reply else {
+            panic!("hook did not refuse");
+        };
+        assert_eq!(answer.code, "account_hold");
+        assert_eq!(answer.detail, json!({"until_ms":123}));
+
+        state.script(vec![RoutingOutcome::Selected(RoutedDecision {
+            model: JEV.into(),
+            account: ACCOUNTS[0].into(),
+            decision_id: "scripted".into(),
+        })]);
+        state.renewal_refusal(refusal);
+        let admitted = admit(&state);
+        state.provider_request(
+            &format!(
+                "authorization: bearer synthetic-classifier-key-{}\r\n",
+                ACCOUNTS[0]
+            ),
+            "/v1/systemone",
+            &json!({"model":"jev-1.13.0"}),
+        );
+        assert_eq!(
+            state.renewal_deadline(
+                &json!({"method":"route.account_observe","params":{"kind":"admission_started"}})
+            ),
+            None
+        );
+        assert_eq!(
+            state.renewal_deadline(
+                &json!({"method":"route.account_observe","params":{"kind":"attempt"}})
+            ),
+            Some(admitted["pin"]["lease_valid_until_ms"].as_u64().unwrap())
+        );
+        assert_eq!(
+            state.renewal_deadline(
+                &json!({"method":"route.account_observe","params":{"kind":"attempt"}})
+            ),
+            None
+        );
+        let mut request = state
+            .0
+            .lock()
+            .unwrap()
+            .admissions
+            .values()
+            .next()
+            .unwrap()
+            .request
+            .clone();
+        request["admission_id"] = json!("renewal-refused");
+        request["mode"] = json!("renew");
+        request["expected_pin"] =
+            json!({"id":admitted["pin"]["id"],"generation":admitted["pin"]["generation"]});
+        let FixtureReply::Refused(answer) =
+            state.request(json!({"method":"route.account_for","params":request}))
+        else {
+            panic!("renewal hook did not refuse");
+        };
+        assert_eq!(answer.detail, json!({"until_ms":123}));
+        assert_eq!(state.observations().provider_requests.len(), 1);
+        state.finish();
+        assert!(state.0.lock().unwrap().renewal_refusal.is_none());
     }
 
     #[test]

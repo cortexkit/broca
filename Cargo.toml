@@ -99,10 +99,10 @@ cortexkit-role-compaction-provider = "=0.7.14"
 cortexkit-role-compaction = "=0.2.6"
 cortexkit-compaction-view = "=0.1.3"
 # System One: the one-pass decision-model role and the batch rules it shares with extraction.
-cortexkit-role-classifier = "=0.6.2"
-cortexkit-role-classifier-conformance = "=0.8.2"
-cortexkit-role-routing = "=0.7.4"
-cortexkit-model-batch = "=0.3.3"
+cortexkit-role-classifier = "=0.6.3"
+cortexkit-role-classifier-conformance = "=0.8.3"
+cortexkit-role-routing = "=0.7.6"
+cortexkit-model-batch = "=0.3.4"
 
 # The logging facade every crate here emits through. The records are formatted and
 # written by cortexkit-log, which the daemon binary installs as the process-global

@@ -43,7 +43,7 @@ async fn audit_exit_committed_selection_survives_first_admission_refusal() {
 }
 
 #[tokio::test]
-async fn audit_exit_readmission_refusal_is_permanent_and_verbatim() {
+async fn audit_exit_readmission_refusal_keeps_shared_class_and_verbatim_cause() {
     for code in [
         "account_selection_unavailable",
         "unknown_decision",
@@ -54,8 +54,20 @@ async fn audit_exit_readmission_refusal_is_permanent_and_verbatim() {
         call(&rig, &routed_request(&["x"])).await.unwrap();
         *rig.router.admission_refused.lock().unwrap() = Some((code, "answer from router"));
         let refusal = call(&rig, &routed_request(&["x"])).await.unwrap_err();
-        assert_eq!(refusal["code"], "routing_refused", "{code}");
-        assert_eq!(refusal["detail"]["class"], "permanent");
+        let transient = code == "account_selection_unavailable";
+        assert_eq!(
+            refusal["code"],
+            if transient {
+                "routing_deferred"
+            } else {
+                "routing_refused"
+            },
+            "{code}"
+        );
+        assert_eq!(
+            refusal["detail"]["class"],
+            if transient { "transient" } else { "permanent" }
+        );
         assert_eq!(refusal["detail"]["routing_code"], code);
         assert_eq!(refusal["detail"]["routing_reason"], "answer from router");
         assert_eq!(rig.provider.calls("x"), 1);
@@ -69,7 +81,8 @@ async fn audit_exit_describe_contract_refusal_is_not_an_outage() {
         let rig = routed_rig(true, true);
         *rig.router.override_refusal.lock().unwrap() = Some(("role.describe", code));
         let refusal = call(&rig, &routed_request(&["x"])).await.unwrap_err();
-        assert_eq!(refusal["code"], "internal_error", "{code}");
+        assert_eq!(refusal["code"], "routing_refused", "{code}");
+        assert_eq!(refusal["detail"]["routing_code"], code);
         assert_eq!(refusal["detail"]["class"], "permanent");
         assert!(rig.store.lookup(STORE_ROLE, "routed").unwrap().is_none());
         assert_eq!(rig.provider.calls("x"), 0);
@@ -252,18 +265,25 @@ async fn audit_exit_answered_renewal_refusal_preserves_partial_reply_and_metadat
         gate.add_permits(1);
         let reply: Value = serde_json::from_str(task.await.unwrap().unwrap().get()).unwrap();
         assert!(reply["items"][0].get("answers").is_some());
+        let transient = code == "account_selection_unavailable";
+        let expected_code = if transient {
+            "routing_deferred"
+        } else {
+            "routing_refused"
+        };
+        assert_eq!(reply["items"][1]["error"]["code"], expected_code, "{code}");
         assert_eq!(
-            reply["items"][1]["error"]["code"], "provider_error",
-            "{code}"
+            reply["items"][1]["error"]["class"],
+            if transient { "transient" } else { "permanent" }
         );
-        assert_eq!(reply["items"][1]["error"]["class"], "transient");
-        assert!(reply["items"][1]["error"]["message"]
+        assert_eq!(reply["items"][1]["error"]["detail"]["routing_code"], code);
+        assert!(!reply["items"][1]["error"]["message"]
             .as_str()
             .unwrap()
             .contains(&format!("routing refused renewal: {code}")));
         let durable = journal(&rig);
         let refusal = &durable["runs"][0]["renewal_refusal"];
-        assert_eq!(refusal["code"], "routing_refused");
+        assert_eq!(refusal["code"], expected_code);
         assert_eq!(refusal["detail"]["routing_code"], code);
         assert_eq!(refusal["detail"]["routing_reason"], "scripted refusal");
         let report = durable["outbox"]
@@ -284,7 +304,12 @@ async fn audit_exit_answered_renewal_refusal_preserves_partial_reply_and_metadat
                 .get(),
         )
         .unwrap();
-        assert!(reply["items"][1].get("answers").is_some());
+        if transient {
+            assert!(reply["items"][1].get("answers").is_some());
+        } else {
+            assert_eq!(reply["items"][1]["error"]["code"], expected_code);
+            assert_eq!(rig.provider.calls("unsent"), 0);
+        }
         assert_eq!(rig.provider.calls("paid"), 1);
         assert_eq!(rig.router.selects.load(Ordering::SeqCst), 1);
     }
@@ -546,12 +571,8 @@ async fn audit_exit_reselection_refusals_are_returned_and_replayed_verbatim() {
         rig.provider.script("x", vec![Script::AccountError]);
         *rig.router.reselection_refusal.lock().unwrap() = Some(code);
         let refusal = call(&rig, &routed_request(&["x"])).await.unwrap_err();
-        if matches!(code, "invalid_request" | "admission_conflict") {
-            assert_eq!(refusal["code"], "internal_error");
-        } else {
-            assert_eq!(refusal["code"], "routing_refused");
-            assert_eq!(refusal["detail"]["routing_code"], code);
-        }
+        assert_eq!(refusal["code"], "routing_refused");
+        assert_eq!(refusal["detail"]["routing_code"], code);
         assert_eq!(refusal["detail"]["class"], "permanent");
         rig.router.clear();
         assert_eq!(
@@ -909,17 +930,26 @@ async fn audit_exit_every_first_admission_boundary_preserves_refusal_class_and_p
             let rig = routed_rig(true, true);
             *rig.router.override_refusal.lock().unwrap() = Some((method, code));
             let refusal = call(&rig, &pinned(&["x"])).await.unwrap_err();
-            assert_eq!(refusal["detail"]["class"], "permanent", "{method}: {code}");
-            if matches!(code, "invalid_request" | "admission_conflict") {
-                assert_eq!(refusal["code"], "internal_error", "{method}: {code}");
-            } else {
-                assert_eq!(refusal["code"], "routing_refused", "{method}: {code}");
-                assert_eq!(refusal["detail"]["routing_code"], code);
-                assert_eq!(
-                    refusal["detail"]["model"], JEV,
-                    "the caller's pin survives every answered refusal boundary: {method}"
-                );
-            }
+            let transient = code == "account_selection_unavailable";
+            assert_eq!(
+                refusal["detail"]["class"],
+                if transient { "transient" } else { "permanent" },
+                "{method}: {code}"
+            );
+            assert_eq!(
+                refusal["code"],
+                if transient {
+                    "routing_deferred"
+                } else {
+                    "routing_refused"
+                },
+                "{method}: {code}"
+            );
+            assert_eq!(refusal["detail"]["routing_code"], code);
+            assert_eq!(
+                refusal["detail"]["model"], JEV,
+                "the caller's pin survives every answered refusal boundary: {method}"
+            );
             assert_eq!(rig.provider.calls("x"), 0);
         }
     }
