@@ -1990,6 +1990,12 @@ pub trait ServeHandler: Send + Sync {
         ))
     }
 
+    /// Whether `session` is kept in the new storage. A handler without the new storage keeps
+    /// none.
+    fn kept_in_new_storage(&self, _session: &LineageKey) -> Result<bool, ServeError> {
+        Ok(false)
+    }
+
     /// Where a file-source import may read from. `None` without the new storage.
     fn import_roots(&self) -> Option<std::sync::Arc<crate::store_import::ImportRoots>> {
         None
@@ -3091,6 +3097,10 @@ impl ServeHandler for crate::LineageRegistry {
 
     fn import_roots(&self) -> Option<std::sync::Arc<crate::store_import::ImportRoots>> {
         self.store_runtime().map(|runtime| runtime.import_roots())
+    }
+
+    fn kept_in_new_storage(&self, session: &LineageKey) -> Result<bool, ServeError> {
+        Ok(self.store_holding(session)?.is_some())
     }
 
     async fn import(&self, req: SessionImportRequest) -> Result<SessionImportResponse, ServeError> {
@@ -4569,6 +4579,10 @@ impl ServeHandler for crate::LineageRegistry {
     }
 
     fn session_written(&self, session: &LineageKey) -> Result<bool, ServeError> {
+        // A session kept in the new storage exists from its head, with no WAL to probe.
+        if self.store_holding(session)?.is_some() {
+            return Ok(true);
+        }
         self.wal_written(session).ok_or_else(|| {
             ServeError::Open(
                 "cannot determine whether the session has a WAL; retry the send".into(),

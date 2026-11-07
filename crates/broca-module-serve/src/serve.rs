@@ -2771,6 +2771,28 @@ where
             PreparedRouteRequest::Request(req) => &req.params,
             PreparedRouteRequest::Subscribe { params, .. } => params,
         };
+        // A session kept in the new storage has no WAL. An op without a store implementation
+        // would fall through to today's WAL reads, which the rollback guard refuses with advice
+        // to run a newer build: wrong on a build that serves the session. So such an op is
+        // refused here by name, before authorization reads anything.
+        if !served_on_new_storage(method, params) {
+            match handler.kept_in_new_storage(&session) {
+                Ok(false) => {}
+                Ok(true) => {
+                    return send_error(
+                        &writer,
+                        ver,
+                        channel,
+                        epoch,
+                        corr,
+                        NOT_SERVED_ON_NEW_STORAGE,
+                        &format!("{method} isn't served yet for a session kept in the new storage"),
+                    )
+                    .await;
+                }
+                Err(error) => return send_serve_error(&writer, ver, channel, epoch, corr, &error).await,
+            }
+        }
         if let Err(error) = authorize_route_request(handler.as_ref(), &session, &bind, method, params).await {
             return send_serve_error(&writer, ver, channel, epoch, corr, &error).await;
         }
@@ -5022,6 +5044,28 @@ fn log_refused_send(
 fn upload_error_body(error: &broca_core::media_uploads::UploadError, for_send: bool) -> ErrorBody {
     let body = broca_module::serve::admission_refusal::upload_refusal(error, for_send);
     ErrorBody::new(body.code, body.message).with_detail(body.detail.expect("upload detail"))
+}
+
+/// The refusal of an op that has no implementation yet for a session kept in the new storage.
+const NOT_SERVED_ON_NEW_STORAGE: &str = "not_served_on_new_storage";
+
+/// Whether `method` is served for a session kept in the new storage. Every other op is refused
+/// `not_served_on_new_storage` for such a session, so none can fall through to today's WAL
+/// reads. An op joins this list in the change that gives it a store implementation.
+fn served_on_new_storage(method: &str, params: &serde_json::Value) -> bool {
+    match method {
+        // Reads served from the store (`store_read`).
+        OP_READ => true,
+        // The store actor serves sends, cancels and retractions.
+        OP_SEND | OP_CANCEL | OP_RETRACT => true,
+        // A head import from a file creates the session in the new storage. An import carrying
+        // its messages inline is today's import, which writes a WAL.
+        OP_IMPORT => params.get("source").is_some(),
+        OP_INSTALL_VIEW => true,
+        // Describes the module, not the session.
+        OP_ROLE_DESCRIBE => true,
+        _ => false,
+    }
 }
 
 /// Routes a command only the new storage serves, and sends its answer: the reply, or its

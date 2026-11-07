@@ -1821,7 +1821,11 @@ fn compare_ops(old: &[FramedRecord], lineage: Option<&str>) -> OpsOutcome {
         .collect();
     let output_reservation = broca_session_loop::output::history(&operations);
     // Session-wide facts the head serves, compared whether or not the session has a run.
+    let parts = broca_session_loop::parts::MemoryParts {
+        parts: converted.parts.clone(),
+    };
     let owner_differs = owner_difference(old, &operations)
+        .or_else(|| first_episode_difference(old, &operations, &parts))
         .or_else(|| session_usage_difference(&records, &operations));
     let Some(run) = operations.run else {
         // Nothing to compare only when today's replay has no run either.
@@ -2023,6 +2027,36 @@ fn compare_ops(old: &[FramedRecord], lineage: Option<&str>) -> OpsOutcome {
 /// Two kinds of cache-send difference are expected and named apart: a cache warm, which the
 /// fold doesn't read yet, and an attempt without a send time, which today dates from a lower
 /// bound.
+/// Whether the first run's tools and plan, as the stored session gives them to `route.bind` and
+/// the plan checks (`ownership_with_first_episode`), differ from what today's bind ownership
+/// reads from the log's first `RunStarted`: its run id, its tools' names in order and its plan
+/// manifest.
+fn first_episode_difference(
+    old: &[FramedRecord],
+    operations: &broca_session_store::fold::operations::Operations,
+    parts: &broca_session_loop::parts::MemoryParts,
+) -> Option<String> {
+    let today = old.iter().find_map(|frame| match &frame.record {
+        broca_wal::WalRecord::RunStarted {
+            run_id,
+            config,
+            manifest,
+            ..
+        } => Some(broca_core::admission::FirstEpisodeV1 {
+            run_id: run_id.clone(),
+            tool_names: config.tools.iter().map(|tool| tool.name.clone()).collect(),
+            manifest: manifest.as_deref().cloned().map(std::sync::Arc::new),
+        }),
+        _ => None,
+    });
+    let folded =
+        match broca_session_loop::owner::ownership_with_first_episode(&operations.owner, parts) {
+            Ok(folded) => folded.first_episode,
+            Err(error) => return Some(format!("owner.first_episode (unreadable: {error})")),
+        };
+    (today != folded).then(|| "owner.first_episode".to_owned())
+}
+
 /// Whether the session's usage by model, summed from each step's recorded model shares,
 /// differs from the usage today's head folds from the same records (`HeadProjection`).
 fn session_usage_difference(

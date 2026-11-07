@@ -2652,6 +2652,10 @@ impl LineageRegistry {
         if let Some(sender) = self.inner.frozen_senders.lock().unwrap().get(key).cloned() {
             return Ok(Some(sender));
         }
+        if let Some(store) = self.store_holding(key)? {
+            let ownership = store_session_ownership(&store, key).await?;
+            return Ok((ownership.episodes > 0).then_some(ownership.first_principal));
+        }
         let reader = self.inner.reader.clone().ok_or_else(|| {
             OpenError::Open("sender authorization reader is not configured".into())
         })?;
@@ -2755,6 +2759,18 @@ impl LineageRegistry {
         key: &LineageKey,
         submission_id: &str,
     ) -> Result<Option<broca_protocol::BindPrincipal>, OpenError> {
+        if self.store_holding(key)?.is_some() {
+            // This lookup lets a sender who isn't the owner retract a queued send it made
+            // itself. The new storage keeps each queued send's sender, but this method doesn't
+            // read it yet. Answering "no recorded sender" would refuse such a sender as not the
+            // owner, which isn't the reason, so refuse it by name instead.
+            return Err(OpenError::Classified {
+                reason: "not_served_on_new_storage: a sender retracting its own queued send \
+                         isn't served yet for a session kept in the new storage"
+                    .into(),
+                class: broca_protocol::ErrorClass::Permanent,
+            });
+        }
         let (records, _) = self
             .read_durable_wal_for(key, ReadPurpose::Authorization)
             .await?;
@@ -2885,6 +2901,9 @@ impl LineageRegistry {
         &self,
         key: &LineageKey,
     ) -> Result<broca_core::SessionOwnershipV1, OpenError> {
+        if let Some(store) = self.store_holding(key)? {
+            return store_session_ownership(&store, key).await;
+        }
         let reader = self.inner.reader.as_ref().ok_or_else(|| {
             OpenError::Open("sender authorization reader is not configured".into())
         })?;
@@ -3089,6 +3108,9 @@ impl LineageRegistry {
             }
             Err(error) => return Err(error.into()),
             Ok(()) => {}
+        }
+        if let Some(store) = self.store_holding(key)? {
+            return Ok(store_session_ownership(&store, key).await?);
         }
         let (live, live_first) = {
             let slots = self.inner.slots.lock().unwrap();
@@ -3509,18 +3531,29 @@ async fn store_bind_ownership(
     store: &crate::store_open::StoreRuntime,
     key: &LineageKey,
 ) -> BindOwnership {
-    match store.view(key).await {
-        Ok(Some(session)) => {
-            match broca_session_loop::owner::ownership(&session.operations.owner) {
-                Ok(ownership) => BindOwnership::Known(ownership),
-                Err(error) => BindOwnership::Unreadable(format!(
-                    "the session's stored owner can't be read: {error}"
-                )),
-            }
-        }
-        Ok(None) => BindOwnership::Known(broca_core::SessionOwnershipV1::default()),
+    match store_session_ownership(store, key).await {
+        Ok(ownership) => BindOwnership::Known(ownership),
         Err(error) => BindOwnership::Unreadable(error.to_string()),
     }
+}
+
+/// The ownership of a session kept in the new storage, as every authorization path reads it:
+/// the owner summary the stored session keeps (`Operations::owner`), with the first run's tools
+/// and plan read back from the deployment's setup parts. It records the same facts
+/// `durable_session_ownership` gathers from a WAL. A session whose creation never committed
+/// holds no run, so it has no owner yet.
+async fn store_session_ownership(
+    store: &crate::store_open::StoreRuntime,
+    key: &LineageKey,
+) -> Result<broca_core::SessionOwnershipV1, OpenError> {
+    let Some(session) = store.view(key).await? else {
+        return Ok(broca_core::SessionOwnershipV1::default());
+    };
+    broca_session_loop::owner::ownership_with_first_episode(
+        &session.operations.owner,
+        store.parts(),
+    )
+    .map_err(|error| OpenError::Open(format!("the session's stored owner can't be read: {error}")))
 }
 
 impl LineageRegistry {
@@ -4881,6 +4914,18 @@ impl LineageRegistry {
 
     /// Whether the session has a WAL, live or archived: a stat, and an archive index lookup
     /// only when there is no live file. `None` means the store cannot tell, not that a WAL exists.
+    /// The new storage's runtime when it keeps the session `key`, which then has no WAL; `None`
+    /// for a session on today's storage, or a module without the new storage.
+    pub(crate) fn store_holding(
+        &self,
+        key: &LineageKey,
+    ) -> Result<Option<Arc<crate::store_open::StoreRuntime>>, OpenError> {
+        match self.store_runtime() {
+            Some(store) if store.holds(key)? => Ok(Some(store)),
+            _ => Ok(None),
+        }
+    }
+
     pub fn wal_written(&self, key: &LineageKey) -> Option<bool> {
         self.inner
             .reader
@@ -8501,6 +8546,10 @@ impl LineageRegistry {
     /// `session.status` may still recover an existing log's torn tail or append an
     /// orphan's terminal; it must never mint a replacement for missing history.
     pub(crate) async fn check_session_log(&self, key: &LineageKey) -> Result<(), OpenError> {
+        // A session kept in the new storage has its head as its log, and no WAL to miss.
+        if self.store_holding(key)?.is_some() {
+            return Ok(());
+        }
         let (Some(inventory), Some(reader)) = (
             self.inner.session_address_inventory.get().cloned(),
             self.inner.reader.as_ref(),
