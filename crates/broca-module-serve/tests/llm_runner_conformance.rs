@@ -4351,8 +4351,8 @@ fn check_0811_cases_for_writer(
             .find(|case| case.case == name)
             .ok_or_else(|| format!("the suite has no case {name}"))?;
         let expected = if name.starts_with("notices_") && !notices_writer {
-            CaseOutcome::Skipped {
-                missing: vec![Capability::Notices],
+            CaseOutcome::Inapplicable {
+                reason: "missing groups: notices".into(),
             }
         } else {
             CaseOutcome::Passed
@@ -4375,8 +4375,8 @@ fn check_0811_cases_for_writer(
             .find(|case| case.case == name)
             .ok_or_else(|| format!("the suite has no case {name}"))?;
         if case.outcome
-            != (CaseOutcome::Skipped {
-                missing: vec![Capability::SenderAttribution],
+            != (CaseOutcome::Inapplicable {
+                reason: "missing groups: sender_attribution".into(),
             })
         {
             return Err(format!("{}: {:?}", case.case, case.outcome));
@@ -4388,58 +4388,108 @@ fn check_0811_cases_for_writer(
 #[test]
 fn new_contract_cases_require_exact_declared_writer_prerequisites() {
     use cortexkit_role_llm_runner_conformance::{CaseReport, CASES};
-    for notices_writer in [false, true] {
-        let cases: Vec<_> = CASES
-            .iter()
-            .map(|case| CaseReport {
-                case: case.name,
-                requires: case.requires.to_vec(),
-                outcome: if case.requires.contains(&Capability::SenderAttribution) {
-                    CaseOutcome::Skipped {
-                        missing: vec![Capability::SenderAttribution],
-                    }
-                } else if !notices_writer && case.requires.contains(&Capability::Notices) {
-                    CaseOutcome::Skipped {
-                        missing: vec![Capability::Notices],
-                    }
-                } else {
-                    CaseOutcome::Passed
-                },
-            })
-            .collect();
-        assert_eq!(
-            cases
+    // Kit 0.17.13's runner::gate is private. Pin its native SuiteReport::render rows
+    // instead of inferring applicability from CaseSpec::requires in this adapter.
+    let reader: Vec<_> = include_str!("golden/llm_runner_0811.reader_applicability.txt")
+        .lines()
+        .map(|line| {
+            let (status, row) = line.split_once(' ').expect("native report status");
+            let (name, reason) = row
+                .trim_start()
+                .split_once(": ")
+                .unwrap_or((row.trim_start(), ""));
+            let spec = CASES
                 .iter()
-                .filter(|case| case.case.starts_with("notices_"))
-                .count(),
-            6
-        );
-        assert!(check_0811_cases_for_writer(&cases, notices_writer).is_ok());
+                .find(|spec| spec.name == name)
+                .expect("the pinned kit still names the native case");
+            CaseReport {
+                case: spec.name,
+                requires: spec.requires.to_vec(),
+                outcome: match status {
+                    "N/A" => CaseOutcome::Inapplicable {
+                        reason: reason.into(),
+                    },
+                    "PASS" => {
+                        assert!(reason.is_empty());
+                        CaseOutcome::Passed
+                    }
+                    _ => panic!("unexpected native report status {status}"),
+                },
+            }
+        })
+        .collect();
+    assert_eq!(reader.len(), 16);
+    assert_eq!(
+        reader
+            .iter()
+            .filter(|case| case.case.starts_with("notices_"))
+            .count(),
+        6
+    );
+    assert_eq!(
+        reader
+            .iter()
+            .filter(|case| case.case.starts_with("sender_attribution_")
+                && case.case != "sender_attribution_undeclared_refused")
+            .count(),
+        7
+    );
+    for notices_writer in [false, true] {
+        let mut cases = reader.clone();
+        if notices_writer {
+            // Declaring notices changes the obligation from the pinned missing-group outcome to Passed.
+            for case in &mut cases {
+                if case.case.starts_with("notices_") {
+                    case.outcome = CaseOutcome::Passed;
+                }
+            }
+        }
+        check_0811_cases_for_writer(&cases, notices_writer)
+            .expect("the native kit's applicability is accepted exactly");
         if notices_writer == broca_core::delivery_order::RIDES_V2_WRITER_ENABLED {
-            assert!(check_0811_cases(&cases).is_ok());
+            check_0811_cases(&cases).unwrap();
         }
         // This kit has no provider-executed capability or case family.
         assert!(!CASES
             .iter()
             .any(|case| case.name.starts_with("provider_executed")));
         for index in 0..cases.len() {
-            if cases[index].case.starts_with("notices_")
-                || [
-                    "subscribe_resume_refusals",
-                    "message_senders_rows_name_their_sender",
-                ]
-                .contains(&cases[index].case)
-            {
-                for outcome in [
-                    CaseOutcome::Inapplicable {
-                        reason: "fixture unavailable".into(),
-                    },
-                    CaseOutcome::Skipped { missing: vec![] },
-                ] {
-                    let mut broken = cases.clone();
-                    broken[index].outcome = outcome;
-                    assert!(check_0811_cases_for_writer(&broken, notices_writer).is_err());
+            for outcome in [
+                CaseOutcome::Passed,
+                CaseOutcome::Failed {
+                    reason: "case failed".into(),
+                },
+                CaseOutcome::Inapplicable {
+                    reason: "fixture unavailable".into(),
+                },
+                CaseOutcome::Inapplicable {
+                    reason: "missing groups: notices".into(),
+                },
+                CaseOutcome::Inapplicable {
+                    reason: "missing groups: sender_attribution".into(),
+                },
+                CaseOutcome::Inapplicable {
+                    reason: "missing groups: notices, sender_attribution".into(),
+                },
+                CaseOutcome::Skipped {
+                    missing: vec![Capability::Notices],
+                },
+                CaseOutcome::Skipped {
+                    missing: vec![Capability::SenderAttribution],
+                },
+                CaseOutcome::Skipped { missing: vec![] },
+            ] {
+                if outcome == cases[index].outcome {
+                    continue;
                 }
+                let mut broken = cases.clone();
+                broken[index].outcome = outcome;
+                assert!(
+                    check_0811_cases_for_writer(&broken, notices_writer).is_err(),
+                    "{} must reject {:?}",
+                    broken[index].case,
+                    broken[index].outcome
+                );
             }
         }
     }
