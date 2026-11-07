@@ -128,34 +128,31 @@ pub fn project_control(records: &[FramedRecord]) -> Vec<(Cursor, ControlUnit)> {
 
 /// Episode-local tracking shared by control projection and run-status reconciliation. A dispatch
 /// intent remains unresolved until a definite terminal arrives; an indeterminate terminal stays in
-/// the reported set because the tool may already have applied its side effect.
+/// the reported set because the tool may already have applied its side effect. A session kept in
+/// the new storage reports a run's indeterminate calls through the same tracking.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub(crate) struct IndeterminateToolCalls {
+pub struct IndeterminateToolCalls {
     unresolved_dispatches: Vec<ToolCallId>,
     indeterminate_outcomes: Vec<ToolCallId>,
 }
 
 impl IndeterminateToolCalls {
-    pub(crate) fn reset_episode(&mut self) {
+    pub fn reset_episode(&mut self) {
         self.unresolved_dispatches.clear();
         self.indeterminate_outcomes.clear();
     }
 
-    pub(crate) fn reset_batch(&mut self) {
+    pub fn reset_batch(&mut self) {
         self.unresolved_dispatches.clear();
     }
 
-    pub(crate) fn record_dispatch_intent(&mut self, tool_call_id: &ToolCallId) {
+    pub fn record_dispatch_intent(&mut self, tool_call_id: &ToolCallId) {
         if !self.unresolved_dispatches.contains(tool_call_id) {
             self.unresolved_dispatches.push(tool_call_id.clone());
         }
     }
 
-    pub(crate) fn record_dispatch_terminal(
-        &mut self,
-        tool_call_id: &ToolCallId,
-        indeterminate: bool,
-    ) {
+    pub fn record_dispatch_terminal(&mut self, tool_call_id: &ToolCallId, indeterminate: bool) {
         self.unresolved_dispatches
             .retain(|pending| pending != tool_call_id);
         if indeterminate && !self.indeterminate_outcomes.contains(tool_call_id) {
@@ -163,7 +160,7 @@ impl IndeterminateToolCalls {
         }
     }
 
-    pub(crate) fn snapshot(&self) -> Vec<ToolCallId> {
+    pub fn snapshot(&self) -> Vec<ToolCallId> {
         let mut calls = self.indeterminate_outcomes.clone();
         for tool_call_id in &self.unresolved_dispatches {
             if !calls.contains(tool_call_id) {

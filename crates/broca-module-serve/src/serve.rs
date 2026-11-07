@@ -5056,6 +5056,8 @@ fn served_on_new_storage(method: &str, params: &serde_json::Value) -> bool {
     match method {
         // Reads served from the store (`store_read`, `store_head`).
         OP_READ | OP_HEAD => true,
+        // Run and send facts built from the store's own records (`store_status`).
+        OP_STATUS | OP_RUN_RESULT | OP_SEND_STATUS | OP_SESSION_SEND_STATUS => true,
         // The store actor serves sends, cancels and retractions.
         OP_SEND | OP_CANCEL | OP_RETRACT => true,
         // A head import from a file creates the session in the new storage. An import carrying

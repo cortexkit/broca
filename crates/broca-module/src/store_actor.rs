@@ -419,6 +419,14 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
 
     /// Serves the active run, and nothing else, until no run is active.
     async fn run_to_end(&mut self) {
+        while self.run.is_some() {
+            self.run_current_to_end().await;
+        }
+    }
+
+    /// Serves the active run, and nothing else, until it ends and its end is recorded. A run the
+    /// queue then starts is left for the command loop.
+    async fn run_current_to_end(&mut self) {
         loop {
             let Some(active) = self.run.as_mut() else {
                 return;
@@ -434,7 +442,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                         active.writer_gone = true;
                     }
                 }
-                Event::Done(end) => self.finish_run(end).await,
+                Event::Done(end) => return self.finish_run(end).await,
                 Event::Command(_) => unreachable!("no command is read here"),
             }
         }
@@ -982,19 +990,14 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     /// restart, the account-limit pause's timer, and calls a provider holds aren't recovered on
     /// this storage yet, so nothing is written for them.
     async fn recover(&mut self) {
-        use broca_session_store::fold::operations::Resolution;
         self.bill_owed().await;
         let operations = self.session.operations();
         let Some(run) = operations.run.as_ref().filter(|run| run.finished.is_none()) else {
             return self.drain().await;
         };
-        let mode = match run.resolution() {
-            Resolution::Resume | Resolution::Interrupted(_) => match run.cancel {
-                None => StoreRunMode::Seal(broca_core::resume::SealCause::CrashOrphan),
-                Some(_) => StoreRunMode::Resume,
-            },
-            Resolution::Idle(_) => StoreRunMode::Resume,
-            Resolution::ProviderHeld(_) | Resolution::Paused(_) => {
+        let mode = match recovery_mode(run) {
+            Some(mode) => mode,
+            None => {
                 if !matches!(run.paused, Some(broca_protocol::PauseReason::AuthRequired)) {
                     tracing::warn!(
                         target: "broca.store_actor",
@@ -1008,7 +1011,14 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             }
         };
         match self.recovery_start(run) {
-            Ok(start) => self.start_run(start, None, None, mode),
+            Ok(start) => {
+                self.start_run(start, None, None, mode);
+                // Today's actor seals a crash's orphan before it takes any command, so no caller
+                // sees the orphan as running; the seal sends nothing, so it ends at once.
+                if matches!(mode, StoreRunMode::Seal(_)) {
+                    self.run_current_to_end().await;
+                }
+            }
             Err(error) => tracing::error!(
                 target: "broca.store_actor",
                 session = %self.key.session,
@@ -2062,6 +2072,25 @@ fn retry_of_queued(
     }
 }
 
+/// What opening the session does with its unfinished latest run `run` before it takes any
+/// command: seal it as a crash's orphan, or resume it to its end. `None` leaves it as it is: a
+/// run paused, or waiting on calls a provider holds, whose recovery isn't built for this storage
+/// yet. A read of the session that no actor holds predicts the run's end from this same decision
+/// (`store_status`), so what it serves is what the next open records.
+pub(crate) fn recovery_mode(
+    run: &broca_session_store::fold::operations::Run,
+) -> Option<StoreRunMode> {
+    use broca_session_store::fold::operations::Resolution;
+    match run.resolution() {
+        Resolution::Resume | Resolution::Interrupted(_) => Some(match run.cancel {
+            None => StoreRunMode::Seal(broca_core::resume::SealCause::CrashOrphan),
+            Some(_) => StoreRunMode::Resume,
+        }),
+        Resolution::Idle(_) => Some(StoreRunMode::Resume),
+        Resolution::ProviderHeld(_) | Resolution::Paused(_) => None,
+    }
+}
+
 fn finished(run_id: &RunId, reason: broca_protocol::RunFinishReason) -> SendOutcome {
     SendOutcome::Finished {
         run_id: run_id.clone(),
@@ -2305,5 +2334,7 @@ mod billing_tests;
 mod differential;
 #[cfg(test)]
 mod import_tests;
+#[cfg(test)]
+mod status_tests;
 #[cfg(test)]
 mod tests;

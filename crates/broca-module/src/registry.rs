@@ -4912,8 +4912,6 @@ impl LineageRegistry {
         }
     }
 
-    /// Whether the session has a WAL, live or archived: a stat, and an archive index lookup
-    /// only when there is no live file. `None` means the store cannot tell, not that a WAL exists.
     /// The new storage's runtime when it keeps the session `key`, which then has no WAL; `None`
     /// for a session on today's storage, or a module without the new storage.
     pub(crate) fn store_holding(
@@ -4926,6 +4924,8 @@ impl LineageRegistry {
         }
     }
 
+    /// Whether the session has a WAL, live or archived: a stat, and an archive index lookup
+    /// only when there is no live file. `None` means the store cannot tell, not that a WAL exists.
     pub fn wal_written(&self, key: &LineageKey) -> Option<bool> {
         self.inner
             .reader
@@ -5917,6 +5917,15 @@ impl LineageRegistry {
                 #[cfg(all(test, feature = "test-clock"))]
                 if let Some(probe) = self.inner.status_open_probe.lock().unwrap().take() {
                     probe();
+                }
+                if let Some(store) = self.store_holding(key)? {
+                    // A session kept in the new storage has no WAL to read: its actor answers,
+                    // opened first when the session needs recovering.
+                    if crate::store_status::status_needs_actor(&store, key).await? {
+                        self.actor_for_mode(key, None, None, true).await?;
+                        continue;
+                    }
+                    return Ok(LineageStatus::Idle);
                 }
                 if self.status_needs_actor(key).await? {
                     if self.crash_orphan_pending(key) {
