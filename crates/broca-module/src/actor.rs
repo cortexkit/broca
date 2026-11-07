@@ -2571,21 +2571,22 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 let prior_reply = self.send_reply.replace(reply);
                 // Input preparation carries admission and staging state; heap-own its
                 // future so ordinary command polling does not copy that state on the stack.
-                let outcome = Box::pin(self.on_send(
-                    run_id,
-                    *request,
-                    kind,
-                    key,
-                    skip_materialization,
-                    delivery,
-                    plan.map(|plan| *plan),
-                    conversation_key,
-                    title,
-                    retention,
-                    session_class,
-                    stop_sequences_named,
-                ))
-                .await;
+                let outcome = self
+                    .on_send(
+                        run_id,
+                        *request,
+                        kind,
+                        key,
+                        skip_materialization,
+                        delivery,
+                        plan.map(|plan| *plan),
+                        conversation_key,
+                        title,
+                        retention,
+                        session_class,
+                        stop_sequences_named,
+                    )
+                    .await;
                 let _ = self.sync_retention_index().await;
                 self.admitting_retention = None;
                 self.admitting_order = None;
@@ -3598,8 +3599,43 @@ impl<W: WalStore + 'static> LineageActor<W> {
     /// Start a run (idle), acknowledge an idempotent retry, or durably queue new work. With
     /// a run active, `delivery` decides what the new message does: wait for it as the next turn
     /// (`Queue`), join it at its next step (`Steer`), or replace it (`Interrupt`).
+    ///
+    /// Returns the send's future boxed (see [`ActorFuture`]): command polling nests it above
+    /// admission recovery and delivery.
     #[allow(clippy::too_many_arguments)]
-    async fn on_send(
+    fn on_send(
+        &mut self,
+        run_id: RunId,
+        request: SubmissionRequest,
+        kind: RunKind,
+        key: SendKey,
+        skip_materialization: bool,
+        delivery: broca_protocol::Delivery,
+        plan: Option<SendPlan>,
+        conversation_key: Option<String>,
+        title: Option<String>,
+        retention: Option<u64>,
+        session_class: Option<String>,
+        stop_sequences_named: bool,
+    ) -> ActorFuture<'_, SendOutcome> {
+        Box::pin(self.on_send_inline(
+            run_id,
+            request,
+            kind,
+            key,
+            skip_materialization,
+            delivery,
+            plan,
+            conversation_key,
+            title,
+            retention,
+            session_class,
+            stop_sequences_named,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn on_send_inline(
         &mut self,
         run_id: RunId,
         mut request: SubmissionRequest,
@@ -4678,8 +4714,33 @@ impl<W: WalStore + 'static> LineageActor<W> {
 
     /// A send with no run to steer into or interrupt: start it now when the lineage is idle,
     /// or durably queue it (as `delivery`) behind the active run or the queued work.
+    ///
+    /// Returns the plain send's future boxed (see [`ActorFuture`]): send, steer, and interrupt
+    /// delivery await it deep in the send path.
     #[allow(clippy::too_many_arguments)]
-    async fn send_plain(
+    fn send_plain(
+        &mut self,
+        run_id: RunId,
+        request: SubmissionRequest,
+        kind: RunKind,
+        identity: SendIdentity,
+        skip_materialization: bool,
+        resume_indexed_run: bool,
+        delivery: broca_protocol::Delivery,
+    ) -> ActorFuture<'_, SendOutcome> {
+        Box::pin(self.send_plain_inline(
+            run_id,
+            request,
+            kind,
+            identity,
+            skip_materialization,
+            resume_indexed_run,
+            delivery,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn send_plain_inline(
         &mut self,
         run_id: RunId,
         request: SubmissionRequest,
@@ -4907,7 +4968,29 @@ impl<W: WalStore + 'static> LineageActor<W> {
     /// and synced before the reply, which names the running run: the message is then durably in
     /// the transcript. With no run active this is a plain send. A restart-paused run accepts
     /// durable steers for its next step; other pauses refuse messages they cannot render.
-    async fn steer_submission(
+    ///
+    /// Returns the steer's future boxed (see [`ActorFuture`]): send delivery awaits it above
+    /// checkpoint recovery and plain-send fallback.
+    fn steer_submission(
+        &mut self,
+        run_id: RunId,
+        request: SubmissionRequest,
+        kind: RunKind,
+        identity: SendIdentity,
+        skip_materialization: bool,
+        stop_sequences_named: bool,
+    ) -> ActorFuture<'_, SendOutcome> {
+        Box::pin(self.steer_submission_inline(
+            run_id,
+            request,
+            kind,
+            identity,
+            skip_materialization,
+            stop_sequences_named,
+        ))
+    }
+
+    async fn steer_submission_inline(
         &mut self,
         run_id: RunId,
         mut request: SubmissionRequest,
@@ -5269,7 +5352,27 @@ impl<W: WalStore + 'static> LineageActor<W> {
     /// by the startup sweep, if the process dies first), and the queue then drains the
     /// interrupt ahead of every plain entry. A paused run is ended the same way; with no run
     /// at all this is a plain send.
-    async fn interrupt_submission(
+    ///
+    /// Returns the interrupt's future boxed (see [`ActorFuture`]): send delivery awaits it
+    /// above queue admission and plain-send fallback.
+    fn interrupt_submission(
+        &mut self,
+        run_id: RunId,
+        request: SubmissionRequest,
+        kind: RunKind,
+        identity: SendIdentity,
+        skip_materialization: bool,
+    ) -> ActorFuture<'_, SendOutcome> {
+        Box::pin(self.interrupt_submission_inline(
+            run_id,
+            request,
+            kind,
+            identity,
+            skip_materialization,
+        ))
+    }
+
+    async fn interrupt_submission_inline(
         &mut self,
         run_id: RunId,
         request: SubmissionRequest,
@@ -6628,7 +6731,18 @@ impl<W: WalStore + 'static> LineageActor<W> {
 
     /// Render once at admission from the attested sender's effective template. The queued
     /// request contains the resulting text, so recovery replays bytes rather than slots.
-    async fn render_ordered_template(
+    ///
+    /// Returns the template-rendering future boxed (see [`ActorFuture`]): send admission
+    /// awaits rendering before it queues or starts delivery.
+    fn render_ordered_template<'a>(
+        &'a mut self,
+        request: &'a mut SubmissionRequest,
+        template: &'a cortexkit_role_llm_runner::delivery_order::TemplateUse,
+    ) -> ActorFuture<'a, Result<(), SendOutcome>> {
+        Box::pin(self.render_ordered_template_inline(request, template))
+    }
+
+    async fn render_ordered_template_inline(
         &mut self,
         request: &mut SubmissionRequest,
         template: &cortexkit_role_llm_runner::delivery_order::TemplateUse,
@@ -6711,7 +6825,27 @@ impl<W: WalStore + 'static> LineageActor<W> {
     /// written under its inbox lock, so a send the turn already delivered is never replaced and
     /// the turn sees the new send at its next boundary. On an idle session a list naming
     /// `idle_start` then drains into a run at once; any other list waits.
-    async fn queue_ordered_submission(
+    ///
+    /// Returns ordered queue admission's future boxed (see [`ActorFuture`]): send delivery
+    /// awaits it above submission preparation and durable queue writes.
+    fn queue_ordered_submission(
+        &mut self,
+        run_id: RunId,
+        request: SubmissionRequest,
+        identity: SendIdentity,
+        skip_materialization: bool,
+        order: broca_protocol::DeliveryOrder,
+    ) -> ActorFuture<'_, SendOutcome> {
+        Box::pin(self.queue_ordered_submission_inline(
+            run_id,
+            request,
+            identity,
+            skip_materialization,
+            order,
+        ))
+    }
+
+    async fn queue_ordered_submission_inline(
         &mut self,
         run_id: RunId,
         mut request: SubmissionRequest,
@@ -15513,15 +15647,41 @@ mod tests {
     /// `recover_startup_admission_view`), a whole recover-and-start chain deeper than the
     /// recovery `run` starts with, and recovery awaits `start_run` and `drain_queue_one` at a
     /// dozen sites. Inline, unoptimized Windows builds overflowed a 2 MiB thread running
-    /// `startup_recovery_budget_exhaustion_fails_send_closed`. These must stay boxed.
+    /// `startup_recovery_budget_exhaustion_fails_send_closed`. The send path also nests
+    /// `on_send`, `steer_submission`, `interrupt_submission`, and `send_plain`, along with
+    /// ordered template rendering and queue admission. Send-path growth overflowed the test
+    /// thread on Windows running
+    /// `scheduler_multiple_multimessage_steers_keep_identical_boundary_inputs_and_queue`.
+    /// These must stay boxed.
     #[test]
     fn deeply_awaited_actor_futures_are_boxed() {
         fn future_size<'a, T: 'a, Fut>(_: impl FnOnce(&'a mut T) -> Fut) -> usize {
             std::mem::size_of::<Fut>()
         }
+        fn future_size_2<'a, T: 'a, A, B, Fut>(_: impl FnOnce(&'a mut T, A, B) -> Fut) -> usize {
+            std::mem::size_of::<Fut>()
+        }
+        #[allow(clippy::too_many_arguments)]
+        fn future_size_5<'a, T: 'a, A, B, C, D, E, Fut>(
+            _: impl FnOnce(&'a mut T, A, B, C, D, E) -> Fut,
+        ) -> usize {
+            std::mem::size_of::<Fut>()
+        }
         #[allow(clippy::too_many_arguments)]
         fn future_size_6<'a, T: 'a, A, B, C, D, E, G, Fut>(
             _: impl FnOnce(&'a mut T, A, B, C, D, E, G) -> Fut,
+        ) -> usize {
+            std::mem::size_of::<Fut>()
+        }
+        #[allow(clippy::too_many_arguments)]
+        fn future_size_7<'a, T: 'a, A, B, C, D, E, F, G, Fut>(
+            _: impl FnOnce(&'a mut T, A, B, C, D, E, F, G) -> Fut,
+        ) -> usize {
+            std::mem::size_of::<Fut>()
+        }
+        #[allow(clippy::too_many_arguments)]
+        fn future_size_12<'a, T: 'a, A, B, C, D, E, F, G, H, I, J, K, L, Fut>(
+            _: impl FnOnce(&'a mut T, A, B, C, D, E, F, G, H, I, J, K, L) -> Fut,
         ) -> usize {
             std::mem::size_of::<Fut>()
         }
@@ -15535,6 +15695,21 @@ mod tests {
             ),
             ("drain_queue_one", future_size(Actor::drain_queue_one)),
             ("start_run", future_size_6(Actor::start_run)),
+            ("on_send", future_size_12(Actor::on_send)),
+            ("steer_submission", future_size_6(Actor::steer_submission)),
+            (
+                "interrupt_submission",
+                future_size_5(Actor::interrupt_submission),
+            ),
+            ("send_plain", future_size_7(Actor::send_plain)),
+            (
+                "render_ordered_template",
+                future_size_2(Actor::render_ordered_template),
+            ),
+            (
+                "queue_ordered_submission",
+                future_size_5(Actor::queue_ordered_submission),
+            ),
         ] {
             assert!(
                 size <= 4096,
