@@ -47,7 +47,10 @@ pub(super) async fn session_live(
     main: &Live,
     session: &str,
 ) -> Result<Option<Arc<Live>>, HarnessError> {
-    if !session.contains("routed-account") {
+    // The kit names a case's sessions after the case. The routed-account cases' names carry
+    // `routed-account` and the account-route cases' (`account_route_*`) carry `account_route`;
+    // both route accounts through the vault, so both need this vault-backed runner.
+    if !(session.contains("routed-account") || session.contains("account_route")) {
         return Ok(None);
     }
     if !session
@@ -512,6 +515,18 @@ pub(super) async fn serve_websocket(
                 .push(wire.clone());
             text
         };
+        // A model hold applies here as on the HTTP stand-in: a case that holds a routed
+        // ChatGPT step must see the request arrive and stay unanswered until it releases it.
+        let gate = (!warm)
+            .then(|| shared.model_holds.lock().unwrap().get(&session).cloned())
+            .flatten();
+        if let Some(gate) = gate {
+            HoldGate::set(&gate.arrived, &gate.arrived_wake);
+            tokio::select! {
+                () = HoldGate::wait(&gate.released, &gate.released_wake) => {},
+                () = shared.released.notified() => return Ok(()),
+            }
+        }
         let id = format!("routed-{session}-{turn_index}");
         let item_id = format!("message-{id}");
         let item = json!({"type":"message","id":item_id,"role":"assistant","status":"completed",

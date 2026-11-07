@@ -91,8 +91,9 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     _ => None,
                 })
                 .collect::<Vec<_>>();
-            // Commons decodes delivery open; the module supplies its selected wire spelling.
-            // The sender's mark is intentionally absent.
+            // The hook contract carries `delivery` as an open string; broca sends the wire
+            // spelling of the mode this input was delivered in. The sender's mark is
+            // intentionally absent.
             let subject = Subject::PreUser {
                 blocks,
                 mark: None,

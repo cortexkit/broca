@@ -3394,8 +3394,9 @@ impl ServeHandler for crate::LineageRegistry {
         } else {
             Default::default()
         };
-        // The cache holds exact native outputs, not an inverse of the model renderer.
-        // Overlay only response copies; joined materialized rows still feed model resume.
+        // The display-facts cache holds each tool result's output exactly as the tool returned
+        // it, before any notice was joined to it for the model. Only this response's copies take
+        // those outputs: the stored rows keep the joined text, because a resumed run renders it.
         for entry in &mut response.messages {
             if let Some(outputs) = native_tool_outputs
                 .as_ref()

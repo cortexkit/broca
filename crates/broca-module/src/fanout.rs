@@ -1697,8 +1697,8 @@ async fn subscriber_task<W: WalStore + 'static>(
                     broca_wal::access_counter::inherit(move || {
                         source.with_reader(&session, Some(h), |reader| {
                             // Without a materialized store, each notice-bearing suffix replay reads
-                            // the key prefix once; only the daemon's disabled overhaul state format
-                            // currently has no store.
+                            // the key prefix once. Only a state root in the `broca-state/2` format,
+                            // which production does not run, has no store.
                             let mut load = || {
                                 durable_notice_index(
                                     wal.as_ref(),
