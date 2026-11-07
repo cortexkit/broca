@@ -97,5 +97,6 @@ pub fn admission<P: Provider>(
                 hooks
             }),
         },
+        pre_model_error: control.pre_model_error.clone(),
     })
 }

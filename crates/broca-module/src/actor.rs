@@ -5601,16 +5601,13 @@ impl<W: WalStore + 'static> LineageActor<W> {
         let mut input_hooks = None;
         let mut pre_model_error = None;
         if let Some(submission_id) = &submission_id {
-            input_hooks = self
-                .pending_fifo
-                .iter()
-                .find(|pending| &pending.submission_id == submission_id)
-                .and_then(|pending| pending.hooks.clone())
-                .map(|mut hooks| {
-                    hooks.original =
-                        Some(serde_json::to_value(&resolved_request.input).expect("message JSON"));
-                    hooks
-                });
+            input_hooks = pre_user::drained_hooks(
+                self.pending_fifo
+                    .iter()
+                    .find(|pending| &pending.submission_id == submission_id)
+                    .and_then(|pending| pending.hooks.clone()),
+                &resolved_request.input,
+            );
         } else if !cancel_before_execute
             && (admits_the_session
                 || matches!(kind, RunKind::AppendEpisode)
@@ -5635,10 +5632,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     ))
                 })?;
             if let Some(provider) = prepared.refused {
-                pre_model_error = Some(serde_json::from_value(serde_json::json!({
-                    "class": "permanent", "provider_code": cortexkit_role_llm_runner::errors::PRE_USER_UNAVAILABLE,
-                    "message": format!("pre_user unavailable: {provider}"),
-                })).expect("input refusal error JSON"));
+                pre_model_error = Some(pre_user::refusal_error(&provider));
             }
             resolved_request.input = prepared.input;
             input_hooks = prepared.hooks;
@@ -5787,12 +5781,9 @@ impl<W: WalStore + 'static> LineageActor<W> {
             // compaction keep the established log layout. An existing log keeps the mode its
             // first run recorded: the run loop reads that before looking at this field, so a
             // legacy session is never upgraded here.
-            new_log_compaction_plan_version: manifest
-                .as_deref()
-                .is_some_and(|manifest| {
-                    matches!(broca_core::compaction::item(manifest), Ok(Some(_)))
-                })
-                .then_some(broca_core::compaction_v2::PLAN_VERSION),
+            new_log_compaction_plan_version: crate::plan_episode::new_log_compaction_plan_version(
+                manifest.as_deref(),
+            ),
             emit_display_context: true,
             step_progress: Some(Arc::clone(&step_progress)),
             clock: self
@@ -16509,7 +16500,7 @@ mod steer_terminal_tests;
 mod writer_shutdown_tests;
 
 #[path = "pre_user.rs"]
-mod pre_user;
+pub(crate) mod pre_user;
 
 #[cfg(test)]
 #[path = "pre_user_tests.rs"]

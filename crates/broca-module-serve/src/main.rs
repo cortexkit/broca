@@ -2823,8 +2823,9 @@ mod executor {
             now_ms: now,
             session_address: Some(broca_core::session_addr(&req.session)),
             compaction_plane,
-            // The run restores the compaction state from the session's records.
-            compaction_session: None,
+            // The session's compaction state, which its actor keeps for the session's life, as
+            // today's actor does; without it a run restores the state from the session's records.
+            compaction_session: control.compaction_session.clone(),
             // No run of a store session warms yet: keep-warm needs its scheduler in the actor.
             keep_warm: None,
             account_reports,
@@ -4485,19 +4486,21 @@ mod executor {
                 mode: _,
                 resolved,
             } = admitted;
-            // The new run loop doesn't yet start a run paused for sign-in or on a routing
-            // refusal; today's loop writes such a run's start and its pause before any model
-            // call. A session in the new storage refuses those runs by name until it does.
+            // The new run loop doesn't yet start a run paused for sign-in; today's loop writes
+            // such a run's start and its pause before any model call. A session in the new
+            // storage refuses that run by name until it does. A routing refusal of the caller's
+            // decision goes to the loop as the run's pre-model error, as `episode_control` hands
+            // it to today's loop: the run's start is written, then the run ends with that error.
             if fresh_episode != (mode == StoreRunMode::Fresh) {
                 return Err(StoreRunError::Admission(RunError::Config(format!(
                     "the store actor asked for a {mode:?} run, but the session's latest run says \
                      otherwise"
                 ))));
             }
-            if routing_decision_error.is_some() || resolution.pause.is_some() {
+            if routing_decision_error.is_none() && resolution.pause.is_some() {
                 return Err(StoreRunError::Admission(RunError::Config(
-                    "a run that starts paused (sign-in needed or a routing refusal) isn't \
-                     served on the new session storage yet"
+                    "a run that starts paused for sign-in isn't served on the new session \
+                     storage yet"
                         .into(),
                 )));
             }
@@ -4526,7 +4529,7 @@ mod executor {
                 control,
                 &req.run_id,
                 Arc::clone(&durable_head),
-                None,
+                routing_decision_error,
                 &resolution,
                 &account_choice,
                 frozen_context_limit,

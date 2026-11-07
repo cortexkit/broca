@@ -196,3 +196,104 @@ async fn a_store_session_runs_through_the_production_executor() {
     drop(daemon);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Routing that refuses every decision it is asked about as unknown, as it refuses a caller's
+/// expired decision.
+struct UnknownDecision;
+
+#[async_trait::async_trait]
+impl broca_module_serve::account_routing::RoutingTransport for UnknownDecision {
+    async fn request(&self, _body: Vec<u8>) -> broca_module_serve::account_routing::RoutingReply {
+        Ok(Err(serde_json::to_vec(&serde_json::json!({
+            "code": "unknown_decision",
+            "message": "fixture decision unknown",
+        }))
+        .unwrap()))
+    }
+}
+
+/// A store session's fresh run whose caller names a routing decision routing doesn't know is
+/// recorded as today's loop records it: the run's start is written, then the run ends with
+/// routing's refusal, and no model request is sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_store_run_refused_by_routing_starts_then_ends_with_the_refusal() {
+    let server = resume_http_fixture().await;
+    let root = broca_test_support::scratch_root()
+        .join(format!("store-run-routing-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    install_alias_catalog();
+    let daemon = CapturingVaultDaemon::start(&root).await;
+    let mut executor = executor_with_capturing_vault(&root, &daemon)
+        .await
+        .with_provider_overrides(runtime_overrides(&server.url));
+    // Routing is asked only once the vault has listed the session's candidate accounts.
+    let listing = serde_json::from_value(serde_json::json!({
+        "credentials": [], "grants": 1, "grant_tuples": [], "view": "store-run-routing",
+    }))
+    .unwrap();
+    executor.vault.as_ref().unwrap().listing.store(listing);
+    executor.routing = Some(Arc::new(
+        broca_module_serve::account_routing::RoutingClient::new(
+            Arc::new(UnknownDecision),
+            broca_module_serve::account_routing::AccountSelectionConfig::default(),
+        ),
+    ));
+    let mut session = store_session().await;
+    let parts = broca_session_loop::parts::SharedParts::new(Box::new(
+        broca_session_loop::parts::MemoryParts::default(),
+    ));
+    let mut req = drift_request(&root);
+    req.model = broca_protocol::request::ModelHandle {
+        provider_module_id: "deepseek".into(),
+        model_id: "alias-model".into(),
+    };
+    req.run_id = broca_protocol::RunId("store-run-routed".into());
+    req.route_decision_id = Some("expired-decision".into());
+    req.input = vec![broca_protocol::Message::new(
+        broca_protocol::Role::User,
+        vec![broca_protocol::ContentBlock::Text {
+            text: "hello".into(),
+        }],
+    )];
+    let end = serve_store_run(
+        &executor,
+        &mut session,
+        &parts,
+        req,
+        broca_module::executor::StoreRunMode::Fresh,
+    )
+    .await;
+    let finished = match end.result {
+        Ok(finished) => finished,
+        Err(error) => panic!("the routed run ends: {error:?}"),
+    };
+    assert_eq!(finished.reason, RunFinishReason::Error);
+    use broca_session_loop::writer::Writer as _;
+    assert_eq!(
+        session
+            .operations()
+            .run
+            .as_ref()
+            .map(|run| run.run_id.as_str()),
+        Some("store-run-routed"),
+        "the run's start is written"
+    );
+    let records = session.open_log_records().await.unwrap();
+    let error = records
+        .iter()
+        .find_map(|(_, record)| match record {
+            broca_session_store::record::Record::RunEnd(end) => Some(end.error.clone()),
+            _ => None,
+        })
+        .expect("the run's end is written")
+        .expect("the run's end carries routing's refusal");
+    assert_eq!(error["provider_code"], "routing_decision_refused", "{error}");
+    assert!(
+        server.requests.lock().unwrap().is_empty(),
+        "no model request is sent"
+    );
+    drop(executor);
+    drop(daemon);
+    let _ = std::fs::remove_dir_all(&root);
+}
