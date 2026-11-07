@@ -44,21 +44,26 @@ fn written_under(operations: &Operations) -> Option<ViewRef> {
 
 impl<W: Writer> Writer for Placed<'_, W> {
     async fn append(&mut self, records: &[Record], barrier: bool) -> Result<u64, SessionError> {
-        let tags = self.facts;
-        let prefix = self.inner.message_id_prefix();
-        let records = with_facts(
-            records.to_vec(),
-            &Placing {
-                conversation: self.inner.conversation(),
-                first_seq: self.inner.next_seq(),
-                prefix: &prefix,
-                tags,
-                view: written_under(self.inner.operations()),
-                operations: self.inner.operations(),
+        if records.is_empty() {
+            return self.inner.append(records, barrier).await;
+        }
+        // The facts name the seq of their own record (a message's id) and the ordinals the
+        // batch places, so they are decided under the writer's hold, from the folds and the
+        // first seq as they stand when the batch goes in. A writer the session actor shares
+        // (`ActorWriter`) may otherwise lag the records the actor appended since the run last
+        // saw the folds, such as a send queued while a model step was in flight, and every id
+        // in the batch would name the wrong record.
+        let batch = records.to_vec();
+        let mut first = None;
+        self.append_with(
+            &mut |_, _, first_seq| {
+                first = Some(first_seq);
+                batch.clone()
             },
+            barrier,
         )
-        .map_err(SessionError::Fold)?;
-        self.inner.append(&records, barrier).await
+        .await?;
+        first.ok_or_else(|| SessionError::Fold("a placed batch was never built".into()))
     }
 
     async fn send_records(&mut self, submission_id: &str) -> Result<Vec<Record>, SessionError> {

@@ -155,7 +155,7 @@ pub async fn serve_read(
         },
         None => req.from_ordinal.map(|at| at.saturating_sub(1)),
     };
-    let StorePage { page, mids } =
+    let StorePage { mut page, mids } =
         read_page(&session, from_ordinal, req.limit)
             .await
             .map_err(|error| match error {
@@ -165,6 +165,15 @@ pub async fn serve_read(
                     Some(broca_protocol::ErrorClass::Permanent),
                 ),
             })?;
+    crate::store_entries::mark_reply_cleaning(&session, store.parts(), &mut page.messages)
+        .await
+        .map_err(|error| {
+            // A backend failure and a damaged start read alike here, so no class is claimed.
+            ServeError::Open(
+                format!("the session's run settings can't be read: {error}"),
+                None,
+            )
+        })?;
     let mut response = crate::serve::session_read_response(page, None);
     response.history_version = head.history_version;
     response.incarnation = broca_session_store::codec::hex(&head.incarnation.0);
@@ -209,7 +218,7 @@ fn empty_page() -> SessionReadPage {
 
 /// A store read that failed. Only a backend failure is worth a retry: anything else is the
 /// session's stored bytes or state being wrong, which reading again won't change.
-fn read_failed(error: SessionError) -> crate::serve::ServeError {
+pub(crate) fn read_failed(error: SessionError) -> crate::serve::ServeError {
     let class = match error {
         SessionError::Backend(_) => broca_protocol::ErrorClass::Transient,
         _ => broca_protocol::ErrorClass::Permanent,

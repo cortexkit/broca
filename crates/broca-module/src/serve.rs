@@ -2159,6 +2159,16 @@ pub trait ServeHandler: Send + Sync {
             .map(|head| (head.mode3, head.lineage_id))
     }
 
+    /// `session.history`'s head for a session kept in the new storage, resolving `mid` when the
+    /// read names a message; `None` for a session on today's storage, which `head` answers.
+    async fn store_history_head(
+        &self,
+        _session: &LineageKey,
+        _mid: Option<&str>,
+    ) -> Result<Option<crate::store_entries::HistoryHead>, ServeError> {
+        Ok(None)
+    }
+
     /// `session.head` — the session's head without message bodies. For retained sessions,
     /// `updated_at` is the durable activity timestamp that sets expiry, not the WAL mtime.
     async fn head(&self, _session: &LineageKey) -> Result<broca_wire::HeadResponse, ServeError> {
@@ -2515,6 +2525,11 @@ impl ServeHandler for crate::LineageRegistry {
         session: &LineageKey,
         tag: u64,
     ) -> Result<Option<broca_core::TagLocation>, ServeError> {
+        if let Some(store) = self.store_runtime() {
+            if store.holds(session)? {
+                return Err(crate::store_entries::tag_location_unserved());
+            }
+        }
         self.route_tag_location(session, tag)
             .await
             .map_err(ServeError::from)
@@ -3445,6 +3460,21 @@ impl ServeHandler for crate::LineageRegistry {
             &req.session.session,
         )?;
         Ok(response)
+    }
+
+    async fn store_history_head(
+        &self,
+        session: &LineageKey,
+        mid: Option<&str>,
+    ) -> Result<Option<crate::store_entries::HistoryHead>, ServeError> {
+        match self.store_runtime() {
+            Some(store) if store.holds(session)? => {
+                crate::store_entries::history_head(&store, session, mid)
+                    .await
+                    .map(Some)
+            }
+            _ => Ok(None),
+        }
     }
 
     async fn head(&self, session: &LineageKey) -> Result<broca_wire::HeadResponse, ServeError> {

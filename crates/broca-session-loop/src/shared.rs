@@ -450,7 +450,7 @@ mod tests {
     use broca_session_store::codec::Message as _;
     use broca_session_store::head::SessionTriple;
     use broca_session_store::keys::DeploymentKey;
-    use broca_session_store::record::{Input, Placement, Record};
+    use broca_session_store::record::{Event, Input, Placement, Record};
     use broca_session_store::session::Session;
 
     use super::{ActorWriter, RunLink};
@@ -626,6 +626,47 @@ mod tests {
         assert_eq!(writer.operations().encode(), session.operations().encode());
         assert_eq!(writer.next_seq(), session.next_seq());
         assert_eq!(texts(&writer), ["one", "steer"]);
+    }
+
+    /// A batch that places a message mints the message's id from the seq its entry facts take.
+    /// When the actor appended one of its own records since the run's copy last caught up (a
+    /// send queued while a model step was in flight, say), the id must still name that record,
+    /// so the message is found by it again.
+    #[tokio::test]
+    async fn a_placed_messages_id_finds_it_after_the_actors_own_append() {
+        let backend = MemoryBackend::default();
+        let mut session = session(&backend).await;
+        let (mut writer, mut link) = ActorWriter::new(&session, None);
+        let run = async {
+            let mut placed = crate::entries::Placed {
+                inner: &mut writer,
+                facts: crate::entries::Tags::default(),
+            };
+            placed.append(&[input("placed")], true).await.unwrap();
+        };
+        let queued = || {
+            vec![Record::Event(Event {
+                name: "queued_while_the_model_answers".into(),
+                run_id: None,
+                body: None,
+            })]
+        };
+        tokio::select! {
+            biased;
+            () = run => {}
+            () = actor(&mut session, &mut link, |n| if n == 0 { queued() } else { Vec::new() }) => unreachable!(),
+        }
+        let entries = session.entries(1, usize::MAX).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        for entry in entries {
+            let mid = entry.state.facts.expect("placed with its facts").mid;
+            assert_eq!(
+                session.find_message(&mid).await.unwrap(),
+                Some(entry.ordinal),
+                "message {} is stored as {mid}",
+                entry.ordinal
+            );
+        }
     }
 
     /// Once the actor is gone, the run's writer refuses by name instead of hanging.

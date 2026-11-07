@@ -2096,6 +2096,7 @@ async fn new_from(
     .expect("the new loop runs");
     let records = writer.records.clone();
     keys_match(writer.session, &plane).await;
+    ids_resolve(writer.session).await;
     if !resuming {
         media_reads_back(writer.session).await;
     }
@@ -2308,6 +2309,33 @@ async fn keys_match(session: &Session<&MemoryBackend>, plane: &Spy) {
         if intent.key_derived != Some(true) {
             assert_eq!(key, format!("{id}:{seq}"), "key of call {}", call.0);
         }
+    }
+}
+
+/// Every message the session holds is found again by the id it was stored with. A new loop's id
+/// names the seq of the message's entry facts, so an id minted from a seq the writer guessed
+/// before its batch went in names another record whenever another appender (the session actor,
+/// here what the scenario injected) appended first. Records alone can't show that: the
+/// comparison renames ids by their order of appearance.
+async fn ids_resolve(session: &Session<&MemoryBackend>) {
+    for entry in session
+        .entries(1, usize::MAX)
+        .await
+        .expect("the entries read")
+    {
+        let Some(facts) = &entry.state.facts else {
+            continue;
+        };
+        assert_eq!(
+            session
+                .find_message(&facts.mid)
+                .await
+                .expect("the id lookup reads"),
+            Some(entry.ordinal),
+            "message {} is stored as {}",
+            entry.ordinal,
+            facts.mid
+        );
     }
 }
 
@@ -3170,6 +3198,7 @@ async fn compare_runs_in_once(scenario: Scenario, runs: &[(&str, Vec<Message>)])
         }
     }
     keys_match(writer.session, &plane).await;
+    ids_resolve(writer.session).await;
     if compaction().is_some_and(|script| {
         script
             .rides
@@ -3802,6 +3831,7 @@ async fn compare_actions_in_once(
     }
     assert_eq!(reports, summaries, "how each run reported");
     keys_match(writer.session, &plane).await;
+    ids_resolve(writer.session).await;
     let new = Outcome {
         records: normalized(&writer.records),
         requests: sent_requests(&provider.inner),
@@ -4167,6 +4197,7 @@ async fn compare_auth_pause_in_once(
     let second =
         through!(writer, |w| resume(w, &parts, &seams).await).expect("the new loop resumes");
     keys_match(writer.session, &plane).await;
+    ids_resolve(writer.session).await;
     pause_names_its_attempt(&writer);
     // A run the resume refroze onto another account keeps naming it when nobody routes one,
     // as a later resume or a rebuild of its requests reads the run back.

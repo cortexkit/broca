@@ -88,6 +88,11 @@ impl StoreRuntime {
         self
     }
 
+    /// The deployment's setup parts, which a run's start names its frozen settings by.
+    pub fn parts(&self) -> &SharedParts {
+        &self.parts
+    }
+
     /// Where a file-source import may read from.
     pub fn import_roots(&self) -> Arc<crate::store_import::ImportRoots> {
         Arc::clone(&self.import_roots)

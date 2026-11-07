@@ -52,6 +52,8 @@ use broca_wal::FramedRecord;
 use futures::executor::block_on;
 use serde::Serialize;
 
+mod serve_check;
+
 /// Measurements encrypt with a fixed throwaway key: only the cost matters, not secrecy.
 fn measurement_key() -> FrameKey {
     FrameKey::new(1, &[7; 32])
@@ -258,6 +260,7 @@ fn main() {
         "billing" => run_billing(&args),
         "episodes" => run_episodes(&args),
         "render" => run_render(&args),
+        "serve-check" => serve_check::run(&args),
         _ => usage(),
     }
 }

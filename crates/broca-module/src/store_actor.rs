@@ -2086,6 +2086,8 @@ mod billing_tests;
 #[cfg(test)]
 mod differential;
 #[cfg(test)]
+mod entries_comparison;
+#[cfg(test)]
 mod import_tests;
 #[cfg(test)]
 mod tests;

@@ -32,6 +32,7 @@ pub mod serve;
 pub mod session_class;
 pub mod store_actor;
 pub mod store_billing;
+pub mod store_entries;
 pub mod store_import;
 pub mod store_open;
 pub mod store_read;
