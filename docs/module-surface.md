@@ -830,7 +830,9 @@ A **subscribe cursor** is `{wal_seq, sub_index, incarnation, digest}`. The incar
 names the WAL, and `digest` is a 16-hex-character verified source-frame identity.
 `subscribe`, `session.head.head` and `session.read.head` share this domain.
 A cursor attach starts strictly after that unit, so `read → subscribe(from: head)` is a
-gapless, duplicate-free handoff. `head` is absent when the log has no resumable control unit.
+gapless, duplicate-free handoff. `head` is absent when the log has no control unit.
+Historical logs without retained identity still stream with position-only cursors;
+those cursors cannot resume, but missing proof never prevents reading the stream.
 Malformed `from` refuses `invalid_params` naming `from`; a parsed cursor with a missing or
 different incarnation, a missing or different frame digest, an absent frame, or a
 sub-index with no corresponding control unit refuses `cursor_expired` before any event. Legacy position-only wire cursors
@@ -842,7 +844,10 @@ the lease fence (the writer's ownership generation) and payload.
 Missing or null `from`
 means live. On either refusal, drop the cursor, reopen live, and read `session.head`.
 
-Broca declares `notices` with `read_display_facts`, `history_display` and `live_events`.
+Broca declares `notices` only when its envelope writer is enabled, with
+`read_display_facts`, `history_display` and `live_events`. A reader-only build can
+read older envelope records without promising to record new notices. Its existing
+`delivery_order` capability remains served with legacy joined tool-result deliveries.
 A send recorded with a `rides-v2/v1` envelope adds a `notices` list to its tool-result entry on opted-in reads and
 to its display row, never a new transcript entry. Each fact names its stored result `part`,
 carrying `call_key`, `send_id`, `sender`, exact `text` and `delivered_as: "tool_result"`.

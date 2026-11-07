@@ -1762,11 +1762,53 @@ async fn collect_subscription_frames_at(
     frames
 }
 
-/// Normalize only minted snapshot identity and wall-clock version fields in serialized replies.
+/// Normalize only minted snapshot identity, cursor proofs and wall-clock versions in replies.
 /// Message content and request-rendering bytes are deliberately left intact.
 pub fn normalize_snapshot_bytes(body: &[u8], run_id: &str, incarnation: &str) -> String {
     use base64::Engine;
     let mut text = String::from_utf8(body.to_vec()).unwrap();
+    // Only envelope cursors vary with source-frame bytes; message digests remain pinned.
+    let root: std::collections::BTreeMap<&str, &serde_json::value::RawValue> =
+        serde_json::from_slice(body).unwrap();
+    let mut cursors: Vec<_> = root.get("cursor").copied().into_iter().collect();
+    if let Some(result) = root.get("result") {
+        if let Ok(result) = serde_json::from_str::<
+            std::collections::BTreeMap<&str, &serde_json::value::RawValue>,
+        >(result.get())
+        {
+            cursors.extend(result.get("head").copied());
+        }
+    }
+    let mut replacements = Vec::new();
+    for raw in cursors {
+        let value: serde_json::Value = serde_json::from_str(raw.get()).unwrap();
+        if value.get("wal_seq").is_none() {
+            continue;
+        }
+        let Some(digest) = value["digest"].as_str() else {
+            continue;
+        };
+        assert!(
+            digest.len() == 16
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
+        assert_eq!(value["incarnation"].as_str(), Some(incarnation));
+        let old = format!("\"digest\":\"{digest}\"");
+        assert!(raw.get().contains(&old));
+        let start = raw.get().as_ptr() as usize - body.as_ptr() as usize;
+        replacements.push((
+            start,
+            start + raw.get().len(),
+            raw.get()
+                .replacen(&old, "\"digest\":\"@CURSOR_DIGEST@\"", 1),
+        ));
+    }
+    replacements.sort_by_key(|(start, _, _)| std::cmp::Reverse(*start));
+    for (start, end, replacement) in replacements {
+        text.replace_range(start..end, &replacement);
+    }
     let scope_prefix = format!(
         "h1.{}.",
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(incarnation.as_bytes())
@@ -1795,6 +1837,15 @@ pub fn normalize_snapshot_bytes(body: &[u8], run_id: &str, incarnation: &str) ->
     }
     text.replace(run_id, "@RUN_ID@")
         .replace(incarnation, "@LINEAGE_ID@")
+}
+
+#[test]
+fn snapshot_cursor_normalization_preserves_order_and_message_digests() {
+    let body = br#"{"cursor":{"wal_seq":1,"sub_index":0,"incarnation":"lineage","digest":"0123456789abcdef"},"result":{"head":{"wal_seq":2,"sub_index":0,"incarnation":"lineage","digest":"0123456789abcdef"},"message":{"digest":"0123456789abcdef","head":{"wal_seq":3,"digest":"0123456789abcdef"}}}}"#;
+    assert_eq!(
+        normalize_snapshot_bytes(body, "run-id", "lineage"),
+        r#"{"cursor":{"wal_seq":1,"sub_index":0,"incarnation":"@LINEAGE_ID@","digest":"@CURSOR_DIGEST@"},"result":{"head":{"wal_seq":2,"sub_index":0,"incarnation":"@LINEAGE_ID@","digest":"@CURSOR_DIGEST@"},"message":{"digest":"0123456789abcdef","head":{"wal_seq":3,"digest":"0123456789abcdef"}}}}"#
+    );
 }
 
 #[cfg(test)]

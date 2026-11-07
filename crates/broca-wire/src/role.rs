@@ -399,7 +399,6 @@ pub fn broca_role_describe_with_writers(
         cortexkit_role_llm_runner::capabilities::HISTORY_DISPLAY,
         cortexkit_role_llm_runner::capabilities::RICH_UI_STAMP,
         cortexkit_role_llm_runner::capabilities::READ_DISPLAY_FACTS,
-        cortexkit_role_llm_runner::capabilities::NOTICES,
         cortexkit_role_llm_runner::capabilities::CALL_IDENTITY,
         cortexkit_role_llm_runner::capabilities::OUTPUT_REFS,
         "run_ops",
@@ -447,6 +446,14 @@ pub fn broca_role_describe_with_writers(
     ]
     .map(String::from)
     .to_vec();
+    if broca_core::delivery_order::RIDES_V2_WRITER_ENABLED {
+        // Historical envelope reads are supported before this build can record new notices.
+        let at = capabilities
+            .iter()
+            .position(|name| name == cortexkit_role_llm_runner::capabilities::CALL_IDENTITY)
+            .unwrap();
+        capabilities.insert(at, cortexkit_role_llm_runner::capabilities::NOTICES.into());
+    }
     if hook_writer {
         capabilities.push(cortexkit_role_llm_runner::capabilities::ORDERED_HOOK_PHASES.into());
     }
@@ -1257,8 +1264,24 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "fdca75b8e62c831dff1aee3f00f3fc72ceab3f4fcedc295bf581493700fcc7f2",
+            "90018d82cc4c8c19f02d6ea59bf4190f58a6a69a50da5968629efc9d746aec7d",
         );
+    }
+
+    #[test]
+    fn notice_declaration_follows_the_envelope_writer_without_disabling_delivery_order() {
+        let describe = broca_role_describe_with_writers("test", true, true, true);
+        assert_eq!(
+            describe
+                .capabilities
+                .iter()
+                .any(|name| name == cortexkit_role_llm_runner::capabilities::NOTICES),
+            broca_core::delivery_order::RIDES_V2_WRITER_ENABLED
+        );
+        assert!(describe
+            .capabilities
+            .iter()
+            .any(|name| name == DELIVERY_ORDER_GROUP));
     }
 
     #[test]
@@ -1436,7 +1459,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "07f6875d84c4c058c1d04cdef32612a47c15ee87162cf32124a818821f20b805";
+        "312c6367b2a189a55b2a6c8d20d1a9aff3671e6e36e9a77ff8304ddefcb1c556";
     const RUN_TOOL_CALLS_PAGE_SHA256: &str =
         "6978763bd48c30edffbf61a4b4a0966d7efdfc146b94023f4a36cca4bda0881d";
     const DELIVERED_STEP_SHA256: &str =

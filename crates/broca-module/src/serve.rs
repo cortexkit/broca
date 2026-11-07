@@ -1801,9 +1801,6 @@ impl std::error::Error for ServeError {}
 /// real outcome or a typed `ServeError`.
 #[async_trait]
 pub trait ServeHandler: Send + Sync {
-    fn requires_cursor_frame_identity(&self) -> bool {
-        false
-    }
     async fn check_plan_selection(
         &self,
         plan: &serde_json::Value,
@@ -2440,9 +2437,6 @@ impl crate::LineageRegistry {
 
 #[async_trait]
 impl ServeHandler for crate::LineageRegistry {
-    fn requires_cursor_frame_identity(&self) -> bool {
-        true
-    }
     async fn check_plan_selection(
         &self,
         plan: &serde_json::Value,

@@ -924,6 +924,7 @@ impl Rig {
 
 #[derive(Debug)]
 struct Source {
+    frame_digest: Option<String>,
     seq: u64,
     end: u64,
     record: Value,
@@ -1233,9 +1234,13 @@ fn decode_sources(bytes: &[u8]) -> (String, Vec<Source>) {
                     framed.seq, next_seq,
                     "noncontiguous record sequence at byte {at}"
                 );
+                let digest = broca_wal::framing::cursor_frame_identity(&bytes[at..])
+                    .expect("decoded source frame has an identity")
+                    .digest_hex();
                 next_seq += 1;
                 at += consumed;
                 records.push(Source {
+                    frame_digest: Some(digest),
                     seq: framed.seq,
                     end: at as u64,
                     record: serde_json::to_value(framed.record).unwrap(),
@@ -1650,6 +1655,17 @@ impl Sources {
                             json!("@LINEAGE@")
                         }
                         "wal_seq" => json!(self.position(value.as_u64().unwrap())),
+                        "digest" if object.contains_key("wal_seq") => {
+                            // Independent roots hash different frame bytes; validate locally before comparing positions.
+                            assert_eq!(
+                                Some(value.as_str().expect("cursor digest must be text")),
+                                self.source(object["wal_seq"].as_u64().unwrap())
+                                    .frame_digest
+                                    .as_deref(),
+                                "cursor digest does not name its own verified source frame"
+                            );
+                            json!("@CURSOR_DIGEST@")
+                        }
                         // Each store allocates its own history version for a session (a
                         // per-store high-water mark), so only its form is comparable.
                         "history_version" if !value.is_null() => {
@@ -3018,6 +3034,7 @@ fn billing_fixture(overhaul: bool) -> BillingFixture {
         .into_iter()
         .enumerate()
         .map(|(index, record)| Source {
+            frame_digest: None,
             seq: index as u64 + 1,
             end: (index as u64 + 1) * 100,
             record,
@@ -3143,6 +3160,7 @@ fn differential_billing_ledger_rejects_unmatched_or_undurable_attempts() {
                     record["attempt_id"] = json!("b".repeat(32));
                 }
                 fixture.sources.records.push(Source {
+                    frame_digest: None,
                     seq: 6,
                     end: 600,
                     record,
@@ -3165,6 +3183,7 @@ fn differential_billing_ledger_rejects_unmatched_or_undurable_attempts() {
     let mut legacy = billing_fixture(false);
     let mut overhaul = billing_fixture(true);
     legacy.sources.records.push(Source {
+        frame_digest: None,
         seq: 4,
         end: 400,
         record: overhaul.sources.records[2].record.clone(),
@@ -3179,6 +3198,7 @@ fn differential_billing_ledger_rejects_unmatched_or_undurable_attempts() {
     .is_err());
     let legacy = billing_fixture(false);
     overhaul.sources.records.push(Source {
+        frame_digest: None,
         seq: 6,
         end: 600,
         record: json!({"type":"attempt_future"}),
@@ -3270,6 +3290,7 @@ fn differential_api_key_attempts_use_wal_without_routing_reports() {
             logical: BTreeMap::new(),
             overhaul,
             records: vec![Source {
+                frame_digest: None,
                 seq: 1,
                 end: 100,
                 record: json!({"type":"run_started","config":{"auth_selection":{
@@ -3279,6 +3300,7 @@ fn differential_api_key_attempts_use_wal_without_routing_reports() {
         };
         for (index, status) in [200, 200, 401].into_iter().enumerate() {
             sources.records.push(Source {
+                frame_digest: None,
                 seq: index as u64 + 2,
                 end: 200 + index as u64 * 100,
                 record: json!({"type":"model_attempt_finished","http_status":status}),
@@ -3388,6 +3410,7 @@ fn subscribe_lane_fixture() -> (Sources, Vec<Value>) {
     .into_iter()
     .enumerate()
     .map(|(index, record)| Source {
+        frame_digest: None,
         seq: index as u64 + 1,
         end: (index as u64 + 1) * 100,
         record,
@@ -3410,6 +3433,46 @@ fn subscribe_lane_fixture() -> (Sources, Vec<Value>) {
         },
         frames,
     )
+}
+
+#[test]
+fn differential_cursor_digest_is_validated_against_its_own_source_before_normalizing() {
+    let frame = broca_wal::framing::encode(
+        1,
+        1,
+        &broca_wal::WalRecord::StepStarted {
+            step_id: broca_protocol::StepId(1),
+        },
+    )
+    .unwrap();
+    let digest = broca_wal::framing::cursor_frame_identity(&frame)
+        .unwrap()
+        .digest_hex();
+    let mut bytes = source_lineage_header("cursor-digest");
+    bytes.extend(frame);
+    let (lineage, records) = decode_sources(&bytes);
+    let sources = Sources {
+        lineage,
+        records,
+        root: "/unused-state".into(),
+        runs: vec![],
+        file_id: 1,
+        logical: BTreeMap::from([(1, 1)]),
+        projected: BTreeSet::from([(1, 0)]),
+        overhaul: false,
+    };
+    let mut cursor =
+        json!({"wal_seq":1,"sub_index":0,"incarnation":sources.lineage,"digest":digest});
+    assert_eq!(sources.normalize(&cursor)["digest"], "@CURSOR_DIGEST@");
+    assert_eq!(
+        sources.normalize(&json!({"digest":"not-a-cursor"}))["digest"],
+        "not-a-cursor"
+    );
+    cursor["digest"] = json!("0000000000000000");
+    assert!(
+        std::panic::catch_unwind(|| sources.normalize(&cursor)).is_err(),
+        "normalization must not hide an incorrect source digest"
+    );
 }
 
 fn subscribe_reply(method: &str, frames: &[Value], order: &[usize]) -> Value {
@@ -3715,6 +3778,7 @@ fn differential_oracle_preserves_unlisted_fields_and_checks_own_source() {
         overhaul: false,
         logical: BTreeMap::from([(3, 1)]),
         records: vec![Source {
+            frame_digest: None,
             seq: 3,
             end: 120,
             record: json!({"type":"tool_dispatch_intent","tool_call_id":"call-a"}),
@@ -3763,6 +3827,7 @@ fn cursor_sources(overhaul: bool) -> Sources {
         .into_iter()
         .enumerate()
         .map(|(i, record)| Source {
+            frame_digest: None,
             seq: i as u64 + 1 + shift,
             end: (i as u64 + 1) * 100,
             record,
@@ -3859,6 +3924,7 @@ fn differential_cursor_end_is_owned_by_one_structural_episode() {
             .records
             .iter()
             .map(|source| Source {
+                frame_digest: None,
                 seq: source.seq + 6,
                 end: source.end + 600,
                 record: source.record.clone(),

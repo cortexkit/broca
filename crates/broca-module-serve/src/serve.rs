@@ -41,7 +41,7 @@ use broca_module::serve::{
 };
 use broca_module::{Delivery, LineageRegistry};
 use broca_protocol::BindIdentity as BrocaBindIdentity;
-use broca_wire::{encode_live_subscribe_control, encode_live_subscribe_display};
+use broca_wire::encode_live_subscribe_display;
 use subc_protocol::session::{
     ModuleControlCommand, ModuleControlRequest, ModuleControlResponse,
     MODULE_CONTROL_OP_HEALTH_CHECK,
@@ -4382,7 +4382,7 @@ where
                         }
                     }
                     let delivery = limit_live_arguments(delivery, limits.as_ref());
-                    let (priority, mut body) = match encode_delivery(&delivery, next_seq) {
+                    let (priority, body) = match encode_delivery(&delivery, next_seq) {
                         EncodedDelivery::Data(priority, body) => (priority, body),
                         // A Detached marker: end the stream cleanly; the client resubscribes.
                         EncodedDelivery::Detached => break,
@@ -4400,21 +4400,6 @@ where
                             return;
                         }
                     };
-                    if let Delivery::Control(_) = &delivery {
-                        match control_cursor_for_delivery(handler.as_ref(), &session, &delivery).await {
-                            Ok(Some(cursor)) => {
-                                let mut value: serde_json::Value = serde_json::from_slice(&body).expect("encoded subscription JSON");
-                                value["cursor"] = serde_json::to_value(cursor).expect("cursor JSON");
-                                body = serde_json::to_vec(&value).expect("subscription JSON");
-                            }
-                            Ok(None) => {},
-                            Err(error) => {
-                                let _ = send_subscribe_error_body(&writer, (ver, channel, epoch, corr), next_seq,
-                                    ErrorBody::new("subscribe_replay_failed", error.to_string())).await;
-                                return;
-                            }
-                        }
-                    }
                     // Subscribe frames share SUBC_MAX_FRAME_BYTES with unary replies. An oversized frame
                     // could invalidate sibling requests on this one module connection, and a clean
                     // StreamEnd here would send the client back to the same cursor forever.
@@ -4616,23 +4601,15 @@ fn limit_live_arguments(
 
 /// Mint the control delivery's opaque resume cursor from its durable source evidence.
 pub async fn control_cursor_for_delivery<H: ServeHandler + ?Sized>(
-    handler: &H,
+    _handler: &H,
     _session: &BrocaBindIdentity,
     delivery: &Delivery,
 ) -> Result<Option<broca_wire::CursorWire>, ServeError> {
     let Delivery::Control(event) = delivery else {
         return Ok(None);
     };
-    if event.0.frame_identity().is_some() {
-        return Ok(Some(event.0.into()));
-    }
-    if handler.requires_cursor_frame_identity() {
-        return Err(ServeError::Open(
-            "cursor_identity_unavailable: live control frame has no retained identity".into(),
-            Some(broca_protocol::ErrorClass::Transient),
-        ));
-    }
-    Ok(None)
+    // Historical logs without retained cursor identity still stream; position-only cursors cannot resume.
+    Ok(Some(event.0.into()))
 }
 
 fn encode_delivery(delivery: &Delivery, seq: u64) -> EncodedDelivery {
@@ -4641,9 +4618,8 @@ fn encode_delivery(delivery: &Delivery, seq: u64) -> EncodedDelivery {
             let (cursor, unit, live_event) = event.as_ref();
             (
                 Priority::Interactive,
-                encode_live_subscribe_control(
-                    cursor.wal_seq,
-                    cursor.sub_index,
+                broca_wire::encode_live_subscribe_control_with_cursor(
+                    (*cursor).into(),
                     unit,
                     seq,
                     live_event,
@@ -7816,6 +7792,28 @@ mod tests {
     }
 
     struct RefusingOpener;
+
+    #[tokio::test]
+    async fn headerless_control_deliveries_keep_streaming_without_a_resume_proof() {
+        let handler = LineageRegistry::new(Arc::new(RefusingOpener));
+        let session = BrocaBindIdentity::new("project", "runner", "headerless");
+        let delivery = Delivery::Control(Arc::new((
+            broca_core::Cursor::new(1, 0),
+            broca_protocol::caller::ControlUnit::StepStarted {
+                step_id: broca_protocol::StepId(1),
+            },
+            serde_json::from_value(serde_json::json!({"type":"message_started","mid":"m1"}))
+                .unwrap(),
+        )));
+        let cursor = control_cursor_for_delivery(&handler, &session, &delivery)
+            .await
+            .expect("a headerless legacy log remains readable")
+            .expect("control delivery retains its position");
+        assert_eq!(
+            serde_json::to_value(cursor).unwrap(),
+            serde_json::json!({"wal_seq":1,"sub_index":0})
+        );
+    }
 
     #[async_trait::async_trait]
     impl broca_module::registry::LineageOpener for RefusingOpener {

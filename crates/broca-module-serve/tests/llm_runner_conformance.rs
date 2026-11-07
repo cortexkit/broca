@@ -2824,7 +2824,6 @@ impl LlmRunnerSubject for BrocaSubject {
             Capability::DeliveryOrder,
             Capability::SenderSuccession,
             Capability::ReadDisplayFacts,
-            Capability::Notices,
             Capability::ClientMessageId,
             // The adapter implements the three session_change subject hooks (a tool-free
             // refresh plan, model request observations and holdable tool calls), so the kit
@@ -2837,6 +2836,9 @@ impl LlmRunnerSubject for BrocaSubject {
         ]
         .into_iter()
         .collect();
+        if broca_core::delivery_order::RIDES_V2_WRITER_ENABLED {
+            capabilities.insert(Capability::Notices);
+        }
         // Decoding retained logs does not mean session.send accepts retention. Advertise
         // retention and its daemon clock only when the production writer switch enables
         // both admission and the retention group in role.describe.
@@ -4326,6 +4328,13 @@ fn head_selection_cases_require_real_fixtures_and_explicit_inapplicability() {
 fn check_0811_cases(
     cases: &[cortexkit_role_llm_runner_conformance::CaseReport],
 ) -> Result<(), String> {
+    check_0811_cases_for_writer(cases, broca_core::delivery_order::RIDES_V2_WRITER_ENABLED)
+}
+
+fn check_0811_cases_for_writer(
+    cases: &[cortexkit_role_llm_runner_conformance::CaseReport],
+    notices_writer: bool,
+) -> Result<(), String> {
     for name in [
         "notices_no_transcript_entry",
         "notices_stored_output_unchanged",
@@ -4341,7 +4350,14 @@ fn check_0811_cases(
             .iter()
             .find(|case| case.case == name)
             .ok_or_else(|| format!("the suite has no case {name}"))?;
-        if case.outcome != CaseOutcome::Passed {
+        let expected = if name.starts_with("notices_") && !notices_writer {
+            CaseOutcome::Skipped {
+                missing: vec![Capability::Notices],
+            }
+        } else {
+            CaseOutcome::Passed
+        };
+        if case.outcome != expected {
             return Err(format!("{name}: {:?}", case.outcome));
         }
     }
@@ -4370,48 +4386,61 @@ fn check_0811_cases(
 }
 
 #[test]
-fn new_contract_cases_cannot_skip_or_claim_inapplicability() {
+fn new_contract_cases_require_exact_declared_writer_prerequisites() {
     use cortexkit_role_llm_runner_conformance::{CaseReport, CASES};
-    let cases: Vec<_> = CASES
-        .iter()
-        .map(|case| CaseReport {
-            case: case.name,
-            requires: case.requires.to_vec(),
-            outcome: if case.requires.contains(&Capability::SenderAttribution) {
-                CaseOutcome::Skipped {
-                    missing: vec![Capability::SenderAttribution],
-                }
-            } else {
-                CaseOutcome::Passed
-            },
-        })
-        .collect();
-    assert_eq!(
-        cases
+    for notices_writer in [false, true] {
+        let cases: Vec<_> = CASES
             .iter()
-            .filter(|case| case.case.starts_with("notices_"))
-            .count(),
-        6
-    );
-    assert!(check_0811_cases(&cases).is_ok());
-    // This kit has no provider-executed capability or case family; the runner
-    // does not claim provider-run tools merely because it upgraded the contract.
-    assert!(!CASES
-        .iter()
-        .any(|case| case.name.starts_with("provider_executed")));
-    for index in 0..cases.len() {
-        if cases[index].case.starts_with("notices_")
-            || [
-                "subscribe_resume_refusals",
-                "message_senders_rows_name_their_sender",
-            ]
-            .contains(&cases[index].case)
-        {
-            let mut broken = cases.clone();
-            broken[index].outcome = CaseOutcome::Inapplicable {
-                reason: "fixture unavailable".into(),
-            };
-            assert!(check_0811_cases(&broken).is_err());
+            .map(|case| CaseReport {
+                case: case.name,
+                requires: case.requires.to_vec(),
+                outcome: if case.requires.contains(&Capability::SenderAttribution) {
+                    CaseOutcome::Skipped {
+                        missing: vec![Capability::SenderAttribution],
+                    }
+                } else if !notices_writer && case.requires.contains(&Capability::Notices) {
+                    CaseOutcome::Skipped {
+                        missing: vec![Capability::Notices],
+                    }
+                } else {
+                    CaseOutcome::Passed
+                },
+            })
+            .collect();
+        assert_eq!(
+            cases
+                .iter()
+                .filter(|case| case.case.starts_with("notices_"))
+                .count(),
+            6
+        );
+        assert!(check_0811_cases_for_writer(&cases, notices_writer).is_ok());
+        if notices_writer == broca_core::delivery_order::RIDES_V2_WRITER_ENABLED {
+            assert!(check_0811_cases(&cases).is_ok());
+        }
+        // This kit has no provider-executed capability or case family.
+        assert!(!CASES
+            .iter()
+            .any(|case| case.name.starts_with("provider_executed")));
+        for index in 0..cases.len() {
+            if cases[index].case.starts_with("notices_")
+                || [
+                    "subscribe_resume_refusals",
+                    "message_senders_rows_name_their_sender",
+                ]
+                .contains(&cases[index].case)
+            {
+                for outcome in [
+                    CaseOutcome::Inapplicable {
+                        reason: "fixture unavailable".into(),
+                    },
+                    CaseOutcome::Skipped { missing: vec![] },
+                ] {
+                    let mut broken = cases.clone();
+                    broken[index].outcome = outcome;
+                    assert!(check_0811_cases_for_writer(&broken, notices_writer).is_err());
+                }
+            }
         }
     }
 }
@@ -5031,7 +5060,24 @@ async fn a_step_cut_before_its_intent_is_sealed_without_sending_the_call() {
 
     // The sealed run's transcript keeps the cut step: the assistant message holding the call,
     // then a tool message holding its never-executed result. The call never got a dispatch
-    // intent, so its entry has no key or module and is not indeterminate.
+    // intent, so its key names the durable negative result, not a dispatch destination.
+    let range = {
+        use broca_core::WalStore;
+        broca_core::FileWalStore::new(live.state_root.join("wal"))
+            .read_records_range(&subject.bind_identity(session), 0, None, None)
+            .unwrap()
+    };
+    let terminal_seq = match range.records() {
+        broca_wal::WalRangeRecords::Complete(records) => {
+            assert!(!records.iter().any(|frame| matches!(&frame.record, broca_wal::WalRecord::ToolDispatchIntent { tool_call_id, .. } if tool_call_id.0 == "call_cut")));
+            let terminals: Vec<_> = records.iter().filter(|frame| matches!(&frame.record,
+                broca_wal::WalRecord::ToolResult { result, .. } if result.tool_call_id.0 == "call_cut")).collect();
+            assert_eq!(terminals.len(), 1, "one durable record closes the cut call");
+            terminals[0].seq
+        }
+        _ => panic!("the sealed step-cut WAL must be complete"),
+    };
+    let expected_key = format!("{}:{terminal_seq}", range.lineage_id.unwrap());
     let page = response(route.request("session.read", json!({})).await.unwrap());
     let messages = page["messages"].as_array().unwrap();
     let roles: Vec<&str> = messages
@@ -5046,7 +5092,7 @@ async fn a_step_cut_before_its_intent_is_sealed_without_sending_the_call() {
     assert!(
         matches!(entries.as_slice(), [entry] if entry["tool_call_id"] == "call_cut"
             && entry["indeterminate"] == false
-            && entry.get("call_key").is_none()
+            && entry["call_key"] == expected_key
             && entry.get("dispatched_to").is_none()),
         "{page}"
     );
@@ -7215,6 +7261,25 @@ async fn conformance_subject_declares_service_tier_exactly_when_enabled() {
             enabled
         );
     }
+}
+
+#[tokio::test]
+async fn conformance_subject_notices_follow_the_served_writer_declaration() {
+    let root = broca_test_support::scratch_root().join("subject-notice-writer-declaration");
+    let subject = BrocaSubject::new(&root).await;
+    let declared = broca_wire::broca_role_describe_with_writers("test", true, true, true)
+        .capabilities
+        .iter()
+        .any(|name| name == cortexkit_role_llm_runner::capabilities::NOTICES);
+    assert_eq!(
+        subject.capabilities().contains(&Capability::Notices),
+        declared
+    );
+    assert_eq!(
+        declared,
+        broca_core::delivery_order::RIDES_V2_WRITER_ENABLED
+    );
+    assert!(subject.capabilities().contains(&Capability::DeliveryOrder));
 }
 
 fn writer_describe_golden_name(service_tier_enabled: bool) -> &'static str {

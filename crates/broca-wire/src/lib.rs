@@ -2913,17 +2913,24 @@ pub fn encode_live_subscribe_control(
     seq: u64,
     event: &cortexkit_role_llm_runner::live::LiveEvent,
 ) -> serde_json::Result<Vec<u8>> {
+    encode_live_subscribe_control_with_cursor(CursorWire::new(wal_seq, sub_index), unit, seq, event)
+}
+
+/// Preserve the control payload's byte order while including its verified resume proof.
+pub fn encode_live_subscribe_control_with_cursor(
+    cursor: CursorWire,
+    unit: &broca_protocol::caller::ControlUnit,
+    seq: u64,
+    event: &cortexkit_role_llm_runner::live::LiveEvent,
+) -> serde_json::Result<Vec<u8>> {
     if let broca_protocol::caller::ControlUnit::Status { run_id, status } = unit {
-        return serde_json::to_vec(&status_subscribe_event(
-            wal_seq,
-            sub_index,
-            run_id,
-            status,
-            Some(seq),
-        ));
+        let mut status =
+            status_subscribe_event(cursor.wal_seq, cursor.sub_index, run_id, status, Some(seq));
+        status.cursor = Some(serde_json::from_value(serde_json::to_value(cursor)?)?);
+        return serde_json::to_vec(&status);
     }
     serde_json::to_vec(&LiveSubscribeEventRef::Control {
-        cursor: CursorWire::new(wal_seq, sub_index),
+        cursor,
         unit,
         seq,
         event,
@@ -2961,6 +2968,49 @@ fn status_subscribe_event(
 #[cfg(test)]
 mod held_status_event_tests {
     use super::*;
+
+    #[test]
+    fn verified_cursor_members_extend_control_and_status_bytes_without_reordering_payloads() {
+        use broca_protocol::{caller::ControlUnit, RunId, StepId};
+        use cortexkit_role_llm_runner::{live::LiveEvent, run::RunStatus};
+        for unit in [
+            ControlUnit::StepStarted { step_id: StepId(1) },
+            ControlUnit::Status {
+                run_id: RunId("run".into()),
+                status: Box::new(RunStatus::new("active")),
+            },
+        ] {
+            let before =
+                encode_live_subscribe_control(7, 0, &unit, 12, &LiveEvent::DisplayReset).unwrap();
+            let mut cursor = CursorWire::new(7, 0);
+            cursor.incarnation = Some("lineage".into());
+            cursor.digest = Some("0123456789abcdef".into());
+            let after = encode_live_subscribe_control_with_cursor(
+                cursor,
+                &unit,
+                12,
+                &LiveEvent::DisplayReset,
+            )
+            .unwrap();
+            let mut stripped = String::from_utf8(after).unwrap();
+            for field in [
+                "\"incarnation\":\"lineage\"",
+                "\"digest\":\"0123456789abcdef\"",
+            ] {
+                assert!(stripped.contains(field));
+                if stripped.contains(&format!(",{field}")) {
+                    stripped = stripped.replacen(&format!(",{field}"), "", 1);
+                } else {
+                    stripped = stripped.replacen(&format!("{field},"), "", 1);
+                }
+            }
+            assert_eq!(
+                stripped.as_bytes(),
+                before,
+                "only cursor members may change"
+            );
+        }
+    }
 
     #[test]
     fn held_status_control_uses_the_shared_envelope_without_a_live_lifecycle() {
