@@ -980,6 +980,17 @@ message! {
 }
 
 message! {
+    /// A run's spend facts are in the usage export. A run's end makes its billing owed (see
+    /// `Operations::billing_owed`); this record, written only after the facts' insert commits,
+    /// settles it. Billing a run again inserts nothing new, so a crash between the insert and
+    /// this record only bills the run again.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct Billed {
+        1 req run_id: String,
+    }
+}
+
+message! {
     /// A caller asked to cancel a run.
     #[derive(Debug, Clone, PartialEq, Serialize)]
     pub struct CancelRequest {
@@ -1257,6 +1268,7 @@ records! {
         98 ConfigRefrozen,
         99 AuthRefrozen,
         100 StepRefused,
+        101 Billed,
     }
 }
 

@@ -371,6 +371,59 @@ impl<B: SessionBackend> Session<B> {
         }
         Ok(records)
     }
+
+    /// Every record of both streams from seq `first` on, sealed or in the open log, in seq
+    /// order: the sealed segments that reach `first`, every block of each, then the open log.
+    /// A record a seal kept in the open log is read once.
+    pub async fn records_from(&self, first: u64) -> Result<Vec<(u64, Record)>, SessionError> {
+        let key = self.key.frame_key();
+        let pages = Pages {
+            backend: &self.backend,
+            addr: &self.addr,
+            session: self.head.session_id,
+            key: &key,
+            fanout: crate::directory::FANOUT,
+        };
+        let mut records = BTreeMap::new();
+        for dir in [&self.head.ledger_dir, &self.head.transcript_dir] {
+            for entry in pages
+                .entries_from(dir.as_ref(), first)
+                .await
+                .map_err(SessionError::Directory)?
+            {
+                let bytes = self
+                    .backend
+                    .get_object(&self.addr, &entry.object)
+                    .await?
+                    .ok_or_else(|| {
+                        SessionError::Fold(format!(
+                            "the directory names a missing segment {}",
+                            entry.object
+                        ))
+                    })?;
+                let segment = Segment::open(&bytes, &key, entry.object.as_bytes())
+                    .map_err(SessionError::Segment)?;
+                for position in 0..segment.index.blocks.len() {
+                    // A block whose successor starts at or before `first` ends before it.
+                    let next = segment.index.blocks.get(position + 1);
+                    if next.is_some_and(|next| next.first_seq <= first) {
+                        continue;
+                    }
+                    for (seq, record) in segment.block(position).map_err(SessionError::Segment)? {
+                        if seq >= first && entry.keeps(seq) {
+                            records.insert(seq, record);
+                        }
+                    }
+                }
+            }
+        }
+        for (seq, record) in self.open_log_records().await? {
+            if seq >= first {
+                records.insert(seq, record);
+            }
+        }
+        Ok(records.into_iter().collect())
+    }
 }
 
 #[cfg(test)]

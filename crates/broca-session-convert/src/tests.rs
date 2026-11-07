@@ -59,6 +59,8 @@ fn a_tool_step_splits_into_transcript_and_ledger_records() {
             "BatchEnd",
             "Event",
             "RunEnd",
+            // Today's storage billed the run when it ended.
+            "Billed",
             "RunStart",
             "Input",
             "EntryFacts",
@@ -101,6 +103,10 @@ fn a_tool_step_splits_into_transcript_and_ledger_records() {
     assert!(matches!(
         &converted.records[15],
         Record::RunEnd(end) if end.run_id == "run-1"
+    ));
+    assert!(matches!(
+        &converted.records[16],
+        Record::Billed(billed) if billed.run_id == "run-1"
     ));
 
     assert!(converted.lost.is_empty(), "{:?}", converted.lost);

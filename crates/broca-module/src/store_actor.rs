@@ -40,7 +40,9 @@ use broca_session_loop::shared::{ActorWriter, RunLink};
 use broca_session_loop::writer::Writer;
 use broca_session_store::backend::SessionBackend;
 use broca_session_store::idindex::IdKind;
-use broca_session_store::record::{CancelPoint, CancelRequest, QueuedSend, Record, Retraction};
+use broca_session_store::record::{
+    Billed, CancelPoint, CancelRequest, QueuedSend, Record, Retraction,
+};
 use broca_session_store::session::Session;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -71,6 +73,9 @@ pub struct StoreActor<B: SessionBackend> {
     run: Option<ActiveRun>,
     /// Set once the module stops the session: no queued send starts after it.
     stopping: bool,
+    /// Where the session's spend facts are written. Without it, a run that ends stays owed
+    /// until an actor that has it opens the session.
+    billing: Option<crate::store_billing::StoreBilling>,
 }
 
 /// How an actor lives in the module's registry. Tests serve an actor without one.
@@ -214,7 +219,14 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             storage: None,
             run: None,
             stopping: false,
+            billing: None,
         }
+    }
+
+    /// The actor writes the spend facts of each run that ends to `billing`.
+    pub fn with_billing(mut self, billing: crate::store_billing::StoreBilling) -> Self {
+        self.billing = Some(billing);
+        self
     }
 
     /// The actor stores setup parts in `storage` before each append that could name them.
@@ -901,6 +913,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     /// this storage yet, so nothing is written for them.
     async fn recover(&mut self) {
         use broca_session_store::fold::operations::Resolution;
+        self.bill_owed().await;
         let operations = self.session.operations();
         let Some(run) = operations.run.as_ref().filter(|run| run.finished.is_none()) else {
             return self.drain().await;
@@ -933,6 +946,45 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 error = %error,
                 "the unfinished run's start could not be read back to recover it",
             ),
+        }
+    }
+
+    /// Bills every run whose billing is owed, oldest first: its spend facts are inserted into
+    /// the usage export, then a `Billed` record settles it, never before the insert commits.
+    /// A run that can't be billed stays owed, and the next run's end or the next open tries
+    /// again; billing never fails a run.
+    async fn bill_owed(&mut self) {
+        let Some(billing) = self.billing.clone() else {
+            return;
+        };
+        let owed = self.session.operations().billing_owed.clone();
+        for run_id in owed {
+            let inserted = billing
+                .insert(&self.session, &self.key, &self.parts, &run_id)
+                .await;
+            let settled = match inserted {
+                Ok(()) => {
+                    let record = Record::Billed(Billed {
+                        run_id: run_id.clone(),
+                    });
+                    Writer::append(&mut self.durable(), std::slice::from_ref(&record), false)
+                        .await
+                        .map(drop)
+                        .map_err(|error| {
+                            format!("the run's billing could not be recorded: {error:?}")
+                        })
+                }
+                Err(error) => Err(error),
+            };
+            if let Err(error) = settled {
+                tracing::warn!(
+                    target: "broca.store_actor",
+                    session = %self.key.session,
+                    run_id = %run_id,
+                    error = %error,
+                    "the run's spend facts were not written; it stays owed and is billed again at the next run's end or open",
+                );
+            }
         }
     }
 
@@ -1346,6 +1398,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 "a run on the new storage stopped without a recorded end",
             );
         }
+        // The run's end, if it wrote one, is durable now: a run's last batch ends with a
+        // barrier, and the run's task has returned.
+        self.bill_owed().await;
         self.drain().await;
     }
 
@@ -2001,6 +2056,8 @@ fn refuse(command: LineageCmd) {
     }
 }
 
+#[cfg(test)]
+mod billing_tests;
 #[cfg(test)]
 mod differential;
 #[cfg(test)]

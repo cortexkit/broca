@@ -72,7 +72,7 @@ fn read_step(id: &str) -> Vec<NormalizedEvent> {
     ]
 }
 
-fn bind() -> BindIdentity {
+pub(super) fn bind() -> BindIdentity {
     BindIdentity::new("/project", "store-actor", "s1")
 }
 
@@ -212,7 +212,7 @@ pub(super) async fn actor(
 }
 
 /// [`actor`] over the setup parts store `parts`, which a reopened actor can share.
-async fn actor_with(
+pub(super) async fn actor_with(
     executor: LoopExecutor,
     parts: SharedParts,
 ) -> (
@@ -236,9 +236,9 @@ async fn actor_with(
     (commands, served, backend)
 }
 
-const ADDR: &str = "0123456789abcdef";
+pub(super) const ADDR: &str = "0123456789abcdef";
 
-fn triple() -> SessionTriple {
+pub(super) fn triple() -> SessionTriple {
     SessionTriple {
         project_root: "/project".into(),
         harness: "store-actor".into(),
@@ -246,13 +246,13 @@ fn triple() -> SessionTriple {
     }
 }
 
-fn deployment() -> DeploymentKey {
+pub(super) fn deployment() -> DeploymentKey {
     DeploymentKey::new(1, &[7; 32])
 }
 
 /// A store actor over the session `backend` already holds, loaded as a module opening it after
 /// a restart loads it.
-async fn reopen(
+pub(super) async fn reopen(
     backend: &'static MemoryBackend,
     executor: Arc<LoopExecutor>,
     parts: &SharedParts,
@@ -283,7 +283,7 @@ pub(super) fn request(text: &str) -> SubmissionRequest {
     .unwrap()
 }
 
-async fn send(
+pub(super) async fn send(
     commands: &mpsc::UnboundedSender<LineageCmd>,
     run_id: &str,
     text: &str,

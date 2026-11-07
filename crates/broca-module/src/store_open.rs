@@ -35,6 +35,9 @@ pub struct StoreRuntime {
     parts: SharedParts,
     executor: Arc<dyn RunExecutor>,
     idle_ttl: Duration,
+    /// Where the spend facts of a session's runs are written. Without it, runs that end stay
+    /// owed, and are billed when a module that has it opens their session.
+    billing: Option<crate::store_billing::StoreBilling>,
 }
 
 impl StoreRuntime {
@@ -61,7 +64,15 @@ impl StoreRuntime {
             parts: SharedParts::new(Box::new(DeploymentParts::loaded(loaded))),
             executor,
             idle_ttl,
+            billing: None,
         })
+    }
+
+    /// Writes the spend facts of every run on the new storage to `billing`, the deployment's
+    /// usage export, as today's runs are written.
+    pub fn with_billing(mut self, billing: crate::store_billing::StoreBilling) -> Self {
+        self.billing = Some(billing);
+        self
     }
 
     /// Whether the session `key` is kept in the new storage: whether its head exists. A head
@@ -141,13 +152,16 @@ impl StoreRuntime {
             backend: LocalBackend::new(store_root(&self.state_root)),
             key: self.deployment.setup_key(),
         };
-        let actor = StoreActor::new(
+        let mut actor = StoreActor::new(
             key.clone(),
             session,
             Arc::clone(&self.executor),
             Box::new(self.parts.clone()),
         )
         .with_storage(storage);
+        if let Some(billing) = &self.billing {
+            actor = actor.with_billing(billing.clone());
+        }
         let (tx, commands) = mpsc::channel(COMMANDS);
         let run_in_flight = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let life = Lifecycle {

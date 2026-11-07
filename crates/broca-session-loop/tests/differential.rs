@@ -1846,8 +1846,8 @@ async fn today_from(
         .expect("today's loop wrote a log");
     let image = LogImage::read(&file);
     let name = file.file_name().unwrap().to_string_lossy().into_owned();
-    let converted = broca_session_convert::convert(&image.framed(), lineage(&image).as_deref())
-        .expect("the log converts");
+    let converted =
+        convert_unbilled(&image.framed(), lineage(&image).as_deref()).expect("the log converts");
     let _ = std::fs::remove_dir_all(&dir);
     (
         Outcome {
@@ -2116,6 +2116,21 @@ fn rand_suffix() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
     NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Today's log converted, without the `Billed` record the converter writes after each run's
+/// end. That record settles the run's usage export, which the store actor writes after a run
+/// ends; the run loop never writes one, so the two loops' records are compared without it.
+fn convert_unbilled(
+    frames: &[broca_wal::FramedRecord],
+    lineage: Option<&str>,
+) -> Result<broca_session_convert::Converted, broca_session_convert::ConvertError> {
+    broca_session_convert::convert(frames, lineage).map(|mut converted| {
+        converted
+            .records
+            .retain(|record| !matches!(record, Record::Billed(_)));
+        converted
+    })
 }
 
 /// The fields that hold a time or an id minted per log, replaced so two logs compare.
@@ -2574,8 +2589,8 @@ async fn compare_every_cut_in_once(scenario: Scenario) {
             })
             .count();
         let steps = scenario.steps[answered..].to_vec();
-        let converted = broca_session_convert::convert(&frames, lineage(&cut_image).as_deref())
-            .expect("the cut converts");
+        let converted =
+            convert_unbilled(&frames, lineage(&cut_image).as_deref()).expect("the cut converts");
         let cut_records = converted.records.clone();
         let before = converted.records.len();
         let (today, _, _) = today_from(&scenario, Some((&name, &bytes)), steps.clone()).await;
@@ -2655,8 +2670,7 @@ async fn compare_seal_every_cut_in(scenario: Scenario) {
         }
         sealed += 1;
         let lineage = lineage(&image);
-        let converted =
-            broca_session_convert::convert(&frames, lineage.as_deref()).expect("the cut converts");
+        let converted = convert_unbilled(&frames, lineage.as_deref()).expect("the cut converts");
         let before = converted.records.len();
         // Today: the seal plan over the cut, appended as today's actor appends it.
         let head = frames.last().map_or(0, |frame| frame.seq);
@@ -2679,7 +2693,7 @@ async fn compare_seal_every_cut_in(scenario: Scenario) {
             &wal,
         )
         .await;
-        let today = broca_session_convert::convert(&today_frames, lineage.as_deref())
+        let today = convert_unbilled(&today_frames, lineage.as_deref())
             .expect("today's sealed log converts");
         let today_sealed = normalized(&today.records)[before..].to_vec();
         // New: the loop's seal over the converted cut.
@@ -3059,7 +3073,7 @@ async fn compare_runs_in_once(scenario: Scenario, runs: &[(&str, Vec<Message>)])
         .expect("today's loop wrote a log");
     let converted = {
         let image = LogImage::read(&file);
-        broca_session_convert::convert(&image.framed(), lineage(&image).as_deref())
+        convert_unbilled(&image.framed(), lineage(&image).as_deref())
     }
     .expect("the log converts");
     let _ = std::fs::remove_dir_all(&dir);
@@ -3467,8 +3481,7 @@ impl SteerSink for NewSink {
                 record,
             })
             .collect();
-        let converted =
-            broca_session_convert::convert(&framed, None).expect("the send's records convert");
+        let converted = convert_unbilled(&framed, None).expect("the send's records convert");
         self.injected.lock().unwrap().extend(converted.records);
     }
 }
@@ -3684,7 +3697,7 @@ async fn compare_actions_in_once(
         .expect("today's loop wrote a log");
     let converted = {
         let image = LogImage::read(&file);
-        broca_session_convert::convert(&image.framed(), lineage(&image).as_deref())
+        convert_unbilled(&image.framed(), lineage(&image).as_deref())
     }
     .expect("the log converts");
     let _ = std::fs::remove_dir_all(&dir);
@@ -4073,7 +4086,7 @@ async fn compare_auth_pause_in_once(
         .expect("today's loop wrote a log");
     let converted = {
         let image = LogImage::read(&file);
-        broca_session_convert::convert(&image.framed(), lineage(&image).as_deref())
+        convert_unbilled(&image.framed(), lineage(&image).as_deref())
     }
     .expect("the log converts");
     let _ = std::fs::remove_dir_all(&dir);

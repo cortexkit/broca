@@ -24,6 +24,12 @@
 //! from the converted records, from the open log and again after sealing at the newest possible
 //! cut. Every entry must be equal, digests included.
 //!
+//! `session-convert billing <path>...`: for every run of every session log, today's spend facts
+//! (`compute_segments_for_run` over the log) against the facts the new storage's billing path
+//! makes from the converted session, from the open log and again after sealing at the newest
+//! possible cut. Every fact must be equal field for field, fact id included. The report names
+//! counts, run ids and field names only.
+//!
 //! Point it only at a copy of a state root (an APFS clone, `cp -c`), never at live files: it opens
 //! each log read-only, but a measurement run should never share a disk path with the daemon.
 
@@ -149,7 +155,8 @@ fn usage() -> ! {
          session-convert check [--dir SCRATCH] [--out FILE] [--limit N] PATH...\n       \
          session-convert append --dir SCRATCH [--sample N] [--out FILE] PATH...\n       \
          session-convert split [--dir SCRATCH] [--out FILE] [--limit N] PATH...\n       \
-         session-convert entries [--dir SCRATCH] [--out FILE] [--limit N] PATH..."
+         session-convert entries [--dir SCRATCH] [--out FILE] [--limit N] PATH...\n       \
+         session-convert billing [--dir SCRATCH] [--out FILE] [--limit N] PATH..."
     );
     std::process::exit(64);
 }
@@ -248,6 +255,7 @@ fn main() {
         "seal" => run_seal(&args),
         "entries" => run_entries(&args),
         "pages" => run_pages(&args),
+        "billing" => run_billing(&args),
         "episodes" => run_episodes(&args),
         "render" => run_render(&args),
         _ => usage(),
@@ -1276,6 +1284,174 @@ fn triple(name: &str) -> broca_session_store::head::SessionTriple {
         harness: "entries".into(),
         session: name.into(),
     }
+}
+
+#[derive(Default, Serialize)]
+struct BillingReport {
+    logs: u64,
+    /// Logs with at least one run start, whose runs are compared.
+    logs_with_runs: u64,
+    /// Converted logs whose owed set is empty, as every converted log's must be: today's
+    /// storage already billed their runs.
+    converted_owe_nothing: u64,
+    /// Converted logs that owe billing, which a store actor would bill again.
+    converted_owing: Vec<String>,
+    /// The comparison over the open log.
+    open: broca_session_convert::billing::Comparison,
+    /// Logs sealed at their newest cut (the latest run input that can start a log), and logs
+    /// sealed with no cut because none could start a log; both move every ledger record out.
+    sealed_at_cut: u64,
+    sealed_without_cut: u64,
+    /// The comparison after sealing.
+    sealed: broca_session_convert::billing::Comparison,
+    /// Logs that couldn't be read, converted, written or sealed, by reason.
+    failures: BTreeMap<String, u64>,
+    /// Differing runs, as `log#run`, by comparison.
+    differing_open: Vec<String>,
+    differing_sealed: Vec<String>,
+}
+
+/// For every run of every log: today's spend facts against the facts the new storage's billing
+/// path makes from the converted session, open and after sealing (see
+/// `broca_session_convert::billing`).
+fn run_billing(args: &Args) {
+    use broca_session_convert::billing::{bind_of, compare, log_session, triple, warms_at};
+    let mut report = BillingReport::default();
+    let deployment = DeploymentKey::new(1, &[0x5a; 32]);
+    each_log(args, |item| {
+        let Item::Log { name, old, .. } = item else {
+            return;
+        };
+        report.logs += 1;
+        let mut fail = |what: &str| *report.failures.entry(what.to_owned()).or_default() += 1;
+        let old = match old {
+            Ok(old) => old,
+            Err(_) => return fail("read"),
+        };
+        let Some(bind) = log_session(&old) else {
+            return;
+        };
+        report.logs_with_runs += 1;
+        let converted = match convert_log(&old) {
+            Ok(converted) => converted,
+            Err(_) => return fail("convert"),
+        };
+        let compared = block_on(async {
+            let backend = MemoryBackend::default();
+            let addr = SessionAddr(name.clone());
+            let triple = triple(&bind);
+            let bind = bind_of(&triple);
+            let mut session =
+                Session::create(&backend, addr.clone(), triple.clone(), &deployment, false)
+                    .await
+                    .map_err(|_| "create")?;
+            let mut run_inputs = Vec::new();
+            let mut warm_seqs = Vec::new();
+            for record in &converted.records {
+                let seq = session
+                    .append(std::slice::from_ref(record), false)
+                    .await
+                    .map_err(|_| "append")?;
+                match record {
+                    Record::Input(input)
+                        if input.placement == broca_session_store::record::Placement::RunInput =>
+                    {
+                        run_inputs.push(seq);
+                    }
+                    Record::Warmed(_) => warm_seqs.push(seq),
+                    _ => {}
+                }
+            }
+            let owes = !session.operations.billing_owed.is_empty();
+            let today = warms_at(&old, &warm_seqs).map_err(|_| "warms")?;
+            let parts = broca_session_loop::parts::MemoryParts {
+                parts: converted.parts.clone(),
+            };
+            let open = compare(&old, &today, &session, &bind, &parts).await;
+            // A seal moves the views the session names out of the open log, so it carries a copy
+            // of each, as the run loop does; billing reads none of them.
+            let operations = session.operations.clone();
+            let carried: Vec<Record> = converted
+                .records
+                .iter()
+                .filter(|record| match record {
+                    Record::View(view) => [
+                        operations.view_accepted.as_ref(),
+                        operations
+                            .view_applied
+                            .as_ref()
+                            .map(|applied| &applied.view),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .any(|slot| slot.version == view.version && slot.checksum == view.checksum),
+                    Record::ViewApplied(applied) => {
+                        operations.view_applied.as_ref().is_some_and(|slot| {
+                            slot.view.version == applied.version
+                                && slot.view.checksum == applied.checksum
+                        })
+                    }
+                    _ => false,
+                })
+                .cloned()
+                .collect();
+            let carry = broca_session_store::session::Carry {
+                records: &carried,
+                window_repetition: None,
+            };
+            let mut at_cut = false;
+            for cut in run_inputs.iter().rev() {
+                match session.seal_carrying(Some(*cut), &carry, 0).await {
+                    Ok(_) => {
+                        at_cut = true;
+                        break;
+                    }
+                    Err(broca_session_store::session::SessionError::BadCut(_)) => continue,
+                    Err(_) => return Err("seal"),
+                }
+            }
+            if !at_cut {
+                session
+                    .seal_carrying(None, &carry, 0)
+                    .await
+                    .map_err(|_| "seal")?;
+            }
+            session.close().await.map_err(|_| "close")?;
+            let view = Session::view(&backend, addr, &triple, &deployment)
+                .await
+                .map_err(|_| "view")?;
+            let sealed = compare(&old, &today, &*view, &bind, &parts).await;
+            Ok::<_, &str>((owes, open, at_cut, sealed))
+        });
+        let (owes, open, at_cut, sealed) = match compared {
+            Ok(compared) => compared,
+            Err(what) => return fail(what),
+        };
+        if owes {
+            report.converted_owing.push(name.clone());
+        } else {
+            report.converted_owe_nothing += 1;
+        }
+        report.open.add(&open);
+        report.differing_open.extend(
+            open.differing_runs
+                .iter()
+                .map(|run| format!("{name}#{run}")),
+        );
+        if at_cut {
+            report.sealed_at_cut += 1;
+        } else {
+            report.sealed_without_cut += 1;
+        }
+        report.sealed.add(&sealed);
+        report.differing_sealed.extend(
+            sealed
+                .differing_runs
+                .iter()
+                .map(|run| format!("{name}#{run}")),
+        );
+    });
+    write_report(&report, args.out_file.as_deref());
 }
 
 #[derive(Default, Serialize)]
