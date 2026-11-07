@@ -28,6 +28,7 @@ use super::{
     internal_refusal, ModelPin, SystemOne,
 };
 use crate::account_routing::{self, Candidates, RoutingCallError, RoutingClient};
+use crate::llm_tools::spend::MarkedItemError;
 
 pub struct Routing {
     pub client: Arc<RoutingClient>,
@@ -682,7 +683,7 @@ pub(super) fn retained(outcome: &StoredOutcome) -> bool {
     match &outcome.outcome {
         Outcome::Answered(_) => true,
         Outcome::Failed(body) => serde_json::from_str::<ItemError>(body).map_or(true, |error| {
-            account_error(&error) || !error.is_retried_on_resend()
+            account_error(&error) || (error.is_stored() && !error.is_retried_on_resend())
         }),
     }
 }
@@ -1317,6 +1318,14 @@ pub(super) async fn run(
         {
             return Ok(None);
         }
+    } else if let Some(model) = request.model.as_deref() {
+        // A caller's pin must be a classifier before routing can select or reserve it.
+        // Resends keep using the frozen catalog facts rather than consulting live rows.
+        let row = service.catalog.row(model);
+        cortexkit_role_classifier::request::check_catalog_row(
+            model,
+            classify::catalog_row(row.as_ref()),
+        )?;
     }
     let identity =
         BatchIdentity::of(&request).map_err(|error| Refusal::invalid_params("items", error.0))?;
@@ -2244,6 +2253,10 @@ async fn dispatch_items(
             continue;
         }
         if let Some(error) = &stop {
+            if !account_error(error) && !error.is_stored() {
+                slots[index] = Some(Slot::Unsent(MarkedItemError::new(error.clone(), None)));
+                continue;
+            }
             let outcome = StoredOutcome {
                 index: index as u64,
                 outcome: Outcome::Failed(classify::item_error_json(error)),
@@ -2288,10 +2301,12 @@ async fn dispatch_items(
             raw.items[index].state.get(),
             raw.questions.get()
         );
+        let first_provider_call = journal.runs[run_index].dispatched == 0;
         journal.runs[run_index].dispatched += 1;
         save(service, &request.batch_id, journal).await?;
         let answer =
             provider_call(service, &request.batch_id, pin, body, journal, run_index).await?;
+        let mut unstored = None;
         let (outcome, cost, fact) = match answer {
             Ok(classify::PaidAnswer {
                 answers,
@@ -2346,8 +2361,17 @@ async fn dispatch_items(
             }
             Err(error) => {
                 journal.runs[run_index].note_error(error.clone());
+                if first_provider_call && error.code == errors::MODEL_UNAVAILABLE {
+                    // Account failures freeze as item errors, but a missing model still
+                    // refuses admission. dispatch releases and reports the run before
+                    // returning the refusal.
+                    return Err(Refusal::model_unavailable(&choice.model).into());
+                }
                 if account_error(&error) || error.stops_the_call() {
                     stop = Some(error.clone());
+                }
+                if !account_error(&error) && !error.is_stored() {
+                    unstored = Some(error.clone());
                 }
                 (
                     StoredOutcome {
@@ -2361,10 +2385,16 @@ async fn dispatch_items(
                 )
             }
         };
-        // Account failures are stored too. Unlike a legacy batch, a routed batch cannot
-        // discard the account that failed and silently choose another one on a resend.
-        record(service, &request.batch_id, &outcome, cost, fact, journal).await?;
-        slots[index] = Some(Slot::Stored(outcome));
+        if let Some(error) = unstored {
+            // Keep run progress durable without making a missing model a permanent item
+            // result: the same frozen choice must be tried again after an operator's fix.
+            save(service, &request.batch_id, journal).await?;
+            slots[index] = Some(Slot::Unsent(MarkedItemError::new(error, None)));
+        } else {
+            // Account failures remain frozen so a resend cannot silently change accounts.
+            record(service, &request.batch_id, &outcome, cost, fact, journal).await?;
+            slots[index] = Some(Slot::Stored(outcome));
+        }
         flush(service, &request.batch_id, journal).await?;
         if journal.runs[run_index].renew_failed {
             stop = journal.runs[run_index].error.clone();

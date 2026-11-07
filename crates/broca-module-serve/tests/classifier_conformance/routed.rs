@@ -269,7 +269,6 @@ impl State {
                     params["model"],
                     choice.model.strip_prefix("typesafe/").unwrap()
                 );
-                assert_eq!(params["method"], "apikey");
                 let renewing = params["mode"] == "renew";
                 if renewing {
                     if let Some(refusal) = &inner.renewal_refusal {
@@ -623,6 +622,25 @@ mod tests {
             decision_id: "scripted".into(),
         })]);
         state
+    }
+
+    #[test]
+    fn routed_fixture_accepts_account_for_without_method() {
+        let state = scripted_state();
+        call(
+            &state,
+            "route.select",
+            json!({"consumer":"classifier","requirements":{"iq":0},"runners":["broca"],"pin":JEV}),
+        );
+        let answer = call(
+            &state,
+            "route.account_for",
+            json!({"provider":"typesafe","model":"jev-1.13.0",
+            "conversation_key":"fixture","admission_id":"first","mode":"admit","decision_id":"scripted",
+            "pool":POOL,"requested_account":{"credential_id":"account-1"},
+            "candidates":{"accounts":[{"account_id":"account-1","credential_id":"account-1"}],"view_digest":"fixture"},"initial_input_bytes":4}),
+        );
+        assert_eq!(answer["account"]["credential_id"], "account-1");
     }
 
     #[tokio::test]

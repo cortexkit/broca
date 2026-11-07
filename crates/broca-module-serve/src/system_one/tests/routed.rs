@@ -1265,6 +1265,46 @@ async fn routed_unavailable_or_unready_never_sends_or_stores() {
     }
 }
 
+async fn assert_invalid_pin_is_unrecorded(model: &str, code: &str, kind: Option<&str>) {
+    let rig = routed_rig(true, true);
+    let mut params: Value =
+        serde_json::from_str(&routed_request(&["valid-after-refusal"])).unwrap();
+    params["model"] = json!(model);
+    let refusal = call(&rig, &params.to_string()).await.unwrap_err();
+    assert_eq!(refusal["code"], code);
+    assert_eq!(refusal["detail"]["model"], model);
+    assert_eq!(refusal["detail"]["kind"].as_str(), kind);
+    assert!(rig.router.calls.lock().unwrap().is_empty());
+    assert!(rig.provider.bodies.lock().unwrap().is_empty());
+    assert!(rig.credentials.lock().unwrap().is_empty());
+    assert!(rig.store.lookup(STORE_ROLE, "routed").unwrap().is_none());
+    assert!(rig.store.routing(STORE_ROLE, "routed").unwrap().is_none());
+    assert!(rig.service.claims.lock().unwrap().is_empty());
+
+    rig.provider.script(
+        "valid-after-refusal",
+        vec![Script::Answer(answered(Some(7)))],
+    );
+    params["model"] = json!(JEV);
+    call(&rig, &params.to_string()).await.unwrap();
+    assert_eq!(rig.provider.calls("valid-after-refusal"), 1);
+}
+
+#[tokio::test]
+async fn routed_unknown_pin_is_refused_before_routing_and_writes() {
+    assert_invalid_pin_is_unrecorded("no-such-provider/unknown", "model_unknown", None).await;
+}
+
+#[tokio::test]
+async fn routed_non_classifier_pin_is_refused_before_routing_and_writes() {
+    assert_invalid_pin_is_unrecorded("openai/gpt-chat", "model_not_classifier", Some("chat")).await;
+}
+
+#[tokio::test]
+async fn routed_kindless_pin_is_refused_before_routing_and_writes() {
+    assert_invalid_pin_is_unrecorded("openai/kindless", "model_not_classifier", None).await;
+}
+
 #[tokio::test]
 async fn routed_unknown_adapter_and_gated_openai_are_refused_and_reported() {
     for model in ["elsewhere/unknown", OPENAI_DECISIONS] {
@@ -1360,6 +1400,121 @@ async fn routed_account_failure_reselects_once_before_any_answer() {
             .filter(|body| body["kind"] == "run_finished")
             .count(),
         2
+    );
+}
+
+#[tokio::test]
+async fn routed_model_unavailable_is_unstored_and_resend_retries_only_unanswered() {
+    let rig = routed_rig(true, true);
+    rig.provider
+        .script("done", vec![Script::Answer(answered(Some(10)))]);
+    rig.provider.script(
+        "missing",
+        vec![Script::Status(404, None), Script::Answer(answered(Some(7)))],
+    );
+    rig.provider
+        .script("not-sent", vec![Script::Answer(answered(Some(11)))]);
+    let params = routed_request(&["done", "missing", "not-sent"]);
+    let first: Value = serde_json::from_str(call(&rig, &params).await.unwrap().get()).unwrap();
+    assert_eq!(first["items"][1]["error"]["code"], "model_unavailable");
+    assert_eq!(first["items"][2]["error"], first["items"][1]["error"]);
+    assert_eq!(rig.provider.calls("missing"), 1);
+    assert_eq!(rig.provider.calls("not-sent"), 0);
+    let batch = rig.store.lookup(STORE_ROLE, "routed").unwrap().unwrap();
+    assert_eq!(batch.outcomes.len(), 1);
+    assert_eq!(batch.outcomes[0].index, 0);
+    assert!(!rig.router.pin_held.load(Ordering::SeqCst));
+    assert_eq!(rig.router.bodies("route.report").len(), 1);
+    let choice = rig
+        .store
+        .routing(STORE_ROLE, "routed")
+        .unwrap()
+        .unwrap()
+        .choice;
+
+    rig.router.clear();
+    rig.catalog.forbidden.store(true, Ordering::SeqCst);
+    let second: Value = serde_json::from_str(call(&rig, &params).await.unwrap().get()).unwrap();
+    assert_eq!(first["model"], second["model"]);
+    assert_eq!(first["decision_id"], second["decision_id"]);
+    assert_eq!(first["items"][0], second["items"][0]);
+    assert!(second["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|item| item["answers"].is_object()));
+    assert_eq!(rig.provider.calls("done"), 1);
+    assert_eq!(rig.provider.calls("missing"), 2);
+    assert_eq!(rig.provider.calls("not-sent"), 1);
+    assert!(rig.router.bodies("route.select").is_empty());
+    assert_eq!(
+        rig.router.bodies("route.account_for")[0]["requested_account"]["credential_id"],
+        "apikey:a"
+    );
+    assert_eq!(
+        rig.store
+            .routing(STORE_ROLE, "routed")
+            .unwrap()
+            .unwrap()
+            .choice,
+        choice
+    );
+}
+
+#[tokio::test]
+async fn routed_first_call_model_unavailable_refuses_after_release_and_retries_frozen_choice() {
+    let rig = routed_rig(true, true);
+    rig.provider.script(
+        "missing-first",
+        vec![Script::Status(404, None), Script::Answer(answered(Some(7)))],
+    );
+    rig.provider
+        .script("not-sent", vec![Script::Answer(answered(Some(11)))]);
+    let params = routed_request(&["missing-first", "not-sent"]);
+    let refusal = call(&rig, &params).await.unwrap_err();
+    assert_eq!(refusal["code"], "model_unavailable");
+    assert_eq!(refusal["detail"]["model"], JEV);
+    assert_eq!(refusal["detail"]["class"], "permanent");
+    assert_eq!(rig.provider.calls("not-sent"), 0);
+    assert!(rig
+        .store
+        .lookup(STORE_ROLE, "routed")
+        .unwrap()
+        .unwrap()
+        .outcomes
+        .is_empty());
+    assert!(!rig.router.pin_held.load(Ordering::SeqCst));
+    assert_eq!(rig.router.bodies("route.report").len(), 1);
+    let choice = rig
+        .store
+        .routing(STORE_ROLE, "routed")
+        .unwrap()
+        .unwrap()
+        .choice;
+    rig.router.clear();
+    rig.catalog.forbidden.store(true, Ordering::SeqCst);
+
+    let reply: Value = serde_json::from_str(call(&rig, &params).await.unwrap().get()).unwrap();
+    assert_eq!(reply["model"], JEV);
+    assert!(reply["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|item| item["answers"].is_object()));
+    assert_eq!(rig.provider.calls("missing-first"), 2);
+    assert_eq!(rig.provider.calls("not-sent"), 1);
+    assert!(rig.router.bodies("route.select").is_empty());
+    assert_eq!(
+        rig.router.bodies("route.account_for")[0]["requested_account"]["credential_id"],
+        "apikey:a"
+    );
+    assert_eq!(
+        rig.store
+            .routing(STORE_ROLE, "routed")
+            .unwrap()
+            .unwrap()
+            .choice,
+        choice
     );
 }
 
