@@ -21,6 +21,7 @@ pub struct At<'a> {
     pub step: u64,
     pub preset: &'a str,
     pub entries: &'a [Entry],
+    pub rides: &'a super::entries::RideEnvelopes,
     pub stored: &'a [Message],
     pub conditions: &'a Conditions,
     pub previous: Option<&'a SendContext>,
@@ -100,7 +101,8 @@ pub async fn prepare(
     let frozen = frozen && view.is_some();
     // Claimed only where the accepted Setup listed it.
     let cache_expired = at.cache_expired && runtime.detects_cache_expired().await;
-    let mut prompt = render::prompt(at.stored, at.entries, edits(&view), &mut image)?;
+    let mut prompt =
+        render::prompt_with_rides(at.stored, at.entries, at.rides, edits(&view), &mut image)?;
     let mut tokens = estimate(&prompt)?;
     let causes = if frozen {
         Vec::new()
@@ -128,7 +130,8 @@ pub async fn prepare(
         )
         .await?;
         view = state.lock().await.view_for_step(at.step).cloned();
-        prompt = render::prompt(at.stored, at.entries, edits(&view), &mut image)?;
+        prompt =
+            render::prompt_with_rides(at.stored, at.entries, at.rides, edits(&view), &mut image)?;
         tokens = estimate(&prompt)?;
     }
     // A cache-rewrite ride can return a larger view. It still owes an over-limit
@@ -146,7 +149,8 @@ pub async fn prepare(
         .await?;
         rode_over_limit = true;
         view = state.lock().await.view_for_step(at.step).cloned();
-        prompt = render::prompt(at.stored, at.entries, edits(&view), &mut image)?;
+        prompt =
+            render::prompt_with_rides(at.stored, at.entries, at.rides, edits(&view), &mut image)?;
         tokens = estimate(&prompt)?;
     }
     runtime

@@ -3204,14 +3204,23 @@ pub type DurableRecordTap =
 /// pointer keeps each slot small and independent of the record's size; the record itself is
 /// still cloned once per publish, exactly as before.
 #[derive(Clone, Debug)]
-pub struct ObservedRecord(Arc<(broca_wal::FramedRecord, Option<broca_wal::WalLineageId>)>);
+pub struct ObservedRecord(
+    Arc<(
+        broca_wal::FramedRecord,
+        Option<broca_wal::WalLineageId>,
+        Option<broca_wal::framing::CursorFrameIdentity>,
+    )>,
+);
 
 impl ObservedRecord {
     pub fn new(framed: broca_wal::FramedRecord) -> Self {
-        Self(Arc::new((framed, None)))
+        Self(Arc::new((framed, None, None)))
     }
     pub fn lineage_id(&self) -> Option<broca_wal::WalLineageId> {
         self.0 .1
+    }
+    pub fn frame_identity(&self) -> Option<broca_wal::framing::CursorFrameIdentity> {
+        self.0 .2
     }
 }
 
@@ -3289,12 +3298,24 @@ impl RecordObserver {
         }
     }
 
+    #[cfg(test)]
     fn observe(
         &self,
         seq: u64,
         fence: u64,
         record: &WalRecord,
         lineage: Option<broca_wal::WalLineageId>,
+    ) {
+        self.observe_with_identity(seq, fence, record, lineage, None);
+    }
+
+    fn observe_with_identity(
+        &self,
+        seq: u64,
+        fence: u64,
+        record: &WalRecord,
+        lineage: Option<broca_wal::WalLineageId>,
+        identity: Option<broca_wal::framing::CursorFrameIdentity>,
     ) {
         if self.subscribers.load(Ordering::Acquire) == 0 {
             return;
@@ -3309,6 +3330,7 @@ impl RecordObserver {
                 record: record.clone(),
             },
             lineage,
+            identity.filter(|identity| identity.seq == seq),
         ))));
     }
 
@@ -3848,6 +3870,8 @@ thread_local! {
 
 /// The loop's handle to the writer task.
 pub struct WalHandle {
+    ride_ledger: Mutex<crate::delivery_order::RideLedger>,
+    rides_writer_enabled: AtomicBool,
     recovery_cut_ids: std::collections::BTreeSet<String>,
     recovery_calls: Vec<broca_wal::recovery::RecoveryRun>,
     recovery_call_keys: std::collections::BTreeSet<String>,
@@ -4688,6 +4712,10 @@ impl WalHandle {
                             | WalRecord::VisibilityLate { .. }
                     )
                 }));
+        let mut ride_ledger = crate::delivery_order::RideLedger::default();
+        for frame in &recovered_frames {
+            ride_ledger.observe(&frame.record, frame.seq);
+        }
         let last_seq = last_seq + u64::from(v4);
         // Seq is 1-based; the first record of an empty WAL is seq 1, so the next seq
         // after a durable head of `last_seq` is `last_seq + 1`.
@@ -4749,7 +4777,8 @@ impl WalHandle {
                 let address = context.address.clone();
                 match context.open(&mut **wal, fence, || clock.now_ms()) {
                     Ok((writer, seq, record, synced)) => {
-                        let mut pending = vec![(seq, Box::new(record))];
+                        let mut pending =
+                            vec![(seq, Box::new(record), synced.last_cursor_frame_identity())];
                         let opened = broca_wal::head_proof::Publisher::from_synced(synced)
                             .map_err(WalWriteError::from_wal)
                             .and_then(|publisher| {
@@ -4765,8 +4794,14 @@ impl WalHandle {
                         writer_durable_head.store(wal.last_seq(), Ordering::Release);
                         *writer_lineage_id.lock().unwrap() = wal.lineage_id();
                         if let Some(obs) = &mut observer {
-                            for (seq, record) in pending {
-                                obs.observe(seq, fence, &record, wal.lineage_id());
+                            for (seq, record, identity) in pending {
+                                obs.observe_with_identity(
+                                    seq,
+                                    fence,
+                                    &record,
+                                    wal.lineage_id(),
+                                    identity,
+                                );
                                 obs.observe_tap(
                                     seq,
                                     fence,
@@ -4858,6 +4893,8 @@ impl WalHandle {
         // Only later publication markers need this separate enqueue-side charge.
         publication_bytes.store(0, Ordering::SeqCst);
         Ok(WalHandle {
+            ride_ledger: Mutex::new(ride_ledger),
+            rides_writer_enabled: AtomicBool::new(crate::delivery_order::RIDES_V2_WRITER_ENABLED),
             recovery_cut_ids,
             recovery_calls,
             recovery_call_keys,
@@ -4894,6 +4931,12 @@ impl WalHandle {
     /// WAL snapshot still matches the writer head before the loop appends anything.
     pub fn next_record_seq(&self) -> u64 {
         self.next_seq.load(Ordering::SeqCst)
+    }
+
+    /// Restore the origin of an already-durable queued send before its inbox is handed to
+    /// the run. A bounded recovery suffix need not contain that send's original Queued frame.
+    pub fn note_queued_ride(&self, pending: &crate::PendingSubmission) {
+        self.ride_ledger.lock().unwrap().seed_pending(pending);
     }
 
     /// Supply already-admitted metadata when resuming or warming without a new RunStarted.
@@ -5049,6 +5092,29 @@ impl WalHandle {
         self.enqueue_record(record, false)
     }
 
+    #[cfg(any(test, feature = "test-clock"))]
+    pub fn enable_ride_writer_for_test(&self) {
+        self.rides_writer_enabled.store(true, Ordering::SeqCst);
+    }
+
+    /// Keep the live renderer's delivery identical to the envelope enqueued for replay.
+    pub(crate) fn record_delivery(&self, mut record: WalRecord) -> WalRecord {
+        let _guard = self.lock_enqueue();
+        if self.rides_writer_enabled.load(Ordering::SeqCst) {
+            let envelope = self.ride_ledger.lock().unwrap().envelope(
+                &record,
+                self.lineage_id().map(|id| id.to_string()).as_deref(),
+            );
+            if let WalRecord::SendDelivered { ride, .. } = &mut record {
+                if ride.is_none() {
+                    *ride = envelope;
+                }
+            }
+        }
+        self.enqueue_record(record.clone(), false);
+        record
+    }
+
     /// Assign the record's runner tags, under the enqueue lock, and keep the ones the run loop
     /// asked for. A record whose parts need tags is refused while the lineage's tag state is
     /// unknown (a writer reopened over a non-empty WAL that no admission has seeded): writing
@@ -5143,6 +5209,19 @@ impl WalHandle {
                     *call_key = self.call_key(self.next_seq.load(Ordering::SeqCst));
                 }
             }
+        }
+        {
+            let mut ledger = self.ride_ledger.lock().unwrap();
+            let lineage = self.lineage_id().map(|id| id.to_string());
+            if self.rides_writer_enabled.load(Ordering::SeqCst) {
+                let envelope = ledger.envelope(&record, lineage.as_deref());
+                if let WalRecord::SendDelivered { ride, .. } = &mut record {
+                    if ride.is_none() {
+                        *ride = envelope;
+                    }
+                }
+            }
+            ledger.observe(&record, self.next_seq.load(Ordering::SeqCst));
         }
         if let Some(error @ WalWriteError::RelocationIncomplete { .. }) =
             current_write_error(&self.poisoned)
@@ -5793,6 +5872,11 @@ impl Drop for WalHandle {
 }
 
 type WriterSequence = (Arc<AtomicU64>, Arc<Mutex<()>>, Arc<AtomicU64>);
+type PendingObservedRecord = (
+    u64,
+    Box<WalRecord>,
+    Option<broca_wal::framing::CursorFrameIdentity>,
+);
 
 struct Publication {
     publisher: Option<broca_wal::head_proof::Publisher>,
@@ -5808,7 +5892,7 @@ impl Publication {
         &mut self,
         wal: &mut dyn Wal,
         rx: &std_mpsc::Receiver<WalCommand>,
-        pending: &mut Vec<(u64, Box<WalRecord>)>,
+        pending: &mut Vec<PendingObservedRecord>,
     ) -> Result<(), WalWriteError> {
         let Some(publisher) = &mut self.publisher else {
             return wal.sync().map_err(WalWriteError::from_wal);
@@ -5821,7 +5905,7 @@ impl Publication {
         &mut self,
         wal: &mut dyn Wal,
         rx: &std_mpsc::Receiver<WalCommand>,
-        pending: &mut Vec<(u64, Box<WalRecord>)>,
+        pending: &mut Vec<PendingObservedRecord>,
     ) -> Result<(), WalWriteError> {
         let publisher = self
             .publisher
@@ -5869,7 +5953,7 @@ impl Publication {
                     command @ (WalCommand::Append { .. } | WalCommand::AppendV4 { .. }) => {
                         let (seq, record) = append_command(wal, self.fence, &self.clock, command)?;
                         if self.observed {
-                            pending.push((seq, record));
+                            pending.push((seq, record, wal.last_cursor_frame_identity()));
                         }
                     }
                     command => self.deferred.push_back(command),
@@ -5882,7 +5966,7 @@ impl Publication {
                 return Err("visibility-late/v1: marker sequence drift".into());
             }
             if self.observed {
-                pending.push((seq, Box::new(record)));
+                pending.push((seq, Box::new(record), wal.last_cursor_frame_identity()));
             }
             // A second slow sync can age the marker too. Repeat, never publish
             // the late batch on the strength of a sync alone.
@@ -5993,7 +6077,7 @@ fn writer_loop_with_identity(
     // whenever the writer goes clean, and also when a sync fails: the writer is then
     // poisoned and must idle until close, not spin on a deadline that can never succeed.
     let mut deadline_at_ms: Option<u64> = None;
-    let mut pending_observed: Vec<(u64, Box<WalRecord>)> = Vec::new();
+    let mut pending_observed: Vec<PendingObservedRecord> = Vec::new();
     let has_tap = observer
         .as_ref()
         .is_some_and(|observer| observer.tap.is_some() || observer.step_events.is_some());
@@ -6036,18 +6120,30 @@ fn writer_loop_with_identity(
                         if let Some(obs) = &mut observer {
                             obs.observe_publication(&*wal);
                             if has_tap {
-                                for (seq, record) in &pending_observed {
-                                    obs.observe(*seq, fence, record, wal.lineage_id());
+                                for (seq, record, identity) in &pending_observed {
+                                    obs.observe_with_identity(
+                                        *seq,
+                                        fence,
+                                        record,
+                                        wal.lineage_id(),
+                                        *identity,
+                                    );
                                 }
                             } else {
-                                for (seq, record) in pending_observed.drain(..) {
-                                    obs.observe(seq, fence, &record, wal.lineage_id());
+                                for (seq, record, identity) in pending_observed.drain(..) {
+                                    obs.observe_with_identity(
+                                        seq,
+                                        fence,
+                                        &record,
+                                        wal.lineage_id(),
+                                        identity,
+                                    );
                                 }
                             }
                         }
                         if has_tap {
                             if let Some(obs) = &mut observer {
-                                for (seq, record) in pending_observed.drain(..) {
+                                for (seq, record, _identity) in pending_observed.drain(..) {
                                     obs.observe_tap(
                                         seq,
                                         fence,
@@ -6114,8 +6210,14 @@ fn writer_loop_with_identity(
                         durable_head.store(last_fsynced_seq, Ordering::Release);
                         if let Some(obs) = &mut observer {
                             obs.observe_publication(&*wal);
-                            for (seq, record) in pending_observed.drain(..) {
-                                obs.observe(seq, fence, &record, wal.lineage_id());
+                            for (seq, record, identity) in pending_observed.drain(..) {
+                                obs.observe_with_identity(
+                                    seq,
+                                    fence,
+                                    &record,
+                                    wal.lineage_id(),
+                                    identity,
+                                );
                                 if has_tap {
                                     obs.observe_tap(
                                         seq,
@@ -6191,7 +6293,11 @@ fn writer_loop_with_identity(
                             // cursor. The writer preserves append order while one sync releases the
                             // whole buffered prefix to live subscribers.
                             if observer.is_some() {
-                                pending_observed.push((assigned, record));
+                                pending_observed.push((
+                                    assigned,
+                                    record,
+                                    wal.last_cursor_frame_identity(),
+                                ));
                             }
                         }
                         Err(error) => set_write_poison(&poisoned, error),
@@ -6221,12 +6327,24 @@ fn writer_loop_with_identity(
                             if let Some(obs) = &mut observer {
                                 obs.observe_publication(&*wal);
                                 if has_tap {
-                                    for (seq, record) in &pending_observed {
-                                        obs.observe(*seq, fence, record, wal.lineage_id());
+                                    for (seq, record, identity) in &pending_observed {
+                                        obs.observe_with_identity(
+                                            *seq,
+                                            fence,
+                                            record,
+                                            wal.lineage_id(),
+                                            *identity,
+                                        );
                                     }
                                 } else {
-                                    for (seq, record) in pending_observed.drain(..) {
-                                        obs.observe(seq, fence, &record, wal.lineage_id());
+                                    for (seq, record, identity) in pending_observed.drain(..) {
+                                        obs.observe_with_identity(
+                                            seq,
+                                            fence,
+                                            &record,
+                                            wal.lineage_id(),
+                                            identity,
+                                        );
                                     }
                                 }
                             }
@@ -6245,7 +6363,7 @@ fn writer_loop_with_identity(
                 let _ = ack.send(res);
                 if durable && has_tap {
                     if let Some(obs) = &mut observer {
-                        for (seq, record) in pending_observed.drain(..) {
+                        for (seq, record, _identity) in pending_observed.drain(..) {
                             obs.observe_tap(seq, fence, wal.lineage_id(), wal.writer_id(), &record);
                         }
                     }
@@ -6268,8 +6386,14 @@ fn writer_loop_with_identity(
                     durable_head.store(wal.last_seq(), Ordering::Release);
                     if let Some(obs) = &mut observer {
                         obs.observe_publication(&*wal);
-                        for (seq, record) in pending_observed.drain(..) {
-                            obs.observe(seq, fence, &record, wal.lineage_id());
+                        for (seq, record, identity) in pending_observed.drain(..) {
+                            obs.observe_with_identity(
+                                seq,
+                                fence,
+                                &record,
+                                wal.lineage_id(),
+                                identity,
+                            );
                             if has_tap {
                                 obs.observe_tap(
                                     seq,
@@ -6331,6 +6455,7 @@ fn close_writer_identity(
                         WalWriteError::Failed(format!("writer-id/v1: cannot close writer: {other}"))
                     }
                 })?;
+        let identity = synced.last_cursor_frame_identity();
         let published = if let Some(publisher) = publisher {
             publisher
                 .scan_synced(synced)
@@ -6349,7 +6474,7 @@ fn close_writer_identity(
             durable_head.store(seq, Ordering::Release);
             if let Some(obs) = observer {
                 obs.observe_publication(wal);
-                obs.observe(seq, fence, &record, wal.lineage_id());
+                obs.observe_with_identity(seq, fence, &record, wal.lineage_id(), identity);
                 obs.observe_tap(seq, fence, wal.lineage_id(), wal.writer_id(), &record);
             }
         }
@@ -7711,6 +7836,9 @@ mod head_proof_tests {
         }
         fn lineage_id(&self) -> Option<broca_wal::WalLineageId> {
             self.inner.lineage_id()
+        }
+        fn last_cursor_frame_identity(&self) -> Option<broca_wal::framing::CursorFrameIdentity> {
+            self.inner.last_cursor_frame_identity()
         }
     }
 

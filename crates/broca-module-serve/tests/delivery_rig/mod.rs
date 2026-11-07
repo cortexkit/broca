@@ -800,6 +800,21 @@ impl Rig {
         Self::start_with_idle_ttl(tag, broca_module::actor::IDLE_TTL).await
     }
 
+    pub async fn start_with_ride_writer(tag: &str) -> Self {
+        let dir = broca_test_support::scratch_root()
+            .join(format!("broca-send-delivery-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("proj")).unwrap();
+        Self::open_existing_as_with_ride_writer(
+            dir,
+            broca_module::actor::IDLE_TTL,
+            false,
+            "runner",
+            true,
+        )
+        .await
+    }
+
     /// Open a stable test root so two independently built releases can replay the same WAL.
     pub async fn open_fixture(dir: PathBuf) -> Self {
         std::fs::create_dir_all(&dir).unwrap();
@@ -852,6 +867,16 @@ impl Rig {
         daemon_scopes: bool,
         harness: &str,
     ) -> Self {
+        Self::open_existing_as_with_ride_writer(dir, idle_ttl, daemon_scopes, harness, false).await
+    }
+
+    async fn open_existing_as_with_ride_writer(
+        dir: PathBuf,
+        idle_ttl: Duration,
+        daemon_scopes: bool,
+        harness: &str,
+        ride_writer: bool,
+    ) -> Self {
         let wal = Arc::new(FileWalStore::new(dir.join("wal")));
         let store = Arc::new(broca_store::SqliteStore::open(dir.join("store.db")).unwrap());
         broca_store::session_refs::migrate(
@@ -867,16 +892,23 @@ impl Rig {
             script: script.clone(),
             hook_plane: hook_plane.clone(),
         });
-        let opener = Arc::new(
-            DefaultOpener::new(
-                Arc::new(FileLeaseStore::new(dir.join("leases"))),
-                wal.clone(),
-                exec,
-            )
-            .with_idle_ttl(idle_ttl)
-            .with_run_index(store.clone())
-            .with_materialized_store(store.clone()),
-        );
+        let opener = DefaultOpener::new(
+            Arc::new(FileLeaseStore::new(dir.join("leases"))),
+            wal.clone(),
+            exec,
+        )
+        .with_idle_ttl(idle_ttl)
+        .with_run_index(store.clone())
+        .with_materialized_store(store.clone());
+        #[cfg(feature = "test-clock")]
+        let opener = if ride_writer {
+            opener.with_ride_writer_for_test()
+        } else {
+            opener
+        };
+        #[cfg(not(feature = "test-clock"))]
+        assert!(!ride_writer, "live envelope fixtures require test-clock");
+        let opener = Arc::new(opener);
         let registry = Arc::new(LineageRegistry::new_with_reader(
             opener,
             wal.clone(),
@@ -1203,6 +1235,30 @@ impl Rig {
         self.bind_as(channel, None).await;
     }
 
+    pub async fn bind_compaction(&mut self, channel: u16, provider: &str) {
+        let bind = ModuleControlRequest::RouteBind {
+            route_channel: channel,
+            epoch: 1,
+            target: RouteTarget::ManagementSurface {
+                module_id: "broca".into(),
+            },
+            identity: SubcBindIdentity::new(self.session.harness.clone(), "delivery"),
+            principal: Some(subc_protocol::Principal::Reserved {
+                module_id: provider.into(),
+            }),
+            consumer_capabilities: None,
+            admission_facts: None,
+            scope: None,
+            role_versions: Some(std::collections::BTreeMap::from([(
+                "compaction-runner".into(),
+                "v1".into(),
+            )])),
+            call_mode: None,
+        };
+        let reply = self.request(0, serde_json::to_value(bind).unwrap()).await;
+        assert_eq!(reply.header.ty, FrameType::Response, "{reply:?}");
+    }
+
     /// The rig's session registry.
     pub fn registry(&self) -> &Arc<LineageRegistry> {
         &self.registry
@@ -1503,6 +1559,16 @@ impl Rig {
 
     /// Recreate the serve connection, registry and store from the same durable session.
     pub async fn restart(self) -> Self {
+        self.restart_with_wal(None).await
+    }
+
+    /// Restore a WAL backup and rebuild its derived index while no writer is running.
+    pub async fn restart_restoring_wal(self, bytes: &[u8]) -> Self {
+        assert!(self.registry.stop_and_seal().await);
+        self.restart_with_wal(Some(bytes)).await
+    }
+
+    async fn restart_with_wal(self, restored: Option<&[u8]>) -> Self {
         let Self {
             dir,
             reader,
@@ -1511,12 +1577,25 @@ impl Rig {
             registry,
             daemon_scopes,
             session,
+            wal_path,
+            store,
             ..
         } = self;
         drop(writer);
         drop(reader);
         let _ = tokio::time::timeout(Duration::from_secs(5), serve).await;
         drop(registry);
+        drop(store);
+        if let Some(bytes) = restored {
+            std::fs::write(wal_path, bytes).unwrap();
+            for file in ["store.db", "store.db-wal", "store.db-shm"] {
+                match std::fs::remove_file(dir.join(file)) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => panic!("removing derived index: {error}"),
+                }
+            }
+        }
         Self::open_existing_as(
             dir,
             Duration::from_millis(100),
@@ -1683,11 +1762,53 @@ async fn collect_subscription_frames_at(
     frames
 }
 
-/// Normalize only minted snapshot identity and wall-clock version fields in serialized replies.
+/// Normalize only minted snapshot identity, cursor proofs and wall-clock versions in replies.
 /// Message content and request-rendering bytes are deliberately left intact.
 pub fn normalize_snapshot_bytes(body: &[u8], run_id: &str, incarnation: &str) -> String {
     use base64::Engine;
     let mut text = String::from_utf8(body.to_vec()).unwrap();
+    // Only envelope cursors vary with source-frame bytes; message digests remain pinned.
+    let root: std::collections::BTreeMap<&str, &serde_json::value::RawValue> =
+        serde_json::from_slice(body).unwrap();
+    let mut cursors: Vec<_> = root.get("cursor").copied().into_iter().collect();
+    if let Some(result) = root.get("result") {
+        if let Ok(result) = serde_json::from_str::<
+            std::collections::BTreeMap<&str, &serde_json::value::RawValue>,
+        >(result.get())
+        {
+            cursors.extend(result.get("head").copied());
+        }
+    }
+    let mut replacements = Vec::new();
+    for raw in cursors {
+        let value: serde_json::Value = serde_json::from_str(raw.get()).unwrap();
+        if value.get("wal_seq").is_none() {
+            continue;
+        }
+        let Some(digest) = value["digest"].as_str() else {
+            continue;
+        };
+        assert!(
+            digest.len() == 16
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
+        assert_eq!(value["incarnation"].as_str(), Some(incarnation));
+        let old = format!("\"digest\":\"{digest}\"");
+        assert!(raw.get().contains(&old));
+        let start = raw.get().as_ptr() as usize - body.as_ptr() as usize;
+        replacements.push((
+            start,
+            start + raw.get().len(),
+            raw.get()
+                .replacen(&old, "\"digest\":\"@CURSOR_DIGEST@\"", 1),
+        ));
+    }
+    replacements.sort_by_key(|(start, _, _)| std::cmp::Reverse(*start));
+    for (start, end, replacement) in replacements {
+        text.replace_range(start..end, &replacement);
+    }
     let scope_prefix = format!(
         "h1.{}.",
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(incarnation.as_bytes())
@@ -1716,6 +1837,15 @@ pub fn normalize_snapshot_bytes(body: &[u8], run_id: &str, incarnation: &str) ->
     }
     text.replace(run_id, "@RUN_ID@")
         .replace(incarnation, "@LINEAGE_ID@")
+}
+
+#[test]
+fn snapshot_cursor_normalization_preserves_order_and_message_digests() {
+    let body = br#"{"cursor":{"wal_seq":1,"sub_index":0,"incarnation":"lineage","digest":"0123456789abcdef"},"result":{"head":{"wal_seq":2,"sub_index":0,"incarnation":"lineage","digest":"0123456789abcdef"},"message":{"digest":"0123456789abcdef","head":{"wal_seq":3,"digest":"0123456789abcdef"}}}}"#;
+    assert_eq!(
+        normalize_snapshot_bytes(body, "run-id", "lineage"),
+        r#"{"cursor":{"wal_seq":1,"sub_index":0,"incarnation":"@LINEAGE_ID@","digest":"@CURSOR_DIGEST@"},"result":{"head":{"wal_seq":2,"sub_index":0,"incarnation":"@LINEAGE_ID@","digest":"@CURSOR_DIGEST@"},"message":{"digest":"0123456789abcdef","head":{"wal_seq":3,"digest":"0123456789abcdef"}}}}"#
+    );
 }
 
 #[cfg(test)]

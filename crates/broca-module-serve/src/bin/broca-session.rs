@@ -2762,10 +2762,7 @@ mod tests {
             open_batch: None,
             messages: Vec::new(),
             next_from_ordinal: Some(9),
-            head: Some(broca_wire::CursorWire {
-                wal_seq: 4,
-                sub_index: 1,
-            }),
+            head: Some(broca_wire::CursorWire::new(4, 1)),
             lineage_id: Some("11111111-2222-4333-8444-555555555555".into()),
             lineage_state: broca_wire::SessionReadLineageState {
                 last_run_id: Some("run-x".into()),

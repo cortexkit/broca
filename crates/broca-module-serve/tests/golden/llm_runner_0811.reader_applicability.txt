@@ -1,0 +1,16 @@
+N/A  notices_no_transcript_entry: missing groups: notices
+N/A  notices_stored_output_unchanged: missing groups: notices
+N/A  notices_display_fact: missing groups: notices
+N/A  notices_live_event: missing groups: notices
+N/A  notices_append_bytes: missing groups: notices
+N/A  notices_tool_result_only_never_system: missing groups: notices
+N/A  sender_attribution_stored_header: missing groups: sender_attribution
+N/A  sender_attribution_fact: missing groups: sender_attribution
+N/A  sender_attribution_photo_only: missing groups: sender_attribution
+N/A  sender_attribution_template: missing groups: sender_attribution
+N/A  sender_attribution_other_sender: missing groups: sender_attribution
+PASS sender_attribution_undeclared_refused
+N/A  sender_attribution_tampered_prefix: missing groups: sender_attribution
+N/A  sender_attribution_display: missing groups: sender_attribution
+PASS subscribe_resume_refusals
+PASS message_senders_rows_name_their_sender

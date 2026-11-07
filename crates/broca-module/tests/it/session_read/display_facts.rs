@@ -1,8 +1,110 @@
 use super::*;
 
 #[tokio::test]
+async fn old_display_seed_rebuilds_only_on_its_sessions_opt_in_read() {
+    use broca_core::display_facts::{
+        DisplayFactVersion, DisplayFacts, DisplayFactsSeed, DISPLAY_FACTS_VERSION,
+    };
+    let (rig, zero_ranges) = Rig::with_counting_zero_ranges("old-display-fact-seed");
+    let key = rig.key("old-seed");
+    let other = rig.key("untouched");
+    append_seed(
+        &rig.wal_store,
+        &key,
+        &[
+            started(&key, "run", "question"),
+            assistant_text(0, "answer"),
+            finished_ok(),
+        ],
+    );
+    materialize_all(&rig, &key);
+    let plain = rig
+        .registry
+        .read(read_request(&key, None, Some(32)))
+        .await
+        .unwrap();
+    let lineage = plain.lineage_id.as_ref().unwrap();
+    let mut old = DisplayFactsSeed::default();
+    old.version -= 1;
+    old.through_seq = u64::MAX;
+    rig.store
+        .publish_display_facts(
+            &key,
+            lineage,
+            None,
+            None,
+            &old,
+            &[DisplayFactVersion {
+                ordinal: 0,
+                seq: 1,
+                facts: DisplayFacts {
+                    client_message_id: Some("stale".into()),
+                    ..Default::default()
+                },
+            }],
+        )
+        .unwrap();
+    zero_ranges.store(0, Ordering::SeqCst);
+    let default = rig
+        .registry
+        .read(read_request(&key, None, Some(32)))
+        .await
+        .unwrap();
+    assert_eq!(default, plain);
+    assert_eq!(
+        zero_ranges.load(Ordering::SeqCst),
+        0,
+        "default reads do not rebuild display facts"
+    );
+    let mut request = read_request(&key, None, Some(32));
+    request.include_display_facts = true;
+    let rebuilt = rig.registry.read(request.clone()).await.unwrap();
+    assert_eq!(
+        zero_ranges.swap(0, Ordering::SeqCst),
+        1,
+        "the old seed requires one cold rebuild"
+    );
+    assert!(rebuilt
+        .messages
+        .iter()
+        .all(|message| message.client_message_id.as_deref() != Some("stale")));
+    let cache = rig
+        .store
+        .read_display_facts_cache(&key, lineage, u64::MAX, &[])
+        .unwrap()
+        .unwrap();
+    assert_eq!(cache.seed.unwrap().version, DISPLAY_FACTS_VERSION);
+    assert_eq!(rig.registry.read(request).await.unwrap(), rebuilt);
+    assert_eq!(
+        zero_ranges.load(Ordering::SeqCst),
+        0,
+        "the rebuilt seed is reused"
+    );
+    assert!(rig
+        .store
+        .read_display_facts_cache(&other, lineage, u64::MAX, &[])
+        .unwrap()
+        .unwrap()
+        .seed
+        .is_none());
+}
+
+#[tokio::test]
 async fn display_fact_backfill_is_lazy_persistent_and_reads_are_bounded_at_1k_and_150k() {
-    for size in [1_000, 150_000] {
+    let mut warm_io = None;
+    let mut continuation_io = None;
+    let signature = |operation: &broca_wal::access_counter::OperationAccess| {
+        (
+            operation
+                .reads
+                .iter()
+                .map(|read| (read.length, read.class))
+                .collect::<Vec<_>>(),
+            operation.frames_decoded,
+        )
+    };
+    for size in [1_000, 10_000, 150_000] {
+        let counter = broca_wal::access_counter::WalAccessCounter::default();
         let fixture_started = std::time::Instant::now();
         let (rig, zero_ranges) = Rig::with_counting_zero_ranges("display-fact-cost");
         let key = rig.key("facts");
@@ -42,24 +144,60 @@ async fn display_fact_backfill_is_lazy_persistent_and_reads_are_bounded_at_1k_an
         let materialize_ms = materialize_started.elapsed().as_secs_f64() * 1000.0;
         eprintln!("display-facts fixture messages={size} materialize_ms={materialize_ms:.3}");
         zero_ranges.store(0, Ordering::SeqCst);
-        let now = std::time::Instant::now();
-        let plain = rig
+        let without_tools = rig
             .registry
-            .read(read_request(&key, None, Some(32)))
+            .read(read_request(&key, None, Some(1)))
+            .await
+            .unwrap();
+        assert!(without_tools
+            .messages
+            .iter()
+            .all(|entry| entry.message.role != broca_protocol::Role::Tool));
+        assert!(
+            rig.store
+                .read_display_facts_cache(
+                    &key,
+                    without_tools.lineage_id.as_ref().unwrap(),
+                    u64::MAX,
+                    &[]
+                )
+                .unwrap()
+                .unwrap()
+                .seed
+                .is_none(),
+            "a default page without tools still avoids backfill"
+        );
+        zero_ranges.store(0, Ordering::SeqCst);
+        let now = std::time::Instant::now();
+        let plain = counter
+            .operation("cold native-output sidecar")
+            .run_future(rig.registry.read(read_request(&key, None, Some(32))))
             .await
             .unwrap();
         let default_ms = now.elapsed().as_secs_f64() * 1000.0;
         let default_full = zero_ranges.swap(0, Ordering::SeqCst);
         assert_eq!(plain.messages.last().unwrap().ordinal, size);
         let lineage = plain.lineage_id.as_ref().unwrap();
+        // One-time linear sidecar backfill plus the pre-existing dispatch-cache lookback
+        // in LineageRegistry::tool_turn_dispatches (registry.rs:4722). Warm reads pay neither.
+        assert_eq!(
+            default_full, 2,
+            "one output backfill and one existing dispatch lookback"
+        );
+        let cold = &counter.snapshot()[0];
+        println!(
+            "native-output cold messages={size} bytes={} decoded={} elapsed_ms={default_ms:.3}",
+            cold.reads.iter().map(|read| read.length).sum::<u64>(),
+            cold.frames_decoded
+        );
         assert!(
             rig.store
                 .read_display_facts_cache(&key, lineage, u64::MAX, &[])
                 .unwrap()
                 .unwrap()
                 .seed
-                .is_none(),
-            "default read never starts display backfill"
+                .is_some(),
+            "tool output separation needs the sidecar even without opt-in display facts"
         );
         let mut request = read_request(&key, None, Some(32));
         request.include_display_facts = true;
@@ -68,11 +206,15 @@ async fn display_fact_backfill_is_lazy_persistent_and_reads_are_bounded_at_1k_an
         let backfill_ms = now.elapsed().as_secs_f64() * 1000.0;
         assert_eq!(
             zero_ranges.swap(0, Ordering::SeqCst),
-            1,
-            "one lazy lineage backfill"
+            0,
+            "the first opt-in read reuses the tool read's completed backfill"
         );
         let now = std::time::Instant::now();
-        let warm = rig.registry.read(request).await.unwrap();
+        let warm = counter
+            .operation("warm opted-in page")
+            .run_future(rig.registry.read(request))
+            .await
+            .unwrap();
         let warm_ms = now.elapsed().as_secs_f64() * 1000.0;
         assert_eq!(
             zero_ranges.swap(0, Ordering::SeqCst),
@@ -100,13 +242,25 @@ async fn display_fact_backfill_is_lazy_persistent_and_reads_are_bounded_at_1k_an
             "completion survives another store connection"
         );
         let now = std::time::Instant::now();
-        let after = rig
-            .registry
-            .read(read_request(&key, None, Some(32)))
+        let after = counter
+            .operation("warm default page")
+            .run_future(rig.registry.read(read_request(&key, None, Some(32))))
             .await
             .unwrap();
         let default_warm_ms = now.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(
+            zero_ranges.swap(0, Ordering::SeqCst),
+            0,
+            "warm default tool reads no whole WAL"
+        );
         assert_eq!(plain, after);
+        let operations = counter.snapshot();
+        let observed = (signature(&operations[1]), signature(&operations[2]));
+        assert_eq!(
+            &observed,
+            warm_io.get_or_insert_with(|| observed.clone()),
+            "warm WAL bytes and decoded frames cannot grow with history"
+        );
         println!("display-facts messages={size} default_cold_ms={default_ms:.3} default_cold_full_reads={default_full} opt_in_backfill_ms={backfill_ms:.3} opt_in_warm_ms={warm_ms:.3} default_warm_ms={default_warm_ms:.3}");
         let mut next = started(&key, "next", "next prompt");
         if let WalRecord::RunStarted {
@@ -124,7 +278,11 @@ async fn display_fact_backfill_is_lazy_persistent_and_reads_are_bounded_at_1k_an
         zero_ranges.store(0, Ordering::SeqCst);
         let mut request = read_request(&key, None, Some(2));
         request.include_display_facts = true;
-        let extended = rig.registry.read(request).await.unwrap();
+        let extended = counter
+            .operation("continued sidecar fold")
+            .run_future(rig.registry.read(request))
+            .await
+            .unwrap();
         assert_eq!(
             extended.messages[0].client_message_id.as_deref(),
             Some("phone_next")
@@ -133,6 +291,17 @@ async fn display_fact_backfill_is_lazy_persistent_and_reads_are_bounded_at_1k_an
             zero_ranges.load(Ordering::SeqCst),
             0,
             "a completed backfill continues from its byte anchor"
+        );
+        let operations = counter.snapshot();
+        let observed = signature(&operations[3]);
+        assert_eq!(
+            &observed,
+            continuation_io.get_or_insert_with(|| observed.clone()),
+            "continuation WAL bytes and decoded frames cannot grow with the old prefix"
+        );
+        println!(
+            "native-output bounded messages={size} warm={:?} continuation={observed:?}",
+            warm_io.as_ref().unwrap()
         );
     }
 }

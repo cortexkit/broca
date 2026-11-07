@@ -90,6 +90,7 @@ pub(super) async fn send_plan(rig: &mut Rig, send_id: &str, prompt: &str, plan: 
 /// the user's text and a number no part holds. Output references add nothing to this page.
 #[tokio::test]
 async fn a_reply_naming_tool_outputs_keeps_its_default_read_bytes() {
+    // Only the resume cursor's incarnation and source-frame digest extend the historical pin.
     let (mut rig, _) = plan_rig("refs-pin-read").await;
     rig.script.push(&[
         Step::Call("call-1"),

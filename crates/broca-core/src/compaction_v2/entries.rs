@@ -33,6 +33,54 @@ pub struct EntryFacts {
 /// assistant entry's mid and native part index; call ids can repeat in later turns.
 pub type Deliveries = HashMap<(String, String), Vec<Delivered>>;
 
+/// Render-only metadata absent from the public compaction part. It stays aligned
+/// with each part's delivered list and is recovered from the durable source frame.
+#[derive(Clone, Debug, Default)]
+pub struct RideEnvelopes(HashMap<(String, String), Vec<Option<broca_wal::record::RideMetadata>>>);
+
+impl RideEnvelopes {
+    pub fn get(
+        &self,
+        mid: &str,
+        part: &str,
+        index: usize,
+    ) -> Option<&broca_wal::record::RideMetadata> {
+        self.0.get(&(mid.into(), part.into()))?.get(index)?.as_ref()
+    }
+
+    pub(crate) fn push(
+        &mut self,
+        mid: &str,
+        part: &str,
+        ride: Option<broca_wal::record::RideMetadata>,
+    ) {
+        self.0
+            .entry((mid.into(), part.into()))
+            .or_default()
+            .push(ride);
+    }
+}
+
+pub(crate) fn attach_ride_envelope(
+    delivered: &mut Delivered,
+    ride: Option<&broca_wal::record::RideMetadata>,
+) {
+    if let Some(ride) = ride {
+        delivered.sender.clone_from(&ride.sender);
+        delivered.send_id = Some(ride.send_id.clone());
+        delivered.forms = Some(
+            ride.forms
+                .iter()
+                .filter_map(|form| match form.as_str() {
+                    "tool_result" => Some(cortexkit_role_compaction::part::RideForm::ToolResult),
+                    "turn_system" => Some(cortexkit_role_compaction::part::RideForm::TurnSystem),
+                    _ => None,
+                })
+                .collect(),
+        );
+    }
+}
+
 pub fn compact(entry: &Entry) -> Entry {
     let mut entry = entry.clone();
     entry.parts = entry.parts.iter().map(Part::compact).collect();
@@ -93,6 +141,7 @@ pub fn delivered_from_records<'a>(
             }
             WalRecord::SendDelivered {
                 submission_id,
+                ride,
                 mode: DeliveryMode::ToolResult,
                 tool_call_id: Some(call),
                 appended_text: Some(text),
@@ -108,6 +157,7 @@ pub fn delivered_from_records<'a>(
                     .expect("tool-result delivery has a sender");
                 let text = text.strip_prefix("\n\n").unwrap_or(text);
                 let mut delivered = Delivered::new(sender, text);
+                attach_ride_envelope(&mut delivered, ride.as_ref());
                 delivered.template = template;
                 deliveries.entry(identity).or_default().push(delivered);
             }

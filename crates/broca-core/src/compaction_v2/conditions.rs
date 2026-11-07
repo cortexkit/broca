@@ -123,10 +123,10 @@ pub fn conditions(
 /// records themselves still decode. Refuse by the field's name before rendering.
 pub fn check_plan_version(recorded: u32) -> Result<(), String> {
     let supported = cortexkit_compaction_view::PLAN_VERSION;
-    if recorded == supported {
+    if recorded == 2 || recorded == supported {
         return Ok(());
     }
     Err(format!(
-        "compaction_plan_version {recorded} cannot resume with compaction plan version {supported}"
+        "compaction_plan_version {recorded} cannot resume; supported compaction plan version 2 or version {supported}"
     ))
 }

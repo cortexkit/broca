@@ -258,6 +258,9 @@ impl Wal for AdmissionWal {
     fn lineage_id(&self) -> Option<broca_wal::WalLineageId> {
         self.wal.lineage_id()
     }
+    fn last_cursor_frame_identity(&self) -> Option<broca_wal::framing::CursorFrameIdentity> {
+        self.wal.last_cursor_frame_identity()
+    }
     fn append_budget(&self) -> Option<(u64, u64, u64)> {
         self.wal.append_budget()
     }

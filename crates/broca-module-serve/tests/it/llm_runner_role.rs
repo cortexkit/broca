@@ -546,6 +546,7 @@ async fn finish_reason_uses_only_the_last_native_step_and_survives_restart() {
 
 #[tokio::test]
 async fn display_facts_opt_in_preserves_default_and_matches_stored_times() {
+    // Only the resume cursor's incarnation and source-frame digest extend the historical pin.
     let mut rig = Rig::start("read-display-facts").await;
     *rig.script.schema_pin.lock().unwrap() = Some(broca_wal::DispatchSchemaPin {
         schema_digest: "a".repeat(64),
@@ -684,6 +685,7 @@ async fn display_facts_opt_in_preserves_default_and_matches_stored_times() {
 /// from the default read-entry times, dispatch attribution, live metadata and message boundaries.
 #[tokio::test]
 async fn read_and_subscribe_bytes_without_new_params_are_pinned() {
+    // Only the resume cursor's incarnation and source-frame digest extend the historical pin.
     let (mut rig, run_id) = one_tool_turn("pin-read").await;
     let read = rig
         .request(
@@ -751,7 +753,11 @@ async fn read_and_subscribe_bytes_without_new_params_are_pinned() {
             let split = body
                 .rfind(",\"seq\":")
                 .expect("live members follow the unchanged payload");
-            Some(format!("{}}}", &body[..split]))
+            let payload = format!("{}}}", &body[..split]);
+            Some(payload.replace(
+                ",\"incarnation\":\"@LINEAGE_ID@\",\"digest\":\"@CURSOR_DIGEST@\"",
+                "",
+            ))
         })
         .collect();
     assert_eq!(
@@ -780,6 +786,7 @@ async fn read_and_subscribe_bytes_without_new_params_are_pinned() {
 
 #[tokio::test]
 async fn tagged_open_tool_turn_read_bytes_are_pinned() {
+    // Only the resume cursor's incarnation and source-frame digest extend the historical pin.
     let (mut rig, _) = crate::plan_admission::plan_rig("pin-tagged-open-read").await;
     rig.script.push(&[
         Step::Usage {
@@ -3160,6 +3167,7 @@ async fn pin_live_sample(rig: &mut Rig, frames: &[Frame], run_id: &str, file: &s
 
 #[tokio::test]
 async fn live_display_samples_match_stored_parts_and_attach_replays_current_step() {
+    // Only the resume cursor's incarnation and source-frame digest extend the historical pin.
     use broca_protocol::{ToolCall, ToolCallId};
     let tool = ContentBlock::ToolCall(ToolCall {
         thought_signature: None,

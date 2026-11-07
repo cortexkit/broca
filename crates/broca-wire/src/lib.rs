@@ -920,10 +920,36 @@ pub struct StatusParams {
 }
 
 /// A durable control-stream position shared by `session.read` and `session.subscribe`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct CursorWire {
     pub wal_seq: u64,
     pub sub_index: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incarnation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+}
+
+impl CursorWire {
+    pub fn new(wal_seq: u64, sub_index: u32) -> Self {
+        Self {
+            wal_seq,
+            sub_index,
+            incarnation: None,
+            digest: None,
+        }
+    }
+}
+
+impl From<broca_core::Cursor> for CursorWire {
+    fn from(cursor: broca_core::Cursor) -> Self {
+        let mut wire = Self::new(cursor.wal_seq, cursor.sub_index);
+        if let Some((lineage, identity)) = cursor.frame_identity() {
+            wire.incarnation = Some(lineage.to_string());
+            wire.digest = Some(identity.digest_hex());
+        }
+        wire
+    }
 }
 
 /// `session.subscribe` params: `from` is `"start"`, `"live"`, or a durable cursor.
@@ -1040,7 +1066,7 @@ pub struct ReadParams {
 #[serde(untagged)]
 pub enum FromWire {
     Named(String),
-    Cursor { wal_seq: u64, sub_index: u32 },
+    Cursor(CursorWire),
 }
 
 /// `session.send` response.
@@ -1155,6 +1181,10 @@ fn serialize_read_message<S: serde::Serializer>(
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct SessionReadMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notices: Vec<cortexkit_role_llm_runner::read::NoticeFact>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<u64>,
@@ -1225,6 +1255,10 @@ impl Serialize for SessionReadMessage {
         #[derive(Serialize)]
         struct Wire<'a> {
             #[serde(skip_serializing_if = "Option::is_none")]
+            sender: &'a Option<String>,
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            notices: &'a [cortexkit_role_llm_runner::read::NoticeFact],
+            #[serde(skip_serializing_if = "Option::is_none")]
             written_at: Option<u64>,
             ordinal: u64,
             mid: &'a str,
@@ -1258,6 +1292,8 @@ impl Serialize for SessionReadMessage {
             reasoning_summaries: &'a [cortexkit_role_llm_runner::read::ReasoningSummary],
         }
         Wire {
+            sender: &self.sender,
+            notices: &self.notices,
             written_at: self.written_at,
             ordinal: self.ordinal,
             mid: &self.mid,
@@ -2877,17 +2913,24 @@ pub fn encode_live_subscribe_control(
     seq: u64,
     event: &cortexkit_role_llm_runner::live::LiveEvent,
 ) -> serde_json::Result<Vec<u8>> {
+    encode_live_subscribe_control_with_cursor(CursorWire::new(wal_seq, sub_index), unit, seq, event)
+}
+
+/// Preserve the control payload's byte order while including its verified resume proof.
+pub fn encode_live_subscribe_control_with_cursor(
+    cursor: CursorWire,
+    unit: &broca_protocol::caller::ControlUnit,
+    seq: u64,
+    event: &cortexkit_role_llm_runner::live::LiveEvent,
+) -> serde_json::Result<Vec<u8>> {
     if let broca_protocol::caller::ControlUnit::Status { run_id, status } = unit {
-        return serde_json::to_vec(&status_subscribe_event(
-            wal_seq,
-            sub_index,
-            run_id,
-            status,
-            Some(seq),
-        ));
+        let mut status =
+            status_subscribe_event(cursor.wal_seq, cursor.sub_index, run_id, status, Some(seq));
+        status.cursor = Some(serde_json::from_value(serde_json::to_value(cursor)?)?);
+        return serde_json::to_vec(&status);
     }
     serde_json::to_vec(&LiveSubscribeEventRef::Control {
-        cursor: CursorWire { wal_seq, sub_index },
+        cursor,
         unit,
         seq,
         event,
@@ -2925,6 +2968,49 @@ fn status_subscribe_event(
 #[cfg(test)]
 mod held_status_event_tests {
     use super::*;
+
+    #[test]
+    fn verified_cursor_members_extend_control_and_status_bytes_without_reordering_payloads() {
+        use broca_protocol::{caller::ControlUnit, RunId, StepId};
+        use cortexkit_role_llm_runner::{live::LiveEvent, run::RunStatus};
+        for unit in [
+            ControlUnit::StepStarted { step_id: StepId(1) },
+            ControlUnit::Status {
+                run_id: RunId("run".into()),
+                status: Box::new(RunStatus::new("active")),
+            },
+        ] {
+            let before =
+                encode_live_subscribe_control(7, 0, &unit, 12, &LiveEvent::DisplayReset).unwrap();
+            let mut cursor = CursorWire::new(7, 0);
+            cursor.incarnation = Some("lineage".into());
+            cursor.digest = Some("0123456789abcdef".into());
+            let after = encode_live_subscribe_control_with_cursor(
+                cursor,
+                &unit,
+                12,
+                &LiveEvent::DisplayReset,
+            )
+            .unwrap();
+            let mut stripped = String::from_utf8(after).unwrap();
+            for field in [
+                "\"incarnation\":\"lineage\"",
+                "\"digest\":\"0123456789abcdef\"",
+            ] {
+                assert!(stripped.contains(field));
+                if stripped.contains(&format!(",{field}")) {
+                    stripped = stripped.replacen(&format!(",{field}"), "", 1);
+                } else {
+                    stripped = stripped.replacen(&format!("{field},"), "", 1);
+                }
+            }
+            assert_eq!(
+                stripped.as_bytes(),
+                before,
+                "only cursor members may change"
+            );
+        }
+    }
 
     #[test]
     fn held_status_control_uses_the_shared_envelope_without_a_live_lifecycle() {
@@ -2995,7 +3081,7 @@ pub fn encode_subscribe_control(
         ));
     }
     serde_json::to_vec(&SubscribeEventRef::Control {
-        cursor: CursorWire { wal_seq, sub_index },
+        cursor: CursorWire::new(wal_seq, sub_index),
         unit,
     })
 }
@@ -3052,10 +3138,7 @@ impl Serialize for SubscribeEvent {
                 sub_index,
                 unit,
             } => SubscribeEventRef::Control {
-                cursor: CursorWire {
-                    wal_seq: *wal_seq,
-                    sub_index: *sub_index,
-                },
+                cursor: CursorWire::new(*wal_seq, *sub_index),
                 unit,
             }
             .serialize(serializer),
@@ -3065,10 +3148,7 @@ impl Serialize for SubscribeEvent {
                 sub_index,
                 state,
             } => UnrecognizedSubscribeEventRef::Control {
-                cursor: CursorWire {
-                    wal_seq: *wal_seq,
-                    sub_index: *sub_index,
-                },
+                cursor: CursorWire::new(*wal_seq, *sub_index),
                 unit: state.into(),
             }
             .serialize(serializer),
@@ -3078,10 +3158,7 @@ impl Serialize for SubscribeEvent {
                 unit,
                 ..
             } => UnknownControlEventRef::Control {
-                cursor: CursorWire {
-                    wal_seq: *wal_seq,
-                    sub_index: *sub_index,
-                },
+                cursor: CursorWire::new(*wal_seq, *sub_index),
                 unit,
             }
             .serialize(serializer),
@@ -6060,6 +6137,8 @@ mod caller_message_tests {
 
     fn read_message(content: Vec<ContentBlock>) -> SessionReadMessage {
         SessionReadMessage {
+            sender: None,
+            notices: Vec::new(),
             created_at: None,
             completed_at: None,
             reasoning_summaries: Vec::new(),
@@ -6449,6 +6528,8 @@ mod caller_message_tests {
         );
         message.cache_prefix_blocks = Some(1);
         let response = SessionReadMessage {
+            sender: None,
+            notices: Vec::new(),
             created_at: None,
             completed_at: None,
             reasoning_summaries: Vec::new(),
@@ -6684,5 +6765,16 @@ mod envelope_time_tests {
         let entry: SessionReadMessage = serde_json::from_str(pinned).unwrap();
         assert_eq!(entry.written_at, None);
         assert_eq!(serde_json::to_string(&entry).unwrap(), pinned);
+    }
+}
+
+#[cfg(test)]
+mod cursor_compatibility_tests {
+    #[test]
+    fn cursor_reply_readers_remain_lenient_about_future_members() {
+        let cursor: super::CursorWire =
+            serde_json::from_value(serde_json::json!({"wal_seq":3,"sub_index":1,"future":true}))
+                .unwrap();
+        assert_eq!(cursor, super::CursorWire::new(3, 1));
     }
 }

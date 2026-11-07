@@ -534,4 +534,7 @@ impl Wal for ObservedWal {
     fn lineage_id(&self) -> Option<WalLineageId> {
         self.inner.lineage_id()
     }
+    fn last_cursor_frame_identity(&self) -> Option<broca_wal::framing::CursorFrameIdentity> {
+        self.inner.last_cursor_frame_identity()
+    }
 }
