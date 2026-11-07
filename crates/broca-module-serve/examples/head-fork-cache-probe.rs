@@ -669,8 +669,11 @@ async fn credentials(
         &identity,
         Duration::from_secs(15),
     );
+    // The token must outlive one probe run, which takes minutes. Google issues Antigravity
+    // tokens that live just under an hour (3,599 s), so the vault refuses any demand of a full
+    // hour (`ttl_unsatisfiable`); 30 minutes is served for every provider the probe drives.
     let secret = vault
-        .get(&handle, Some(60 * 60 * 1000), false)
+        .get(&handle, Some(30 * 60 * 1000), false)
         .await
         .result
         .map_err(|_| "vault credential unavailable (provider/vault response withheld)")?;
