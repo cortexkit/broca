@@ -101,7 +101,8 @@ Answered `invalid_request` and `admission_conflict` refusals are permanent
 `routing_refused`, with the original routing code and a local warning naming its
 reason. Invalid locally constructed routing requests and malformed routing answers
 remain permanent internal errors. A failure to obtain an answer is transient
-`routing_unavailable`; an unknown pending grant retains its cleanup obligation. A local vault-read failure
+`routing_unavailable`. When an account admission got no answer, routing may still have granted
+the account, so broca keeps that admission's id and releases the grant when it recovers. A local vault-read failure
 is a retryable item error, not evidence that the provider refused the credential.
 
 ## Dispatch attempts, leases and reports

@@ -864,6 +864,9 @@ read older envelope records without promising to record new notices. Its existin
 A send recorded with a `rides-v2/v1` envelope adds a `notices` list to its tool-result entry on opted-in reads and
 to its display row, never a new transcript entry. Each fact names its stored result `part`,
 carrying `call_key`, `send_id`, `sender`, exact `text` and `delivered_as: "tool_result"`.
+That mode belongs to the notice fact, not the carrier: an envelope ride never adds
+`delivered_as` to the carrying transcript message. Legacy ride attribution and all
+existing message ordinals and mids stay unchanged.
 The corresponding `notice_delivered` live event names the same result and carrying call.
 Envelope carriers serve only the tool's own output on default and opt-in reads, raw and
 display history, compaction entries and subscribe frames. The shared renderer adds the
