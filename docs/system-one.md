@@ -1,8 +1,8 @@
 # System One classifier routing
 
 The `classifier/v1` route serves sessionless batches of decision-model requests.
-Its contract is `cortexkit-role-classifier` 0.6.2, using the shared model-batch
-rules; routed operations use `cortexkit-role-routing` 0.7.4.
+Its contract is `cortexkit-role-classifier` 0.6.3, using the shared model-batch
+0.3.4 rules; routed operations use `cortexkit-role-routing` 0.7.6.
 
 ## Rollout switch
 
@@ -23,8 +23,13 @@ format. A missing-model refusal uses the classifier contract's wording:
 
 On, describe declares `routed_models: {}` only after a live routing describe lists
 consumer `classifier`. An unavailable or unready router gives `routing_unavailable`
-(transient), never fixed-credential fallback. An answered routing refusal gives
-`routing_refused` (permanent), preserving its code, reason and the caller's pin.
+(transient), never fixed-credential fallback. An answered routing refusal uses
+routing's `refusals::retry_class`: Permanent gives `routing_refused` (permanent),
+Transient or RetryAt gives `routing_deferred` (transient). Both preserve routing's
+code, reason and the caller's pin. A timed refusal includes `detail.retry_after_ms`,
+the retry timestamp minus the current Unix time in milliseconds, saturating at zero.
+An untimed refusal omits that delay. A refused selection writes no batch and sends
+no report.
 OpenAI Decisions also requires its independent serving gate; enabling routing
 does not enable that adapter.
 
@@ -72,7 +77,7 @@ answered but broca died before committing the answer, the adapters offer no
 idempotency key: a resend asks that unrecorded item again, matching the legacy
 classifier path. If a select answer was lost before its first local commit, a
 resend selects again; that never-dispatched selection has no spend.
-`cortexkit-role-routing` 0.7.4's CONTRACT.md §8 makes reporting optional, so a
+`cortexkit-role-routing` 0.7.6's CONTRACT.md §8 makes reporting optional, so a
 selection that never dispatched has no mandatory cleanup report.
 
 ## Replay and account failures
@@ -90,13 +95,13 @@ Resettable account limits do not trigger reselection. One batch never mixes mode
 
 A committed selection survives a refused first account admission, so a resend reuses
 that decision instead of silently selecting again. Answered admission and re-admission
-refusals are permanent `routing_refused`, preserving routing's code and reason; no
+refusals use the same `retry_class` mapping, preserving routing's code and reason; no
 new run, provider request or account failure is invented. Stored outcomes stay intact.
-Classifier 0.6.2 CONTRACT.md §7 conservatively makes every answered routing refusal
-permanent, even when routing calls its own refusal transient.
-Invalid requests, conflicting admission ids and invalid routing answers are permanent
-internal errors. A failure to obtain an answer is transient `routing_unavailable`;
-an unknown pending grant retains its cleanup obligation. A local vault-read failure
+Answered `invalid_request` and `admission_conflict` refusals are permanent
+`routing_refused`, with the original routing code and a local warning naming its
+reason. Invalid locally constructed routing requests and malformed routing answers
+remain permanent internal errors. A failure to obtain an answer is transient
+`routing_unavailable`; an unknown pending grant retains its cleanup obligation. A local vault-read failure
 is a retryable item error, not evidence that the provider refused the credential.
 
 ## Dispatch attempts, leases and reports
@@ -109,13 +114,15 @@ holds no lease. Active calls renew the same account pin at
 `<attempt id>:renew:<n>` and the stored pin generation; a transport retry reuses
 that exact request once. The provider future keeps being polled while renewal waits,
 so a ready, paid reply is not lost to an adapter deadline. Failed renewal stops further
-dispatch without cancelling that reply. Unanswered items receive transient
-`provider_error`; an answered refusal's message includes `routing refused renewal: <code>`.
-The full classified refusal stays in the batch journal and local report metadata;
-the published item-error wire shape has no routing-specific detail member.
+dispatch without cancelling that reply. For an answered refusal, every undispatched
+item receives the same `routing_refused`/permanent or `routing_deferred`/transient
+mapping as admission, with `detail.routing_code` and a top-level `retry_after_ms`
+delay when timed. The message does not embed routing's code. Transport and locally
+invalid renewal failures remain `provider_error`. The full classified refusal stays
+in the batch journal and local report metadata.
 A resend replays paid answers and re-admits the frozen
-choice only for unanswered work. An unknown renewal outcome owes finishes for the
-original admission first and the possibly granted renewal second. Successful renewals
+choice only for retryable unanswered work. An unknown renewal outcome owes finishes
+for the original admission first and the possibly granted renewal second. Successful renewals
 make subsequent observations name the latest admission. No lease is held between calls.
 
 The decision freezes its report capability basis: refreshing routing readiness

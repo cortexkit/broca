@@ -1154,9 +1154,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-model-batch"
-version = "0.3.3"
+version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e92e5c0cc73286ed971f94d3f206bc3652cca18e4d0c4242327c17c8daea5633"
+checksum = "dba0c04527a53334432fbdd755631fd52d033fdb970d79c2c74c97865526e8d5"
 dependencies = [
  "base64",
  "serde",
@@ -1186,11 +1186,12 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-classifier"
-version = "0.6.2"
+version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "747d8ae6234a5673b3378bf2d40fab0f159f6ab0323555b6423a818fd062293e"
+checksum = "c3d1b44aa7863bd4bf8707d6638df73500708dfb5f64868bbff8a5d0f2fd32d5"
 dependencies = [
  "cortexkit-model-batch",
+ "cortexkit-role-routing",
  "indexmap",
  "serde",
  "serde_json",
@@ -1198,9 +1199,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-classifier-conformance"
-version = "0.8.2"
+version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d308c08dcfb67045f4d55198c97a1aafbb7ddd54d1a95f905d025f4b232db644"
+checksum = "92dcf0f1ac54b8a3b0379efac95392e982c89eff5c7dd6b896678f4ff0200132"
 dependencies = [
  "async-trait",
  "cortexkit-role-classifier",
@@ -1317,9 +1318,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-routing"
-version = "0.7.4"
+version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "01d0853c2dde38731c0b4a5bb6bd1827436fd05e780becebc5988efc8e1b4401"
+checksum = "d02627558b2b45baaae1f79fdf6acfb2a4ea155f36dbfebc97d1a5b856071f5b"
 dependencies = [
  "cortexkit-role-media",
  "serde",

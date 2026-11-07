@@ -709,6 +709,28 @@ impl ClassifierSubject for Subject<'_> {
             .map(|services| services.state.observations())
     }
 
+    async fn script_routing_admission_refusal(
+        &self,
+        refusal: cortexkit_role_classifier_conformance::RoutingRefusalFixture,
+    ) -> bool {
+        let Some(services) = &self.rig.routed else {
+            return false;
+        };
+        services.state.admission_refusal(refusal);
+        true
+    }
+
+    async fn script_routing_renewal(
+        &self,
+        refusal: cortexkit_role_classifier_conformance::RoutingRefusalFixture,
+    ) -> bool {
+        let Some(services) = &self.rig.routed else {
+            return false;
+        };
+        services.state.renewal_refusal(refusal);
+        true
+    }
+
     async fn finish_routing(&self) {
         if let Some(services) = &self.rig.routed {
             services.state.finish();
@@ -812,12 +834,15 @@ async fn classifier_image_reference_conformance_uses_stand_in_cerebellum() {
     );
 }
 
-const ROUTED_CASES: [&str; 6] = [
+const ROUTED_CASES: [&str; 9] = [
     "routed_replay_keeps_decision",
     "routed_partial_failure_keeps_model",
     "routed_reply_has_decision_id",
     "routed_pin_never_substituted",
     "routed_admission_refusals",
+    "routed_transient_admission_refusals",
+    "routed_permanent_admission_refusal",
+    "routed_renewal_refusals",
     "routed_initial_account_failure_bounded",
 ];
 

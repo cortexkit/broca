@@ -988,6 +988,7 @@ pub enum RoutingCallError {
     Refused {
         code: String,
         message: String,
+        detail: Value,
     },
     Unavailable(String),
     /// A response or locally constructed request violates the routing contract.
@@ -1045,6 +1046,8 @@ impl RoutingClient {
                     code: String,
                     #[serde(default)]
                     message: String,
+                    #[serde(default)]
+                    detail: Value,
                 }
                 let error: Refused = serde_json::from_slice(&body).map_err(|error| {
                     RoutingCallError::Invalid(format!("routing refusal did not decode: {error}"))
@@ -1052,6 +1055,7 @@ impl RoutingClient {
                 Err(RoutingCallError::Refused {
                     code: error.code,
                     message: error.message,
+                    detail: error.detail,
                 })
             }
         }

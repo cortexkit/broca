@@ -42,6 +42,8 @@ impl RoutingCredentials for Keys {
 }
 
 struct Router {
+    refusal_detail: Mutex<Value>,
+    renewal_refusal: Mutex<Option<(&'static str, &'static str)>>,
     override_refusal: Mutex<Option<(&'static str, &'static str)>>,
     lose_granted_renewal_replies: AtomicUsize,
     lose_first_admission_before_grant: AtomicBool,
@@ -104,6 +106,8 @@ impl Router {
             ]);
         }
         Arc::new(Self {
+            refusal_detail: Mutex::new(json!({})),
+            renewal_refusal: Mutex::new(None),
             override_refusal: Mutex::new(None),
             lose_granted_renewal_replies: AtomicUsize::new(0),
             lose_first_admission_before_grant: AtomicBool::new(false),
@@ -201,7 +205,7 @@ impl RoutingTransport for Router {
         }
         let refused = |code, message| {
             Ok(Err(serde_json::to_vec(
-                &json!({"code":code,"message":message}),
+                &json!({"code":code,"message":message,"detail":*self.refusal_detail.lock().unwrap()}),
             )
             .unwrap()))
         };
@@ -282,6 +286,9 @@ impl RoutingTransport for Router {
                 if renewing {
                     self.renew_times.lock().unwrap().push(self.now());
                     self.renewed.notify_waiters();
+                    if let Some((code, message)) = *self.renewal_refusal.lock().unwrap() {
+                        return refused(code, message);
+                    }
                 }
                 if renewing && self.renew_refused.load(Ordering::SeqCst) {
                     return refused("pin_generation_conflict", "pin changed");
@@ -685,18 +692,23 @@ async fn audit_readmission_preserves_answered_and_contract_refusals() {
         let error = call(&rig, &params).await.unwrap_err();
         assert_eq!(
             error["code"],
-            if matches!(code, "invalid_request" | "admission_conflict") {
-                "internal_error"
+            if code == "account_selection_unavailable" {
+                "routing_deferred"
             } else {
                 "routing_refused"
             },
             "{code}"
         );
-        assert_eq!(error["detail"]["class"], "permanent");
-        if !matches!(code, "invalid_request" | "admission_conflict") {
-            assert_eq!(error["detail"]["routing_code"], code);
-            assert_eq!(error["detail"]["routing_reason"], "router refusal");
-        }
+        assert_eq!(
+            error["detail"]["class"],
+            if code == "account_selection_unavailable" {
+                "transient"
+            } else {
+                "permanent"
+            }
+        );
+        assert_eq!(error["detail"]["routing_code"], code);
+        assert_eq!(error["detail"]["routing_reason"], "router refusal");
         let after = rig.store.routing(STORE_ROLE, "routed").unwrap().unwrap();
         assert_eq!(before.choice, after.choice);
         assert_eq!(
@@ -922,8 +934,12 @@ async fn audit_failed_renewal_keeps_inflight_answer_and_stops_next_item() {
         "in-flight paid answer must finish after renewal refusal"
     );
     assert_eq!(rig.provider.calls("unsent"), 0);
-    assert_eq!(reply["items"][1]["error"]["code"], "provider_error");
-    assert_eq!(reply["items"][1]["error"]["class"], "transient");
+    assert_eq!(reply["items"][1]["error"]["code"], "routing_refused");
+    assert_eq!(reply["items"][1]["error"]["class"], "permanent");
+    assert_eq!(
+        reply["items"][1]["error"]["detail"]["routing_code"],
+        "pin_generation_conflict"
+    );
 }
 
 #[tokio::test]
@@ -1556,11 +1572,12 @@ async fn routed_refused_renewal_fails_unanswered_without_further_dispatch() {
     let reply: Value = serde_json::from_str(task.await.unwrap().unwrap().get()).unwrap();
     assert!(reply["items"][0].get("answers").is_some());
     assert!(reply["items"][1].get("answers").is_some());
-    assert_eq!(reply["items"][2]["error"]["code"], "provider_error");
-    assert!(reply["items"][2]["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("pin_generation_conflict"));
+    assert_eq!(reply["items"][2]["error"]["code"], "routing_refused");
+    assert_eq!(reply["items"][2]["error"]["class"], "permanent");
+    assert_eq!(
+        reply["items"][2]["error"]["detail"]["routing_code"],
+        "pin_generation_conflict"
+    );
     assert_eq!(rig.provider.calls("never"), 0);
     assert_eq!(rig.router.bodies("route.select").len(), 1);
     assert_eq!(rig.router.bodies("route.account_for").len(), 2);
@@ -2366,3 +2383,6 @@ async fn routed_restart_after_account_failure_before_cascade_cannot_dispatch_aga
 
 #[path = "routed/exits.rs"]
 mod exits;
+
+#[path = "routed/refusals.rs"]
+mod refusals;
