@@ -1,4 +1,4 @@
-//! `session-convert serve-check <path>...`: for every session log, what a session kept in the new
+//! `session-convert entries-check <path>...`: for every session log, what a session kept in the new
 //! storage serves the compaction provider and history readers, against what today's storage
 //! serves for the same history. Each log is converted and built in memory, as the `pages` check
 //! builds it, and both sides are served by the same code their op serves them with:
@@ -32,7 +32,7 @@ use serde_json::{json, Value};
 use crate::{convert_log, each_log, triple, write_report, Args, Item};
 
 #[derive(Default, Serialize)]
-struct ServeCheckReport {
+struct EntriesCheckReport {
     logs: u64,
     mode3_logs: u64,
     /// Raw `session.history` entries today serves, walking every page, and how many the store
@@ -64,7 +64,7 @@ struct ServeCheckReport {
     failures: BTreeMap<String, u64>,
 }
 
-impl ServeCheckReport {
+impl EntriesCheckReport {
     fn note(&mut self, key: String, example: String) {
         let key: String = key.chars().take(100).collect();
         *self.mismatches.entry(key.clone()).or_default() += 1;
@@ -103,13 +103,15 @@ fn log_bind(old: &[broca_wal::FramedRecord], name: &str) -> broca_protocol::Bind
             broca_wal::WalRecord::CompactionMarker {
                 harness, session, ..
             } => Some(broca_protocol::BindIdentity::new(
-                "/serve-check",
+                "/entries-check",
                 harness.clone(),
                 session.clone(),
             )),
             _ => None,
         })
-        .unwrap_or_else(|| broca_protocol::BindIdentity::new("/serve-check", "serve-check", name))
+        .unwrap_or_else(|| {
+            broca_protocol::BindIdentity::new("/entries-check", "entries-check", name)
+        })
 }
 
 /// A refusal or an answer, as JSON, so two can be compared whole.
@@ -140,7 +142,7 @@ where
 }
 
 pub(crate) fn run(args: &Args) {
-    let mut report = ServeCheckReport::default();
+    let mut report = EntriesCheckReport::default();
     let deployment = DeploymentKey::new(1, &[0x5a; 32]);
     let limit = std::env::var("PAGES_LIMIT")
         .ok()
