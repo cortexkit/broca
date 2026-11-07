@@ -1692,6 +1692,51 @@ async fn idle_read_flush_failure_hides_the_unproven_tail() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+#[tokio::test]
+async fn idle_read_flush_failure_keeps_the_verified_materialized_prefix() {
+    let (rig, _) = Rig::with_counting_zero_ranges("flush-failure-prefix");
+    let key = rig.key("flush-failure-prefix");
+    append_seed(
+        &rig.wal_store,
+        &key,
+        &[
+            started(&key, "prefix", "proven prompt"),
+            assistant_text(0, "proven answer"),
+            finished_ok(),
+        ],
+    );
+    materialize_all(&rig, &key);
+    append_seed(
+        &rig.wal_store,
+        &key,
+        &[started(&key, "tail", "must stay hidden")],
+    );
+    let flushes = Arc::new(AtomicUsize::new(0));
+    let reader = Arc::new(FlushCountingWalStore {
+        inner: rig.wal_store.clone(),
+        flushes: flushes.clone(),
+        fail_flush: true,
+    });
+    let opener = Arc::new(DefaultOpener::new(
+        Arc::new(FileLeaseStore::new(rig.dir.join("failure-leases"))),
+        rig.wal_store.clone(),
+        Arc::new(NoopExec),
+    ));
+    let registry = LineageRegistry::new_with_reader(opener, reader, Some(rig.store.clone()));
+    let page = registry
+        .route_read(&key, None, None)
+        .await
+        .expect("serve the verified prefix, not the unproven tail");
+    assert_eq!(page.messages.len(), 2);
+    for (message, text) in page.messages.iter().zip(["proven prompt", "proven answer"]) {
+        assert_eq!(
+            message.message.content,
+            vec![broca_protocol::ContentBlock::Text { text: text.into() }]
+        );
+    }
+    assert_eq!(flushes.load(Ordering::SeqCst), 1);
+}
+
 fn min_config() -> RunConfig {
     RunConfig {
         global_system: None,

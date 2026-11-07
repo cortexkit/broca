@@ -1226,6 +1226,7 @@ mod tests {
                 bytes.len() as u64 - boundary.frame_end,
             ),
         ];
+        let mut cursor_frames = Vec::new();
         let add_frame = |sources: &mut Vec<(&'static str, u64, u64)>, name, off| {
             let frame = positions
                 .iter()
@@ -1257,6 +1258,40 @@ mod tests {
             }
             let encoded: String = tx.query_row("SELECT locator_seed FROM session WHERE sid=?1", [&key], |r| r.get(0))?;
             let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+            // A stored head can precede TurnFinished. Cursor qualification reads
+            // its ToolBatchFinished payload within one indexed message span; legacy
+            // headers lack their own checksum, so their preceding payloads are read too.
+            if let Some(seq) = value[1]["qualified_control_head"][0].as_u64().filter(|seq| *seq < boundary.seq) {
+                for row in tx.prepare("SELECT lo_off,hi_off FROM message WHERE sid=?1 AND lo_seq<=?2 ORDER BY ord DESC LIMIT 1")?.query_map(params![key,seq], |r| Ok((r.get::<_,u64>(0)?,r.get::<_,u64>(1)?)))? {
+                    let (span_lo, span_hi) = row?;
+                    let (lo, hi, frame) = positions.iter().find(|(_,_,frame)| frame.seq == seq).unwrap();
+                    assert!(span_lo <= *lo as u64 && *hi as u64 <= span_hi);
+                    assert!(matches!(frame.record, WalRecord::ToolBatchFinished { .. }));
+                    let target_lo = *lo;
+                    let target_hi = *hi;
+                    let mut at = span_lo as usize;
+                    while at < target_hi {
+                        let consumed = match broca_wal::framing::decode_next(&bytes[at..target_hi]) {
+                            DecodeStep::Record { consumed, .. } | DecodeStep::Lineage { consumed, .. } => consumed,
+                            _ => panic!("invalid stored cursor span"),
+                        };
+                        let end = at + consumed;
+                        cursor_frames.push((at, end));
+                        let payload_len = u32::from_le_bytes(bytes[at..at+4].try_into().unwrap()) as u64;
+                        let header_len = consumed as u64 - payload_len;
+                        sources.push(("stored cursor header", at as u64, broca_wal::framing::HEADER_LEN as u64));
+                        if header_len > broca_wal::framing::HEADER_LEN as u64 {
+                            sources.push(("stored cursor header extension", at as u64 + broca_wal::framing::HEADER_LEN as u64, header_len - broca_wal::framing::HEADER_LEN as u64));
+                        }
+                        if at == target_lo || bytes[at + 4] != broca_wal::framing::V4_FRAMING_VERSION {
+                            let name = if at == target_lo { "stored cursor target payload" } else { "stored cursor preceding payload" };
+                            sources.push((name, end as u64 - payload_len, payload_len));
+                        }
+                        at = end;
+                    }
+                    assert_eq!(at, target_hi);
+                }
+            }
             if let Some(off) = value[1]["episode"]["last_step_off"].as_u64() { sources.push(("current last step header",off,broca_wal::framing::HEADER_LEN as u64)); add_frame(&mut sources,"current last step",off); }
             if let Some(off) = value[1]["title_off"].as_u64() {
                 sources.push(("title header",off,broca_wal::framing::HEADER_LEN as u64)); add_frame(&mut sources,"title source",off);
@@ -1275,7 +1310,10 @@ mod tests {
                     .iter()
                     .find(|(_, off, len)| (*off, *len) == (read.offset, read.length))
                     .map(|(name, _, _)| *name)
-                    .unwrap_or_else(|| panic!("unlisted source: {:?}", read)),
+                    .unwrap_or_else(|| {
+                        let overlapping: Vec<_> = positions.iter().filter(|(lo, hi, _)| *lo as u64 <= read.offset && read.offset < *hi as u64).map(|(lo, hi, frame)| (*lo, *hi, frame.seq)).collect();
+                        panic!("unlisted source: {read:?}; boundary={}; frame={overlapping:?}; allowed={sources:?}", boundary.seq)
+                    }),
                 ReadClass::LineageHeader => {
                     assert_eq!(
                         (read.offset, read.length),
@@ -1311,6 +1349,36 @@ mod tests {
             *named_counts.entry(name).or_insert(0) += 1;
             if name == "row cursor" {
                 decodes += 1;
+                continue;
+            }
+            if matches!(
+                name,
+                "stored cursor header" | "stored cursor header extension"
+            ) {
+                continue;
+            }
+            if matches!(
+                name,
+                "stored cursor target payload" | "stored cursor preceding payload"
+            ) {
+                let (lo, hi) = cursor_frames
+                    .iter()
+                    .find(|(lo, hi)| {
+                        let len =
+                            u32::from_le_bytes(bytes[*lo..*lo + 4].try_into().unwrap()) as u64;
+                        (*hi as u64 - len, len) == (read.offset, read.length)
+                    })
+                    .unwrap();
+                assert!(
+                    matches!(broca_wal::framing::decode_next(&bytes[*lo..*hi]), DecodeStep::Record { consumed, .. } | DecodeStep::Lineage { consumed, .. } if consumed == hi - lo)
+                );
+                decodes += 1;
+                // Legacy payload verification precedes the target frame's kind check.
+                if name == "stored cursor target payload"
+                    && bytes[*lo + 4] != broca_wal::framing::V4_FRAMING_VERSION
+                {
+                    decodes += 1;
+                }
                 continue;
             }
             let mut at = read.offset as usize;

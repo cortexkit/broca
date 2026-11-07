@@ -18,6 +18,7 @@ fn turn_system_writer_serializer_requires_reader_support_and_preserves_legacy_by
     );
     message.turn_system = true;
     let delivered = WalRecord::SendDelivered {
+        ride: None,
         written_at_ms: None,
         tags: None,
         submission_id: SubmissionId("note".into()),

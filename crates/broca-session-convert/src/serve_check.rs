@@ -387,7 +387,12 @@ pub(super) fn run(args: &Args) {
                 continue;
             }
             report.sends += 1;
-            let today = reply(todays::send_status(&old, RunId(own_run.clone()), send_id));
+            let today = reply(todays::send_status(
+                &old,
+                old.lineage_id,
+                RunId(own_run.clone()),
+                send_id,
+            ));
             let store = reply(block_on(reader.send_status(
                 &view,
                 RunId(own_run.clone()),

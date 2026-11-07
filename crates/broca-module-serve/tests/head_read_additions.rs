@@ -50,7 +50,11 @@ fn capture_known_with_run(frame: &subc_protocol::Frame, name: &str, run: Option<
         result(frame)
     );
     let answer = result(frame);
-    let mut bytes = String::from_utf8(frame.body.clone()).unwrap();
+    // Cursor binding adds an incarnation and a frame digest, not a message-byte change.
+    let mut bytes = delivery_rig::normalize_cursor_digests(
+        &frame.body,
+        answer["incarnation"].as_str().unwrap_or(""),
+    );
     for field in ["lineage_id", "incarnation"] {
         if let Some(value) = answer[field].as_str() {
             bytes = bytes.replace(
@@ -797,6 +801,8 @@ async fn responses_summary_and_completion_are_display_only_with_stable_bytes_and
     let history = rig
         .request(7, json!({"method":"session.history","params":{}}))
         .await;
+    // llm-runner 0.8.11 §4.2: raw history carries sender; history has no display-facts flag.
+    assert_eq!(result(&history)["messages"][0]["sender"], "owner");
     capture_known(
         &history,
         "session_history.responses_before_display_facts.json",
@@ -814,6 +820,12 @@ async fn responses_summary_and_completion_are_display_only_with_stable_bytes_and
     let opted = rig.request(7, json!({"method":"session.read","params":{"media":"descriptors","include_display_facts":true}})).await;
     capture_runner_display_sample("session.read.display_facts.json", &opted);
     let body = result(&opted);
+    assert_eq!(body["messages"][0]["sender"], "owner");
+    assert!(result(&descriptors)["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|entry| entry.get("sender").is_none()));
     let assistant = &body["messages"][1];
     assert_eq!(
         assistant["reasoning_summaries"],
@@ -823,6 +835,8 @@ async fn responses_summary_and_completion_are_display_only_with_stable_bytes_and
     assert!(body["messages"][0].get("completed_at").is_none());
     assert!(body["messages"][0].get("reasoning_summaries").is_none());
     let mut stripped = String::from_utf8(opted.body.clone()).unwrap();
+    assert_eq!(stripped.matches("\"sender\":\"owner\",").count(), 1);
+    stripped = stripped.replacen("\"sender\":\"owner\",", "", 1);
     stripped = stripped.replace(",\"completed_at\":505", "");
     stripped = stripped.replace(
         ",\"reasoning_summaries\":[{\"part\":1,\"text\":\"I checked the arithmetic.\"}]",
@@ -864,16 +878,24 @@ async fn created_at_uses_recorded_acceptance_and_request_send_time_only_when_opt
     let opted = rig.request(7, json!({"method":"session.read","params":{"media":"descriptors","include_display_facts":true}})).await;
     capture_runner_display_sample("session.read.created_at.json", &opted);
     let answer = result(&opted);
+    assert_eq!(answer["messages"][0]["sender"], "owner");
+    assert!(result(&plain)["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|entry| entry.get("sender").is_none()));
     assert_eq!(answer["messages"][0]["created_at"], 250);
     assert_eq!(answer["messages"][0]["written_at"], 250);
     assert_eq!(answer["messages"][1]["created_at"], 600);
     assert_eq!(answer["messages"][1]["written_at"], 505);
     assert_eq!(answer["messages"][1]["completed_at"], 505);
     let mut stripped = String::from_utf8(opted.body.clone()).unwrap();
+    assert_eq!(stripped.matches("\"sender\":\"owner\",").count(), 1);
     for field in [
         ",\"created_at\":250",
         ",\"created_at\":600",
         ",\"completed_at\":505",
+        "\"sender\":\"owner\",",
     ] {
         stripped = stripped.replace(field, "");
     }

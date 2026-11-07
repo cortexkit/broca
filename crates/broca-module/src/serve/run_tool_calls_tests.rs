@@ -385,6 +385,7 @@ async fn run_tool_calls_pages_by_count_and_reads_a_closed_session_from_wal_only(
 async fn run_tool_calls_lists_duplicate_id_with_its_synthetic_error_result() {
     let mut session = ClosedSession::new("duplicate-id");
     session.write_duplicate_id_tool_turn();
+    let lineage = session.wal.as_ref().unwrap().lineage_id().unwrap();
     session.finish();
     session.close_writer();
 
@@ -393,14 +394,14 @@ async fn run_tool_calls_lists_duplicate_id_with_its_synthetic_error_result() {
     assert_eq!(page.calls[0].tool_call_id, "duplicate-id");
     assert_eq!(page.calls[0].args, json!({"path":"first"}));
     assert_eq!(page.calls[0].outcome, outcomes::SUCCEEDED);
-    assert!(page.calls[0].call_key.is_some());
+    assert_eq!(page.calls[0].call_key, Some(format!("{lineage}:4")));
     assert_eq!(page.calls[0].dispatched_to.as_deref(), Some("test-tools"));
 
     let duplicate = &page.calls[1];
     assert_eq!(duplicate.tool_call_id, "duplicate-id");
     assert_eq!(duplicate.args, json!({"path":"duplicate"}));
     assert_eq!(duplicate.outcome, outcomes::REFUSED);
-    assert!(duplicate.call_key.is_none());
+    assert_eq!(duplicate.call_key, Some(format!("{lineage}:6")));
     assert!(duplicate.dispatched_to.is_none());
     assert!(duplicate.result_bytes.is_some_and(|bytes| bytes > 0));
 }

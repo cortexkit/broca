@@ -138,10 +138,12 @@ pub fn run_result(
 }
 
 /// `send.status` for the send `send_id` whose run id is `own_run`, asked with no principal.
+/// `lineage` is the log's lineage id, as today's serve path reads it with the records.
 pub fn send_status(
     records: &[FramedRecord],
+    lineage: Option<broca_wal::WalLineageId>,
     own_run: RunId,
     send_id: &str,
 ) -> Result<broca_wire::SendReplyWire, ServeError> {
-    crate::serve::send_status_of_records(records.to_vec(), own_run, send_id, None)
+    crate::serve::send_status_of_records(records.to_vec(), lineage, own_run, send_id, None)
 }

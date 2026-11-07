@@ -795,6 +795,11 @@ pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
         scope: admission.send.scope.as_ref(),
     };
     let journal = StoreJournal::new(writer, &seams.bind);
+    // The store records no ride envelope yet, so every delivered notice renders the way a
+    // delivery recorded before envelopes existed does, as `render::prompt` and
+    // `render::deliveries_only` render them here. That is also what today's loop renders while
+    // its envelope writer (`RIDES_V2_WRITER_ENABLED`) is off.
+    let rides = v2::entries::RideEnvelopes::default();
     let prepared = v2::request::prepare(
         &ctx.session.state,
         &ctx.session.runtime,
@@ -804,6 +809,7 @@ pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
             step,
             preset: &ctx.preset,
             entries: &entries,
+            rides: &rides,
             stored: &opts.prompt,
             conditions: &conditions,
             previous: previous.as_ref(),
