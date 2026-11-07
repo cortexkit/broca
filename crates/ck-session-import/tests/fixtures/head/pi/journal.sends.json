@@ -7,7 +7,7 @@
   "delivered_as": "idle_start"
  },
  {
-  "call_key": "pi-ses/e2/tc1",
+  "call_key": "e2/tc1",
   "send_id": "pi-send-2",
   "sender": "occi",
   "delivered_as": "tool_result",

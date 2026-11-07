@@ -1566,3 +1566,257 @@ async fn a_view_naming_800_sealed_messages_reads_them_once() {
     )
     .unwrap();
 }
+
+/// One of Thalamus's published exports (`ck-session-import`'s `thalamus-export-v1` fixtures),
+/// imported through `session.import` into a new session: the reply, the session as a reload
+/// finds it, and Thalamus's own export reply.
+async fn import_thalamus(
+    dir: &str,
+    journal: &str,
+    harness: ImportHarness,
+    session: &str,
+) -> (
+    FileImportReply,
+    Session<&'static MemoryBackend>,
+    serde_json::Value,
+) {
+    let fixture = |name: &str| {
+        std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../ck-session-import/tests/fixtures/thalamus-export-v1")
+                .join(dir)
+                .join(name),
+        )
+        .unwrap()
+    };
+    let export: serde_json::Value = serde_json::from_slice(&fixture("reply.json")).unwrap();
+    let backend: &'static MemoryBackend = Box::leak(Box::default());
+    let source = Source::of(dir, fixture(journal), Some(fixture("export.sends.json")));
+    let mut params = source.params("imp-thalamus");
+    params.source.harness = harness;
+    params.source.session = session.into();
+    params.source.sha256 = export["sha256"].as_str().unwrap().into();
+    params.tag_floor = export["tag_floor"].as_u64();
+    let (commands, served) = serve(create(backend).await.unwrap());
+    let reply = imported(ask(&commands, source.import(params)).await);
+    drop(commands);
+    served.await.unwrap();
+    assert!(
+        !source.dir.join("head.sends.json").exists(),
+        "the side file is gone"
+    );
+    (reply, load(backend).await.unwrap(), export)
+}
+
+/// What every imported export must show: the newest imported message is the one Thalamus's
+/// reply names, and it is the last row the move list places; the first message's parts are
+/// numbered from the reply's `tag_floor`, and each later message's parts after the earlier
+/// messages' parts.
+async fn newest_and_floor(
+    reply: &FileImportReply,
+    session: &Session<&'static MemoryBackend>,
+    export: &serde_json::Value,
+) -> Vec<broca_session_store::session::StoredEntry> {
+    let placed = session.conversation.placed;
+    assert_eq!(placed, reply.imported_messages);
+    let entries = session.entries(1, placed as usize).await.unwrap();
+    let newest = export["newest_mid"].as_str().unwrap();
+    assert_eq!(
+        entries.last().unwrap().state.facts.as_ref().unwrap().mid,
+        newest
+    );
+    let last_placed = reply
+        .moves
+        .rows
+        .iter()
+        .rev()
+        .find(|row| row.entry.is_some())
+        .unwrap();
+    assert_eq!(
+        (last_placed.mid.as_str(), last_placed.entry),
+        (newest, Some(placed))
+    );
+    let bases: Vec<u64> = entries
+        .iter()
+        .map(|entry| entry.state.facts.as_ref().unwrap().tag_base)
+        .collect();
+    assert_eq!(bases[0], export["tag_floor"].as_u64().unwrap());
+    assert!(bases.windows(2).all(|pair| pair[0] <= pair[1]), "{bases:?}");
+    assert!(bases.last().unwrap() > &bases[0], "{bases:?}");
+    entries
+}
+
+/// OpenCode 2.2.3's real export imports whole: its move list, its newest message, its parts
+/// numbered from `tag_floor`, and every side-file send as reads serve broca's own: the ride's
+/// delivered text on its call, the second turn's client message id and marks, and the note's
+/// template as its notice.
+#[tokio::test]
+async fn thalamus_opencode2_export_imports_into_the_store() {
+    let (reply, session, export) = import_thalamus(
+        "opencode2",
+        "export.json",
+        ImportHarness::OpenCode2,
+        "ses_a0ba61c714d844b0af1d9c52d4135091",
+    )
+    .await;
+    let rows: Vec<_> = reply
+        .moves
+        .rows
+        .iter()
+        .map(|row| (row.mid.as_str(), row.entry))
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            ("msg_1b49586aa0016EUiZetDheU1f4", Some(1)),
+            ("msg_1b49586f1001rVgZgzWdeKZmu8", Some(2)),
+            ("msg_1b49587f10010uHhgvansXbRF1", Some(4)),
+            ("msg_1b495900c001DES0ba9sPPASsN", Some(5)),
+            ("msg_1b49591470019dpMEsZc2WOTUW", Some(6)),
+            ("msg_1b495915a001xOIirlVXwIIakW", Some(7)),
+            ("msg_1b4959296001mKWG88czxOfO3s", Some(8)),
+            ("msg_1b49592a7001zLB2AYW13z4J7F", Some(9)),
+            ("msg_1b495955f001hVi7sIosw8140K", Some(10)),
+            ("msg_1b495957b001zk2Vzqz0lhIKBJ", Some(11)),
+            ("msg_1b49595fe001dZGvbH2E283JZ2", Some(13)),
+        ]
+    );
+    assert_eq!(reply.dropped_system_messages, 0);
+    let entries = newest_and_floor(&reply, &session, &export).await;
+    for (mid, ordinal) in rows
+        .iter()
+        .filter_map(|(mid, entry)| Some((*mid, (*entry)?)))
+    {
+        assert_eq!(session.find_message(mid).await.unwrap(), Some(ordinal));
+    }
+
+    let call = crate::store_read::display_facts(&entries[1]);
+    assert_eq!(
+        call.calls[0].call_key,
+        "msg_1b49586f1001rVgZgzWdeKZmu8/call_probe"
+    );
+    assert_eq!(
+        call.calls[0].call_carrier.as_deref(),
+        Some("thalamus-harness")
+    );
+    let ride = &call.notices[0];
+    assert_eq!(
+        (
+            ride.call_key.as_deref(),
+            ride.send_id.as_deref(),
+            ride.sender.as_deref(),
+            ride.text.as_str()
+        ),
+        (
+            Some("msg_1b49586f1001rVgZgzWdeKZmu8/call_probe"),
+            Some("ride"),
+            Some("magic-context"),
+            "RIDE_TEXT"
+        )
+    );
+    let first = crate::store_read::display_facts(&entries[0]);
+    assert_eq!(first.sender.as_deref(), Some("prefrontal-core"));
+    assert_eq!(entries[0].state.facts.as_ref().unwrap().notice, None);
+    let second = crate::store_read::display_facts(&entries[5]);
+    assert_eq!(second.client_message_id.as_deref(), Some("cmid-2"));
+    assert_eq!(
+        second.speaks_for,
+        Some(serde_json::json!({"agent_id": "agent-7"}))
+    );
+    let note = &entries[7];
+    let notice = note.state.facts.as_ref().unwrap().notice.clone().unwrap();
+    assert_eq!(
+        (notice.sender.as_str(), notice.template.as_deref()),
+        ("magic-context", Some("note"))
+    );
+    assert!(crate::store_read::display_facts(note).notice);
+    assert_eq!(
+        note.state.facts.as_ref().unwrap().delivery_mode.as_deref(),
+        Some("idle_start")
+    );
+    assert_eq!(
+        entries[3]
+            .state
+            .facts
+            .as_ref()
+            .unwrap()
+            .delivery_mode
+            .as_deref(),
+        Some("steer")
+    );
+}
+
+/// Pi 1.5.0's real journal imports whole: its system entry dropped and listed with no entry,
+/// its newest message, its parts numbered from `tag_floor`, its call keyed
+/// `<entry id>/<toolCall id>` as Thalamus's runner keyed it, the reminder delivered with that
+/// call's result, and the note's template as its notice.
+#[tokio::test]
+async fn thalamus_pi_export_imports_into_the_store() {
+    let (reply, session, export) = import_thalamus(
+        "pi",
+        "export.jsonl",
+        ImportHarness::Pi,
+        "01a1b49a-6d6e-7506-bfaa-62da1e6cef3d",
+    )
+    .await;
+    let ids = [
+        "213ff4e5", "c62f7305", "1a089c7d", "daee0155", "b951b5cb", "62c953eb", "07b9345b",
+        "a6909356", "93de564a", "5a2aaef2", "9c4dddb3", "fd58b6d7",
+    ];
+    let rows: Vec<_> = reply
+        .moves
+        .rows
+        .iter()
+        .map(|row| (row.mid.as_str(), row.entry))
+        .collect();
+    let mut expected = vec![("9d881624", None)];
+    expected.extend(
+        ids.iter()
+            .enumerate()
+            .map(|(at, id)| (*id, Some(at as u64 + 1))),
+    );
+    assert_eq!(rows, expected);
+    assert_eq!(reply.dropped_system_messages, 1);
+    let entries = newest_and_floor(&reply, &session, &export).await;
+    for (at, id) in ids.iter().enumerate() {
+        assert_eq!(session.find_message(id).await.unwrap(), Some(at as u64 + 1));
+    }
+
+    let call = crate::store_read::display_facts(&entries[1]);
+    assert_eq!(call.calls[0].call_key, "c62f7305/call_probe_1");
+    assert_eq!(call.calls[0].call_carrier.as_deref(), Some("thalamus-pi"));
+    let ride = &call.notices[0];
+    assert_eq!(
+        (
+            ride.call_key.as_deref(),
+            ride.send_id.as_deref(),
+            ride.sender.as_deref(),
+            ride.text.as_str()
+        ),
+        (
+            Some("c62f7305/call_probe_1"),
+            Some("ride"),
+            Some("notifier"),
+            "RIDE_REMINDER"
+        )
+    );
+    let note = &entries[6];
+    let notice = note.state.facts.as_ref().unwrap().notice.clone().unwrap();
+    assert_eq!(
+        (notice.sender.as_str(), notice.template.as_deref()),
+        ("notifier", Some("note"))
+    );
+    assert!(crate::store_read::display_facts(note).notice);
+    let second = crate::store_read::display_facts(&entries[4]);
+    assert_eq!(second.client_message_id.as_deref(), Some("cmid-2"));
+    assert_eq!(
+        entries[10]
+            .state
+            .facts
+            .as_ref()
+            .unwrap()
+            .delivery_mode
+            .as_deref(),
+        Some("steer")
+    );
+}

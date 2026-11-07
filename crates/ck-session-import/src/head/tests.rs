@@ -439,7 +439,7 @@ fn pi_calls_keep_their_runner_keys_and_reasoning_drops_its_signature() {
             signature: None
         }
     );
-    assert_eq!(assistant.calls[0].call_key, "pi-ses/e2/tc1");
+    assert_eq!(assistant.calls[0].call_key, "e2/tc1");
     assert_eq!(assistant.calls[0].carrier, "thalamus-pi");
     assert_eq!(
         assistant.usage,
@@ -749,4 +749,245 @@ fn pi_refuses_a_result_for_a_skipped_turns_call() {
         error.to_string().contains("errored or was aborted"),
         "{error}"
     );
+}
+
+/// A file of Thalamus's published exports (`tests/fixtures/thalamus-export-v1`).
+fn thalamus(path: &str) -> Vec<u8> {
+    std::fs::read(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/thalamus-export-v1")
+            .join(path),
+    )
+    .unwrap()
+}
+
+/// Every file of Thalamus's published exports is the one its checksum names.
+#[test]
+fn thalamus_exports_match_their_checksums() {
+    let sums = String::from_utf8(thalamus("SHA256SUMS")).unwrap();
+    let mut checked = 0;
+    for line in sums.lines().filter(|line| !line.is_empty()) {
+        let (digest, path) = line.split_once("  ").unwrap();
+        assert_eq!(
+            format!("{:x}", Sha256::digest(thalamus(path))),
+            digest,
+            "{path}"
+        );
+        checked += 1;
+    }
+    assert_eq!(checked, 6);
+}
+
+/// The history a published export imports as: the reader, then its side file.
+fn thalamus_history(dir: &str, journal: &str, session: Option<&str>) -> (HeadHistory, Value) {
+    let bytes = thalamus(&format!("{dir}/{journal}"));
+    let reply: Value = serde_json::from_slice(&thalamus(&format!("{dir}/reply.json"))).unwrap();
+    assert_eq!(
+        reply["sha256"],
+        format!("{:x}", Sha256::digest(&bytes)),
+        "the reply names its file's digest"
+    );
+    let mut history = match session {
+        None => opencode2::read(&bytes, &mut accept).unwrap(),
+        Some(session) => pi::read(&bytes, session, &mut accept).unwrap(),
+    };
+    let rows = read_sends(&thalamus(&format!("{dir}/export.sends.json"))).unwrap();
+    apply_sends(&mut history, rows).unwrap();
+    (history, reply)
+}
+
+fn send_of<'a>(history: &'a HeadHistory, mid: &str) -> &'a SendFacts {
+    history
+        .messages
+        .iter()
+        .find(|message| message.mid.as_deref() == Some(mid))
+        .and_then(|message| message.send.as_ref())
+        .unwrap_or_else(|| panic!("no send on {mid}"))
+}
+
+/// OpenCode 2.2.3's real export: each message keeps its source id, a call's results come as a
+/// message broca names itself, the export's `idle` rows (a turn's end, with no message) have
+/// no move-list row, and the newest message is the one the reply names. The side file's sends
+/// land on their messages, the ride on its call's results.
+#[test]
+fn thalamus_opencode2_export_reads_as_recorded() {
+    let (history, reply) = thalamus_history("opencode2", "export.json", None);
+    let ids = [
+        "msg_1b49586aa0016EUiZetDheU1f4",
+        "msg_1b49586f1001rVgZgzWdeKZmu8",
+        "msg_1b49587f10010uHhgvansXbRF1",
+        "msg_1b495900c001DES0ba9sPPASsN",
+        "msg_1b49591470019dpMEsZc2WOTUW",
+        "msg_1b495915a001xOIirlVXwIIakW",
+        "msg_1b4959296001mKWG88czxOfO3s",
+        "msg_1b49592a7001zLB2AYW13z4J7F",
+        "msg_1b495955f001hVi7sIosw8140K",
+        "msg_1b495957b001zk2Vzqz0lhIKBJ",
+        "msg_1b49595fe001dZGvbH2E283JZ2",
+    ];
+    assert_eq!(
+        mids(&history),
+        [
+            Some(ids[0]),
+            Some(ids[1]),
+            None,
+            Some(ids[2]),
+            Some(ids[3]),
+            Some(ids[4]),
+            Some(ids[5]),
+            Some(ids[6]),
+            Some(ids[7]),
+            Some(ids[8]),
+            Some(ids[9]),
+            None,
+            Some(ids[10]),
+        ]
+    );
+    assert_eq!(
+        moves(&history),
+        [
+            (ids[0], Some(0)),
+            (ids[1], Some(1)),
+            (ids[2], Some(3)),
+            (ids[3], Some(4)),
+            (ids[4], Some(5)),
+            (ids[5], Some(6)),
+            (ids[6], Some(7)),
+            (ids[7], Some(8)),
+            (ids[8], Some(9)),
+            (ids[9], Some(10)),
+            (ids[10], Some(12)),
+        ]
+    );
+    assert_eq!(history.dropped_system_messages, 0);
+    assert_eq!(
+        history.messages.last().unwrap().mid.as_deref(),
+        reply["newest_mid"].as_str()
+    );
+    assert_eq!(
+        reply["messages"], 15,
+        "rows the export holds, idle ones too"
+    );
+    let keys: Vec<(&str, &str)> = history
+        .messages
+        .iter()
+        .flat_map(|message| &message.calls)
+        .map(|call| (call.call_key.as_str(), call.carrier.as_str()))
+        .collect();
+    assert_eq!(
+        keys,
+        [
+            (
+                "msg_1b49586f1001rVgZgzWdeKZmu8/call_probe",
+                "thalamus-harness"
+            ),
+            (
+                "msg_1b495957b001zk2Vzqz0lhIKBJ/call_each",
+                "thalamus-harness"
+            ),
+        ]
+    );
+
+    let first = send_of(&history, ids[0]);
+    assert_eq!(
+        (first.sender.as_str(), first.delivery_mode.as_deref()),
+        ("prefrontal-core", None),
+        "a queued send has no delivery mode, as broca's own queued sends have none"
+    );
+    let steer = send_of(&history, ids[2]);
+    assert_eq!(steer.delivery_mode.as_deref(), Some("steer"));
+    let second = send_of(&history, ids[4]);
+    assert_eq!(second.client_message_id.as_deref(), Some("cmid-2"));
+    assert_eq!(
+        second.marks,
+        Some(json!({"speaks_for": {"agent_id": "agent-7"}}))
+    );
+    let note = send_of(&history, ids[6]);
+    assert_eq!(
+        (
+            note.sender.as_str(),
+            note.template.as_deref(),
+            note.delivery_mode.as_deref()
+        ),
+        ("magic-context", Some("note"), Some("idle_start"))
+    );
+    assert_eq!(note.marks, Some(json!({"notice": true})));
+    let rides = &history.messages[2].rides;
+    assert_eq!(rides.len(), 1);
+    assert_eq!(
+        (
+            rides[0].send_id.as_str(),
+            rides[0].sender.as_str(),
+            rides[0].text.as_deref(),
+            rides[0].delivery_tool_call_id.as_deref()
+        ),
+        (
+            "ride",
+            "magic-context",
+            Some("RIDE_TEXT"),
+            Some("call_probe")
+        )
+    );
+}
+
+/// Pi 1.5.0's real journal: each message keeps its entry id, the system entry is dropped and
+/// counted, the reply that stopped to use tools keys its call `<entry id>/<toolCall id>`
+/// verbatim, the note arrives as a custom message, and the newest message is the one the reply
+/// names.
+#[test]
+fn thalamus_pi_export_reads_as_recorded() {
+    let (history, reply) = thalamus_history(
+        "pi",
+        "export.jsonl",
+        Some("01a1b49a-6d6e-7506-bfaa-62da1e6cef3d"),
+    );
+    let ids = [
+        "213ff4e5", "c62f7305", "1a089c7d", "daee0155", "b951b5cb", "62c953eb", "07b9345b",
+        "a6909356", "93de564a", "5a2aaef2", "9c4dddb3", "fd58b6d7",
+    ];
+    assert_eq!(mids(&history), ids.map(Some));
+    let mut expected = vec![("9d881624", None)];
+    expected.extend(ids.iter().enumerate().map(|(at, id)| (*id, Some(at))));
+    assert_eq!(moves(&history), expected);
+    assert_eq!(history.dropped_system_messages, 1);
+    assert_eq!(
+        history.messages.last().unwrap().mid.as_deref(),
+        reply["newest_mid"].as_str()
+    );
+    let calls = &history.messages[1].calls;
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].call_key, "c62f7305/call_probe_1");
+    assert_eq!(calls[0].carrier, "thalamus-pi");
+    assert_eq!(history.messages[6].message.role, Role::User);
+    assert_eq!(texts(&history.messages[6]), ["NOTE 3"]);
+
+    let rides = &history.messages[2].rides;
+    assert_eq!(rides.len(), 1);
+    assert_eq!(
+        (
+            rides[0].send_id.as_str(),
+            rides[0].sender.as_str(),
+            rides[0].text.as_deref()
+        ),
+        ("ride", "notifier", Some("RIDE_REMINDER"))
+    );
+    let note = send_of(&history, ids[6]);
+    assert_eq!(
+        (
+            note.sender.as_str(),
+            note.template.as_deref(),
+            note.delivery_mode.as_deref()
+        ),
+        ("notifier", Some("note"), Some("idle_start"))
+    );
+    assert_eq!(note.marks, Some(json!({"notice": true})));
+    assert_eq!(
+        send_of(&history, ids[4]).client_message_id.as_deref(),
+        Some("cmid-2")
+    );
+    assert_eq!(
+        send_of(&history, ids[10]).delivery_mode.as_deref(),
+        Some("steer")
+    );
+    assert_eq!(send_of(&history, ids[8]).delivery_mode.as_deref(), None);
 }
