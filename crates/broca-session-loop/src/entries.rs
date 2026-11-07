@@ -13,11 +13,16 @@
 //!   view the step rendered with.
 //! - **Time:** the message's own time, else the nearest earlier entry's.
 
+use std::collections::HashMap;
+
 use broca_core::compaction_v2::metadata::{numbered_parts, step_usage};
-use broca_protocol::content::{Message, Role};
+use broca_protocol::content::{ContentBlock, Message, Role};
+use broca_protocol::ToolCallId;
 use broca_session_store::fold::conversation::Conversation;
 use broca_session_store::fold::operations::Operations;
-use broca_session_store::record::{EntryFacts, Notice, Placement, Record, StepUsage, ViewRef};
+use broca_session_store::record::{
+    CallFacts, EntryFacts, Notice, Placement, Record, StepUsage, ToolIntent, TurnFacts, ViewRef,
+};
 use broca_session_store::session::{SessionError, StoredEntry};
 use cortexkit_role_compaction::read::Entry;
 
@@ -26,11 +31,54 @@ use crate::writer::Writer;
 /// A writer that adds entry facts to every batch it appends, so no place in the loop that
 /// writes a message can forget them. Every session records them: `session.read` serves each
 /// message from them. Only a session on the current compaction contract records the facts
-/// `session.entries` serves (see [`Tags::entries`]).
+/// `session.entries` serves (see [`Tags::entries`]). The batch that places a tool turn's results
+/// also records the turn's facts ([`turn_facts`]).
 pub struct Placed<'w, W> {
     pub inner: &'w mut W,
     /// The run's tag rules.
     pub facts: Tags,
+    /// The dispatch intents of the open batch's calls, as far as this writer has seen them
+    /// appended or looked them up.
+    pub intents: Intents,
+}
+
+/// Dispatch intents by the call key each recorded. A tool turn's facts name, for each call, the
+/// key and module its intent recorded, which the operational fold doesn't keep: it keeps only
+/// that an intent was recorded, and its key.
+#[derive(Debug, Default)]
+pub struct Intents(HashMap<String, ToolIntent>);
+
+impl<W: Writer> Placed<'_, W> {
+    /// Learns the intent of every call of the open batch that has one and isn't known yet: those
+    /// written before this writer was made (by a run a resume continues, say). A call's intent
+    /// may already be sealed, so it's found through the session's id lookup.
+    async fn learn_open_intents(&mut self) -> Result<(), SessionError> {
+        let missing: Vec<String> = self
+            .inner
+            .operations()
+            .run
+            .as_ref()
+            .and_then(|run| run.open_batch.as_ref())
+            .map(|batch| {
+                // A call answered without an intent has its outcome's key, and no intent.
+                batch
+                    .calls
+                    .iter()
+                    .filter(|call| call.intent)
+                    .filter_map(|call| call.key.as_deref())
+                    .filter(|key| !self.intents.0.contains_key(*key))
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        for key in missing {
+            let intent = self.inner.tool_intent(&key).await?.ok_or_else(|| {
+                SessionError::Fold(format!("no dispatch intent records the call key {key}"))
+            })?;
+            self.intents.0.insert(key, intent);
+        }
+        Ok(())
+    }
 }
 
 /// The view a model-written message was written under, as today's projection decides it: the
@@ -44,21 +92,26 @@ fn written_under(operations: &Operations) -> Option<ViewRef> {
 
 impl<W: Writer> Writer for Placed<'_, W> {
     async fn append(&mut self, records: &[Record], barrier: bool) -> Result<u64, SessionError> {
-        let tags = self.facts;
-        let prefix = self.inner.message_id_prefix();
-        let records = with_facts(
-            records.to_vec(),
-            &Placing {
-                conversation: self.inner.conversation(),
-                first_seq: self.inner.next_seq(),
-                prefix: &prefix,
-                tags,
-                view: written_under(self.inner.operations()),
-                operations: self.inner.operations(),
+        if records.is_empty() {
+            return self.inner.append(records, barrier).await;
+        }
+        // The facts name the seq of their own record (a message's id) and the ordinals the
+        // batch places, so they are decided under the writer's hold, from the folds and the
+        // first seq as they stand when the batch goes in. A writer the session actor shares
+        // (`ActorWriter`) may otherwise lag the records the actor appended since the run last
+        // saw the folds, such as a send queued while a model step was in flight, and every id
+        // in the batch would name the wrong record.
+        let batch = records.to_vec();
+        let mut first = None;
+        self.append_with(
+            &mut |_, _, first_seq| {
+                first = Some(first_seq);
+                batch.clone()
             },
+            barrier,
         )
-        .map_err(SessionError::Fold)?;
-        self.inner.append(&records, barrier).await
+        .await?;
+        first.ok_or_else(|| SessionError::Fold("a placed batch was never built".into()))
     }
 
     async fn send_records(&mut self, submission_id: &str) -> Result<Vec<Record>, SessionError> {
@@ -71,9 +124,11 @@ impl<W: Writer> Writer for Placed<'_, W> {
                   + Send),
         barrier: bool,
     ) -> Result<Vec<Record>, SessionError> {
+        self.learn_open_intents().await?;
         let tags = self.facts;
         let prefix = self.inner.message_id_prefix();
         let mut failure = None;
+        let intents = &self.intents;
         let records = self
             .inner
             .append_with(
@@ -86,6 +141,7 @@ impl<W: Writer> Writer for Placed<'_, W> {
                         tags,
                         view: written_under(operations),
                         operations,
+                        intents,
                     };
                     match with_facts(batch, &placing) {
                         Ok(batch) => batch,
@@ -100,7 +156,16 @@ impl<W: Writer> Writer for Placed<'_, W> {
             .await?;
         match failure {
             Some(error) => Err(SessionError::Fold(error)),
-            None => Ok(records),
+            None => {
+                for record in &records {
+                    if let Record::ToolIntent(intent) = record {
+                        if let Some(key) = &intent.call_key {
+                            self.intents.0.insert(key.clone(), intent.clone());
+                        }
+                    }
+                }
+                Ok(records)
+            }
         }
     }
 
@@ -133,6 +198,10 @@ impl<W: Writer> Writer for Placed<'_, W> {
         run_id: &str,
     ) -> Result<Option<broca_session_store::record::RunStart>, SessionError> {
         self.inner.run_start(run_id).await
+    }
+
+    async fn tool_intent(&self, call_key: &str) -> Result<Option<ToolIntent>, SessionError> {
+        self.inner.tool_intent(call_key).await
     }
 
     async fn seal_at_entry(
@@ -252,6 +321,8 @@ pub struct Placing<'a> {
     /// The operational state before the batch: the step's request, the pending steers and the
     /// queue the batch's messages come from.
     pub operations: &'a Operations,
+    /// The intents of the open batch's calls, by call key.
+    pub intents: &'a Intents,
 }
 
 /// `batch` with an `EntryFacts` record after the records that place or reserve each message:
@@ -274,16 +345,101 @@ pub fn with_facts(batch: Vec<Record>, at: &Placing<'_>) -> Result<Vec<Record>, S
     // Who sent the input of a run started in this batch, read from its start as today's entry
     // metadata reads it from the run's start.
     let mut run_sender = None;
+    // The calls a dispatch intent anchored, before this batch and in it: their key is the
+    // intent's.
+    let mut dispatched: Vec<broca_protocol::ToolCallId> = at
+        .operations
+        .run
+        .as_ref()
+        .and_then(|run| run.open_batch.as_ref())
+        .map(|batch| {
+            batch
+                .calls
+                .iter()
+                .filter(|call| call.intent)
+                .map(|call| call.id.clone())
+                .collect()
+        })
+        .unwrap_or_default();
     let mut records = batch.into_iter().peekable();
-    while let Some(record) = records.next() {
+    // A tool turn this batch places: its assistant message's ordinal and the message. Its
+    // facts are written after the records that place it, once the closing reply's outcome
+    // (which may carry the key of a call answered without an intent) is in.
+    let mut placed_turn: Option<(u64, Message)> = None;
+    // The intents of the calls the open turn made, by call id: the open batch's, then those
+    // this batch records itself. A call id's first intent is the call's, as today's reads take it.
+    let mut intent_of: HashMap<ToolCallId, ToolIntent> = HashMap::new();
+    // The keys of the calls answered without an intent, which their outcomes recorded.
+    let mut outcome_key_of: HashMap<ToolCallId, String> = HashMap::new();
+    if let Some(batch) = at
+        .operations
+        .run
+        .as_ref()
+        .and_then(|run| run.open_batch.as_ref())
+    {
+        for call in &batch.calls {
+            let Some(key) = &call.key else {
+                continue;
+            };
+            if call.intent {
+                let intent = at.intents.0.get(key).ok_or_else(|| {
+                    format!("turn facts: the intent of call key {key} is unknown")
+                })?;
+                intent_of
+                    .entry(call.id.clone())
+                    .or_insert_with(|| intent.clone());
+            } else {
+                outcome_key_of
+                    .entry(call.id.clone())
+                    .or_insert_with(|| key.clone());
+            }
+        }
+    }
+    while let Some(mut record) = records.next() {
         if let Record::RunStart(start) = &record {
             run_sender = input_sender(start);
         }
+        match &mut record {
+            Record::BatchStart(_) => dispatched.clear(),
+            Record::ToolIntent(intent) => {
+                dispatched.push(intent.tool_call_id.clone());
+                intent_of
+                    .entry(intent.tool_call_id.clone())
+                    .or_insert_with(|| intent.clone());
+            }
+            // A call answered without a dispatch intent takes a key minted from the writer
+            // generation and the seq its outcome takes, in the form of the store's ids.
+            Record::ToolOutcome(outcome)
+                if outcome.call_key.is_none() && !dispatched.contains(&outcome.tool_call_id) =>
+            {
+                let key = format!("{}.{}", at.prefix, at.first_seq + out.len() as u64);
+                outcome_key_of
+                    .entry(outcome.tool_call_id.clone())
+                    .or_insert_with(|| key.clone());
+                outcome.call_key = Some(key);
+            }
+            Record::ToolOutcome(outcome) => {
+                if let Some(key) = &outcome.call_key {
+                    outcome_key_of
+                        .entry(outcome.tool_call_id.clone())
+                        .or_insert_with(|| key.clone());
+                }
+            }
+            _ => {}
+        }
         if record.stream() == broca_session_store::record::Stream::Transcript {
+            let open_turn = counts.open_tool_turn().cloned();
             counts
                 .apply(&record)
                 .map_err(|error| format!("entry facts: conversation {error:?}"))?;
             counts.clear_window();
+            if let (Some(assistant), Record::ToolReply(_), None) =
+                (&open_turn, &record, counts.open_tool_turn())
+            {
+                // The reply completed the turn, which placed the assistant message and then its
+                // results' message.
+                placed_turn = Some((counts.placed - 1, assistant.clone()));
+            }
             let now_known = known_of(&counts);
             for ordinal in known + 1..=now_known {
                 let (message, facts) = describe(&record, at, run_sender.as_ref())?;
@@ -354,9 +510,71 @@ pub fn with_facts(batch: Vec<Record>, at: &Placing<'_>) -> Result<Vec<Record>, S
             flush(&mut out, &mut pending, at);
             inserted = true;
         }
+        if !continues {
+            if let Some((ordinal, assistant)) = placed_turn.take() {
+                out.push(Record::TurnFacts(turn_facts(
+                    ordinal,
+                    &assistant,
+                    |id| intent_of.get(id),
+                    |id| outcome_key_of.get(id),
+                )));
+                inserted = true;
+            }
+        }
     }
     flush(&mut out, &mut pending, at);
+    if let Some((ordinal, assistant)) = placed_turn.take() {
+        out.push(Record::TurnFacts(turn_facts(
+            ordinal,
+            &assistant,
+            |id| intent_of.get(id),
+            |id| outcome_key_of.get(id),
+        )));
+    }
     Ok(out)
+}
+
+/// The facts of the tool turn whose assistant message, at `ordinal`, made the calls in
+/// `assistant`: for each call, in the order the message made them, its key and what its
+/// dispatch recorded. A dispatched call takes the key, module, schema pin and dispatch time its
+/// intent recorded (`intent_of`); a call answered without an intent (denied, invalid, synthetic,
+/// or refused with its batch) takes the key its outcome recorded (`outcome_key_of`) and nothing
+/// else. A call with neither has no facts. The call's finish time isn't recorded here: its
+/// result may have gone in with an earlier batch than the one that places the turn.
+pub fn turn_facts<'i>(
+    ordinal: u64,
+    assistant: &Message,
+    intent_of: impl Fn(&ToolCallId) -> Option<&'i ToolIntent>,
+    outcome_key_of: impl Fn(&ToolCallId) -> Option<&'i String>,
+) -> TurnFacts {
+    let calls = assistant
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::ToolCall(call) => match intent_of(&call.tool_call_id) {
+                Some(intent) => Some(CallFacts {
+                    tool_call_id: call.tool_call_id.clone(),
+                    call_key: intent.call_key.clone()?,
+                    schema_pin: intent.schema_pin.clone(),
+                    carrier: None,
+                    dispatched_to: intent.module_id.clone(),
+                    dispatched_at_ms: intent.dispatched_at_ms,
+                    finished_at_ms: None,
+                }),
+                None => Some(CallFacts {
+                    tool_call_id: call.tool_call_id.clone(),
+                    call_key: outcome_key_of(&call.tool_call_id)?.clone(),
+                    schema_pin: None,
+                    carrier: None,
+                    dispatched_to: None,
+                    dispatched_at_ms: None,
+                    finished_at_ms: None,
+                }),
+            },
+            _ => None,
+        })
+        .collect();
+    TurnFacts { ordinal, calls }
 }
 
 /// When an input message was accepted: a steer's or delivered send's acceptance, kept across

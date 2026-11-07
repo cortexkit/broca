@@ -477,7 +477,88 @@ pub(crate) fn apply_media_mode(
     Ok(())
 }
 
-pub(crate) fn session_read_response(
+/// Fills each message's `tool_calls`, and a tool result delivered as a send's carrier call key,
+/// from the dispatch facts of the tool turns the messages belong to, keyed by the 0-based ordinal
+/// of each turn's assistant message (`broca_core::dispatches_of_turns`). `lineage_id` is the
+/// log's, which a call's derived key names.
+pub fn apply_tool_call_dispatches(
+    response: &mut SessionReadResponse,
+    dispatches: &std::collections::BTreeMap<u64, Vec<broca_core::ToolCallDispatch>>,
+    lineage_id: &str,
+) {
+    let calls_of = |message: &broca_protocol::Message| -> Vec<String> {
+        message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                broca_protocol::content::ContentBlock::ToolCall(call) => {
+                    Some(call.tool_call_id.0.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    for message in &mut response.messages {
+        if let Some(carrier) = message
+            .run
+            .as_ref()
+            .and_then(|run| run.delivery.as_ref())
+            .and_then(|delivery| delivery.tool_call_id.as_ref())
+        {
+            if let Some(dispatch) = message
+                .ordinal
+                .checked_sub(2)
+                .and_then(|ordinal| dispatches.get(&ordinal))
+                .and_then(|calls| calls.iter().find(|call| &call.tool_call_id == carrier))
+            {
+                if let Some(receipt) = &mut message.delivered_as {
+                    receipt.call_key = dispatch.key_seq.or(dispatch.intent_seq).and_then(|seq| {
+                        broca_core::tool_call_key(
+                            Some(lineage_id),
+                            seq,
+                            dispatch.recorded_call_key.as_deref(),
+                        )
+                    });
+                }
+            }
+        }
+        let ids = calls_of(&message.message);
+        if ids.is_empty() {
+            continue;
+        }
+        message.tool_calls = match dispatches.get(&message.ordinal.saturating_sub(1)) {
+            // The step that produced this message holds exactly these calls: report them.
+            Some(found) if found.iter().map(|d| &d.tool_call_id).eq(ids.iter()) => found
+                .iter()
+                .map(|dispatch| broca_wire::SessionReadToolCall {
+                    tool_call_id: dispatch.tool_call_id.clone(),
+                    call_key: dispatch.key_seq.or(dispatch.intent_seq).and_then(|seq| {
+                        broca_core::tool_call_key(
+                            Some(lineage_id),
+                            seq,
+                            dispatch.recorded_call_key.as_deref(),
+                        )
+                    }),
+                    dispatched_to: dispatch.dispatched_to.clone(),
+                    indeterminate: dispatch.indeterminate,
+                })
+                .collect(),
+            // No recorded step produced this message (an imported one, say): report each
+            // call with no dispatch fact rather than guess one.
+            _ => ids
+                .into_iter()
+                .map(|tool_call_id| broca_wire::SessionReadToolCall {
+                    tool_call_id,
+                    call_key: None,
+                    dispatched_to: None,
+                    indeterminate: false,
+                })
+                .collect(),
+        };
+    }
+}
+
+pub fn session_read_response(
     page: broca_core::SessionReadPage,
     tools: Option<crate::registry::SessionReadTools>,
 ) -> SessionReadResponse {
@@ -2410,6 +2491,16 @@ pub trait ServeHandler: Send + Sync {
             .map(|head| (head.mode3, head.lineage_id))
     }
 
+    /// `session.history`'s head for a session kept in the new storage, resolving `mid` when the
+    /// read names a message; `None` for a session on today's storage, which `head` answers.
+    async fn store_history_head(
+        &self,
+        _session: &LineageKey,
+        _mid: Option<&str>,
+    ) -> Result<Option<crate::store_entries::HistoryHead>, ServeError> {
+        Ok(None)
+    }
+
     /// `session.head` — the session's head without message bodies. For retained sessions,
     /// `updated_at` is the durable activity timestamp that sets expiry, not the WAL mtime.
     async fn head(&self, _session: &LineageKey) -> Result<broca_wire::HeadResponse, ServeError> {
@@ -2652,65 +2743,7 @@ impl crate::LineageRegistry {
         let dispatches = self
             .tool_turn_dispatches(session, &lineage_id, tail, &ordinals, prompt_len)
             .await?;
-        for message in &mut response.messages {
-            if let Some(carrier) = message
-                .run
-                .as_ref()
-                .and_then(|run| run.delivery.as_ref())
-                .and_then(|delivery| delivery.tool_call_id.as_ref())
-            {
-                if let Some(dispatch) = message
-                    .ordinal
-                    .checked_sub(2)
-                    .and_then(|ordinal| dispatches.get(&ordinal))
-                    .and_then(|calls| calls.iter().find(|call| &call.tool_call_id == carrier))
-                {
-                    if let Some(receipt) = &mut message.delivered_as {
-                        receipt.call_key =
-                            dispatch.key_seq.or(dispatch.intent_seq).and_then(|seq| {
-                                broca_core::tool_call_key(
-                                    Some(&lineage_id),
-                                    seq,
-                                    dispatch.recorded_call_key.as_deref(),
-                                )
-                            });
-                    }
-                }
-            }
-            let ids = calls_of(&message.message);
-            if ids.is_empty() {
-                continue;
-            }
-            message.tool_calls = match dispatches.get(&message.ordinal.saturating_sub(1)) {
-                // The step that produced this message holds exactly these calls: report them.
-                Some(found) if found.iter().map(|d| &d.tool_call_id).eq(ids.iter()) => found
-                    .iter()
-                    .map(|dispatch| broca_wire::SessionReadToolCall {
-                        tool_call_id: dispatch.tool_call_id.clone(),
-                        call_key: dispatch.key_seq.or(dispatch.intent_seq).and_then(|seq| {
-                            broca_core::tool_call_key(
-                                Some(&lineage_id),
-                                seq,
-                                dispatch.recorded_call_key.as_deref(),
-                            )
-                        }),
-                        dispatched_to: dispatch.dispatched_to.clone(),
-                        indeterminate: dispatch.indeterminate,
-                    })
-                    .collect(),
-                // No recorded step produced this message (an imported one, say): report each
-                // call with no dispatch fact rather than guess one.
-                _ => ids
-                    .into_iter()
-                    .map(|tool_call_id| broca_wire::SessionReadToolCall {
-                        tool_call_id,
-                        call_key: None,
-                        dispatched_to: None,
-                        indeterminate: false,
-                    })
-                    .collect(),
-            };
-        }
+        apply_tool_call_dispatches(response, &dispatches, &lineage_id);
         Ok(())
     }
 }
@@ -2767,6 +2800,11 @@ impl ServeHandler for crate::LineageRegistry {
         session: &LineageKey,
         tag: u64,
     ) -> Result<Option<broca_core::TagLocation>, ServeError> {
+        if let Some(store) = self.store_runtime() {
+            if store.holds(session)? {
+                return Err(crate::store_entries::tag_location_unserved());
+            }
+        }
         self.route_tag_location(session, tag)
             .await
             .map_err(ServeError::from)
@@ -3679,6 +3717,21 @@ impl ServeHandler for crate::LineageRegistry {
             &req.session.session,
         )?;
         Ok(response)
+    }
+
+    async fn store_history_head(
+        &self,
+        session: &LineageKey,
+        mid: Option<&str>,
+    ) -> Result<Option<crate::store_entries::HistoryHead>, ServeError> {
+        match self.store_runtime() {
+            Some(store) if store.holds(session)? => {
+                crate::store_entries::history_head(&store, session, mid)
+                    .await
+                    .map(Some)
+            }
+            _ => Ok(None),
+        }
     }
 
     async fn head(&self, session: &LineageKey) -> Result<broca_wire::HeadResponse, ServeError> {

@@ -108,8 +108,8 @@ pub(super) struct LoopExecutor {
     pub(super) planes: Planes,
 }
 
-/// The hook and compaction planes a test executor offers, as the module's executor offers its
-/// subc planes; none by default.
+/// The hook and compaction planes a test executor offers, standing in for the ones the module's
+/// executor reaches over the daemon; none by default.
 #[derive(Clone, Default)]
 pub(super) struct Planes {
     pub(super) hooks: Option<Arc<dyn broca_core::HookPlane>>,

@@ -129,6 +129,10 @@ struct State {
     /// In a mode-3 log: who delivered each tool-result delivery's text, by the delivering
     /// record's seq (see `entry_facts`).
     delivery_notices: HashMap<u64, Notice>,
+    /// The current step's calls that a record already anchored, as today's call keys read them:
+    /// `None` for a dispatch intent, which holds the call's key, or the seq of the deferral that
+    /// prepared a call for an approval.
+    anchored: HashMap<String, Option<u64>>,
 }
 
 /// Writes the held copies as transcript entries at the boundary that places them.
@@ -174,6 +178,12 @@ pub fn convert(old: &[FramedRecord], lineage: Option<&str>) -> Result<Converted,
     let mut stop_when = Vec::new();
     // Session-scoped: the schedule carries from run to run under the same model.
     let mut schedule: Option<broca_wal::RefusalFallbackSchedule> = None;
+    // The dispatch intents of the calls the step in progress made, by call id, which the facts
+    // of its tool turn name when the turn's results place it. A call id's first intent after its
+    // step is the call's, as today's reads take it.
+    let mut turn_intents: HashMap<ToolCallId, ToolIntent> = HashMap::new();
+    // The keys of that step's calls answered without an intent, as their outcomes record them.
+    let mut turn_outcome_keys: HashMap<ToolCallId, String> = HashMap::new();
     // The provider serving the run in force, which decides what lifetime its requests ask for.
     let mut provider_id = String::new();
     for framed in old {
@@ -236,20 +246,72 @@ pub fn convert(old: &[FramedRecord], lineage: Option<&str>) -> Result<Converted,
                 broca_core::run::limiting_stop_satisfied(&stop_when, steps, assistant_message);
         }
         state.seq = framed.seq;
+        // Today's call keys come from the record that first anchors each call of a step.
+        match &framed.record {
+            WalRecord::RunStarted { .. }
+            | WalRecord::ModelStepFinished { .. }
+            | WalRecord::TurnFinished { .. }
+            | WalRecord::RunFinished { .. } => state.anchored.clear(),
+            WalRecord::ToolDispatchIntent { tool_call_id, .. } => {
+                state.anchored.insert(tool_call_id.0.clone(), None);
+            }
+            WalRecord::ToolCallDeferred { call_id, .. } => {
+                state
+                    .anchored
+                    .entry(call_id.0.clone())
+                    .or_insert(Some(framed.seq));
+            }
+            _ => {}
+        }
         let before = out.records.len();
         convert_one(&framed.record, &mut state, &mut out)?;
+        for record in &out.records[before..] {
+            match record {
+                Record::Assistant(_) | Record::RunStart(_) => {
+                    turn_intents.clear();
+                    turn_outcome_keys.clear();
+                }
+                Record::ToolIntent(intent) => {
+                    turn_intents
+                        .entry(intent.tool_call_id.clone())
+                        .or_insert_with(|| intent.clone());
+                }
+                Record::ToolOutcome(outcome) => {
+                    if let Some(key) = &outcome.call_key {
+                        turn_outcome_keys
+                            .entry(outcome.tool_call_id.clone())
+                            .or_insert_with(|| key.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
         if let Some((legacy, counts, emitted)) = &mut facts {
             let mut known = *emitted;
             // Whether broca wrote each newly known message, told by the record that placed it.
             let mut native_of = BTreeMap::new();
+            // The facts of a tool turn these records place, written after the turn's entry facts,
+            // as the run loop writes them.
+            let mut placed_turn = None;
             for record in &out.records[before..] {
                 if record.stream() != Stream::Transcript {
                     continue;
                 }
+                let open_turn = counts.open_tool_turn().cloned();
                 counts
                     .apply(record)
                     .map_err(|e| err(format!("entry facts: conversation {e:?}")))?;
                 counts.clear_window();
+                if let (Some(assistant), Record::ToolReply(_), None) =
+                    (&open_turn, record, counts.open_tool_turn())
+                {
+                    placed_turn = Some(broca_session_loop::entries::turn_facts(
+                        counts.placed - 1,
+                        assistant,
+                        |id| turn_intents.get(id),
+                        |id| turn_outcome_keys.get(id),
+                    ));
+                }
                 let reserved = counts.open_tool_turn().is_some();
                 let now = counts.placed + u64::from(reserved);
                 for ordinal in known + 1..=now {
@@ -288,6 +350,9 @@ pub fn convert(old: &[FramedRecord], lineage: Option<&str>) -> Result<Converted,
                 )));
             }
             *emitted = known;
+            if let Some(turn) = placed_turn {
+                out.records.push(Record::TurnFacts(turn));
+            }
         }
     }
     if let Some((legacy, _, emitted)) = &facts {
@@ -1359,6 +1424,15 @@ fn reply_and_outcome(terminal: Terminal, state: &State, out: &mut Converted) {
     let result_digest = sha256(&result.encode());
     let tool_call_id = result.tool_call_id.clone();
     let is_error = result.is_error;
+    // A call no dispatch intent anchored keeps the key today's projection gives it: the log's
+    // lineage and the seq of the record that first anchored it, its deferral or this terminal.
+    let call_key = match state.anchored.get(&tool_call_id.0) {
+        Some(None) => None,
+        Some(Some(deferred)) => {
+            broca_core::context::tool_call_key(state.lineage.as_deref(), *deferred, None)
+        }
+        None => broca_core::context::tool_call_key(state.lineage.as_deref(), state.seq, None),
+    };
     out.records.push(Record::ToolReply(ToolReply {
         run_id: state.run_id.clone(),
         batch_id: Some(batch_id.clone()),
@@ -1378,6 +1452,7 @@ fn reply_and_outcome(terminal: Terminal, state: &State, out: &mut Converted) {
         finished_at_ms,
         detail,
         hooks,
+        call_key,
     }));
 }
 

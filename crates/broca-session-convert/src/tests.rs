@@ -56,6 +56,8 @@ fn a_tool_step_splits_into_transcript_and_ledger_records() {
             "ToolReply",
             "ToolOutcome",
             "EntryFacts",
+            // The batch that places the turn's results records the facts of its calls.
+            "TurnFacts",
             "BatchEnd",
             "Event",
             "RunEnd",
@@ -94,18 +96,24 @@ fn a_tool_step_splits_into_transcript_and_ledger_records() {
         Record::Input(input) if input.placement == Placement::RunInput && input.run_id == "run-1"
     ));
     assert!(matches!(
-        &converted.records[14],
+        &converted.records[13],
+        // The turn's assistant message is the run's second message. The log names no lineage,
+        // so its call has no key and the facts list no call.
+        Record::TurnFacts(turn) if turn.ordinal == 2 && turn.calls.is_empty()
+    ));
+    assert!(matches!(
+        &converted.records[15],
         // The event names a run only when the old record did.
         Record::Event(event) if event.name == "input_token_cap_frozen"
             && event.run_id.is_none()
             && event.body == Some(serde_json::json!({"limit": 5}))
     ));
     assert!(matches!(
-        &converted.records[15],
+        &converted.records[16],
         Record::RunEnd(end) if end.run_id == "run-1"
     ));
     assert!(matches!(
-        &converted.records[16],
+        &converted.records[17],
         Record::Billed(billed) if billed.run_id == "run-1"
     ));
 
@@ -153,6 +161,41 @@ fn changed_dispatch_arguments_are_kept() {
         panic!("last record is the intent");
     };
     assert_eq!(intent.args, Some(serde_json::json!({"cmd": "ls -la"})));
+}
+
+/// A call answered without a dispatch intent keeps the key today's projection gives it, made
+/// from the log's lineage and the seq of its terminal record; a dispatched call's key stays on
+/// its intent.
+#[test]
+fn a_call_answered_without_an_intent_keeps_todays_key_on_its_outcome() {
+    let old = log(&[
+        &RUN.replace("RUN", "r"),
+        r#"{"type":"step_started","step_id":1}"#,
+        r#"{"type":"model_step_finished","step_id":1,"assistant_message":{"message_id":"m1","content":[{"type":"tool_call","tool_call_id":"c1","tool_name":"bash","input":{}},{"type":"tool_call","tool_call_id":"c2","tool_name":"nope","input":{}}]},"usage":{},"retries_used":0}"#,
+        r#"{"type":"tool_batch_started","batch_id":"b1","step_id":1,"planned_calls":["c1","c2"]}"#,
+        r#"{"type":"tool_dispatch_intent","batch_id":"b1","tool_call_id":"c1","args":{}}"#,
+        r#"{"type":"tool_result","batch_id":"b1","result":{"tool_call_id":"c1","output":{"kind":"text","text":"ok"},"is_error":false},"outcome":"completed"}"#,
+        r#"{"type":"tool_no_dispatch","batch_id":"b1","tool_call_id":"c2","reason":{"kind":"validation_failed","detail":"no such tool"}}"#,
+    ]);
+    let converted = convert(&old, Some("lineage")).unwrap();
+    let keys: Vec<(String, Option<String>)> = converted
+        .records
+        .iter()
+        .filter_map(|record| match record {
+            Record::ToolOutcome(outcome) => {
+                Some((outcome.tool_call_id.0.clone(), outcome.call_key.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        keys,
+        [
+            ("c1".to_owned(), None),
+            // The no-dispatch record is the log's seventh.
+            ("c2".to_owned(), Some("lineage:7".to_owned())),
+        ]
+    );
 }
 
 /// A refusal-fallback schedule carries to the next run under the same model and is dropped

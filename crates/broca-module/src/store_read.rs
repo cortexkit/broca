@@ -35,16 +35,73 @@ impl From<SessionError> for StoreReadError {
     }
 }
 
-/// How many messages the session's transcript holds: the placed ones, and the assistant
-/// message whose tool calls are still running, at its reserved ordinal.
-fn transcript_len<B: SessionBackend>(session: &Session<B>) -> u64 {
+/// How many messages reads serve of the session's transcript: the placed ones, and the
+/// assistant message whose tool calls are still running, at its reserved ordinal, but not the
+/// results of a batch that hasn't closed (see [`results_await_close`]).
+pub fn transcript_len<B: SessionBackend>(session: &Session<B>) -> u64 {
     session.conversation.placed + u64::from(session.conversation.open_tool_turn().is_some())
+        - u64::from(results_await_close(session))
+}
+
+/// Whether the newest placed message holds the results of a tool batch that hasn't closed. The
+/// session places a turn's results once every call has one, but its batch closes after: as it
+/// closes, a delivered note may still join the last result, and the note's facts land with it.
+/// Reads serve such results only once the batch is closed, as today's do, so no entry they
+/// served changes afterwards; until then the turn reads as still running.
+pub fn results_await_close<B: SessionBackend>(session: &Session<B>) -> bool {
+    let conversation = &session.conversation;
+    let Some(batch) = session
+        .operations
+        .run
+        .as_ref()
+        .and_then(|run| run.open_batch.as_ref())
+    else {
+        return false;
+    };
+    if conversation.open_tool_turn().is_some() {
+        return false;
+    }
+    conversation
+        .window_message(conversation.placed)
+        .is_some_and(|newest| {
+            newest.role == Role::Tool
+                && newest.content.iter().all(|block| match block {
+                    broca_protocol::ContentBlock::ToolResult(result) => batch
+                        .calls
+                        .iter()
+                        .any(|call| call.id == result.tool_call_id),
+                    _ => false,
+                })
+        })
+}
+
+/// Up to `limit` entries from ordinal `from` (counting from 1), as reads serve them: the
+/// results of a batch that hasn't closed held back, and the turn they answer served as still
+/// running (see [`results_await_close`]).
+pub async fn served_entries<B: SessionBackend>(
+    session: &Session<B>,
+    from: u64,
+    limit: usize,
+) -> Result<Vec<StoredEntry>, SessionError> {
+    let mut entries = session.entries(from, limit).await?;
+    if results_await_close(session) {
+        let held = session.conversation.placed;
+        entries.retain(|entry| entry.ordinal < held);
+        if let Some(turn) = entries.iter_mut().find(|entry| entry.ordinal + 1 == held) {
+            turn.next = None;
+            turn.open = true;
+        }
+    }
+    Ok(entries)
 }
 
 /// A `session.read` page, and each of its messages' stable id (`EntryFacts::mid`), in order.
 pub struct StorePage {
     pub page: SessionReadPage,
     pub mids: Vec<String>,
+    /// What each message's tool calls are served from, in order (see
+    /// `crate::store_calls::attribute_tool_calls`).
+    pub turns: Vec<crate::store_calls::TurnOf>,
 }
 
 /// A `session.read` page: up to `limit` messages from `from_ordinal` (counting from 0, as
@@ -68,16 +125,18 @@ pub async fn read_page<B: SessionBackend>(
     let wanted = usize::try_from(end - start)
         .unwrap_or(usize::MAX)
         .saturating_add(1);
-    let mut entries = session.entries(start + 1, wanted).await?;
+    let mut entries = served_entries(session, start + 1, wanted).await?;
     let after = (entries.len() as u64 > end - start)
         .then(|| entries.pop())
         .flatten();
     let latest = session.operations.run.as_ref();
     let mut messages = Vec::with_capacity(entries.len());
     let mut mids = Vec::with_capacity(entries.len());
+    let mut turns = Vec::with_capacity(entries.len());
     for (index, entry) in entries.iter().enumerate() {
         let next = entries.get(index + 1).or(after.as_ref());
         messages.push(page_message(entry, next, latest)?);
+        turns.push(crate::store_calls::TurnOf::of(entry));
         // `page_message` has refused an entry without facts.
         mids.push(
             entry
@@ -101,7 +160,7 @@ pub async fn read_page<B: SessionBackend>(
         withdrawals_owed: false,
         tags_await_setup: false,
     };
-    Ok(StorePage { page, mids })
+    Ok(StorePage { page, mids, turns })
 }
 
 /// Serves `session.read` for a session kept in the new storage. The reply is today's for the
@@ -155,22 +214,37 @@ pub async fn serve_read(
         },
         None => req.from_ordinal.map(|at| at.saturating_sub(1)),
     };
-    let StorePage { page, mids } =
-        read_page(&session, from_ordinal, req.limit)
-            .await
-            .map_err(|error| match error {
-                StoreReadError::Session(error) => read_failed(error),
-                other => ServeError::Open(
-                    format!("the session's stored facts can't be read: {other:?}"),
-                    Some(broca_protocol::ErrorClass::Permanent),
-                ),
-            })?;
+    let StorePage {
+        mut page,
+        mids,
+        turns,
+    } = read_page(&session, from_ordinal, req.limit)
+        .await
+        .map_err(|error| match error {
+            StoreReadError::Session(error) => read_failed(error),
+            other => ServeError::Open(
+                format!("the session's stored facts can't be read: {other:?}"),
+                Some(broca_protocol::ErrorClass::Permanent),
+            ),
+        })?;
+    crate::store_entries::mark_reply_cleaning(&session, store.parts(), &mut page.messages)
+        .await
+        .map_err(|error| {
+            // A backend failure and a damaged start read alike here, so no class is claimed.
+            ServeError::Open(
+                format!("the session's run settings can't be read: {error}"),
+                None,
+            )
+        })?;
     let mut response = crate::serve::session_read_response(page, None);
     response.history_version = head.history_version;
     response.incarnation = broca_session_store::codec::hex(&head.incarnation.0);
     for (entry, mid) in response.messages.iter_mut().zip(mids) {
         entry.mid = mid;
     }
+    crate::store_calls::attribute_tool_calls(&session, &mut response, &turns)
+        .await
+        .map_err(read_failed)?;
     crate::serve::apply_media_mode(&mut response, req.media, &req.session.session)?;
     let cap = req
         .max_bytes
@@ -209,7 +283,7 @@ fn empty_page() -> SessionReadPage {
 
 /// A store read that failed. Only a backend failure is worth a retry: anything else is the
 /// session's stored bytes or state being wrong, which reading again won't change.
-fn read_failed(error: SessionError) -> crate::serve::ServeError {
+pub(crate) fn read_failed(error: SessionError) -> crate::serve::ServeError {
     let class = match error {
         SessionError::Backend(_) => broca_protocol::ErrorClass::Transient,
         _ => broca_protocol::ErrorClass::Permanent,

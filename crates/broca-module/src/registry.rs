@@ -2557,6 +2557,21 @@ impl LineageRegistry {
     {
         use broca_core::compaction_v2::protocol::wire::Refusal;
         let internal = |message: String| Refusal::new("internal_error", message, None);
+        if let Some(store) = self.store_runtime() {
+            if store
+                .holds(key)
+                .map_err(|error| internal(error.to_string()))?
+            {
+                if method == "session.apply_view" {
+                    return crate::store_entries::apply_view(self, &store, key, caller, params)
+                        .await;
+                }
+                return crate::store_entries::compaction_runner(
+                    &store, key, caller, method, params,
+                )
+                .await;
+            }
+        }
         self.check_move(key, true)
             .map_err(|error| internal(error.to_string()))?;
         self.check_expired(key, None)
