@@ -3,22 +3,16 @@
 Standing rules for every worker in this repository. A brief can tighten them but never loosen
 them. Start with `CONTRIBUTING.md` and the public contracts under `docs/`.
 
-## Build and test remotely
+## Build and test on the local machine
 
-- Run builds, tests and lint on the build server (`runon: "linux,8c"`, or `linux,16c` for
-  whole-workspace jobs). Any job that runs `broca-crash-harness` tests also takes `linux,16c`:
-  the harness keeps every crash image in memory, and one filtered run used 16.5 GiB at 8c,
-  over the build server's coming limit of 2 GiB per vCPU. Never go below 8c for the commit
-  check (`scripts/linux-quickcheck-attest.sh`). On the local machine, run only what needs it,
-  at `nice -n 10`.
-- Remote jobs that write logs start with `mkdir -p target/scratch &&`.
-- A remote Linux job can't change files git tracks. Its writes fail with "Operation not
-  permitted", and before that rule they were silently lost when the next job reset the tree.
-  So edit tracked files locally with the edit tools, never inside a job: no `python3`, `sed -i`
-  or `perl -pi` edits, no `cargo fmt` (the commit check runs `--check`), and no `git show` or
-  `git checkout` restores. For a red-first proof, revert the fix locally, run the test remotely,
-  then reapply it. To regenerate goldens, captures or fixtures remotely, name every file the job
-  rewrites in `return_paths` so they come back to your checkout, or regenerate locally.
+- Run builds, tests and lint locally. Start every cargo command with
+  `nice -n 10 env CARGO_INCREMENTAL=0`, so builds yield to the person using the machine. Never
+  clear the compiler wrapper: if your shell sets `RUSTC_WRAPPER` or `CARGO_BUILD_RUSTC_WRAPPER`
+  empty, `unset` them first.
+- Use the build server only for what needs its platform: Windows-only behaviour
+  (`runon: "windows"`), or a test that runs only on Linux (`runon: "linux,8c"`). A remote Linux
+  job can't change files git tracks, so edit tracked files locally, and name any file a remote job
+  regenerates in `return_paths`.
 - Never run the native kill-conformance, real-daemon or crash-harness release lanes yourself. The
   integrating agent runs them once per merged batch. List the native tests your change needs.
 
@@ -27,27 +21,22 @@ them. Start with `CONTRIBUTING.md` and the public contracts under `docs/`.
 The integrating agent runs every full suite once over each batch of merged deliveries. Your
 testing proves your change, in minutes, not hours:
 
-- Run only the tests for the code and behaviour you changed, on the build server, with
-  `scripts/linux-test.sh '<nextest filterset>'`. It uses the commit attestation's build, so the
-  final attestation recompiles nothing new. A bug fix adds a test and shows it failing once
+- Run only the tests for the code and behaviour you changed, with
+  `cargo nextest run --locked -p <crate> -E '<filterset>'` plus the features and
+  `BROCA_REQUIRE_*` variables the test needs. A bug fix adds a test and shows it failing once
   without the fix.
 - Never run a whole crate's tests, an integration suite, `scripts/gate.sh`,
   `scripts/linux-preflight.sh` or `scripts/prepush.sh`.
 - A failure that looks unrelated: rerun that one test by name on your base commit, never a suite.
-- A filtered run longer than about 15 minutes means the filter is too broad. Narrow it, rather
-  than repeatedly waiting up to 30 minutes on a background build job (`bash_watch`).
-- Don't run clippy or fmt separately while iterating: the attestation runs both once. When you
+- A filtered run longer than about 15 minutes means the filter is too broad. Narrow it.
+- Don't run clippy or fmt separately while iterating: the commit gate runs both once. When you
   change `cfg` code, also run clippy once with `--target x86_64-pc-windows-gnu`.
 - Keep the normal build directory. Never set a separate `CARGO_TARGET_DIR` for a run.
 - Update any pin, golden, manifest count or lockfile check your change covers.
 
-Commit only through `scripts/gated-commit.sh`, never a plain `git commit`. To commit on a Linux
-attestation: stage the change, run `bash scripts/linux-quickcheck-attest.sh --output - <crates>`
-remotely once, write its five-line record to `$(git rev-parse --git-path
-broca-linux-quickcheck-attestation)` after checking its tree equals `git write-tree`, then run the
-gated commit. The attestation runs fmt, clippy and the touched crates' unit tests on the warm
-build; that is the only crate-wide run you make. The crate list must match the set the gate
-derives from the diff. A root manifest or lockfile change adds `broca-subc`.
+Commit only through `scripts/gated-commit.sh`, never a plain `git commit`. Stage the change and
+run it: it runs fmt, clippy and the unit tests of the crates it derives from your diff, locally.
+That is the only crate-wide run you make. A root manifest or lockfile change adds `broca-subc`.
 
 Report each command, its pass and fail counts, and every failing test name.
 
