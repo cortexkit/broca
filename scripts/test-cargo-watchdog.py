@@ -40,6 +40,12 @@ class CargoWatchdogTests(unittest.TestCase):
             "    raise SystemExit(3)\n"
             "elif mode == 'silent':\n"
             "    time.sleep(10)\n"
+            "elif mode == 'busy':\n"
+            "    # Silent but working, as a compiler or linker is: burn CPU, then finish.\n"
+            "    end = time.monotonic() + float(os.environ['BUSY_FOR'])\n"
+            "    while time.monotonic() < end:\n"
+            "        pass\n"
+            "    print('fixture cargo built', flush=True)\n"
             "else:\n"
             "    print('fixture cargo failure', flush=True)\n"
             "    print('fixture cargo diagnostic', file=sys.stderr, flush=True)\n"
@@ -59,7 +65,7 @@ class CargoWatchdogTests(unittest.TestCase):
             env=env,
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=10,
         )
 
     def test_lock_timeout_names_lock_and_step_and_kills_process_group(self):
@@ -83,6 +89,40 @@ class CargoWatchdogTests(unittest.TestCase):
         self.assertEqual(result.returncode, 124, result.stdout + result.stderr)
         self.assertIn("inventory list", result.stderr)
         self.assertIn("no output progress", result.stderr)
+
+    def test_a_silent_step_that_keeps_using_cpu_is_not_stopped(self):
+        """No output for several idle periods, but the step is working (a long link, say): the
+        watchdog says it's still working and lets it finish with its own status."""
+        result = self.run_cargo(
+            "busy",
+            BUSY_FOR="2.5",
+            BROCA_CARGO_IDLE_TIMEOUT_SECONDS="0.6",
+            BROCA_CARGO_BUSY_CPU_SECONDS="0.1",
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("fixture cargo built", result.stdout)
+        self.assertIn("still working", result.stderr)
+
+    def test_a_silent_idle_step_names_its_processes(self):
+        result = self.run_cargo(
+            "silent",
+            BROCA_CARGO_IDLE_TIMEOUT_SECONDS="0.3",
+            BROCA_CARGO_BUSY_CPU_SECONDS="0.5",
+        )
+        self.assertEqual(result.returncode, 124, result.stdout + result.stderr)
+        self.assertIn("processes:", result.stderr)
+        self.assertNotIn("still working", result.stderr)
+
+    def test_a_step_busy_past_the_limit_is_stopped(self):
+        result = self.run_cargo(
+            "busy",
+            BUSY_FOR="8",
+            BROCA_CARGO_IDLE_TIMEOUT_SECONDS="0.6",
+            BROCA_CARGO_BUSY_CPU_SECONDS="0.1",
+            BROCA_CARGO_BUSY_LIMIT_SECONDS="2",
+        )
+        self.assertEqual(result.returncode, 124, result.stdout + result.stderr)
+        self.assertIn("past the 2s limit", result.stderr)
 
     def test_an_exited_cargo_is_not_held_open_by_a_descendant(self):
         """Cargo has exited, but a child it started still holds the output pipe. The step is

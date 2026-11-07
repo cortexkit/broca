@@ -4,8 +4,21 @@
 BROCA_CARGO_LOCK_TIMEOUT_SECONDS defaults to 300 seconds; after Cargo reports
 that it is waiting for a named file lock, no further output for this long is
 reported as a lock timeout (exit 125). BROCA_CARGO_IDLE_TIMEOUT_SECONDS
-defaults to 900 seconds; no output for this long is an idle timeout (exit 124).
-Both values may be fractional seconds for tests. An optional
+defaults to 900 seconds; no output for this long is an idle timeout (exit 124)
+unless Cargo's processes are still using CPU.
+
+Silence alone doesn't mean Cargo is stuck: a cold build links its largest test
+binaries, or a compiler works on one crate, for many minutes without a line of
+output. So when the idle timeout passes, the watchdog asks how much CPU the
+processes in Cargo's process group used since it last looked. At least
+BROCA_CARGO_BUSY_CPU_SECONDS (default 5) counts as work in progress: it says so
+once, then waits another idle period. A step stuck on a lock or a wedged
+compiler cache uses no CPU and is stopped as before. Being busy can keep a silent
+step alive for at most BROCA_CARGO_BUSY_LIMIT_SECONDS (default 3600) past its
+last output, so a process spinning forever is still stopped. Every idle timeout
+names the group's processes and their CPU time, so the next stall says what hung.
+
+All values may be fractional seconds for tests. An optional
 --deadline-seconds keeps callers' existing hard wall-clock limits (also exit
 124). Ordinary Cargo exit statuses pass through unchanged.
 
@@ -68,6 +81,77 @@ def terminate_group(process: subprocess.Popen) -> int:
     return process.wait()
 
 
+def cpu_seconds(text: str) -> float:
+    """Parse ps's cumulative CPU time: `[[dd-]hh:]mm:ss[.ff]` (Linux) or `mm:ss.ff` (macOS)."""
+    days = 0
+    if "-" in text:
+        day_text, text = text.split("-", 1)
+        days = int(day_text)
+    seconds = 0.0
+    for part in text.split(":"):
+        seconds = seconds * 60 + float(part)
+    return days * 86400 + seconds
+
+
+def group_cpu(pgid: int) -> dict:
+    """CPU seconds used so far by each living process in process group `pgid`, by pid, with its
+    command name. Empty when the processes can't be listed; the caller then treats the group as
+    idle. Linux is read from /proc, whose clock ticks are finer than ps's whole seconds there."""
+    if os.path.exists("/proc/self/stat"):
+        return proc_group_cpu(pgid)
+    try:
+        listing = subprocess.run(
+            ["ps", "-A", "-o", "pgid=,pid=,time=,comm="],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    usage = {}
+    for line in listing.splitlines():
+        fields = line.split(None, 3)
+        if len(fields) < 3 or fields[0] != str(pgid):
+            continue
+        try:
+            usage[int(fields[1])] = (cpu_seconds(fields[2]), fields[3] if len(fields) > 3 else "?")
+        except ValueError:
+            continue
+    return usage
+
+
+def proc_group_cpu(pgid: int) -> dict:
+    ticks = os.sysconf("SC_CLK_TCK")
+    usage = {}
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/stat") as stat:
+                text = stat.read()
+        except OSError:
+            continue
+        # The command name sits in parentheses and may hold spaces, so fields count from the
+        # last ')': state, ppid, pgrp, ... then utime and stime at 11 and 12.
+        name, _, rest = text.rpartition(")")
+        fields = rest.split()
+        if len(fields) < 13 or fields[2] != str(pgid):
+            continue
+        usage[int(entry)] = ((int(fields[11]) + int(fields[12])) / ticks, name.partition("(")[2])
+    return usage
+
+
+def cpu_since(before: dict, after: dict) -> float:
+    """CPU the group used between two `group_cpu` samples. A process that started since counts
+    from zero, and one that ended since takes its CPU with it, so this can only undercount."""
+    return sum(max(0.0, cpu - before.get(pid, (0.0, ""))[0]) for pid, (cpu, _) in after.items())
+
+
+def describe_group(usage: dict) -> str:
+    busiest = sorted(usage.values(), reverse=True)[:5]
+    return ", ".join(f"{name.rsplit('/', 1)[-1]} {cpu:.0f}s" for cpu, name in busiest) or "none"
+
+
 def shell_status(returncode: int) -> int:
     return returncode if returncode >= 0 else 128 - returncode
 
@@ -109,6 +193,8 @@ def main() -> int:
         lock_timeout = positive_seconds("BROCA_CARGO_LOCK_TIMEOUT_SECONDS", "300")
         idle_timeout = positive_seconds("BROCA_CARGO_IDLE_TIMEOUT_SECONDS", "900")
         exit_drain = positive_seconds("BROCA_CARGO_EXIT_DRAIN_SECONDS", "5")
+        busy_cpu = positive_seconds("BROCA_CARGO_BUSY_CPU_SECONDS", "5")
+        busy_limit = positive_seconds("BROCA_CARGO_BUSY_LIMIT_SECONDS", "3600")
     except ValueError as error:
         parser.error(str(error))
 
@@ -157,6 +243,13 @@ def main() -> int:
 
     started = time.monotonic()
     last_output = started
+    # When the idle clock last restarted, by output or by the group still being busy, and the
+    # group's CPU sample taken then. Output clears the sample rather than taking a new one, so a
+    # chatty step never pays for listing processes; a silent step then takes its first sample
+    # at the idle timeout and decides after a short probe.
+    idle_since = started
+    cpu_sample = group_cpu(process.pid)
+    probe = min(60.0, idle_timeout / 4)
     lock_name = None
     lock_started = None
     interrupted = []
@@ -199,11 +292,36 @@ def main() -> int:
                 terminate_group(process)
                 return 125
 
-            idle = now - last_output
+            idle = now - idle_since
+            if idle >= idle_timeout and cpu_sample is None:
+                cpu_sample = group_cpu(process.pid)
+                idle_since = now - idle_timeout + probe
+                continue
             if idle >= idle_timeout:
+                usage = group_cpu(process.pid)
+                used = cpu_since(cpu_sample, usage)
+                silent = now - last_output
+                if used >= busy_cpu and silent + idle_timeout <= busy_limit:
+                    print(
+                        f"cargo watchdog: step '{args.step}' has printed nothing for {silent:.0f}s "
+                        f"but its processes used {used:.0f}s of CPU in the last {idle:.0f}s; "
+                        f"still working ({describe_group(usage)})",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    idle_since = now
+                    cpu_sample = usage
+                    continue
+                reason = (
+                    f"made no output progress for {silent:.0f}s while its processes kept using CPU, "
+                    f"past the {busy_limit:g}s limit"
+                    if used >= busy_cpu
+                    else f"made no output progress for {silent:.0f}s and its processes used "
+                    f"{used:.1f}s of CPU in the last {idle:.0f}s"
+                )
                 print(
-                    f"cargo watchdog: step '{args.step}' made no output progress for "
-                    f"{idle_timeout:g}s; terminating Cargo process group (exit 124)",
+                    f"cargo watchdog: step '{args.step}' {reason}; processes: "
+                    f"{describe_group(usage)}; terminating Cargo process group (exit 124)",
                     file=sys.stderr,
                     flush=True,
                 )
@@ -249,6 +367,8 @@ def main() -> int:
                     output.write(data)
                     output.flush()
                 last_output = time.monotonic()
+                idle_since = last_output
+                cpu_sample = None
 
                 buffered = pending_lines[stream] + data
                 lines = buffered.split(b"\n")
