@@ -948,10 +948,12 @@ dependencies = [
 name = "ck-session-import"
 version = "0.3.320"
 dependencies = [
+ "base64",
  "broca-module-serve",
  "broca-protocol",
  "broca-provider",
  "broca-test-support",
+ "cortexkit-role-llm-runner 0.8.7",
  "rusqlite",
  "serde_json",
  "sha2",

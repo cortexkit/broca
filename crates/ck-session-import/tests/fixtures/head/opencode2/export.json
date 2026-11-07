@@ -1,0 +1,52 @@
+{
+  "info": {"id": "ses_head", "title": "a head", "time": {"created": 1700000000000}},
+  "messages": [
+    {"id": "msg_u1", "type": "user", "time": {"created": 1700000001000},
+     "skills": [{"name": "review", "text": "Skill: review carefully."}],
+     "text": "Look at this.",
+     "files": [
+       {"mime": "image/png", "name": "dot.png", "source": {"type": "inline"},
+        "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg=="},
+       {"mime": "text/plain", "name": "notes.txt", "source": {"type": "inline"},
+        "data": "aGVsbG8gZnJvbSBhIGZpbGUK"},
+       {"mime": "application/zip", "name": "bundle.zip", "data": "AAAA"}
+     ]},
+    {"id": "msg_sys", "type": "system", "time": {"created": 1700000001500}, "text": "be kind"},
+    {"id": "msg_a1", "type": "assistant", "time": {"created": 1700000002000, "completed": 1700000004000},
+     "model": {"providerID": "anthropic", "id": "claude-x"},
+     "tokens": {"input": 10, "output": 20, "reasoning": 5, "cache": {"read": 100, "write": 0}},
+     "content": [
+       {"type": "reasoning", "text": "Thinking it over.", "native": {"signature": "sig-abc"}},
+       {"type": "text", "text": "Reading the file."},
+       {"type": "tool", "id": "call_1", "name": "read", "state": {"status": "completed", "input": {"path": "a.txt"},
+        "content": [{"type": "text", "text": "line one"}, {"type": "text", "text": "line two"}]}},
+       {"type": "tool", "id": "call_2", "name": "screenshot", "state": {"status": "completed", "input": "{\"full\":true}",
+        "content": [{"type": "text", "text": "taken"},
+                    {"type": "file", "mime": "image/png", "uri": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAYAAAD0In+KAAAADklEQVR4nGP4z8AAQv8BD/kD/YURmXYAAAAASUVORK5CYII="}]}},
+       {"type": "tool", "id": "call_3", "name": "bash", "state": {"status": "error", "input": {"cmd": "false"},
+        "error": {"message": "exit 1"}}}
+     ]},
+    {"id": "msg_idle", "type": "idle", "time": {"created": 1700000004100}},
+    {"id": "msg_loc", "type": "location-switched", "time": {"created": 1700000004200},
+     "location": {"directory": "/work/other"}},
+    {"id": "msg_model", "type": "model-switched", "time": {"created": 1700000004300},
+     "model": {"providerID": "openai", "id": "gpt-x"}},
+    {"id": "msg_agent", "type": "agent-switched", "time": {"created": 1700000004400}},
+    {"id": "msg_shell_bg", "type": "shell", "time": {"created": 1700000004500},
+     "command": "sleep 1", "output": {"output": ""}, "metadata": {"background": true}},
+    {"id": "msg_shell", "type": "shell", "time": {"created": 1700000004600},
+     "command": "ls", "output": {"output": "a.txt\n"}},
+    {"id": "msg_syn", "type": "synthetic", "time": {"created": 1700000004700}, "text": "Continue."},
+    {"id": "msg_cut", "type": "compaction", "time": {"created": 1700000004800}, "status": "completed",
+     "metadata": {"keepID": "msg_cut"}},
+    {"id": "msg_a2", "type": "assistant", "time": {"created": 1700000005000, "completed": 1700000006000},
+     "tokens": {"input": 0, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}},
+     "content": [
+       {"type": "reasoning", "text": "", "native": {"redactedData": "opaque"}},
+       {"type": "tool", "id": "call_1", "name": "read", "state": {"status": "completed", "input": {"path": "b.txt"},
+        "content": [{"type": "text", "text": "bee"}]}}
+     ]},
+    {"id": "msg_a3", "type": "assistant", "time": {"created": 1700000007000, "completed": 1700000008000},
+     "content": [{"type": "text", "text": "Done."}]}
+  ]
+}
