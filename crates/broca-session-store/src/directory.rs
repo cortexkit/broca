@@ -546,6 +546,39 @@ impl<B: SessionBackend> Pages<'_, B> {
             page = self.read(&child).await?;
         }
     }
+
+    /// Every entry whose segment holds a record at or after `seq`, in seq order. Walks only the
+    /// pages whose range reaches `seq`.
+    pub async fn entries_from(
+        &self,
+        root: Option<&PageRef>,
+        seq: u64,
+    ) -> Result<Vec<DirEntry>, DirectoryError> {
+        let mut out = Vec::new();
+        let Some(root) = root else {
+            return Ok(out);
+        };
+        // Pages still to read, the next one last, so entries come out in seq order.
+        let mut pending = vec![root.clone()];
+        while let Some(page) = pending.pop() {
+            let page = self.read(&page).await?;
+            if page.level == 0 {
+                out.extend(
+                    page.entries
+                        .into_iter()
+                        .filter(|entry| entry.last_seq >= seq),
+                );
+            } else {
+                pending.extend(
+                    page.children
+                        .into_iter()
+                        .filter(|child| child.last_seq >= seq)
+                        .rev(),
+                );
+            }
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]

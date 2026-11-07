@@ -800,6 +800,14 @@ state! {
             reset: "never",
             bound: Bound::Declared,
         },
+        /// The runs whose spend facts are owed to the usage export: a run's end adds it, unless
+        /// the run was seeded from an import or fork and so never called a provider, and its
+        /// `Billed` record removes it. The store actor bills every run listed here.
+        21 rep pub billing_owed: String => {
+            owner: "billing",
+            reset: "billed",
+            bound: Bound::OpenWork("runs that ended and aren't billed yet"),
+        },
     }
 }
 
@@ -1118,6 +1126,25 @@ impl Operations {
         self.apply_at(None, record)
     }
 
+    /// A run's end makes its billing owed, unless the latest run it ends was seeded and never
+    /// called a provider; `Billed` settles it. Applied before the run fold, which reads the
+    /// same end.
+    fn apply_billing(&mut self, record: &Record) {
+        match record {
+            Record::RunEnd(end) => {
+                let billable = self
+                    .run
+                    .as_ref()
+                    .is_some_and(|run| run.run_id == end.run_id && !run.seeded);
+                if billable && !self.billing_owed.contains(&end.run_id) {
+                    self.billing_owed.push(end.run_id.clone());
+                }
+            }
+            Record::Billed(billed) => self.billing_owed.retain(|owed| *owed != billed.run_id),
+            _ => {}
+        }
+    }
+
     /// The session's latest sends: a run's start names the current model, an attempt its
     /// request's size and whether it reached the cache, and a step's end the newest step.
     fn apply_sends(&mut self, record: &Record) {
@@ -1293,6 +1320,7 @@ impl Operations {
             _ => {}
         }
         self.apply_sends(record);
+        self.apply_billing(record);
         if let Record::RunStart(start) = record {
             self.run = Some(Run::new(start));
             self.refusal_schedule = start.refusal_schedule.clone();

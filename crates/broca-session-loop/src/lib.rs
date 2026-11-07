@@ -30,6 +30,7 @@
 //! proven against today's loop by the differential tests in `tests/`.
 
 pub mod admit;
+pub mod billing;
 pub mod budget;
 pub mod compaction;
 pub mod durable;
@@ -42,6 +43,7 @@ pub mod queue;
 mod refusal;
 pub mod run;
 pub mod shared;
+pub mod today;
 pub mod writer;
 
 pub use media::PendingMedia;

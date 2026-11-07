@@ -484,3 +484,92 @@ fn session_usage_counts_each_steps_model_shares() {
         ]
     );
 }
+
+fn started(run_id: &str, seeded: bool) -> Record {
+    let Record::RunStart(mut start) = start() else {
+        unreachable!("start() is a run start")
+    };
+    start.run_id = run_id.into();
+    start.seeded = seeded.then_some(true);
+    Record::RunStart(start)
+}
+
+fn ended(run_id: &str) -> Record {
+    Record::RunEnd(RunEnd {
+        run_id: run_id.into(),
+        reason: RunFinishReason::Completed,
+        usage: None,
+        ts_ms: None,
+        retries_used: 0,
+        interrupt_reason: None,
+        error: None,
+    })
+}
+
+fn billed(run_id: &str) -> Record {
+    Record::Billed(crate::record::Billed {
+        run_id: run_id.into(),
+    })
+}
+
+/// A run's end makes its billing owed and its `Billed` record settles it, so the owed set holds
+/// only runs that ended and aren't billed yet, however many runs the session had.
+#[test]
+fn a_runs_end_owes_its_billing_until_it_is_billed() {
+    let mut records = vec![started("r1", false)];
+    assert!(
+        fold(&records).unwrap().billing_owed.is_empty(),
+        "owed before its end"
+    );
+    records.push(ended("r1"));
+    assert_eq!(fold(&records).unwrap().billing_owed, ["r1"]);
+    // A second run ends before the first is billed: both are owed, in the order they ended.
+    records.extend([started("r2", false), ended("r2")]);
+    assert_eq!(fold(&records).unwrap().billing_owed, ["r1", "r2"]);
+    records.push(billed("r1"));
+    assert_eq!(fold(&records).unwrap().billing_owed, ["r2"]);
+    records.push(billed("r2"));
+    for n in 3..20 {
+        let run = format!("r{n}");
+        records.extend([started(&run, false), ended(&run), billed(&run)]);
+    }
+    assert!(fold(&records).unwrap().billing_owed.is_empty());
+    // A paused run owes nothing: only its end does.
+    records.extend([
+        started("paused", false),
+        Record::Pause(Pause {
+            run_id: "paused".into(),
+            reason: PauseReason::Restart,
+            ts_ms: None,
+            error: None,
+            account_limit: None,
+        }),
+    ]);
+    assert!(fold(&records).unwrap().billing_owed.is_empty());
+}
+
+/// A run seeded from an import or fork never called a provider, so its end owes no billing, and
+/// a run started after it is owed as any other.
+#[test]
+fn a_seeded_runs_end_owes_no_billing() {
+    let operations = fold(&[
+        started("imported", true),
+        ended("imported"),
+        started("next", false),
+        ended("next"),
+    ])
+    .unwrap();
+    assert_eq!(operations.billing_owed, ["next"]);
+}
+
+/// The owed set is part of the operational fold's declared schema, as open work that empties
+/// when it is billed, so its growth is accounted for like every other fold field.
+#[test]
+fn the_owed_set_is_declared_as_open_work() {
+    let field = Operations::SCHEMA
+        .iter()
+        .find(|field| field.name == "billing_owed")
+        .expect("the owed set is declared");
+    assert!(matches!(field.bound, crate::fold::Bound::OpenWork(_)));
+    assert_eq!(field.reset, "billed");
+}

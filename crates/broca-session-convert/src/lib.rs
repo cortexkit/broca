@@ -22,8 +22,8 @@ use broca_protocol::usage::Usage;
 use broca_session_store::codec::{Digest, Message as _};
 use broca_session_store::fold::conversation::Conversation;
 use broca_session_store::record::{
-    Assistant, Attempt, AuthRefrozen, BatchEnd, BatchStart, BudgetFire, BudgetFiring, CallOutcome,
-    CancelPoint, CancelRequest, CeilingDecided, Compaction, ConfigRefrozen, Delivery,
+    Assistant, Attempt, AuthRefrozen, BatchEnd, BatchStart, Billed, BudgetFire, BudgetFiring,
+    CallOutcome, CancelPoint, CancelRequest, CeilingDecided, Compaction, ConfigRefrozen, Delivery,
     DeliveryOrdered, Event, Input, Marker, ModelStepUsage, Notice, OutputCapLowered, PartKind,
     PartRef, Pause, Placement, QueuedSend, Record, Redo, ResultAppend, Resumed, Retraction, RunEnd,
     RunStart, SendEnded, SessionRefresh, SetupStub, Steer, StepEnd, StepRefused, StepStart, Stream,
@@ -35,6 +35,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 use sha2::{Digest as _, Sha256};
 
+pub mod billing;
 pub mod entry_facts;
 pub mod inverse;
 pub mod measure;
@@ -550,6 +551,11 @@ fn convert_record(
                 retries_used: f.u64("retries_used").unwrap_or_default() as u32,
                 interrupt_reason: f.string("interrupt_reason"),
                 error: f.take("error"),
+            }));
+            // Today's storage billed this run when it ended, so the converted session owes no
+            // billing for it and never bills it again.
+            out.records.push(Record::Billed(Billed {
+                run_id: state.run_id.clone(),
             }));
         }
         "steered" => {

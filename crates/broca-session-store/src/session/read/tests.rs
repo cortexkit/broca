@@ -5,7 +5,7 @@ use futures::executor::block_on;
 use crate::backend::MemoryBackend;
 use crate::head::SessionTriple;
 use crate::keys::DeploymentKey;
-use crate::record::{Assistant, EntryFacts, Input, Placement, Record, ToolReply};
+use crate::record::{Assistant, EntryFacts, Input, Placement, Record, StepStart, ToolReply};
 use crate::session::Session;
 
 fn triple() -> SessionTriple {
@@ -298,5 +298,68 @@ fn a_held_assistant_message_reads_last_at_its_reserved_ordinal() {
         assert!(entries[1].next.is_none());
         assert_eq!(entries[1].state.facts.as_ref().map(|f| f.tag_base), Some(2));
         assert_eq!(session.entries(2, 10).await.unwrap().len(), 1);
+    });
+}
+
+/// Every record of both streams from a seq on reads back once, in seq order, wherever two cuts
+/// left it: sealed ledger and transcript segments, a segment the read starts inside, and the
+/// open log, which keeps the transcript after the last cut.
+#[test]
+fn records_from_a_seq_read_both_streams_sealed_and_open() {
+    let backend = MemoryBackend::default();
+    block_on(async {
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(), false)
+            .await
+            .unwrap();
+        let mut appended = Vec::new();
+        let mut cuts = Vec::new();
+        for n in 0..30 {
+            for (part, mut batch) in round(n).into_iter().enumerate() {
+                // A ledger record in every batch, so both streams are sealed.
+                batch.insert(
+                    0,
+                    Record::StepStart(StepStart {
+                        run_id: "r".into(),
+                        step_id: (4 * n + part) as u64,
+                    }),
+                );
+                let first = session.append(&batch, true).await.unwrap();
+                if part == 0 && (n == 12 || n == 24) {
+                    // A cut starts at the round's input, after its ledger record.
+                    cuts.push(first + 1);
+                }
+                appended.extend((first..).zip(batch));
+            }
+        }
+        for cut in &cuts {
+            session.seal(Some(*cut), 0).await.unwrap();
+        }
+        session.close().await.unwrap();
+        let loaded = Session::load(&backend, addr(), &triple(), &deployment())
+            .await
+            .unwrap();
+        for first in [
+            1,
+            cuts[0] - 7,
+            cuts[0],
+            cuts[1] + 3,
+            appended.last().unwrap().0,
+        ] {
+            let read = loaded.records_from(first).await.unwrap();
+            assert!(
+                read.windows(2).all(|pair| pair[0].0 < pair[1].0),
+                "from {first}: seqs ascend once each"
+            );
+            // The seals' own records are in the log too; every appended record reads back.
+            let ours: Vec<&(u64, Record)> = read
+                .iter()
+                .filter(|(_, record)| {
+                    !matches!(record, Record::ChangeIntent(_) | Record::WriterOpened(_))
+                })
+                .collect();
+            let expected: Vec<&(u64, Record)> =
+                appended.iter().filter(|(seq, _)| *seq >= first).collect();
+            assert_eq!(ours, expected, "from {first}");
+        }
     });
 }

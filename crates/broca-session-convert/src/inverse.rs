@@ -16,177 +16,22 @@
 use std::collections::{BTreeMap, HashMap};
 
 use broca_protocol::content::Message;
+use broca_session_loop::today::{
+    self, fill_manifest, finish_manifest, hex, json, members, model_step_finished, set,
+};
 use broca_session_store::codec::Digest;
 use broca_session_store::record::{
-    Assistant, Attempt, BudgetFire, BudgetFiring, CallOutcome, CancelPoint, Delivery, Event, Input,
-    PartKind, PartRef, Placement, QueuedSend, Record, ResultAppend, RunStart, SessionRefresh,
-    Steer, StepEnd, ToolIntent, ToolOutcome, ToolReply,
+    Attempt, BudgetFire, BudgetFiring, CallOutcome, CancelPoint, Delivery, Event, Input, PartKind,
+    PartRef, Placement, QueuedSend, Record, ResultAppend, SessionRefresh, Steer, ToolIntent,
+    ToolOutcome, ToolReply,
 };
-use serde::Serialize;
 use serde_json::{Map, Value};
-
-fn json(value: impl Serialize) -> Value {
-    serde_json::to_value(value).expect("record values serialize")
-}
-
-fn set<T: Serialize>(object: &mut Map<String, Value>, key: &str, value: Option<T>) {
-    if let Some(value) = value {
-        object.insert(key.into(), json(value));
-    }
-}
-
-/// An owned payload's members, as the object a record was rebuilt on.
-fn members(payload: Option<&Value>) -> Result<Map<String, Value>, String> {
-    match payload {
-        None => Ok(Map::new()),
-        Some(Value::Object(object)) => Ok(object.clone()),
-        Some(_) => Err("a carried payload is not an object".into()),
-    }
-}
-
-fn hex(digest: &Digest) -> String {
-    digest.0.iter().map(|b| format!("{b:02x}")).collect()
-}
 
 fn part_value(parts: &BTreeMap<Digest, Vec<u8>>, part: &PartRef) -> Result<Value, String> {
     let bytes = parts
         .get(&part.digest)
         .ok_or_else(|| format!("setup part {} is missing", hex(&part.digest)))?;
     serde_json::from_slice(bytes).map_err(|e| format!("setup part {}: {e}", hex(&part.digest)))
-}
-
-/// Puts a plan manifest's setup part back into the manifest object.
-fn fill_manifest(manifest: &mut Map<String, Value>, kind: PartKind, value: Value) {
-    match kind {
-        PartKind::Plan => {
-            manifest.insert("plan".into(), value);
-        }
-        PartKind::ProviderAnswer => {
-            if let Some(Value::Array(fetches)) = manifest.get_mut("fetches") {
-                fetches.push(value);
-            } else {
-                manifest.insert("fetches".into(), Value::Array(vec![value]));
-            }
-        }
-        PartKind::Tools => {
-            manifest.insert("tools".into(), value);
-        }
-        PartKind::SystemText => {
-            manifest.insert("system_text".into(), value);
-        }
-        PartKind::Declarations => {
-            manifest.insert("declarations".into(), value);
-        }
-        PartKind::ResponseFormat | PartKind::GlobalSystem | PartKind::RenderConfig => {}
-    }
-}
-
-/// A manifest always lists its provider answers, even when there are none.
-fn finish_manifest(mut manifest: Map<String, Value>) -> Value {
-    manifest
-        .entry("fetches")
-        .or_insert_with(|| Value::Array(Vec::new()));
-    Value::Object(manifest)
-}
-
-fn tags(entries: impl Iterator<Item = Option<Value>>) -> Option<Value> {
-    let entries: Vec<Option<Value>> = entries.collect();
-    entries.iter().any(Option::is_some).then(|| {
-        Value::Array(
-            entries
-                .into_iter()
-                .map(|t| t.unwrap_or(Value::Null))
-                .collect(),
-        )
-    })
-}
-
-fn run_started(
-    start: &RunStart,
-    inputs: &[&Input],
-    parts: &BTreeMap<Digest, Vec<u8>>,
-) -> Result<Value, String> {
-    let choices = members(start.run_choices.as_ref())?;
-    let mut object = members(choices.get("record"))?;
-    let mut manifest = choices
-        .get("manifest")
-        .map(|m| members(Some(m)))
-        .transpose()?;
-
-    object.insert("type".into(), json("run_started"));
-    object.insert("run_id".into(), json(&start.run_id));
-    set(&mut object, "session_class", start.session_class.as_ref());
-    set(&mut object, "submission_id", start.submission_id.as_ref());
-    set(&mut object, "send_id", start.send_id.as_ref());
-    set(
-        &mut object,
-        "request_identity_digest",
-        start.request_identity_digest.as_ref(),
-    );
-    set(&mut object, "ts_ms", start.ts_ms);
-    set(&mut object, "written_at_ms", start.written_at_ms);
-    set(&mut object, "retention", start.retention_secs);
-    set(&mut object, "title", start.title.as_ref());
-    set(
-        &mut object,
-        "compaction_plan_version",
-        start.compaction_plan_version,
-    );
-    set(&mut object, "origin", start.origin.as_ref());
-    set(&mut object, "principal", start.principal.as_ref());
-    set(&mut object, "scope", start.scope.as_ref());
-    set(&mut object, "hooks", start.hooks.as_ref());
-    set(&mut object, "keep_warm", start.keep_warm.as_ref());
-    set(&mut object, "on_restart", start.on_restart.as_ref());
-
-    // The config's members and setup parts are read as the serve executor reads them.
-    let (members_of_config, manifest_parts) = broca_session_loop::run::run_config_members(
-        start,
-        |part| part_value(parts, part),
-        || "a carried payload is not an object".to_string(),
-    )?;
-    let config = members_of_config;
-    for (kind, value) in manifest_parts {
-        fill_manifest(manifest.get_or_insert_with(Map::new), kind, value);
-    }
-    object.insert("config".into(), Value::Object(config));
-    if let Some(manifest) = manifest {
-        object.insert("manifest".into(), finish_manifest(manifest));
-    }
-
-    object.insert(
-        "input".into(),
-        Value::Array(inputs.iter().map(|i| json(&i.message)).collect()),
-    );
-    set(
-        &mut object,
-        "tags",
-        tags(inputs.iter().map(|i| i.tags_v1.clone())),
-    );
-    Ok(Value::Object(object))
-}
-
-fn model_step_finished(assistant: &Assistant, end: &StepEnd) -> Result<Value, String> {
-    let mut object = members(end.fallback.as_ref())?;
-    object.insert("type".into(), json("model_step_finished"));
-    object.insert("step_id".into(), json(end.step_id));
-    let mut message = Map::new();
-    message.insert("message_id".into(), json(&assistant.provider_message_id));
-    message.insert("content".into(), json(&assistant.message.content));
-    object.insert("assistant_message".into(), Value::Object(message));
-    set(&mut object, "usage", assistant.usage.as_ref());
-    set(&mut object, "written_at_ms", assistant.written_at_ms);
-    set(&mut object, "tags", assistant.tags_v1.as_ref());
-    set(&mut object, "finish_reason", end.finish_reason.as_ref());
-    object.insert("retries_used".into(), json(end.retries_used));
-    set(
-        &mut object,
-        "service_tier_used",
-        end.service_tier_used.as_ref(),
-    );
-    set(&mut object, "speed_used", end.speed_used.as_ref());
-    set(&mut object, "hooks", end.hooks.as_ref());
-    Ok(Value::Object(object))
 }
 
 fn model_attempt(attempt: &Attempt) -> Result<Value, String> {
@@ -548,6 +393,9 @@ pub fn invert(records: &[Record], parts: &BTreeMap<Digest, Vec<u8>>) -> Result<V
             // Both are derived from today's records, and neither is one of its own: entry facts
             // are what today's projection computes from the log.
             Record::SetupStub(_) | Record::EntryFacts(_) => {}
+            // A converted run's billing was settled by today's storage when the run ended; the
+            // converter records that, and today's log has no record of it.
+            Record::Billed(_) => {}
             Record::Input(Input {
                 receipt_seq: Some(_),
                 ..
@@ -602,7 +450,9 @@ pub fn invert(records: &[Record], parts: &BTreeMap<Digest, Vec<u8>>) -> Result<V
                     index += 1;
                 }
                 calls.clear();
-                out.push(run_started(start, &inputs, parts)?);
+                out.push(today::run_started(start, &inputs, |part| {
+                    part_value(parts, part)
+                })?);
             }
             Record::StepEnd(end) => {
                 let [Record::Assistant(assistant)] = pending.as_slice() else {
@@ -635,21 +485,7 @@ pub fn invert(records: &[Record], parts: &BTreeMap<Digest, Vec<u8>>) -> Result<V
             other => {
                 unclaimed(&pending, other.name())?;
                 out.push(match other {
-                    Record::RunEnd(end) => {
-                        let mut object = Map::new();
-                        object.insert("type".into(), json("run_finished"));
-                        object.insert("reason".into(), json(end.reason));
-                        set(&mut object, "usage", end.usage.as_ref());
-                        set(&mut object, "ts_ms", end.ts_ms);
-                        object.insert("retries_used".into(), json(end.retries_used));
-                        set(
-                            &mut object,
-                            "interrupt_reason",
-                            end.interrupt_reason.as_ref(),
-                        );
-                        set(&mut object, "error", end.error.as_ref());
-                        Value::Object(object)
-                    }
+                    Record::RunEnd(end) => today::run_finished(end),
                     Record::StepStart(start) => serde_json::json!({
                         "type": "step_started",
                         "step_id": start.step_id,
@@ -689,16 +525,7 @@ pub fn invert(records: &[Record], parts: &BTreeMap<Digest, Vec<u8>>) -> Result<V
                         }).collect::<Vec<_>>(),
                         "indeterminate": resumed.indeterminate,
                     }),
-                    Record::Pause(pause) => {
-                        let mut object = Map::new();
-                        object.insert("type".into(), json("run_paused"));
-                        object.insert("run_id".into(), json(&pause.run_id));
-                        object.insert("reason".into(), json(pause.reason));
-                        set(&mut object, "ts_ms", pause.ts_ms);
-                        set(&mut object, "error", pause.error.as_ref());
-                        set(&mut object, "account_limit", pause.account_limit.as_ref());
-                        Value::Object(object)
-                    }
+                    Record::Pause(pause) => today::run_paused(pause),
                     Record::ToolHeld(held) => {
                         let mut object = Map::new();
                         object.insert("type".into(), json("tool_call_provider_held"));
@@ -746,67 +573,10 @@ pub fn invert(records: &[Record], parts: &BTreeMap<Digest, Vec<u8>>) -> Result<V
                         set(&mut object, "failure", retraction.failure.as_ref());
                         Value::Object(object)
                     }
-                    Record::StepRefused(refused) => {
-                        let mut object = Map::new();
-                        object.insert("type".into(), json("model_step_refused"));
-                        object.insert("step_id".into(), json(refused.step_id));
-                        object.insert("usage".into(), json(refused.usage));
-                        set(&mut object, "served_model", refused.served_model.as_ref());
-                        set(&mut object, "usage_iterations", refused.usage_iterations.as_ref());
-                        object.insert("discarded_blocks".into(), json(refused.discarded_blocks));
-                        object.insert("schedule".into(), refused.schedule.clone());
-                        set(&mut object, "ts_ms", refused.ts_ms);
-                        Value::Object(object)
-                    }
-                    Record::ConfigRefrozen(refrozen) => {
-                        let mut object = Map::new();
-                        object.insert("type".into(), json("run_config_refrozen"));
-                        set(&mut object, "ts_ms", refrozen.ts_ms);
-                        object.insert("renderer_version".into(), json(refrozen.renderer_version));
-                        object.insert(
-                            "frozen_render_config".into(),
-                            refrozen.render_config.clone(),
-                        );
-                        Value::Object(object)
-                    }
-                    Record::AuthRefrozen(refrozen) => {
-                        let mut object = Map::new();
-                        object.insert("type".into(), json("run_auth_refrozen"));
-                        set(&mut object, "ts_ms", refrozen.ts_ms);
-                        object.insert("auth_selection".into(), refrozen.auth_selection.clone());
-                        Value::Object(object)
-                    }
-                    Record::Warmed(warmed) => {
-                        let mut object = members(warmed.billing.as_ref())?;
-                        object.insert("type".into(), json("cache_warmed"));
-                        set(&mut object, "attempt_id", warmed.attempt_id.as_ref());
-                        set(&mut object, "trigger", warmed.trigger.as_ref());
-                        object.insert("run_id".into(), json(&warmed.run_id));
-                        object.insert("step_id".into(), json(warmed.step_id));
-                        object.insert(
-                            "request_body_sha256".into(),
-                            json(hex(&warmed.request_body_sha256)),
-                        );
-                        object.insert(
-                            "warm_body_sha256".into(),
-                            json(hex(&warmed.warm_body_sha256)),
-                        );
-                        object.insert("usage".into(), json(warmed.usage));
-                        set(
-                            &mut object,
-                            "served_account_ref",
-                            warmed.served_account_ref.as_ref(),
-                        );
-                        set(
-                            &mut object,
-                            "ratelimit_headers",
-                            warmed.ratelimit_headers.as_ref(),
-                        );
-                        object.insert("sent_at_ms".into(), json(warmed.sent_at_ms));
-                        set(&mut object, "ttl_ms", warmed.ttl_ms);
-                        set(&mut object, "expires_at_ms", warmed.expires_at_ms);
-                        Value::Object(object)
-                    }
+                    Record::StepRefused(refused) => today::model_step_refused(refused),
+                    Record::ConfigRefrozen(refrozen) => today::run_config_refrozen(refrozen),
+                    Record::AuthRefrozen(refrozen) => today::run_auth_refrozen(refrozen),
+                    Record::Warmed(warmed) => today::cache_warmed(warmed)?,
                     Record::StructuredDowngraded(downgraded) => serde_json::json!({
                         "type": "structured_output_downgraded",
                         "run_id": downgraded.run_id,

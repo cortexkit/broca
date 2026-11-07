@@ -124,6 +124,8 @@ pub fn record_ids(record: &Record) -> Vec<(IdKind, String)> {
         | Record::ConfigRefrozen(_)
         | Record::AuthRefrozen(_)
         | Record::StepRefused(_) => {}
+        // Whether a run is billed is read from the operational fold's owed set, never looked up.
+        Record::Billed(_) => {}
         Record::ToolIntent(intent) => push(IdKind::CallKey, intent.call_key.as_deref()),
         Record::ToolHeld(held) => push(IdKind::CallKey, Some(&held.call_key)),
         Record::QueuedSend(send) => {
