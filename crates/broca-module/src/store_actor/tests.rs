@@ -47,7 +47,7 @@ pub(super) fn text_step(id: &str, text: &str) -> Vec<NormalizedEvent> {
 }
 
 /// A step that calls the `read` tool and asks for its result.
-fn read_step(id: &str) -> Vec<NormalizedEvent> {
+pub(super) fn read_step(id: &str) -> Vec<NormalizedEvent> {
     vec![
         NormalizedEvent::Control(ProviderControl::AssistantMessage {
             message: AssistantMessage {
@@ -199,6 +199,9 @@ impl RunExecutor for LoopExecutor {
                 session_address: None,
                 compaction_plane: control.compaction_plane.as_deref(),
                 compaction_session: control.compaction_session.clone(),
+                // The module's executor has every store run tell the compaction provider of
+                // the session's changes outside its steps (`Seams::compaction_changes`).
+                compaction_changes: true,
                 keep_warm: None,
                 account_reports: None,
                 max_same_account_wait: Default::default(),

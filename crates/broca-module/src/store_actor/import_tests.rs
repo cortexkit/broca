@@ -609,6 +609,7 @@ async fn a_later_run_renders_the_imported_history_without_reasoning_payloads() {
         session_address: None,
         compaction_plane: None,
         compaction_session: None,
+        compaction_changes: false,
         keep_warm: None,
         account_reports: None,
         max_same_account_wait: Default::default(),
