@@ -574,3 +574,60 @@ fn the_owed_set_is_declared_as_open_work() {
     assert!(matches!(field.bound, crate::fold::Bound::OpenWork(_)));
     assert_eq!(field.reset, "billed");
 }
+
+/// The session's title is the newest one a send carried, on a run start or in a queued send's
+/// or a steer's receipt, and a later send without one leaves it, as today's head reads the
+/// newest titled record of its log.
+#[test]
+fn the_title_is_the_newest_one_any_send_carried() {
+    let titled_start = |title: Option<&str>| {
+        let mut record = start();
+        if let Record::RunStart(start) = &mut record {
+            start.title = title.map(str::to_owned);
+        }
+        record
+    };
+    let mut titled_queue = queued("q", None);
+    if let Record::QueuedSend(send) = &mut titled_queue {
+        send.receipt = Some(serde_json::json!({ "title": "queued", "retention": 60 }));
+    }
+    let steer = |receipt: Option<serde_json::Value>| {
+        Record::Steer(Steer {
+            input: Vec::new(),
+            written_at_ms: None,
+            tags_v1: None,
+            receipt,
+        })
+    };
+    let title = |records: &[Record]| fold(records).unwrap().title;
+    assert_eq!(title(&[start()]), None);
+    assert_eq!(
+        title(&[titled_start(Some("first"))]).as_deref(),
+        Some("first")
+    );
+    assert_eq!(
+        title(&[titled_start(Some("first")), titled_start(None)]).as_deref(),
+        Some("first"),
+    );
+    assert_eq!(
+        title(&[titled_start(Some("first")), titled_queue.clone()]).as_deref(),
+        Some("queued"),
+    );
+    assert_eq!(
+        title(&[
+            titled_start(Some("first")),
+            steer(Some(serde_json::json!({ "title": "steered" }))),
+        ])
+        .as_deref(),
+        Some("steered"),
+    );
+    assert_eq!(
+        title(&[
+            titled_start(Some("first")),
+            steer(Some(serde_json::json!({ "send_id": "s" }))),
+            steer(None),
+        ])
+        .as_deref(),
+        Some("first"),
+    );
+}

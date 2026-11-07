@@ -159,6 +159,26 @@ impl<W: Writer, S: PartStore> Writer for Durable<'_, W, S> {
         self.writer.entry_by_mid(mid).await
     }
 
+    async fn entries_by_mid(
+        &self,
+        mids: &[String],
+    ) -> Result<Vec<broca_session_store::session::StoredEntry>, SessionError> {
+        self.writer.entries_by_mid(mids).await
+    }
+
+    async fn sealed_derived(
+        &self,
+    ) -> Result<Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>, SessionError> {
+        self.writer.sealed_derived().await
+    }
+
+    async fn keep_sealed_derived(
+        &self,
+        value: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Result<(), SessionError> {
+        self.writer.keep_sealed_derived(value).await
+    }
+
     fn media(&self) -> Option<std::sync::Arc<dyn broca_core::tool_media::MediaCapture>> {
         self.writer.media()
     }

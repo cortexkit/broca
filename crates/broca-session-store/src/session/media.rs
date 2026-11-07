@@ -26,11 +26,18 @@ pub(crate) struct OpenLogIndex {
     pub facts: BTreeMap<u64, u64>,
     /// The object each media digest the open log names is stored as.
     pub media: BTreeMap<String, MediaObject>,
+    /// The newest time any of the open log's records says something happened in the session
+    /// ([`Record::activity_ms`]), which `session.head` serves as the session's last update.
+    pub newest_activity_ms: Option<u64>,
 }
 
 impl OpenLogIndex {
     /// Takes in one record of the open log.
     pub fn note(&mut self, seq: u64, record: &Record) {
+        if let Some(at) = record.activity_ms() {
+            self.newest_activity_ms =
+                Some(self.newest_activity_ms.map_or(at, |newest| newest.max(at)));
+        }
         match record {
             Record::EntryFacts(facts) => {
                 self.facts.insert(seq, facts.ordinal);

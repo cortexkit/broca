@@ -426,6 +426,7 @@ dependencies = [
  "broca-wire",
  "ck-session-import",
  "cortexkit-bus-trait",
+ "cortexkit-compaction-view",
  "cortexkit-role-llm-runner 0.7.48",
  "cortexkit-role-llm-runner 0.8.7",
  "cortexkit-role-step-transform-provider",

@@ -193,6 +193,25 @@ fn input(profile: &broca_provider::media_profile::MediaProfile) -> HeadInput {
     input
 }
 
+/// Whether the head of a session whose latest run is in `state` quotes the catalog's media
+/// profile for the selected model, rather than reading the profile the run froze.
+pub(crate) fn quotes_catalog(state: &str) -> bool {
+    matches!(state, "completed" | "cancelled" | "error" | "exhausted")
+}
+
+/// The input profile a run's frozen render config describes, from its `media` member: attachments
+/// off when the run froze none, and unknown when the member doesn't read as a media profile.
+pub(crate) fn frozen_input(media: Option<serde_json::Value>) -> HeadInput {
+    match media {
+        Some(value) => serde_json::from_value(value)
+            .ok()
+            .as_ref()
+            .map(input)
+            .unwrap_or_else(|| HeadInput::new("unknown")),
+        None => broca_wire::head_input(),
+    }
+}
+
 fn quote_request(model: &HeadModel) -> SubmissionRequest {
     SubmissionRequest {
         route_decision_id: None,
@@ -227,7 +246,7 @@ fn quote_request(model: &HeadModel) -> SubmissionRequest {
 }
 
 impl LineageRegistry {
-    async fn quoted_media_head(&self, model: Option<&HeadModel>) -> HeadInput {
+    pub(crate) async fn quoted_media_head(&self, model: Option<&HeadModel>) -> HeadInput {
         let Some(model) = model else {
             return HeadInput::new("unknown");
         };
@@ -249,10 +268,7 @@ impl LineageRegistry {
                 interrupt_reason: None,
             });
         }
-        if matches!(
-            request.state,
-            "completed" | "cancelled" | "error" | "exhausted"
-        ) {
+        if quotes_catalog(request.state) {
             return Ok(Facts {
                 input: self.quoted_media_head(request.model).await,
                 interrupt_reason: None,
@@ -308,14 +324,7 @@ impl LineageRegistry {
                 interrupt_reason: None,
             });
         };
-        let input = match frozen.media {
-            Some(value) => serde_json::from_value(value)
-                .ok()
-                .as_ref()
-                .map(input)
-                .unwrap_or_else(|| HeadInput::new("unknown")),
-            None => broca_wire::head_input(),
-        };
+        let input = frozen_input(frozen.media);
         Ok(Facts {
             input,
             interrupt_reason: frozen.interrupt_reason,

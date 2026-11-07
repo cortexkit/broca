@@ -79,6 +79,17 @@ pub enum Request {
         mid: String,
         reply: Reply<Option<StoredEntry>>,
     },
+    EntriesByMid {
+        mids: Vec<String>,
+        reply: Reply<Vec<StoredEntry>>,
+    },
+    SealedDerived {
+        reply: Reply<Option<Arc<dyn std::any::Any + Send + Sync>>>,
+    },
+    KeepSealedDerived {
+        value: Arc<dyn std::any::Any + Send + Sync>,
+        reply: Reply<()>,
+    },
     Seal {
         /// `Some` for a cut before the entry with this ordinal, `None` for a ledger seal.
         ordinal: Option<u64>,
@@ -319,6 +330,28 @@ impl Writer for ActorWriter {
         .await
     }
 
+    async fn entries_by_mid(&self, mids: &[String]) -> Result<Vec<StoredEntry>, SessionError> {
+        self.ask(|reply| Request::EntriesByMid {
+            mids: mids.to_vec(),
+            reply,
+        })
+        .await
+    }
+
+    async fn sealed_derived(
+        &self,
+    ) -> Result<Option<Arc<dyn std::any::Any + Send + Sync>>, SessionError> {
+        self.ask(|reply| Request::SealedDerived { reply }).await
+    }
+
+    async fn keep_sealed_derived(
+        &self,
+        value: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Result<(), SessionError> {
+        self.ask(|reply| Request::KeepSealedDerived { value, reply })
+            .await
+    }
+
     fn media(&self) -> Option<Arc<dyn MediaCapture>> {
         self.media.clone()
     }
@@ -394,6 +427,15 @@ impl RunLink {
             }
             Request::EntryByMid { mid, reply } => {
                 let _ = reply.send(session.entry_by_mid(&mid).await);
+            }
+            Request::EntriesByMid { mids, reply } => {
+                let _ = reply.send(session.entries_by_mid(&mids).await);
+            }
+            Request::SealedDerived { reply } => {
+                let _ = reply.send(session.sealed_derived().await);
+            }
+            Request::KeepSealedDerived { value, reply } => {
+                let _ = reply.send(session.keep_sealed_derived(value).await);
             }
             Request::Seal {
                 ordinal,

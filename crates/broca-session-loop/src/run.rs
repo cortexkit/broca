@@ -984,7 +984,7 @@ fn manifest_parts(
 
 /// The plan manifest a run's start froze, rebuilt from the setup parts from its plan on and the
 /// remainder its choices keep. `None` for a run admitted without a plan.
-fn frozen_manifest(
+pub fn frozen_manifest(
     start: &broca_session_store::record::RunStart,
     parts: &dyn Parts,
 ) -> Result<Option<std::sync::Arc<broca_wal::PlanManifest>>, LoopError> {

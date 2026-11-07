@@ -93,7 +93,115 @@ pub fn window_entries(conversation: &Conversation, from: u64, limit: usize) -> V
         .collect()
 }
 
+/// What a session keeps of its sealed history while it's open, with the history version it was
+/// read under. Sealed history never changes, except that a revert to a sealed message cuts the
+/// history after it and moves the history version: everything read under an older version is
+/// dropped together.
+#[derive(Default)]
+pub(super) struct SealedCaches {
+    version: u64,
+    /// Sealed entries read by message id (see `entry_by_mid`).
+    entries: std::collections::HashMap<String, StoredEntry>,
+    /// A value a reader derived from sealed history and asked the session to keep (see
+    /// `keep_sealed_derived`).
+    derived: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+}
+
+pub(super) type SealedEntries = std::sync::Mutex<SealedCaches>;
+
+/// How far apart two named sealed entries may be and still be read in one pass: reading the
+/// entries between them decodes blocks that one read per entry would decode anyway.
+const READ_TOGETHER: u64 = 64;
+
 impl<B: SessionBackend> Session<B> {
+    /// The sealed caches, emptied first when the history version moved since they were filled.
+    fn sealed_caches(&self) -> std::sync::MutexGuard<'_, SealedCaches> {
+        let version = self.operations.history_version;
+        let mut caches = self.sealed_entries.lock().expect("sealed caches");
+        if caches.version != version {
+            *caches = SealedCaches {
+                version,
+                ..SealedCaches::default()
+            };
+        }
+        caches
+    }
+
+    /// The entry whose message id is `mid`, wherever it is: in the window, or read back from
+    /// sealed history; `None` when no entry of the session has that id. The id is found as
+    /// [`Session::find_message`] finds it, so an import's source id is found too. An entry read
+    /// from sealed history is kept while the session is open, so asking for it again reads
+    /// nothing.
+    pub async fn entry_by_mid(&self, mid: &str) -> Result<Option<StoredEntry>, SessionError> {
+        if let Some(entry) = self.sealed_caches().entries.get(mid) {
+            return Ok(Some(entry.clone()));
+        }
+        let version = self.operations.history_version;
+        let Some(ordinal) = self.find_message(mid).await? else {
+            return Ok(None);
+        };
+        let Some(entry) = self.entries(ordinal, 1).await?.into_iter().next() else {
+            return Ok(None);
+        };
+        if ordinal < self.conversation.window_start() {
+            let mut caches = self.sealed_caches();
+            if caches.version == version {
+                caches.entries.insert(mid.to_owned(), entry.clone());
+            }
+        }
+        Ok(Some(entry))
+    }
+
+    /// The entries whose message ids `mids` lists, in ordinal order, each once; an id no entry
+    /// has is left out. The ids are found as [`Session::find_message`] finds them, and the
+    /// entries are read together: named entries close to each other are read in one pass over
+    /// the history between them, not one read each. Nothing is kept: a caller that reads the
+    /// same entries at every step keeps what it derives from them (see `keep_sealed_derived`).
+    pub async fn entries_by_mid(&self, mids: &[String]) -> Result<Vec<StoredEntry>, SessionError> {
+        let mut ordinals = Vec::with_capacity(mids.len());
+        for mid in mids {
+            if let Some(ordinal) = self.find_message(mid).await? {
+                ordinals.push(ordinal);
+            }
+        }
+        ordinals.sort_unstable();
+        ordinals.dedup();
+        let mut runs: Vec<(u64, u64)> = Vec::new();
+        for ordinal in ordinals.iter().copied() {
+            match runs.last_mut() {
+                Some((_, end)) if ordinal - *end <= READ_TOGETHER => *end = ordinal,
+                _ => runs.push((ordinal, ordinal)),
+            }
+        }
+        let mut out = Vec::with_capacity(ordinals.len());
+        for (start, end) in runs {
+            let read = self.entries(start, (end - start + 1) as usize).await?;
+            out.extend(
+                read.into_iter()
+                    .filter(|entry| ordinals.binary_search(&entry.ordinal).is_ok()),
+            );
+        }
+        Ok(out)
+    }
+
+    /// The value a reader asked the session to keep with [`Session::keep_sealed_derived`], unless
+    /// the history version moved since.
+    pub fn sealed_derived(&self) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
+        self.sealed_caches().derived.clone()
+    }
+
+    /// Keeps `value`, which a reader derived from sealed history, while the session is open and
+    /// its history version stays: what the compaction transcript projects from the sealed
+    /// entries its views name, so a later step reads none of them again.
+    pub fn keep_sealed_derived(&self, value: std::sync::Arc<dyn std::any::Any + Send + Sync>) {
+        self.sealed_caches().derived = Some(value);
+    }
+
+    /// How many sealed entries the session keeps by message id now, for diagnostics.
+    pub fn kept_sealed_entries(&self) -> usize {
+        self.sealed_caches().entries.len()
+    }
+
     /// Up to `limit` entries from ordinal `from` on (counting from 1), in order, over the whole
     /// conversation: sealed history a block at a time, then the window, then the held assistant
     /// message, if any.

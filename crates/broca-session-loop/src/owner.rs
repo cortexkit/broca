@@ -37,5 +37,31 @@ pub fn ownership(owner: &Owner) -> Result<SessionOwnershipV1, String> {
     .for_owner_access())
 }
 
+/// [`ownership`] plus the first run's tools and fetch-plan manifest (`first_episode`), read
+/// back from the setup parts the first run's start names, as `SessionOwnershipV1` carries them
+/// for `route.bind` and the plan checks. The store takes no plan refresh yet, so the first
+/// manifest is also the latest and `latest_manifest` stays absent, as today's summary leaves it
+/// for an unrefreshed session.
+pub fn ownership_with_first_episode(
+    owner: &Owner,
+    parts: &dyn crate::parts::Parts,
+) -> Result<SessionOwnershipV1, String> {
+    let mut summary = ownership(owner)?;
+    if let Some(first) = &owner.first_start {
+        let admission = crate::run::admission_of_start(first, parts)
+            .map_err(|error| format!("the first run's start: {error:?}"))?;
+        summary.first_episode = Some(broca_core::admission::FirstEpisodeV1 {
+            run_id: broca_protocol::RunId(admission.run_id.clone()),
+            tool_names: admission
+                .tools
+                .iter()
+                .map(|tool| tool.name.clone())
+                .collect(),
+            manifest: admission.manifest,
+        });
+    }
+    Ok(summary)
+}
+
 #[cfg(test)]
 mod tests;

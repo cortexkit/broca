@@ -406,3 +406,73 @@ async fn a_module_without_the_new_storage_refuses_file_imports_by_name() {
     );
     assert!(rig.import_folder().join("imp-1.json").exists());
 }
+
+/// On a session kept in the new storage, an op with no store implementation yet is refused by
+/// name before authorization reads anything, never with today's storage's advice to run a newer
+/// build. `role.describe` still answers on the session's route. Cancels are authorized from the
+/// stored owner: a stranger is refused as not the owner, and the owner's cancel is answered.
+#[tokio::test]
+async fn a_store_session_refuses_unbuilt_ops_by_name_and_checks_owners_from_the_store() {
+    let mut rig = Rig::start("gate", true).await;
+    rig.bind(1, core(), Some(stamp(core()))).await;
+    let params = rig.import_params("imp-1");
+    rig.result(1, "session.import", params).await;
+
+    for method in ["run.status", "run.result", "session.baseline"] {
+        assert_eq!(
+            rig.refused(1, method, serde_json::json!({"run_id": "r1"}))
+                .await,
+            "not_served_on_new_storage",
+            "{method}"
+        );
+    }
+    // An import carrying its messages inline is today's import, which writes a WAL.
+    assert_eq!(
+        rig.refused(
+            1,
+            "session.import",
+            serde_json::json!({"import_id": "inline", "messages": []})
+        )
+        .await,
+        "not_served_on_new_storage"
+    );
+    let describe = rig
+        .request(
+            1,
+            serde_json::json!({"method": "role.describe", "params": {}}),
+        )
+        .await;
+    assert_eq!(describe.header.ty, FrameType::Response);
+    // The head is served from the store. The import's own completed run is the last run, and
+    // the head's time is the newest imported message's.
+    let head = rig.result(1, "session.head", serde_json::json!({})).await;
+    assert_eq!(head["last_run_state"]["state"], "completed", "{head}");
+    assert!(
+        head["last_run_state"]["run_id"]
+            .as_str()
+            .is_some_and(|run| run.starts_with("import-")),
+        "{head}"
+    );
+    assert_eq!(head["updated_at"], 4000, "{head}");
+    assert_eq!(
+        (head["first_ordinal"].clone(), head["last_ordinal"].clone()),
+        (1.into(), 4.into()),
+        "{head}"
+    );
+
+    rig.bind(2, stranger(), Some(stamp(stranger()))).await;
+    let cancel = serde_json::json!({"run_id": "r-none"});
+    let refused = rig.refused(2, "run.cancel", cancel.clone()).await;
+    assert_eq!(refused, "scope_owner_mismatch");
+    let reply = rig
+        .request(
+            1,
+            serde_json::json!({"method": "run.cancel", "params": cancel}),
+        )
+        .await;
+    let body = String::from_utf8_lossy(&reply.body).into_owned();
+    assert!(
+        !body.contains("wal_newer_writer") && !body.contains("not_served_on_new_storage"),
+        "the owner's cancel reaches the store actor: {body}"
+    );
+}

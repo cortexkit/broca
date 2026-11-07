@@ -180,6 +180,9 @@ pub struct Session<B: SessionBackend> {
     window: OpenLogIndex,
     /// The import's id map, once read (see `import`).
     imported: import::IdMapCache,
+    /// What the session keeps of its sealed history while it's open (see `entry_by_mid` and
+    /// `keep_sealed_derived`).
+    sealed_entries: read::SealedEntries,
 }
 
 impl<B: SessionBackend> Session<B> {
@@ -294,6 +297,7 @@ impl<B: SessionBackend> Session<B> {
             open_ids: OpenIds::default(),
             window: OpenLogIndex::default(),
             imported: Default::default(),
+            sealed_entries: Default::default(),
         })
     }
 
@@ -443,6 +447,7 @@ impl<B: SessionBackend> Session<B> {
             open_ids,
             window,
             imported: Default::default(),
+            sealed_entries: Default::default(),
         };
         Ok(Loaded::Open {
             session: Box::new(session),
@@ -639,6 +644,12 @@ impl<B: SessionBackend> Session<B> {
     /// The open log's change id and its current length.
     pub fn open_log(&self) -> (Id128, u64) {
         (self.log, self.encoder.offset())
+    }
+
+    /// The newest time a record of the open log carries (`Record::activity_ms`), or `None` when
+    /// no record there carries one. Records a seal moved out of the open log aren't counted.
+    pub fn open_log_activity_ms(&self) -> Option<u64> {
+        self.window.newest_activity_ms
     }
 
     /// The id for a new message whose `EntryFacts` record will be the `offset`th record (from 0)

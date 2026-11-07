@@ -294,3 +294,34 @@ fn a_view_of_a_damaged_log_refuses_and_changes_nothing() {
         bytes
     );
 }
+
+/// The open log's newest activity time is the newest time any of its records carries, whatever
+/// order they were appended in, and a load for a read finds the same.
+#[test]
+fn the_open_logs_newest_activity_is_kept_and_read_back() {
+    let backend = MemoryBackend::default();
+    let timed = |text: &str, at: u64| {
+        let mut record = input(text);
+        if let Record::Input(input) = &mut record {
+            input.written_at_ms = Some(at);
+        }
+        record
+    };
+    block_on(async {
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(), false)
+            .await
+            .unwrap();
+        assert_eq!(session.open_log_activity_ms(), None);
+        session
+            .append(&[timed("one", 9), event("a")], true)
+            .await
+            .unwrap();
+        session.append(&[timed("two", 5)], true).await.unwrap();
+        assert_eq!(session.open_log_activity_ms(), Some(9));
+        session.close().await.unwrap();
+        let view = Session::view(&backend, addr(), &triple(), &deployment())
+            .await
+            .unwrap();
+        assert_eq!(view.open_log_activity_ms(), Some(9));
+    });
+}

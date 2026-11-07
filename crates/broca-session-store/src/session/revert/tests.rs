@@ -190,6 +190,71 @@ async fn runs<B: SessionBackend>(
     (mids, inputs)
 }
 
+/// What a session keeps of its sealed history goes when a revert moves the history version:
+/// after a revert into sealed history, a sealed entry the revert cut away is read fresh and not
+/// found, instead of being answered from what was kept, and a value derived from sealed history
+/// is gone. Both are kept again under the new version.
+#[test]
+fn a_revert_drops_what_the_session_kept_of_its_sealed_history() {
+    let backend = MemoryBackend::default();
+    block_on(async {
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(), false)
+            .await
+            .unwrap();
+        let (mids, inputs) = runs(&mut session, 0, 4).await;
+        session.seal(Some(inputs[3]), 1_000).await.unwrap();
+        assert_eq!(session.conversation.window_start(), 7);
+        let kept = session.entry_by_mid(&mids[4]).await.unwrap().unwrap();
+        assert_eq!(kept.ordinal, 5);
+        assert_eq!(session.kept_sealed_entries(), 1);
+        session.keep_sealed_derived(std::sync::Arc::new(7u32));
+        assert!(session.sealed_derived().is_some());
+
+        session
+            .revert(&mids[2], resend("r9", "s9", "edited"), 2_000)
+            .await
+            .unwrap();
+        assert_eq!(session.kept_sealed_entries(), 0);
+        assert!(session.sealed_derived().is_none());
+        assert_eq!(session.entry_by_mid(&mids[4]).await.unwrap(), None);
+        assert_eq!(
+            session
+                .entry_by_mid(&mids[1])
+                .await
+                .unwrap()
+                .unwrap()
+                .ordinal,
+            2
+        );
+        assert_eq!(session.kept_sealed_entries(), 1);
+    });
+}
+
+/// Entries read by message id come back once each, in ordinal order, from sealed history and
+/// the window alike; an id no entry has is left out.
+#[test]
+fn entries_by_mid_reads_named_entries_in_order() {
+    let backend = MemoryBackend::default();
+    block_on(async {
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(), false)
+            .await
+            .unwrap();
+        let (mids, inputs) = runs(&mut session, 0, 4).await;
+        session.seal(Some(inputs[3]), 1_000).await.unwrap();
+        let named = [
+            mids[7].clone(),
+            mids[0].clone(),
+            "g0000000000000000.99".into(),
+            mids[4].clone(),
+            mids[0].clone(),
+        ];
+        let read = session.entries_by_mid(&named).await.unwrap();
+        let ordinals: Vec<u64> = read.iter().map(|entry| entry.ordinal).collect();
+        assert_eq!(ordinals, [1, 5, 8]);
+        assert_eq!(read[1].state.facts.as_ref().unwrap().mid, mids[4]);
+    });
+}
+
 /// A revert at a message in the open log: the window keeps the messages before it, then the
 /// resend at its ordinal. The reverted message's id and every later one resolve to nothing, the
 /// resend's resolves to the ordinal, and the ledger keeps every abandoned run. The fold owes a
