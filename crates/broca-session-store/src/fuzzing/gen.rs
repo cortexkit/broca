@@ -1097,7 +1097,8 @@ mod operations {
         owner,
         session_usage,
         billing_owed,
-        imported_ids
+        imported_ids,
+        title
     });
     crate::fuzzing::gen::fields!(SessionUsage {
         since,

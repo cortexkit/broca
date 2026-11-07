@@ -646,6 +646,12 @@ impl<B: SessionBackend> Session<B> {
         (self.log, self.encoder.offset())
     }
 
+    /// The newest time a record of the open log carries (`Record::activity_ms`), or `None` when
+    /// no record there carries one. Records a seal moved out of the open log aren't counted.
+    pub fn open_log_activity_ms(&self) -> Option<u64> {
+        self.window.newest_activity_ms
+    }
+
     /// The id for a new message whose `EntryFacts` record will be the `offset`th record (from 0)
     /// of the next batch: `g<generation>.<seq of that record>`. A seq can repeat after a crash,
     /// since a record that never became durable gives its number back, but never under the same

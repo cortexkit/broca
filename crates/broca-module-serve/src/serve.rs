@@ -5054,8 +5054,8 @@ const NOT_SERVED_ON_NEW_STORAGE: &str = "not_served_on_new_storage";
 /// reads. An op joins this list in the change that gives it a store implementation.
 fn served_on_new_storage(method: &str, params: &serde_json::Value) -> bool {
     match method {
-        // Reads served from the store (`store_read`).
-        OP_READ => true,
+        // Reads served from the store (`store_read`, `store_head`).
+        OP_READ | OP_HEAD => true,
         // The store actor serves sends, cancels and retractions.
         OP_SEND | OP_CANCEL | OP_RETRACT => true,
         // A head import from a file creates the session in the new storage. An import carrying

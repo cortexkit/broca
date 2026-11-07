@@ -145,10 +145,7 @@ impl HeadProjection {
     }
 
     fn set_senders(&mut self, manifest: &broca_wal::PlanManifest) {
-        self.senders = crate::admission::manifest_senders(manifest);
-        for sender in &mut self.senders {
-            sender.templates.clear();
-        }
+        self.senders = head_senders(manifest);
     }
 
     pub(crate) fn restore_sender_admission(&mut self, ownership: &crate::SessionOwnershipV1) {
@@ -321,44 +318,66 @@ impl HeadProjection {
         scope: &broca_protocol::SendScope,
         modes: &[cortexkit_role_llm_runner::delivery_order::Mode],
     ) -> Option<cortexkit_role_llm_runner::read::HeadSender> {
-        use cortexkit_role_llm_runner::{delivery_order, read::HeadSender};
-        if self.ownership.episodes == 0 {
-            return None;
-        }
-        if crate::scope_admission::decide_owner_access(&self.ownership, principal, scope).is_ok() {
-            return Some(HeadSender::for_owner(
-                modes.iter().map(|mode| mode.as_str().into()).collect(),
-            ));
-        }
-        let broca_protocol::BindPrincipal::Reserved { module_id } = principal? else {
-            return None;
-        };
-        let owner = self
-            .ownership
-            .scope
-            .as_ref()
-            .map(|scope| &scope.owner)
-            .or(self.ownership.first_principal.as_ref())?
-            .as_owner_string();
-        let granted = modes
-            .iter()
-            .filter(|mode| {
-                delivery_order::admit(module_id, Some(&owner), &self.senders, &[**mode]).is_ok()
-            })
-            .map(|mode| mode.as_str().to_owned())
-            .collect::<Vec<_>>();
-        self.senders
-            .iter()
-            .find(|sender| &sender.module == module_id)?;
-        let interrupt = delivery_order::admit_delivery(
-            module_id,
-            Some(&owner),
-            &self.senders,
-            cortexkit_role_llm_runner::send::Delivery::Interrupt,
-        )
-        .is_ok();
-        Some(HeadSender::new(granted, interrupt))
+        head_sender(&self.ownership, &self.senders, principal, scope, modes)
     }
+}
+
+/// The plan's senders as `session.head` reads them: each sender's grants without its templates,
+/// which only admission reads.
+pub fn head_senders(
+    manifest: &broca_wal::PlanManifest,
+) -> Vec<cortexkit_role_llm_runner::delivery_order::PlanSender> {
+    let mut senders = crate::admission::manifest_senders(manifest);
+    for sender in &mut senders {
+        sender.templates.clear();
+    }
+    senders
+}
+
+/// What `session.head` tells a caller it may send to the session: every delivery mode for the
+/// session's owner, and for a reserved module the plan names as a sender, the modes and the
+/// interrupt that plan grants it. `None` before the session's first run, and for any other
+/// caller. `ownership` is the session's owner summary and `senders` its plan's senders
+/// ([`head_senders`]), whichever storage keeps the session.
+pub fn head_sender(
+    ownership: &crate::SessionOwnershipV1,
+    senders: &[cortexkit_role_llm_runner::delivery_order::PlanSender],
+    principal: Option<&broca_protocol::BindPrincipal>,
+    scope: &broca_protocol::SendScope,
+    modes: &[cortexkit_role_llm_runner::delivery_order::Mode],
+) -> Option<cortexkit_role_llm_runner::read::HeadSender> {
+    use cortexkit_role_llm_runner::{delivery_order, read::HeadSender};
+    if ownership.episodes == 0 {
+        return None;
+    }
+    if crate::scope_admission::decide_owner_access(ownership, principal, scope).is_ok() {
+        return Some(HeadSender::for_owner(
+            modes.iter().map(|mode| mode.as_str().into()).collect(),
+        ));
+    }
+    let broca_protocol::BindPrincipal::Reserved { module_id } = principal? else {
+        return None;
+    };
+    let owner = ownership
+        .scope
+        .as_ref()
+        .map(|scope| &scope.owner)
+        .or(ownership.first_principal.as_ref())?
+        .as_owner_string();
+    let granted = modes
+        .iter()
+        .filter(|mode| delivery_order::admit(module_id, Some(&owner), senders, &[**mode]).is_ok())
+        .map(|mode| mode.as_str().to_owned())
+        .collect::<Vec<_>>();
+    senders.iter().find(|sender| &sender.module == module_id)?;
+    let interrupt = delivery_order::admit_delivery(
+        module_id,
+        Some(&owner),
+        senders,
+        cortexkit_role_llm_runner::send::Delivery::Interrupt,
+    )
+    .is_ok();
+    Some(HeadSender::new(granted, interrupt))
 }
 
 /// Only admission interprets untrusted plan choices. Replay reads an already admitted manifest.

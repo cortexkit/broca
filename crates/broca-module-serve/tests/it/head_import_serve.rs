@@ -418,12 +418,7 @@ async fn a_store_session_refuses_unbuilt_ops_by_name_and_checks_owners_from_the_
     let params = rig.import_params("imp-1");
     rig.result(1, "session.import", params).await;
 
-    for method in [
-        "run.status",
-        "session.head",
-        "run.result",
-        "session.baseline",
-    ] {
+    for method in ["run.status", "run.result", "session.baseline"] {
         assert_eq!(
             rig.refused(1, method, serde_json::json!({"run_id": "r1"}))
                 .await,
@@ -448,6 +443,22 @@ async fn a_store_session_refuses_unbuilt_ops_by_name_and_checks_owners_from_the_
         )
         .await;
     assert_eq!(describe.header.ty, FrameType::Response);
+    // The head is served from the store. The import's own completed run is the last run, and
+    // the head's time is the newest imported message's.
+    let head = rig.result(1, "session.head", serde_json::json!({})).await;
+    assert_eq!(head["last_run_state"]["state"], "completed", "{head}");
+    assert!(
+        head["last_run_state"]["run_id"]
+            .as_str()
+            .is_some_and(|run| run.starts_with("import-")),
+        "{head}"
+    );
+    assert_eq!(head["updated_at"], 4000, "{head}");
+    assert_eq!(
+        (head["first_ordinal"].clone(), head["last_ordinal"].clone()),
+        (1.into(), 4.into()),
+        "{head}"
+    );
 
     rig.bind(2, stranger(), Some(stamp(stranger()))).await;
     let cancel = serde_json::json!({"run_id": "r-none"});
