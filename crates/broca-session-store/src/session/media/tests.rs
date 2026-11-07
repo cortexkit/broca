@@ -128,7 +128,7 @@ fn call(id: &str) -> ContentBlock {
 fn facts(ordinal: u64, mid: String) -> Record {
     Record::EntryFacts(EntryFacts {
         ordinal,
-        written_at_ms: ordinal,
+        written_at_ms: Some(ordinal),
         tag_base: 0,
         notice: None,
         usage: None,
@@ -137,6 +137,10 @@ fn facts(ordinal: u64, mid: String) -> Record {
         render_tags: false,
         clean_reply: false,
         mid,
+        run_id: None,
+        created_at_ms: None,
+        delivery_mode: None,
+        delivery_tool_call_id: None,
     })
 }
 

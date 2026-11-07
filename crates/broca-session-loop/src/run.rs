@@ -297,8 +297,11 @@ where
     }
     admission.input = input;
     let mut placed = Placed {
-        facts: contract
-            .then(|| Tags::for_run(admission.manifest.as_deref(), &admission.render_config)),
+        facts: Tags::for_session(
+            contract,
+            admission.manifest.as_deref(),
+            &admission.render_config,
+        ),
         inner: writer,
     };
     let start_seq = admit(&mut placed, parts, &admission).await?;
@@ -469,9 +472,11 @@ where
     }
     let drift = drift.filter(|_| !matches!(resolution, Resolution::Paused(_)));
     let mut placed = Placed {
-        facts: admission
-            .compaction_plan_version
-            .map(|_| Tags::for_run(admission.manifest.as_deref(), &admission.render_config)),
+        facts: Tags::for_session(
+            admission.compaction_plan_version.is_some(),
+            admission.manifest.as_deref(),
+            &admission.render_config,
+        ),
         inner: writer,
     };
     let writer = &mut placed;
@@ -689,9 +694,11 @@ where
     // The closing results message is placed with the facts its run's frozen rules give it, as a
     // resume places it.
     let mut placed = Placed {
-        facts: admission
-            .compaction_plan_version
-            .map(|_| Tags::for_run(admission.manifest.as_deref(), &admission.render_config)),
+        facts: Tags::for_session(
+            admission.compaction_plan_version.is_some(),
+            admission.manifest.as_deref(),
+            &admission.render_config,
+        ),
         inner: writer,
     };
     let writer = &mut placed;

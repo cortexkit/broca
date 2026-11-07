@@ -299,7 +299,7 @@ impl<B: SessionBackend> Session<B> {
             *seq == cut && matches!(record, Record::Input(_) | Record::Assistant(_))
         });
         let before = conversation_at(checkpoint, records, cut).map_err(SessionError::Fold)?;
-        if !starts_entry || before.open_tool_turn().is_some() {
+        if !starts_entry || before.open_tool_turn().is_some() || owes_facts(records, cut) {
             return Err(SessionError::BadCut(cut));
         }
         Ok(())
@@ -816,10 +816,31 @@ impl<B: SessionBackend> Session<B> {
     }
 }
 
+/// Whether a message before `cut` is still waiting for its `EntryFacts` there: messages placed
+/// together are written before all their facts, so a log can't start between them (see
+/// `segment::groups`). A log with no facts at all owes none.
+fn owes_facts(records: &[(u64, Record)], cut: u64) -> bool {
+    let tracks_facts = records
+        .iter()
+        .any(|(_, record)| matches!(record, Record::EntryFacts(_)));
+    let mut owed = 0usize;
+    for (_, record) in records.iter().take_while(|(seq, _)| *seq < cut) {
+        match record {
+            Record::Input(_) | Record::Assistant(_) => owed += usize::from(tracks_facts),
+            Record::EntryFacts(_) => owed = owed.saturating_sub(1),
+            _ => {}
+        }
+    }
+    owed > 0
+}
+
 /// The checkpoint's conversation state folded over the log's transcript records before `cut`.
 /// The seq of the latest open-log record a log can start at that places an entry with ordinal at
-/// most `ordinal`: an input or an assistant message, with no tool turn open before it. Every
-/// entry the log knows counts: those it placed, and an assistant message waiting for its results.
+/// most `ordinal`: an input or an assistant message, with no tool turn open before it and no
+/// earlier message still waiting for its `EntryFacts` (see `segment::groups`: messages placed
+/// together come before all their facts, and a log starting between them would leave a sealed
+/// message's facts in the open log). Every entry the log knows counts: those it placed, and an
+/// assistant message waiting for its results.
 fn placing_seq(
     checkpoint: &Checkpoint,
     records: &[(u64, Record)],
@@ -828,6 +849,10 @@ fn placing_seq(
     let known = |conversation: &Conversation| {
         conversation.placed + u64::from(conversation.open_tool_turn().is_some())
     };
+    let tracks_facts = records
+        .iter()
+        .any(|(_, record)| matches!(record, Record::EntryFacts(_)));
+    let mut owed = 0usize;
     let mut conversation = checkpoint.conversation.clone();
     let mut start = None;
     let mut reached = false;
@@ -835,8 +860,14 @@ fn placing_seq(
         if record.stream() != Stream::Transcript {
             continue;
         }
+        let owed_before = owed;
+        match record {
+            Record::Input(_) | Record::Assistant(_) => owed += usize::from(tracks_facts),
+            Record::EntryFacts(_) => owed = owed.saturating_sub(1),
+            _ => {}
+        }
         let before = known(&conversation);
-        let open_before = conversation.open_tool_turn().is_some();
+        let open_before = conversation.open_tool_turn().is_some() || owed_before > 0;
         conversation
             .apply(record)
             .map_err(|e| SessionError::Fold(format!("conversation: {e:?}")))?;

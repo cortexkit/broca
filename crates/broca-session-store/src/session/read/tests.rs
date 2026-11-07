@@ -83,7 +83,7 @@ fn reply(id: &str, text: String) -> Record {
 fn facts(ordinal: u64) -> Record {
     Record::EntryFacts(EntryFacts {
         ordinal,
-        written_at_ms: ordinal,
+        written_at_ms: Some(ordinal),
         tag_base: ordinal,
         notice: None,
         usage: None,
@@ -92,6 +92,10 @@ fn facts(ordinal: u64) -> Record {
         render_tags: false,
         clean_reply: false,
         mid: format!("mfeedface.{}", ordinal - 1),
+        run_id: None,
+        created_at_ms: None,
+        delivery_mode: None,
+        delivery_tool_call_id: None,
     })
 }
 

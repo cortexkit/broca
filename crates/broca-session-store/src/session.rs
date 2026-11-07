@@ -127,6 +127,36 @@ pub fn apply(
     }
 }
 
+/// What [`Session::read`] found: a creation that never committed, or a log read and folded.
+enum Loaded<B: SessionBackend> {
+    Creating {
+        backend: B,
+        addr: SessionAddr,
+        // Boxed, as the open session is: a head is large, and the two variants should cost alike.
+        head: Box<Head>,
+        version: Version,
+        key: DataKey,
+        log: Id128,
+    },
+    Open {
+        session: Box<Session<B>>,
+        read: ReadLog,
+        end: u64,
+    },
+}
+
+/// A session loaded for reading only ([`Session::view`]). It gives the session's read methods,
+/// which take `&self`, and none of its writes, which take `&mut self`.
+pub struct SessionView<B: SessionBackend>(Session<B>);
+
+impl<B: SessionBackend> std::ops::Deref for SessionView<B> {
+    type Target = Session<B>;
+
+    fn deref(&self) -> &Session<B> {
+        &self.0
+    }
+}
+
 /// A session open for writing. It holds the head version it last committed, which fences every
 /// write it makes.
 pub struct Session<B: SessionBackend> {
@@ -269,6 +299,62 @@ impl<B: SessionBackend> Session<B> {
         triple: &SessionTriple,
         deployment: &DeploymentKey,
     ) -> Result<Self, SessionError> {
+        match Self::read(backend, addr, triple, deployment).await? {
+            Loaded::Creating {
+                backend,
+                addr,
+                head,
+                version,
+                key,
+                log,
+            } => {
+                // Creation crashed before its commit, so the session has no records yet.
+                let appends = head.appends_in_conversation.unwrap_or(false);
+                let mut session =
+                    Self::create_log(backend, addr, *head, version, &key, log, appends).await?;
+                session.open_writer(&key).await?;
+                Ok(session)
+            }
+            Loaded::Open {
+                mut session,
+                read,
+                end,
+            } => {
+                let key = session.key.clone();
+                session.open_writer_over(&key, &read, end).await?;
+                Ok(*session)
+            }
+        }
+    }
+
+    /// Loads the session at `addr` for reading only, writing nothing. A torn tail reads as not
+    /// yet written. A log that needs a recovery refuses `NeedsRecovery`, since only a writer
+    /// may repair. A session whose creation never committed reads as `Missing`: it holds no
+    /// record yet. A session a writer holds reads as of the writer's last write that reached
+    /// the backend.
+    pub async fn view(
+        backend: B,
+        addr: SessionAddr,
+        triple: &SessionTriple,
+        deployment: &DeploymentKey,
+    ) -> Result<SessionView<B>, SessionError> {
+        match Self::read(backend, addr, triple, deployment).await? {
+            Loaded::Creating { .. } => Err(SessionError::Missing),
+            Loaded::Open { mut session, .. } => {
+                // No writer was opened, so nothing may be appended: every write checks this.
+                session.poisoned = true;
+                Ok(SessionView(*session))
+            }
+        }
+    }
+
+    /// Reads the session's head, checkpoint and open log and folds them, writing nothing.
+    async fn read(
+        backend: B,
+        addr: SessionAddr,
+        triple: &SessionTriple,
+        deployment: &DeploymentKey,
+    ) -> Result<Loaded<B>, SessionError> {
         let (stored, version) = backend
             .read_head(&addr)
             .await?
@@ -281,12 +367,14 @@ impl<B: SessionBackend> Session<B> {
             return Err(SessionError::NeedsRecovery);
         }
         if let Residence::Creating(log) = head.residence {
-            // Creation crashed before its commit, so the session has no records yet.
-            let appends = head.appends_in_conversation.unwrap_or(false);
-            let mut session =
-                Self::create_log(backend, addr, head, version, &key, log, appends).await?;
-            session.open_writer(&key).await?;
-            return Ok(session);
+            return Ok(Loaded::Creating {
+                backend,
+                addr,
+                head: Box::new(head),
+                version,
+                key,
+                log,
+            });
         }
         let open = head
             .open_log
@@ -335,7 +423,7 @@ impl<B: SessionBackend> Session<B> {
             }
             apply(&mut conversation, &mut operations, *seq, record).map_err(SessionError::Fold)?;
         }
-        let mut session = Self {
+        let session = Self {
             backend,
             addr,
             head,
@@ -349,8 +437,11 @@ impl<B: SessionBackend> Session<B> {
             open_ids,
             window,
         };
-        session.open_writer_over(&key, &read, end).await?;
-        Ok(session)
+        Ok(Loaded::Open {
+            session: Box::new(session),
+            read,
+            end,
+        })
     }
 
     /// Every record of the open log after its checkpoint, with its seq, read again from the

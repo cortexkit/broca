@@ -233,3 +233,63 @@ fn another_triple_or_deployment_key_refuses() {
         Err(SessionError::Head(_))
     ));
 }
+
+/// A view reads what a writer still holding the session wrote, writes nothing (not even the
+/// generation a writer's open commits), and reads a torn tail as not yet written without
+/// cutting it.
+#[test]
+fn a_view_reads_a_held_session_and_writes_nothing() {
+    let backend = MemoryBackend::default();
+    let (log, synced) = block_on(async {
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(), false)
+            .await
+            .unwrap();
+        session.append(&[input("one")], true).await.unwrap();
+        session.append(&[input("two")], true).await.unwrap();
+        let view = Session::view(&backend, addr(), &triple(), &deployment())
+            .await
+            .unwrap();
+        assert_eq!(texts(&view.conversation.messages), ["one", "two"]);
+        assert_eq!(view.next_seq(), session.next_seq());
+        session.open_log()
+    });
+    let (head_before, _) = block_on(backend.read_head(&addr())).unwrap().unwrap();
+    // A write cut short past the last batch.
+    let mut bytes = block_on(backend.read_log(&addr(), &log, 0..synced)).unwrap();
+    bytes.extend_from_slice(&[0xA5; 40]);
+    backend.set_log(&addr(), &log, bytes.clone());
+    let view = block_on(Session::view(&backend, addr(), &triple(), &deployment())).unwrap();
+    assert_eq!(texts(&view.conversation.messages), ["one", "two"]);
+    drop(view);
+    assert_eq!(
+        block_on(backend.read_log(&addr(), &log, 0..synced + 40)).unwrap(),
+        bytes,
+        "the view left the torn tail in place"
+    );
+    let (head_after, _) = block_on(backend.read_head(&addr())).unwrap().unwrap();
+    assert_eq!(head_after, head_before, "the view committed no head");
+}
+
+/// A view refuses a log only a recovery may repair, and changes nothing.
+#[test]
+fn a_view_of_a_damaged_log_refuses_and_changes_nothing() {
+    let backend = MemoryBackend::default();
+    create_and_write(&backend);
+    let (stored, _) = block_on(backend.read_head(&addr())).unwrap().unwrap();
+    let (head, _) = crate::head::open(&stored, &deployment()).unwrap();
+    let log = head.open_log.unwrap().change;
+    let end = block_on(backend.log_end(&addr(), &log)).unwrap();
+    let mut bytes = block_on(backend.read_log(&addr(), &log, 0..end)).unwrap();
+    let flip = bytes.len() - 60;
+    bytes[flip] ^= 1;
+    backend.set_log(&addr(), &log, bytes.clone());
+    let error = block_on(Session::view(&backend, addr(), &triple(), &deployment())).err();
+    assert!(
+        matches!(error, Some(SessionError::NeedsRecovery)),
+        "{error:?}"
+    );
+    assert_eq!(
+        block_on(backend.read_log(&addr(), &log, 0..end)).unwrap(),
+        bytes
+    );
+}

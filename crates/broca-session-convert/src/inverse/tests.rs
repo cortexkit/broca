@@ -81,21 +81,24 @@ fn a_steer_is_recorded_where_it_is_placed_and_round_trips() {
             "SetupStub",
             "RunStart",
             "Input",
+            "EntryFacts",
             "StepStart",
             "Steer",
             "Assistant",
             "StepEnd",
+            "EntryFacts",
             "Input",
-            "StepStart"
+            "StepStart",
+            "EntryFacts",
         ]
     );
-    let broca_session_store::record::Record::Input(steer) = &converted.records[7] else {
+    let broca_session_store::record::Record::Input(steer) = &converted.records[9] else {
         panic!("the placed steer");
     };
     assert_eq!(
         steer.receipt_seq,
-        Some(5),
-        "it names the steered event, at seq 5"
+        Some(6),
+        "it names the steer's record, at seq 6, after the input's entry facts"
     );
     assert_round_trip(&old);
 }

@@ -46,20 +46,22 @@ fn a_tool_step_splits_into_transcript_and_ledger_records() {
             "SetupStub",
             "RunStart",
             "Input",
+            "EntryFacts",
             "StepStart",
             "Assistant",
             "StepEnd",
+            "EntryFacts",
             "BatchStart",
             "ToolIntent",
             "ToolReply",
             "ToolOutcome",
+            "EntryFacts",
             "BatchEnd",
-            // A record whose fields nothing reads individually yet travels whole as an event.
             "Event",
             "RunEnd",
-            // The second run has the same setup, so it gets no second stub.
             "RunStart",
             "Input",
+            "EntryFacts",
         ]
     );
 
@@ -90,14 +92,14 @@ fn a_tool_step_splits_into_transcript_and_ledger_records() {
         Record::Input(input) if input.placement == Placement::RunInput && input.run_id == "run-1"
     ));
     assert!(matches!(
-        &converted.records[11],
+        &converted.records[14],
         // The event names a run only when the old record did.
         Record::Event(event) if event.name == "input_token_cap_frozen"
             && event.run_id.is_none()
             && event.body == Some(serde_json::json!({"limit": 5}))
     ));
     assert!(matches!(
-        &converted.records[12],
+        &converted.records[15],
         Record::RunEnd(end) if end.run_id == "run-1"
     ));
 

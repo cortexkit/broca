@@ -16,7 +16,7 @@ use broca_session_loop::parts::{DeploymentParts, SharedParts};
 use broca_session_store::backend::{LocalBackend, SessionAddr};
 use broca_session_store::head::SessionTriple;
 use broca_session_store::keys::DeploymentKey;
-use broca_session_store::session::{Session, SessionError};
+use broca_session_store::session::{Session, SessionError, SessionView};
 use broca_session_store::setup::SetupStore;
 use tokio::sync::mpsc;
 
@@ -74,6 +74,31 @@ impl StoreRuntime {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(error) => Err(OpenError::Open(format!(
                 "the new storage's head of this session could not be checked: {error}"
+            ))),
+        }
+    }
+
+    /// Loads the session `key` for a read, writing nothing and taking no lease (see
+    /// `Session::view`). A session whose creation never committed holds no record, so it reads
+    /// as having none (`None`). A log that needs a recovery refuses, transiently: the session's
+    /// next send opens its actor, which repairs it.
+    pub async fn view(
+        &self,
+        key: &BindIdentity,
+    ) -> Result<Option<SessionView<LocalBackend>>, OpenError> {
+        let addr = SessionAddr(broca_core::session_addr(key));
+        let backend = LocalBackend::new(store_root(&self.state_root));
+        match Session::view(backend, addr, &triple(key), &self.deployment).await {
+            Ok(view) => Ok(Some(view)),
+            Err(SessionError::Missing) => Ok(None),
+            Err(SessionError::NeedsRecovery) => Err(OpenError::Classified {
+                reason: "session_needs_recovery: the session's log must be repaired before it \
+                         can be read; its next send repairs it"
+                    .into(),
+                class: broca_protocol::ErrorClass::Transient,
+            }),
+            Err(error) => Err(OpenError::Open(format!(
+                "the session could not be read from the new storage: {error:?}"
             ))),
         }
     }

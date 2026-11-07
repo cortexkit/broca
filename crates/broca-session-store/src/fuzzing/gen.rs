@@ -565,6 +565,10 @@ mod records {
         render_tags,
         clean_reply,
         mid,
+        run_id,
+        created_at_ms,
+        delivery_mode,
+        delivery_tool_call_id,
     });
     crate::fuzzing::gen::fields!(PartRef { kind, digest });
     crate::fuzzing::gen::fields!(SetupStub {
@@ -994,7 +998,16 @@ mod operations {
         warms,
         refrozen_render,
         refrozen_auth,
-        refused_step
+        refused_step,
+        step_request,
+        step_attempt,
+        end_error,
+        end_usage
+    });
+    crate::fuzzing::gen::fields!(StepAttempt { step_id, ts_ms });
+    crate::fuzzing::gen::fields!(StepRequest {
+        step_id,
+        sent_at_ms
     });
     crate::fuzzing::gen::fields!(OutputCap {
         step_id,

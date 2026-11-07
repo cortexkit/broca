@@ -59,6 +59,7 @@ pub mod replay;
 pub mod served_history;
 pub use served_history::ServedHistory;
 
+pub use context::state_for_terminal;
 pub use context::StorePageReadError;
 pub use replay::RunAttribution;
 pub mod resume;

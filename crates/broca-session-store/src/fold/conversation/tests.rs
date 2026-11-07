@@ -211,7 +211,7 @@ fn delivered_text_joins_its_result_only_where_the_session_stores_it_there() {
 fn facts(ordinal: u64, tag_base: u64) -> Record {
     Record::EntryFacts(EntryFacts {
         ordinal,
-        written_at_ms: 1_000 + ordinal,
+        written_at_ms: Some(1_000 + ordinal),
         tag_base,
         notice: None,
         usage: None,
@@ -220,6 +220,10 @@ fn facts(ordinal: u64, tag_base: u64) -> Record {
         render_tags: true,
         clean_reply: true,
         mid: format!("m{}", ordinal - 1),
+        run_id: None,
+        created_at_ms: None,
+        delivery_mode: None,
+        delivery_tool_call_id: None,
     })
 }
 

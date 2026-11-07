@@ -401,6 +401,54 @@ state! {
             reset: "a step's end",
             bound: Bound::Fixed,
         },
+        /// When the request that produced the current step's response was sent: the newest
+        /// attempt that completed the step and wasn't a warm. An assistant message's creation
+        /// time is this. A warm for the step clears it, and an attempt with no send time leaves
+        /// it unknown, as `broca_core::creation_times` rules.
+        30 opt pub step_request: StepRequest => {
+            owner: "run loop",
+            reset: "step_start",
+            bound: Bound::Fixed,
+        },
+        /// When the newest attempt that completed the current step finished, warm or not. An
+        /// assistant message without its own written time takes this, as
+        /// `broca_core::message_times` rules.
+        31 opt pub step_attempt: StepAttempt => {
+            owner: "run loop",
+            reset: "step_start",
+            bound: Bound::Fixed,
+        },
+        /// Owned by the provider layer: the typed error the run's end or pause recorded, so a
+        /// read names it without reading the log back.
+        32 opt pub end_error: serde_json::Value => {
+            owner: "run loop",
+            reset: "run_start",
+            bound: Bound::Fixed,
+        },
+        /// The usage the run's end recorded.
+        33 opt pub end_usage: Usage => {
+            owner: "run loop",
+            reset: "run_start",
+            bound: Bound::Fixed,
+        },
+    }
+}
+
+crate::message! {
+    /// The request that produced a step's response (`Run::step_request`).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct StepRequest {
+        1 req step_id: u64,
+        2 opt sent_at_ms: u64,
+    }
+}
+
+crate::message! {
+    /// When the newest attempt that completed a step finished (`Run::step_attempt`).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct StepAttempt {
+        1 req step_id: u64,
+        2 req ts_ms: u64,
     }
 }
 
@@ -481,6 +529,10 @@ impl Run {
             refrozen_render: None,
             refrozen_auth: None,
             refused_step: None,
+            step_request: None,
+            step_attempt: None,
+            end_error: None,
+            end_usage: None,
             warms: Vec::new(),
             keep_warm: start.keep_warm.clone(),
             on_restart: start.on_restart.clone(),
@@ -1132,8 +1184,51 @@ impl Operations {
         let Some(run) = self.run.as_mut() else {
             return Ok(());
         };
+        if let Record::Attempt(attempt) = record {
+            if attempt.run_id == run.run_id
+                && matches!(
+                    attempt.outcome.as_str(),
+                    "complete" | "tool_args_trailing_garbage"
+                )
+            {
+                run.step_attempt = Some(StepAttempt {
+                    step_id: attempt.step_id,
+                    ts_ms: attempt.ts_ms,
+                });
+            }
+        }
+        match record {
+            Record::Attempt(attempt)
+                if attempt.run_id == run.run_id
+                    && matches!(
+                        attempt.outcome.as_str(),
+                        "complete" | "tool_args_trailing_garbage"
+                    )
+                    && !attempt
+                        .billing
+                        .as_ref()
+                        .is_some_and(|billing| billing["reservation"]["warm"] == true) =>
+            {
+                run.step_request = Some(StepRequest {
+                    step_id: attempt.step_id,
+                    sent_at_ms: attempt.sent_at_ms,
+                });
+            }
+            Record::Warmed(warmed)
+                if warmed.run_id == run.run_id
+                    && run
+                        .step_request
+                        .as_ref()
+                        .is_some_and(|request| request.step_id == warmed.step_id) =>
+            {
+                run.step_request = None;
+            }
+            _ => {}
+        }
         match record {
             Record::StepStart(_) => {
+                run.step_request = None;
+                run.step_attempt = None;
                 run.warms.clear();
                 run.provider_call_started = true;
                 run.account_limit_pause = None;
@@ -1332,11 +1427,15 @@ impl Operations {
                 run.retries_used = end.retries_used;
                 run.pending_steers.clear();
                 run.paused = None;
+                run.end_error = end.error.clone();
+                run.end_usage = end.usage;
             }
             Record::Pause(pause) => {
                 run.account_limit_pause = pause.account_limit.clone();
                 run.paused = Some(pause.reason);
                 run.finished = None;
+                run.end_error = pause.error.clone();
+                run.end_usage = None;
             }
             Record::Retraction(retraction) if retraction.failure.is_some() => {
                 // A send that failed admission ends as a run of its own with no step, so the

@@ -24,12 +24,13 @@ use cortexkit_role_compaction::read::Entry;
 use crate::writer::Writer;
 
 /// A writer that adds entry facts to every batch it appends, so no place in the loop that
-/// writes a message can forget them. Only a session on the current compaction contract records
-/// entry facts; for any other, `facts` is `None` and batches pass through unchanged.
+/// writes a message can forget them. Every session records them: `session.read` serves each
+/// message from them. Only a session on the current compaction contract records the facts
+/// `session.entries` serves (see [`Tags::entries`]).
 pub struct Placed<'w, W> {
     pub inner: &'w mut W,
-    /// The run's tag rules, for a session that records entry facts.
-    pub facts: Option<Tags>,
+    /// The run's tag rules.
+    pub facts: Tags,
 }
 
 /// The view a model-written message was written under, as today's projection decides it: the
@@ -43,9 +44,7 @@ fn written_under(operations: &Operations) -> Option<ViewRef> {
 
 impl<W: Writer> Writer for Placed<'_, W> {
     async fn append(&mut self, records: &[Record], barrier: bool) -> Result<u64, SessionError> {
-        let Some(tags) = self.facts else {
-            return self.inner.append(records, barrier).await;
-        };
+        let tags = self.facts;
         let prefix = self.inner.message_id_prefix();
         let records = with_facts(
             records.to_vec(),
@@ -55,6 +54,7 @@ impl<W: Writer> Writer for Placed<'_, W> {
                 prefix: &prefix,
                 tags,
                 view: written_under(self.inner.operations()),
+                operations: self.inner.operations(),
             },
         )
         .map_err(SessionError::Fold)?;
@@ -71,9 +71,7 @@ impl<W: Writer> Writer for Placed<'_, W> {
                   + Send),
         barrier: bool,
     ) -> Result<Vec<Record>, SessionError> {
-        let Some(tags) = self.facts else {
-            return self.inner.append_with(build, barrier).await;
-        };
+        let tags = self.facts;
         let prefix = self.inner.message_id_prefix();
         let mut failure = None;
         let records = self
@@ -87,6 +85,7 @@ impl<W: Writer> Writer for Placed<'_, W> {
                         prefix: &prefix,
                         tags,
                         view: written_under(operations),
+                        operations,
                     };
                     match with_facts(batch, &placing) {
                         Ok(batch) => batch,
@@ -172,9 +171,32 @@ pub struct Tags {
     pub render: bool,
     /// Whether the run cleans part numbers out of the model's replies.
     pub clean_replies: bool,
+    /// Whether the session is on the current compaction contract, so it serves
+    /// `session.entries` and records what that serves: part numbers, notices, usage and the view
+    /// in force. Off the contract those facts take fixed values (part numbers from 0, none of
+    /// the rest), since nothing reads them there.
+    pub entries: bool,
 }
 
 impl Tags {
+    /// The rules for a run of a session that is (`contract`) or isn't on the current compaction
+    /// contract.
+    pub fn for_session(
+        contract: bool,
+        manifest: Option<&broca_wal::PlanManifest>,
+        render_config: &serde_json::Value,
+    ) -> Self {
+        if contract {
+            Self::for_run(manifest, render_config)
+        } else {
+            Self {
+                render: false,
+                clean_replies: false,
+                entries: false,
+            }
+        }
+    }
+
     /// Today's rules for a run on the current compaction contract: numbers render when the plan
     /// asks for them or names a compaction item, and replies are cleaned when they render, except
     /// a structured-output run's final text.
@@ -192,6 +214,7 @@ impl Tags {
                 render,
                 render_config,
             ),
+            entries: true,
         }
     }
 }
@@ -206,6 +229,9 @@ pub struct Placing<'a> {
     pub tags: Tags,
     /// The compaction view the current step rendered with.
     pub view: Option<ViewRef>,
+    /// The operational state before the batch: the step's request, the pending steers and the
+    /// queue the batch's messages come from.
+    pub operations: &'a Operations,
 }
 
 /// `batch` with an `EntryFacts` record after the records that place or reserve each message:
@@ -216,7 +242,12 @@ pub fn with_facts(batch: Vec<Record>, at: &Placing<'_>) -> Result<Vec<Record>, S
     let mut counts = at.conversation.without_window();
     let mut known = known_of(&counts);
     let mut inserted = false;
-    let mut high = high_water(at.conversation)?;
+    let entries = at.tags.entries;
+    let mut high = if entries {
+        high_water(at.conversation)?
+    } else {
+        0
+    };
     let mut time = last_time(at.conversation);
     let mut out = Vec::with_capacity(batch.len() + 2);
     let mut pending: Vec<EntryFacts> = Vec::new();
@@ -237,22 +268,39 @@ pub fn with_facts(batch: Vec<Record>, at: &Placing<'_>) -> Result<Vec<Record>, S
             for ordinal in known + 1..=now_known {
                 let (message, facts) = describe(&record, at, run_sender.as_ref())?;
                 let own = facts.written_at_ms;
-                let written_at_ms = own.or(time).unwrap_or(0);
-                time = Some(written_at_ms);
+                // On the contract a message without its own time takes the newest earlier
+                // entry's, as `session.entries` serves it. Off it, only its own, as
+                // `session.read` serves it there, where a zero stamp means none
+                // (`broca_core::message_times::fold`).
+                let written_at_ms = if entries {
+                    let written = own.or(time).unwrap_or(0);
+                    time = Some(written);
+                    Some(written)
+                } else {
+                    own.filter(|at| *at != 0)
+                };
                 pending.push(EntryFacts {
                     ordinal,
                     written_at_ms,
                     tag_base: high,
-                    notice: facts.notice,
-                    usage: facts.usage,
-                    generated_under: facts.generated_under,
+                    notice: facts.notice.filter(|_| entries),
+                    usage: facts.usage.filter(|_| entries),
+                    generated_under: facts.generated_under.filter(|_| entries),
                     native: facts.native,
                     render_tags: at.tags.render,
                     clean_reply: facts.clean_reply,
                     mid: String::new(),
+                    run_id: facts.run_id,
+                    created_at_ms: facts.created_at_ms,
+                    delivery_mode: facts.delivery_mode.map(str::to_owned),
+                    delivery_tool_call_id: None,
                 });
                 high = high
-                    .checked_add(message.map_or(0, numbered_parts))
+                    .checked_add(if entries {
+                        message.map_or(0, numbered_parts)
+                    } else {
+                        0
+                    })
                     .filter(|high| *high <= 9_007_199_254_740_991)
                     .ok_or("compaction tag numbers exceed the protocol integer range")?;
             }
@@ -286,6 +334,27 @@ pub fn with_facts(batch: Vec<Record>, at: &Placing<'_>) -> Result<Vec<Record>, S
     }
     flush(&mut out, &mut pending, at);
     Ok(out)
+}
+
+/// When an input message was accepted: a steer's or delivered send's acceptance, kept across
+/// its wait for a boundary, else the message's own time. A budget reminder or imported message
+/// has none, as `broca_core::creation_times` rules.
+fn accepted_at(input: &broca_session_store::record::Input, at: &Placing<'_>) -> Option<u64> {
+    match input.placement {
+        Placement::BudgetNudge | Placement::Imported | Placement::DamageNotice => None,
+        Placement::RunInput => input.written_at_ms,
+        Placement::Steer | Placement::Delivered | Placement::DeliveredTurnSystem => at
+            .operations
+            .run
+            .as_ref()
+            .and_then(|run| {
+                run.pending_steers
+                    .iter()
+                    .find(|pending| pending.seq.is_some() && pending.seq == input.receipt_seq)
+            })
+            .and_then(|pending| pending.written_at_ms)
+            .or(input.written_at_ms),
+    }
 }
 
 fn flush(out: &mut Vec<Record>, pending: &mut Vec<EntryFacts>, at: &Placing<'_>) {
@@ -335,11 +404,28 @@ fn input_sender(start: &broca_session_store::record::RunStart) -> Option<Notice>
 
 struct Described {
     written_at_ms: Option<u64>,
+    /// The run that placed the message, when one owns it.
+    run_id: Option<String>,
+    /// When the message was accepted (`EntryFacts::created_at_ms`).
+    created_at_ms: Option<u64>,
+    /// How a delivered send placed the message: `steer`, `turn_system` or `idle_start`.
+    delivery_mode: Option<&'static str>,
     notice: Option<Notice>,
     usage: Option<StepUsage>,
     generated_under: Option<ViewRef>,
     native: bool,
     clean_reply: bool,
+}
+
+/// Whether the message `record` places was written by broca itself (a model step's message, a
+/// tool-results message, or a budget reminder), rather than given as input. A model step's
+/// message is complete when its tool calls all have results.
+pub fn native(record: &Record) -> bool {
+    match record {
+        Record::Input(input) => input.placement == Placement::BudgetNudge,
+        Record::Assistant(_) | Record::ToolReply(_) => true,
+        _ => false,
+    }
 }
 
 /// The message `record` placed or reserved, and its facts besides number and time. A tool result
@@ -356,13 +442,16 @@ fn describe<'r>(
             Some(&input.message),
             Described {
                 written_at_ms: input.written_at_ms,
+                run_id: Some(input.run_id.clone()),
+                created_at_ms: None,
+                delivery_mode: None,
                 notice: Some(Notice {
                     sender: "broca".into(),
                     template: None,
                 }),
                 usage: None,
                 generated_under: None,
-                native: true,
+                native: native(record),
                 clean_reply: false,
             },
         ),
@@ -370,6 +459,17 @@ fn describe<'r>(
             Some(&input.message),
             Described {
                 written_at_ms: input.written_at_ms,
+                // An imported seed belongs to no run.
+                run_id: (input.placement != Placement::Imported).then(|| input.run_id.clone()),
+                created_at_ms: accepted_at(input, at),
+                // A run started from a queued send with a delivery order (`idle_start`) and a send
+                // riding on a tool result (`tool_result`) aren't named here: a session in the new
+                // storage takes neither yet, and refuses both by name.
+                delivery_mode: match input.placement {
+                    Placement::Delivered => Some("steer"),
+                    Placement::DeliveredTurnSystem => Some("turn_system"),
+                    _ => None,
+                },
                 notice: match input.placement {
                     Placement::RunInput => run_sender.cloned(),
                     _ => input.notice.clone(),
@@ -377,14 +477,32 @@ fn describe<'r>(
                 .filter(|_| input.message.role == Role::User),
                 usage: None,
                 generated_under: None,
-                native: false,
+                native: native(record),
                 clean_reply: at.tags.clean_replies && input.message.role == Role::Assistant,
             },
         ),
         Record::Assistant(assistant) => (
             Some(&assistant.message),
             Described {
-                written_at_ms: assistant.written_at_ms,
+                // A step that recorded no written time takes its completing attempt's finish,
+                // as `broca_core::message_times` rules.
+                written_at_ms: assistant.written_at_ms.or_else(|| {
+                    at.operations
+                        .run
+                        .as_ref()
+                        .and_then(|run| run.step_attempt.as_ref())
+                        .filter(|attempt| attempt.step_id == assistant.step_id)
+                        .map(|attempt| attempt.ts_ms)
+                }),
+                run_id: Some(assistant.run_id.clone()),
+                created_at_ms: at
+                    .operations
+                    .run
+                    .as_ref()
+                    .and_then(|run| run.step_request.as_ref())
+                    .filter(|request| request.step_id == assistant.step_id)
+                    .and_then(|request| request.sent_at_ms),
+                delivery_mode: None,
                 notice: None,
                 usage: assistant.usage.and_then(step_usage).map(|usage| {
                     // `StepUsage` from the contract crate can't be read field by field outside
@@ -400,7 +518,7 @@ fn describe<'r>(
                     }
                 }),
                 generated_under: at.view.clone(),
-                native: true,
+                native: native(record),
                 clean_reply: at.tags.clean_replies,
             },
         ),
@@ -408,10 +526,14 @@ fn describe<'r>(
             None,
             Described {
                 written_at_ms: reply.finished_at_ms,
+                run_id: Some(reply.run_id.clone()),
+                // A tool-results message has no creation time of its own.
+                created_at_ms: None,
+                delivery_mode: None,
                 notice: None,
                 usage: None,
                 generated_under: None,
-                native: true,
+                native: native(record),
                 clean_reply: false,
             },
         ),
@@ -458,7 +580,7 @@ fn last_time(conversation: &Conversation) -> Option<u64> {
         .filter(|_| conversation.open_tool_turn().is_some())
         .or(conversation.entries.last())
         .and_then(|entry| entry.facts.as_ref())
-        .map(|facts| facts.written_at_ms)
+        .and_then(|facts| facts.written_at_ms)
 }
 
 /// The compaction entry for a message the new format stored, built only from what it stored:
@@ -473,6 +595,11 @@ pub fn project(stored: &StoredEntry) -> Result<Entry, String> {
         .as_ref()
         .ok_or_else(|| format!("message {} has no entry facts", stored.ordinal))?;
     let mid = facts.mid.as_str();
+    // Only a session on the compaction contract serves entries, and its facts always carry a
+    // time.
+    let written_at = facts
+        .written_at_ms
+        .ok_or_else(|| format!("message {} has entry facts with no time", stored.ordinal))?;
     let usage = facts.usage.map(|usage| {
         let mut out = cortexkit_role_compaction::read::StepUsage::default();
         out.prompt_tokens = usage.prompt_tokens;
@@ -502,9 +629,9 @@ pub fn project(stored: &StoredEntry) -> Result<Entry, String> {
         mid: mid.to_owned(),
         ordinal: stored.ordinal,
         tag_base: Some(facts.tag_base),
-        written_at: facts.written_at_ms,
+        written_at,
         completed_at: (stored.message.role == Role::Assistant && facts.native)
-            .then_some(facts.written_at_ms),
+            .then_some(written_at),
         notice,
         usage,
         generated_under,
@@ -517,7 +644,7 @@ pub fn project(stored: &StoredEntry) -> Result<Entry, String> {
             mid: format!("{mid}:next"),
             ordinal: stored.ordinal + 1,
             tag_base: Some(facts.tag_base),
-            written_at: facts.written_at_ms,
+            written_at,
             ..Facts::default()
         });
     }

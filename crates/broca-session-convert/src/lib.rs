@@ -236,6 +236,8 @@ pub fn convert(old: &[FramedRecord], lineage: Option<&str>) -> Result<Converted,
         convert_one(&framed.record, &mut state, &mut out)?;
         if let Some((legacy, counts, emitted)) = &mut facts {
             let mut known = *emitted;
+            // Whether broca wrote each newly known message, told by the record that placed it.
+            let mut native_of = BTreeMap::new();
             for record in &out.records[before..] {
                 if record.stream() != Stream::Transcript {
                     continue;
@@ -245,7 +247,11 @@ pub fn convert(old: &[FramedRecord], lineage: Option<&str>) -> Result<Converted,
                     .map_err(|e| err(format!("entry facts: conversation {e:?}")))?;
                 counts.clear_window();
                 let reserved = counts.open_tool_turn().is_some();
-                known = known.max(counts.placed + u64::from(reserved));
+                let now = counts.placed + u64::from(reserved);
+                for ordinal in known + 1..=now {
+                    native_of.insert(ordinal, broca_session_loop::entries::native(record));
+                }
+                known = known.max(now);
             }
             for ordinal in *emitted + 1..=known {
                 let pending = legacy
@@ -259,11 +265,22 @@ pub fn convert(old: &[FramedRecord], lineage: Option<&str>) -> Result<Converted,
                             "entry facts: today's projection has no message {ordinal}"
                         ))
                     })?;
+                // Off the contract, whether broca wrote the message is told by the record that
+                // placed it, as the run loop tells it.
+                let native = if legacy.page_only {
+                    native_of.get(&ordinal).copied().unwrap_or(false)
+                } else {
+                    metadata.source_input.is_none()
+                };
                 out.records.push(Record::EntryFacts(entry_facts::record(
                     ordinal,
                     metadata,
                     *written_at,
+                    native,
                     mid.clone(),
+                    legacy.runs.get(&(ordinal - 1)).cloned(),
+                    legacy.created.get(&(ordinal - 1)).copied(),
+                    legacy.deliveries.get(&(ordinal - 1)),
                 )));
             }
             *emitted = known;

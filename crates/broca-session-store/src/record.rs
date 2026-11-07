@@ -241,8 +241,12 @@ message! {
     pub struct EntryFacts {
         /// The message's place in the whole conversation, counting from 1.
         1 req ordinal: u64,
-        /// When the message was written. Never moves later than an earlier entry's.
-        2 req written_at_ms: u64,
+        /// When the message was written. On a session on the current compaction contract it is
+        /// always set and never moves later than an earlier entry's: a message without its own
+        /// time takes the newest earlier entry's, as `session.entries` serves it. Off the
+        /// contract it is the message's own time, absent when it has none, as `session.read`
+        /// serves it there.
+        2 opt written_at_ms: u64,
         /// The part number before this message's first numbered part: its parts take the
         /// numbers after it, in order.
         3 req tag_base: u64,
@@ -261,6 +265,21 @@ message! {
         /// converted from today's storage keeps today's id. A new message's id is minted from
         /// the writer generation and the seq this record takes (`Session::message_id`).
         10 req mid: String,
+        /// The run that placed the message. Absent when no run owns it, such as an imported
+        /// seed. `session.read` names it as the message's run.
+        11 opt run_id: String,
+        /// When the message was accepted, as `session.read` serves it. An input, steer or
+        /// delivered send takes its send's acceptance time, kept across a queue. An assistant
+        /// message takes the send time of its step's last complete attempt, not counting a warm
+        /// request. A tool result message has none.
+        12 opt created_at_ms: u64,
+        /// How a delivered send reached the conversation, as `session.read` names it beside the
+        /// message's run: `steer` or `turn_system` for the messages it placed, `idle_start` for
+        /// the input of a run it started, `tool_result` for the tool result message it rode
+        /// on. A steer that wasn't queued, and every other message, has none.
+        13 opt delivery_mode: String,
+        /// For a send that rode on a tool result: the call whose result carried it.
+        14 opt delivery_tool_call_id: String,
     }
 }
 
@@ -1174,7 +1193,7 @@ impl Record {
             Record::Assistant(r) => r.last_content_at_ms.or(r.written_at_ms),
             Record::ToolReply(r) => r.finished_at_ms,
             Record::ResultAppend(r) => r.written_at_ms,
-            Record::EntryFacts(r) => Some(r.written_at_ms),
+            Record::EntryFacts(r) => r.written_at_ms,
             Record::RunStart(r) => r.written_at_ms.or(r.ts_ms),
             Record::RunEnd(r) => r.ts_ms,
             Record::Attempt(r) => r.last_content_at_ms.or(Some(r.ts_ms)),

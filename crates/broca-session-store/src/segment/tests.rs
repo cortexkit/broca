@@ -92,6 +92,42 @@ fn a_group_never_splits_across_blocks() {
     assert_eq!(segment.index.blocks[0].records, 39);
 }
 
+/// Facts for `ordinal`, as a writer places them after its messages.
+fn facts(ordinal: u64) -> Record {
+    Record::EntryFacts(crate::record::EntryFacts {
+        ordinal,
+        written_at_ms: None,
+        tag_base: 0,
+        notice: None,
+        usage: None,
+        generated_under: None,
+        native: false,
+        render_tags: false,
+        clean_reply: false,
+        mid: format!("g1.{ordinal}"),
+        run_id: None,
+        created_at_ms: None,
+        delivery_mode: None,
+        delivery_tool_call_id: None,
+    })
+}
+
+#[test]
+fn messages_placed_together_share_a_group_with_their_facts() {
+    // A run's two input messages come before both their facts, so neither message may start a
+    // block of its own before its facts arrive. The next message, owed nothing earlier, starts a
+    // group again.
+    let records = vec![
+        (1, input("system")),
+        (2, input("user")),
+        (3, facts(1)),
+        (4, facts(2)),
+        (5, input("next")),
+        (6, facts(3)),
+    ];
+    assert_eq!(groups(&records), vec![0..4, 4..6]);
+}
+
 #[test]
 fn a_segment_read_under_another_name_or_key_refuses() {
     let records = transcript(50, 400);

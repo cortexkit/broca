@@ -16,6 +16,7 @@ path = "src/main.rs"
 broca-core = { path = "../broca-core" }
 # Today's offline request renderer (`wal_render`), which the `render` check compares the new run
 # loop's rebuilt requests with.
+broca-module = { path = "../broca-module" }
 broca-module-serve = { path = "../broca-module-serve" }
 broca-protocol = { path = "../broca-protocol" }
 broca-provider = { path = "../broca-provider" }

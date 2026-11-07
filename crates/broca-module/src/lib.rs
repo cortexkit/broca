@@ -32,6 +32,7 @@ pub mod serve;
 pub mod session_class;
 pub mod store_actor;
 pub mod store_open;
+pub mod store_read;
 mod uploads;
 
 pub use cache::{CacheDeclaration, CacheDeclarer};

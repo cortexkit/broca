@@ -147,16 +147,35 @@ pub struct SegmentMeta {
 
 /// Splits transcript records into groups that must share a block: each user input or assistant
 /// message starts a group, and the records after it (its tool results, text delivered with a tool
-/// result, markers) join it. Ledger records are grouped one by one.
+/// result, markers, entry facts) join it. Ledger records are grouped one by one.
+///
+/// A message whose `EntryFacts` hasn't come yet keeps its group open. Messages placed together,
+/// such as a run's several input messages, are written before all their facts, and a block
+/// holding a message without its facts would read it without them. Every message of a session
+/// that records facts gets them in the batch that places it, so a segment holding any
+/// `EntryFacts` holds every message's; one holding none (a session from before facts) groups as
+/// before.
 pub fn groups(records: &[(u64, Record)]) -> Vec<Range<usize>> {
     let mut out: Vec<Range<usize>> = Vec::new();
+    let tracks_facts = records
+        .iter()
+        .any(|(_, record)| matches!(record, Record::EntryFacts(_)));
+    // Messages in the current group still waiting for their `EntryFacts`.
+    let mut owed = 0usize;
     for (index, (_, record)) in records.iter().enumerate() {
         let starts = match record {
-            Record::Input(_) | Record::Assistant(_) => true,
+            Record::Input(_) | Record::Assistant(_) => {
+                let starts = owed == 0;
+                owed += usize::from(tracks_facts);
+                starts
+            }
+            Record::EntryFacts(_) => {
+                owed = owed.saturating_sub(1);
+                false
+            }
             Record::ToolReply(_)
             | Record::ResultAppend(_)
             | Record::Marker(_)
-            | Record::EntryFacts(_)
             | Record::SetupStub(_)
             | Record::Compaction(_) => false,
             _ => true,

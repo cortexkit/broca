@@ -2767,7 +2767,8 @@ fn zero_step_seeded_episode(framed: &[FramedRecord], run_id: Option<&RunId>) -> 
     seeded
 }
 
-fn state_for_terminal(reason: RunFinishReason) -> SessionReadStateKind {
+/// The `session.read` state of a session whose latest run ended for `reason`.
+pub fn state_for_terminal(reason: RunFinishReason) -> SessionReadStateKind {
     match reason {
         RunFinishReason::Completed => SessionReadStateKind::Completed,
         RunFinishReason::MaxSteps => SessionReadStateKind::MaxSteps,

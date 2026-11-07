@@ -880,13 +880,19 @@ fn provider_id() -> &'static str {
     }
 }
 
+/// The time the harness stamps where it writes a time itself, for either loop. Not 0: a
+/// session off the compaction contract reads a zero stamp as none, as today's
+/// `broca_core::message_times` does, so a zero here would hide a time that a loop really recorded.
+const HARNESS_TIME_MS: u64 = 1;
+
 /// The time the new loop reads: today's loop reads the wall clock, so a comparison whose result
-/// depends on it does too; every other comparison reads 0 and normalizes the times recorded.
+/// depends on it does too; every other comparison reads [`HARNESS_TIME_MS`] and normalizes the
+/// times recorded.
 fn harness_now() -> u64 {
     if cache() || account().is_some() || fallback().is_some() {
         broca_core::clock::Clock::default().now_ms()
     } else {
-        0
+        HARNESS_TIME_MS
     }
 }
 
@@ -2116,6 +2122,9 @@ fn rand_suffix() -> u64 {
 const NORMALIZED: &[&str] = &[
     "ts_ms",
     "written_at_ms",
+    // When a message was accepted or its request sent: a wall-clock time each loop takes.
+    // Whether a message has one is still compared.
+    "created_at_ms",
     "finished_at_ms",
     "dispatched_at_ms",
     "last_content_at_ms",
@@ -3302,7 +3311,7 @@ fn ordered(id: &str, modes: &[&str], text: &str, expires_at_ms: Option<u64>) -> 
     }
     let input = vec![user(text)];
     let send = broca_core::delivery_order::OrderedSend {
-        admitted_at_ms: Some(0),
+        admitted_at_ms: Some(HARNESS_TIME_MS),
         submission_id: broca_protocol::SubmissionId(id.into()),
         order: serde_json::from_value(order.clone()).unwrap(),
         principal: None,
@@ -3324,7 +3333,7 @@ fn ordered(id: &str, modes: &[&str], text: &str, expires_at_ms: Option<u64>) -> 
                 "generation": {},
                 "stop_when": [],
             },
-            "written_at_ms": 0,
+            "written_at_ms": HARNESS_TIME_MS,
         }))
         .unwrap(),
     ];
@@ -3498,9 +3507,9 @@ impl Provider for SteeringProvider {
 fn steered(call: usize, index: usize, messages: Vec<Message>) -> WalRecord {
     WalRecord::Steered {
         sent_by: None,
-        written_at_ms: Some(0),
+        written_at_ms: Some(HARNESS_TIME_MS),
         retention: None,
-        ts_ms: Some(0),
+        ts_ms: Some(HARNESS_TIME_MS),
         send_id: Some(format!("steer-{call}-{index}")),
         request_identity_digest: None,
         delivery: Some(broca_protocol::Delivery::Steer),
