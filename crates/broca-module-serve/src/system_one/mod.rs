@@ -608,9 +608,6 @@ impl SystemOne {
                     _ = stop.cancelled() => return,
                     _ = tick.tick() => {}
                 }
-                if let Err(error) = service.recover_routing().await {
-                    tracing::warn!(target: "system_one", %error, "routing report recovery failed; pending bodies remain durable");
-                }
                 match service.sweep().await {
                     Ok(0) => {}
                     Ok(batches) => tracing::info!(target: "system_one", batches,

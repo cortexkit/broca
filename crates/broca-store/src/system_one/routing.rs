@@ -95,11 +95,136 @@ impl SystemOneStore {
         let rows = statement.query_map([role], |row| row.get(0))?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
+
+    /// Include expired routed rows even when they have no outstanding RPCs, so
+    /// content retention does not depend on the state root's retention worker.
+    pub fn routing_recovery_batches(&self, role: &str, now_ms: i64) -> Result<Vec<String>> {
+        let conn = self.lock();
+        let mut statement = conn.prepare("SELECT batch_id FROM batch WHERE role=?1 AND state='idle' AND routing_choice IS NOT NULL AND (routing_pending=1 OR admitted_at_ms<=?2) ORDER BY admitted_at_ms, batch_id")?;
+        let rows = statement.query_map(
+            rusqlite::params![role, now_ms.saturating_sub(RETENTION_MS)],
+            |row| row.get(0),
+        )?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    pub fn claim_routing_recovery(
+        &self,
+        role: &str,
+        batch_id: &str,
+        owner: &str,
+        now_ms: i64,
+    ) -> Result<bool> {
+        self.hold_owner_lifetime(owner)?;
+        Ok(self.lock().execute("UPDATE batch SET state='running', owner=?3, started_at_ms=?4 WHERE role=?1 AND batch_id=?2 AND state='idle' AND routing_choice IS NOT NULL", rusqlite::params![role, batch_id, owner, now_ms])? != 0)
+    }
+
+    /// Remove caller content atomically while retaining only unresolved RPC bodies.
+    /// A content-free tombstone prevents reusing an id whose old report is still owed.
+    pub fn expire_routed(
+        &self,
+        role: &str,
+        batch_id: &str,
+        owner: &str,
+        archive: Option<&str>,
+    ) -> Result<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let held: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM batch WHERE role=?1 AND batch_id=?2 AND owner=?3 AND state='running')", rusqlite::params![role,batch_id,owner], |row| row.get(0))?;
+        if !held {
+            return Err(super::SystemOneStoreError(
+                "routing recovery lost batch hold".into(),
+            ));
+        }
+        tx.execute(
+            "DELETE FROM item_outcome WHERE role=?1 AND batch_id=?2",
+            rusqlite::params![role, batch_id],
+        )?;
+        if let Some(archive) = archive {
+            tx.execute("UPDATE batch SET model='', identity='{}', body_digest='', frozen_row='{}', scope_json=NULL, ceiling_nanos=NULL, spent_nanos=0, routing_choice='null', routing_runs=?3, routing_pending=1 WHERE role=?1 AND batch_id=?2", rusqlite::params![role,batch_id,archive])?;
+        } else {
+            tx.execute(
+                "DELETE FROM batch WHERE role=?1 AND batch_id=?2",
+                rusqlite::params![role, batch_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audit_routing_archive_scrub_rolls_back_as_one_transaction() {
+        let store = SystemOneStore::open_in_memory().unwrap();
+        let scope = BatchScope::Flow {
+            flow_id: "flow".into(),
+        };
+        let claim = BatchClaim {
+            role: "classifier/v1",
+            batch_id: "routed",
+            model: "model",
+            identity: "private input",
+            body_digest: "digest",
+            frozen_row: "{}",
+            scope: &scope,
+            ceiling_nanos: None,
+            owner: "owner",
+            now_ms: 1,
+        };
+        store.claim_routed(&claim, 1).unwrap();
+        store
+            .record(
+                claim.role,
+                claim.batch_id,
+                claim.owner,
+                &StoredOutcome {
+                    index: 0,
+                    outcome: Outcome::Answered("private answer".into()),
+                    input_tokens: Some(7),
+                    output_tokens: None,
+                },
+                0,
+                1,
+            )
+            .unwrap();
+        store.lock().execute_batch("CREATE TRIGGER interrupt_archive BEFORE UPDATE OF identity ON batch WHEN NEW.identity='{}' BEGIN SELECT RAISE(FAIL, 'crash during scrub'); END;").unwrap();
+        let archive =
+            r#"{"expired":true,"outbox":[{"method":"route.report","params":{"decision_id":"d"}}]}"#;
+        assert!(store
+            .expire_routed(claim.role, claim.batch_id, claim.owner, Some(archive))
+            .is_err());
+        let before = store.lookup(claim.role, claim.batch_id).unwrap().unwrap();
+        assert_eq!(before.identity, "private input");
+        assert_eq!(
+            before.outcomes.len(),
+            1,
+            "delete must roll back with interrupted scrub"
+        );
+        store
+            .lock()
+            .execute_batch("DROP TRIGGER interrupt_archive;")
+            .unwrap();
+        store
+            .expire_routed(claim.role, claim.batch_id, claim.owner, Some(archive))
+            .unwrap();
+        let after = store.lookup(claim.role, claim.batch_id).unwrap().unwrap();
+        assert_eq!(after.identity, "{}");
+        assert!(after.outcomes.is_empty());
+        assert!(after.scope.is_none());
+        assert_eq!(after.model, "");
+        assert_eq!(
+            store
+                .routing(claim.role, claim.batch_id)
+                .unwrap()
+                .unwrap()
+                .runs,
+            archive
+        );
+    }
 
     #[test]
     fn routing_columns_are_nullable_without_defaults_or_legacy_backfill() {

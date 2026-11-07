@@ -935,6 +935,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         }
         service
     };
+    let _routing_recovery = system_one.spawn_routing_recovery(registry.stopping_signal());
     // System One's batch sweep deletes batches, so it counts as retention: an overhaul root runs
     // none.
     let _system_one_sweep = state_format.start(BackgroundTask::RetentionSweeper, || {

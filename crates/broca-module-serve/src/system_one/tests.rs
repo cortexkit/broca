@@ -21,6 +21,7 @@ mod routed;
 /// What the stand-in answers for one item, by its state.
 #[derive(Clone)]
 enum Script {
+    Credential,
     AccountError,
     AccountLimit(u64),
     Attributed(String),
@@ -90,6 +91,7 @@ impl ClassifierProvider for StandIn {
                 .map(|list| list[(n - 1).min(list.len() - 1)].clone())
         };
         match script {
+            Some(Script::Credential) => ProviderReply::Credential("vault offline".into()),
             Some(Script::AccountError) => ProviderReply::ClassifiedError {
                 error: cortexkit_role_classifier::errors::ItemError::for_code(
                     cortexkit_role_classifier::errors::ACCOUNT_NOT_ENTITLED,

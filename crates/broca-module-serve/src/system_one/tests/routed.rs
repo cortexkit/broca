@@ -42,6 +42,18 @@ impl RoutingCredentials for Keys {
 }
 
 struct Router {
+    check_expired_content: Mutex<Option<Arc<SystemOneStore>>>,
+    admissions: Mutex<HashMap<String, Value>>,
+    active_admission: Mutex<Option<String>>,
+    pin_held: AtomicBool,
+    panic_on_admission: AtomicBool,
+    invalid_account: AtomicBool,
+    override_answer: Mutex<Option<(&'static str, Value)>>,
+    observe_failures: AtomicUsize,
+    panic_on_attempt: AtomicBool,
+    fail_attempts: AtomicBool,
+    check_pending: Mutex<Option<Arc<SystemOneStore>>>,
+    pending_seen: AtomicBool,
     calls: Mutex<Vec<Value>>,
     describe: Mutex<RoleDescribe>,
     models: Mutex<Vec<String>>,
@@ -85,6 +97,18 @@ impl Router {
             ]);
         }
         Arc::new(Self {
+            check_expired_content: Mutex::new(None),
+            admissions: Mutex::new(HashMap::new()),
+            active_admission: Mutex::new(None),
+            pin_held: AtomicBool::new(false),
+            panic_on_admission: AtomicBool::new(false),
+            invalid_account: AtomicBool::new(false),
+            override_answer: Mutex::new(None),
+            observe_failures: AtomicUsize::new(0),
+            panic_on_attempt: AtomicBool::new(false),
+            fail_attempts: AtomicBool::new(false),
+            check_pending: Mutex::new(None),
+            pending_seen: AtomicBool::new(false),
             calls: Mutex::new(vec![]),
             describe: Mutex::new(describe),
             models: Mutex::new(vec![JEV.into()]),
@@ -131,6 +155,11 @@ impl RoutingTransport for Router {
             return Err("route closed".into());
         }
         let params = &body["params"];
+        if let Some((method, answer)) = &*self.override_answer.lock().unwrap() {
+            if body["method"] == *method {
+                return Ok(Ok(serde_json::to_vec(&json!({"result":answer})).unwrap()));
+            }
+        }
         let refused = |code, message| {
             Ok(Err(serde_json::to_vec(
                 &json!({"code":code,"message":message}),
@@ -170,7 +199,19 @@ impl RoutingTransport for Router {
                 serde_json::to_value(answer).unwrap()
             }
             "route.account_for" => {
+                if let Some(store) = &*self.check_pending.lock().unwrap() {
+                    let row = store.routing(STORE_ROLE, "routed").unwrap().unwrap();
+                    let journal: Value = serde_json::from_str(&row.runs).unwrap();
+                    self.pending_seen.store(
+                        journal["pending_admission"]["id"] == params["admission_id"],
+                        Ordering::SeqCst,
+                    );
+                }
                 cortexkit_role_routing::account::parse_account_for_request(params).unwrap();
+                let admission_id = params["admission_id"].as_str().unwrap();
+                if let Some(answer) = self.admissions.lock().unwrap().get(admission_id) {
+                    return Ok(Ok(serde_json::to_vec(&json!({"result": answer})).unwrap()));
+                }
                 let renewing = params["mode"] == "renew";
                 if !renewing {
                     if let Some((code, message)) = *self.admission_refused.lock().unwrap() {
@@ -197,7 +238,10 @@ impl RoutingTransport for Router {
                     && decision != "decision-0"
                     && self.refuse_reselection.load(Ordering::SeqCst)
                 {
-                    return refused("account_pool_exhausted", "replacement has no credit");
+                    return refused(
+                        "account_not_authorized",
+                        "replacement credential is not authorized",
+                    );
                 }
                 let credential = params["requested_account"]["credential_id"]
                     .as_str()
@@ -210,20 +254,61 @@ impl RoutingTransport for Router {
                 let generation = params["expected_pin"]["generation"]
                     .as_u64()
                     .map_or(1, |generation| generation + 1);
-                json!({"admission":{"id":params["admission_id"],"state":"admitted"},
+                let mut answer = json!({"admission":{"id":params["admission_id"],"state":"admitted"},
                     "account":{"provider":params["provider"],"method":"apikey","account_id":account,"credential_id":credential},
                     "pin":{"id":"pin","generation":generation,"affinity_expires_at_ms":self.now()+3_600_000,"admission_valid_until_ms":self.now()+60_000,"lease_valid_until_ms":self.now()+self.lease_ms.load(Ordering::SeqCst) as u64,"mode":if renewing {"renew"} else {"admit"}},
-                    "reason":{"code":if renewing {"renewed"} else {"headroom"},"decision_id":decision,"policy_version":"test","quota_age_band":"fresh"}})
+                    "reason":{"code":if renewing {"renewed"} else {"headroom"},"decision_id":decision,"policy_version":"test","quota_age_band":"fresh"}});
+                if self.invalid_account.load(Ordering::SeqCst) {
+                    answer["account"]["credential_id"] = json!("apikey:unoffered");
+                }
+                self.admissions
+                    .lock()
+                    .unwrap()
+                    .insert(admission_id.into(), answer.clone());
+                *self.active_admission.lock().unwrap() = Some(admission_id.into());
+                self.pin_held.store(true, Ordering::SeqCst);
+                if self.panic_on_admission.swap(false, Ordering::SeqCst) {
+                    panic!("crash after admission grant before freeze");
+                }
+                answer
             }
             "route.account_observe" => {
+                if params["kind"] == "attempt"
+                    && self.panic_on_attempt.swap(false, Ordering::SeqCst)
+                {
+                    panic!("crash at post-provider observation delivery");
+                }
+                if params["kind"] == "attempt" && self.fail_attempts.load(Ordering::SeqCst) {
+                    return Err("attempt observation unavailable".into());
+                }
+                if self
+                    .observe_failures
+                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                    .is_ok()
+                {
+                    return Err("observation delivery unavailable".into());
+                }
                 cortexkit_role_routing::observe::parse_account_observe_request_serving(
                     params,
                     &self.describe.lock().unwrap().capabilities,
                 )
                 .unwrap();
+                if params["kind"] == "run_finished"
+                    && params["admission_id"].as_str()
+                        == self.active_admission.lock().unwrap().as_deref()
+                {
+                    self.pin_held.store(false, Ordering::SeqCst);
+                }
                 json!({"observation":{"id":params["event_id"],"duplicate":false,"bound":true,"effects":[]}})
             }
             "route.report" => {
+                if let Some(store) = &*self.check_expired_content.lock().unwrap() {
+                    let row = store.lookup(STORE_ROLE, "routed").unwrap().unwrap();
+                    assert!(
+                        row.outcomes.is_empty() && row.identity == "{}",
+                        "expired item content must be scrubbed before waiting on routing"
+                    );
+                }
                 cortexkit_role_routing::report::parse_report_request_serving(
                     params,
                     &self.describe.lock().unwrap().capabilities,
@@ -399,7 +484,590 @@ async fn call(rig: &RoutedRig, params: &str) -> Result<Box<serde_json::value::Ra
         .map_err(|body| serde_json::from_slice(&body).unwrap())
 }
 
+async fn wait_for(label: &'static str, ready: impl Fn() -> bool) {
+    broca_test_support::event_timeout(
+        label,
+        async {
+            while !ready() {
+                tokio::task::yield_now().await;
+            }
+        },
+        || label.into(),
+    )
+    .await
+    .unwrap();
+}
+
 const CLEF: &str = "cloudflare-workers-ai/@cf/cloudflare/clef";
+
+#[tokio::test]
+async fn audit_paid_answer_is_committed_before_observation_crash() {
+    for crash in [false, true] {
+        let root = broca_test_support::scratch_root().join(format!(
+            "audit-paid-{crash}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("system-one.db");
+        let router = Router::new(true, true);
+        let rig = routed_rig_with_store(
+            Arc::new(SystemOneStore::open(&path).unwrap()),
+            router.clone(),
+        );
+        rig.provider
+            .script("paid", vec![Script::Answer(answered(Some(7)))]);
+        router.panic_on_attempt.store(crash, Ordering::SeqCst);
+        router.fail_attempts.store(!crash, Ordering::SeqCst);
+        let first = call(&rig, &routed_request(&["paid"])).await;
+        if !crash {
+            assert!(
+                first.is_ok(),
+                "routing delivery failure must not delay the answer"
+            );
+        }
+        let stored = rig.store.lookup(STORE_ROLE, "routed").unwrap().unwrap();
+        assert!(
+            matches!(
+                stored.outcomes.first().map(|item| &item.outcome),
+                Some(broca_store::system_one::Outcome::Answered(_))
+            ),
+            "paid outcome must precede routing delivery"
+        );
+        assert_eq!(rig.provider.calls("paid"), 1);
+        drop(rig);
+        router.fail_attempts.store(false, Ordering::SeqCst);
+        let store = Arc::new(SystemOneStore::open(&path).unwrap());
+        store.release_abandoned().unwrap();
+        let resumed = routed_rig_with_store(store, router.clone());
+        let replay = call(&resumed, &routed_request(&["paid"])).await.unwrap();
+        assert_eq!(resumed.provider.calls("paid"), 0);
+        if let Ok(first) = first {
+            assert_eq!(replay.get(), first.get());
+        }
+        resumed.service.recover_routing().await.unwrap();
+        let row = resumed
+            .store
+            .routing(STORE_ROLE, "routed")
+            .unwrap()
+            .unwrap();
+        assert!(!row.pending, "owed observation must drain after restart");
+        assert!(router
+            .bodies("route.account_observe")
+            .iter()
+            .any(|body| body["kind"] == "attempt"));
+    }
+}
+
+#[tokio::test]
+async fn audit_admission_intent_is_durable_before_rpc() {
+    let rig = routed_rig(true, true);
+    *rig.router.check_pending.lock().unwrap() = Some(rig.store.clone());
+    rig.provider
+        .script("x", vec![Script::Answer(answered(Some(7)))]);
+    call(&rig, &routed_request(&["x"])).await.unwrap();
+    assert!(rig.router.pending_seen.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn audit_local_credential_failure_is_transient_not_account_refusal() {
+    let rig = routed_rig(true, true);
+    rig.provider.script("x", vec![Script::Credential]);
+    let reply: Value =
+        serde_json::from_str(call(&rig, &routed_request(&["x"])).await.unwrap().get()).unwrap();
+    assert_eq!(reply["items"][0]["error"]["code"], "provider_error");
+    assert_eq!(rig.router.selects.load(Ordering::SeqCst), 1);
+    assert!(rig
+        .router
+        .bodies("route.account_observe")
+        .iter()
+        .all(|body| body["kind"] != "credential_refused"));
+    assert!(rig
+        .router
+        .bodies("route.report")
+        .iter()
+        .all(|body| body.get("refusal_class").is_none()));
+}
+
+#[tokio::test]
+async fn audit_readmission_preserves_transient_and_bug_refusals() {
+    for code in [
+        "store_error",
+        "internal_error",
+        "account_selection_unavailable",
+        "no_eligible_account",
+        "unknown_decision",
+        "account_hold",
+        "account_quota_unknown",
+        "account_pool_exhausted",
+        "account_pool_reserve_limited",
+        "account_selection_disabled",
+        "invalid_request",
+        "admission_conflict",
+    ] {
+        let rig = routed_rig(true, true);
+        rig.provider
+            .script("first", vec![Script::Answer(answered(Some(7)))]);
+        rig.provider
+            .script("second", vec![Script::Status(503, None)]);
+        let params = routed_request(&["first", "second"]);
+        call(&rig, &params).await.unwrap();
+        let before = rig.store.routing(STORE_ROLE, "routed").unwrap().unwrap();
+        *rig.router.admission_refused.lock().unwrap() = Some((code, "router refusal"));
+        let error = call(&rig, &params).await.unwrap_err();
+        assert_eq!(
+            error["code"],
+            if matches!(code, "invalid_request" | "admission_conflict") {
+                "internal_error"
+            } else {
+                "routing_unavailable"
+            },
+            "{code}"
+        );
+        let after = rig.store.routing(STORE_ROLE, "routed").unwrap().unwrap();
+        assert_eq!(before.choice, after.choice);
+        assert_eq!(
+            rig.store
+                .lookup(STORE_ROLE, "routed")
+                .unwrap()
+                .unwrap()
+                .outcomes
+                .len(),
+            2
+        );
+    }
+}
+
+#[tokio::test]
+async fn audit_invalid_routing_answer_is_permanent_internal_error() {
+    let rig = routed_rig(true, true);
+    *rig.router.override_answer.lock().unwrap() = Some(("route.select", json!({"broken":true})));
+    let error = call(&rig, &routed_request(&["x"])).await.unwrap_err();
+    assert_eq!(error["code"], "internal_error");
+    assert_eq!(error["detail"]["class"], "permanent");
+}
+
+#[tokio::test]
+async fn audit_unservable_reselection_preserves_original_decision() {
+    let rig = routed_rig(true, true);
+    *rig.router.models.lock().unwrap() = vec![JEV.into(), "openai/gated".into()];
+    rig.provider.script("x", vec![Script::AccountError]);
+    let params = routed_request(&["x"]);
+    let reply: Value = serde_json::from_str(call(&rig, &params).await.unwrap().get()).unwrap();
+    assert_eq!(reply["decision_id"], "decision-0");
+    assert_eq!(reply["model"], JEV);
+    assert_eq!(
+        rig.router.bodies("route.report").last().unwrap()["outcome"],
+        "launch_failed"
+    );
+    rig.router.clear();
+    call(&rig, &params).await.unwrap();
+    assert!(rig.router.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn audit_outbox_stops_at_first_failed_observation() {
+    let rig = routed_rig(true, true);
+    rig.router.observe_failures.store(100, Ordering::SeqCst);
+    rig.provider
+        .script("x", vec![Script::Answer(answered(Some(7)))]);
+    call(&rig, &routed_request(&["x"])).await.unwrap();
+    assert!(rig
+        .router
+        .bodies("route.account_observe")
+        .iter()
+        .all(|body| body["kind"] == "admission_started"));
+    assert!(rig.router.bodies("route.report").is_empty());
+}
+
+#[tokio::test]
+async fn audit_report_basis_is_frozen_for_decision() {
+    let rig = routed_rig(false, true);
+    rig.provider
+        .script("a", vec![Script::Answer(answered(Some(7)))]);
+    rig.provider.script(
+        "b",
+        vec![Script::Status(503, None), Script::Answer(answered(Some(9)))],
+    );
+    let params = routed_request(&["a", "b"]);
+    call(&rig, &params).await.unwrap();
+    rig.router
+        .describe
+        .lock()
+        .unwrap()
+        .capabilities
+        .push("report_usage_run_id".into());
+    call(&rig, &params).await.unwrap();
+    let reports = rig.router.bodies("route.report");
+    assert_eq!(reports.len(), 1);
+    assert!(reports[0]["usage"].get("run_id").is_none());
+}
+
+#[test]
+fn audit_classifier_keys_require_explicit_provider_binding() {
+    let rows: broca_subc::vault::ScopedList = serde_json::from_value(json!({
+        "view":"view", "grants":0,"grant_tuples":[],"credentials": [
+            {"id":"unknown-key","state":"active","record_version":1,"categories":[],"type":"apikey","serves":[],"operations":["read"],"auth_method":"apikey","provider_ids":[]},
+            {"id":"wrong-key","state":"active","record_version":1,"categories":[],"type":"apikey","serves":[],"operations":["read"],"auth_method":"apikey","provider_ids":["openai"]},
+            {"id":"right-key","state":"active","record_version":1,"categories":[],"type":"apikey","serves":[],"operations":["read"],"auth_method":"apikey","provider_ids":["typesafe"]}
+        ]})).unwrap();
+    let candidates = super::super::routed::classifier_candidates(&rows, "typesafe");
+    assert_eq!(
+        candidates
+            .accounts
+            .iter()
+            .map(|candidate| candidate.credential_id.as_str())
+            .collect::<Vec<_>>(),
+        ["right-key"]
+    );
+}
+
+#[test]
+fn audit_routing_recovery_is_started_outside_retention_gate() {
+    let main = include_str!("../../main.rs");
+    let start = main
+        .find("system_one.spawn_routing_recovery(")
+        .expect("routing recovery must be started explicitly on every root");
+    let gate = main
+        .find("state_format.start(BackgroundTask::RetentionSweeper")
+        .unwrap();
+    assert!(
+        start < gate,
+        "routing recovery must not be inside legacy-only retention"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn audit_pending_reports_do_not_extend_item_content_retention() {
+    let mut rig = routed_rig(true, true);
+    rig.provider
+        .script("private-content", vec![Script::Answer(answered(Some(7)))]);
+    *rig.router.report_refused.lock().unwrap() = Some("store_error");
+    call(&rig, &routed_request(&["private-content"]))
+        .await
+        .unwrap();
+    tokio::time::advance(std::time::Duration::from_millis(
+        broca_store::system_one::RETENTION_MS as u64 + 1,
+    ))
+    .await;
+    rig.service.recover_routing().await.unwrap();
+    let stored = rig.store.lookup(STORE_ROLE, "routed").unwrap();
+    assert!(stored.as_ref().is_none_or(
+        |batch| !batch.identity.contains("private-content") && batch.outcomes.is_empty()
+    ));
+    assert!(
+        rig.store.routing(STORE_ROLE, "routed").unwrap().is_some(),
+        "unacknowledged report must remain"
+    );
+    Arc::get_mut(&mut rig.service).unwrap().config.routed_models = false;
+    let refusal = call(&rig, &routed_request(&["private-content"]))
+        .await
+        .unwrap_err();
+    assert_eq!(refusal["code"], "routing_unavailable");
+    assert!(refusal["message"]
+        .as_str()
+        .unwrap()
+        .contains("owed routing report"));
+    let archive = rig.store.routing(STORE_ROLE, "routed").unwrap().unwrap();
+    assert_eq!(archive.choice, "null");
+    assert!(!archive.runs.contains("private-content"));
+    *rig.router.report_refused.lock().unwrap() = None;
+    rig.service.recover_routing().await.unwrap();
+    assert!(rig.store.lookup(STORE_ROLE, "routed").unwrap().is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn audit_retention_scrubs_without_a_routing_connection() {
+    let mut rig = routed_rig(true, true);
+    rig.provider
+        .script("private-content", vec![Script::Answer(answered(Some(7)))]);
+    *rig.router.report_refused.lock().unwrap() = Some("store_error");
+    call(&rig, &routed_request(&["private-content"]))
+        .await
+        .unwrap();
+    let routing = Arc::get_mut(&mut rig.service).unwrap().routing.take();
+    tokio::time::advance(std::time::Duration::from_millis(
+        broca_store::system_one::RETENTION_MS as u64 + 1,
+    ))
+    .await;
+    rig.service.recover_routing().await.unwrap();
+    let archived = rig.store.lookup(STORE_ROLE, "routed").unwrap().unwrap();
+    assert_eq!(archived.identity, "{}");
+    assert!(archived.outcomes.is_empty());
+    assert!(archived.scope.is_none());
+    Arc::get_mut(&mut rig.service).unwrap().routing = routing;
+    *rig.router.report_refused.lock().unwrap() = None;
+    rig.service.recover_routing().await.unwrap();
+    assert!(rig.store.lookup(STORE_ROLE, "routed").unwrap().is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn audit_expiry_scrubs_before_any_network_delivery() {
+    let rig = routed_rig(true, true);
+    rig.provider
+        .script("private-content", vec![Script::Answer(answered(Some(7)))]);
+    *rig.router.report_refused.lock().unwrap() = Some("store_error");
+    call(&rig, &routed_request(&["private-content"]))
+        .await
+        .unwrap();
+    *rig.router.check_expired_content.lock().unwrap() = Some(rig.store.clone());
+    tokio::time::advance(std::time::Duration::from_millis(
+        broca_store::system_one::RETENTION_MS as u64 + 1,
+    ))
+    .await;
+    rig.service.recover_routing().await.unwrap();
+    let row = rig.store.lookup(STORE_ROLE, "routed").unwrap().unwrap();
+    assert!(row.outcomes.is_empty() && row.identity == "{}");
+    *rig.router.report_refused.lock().unwrap() = None;
+    rig.service.recover_routing().await.unwrap();
+    assert!(rig.store.lookup(STORE_ROLE, "routed").unwrap().is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn audit_failed_renewal_keeps_inflight_answer_and_stops_next_item() {
+    let rig = routed_rig(true, true);
+    rig.router.lease_ms.store(12_000, Ordering::SeqCst);
+    rig.router.renew_refused.store(true, Ordering::SeqCst);
+    let gate = Arc::new(Semaphore::new(0));
+    rig.provider
+        .script("paid", vec![Script::Held(gate.clone(), answered(Some(7)))]);
+    rig.provider
+        .script("unsent", vec![Script::Answer(answered(Some(9)))]);
+    let service = rig.service.clone();
+    let task = tokio::spawn(async move {
+        service
+            .spawn_call(routed_request(&["paid", "unsent"]), test_scope())
+            .await
+    });
+    wait_for("paid request entered", || rig.provider.calls("paid") > 0).await;
+    tokio::time::advance(std::time::Duration::from_secs(8)).await;
+    wait_for("lease renewal entered", || {
+        !rig.router.renew_times.lock().unwrap().is_empty()
+    })
+    .await;
+    gate.add_permits(1);
+    let reply: Value = serde_json::from_str(task.await.unwrap().unwrap().get()).unwrap();
+    assert!(
+        reply["items"][0].get("answers").is_some(),
+        "in-flight paid answer must finish after renewal refusal"
+    );
+    assert_eq!(rig.provider.calls("unsent"), 0);
+    assert_eq!(reply["items"][1]["error"]["code"], "auth_failed");
+}
+
+#[tokio::test]
+async fn audit_rejected_account_is_released_and_never_dispatched() {
+    let rig = routed_rig(true, true);
+    rig.router.invalid_account.store(true, Ordering::SeqCst);
+    let error = call(&rig, &routed_request(&["x"])).await.unwrap_err();
+    assert_eq!(error["code"], "internal_error");
+    assert_eq!(error["detail"]["class"], "permanent");
+    assert!(!rig.router.pin_held.load(Ordering::SeqCst));
+    assert_eq!(rig.provider.calls("x"), 0);
+    assert_eq!(
+        rig.router.bodies("route.account_observe")[0]["kind"],
+        "run_finished"
+    );
+}
+
+#[tokio::test]
+async fn audit_admission_grant_crash_replays_intent_and_releases_before_next_run() {
+    let root = broca_test_support::scratch_root().join(format!(
+        "audit-admission-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("system-one.db");
+    let rig = routed_rig_with_store(
+        Arc::new(SystemOneStore::open(&path).unwrap()),
+        Router::new(true, true),
+    );
+    rig.router.panic_on_admission.store(true, Ordering::SeqCst);
+    let router = rig.router.clone();
+    assert!(call(&rig, &routed_request(&["x"])).await.is_err());
+    assert_eq!(rig.provider.calls("x"), 0);
+    assert!(router.pin_held.load(Ordering::SeqCst));
+    let original = router.bodies("route.account_for")[0].clone();
+    drop(rig);
+    let store = Arc::new(SystemOneStore::open(&path).unwrap());
+    store.release_abandoned().unwrap();
+    let resumed = routed_rig_with_store(store, router.clone());
+    resumed.service.recover_routing().await.unwrap();
+    assert_eq!(router.bodies("route.account_for")[1], original);
+    assert!(!router.pin_held.load(Ordering::SeqCst));
+    resumed
+        .provider
+        .script("x", vec![Script::Answer(answered(Some(7)))]);
+    call(&resumed, &routed_request(&["x"])).await.unwrap();
+    assert_eq!(
+        router.selects.load(Ordering::SeqCst),
+        1,
+        "committed decision must survive failed admission freeze"
+    );
+    assert_eq!(resumed.provider.calls("x"), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn audit_latest_renewal_admission_releases_bound_pin() {
+    let _clock = ManualClock::new();
+    let rig = routed_rig(true, true);
+    rig.router.lease_ms.store(12_000, Ordering::SeqCst);
+    let gate = Arc::new(Semaphore::new(0));
+    rig.provider
+        .script("held", vec![Script::Held(gate.clone(), answered(Some(7)))]);
+    let service = rig.service.clone();
+    let task = tokio::spawn(async move {
+        service
+            .spawn_call(routed_request(&["held"]), test_scope())
+            .await
+    });
+    wait_for("held request entered", || rig.provider.calls("held") > 0).await;
+    let renewed = rig.router.renewed.notified();
+    tokio::time::advance(std::time::Duration::from_secs(8)).await;
+    broca_test_support::event_timeout("lease renewal", renewed, || "router did not renew".into())
+        .await
+        .unwrap();
+    wait_for("renewal admission stored", || {
+        rig.router.bodies("route.account_for").len() >= 2
+    })
+    .await;
+    let admissions = rig.router.bodies("route.account_for");
+    let original_id = admissions[0]["admission_id"].as_str().unwrap();
+    let latest_id = admissions[1]["admission_id"].as_str().unwrap();
+    let wrong_finish = json!({"method":"route.account_observe", "params":{"event_id":"negative-control", "kind":"run_finished", "admission_id":original_id}});
+    rig.router
+        .request(serde_json::to_vec(&wrong_finish).unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        rig.router.pin_held.load(Ordering::SeqCst),
+        "finishing original admission must not release a renewed pin"
+    );
+    gate.add_permits(1);
+    task.await.unwrap().unwrap();
+    assert!(!rig.router.pin_held.load(Ordering::SeqCst));
+    assert_eq!(
+        rig.router.bodies("route.account_observe").last().unwrap()["admission_id"],
+        latest_id
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn audit_invalid_renewal_keeps_paid_answer_and_releases_rejected_admission() {
+    let _clock = ManualClock::new();
+    let rig = routed_rig(true, true);
+    rig.router.lease_ms.store(12_000, Ordering::SeqCst);
+    let gate = Arc::new(Semaphore::new(0));
+    rig.provider
+        .script("paid", vec![Script::Held(gate.clone(), answered(Some(7)))]);
+    let service = rig.service.clone();
+    let task = tokio::spawn(async move {
+        service
+            .spawn_call(routed_request(&["paid"]), test_scope())
+            .await
+    });
+    broca_test_support::event_timeout(
+        "paid request entered",
+        async {
+            while rig.provider.calls("paid") == 0 {
+                tokio::task::yield_now().await;
+            }
+        },
+        || "provider did not enter".into(),
+    )
+    .await
+    .unwrap();
+    rig.router.invalid_account.store(true, Ordering::SeqCst);
+    let renewed = rig.router.renewed.notified();
+    tokio::time::advance(std::time::Duration::from_secs(8)).await;
+    broca_test_support::event_timeout("lease renewal", renewed, || "router did not renew".into())
+        .await
+        .unwrap();
+    gate.add_permits(1);
+    let refusal: Value = serde_json::from_slice(&task.await.unwrap().unwrap_err()).unwrap();
+    assert_eq!(refusal["code"], "internal_error");
+    assert_eq!(refusal["detail"]["class"], "permanent");
+    assert!(!rig.router.pin_held.load(Ordering::SeqCst));
+    assert!(matches!(
+        rig.store
+            .lookup(STORE_ROLE, "routed")
+            .unwrap()
+            .unwrap()
+            .outcomes[0]
+            .outcome,
+        broca_store::system_one::Outcome::Answered(_)
+    ));
+    let report = &rig.router.bodies("route.report")[0];
+    assert_eq!(report["runner_code"], "internal_error");
+    assert!(report.get("refusal_class").is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn audit_recovery_runs_at_boot_and_interval_and_skips_corrupt_batch() {
+    let _clock = ManualClock::new();
+    let root = broca_test_support::scratch_root().join(format!(
+        "audit-recovery-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("system-one.db");
+    let rig = routed_rig_with_store(
+        Arc::new(SystemOneStore::open(&path).unwrap()),
+        Router::new(true, true),
+    );
+    *rig.router.report_refused.lock().unwrap() = Some("store_error");
+    rig.provider
+        .script("x", vec![Script::Answer(answered(Some(7)))]);
+    call(&rig, &routed_request(&["x"])).await.unwrap();
+    rusqlite::Connection::open(&path).unwrap().execute_batch("CREATE TEMP TABLE broken AS SELECT * FROM batch WHERE batch_id='routed'; UPDATE broken SET batch_id='a-bad', routing_runs='not-json'; INSERT INTO batch SELECT * FROM broken;").unwrap();
+    let stop = tokio_util::sync::CancellationToken::new();
+    let worker = rig.service.spawn_routing_recovery(stop.clone());
+    let before = rig.router.bodies("route.report").len();
+    broca_test_support::event_timeout(
+        "boot routing report",
+        async {
+            while rig.router.bodies("route.report").len() == before {
+                tokio::task::yield_now().await;
+            }
+        },
+        || "boot recovery never attempted healthy row after bad row".into(),
+    )
+    .await
+    .unwrap();
+    *rig.router.report_refused.lock().unwrap() = None;
+    tokio::time::advance(std::time::Duration::from_secs(30)).await;
+    broca_test_support::event_timeout(
+        "periodic routing report",
+        async {
+            while rig
+                .store
+                .routing(STORE_ROLE, "routed")
+                .unwrap()
+                .unwrap()
+                .pending
+            {
+                tokio::task::yield_now().await;
+            }
+        },
+        || "periodic recovery did not drain healthy batch".into(),
+    )
+    .await
+    .unwrap();
+    stop.cancel();
+    worker.await.unwrap();
+}
 
 #[tokio::test]
 async fn routed_batch_freezes_requirements_account_and_replays_bytes() {
@@ -512,7 +1180,9 @@ async fn routed_unknown_adapter_and_gated_openai_are_refused_and_reported() {
             .iter()
             .any(|entry| entry.model == model));
         let error = call(&rig, &routed_request(&["first"])).await.unwrap_err();
-        assert_eq!(error["code"], "routing_refused");
+        assert_eq!(error["code"], "model_unavailable");
+        assert!(error["detail"].get("routing_code").is_none());
+        assert!(error["detail"].get("routing_answer").is_some());
         assert!(error["message"].as_str().unwrap().contains(model));
         assert!(rig.provider.bodies.lock().unwrap().is_empty());
         assert_eq!(
@@ -725,7 +1395,11 @@ async fn routed_lease_renews_on_schedule_with_frozen_pin_and_stable_retry_id() {
         assert!(rig.router.renew_times.lock().unwrap().is_empty());
         let renewed = rig.router.renewed.notified();
         tokio::time::advance(std::time::Duration::from_millis(1)).await;
-        renewed.await;
+        broca_test_support::event_timeout("lease renewal", renewed, || {
+            "router did not renew".into()
+        })
+        .await
+        .unwrap();
         gate.add_permits(1);
         let reply = task.await.unwrap().unwrap();
         assert_eq!(
@@ -769,7 +1443,7 @@ async fn routed_refused_renewal_fails_unanswered_without_further_dispatch() {
         .script("done", vec![Script::Answer(answered(Some(10)))]);
     let gate = Arc::new(Semaphore::new(0));
     rig.provider
-        .script("held", vec![Script::Held(gate, answered(Some(10)))]);
+        .script("held", vec![Script::Held(gate.clone(), answered(Some(10)))]);
     let entered = rig.provider.entered.notified();
     let service = rig.service.clone();
     let task = tokio::spawn(async move {
@@ -793,15 +1467,18 @@ async fn routed_refused_renewal_fails_unanswered_without_further_dispatch() {
     let due = journal["runs"][0]["renew_at_ms"].as_u64().unwrap();
     let renewed = rig.router.renewed.notified();
     tokio::time::advance(std::time::Duration::from_millis(due - rig.router.now())).await;
-    renewed.await;
+    broca_test_support::event_timeout("lease renewal", renewed, || "router did not renew".into())
+        .await
+        .unwrap();
+    gate.add_permits(1);
     let reply: Value = serde_json::from_str(task.await.unwrap().unwrap().get()).unwrap();
     assert!(reply["items"][0].get("answers").is_some());
-    assert_eq!(reply["items"][1]["error"]["code"], "auth_failed");
-    assert!(reply["items"][1]["error"]["message"]
+    assert!(reply["items"][1].get("answers").is_some());
+    assert_eq!(reply["items"][2]["error"]["code"], "auth_failed");
+    assert!(reply["items"][2]["error"]["message"]
         .as_str()
         .unwrap()
         .contains("pin_generation_conflict"));
-    assert_eq!(reply["items"][2]["error"], reply["items"][1]["error"]);
     assert_eq!(rig.provider.calls("never"), 0);
     assert_eq!(rig.router.bodies("route.select").len(), 1);
     assert_eq!(rig.router.bodies("route.account_for").len(), 2);
@@ -859,8 +1536,7 @@ async fn routed_fresh_account_refusal_preserves_pin_and_leaves_no_batch() {
 async fn routed_readmission_refusal_is_stored_without_a_run_or_penalty_report() {
     for (routing_code, item_code) in [
         ("auth_required", "auth_failed"),
-        ("account_pool_exhausted", "account_limit_exhausted"),
-        ("account_selection_disabled", "account_not_entitled"),
+        ("account_not_authorized", "auth_failed"),
     ] {
         let rig = routed_rig(true, true);
         rig.provider
@@ -1183,7 +1859,7 @@ async fn routed_report_terminal_refusals_are_not_retried() {
         rig.service.recover_routing().await.unwrap();
         assert_eq!(rig.router.bodies("route.report").len(), 1);
         let record = rig.store.routing(STORE_ROLE, "routed").unwrap().unwrap();
-        assert_eq!(record.pending, code == "report_conflict");
+        assert!(!record.pending);
         let journal: Value = serde_json::from_str(&record.runs).unwrap();
         let report = journal["outbox"]
             .as_array()
@@ -1191,8 +1867,8 @@ async fn routed_report_terminal_refusals_are_not_retried() {
             .iter()
             .find(|rpc| rpc["method"] == "route.report")
             .unwrap();
-        assert_eq!(report["conflict"], code == "report_conflict");
-        assert_eq!(report["closed"], code == "unknown_decision");
+        assert_eq!(report["conflict"], false);
+        assert_eq!(report["closed"], true);
     }
 }
 
@@ -1234,7 +1910,7 @@ async fn routed_optional_outcome_and_credential_groups_are_respected() {
         call(&gated, &routed_request(&["not-sent"]))
             .await
             .unwrap_err()["code"],
-        "routing_refused"
+        "model_unavailable"
     );
     assert_eq!(
         gated.router.bodies("route.report")[0]["outcome"],
@@ -1462,11 +2138,11 @@ async fn routed_refused_reselection_account_keeps_original_choice_and_diagnostic
         assert_eq!(value["model"], JEV);
         assert_eq!(value["decision_id"], "decision-0");
         for item in value["items"].as_array().unwrap() {
-            assert_eq!(item["error"]["code"], "account_limit_exhausted");
+            assert_eq!(item["error"]["code"], "auth_failed");
             assert!(item["error"]["message"]
                 .as_str()
                 .unwrap()
-                .contains("account_pool_exhausted"));
+                .contains("account_not_authorized"));
         }
         assert_eq!(rig.provider.calls("auth"), 2);
         assert_eq!(rig.provider.calls("never"), 0);
@@ -1488,7 +2164,7 @@ async fn routed_refused_reselection_account_keeps_original_choice_and_diagnostic
         );
         assert_eq!(
             journal["reselection"]["refusal"]["detail"]["routing_code"],
-            "account_pool_exhausted"
+            "account_not_authorized"
         );
         assert_eq!(journal["reselection"]["finished"], true);
         assert_eq!(
@@ -1509,7 +2185,8 @@ async fn routed_refused_readmission_without_run_reports_adds_no_final_penalty() 
         .script("retry", vec![Script::Status(503, None)]);
     let params = routed_request(&["retry"]);
     call(&rig, &params).await.unwrap();
-    *rig.router.admission_refused.lock().unwrap() = Some(("account_pool_exhausted", "no credit"));
+    *rig.router.admission_refused.lock().unwrap() =
+        Some(("account_not_authorized", "credential not authorized"));
     call(&rig, &params).await.unwrap();
     rig.service.recover_routing().await.unwrap();
     assert!(rig.router.bodies("route.report").is_empty());

@@ -979,8 +979,13 @@ pub struct RoutingClient {
 /// preserve the router's code rather than turning every failure into a retryable outage.
 #[derive(Clone, Debug)]
 pub enum RoutingCallError {
-    Refused { code: String, message: String },
+    Refused {
+        code: String,
+        message: String,
+    },
     Unavailable(String),
+    /// A response or locally constructed request violates the routing contract.
+    Invalid(String),
 }
 
 impl RoutingClient {
@@ -992,15 +997,15 @@ impl RoutingClient {
     ) -> Result<cortexkit_role_routing::account::AccountForAnswer, RoutingCallError> {
         use cortexkit_role_routing::account::{parse_account_for_request, AccountMode};
         if request.mode() != AccountMode::Renew || request.expected_pin.is_none() {
-            return Err(RoutingCallError::Unavailable(
+            return Err(RoutingCallError::Invalid(
                 "renewal requires mode renew and expected_pin".into(),
             ));
         }
         parse_account_for_request(
             &serde_json::to_value(request)
-                .map_err(|error| RoutingCallError::Unavailable(error.to_string()))?,
+                .map_err(|error| RoutingCallError::Invalid(error.to_string()))?,
         )
-        .map_err(|error| RoutingCallError::Unavailable(format!("invalid renewal: {error:?}")))?;
+        .map_err(|error| RoutingCallError::Invalid(format!("invalid renewal: {error:?}")))?;
         self.classifier_rpc("route.account_for", request).await
     }
 
@@ -1011,7 +1016,7 @@ impl RoutingClient {
         params: &impl serde::Serialize,
     ) -> Result<T, RoutingCallError> {
         let body = serde_json::to_vec(&json!({"method":method,"params":params}))
-            .map_err(|error| RoutingCallError::Unavailable(error.to_string()))?;
+            .map_err(|error| RoutingCallError::Invalid(error.to_string()))?;
         let reply = tokio::time::timeout(ADMISSION_BUDGET, self.transport.request(body))
             .await
             .map_err(|_| RoutingCallError::Unavailable("routing timed out".into()))?
@@ -1025,9 +1030,7 @@ impl RoutingClient {
                 serde_json::from_slice::<Response<T>>(&body)
                     .map(|answer| answer.result)
                     .map_err(|error| {
-                        RoutingCallError::Unavailable(format!(
-                            "routing answer did not decode: {error}"
-                        ))
+                        RoutingCallError::Invalid(format!("routing answer did not decode: {error}"))
                     })
             }
             Err(body) => {
@@ -1038,9 +1041,7 @@ impl RoutingClient {
                     message: String,
                 }
                 let error: Refused = serde_json::from_slice(&body).map_err(|error| {
-                    RoutingCallError::Unavailable(format!(
-                        "routing refusal did not decode: {error}"
-                    ))
+                    RoutingCallError::Invalid(format!("routing refusal did not decode: {error}"))
                 })?;
                 Err(RoutingCallError::Refused {
                     code: error.code,
@@ -1055,7 +1056,7 @@ impl RoutingClient {
     ) -> Result<cortexkit_role_routing::describe::RoleDescribe, RoutingCallError> {
         let describe = self.classifier_rpc("role.describe", &json!({})).await?;
         cortexkit_role_routing::describe::check_describe(&describe)
-            .map_err(|error| RoutingCallError::Unavailable(error.to_string()))?;
+            .map_err(|error| RoutingCallError::Invalid(error.to_string()))?;
         Ok(describe)
     }
 
@@ -1065,7 +1066,7 @@ impl RoutingClient {
     ) -> Result<cortexkit_role_routing::select::SelectAnswer, RoutingCallError> {
         let answer = self.classifier_rpc("route.select", request).await?;
         cortexkit_role_routing::select::check_answer(request, &answer)
-            .map_err(|error| RoutingCallError::Unavailable(error.to_string()))?;
+            .map_err(|error| RoutingCallError::Invalid(error.to_string()))?;
         Ok(answer)
     }
 
@@ -1076,16 +1077,14 @@ impl RoutingClient {
     ) -> Result<cortexkit_role_routing::report::ReportAnswer, RoutingCallError> {
         cortexkit_role_routing::report::parse_report_request_serving(
             &serde_json::to_value(request)
-                .map_err(|error| RoutingCallError::Unavailable(error.to_string()))?,
+                .map_err(|error| RoutingCallError::Invalid(error.to_string()))?,
             capabilities,
         )
-        .map_err(|error| {
-            RoutingCallError::Unavailable(format!("invalid routing report: {error:?}"))
-        })?;
+        .map_err(|error| RoutingCallError::Invalid(format!("invalid routing report: {error:?}")))?;
         let answer: cortexkit_role_routing::report::ReportAnswer =
             self.classifier_rpc("route.report", request).await?;
         if answer.decision_id != request.decision_id || answer.outcome != request.outcome {
-            return Err(RoutingCallError::Unavailable(
+            return Err(RoutingCallError::Invalid(
                 "routing acknowledged a different decision or report outcome".into(),
             ));
         }

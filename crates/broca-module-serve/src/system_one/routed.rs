@@ -45,6 +45,17 @@ pub trait RoutingCredentials: Send + Sync {
 
 pub struct VaultRoutingCredentials(pub Arc<broca_subc::VaultClient>);
 
+pub(super) fn classifier_candidates(
+    listing: &broca_subc::vault::ScopedList,
+    provider: &str,
+) -> Candidates {
+    let mut bound = listing.clone();
+    bound
+        .credentials
+        .retain(|row| row.provider_ids.iter().any(|id| id == provider));
+    Candidates::api_keys(&bound, provider)
+}
+
 #[async_trait]
 impl RoutingCredentials for VaultRoutingCredentials {
     async fn candidates(&self, provider: &str) -> Result<Candidates, String> {
@@ -53,7 +64,7 @@ impl RoutingCredentials for VaultRoutingCredentials {
             .list_scoped()
             .await
             .map_err(|error| error.to_string())?;
-        Ok(Candidates::api_keys(&listing, provider))
+        Ok(classifier_candidates(&listing, provider))
     }
 
     fn source(&self, credential_id: &str) -> Arc<dyn CredentialSource> {
@@ -68,6 +79,7 @@ impl RoutingCredentials for VaultRoutingCredentials {
 pub(super) enum Error {
     Classifier(Refusal),
     Routing(Box<RoutingRefusal>),
+    Runner(Box<Value>),
 }
 impl From<Refusal> for Error {
     fn from(error: Refusal) -> Self {
@@ -79,6 +91,7 @@ impl Error {
         match self {
             Self::Classifier(error) => super::refusal_body(&error),
             Self::Routing(error) => serde_json::to_vec(&error).expect("routing refusal encodes"),
+            Self::Runner(error) => serde_json::to_vec(&error).expect("runner refusal encodes"),
         }
     }
 }
@@ -86,8 +99,15 @@ impl Error {
 fn unavailable(message: impl Into<String>) -> Error {
     Error::Routing(Box::new(RoutingRefusal::unavailable(message)))
 }
+fn contract_error(message: impl Into<String>) -> Error {
+    let mut refusal = Refusal::new("internal_error", message);
+    refusal.detail.class = cortexkit_role_classifier::errors::ErrorClass::Permanent;
+    refusal.into()
+}
+
 fn routing_error(error: RoutingCallError, pin: Option<&str>) -> Error {
     match error {
+        RoutingCallError::Invalid(message) => contract_error(message),
         RoutingCallError::Unavailable(message) => unavailable(message),
         RoutingCallError::Refused { code, message } => Error::Routing(Box::new(
             RoutingRefusal::refused(code, Some(message), pin.map(str::to_owned)),
@@ -103,13 +123,17 @@ struct Choice {
     entry: Option<cortexkit_role_classifier::describe::ModelEntry>,
     describe: RoleDescribe,
     account: Option<AccountForAnswer>,
-    refusal: Option<RoutingRefusal>,
+    refusal: Option<Value>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
 #[serde(default)]
 struct Journal {
+    expired: bool,
+    terminal_error: Option<Refusal>,
     reselected: bool,
+    selected: Option<Choice>,
+    pending_admission: Option<PendingAdmission>,
     reselection: Option<Reselection>,
     admission_refusal: Option<RoutingRefusal>,
     admission_refusal_pending: bool,
@@ -122,6 +146,13 @@ struct Reselection {
     choice: Option<Choice>,
     refusal: Option<Value>,
     finished: bool,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct PendingAdmission {
+    id: String,
+    choice: Choice,
+    params: Value,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -141,6 +172,22 @@ struct Run {
     renew_failed: bool,
     reset_at_ms: Option<u64>,
     unmeasured_attempt: bool,
+    #[serde(default)]
+    cleanup_admissions: Vec<String>,
+}
+
+impl Run {
+    fn observation_admission(&self) -> &str {
+        // Routing binds observations to the exact admission row. The latest renewal
+        // names the row whose run_finished releases the currently held pin.
+        &self
+            .choice
+            .account
+            .as_ref()
+            .expect("admitted run")
+            .admission
+            .id
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -155,7 +202,8 @@ struct Rpc {
 
 impl Journal {
     fn pending(&self) -> bool {
-        self.admission_refusal_pending
+        self.pending_admission.is_some()
+            || self.admission_refusal_pending
             || pending_reselection(self)
             || self.runs.iter().any(|run| !run.finished)
             || self.outbox.iter().any(|rpc| !rpc.closed)
@@ -247,6 +295,7 @@ impl SystemOne {
             .classifier_describe()
             .await
             .map_err(|error| match error {
+                RoutingCallError::Invalid(message) => contract_error(message),
                 RoutingCallError::Unavailable(message) => unavailable(message),
                 RoutingCallError::Refused { .. } => unavailable("routing is not ready"),
             })?;
@@ -330,27 +379,30 @@ async fn select(
         .await
         .map_err(|error| routing_error(error, request.model.as_deref()))?;
     let model = answer.runner.model.route_key();
-    let refusal = if service.pin(&model).is_none()
+    let mut refusal = if service.pin(&model).is_none()
         || request.model.as_ref().is_some_and(|pin| pin != &model)
     {
         let message =
             format!("routing selected {model}, which broca cannot serve for this request");
-        let mut refusal = RoutingRefusal::refused(
-            "model_unavailable",
-            Some(message.clone()),
-            request.model.clone(),
-        );
-        refusal.message = message;
+        let mut refusal = serde_json::to_value(Refusal::new(errors::MODEL_UNAVAILABLE, message))
+            .expect("runner refusal encodes");
+        refusal["detail"]["routing_answer"] =
+            serde_json::to_value(&answer).expect("selection encodes");
         Some(refusal)
     } else {
         None
     };
     let row = service.catalog.row(&model);
     if refusal.is_none() {
-        cortexkit_role_classifier::request::check_catalog_row(
+        if let Err(error) = cortexkit_role_classifier::request::check_catalog_row(
             &model,
             classify::catalog_row(row.as_ref()),
-        )?;
+        ) {
+            let mut body = serde_json::to_value(error).expect("catalog refusal encodes");
+            body["detail"]["routing_answer"] =
+                serde_json::to_value(&answer).expect("selection encodes");
+            refusal = Some(body);
+        }
     }
     let entry = row
         .as_ref()
@@ -372,14 +424,13 @@ async fn select(
     })
 }
 
-async fn admit(
+async fn prepare_admission(
     service: &SystemOne,
     choice: &Choice,
     id: &str,
     batch_id: &str,
     initial_input_bytes: u64,
-    pin: Option<&str>,
-) -> Result<AccountForAnswer, Error> {
+) -> Result<PendingAdmission, Error> {
     let routing = service
         .routing
         .as_ref()
@@ -412,30 +463,103 @@ async fn admit(
         candidates: &candidates,
         hold_cap: Default::default(),
     });
-    // New operations use the attested route principal, never the legacy caller hint.
     params
         .as_object_mut()
         .expect("account params")
         .remove("caller");
-    let request = cortexkit_role_routing::account::parse_account_for_request(&params)
-        .map_err(|error| internal_refusal(&format!("invalid account admission: {error:?}")))?;
-    let answer: AccountForAnswer = routing
-        .client
-        .classifier_rpc("route.account_for", &request)
-        .await
-        .map_err(|error| routing_error(error, pin))?;
-    if answer.admission.id != id
+    cortexkit_role_routing::account::parse_account_for_request(&params)
+        .map_err(|error| contract_error(format!("invalid account admission: {error:?}")))?;
+    Ok(PendingAdmission {
+        id: id.into(),
+        choice: choice.clone(),
+        params,
+    })
+}
+
+fn admission_error(error: RoutingCallError, pin: Option<&str>) -> Error {
+    use cortexkit_role_routing::errors::RefusalCode;
+    if let RoutingCallError::Refused { code, message } = &error {
+        match RefusalCode::from(code.as_str()) {
+            RefusalCode::InvalidRequest | RefusalCode::AdmissionConflict => {
+                return contract_error(format!(
+                    "routing admission contract error: {code}: {message}"
+                ));
+            }
+            // These are the only admission answers that establish a credential problem.
+            RefusalCode::AuthRequired | RefusalCode::AccountNotAuthorized => {}
+            // Unknown/forgotten/foreign decisions are indistinguishable. They do not
+            // authorize a new selection, particularly after a paid answer.
+            _ => return unavailable(format!("routing admission unavailable: {code}: {message}")),
+        }
+    }
+    routing_error(error, pin)
+}
+
+fn check_admission(pending: &PendingAdmission, answer: &AccountForAnswer) -> Result<(), Error> {
+    let choice = &pending.choice;
+    let offered = pending.params["candidates"]["accounts"]
+        .as_array()
+        .is_some_and(|accounts| {
+            accounts.iter().any(|account| {
+                account["account_id"] == answer.account.account_id
+                    && account["credential_id"] == answer.account.credential_id
+            })
+        });
+    let credential = pending.params["requested_account"]["credential_id"].as_str();
+    if answer.admission.id != pending.id
+        || answer.pin.id.is_empty()
+        || answer.pin.mode != cortexkit_role_routing::account::AccountMode::Admit
         || answer.reason.decision_id != choice.select.decision_id
         || answer.account.provider != choice.select.route.provider
         || answer.account.method != "apikey"
-        || !candidates.offers(&answer.account.account_id, &answer.account.credential_id)
-        || credential.is_some_and(|credential| credential != answer.account.credential_id)
+        || !offered
+        || credential.is_some_and(|id| id != answer.account.credential_id)
     {
-        return Err(unavailable(
+        return Err(contract_error(
             "routing returned an account outside the frozen choice or admitted candidates",
         ));
     }
-    Ok(answer)
+    Ok(())
+}
+
+fn queue_pending_release(
+    journal: &mut Journal,
+    pending: &PendingAdmission,
+    answered_id: Option<&str>,
+) {
+    // A recovered admission never dispatches. Its exact request can be replayed safely,
+    // then released; a later call gets its own run and lease.
+    for id in std::iter::once(pending.id.as_str()).chain(answered_id.filter(|id| *id != pending.id))
+    {
+        let mut body = account_routing::run_finished_body(
+            &format!("{}:abandoned:{id}", pending.id),
+            id,
+            &pending.id,
+            broca_protocol::RunFinishReason::Error,
+            None,
+        );
+        body.as_object_mut().expect("observation").remove("caller");
+        journal.outbox.push(Rpc {
+            method: "route.account_observe".into(),
+            params: body,
+            capabilities: pending.choice.describe.capabilities.clone(),
+            closed: false,
+            conflict: false,
+        });
+    }
+    journal.pending_admission = None;
+}
+
+async fn release_pending(
+    service: &Arc<SystemOne>,
+    batch_id: &str,
+    journal: &mut Journal,
+    pending: &PendingAdmission,
+    answered_id: Option<&str>,
+) -> Result<(), Error> {
+    queue_pending_release(journal, pending, answered_id);
+    save(service, batch_id, journal).await?;
+    flush(service, batch_id, journal).await
 }
 
 async fn save(service: &Arc<SystemOne>, batch_id: &str, journal: &Journal) -> Result<(), Error> {
@@ -618,35 +742,48 @@ async fn flush(
         return Ok(());
     };
     for index in 0..journal.outbox.len() {
+        if journal.outbox[index].conflict {
+            journal.outbox[index].closed = true;
+            journal.outbox[index].conflict = false;
+            save(service, batch_id, journal).await?;
+        }
         let rpc = &journal.outbox[index];
-        if rpc.closed || rpc.conflict {
+        if rpc.closed {
             continue;
         }
-        let result = if rpc.method == "route.report" {
-            let request: ReportRequest = serde_json::from_value(rpc.params.clone())
-                .map_err(|_| internal_refusal("a stored routing report does not decode"))?;
-            routing
-                .client
-                .classifier_report(&request, &rpc.capabilities)
-                .await
-                .map(|_| ())
-        } else {
-            let request = cortexkit_role_routing::observe::parse_account_observe_request_serving(
-                &rpc.params,
-                &rpc.capabilities,
-            )
-            .map_err(|error| {
-                internal_refusal(&format!("stored account observation is invalid: {error:?}"))
-            })?;
-            routing
-                .client
-                .classifier_rpc::<cortexkit_role_routing::observe::AccountObserveAnswer>(
-                    &rpc.method,
-                    &request,
-                )
-                .await
-                .map(|_| ())
-        };
+        let result: Result<(), RoutingCallError> = async {
+            if rpc.method == "route.report" {
+                let request: ReportRequest =
+                    serde_json::from_value(rpc.params.clone()).map_err(|_| {
+                        RoutingCallError::Invalid("a stored routing report does not decode".into())
+                    })?;
+                routing
+                    .client
+                    .classifier_report(&request, &rpc.capabilities)
+                    .await
+                    .map(|_| ())
+            } else {
+                let request =
+                    cortexkit_role_routing::observe::parse_account_observe_request_serving(
+                        &rpc.params,
+                        &rpc.capabilities,
+                    )
+                    .map_err(|error| {
+                        RoutingCallError::Invalid(format!(
+                            "stored account observation is invalid: {error:?}"
+                        ))
+                    })?;
+                routing
+                    .client
+                    .classifier_rpc::<cortexkit_role_routing::observe::AccountObserveAnswer>(
+                        &rpc.method,
+                        &request,
+                    )
+                    .await
+                    .map(|_| ())
+            }
+        }
+        .await;
         match result {
             Ok(()) => journal.outbox[index].closed = true,
             Err(RoutingCallError::Refused { code, message }) if code == "unknown_decision" => {
@@ -654,11 +791,25 @@ async fn flush(
                 journal.outbox[index].closed = true;
             }
             Err(RoutingCallError::Refused { code, message }) if code == "report_conflict" => {
-                tracing::error!(target: "system_one", %code, %message, "conflicting routing report retained for investigation; it will not be retried");
-                journal.outbox[index].conflict = true;
+                tracing::error!(target: "system_one", %code, %message, "routing report conflict closed; immutable body cannot be retried");
+                journal.outbox[index].closed = true;
+            }
+            Err(RoutingCallError::Invalid(message)) => {
+                tracing::error!(target: "system_one", %message, "invalid routing RPC closed; immutable body cannot be retried");
+                journal.outbox[index].closed = true;
+            }
+            Err(RoutingCallError::Refused { code, message })
+                if matches!(
+                    code.as_str(),
+                    "invalid_request" | "account_not_authorized" | "admission_conflict"
+                ) =>
+            {
+                tracing::error!(target: "system_one", %code, %message, "terminal routing RPC refusal closed");
+                journal.outbox[index].closed = true;
             }
             Err(error) => {
-                tracing::warn!(target: "system_one", ?error, "routing outbox delivery will be retried")
+                tracing::warn!(target: "system_one", ?error, "routing outbox delivery will be retried");
+                break;
             }
         }
         save(service, batch_id, journal).await?;
@@ -666,26 +817,35 @@ async fn flush(
     Ok(())
 }
 
-async fn finish_run(
-    service: &Arc<SystemOne>,
-    batch_id: &str,
+fn queue_finished_run(
     journal: &mut Journal,
     index: usize,
     final_batch: bool,
-) -> Result<(), Error> {
+    batch: Option<&StoredBatch>,
+) {
     if !journal.runs[index].finished {
         journal.runs[index].finished = true;
         let run = &journal.runs[index];
-        if let Some(account) = &run.choice.account {
+        if run.choice.account.is_some() {
             journal.observe(account_routing::run_finished_body(
                 &format!("{}:finished", run.id),
-                &account.admission.id,
+                run.observation_admission(),
                 &run.id,
                 if run.error.is_some() {
                     broca_protocol::RunFinishReason::Error
                 } else {
                     broca_protocol::RunFinishReason::Completed
                 },
+                None,
+            ));
+        }
+        for admission in journal.runs[index].cleanup_admissions.clone() {
+            let run = &journal.runs[index];
+            journal.observe(account_routing::run_finished_body(
+                &format!("{}:rejected:{admission}", run.id),
+                &admission,
+                &run.id,
+                broca_protocol::RunFinishReason::Error,
                 None,
             ));
         }
@@ -700,22 +860,32 @@ async fn finish_run(
                 rpc.method == "route.report"
                     && rpc.params["decision_id"] == run.choice.select.decision_id
             });
-        let batch = service
-            .stored_batch(batch_id)
-            .await
-            .map_err(|_| internal_refusal("routing usage recovery is unavailable"))?;
         let decision_measured = journal
             .runs
             .iter()
             .filter(|other| other.choice.select.decision_id == run.choice.select.decision_id)
             .all(|other| !other.unmeasured_attempt && other.input.len() == other.dispatched);
-        let report = finished_report(run, batch.as_ref(), decision_measured);
+        let report = finished_report(run, batch, decision_measured);
         journal.runs[index].report_queued = true;
         let capabilities = journal.runs[index].choice.describe.capabilities.clone();
         if !already_reported {
             journal.report(report, capabilities);
         }
     }
+}
+
+async fn finish_run(
+    service: &Arc<SystemOne>,
+    batch_id: &str,
+    journal: &mut Journal,
+    index: usize,
+    final_batch: bool,
+) -> Result<(), Error> {
+    let batch = service
+        .stored_batch(batch_id)
+        .await
+        .map_err(|_| internal_refusal("routing usage recovery is unavailable"))?;
+    queue_finished_run(journal, index, final_batch, batch.as_ref());
     save(service, batch_id, journal).await?;
     flush(service, batch_id, journal).await
 }
@@ -747,6 +917,37 @@ async fn recover_claimed(
     batch_id: &str,
     journal: &mut Journal,
 ) -> Result<(), Error> {
+    if let Some(pending) = journal.pending_admission.clone() {
+        let client = &service
+            .routing
+            .as_ref()
+            .ok_or_else(|| unavailable("routing is not configured"))?
+            .client;
+        match client
+            .classifier_rpc::<AccountForAnswer>("route.account_for", &pending.params)
+            .await
+        {
+            Ok(answer) => {
+                release_pending(
+                    service,
+                    batch_id,
+                    journal,
+                    &pending,
+                    Some(&answer.admission.id),
+                )
+                .await?
+            }
+            Err(RoutingCallError::Unavailable(message)) => return Err(unavailable(message)),
+            Err(RoutingCallError::Invalid(message)) => {
+                release_pending(service, batch_id, journal, &pending, None).await?;
+                tracing::error!(target: "system_one", %message, "recovered admission returned invalid answer");
+            }
+            Err(RoutingCallError::Refused { .. }) => {
+                journal.pending_admission = None;
+                save(service, batch_id, journal).await?;
+            }
+        }
+    }
     let batch = service
         .stored_batch(batch_id)
         .await
@@ -784,70 +985,113 @@ async fn recover_claimed(
 }
 
 impl SystemOne {
-    /// Retry durable reports outside request replay. A fully stored reply performs no
-    /// routing lookup, even if a previous acknowledgement was lost.
+    /// Drain routing work independently of content retention and the admission switch.
     pub async fn recover_routing(self: &Arc<Self>) -> Result<(), String> {
-        if self.routing.is_none() {
-            return Ok(());
-        }
         let service = self.clone();
-        let ids = classify::blocking(move || service.store.pending_routing_batches(&service.role))
-            .await
-            .map_err(|error| error.message)?;
-        for batch_id in ids {
-            let Some(batch) = self.stored_batch(&batch_id).await? else {
-                continue;
-            };
-            let Some(scope) = batch.scope.clone() else {
-                continue;
-            };
-            let service = self.clone();
-            let id = batch_id.clone();
-            let claimed = classify::blocking(move || {
-                service.store.claim_routed(
-                    &BatchClaim {
-                        role: &service.role,
-                        batch_id: &id,
-                        model: &batch.model,
-                        identity: &batch.identity,
-                        body_digest: &batch.args_digest,
-                        frozen_row: &batch.frozen_row,
-                        scope: &scope,
-                        ceiling_nanos: None,
-                        owner: &service.owner,
-                        now_ms: (service.clock)(),
-                    },
-                    batch.admitted_at_ms,
-                )
-            })
-            .await
-            .map_err(|error| error.message)?;
-            if !matches!(claimed, Claimed::Resumed(_)) {
-                continue;
+        let now = (self.clock)();
+        let ids =
+            classify::blocking(move || service.store.routing_recovery_batches(&service.role, now))
+                .await
+                .map_err(|error| error.message)?;
+        for id in ids {
+            if let Err(error) = recover_batch(self, &id).await {
+                tracing::warn!(target: "system_one", batch_id=%id, error=%String::from_utf8_lossy(&error.bytes()), "routing batch recovery failed; continuing with other batches");
             }
-            let hold = Hold {
-                service: self,
-                batch_id: batch_id.clone(),
-                stored: true,
-            };
-            let result = async {
-                let service = self.clone();
-                let id = batch_id.clone();
-                if let Some(record) =
-                    classify::blocking(move || service.store.routing(&service.role, &id)).await?
-                {
-                    let mut journal: Journal = serde_json::from_str(&record.runs)
-                        .map_err(|_| internal_refusal("routing journal does not decode"))?;
-                    recover_claimed(self, &batch_id, &mut journal).await?;
-                }
-                Ok::<_, Error>(())
-            }
-            .await;
-            hold.release().await;
-            result.map_err(|error| String::from_utf8_lossy(&error.bytes()).into_owned())?;
         }
         Ok(())
     }
+
+    /// Run once at boot, then periodically on every state-root format. Routing reports
+    /// describe real dispatches, so disabling new routed admissions cannot stop delivery.
+    pub fn spawn_routing_recovery(
+        self: &Arc<Self>,
+        stop: tokio_util::sync::CancellationToken,
+    ) -> tokio::task::JoinHandle<()> {
+        let service = self.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                tokio::select! { biased; _ = stop.cancelled() => return, _ = tick.tick() => {} }
+                if let Err(error) = service.recover_routing().await {
+                    tracing::warn!(target: "system_one", %error, "routing recovery scan failed");
+                }
+            }
+        })
+    }
+}
+
+async fn recover_batch(service: &Arc<SystemOne>, batch_id: &str) -> Result<(), Error> {
+    let (store, role, id, owner, now) = (
+        service.store.clone(),
+        service.role.clone(),
+        batch_id.to_owned(),
+        service.owner.clone(),
+        (service.clock)(),
+    );
+    if !classify::blocking(move || store.claim_routing_recovery(&role, &id, &owner, now)).await? {
+        return Ok(());
+    }
+    let hold = Hold {
+        service,
+        batch_id: batch_id.into(),
+        stored: true,
+    };
+    let result = async {
+        let (store, role, id) = (
+            service.store.clone(),
+            service.role.clone(),
+            batch_id.to_owned(),
+        );
+        let Some(row) = classify::blocking(move || store.routing(&role, &id)).await? else {
+            return Ok(());
+        };
+        let batch = service.stored_batch(batch_id).await.map_err(|_| internal_refusal("routing retention lookup failed"))?;
+        let expired = batch.as_ref().is_some_and(|batch| now.saturating_sub(batch.admitted_at_ms) >= broca_store::system_one::RETENTION_MS);
+        let mut journal: Journal = match serde_json::from_str(&row.runs) {
+            Ok(journal) => journal,
+            Err(_) if expired => {
+                tracing::error!(target: "system_one", %batch_id, "expired routing journal is undecodable; removing unrecoverable content");
+                let (store, role, id, owner) = (service.store.clone(), service.role.clone(), batch_id.to_owned(), service.owner.clone());
+                classify::blocking(move || store.expire_routed(&role, &id, &owner, None)).await?;
+                return Ok(());
+            }
+            Err(_) => return Err(internal_refusal("routing journal does not decode").into()),
+        };
+        if journal.expired { flush(service, batch_id, &mut journal).await?; }
+        else if expired {
+            if let Some(pending) = journal.pending_admission.clone() {
+                queue_pending_release(&mut journal, &pending, None);
+            }
+            let final_batch = batch.as_ref().is_some_and(|batch| serde_json::from_str::<BatchIdentity>(&batch.identity).is_ok_and(|identity| identity.items.len() == batch.outcomes.len() && batch.outcomes.iter().all(retained)));
+            for index in 0..journal.runs.len() {
+                let run = &mut journal.runs[index];
+                if run.renewing { run.cleanup_admissions.push(format!("{}:renew:{}", run.id, run.renewals + 1)); run.renewing = false; }
+                if !run.finished && run.input.len() != run.dispatched {
+                    run.error.get_or_insert_with(|| ItemError::for_code(errors::PROVIDER_ERROR, "dispatch ended before its terminal was committed"));
+                }
+                queue_finished_run(&mut journal, index, final_batch, batch.as_ref());
+            }
+        } else { recover_claimed(service, batch_id, &mut journal).await?; }
+        if journal.expired || expired {
+            journal.outbox.retain(|rpc| !rpc.closed);
+            let archive = (!journal.outbox.is_empty()).then(|| {
+                serde_json::to_string(&json!({"expired":true,"outbox":journal.outbox}))
+                    .expect("outbox archive encodes")
+            });
+            let (store, role, id, owner) = (
+                service.store.clone(),
+                service.role.clone(),
+                batch_id.to_owned(),
+                service.owner.clone(),
+            );
+            classify::blocking(move || store.expire_routed(&role, &id, &owner, archive.as_deref()))
+                .await?;
+        }
+        Ok(())
+    }
+    .await;
+    hold.release().await;
+    result
 }
 
 pub(super) async fn run(
@@ -865,6 +1109,21 @@ pub(super) async fn run(
         ),
     )?;
     let request = parse_request(params)?;
+    let (store, role, id) = (
+        service.store.clone(),
+        service.role.clone(),
+        request.batch_id.clone(),
+    );
+    if classify::blocking(move || store.routing(&role, &id))
+        .await?
+        .and_then(|row| serde_json::from_str::<Value>(&row.runs).ok())
+        .is_some_and(|journal| journal["expired"] == true)
+    {
+        return Err(unavailable(format!(
+            "batch_id {} has an owed routing report; retry after report delivery",
+            request.batch_id
+        )));
+    }
     flush_facts(service).await?;
     let snapshot = service
         .stored_batch(&request.batch_id)
@@ -988,12 +1247,13 @@ pub(super) async fn run(
             .map_err(|_| internal_refusal("stored routing choice does not decode"))?;
         let mut journal: Journal = serde_json::from_str(&routing.runs)
             .map_err(|_| internal_refusal("stored routing journal does not decode"))?;
+        if let Some(error) = &journal.terminal_error { return Err(error.clone().into()); }
         let stored_outcomes = stored
             .as_ref()
             .map_or_else(Vec::new, |record| record.outcomes.clone());
         if let Some(choice) = &choice {
             if let Some(refusal) = &choice.refusal {
-                return Err(Error::Routing(Box::new(refusal.clone())));
+                return Err(Error::Runner(Box::new(refusal.clone())));
             }
             if stored_outcomes.len() == request.items.len()
                 && stored_outcomes.iter().all(retained)
@@ -1022,6 +1282,7 @@ pub(super) async fn run(
                 .map_err(Into::into);
             }
         }
+        let unadmitted = choice.as_ref().is_none_or(|choice| choice.account.is_none());
         let answer = dispatch(
             service,
             &request,
@@ -1037,7 +1298,9 @@ pub(super) async fn run(
             prepared,
         )
         .await;
-        if answer.is_err() && fresh && journal.runs.is_empty() && journal.outbox.is_empty() {
+        if answer.is_err() && (fresh || unadmitted) && journal.runs.is_empty() && journal.outbox.iter().all(|rpc| rpc.closed)
+            && journal.pending_admission.is_none()
+            && (journal.selected.is_none() || matches!(&answer, Err(Error::Routing(refusal)) if refusal.code == errors::ROUTING_REFUSED)) {
             let (store, role, owner, id) = (
                 service.store.clone(),
                 service.role.clone(),
@@ -1092,6 +1355,14 @@ pub(super) async fn replay_when_disabled(
     let Some(record) = classify::blocking(move || store.routing(&role, &id)).await? else {
         return Ok(None);
     };
+    let journal: Journal = serde_json::from_str(&record.runs)
+        .map_err(|_| internal_refusal("stored routing journal does not decode"))?;
+    if journal.expired {
+        return Err(unavailable(format!(
+            "batch_id {} has an owed routing report; retry after report delivery",
+            probe.batch_id
+        )));
+    }
     cortexkit_role_classifier::request::check_request_bytes(
         params.len(),
         &cortexkit_role_classifier::describe::Limits::new(
@@ -1124,8 +1395,9 @@ pub(super) async fn replay_when_disabled(
     }
     let choice: Option<Choice> = serde_json::from_str(&record.choice)
         .map_err(|_| internal_refusal("stored routing choice does not decode"))?;
-    let journal: Journal = serde_json::from_str(&record.runs)
-        .map_err(|_| internal_refusal("stored routing journal does not decode"))?;
+    if let Some(error) = &journal.terminal_error {
+        return Err(error.clone().into());
+    }
     if let Some(choice) = choice.filter(|_| {
         batch.outcomes.len() == request.items.len()
             && batch.outcomes.iter().all(retained)
@@ -1176,7 +1448,15 @@ async fn dispatch(
     let mut estimates = estimates(request)?;
     let mut choice = match choice {
         Some(choice) => choice,
-        None => select(service, request, &estimates).await?,
+        None => match journal.selected.clone() {
+            Some(choice) => choice,
+            None => {
+                let choice = select(service, request, &estimates).await?;
+                journal.selected = Some(choice.clone());
+                save(service, &request.batch_id, journal).await?;
+                choice
+            }
+        },
     };
     let mut slots: Vec<Option<Slot>> = (0..request.items.len()).map(|_| None).collect();
     for outcome in stored {
@@ -1227,7 +1507,9 @@ async fn dispatch(
     if let Some(replacement) = replacement {
         previous_choice = Some(choice);
         choice = replacement;
-        slots.iter_mut().for_each(|slot| *slot = None);
+        if choice.refusal.is_none() {
+            slots.iter_mut().for_each(|slot| *slot = None);
+        }
     } else if let Some(error) = journal
         .runs
         .last()
@@ -1265,6 +1547,9 @@ async fn dispatch(
             true,
         )
         .await?;
+        if let Some(error) = &journal.terminal_error {
+            return Err(error.clone().into());
+        }
         let mut answered = request.clone();
         answered.model = Some(choice.model.clone());
         return classify::reply_decision(
@@ -1288,12 +1573,26 @@ async fn dispatch(
             };
             journal.report(
                 ReportRequest::new(&choice.select.decision_id, outcome)
-                    .with_runner_code("model_unavailable"),
+                    .with_runner_code(refusal["code"].as_str().unwrap_or("internal_error")),
                 choice.describe.capabilities.clone(),
             );
+            if let Some(original) = &previous_choice {
+                save(service, &request.batch_id, journal).await?;
+                flush(service, &request.batch_id, journal).await?;
+                let mut answered = request.clone();
+                answered.model = Some(original.model.clone());
+                return classify::reply_decision(
+                    &answered,
+                    &original.frozen,
+                    slots,
+                    false,
+                    Some(&original.select.decision_id),
+                )
+                .map_err(Into::into);
+            }
             freeze(service, &request.batch_id, &choice, journal).await?;
             flush(service, &request.batch_id, journal).await?;
-            return Err(Error::Routing(Box::new(refusal.clone())));
+            return Err(Error::Runner(Box::new(refusal.clone())));
         }
         let entry = choice
             .entry
@@ -1368,24 +1667,57 @@ async fn dispatch(
             }
         }
         if choice.account.is_some() {
-            choice.describe = service.routing_ready().await?;
+            service.routing_ready().await?;
         }
         let id = token()?;
-        let account = match admit(
+        let pending = prepare_admission(
             service,
             &choice,
             &id,
             &request.batch_id,
             params.len() as u64,
-            request.model.as_deref(),
         )
-        .await
-        {
-            Ok(account) => account,
+        .await?;
+        journal.pending_admission = Some(pending.clone());
+        save(service, &request.batch_id, journal).await?;
+        let client = &service
+            .routing
+            .as_ref()
+            .expect("routing is configured")
+            .client;
+        let admission = client
+            .classifier_rpc::<AccountForAnswer>("route.account_for", &pending.params)
+            .await;
+        if matches!(admission, Err(RoutingCallError::Invalid(_))) {
+            release_pending(service, &request.batch_id, journal, &pending, None).await?;
+        }
+        let refused = matches!(&admission, Err(RoutingCallError::Refused { .. }));
+        let account = match admission.map_err(|error| {
+            if choice.account.is_some() || previous_choice.is_some() {
+                admission_error(error, request.model.as_deref())
+            } else {
+                routing_error(error, request.model.as_deref())
+            }
+        }) {
+            Ok(account) => {
+                if let Err(error) = check_admission(&pending, &account) {
+                    release_pending(
+                        service,
+                        &request.batch_id,
+                        journal,
+                        &pending,
+                        Some(&account.admission.id),
+                    )
+                    .await?;
+                    return Err(error);
+                }
+                account
+            }
             Err(Error::Routing(refusal))
                 if refusal.code == errors::ROUTING_REFUSED
                     && (choice.account.is_some() || previous_choice.is_some()) =>
             {
+                journal.pending_admission = None;
                 return refuse_admission(
                     service,
                     request,
@@ -1396,9 +1728,18 @@ async fn dispatch(
                 )
                 .await;
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                if refused {
+                    journal.pending_admission = None;
+                    if choice.account.is_some() || previous_choice.is_some() {
+                        save(service, &request.batch_id, journal).await?;
+                    }
+                }
+                return Err(error);
+            }
         };
         let old_account = choice.account.is_some();
+        journal.pending_admission = None;
         choice.account = Some(account.clone());
         if let Some(selection) = &mut journal.reselection {
             selection.finished = true;
@@ -1435,6 +1776,7 @@ async fn dispatch(
             renew_failed: false,
             reset_at_ms: None,
             unmeasured_attempt: false,
+            cleanup_admissions: Vec::new(),
         });
         journal.observe(account_routing::admission_started_body(
             &format!("{id}:started"),
@@ -1493,11 +1835,16 @@ async fn dispatch(
             final_batch || should_reselect,
         )
         .await?;
+        if let Some(error) = &journal.terminal_error {
+            return Err(error.clone().into());
+        }
         if should_reselect {
             if let Some(selected) = reselect(service, request, &estimates, journal).await? {
                 previous_choice = Some(choice);
                 choice = selected;
-                slots.iter_mut().for_each(|slot| *slot = None);
+                if choice.refusal.is_none() {
+                    slots.iter_mut().for_each(|slot| *slot = None);
+                }
                 continue;
             }
         }
@@ -1553,6 +1900,24 @@ async fn refuse_admission(
     mut slots: Vec<Option<Slot>>,
     refusal: RoutingRefusal,
 ) -> Result<Box<RawValue>, Error> {
+    let routing_code = refusal
+        .detail
+        .routing_code
+        .as_deref()
+        .unwrap_or("unknown_refusal");
+    if !matches!(routing_code, "auth_required" | "account_not_authorized") {
+        return Err(admission_error(
+            RoutingCallError::Refused {
+                code: routing_code.into(),
+                message: refusal
+                    .detail
+                    .routing_reason
+                    .clone()
+                    .unwrap_or_else(|| refusal.message.clone()),
+            },
+            request.model.as_deref(),
+        ));
+    }
     journal.admission_refusal = Some(refusal.clone());
     journal.admission_refusal_pending = true;
     if let Some(selection) = journal
@@ -1767,6 +2132,10 @@ async fn dispatch_items(
         // discard the account that failed and silently choose another one on a resend.
         record(service, &request.batch_id, &outcome, cost, fact, journal).await?;
         slots[index] = Some(Slot::Stored(outcome));
+        flush(service, &request.batch_id, journal).await?;
+        if journal.runs[run_index].renew_failed {
+            stop = journal.runs[run_index].error.clone();
+        }
     }
     Ok(())
 }
@@ -1781,29 +2150,45 @@ async fn provider_call(
 ) -> Result<Result<classify::PaidAnswer, ItemError>, Error> {
     let slot = service.model_slot(&pin.catalog_id);
     for attempt in 1..=service.config.max_attempts.max(2) {
+        let started = std::sync::atomic::AtomicBool::new(false);
         let provider = async {
             let _permit = slot.acquire().await;
+            started.store(true, std::sync::atomic::Ordering::SeqCst);
             pin.provider.call(body.clone()).await
         };
         tokio::pin!(provider);
         let reply = loop {
+            if journal.runs[run_index].renew_failed {
+                if started.load(std::sync::atomic::Ordering::SeqCst) {
+                    break provider.await;
+                }
+                return Ok(Err(journal.runs[run_index]
+                    .error
+                    .clone()
+                    .expect("failed renewal has an error")));
+            }
             let now = (service.clock)().max(0) as u64;
             let delay = journal.runs[run_index].renew_at_ms.saturating_sub(now);
             if delay == 0 {
-                if let Some(error) = renew(service, batch_id, journal, run_index).await? {
-                    return Ok(Err(error));
-                }
+                renew_during_provider(service, batch_id, journal, run_index).await;
                 continue;
             }
             tokio::select! {
                 biased;
                 reply = &mut provider => break reply,
                 _ = tokio::time::sleep(std::time::Duration::from_millis(delay)) => {
-                    if let Some(error) = renew(service, batch_id, journal, run_index).await? { return Ok(Err(error)); }
+                    renew_during_provider(service, batch_id, journal, run_index).await;
                 }
             }
         };
-        let mapped = classify::map_reply(reply.clone(), pin);
+        let mapped = if let super::ProviderReply::Credential(message) = &reply {
+            Err(ItemError::for_code(
+                errors::PROVIDER_ERROR,
+                format!("credential read unavailable: {message}"),
+            ))
+        } else {
+            classify::paid_answer(reply.clone(), pin)
+        };
         if mapped.is_err() {
             journal.runs[run_index].unmeasured_attempt = true;
         }
@@ -1819,7 +2204,7 @@ async fn provider_call(
         }
         let run = &journal.runs[run_index];
         let event_id = format!("{}:{}:{attempt}", run.id, run.dispatched);
-        let mut observation = json!({"event_id":event_id,"kind":"attempt","admission_id":run.choice.account.as_ref().expect("admitted").admission.id,"run_id":run.id,"observed_at_ms":(service.clock)(),"upstream_origin":"upstream"});
+        let mut observation = json!({"event_id":event_id,"kind":"attempt","admission_id":run.observation_admission(),"run_id":run.id,"observed_at_ms":(service.clock)(),"upstream_origin":"upstream"});
         if let Err(error) = &mapped {
             if error.code == errors::ACCOUNT_LIMIT_EXHAUSTED {
                 observation["kind"] = json!("account_limit_exhausted");
@@ -1850,19 +2235,29 @@ async fn provider_call(
                 observation["terminal_reason"] = json!("transport_failure");
             }
         }
-        journal.observe(observation);
-        save(service, batch_id, journal).await?;
-        flush(service, batch_id, journal).await?;
+        if !matches!(reply, super::ProviderReply::Credential(_)) {
+            journal.observe(observation);
+        }
+        // Terminal answers and observations are committed together by the caller.
+        if journal.runs[run_index].renew_failed
+            || matches!(reply, super::ProviderReply::Credential(_))
+        {
+            return Ok(mapped);
+        }
         if mapped
             .as_ref()
             .is_err_and(|error| error.code == errors::AUTH_FAILED)
             && attempt == 1
         {
+            save(service, batch_id, journal).await?;
+            flush(service, batch_id, journal).await?;
             continue;
         }
         if let Some(wait) =
             classify::retry_wait(&reply, service).filter(|_| attempt < service.config.max_attempts)
         {
+            save(service, batch_id, journal).await?;
+            flush(service, batch_id, journal).await?;
             let deadline = tokio::time::Instant::now() + wait;
             loop {
                 let now = (service.clock)().max(0) as u64;
@@ -1875,7 +2270,7 @@ async fn provider_call(
                 }
             }
         } else {
-            return Ok(classify::paid_answer(reply, pin));
+            return Ok(mapped);
         }
     }
     unreachable!("the final provider attempt returns")
@@ -1884,6 +2279,26 @@ async fn provider_call(
 fn renew_at(now_ms: u64, expiry_ms: u64) -> u64 {
     let remaining = expiry_ms.saturating_sub(now_ms);
     now_ms.saturating_add(remaining.saturating_sub(30_000.min(remaining / 3)))
+}
+
+/// A renewal error must not cancel a provider future that may already have spent.
+async fn renew_during_provider(
+    service: &Arc<SystemOne>,
+    batch_id: &str,
+    journal: &mut Journal,
+    index: usize,
+) {
+    if renew(service, batch_id, journal, index).await.is_err() {
+        let run = &mut journal.runs[index];
+        run.renewing = false;
+        run.renew_failed = true;
+        run.error.get_or_insert_with(|| {
+            ItemError::for_code(
+                errors::PROVIDER_ERROR,
+                "account lease renewal could not finish locally",
+            )
+        });
+    }
 }
 
 async fn renew(
@@ -1941,6 +2356,10 @@ async fn renew(
     let run = &mut journal.runs[index];
     let previous = run.choice.account.as_ref().expect("admitted");
     let now = (service.clock)().max(0) as u64;
+    let answered_admission = answer
+        .as_ref()
+        .ok()
+        .map(|answer| answer.admission.id.clone());
     let answer = answer.and_then(|answer| {
         if answer.admission.id != request.admission_id
             || answer.reason.decision_id != run.choice.select.decision_id
@@ -1948,10 +2367,13 @@ async fn renew(
             || answer.pin.id != previous.pin.id
             || answer.pin.generation < previous.pin.generation
             || answer.pin.mode != AccountMode::Renew
-            || answer.pin.lease_valid_until_ms <= now
         {
-            Err(RoutingCallError::Unavailable(
+            Err(RoutingCallError::Invalid(
                 "routing renewal changed the frozen account or returned an expired pin".into(),
+            ))
+        } else if answer.pin.lease_valid_until_ms <= now {
+            Err(RoutingCallError::Unavailable(
+                "renewed lease expired before it could be used".into(),
             ))
         } else {
             Ok(answer)
@@ -1967,15 +2389,31 @@ async fn renew(
         }
         Err(error) => {
             run.renew_failed = true;
+            let invalid = matches!(error, RoutingCallError::Invalid(_));
             let message = match error {
-                RoutingCallError::Unavailable(message) => message,
+                RoutingCallError::Unavailable(message) | RoutingCallError::Invalid(message) => {
+                    message
+                }
                 RoutingCallError::Refused { code, message } => format!("{code}: {message}"),
             };
             let error = ItemError::for_code(
-                errors::AUTH_FAILED,
+                if invalid {
+                    "internal_error"
+                } else {
+                    errors::AUTH_FAILED
+                },
                 format!("account lease renewal failed: {message}"),
             );
             run.error = Some(error.clone());
+            if invalid {
+                run.cleanup_admissions.push(request.admission_id.clone());
+                if let Some(id) = answered_admission.filter(|id| *id != request.admission_id) {
+                    run.cleanup_admissions.push(id);
+                }
+                let mut refusal = Refusal::new("internal_error", &error.message);
+                refusal.detail.class = cortexkit_role_classifier::errors::ErrorClass::Permanent;
+                journal.terminal_error = Some(refusal);
+            }
             Some(error)
         }
     };
