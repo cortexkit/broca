@@ -90,6 +90,41 @@ pub trait Writer {
         mid: &str,
     ) -> Result<Option<broca_session_store::session::StoredEntry>, SessionError>;
 
+    /// The entries whose message ids `mids` lists, in ordinal order, each once; an id no entry
+    /// has is left out. A session reads named entries close to each other in one pass.
+    async fn entries_by_mid(
+        &self,
+        mids: &[String],
+    ) -> Result<Vec<broca_session_store::session::StoredEntry>, SessionError> {
+        let mut out = Vec::new();
+        for mid in mids {
+            if let Some(entry) = self.entry_by_mid(mid).await? {
+                out.push(entry);
+            }
+        }
+        out.sort_by_key(|entry| entry.ordinal);
+        out.dedup_by_key(|entry| entry.ordinal);
+        Ok(out)
+    }
+
+    /// What a reader derived from the session's sealed history and asked it to keep (see
+    /// `Session::keep_sealed_derived`); `None` when nothing is kept, or the history version
+    /// moved since. A writer that keeps nothing always answers `None`.
+    async fn sealed_derived(
+        &self,
+    ) -> Result<Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>, SessionError> {
+        Ok(None)
+    }
+
+    /// Asks the session to keep `value`, derived from its sealed history, while it's open and
+    /// its history version stays.
+    async fn keep_sealed_derived(
+        &self,
+        _value: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Result<(), SessionError> {
+        Ok(())
+    }
+
     /// Where the tool plane captures a result's media. A writer that offers one stores, when it
     /// appends a call's result, the bytes of every media part captured for that call, durable
     /// before the record. Without one nothing is captured, so every media part of a result
@@ -177,6 +212,27 @@ impl<B: SessionBackend> Writer for Session<B> {
         mid: &str,
     ) -> Result<Option<broca_session_store::session::StoredEntry>, SessionError> {
         Session::entry_by_mid(self, mid).await
+    }
+
+    async fn entries_by_mid(
+        &self,
+        mids: &[String],
+    ) -> Result<Vec<broca_session_store::session::StoredEntry>, SessionError> {
+        Session::entries_by_mid(self, mids).await
+    }
+
+    async fn sealed_derived(
+        &self,
+    ) -> Result<Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>, SessionError> {
+        Ok(Session::sealed_derived(self))
+    }
+
+    async fn keep_sealed_derived(
+        &self,
+        value: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Result<(), SessionError> {
+        Session::keep_sealed_derived(self, value);
+        Ok(())
     }
 
     async fn run_start(

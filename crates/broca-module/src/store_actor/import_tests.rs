@@ -1480,8 +1480,9 @@ fn many_exchanges(exchanges: u64) -> Vec<u8> {
 }
 
 /// A view naming 800 sealed messages reads each of them once while the session is open: the
-/// first `transcript()` after a reload reads them back from sealed history, and every later
-/// one finds them kept. Both times are written to `target/scratch/transcript-timing.txt`.
+/// first `transcript()` after a reload reads them back from sealed history, and every later one
+/// borrows what the first built. Both times are written to
+/// `target/scratch/transcript-timing.txt`.
 #[tokio::test]
 async fn a_view_naming_800_sealed_messages_reads_them_once() {
     const NAMED: u64 = 800;
@@ -1537,6 +1538,10 @@ async fn a_view_naming_800_sealed_messages_reads_them_once() {
         NAMED,
         "every named sealed message"
     );
+    let expected = (*first.entries).clone();
+    let built = Arc::as_ptr(&first.entries);
+    // A step's transcript is gone before the next step asks for one.
+    drop(first);
     let mut warm = Vec::new();
     for _ in 0..5 {
         let started = std::time::Instant::now();
@@ -1544,7 +1549,12 @@ async fn a_view_naming_800_sealed_messages_reads_them_once() {
             .await
             .unwrap();
         warm.push(started.elapsed());
-        assert_eq!(later.entries, first.entries);
+        assert_eq!(*later.entries, expected);
+        assert_eq!(
+            Arc::as_ptr(&later.entries),
+            built,
+            "a later step borrows the entries built before, copying none"
+        );
     }
     let scratch = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/scratch");
     std::fs::create_dir_all(&scratch).unwrap();

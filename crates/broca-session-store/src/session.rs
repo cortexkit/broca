@@ -180,7 +180,8 @@ pub struct Session<B: SessionBackend> {
     window: OpenLogIndex,
     /// The import's id map, once read (see `import`).
     imported: import::IdMapCache,
-    /// Sealed entries already read by message id (see `entry_by_mid`).
+    /// What the session keeps of its sealed history while it's open (see `entry_by_mid` and
+    /// `keep_sealed_derived`).
     sealed_entries: read::SealedEntries,
 }
 
