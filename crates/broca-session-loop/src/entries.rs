@@ -274,10 +274,39 @@ pub fn with_facts(batch: Vec<Record>, at: &Placing<'_>) -> Result<Vec<Record>, S
     // Who sent the input of a run started in this batch, read from its start as today's entry
     // metadata reads it from the run's start.
     let mut run_sender = None;
+    // The calls a dispatch intent anchored, before this batch and in it: their key is the
+    // intent's.
+    let mut dispatched: Vec<broca_protocol::ToolCallId> = at
+        .operations
+        .run
+        .as_ref()
+        .and_then(|run| run.open_batch.as_ref())
+        .map(|batch| {
+            batch
+                .calls
+                .iter()
+                .filter(|call| call.intent)
+                .map(|call| call.id.clone())
+                .collect()
+        })
+        .unwrap_or_default();
     let mut records = batch.into_iter().peekable();
-    while let Some(record) = records.next() {
+    while let Some(mut record) = records.next() {
         if let Record::RunStart(start) = &record {
             run_sender = input_sender(start);
+        }
+        match &mut record {
+            Record::BatchStart(_) => dispatched.clear(),
+            Record::ToolIntent(intent) => dispatched.push(intent.tool_call_id.clone()),
+            // A call answered without a dispatch intent takes a key minted from the writer
+            // generation and the seq its outcome takes, in the form of the store's ids.
+            Record::ToolOutcome(outcome)
+                if outcome.call_key.is_none() && !dispatched.contains(&outcome.tool_call_id) =>
+            {
+                outcome.call_key =
+                    Some(format!("{}.{}", at.prefix, at.first_seq + out.len() as u64));
+            }
+            _ => {}
         }
         if record.stream() == broca_session_store::record::Stream::Transcript {
             counts

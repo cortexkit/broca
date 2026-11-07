@@ -732,6 +732,7 @@ mod records {
         finished_at_ms,
         detail,
         hooks,
+        call_key,
     });
     crate::fuzzing::gen::fields!(Compaction { version, body });
     crate::fuzzing::gen::fields!(Marker {

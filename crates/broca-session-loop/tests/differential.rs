@@ -1175,6 +1175,28 @@ fn pause_names_its_attempt(writer: &Recording<'_, '_>) {
     }
 }
 
+/// Every key the new loop gave a call answered without a dispatch intent names the outcome that
+/// carries it, by the writer's generation and that outcome's seq, so no two calls share one. The
+/// comparison masks the key itself, since today's is made of the log's lineage and its own seq;
+/// it still compares which outcomes carry one.
+fn outcome_keys_name_their_place(writer: &Recording<'_, '_>) {
+    let first_seq = writer.session.next_seq() - writer.records.len() as u64;
+    let prefix = writer.session.message_id_prefix();
+    for (index, record) in writer.records.iter().enumerate() {
+        let Record::ToolOutcome(outcome) = record else {
+            continue;
+        };
+        if let Some(key) = &outcome.call_key {
+            assert_eq!(
+                *key,
+                format!("{prefix}.{}", first_seq + index as u64),
+                "key of call {}",
+                outcome.tool_call_id.0
+            );
+        }
+    }
+}
+
 /// Waits until a scripted account limit has reset, when the comparison routes an account.
 async fn reset_passes() {
     if account().is_some_and(|script| script.wait_for_reset) {
@@ -2099,6 +2121,7 @@ async fn new_from(
     .expect("the new loop runs");
     let records = writer.records.clone();
     keys_match(writer.session, &plane).await;
+    outcome_keys_name_their_place(&writer);
     if !resuming {
         media_reads_back(writer.session).await;
     }
@@ -3174,6 +3197,7 @@ async fn compare_runs_in_once(scenario: Scenario, runs: &[(&str, Vec<Message>)])
         }
     }
     keys_match(writer.session, &plane).await;
+    outcome_keys_name_their_place(&writer);
     if compaction().is_some_and(|script| {
         script
             .rides
@@ -3807,6 +3831,7 @@ async fn compare_actions_in_once(
     }
     assert_eq!(reports, summaries, "how each run reported");
     keys_match(writer.session, &plane).await;
+    outcome_keys_name_their_place(&writer);
     let new = Outcome {
         records: normalized(&writer.records),
         requests: sent_requests(&provider.inner),
@@ -4173,6 +4198,7 @@ async fn compare_auth_pause_in_once(
     let second =
         through!(writer, |w| resume(w, &parts, &seams).await).expect("the new loop resumes");
     keys_match(writer.session, &plane).await;
+    outcome_keys_name_their_place(&writer);
     pause_names_its_attempt(&writer);
     // A run the resume refroze onto another account keeps naming it when nobody routes one,
     // as a later resume or a rebuild of its requests reads the run back.

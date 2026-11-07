@@ -182,6 +182,7 @@ fn answered(run: &str, id: &str) -> [Record; 2] {
             finished_at_ms: None,
             detail: None,
             hooks: None,
+            call_key: None,
         }),
     ]
 }

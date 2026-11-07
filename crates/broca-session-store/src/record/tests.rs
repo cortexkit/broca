@@ -210,6 +210,7 @@ fn one_of_each() -> Vec<Record> {
             finished_at_ms: Some(7),
             detail: None,
             hooks: None,
+            call_key: None,
         }),
         Record::QueuedSend(QueuedSend {
             submission_id: "sub".into(),

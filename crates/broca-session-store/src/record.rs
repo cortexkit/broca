@@ -701,6 +701,13 @@ message! {
         /// Owned by the tool router: why a call wasn't dispatched, held or withdrawn.
         9 opt detail: serde_json::Value,
         10 opt hooks: serde_json::Value,
+        /// The key of a call answered without a dispatch intent (denied, invalid, synthetic, or
+        /// refused with its batch), which no intent holds: the new loop mints it from this
+        /// record's writer generation and seq, in the form of the store's ids, and a converted
+        /// call keeps today's key, made from the log's lineage and its terminal record's seq.
+        /// Absent for a dispatched call, whose key is its intent's, and on outcomes written
+        /// before it was recorded.
+        11 opt call_key: String,
     }
 }
 

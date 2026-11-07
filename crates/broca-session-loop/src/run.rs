@@ -3623,6 +3623,8 @@ fn no_dispatch(
         finished_at_ms: Some(now),
         detail: serde_json::to_value(reason).ok(),
         hooks,
+        // Minted by the entry-facts writer, which knows the seq this record takes.
+        call_key: None,
     }));
 }
 
@@ -3696,6 +3698,8 @@ fn terminal_with_reason(
         finished_at_ms: now,
         detail: None,
         hooks: None,
+        // Minted by the entry-facts writer for a call without a dispatch intent.
+        call_key: None,
     }));
 }
 
