@@ -1265,7 +1265,7 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "691b0dd4715193a2d22103784a7e1926ee10e8b288d9f8cf4718ba8d48f396cc",
+            "65326e725ce01aa13556dd27251298cf293d77a40ebb7823392747a0d8ee37a3",
         );
     }
 
@@ -1460,7 +1460,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "13db65e5f96519035ec6ac03a282e1b8d22d694c437d3e5e394df9660c4aacad";
+        "90057f736efc8c30593691f0f6ae5338402023e55e8cd07100ed87f0cc51f333";
     const RUN_TOOL_CALLS_PAGE_SHA256: &str =
         "6978763bd48c30edffbf61a4b4a0966d7efdfc146b94023f4a36cca4bda0881d";
     const DELIVERED_STEP_SHA256: &str =

@@ -589,7 +589,7 @@ mod tests {
 }
 
 /// Reader support ships before any writer enables the new resume-sensitive envelope.
-pub const RIDES_V2_WRITER_ENABLED: bool = true;
+pub const RIDES_V2_WRITER_ENABLED: bool = false;
 
 #[derive(Default)]
 pub(crate) struct RideLedger {

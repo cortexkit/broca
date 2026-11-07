@@ -574,7 +574,8 @@ async fn published_classify_request_vectors_use_the_real_serve_path() {
     };
     let route = rig.open(true, false).await;
     let vectors: Value = serde_json::from_str(cortexkit_llm_tools::vectors::CLASSIFY).unwrap();
-    for vector in vectors["valid_requests"].as_array().unwrap() {
+    let valid = vectors["valid_requests"].as_array().unwrap();
+    for vector in valid {
         let mut arguments = vector["value"].clone();
         arguments["model"] = json!(MODEL);
         let bytes = route
@@ -586,7 +587,13 @@ async fn published_classify_request_vectors_use_the_real_serve_path() {
     }
     for vector in vectors["invalid_requests"].as_array().unwrap() {
         let mut arguments = vector["value"].clone();
-        if arguments.get("model").is_some() {
+        // A vector's example model is swapped for the rig's, so only the defect the vector
+        // names is refused. An empty model is itself that defect (`empty-model`), so it stays.
+        if arguments
+            .get("model")
+            .and_then(Value::as_str)
+            .is_some_and(|model| !model.is_empty())
+        {
             arguments["model"] = json!(MODEL);
         }
         refused_without_writes(
@@ -598,7 +605,8 @@ async fn published_classify_request_vectors_use_the_real_serve_path() {
         )
         .await;
     }
-    assert_eq!(rig.calls(), 3);
+    // One provider call per valid vector; no invalid vector reaches the provider.
+    assert_eq!(rig.calls(), valid.len());
 }
 
 /// A batch another process holds is refused as transient and writes nothing; once that owner is
