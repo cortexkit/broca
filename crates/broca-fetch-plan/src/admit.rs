@@ -590,7 +590,15 @@ pub async fn compose(
     Ok(plan)
 }
 
-/// Check every item carrying `params.model` before opening or calling any provider.
+/// Check that a system-text item naming a model names the model the send runs, before opening or
+/// calling any provider.
+///
+/// Only system-text items are checked: a persona's system text describes the model it runs on,
+/// in the form `{provider, id, variant?}`. Tool and step-transform items' `params` belong to their
+/// provider and pass through unread, as the runner contract requires. That includes a tool item's
+/// tool-catalog model hint (`{provider, model}`, tool-provider `tool-catalog-model/v1`), which a
+/// tool provider uses to tailor its tool descriptions to the model; a head plan carrying it is
+/// admitted.
 ///
 /// Compare the caller's provider and model id strings and requested variant, not catalog aliases,
 /// wire ids or renderer tiers: the persona provider receives these caller values verbatim.
@@ -605,22 +613,10 @@ pub fn check_plan_model(
         send_model["variant"] = json!(variant);
     }
     let items = plan
-        .tool_items
+        .system_text_items
         .iter()
         .enumerate()
-        .map(|(i, item)| (format!("plan.tool_items[{i}]"), item))
-        .chain(
-            plan.system_text_items
-                .iter()
-                .enumerate()
-                .map(|(i, item)| (format!("plan.system_text_items[{i}]"), item)),
-        )
-        .chain(
-            plan.step_items
-                .iter()
-                .enumerate()
-                .map(|(i, step)| (format!("plan.step_transform_items[{i}]"), &step.item)),
-        );
+        .map(|(i, item)| (format!("plan.system_text_items[{i}]"), item));
     for (path, item) in items {
         let Some(plan_model) = item.params.get("model") else {
             continue;

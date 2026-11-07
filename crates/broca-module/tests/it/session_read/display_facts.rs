@@ -178,8 +178,10 @@ async fn display_fact_backfill_is_lazy_persistent_and_reads_are_bounded_at_1k_an
         let default_full = zero_ranges.swap(0, Ordering::SeqCst);
         assert_eq!(plain.messages.last().unwrap().ordinal, size);
         let lineage = plain.lineage_id.as_ref().unwrap();
-        // The one-time linear sidecar backfill also seeds dispatch attribution from that
-        // same decode; a second historical pass is unnecessary. Warm reads pay neither.
+        // The first default read builds the display-facts cache: each tool call's native
+        // output, kept beside the transcript so later reads skip the session log. That one full
+        // decode of the log also records which run dispatched each call, so no second pass over
+        // the history is needed. Later (warm) reads decode neither.
         assert_eq!(default_full, 1, "one shared output and dispatch backfill");
         let cold = &counter.snapshot()[0];
         println!(
