@@ -93,6 +93,11 @@ impl StoreRuntime {
         Arc::clone(&self.import_roots)
     }
 
+    /// The deployment's setup parts, which a read resolves a run start's parts through.
+    pub fn parts(&self) -> &SharedParts {
+        &self.parts
+    }
+
     /// Writes the spend facts of every run on the new storage to `billing`, the deployment's
     /// usage export, as today's runs are written.
     pub fn with_billing(mut self, billing: crate::store_billing::StoreBilling) -> Self {

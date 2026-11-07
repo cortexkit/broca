@@ -815,6 +815,15 @@ state! {
             reset: "never",
             bound: Bound::Fixed,
         },
+        /// The newest title a send to the session carried: on a run start, or in a queued
+        /// send's or a steer's receipt, whichever came last. `session.head` serves it, as
+        /// today's head serves the newest title its log holds on those three records. A later
+        /// send without a title leaves it.
+        23 opt pub title: String => {
+            owner: "admission",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
     }
 }
 
@@ -1075,6 +1084,11 @@ state! {
     }
 }
 
+/// The title a queued send's or a steer's receipt holds, under the name today's records give it.
+fn receipt_title(receipt: Option<&serde_json::Value>) -> Option<String> {
+    receipt?.get("title")?.as_str().map(str::to_owned)
+}
+
 impl Operations {
     /// A queued send joins the queue; a run that consumes it, a retraction, an ended send or a
     /// delivery into a running run removes it.
@@ -1222,6 +1236,20 @@ impl Operations {
         }
     }
 
+    /// The records a send writes, a run start, a queued send and a steer, each carry the send's
+    /// title when it had one; the newest such title is the session's.
+    fn apply_title(&mut self, record: &Record) {
+        let title = match record {
+            Record::RunStart(start) => start.title.clone(),
+            Record::QueuedSend(send) => receipt_title(send.receipt.as_ref()),
+            Record::Steer(steer) => receipt_title(steer.receipt.as_ref()),
+            _ => None,
+        };
+        if title.is_some() {
+            self.title = title;
+        }
+    }
+
     /// A step's end measures its input when the provider reported it, an attempt's body length
     /// is known and the model that served the measured call is: the model the step was routed
     /// to, else the run's, with a server-side handoff measured on the last model that served it.
@@ -1327,6 +1355,7 @@ impl Operations {
             _ => {}
         }
         self.apply_sends(record);
+        self.apply_title(record);
         self.apply_billing(record);
         if let Record::RunStart(start) = record {
             self.run = Some(Run::new(start));

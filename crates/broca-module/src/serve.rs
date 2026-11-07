@@ -3475,6 +3475,12 @@ impl ServeHandler for crate::LineageRegistry {
         principal: Option<&broca_protocol::BindPrincipal>,
         scope: &broca_protocol::SendScope,
     ) -> Result<broca_wire::HeadResponse, ServeError> {
+        if let Some(store) = self.store_runtime() {
+            if store.holds(session)? {
+                return crate::store_head::serve_head(self, &store, session, principal, scope)
+                    .await;
+            }
+        }
         let before_history = self.history_read_version(session).await?;
         // The newest page of one message: the store's last row and the WAL past its watermark,
         // so the cost follows what is not yet materialized, never the session's length.
