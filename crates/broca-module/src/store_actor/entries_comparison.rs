@@ -1204,7 +1204,9 @@ fn comparison(
             }
         }
     }
-    for moved in &reply.moves.rows {
+    // A row for a message broca added names no source message: it is listed with the
+    // entries broca adds.
+    for moved in reply.moves.rows.iter().filter(|moved| !moved.added) {
         let at = row(&mut rows, &moved.mid);
         rows[at].1.broca_ordinal = moved.entry;
     }
@@ -1256,11 +1258,19 @@ fn comparison(
     if added.is_empty() {
         out.push_str("(none)\n");
     } else {
-        out.push_str("| broca mid | broca ordinal | broca part ids |\n|---|---|---|\n");
+        out.push_str(
+            "| broca mid | broca ordinal | broca part ids | move list row |\n|---|---|---|---|\n",
+        );
         for (mid, ordinal, part_ids) in &added {
+            let listed = reply
+                .moves
+                .rows
+                .iter()
+                .any(|moved| moved.added && &moved.mid == mid && moved.entry == Some(*ordinal));
             out.push_str(&format!(
-                "| {mid} | {ordinal} | {} |\n",
-                parts(&Some(part_ids.clone()))
+                "| {mid} | {ordinal} | {} | {} |\n",
+                parts(&Some(part_ids.clone())),
+                if listed { "added" } else { "none" }
             ));
         }
     }

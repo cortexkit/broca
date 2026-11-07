@@ -329,6 +329,8 @@ pub fn seed(history: HeadHistory, at: &SeedFacts<'_>) -> Result<Seed, ImportRefu
     let mut ids = Vec::new();
     let mut high = floor;
     let mut time: Option<u64> = None;
+    // The messages broca makes itself, by index, with the id each is stored under.
+    let mut added: Vec<(usize, String)> = Vec::new();
     for (index, message) in history.messages.iter().enumerate() {
         let ordinal = index as u64 + 1;
         let notice = notice_of(message, owner.as_deref());
@@ -390,7 +392,11 @@ pub fn seed(history: HeadHistory, at: &SeedFacts<'_>) -> Result<Seed, ImportRefu
                 mid.clone()
             }
             // The facts record is the next one; a message broca makes is named by its seq.
-            None => format!("{}.{}", at.prefix, at.first_seq + records.len() as u64),
+            None => {
+                let mid = format!("{}.{}", at.prefix, at.first_seq + records.len() as u64);
+                added.push((index, mid.clone()));
+                mid
+            }
         };
         let written = message.written_at_ms.or(time).unwrap_or(0);
         time = Some(written);
@@ -454,14 +460,7 @@ pub fn seed(history: HeadHistory, at: &SeedFacts<'_>) -> Result<Seed, ImportRefu
         import_id: at.params.import_id.clone(),
         digest,
         shape: shape_name(shape_of(at.params.source.harness)).into(),
-        moves: history
-            .rows
-            .iter()
-            .map(|row| ImportedMove {
-                mid: row.mid.clone(),
-                ordinal: row.message.map(|index| index as u64 + 1),
-            })
-            .collect(),
+        moves: moves_with_added(&history, added),
         imported_messages: history.messages.len() as u64,
         dropped_system_messages: history.dropped_system_messages as u64,
     };
@@ -471,6 +470,45 @@ pub fn seed(history: HeadHistory, at: &SeedFacts<'_>) -> Result<Seed, ImportRefu
         ids,
         receipt,
     })
+}
+
+/// The move list: one row per source row, in source order, and after each source row the
+/// messages broca added that belong to it, in ordinal order: the tool results split off an
+/// assistant row, or the results closing a call it left unanswered. An added message belongs to
+/// the nearest source message before it. So every ordinal the import placed appears exactly once.
+fn moves_with_added(history: &HeadHistory, added: Vec<(usize, String)>) -> Vec<ImportedMove> {
+    // Each added message's owner: the index of the nearest earlier message a source row names.
+    let mut after: std::collections::BTreeMap<Option<usize>, Vec<(usize, String)>> =
+        Default::default();
+    for (index, mid) in added {
+        let owner = (0..index)
+            .rev()
+            .find(|earlier| history.messages[*earlier].mid.is_some());
+        after.entry(owner).or_default().push((index, mid));
+    }
+    let row = |(index, mid): (usize, String)| ImportedMove {
+        mid,
+        ordinal: Some(index as u64 + 1),
+    };
+    let mut moves: Vec<ImportedMove> = after
+        .remove(&None)
+        .unwrap_or_default()
+        .into_iter()
+        .map(row)
+        .collect();
+    for source in &history.rows {
+        moves.push(ImportedMove {
+            mid: source.mid.clone(),
+            ordinal: source.message.map(|index| index as u64 + 1),
+        });
+        if let Some(owned) = source.message.and_then(|index| after.remove(&Some(index))) {
+            moves.extend(owned.into_iter().map(row));
+        }
+    }
+    // An owner no source row names can't be told apart from its source rows: its added
+    // messages close the list, in ordinal order, so none is left out.
+    moves.extend(after.into_values().flatten().map(row));
+    moves
 }
 
 /// A user message's notice, by the source runner's rule (Thalamus's `runner/compaction.rs`,
@@ -607,6 +645,9 @@ pub fn reply_of(
                     mid: row.mid.clone(),
                     entry: row.ordinal,
                     finished_summary: None,
+                    // No source id has the form of one broca mints (the import refuses one), so
+                    // a row under such an id is a message broca added.
+                    added: broca_session_store::session::is_broca_id_form(&row.mid),
                 })
                 .collect(),
         },
