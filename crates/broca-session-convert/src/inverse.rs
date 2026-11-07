@@ -103,6 +103,8 @@ fn tool_intent(intent: &ToolIntent, calls: &HashMap<String, Value>) -> Value {
     Value::Object(object)
 }
 
+/// Today's `tool_result` or `tool_no_dispatch`. The outcome's `call_key` is left out: today's
+/// record holds no key, and the converter made it from the record's position.
 fn tool_terminal(reply: &ToolReply, outcome: &ToolOutcome) -> Result<Value, String> {
     if reply.result.tool_call_id != outcome.tool_call_id {
         return Err("a tool outcome claims another call's reply".into());

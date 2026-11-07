@@ -37,6 +37,11 @@ struct CallsCheckReport {
     /// Cut points where today serves at least one call as indeterminate: the comparison sees
     /// the case it checks.
     cuts_with_indeterminate: u64,
+    /// Calls answered without a dispatch intent (denied, invalid, synthetic, or refused with
+    /// their batch), which today keys by the record that answered them, over every cut, and the
+    /// cuts that hold at least one.
+    calls_answered_without_intent: u64,
+    cuts_with_call_answered_without_intent: u64,
     /// Cut points right after a provider-held record, and what today serves for the held call
     /// there: indeterminate or not.
     held_cuts: u64,
@@ -297,6 +302,16 @@ pub(crate) fn run(args: &Args) {
                 }
             };
             report.cuts += 1;
+            let without_intent = broca_core::tool_call_dispatches(framed)
+                .map(|all| {
+                    all.values()
+                        .flatten()
+                        .filter(|call| call.intent_seq.is_none() && call.key_seq.is_some())
+                        .count() as u64
+                })
+                .unwrap_or(0);
+            report.calls_answered_without_intent += without_intent;
+            report.cuts_with_call_answered_without_intent += u64::from(without_intent > 0);
             let calls = || {
                 expected.iter().flat_map(|message| {
                     message["tool_calls"]
@@ -443,6 +458,45 @@ mod tests {
             );
             assert_eq!(calls[0]["call_key"], json!("l1:5"), "after record {end}");
             assert_eq!(calls[0]["dispatched_to"], json!("tools"));
+            assert_eq!(store_of(framed, "l1"), today, "after record {end}");
+        }
+    }
+
+    /// A step with a call the policy denied beside a dispatched one: today keys the denied call
+    /// by the record that answered it, and the store serves the same key from the outcome it
+    /// recorded, at every cut and on the closed turn. The denied call has no module and is never
+    /// indeterminate.
+    #[test]
+    fn a_denied_call_reads_alike_with_its_key() {
+        let lines = [
+            RUN,
+            r#"{"type":"step_started","step_id":1}"#,
+            r#"{"type":"model_step_finished","step_id":1,"assistant_message":{"message_id":"m1","content":[{"type":"tool_call","tool_call_id":"c1","tool_name":"bash","input":{"cmd":"ls"}},{"type":"tool_call","tool_call_id":"c2","tool_name":"bash","input":{"cmd":"rm"}}]},"usage":{"input_tokens":3},"finish_reason":"tool_calls","retries_used":0}"#,
+            r#"{"type":"tool_batch_started","batch_id":"b1","step_id":1,"planned_calls":["c1","c2"]}"#,
+            r#"{"type":"tool_dispatch_intent","batch_id":"b1","tool_call_id":"c1","args":{"cmd":"ls"},"module_id":"tools"}"#,
+            r#"{"type":"tool_no_dispatch","batch_id":"b1","tool_call_id":"c2","reason":{"kind":"denied","reason":"not allowed"}}"#,
+            r#"{"type":"tool_result","batch_id":"b1","result":{"tool_call_id":"c1","output":{"kind":"text","text":"ok"},"is_error":false},"outcome":"completed"}"#,
+            r#"{"type":"tool_batch_finished","batch_id":"b1"}"#,
+        ];
+        let old = log(&lines);
+        // Not after record 7: until the batch's end, today's read keeps the answered turn's
+        // results out of the transcript, while the store has placed them (a difference of the
+        // pages, not of the calls).
+        for end in [6, 8] {
+            let framed = &old[..end];
+            let today = today(framed, Some("l1"), 50).unwrap();
+            let calls: Vec<&Value> = today
+                .iter()
+                .flat_map(|message| message["tool_calls"].as_array().into_iter().flatten())
+                .collect();
+            assert_eq!(calls[1]["tool_call_id"], json!("c2"), "after record {end}");
+            assert_eq!(
+                calls[1]["call_key"],
+                json!("l1:6"),
+                "today keys the denied call by its answer, after record {end}"
+            );
+            assert_eq!(calls[1]["dispatched_to"], Value::Null);
+            assert_eq!(calls[1]["indeterminate"], json!(false));
             assert_eq!(store_of(framed, "l1"), today, "after record {end}");
         }
     }

@@ -325,8 +325,8 @@ message! {
     pub struct TurnFacts {
         /// The ordinal of the assistant message that made the calls.
         1 req ordinal: u64,
-        /// One per call that has a key, in the order the message made them. A call broca never
-        /// dispatched has no key, so it has none.
+        /// One per call that has a key, in the order the message made them: a dispatched call's
+        /// is its intent's, a call answered without an intent its outcome's.
         2 rep calls: CallFacts,
     }
 }
@@ -702,6 +702,13 @@ message! {
         /// Owned by the tool router: why a call wasn't dispatched, held or withdrawn.
         9 opt detail: serde_json::Value,
         10 opt hooks: serde_json::Value,
+        /// The key of a call answered without a dispatch intent (denied, invalid, synthetic, or
+        /// refused with its batch), which no intent holds: the new loop mints it from this
+        /// record's writer generation and seq, in the form of the store's ids, and a converted
+        /// call keeps today's key, made from the log's lineage and its terminal record's seq.
+        /// Absent for a dispatched call, whose key is its intent's, and on outcomes written
+        /// before it was recorded.
+        11 opt call_key: String,
     }
 }
 
