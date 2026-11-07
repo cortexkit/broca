@@ -129,6 +129,8 @@ pub struct StoredBatch {
 /// How a claim went.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Claimed {
+    /// Routed content has expired. Cleanup owns it until retention releases the id.
+    Expired,
     /// No batch had this id: it is now recorded as running, with this call's ceiling.
     Fresh,
     /// The same body was recorded before: it is now running under this call, and its ceiling
@@ -477,7 +479,7 @@ impl SystemOneStore {
         let existing = tx
             .query_row(
                 "SELECT model, identity, body_digest, frozen_row, ceiling_nanos, spent_nanos,
-                        state, admitted_at_ms, scope_json
+                        state, admitted_at_ms, scope_json, routing_choice IS NOT NULL
                    FROM batch WHERE role = ?1 AND batch_id = ?2",
                 rusqlite::params![claim.role, claim.batch_id],
                 |row| {
@@ -491,14 +493,25 @@ impl SystemOneStore {
                         row.get::<_, String>(6)?,
                         row.get::<_, i64>(7)?,
                         row.get::<_, Option<String>>(8)?,
+                        row.get::<_, bool>(9)?,
                     ))
                 },
             )
             .optional()?;
         let scope_json = serde_json::to_string(claim.scope)
             .map_err(|error| SystemOneStoreError(error.to_string()))?;
-        let Some((model, identity, digest, frozen_row, ceiling, spent, state, admitted, scope)) =
-            existing
+        let Some((
+            model,
+            identity,
+            digest,
+            frozen_row,
+            ceiling,
+            spent,
+            state,
+            admitted,
+            scope,
+            was_routed,
+        )) = existing
         else {
             tx.execute(
                 "INSERT INTO batch (role, batch_id, model, identity, body_digest, frozen_row,
@@ -525,6 +538,9 @@ impl SystemOneStore {
             tx.commit()?;
             return Ok(Claimed::Fresh);
         };
+        if was_routed && claim.now_ms.saturating_sub(admitted) >= RETENTION_MS {
+            return Ok(Claimed::Expired);
+        }
         // Legacy unscoped rows are refused too; adopting them would silently assign old work
         // to a new caller. Retention eventually removes them under the ordinary batch rules.
         if scope.as_deref() != Some(scope_json.as_str()) {
@@ -746,11 +762,21 @@ impl SystemOneStore {
 
     /// End `owner`'s hold on a batch; its record stays.
     pub fn release(&self, role: &str, batch_id: &str, owner: &str) -> Result<()> {
-        self.lock().execute(
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Expiry leaves the old incarnation held until deletion and release can be one
+        // transaction. A later call in this process must never be released by this hold.
+        tx.execute(
+            "DELETE FROM batch WHERE role=?1 AND batch_id=?2 AND owner=?3
+             AND state='running' AND routing_pending=0 AND routing_runs=?4",
+            rusqlite::params![role, batch_id, owner, routing::EMPTY_EXPIRED_JOURNAL],
+        )?;
+        tx.execute(
             "UPDATE batch SET state = 'idle', owner = NULL, started_at_ms = NULL
               WHERE role = ?1 AND batch_id = ?2 AND owner = ?3",
             rusqlite::params![role, batch_id, owner],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -812,6 +838,36 @@ impl SystemOneStore {
     /// A batch as recorded under `role`, with its outcomes, or `None` when there is none.
     /// Reads only: the batch is not claimed and nothing is written.
     pub fn lookup(&self, role: &str, batch_id: &str) -> Result<Option<StoredBatch>> {
+        self.lookup_at(role, batch_id, None, true)
+    }
+
+    /// A caller-visible snapshot never exposes expired routed content, even before cleanup.
+    pub fn lookup_live(
+        &self,
+        role: &str,
+        batch_id: &str,
+        now_ms: i64,
+    ) -> Result<Option<StoredBatch>> {
+        self.lookup_at(role, batch_id, Some(now_ms), true)
+    }
+
+    /// Routing cleanup is already claimed by the owner and never reattributes the batch.
+    /// A damaged caller scope must not stop release/report delivery or content expiry.
+    pub fn lookup_for_routing_cleanup(
+        &self,
+        role: &str,
+        batch_id: &str,
+    ) -> Result<Option<StoredBatch>> {
+        self.lookup_at(role, batch_id, None, false)
+    }
+
+    fn lookup_at(
+        &self,
+        role: &str,
+        batch_id: &str,
+        now_ms: Option<i64>,
+        decode_scope: bool,
+    ) -> Result<Option<StoredBatch>> {
         let mut conn = self.lock();
         // One read transaction, so the row and its outcomes come from the same moment even
         // when another process shares the file.
@@ -819,7 +875,7 @@ impl SystemOneStore {
         let row = tx
             .query_row(
                 "SELECT model, scope_json, identity, body_digest, frozen_row, ceiling_nanos,
-                        spent_nanos, admitted_at_ms, state
+                        spent_nanos, admitted_at_ms, state, routing_choice IS NOT NULL
                    FROM batch WHERE role = ?1 AND batch_id = ?2",
                 rusqlite::params![role, batch_id],
                 |row| {
@@ -833,16 +889,31 @@ impl SystemOneStore {
                         row.get::<_, i64>(6)?,
                         row.get::<_, i64>(7)?,
                         row.get::<_, String>(8)?,
+                        row.get::<_, bool>(9)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((model, scope, identity, digest, frozen_row, ceiling, spent, admitted, state)) =
-            row
+        let Some((
+            model,
+            scope,
+            identity,
+            digest,
+            frozen_row,
+            ceiling,
+            spent,
+            admitted,
+            state,
+            routed,
+        )) = row
         else {
             return Ok(None);
         };
+        if routed && now_ms.is_some_and(|now| now.saturating_sub(admitted) >= RETENTION_MS) {
+            return Ok(None);
+        }
         let scope = scope
+            .filter(|_| decode_scope)
             .map(|json| serde_json::from_str::<BatchScope>(&json))
             .transpose()
             .map_err(|error| SystemOneStoreError(format!("a recorded batch scope: {error}")))?;

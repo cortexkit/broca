@@ -29,6 +29,7 @@ enum Script {
     Status(u16, Option<u64>),
     /// Wait for a permit on the semaphore, then answer.
     Held(Arc<Semaphore>, String),
+    TimedHeld(Arc<Semaphore>, String),
     Panic,
 }
 
@@ -125,6 +126,20 @@ impl ClassifierProvider for StandIn {
                 let _permit = gate.acquire().await.unwrap();
                 self.held.fetch_sub(1, Ordering::SeqCst);
                 ProviderReply::Answered(body.into_bytes())
+            }
+            Some(Script::TimedHeld(gate, body)) => {
+                self.held.fetch_add(1, Ordering::SeqCst);
+                self.entered.notify_waiters();
+                let reply = tokio::select! {
+                    biased;
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => ProviderReply::Transport("adapter response deadline elapsed".into()),
+                    permit = gate.acquire() => {
+                        drop(permit.unwrap());
+                        ProviderReply::Answered(body.into_bytes())
+                    }
+                };
+                self.held.fetch_sub(1, Ordering::SeqCst);
+                reply
             }
             Some(Script::Panic) => panic!("the stand-in provider panicked on purpose"),
         }

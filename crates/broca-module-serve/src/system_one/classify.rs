@@ -164,6 +164,7 @@ pub(super) struct Hold<'a> {
     pub(super) service: &'a Arc<SystemOne>,
     pub(super) batch_id: String,
     pub(super) stored: bool,
+    pub(super) local: bool,
 }
 
 /// End this process's store hold on a batch. A failure is only logged: the call is answered
@@ -232,11 +233,13 @@ impl Drop for Hold<'_> {
                 Err(_) => release(),
             }
         }
-        self.service
-            .claims
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(&self.batch_id);
+        if self.local {
+            self.service
+                .claims
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&self.batch_id);
+        }
     }
 }
 
@@ -810,6 +813,7 @@ pub(super) async fn run_inner(
         service,
         batch_id: request.batch_id.clone(),
         stored: false,
+        local: true,
     };
     // Everything after the in-process claim runs in `serve_claimed`, so that every way the
     // call can end normally once the store row may exist (a reply, a scope or reuse refusal,
@@ -906,6 +910,9 @@ async fn serve_claimed(
         .await?
     };
     let (fresh, frozen, ceiling, mut spent, stored) = match claimed {
+        Claimed::Expired => return Err(super::routed::disabled_unavailable(
+            "batch content has expired; routing cleanup must finish before this id can be reused",
+        )),
         Claimed::ScopeMismatch => {
             return Err(Refusal::new(
                 "batch_scope_mismatch",
@@ -927,13 +934,23 @@ async fn serve_claimed(
             ))
         }
         Claimed::Fresh => (true, live_frozen, sent_ceiling, 0u64, Vec::new()),
-        Claimed::Resumed(record) => (
-            false,
-            serde_json::from_str(&record.frozen_row).unwrap_or_default(),
-            record.ceiling_nanos,
-            record.spent_nanos,
-            record.outcomes,
-        ),
+        Claimed::Resumed(record) => {
+            hold.stored = true;
+            if !service.config.routed_models && service.role == super::STORE_ROLE {
+                if let Some(reply) =
+                    super::routed::replay_when_disabled(service, request, &record).await?
+                {
+                    return Ok(reply);
+                }
+            }
+            (
+                false,
+                serde_json::from_str(&record.frozen_row).unwrap_or_default(),
+                record.ceiling_nanos,
+                record.spent_nanos,
+                record.outcomes,
+            )
+        }
     };
     hold.stored = true;
     let rate = frozen.input_rate_nanos.unwrap_or(0);

@@ -303,6 +303,7 @@ impl ModelPin {
 
 /// The System One service: the batch store, the routing pins, and the concurrency caps.
 pub struct SystemOne {
+    routing_content_retention: bool,
     routing: Option<Routing>,
     image_resolver: Option<Arc<dyn ImageResolver>>,
     store: Arc<SystemOneStore>,
@@ -371,6 +372,7 @@ impl SystemOne {
         in_flight: Arc<AtomicUsize>,
     ) -> Self {
         Self {
+            routing_content_retention: true,
             routing: None,
             image_resolver: None,
             store,
@@ -486,6 +488,7 @@ impl SystemOne {
         service.export = self.export.clone();
         service.charge_basis = self.charge_basis.clone();
         service.image_resolver = self.image_resolver.clone();
+        service.routing_content_retention = self.routing_content_retention;
         service
     }
 
@@ -558,17 +561,35 @@ impl SystemOne {
     }
 
     /// The batch recorded under this service's role for `batch_id`, with its outcomes; `None`
-    /// when there is none. Reads only: nothing is claimed or written.
+    /// when there is none or its routed content expired. Cleanup uses a separate raw snapshot.
     pub async fn stored_batch(
         &self,
         batch_id: &str,
     ) -> Result<Option<broca_store::system_one::StoredBatch>, String> {
         let store = Arc::clone(&self.store);
         let (role, batch_id) = (self.role.clone(), batch_id.to_owned());
-        tokio::task::spawn_blocking(move || store.lookup(&role, &batch_id))
+        let now = (self.clock)();
+        tokio::task::spawn_blocking(move || store.lookup_live(&role, &batch_id, now))
             .await
             .map_err(|e| e.to_string())?
             .map_err(|e| e.to_string())
+    }
+
+    async fn stored_batch_for_routing_cleanup(
+        &self,
+        batch_id: &str,
+    ) -> Result<Option<broca_store::system_one::StoredBatch>, String> {
+        let (store, role, id) = (self.store.clone(), self.role.clone(), batch_id.to_owned());
+        tokio::task::spawn_blocking(move || store.lookup_for_routing_cleanup(&role, &id))
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())
+    }
+
+    /// Routing debt is drained on every root; only the existing retention policy permits deletion.
+    pub fn with_routing_content_retention(mut self, enabled: bool) -> Self {
+        self.routing_content_retention = enabled;
+        self
     }
 
     /// Replace the clock; tests drive retention with it.
@@ -585,6 +606,9 @@ impl SystemOne {
 
     /// Delete batches past retention. Returns how many batches went.
     pub async fn sweep(&self) -> Result<usize, String> {
+        if !self.routing_content_retention {
+            return Ok(0);
+        }
         let store = Arc::clone(&self.store);
         let now = (self.clock)();
         tokio::task::spawn_blocking(move || store.sweep(now))
@@ -690,7 +714,7 @@ impl SystemOne {
     /// enough evidence to offer model-less calls after its route has closed.
     pub async fn describe_live(&self) -> RoleDescribe {
         let describe = self.describe();
-        if self.config.routed_models && self.routing_ready().await.is_ok() {
+        if self.config.routed_models && self.routing_ready(None).await.is_ok() {
             describe.with_routed_models()
         } else {
             describe
@@ -743,26 +767,16 @@ impl SystemOne {
                         .batches_failed += 1;
                     refusal_body(&e)
                 })?;
-                if !self.config.routed_models && self.image_references() {
-                    if let Some(reply) = routed::replay_when_disabled(&self, params, &scope)
-                        .await
-                        .map_err(|error| {
-                        self.metrics
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .batches_failed += 1;
-                        error.bytes()
-                    })? {
-                        self.metrics
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .batches_answered += 1;
-                        return Ok(reply);
-                    }
-                }
                 let stored = if self.image_references() {
-                    let request = cortexkit_role_classifier::request::parse_request(params)
-                        .map_err(|e| refusal_body(&e))?;
+                    let request = if self.config.routed_models {
+                        cortexkit_role_classifier::request::parse_request(params)
+                    } else {
+                        cortexkit_role_classifier::request::parse_request_for(
+                            params,
+                            &self.describe(),
+                        )
+                    }
+                    .map_err(|e| refusal_body(&e))?;
                     self.stored_batch(&request.batch_id)
                         .await
                         .map_err(|_| {
@@ -834,14 +848,6 @@ impl SystemOne {
         let task = tokio::spawn(async move {
             let _lowered = lowered;
             let _slot = Arc::clone(&service.call_slots).acquire_owned().await;
-            if !service.config.routed_models && service.role == STORE_ROLE {
-                if let Some(reply) = routed::replay_when_disabled(&service, &params, &scope)
-                    .await
-                    .map_err(routed::Error::bytes)?
-                {
-                    return Ok(reply);
-                }
-            }
             if service.config.routed_models && service.role == STORE_ROLE {
                 if let Some(reply) = routed::run(&service, &params, &scope, admitted_at_ms, &images)
                     .await

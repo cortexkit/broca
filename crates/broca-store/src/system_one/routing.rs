@@ -1,5 +1,7 @@
 use super::*;
 
+pub(super) const EMPTY_EXPIRED_JOURNAL: &str = r#"{"expired":true,"outbox":[]}"#;
+
 /// Opaque routing facts owned by the classifier implementation. Null columns identify a
 /// legacy pinned batch; opening a store never turns one into a routed batch.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -140,14 +142,9 @@ impl SystemOneStore {
             "DELETE FROM item_outcome WHERE role=?1 AND batch_id=?2",
             rusqlite::params![role, batch_id],
         )?;
-        if let Some(archive) = archive {
-            tx.execute("UPDATE batch SET model='', identity='{}', body_digest='', frozen_row='{}', scope_json=NULL, ceiling_nanos=NULL, spent_nanos=0, routing_choice='null', routing_runs=?3, routing_pending=1 WHERE role=?1 AND batch_id=?2", rusqlite::params![role,batch_id,archive])?;
-        } else {
-            tx.execute(
-                "DELETE FROM batch WHERE role=?1 AND batch_id=?2",
-                rusqlite::params![role, batch_id],
-            )?;
-        }
+        // Keep a content-free running row even with no debt. The owner's release deletes
+        // that empty tombstone atomically, without a stale release touching a new batch.
+        tx.execute("UPDATE batch SET model='', identity='{}', body_digest='', frozen_row='{}', scope_json=NULL, ceiling_nanos=NULL, spent_nanos=0, routing_choice='null', routing_runs=?3, routing_pending=?4 WHERE role=?1 AND batch_id=?2", rusqlite::params![role,batch_id,archive.unwrap_or(EMPTY_EXPIRED_JOURNAL), i64::from(archive.is_some())])?;
         tx.commit()?;
         Ok(())
     }
@@ -156,6 +153,147 @@ impl SystemOneStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audit_exit_expiry_holds_the_old_incarnation_until_atomic_release() {
+        let store = SystemOneStore::open_in_memory().unwrap();
+        let scope = BatchScope::Flow {
+            flow_id: "flow".into(),
+        };
+        let mut claim = BatchClaim {
+            role: "classifier/v1",
+            batch_id: "routed",
+            model: "model",
+            identity: "private input",
+            body_digest: "digest",
+            frozen_row: "{}",
+            scope: &scope,
+            ceiling_nanos: None,
+            owner: "same-process",
+            now_ms: 1,
+        };
+        assert!(matches!(
+            store.claim_routed(&claim, 1).unwrap(),
+            Claimed::Fresh
+        ));
+        store
+            .expire_routed(claim.role, claim.batch_id, claim.owner, None)
+            .unwrap();
+        let held = store.lookup(claim.role, claim.batch_id).unwrap();
+        assert!(
+            held.as_ref()
+                .is_some_and(|row| row.running && row.identity == "{}"),
+            "expiry must not expose a fresh same-id incarnation before the old hold releases"
+        );
+        claim.now_ms = RETENTION_MS + 2;
+        assert!(!matches!(
+            store.claim_routed(&claim, claim.now_ms).unwrap(),
+            Claimed::Fresh
+        ));
+        store
+            .release(claim.role, claim.batch_id, claim.owner)
+            .unwrap();
+        assert!(store.lookup(claim.role, claim.batch_id).unwrap().is_none());
+        assert!(matches!(
+            store.claim_routed(&claim, claim.now_ms).unwrap(),
+            Claimed::Fresh
+        ));
+        assert!(
+            matches!(
+                store.claim_routed(&claim, claim.now_ms).unwrap(),
+                Claimed::InProgress
+            ),
+            "the new incarnation stays single-flight after the old one is gone"
+        );
+    }
+
+    #[test]
+    fn audit_exit_live_claim_never_resumes_expired_routed_content() {
+        let store = SystemOneStore::open_in_memory().unwrap();
+        let scope = BatchScope::Flow {
+            flow_id: "flow".into(),
+        };
+        let mut claim = BatchClaim {
+            role: "classifier/v1",
+            batch_id: "routed",
+            model: "model",
+            identity: "private input",
+            body_digest: "digest",
+            frozen_row: "{}",
+            scope: &scope,
+            ceiling_nanos: None,
+            owner: "same-process",
+            now_ms: 1,
+        };
+        store.claim_routed(&claim, 1).unwrap();
+        store
+            .release(claim.role, claim.batch_id, claim.owner)
+            .unwrap();
+        claim.now_ms = RETENTION_MS + 1;
+        let claimed = store.claim_routed(&claim, claim.now_ms).unwrap();
+        assert!(
+            !matches!(claimed, Claimed::Fresh | Claimed::Resumed(_)),
+            "a live claim must refuse expired routed content before taking its hold: {claimed:?}"
+        );
+        assert!(
+            !store
+                .lookup(claim.role, claim.batch_id)
+                .unwrap()
+                .unwrap()
+                .running
+        );
+    }
+
+    #[test]
+    fn audit_exit_stale_expiry_release_cannot_authorize_duplicate_dispatch() {
+        let store = SystemOneStore::open_in_memory().unwrap();
+        let scope = BatchScope::Flow {
+            flow_id: "flow".into(),
+        };
+        let mut claim = BatchClaim {
+            role: "classifier/v1",
+            batch_id: "routed",
+            model: "model",
+            identity: "input",
+            body_digest: "digest",
+            frozen_row: "{}",
+            scope: &scope,
+            ceiling_nanos: None,
+            owner: "same-process",
+            now_ms: 1,
+        };
+        store.claim_routed(&claim, 1).unwrap();
+        store
+            .expire_routed(claim.role, claim.batch_id, claim.owner, None)
+            .unwrap();
+        claim.now_ms = RETENTION_MS + 2;
+        let contender = store.claim_routed(&claim, claim.now_ms).unwrap();
+        if matches!(contender, Claimed::Fresh) {
+            // Reproduce the original interleaving: recovery deleted the old row, a
+            // new call created its row, and only then did the old hold release it.
+            store
+                .release(claim.role, claim.batch_id, claim.owner)
+                .unwrap();
+            assert_eq!(
+                store.claim_routed(&claim, claim.now_ms).unwrap(),
+                Claimed::InProgress,
+                "the stale expiry release authorized a duplicate provider dispatch"
+            );
+        } else {
+            assert_eq!(contender, Claimed::Expired);
+            store
+                .release(claim.role, claim.batch_id, claim.owner)
+                .unwrap();
+            assert_eq!(
+                store.claim_routed(&claim, claim.now_ms).unwrap(),
+                Claimed::Fresh
+            );
+            assert_eq!(
+                store.claim_routed(&claim, claim.now_ms).unwrap(),
+                Claimed::InProgress
+            );
+        }
+    }
 
     #[test]
     fn audit_routing_archive_scrub_rolls_back_as_one_transaction() {

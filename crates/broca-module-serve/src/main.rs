@@ -909,7 +909,8 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             },
             config,
             registry.batches_in_flight_gauge(),
-        );
+        )
+        .with_routing_content_retention(state_format.runs(BackgroundTask::RetentionSweeper));
         let service = if let Some(routing) = classifier_router {
             service.with_routing(routing)
         } else {

@@ -28,11 +28,13 @@ consumer `classifier`. An unavailable or unready router gives `routing_unavailab
 OpenAI Decisions also requires its independent serving gate; enabling routing
 does not enable that adapter.
 
-Switching routing off later does not reinterpret an existing routed row. Stored
-final outcomes still replay with their model and decision id. An unfinished routed
-batch instead receives transient `routing_unavailable` without a write or dispatch;
-turning the switch back on lets it continue under the frozen decision. Reports owed
-for earlier real runs keep being drained while the switch is off.
+Switching routing off restores the base validation order before any batch lookup.
+A request without a model therefore refuses even when that id names a routed batch.
+An originally pinned, final routed batch can replay with its model and decision id at
+that same legacy claim boundary. An unfinished routed batch refuses without provider
+dispatch; turning routing back on continues its frozen decision. Adding a model to
+an originally unpinned batch still changes its immutable body identity. Reports and
+release obligations keep draining while admission is switched off.
 
 ## Selection and storage
 
@@ -86,16 +88,16 @@ is stored before dispatch, and a caller's pin still applies. After any answer,
 there is no reselection and every unanswered item receives the account error.
 Resettable account limits do not trigger reselection. One batch never mixes models.
 
-Fresh account-admission refusal leaves no batch or provider request. Refused
-re-admission of an existing batch stores an account error only for an explicit
-credential/sign-in authorization refusal. Temporary allocator/store failures and
-`unknown_decision` leave every outcome unchanged and refuse transiently; an
-unknown decision can also be foreign or forgotten, so it does not authorize a
-new selection. Invalid requests, conflicting admission ids and invalid routing
-answers are permanent internal errors, not credential failures. Refused admissions
-send no run observations or usage report. Transport failure leaves stored outcomes
-unchanged and is `routing_unavailable`. A local vault-read failure is a retryable
-item error, not evidence that the provider refused the credential.
+A committed selection survives a refused first account admission, so a resend reuses
+that decision instead of silently selecting again. Answered admission and re-admission
+refusals are permanent `routing_refused`, preserving routing's code and reason; no
+new run, provider request or account failure is invented. Stored outcomes stay intact.
+Classifier 0.6.1 CONTRACT.md §7 conservatively makes every answered routing refusal
+permanent, even when routing calls its own refusal transient.
+Invalid requests, conflicting admission ids and invalid routing answers are permanent
+internal errors. A failure to obtain an answer is transient `routing_unavailable`;
+an unknown pending grant retains its cleanup obligation. A local vault-read failure
+is a retryable item error, not evidence that the provider refused the credential.
 
 ## Dispatch attempts, leases and reports
 
@@ -105,11 +107,16 @@ sends `run_finished` when the call ends. A storage-only replay is not a run and
 holds no lease. Active calls renew the same account pin at
 `now + remaining - min(30 seconds, remaining / 3)`. A renewal uses
 `<attempt id>:renew:<n>` and the stored pin generation; a transport retry reuses
-that exact request once. Failed renewal lets an in-flight provider request finish
-and commits its answer, then stops further dispatch. Only items still unanswered
-fail with the renewal error. Later observations and `run_finished` name the latest
-renewal's admission id, the row that releases the current pin. No lease is held
-between calls.
+that exact request once. The provider future keeps being polled while renewal waits,
+so a ready, paid reply is not lost to an adapter deadline. Failed renewal stops further
+dispatch without cancelling that reply. Unanswered items receive transient
+`provider_error`; an answered refusal's message includes `routing refused renewal: <code>`.
+The full classified refusal stays in the batch journal and local report metadata;
+the published item-error wire shape has no routing-specific detail member.
+A resend replays paid answers and re-admits the frozen
+choice only for unanswered work. An unknown renewal outcome owes finishes for the
+original admission first and the possibly granted renewal second. Successful renewals
+make subsequent observations name the latest admission. No lease is held between calls.
 
 The decision freezes its report capability basis: refreshing routing readiness
 on a resend cannot switch between per-run and per-decision accounting.
@@ -121,23 +128,33 @@ still follows its separate answered-item aggregation rule. Credential refusals
 and known reset times use the router's advertised reporting/observation groups.
 
 Without that capability, broca reports a decision only when the batch is final.
-A batch left with retryable unanswered items has no report and no finalization
-deadline. Each report body is durable before sending. Recovery retries the same
-body and identity after a lost acknowledgement; it never invents a replacement
-body. Delivery is ordered and stops at the first temporary failure. Final routing
-answers, including `unknown_decision` and `report_conflict`, close the entry;
-a conflict is logged as a bug. Recovery runs once at boot and every 30 seconds,
-on every state-root format, independently of retention and the admission switch.
-One broken batch is logged without stopping other batches.
+A batch left with retryable unanswered items has no final report until completion or
+expiry. Every abandoned committed decision is closed with a durable report, using
+`launch_failed` for pre-dispatch failure (or `cancelled` without `report_outcomes`).
+A transient replacement-selection outage does not spend the single replacement;
+an invalid or refused replacement is surfaced rather than swallowed. A replacement
+failing model, image or ceiling validation leaves the original choice and outcomes
+intact and reports the replacement's launch failure.
 
-At seven days, routing recovery atomically removes item content, answers, request
-identity and diagnostics. Only unresolved routing RPC bodies and their ids can
-remain in a content-free tombstone. Reusing that `batch_id` is refused transiently
-with a message naming its owed routing report until delivery closes the tombstone.
-A settled report never keeps a tombstone alive. Within retention, a reselection
-keeps both decisions' runs and reports in the journal, while the reply names the
-decision that answered. An unservable replacement is reported as a launch failure
-without replacing the original frozen choice or outcomes.
+Each report body is durable before sending. Recovery retries the same body and identity
+after a lost acknowledgement; it never invents a replacement body. Delivery is ordered
+and stops at the first unknown outcome, including an invalid acknowledgement. Definitive
+routing refusals such as `unknown_decision` and `report_conflict` close the entry; a
+conflict is logged as a bug. Cleanup runs at boot and every 30 seconds on every root,
+independently of the admission switch. One broken batch does not stop other batches.
+
+On legacy roots, seven-day expiry atomically removes item content, answers, request
+identity and diagnostics. Only owed routing bodies, their stable cleanup ids, and
+metadata needed to deliver them remain in a content-free tombstone. An unknown first
+admission retains its exact `account_for` body: recovery replays its idempotency key,
+then releases every requested or answered admission id. An unknown outcome keeps that
+debt owed. A held, content-free row is removed atomically with release, so an old hold
+cannot free a new same-id incarnation. Settled routing debt never extends content TTL.
+
+Overhaul (`broca-state/2`) roots keep the existing destructive-retention fence: routing cleanup still
+drains reports, releases, pending admissions and tombstones, but it does not scrub
+content or run the ordinary sweep. Live snapshots and claims refuse expired routed
+rows on **every** root, so cleanup timing never exposes content past retention.
 
 `llm.classify/v1` results include the model used, as required by llm-tools 0.3.0.
 That tool still requires a pin to identify the provider before checking consent
