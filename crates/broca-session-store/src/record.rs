@@ -325,7 +325,8 @@ message! {
     pub struct TurnFacts {
         /// The ordinal of the assistant message that made the calls.
         1 req ordinal: u64,
-        /// One per call, in the order the message made them.
+        /// One per call that has a key, in the order the message made them. A call broca never
+        /// dispatched has no key, so it has none.
         2 rep calls: CallFacts,
     }
 }

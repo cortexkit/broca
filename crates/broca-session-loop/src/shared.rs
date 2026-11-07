@@ -75,6 +75,10 @@ pub enum Request {
         run_id: String,
         reply: Reply<Option<RunStart>>,
     },
+    ToolIntent {
+        call_key: String,
+        reply: Reply<Option<broca_session_store::record::ToolIntent>>,
+    },
     EntryByMid {
         mid: String,
         reply: Reply<Option<StoredEntry>>,
@@ -309,6 +313,17 @@ impl Writer for ActorWriter {
         .await
     }
 
+    async fn tool_intent(
+        &self,
+        call_key: &str,
+    ) -> Result<Option<broca_session_store::record::ToolIntent>, SessionError> {
+        self.ask(|reply| Request::ToolIntent {
+            call_key: call_key.to_owned(),
+            reply,
+        })
+        .await
+    }
+
     async fn seal_at_entry(
         &mut self,
         ordinal: u64,
@@ -424,6 +439,9 @@ impl RunLink {
             }
             Request::RunStart { run_id, reply } => {
                 let _ = reply.send(session.run_start(&run_id).await);
+            }
+            Request::ToolIntent { call_key, reply } => {
+                let _ = reply.send(session.tool_intent(&call_key).await);
             }
             Request::EntryByMid { mid, reply } => {
                 let _ = reply.send(session.entry_by_mid(&mid).await);
@@ -683,6 +701,7 @@ mod tests {
             let mut placed = crate::entries::Placed {
                 inner: &mut writer,
                 facts: crate::entries::Tags::default(),
+                intents: Default::default(),
             };
             placed.append(&[input("placed")], true).await.unwrap();
         };

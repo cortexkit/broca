@@ -335,7 +335,7 @@ async fn an_import_writes_the_history_and_answers_its_retry_from_the_receipt() {
         Some("msg_a1/call_1")
     );
     assert_eq!(reply_facts.notices[0].sender.as_deref(), Some("occi"));
-    let crate::store_read::StorePage { page, mids } =
+    let crate::store_read::StorePage { page, mids, .. } =
         crate::store_read::read_page(&session, Some(0), Some(10))
             .await
             .unwrap();
@@ -951,6 +951,13 @@ impl Writer for Unsealed<'_> {
         run_id: &str,
     ) -> Result<Option<broca_session_store::record::RunStart>, SessionError> {
         Writer::run_start(&*self.0, run_id).await
+    }
+
+    async fn tool_intent(
+        &self,
+        call_key: &str,
+    ) -> Result<Option<broca_session_store::record::ToolIntent>, SessionError> {
+        Writer::tool_intent(&*self.0, call_key).await
     }
 
     async fn seal_at_entry(

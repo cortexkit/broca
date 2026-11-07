@@ -1355,6 +1355,25 @@ struct CompactionSpy {
     mids: Mutex<std::collections::BTreeMap<u64, String>>,
     version: std::sync::atomic::AtomicU64,
     calls: Mutex<Vec<(String, Value)>>,
+    /// The one answer that says the provider lost its Setup, if the comparison scripts one.
+    lost: Mutex<Option<Lost>>,
+    notices: std::sync::atomic::AtomicUsize,
+    rides_asked: std::sync::atomic::AtomicUsize,
+}
+
+tokio::task_local! {
+    /// The answer, if any, with which the compaction provider says it lost the session's Setup,
+    /// as a provider restarted mid-run does.
+    static LOST: Lost;
+}
+
+/// Where a restarted compaction provider first hears from the run again.
+#[derive(Clone, Copy, Debug)]
+enum Lost {
+    /// The `n`th notice (from 1) is answered `setup_required`.
+    Notice(usize),
+    /// The `n`th ride (from 1) is refused `unknown_session`.
+    Ride(usize),
 }
 
 impl CompactionSpy {
@@ -1364,7 +1383,30 @@ impl CompactionSpy {
             mids: Mutex::default(),
             version: Default::default(),
             calls: Mutex::default(),
+            lost: Mutex::new(LOST.try_with(|lost| *lost).ok()),
+            notices: Default::default(),
+            rides_asked: Default::default(),
         }
+    }
+
+    /// Whether this call is the one the script answers as a provider that lost its Setup; it is
+    /// answered so once.
+    fn loses_setup(&self, method: &str) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut lost = self.lost.lock().unwrap();
+        let hit = match (*lost, method) {
+            (Some(Lost::Notice(n)), "compaction.notice") => {
+                self.notices.fetch_add(1, SeqCst) + 1 == n
+            }
+            (Some(Lost::Ride(n)), "compaction.ride") => {
+                self.rides_asked.fetch_add(1, SeqCst) + 1 == n
+            }
+            _ => false,
+        };
+        if hit {
+            *lost = None;
+        }
+        hit
     }
 
     /// The calls made, in order, each with message ids, digests and checksums renamed by order of
@@ -1461,6 +1503,17 @@ impl broca_core::CompactionPlane for CompactionSpy {
             None => method.into(),
         };
         self.calls.lock().unwrap().push((routed, params));
+        if self.loses_setup(method) {
+            if method == "compaction.ride" {
+                return Err(broca_core::compaction_v2::runtime::CallError::Refused(
+                    cortexkit_role_compaction::wire::Refusal::unknown_session(),
+                ));
+            }
+            return Ok(
+                serde_json::value::to_raw_value(&json!({"answer": "setup_required"}))
+                    .expect("an answer serializes"),
+            );
+        }
         let answer = match method {
             "compaction.setup" => json!({"answer": "ready"}),
             "compaction.notice" => json!({"answer": "received"}),
@@ -1955,6 +2008,13 @@ impl Writer for Recording<'_, '_> {
         Writer::run_start(&*self.session, run_id).await
     }
 
+    async fn tool_intent(
+        &self,
+        call_key: &str,
+    ) -> Result<Option<broca_session_store::record::ToolIntent>, SessionError> {
+        Writer::tool_intent(&*self.session, call_key).await
+    }
+
     async fn seal_at_entry(
         &mut self,
         ordinal: u64,
@@ -2097,6 +2157,7 @@ async fn new_from(
     let records = writer.records.clone();
     keys_match(writer.session, &plane).await;
     ids_resolve(writer.session).await;
+    turns_have_facts(writer.session).await;
     if !resuming {
         media_reads_back(writer.session).await;
     }
@@ -2336,6 +2397,30 @@ async fn ids_resolve(session: &Session<&MemoryBackend>) {
             entry.ordinal,
             facts.mid
         );
+    }
+}
+
+/// Every tool turn the session placed carries the facts of its calls (`TurnFacts`), whichever
+/// way the turn closed: its results arriving, a crash's close-out, a cancel, or a batch that
+/// sent nothing. `session.read` serves each call's key and dispatch from them.
+async fn turns_have_facts(session: &Session<&MemoryBackend>) {
+    for entry in session
+        .entries(1, usize::MAX)
+        .await
+        .expect("the entries read")
+    {
+        let calls = entry
+            .message
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolCall(_)));
+        if calls && !entry.open {
+            assert!(
+                entry.state.turn.is_some(),
+                "tool turn {} has no turn facts",
+                entry.ordinal
+            );
+        }
     }
 }
 
@@ -3199,6 +3284,7 @@ async fn compare_runs_in_once(scenario: Scenario, runs: &[(&str, Vec<Message>)])
     }
     keys_match(writer.session, &plane).await;
     ids_resolve(writer.session).await;
+    turns_have_facts(writer.session).await;
     if compaction().is_some_and(|script| {
         script
             .rides
@@ -3832,6 +3918,7 @@ async fn compare_actions_in_once(
     assert_eq!(reports, summaries, "how each run reported");
     keys_match(writer.session, &plane).await;
     ids_resolve(writer.session).await;
+    turns_have_facts(writer.session).await;
     let new = Outcome {
         records: normalized(&writer.records),
         requests: sent_requests(&provider.inner),
@@ -4198,6 +4285,7 @@ async fn compare_auth_pause_in_once(
         through!(writer, |w| resume(w, &parts, &seams).await).expect("the new loop resumes");
     keys_match(writer.session, &plane).await;
     ids_resolve(writer.session).await;
+    turns_have_facts(writer.session).await;
     pause_names_its_attempt(&writer);
     // A run the resume refroze onto another account keeps naming it when nobody routes one,
     // as a later resume or a rebuild of its requests reads the run back.
@@ -5366,6 +5454,88 @@ fn compacted_scenario(steps: Vec<Vec<NormalizedEvent>>) -> Scenario {
         tools,
         stop_when: Vec::new(),
         steps,
+    }
+}
+
+/// A compaction provider restarted mid-run says so the next time the run reaches it: a notice
+/// answered `setup_required`, or a ride refused `unknown_session`. Both loops send Setup again
+/// before anything else reaches the provider, so before the run's next step rather than at the
+/// next run, and make the same calls throughout.
+#[tokio::test]
+async fn a_provider_that_lost_its_setup_mid_run_gets_setup_before_the_next_step() {
+    let two_tool_steps = || {
+        vec![
+            answer(
+                "a1",
+                vec![call("c1", "read", json!({"path": "a"}))],
+                FinishReason::ToolCalls,
+            ),
+            answer(
+                "a2",
+                vec![call("c2", "read", json!({"path": "b"}))],
+                FinishReason::ToolCalls,
+            ),
+            text_step("a3", "done"),
+        ]
+    };
+    let over_limit = || {
+        vec![
+            answer(
+                "a1",
+                vec![call("c1", "big", json!({}))],
+                FinishReason::ToolCalls,
+            ),
+            text_step("a2", "done"),
+        ]
+    };
+    for (lost, steps, context_limit, method) in [
+        (
+            Lost::Notice(1),
+            two_tool_steps(),
+            100_000,
+            "compaction.notice",
+        ),
+        (Lost::Ride(1), over_limit(), 1_200, "compaction.ride"),
+    ] {
+        let script = || CompactionScript {
+            context_limit,
+            rides: vec![Ride::Drop(2)],
+        };
+        let scenario = compacted_scenario(steps);
+        LOST.scope(lost, compare_compacted(scenario.clone(), script()))
+            .await;
+        // Today's calls, which the new loop's were just compared with, show the case is seen:
+        // the call after the lost answer is a Setup, and a Setup was sent once before it.
+        let calls = LOST
+            .scope(
+                lost,
+                LAYOUT.scope(
+                    Some(cortexkit_compaction_view::PLAN_VERSION),
+                    COMPACTION.scope(Some(Arc::new(script())), today(&scenario)),
+                ),
+            )
+            .await
+            .calls;
+        let calls: Vec<&String> = calls
+            .iter()
+            .filter(|call| call.starts_with("compaction."))
+            .collect();
+        let at = calls
+            .iter()
+            .position(|call| call.starts_with(method))
+            .unwrap_or_else(|| panic!("{lost:?}: no {method} in {calls:?}"));
+        assert!(
+            calls[..at]
+                .iter()
+                .any(|call| call.starts_with("compaction.setup")),
+            "{lost:?}: the run set up before {calls:?}"
+        );
+        assert!(
+            calls
+                .get(at + 1)
+                .is_some_and(|call| call.starts_with("compaction.setup")),
+            "{lost:?}: Setup follows the lost answer in {calls:?}"
+        );
     }
 }
 

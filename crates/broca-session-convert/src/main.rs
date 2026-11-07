@@ -52,6 +52,7 @@ use broca_wal::FramedRecord;
 use futures::executor::block_on;
 use serde::Serialize;
 
+mod calls_check;
 mod heads;
 mod serve_check;
 
@@ -263,6 +264,7 @@ fn main() {
         "episodes" => run_episodes(&args),
         "render" => run_render(&args),
         "serve-check" => serve_check::run(&args),
+        "calls-check" => calls_check::run(&args),
         _ => usage(),
     }
 }

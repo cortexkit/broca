@@ -45,6 +45,9 @@ fn transcript_len<B: SessionBackend>(session: &Session<B>) -> u64 {
 pub struct StorePage {
     pub page: SessionReadPage,
     pub mids: Vec<String>,
+    /// What each message's tool calls are served from, in order (see
+    /// `crate::store_calls::attribute_tool_calls`).
+    pub turns: Vec<crate::store_calls::TurnOf>,
 }
 
 /// A `session.read` page: up to `limit` messages from `from_ordinal` (counting from 0, as
@@ -75,9 +78,11 @@ pub async fn read_page<B: SessionBackend>(
     let latest = session.operations.run.as_ref();
     let mut messages = Vec::with_capacity(entries.len());
     let mut mids = Vec::with_capacity(entries.len());
+    let mut turns = Vec::with_capacity(entries.len());
     for (index, entry) in entries.iter().enumerate() {
         let next = entries.get(index + 1).or(after.as_ref());
         messages.push(page_message(entry, next, latest)?);
+        turns.push(crate::store_calls::TurnOf::of(entry));
         // `page_message` has refused an entry without facts.
         mids.push(
             entry
@@ -101,7 +106,7 @@ pub async fn read_page<B: SessionBackend>(
         withdrawals_owed: false,
         tags_await_setup: false,
     };
-    Ok(StorePage { page, mids })
+    Ok(StorePage { page, mids, turns })
 }
 
 /// Serves `session.read` for a session kept in the new storage. The reply is today's for the
@@ -155,16 +160,19 @@ pub async fn serve_read(
         },
         None => req.from_ordinal.map(|at| at.saturating_sub(1)),
     };
-    let StorePage { mut page, mids } =
-        read_page(&session, from_ordinal, req.limit)
-            .await
-            .map_err(|error| match error {
-                StoreReadError::Session(error) => read_failed(error),
-                other => ServeError::Open(
-                    format!("the session's stored facts can't be read: {other:?}"),
-                    Some(broca_protocol::ErrorClass::Permanent),
-                ),
-            })?;
+    let StorePage {
+        mut page,
+        mids,
+        turns,
+    } = read_page(&session, from_ordinal, req.limit)
+        .await
+        .map_err(|error| match error {
+            StoreReadError::Session(error) => read_failed(error),
+            other => ServeError::Open(
+                format!("the session's stored facts can't be read: {other:?}"),
+                Some(broca_protocol::ErrorClass::Permanent),
+            ),
+        })?;
     crate::store_entries::mark_reply_cleaning(&session, store.parts(), &mut page.messages)
         .await
         .map_err(|error| {
@@ -180,6 +188,9 @@ pub async fn serve_read(
     for (entry, mid) in response.messages.iter_mut().zip(mids) {
         entry.mid = mid;
     }
+    crate::store_calls::attribute_tool_calls(&session, &mut response, &turns)
+        .await
+        .map_err(read_failed)?;
     crate::serve::apply_media_mode(&mut response, req.media, &req.session.session)?;
     let cap = req
         .max_bytes

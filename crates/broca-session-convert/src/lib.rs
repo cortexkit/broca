@@ -174,6 +174,10 @@ pub fn convert(old: &[FramedRecord], lineage: Option<&str>) -> Result<Converted,
     let mut stop_when = Vec::new();
     // Session-scoped: the schedule carries from run to run under the same model.
     let mut schedule: Option<broca_wal::RefusalFallbackSchedule> = None;
+    // The dispatch intents of the calls the step in progress made, by call id, which the facts
+    // of its tool turn name when the turn's results place it. A call id's first intent after its
+    // step is the call's, as today's reads take it.
+    let mut turn_intents: HashMap<ToolCallId, ToolIntent> = HashMap::new();
     // The provider serving the run in force, which decides what lifetime its requests ask for.
     let mut provider_id = String::new();
     for framed in old {
@@ -238,18 +242,42 @@ pub fn convert(old: &[FramedRecord], lineage: Option<&str>) -> Result<Converted,
         state.seq = framed.seq;
         let before = out.records.len();
         convert_one(&framed.record, &mut state, &mut out)?;
+        for record in &out.records[before..] {
+            match record {
+                Record::Assistant(_) | Record::RunStart(_) => turn_intents.clear(),
+                Record::ToolIntent(intent) => {
+                    turn_intents
+                        .entry(intent.tool_call_id.clone())
+                        .or_insert_with(|| intent.clone());
+                }
+                _ => {}
+            }
+        }
         if let Some((legacy, counts, emitted)) = &mut facts {
             let mut known = *emitted;
             // Whether broca wrote each newly known message, told by the record that placed it.
             let mut native_of = BTreeMap::new();
+            // The facts of a tool turn these records place, written after the turn's entry facts,
+            // as the run loop writes them.
+            let mut placed_turn = None;
             for record in &out.records[before..] {
                 if record.stream() != Stream::Transcript {
                     continue;
                 }
+                let open_turn = counts.open_tool_turn().cloned();
                 counts
                     .apply(record)
                     .map_err(|e| err(format!("entry facts: conversation {e:?}")))?;
                 counts.clear_window();
+                if let (Some(assistant), Record::ToolReply(_), None) =
+                    (&open_turn, record, counts.open_tool_turn())
+                {
+                    placed_turn = Some(broca_session_loop::entries::turn_facts(
+                        counts.placed - 1,
+                        assistant,
+                        |id| turn_intents.get(id),
+                    ));
+                }
                 let reserved = counts.open_tool_turn().is_some();
                 let now = counts.placed + u64::from(reserved);
                 for ordinal in known + 1..=now {
@@ -288,6 +316,9 @@ pub fn convert(old: &[FramedRecord], lineage: Option<&str>) -> Result<Converted,
                 )));
             }
             *emitted = known;
+            if let Some(turn) = placed_turn {
+                out.records.push(Record::TurnFacts(turn));
+            }
         }
     }
     if let Some((legacy, _, emitted)) = &facts {

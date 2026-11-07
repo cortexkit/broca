@@ -297,6 +297,7 @@ where
     }
     admission.input = input;
     let mut placed = Placed {
+        intents: Default::default(),
         facts: Tags::for_session(
             contract,
             admission.manifest.as_deref(),
@@ -472,6 +473,7 @@ where
     }
     let drift = drift.filter(|_| !matches!(resolution, Resolution::Paused(_)));
     let mut placed = Placed {
+        intents: Default::default(),
         facts: Tags::for_session(
             admission.compaction_plan_version.is_some(),
             admission.manifest.as_deref(),
@@ -704,6 +706,7 @@ where
     // The closing results message is placed with the facts its run's frozen rules give it, as a
     // resume places it.
     let mut placed = Placed {
+        intents: Default::default(),
         facts: Tags::for_session(
             admission.compaction_plan_version.is_some(),
             admission.manifest.as_deref(),

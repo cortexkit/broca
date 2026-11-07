@@ -399,6 +399,23 @@ fn masked(reply: &Result<Value, crate::history::HistoryError>) -> Value {
                 *at = json!(!at.is_null());
             }
         }
+        // A call key names a position in each storage's own log: kept as whether present.
+        for call in message
+            .get_mut("tool_calls")
+            .and_then(Value::as_array_mut)
+            .into_iter()
+            .flatten()
+        {
+            let present = !call["call_key"].is_null();
+            call["call_key"] = json!(present);
+        }
+        if let Some(receipt) = message
+            .get_mut("delivered_as")
+            .and_then(Value::as_object_mut)
+        {
+            let present = receipt.get("call_key").is_some_and(|key| !key.is_null());
+            receipt.insert("call_key".into(), json!(present));
+        }
     }
     value
 }
@@ -577,11 +594,16 @@ fn failing_step() -> Vec<NormalizedEvent> {
     })]
 }
 
-/// Finished runs read alike from either storage.
+/// Finished runs read alike from either storage, a tool turn's calls included: each call's key
+/// (present on both), the module it was dispatched to, and that it isn't indeterminate.
 #[tokio::test]
 async fn finished_runs_read_as_the_same_history() {
     let (today, store) = both(
-        vec![text_step("a1", "hello"), text_step("a2", "again")],
+        vec![
+            text_step("a1", "hello"),
+            tool_step("a2"),
+            text_step("a3", "read it"),
+        ],
         false,
     )
     .await;
@@ -598,6 +620,17 @@ async fn finished_runs_read_as_the_same_history() {
         ));
         side.settled("r2").await;
     }
+    // The comparison sees a served call: keyed, dispatched, determinate.
+    let read = store.history(json!({"from_ordinal": 1})).await.unwrap();
+    let calls: Vec<&Value> = read["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|message| message["tool_calls"].as_array().into_iter().flatten())
+        .collect();
+    assert_eq!(calls.len(), 1, "{read}");
+    assert!(calls[0]["call_key"].is_string(), "{read}");
+    assert_eq!(calls[0]["indeterminate"], json!(false), "{read}");
     compare_history(&today, &store, "finished").await;
     compare_compaction_refusals(&today, &store, "finished").await;
 }
