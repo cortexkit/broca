@@ -77,10 +77,23 @@ impl LineageRegistry {
             .next_anchor
             .map(|anchor| (anchor.file_id, anchor.seq, anchor.byte_end));
         let source_lineage = lineage.to_owned();
-        let (seed, versions) = spawn_blocking(JobKind::StoreRead, move || {
+        let whole_source = seed.through_seq == 0;
+        let (seed, versions, dispatches) = spawn_blocking(JobKind::StoreRead, move || {
             let versions = seed.fold(&frames, &source_lineage)?;
             seed.anchor = anchor;
-            Ok::<_, String>((seed, versions))
+            // Reuse this proven full decode instead of rereading it for default call attribution.
+            let dispatches = if whole_source {
+                let facts =
+                    broca_core::tool_call_dispatches(&frames).map_err(|error| error.to_string())?;
+                // Display facts can mention an uncommitted call; only committed turns prove coverage.
+                let covered = facts
+                    .last_key_value()
+                    .map_or(0, |(ordinal, _)| ordinal.saturating_add(1));
+                Some((covered, facts))
+            } else {
+                None
+            };
+            Ok::<_, String>((seed, versions, dispatches))
         })
         .await
         .map_err(|e| OpenError::Open(e.to_string()))?
@@ -89,6 +102,9 @@ impl LineageRegistry {
             return Err(OpenError::Open(
                 "display facts source does not cover the read snapshot".into(),
             ));
+        }
+        if let Some((covered, dispatches)) = dispatches {
+            self.cache_tool_dispatches(session, lineage, covered, dispatches);
         }
         for version in &versions {
             if ordinals.contains(&version.ordinal) {

@@ -1762,10 +1762,8 @@ async fn collect_subscription_frames_at(
     frames
 }
 
-/// Normalize only minted snapshot identity, cursor proofs and wall-clock versions in replies.
-/// Message content and request-rendering bytes are deliberately left intact.
-pub fn normalize_snapshot_bytes(body: &[u8], run_id: &str, incarnation: &str) -> String {
-    use base64::Engine;
+/// Normalize only envelope cursor digests; leave message digests and byte order intact.
+pub fn normalize_cursor_digests(body: &[u8], incarnation: &str) -> String {
     let mut text = String::from_utf8(body.to_vec()).unwrap();
     // Only envelope cursors vary with source-frame bytes; message digests remain pinned.
     let root: std::collections::BTreeMap<&str, &serde_json::value::RawValue> =
@@ -1809,6 +1807,14 @@ pub fn normalize_snapshot_bytes(body: &[u8], run_id: &str, incarnation: &str) ->
     for (start, end, replacement) in replacements {
         text.replace_range(start..end, &replacement);
     }
+    text
+}
+
+/// Normalize only minted snapshot identity, cursor proofs and wall-clock versions in replies.
+/// Message content and request-rendering bytes are deliberately left intact.
+pub fn normalize_snapshot_bytes(body: &[u8], run_id: &str, incarnation: &str) -> String {
+    use base64::Engine;
+    let mut text = normalize_cursor_digests(body, incarnation);
     let scope_prefix = format!(
         "h1.{}.",
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(incarnation.as_bytes())

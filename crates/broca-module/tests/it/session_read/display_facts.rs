@@ -178,12 +178,9 @@ async fn display_fact_backfill_is_lazy_persistent_and_reads_are_bounded_at_1k_an
         let default_full = zero_ranges.swap(0, Ordering::SeqCst);
         assert_eq!(plain.messages.last().unwrap().ordinal, size);
         let lineage = plain.lineage_id.as_ref().unwrap();
-        // One-time linear sidecar backfill plus the pre-existing dispatch-cache lookback
-        // in LineageRegistry::tool_turn_dispatches (registry.rs:4722). Warm reads pay neither.
-        assert_eq!(
-            default_full, 2,
-            "one output backfill and one existing dispatch lookback"
-        );
+        // The one-time linear sidecar backfill also seeds dispatch attribution from that
+        // same decode; a second historical pass is unnecessary. Warm reads pay neither.
+        assert_eq!(default_full, 1, "one shared output and dispatch backfill");
         let cold = &counter.snapshot()[0];
         println!(
             "native-output cold messages={size} bytes={} decoded={} elapsed_ms={default_ms:.3}",

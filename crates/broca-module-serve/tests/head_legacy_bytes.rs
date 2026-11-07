@@ -56,20 +56,44 @@ async fn populated_head_preserves_pre_addition_reply_bytes() {
     assert_eq!(answer["last_ordinal"], 2);
     assert_eq!(answer["first_ordinal"], 1);
     assert!(answer["history_version"].as_u64().unwrap() > 0);
-    assert_eq!(answer["head"], json!({"wal_seq":3,"sub_index":0}));
+    // The 0.8.11 cursor adds only its log incarnation and verified source-frame digest.
+    let mut cursor = answer["head"].as_object().unwrap().clone();
+    assert_eq!(
+        cursor.remove("incarnation"),
+        Some(answer["incarnation"].clone())
+    );
+    let digest = cursor.remove("digest").unwrap();
+    let digest = digest.as_str().unwrap();
+    assert!(digest.len() == 16 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    assert_eq!(
+        serde_json::Value::Object(cursor),
+        json!({"wal_seq":3,"sub_index":0})
+    );
     assert_eq!(
         answer["last_run_state"],
         json!({"run_id":"legacy-run","state":"completed","reason":"completed"})
     );
     assert_eq!(answer["input"], json!({"attachments":"no"}));
 
-    let mut bytes = String::from_utf8(head.body).unwrap();
+    let mut bytes = String::from_utf8(head.body.clone()).unwrap();
     // The new optional members are appended after the old head fields. Preserve the original
     // wire bytes, rather than serializing a JSON map that could hide changes to field order.
     let additions = ["model", "usage", "sender", "incarnation"];
+    let root: std::collections::BTreeMap<&str, &serde_json::value::RawValue> =
+        serde_json::from_slice(&head.body).unwrap();
+    let fields: std::collections::BTreeMap<&str, &serde_json::value::RawValue> =
+        serde_json::from_str(root["result"].get()).unwrap();
     let end = additions
         .iter()
-        .filter_map(|key| bytes.find(&format!(",\"{key}\":")))
+        .filter_map(|key| {
+            fields.get(key).map(|value| {
+                let value_at = value.get().as_ptr() as usize - head.body.as_ptr() as usize;
+                let prefix = format!(",\"{key}\":");
+                let at = value_at - prefix.len();
+                assert_eq!(&bytes[at..value_at], prefix);
+                at
+            })
+        })
         .min();
     if let Some(end) = end {
         bytes.truncate(end);
@@ -82,6 +106,10 @@ async fn populated_head_preserves_pre_addition_reply_bytes() {
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&bytes).unwrap(),
         json!({"result":legacy})
+    );
+    bytes = delivery_rig::normalize_cursor_digests(
+        bytes.as_bytes(),
+        answer["incarnation"].as_str().unwrap(),
     );
     bytes = bytes.replace(
         &format!(

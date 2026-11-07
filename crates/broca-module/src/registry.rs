@@ -1280,7 +1280,7 @@ pub struct RouteReadPage {
     /// The dispatch facts of every tool turn the snapshot's WAL tail commits, by ordinal. A
     /// turn already in the materialized prefix is not among them.
     pub dispatches: std::collections::BTreeMap<u64, Vec<broca_core::ToolCallDispatch>>,
-    /// `Some` attests that the raw reader inspected every returned message source span.
+    /// `Some` attests that returned tool outputs were inspected or need no envelope overlay.
     /// Even an empty map then avoids a separate historical native-output backfill.
     pub native_tool_outputs: Option<broca_core::display_facts::NativeToolOutputs>,
     /// When the newest timestamped record of the snapshot's WAL tail was written, in
@@ -1597,6 +1597,8 @@ impl RawPageSource {
 #[derive(Clone, Copy)]
 enum ReadPurpose {
     Session,
+    /// A transcript page may serve its verified store prefix when a tail flush fails.
+    TranscriptPage,
     Authorization,
     /// Require an anchor so an unusable media checkpoint cannot silently scan the prefix.
     Media,
@@ -4358,7 +4360,7 @@ impl LineageRegistry {
         }
     }
 
-    /// Read a WAL suffix bounded by a writer proof or by a read-side flush proof.
+    /// Read a page suffix, retaining only its store prefix if the tail cannot be flushed.
     async fn read_durable_range(
         &self,
         reader: &ReadSources,
@@ -4375,7 +4377,7 @@ impl LineageRegistry {
                 anchor,
                 live_head,
                 through_seq: None,
-                purpose: ReadPurpose::Session,
+                purpose: ReadPurpose::TranscriptPage,
             },
         )
         .await
@@ -4438,40 +4440,37 @@ impl LineageRegistry {
             (None, through) => through,
         };
         let whole_source = after_seq == 0 && anchor.is_none() && requested_through.is_none();
-        let range_read = |through_seq| {
-            let wal_store = reader.wal_store.clone();
-            let session = key.clone();
-            let read_anchor = anchor;
-            spawn_blocking(JobKind::WalRead, move || match purpose {
-                ReadPurpose::Session => wal_store.read_records_range(
-                    &session,
-                    after_seq,
-                    through_seq,
-                    read_anchor.as_ref(),
-                ),
-                ReadPurpose::Authorization => wal_store.read_records_range_for_authorization(
-                    &session,
-                    after_seq,
-                    through_seq,
-                    read_anchor.as_ref(),
-                ),
-                ReadPurpose::Media => match read_anchor {
-                    Some(anchor) if anchor.seq == after_seq => wal_store
-                        .read_records_range_from_valid_anchor(
-                            &session,
-                            after_seq,
-                            through_seq,
-                            &anchor,
-                        )
-                        .map(|range| {
-                            range.unwrap_or_else(|| {
-                                broca_wal::WalRangeRead::without_anchors(Vec::new())
-                            })
-                        }),
-                    _ => Ok(broca_wal::WalRangeRead::without_anchors(Vec::new())),
-                },
-            })
-        };
+        let range_read =
+            |through_seq| {
+                let wal_store = reader.wal_store.clone();
+                let session = key.clone();
+                let read_anchor = anchor;
+                spawn_blocking(JobKind::WalRead, move || match purpose {
+                    ReadPurpose::Session | ReadPurpose::TranscriptPage => wal_store
+                        .read_records_range(&session, after_seq, through_seq, read_anchor.as_ref()),
+                    ReadPurpose::Authorization => wal_store.read_records_range_for_authorization(
+                        &session,
+                        after_seq,
+                        through_seq,
+                        read_anchor.as_ref(),
+                    ),
+                    ReadPurpose::Media => match read_anchor {
+                        Some(anchor) if anchor.seq == after_seq => wal_store
+                            .read_records_range_from_valid_anchor(
+                                &session,
+                                after_seq,
+                                through_seq,
+                                &anchor,
+                            )
+                            .map(|range| {
+                                range.unwrap_or_else(|| {
+                                    broca_wal::WalRangeRead::without_anchors(Vec::new())
+                                })
+                            }),
+                        _ => Ok(broca_wal::WalRangeRead::without_anchors(Vec::new())),
+                    },
+                })
+            };
 
         if live_head.is_some() {
             let range = range_read(requested_through)
@@ -4490,7 +4489,9 @@ impl LineageRegistry {
             let wal_store = reader.wal_store.clone();
             let session = key.clone();
             move || match purpose {
-                ReadPurpose::Session | ReadPurpose::Media => wal_store.file_identity(&session),
+                ReadPurpose::Session | ReadPurpose::TranscriptPage | ReadPurpose::Media => {
+                    wal_store.file_identity(&session)
+                }
                 ReadPurpose::Authorization => wal_store.file_identity_for_authorization(&session),
             }
         })
@@ -4529,11 +4530,27 @@ impl LineageRegistry {
         // Never use FileWal::open here: it has writer-recovery truncation semantics. This handle
         // has write permission solely because Windows FlushFileBuffers requires it; sync_all is
         // the only operation performed, so a reader cannot alter or truncate the WAL.
+        let failed_flush = |error: String| {
+            if matches!(purpose, ReadPurpose::TranscriptPage) {
+                tracing::warn!(target: "session", %error, "tail flush failed; serving only the verified materialized prefix");
+                let mut unproven = broca_wal::WalRangeRead::without_anchors(Vec::new());
+                // Keep observed identity for the prefix check, but no tail or completeness proof.
+                unproven.lineage_id = candidate.lineage_id;
+                Ok(unproven)
+            } else {
+                Err(OpenError::Classified {
+                    reason: format!("durability_flush_failed: {error}"),
+                    class: broca_protocol::ErrorClass::Transient,
+                })
+            }
+        };
         let flush_identity = match spawn_blocking(JobKind::WalRead, {
             let wal_store = reader.wal_store.clone();
             let session = key.clone();
             move || match purpose {
-                ReadPurpose::Session | ReadPurpose::Media => wal_store.flush_for_read(&session),
+                ReadPurpose::Session | ReadPurpose::TranscriptPage | ReadPurpose::Media => {
+                    wal_store.flush_for_read(&session)
+                }
                 ReadPurpose::Authorization => wal_store.flush_for_authorization(&session),
             }
         })
@@ -4547,16 +4564,10 @@ impl LineageRegistry {
                 ));
             }
             Ok(Err(error)) => {
-                return Err(OpenError::Classified {
-                    reason: format!("durability_flush_failed: {error}"),
-                    class: broca_protocol::ErrorClass::Transient,
-                });
+                return failed_flush(error.to_string());
             }
             Err(error) => {
-                return Err(OpenError::Classified {
-                    reason: format!("durability_flush_failed: {error}"),
-                    class: broca_protocol::ErrorClass::Transient,
-                });
+                return failed_flush(error.to_string());
             }
         };
 
@@ -4581,7 +4592,9 @@ impl LineageRegistry {
             let wal_store = reader.wal_store.clone();
             let session = key.clone();
             move || match purpose {
-                ReadPurpose::Session | ReadPurpose::Media => wal_store.file_identity(&session),
+                ReadPurpose::Session | ReadPurpose::TranscriptPage | ReadPurpose::Media => {
+                    wal_store.file_identity(&session)
+                }
                 ReadPurpose::Authorization => wal_store.file_identity_for_authorization(&session),
             }
         })
@@ -4730,16 +4743,35 @@ impl LineageRegistry {
         }
         let all = broca_core::tool_call_dispatches(&records)
             .map_err(|error| OpenError::Open(format!("replay failed: {error}")))?;
-        let mut cache = self.inner.dispatch_cache.lock().unwrap();
-        if let Some(entry) = cache
-            .get_mut(key)
-            .filter(|entry| entry.lineage_id == lineage_id)
-        {
-            entry.by_ordinal.extend(all);
-            entry.covered = entry.covered.max(prompt_len);
-        }
-        drop(cache);
+        self.cache_tool_dispatches(key, lineage_id, prompt_len, all);
         Ok(lookup(&mut self.inner.dispatch_cache.lock().unwrap()).0)
+    }
+
+    fn cache_tool_dispatches(
+        &self,
+        key: &LineageKey,
+        lineage_id: &str,
+        covered: u64,
+        facts: std::collections::BTreeMap<u64, Vec<broca_core::ToolCallDispatch>>,
+    ) {
+        let mut cache = self.inner.dispatch_cache.lock().unwrap();
+        if cache
+            .get(key)
+            .is_none_or(|entry| entry.lineage_id != lineage_id)
+        {
+            cache.insert(
+                key.clone(),
+                DispatchCache {
+                    lineage_id: lineage_id.to_owned(),
+                    ..Default::default()
+                },
+            );
+        }
+        let entry = cache
+            .get_mut(key)
+            .expect("the session's dispatch cache exists");
+        entry.by_ordinal.extend(facts);
+        entry.covered = entry.covered.max(covered);
     }
 
     /// The session's first episode, as its open actor knows it, with no read of the WAL or the
@@ -4836,7 +4868,9 @@ impl LineageRegistry {
         OpenError,
     > {
         match purpose {
-            ReadPurpose::Session | ReadPurpose::Media => self.check_expired(key, None).await?,
+            ReadPurpose::Session | ReadPurpose::TranscriptPage | ReadPurpose::Media => {
+                self.check_expired(key, None).await?
+            }
             ReadPurpose::Authorization => self.check_authorization_expired(key).await?,
         }
         let Some(reader) = &self.inner.reader else {
@@ -5414,6 +5448,7 @@ impl LineageRegistry {
         // full-replay fallbacks above reset the snapshot to empty, this is 0: the tail then
         // covers the whole WAL and no separate prefix read is needed for tools.
         let prefix_watermark = snapshot.watermark_seq;
+        let prefix_len = snapshot.prefix_len;
         let open_batch = match tail.records() {
             broca_wal::WalRangeRecords::Complete(records) => {
                 let records: Vec<_> = records.iter().map(|frame| frame.record.clone()).collect();
@@ -5563,6 +5598,20 @@ impl LineageRegistry {
         )
         .map_err(|e| OpenError::Open(format!("replay failed: {e}")))?;
         page.lineage_id = lineage_id;
+        // Tail-only tool rows without envelope deliveries need no historical output overlay.
+        // Any prefix tool row or envelope keeps the full sidecar path and its exact native bytes.
+        let native_tool_outputs = if page
+            .messages
+            .iter()
+            .filter(|entry| entry.message.role == broca_protocol::Role::Tool)
+            .all(|entry| entry.ordinal >= prefix_len)
+            && !matches!(tail.records(), broca_wal::WalRangeRecords::Complete(records) | broca_wal::WalRangeRecords::Partial(records) | broca_wal::WalRangeRecords::Unknown(records)
+                if records.iter().any(|frame| matches!(&frame.record, broca_wal::WalRecord::SendDelivered { ride: Some(_), .. })))
+        {
+            Some(Default::default())
+        } else {
+            None
+        };
         if let (Some(cursor), Some(lineage)) = (page.head, lineage_id) {
             if let Some(identity) = tail.cursor_frame_identity_at(cursor.wal_seq) {
                 page.head = Some(cursor.with_frame_identity(lineage, identity));
@@ -5650,7 +5699,7 @@ impl LineageRegistry {
             tools,
             dispatches,
             newest_record_ms,
-            native_tool_outputs: None,
+            native_tool_outputs,
             retention_activity_ms,
             last_title,
         })))
@@ -7882,7 +7931,17 @@ mod tests {
         };
 
         let error = registry
-            .read_durable_range(&reader, &session, 0, None, None)
+            .read_durable_range_for(
+                &reader,
+                &session,
+                ReadRangeRequest {
+                    after_seq: 0,
+                    anchor: None,
+                    live_head: None,
+                    through_seq: None,
+                    purpose: ReadPurpose::Session,
+                },
+            )
             .await
             .expect_err("a failed durability flush cannot prove an empty suffix");
         assert!(

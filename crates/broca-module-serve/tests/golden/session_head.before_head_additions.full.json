@@ -1,1 +1,1 @@
-{"result":{"last_ordinal":2,"first_ordinal":1,"history_version":"@HISTORY_VERSION@","head":{"wal_seq":3,"sub_index":0},"last_run_state":{"run_id":"@RUN_ID@","state":"completed","reason":"completed"},"updated_at":"@UPDATED_AT@","input":{"attachments":"no"}}}
+{"result":{"last_ordinal":2,"first_ordinal":1,"history_version":"@HISTORY_VERSION@","head":{"wal_seq":3,"sub_index":0,"incarnation":"@LOG_ID@","digest":"@CURSOR_DIGEST@"},"last_run_state":{"run_id":"@RUN_ID@","state":"completed","reason":"completed"},"updated_at":"@UPDATED_AT@","input":{"attachments":"no"}}}

@@ -22,17 +22,17 @@ async fn describe_contract_sample() {
     assert_eq!(frame.header.ty, subc_protocol::FrameType::Response);
     let describe = result(&frame);
     let groups = describe["capabilities"].as_array().unwrap();
-    for required in [
-        "notices",
-        "message_senders",
-        "read_display_facts",
-        "call_identity",
-    ] {
+    for required in ["message_senders", "read_display_facts", "call_identity"] {
         assert!(
             groups.iter().any(|group| group == required),
             "missing {required}"
         );
     }
+    assert_eq!(
+        groups.iter().any(|group| group == "notices"),
+        broca_core::delivery_order::RIDES_V2_WRITER_ENABLED,
+        "notices must follow the installed envelope writer"
+    );
     for undeclared in ["sender_attribution", "provider_executed"] {
         assert!(
             !groups.iter().any(|group| group == undeclared),
@@ -202,8 +202,17 @@ async fn legacy_direct_call_has_key_without_a_guessed_schema_pin() {
         .as_str()
         .is_some_and(|key| key.contains(':')));
     assert!(call.get("schema_pin").is_none());
+    // Replay must reach the terminal lifecycle event before a quiet stream can end collection.
     let frames = rig
-        .subscribe_collect(8, json!({"from":"start"}), Duration::from_millis(30))
+        .subscribe_collect_until(
+            8,
+            json!({"from":"start"}),
+            Duration::from_millis(30),
+            |frame| {
+                serde_json::from_slice::<serde_json::Value>(&frame.body)
+                    .is_ok_and(|value| value["event"]["type"] == "tool_finished")
+            },
+        )
         .await;
     let mut observed = 0;
     for frame in frames {
