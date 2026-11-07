@@ -3945,10 +3945,12 @@ fn replay_seeded_with_compaction<'a>(
                             crate::delivery_order::apply_to_prompt(&mut prompt, tool_call_id, text);
                         }
                     }
+                    // Envelope rides belong to the carrying call, not the transcript
+                    // message. Only legacy deliveries retain entry attribution.
                     if let Some(index) = prompt.iter().rposition(|message| {
                         message.content.iter().any(|block| matches!(block,
                             ContentBlock::ToolResult(result) if &result.tool_call_id == tool_call_id))
-                    }) {
+                    }).filter(|_| ride.is_none()) {
                         let delivery = broca_protocol::tags::DeliveryAttribution {
                             mode: *mode, tool_call_id: Some(tool_call_id.0.clone()),
                         };
