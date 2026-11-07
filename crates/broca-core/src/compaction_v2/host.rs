@@ -34,13 +34,13 @@ pub fn context(config: &RunConfig, manifest: Option<&PlanManifest>) -> SendConte
     }
 }
 
-/// The conditions a notice, ride or view check states. `entries` is the session's transcript as
-/// `session.entries` serves it; the newest reported prompt size comes from it, so the provider
-/// reads the same number in these conditions as in that entry's `usage.prompt_tokens`.
+/// The conditions a notice, ride or view check states. Entries retain billed usage; the
+/// host-only fill overrides it only for the newest step that reported input usage.
 pub fn conditions(
     config: &RunConfig,
     entries: &[Entry],
     chained: bool,
+    newest_step_fill: Option<(&str, u64)>,
 ) -> Result<Conditions, String> {
     let window = config
         .context_limit
@@ -71,18 +71,37 @@ pub fn conditions(
         .and_then(serde_json::Value::as_bool);
     // The provider measures the session's fill from this field alone; without it a session
     // never reaches the provider's compaction threshold.
-    conditions.last_prompt_tokens = last_prompt_tokens(entries);
+    conditions.last_prompt_tokens = last_prompt_tokens(entries, newest_step_fill);
     Ok(conditions)
 }
 
-/// The prompt size of the newest request a provider reported: the newest entry's
-/// `usage.prompt_tokens` (uncached input plus cache reads plus cache writes). Absent until a
-/// request has reported its input.
-pub fn last_prompt_tokens(entries: &[Entry]) -> Option<u64> {
-    entries
-        .iter()
-        .rev()
-        .find_map(|entry| entry.usage.as_ref()?.prompt_tokens)
+/// The newest entry's reported prompt, using the last serving model's fill when that
+/// entry came from the newest input-reporting step. Imported entries keep their own usage.
+pub fn last_prompt_tokens(entries: &[Entry], newest_step_fill: Option<(&str, u64)>) -> Option<u64> {
+    entries.iter().rev().find_map(|entry| {
+        let prompt = entry.usage.as_ref()?.prompt_tokens?;
+        Some(match newest_step_fill {
+            Some((mid, fill)) if entry.mid == mid => fill,
+            _ => prompt,
+        })
+    })
+}
+
+/// Billed iterations can include a refused request on another model. Only the last
+/// serving model's prompt measures context fill; single-model steps need no override.
+/// A last model that reports zero for every input count gives `None`, as `step_usage` treats
+/// zero as unmeasured: a real request always has a prompt, and a fill of 0 would read as empty.
+pub fn fallback_fill(
+    served_model: &str,
+    usage: broca_protocol::Usage,
+    usage_iterations: Option<&[broca_protocol::usage::UsageIteration]>,
+) -> Option<u64> {
+    let serving = broca_protocol::usage::model_usage(served_model, usage, usage_iterations);
+    let (last_model, last_usage) = serving.last()?;
+    if !serving.iter().any(|(model, _)| model != last_model) {
+        return None;
+    }
+    super::metadata::step_usage(*last_usage)?.prompt_tokens
 }
 
 /// Ride causes compare the last accepted request's frozen session model.
@@ -218,7 +237,12 @@ pub async fn notice(
         .ok_or("mode-3 compaction requires a WAL lineage")?
         .to_string();
     let transcript = super::transcript::project(&frames, &lineage)?;
-    let conditions = conditions(&config, &transcript.entries, false)?;
+    let conditions = conditions(
+        &config,
+        &transcript.entries,
+        false,
+        transcript.newest_step_fill(),
+    )?;
     let applied = session.state.lock().await.applied_identity();
     let mut setup = conditions::setup_request(
         &preset,

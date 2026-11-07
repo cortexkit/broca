@@ -13,6 +13,16 @@ pub struct Transcript {
     pub stored: Vec<Message>,
     pub entries: Vec<Entry>,
     pub rides: super::entries::RideEnvelopes,
+    /// Host-only attribution; never projected into `session.entries`.
+    pub newest_step_fill: Option<(String, u64)>,
+}
+
+impl Transcript {
+    pub fn newest_step_fill(&self) -> Option<(&str, u64)> {
+        self.newest_step_fill
+            .as_ref()
+            .map(|(mid, fill)| (mid.as_str(), *fill))
+    }
 }
 
 pub fn project(records: &[FramedRecord], lineage: &str) -> Result<Transcript, String> {
@@ -122,6 +132,23 @@ fn finish(
         }
         rows.insert(position, metadata.clone());
     }
+    let newest_step = records.iter().rev().find_map(|frame| match &frame.record {
+        WalRecord::ModelStepFinished {
+            usage, fallback, ..
+        } => {
+            super::metadata::step_usage(*usage)?.prompt_tokens?;
+            Some((
+                frame.seq,
+                super::host::fallback_fill(
+                    fallback.served_model.as_deref().unwrap_or_default(),
+                    *usage,
+                    fallback.usage_iterations.as_deref(),
+                ),
+            ))
+        }
+        _ => None,
+    });
+    let mut newest_step_fill = None;
     let mut entries = Vec::with_capacity(stored.len());
     let mut rides = super::entries::RideEnvelopes::default();
     let mut prior_time = 0;
@@ -134,6 +161,11 @@ fn finish(
         metadata::attach_native_tags(message, metadata)?;
         prior_time = times.get(&position).copied().unwrap_or(prior_time);
         let mid = crate::message_mid(true, Some(lineage), position)?;
+        if let Some((seq, fill)) = newest_step {
+            if metadata.source_seq == seq && metadata.source_input.is_none() {
+                newest_step_fill = fill.map(|fill| (mid.clone(), fill));
+            }
+        }
         for origin in &metadata.deliveries {
             let ride = records
                 .iter()
@@ -158,5 +190,6 @@ fn finish(
         stored,
         entries,
         rides,
+        newest_step_fill,
     })
 }

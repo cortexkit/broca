@@ -5557,7 +5557,11 @@ mod database_attach_tests {
             .reads
             .iter()
             .all(|read| read.class != broca_wal::access_counter::ReadClass::Origin));
+        // Close every handle into the folders first: Windows refuses to remove a file that is
+        // still open, and the episode reader holds the log.
+        drop(reader);
         drop(wal);
+        drop(store);
         drop(db);
         drop(facts);
         std::fs::remove_dir_all(root).unwrap();
@@ -5633,7 +5637,11 @@ mod database_attach_tests {
             );
             assert!(operation.seed_fallbacks.is_empty(), "{operation:?}");
         }
+        // Close every handle into the folder first: Windows refuses to remove a file that is
+        // still open, and the episode reader holds the log.
+        drop(reader);
         drop(wal);
+        drop(store);
         drop(db);
         std::fs::remove_dir_all(root).unwrap();
     }
