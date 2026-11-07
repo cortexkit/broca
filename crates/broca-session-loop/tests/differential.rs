@@ -2075,6 +2075,9 @@ async fn new_from(
             .as_deref()
             .map(|spy| spy as &dyn broca_core::CompactionPlane),
         compaction_session: None,
+        // Today's loop (`broca_core::run`) here runs with no `RunControl::compaction_changes`,
+        // so it sends no change notices outside its steps, and the new one sends none either.
+        compaction_changes: false,
         keep_warm: new_warmer(),
         account_reports: reports().map(|reports| {
             Arc::new(NewReports(Arc::clone(&reports.new))) as Arc<dyn AccountReports>
@@ -3134,6 +3137,7 @@ async fn compare_runs_in_once(scenario: Scenario, runs: &[(&str, Vec<Message>)])
             .map(|spy| spy as &dyn broca_core::CompactionPlane),
         // One session state for the session's life, as the actor keeps it across runs.
         compaction_session: Some(Arc::default()),
+        compaction_changes: false,
         keep_warm: new_warmer(),
         account_reports: reports().map(|reports| {
             Arc::new(NewReports(Arc::clone(&reports.new))) as Arc<dyn AccountReports>
@@ -3763,6 +3767,7 @@ async fn compare_actions_in_once(
         session_address: Some(broca_core::wal_writer::session_addr(&bind)),
         compaction_plane: None,
         compaction_session: None,
+        compaction_changes: false,
         keep_warm: new_warmer(),
         account_reports: reports().map(|reports| {
             Arc::new(NewReports(Arc::clone(&reports.new))) as Arc<dyn AccountReports>
@@ -4142,6 +4147,7 @@ async fn compare_auth_pause_in_once(
         session_address: Some(broca_core::wal_writer::session_addr(&bind)),
         compaction_plane: None,
         compaction_session: None,
+        compaction_changes: false,
         keep_warm: new_warmer(),
         account_reports: reports().map(|reports| {
             Arc::new(NewReports(Arc::clone(&reports.new))) as Arc<dyn AccountReports>

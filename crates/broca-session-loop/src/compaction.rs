@@ -899,6 +899,47 @@ pub async fn notice<W: Writer, P, T>(
     Ok(())
 }
 
+/// What a run tells its session's compaction provider about the session's changes outside its
+/// own steps: once the run's end is durable, once a tool batch's results are, and once a call a
+/// provider held has its result. Those are the points today's actor has today's loop tell it,
+/// through `RunControl::compaction_changes` (`compaction_v2::host::notice`). Like today's
+/// notice, it writes nothing, and one that can't be sent fails nothing: the provider hears of
+/// the same changes with the next notice.
+pub struct Changes<'a> {
+    admission: &'a Admission,
+    ctx: Ctx,
+}
+
+impl<'a> Changes<'a> {
+    /// The changes a run of `admission` tells its compaction provider about, when the seams ask
+    /// for them (`Seams::compaction_changes`) and the run is on the current compaction contract
+    /// under a plan that names a compaction provider with a preset. They go through the
+    /// session's own compaction state (`Seams::compaction_session`), the one the run's steps
+    /// use, so the provider hears each change once.
+    pub fn of<P, T>(admission: &'a Admission, seams: &Seams<'_, P, T>) -> Option<Self> {
+        if !seams.compaction_changes || admission.compaction_plan_version.is_none() {
+            return None;
+        }
+        let manifest = admission.manifest.as_deref()?;
+        let (provider, preset, _, _) = broca_core::compaction::item(manifest).ok().flatten()?;
+        Some(Self {
+            admission,
+            ctx: Ctx {
+                session: seams.compaction_session.clone()?,
+                provider,
+                preset: preset?,
+                earlier: None,
+            },
+        })
+    }
+
+    /// Tells the provider of every change since its last notice. A failure is left for the next
+    /// notice to make up, as `compaction_v2::host::notice` leaves its own.
+    pub async fn tell<W: Writer, P, T>(&self, writer: &W, seams: &Seams<'_, P, T>) {
+        let _ = notice(writer, self.admission, seams, &self.ctx).await;
+    }
+}
+
 /// What the loop gives today's compaction code as the next message's id. A new message's id is
 /// minted from the seq its record takes, so before it's written there's none; the journal
 /// refuses a marker that would name it.

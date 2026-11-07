@@ -63,11 +63,13 @@ impl Noter {
     }
 }
 
-/// A compaction provider that is always ready and never has a view to offer. It keeps the
-/// method of every call it is sent.
+/// A compaction provider that is always ready and never has a view to offer. It keeps each
+/// call it is sent: its method, and for a notice its sequence number and the ordinals of the
+/// entries it carries.
 #[derive(Default)]
 struct Compactor {
     methods: Mutex<Vec<String>>,
+    calls: Mutex<Vec<Value>>,
 }
 
 impl Compactor {
@@ -78,6 +80,10 @@ impl Compactor {
             .iter()
             .filter(|method| *method == "compaction.setup")
             .count()
+    }
+
+    fn calls(&self) -> Vec<Value> {
+        self.calls.lock().unwrap().clone()
     }
 }
 
@@ -108,11 +114,23 @@ impl broca_core::CompactionPlane for Compactor {
         _: &BindIdentity,
         _: Option<&SessionScope>,
         method: &str,
-        _: Value,
+        params: Value,
         _: u64,
     ) -> Result<Box<serde_json::value::RawValue>, broca_core::compaction_v2::runtime::CallError>
     {
         self.methods.lock().unwrap().push(method.to_owned());
+        let ordinals: Vec<Value> = params
+            .get("entries")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.get("ordinal").cloned())
+            .collect();
+        self.calls.lock().unwrap().push(json!({
+            "method": method,
+            "seq": params.get("seq"),
+            "entries": ordinals,
+        }));
         let answer = match method {
             "compaction.setup" => json!({"answer": "ready"}),
             "compaction.notice" => json!({"answer": "received"}),
@@ -512,21 +530,8 @@ impl Ended {
 /// life: neither storage sends the provider Setup again.
 #[tokio::test]
 async fn a_plan_naming_a_compaction_provider_starts_on_the_contract_alike() {
-    let (old, new) = (
-        Arc::new(Compactor::default()),
-        Arc::new(Compactor::default()),
-    );
-    let compacting = |compactor: &Arc<Compactor>| Planes {
-        hooks: None,
-        compaction: Some(Arc::clone(compactor) as Arc<dyn broca_core::CompactionPlane>),
-    };
-    let pair = Pair::new(super::hello(), false, compacting(&old), compacting(&new)).await;
+    let (pair, old, new) = compacting_pair(super::hello(), false).await;
     let plan = compacting_plan();
-    let limited = |text: &str| {
-        let mut request = untooled(text);
-        request.context_limit = Some(200_000);
-        request
-    };
     let (today, store) = pair
         .send("r1", limited("first"), Some(&plan), Delivery::Queue)
         .await;
@@ -762,5 +767,102 @@ async fn a_refused_steer_or_queued_send_writes_nothing_alike() {
     ended.assert_alike().await;
     assert_eq!(ended.today_send_hooks(), vec![]);
     assert_eq!(ended.store_send_hooks().await, vec![]);
+    ended.stop().await;
+}
+
+/// The planes of an executor whose compaction provider is `compactor`.
+fn compacting(compactor: &Arc<Compactor>) -> Planes {
+    Planes {
+        hooks: None,
+        compaction: Some(Arc::clone(compactor) as Arc<dyn broca_core::CompactionPlane>),
+    }
+}
+
+/// A send with no tools of its own and a context window, which a run on the compaction
+/// contract needs.
+fn limited(text: &str) -> SubmissionRequest {
+    let mut request = untooled(text);
+    request.context_limit = Some(200_000);
+    request
+}
+
+/// A pair whose executors each offer their own compaction provider, which keeps every call it
+/// is sent. Returns the pair, then today's side's provider, then the store side's.
+async fn compacting_pair(
+    script: Vec<Vec<NormalizedEvent>>,
+    gated: bool,
+) -> (Pair, Arc<Compactor>, Arc<Compactor>) {
+    let (old, new) = (
+        Arc::new(Compactor::default()),
+        Arc::new(Compactor::default()),
+    );
+    let pair = Pair::new(script, gated, compacting(&old), compacting(&new)).await;
+    (pair, old, new)
+}
+
+/// A run on the compaction contract that reaches its step limit with a tool call unanswered
+/// ends with that call answered as never run. Today's actor has its runs tell the compaction
+/// provider of the session's changes once their end is durable, so on both storages the
+/// provider hears of that answer before the session's next run starts, and then the same
+/// calls follow.
+#[tokio::test]
+async fn a_change_at_a_runs_end_is_told_before_the_next_run_alike() {
+    let (pair, old, new) = compacting_pair(
+        vec![store::read_step("a1"), store::text_step("a2", "again")],
+        false,
+    )
+    .await;
+    let plan = compacting_plan();
+    let mut first = limited("first");
+    first.stop_when = vec![broca_protocol::request::StopCondition::StepCount { n: 1 }];
+    let (today, store) = pair.send("r1", first, Some(&plan), Delivery::Queue).await;
+    assert!(matches!(today, SendOutcome::Active { .. }), "{today:?}");
+    assert_eq!(store, today);
+    pair.idle().await;
+    assert_eq!(
+        new.calls(),
+        old.calls(),
+        "between the runs the compaction provider was told different things"
+    );
+    let (today, store) = pair
+        .send("r2", limited("second"), None, Delivery::Queue)
+        .await;
+    assert!(matches!(today, SendOutcome::Active { .. }), "{today:?}");
+    assert_eq!(store, today);
+    pair.idle().await;
+    assert_eq!(new.calls(), old.calls());
+    let ended = pair.end().await;
+    ended.assert_alike().await;
+    ended.stop().await;
+}
+
+/// A tool batch's results are told to the compaction provider once they are durable, as
+/// today's actor has its runs tell it, not left for the next step's notice. So a message
+/// steered in during the step reaches the provider in a notice of its own after the results,
+/// on both storages.
+#[tokio::test]
+async fn a_tool_batchs_results_are_told_once_durable_alike() {
+    let (pair, old, new) = compacting_pair(
+        vec![store::read_step("a1"), store::text_step("a2", "again")],
+        true,
+    )
+    .await;
+    let plan = compacting_plan();
+    let (today, store) = pair
+        .send("r1", limited("first"), Some(&plan), Delivery::Queue)
+        .await;
+    assert!(matches!(today, SendOutcome::Active { .. }), "{today:?}");
+    assert_eq!(store, today);
+    let (today, store) = pair
+        .send("s1", limited("more"), None, Delivery::Steer)
+        .await;
+    assert!(matches!(today, SendOutcome::Active { .. }), "{today:?}");
+    assert_eq!(store, today);
+    pair.release();
+    pair.release();
+    pair.idle().await;
+    assert_eq!(new.calls(), old.calls());
+    let ended = pair.end().await;
+    ended.assert_alike().await;
     ended.stop().await;
 }

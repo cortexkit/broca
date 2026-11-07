@@ -2826,6 +2826,10 @@ mod executor {
             // The session's compaction state, which its actor keeps for the session's life, as
             // today's actor does; without it a run restores the state from the session's records.
             compaction_session: control.compaction_session.clone(),
+            // Today's actor has every run tell the session's compaction provider of the
+            // session's changes outside its steps (`RunControl::compaction_changes`); a store
+            // run does the same.
+            compaction_changes: true,
             // No run of a store session warms yet: keep-warm needs its scheduler in the actor.
             keep_warm: None,
             account_reports,
