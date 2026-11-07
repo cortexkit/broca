@@ -29,6 +29,8 @@ cortexkit-role-tool-provider = { workspace = true }
 cortexkit-role-step-transform-provider = { workspace = true }
 # Fetch-plan admission: the refusals a plan meets and the baseline a frozen manifest answers.
 broca-fetch-plan = { path = "../broca-fetch-plan" }
+# The compaction view library: an installed view is checked against the imported history.
+cortexkit-compaction-view.workspace = true
 # The `llm-runner/v1` role's steer delivery receipt, which a retried steer's answer carries.
 cortexkit-role-llm-runner = { workspace = true }
 # Continuation tokens are authenticated, so only a cursor broca issued can resume a page.

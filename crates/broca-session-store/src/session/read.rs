@@ -93,7 +93,44 @@ pub fn window_entries(conversation: &Conversation, from: u64, limit: usize) -> V
         .collect()
 }
 
+/// Sealed entries a session already read by message id, with the history version they were read
+/// under. Sealed history never changes, except that a revert to a sealed message cuts the
+/// history after it and moves the history version: entries read under an older version are
+/// dropped together.
+pub(super) type SealedEntries =
+    std::sync::Mutex<(u64, std::collections::HashMap<String, StoredEntry>)>;
+
 impl<B: SessionBackend> Session<B> {
+    /// The entry whose message id is `mid`, wherever it is: in the window, or read back from
+    /// sealed history; `None` when no entry of the session has that id. The id is found as
+    /// [`Session::find_message`] finds it, so an import's source id is found too. An entry read
+    /// from sealed history is kept while the session is open, so asking for it again reads
+    /// nothing.
+    pub async fn entry_by_mid(&self, mid: &str) -> Result<Option<StoredEntry>, SessionError> {
+        let version = self.operations.history_version;
+        {
+            let mut cached = self.sealed_entries.lock().expect("sealed entry cache");
+            if cached.0 != version {
+                *cached = (version, Default::default());
+            }
+            if let Some(entry) = cached.1.get(mid) {
+                return Ok(Some(entry.clone()));
+            }
+        }
+        let Some(ordinal) = self.find_message(mid).await? else {
+            return Ok(None);
+        };
+        let Some(entry) = self.entries(ordinal, 1).await?.into_iter().next() else {
+            return Ok(None);
+        };
+        if ordinal < self.conversation.window_start() {
+            let mut cached = self.sealed_entries.lock().expect("sealed entry cache");
+            if cached.0 == version {
+                cached.1.insert(mid.to_owned(), entry.clone());
+            }
+        }
+        Ok(Some(entry))
+    }
     /// Up to `limit` entries from ordinal `from` on (counting from 1), in order, over the whole
     /// conversation: sealed history a block at a time, then the window, then the held assistant
     /// message, if any.

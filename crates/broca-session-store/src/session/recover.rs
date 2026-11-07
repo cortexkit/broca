@@ -503,6 +503,7 @@ impl<B: SessionBackend> Session<B> {
             open_ids: OpenIds::default(),
             window: OpenLogIndex::default(),
             imported: Default::default(),
+            sealed_entries: Default::default(),
         };
         let checkpoint_body = Checkpoint {
             covers_through: intent_seq,

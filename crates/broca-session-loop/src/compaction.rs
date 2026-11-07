@@ -261,45 +261,80 @@ pub fn unavailable_error(message: &str) -> broca_protocol::ProviderError {
 ///
 /// The entries are the window's, in today's terms: the window, and the assistant message whose
 /// tool calls are still running. After a seal at a cut, the history before the window is sealed,
-/// and today's code still expects each view's cut target among the entries, so each target the
-/// views name before the window is read back and put in front, with its message. Every other
-/// edit naming a sealed entry is skipped by the renderer, which changes nothing: those entries
-/// are cut anyway, and the compaction provider never anchors an insert before an entry.
-struct Transcript {
-    entries: Vec<cortexkit_role_compaction::read::Entry>,
+/// but the views still name entries there: the cut's target, and the messages earlier edits drop,
+/// replace or anchor an insert before, which a provider may carry into every later view. Today's
+/// code checks each new view against the entries, and refuses one naming a message it doesn't
+/// hold, so each sealed entry the applied or the accepted view names is read back and put in
+/// front, with its message, as today's loop, which seals nothing, would hold it. Rendering
+/// changes nothing: every one of them is before the cut, which leaves it out.
+pub struct Transcript {
+    pub entries: Vec<cortexkit_role_compaction::read::Entry>,
     /// The sealed messages put in front of the window's, for the stored prompt, with ordinals.
-    sealed: Vec<(u64, broca_protocol::Message)>,
+    pub sealed: Vec<(u64, broca_protocol::Message)>,
 }
 
-async fn transcript<W: Writer>(writer: &W, ctx: &Ctx) -> Result<Transcript, LoopError> {
+/// The transcript a step's compaction reads (see [`Transcript`]). A sealed entry is read back
+/// through the session's id lookup, which finds broca's own ids and an import's source ids
+/// alike; the session keeps each one it read for as long as it's open, so a view naming hundreds
+/// of sealed messages reads them once, not at every step. A view's cut target the session
+/// doesn't hold fails the step; any other named message it doesn't hold is left out, and the
+/// check refuses a view naming it, by that id.
+pub async fn transcript<W: Writer>(writer: &W, ctx: &Ctx) -> Result<Transcript, LoopError> {
+    use cortexkit_role_compaction::view::{EditOp, InsertAt};
     let conversation = writer.conversation();
     let window = broca_session_store::session::served_window(conversation);
     let mut stored = Vec::new();
     if conversation.window_start() > 1 {
-        let mut targets: Vec<String> = {
+        // Every message the views name, each once: the cut targets, and the rest.
+        let (cuts, named) = {
             let state = ctx.session.state.lock().await;
-            [state.applied(), state.latest()]
+            let mut cuts = std::collections::BTreeSet::new();
+            let mut named = std::collections::BTreeSet::new();
+            for edit in [state.applied(), state.latest()]
                 .into_iter()
                 .flatten()
                 .flat_map(|view| &view.edits)
-                .filter_map(|edit| match &edit.op {
-                    cortexkit_role_compaction::view::EditOp::Cut { through } => {
-                        Some(through.clone())
+            {
+                match &edit.op {
+                    EditOp::Cut { through } => {
+                        cuts.insert(through.clone());
                     }
-                    _ => None,
-                })
-                .collect()
+                    EditOp::Drop { mid, .. }
+                    | EditOp::Replace { mid, .. }
+                    | EditOp::Insert {
+                        at: InsertAt::Before(mid),
+                        ..
+                    } => {
+                        named.insert(mid.clone());
+                    }
+                    _ => {}
+                }
+            }
+            (cuts, named)
         };
-        targets.sort();
-        targets.dedup();
-        for mid in targets {
-            let entry = writer.entry_by_mid(&mid).await?.ok_or_else(|| {
+        let in_window: std::collections::HashSet<&str> = window
+            .iter()
+            .filter_map(|entry| entry.state.facts.as_ref())
+            .map(|facts| facts.mid.as_str())
+            .collect();
+        for mid in &cuts {
+            let entry = writer.entry_by_mid(mid).await?.ok_or_else(|| {
                 LoopError::Parts(format!(
                     "a compaction view cuts through {mid}, which the session doesn't hold"
                 ))
             })?;
             if entry.ordinal < conversation.window_start() {
                 stored.push(entry);
+            }
+        }
+        for mid in named
+            .iter()
+            .filter(|mid| !cuts.contains(*mid) && !in_window.contains(mid.as_str()))
+        {
+            if let Some(entry) = writer.entry_by_mid(mid).await? {
+                if entry.ordinal < conversation.window_start() {
+                    stored.push(entry);
+                }
             }
         }
         stored.sort_by_key(|entry| entry.ordinal);

@@ -176,10 +176,7 @@ impl<B: SessionBackend> Writer for Session<B> {
         &self,
         mid: &str,
     ) -> Result<Option<broca_session_store::session::StoredEntry>, SessionError> {
-        let Some(ordinal) = self.find_message(mid).await? else {
-            return Ok(None);
-        };
-        Ok(self.entries(ordinal, 1).await?.into_iter().next())
+        Session::entry_by_mid(self, mid).await
     }
 
     async fn run_start(
