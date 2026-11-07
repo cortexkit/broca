@@ -8685,6 +8685,7 @@ mod tests {
             let (writer, mut written) =
                 broca_diagnostics::channel::<Frame>(EGRESS_BUFFER, Arc::default());
             let large = serde_json::to_vec(&serde_json::json!({
+                "model":"typesafe/jev-1.13.0",
                 "answers":{"q":{"type":"noul","noul":0.5,"provider_extra":{"text":"x".repeat(broca_wire::SUBC_MAX_FRAME_BYTES as usize)}}},
                 "usage":{"input_tokens":0},"cost_usd":0,
             })).unwrap();

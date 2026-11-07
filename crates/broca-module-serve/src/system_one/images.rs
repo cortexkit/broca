@@ -98,22 +98,43 @@ impl SystemOne {
                 self.config.max_request_bytes,
             ),
         )?;
-        let request = parse_request(params)?;
-        let row = self.catalog.row(&request.model);
-        cortexkit_role_classifier::request::check_catalog_row(
-            &request.model,
-            super::classify::catalog_row(row.as_ref()),
-        )?;
-        let row = row.expect("catalog admission checked presence");
-        let pin = self
-            .pin(&request.model)
-            .ok_or_else(|| Refusal::model_unavailable(&request.model))?;
-        let entry = self.model_entry(pin, &row);
+        let request = if self.config.routed_models && self.role == super::STORE_ROLE {
+            parse_request(params)?
+        } else {
+            cortexkit_role_classifier::request::parse_request_for(
+                params,
+                &cortexkit_role_classifier::describe::RoleDescribe::new(
+                    cortexkit_role_classifier::describe::Limits::new(
+                        self.config.max_items,
+                        self.config.max_request_bytes,
+                    ),
+                    vec![],
+                ),
+            )?
+        };
+        let model = request.model.as_deref().unwrap_or_default();
+        let entry = if self.config.routed_models && self.role == super::STORE_ROLE {
+            super::routed::validation_entry(self)
+        } else {
+            let row = self.catalog.row(model);
+            cortexkit_role_classifier::request::check_catalog_row(
+                model,
+                super::classify::catalog_row(row.as_ref()),
+            )?;
+            let row = row.expect("catalog admission checked presence");
+            let pin = self
+                .pin(model)
+                .ok_or_else(|| Refusal::model_unavailable(model))?;
+            self.model_entry(pin, &row)
+        };
         self.check_images_request(&request, &entry)?;
         let mut prepared = Vec::with_capacity(request.items.len());
         for (i, item) in request.items.iter().enumerate() {
             let final_item = stored.is_some_and(|batch| {
                 batch.outcomes.iter().any(|outcome| {
+                    if self.config.routed_models && self.role == super::STORE_ROLE {
+                        return outcome.index == i as u64 && super::routed::retained(outcome);
+                    }
                     outcome.index == i as u64 && match &outcome.outcome {
                         broca_store::system_one::Outcome::Answered(_) => true,
                         broca_store::system_one::Outcome::Failed(text) => {

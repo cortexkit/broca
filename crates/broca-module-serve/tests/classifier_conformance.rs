@@ -730,8 +730,22 @@ async fn classifier_image_reference_conformance_uses_stand_in_cerebellum() {
     else {
         return;
     };
-    let report = run_suite(&Subject { rig: &rig }).await;
-    assert_eq!(report.verdict, SuiteVerdict::Passed, "{:#?}", report.checks);
+    let report = legacy_suite_report(run_suite(&Subject { rig: &rig }).await);
+    assert_eq!(
+        report.verdict,
+        SuiteVerdict::PassedExceptNotApplicable {
+            not_applicable: ROUTED_CASES.to_vec()
+        },
+        "{:#?}",
+        report.checks
+    );
+    for check in report
+        .checks
+        .iter()
+        .filter(|check| !ROUTED_CASES.contains(&check.check))
+    {
+        assert_eq!(check.outcome, CheckOutcome::Passed, "{check:?}");
+    }
     for check in report.checks.iter().filter(|check| {
         check.check.starts_with("image_reference_")
             || check.check == "image_source_down_refused_transient"
@@ -745,6 +759,30 @@ async fn classifier_image_reference_conformance_uses_stand_in_cerebellum() {
             .any(|(_, body)| body["images"][0]["base64"].is_string()),
         "resolved images reached Workers AI"
     );
+}
+
+const ROUTED_CASES: [&str; 6] = [
+    "routed_replay_keeps_decision",
+    "routed_partial_failure_keeps_model",
+    "routed_reply_has_decision_id",
+    "routed_pin_never_substituted",
+    "routed_admission_refusals",
+    "routed_initial_account_failure_bounded",
+];
+
+fn legacy_suite_report(
+    mut report: cortexkit_role_classifier_conformance::SuiteReport,
+) -> cortexkit_role_classifier_conformance::SuiteReport {
+    for check in &mut report.checks {
+        if ROUTED_CASES.contains(&check.check) {
+            let CheckOutcome::NotApplicable { reason } = &mut check.outcome else {
+                panic!("legacy route must not declare routed_models: {check:?}");
+            };
+            assert_eq!(reason, "provider does not declare routed_models");
+            *reason = "routed_models not declared".into();
+        }
+    }
+    report
 }
 
 fn assert_legacy_conformance(
@@ -762,7 +800,16 @@ fn assert_legacy_conformance(
                 | "image_source_down_refused_transient"
                 | "image_reference_identity_is_its_handle"
         );
-        if reference_only || (!images && check.check == "image_reference_follows_declaration") {
+        if ROUTED_CASES.contains(&check.check) {
+            assert_eq!(
+                check.outcome,
+                CheckOutcome::NotApplicable {
+                    reason: "routed_models not declared".into()
+                }
+            );
+        } else if reference_only
+            || (!images && check.check == "image_reference_follows_declaration")
+        {
             assert!(
                 matches!(check.outcome, CheckOutcome::NotApplicable { .. }),
                 "{check:?}"
@@ -778,7 +825,7 @@ async fn classifier_conformance_suite_passes_against_the_real_serve_path() {
     let Some(rig) = start_rig("suite", Served::Jev).await else {
         return;
     };
-    let report = run_suite(&Subject { rig: &rig }).await;
+    let report = legacy_suite_report(run_suite(&Subject { rig: &rig }).await);
     for check in &report.checks {
         println!("{}: {:?}", check.check, check.outcome);
     }
@@ -796,7 +843,7 @@ async fn classifier_conformance_suite_passes_through_workers_ai() {
     let Some(rig) = start_rig("workers-ai", Served::WorkersAi).await else {
         return;
     };
-    let report = run_suite(&Subject { rig: &rig }).await;
+    let report = legacy_suite_report(run_suite(&Subject { rig: &rig }).await);
     for check in &report.checks {
         println!("{}: {:?}", check.check, check.outcome);
     }

@@ -1810,6 +1810,32 @@ fn args() -> Value {
     json!({"model":MODEL,"questions":{"q":{"type":"noul","instructions":"Is the invented note urgent?"}},"item":{"state":"invented"},"max_cost_usd":0.01})
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn contract03_unpinned_tool_refusal_changes_no_artifact() {
+    let Some(rig) = Rig::start(
+        "contract03-missing-pin",
+        true,
+        true,
+        Some(42_000_000),
+        0,
+        false,
+    )
+    .await
+    else {
+        return;
+    };
+    let route = rig.open(true, false).await;
+    let mut arguments = args();
+    arguments.as_object_mut().unwrap().remove("model");
+    let error =
+        refused_without_writes(&rig, &route, arguments, "missing-model", "invalid_params").await;
+    assert_eq!(error["detail"]["field"], "model");
+    let call = route.call(args(), Some("pinned")).await.unwrap();
+    let result: cortexkit_llm_tools::classify::Result = serde_json::from_slice(&call).unwrap();
+    cortexkit_llm_tools::classify::validate_result(&result).unwrap();
+    assert_eq!(result.model, MODEL);
+}
+
 fn rows(path: &Path, table: &str) -> Vec<String> {
     if !path.exists() {
         return Vec::new();

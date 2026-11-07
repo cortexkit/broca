@@ -153,6 +153,8 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     broca_module_serve::config::warn_obsolete_media_default().map_err(ServeIoError)?;
     let service_tier =
         broca_module_serve::config::ServiceTierConfig::load_default().map_err(ServeIoError)?;
+    let classifier_routing = broca_module_serve::config::ClassifierRoutingConfig::load_default()
+        .map_err(ServeIoError)?;
     broca_protocol::configure_service_tier(service_tier.enabled)
         .map_err(|error| ServeIoError(error.into()))?;
     let archive_config = broca_module_serve::wal_archive::WalArchiveConfig::load_default_path()
@@ -569,6 +571,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
     let mut vault_gauge = broca_module_serve::serve::VaultGauge::not_in_use();
+    let mut classifier_router = None;
     // System One's provider credentials. Without a vault (the mock provider path) their
     // requests carry none, as every run's do there.
     let mut system_one_credential: Arc<
@@ -686,6 +689,14 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             &vault_bind,
             VAULT_READY_TIMEOUT,
         ));
+        // Owed reports still describe real runs after routed admission is switched off.
+        classifier_router = Some(broca_module_serve::system_one::Routing {
+            client: routing.clone(),
+            credentials: Arc::new(broca_module_serve::system_one::VaultRoutingCredentials(
+                system_one_vault.clone(),
+            )),
+            module_id: "broca".into(),
+        });
         let system_one_vault_credential = |credential_id: &str| {
             Arc::new(
                 broca_module_serve::system_one::credential::VaultCredential {
@@ -849,7 +860,10 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             broca_store::SystemOneStore::open(state_root.join("system-one.db"))
                 .map_err(|e| ServeIoError(format!("open System One batch store: {e}")))?,
         );
-        let config = broca_module_serve::system_one::Config::default();
+        let config = broca_module_serve::system_one::Config {
+            routed_models: classifier_routing.enabled,
+            ..Default::default()
+        };
         let openai_decisions =
             broca_module_serve::system_one::openai_decisions::OpenAiDecisions::new(
                 openai_decisions_base_url.as_deref(),
@@ -896,6 +910,11 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             config,
             registry.batches_in_flight_gauge(),
         );
+        let service = if let Some(routing) = classifier_router {
+            service.with_routing(routing)
+        } else {
+            service
+        };
         let service = if llm_tools_config.image_references {
             service.with_image_resolver(cerebellum.clone())
         } else {

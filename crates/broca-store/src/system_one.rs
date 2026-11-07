@@ -201,6 +201,9 @@ pub struct SystemOneStore {
     owner_lifetimes: Mutex<HashMap<String, File>>,
 }
 
+mod routing;
+pub use routing::RoutingRecord;
+
 fn to_i64(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
@@ -285,6 +288,16 @@ impl SystemOneStore {
         let has_scope = conn.prepare("SELECT scope_json FROM batch").is_ok();
         if !has_scope {
             conn.execute("ALTER TABLE batch ADD COLUMN scope_json TEXT", [])?;
+        }
+        for column in [
+            "routing_choice TEXT",
+            "routing_runs TEXT",
+            "routing_pending INTEGER",
+        ] {
+            let name = column.split_once(' ').expect("a column has a type").0;
+            if conn.prepare(&format!("SELECT {name} FROM batch")).is_err() {
+                conn.execute(&format!("ALTER TABLE batch ADD COLUMN {column}"), [])?;
+            }
         }
         let (owner_dir, owner_prefix) = match owner_location {
             Some((dir, prefix)) => (Some(dir), prefix),
@@ -443,6 +456,21 @@ impl SystemOneStore {
         claim: &BatchClaim<'_>,
         admitted_at_ms: i64,
     ) -> Result<Claimed> {
+        self.claim_admitted_at_mode(claim, admitted_at_ms, false)
+    }
+
+    /// Reserve routed admission atomically with the claim. A null JSON choice is an
+    /// interrupted admission, not permission to fall back to a legacy fixed credential.
+    pub fn claim_routed(&self, claim: &BatchClaim<'_>, admitted_at_ms: i64) -> Result<Claimed> {
+        self.claim_admitted_at_mode(claim, admitted_at_ms, true)
+    }
+
+    fn claim_admitted_at_mode(
+        &self,
+        claim: &BatchClaim<'_>,
+        admitted_at_ms: i64,
+        routed: bool,
+    ) -> Result<Claimed> {
         self.hold_owner_lifetime(claim.owner)?;
         let mut conn = self.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -475,8 +503,8 @@ impl SystemOneStore {
             tx.execute(
                 "INSERT INTO batch (role, batch_id, model, identity, body_digest, frozen_row,
                                     ceiling_nanos, spent_nanos, state, owner, started_at_ms,
-                                     admitted_at_ms, scope_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 'running', ?8, ?9, ?10, ?11)",
+                                     admitted_at_ms, scope_json, routing_choice, routing_runs, routing_pending)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 'running', ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 rusqlite::params![
                     claim.role,
                     claim.batch_id,
@@ -489,6 +517,9 @@ impl SystemOneStore {
                     claim.now_ms,
                     admitted_at_ms,
                     scope_json,
+                    routed.then_some("null"),
+                    routed.then_some("{}"),
+                    routed.then_some(1),
                 ],
             )?;
             tx.commit()?;
@@ -574,6 +605,21 @@ impl SystemOneStore {
         outcome: &StoredOutcome,
         paid: &PaidRecord<'_>,
     ) -> Result<bool> {
+        self.record_paid_routed(role, batch_id, owner, outcome, paid, None)
+    }
+
+    /// Commit routed-run progress in the same transaction as the item and export intent.
+    /// Recovery can therefore report measured usage without guessing whether a paid item
+    /// committed before the process stopped.
+    pub fn record_paid_routed(
+        &self,
+        role: &str,
+        batch_id: &str,
+        owner: &str,
+        outcome: &StoredOutcome,
+        paid: &PaidRecord<'_>,
+        runs: Option<&str>,
+    ) -> Result<bool> {
         let PaidRecord {
             spend_nanos,
             now_ms,
@@ -588,6 +634,12 @@ impl SystemOneStore {
         )?;
         if held == 0 {
             return Ok(false);
+        }
+        if let Some(runs) = runs {
+            tx.execute(
+                "UPDATE batch SET routing_runs=?3, routing_pending=1 WHERE role=?1 AND batch_id=?2",
+                rusqlite::params![role, batch_id, runs],
+            )?;
         }
         let (kind, body) = match &outcome.outcome {
             Outcome::Answered(text) => ("answered", text),
@@ -738,11 +790,13 @@ impl SystemOneStore {
         let outcomes = tx.execute(
             "DELETE FROM item_outcome WHERE (role, batch_id) IN
                  (SELECT role, batch_id FROM batch
-                   WHERE admitted_at_ms <= ?1 AND state = 'idle')",
+                    WHERE admitted_at_ms <= ?1 AND state = 'idle'
+                      AND (routing_pending IS NULL OR routing_pending=0))",
             [cutoff],
         )?;
         let batches = tx.execute(
-            "DELETE FROM batch WHERE admitted_at_ms <= ?1 AND state = 'idle'",
+            "DELETE FROM batch WHERE admitted_at_ms <= ?1 AND state = 'idle'
+               AND (routing_pending IS NULL OR routing_pending=0)",
             [cutoff],
         )?;
         tx.commit()?;

@@ -506,8 +506,9 @@ async fn image_reference_switch_off_preserves_catalog_schema_digest_and_describe
         )
         .await
         .unwrap();
-    // Frozen from the previous released schema and the existing catalog envelope, not from
-    // the new schema generator: changes to either hashes or schema bytes must be visible.
+    // Frozen from llm-tools 0.3.0's inline-only schema and the existing catalog envelope,
+    // independently of image-reference generation. The model is optional in that contract;
+    // tool admission still needs a pin to identify the provider before checking consent.
     assert_eq!(
         catalog.get(),
         include_str!("fixtures/llm-tools/catalog-before-image-references.json").trim_end()

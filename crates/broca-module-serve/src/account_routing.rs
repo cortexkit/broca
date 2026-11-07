@@ -975,7 +975,123 @@ pub struct RoutingClient {
     config: AccountSelectionConfig,
 }
 
+/// An answered refusal is distinct from an unavailable route. Classifier admission must
+/// preserve the router's code rather than turning every failure into a retryable outage.
+#[derive(Clone, Debug)]
+pub enum RoutingCallError {
+    Refused { code: String, message: String },
+    Unavailable(String),
+}
+
 impl RoutingClient {
+    /// Extend an existing account pin without selecting a different account. The caller
+    /// retains the request until its answer is durable so a transport retry reuses its id.
+    pub async fn renew_account(
+        &self,
+        request: &cortexkit_role_routing::account::AccountForRequest,
+    ) -> Result<cortexkit_role_routing::account::AccountForAnswer, RoutingCallError> {
+        use cortexkit_role_routing::account::{parse_account_for_request, AccountMode};
+        if request.mode() != AccountMode::Renew || request.expected_pin.is_none() {
+            return Err(RoutingCallError::Unavailable(
+                "renewal requires mode renew and expected_pin".into(),
+            ));
+        }
+        parse_account_for_request(
+            &serde_json::to_value(request)
+                .map_err(|error| RoutingCallError::Unavailable(error.to_string()))?,
+        )
+        .map_err(|error| RoutingCallError::Unavailable(format!("invalid renewal: {error:?}")))?;
+        self.classifier_rpc("route.account_for", request).await
+    }
+
+    /// Typed classifier operations share the LLM account client's transport and deadlines.
+    pub async fn classifier_rpc<T: serde::de::DeserializeOwned>(
+        &self,
+        method: &str,
+        params: &impl serde::Serialize,
+    ) -> Result<T, RoutingCallError> {
+        let body = serde_json::to_vec(&json!({"method":method,"params":params}))
+            .map_err(|error| RoutingCallError::Unavailable(error.to_string()))?;
+        let reply = tokio::time::timeout(ADMISSION_BUDGET, self.transport.request(body))
+            .await
+            .map_err(|_| RoutingCallError::Unavailable("routing timed out".into()))?
+            .map_err(RoutingCallError::Unavailable)?;
+        match reply {
+            Ok(body) => {
+                #[derive(serde::Deserialize)]
+                struct Response<T> {
+                    result: T,
+                }
+                serde_json::from_slice::<Response<T>>(&body)
+                    .map(|answer| answer.result)
+                    .map_err(|error| {
+                        RoutingCallError::Unavailable(format!(
+                            "routing answer did not decode: {error}"
+                        ))
+                    })
+            }
+            Err(body) => {
+                #[derive(serde::Deserialize)]
+                struct Refused {
+                    code: String,
+                    #[serde(default)]
+                    message: String,
+                }
+                let error: Refused = serde_json::from_slice(&body).map_err(|error| {
+                    RoutingCallError::Unavailable(format!(
+                        "routing refusal did not decode: {error}"
+                    ))
+                })?;
+                Err(RoutingCallError::Refused {
+                    code: error.code,
+                    message: error.message,
+                })
+            }
+        }
+    }
+
+    pub async fn classifier_describe(
+        &self,
+    ) -> Result<cortexkit_role_routing::describe::RoleDescribe, RoutingCallError> {
+        let describe = self.classifier_rpc("role.describe", &json!({})).await?;
+        cortexkit_role_routing::describe::check_describe(&describe)
+            .map_err(|error| RoutingCallError::Unavailable(error.to_string()))?;
+        Ok(describe)
+    }
+
+    pub async fn classifier_select(
+        &self,
+        request: &cortexkit_role_routing::select::SelectRequest,
+    ) -> Result<cortexkit_role_routing::select::SelectAnswer, RoutingCallError> {
+        let answer = self.classifier_rpc("route.select", request).await?;
+        cortexkit_role_routing::select::check_answer(request, &answer)
+            .map_err(|error| RoutingCallError::Unavailable(error.to_string()))?;
+        Ok(answer)
+    }
+
+    pub async fn classifier_report(
+        &self,
+        request: &cortexkit_role_routing::report::ReportRequest,
+        capabilities: &[String],
+    ) -> Result<cortexkit_role_routing::report::ReportAnswer, RoutingCallError> {
+        cortexkit_role_routing::report::parse_report_request_serving(
+            &serde_json::to_value(request)
+                .map_err(|error| RoutingCallError::Unavailable(error.to_string()))?,
+            capabilities,
+        )
+        .map_err(|error| {
+            RoutingCallError::Unavailable(format!("invalid routing report: {error:?}"))
+        })?;
+        let answer: cortexkit_role_routing::report::ReportAnswer =
+            self.classifier_rpc("route.report", request).await?;
+        if answer.decision_id != request.decision_id || answer.outcome != request.outcome {
+            return Err(RoutingCallError::Unavailable(
+                "routing acknowledged a different decision or report outcome".into(),
+            ));
+        }
+        Ok(answer)
+    }
+
     pub fn new(transport: Arc<dyn RoutingTransport>, config: AccountSelectionConfig) -> Self {
         Self {
             transport,

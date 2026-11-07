@@ -477,6 +477,7 @@ dependencies = [
  "cortexkit-role-harness",
  "cortexkit-role-llm-runner 0.8.7",
  "cortexkit-role-llm-runner-conformance",
+ "cortexkit-role-routing",
  "cortexkit-role-step-transform-provider",
  "cortexkit-role-tool-provider",
  "flate2",
@@ -1125,9 +1126,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-llm-tools"
-version = "0.2.1"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8681854859b3571b38e1f353df55fbb714e97ee670d1152201c47b9139e23c25"
+checksum = "7c7af89cec4110babc886b34747a0de7f006cb2ffee62bfc2e9cafdf46db1cd9"
 dependencies = [
  "cortexkit-model-batch",
  "cortexkit-role-classifier",
@@ -1185,9 +1186,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-classifier"
-version = "0.5.2"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "64fbf22c820316d2ecc3cab844c047a47bb690f4fdae2a4ebfefa9900f592ca6"
+checksum = "cc1abbce8e1f542ca5df32552c6bbbc58834451fc2a8069c1afe7e0056b33faa"
 dependencies = [
  "cortexkit-model-batch",
  "indexmap",
@@ -1197,9 +1198,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-classifier-conformance"
-version = "0.7.1"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "939ac6c9f239d670530fd532abeb435ba40c4341e0888ed8359d0cde29e04ca3"
+checksum = "e662cc55b591b61995a1f9d16a5244dae37f83f4f154d15d9ee4ac3d8549deef"
 dependencies = [
  "async-trait",
  "cortexkit-role-classifier",
@@ -1300,6 +1301,29 @@ dependencies = [
  "serde_json",
  "subc-protocol",
  "tokio",
+]
+
+[[package]]
+name = "cortexkit-role-media"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "baf764fa40506723c074f032364198a9ae6f15f8ba6ccac2b6a47fe5ddb0cb04"
+dependencies = [
+ "base64",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "cortexkit-role-routing"
+version = "0.7.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "01d0853c2dde38731c0b4a5bb6bd1827436fd05e780becebc5988efc8e1b4401"
+dependencies = [
+ "cortexkit-role-media",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

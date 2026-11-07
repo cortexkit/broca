@@ -1196,8 +1196,20 @@ The manifest lists `classifier/v1` in `capabilities.provides`.
   It contains no item content. Replayed facts and
   served cached outcomes do not increase item or spend counters.
 - **Catalog.** A row whose `model.kind` is `decision` is a classifier; another
-  stated kind, or no kind, is refused `model_not_classifier`; a model the catalog
+  serving kind, `classifier`, is accepted too, as defined by the classifier contract.
+  Any other stated kind, or no kind, is refused `model_not_classifier`; a model the catalog
   does not list is `model_unknown`.
+- **Routed models (opt-in).** `classifier_routing.enabled` defaults to `false`.
+  Off, the existing pinned-model/fixed-credential path remains in use and describe
+  omits `routed_models`. On, a successful live routing readiness check for consumer
+  `classifier` adds `routed_models: {}`; `classify.run.model` becomes optional and
+  a supplied model is a strict routing pin without fallback. One durable model,
+  account and decision is frozen before provider dispatch. Replies name the model
+  actually used and its `decision_id`, including on replay. Routing failures never
+  fall back to a fixed credential. See [System One routing](system-one.md) for
+  retry, admission and report recovery rules.
+  The OpenAI Decisions adapter stays behind its own serving gate, whatever the
+  classifier routing switch is.
 - **Providers.** Jev is called at `POST https://api.typesafe.ai/v1/systemone` with
   the vault credential `apikey:typesafe`. Clef and Clef-flash are called at `POST
   https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/@cf/cloudflare/{model}`
@@ -1216,8 +1228,10 @@ The manifest lists `classifier/v1` in `capabilities.provides`.
   in the message and provider health metric, and `Retry-After` is preserved.
   Workers AI errors map by their `errors[].code` first: a
   daily allocation used up (3036) or an account not entitled (5035, 5016, 3023)
-  ends the whole batch, is never recorded for an item, and is refused at admission
-  when the call's first provider call meets it.
+  ends the whole batch. On the default pinned path it is never recorded for an item
+  and is refused at admission when the call's first provider call meets it. A routed
+  batch instead retains account errors with its frozen choice, subject to the single
+  pre-answer reselection described in [System One routing](system-one.md).
 
 ## 5. Reliability model (the egress reality)
 
