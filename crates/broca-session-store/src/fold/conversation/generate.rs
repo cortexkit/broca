@@ -4,8 +4,17 @@
 use super::{Conversation, Delivered, EntryState, Episode, ToolTurn};
 use crate::fuzzing::gen::fields;
 
-fields!(Delivered { part, notice, text });
-fields!(EntryState { facts, delivered });
+fields!(Delivered {
+    part,
+    notice,
+    text,
+    send_id
+});
+fields!(EntryState {
+    facts,
+    delivered,
+    turn
+});
 fields!(Episode {
     run_id,
     start,

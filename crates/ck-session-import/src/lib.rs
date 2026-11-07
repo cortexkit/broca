@@ -18,6 +18,7 @@ use serde_json::Value;
 pub mod claude_code;
 pub mod codex;
 pub mod goose;
+pub mod head;
 pub mod opencode;
 pub mod pi;
 

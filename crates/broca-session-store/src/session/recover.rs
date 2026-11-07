@@ -419,6 +419,7 @@ impl<B: SessionBackend> Session<B> {
                 }));
             }
             notice = Some(Record::Input(Input {
+                media: Vec::new(),
                 run_id: latest_run.unwrap_or_default(),
                 placement: Placement::DamageNotice,
                 message: Message::new(
@@ -501,6 +502,7 @@ impl<B: SessionBackend> Session<B> {
             operations: settled.clone(),
             open_ids: OpenIds::default(),
             window: OpenLogIndex::default(),
+            imported: Default::default(),
         };
         let checkpoint_body = Checkpoint {
             covers_through: intent_seq,

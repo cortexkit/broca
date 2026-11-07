@@ -380,3 +380,101 @@ fn lineage_state<B: SessionBackend>(session: &Session<B>) -> SessionReadLineageS
         },
     }
 }
+
+/// What `session.read` serves about a message besides its page entry, from the facts the
+/// session recorded when it placed the message, as today's read serves them for broca's own
+/// sends: the send's id, sender and marks for a user message, each tool call's key, and the
+/// text delivered with the message's tool calls.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DisplayFacts {
+    /// For a user message: the `client_message_id` of the send that placed it.
+    pub client_message_id: Option<String>,
+    /// For a user message: the attested module id of the send's sender.
+    pub sender: Option<String>,
+    /// The send's `speaks_for` mark, as stored.
+    pub speaks_for: Option<serde_json::Value>,
+    /// The send's positive notice mark.
+    pub notice: bool,
+    /// One per tool call the message made, in call order.
+    pub calls: Vec<CallDisplay>,
+    /// Text delivered with the message's tool calls, in the order it was delivered.
+    pub notices: Vec<NoticeDisplay>,
+}
+
+/// A tool call's identity, as reads serve it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CallDisplay {
+    pub tool_call_id: String,
+    pub call_key: String,
+    /// The runner that minted `call_key`, when it wasn't broca: a key is unique only within the
+    /// runner that minted it.
+    pub call_carrier: Option<String>,
+    pub schema_pin: Option<serde_json::Value>,
+}
+
+/// Text delivered with one of a message's tool calls.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NoticeDisplay {
+    /// The tool call's position among the message's content blocks.
+    pub part: u32,
+    pub call_key: Option<String>,
+    pub send_id: Option<String>,
+    pub sender: Option<String>,
+    pub text: String,
+}
+
+/// The display facts of `entry`.
+pub fn display_facts(entry: &StoredEntry) -> DisplayFacts {
+    let user = entry.message.role == Role::User;
+    let facts = entry.state.facts.as_ref();
+    let marks = facts.and_then(|facts| facts.marks.as_ref());
+    let calls: Vec<CallDisplay> = entry
+        .state
+        .turn
+        .iter()
+        .flat_map(|turn| &turn.calls)
+        .map(|call| CallDisplay {
+            tool_call_id: call.tool_call_id.0.clone(),
+            call_key: call.call_key.clone(),
+            call_carrier: call.carrier.clone(),
+            schema_pin: call.schema_pin.clone(),
+        })
+        .collect();
+    let key_at = |part: u32| {
+        let block = entry.message.content.get(part as usize)?;
+        let broca_protocol::ContentBlock::ToolCall(call) = block else {
+            return None;
+        };
+        calls
+            .iter()
+            .find(|known| known.tool_call_id == call.tool_call_id.0)
+            .map(|known| known.call_key.clone())
+    };
+    let notices = entry
+        .state
+        .delivered
+        .iter()
+        .map(|delivered| NoticeDisplay {
+            part: delivered.part,
+            call_key: key_at(delivered.part),
+            send_id: delivered.send_id.clone(),
+            sender: delivered
+                .notice
+                .as_ref()
+                .map(|notice| notice.sender.clone()),
+            text: delivered.text.clone(),
+        })
+        .collect();
+    DisplayFacts {
+        client_message_id: facts
+            .and_then(|facts| facts.client_message_id.clone())
+            .filter(|_| user),
+        sender: facts
+            .and_then(|facts| facts.sender.clone())
+            .filter(|_| user),
+        speaks_for: marks.and_then(|marks| marks.get("speaks_for").cloned()),
+        notice: marks.and_then(|marks| marks.get("notice")) == Some(&serde_json::Value::Bool(true)),
+        calls,
+        notices,
+    }
+}

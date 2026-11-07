@@ -13,6 +13,7 @@ fn model() -> ModelHandle {
 
 fn input(text: &str, placement: Placement) -> Record {
     Record::Input(Input {
+        media: Vec::new(),
         run_id: "r".into(),
         placement,
         message: Message::new(Role::User, vec![ContentBlock::Text { text: text.into() }]),
@@ -190,6 +191,7 @@ fn a_budget_finalize_step_enters_at_once_without_its_calls() {
 #[test]
 fn delivered_text_joins_its_result_only_where_the_session_stores_it_there() {
     let append = Record::ResultAppend(ResultAppend {
+        send_id: None,
         run_id: "r".into(),
         tool_call_id: ToolCallId("a".into()),
         text: " +note".into(),
@@ -210,6 +212,9 @@ fn delivered_text_joins_its_result_only_where_the_session_stores_it_there() {
 
 fn facts(ordinal: u64, tag_base: u64) -> Record {
     Record::EntryFacts(EntryFacts {
+        client_message_id: None,
+        sender: None,
+        marks: None,
         ordinal,
         written_at_ms: Some(1_000 + ordinal),
         tag_base,
@@ -306,6 +311,7 @@ fn delivered_text_attaches_to_the_call_that_made_it() {
     };
     let append = |id: &str| {
         Record::ResultAppend(ResultAppend {
+            send_id: None,
             run_id: "r".into(),
             tool_call_id: ToolCallId(id.into()),
             text: "\n\nnote".into(),
@@ -331,6 +337,7 @@ fn delivered_text_attaches_to_the_call_that_made_it() {
             part: 1,
             notice: Some(notice),
             text: "\n\nnote".into(),
+            send_id: None,
         }],
         "an unknown call's text attaches nowhere"
     );

@@ -48,6 +48,7 @@ fn image(bytes: &[u8]) -> MediaRef {
 
 fn start(run: &str, send: &str) -> Record {
     Record::RunStart(Box::new(RunStart {
+        imported_ids: None,
         run_id: run.into(),
         model: model(),
         setup: Vec::new(),
@@ -91,6 +92,7 @@ fn end(run: &str) -> Record {
 
 fn input(run: &str, text: &str) -> Record {
     Record::Input(Input {
+        media: Vec::new(),
         run_id: run.into(),
         placement: Placement::RunInput,
         message: Message::new(Role::User, vec![ContentBlock::Text { text: text.into() }]),
@@ -127,6 +129,9 @@ fn call(id: &str) -> ContentBlock {
 
 fn facts(ordinal: u64, mid: String) -> Record {
     Record::EntryFacts(EntryFacts {
+        client_message_id: None,
+        sender: None,
+        marks: None,
         ordinal,
         written_at_ms: Some(ordinal),
         tag_base: 0,

@@ -1565,6 +1565,7 @@ where
                         let seq = first_seq + batch.len() as u64;
                         delivered.extend(send.input.iter().map(|message| {
                             Record::Input(Input {
+                                media: Vec::new(),
                                 run_id: run_id.clone(),
                                 placement: Placement::Delivered,
                                 message: message.clone(),
@@ -2254,6 +2255,7 @@ async fn admit<W: Writer>(
         }));
     }
     records.push(Record::RunStart(Box::new(RunStart {
+        imported_ids: None,
         run_id: admission.run_id.clone(),
         model: admission.model.clone(),
         setup,
@@ -2296,6 +2298,7 @@ async fn admit<W: Writer>(
     })));
     for message in &admission.input {
         records.push(Record::Input(Input {
+            media: Vec::new(),
             run_id: admission.run_id.clone(),
             placement: Placement::RunInput,
             message: message.clone(),
@@ -4961,6 +4964,7 @@ fn placed_copies(operations: &Operations, run_id: &str) -> Vec<Record> {
                 .enumerate()
                 .map(move |(index, message)| {
                     Record::Input(Input {
+                        media: Vec::new(),
                         run_id: run_id.to_string(),
                         placement: pending.placement,
                         message: message.clone(),

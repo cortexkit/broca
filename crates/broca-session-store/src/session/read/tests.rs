@@ -26,6 +26,7 @@ fn addr() -> crate::backend::SessionAddr {
 
 fn input(text: String) -> Record {
     Record::Input(Input {
+        media: Vec::new(),
         run_id: "r".into(),
         placement: Placement::RunInput,
         message: Message::new(Role::User, vec![ContentBlock::Text { text }]),
@@ -82,6 +83,9 @@ fn reply(id: &str, text: String) -> Record {
 /// returns another message's facts shows it.
 fn facts(ordinal: u64) -> Record {
     Record::EntryFacts(EntryFacts {
+        client_message_id: None,
+        sender: None,
+        marks: None,
         ordinal,
         written_at_ms: Some(ordinal),
         tag_base: ordinal,

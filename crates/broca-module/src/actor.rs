@@ -246,6 +246,13 @@ pub enum LineageCmd {
         request: Box<broca_core::ImportRequest>,
         reply: oneshot::Sender<ImportOutcome>,
     },
+    /// A command only a session kept in the new storage serves: a file-source import, or
+    /// installing the compaction provider's first view (see `store_import`). This actor refuses
+    /// it: a session on today's storage already exists.
+    Store {
+        command: crate::store_import::StoreCommand,
+        reply: oneshot::Sender<crate::store_import::StoreOutcome>,
+    },
     /// Cancel a run by id. A boundary request preserves the in-flight step and tool batch.
     Cancel {
         run_id: RunId,
@@ -2580,6 +2587,15 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 let _ = reply.send(outcome);
                 false
             }
+            LineageCmd::Store { reply, .. } => {
+                let _ = reply.send(crate::store_import::StoreOutcome::Refused(
+                    crate::store_import::ImportRefusal::new(
+                        "session_exists",
+                        "the session already exists on today's storage",
+                    ),
+                ));
+                false
+            }
             LineageCmd::Cancel { run_id, at, reply } => {
                 let held = self.provider_held_episode(&run_id);
                 let outcome = self.on_cancel_at(&run_id, at, held).await;
@@ -2843,6 +2859,9 @@ impl<W: WalStore + 'static> LineageActor<W> {
             }
             LineageCmd::Import { reply, .. } => {
                 let _ = reply.send(ImportOutcome::Error(broca_core::ImportError::Wal(error)));
+            }
+            LineageCmd::Store { reply, .. } => {
+                let _ = reply.send(crate::store_import::StoreOutcome::Reopen);
             }
             LineageCmd::Cancel { reply, .. } | LineageCmd::CancelFrom { reply, .. } => {
                 let _ = reply.send(CancelOutcome::Reopen);
@@ -8766,6 +8785,9 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 LineageCmd::Import { reply, .. } => {
                     let _ = reply.send(ImportOutcome::Reopen);
                 }
+                LineageCmd::Store { reply, .. } => {
+                    let _ = reply.send(crate::store_import::StoreOutcome::Reopen);
+                }
                 LineageCmd::Cancel { reply, .. } | LineageCmd::CancelFrom { reply, .. } => {
                     let _ = reply.send(CancelOutcome::Reopen);
                 }
@@ -9708,6 +9730,9 @@ impl<W: WalStore + 'static> LineageActor<W> {
             }
             LineageCmd::Import { reply, .. } => {
                 let _ = reply.send(ImportOutcome::Reopen);
+            }
+            LineageCmd::Store { reply, .. } => {
+                let _ = reply.send(crate::store_import::StoreOutcome::Reopen);
             }
             LineageCmd::Cancel { reply, .. } | LineageCmd::CancelFrom { reply, .. } => {
                 let _ = reply.send(CancelOutcome::Reopen);

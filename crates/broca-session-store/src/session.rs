@@ -79,6 +79,9 @@ pub enum SessionError {
     /// The session belongs to an actor that has stopped, so a run writing through it can't
     /// append or read anything more. Nothing of the request was appended.
     OwnerGone,
+    /// The session names an import's id map that is missing or doesn't read: damage, never an
+    /// id the session doesn't hold.
+    ImportedIdsDamaged(String),
 }
 
 impl From<BackendError> for SessionError {
@@ -175,6 +178,8 @@ pub struct Session<B: SessionBackend> {
     /// What the open log's records name: each new message's ordinal, so `find_message` finds
     /// its id before it's sealed, and where each media digest's bytes are stored.
     window: OpenLogIndex,
+    /// The import's id map, once read (see `import`).
+    imported: import::IdMapCache,
 }
 
 impl<B: SessionBackend> Session<B> {
@@ -288,6 +293,7 @@ impl<B: SessionBackend> Session<B> {
             operations,
             open_ids: OpenIds::default(),
             window: OpenLogIndex::default(),
+            imported: Default::default(),
         })
     }
 
@@ -436,6 +442,7 @@ impl<B: SessionBackend> Session<B> {
             operations,
             open_ids,
             window,
+            imported: Default::default(),
         };
         Ok(Loaded::Open {
             session: Box::new(session),
@@ -658,6 +665,8 @@ impl<B: SessionBackend> Session<B> {
 mod media;
 use media::OpenLogIndex;
 pub use media::{MediaError, NewMedia};
+mod import;
+pub use import::{is_broca_id_form, NewInputMedia};
 
 mod read;
 pub use read::{served_window, window_entries, StoredEntry};

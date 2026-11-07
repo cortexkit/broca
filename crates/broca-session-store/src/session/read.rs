@@ -44,7 +44,7 @@ pub struct StoredEntry {
 }
 
 /// A decimal number as an id writes it: no sign, no leading zero, no overflow.
-fn canonical_u64(digits: &str) -> Option<u64> {
+pub(super) fn canonical_u64(digits: &str) -> Option<u64> {
     let canonical = !digits.is_empty()
         && (digits.len() == 1 || !digits.starts_with('0'))
         && digits.bytes().all(|byte| byte.is_ascii_digit());
@@ -182,14 +182,17 @@ impl<B: SessionBackend> Session<B> {
     pub async fn find_message(&self, mid: &str) -> Result<Option<u64>, SessionError> {
         let candidate = if let Some(rest) = mid.strip_prefix('g') {
             let Some(seq) = rest.split_once('.').and_then(|(_, seq)| canonical_u64(seq)) else {
-                return Ok(None);
+                return self.imported_ordinal_checked(mid).await;
             };
             self.facts_ordinal(seq).await?
         } else if let Some(rest) = mid.strip_prefix('m') {
             let digits = rest.split_once('.').map_or(rest, |(_, digits)| digits);
-            canonical_u64(digits).and_then(|position| position.checked_add(1))
+            match canonical_u64(digits) {
+                Some(position) => position.checked_add(1),
+                None => return self.imported_ordinal_checked(mid).await,
+            }
         } else {
-            None
+            return self.imported_ordinal_checked(mid).await;
         };
         let Some(ordinal) = candidate else {
             return Ok(None);
@@ -203,6 +206,23 @@ impl<B: SessionBackend> Session<B> {
                 .strip_prefix('m')
                 .is_some_and(|rest| !rest.contains('.')),
         };
+        Ok((entry.ordinal == ordinal && matches).then_some(ordinal))
+    }
+
+    /// The ordinal of an imported message with source id `mid`, by the import's id map, checked
+    /// as `find_message` checks a broca id: the entry there must carry exactly that id.
+    async fn imported_ordinal_checked(&self, mid: &str) -> Result<Option<u64>, SessionError> {
+        let Some(ordinal) = self.imported_ordinal(mid).await? else {
+            return Ok(None);
+        };
+        let Some(entry) = self.entries(ordinal, 1).await?.into_iter().next() else {
+            return Ok(None);
+        };
+        let matches = entry
+            .state
+            .facts
+            .as_ref()
+            .is_some_and(|facts| facts.mid == mid);
         Ok((entry.ordinal == ordinal && matches).then_some(ordinal))
     }
 

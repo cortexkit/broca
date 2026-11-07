@@ -588,6 +588,8 @@ pub fn directory_idindex(data: &[u8]) {
             message::<idindex::DataPage>(bytes);
             message::<idindex::Retired>(bytes);
             message::<idindex::Level>(bytes);
+            message::<crate::record::ImportedIdMap>(bytes);
+            message::<crate::record::ImportReceipt>(bytes);
         }
         1 => walk_directory(&mut input),
         _ => walk_idindex(&mut input),

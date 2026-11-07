@@ -132,6 +132,27 @@ message! {
         8 opt receipt_seq: u64,
         /// Opaque payloads removed when the record left the open log (see `prune`).
         9 rep [must] pruned: crate::prune::PrunedOpaque,
+        /// Where the bytes of each medium the message carries are stored: a media block, or a
+        /// media part of a tool result in it. Only an imported message carries any. A reader
+        /// that renders the message needs them, so a record carrying any is refused by a reader
+        /// that doesn't know the field.
+        10 rep [must] media: InputMedia,
+    }
+}
+
+message! {
+    /// The stored bytes of one medium of an input message, stored as a tool result's are (see
+    /// [`MediaObject`]).
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    pub struct InputMedia {
+        /// The message's content block holding the medium.
+        1 req block: u32,
+        /// For a medium inside a tool result block: its position in the result's parts.
+        2 opt part: u32,
+        /// The open log the object was written under.
+        3 req log: crate::codec::Id128,
+        4 req generation: crate::codec::Id128,
+        5 req seq: u64,
     }
 }
 
@@ -205,6 +226,10 @@ message! {
         3 req text: String,
         4 opt notice: Notice,
         5 opt written_at_ms: u64,
+        /// The id of the send whose text this is, which reads serve beside the text. A reader
+        /// that doesn't know the field would serve the text without it, so it is
+        /// must-understand.
+        6 opt [must] send_id: String,
     }
 }
 
@@ -280,6 +305,49 @@ message! {
         13 opt delivery_mode: String,
         /// For a send that rode on a tool result: the call whose result carried it.
         14 opt delivery_tool_call_id: String,
+        /// The `client_message_id` of the send that placed the message, as `session.read`
+        /// serves it in the message's display facts.
+        15 opt client_message_id: String,
+        /// The attested module id of whoever sent the message, as recorded at its send.
+        16 opt sender: String,
+        /// The send's display marks, as llm-runner's `MessageMarks` JSON: `speaks_for` and a
+        /// true `notice`.
+        17 opt marks: serde_json::Value,
+    }
+}
+
+message! {
+    /// What reads serve about each tool call of one assistant message besides the message
+    /// itself, decided once and never derived again. Written in the batch that places the
+    /// message's tool results, so a sealed block never splits it from its turn. A later
+    /// `TurnFacts` for the same ordinal replaces it.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct TurnFacts {
+        /// The ordinal of the assistant message that made the calls.
+        1 req ordinal: u64,
+        /// One per call, in the order the message made them.
+        2 rep calls: CallFacts,
+    }
+}
+
+message! {
+    /// One tool call's identity and times, as reads serve them.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct CallFacts {
+        /// The call's id in the message.
+        1 req tool_call_id: ToolCallId,
+        /// The call's durable key, unique within the runner that minted it.
+        2 req call_key: String,
+        /// The schema pin the call ran under, as its runner recorded it.
+        3 opt schema_pin: serde_json::Value,
+        /// The attested module id of the runner that minted `call_key`, when that wasn't broca:
+        /// a call imported from another runner keeps its key, which is unique only within that
+        /// runner.
+        4 opt carrier: String,
+        /// The module the call was dispatched to.
+        5 opt dispatched_to: String,
+        6 opt dispatched_at_ms: u64,
+        7 opt finished_at_ms: u64,
     }
 }
 
@@ -374,6 +442,67 @@ message! {
         /// run was admitted (`broca_core::refusal_fallback::on_episode_admitted`). Absent when
         /// the run starts with none.
         27 opt refusal_schedule: serde_json::Value,
+        /// On an import's seeded run: the session object that maps each imported message's
+        /// source id to its ordinal. Message ids broca mints name where their message is, and
+        /// an imported id doesn't, so a reader resolving an imported id needs the map.
+        28 opt [must] imported_ids: ImportedIds,
+    }
+}
+
+message! {
+    /// Where an import's id map and receipt are stored: session objects written under the open
+    /// log by the batch whose seeded run start names them, before that batch.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    pub struct ImportedIds {
+        1 req log: crate::codec::Id128,
+        2 req generation: crate::codec::Id128,
+        /// The seq of the run start naming it.
+        3 req seq: u64,
+    }
+}
+
+message! {
+    /// One imported message's source id and ordinal.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    pub struct ImportedId {
+        1 req mid: String,
+        2 req ordinal: u64,
+    }
+}
+
+message! {
+    /// An import's id map, the body of the object [`ImportedIds`] names: every imported
+    /// message's source id, sorted by id.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    pub struct ImportedIdMap {
+        1 rep ids: ImportedId,
+    }
+}
+
+message! {
+    /// One source message of an import's move list and the ordinal it became, if any.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    pub struct ImportedMove {
+        1 req mid: String,
+        2 opt ordinal: u64,
+    }
+}
+
+message! {
+    /// What an import answered, kept so a retry of it is answered the same after its source is
+    /// gone: the body of a session object written before the import's batch, beside the id
+    /// map, at the place [`ImportedIds`] names.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    pub struct ImportReceipt {
+        /// The import's idempotency key, and the digest of the payload it was made with.
+        1 req import_id: String,
+        2 req digest: String,
+        /// The move list's shape, as the reply names it.
+        3 req shape: String,
+        /// One per source message on the session's path, in source order.
+        4 rep moves: ImportedMove,
+        5 req imported_messages: u64,
+        6 req dropped_system_messages: u64,
     }
 }
 
@@ -1248,6 +1377,7 @@ records! {
         6 Compaction,
         7 Marker,
         8 EntryFacts,
+        9 TurnFacts,
     }
     ledger {
         // One per run, and much larger than the rest.

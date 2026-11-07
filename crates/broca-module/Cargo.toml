@@ -20,6 +20,7 @@ broca-store = { path = "../broca-store" }
 # Sessions kept in the new storage: their store and the run loop that runs on it.
 broca-session-store = { path = "../broca-session-store" }
 broca-session-loop = { path = "../broca-session-loop" }
+ck-session-import = { path = "../ck-session-import" }
 # The intake's registration store is SQLite, written only on dispatch groups and prunes.
 rusqlite = { version = "0.32", features = ["bundled"] }
 # The late-results wire types: entry kinds, cursors and the custodian's dedupe key.

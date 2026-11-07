@@ -283,6 +283,9 @@ pub fn record(
         }
     });
     EntryFacts {
+        client_message_id: None,
+        sender: None,
+        marks: None,
         ordinal,
         written_at_ms,
         tag_base: metadata.tag_base,

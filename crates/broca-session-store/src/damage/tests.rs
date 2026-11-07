@@ -13,6 +13,7 @@ fn key() -> FrameKey {
 
 fn input(text: &str) -> Record {
     Record::Input(Input {
+        media: Vec::new(),
         run_id: "r".into(),
         placement: Placement::RunInput,
         message: Message::new(Role::User, vec![ContentBlock::Text { text: text.into() }]),

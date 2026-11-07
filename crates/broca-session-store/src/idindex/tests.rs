@@ -42,6 +42,7 @@ fn model() -> ModelHandle {
 
 fn start(run: &str, send: Option<&str>) -> Record {
     Record::RunStart(Box::new(RunStart {
+        imported_ids: None,
         run_id: run.into(),
         model: model(),
         setup: Vec::new(),
@@ -155,6 +156,7 @@ fn records_name_their_ids() {
     );
     // A transcript record names nothing the index files, even when it carries an id.
     let input = Record::Input(Input {
+        media: Vec::new(),
         run_id: "r1".into(),
         placement: Placement::RunInput,
         message: Message::new(Role::User, vec![ContentBlock::Text { text: "hi".into() }]),

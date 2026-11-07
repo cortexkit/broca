@@ -21,7 +21,9 @@ use broca_protocol::ids::ToolCallId;
 
 use crate::codec::Digest;
 use crate::fold::Bound;
-use crate::record::{EntryFacts, Marker, Notice, PartKind, PartRef, Placement, Record, Stream};
+use crate::record::{
+    EntryFacts, Marker, Notice, PartKind, PartRef, Placement, Record, Stream, TurnFacts,
+};
 
 /// Why a record can't be folded into the conversation. Each one means the records don't
 /// describe a conversation a provider would accept, so the fold refuses rather than guess.
@@ -53,6 +55,8 @@ crate::message! {
         2 opt notice: Notice,
         /// As delivered, before any rendering.
         3 req text: String,
+        /// The id of the send the text is, when its record names one.
+        4 opt send_id: String,
     }
 }
 
@@ -63,6 +67,8 @@ crate::message! {
         /// Absent for sessions written before entry facts were recorded.
         1 opt facts: EntryFacts,
         2 rep delivered: Delivered,
+        /// For an assistant message that made tool calls: what reads serve about each call.
+        3 opt turn: TurnFacts,
     }
 }
 
@@ -503,6 +509,17 @@ impl Conversation {
                 // Facts for a message below the window have nothing to attach to here, as the
                 // message itself isn't held: a fold that keeps only counts drops both.
             }
+            Record::TurnFacts(turn) => {
+                let start = self.window_start();
+                if self.open.is_some() && turn.ordinal == self.placed + 1 {
+                    self.open_entry.get_or_insert_with(EntryState::default).turn =
+                        Some(turn.clone());
+                } else if turn.ordinal >= start && turn.ordinal <= self.placed {
+                    self.entries[(turn.ordinal - start) as usize].turn = Some(turn.clone());
+                } else if turn.ordinal > self.placed {
+                    return Err(FoldError::FactsWithoutEntry(turn.ordinal));
+                }
+            }
             Record::Marker(marker) => self.marker = Some(marker.clone()),
             Record::SetupStub(stub) => {
                 self.render_config = stub
@@ -535,6 +552,7 @@ impl Conversation {
                     part: part as u32,
                     notice: append.notice.clone(),
                     text: append.text.clone(),
+                    send_id: append.send_id.clone(),
                 });
                 return;
             }

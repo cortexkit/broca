@@ -12,6 +12,7 @@ use crate::record::{
 
 fn start() -> Record {
     Record::RunStart(Box::new(RunStart {
+        imported_ids: None,
         run_id: "r".into(),
         model: serde_json::from_value::<ModelHandle>(
             serde_json::json!({"provider_module_id": "p", "model_id": "m"}),

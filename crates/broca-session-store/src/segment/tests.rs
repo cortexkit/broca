@@ -23,6 +23,7 @@ fn meta() -> SegmentMeta {
 
 fn input(text: &str) -> Record {
     Record::Input(Input {
+        media: Vec::new(),
         run_id: "r".into(),
         placement: Placement::RunInput,
         message: Message::new(Role::User, vec![ContentBlock::Text { text: text.into() }]),
@@ -74,6 +75,7 @@ fn a_group_never_splits_across_blocks() {
         records.push((
             seq,
             Record::ResultAppend(crate::record::ResultAppend {
+                send_id: None,
                 run_id: "r".into(),
                 tool_call_id: broca_protocol::ToolCallId(format!("c{seq}")),
                 text: "y".repeat(1_000),
@@ -95,6 +97,9 @@ fn a_group_never_splits_across_blocks() {
 /// Facts for `ordinal`, as a writer places them after its messages.
 fn facts(ordinal: u64) -> Record {
     Record::EntryFacts(crate::record::EntryFacts {
+        client_message_id: None,
+        sender: None,
+        marks: None,
         ordinal,
         written_at_ms: None,
         tag_base: 0,

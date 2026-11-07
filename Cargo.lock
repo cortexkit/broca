@@ -424,6 +424,7 @@ dependencies = [
  "broca-test-support",
  "broca-wal",
  "broca-wire",
+ "ck-session-import",
  "cortexkit-bus-trait",
  "cortexkit-role-llm-runner 0.7.48",
  "cortexkit-role-llm-runner 0.8.7",
@@ -949,10 +950,12 @@ dependencies = [
 name = "ck-session-import"
 version = "0.3.321"
 dependencies = [
+ "base64",
  "broca-module-serve",
  "broca-protocol",
  "broca-provider",
  "broca-test-support",
+ "cortexkit-role-llm-runner 0.8.7",
  "rusqlite",
  "serde_json",
  "sha2",

@@ -1,0 +1,17 @@
+[
+ {
+  "mid": "e5",
+  "send_id": "pi-send-1",
+  "client_message_id": "cm-pi",
+  "sender": "prefrontal-core",
+  "delivered_as": "idle_start"
+ },
+ {
+  "call_key": "pi-ses/e2/tc1",
+  "send_id": "pi-send-2",
+  "sender": "occi",
+  "delivered_as": "tool_result",
+  "text": "ride text",
+  "template": "occi-ride"
+ }
+]
