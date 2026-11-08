@@ -135,6 +135,8 @@ fn facts(ordinal: u64, mid: &str) -> Record {
         no_display_facts: None,
         reasoning_summaries: Vec::new(),
         rich_ui: None,
+        runner_tag_base: None,
+        legacy_view_seq: None,
     })
 }
 

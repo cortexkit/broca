@@ -32,6 +32,26 @@ pub struct Stored {
 /// appended in one batch, from its input to the next run's, and the session sealed at each run's
 /// input once the next run is in, as a session's runs seal it.
 pub fn store(old: &[FramedRecord], lineage: Option<&str>, name: &str) -> Result<Stored, String> {
+    stored(old, lineage, name, true)
+}
+
+/// [`store`], with every run appended before the first seal, as a converted session is stored:
+/// its records then take the seqs the converter numbered them by, from 1 in order, which a
+/// seal between runs would move past (its own records take seqs).
+pub fn store_then_seal(
+    old: &[FramedRecord],
+    lineage: Option<&str>,
+    name: &str,
+) -> Result<Stored, String> {
+    stored(old, lineage, name, false)
+}
+
+fn stored(
+    old: &[FramedRecord],
+    lineage: Option<&str>,
+    name: &str,
+    seal_as_runs_end: bool,
+) -> Result<Stored, String> {
     let converted = crate::convert(old, lineage).map_err(|error| format!("convert: {error:?}"))?;
     let backend = Counting::new(MemoryBackend::default());
     let addr = SessionAddr(name.to_owned());
@@ -60,18 +80,36 @@ pub fn store(old: &[FramedRecord], lineage: Option<&str>, name: &str) -> Result<
                 .await
                 .map_err(|error| format!("create: {error:?}"))?;
         let mut seals = 0;
+        let mut cuts = Vec::new();
         for (index, batch) in bounds.windows(2).enumerate() {
             let first = session
                 .append(&converted.records[batch[0]..batch[1]], false)
                 .await
                 .map_err(|error| format!("append: {error:?}"))?;
+            // Converted records that name others by seq count on taking the seqs they were
+            // numbered by; a seal between runs moves the later ones past them.
+            if !seal_as_runs_end && first != batch[0] as u64 + crate::FIRST_SEQ {
+                return Err(format!("converted record {} took seq {first}", batch[0]));
+            }
             // The batch starts at a run's input (but the first): everything before it is sealed.
             if index > 0 {
-                match session.seal(Some(first), 0).await {
-                    Ok(_) => seals += 1,
-                    Err(SessionError::BadCut(_)) => {}
-                    Err(error) => return Err(format!("seal: {error:?}")),
+                cuts.push(first);
+            }
+            if seal_as_runs_end {
+                for cut in cuts.drain(..) {
+                    match session.seal(Some(cut), 0).await {
+                        Ok(_) => seals += 1,
+                        Err(SessionError::BadCut(_)) => {}
+                        Err(error) => return Err(format!("seal: {error:?}")),
+                    }
                 }
+            }
+        }
+        for cut in cuts {
+            match session.seal(Some(cut), 0).await {
+                Ok(_) => seals += 1,
+                Err(SessionError::BadCut(_)) => {}
+                Err(error) => return Err(format!("seal: {error:?}")),
             }
         }
         let messages = session.conversation.placed;

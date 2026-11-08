@@ -43,6 +43,7 @@ pub mod inverse;
 pub mod measure;
 pub mod read_cost;
 pub mod split;
+pub mod stored_history;
 
 /// A count of old records, fields or values, and their stored JSON size.
 #[derive(Debug, Default, Clone, Copy, serde::Serialize)]
@@ -143,6 +144,12 @@ struct State {
     /// the step's assistant message or the batch's tool-results message, at the position
     /// today's placement gives it.
     announced_mid: Option<String>,
+    /// The seq, in the converted session, of the newest first-protocol compaction view event
+    /// (`compaction_view_applied`, kept whole as a ledger event) converted so far.
+    legacy_view: Option<u64>,
+    /// That view as it stood when the newest model step finished: the view in force for the
+    /// request that step sent (`output_refs::view_at_writing_step`).
+    step_legacy_view: Option<u64>,
 }
 
 /// Writes the held copies as transcript entries at the boundary that places them.
@@ -162,6 +169,11 @@ fn hold(inputs: Vec<Input>, state: &mut State, out: &Converted) {
         ..input
     }));
 }
+
+/// The seq a converted session's first record takes, which a converted record that names another
+/// by its seq counts from: creating a session opens its writer, which writes `WriterOpened` at
+/// seq 1, and the converted records are appended right after it, in order, by that writer.
+pub const FIRST_SEQ: u64 = 2;
 
 /// Converts one log. `lineage` is the log's lineage id: a log on the current compaction
 /// contract needs it, because today's message ids carry it and a converted message keeps its id.
@@ -414,6 +426,8 @@ pub fn convert(old: &[FramedRecord], lineage: Option<&str>) -> Result<Converted,
                 // Today's read serves display facts only on a log with a lineage.
                 entry.no_display_facts = lineage.is_none().then_some(true);
                 entry.reasoning_summaries = summaries_of.remove(&ordinal).unwrap_or_default();
+                entry.runner_tag_base = legacy.runner_bases.get(&(ordinal - 1)).copied();
+                entry.legacy_view_seq = state.step_legacy_view;
                 // A run's assistant messages carry its Rich UI stamp, as today's read serves it.
                 if assistant_of.get(&ordinal) == Some(&true) {
                     entry.rich_ui = entry
@@ -723,6 +737,15 @@ fn convert_record(
         _ => return Err(err("record without a type")),
     };
     let mut f = Fields::new(kind.clone(), object);
+    match kind.as_str() {
+        "model_step_finished" => state.step_legacy_view = state.legacy_view,
+        "compaction_view_applied" => {
+            // The event about to be pushed takes the seq after the records before it, counting
+            // from the seq a converted session's first record takes.
+            state.legacy_view = Some(out.records.len() as u64 + FIRST_SEQ);
+        }
+        _ => {}
+    }
     match kind.as_str() {
         "run_started" => run_started(&mut f, state, out)?,
         "model_step_finished" => model_step_finished(&mut f, state, out)?,

@@ -570,11 +570,10 @@ fn history_texts(page: &Value) -> Vec<String> {
         .collect()
 }
 
-/// `session.history` in its raw form reaches the store through the serve path and pages the
-/// session's messages; the display form is still refused by name. A request with no form is
-/// the raw form.
+/// `session.history` reaches the store through the serve path in both forms and pages the
+/// session's messages. A request with no form is the raw form.
 #[tokio::test]
-async fn raw_history_reaches_the_store_through_serve() {
+async fn history_reaches_the_store_through_serve() {
     let mut rig = Rig::start(
         "history",
         vec![text_step("a1", "hello"), text_step("a2", "again")],
@@ -592,15 +591,20 @@ async fn raw_history_reaches_the_store_through_serve() {
             "{params}: {page}"
         );
     }
+    // The display form answers with its own page shape, read from the store.
+    let display = rig
+        .result(1, "session.history", json!({"form": "display"}))
+        .await;
+    assert!(
+        display["messages"]
+            .as_array()
+            .is_some_and(|messages| !messages.is_empty()),
+        "{display}"
+    );
     let page = rig
         .result(1, "session.history", json!({"from_ordinal": 2, "limit": 2}))
         .await;
     assert_eq!(history_texts(&page), ["hello", "second"], "{page}");
-    assert_eq!(
-        rig.refused(1, "session.history", json!({"form": "display"}))
-            .await,
-        "not_served_on_new_storage"
-    );
 }
 
 /// Magic Context's `session.entries`, on the `compaction-runner/v1` route, reaches the store

@@ -625,6 +625,8 @@ mod records {
         no_display_facts,
         reasoning_summaries,
         rich_ui,
+        runner_tag_base,
+        legacy_view_seq,
     });
     crate::fuzzing::gen::fields!(ReasoningSummary { part, text });
     crate::fuzzing::gen::fields!(RichUi {

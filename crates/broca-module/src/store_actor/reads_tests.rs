@@ -610,6 +610,8 @@ fn shape(reply: StoreReadReply) -> String {
         },
         StoreReadReply::HistoryHead(head) => format!("{head:?}"),
         StoreReadReply::Media(media) => format!("{media:?}"),
+        StoreReadReply::TagLocation(location) => format!("{location:?}"),
+        StoreReadReply::WritingView(view) => format!("{view:?}"),
         StoreReadReply::PlanChange(read) => format!("{:?}", read.map(|read| read.0)),
         StoreReadReply::PlanIdentities(identities) => format!("{identities:?}"),
         StoreReadReply::Entries(entries) => format!("{entries:?}"),

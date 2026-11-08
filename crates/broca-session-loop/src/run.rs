@@ -316,8 +316,24 @@ where
         .map_err(LoopError::Refused)?;
     }
     admission.input = input;
+    // The run numbers its messages' parts by its own computed rules, after the highest number
+    // the session has shown, as its start freezes them. On the compaction contract its
+    // requests show the projection's numbers instead, but today's reads still number the run's
+    // messages by these rules, so they are recorded alike.
+    let checkpoint = shown_high(&*writer, &*parts).await?;
+    let runner = broca_core::tags::rules_for(
+        Some(broca_wal::ComputedTagRules { checkpoint }),
+        frozen_render_tags(&admission),
+        &admission.render_config,
+    )
+    .map(|rules| crate::entries::RunnerTags {
+        run_id: admission.run_id.clone(),
+        rules,
+        checkpoint,
+    });
     let mut placed = Placed {
         calls: Default::default(),
+        runner,
         rich_ui: admission
             .manifest
             .as_ref()
@@ -330,7 +346,7 @@ where
         ),
         inner: writer,
     };
-    let start_seq = admit(&mut placed, parts, &admission).await?;
+    let start_seq = admit(&mut placed, parts, &admission, checkpoint).await?;
     if let Some(reports) = &seams.account_reports {
         reports.run_started(&event_id(&placed, start_seq), start_seq);
     }
@@ -551,8 +567,10 @@ where
         }
     }
     let drift = drift.filter(|_| !matches!(resolution, Resolution::Paused(_)));
+    let runner = runner_of_start(writer, parts, &admission.run_id).await?;
     let mut placed = Placed {
         calls: Default::default(),
+        runner,
         rich_ui: admission
             .manifest
             .as_ref()
@@ -787,10 +805,12 @@ where
         return Err(LoopError::Unsupported("sealing a run that wasn't running"));
     }
     let admission = frozen_admission(run, parts)?;
+    let runner = runner_of_start(writer, parts, &run_id).await?;
     // The closing results message is placed with the facts its run's frozen rules give it, as a
     // resume places it.
     let mut placed = Placed {
         calls: Default::default(),
+        runner,
         rich_ui: admission
             .manifest
             .as_ref()
@@ -1421,6 +1441,26 @@ async fn run_tag_rules<W: Writer>(
 /// Whether the run froze part numbers into the model's view: a run read back from its start
 /// carries the frozen choice, and a new run takes it from its plan, as its start record freezes
 /// it.
+/// The open run `run_id`'s own part numbering, as its start froze it.
+async fn runner_of_start<W: Writer>(
+    writer: &W,
+    parts: &dyn Parts,
+    run_id: &str,
+) -> Result<Option<crate::entries::RunnerTags>, LoopError> {
+    let Some(start) = writer.run_start(run_id).await? else {
+        return Ok(None);
+    };
+    let config = run_config_of_start(&start, parts)?;
+    Ok(config
+        .computed_tags
+        .zip(broca_core::tags::computed_rules(&config))
+        .map(|(tags, rules)| crate::entries::RunnerTags {
+            run_id: run_id.to_owned(),
+            rules,
+            checkpoint: tags.checkpoint,
+        }))
+}
+
 fn frozen_render_tags(admission: &Admission) -> bool {
     admission.render_tags
         || admission
@@ -2286,10 +2326,13 @@ fn to_value<T: serde::Serialize>(value: Option<&T>) -> Result<Option<Value>, Loo
         .map_err(|e| LoopError::Parts(e.to_string()))
 }
 
+/// Writes the run's start. `checkpoint` is the highest part number the session has shown
+/// ([`shown_high`]), which the run's computed numbering continues after.
 async fn admit<W: Writer>(
     writer: &mut W,
     parts: &mut dyn Parts,
     admission: &Admission,
+    checkpoint: u64,
 ) -> Result<u64, LoopError> {
     // The session's refusal-fallback schedule carries into the run only under the same model
     // and within a day of its last change, as today's admission decides it.
@@ -2348,7 +2391,6 @@ async fn admit<W: Writer>(
         config.insert("render_tags".into(), json!(true));
     }
     // Today's computed tag rules, starting after the highest number the session has shown.
-    let checkpoint = shown_high(writer, parts).await?;
     config.insert("computed_tags".into(), json!({ "checkpoint": checkpoint }));
     config.insert("context_epoch".into(), json!(0));
     if !admission.stop_when.is_empty() {

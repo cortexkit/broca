@@ -71,6 +71,12 @@ pub enum StoreReadRequest {
     /// The medium with digest `sha256` that a record of the session names, with its bytes, as
     /// `session.media_read` serves it.
     Media { sha256: String },
+    /// Where part number `tag` sits, for output references (see
+    /// `store_output_refs::tag_location`).
+    TagLocation(u64),
+    /// The compaction view the model step that wrote message `ordinal` (counting from 0) was
+    /// rendered under, for output references (see `store_output_refs::writing_view`).
+    WritingView { ordinal: u64 },
     /// What a plan-change op's preflight reads about the session, for a request naming
     /// `generation` and `send_id` (see `store_plan_change::change_read`).
     PlanChange {
@@ -141,6 +147,8 @@ pub enum StoreReadReply {
     HistoryHead(Result<crate::store_entries::HistoryHead, ServeError>),
     /// `None` when no record of the session names the digest.
     Media(Result<Option<StoredMedia>, ServeError>),
+    TagLocation(Result<broca_core::TagLocation, ServeError>),
+    WritingView(Result<Option<broca_core::compaction_provider::view::CompactionView>, ServeError>),
     PlanChange(Result<PlanChangeRead, String>),
     PlanIdentities(Result<RefreshedIdentities, String>),
 }
@@ -303,6 +311,16 @@ pub async fn execute<B: SessionBackend>(
         StoreReadRequest::Media { sha256 } => {
             StoreReadReply::Media(stored_media(session, sha256).await)
         }
+        StoreReadRequest::TagLocation(tag) => StoreReadReply::TagLocation(
+            crate::store_output_refs::tag_location(session, ctx.parts, *tag)
+                .await
+                .map_err(output_refs_failed),
+        ),
+        StoreReadRequest::WritingView { ordinal } => StoreReadReply::WritingView(
+            crate::store_output_refs::writing_view(session, *ordinal)
+                .await
+                .map_err(output_refs_failed),
+        ),
         StoreReadRequest::PlanChange {
             generation,
             send_id,
@@ -342,6 +360,15 @@ async fn stored_media<B: SessionBackend>(
         reference: medium.reference,
         bytes,
     }))
+}
+
+/// A read output references make of the session that failed: a backend failure and damaged
+/// facts read alike here, so no class is claimed.
+fn output_refs_failed(error: String) -> ServeError {
+    ServeError::Open(
+        format!("the session's output reference facts can't be read: {error}"),
+        None,
+    )
 }
 
 /// Makes `session`'s latest records durable before a read reports them: the read's refusal when

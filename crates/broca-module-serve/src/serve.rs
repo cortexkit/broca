@@ -5170,11 +5170,9 @@ fn served_on_new_storage(method: &str, params: &serde_json::Value) -> bool {
         | "session.upload_append"
         | "session.upload_commit"
         | "session.upload_status" => true,
-        // The raw form pages through the store's `session.read` (`crate::history`). The display
-        // form needs per-call facts the store doesn't serve yet, so it is refused here.
-        cortexkit_role_llm_runner::ops::SESSION_HISTORY => {
-            params.get("form").and_then(serde_json::Value::as_str) != Some("display")
-        }
+        // Both forms page through the store (`crate::history`): the raw form through its
+        // `session.read`, the display form with the per-call facts the store records.
+        cortexkit_role_llm_runner::ops::SESSION_HISTORY => true,
         _ => false,
     }
 }

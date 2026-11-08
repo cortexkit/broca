@@ -345,6 +345,20 @@ message! {
         /// `session.read` serves on it with `include_rich_ui`. Recorded here so a read finds it
         /// without looking up the run's start. Absent when the run's plan has none.
         20 opt rich_ui: RichUi,
+        /// The highest part number the runner's own numbering (llm-runner's tags: stamped on a
+        /// v1 run's records, computed by `broca_protocol::tags::number_message` from each later
+        /// run's checkpoint) shows before this message. The message's numbered parts take the
+        /// numbers after it, under its run's rules. It is the numbering today's read attaches to
+        /// each message and output references resolve a reply's `$$tc(N)` against; on the
+        /// compaction contract the model is shown `tag_base`'s numbering instead. Absent on
+        /// sessions written before it was recorded.
+        21 opt runner_tag_base: u64,
+        /// On a session converted from a log whose compaction provider spoke the first
+        /// compaction protocol only: the seq of that log's view event (`compaction_view_applied`,
+        /// kept whole as a ledger event) in force when the model step that wrote this message
+        /// sent its request, which output references check a named part against. Absent when no
+        /// such view had applied; the run loop never writes first-protocol views.
+        22 opt legacy_view_seq: u64,
     }
 }
 
