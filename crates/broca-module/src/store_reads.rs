@@ -80,6 +80,26 @@ pub struct PageRequest {
     /// Start at this ordinal, counting from 1; the newest page without one.
     pub from_ordinal: Option<u64>,
     pub limit: Option<u64>,
+    /// What the read opts into: each message's display facts, the latest run's tools, and each
+    /// assistant message's Rich UI stamp.
+    pub include_display_facts: bool,
+    pub include_tools: bool,
+    pub include_rich_ui: bool,
+}
+
+impl PageRequest {
+    /// What `req` asks of the session itself.
+    pub fn of(req: &crate::serve::SessionReadRequest) -> Self {
+        Self {
+            history_version: req.history_version,
+            after_mid: req.after_mid.clone(),
+            from_ordinal: req.from_ordinal,
+            limit: req.limit,
+            include_display_facts: req.include_display_facts,
+            include_tools: req.include_tools,
+            include_rich_ui: req.include_rich_ui,
+        }
+    }
 }
 
 /// A `session.read` page and what the reply says about the session beside it.
@@ -149,6 +169,10 @@ pub struct ReadContext<'a> {
     pub session_name: &'a str,
     /// The in-flight step of the actor's running run, if any.
     pub live_step: Option<&'a LiveStep>,
+    /// The cursor of the session's last control unit, as the actor's live projection holds it
+    /// (`Some(None)` for a stream with no unit yet), or `None` when no seeded projection knows
+    /// it, so a page projects it from storage.
+    pub stream_head: Option<Option<broca_core::Cursor>>,
 }
 
 impl ReadContext<'_> {
@@ -214,9 +238,9 @@ pub async fn execute<B: SessionBackend>(
                 .map(Box::new)
                 .map_err(crate::store_head::head_failed),
         ),
-        StoreReadRequest::Page(page) => {
-            StoreReadReply::Page(crate::store_read::page(session, ctx.parts, page).await)
-        }
+        StoreReadRequest::Page(page) => StoreReadReply::Page(
+            crate::store_read::page(session, ctx.parts, page, ctx.stream_head).await,
+        ),
         StoreReadRequest::Entries { from, limit } => StoreReadReply::Entries(
             crate::store_read::served_entries(session, *from, *limit)
                 .await
@@ -251,6 +275,27 @@ pub async fn execute<B: SessionBackend>(
     }
 }
 
+/// Makes `session`'s latest records durable before a read reports them: the read's refusal when
+/// they can't be.
+pub(crate) async fn durable_for_read<B: SessionBackend>(
+    session: &mut Session<B>,
+) -> Option<StoreReadOutcome> {
+    if session.unsynced() {
+        // A batch appended without a barrier isn't durable yet; a read must not report it until
+        // it is. Making it durable early is harmless.
+        if let Err(error) = session.sync().await {
+            return Some(StoreReadOutcome::Refused(ServeError::Open(
+                format!(
+                    "durability_flush_failed: the session's latest records could not be made \
+                     durable before reading them: {error:?}"
+                ),
+                Some(broca_protocol::ErrorClass::Transient),
+            )));
+        }
+    }
+    None
+}
+
 /// Answers `request` from `session` as its actor holds it: durable first, then from memory only.
 /// `None` from `answer` means the read needed storage. The actor calls this between its commands,
 /// with nothing else appending.
@@ -260,18 +305,8 @@ pub async fn answer_in_memory<B: SessionBackend>(
     request: &StoreReadRequest,
 ) -> StoreReadOutcome {
     use futures::FutureExt as _;
-    if session.unsynced() {
-        // A batch appended without a barrier isn't durable yet; a read must not report it until
-        // it is. Making it durable early is harmless.
-        if let Err(error) = session.sync().await {
-            return StoreReadOutcome::Refused(ServeError::Open(
-                format!(
-                    "durability_flush_failed: the session's latest records could not be made \
-                     durable before reading them: {error:?}"
-                ),
-                Some(broca_protocol::ErrorClass::Transient),
-            ));
-        }
+    if let Some(refused) = durable_for_read(session).await {
+        return refused;
     }
     let session: &Session<B> = session;
     let memory = session.in_memory();

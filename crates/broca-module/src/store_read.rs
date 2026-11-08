@@ -9,14 +9,20 @@
 //! a WAL for the same history, except that it has no WAL lineage and its cursors use the store's
 //! own record seqs.
 
+use std::collections::BTreeMap;
+
 use broca_core::{
     RunAttribution, SessionReadLineageState, SessionReadMessage, SessionReadPage,
     SessionReadReason, SessionReadStateKind,
 };
 use broca_protocol::content::Role;
+use broca_session_loop::parts::Parts;
 use broca_session_store::backend::SessionBackend;
 use broca_session_store::fold::operations::Run;
+use broca_session_store::record::Record;
 use broca_session_store::session::{Session, SessionError, StoredEntry};
+
+pub mod todays;
 
 /// Why a store read refused.
 #[derive(Debug)]
@@ -28,6 +34,8 @@ pub enum StoreReadError {
     NoFacts { ordinal: u64 },
     /// A message's entry facts name a value no build of this format writes.
     BadFact { ordinal: u64, field: &'static str },
+    /// A run's start, or a setup part it names, couldn't be read back.
+    Setup(String),
 }
 
 impl From<SessionError> for StoreReadError {
@@ -96,13 +104,23 @@ pub async fn served_entries<B: SessionBackend>(
     Ok(entries)
 }
 
-/// A `session.read` page, and each of its messages' stable id (`EntryFacts::mid`), in order.
+/// A `session.read` page, each of its messages' stable id (`EntryFacts::mid`), in order, and
+/// what an `include_display_facts` read serves about each message, by zero-based ordinal.
 pub struct StorePage {
     pub page: SessionReadPage,
     pub mids: Vec<String>,
     /// What each message's tool calls are served from, in order (see
     /// `crate::store_calls::attribute_tool_calls`).
     pub turns: Vec<crate::store_calls::TurnOf>,
+    pub facts: BTreeMap<u64, broca_core::display_facts::DisplayFacts>,
+    /// The zero-based ordinals of the messages served without display facts
+    /// (`EntryFacts::no_display_facts`).
+    pub withheld: std::collections::BTreeSet<u64>,
+    /// The reasoning summaries each message's entry facts recorded, by zero-based ordinal.
+    pub summaries: crate::serve::RecordedSummaries,
+    /// The Rich UI stamp of each run whose assistant messages the page holds, as their entry
+    /// facts recorded it.
+    pub stamps: BTreeMap<String, Option<broca_protocol::RichUiStamp>>,
 }
 
 /// A `session.read` page: up to `limit` messages from `from_ordinal` (counting from 0, as
@@ -134,10 +152,49 @@ pub async fn read_page<B: SessionBackend>(
     let mut messages = Vec::with_capacity(entries.len());
     let mut mids = Vec::with_capacity(entries.len());
     let mut turns = Vec::with_capacity(entries.len());
+    let mut facts = BTreeMap::new();
+    let mut withheld = std::collections::BTreeSet::new();
+    let mut summaries = crate::serve::RecordedSummaries::new();
+    let mut stamps = BTreeMap::new();
     for (index, entry) in entries.iter().enumerate() {
         let next = entries.get(index + 1).or(after.as_ref());
         messages.push(page_message(entry, next, latest)?);
         turns.push(crate::store_calls::TurnOf::of(entry));
+        let mut served = display_facts(entry).served();
+        // A turn whose results are placed has its facts, though reads still serve it as running
+        // until its batch closes (`results_await_close`).
+        if entry.open && entry.state.turn.is_none() {
+            served.tool_times = open_turn_times(session, &entry.message).await?;
+        }
+        facts.insert(entry.ordinal - 1, served);
+        if let Some(facts) = &entry.state.facts {
+            if facts.no_display_facts == Some(true) {
+                withheld.insert(entry.ordinal - 1);
+            }
+            if let (Some(run), Role::Assistant) = (&facts.run_id, entry.message.role) {
+                let stamp = facts.rich_ui.as_ref().and_then(|stamp| {
+                    serde_json::from_value(serde_json::json!({
+                        "dialect": stamp.dialect,
+                        "catalog_digest": stamp.catalog_digest,
+                    }))
+                    .ok()
+                });
+                stamps.entry(run.clone()).or_insert(stamp);
+            }
+            summaries.insert(
+                entry.ordinal - 1,
+                facts
+                    .reasoning_summaries
+                    .iter()
+                    .map(|summary| {
+                        cortexkit_role_llm_runner::read::ReasoningSummary::new(
+                            summary.part,
+                            summary.text.clone(),
+                        )
+                    })
+                    .collect(),
+            );
+        }
         // `page_message` has refused an entry without facts.
         mids.push(
             entry
@@ -161,15 +218,22 @@ pub async fn read_page<B: SessionBackend>(
         withdrawals_owed: false,
         tags_await_setup: false,
     };
-    Ok(StorePage { page, mids, turns })
+    Ok(StorePage {
+        page,
+        mids,
+        turns,
+        facts,
+        withheld,
+        summaries,
+        stamps,
+    })
 }
 
 /// Serves `session.read` for a session kept in the new storage. The reply is today's for the
 /// same history, built from the session's head, its folds and its entry facts, never from a WAL.
 ///
-/// Until the store keeps per-call facts, a read that opts in to display facts, tools or Rich UI
-/// stamps is refused by name rather than answered without them, as is a late-approval cursor:
-/// the new storage takes no approval questions, so no cursor names one.
+/// A late-approval cursor is refused by name: the new storage takes no approval questions, so no
+/// cursor names one.
 pub async fn serve_read(
     registry: &crate::LineageRegistry,
     store: &crate::store_open::StoreRuntime,
@@ -184,24 +248,7 @@ pub async fn serve_read(
             message: refusal.message,
         });
     }
-    for (asked, field) in [
-        (req.include_display_facts, "include_display_facts"),
-        (req.include_tools, "include_tools"),
-        (req.include_rich_ui, "include_rich_ui"),
-    ] {
-        if asked {
-            return Err(ServeError::InvalidParams {
-                field: field.into(),
-                message: format!("{field} isn't served yet for a session kept in the new storage"),
-            });
-        }
-    }
-    let request = StoreReadRequest::Page(PageRequest {
-        history_version: req.history_version,
-        after_mid: req.after_mid.clone(),
-        from_ordinal: req.from_ordinal,
-        limit: req.limit,
-    });
+    let request = StoreReadRequest::Page(PageRequest::of(&req));
     let answer = match store.read(registry, &req.session, request).await? {
         Some(StoreReadReply::Page(answer)) => answer?,
         Some(_) => return Err(crate::store_reads::mismatched()),
@@ -212,6 +259,32 @@ pub async fn serve_read(
             return Ok(response);
         }
     };
+    finish(answer, &req)
+}
+
+/// The `session.read` reply for `req` from `session`, loaded by the caller, reading its run
+/// starts' setup parts from `parts`: what [`serve_read`] serves once it has the session, built
+/// by the same [`page`] the session's actor runs.
+pub async fn serve_view<B: SessionBackend>(
+    session: &Session<B>,
+    parts: &dyn Parts,
+    req: &crate::serve::SessionReadRequest,
+) -> Result<broca_wire::SessionReadResponse, crate::serve::ServeError> {
+    let answer = page(
+        session,
+        parts,
+        &crate::store_reads::PageRequest::of(req),
+        None,
+    )
+    .await?;
+    finish(answer, req)
+}
+
+/// What a reply takes besides the session: the media mode and the byte cap `req` asks for.
+fn finish(
+    answer: crate::store_reads::PageAnswer,
+    req: &crate::serve::SessionReadRequest,
+) -> Result<broca_wire::SessionReadResponse, crate::serve::ServeError> {
     let mut response = answer.response;
     crate::serve::apply_media_mode(&mut response, req.media, &req.session.session)?;
     let cap = req
@@ -230,7 +303,8 @@ pub async fn serve_read(
 /// The `session.read` reply `request` asks of `session`, as far as the session decides it: the
 /// page, from the message `after_mid` names or the ordinal asked for, refused when the session's
 /// history version isn't the one asked for; each model-written message marked for reply cleaning
-/// by its run's tag rules; and each message's tool calls attributed from its turn facts. The
+/// by its run's tag rules; each message's tool calls attributed from its turn facts; and what
+/// each opt-in adds, from the page's own entry and turn facts and the session's folds. The
 /// session's actor runs this over the session it holds, so all of it reads from memory or none of
 /// it is served there. What doesn't depend on the session (media mode, the byte cap) is the
 /// caller's.
@@ -238,6 +312,7 @@ pub(crate) async fn page<B: SessionBackend>(
     session: &Session<B>,
     parts: &dyn broca_session_loop::parts::Parts,
     request: &crate::store_reads::PageRequest,
+    stream_head: Option<Option<broca_core::Cursor>>,
 ) -> Result<crate::store_reads::PageAnswer, crate::serve::ServeError> {
     use crate::serve::ServeError;
     let head = session.head();
@@ -259,15 +334,13 @@ pub(crate) async fn page<B: SessionBackend>(
         mut page,
         mids,
         turns,
+        facts,
+        withheld,
+        summaries,
+        stamps,
     } = read_page(session, from_ordinal, request.limit)
         .await
-        .map_err(|error| match error {
-            StoreReadError::Session(error) => read_failed(error),
-            other => ServeError::Open(
-                format!("the session's stored facts can't be read: {other:?}"),
-                Some(broca_protocol::ErrorClass::Permanent),
-            ),
-        })?;
+        .map_err(refused)?;
     crate::store_entries::mark_reply_cleaning(session, parts, &mut page.messages)
         .await
         .map_err(|error| {
@@ -277,11 +350,56 @@ pub(crate) async fn page<B: SessionBackend>(
                 None,
             )
         })?;
-    let mut response = crate::serve::session_read_response(page, None);
+    let times = request
+        .include_display_facts
+        .then(|| crate::serve::DisplayTimes::of(&page));
+    let tools = if request.include_tools {
+        latest_tools(session, parts).map_err(refused)?
+    } else {
+        None
+    };
+    let mut response = crate::serve::session_read_response(page, tools);
     response.history_version = head.history_version;
     response.incarnation = broca_session_store::codec::hex(&head.incarnation.0);
+    // The cursor at the read's durable end, which a subscribe resumes from with nothing missed
+    // or repeated: the actor's live projection knows it; otherwise it is projected from the open
+    // log, a read of storage, so a read from memory only is then served from a view instead.
+    let stream_head = match stream_head {
+        Some(known) => known,
+        None => crate::store_fanout::last_cursor(session)
+            .await
+            .map_err(|error| {
+                ServeError::Open(
+                    format!("the session's control stream can't be projected: {error}"),
+                    Some(broca_protocol::ErrorClass::Permanent),
+                )
+            })?,
+    };
+    response.head = stream_head.map(broca_wire::CursorWire::from);
     for (entry, mid) in response.messages.iter_mut().zip(mids) {
         entry.mid = mid;
+    }
+    if let Some(times) = &times {
+        // A message served without display facts keeps the form it has before they are added.
+        let before: Vec<_> = response
+            .messages
+            .iter()
+            .filter(|entry| withheld.contains(&(entry.ordinal - 1)))
+            .cloned()
+            .collect();
+        crate::serve::apply_display_facts(&mut response, times, &facts, Some(&summaries));
+        for original in before {
+            if let Some(entry) = response
+                .messages
+                .iter_mut()
+                .find(|entry| entry.ordinal == original.ordinal)
+            {
+                *entry = original;
+            }
+        }
+    }
+    if request.include_rich_ui {
+        crate::serve::apply_rich_ui(&mut response, &stamps);
     }
     crate::store_calls::attribute_tool_calls(session, &mut response, &turns)
         .await
@@ -290,6 +408,81 @@ pub(crate) async fn page<B: SessionBackend>(
         response,
         from_ordinal,
     })
+}
+
+/// What an `include_display_facts` read serves about each tool call of `message`, the
+/// assistant message whose calls are still running: its tool turn has no facts until its last
+/// call is answered, so each call is served from the open batch the operational fold keeps,
+/// with the key, dispatch time and schema pin its intent recorded (found through the session's
+/// id lookup, as the run loop finds it, and as `store_calls` attributes the same call). A call
+/// answered without an intent is named with the key its outcome recorded, and one without
+/// either with none. The open batch doesn't keep a call's finish time or why it has no answer,
+/// so those wait for the turn's facts.
+async fn open_turn_times<B: SessionBackend>(
+    session: &Session<B>,
+    message: &broca_protocol::Message,
+) -> Result<Vec<cortexkit_role_llm_runner::read::ToolTime>, StoreReadError> {
+    use cortexkit_role_llm_runner::read::ToolTime;
+    let batch = session
+        .operations
+        .run
+        .as_ref()
+        .and_then(|run| run.open_batch.as_ref());
+    let mut copies: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut times = Vec::new();
+    for block in &message.content {
+        let broca_protocol::ContentBlock::ToolCall(call) = block else {
+            continue;
+        };
+        let copy = copies.entry(call.tool_call_id.0.as_str()).or_default();
+        let position = batch.and_then(|batch| {
+            (0..batch.calls.len())
+                .filter(|position| batch.id(*position) == &call.tool_call_id)
+                .nth(*copy)
+        });
+        *copy += 1;
+        let mut time = ToolTime::new(&call.tool_call_id.0);
+        // The fold marks every copy of an id with the intent that anchored its first copy
+        // (`store_calls::open_call`): only that copy is the intent's.
+        let (key, dispatched) = batch
+            .zip(position)
+            .map_or((None, false), |(batch, position)| {
+                let first = (0..batch.calls.len())
+                    .find(|at| batch.id(*at) == &call.tool_call_id && batch.calls[*at].intent);
+                let own = &batch.calls[position];
+                match first == Some(position) {
+                    true => (batch.key(position), true),
+                    false => (own.key.as_deref().filter(|_| !own.intent), false),
+                }
+            });
+        if let (Some(key), false) = (key, dispatched) {
+            time = time.with_call_key(key);
+        } else if let Some(key) = key {
+            let intent = session
+                .find_id(broca_session_store::idindex::IdKind::CallKey, key)
+                .await?
+                .into_iter()
+                .find_map(|(_, record)| match record {
+                    Record::ToolIntent(intent) => Some(intent),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    StoreReadError::Setup(format!("no dispatch intent records the call key {key}"))
+                })?;
+            time = time.with_call_key(key);
+            time.started_at = intent.dispatched_at_ms;
+            if let Some(pin) = intent.schema_pin.as_ref().and_then(|pin| {
+                broca_session_loop::entries::served_schema_pin(
+                    intent.tool_name.as_deref().unwrap_or(&call.tool_name),
+                    pin,
+                )
+            }) {
+                time = time.with_schema_pin(pin);
+            }
+        }
+        times.push(time);
+    }
+    Ok(times)
 }
 
 /// The page of a session that holds nothing.
@@ -325,6 +518,48 @@ pub(crate) fn read_failed(error: SessionError) -> crate::serve::ServeError {
         format!("the session could not be read from the new storage: {error:?}"),
         Some(class),
     )
+}
+
+/// The serve error for a store read that refused.
+fn refused(error: StoreReadError) -> crate::serve::ServeError {
+    match error {
+        StoreReadError::Session(error) => read_failed(error),
+        other => crate::serve::ServeError::Open(
+            format!("the session's stored facts can't be read: {other:?}"),
+            Some(broca_protocol::ErrorClass::Permanent),
+        ),
+    }
+}
+
+/// The tool list an `include_tools` read serves: the one the session's latest run was frozen
+/// with, which its start names as a setup part, with that run's id. `None` before any run.
+/// A resumed run continues its run without a new start, so the latest start is the current
+/// episode's, as today's read takes the last `RunStarted`.
+pub fn latest_tools<B: SessionBackend>(
+    session: &Session<B>,
+    parts: &dyn Parts,
+) -> Result<Option<crate::registry::SessionReadTools>, StoreReadError> {
+    let Some(run) = session.operations.run.as_ref() else {
+        return Ok(None);
+    };
+    let start = run
+        .start
+        .as_ref()
+        .ok_or_else(|| StoreReadError::Setup(format!("run {} has no start", run.run_id)))?;
+    let (config, _) = broca_session_loop::run::run_config_members(
+        start,
+        |part| parts.get(part).map_err(StoreReadError::Setup),
+        || StoreReadError::Setup("a run's frozen choices aren't an object".into()),
+    )?;
+    let tools: Vec<broca_protocol::request::Tool> = match config.get("tools") {
+        Some(tools) => serde_json::from_value(tools.clone())
+            .map_err(|error| StoreReadError::Setup(format!("tools part: {error}")))?,
+        None => Vec::new(),
+    };
+    Ok(Some(crate::registry::SessionReadTools {
+        run_id: broca_protocol::RunId(start.run_id.clone()),
+        tools: std::sync::Arc::new(tools),
+    }))
 }
 
 /// One page message from its entry. `next` is the entry after it, if any; `latest` is the
@@ -489,14 +724,15 @@ fn lineage_state<B: SessionBackend>(session: &Session<B>) -> SessionReadLineageS
 }
 
 /// What `session.read` serves about a message besides its page entry, from the facts the
-/// session recorded when it placed the message, as today's read serves them for broca's own
-/// sends: the send's id, sender and marks for a user message, each tool call's key, and the
-/// text delivered with the message's tool calls.
+/// session recorded when it placed the message: the send's id and marks for a user message, the
+/// attested sender of whatever message a send placed, each tool call's key, and the text
+/// delivered with the message's tool calls.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DisplayFacts {
     /// For a user message: the `client_message_id` of the send that placed it.
     pub client_message_id: Option<String>,
-    /// For a user message: the attested module id of the send's sender.
+    /// The attested module id of the sender of the send that placed the message: every message
+    /// of a run's input or of a steer, as today's read names it.
     pub sender: Option<String>,
     /// The send's `speaks_for` mark, as stored.
     pub speaks_for: Option<serde_json::Value>,
@@ -506,6 +742,9 @@ pub struct DisplayFacts {
     pub calls: Vec<CallDisplay>,
     /// Text delivered with the message's tool calls, in the order it was delivered.
     pub notices: Vec<NoticeDisplay>,
+    /// For an assistant message whose tool turn has facts: one per tool call it made, in call
+    /// order, as reads serve them (see [`turn_times`]). Empty otherwise.
+    pub tool_times: Vec<cortexkit_role_llm_runner::read::ToolTime>,
 }
 
 /// A tool call's identity, as reads serve it.
@@ -576,12 +815,86 @@ pub fn display_facts(entry: &StoredEntry) -> DisplayFacts {
         client_message_id: facts
             .and_then(|facts| facts.client_message_id.clone())
             .filter(|_| user),
-        sender: facts
-            .and_then(|facts| facts.sender.clone())
-            .filter(|_| user),
+        sender: facts.and_then(|facts| facts.sender.clone()),
         speaks_for: marks.and_then(|marks| marks.get("speaks_for").cloned()),
         notice: marks.and_then(|marks| marks.get("notice")) == Some(&serde_json::Value::Bool(true)),
         calls,
         notices,
+        tool_times: entry
+            .state
+            .turn
+            .as_ref()
+            .map(|turn| turn_times(&entry.message, turn))
+            .unwrap_or_default(),
+    }
+}
+
+/// What an `include_display_facts` read serves about each tool call of `message`, whose tool
+/// turn recorded `turn`: one per call, in the order the message made them, with its key, schema
+/// pin, dispatch and finish times and why it has no answer, as the turn recorded them (see
+/// [`facts_by_call`]); a call the turn has no facts for is named with none. A call imported
+/// from another runner (`CallFacts::carrier`) is named with none too, as today's read names a
+/// call no step of its log made.
+pub fn turn_times(
+    message: &broca_protocol::Message,
+    turn: &broca_session_store::record::TurnFacts,
+) -> Vec<cortexkit_role_llm_runner::read::ToolTime> {
+    use cortexkit_role_llm_runner::read::ToolTime;
+    let ids: Vec<&str> = message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            broca_protocol::ContentBlock::ToolCall(call) => Some(call.tool_call_id.0.as_str()),
+            _ => None,
+        })
+        .collect();
+    ids.iter()
+        .zip(facts_by_call(&ids, turn))
+        .map(|(id, call)| {
+            let Some(call) = call.filter(|call| call.carrier.is_none()) else {
+                return ToolTime::new(*id);
+            };
+            let mut time = ToolTime::new(*id).with_call_key(&call.call_key);
+            time.started_at = call.dispatched_at_ms;
+            time.finished_at = call.finished_at_ms;
+            time.unanswered = call.unanswered.map(|why| why.as_str().to_owned());
+            if let Some(serde_json::Value::String(pin)) = &call.schema_pin {
+                time = time.with_schema_pin(pin);
+            }
+            time
+        })
+        .collect()
+}
+
+/// The facts `turn` recorded for each of a message's tool calls `ids`, in call order. A turn
+/// records the facts of the calls that have them, in the order the message made the calls, so
+/// each call takes the next facts naming its id: a model's repeated call id finds each copy's
+/// own.
+pub fn facts_by_call<'t>(
+    ids: &[&str],
+    turn: &'t broca_session_store::record::TurnFacts,
+) -> Vec<Option<&'t broca_session_store::record::CallFacts>> {
+    let mut facts = turn.calls.iter().peekable();
+    ids.iter()
+        .map(|id| facts.next_if(|call| call.tool_call_id.0 == *id))
+        .collect()
+}
+
+impl DisplayFacts {
+    /// What an `include_display_facts` read serves from these facts, in the form today's read
+    /// builds for a page message (`crate::serve::apply_display_facts`): the sender, for a user
+    /// message the send's `client_message_id`, and each tool call's facts.
+    ///
+    /// Notices are left out: today's read serves one only for a send that rode on a tool result
+    /// with its notice envelope, which the new storage doesn't record yet. A converted session
+    /// holds none (the conversion refuses such a log) and the run loop refuses such a send, so
+    /// no session here has one to serve.
+    pub fn served(&self) -> broca_core::display_facts::DisplayFacts {
+        broca_core::display_facts::DisplayFacts {
+            sender: self.sender.clone(),
+            client_message_id: self.client_message_id.clone(),
+            tool_times: self.tool_times.clone(),
+            ..Default::default()
+        }
     }
 }

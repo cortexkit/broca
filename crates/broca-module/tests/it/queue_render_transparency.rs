@@ -506,6 +506,7 @@ async fn run_started_submission_id(
             }
             Delivery::Display(_) => {}
             Delivery::Error(error) => panic!("control-stream replay failed: {error}"),
+            Delivery::AccessEnded(refusal) => panic!("read access ended: {refusal:?}"),
             Delivery::Expired { .. } => panic!("forever subscriber expired"),
             Delivery::Detached => panic!("control stream detached before RunStarted"),
             Delivery::CursorExpired => panic!("control cursor expired before RunStarted"),

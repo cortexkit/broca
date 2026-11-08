@@ -558,6 +558,139 @@ pub fn apply_tool_call_dispatches(
     }
 }
 
+/// The creation and completion times of a page's messages, by zero-based ordinal, kept for an
+/// `include_display_facts` read before the page becomes a reply (which serves neither without
+/// the opt-in).
+#[derive(Debug, Clone, Default)]
+pub struct DisplayTimes {
+    creations: std::collections::BTreeMap<u64, u64>,
+    completions: std::collections::BTreeMap<u64, u64>,
+}
+
+impl DisplayTimes {
+    pub fn of(page: &broca_core::SessionReadPage) -> Self {
+        Self {
+            creations: page
+                .messages
+                .iter()
+                .filter_map(|entry| entry.created_at.map(|at| (entry.ordinal, at)))
+                .collect(),
+            completions: page
+                .messages
+                .iter()
+                .filter_map(|entry| entry.completed_at.map(|at| (entry.ordinal, at)))
+                .collect(),
+        }
+    }
+}
+
+/// Reasoning summaries recorded for each message, by zero-based ordinal.
+pub type RecordedSummaries =
+    std::collections::BTreeMap<u64, Vec<cortexkit_role_llm_runner::read::ReasoningSummary>>;
+
+/// What `include_display_facts` adds to each message of `response`, the same for both storages:
+/// its creation time; for an assistant message its completion time and reasoning summaries; the
+/// sender, notices and per-call times `facts` holds for it (by zero-based ordinal), and for a
+/// user message its send's `client_message_id`. A message that makes tool calls and has no
+/// per-call facts names each call with no times.
+///
+/// Today's storage reads reasoning summaries from the message's reasoning blocks (`recorded` is
+/// `None`); the new storage serves the ones it recorded when it placed the message, as a seal
+/// prunes the blocks they are read from.
+pub fn apply_display_facts(
+    response: &mut SessionReadResponse,
+    times: &DisplayTimes,
+    facts: &std::collections::BTreeMap<u64, broca_core::display_facts::DisplayFacts>,
+    recorded: Option<&RecordedSummaries>,
+) {
+    for entry in &mut response.messages {
+        entry.created_at = times.creations.get(&(entry.ordinal - 1)).copied();
+        if entry.message.role == broca_protocol::Role::Assistant {
+            entry.completed_at = times.completions.get(&(entry.ordinal - 1)).copied();
+            entry.reasoning_summaries = match recorded {
+                Some(recorded) => recorded
+                    .get(&(entry.ordinal - 1))
+                    .cloned()
+                    .unwrap_or_default(),
+                None => entry
+                    .message
+                    .content
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(part, block)| {
+                        let stored = serde_json::to_value(block).ok()?;
+                        let text = cortexkit_role_llm_runner::display::reasoning_summary(&stored)?;
+                        Some(cortexkit_role_llm_runner::read::ReasoningSummary::new(
+                            u32::try_from(part).ok()?,
+                            text,
+                        ))
+                    })
+                    .collect(),
+            };
+        }
+        if let Some(facts) = facts.get(&(entry.ordinal - 1)) {
+            entry.sender = facts.sender.clone();
+            entry.notices = facts
+                .notices
+                .iter()
+                .map(|notice| notice.fact.clone())
+                .collect();
+            if entry.message.role == broca_protocol::Role::User {
+                entry.client_message_id = facts.client_message_id.clone();
+            }
+            entry.tool_times = facts.tool_times.clone();
+        }
+        if entry.tool_times.is_empty() {
+            entry.tool_times = entry
+                .message
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    broca_protocol::ContentBlock::ToolCall(call) => Some(
+                        cortexkit_role_llm_runner::read::ToolTime::new(&call.tool_call_id.0),
+                    ),
+                    _ => None,
+                })
+                .collect();
+        }
+    }
+}
+
+/// The runs whose Rich UI stamps an `include_rich_ui` read of `response` needs: the producing
+/// run of each assistant message that names one, each once, in page order.
+pub fn rich_ui_runs(response: &SessionReadResponse) -> Vec<String> {
+    let mut runs: Vec<String> = Vec::new();
+    for entry in &response.messages {
+        if entry.message.role != broca_protocol::Role::Assistant {
+            continue;
+        }
+        if let Some(run) = &entry.run {
+            if !runs.contains(&run.run_id) {
+                runs.push(run.run_id.clone());
+            }
+        }
+    }
+    runs
+}
+
+/// Stamps each assistant message of `response` with its producing run's Rich UI stamp, from
+/// `stamps` (by run id; a run it doesn't name has none).
+pub fn apply_rich_ui(
+    response: &mut SessionReadResponse,
+    stamps: &std::collections::BTreeMap<
+        String,
+        Option<cortexkit_role_llm_runner::rich_ui::RichUiStamp>,
+    >,
+) {
+    for entry in &mut response.messages {
+        if entry.message.role != broca_protocol::Role::Assistant {
+            continue;
+        }
+        let Some(run) = &entry.run else { continue };
+        entry.rich_ui = stamps.get(&run.run_id).cloned().flatten();
+    }
+}
+
 pub fn session_read_response(
     page: broca_core::SessionReadPage,
     tools: Option<crate::registry::SessionReadTools>,
@@ -3537,21 +3670,10 @@ impl ServeHandler for crate::LineageRegistry {
             page.next_from_ordinal = None;
         }
         let prompt_len = page.prompt_len;
-        let creations: std::collections::BTreeMap<_, _> = if req.include_display_facts {
-            page.messages
-                .iter()
-                .filter_map(|entry| entry.created_at.map(|at| (entry.ordinal, at)))
-                .collect()
+        let times = if req.include_display_facts {
+            DisplayTimes::of(&page)
         } else {
-            Default::default()
-        };
-        let completions: std::collections::BTreeMap<_, _> = if req.include_display_facts {
-            page.messages
-                .iter()
-                .filter_map(|entry| entry.completed_at.map(|at| (entry.ordinal, at)))
-                .collect()
-        } else {
-            Default::default()
+            DisplayTimes::default()
         };
         let mut response = session_read_response(page, tools);
         response.history_version = snapshot.history_version;
@@ -3604,82 +3726,27 @@ impl ServeHandler for crate::LineageRegistry {
             }
         }
         if req.include_display_facts && response.lineage_id.is_some() {
-            for entry in &mut response.messages {
-                entry.created_at = creations.get(&(entry.ordinal - 1)).copied();
-                if entry.message.role == broca_protocol::Role::Assistant {
-                    entry.completed_at = completions.get(&(entry.ordinal - 1)).copied();
-                    entry.reasoning_summaries = entry
-                        .message
-                        .content
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(part, block)| {
-                            let stored = serde_json::to_value(block).ok()?;
-                            let text =
-                                cortexkit_role_llm_runner::display::reasoning_summary(&stored)?;
-                            Some(cortexkit_role_llm_runner::read::ReasoningSummary::new(
-                                u32::try_from(part).ok()?,
-                                text,
-                            ))
-                        })
-                        .collect();
-                }
-                if let Some(facts) = facts.get(&(entry.ordinal - 1)) {
-                    entry.sender = facts.sender.clone();
-                    entry.notices = facts
-                        .notices
-                        .iter()
-                        .map(|notice| notice.fact.clone())
-                        .collect();
-                    if entry.message.role == broca_protocol::Role::User {
-                        entry.client_message_id = facts.client_message_id.clone();
-                    }
-                    entry.tool_times = facts.tool_times.clone();
-                }
-                if entry.tool_times.is_empty() {
-                    entry.tool_times = entry
-                        .message
-                        .content
-                        .iter()
-                        .filter_map(|block| match block {
-                            broca_protocol::ContentBlock::ToolCall(call) => {
-                                Some(cortexkit_role_llm_runner::read::ToolTime::new(
-                                    &call.tool_call_id.0,
-                                ))
-                            }
-                            _ => None,
-                        })
-                        .collect();
-                }
-            }
+            apply_display_facts(&mut response, &times, &facts, None);
         }
         if req.include_rich_ui {
             let mut stamps = std::collections::BTreeMap::new();
-            for entry in &mut response.messages {
-                if entry.message.role != broca_protocol::Role::Assistant {
-                    continue;
-                }
-                let Some(run) = &entry.run else { continue };
-                if let std::collections::btree_map::Entry::Vacant(slot) =
-                    stamps.entry(run.run_id.clone())
-                {
-                    let stamp = self
-                        .session_log(&req.session, &run.run_id)
-                        .await?
-                        .into_iter()
-                        .flatten()
-                        .find_map(|record| match record {
-                            broca_wal::WalRecord::RunStarted {
-                                run_id, manifest, ..
-                            } if run_id.0 == run.run_id => {
-                                manifest.and_then(|manifest| manifest.rich_ui)
-                            }
-                            _ => None,
-                        });
-                    slot.insert(stamp);
-                }
-                entry.rich_ui = stamps[&run.run_id].clone();
+            for run_id in rich_ui_runs(&response) {
+                let stamp = self
+                    .session_log(&req.session, &run_id)
+                    .await?
+                    .into_iter()
+                    .flatten()
+                    .find_map(|record| match record {
+                        broca_wal::WalRecord::RunStarted {
+                            run_id: started,
+                            manifest,
+                            ..
+                        } if started.0 == run_id => manifest.and_then(|manifest| manifest.rich_ui),
+                        _ => None,
+                    });
+                stamps.insert(run_id, stamp);
             }
+            apply_rich_ui(&mut response, &stamps);
         }
         if had_late || late_only {
             response.late_approvals = late;

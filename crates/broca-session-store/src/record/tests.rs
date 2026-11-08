@@ -135,6 +135,7 @@ fn one_of_each() -> Vec<Record> {
         Record::StepStart(StepStart {
             run_id: "run-1".into(),
             step_id: 1,
+            mid: Some("gabc.4".into()),
         }),
         Record::StepEnd(StepEnd {
             run_id: "run-1".into(),
@@ -185,6 +186,7 @@ fn one_of_each() -> Vec<Record> {
             batch_id: "b1".into(),
             step_id: 1,
             planned: vec![ToolCallId("c1".into())],
+            mid: Some("gabc.9".into()),
         }),
         Record::BatchEnd(BatchEnd {
             run_id: "run-1".into(),

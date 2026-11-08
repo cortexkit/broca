@@ -98,6 +98,9 @@ pub struct StoreActor<B: SessionBackend> {
     /// The module's stop, once the actor serves in a module: work a send waits on, such as its
     /// input transforms, gives up when it fires.
     seal: CancellationToken,
+    /// The session's subscriptions, once the actor can read its records apart from the writer
+    /// (see [`StoreActor::with_readers`]); without it `session.subscribe` is refused by name.
+    fanout: Option<crate::store_fanout::StoreFanout<B>>,
     /// Where finished runs' facts are kept, shared with the module's reads (see `with_settled`).
     settled: Option<Arc<crate::store_status::SettledRuns>>,
 }
@@ -270,8 +273,54 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             compaction_session: Arc::default(),
             pending_views: Vec::new(),
             seal: CancellationToken::new(),
+            fanout: None,
             settled: None,
         }
+    }
+
+    /// The actor serves `session.subscribe`, catching subscribers up over backends `readers`
+    /// makes: handles on the session's storage that only read.
+    pub fn with_readers(mut self, readers: Arc<dyn Fn() -> B + Send + Sync>) -> Self {
+        self.fanout = Some(crate::store_fanout::StoreFanout::new(
+            &mut self.session,
+            readers,
+        ));
+        self
+    }
+
+    /// [`StoreActor::with_readers`], with each seeding of the live projection held until `gate`
+    /// is notified.
+    #[cfg(test)]
+    pub(crate) fn with_readers_held(
+        mut self,
+        readers: Arc<dyn Fn() -> B + Send + Sync>,
+        gate: Arc<tokio::sync::Notify>,
+    ) -> Self {
+        self.fanout = Some(crate::store_fanout::StoreFanout::held(
+            &mut self.session,
+            readers,
+            gate,
+        ));
+        self
+    }
+
+    /// Attaches a subscriber from `from`, or after the session's last record when `live`.
+    fn subscribe(
+        &mut self,
+        from: crate::fanout::FromCursor,
+        live: bool,
+        sink: mpsc::Sender<crate::fanout::Delivery>,
+    ) -> crate::actor::SubscribeOutcome {
+        let Some(fanout) = self.fanout.as_mut() else {
+            return crate::actor::SubscribeOutcome::Error(unserved("subscribe"));
+        };
+        let from = if live {
+            crate::fanout::AttachFrom::Live
+        } else {
+            crate::fanout::AttachFrom::Cursor(from)
+        };
+        fanout.attach(&self.session, from, sink);
+        crate::actor::SubscribeOutcome::Attached
     }
 
     /// The actor serves finished runs' facts from `settled`, and keeps the ones it reads there,
@@ -287,6 +336,14 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         &mut self,
         request: &crate::store_reads::StoreReadRequest,
     ) -> crate::store_reads::StoreReadOutcome {
+        // Made durable first, so the live projection has published every batch the read sees
+        // and its last unit is the read's head.
+        if let Some(refused) = crate::store_reads::durable_for_read(&mut self.session).await {
+            return refused;
+        }
+        if let Some(fanout) = self.fanout.as_mut() {
+            fanout.ensure_seeded(&self.session);
+        }
         let addr = broca_core::session_addr(&self.key);
         let live_step = self
             .run
@@ -305,6 +362,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 .map(|settled| (settled, addr.as_str())),
             session_name: &self.key.session,
             live_step: live_step.as_ref(),
+            stream_head: self.fanout.as_ref().and_then(|fanout| fanout.head()),
         };
         crate::store_reads::answer_in_memory(&mut self.session, &context, request).await
     }
@@ -1004,6 +1062,15 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 let _ = reply.send(outcome);
                 exit
             }
+            LineageCmd::Subscribe {
+                from,
+                live,
+                sink,
+                reply,
+            } if self.fanout.is_some() => {
+                let _ = reply.send(self.subscribe(from, live, sink));
+                false
+            }
             LineageCmd::StoreRead { request, reply } => {
                 let _ = reply.send(self.store_read(&request).await);
                 false
@@ -1090,9 +1157,16 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         let parts: Box<dyn Parts> = Box::new(self.parts.clone());
         let executor = Arc::clone(&self.executor);
         let (out, mut events) = mpsc::channel(256);
-        // Nothing subscribes to a store session's events yet; they're drained so the run never
-        // waits on a full channel.
-        tokio::spawn(async move { while events.recv().await.is_some() {} });
+        match &self.fanout {
+            Some(fanout) => {
+                crate::store_fanout::drain_display(events, fanout.display());
+            }
+            // Without subscriptions the run's output is drained so it never waits on a full
+            // channel.
+            None => {
+                tokio::spawn(async move { while events.recv().await.is_some() {} });
+            }
+        }
         let job = StoreRunJob {
             req,
             auth,
@@ -2588,5 +2662,7 @@ mod read_cost;
 mod reads_tests;
 #[cfg(test)]
 mod status_tests;
+#[cfg(test)]
+mod subscribe_tests;
 #[cfg(test)]
 mod tests;

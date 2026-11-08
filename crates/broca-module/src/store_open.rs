@@ -205,6 +205,7 @@ impl StoreRuntime {
             settled: Some((self.settled_runs(), &addr)),
             session_name: &key.session,
             live_step,
+            stream_head: None,
         };
         for _ in 0..POSITION_TRIES {
             let Some(handle) = registry.open_handle(key) else {
@@ -292,6 +293,8 @@ impl StoreRuntime {
         )
         .with_storage(storage)
         .with_settled(Arc::clone(&self.settled));
+        let readers_root = store_root(&self.state_root);
+        actor = actor.with_readers(Arc::new(move || LocalBackend::new(readers_root.clone())));
         if let Some(billing) = &self.billing {
             actor = actor.with_billing(billing.clone());
         }

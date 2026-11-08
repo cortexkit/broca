@@ -701,7 +701,8 @@ mod tests {
             let mut placed = crate::entries::Placed {
                 inner: &mut writer,
                 facts: crate::entries::Tags::default(),
-                intents: Default::default(),
+                calls: Default::default(),
+                rich_ui: None,
             };
             placed.append(&[input("placed")], true).await.unwrap();
         };

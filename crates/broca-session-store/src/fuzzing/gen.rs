@@ -480,6 +480,12 @@ mod records {
         CallOutcome::NotDispatched,
     );
     variants!(BudgetFiring: BudgetFiring::Nudge, BudgetFiring::Finalize);
+    variants!(
+        Unanswered: Unanswered::Denied,
+        Unanswered::NotExecuted,
+        Unanswered::Interrupted,
+        Unanswered::Cancelled,
+    );
     variants!(CancelPoint: CancelPoint::Now, CancelPoint::StepBoundary);
     variants!(
         ChangeKind: ChangeKind::Cut,
@@ -572,6 +578,7 @@ mod records {
         dispatched_to,
         dispatched_at_ms,
         finished_at_ms,
+        unanswered,
     });
     crate::fuzzing::gen::fields!(ResultAppend {
         run_id,
@@ -615,6 +622,14 @@ mod records {
         client_message_id,
         sender,
         marks,
+        no_display_facts,
+        reasoning_summaries,
+        rich_ui,
+    });
+    crate::fuzzing::gen::fields!(ReasoningSummary { part, text });
+    crate::fuzzing::gen::fields!(RichUi {
+        dialect,
+        catalog_digest
     });
     crate::fuzzing::gen::fields!(PartRef { kind, digest });
     crate::fuzzing::gen::fields!(SetupStub {
@@ -661,7 +676,11 @@ mod records {
         interrupt_reason,
         error,
     });
-    crate::fuzzing::gen::fields!(StepStart { run_id, step_id });
+    crate::fuzzing::gen::fields!(StepStart {
+        run_id,
+        step_id,
+        mid
+    });
     crate::fuzzing::gen::fields!(StepEnd {
         run_id,
         step_id,
@@ -711,7 +730,8 @@ mod records {
         run_id,
         batch_id,
         step_id,
-        planned
+        planned,
+        mid
     });
     crate::fuzzing::gen::fields!(BatchEnd { run_id, batch_id });
     crate::fuzzing::gen::fields!(ToolIntent {
@@ -1012,7 +1032,8 @@ mod operations {
     crate::fuzzing::gen::fields!(OpenBatch {
         batch_id,
         step_id,
-        calls
+        calls,
+        results_mid
     });
     crate::fuzzing::gen::fields!(PendingInput {
         seq,
@@ -1021,6 +1042,8 @@ mod operations {
         written_at_ms,
         tags_v1,
         submission_id,
+        sender,
+        request_identity_digest,
     });
     crate::fuzzing::gen::fields!(NaturalEnd { stop, extendable });
     crate::fuzzing::gen::fields!(Budget {
@@ -1061,7 +1084,8 @@ mod operations {
         step_request,
         step_attempt,
         end_error,
-        end_usage
+        end_usage,
+        step_mid
     });
     crate::fuzzing::gen::fields!(StepAttempt { step_id, ts_ms });
     crate::fuzzing::gen::fields!(StepRequest {
@@ -1082,7 +1106,9 @@ mod operations {
     crate::fuzzing::gen::fields!(Pending {
         submission_id,
         interrupt,
-        ordered
+        ordered,
+        sender,
+        request_identity_digest,
     });
     crate::fuzzing::gen::fields!(Operations {
         run,

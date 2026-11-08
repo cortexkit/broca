@@ -376,6 +376,66 @@ pub(crate) fn run(args: &Args) {
 mod tests {
     use super::*;
 
+    /// A page message as JSON, for comparing two pages field by field.
+    fn page_message_json(message: &broca_core::SessionReadMessage) -> Value {
+        json!({
+            "ordinal": message.ordinal,
+            "created_at": message.created_at,
+            "written_at": message.written_at,
+            "completed_at": message.completed_at,
+            "message": message.message,
+            "run": message.run,
+        })
+    }
+
+    /// Every page of a transcript, walked from the start by `next_from_ordinal`, `limit`
+    /// messages at a time, with each page's state (lineage state, length, next ordinal).
+    fn walk_pages<F>(mut page: F, limit: u64) -> Result<(Vec<Value>, Vec<String>), String>
+    where
+        F: FnMut(u64, u64) -> Result<broca_core::SessionReadPage, String>,
+    {
+        let mut messages = Vec::new();
+        let mut states = Vec::new();
+        let mut from = 0;
+        loop {
+            let read = page(from, limit)?;
+            states.push(format!(
+                "{:?} len {} next {:?}",
+                read.lineage_state, read.prompt_len, read.next_from_ordinal
+            ));
+            messages.extend(read.messages.iter().map(page_message_json));
+            match read.next_from_ordinal {
+                Some(next) if next > from => from = next,
+                _ => return Ok((messages, states)),
+            }
+        }
+    }
+
+    /// [`walk_pages`] over the pages the new format serves for `session`.
+    async fn walk_store_pages(
+        session: &Session<&MemoryBackend>,
+        limit: u64,
+    ) -> Result<(Vec<Value>, Vec<String>), String> {
+        let mut messages = Vec::new();
+        let mut states = Vec::new();
+        let mut from = 0;
+        loop {
+            let read = broca_module::store_read::read_page(session, Some(from), Some(limit))
+                .await
+                .map_err(|e| format!("{e:?}"))?
+                .page;
+            states.push(format!(
+                "{:?} len {} next {:?}",
+                read.lineage_state, read.prompt_len, read.next_from_ordinal
+            ));
+            messages.extend(read.messages.iter().map(page_message_json));
+            match read.next_from_ordinal {
+                Some(next) if next > from => from = next,
+                _ => return Ok((messages, states)),
+            }
+        }
+    }
+
     const RUN: &str = r#"{"type":"run_started","run_id":"r1","session":{"project_root":"/project","harness":"runner","session":"s"},"config":{"model":{"provider_module_id":"p","model_id":"m"},"tools":[{"name":"bash","description":"run","input_schema":{"type":"object"},"execution_mode":"parallel"}],"tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},"context_epoch":0,"renderer_version":1},"input":[{"role":"user","content":[{"type":"text","text":"hi"}]}],"origin":{"kind":"fresh"}}"#;
 
     fn log(lines: &[&str]) -> Vec<broca_wal::FramedRecord> {
@@ -498,6 +558,70 @@ mod tests {
         }
     }
 
+    /// A step that repeats a call id: the first copy is sent, and the second is answered with
+    /// the duplicate error without being sent. Today keys each copy by its own record, the first
+    /// by its intent and the second by its answer, and the store serves the same two keys, at
+    /// every cut and on the closed turn.
+    #[test]
+    fn a_repeated_call_id_keys_each_copy_by_its_own_record() {
+        let lines = [
+            RUN,
+            r#"{"type":"step_started","step_id":1}"#,
+            r#"{"type":"model_step_finished","step_id":1,"assistant_message":{"message_id":"m1","content":[{"type":"tool_call","tool_call_id":"c1","tool_name":"bash","input":{"cmd":"ls"}},{"type":"tool_call","tool_call_id":"c1","tool_name":"bash","input":{"cmd":"pwd"}}]},"usage":{"input_tokens":3},"finish_reason":"tool_calls","retries_used":0}"#,
+            r#"{"type":"tool_batch_started","batch_id":"b1","step_id":1,"planned_calls":["c1","c1"]}"#,
+            r#"{"type":"tool_dispatch_intent","batch_id":"b1","tool_call_id":"c1","args":{"cmd":"ls"},"module_id":"tools"}"#,
+            r#"{"type":"tool_result","batch_id":"b1","result":{"tool_call_id":"c1","output":{"kind":"text","text":"ok"},"is_error":false},"outcome":"completed"}"#,
+            r#"{"type":"tool_result","batch_id":"b1","result":{"tool_call_id":"c1","output":{"kind":"error","message":"duplicate tool_call_id from provider"},"is_error":true},"outcome":"completed"}"#,
+            r#"{"type":"tool_batch_finished","batch_id":"b1"}"#,
+        ];
+        let old = log(&lines);
+        for end in [5, 6, 7, 8] {
+            let framed = &old[..end];
+            let today = today(framed, Some("l1"), 50).unwrap();
+            let keys: Vec<&Value> = today
+                .iter()
+                .flat_map(|message| message["tool_calls"].as_array().into_iter().flatten())
+                .map(|call| &call["call_key"])
+                .collect();
+            if end >= 7 {
+                assert_eq!(
+                    keys,
+                    [&json!("l1:5"), &json!("l1:7")],
+                    "today keys each copy by its own record, after record {end}"
+                );
+            }
+            assert_eq!(store_of(framed, "l1"), today, "after record {end}");
+        }
+        // The conversion keys the second copy's outcome by its answer, and its turn's facts name
+        // both keys.
+        use broca_session_store::record::Record;
+        let converted = broca_session_convert::convert(&old, Some("l1")).unwrap();
+        let outcome_keys: Vec<Option<&str>> = converted
+            .records
+            .iter()
+            .filter_map(|record| match record {
+                Record::ToolOutcome(outcome) => Some(outcome.call_key.as_deref()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(outcome_keys, [None, Some("l1:7")]);
+        let turn = converted
+            .records
+            .iter()
+            .rev()
+            .find_map(|record| match record {
+                Record::TurnFacts(turn) => Some(turn),
+                _ => None,
+            })
+            .expect("the turn has facts");
+        let turn_keys: Vec<&str> = turn
+            .calls
+            .iter()
+            .map(|call| call.call_key.as_str())
+            .collect();
+        assert_eq!(turn_keys, ["l1:5", "l1:7"]);
+    }
+
     /// A batch's results enter the transcript only once the batch closes, on both storages:
     /// broca may still join a delivered note to the last result as the batch closes, so a read
     /// between the batch's last result and its end shows the assistant message without them,
@@ -518,7 +642,7 @@ mod tests {
         // After the intent, after the batch's last result, after its end.
         for (end, messages) in [(5, 2), (6, 2), (7, 3)] {
             let framed = &old[..end];
-            let today = crate::walk_pages(
+            let today = walk_pages(
                 |from, limit| {
                     broca_core::read_session_page(
                         &broca_core::StorePageSnapshot::empty(),
@@ -549,7 +673,7 @@ mod tests {
                         .await
                         .unwrap();
                 }
-                crate::walk_store_pages(&session, 7).await.unwrap()
+                walk_store_pages(&session, 7).await.unwrap()
             });
             assert_eq!(
                 today.0.len(),

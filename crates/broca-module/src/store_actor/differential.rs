@@ -21,7 +21,7 @@ use broca_session_store::backend::MemoryBackend;
 use broca_session_store::session::Session;
 use tokio::sync::{mpsc, Notify};
 
-use super::tests::{actor, auth_failure, executor, request, texts, Gated};
+use super::tests::{auth_failure, executor, request, texts, Gated};
 use crate::actor::{LineageStatus, SendKey, SendOutcome};
 use crate::executor::{RunExecutor, RunJob, RunKind};
 use crate::registry::LineageRegistry;
@@ -362,7 +362,13 @@ async fn compare(script: Vec<Vec<NormalizedEvent>>, gated: bool, steps: Vec<Step
     let today_gate = gated.then(|| Arc::new(Notify::new()));
     let store_gate = gated.then(|| Arc::new(Notify::new()));
     let today = today(script.clone(), today_gate.clone());
-    let (commands, served, _) = actor(executor(script, store_gate.clone())).await;
+    // The store actor's setup parts, kept so its session's reads after the steps can name the
+    // tools and plans its runs started with.
+    let parts = broca_session_loop::parts::SharedParts::new(Box::new(
+        broca_session_loop::parts::MemoryParts::default(),
+    ));
+    let (commands, served, _) =
+        super::tests::actor_with(executor(script, store_gate.clone()), parts.clone()).await;
     let mut all_same = true;
     for (index, step) in steps.into_iter().enumerate() {
         match step {
@@ -436,6 +442,12 @@ async fn compare(script: Vec<Vec<NormalizedEvent>>, gated: bool, steps: Vec<Step
             }
         }
     }
+    if all_same {
+        streams::assert_alike(
+            &streams::store(&commands).await,
+            &streams::routed(&today.registry, &today.key).await,
+        );
+    }
     drop(commands);
     let session: Session<&'static MemoryBackend> = served.await.unwrap();
     if all_same {
@@ -449,8 +461,131 @@ async fn compare(script: Vec<Vec<NormalizedEvent>>, gated: bool, steps: Vec<Step
             today.starts(),
             "the run starts record the sends differently"
         );
+        display_reads_alike(&today, &session, &parts).await;
     }
     assert!(today.registry.stop_and_seal().await);
+}
+
+/// The read modes that add to a reply: display facts, tools, Rich UI stamps, each alone and all
+/// together.
+const OPTED: [(bool, bool, bool); 4] = [
+    (true, false, false),
+    (false, true, false),
+    (false, false, true),
+    (true, true, true),
+];
+
+/// The pages read in each mode: the newest, the first message alone, and three from the second.
+const PAGES: [(Option<u64>, Option<u64>); 3] =
+    [(None, None), (Some(1), Some(1)), (Some(2), Some(3))];
+
+/// A read of `session` from `from`, `limit` messages, opted in as `opted` says.
+fn opted_request(
+    session: &BindIdentity,
+    (from, limit): (Option<u64>, Option<u64>),
+    (display, tools, rich_ui): (bool, bool, bool),
+) -> crate::serve::SessionReadRequest {
+    let mut request = crate::serve::SessionReadRequest::new(session.clone(), from, limit);
+    request.include_display_facts = display;
+    request.include_tools = tools;
+    request.include_rich_ui = rich_ui;
+    request
+}
+
+/// `session.read` with what each opt-in adds, on a few pages: today's actor's reply and the
+/// store actor's session's, compared as [`comparable_read`] leaves them.
+async fn display_reads_alike(
+    today: &Today,
+    session: &Session<&'static MemoryBackend>,
+    parts: &broca_session_loop::parts::SharedParts,
+) {
+    use crate::serve::ServeHandler;
+    for opted in OPTED {
+        for page in PAGES {
+            let request = opted_request(&today.key, page, opted);
+            let old = today
+                .registry
+                .read(request.clone())
+                .await
+                .expect("today's session reads");
+            let new = crate::store_read::serve_view(session, parts, &request)
+                .await
+                .expect("the store's session reads");
+            assert_eq!(
+                comparable_read(&new),
+                comparable_read(&old),
+                "display facts, tools, rich ui {opted:?}, page {page:?}"
+            );
+        }
+    }
+}
+
+/// The same reads through each module's registry: a session on today's storage, and one the
+/// new storage keeps.
+async fn opted_reads_alike(today: &Module, store: &Module, label: &str) {
+    use crate::serve::ServeHandler;
+    for opted in OPTED {
+        for page in PAGES {
+            let old = today
+                .registry
+                .read(opted_request(&today.key, page, opted))
+                .await
+                .expect("today's session reads");
+            let new = store
+                .registry
+                .read(opted_request(&store.key, page, opted))
+                .await
+                .expect("the store's session reads");
+            assert_eq!(
+                comparable_read(&new),
+                comparable_read(&old),
+                "{label}: display facts, tools, rich ui {opted:?}, page {page:?}"
+            );
+        }
+    }
+}
+
+/// A `session.read` reply as JSON, with what each storage keeps for itself taken out: the log
+/// identity (`incarnation`), the history version each counts for itself, the subscribe cursor
+/// (`head`), each message's id, which each mints in its own form, and each call's key, which
+/// names a record of its own log. Wall-clock times, which each run stamps for itself, are kept
+/// as whether they're present, and so are call keys.
+fn comparable_read(reply: &broca_wire::SessionReadResponse) -> serde_json::Value {
+    fn presence(object: &mut serde_json::Map<String, serde_json::Value>, members: &[&str]) {
+        for member in members {
+            if let Some(value) = object.get_mut(*member) {
+                *value = serde_json::json!(!value.is_null());
+            }
+        }
+    }
+    let mut value = serde_json::to_value(reply).unwrap();
+    for member in ["incarnation", "history_version", "head"] {
+        value.as_object_mut().unwrap().remove(member);
+    }
+    for message in value["messages"].as_array_mut().unwrap() {
+        let message = message.as_object_mut().unwrap();
+        message.remove("mid");
+        presence(message, &["written_at", "created_at", "completed_at"]);
+        for list in ["tool_calls", "tool_times", "notices"] {
+            for item in message
+                .get_mut(list)
+                .and_then(serde_json::Value::as_array_mut)
+                .into_iter()
+                .flatten()
+            {
+                if let Some(item) = item.as_object_mut() {
+                    presence(item, &["call_key", "started_at", "finished_at"]);
+                }
+            }
+        }
+        if let Some(delivered) = message
+            .get_mut("delivered_as")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            presence(delivered, &["call_key"]);
+        }
+    }
+    value
 }
 
 /// What each run's start in `session` recorded about its send, in the shape [`Today::starts`]
@@ -1396,6 +1531,7 @@ async fn a_store_session_reads_as_the_same_history_on_todays_storage() {
     // The ids served are the ones the session stored when it placed each message.
     let (_, all) = read_json(&store, Some(1), None, None).await;
     assert_eq!(all, store.stored_mids().await);
+    opted_reads_alike(&today, &store, "two finished runs").await;
     // A cursor naming another history version is refused, never answered.
     use crate::serve::{ServeHandler, SessionReadRequest};
     let mut stale = SessionReadRequest::new(store.key.clone(), None, Some(1));
@@ -1410,3 +1546,4 @@ async fn a_store_session_reads_as_the_same_history_on_todays_storage() {
 mod controls;
 mod head;
 mod ordered;
+mod streams;

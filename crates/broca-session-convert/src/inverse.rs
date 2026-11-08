@@ -511,6 +511,8 @@ pub fn invert(records: &[Record], parts: &BTreeMap<Digest, Vec<u8>>) -> Result<V
                 unclaimed(&pending, other.name())?;
                 out.push(match other {
                     Record::RunEnd(end) => today::run_finished(end),
+                    // Today's records have no message id on a step or batch start: the
+                    // converter filled it from today's id rule, so it is left out here.
                     Record::StepStart(start) => serde_json::json!({
                         "type": "step_started",
                         "step_id": start.step_id,

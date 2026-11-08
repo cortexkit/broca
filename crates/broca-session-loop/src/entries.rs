@@ -19,10 +19,10 @@ use broca_core::compaction_v2::metadata::{numbered_parts, step_usage};
 use broca_protocol::content::{ContentBlock, Message, Role};
 use broca_protocol::ToolCallId;
 use broca_session_store::fold::conversation::{Conversation, Delivered};
-use broca_session_store::fold::operations::Operations;
+use broca_session_store::fold::operations::{CallState, Operations};
 use broca_session_store::record::{
-    CallFacts, EntryFacts, Notice, Placement, Record, RideForm, StepUsage, ToolIntent, TurnFacts,
-    ViewRef,
+    CallFacts, CallOutcome, EntryFacts, Notice, Placement, ReasoningSummary, Record, RichUi,
+    RideForm, StepUsage, ToolIntent, ToolOutcome, ToolReply, TurnFacts, Unanswered, ViewRef,
 };
 use broca_session_store::session::{SessionError, StoredEntry};
 use cortexkit_role_compaction::read::Entry;
@@ -38,45 +38,189 @@ pub struct Placed<'w, W> {
     pub inner: &'w mut W,
     /// The run's tag rules.
     pub facts: Tags,
-    /// The dispatch intents of the open batch's calls, as far as this writer has seen them
-    /// appended or looked them up.
-    pub intents: Intents,
+    /// What this writer knows of the open batch's calls.
+    pub calls: OpenCalls,
+    /// The Rich UI stamp the run's plan froze, which the run's assistant messages record.
+    pub rich_ui: Option<RichUi>,
 }
 
-/// Dispatch intents by the call key each recorded. A tool turn's facts name, for each call, the
-/// key and module its intent recorded, which the operational fold doesn't keep: it keeps only
-/// that an intent was recorded, and its key.
+/// What a tool turn's facts name about its calls that the operational fold doesn't keep, as far
+/// as this writer has seen it appended or looked it up: each dispatch intent, by the call key it
+/// recorded, with its seq where known (the fold keeps only that an intent was recorded, and its
+/// key), and each call's terminal in the open batch, in the order they were recorded (the fold
+/// keeps only the kind).
 #[derive(Debug, Default)]
-pub struct Intents(HashMap<String, ToolIntent>);
+pub struct OpenCalls {
+    intents: HashMap<String, (ToolIntent, Option<u64>)>,
+    /// The batch the terminals were recorded in, and the terminals.
+    terminals: Option<(String, Vec<Terminal>)>,
+}
+
+/// What a tool call's terminal says about it, as reads serve it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Terminal {
+    tool_call_id: ToolCallId,
+    /// The tool answered: reads serve the answer's time (`finished_at_ms`) as the call's finish.
+    answered: bool,
+    finished_at_ms: Option<u64>,
+    unanswered: Option<Unanswered>,
+    /// The call never left: it took no dispatch intent.
+    refused: bool,
+    /// The seq of the outcome record, which orders it among the turn's other call records.
+    seq: u64,
+    /// The key the outcome recorded for a call answered without a dispatch intent
+    /// (`ToolOutcome::call_key`).
+    call_key: Option<String>,
+}
+
+impl Terminal {
+    /// The terminal the reply `reply` and its outcome `outcome`, at `seq`, record. A call its tool
+    /// answered has its answer's time; any other has why it has no answer, by today's rules:
+    /// a refusal or a policy block is `denied`, a call that was never sent or failed validation
+    /// is `not_executed`, one abandoned or sent without an answer back is `interrupted`, and one
+    /// a step limit stopped is `cancelled`.
+    pub fn of(reply: &ToolReply, outcome: &ToolOutcome, seq: u64) -> Self {
+        use broca_protocol::content::ToolOutput;
+        let unanswered = match outcome.outcome {
+            CallOutcome::Completed => match &reply.result.output {
+                ToolOutput::Denied { .. } => Some(Unanswered::Denied),
+                ToolOutput::Error {
+                    nothing_sent: Some(true),
+                    ..
+                } => Some(Unanswered::NotExecuted),
+                _ => None,
+            },
+            CallOutcome::Unknown | CallOutcome::Interrupted => Some(Unanswered::Interrupted),
+            CallOutcome::MaxSteps => Some(Unanswered::Cancelled),
+            CallOutcome::NotDispatched => match outcome
+                .detail
+                .as_ref()
+                .and_then(|detail| detail.get("kind"))
+                .and_then(serde_json::Value::as_str)
+            {
+                Some("denied" | "policy_blocked") => Some(Unanswered::Denied),
+                Some("validation_failed" | "unavailable") => Some(Unanswered::NotExecuted),
+                _ => None,
+            },
+        };
+        Self {
+            tool_call_id: outcome.tool_call_id.clone(),
+            answered: outcome.outcome == CallOutcome::Completed && unanswered.is_none(),
+            finished_at_ms: reply.finished_at_ms,
+            unanswered,
+            refused: outcome.outcome == CallOutcome::NotDispatched,
+            seq,
+            call_key: outcome.call_key.clone(),
+        }
+    }
+}
+
+/// The terminals of batch `batch` among `records`, each a reply followed by its outcome, in order.
+fn terminals_in<'r>(
+    records: impl IntoIterator<Item = (u64, &'r Record)>,
+    batch: &str,
+) -> Vec<Terminal> {
+    let mut reply = None;
+    let mut terminals = Vec::new();
+    for (seq, record) in records {
+        match record {
+            Record::ToolReply(next) => reply = Some(next),
+            Record::ToolOutcome(outcome) if outcome.batch_id == batch => {
+                if let Some(reply) = reply
+                    .take()
+                    .filter(|reply| reply.result.tool_call_id == outcome.tool_call_id)
+                {
+                    terminals.push(Terminal::of(reply, outcome, seq));
+                }
+            }
+            _ => {}
+        }
+    }
+    terminals
+}
+
+/// The seq a call key the run loop minted names (`format!("{session}:{seq}")`), if `key` is one
+/// of this session's.
+fn key_seq(key: &str, session: &str) -> Option<u64> {
+    key.strip_prefix(session)?.strip_prefix(':')?.parse().ok()
+}
+
+impl OpenCalls {
+    /// Notes what `records`, the first at `first_seq`, record about the open batch's calls.
+    fn note(&mut self, records: &[Record], first_seq: u64) {
+        for (seq, record) in (first_seq..).zip(records) {
+            if let Record::ToolIntent(intent) = record {
+                if let Some(key) = &intent.call_key {
+                    self.intents
+                        .insert(key.clone(), (intent.clone(), Some(seq)));
+                }
+            }
+        }
+        let Some(batch) = records.iter().rev().find_map(|record| match record {
+            Record::ToolOutcome(outcome) => Some(outcome.batch_id.clone()),
+            _ => None,
+        }) else {
+            return;
+        };
+        let terminals = terminals_in((first_seq..).zip(records), &batch);
+        match &mut self.terminals {
+            Some((known, noted)) if *known == batch => noted.extend(terminals),
+            _ => self.terminals = Some((batch, terminals)),
+        }
+    }
+
+    /// The terminals recorded in batch `batch`.
+    fn terminals_of(&self, batch: &str) -> &[Terminal] {
+        match &self.terminals {
+            Some((known, terminals)) if known == batch => terminals,
+            _ => &[],
+        }
+    }
+}
 
 impl<W: Writer> Placed<'_, W> {
-    /// Learns the intent of every call of the open batch that has one and isn't known yet: those
-    /// written before this writer was made (by a run a resume continues, say). A call's intent
-    /// may already be sealed, so it's found through the session's id lookup.
-    async fn learn_open_intents(&mut self) -> Result<(), SessionError> {
-        let missing: Vec<String> = self
+    /// Learns what the open batch's calls recorded before this writer was made (by a run a
+    /// resume continues, say): the intent of every call that has one, found through the
+    /// session's id lookup since it may already be sealed, and the terminals, read from the open
+    /// log, which holds every record of a batch still open.
+    async fn learn_open_calls(&mut self) -> Result<(), SessionError> {
+        let Some(batch) = self
             .inner
             .operations()
             .run
             .as_ref()
             .and_then(|run| run.open_batch.as_ref())
-            .map(|batch| {
-                // A call answered without an intent has its outcome's key, and no intent.
-                batch
-                    .calls
-                    .iter()
-                    .filter(|call| call.intent)
-                    .filter_map(|call| call.key.as_deref())
-                    .filter(|key| !self.intents.0.contains_key(*key))
-                    .map(str::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default();
+        else {
+            return Ok(());
+        };
+        // A call answered without an intent has its outcome's key, and no intent.
+        let missing: Vec<String> = batch
+            .calls
+            .iter()
+            .filter(|call| call.intent)
+            .filter_map(|call| call.key.as_deref())
+            .filter(|key| !self.calls.intents.contains_key(*key))
+            .map(str::to_owned)
+            .collect();
+        let answered = (0..batch.calls.len())
+            .filter(|position| batch.state(*position) == CallState::Terminated)
+            .count();
+        let batch_id = batch.batch_id.clone();
+        let session = self.inner.session_id();
         for key in missing {
             let intent = self.inner.tool_intent(&key).await?.ok_or_else(|| {
                 SessionError::Fold(format!("no dispatch intent records the call key {key}"))
             })?;
-            self.intents.0.insert(key, intent);
+            let seq = key_seq(&key, &session);
+            self.calls.intents.insert(key, (intent, seq));
+        }
+        if self.calls.terminals_of(&batch_id).len() < answered {
+            let records = self.inner.open_log_records().await?;
+            let terminals = terminals_in(
+                records.iter().map(|(seq, record)| (*seq, record)),
+                &batch_id,
+            );
+            self.calls.terminals = Some((batch_id, terminals));
         }
         Ok(())
     }
@@ -125,24 +269,30 @@ impl<W: Writer> Writer for Placed<'_, W> {
                   + Send),
         barrier: bool,
     ) -> Result<Vec<Record>, SessionError> {
-        self.learn_open_intents().await?;
+        self.learn_open_calls().await?;
         let tags = self.facts;
         let prefix = self.inner.message_id_prefix();
+        let session = self.inner.session_id();
         let mut failure = None;
-        let intents = &self.intents;
+        let mut first = 0;
+        let calls = &self.calls;
+        let rich_ui = self.rich_ui.as_ref();
         let records = self
             .inner
             .append_with(
                 &mut |conversation, operations, first_seq| {
+                    first = first_seq;
                     let batch = build(conversation, operations, first_seq);
                     let placing = Placing {
                         conversation,
                         first_seq,
                         prefix: &prefix,
+                        session: &session,
                         tags,
                         view: written_under(operations),
                         operations,
-                        intents,
+                        calls,
+                        rich_ui,
                     };
                     match with_facts(batch, &placing) {
                         Ok(batch) => batch,
@@ -158,13 +308,7 @@ impl<W: Writer> Writer for Placed<'_, W> {
         match failure {
             Some(error) => Err(SessionError::Fold(error)),
             None => {
-                for record in &records {
-                    if let Record::ToolIntent(intent) = record {
-                        if let Some(key) = &intent.call_key {
-                            self.intents.0.insert(key.clone(), intent.clone());
-                        }
-                    }
-                }
+                self.calls.note(&records, first);
                 Ok(records)
             }
         }
@@ -316,20 +460,26 @@ pub struct Placing<'a> {
     pub first_seq: u64,
     /// The writer's message id prefix (`Writer::message_id_prefix`).
     pub prefix: &'a str,
+    /// The session's id, which a call key names (`Writer::session_id`).
+    pub session: &'a str,
     pub tags: Tags,
     /// The compaction view the current step rendered with.
     pub view: Option<ViewRef>,
     /// The operational state before the batch: the step's request, the pending steers and the
     /// queue the batch's messages come from.
     pub operations: &'a Operations,
-    /// The intents of the open batch's calls, by call key.
-    pub intents: &'a Intents,
+    /// What the writer knows of the open batch's calls.
+    pub calls: &'a OpenCalls,
+    /// The run's Rich UI stamp (`Placed::rich_ui`).
+    pub rich_ui: Option<&'a RichUi>,
 }
 
 /// `batch` with an `EntryFacts` record after the records that place or reserve each message:
 /// after an assistant message and its step's end, after a tool result and its outcome, and after
 /// a run of input messages together with the step start or run end that places them, as the
-/// converter places them for a converted session.
+/// converter places them for a converted session. The batch that places a tool turn's results
+/// also gets the turn's facts after them ([`turn_facts`]); a run's end as cancelled restates its
+/// last turn's facts with the calls it abandoned as cancelled, as today's reads state them.
 pub fn with_facts(batch: Vec<Record>, at: &Placing<'_>) -> Result<Vec<Record>, String> {
     let mut counts = at.conversation.without_window();
     let mut known = known_of(&counts);
@@ -343,9 +493,19 @@ pub fn with_facts(batch: Vec<Record>, at: &Placing<'_>) -> Result<Vec<Record>, S
     let mut time = last_time(at.conversation);
     let mut out = Vec::with_capacity(batch.len() + 2);
     let mut pending: Vec<EntryFacts> = Vec::new();
+    // The ids the current step and batch announced for the messages they write, which those
+    // messages' facts carry: from earlier batches, then from this batch's own starts.
+    let run = at.operations.run.as_ref();
+    let mut step_mid = run.and_then(|run| run.step_mid.clone());
+    // Whether this batch placed or held the message `step_mid` names.
+    let mut step_placed = false;
+    let mut results_mid = run
+        .and_then(|run| run.open_batch.as_ref())
+        .and_then(|batch| batch.results_mid.clone());
     // Who sent the input of a run started in this batch, read from its start as today's entry
-    // metadata reads it from the run's start.
+    // metadata reads it from the run's start, and the send display facts of that input.
     let mut run_sender = None;
+    let mut run_send = SendFacts::default();
     // Whether a run started in this batch takes its input from a queued send delivered by its
     // `idle_start` mode, whose messages today's reads name as delivered that way.
     let mut run_idle_start = false;
@@ -355,106 +515,189 @@ pub fn with_facts(batch: Vec<Record>, at: &Placing<'_>) -> Result<Vec<Record>, S
         Record::ResultAppend(append) if append.ride.is_some() => Some(append.tool_call_id.clone()),
         _ => None,
     });
-    // The calls a dispatch intent anchored, before this batch and in it: their key is the
-    // intent's.
-    let mut dispatched: Vec<broca_protocol::ToolCallId> = at
+    let mut records = batch.into_iter().peekable();
+    // The tool turn this batch places, written after the records that place it: the ordinal of
+    // its assistant message, and the message. Its facts are written once the closing reply's
+    // outcome (which may carry the key of a call answered without an intent) is in.
+    let mut placed_turn: Option<(u64, Message)> = None;
+    // The facts of the last tool turn this batch wrote.
+    let mut latest_turn: Option<TurnFacts> = None;
+    // What the open turn's calls recorded, in the order recorded: the open batch's, then this
+    // batch's own.
+    let open_batch = at
         .operations
         .run
         .as_ref()
-        .and_then(|run| run.open_batch.as_ref())
+        .and_then(|run| run.open_batch.as_ref());
+    // The fold marks every copy of a call id with the intent that anchored its first copy, so
+    // each intent is its first copy's: the open batch's intents, each once, by that copy.
+    let anchored: Vec<&broca_session_store::fold::operations::Call> = open_batch
         .map(|batch| {
+            let mut seen = std::collections::HashSet::new();
             batch
                 .calls
                 .iter()
                 .filter(|call| call.intent)
-                .map(|call| call.id.clone())
+                .filter(|call| call.key.as_ref().is_none_or(|key| seen.insert(key)))
                 .collect()
         })
         .unwrap_or_default();
-    let mut records = batch.into_iter().peekable();
-    // A tool turn this batch places: its assistant message's ordinal and the message. Its
-    // facts are written after the records that place it, once the closing reply's outcome
-    // (which may carry the key of a call answered without an intent) is in.
-    let mut placed_turn: Option<(u64, Message)> = None;
-    // The intents of the calls the open turn made, by call id: the open batch's, then those
-    // this batch records itself. A call id's first intent is the call's, as today's reads take it.
-    let mut intent_of: HashMap<ToolCallId, ToolIntent> = HashMap::new();
-    // The keys of the calls answered without an intent, which their outcomes recorded.
-    let mut outcome_key_of: HashMap<ToolCallId, String> = HashMap::new();
-    if let Some(batch) = at
-        .operations
-        .run
-        .as_ref()
-        .and_then(|run| run.open_batch.as_ref())
-    {
-        for call in &batch.calls {
-            let Some(key) = &call.key else {
+    // The calls a dispatch intent anchored whose outcome isn't recorded yet, one entry per
+    // intent: each outcome for one of them answers it, and any other outcome answers a call
+    // that took no intent.
+    let mut dispatched: Vec<ToolCallId> = anchored
+        .iter()
+        .filter(|call| call.terminal.is_none())
+        .map(|call| call.id.clone())
+        .collect();
+    let mut events: Vec<CallEvent> = Vec::new();
+    if let Some(batch) = open_batch {
+        for call in &anchored {
+            // A call answered without an intent has its outcome's key, which its terminal
+            // carries.
+            let Some(key) = call.key.as_deref() else {
                 continue;
             };
-            if call.intent {
-                let intent = at.intents.0.get(key).ok_or_else(|| {
+            let (intent, seq) =
+                at.calls.intents.get(key).ok_or_else(|| {
                     format!("turn facts: the intent of call key {key} is unknown")
                 })?;
-                intent_of
-                    .entry(call.id.clone())
-                    .or_insert_with(|| intent.clone());
-            } else {
-                outcome_key_of
-                    .entry(call.id.clone())
-                    .or_insert_with(|| key.clone());
-            }
+            events.push(CallEvent::Intent(Box::new(intent.clone()), *seq));
+        }
+        events.extend(
+            at.calls
+                .terminals_of(&batch.batch_id)
+                .iter()
+                .cloned()
+                .map(CallEvent::Terminal),
+        );
+    }
+    // The key of each call of the open turn, by call id, which a ride names its carrier by: the
+    // open batch's calls, then this batch's intents and the outcomes of calls answered without
+    // one. A call id's first key is the call's, as today's reads take it.
+    let mut key_of: std::collections::HashMap<ToolCallId, String> = Default::default();
+    for call in open_batch.iter().flat_map(|batch| &batch.calls) {
+        if let Some(key) = &call.key {
+            key_of.entry(call.id.clone()).or_insert_with(|| key.clone());
         }
     }
+    let mut reply: Option<ToolReply> = None;
+    // A run's end restating its last turn's facts after itself, as it places no message.
+    let mut restated: Option<TurnFacts> = None;
     while let Some(mut record) = records.next() {
-        if let Record::RunStart(start) = &record {
-            run_sender = input_sender(start);
-            run_idle_start = start.submission_id.as_ref().is_some_and(|id| {
-                at.operations
-                    .queue
-                    .iter()
-                    .any(|pending| pending.ordered && &pending.submission_id == id)
-            });
-        }
+        // The seq the record takes.
+        let seq = at.first_seq + out.len() as u64;
         match &mut record {
-            Record::BatchStart(_) => dispatched.clear(),
+            Record::RunStart(start) => {
+                run_sender = input_sender(start);
+                run_send = run_send_facts(start, at.operations);
+                run_idle_start = start.submission_id.as_ref().is_some_and(|id| {
+                    at.operations
+                        .queue
+                        .iter()
+                        .any(|pending| pending.ordered && &pending.submission_id == id)
+                });
+                step_mid = None;
+                results_mid = None;
+            }
             // A ride names its carrier by the call's key, which only now is known for a call
-            // answered in this batch without an intent: the intent's key, else the outcome's.
+            // answered in this batch: the intent's key, else the outcome's.
             Record::ResultAppend(append) => {
                 if let Some(ride) = append.ride.as_mut().filter(|ride| ride.call_key.is_empty()) {
-                    ride.call_key = intent_of
-                        .get(&append.tool_call_id)
-                        .and_then(|intent| intent.call_key.clone())
-                        .or_else(|| outcome_key_of.get(&append.tool_call_id).cloned())
-                        .ok_or_else(|| {
-                            format!(
-                                "entry facts: the call {} a send rides on has no key",
-                                append.tool_call_id.0
-                            )
-                        })?;
+                    ride.call_key = key_of.get(&append.tool_call_id).cloned().ok_or_else(|| {
+                        format!(
+                            "entry facts: the call {} a send rides on has no key",
+                            append.tool_call_id.0
+                        )
+                    })?;
                 }
+            }
+            // A step or batch start announces the id of the message it will write, minted from
+            // the writer generation and the seq this record takes.
+            Record::StepStart(start) => {
+                // A step started again after an attempt that wrote no message (a pause, a
+                // refusal, a crash) writes the message that attempt announced, under the id
+                // today's storage gives it. A minted id names the record that announced it, so
+                // the retried step reuses it wherever its message lands. A position id (a
+                // converted `m<position>`, or `m<lineage>.<position>` on the compaction
+                // contract) is a function of the message's ordinal, as today's storage numbers
+                // it, so it is derived again from the ordinal the message takes now: a
+                // delivery placed at the retried step's boundary moves the message on.
+                let retried = step_mid
+                    .take()
+                    .filter(|mid| !step_placed && !newest_assistant_is(at.conversation, mid))
+                    .map(|mid| positioned(&mid, known_of(&counts)).unwrap_or(mid));
+                step_mid = Some(
+                    start
+                        .mid
+                        .get_or_insert_with(|| retried.unwrap_or(format!("{}.{seq}", at.prefix)))
+                        .clone(),
+                );
+                step_placed = false;
+                results_mid = None;
+            }
+            Record::Assistant(_) => step_placed = true,
+            Record::BatchStart(batch) => {
+                results_mid = Some(
+                    batch
+                        .mid
+                        .get_or_insert(format!("{}.{seq}", at.prefix))
+                        .clone(),
+                );
+                dispatched.clear();
             }
             Record::ToolIntent(intent) => {
                 dispatched.push(intent.tool_call_id.clone());
-                intent_of
-                    .entry(intent.tool_call_id.clone())
-                    .or_insert_with(|| intent.clone());
+                if let Some(key) = &intent.call_key {
+                    key_of
+                        .entry(intent.tool_call_id.clone())
+                        .or_insert_with(|| key.clone());
+                }
+                events.push(CallEvent::Intent(Box::new(intent.clone()), Some(seq)));
             }
-            // A call answered without a dispatch intent takes a key minted from the writer
-            // generation and the seq its outcome takes, in the form of the store's ids.
-            Record::ToolOutcome(outcome)
-                if outcome.call_key.is_none() && !dispatched.contains(&outcome.tool_call_id) =>
-            {
-                let key = format!("{}.{}", at.prefix, at.first_seq + out.len() as u64);
-                outcome_key_of
-                    .entry(outcome.tool_call_id.clone())
-                    .or_insert_with(|| key.clone());
-                outcome.call_key = Some(key);
-            }
+            Record::ToolReply(next) => reply = Some(next.clone()),
             Record::ToolOutcome(outcome) => {
+                // The outcome answers a call an intent anchored, or else a call answered
+                // without a dispatch intent, which takes a key minted from the writer
+                // generation and the seq its outcome takes, in the form of the store's ids.
+                match dispatched.iter().position(|id| *id == outcome.tool_call_id) {
+                    Some(position) => {
+                        dispatched.remove(position);
+                    }
+                    None if outcome.call_key.is_none() => {
+                        outcome.call_key = Some(format!("{}.{seq}", at.prefix));
+                    }
+                    None => {}
+                }
                 if let Some(key) = &outcome.call_key {
-                    outcome_key_of
+                    key_of
                         .entry(outcome.tool_call_id.clone())
                         .or_insert_with(|| key.clone());
+                }
+                if let Some(reply) = reply
+                    .take()
+                    .filter(|reply| reply.result.tool_call_id == outcome.tool_call_id)
+                {
+                    events.push(CallEvent::Terminal(Terminal::of(&reply, outcome, seq)));
+                }
+            }
+            Record::RunEnd(end) if end.reason == broca_protocol::RunFinishReason::Cancelled => {
+                let latest = latest_turn.clone().or_else(|| newest_turn(at.conversation));
+                if let Some(turn) = latest.and_then(cancelled) {
+                    // Ahead of the messages the run's end places, so the facts share a sealed
+                    // block with their turn; right after the run's end when it places none.
+                    let placed_here = out
+                        .iter()
+                        .rev()
+                        .take_while(|record| matches!(record, Record::Input(_)))
+                        .count();
+                    if placed_here > 0 {
+                        out.insert(out.len() - placed_here, Record::TurnFacts(turn.clone()));
+                    } else {
+                        restated = Some(turn.clone());
+                    }
+                    latest_turn = Some(turn);
+                    inserted = true;
                 }
             }
             _ => {}
@@ -466,15 +709,27 @@ pub fn with_facts(batch: Vec<Record>, at: &Placing<'_>) -> Result<Vec<Record>, S
                 .map_err(|error| format!("entry facts: conversation {error:?}"))?;
             counts.clear_window();
             if let (Some(assistant), Record::ToolReply(_), None) =
-                (&open_turn, &record, counts.open_tool_turn())
+                (open_turn, &record, counts.open_tool_turn())
             {
                 // The reply completed the turn, which placed the assistant message and then its
                 // results' message.
-                placed_turn = Some((counts.placed - 1, assistant.clone()));
+                placed_turn = Some((counts.placed - 1, assistant));
             }
             let now_known = known_of(&counts);
             for ordinal in known + 1..=now_known {
-                let (message, facts) = describe(&record, at, run_sender.as_ref())?;
+                let (message, facts) = describe(&record, at, run_sender.as_ref(), &run_send)?;
+                // The message a step or batch announced takes the id it announced: a step's
+                // assistant message, and the tool-results message a batch's last reply places.
+                // A position id a step announced but hasn't placed names an ordinal, not a
+                // message: any message that lands there takes it, as today's storage numbers it.
+                let announced = match &record {
+                    Record::Assistant(_) => step_mid.clone(),
+                    Record::ToolReply(_) if ordinal == now_known => results_mid.clone(),
+                    Record::Input(_) => step_mid.clone().filter(|mid| {
+                        !step_placed && positioned(mid, ordinal - 1).as_deref() == Some(mid)
+                    }),
+                    _ => None,
+                };
                 let own = facts.written_at_ms;
                 // On the contract a message without its own time takes the newest earlier
                 // entry's, as `session.entries` serves it. Off it, only its own, as
@@ -500,10 +755,17 @@ pub fn with_facts(batch: Vec<Record>, at: &Placing<'_>) -> Result<Vec<Record>, S
                     }
                     _ => (facts.delivery_mode.map(str::to_owned), None),
                 };
+                // A run's assistant messages carry its Rich UI stamp, as reads serve it.
+                let stamped = message
+                    .filter(|message| message.role == Role::Assistant && facts.run_id.is_some())
+                    .and(at.rich_ui.cloned());
                 pending.push(EntryFacts {
-                    client_message_id: None,
-                    sender: None,
+                    client_message_id: facts.send.client_message_id,
+                    sender: facts.send.sender,
                     marks: None,
+                    no_display_facts: None,
+                    reasoning_summaries: message.map(reasoning_summaries).unwrap_or_default(),
+                    rich_ui: stamped,
                     ordinal,
                     written_at_ms,
                     tag_base: high,
@@ -513,7 +775,9 @@ pub fn with_facts(batch: Vec<Record>, at: &Placing<'_>) -> Result<Vec<Record>, S
                     native: facts.native,
                     render_tags: at.tags.render,
                     clean_reply: facts.clean_reply,
-                    mid: String::new(),
+                    // Empty until `flush` mints one: only a message nothing announced takes an
+                    // id from the seq of its own facts.
+                    mid: announced.unwrap_or_default(),
                     run_id: facts.run_id,
                     created_at_ms: facts.created_at_ms,
                     delivery_mode,
@@ -551,75 +815,310 @@ pub fn with_facts(batch: Vec<Record>, at: &Placing<'_>) -> Result<Vec<Record>, S
             return Err("entry facts: a tool intent follows a placed message in one batch".into());
         }
         out.push(record);
+        if let Some(turn) = restated.take() {
+            out.push(Record::TurnFacts(turn));
+        }
         if !continues && !pending.is_empty() {
             flush(&mut out, &mut pending, at);
             inserted = true;
         }
         if !continues {
             if let Some((ordinal, assistant)) = placed_turn.take() {
-                out.push(Record::TurnFacts(turn_facts(
-                    ordinal,
-                    &assistant,
-                    |id| intent_of.get(id),
-                    |id| outcome_key_of.get(id),
-                )));
+                let turn = turn_facts(ordinal, &assistant, &events);
+                out.push(Record::TurnFacts(turn.clone()));
+                latest_turn = Some(turn);
                 inserted = true;
             }
         }
     }
     flush(&mut out, &mut pending, at);
     if let Some((ordinal, assistant)) = placed_turn.take() {
-        out.push(Record::TurnFacts(turn_facts(
-            ordinal,
-            &assistant,
-            |id| intent_of.get(id),
-            |id| outcome_key_of.get(id),
-        )));
+        out.push(Record::TurnFacts(turn_facts(ordinal, &assistant, &events)));
     }
     Ok(out)
 }
 
+/// One thing recorded about a call of the open turn: its dispatch intent, with the intent's seq
+/// where known, or its terminal.
+#[derive(Debug, Clone)]
+pub enum CallEvent {
+    Intent(Box<ToolIntent>, Option<u64>),
+    Terminal(Terminal),
+}
+
+impl CallEvent {
+    fn seq(&self) -> Option<u64> {
+        match self {
+            CallEvent::Intent(_, seq) => *seq,
+            CallEvent::Terminal(terminal) => Some(terminal.seq),
+        }
+    }
+}
+
 /// The facts of the tool turn whose assistant message, at `ordinal`, made the calls in
-/// `assistant`: for each call, in the order the message made them, its key and what its
-/// dispatch recorded. A dispatched call takes the key, module, schema pin and dispatch time its
-/// intent recorded (`intent_of`); a call answered without an intent (denied, invalid, synthetic,
-/// or refused with its batch) takes the key its outcome recorded (`outcome_key_of`) and nothing
-/// else. A call with neither has no facts. The call's finish time isn't recorded here: its
-/// result may have gone in with an earlier batch than the one that places the turn.
-pub fn turn_facts<'i>(
-    ordinal: u64,
-    assistant: &Message,
-    intent_of: impl Fn(&ToolCallId) -> Option<&'i ToolIntent>,
-    outcome_key_of: impl Fn(&ToolCallId) -> Option<&'i String>,
-) -> TurnFacts {
-    let calls = assistant
+/// `assistant`, from what its calls recorded (`events`), by today's display rules
+/// (`broca_core::display_facts` and `broca_core::call_identity`), so a read serves each call as
+/// today's read serves it:
+///
+/// - Each copy of a call id has its own identity: an intent takes the first copy not yet sent or
+///   closed, a refusal the first without a key, and a result the first not yet closed. A copy
+///   that took no intent takes the key its outcome recorded (`ToolOutcome::call_key`). A copy
+///   with neither has no facts.
+/// - Times and why a call has no answer go to the first copy of its id, each later record
+///   overwriting what an earlier one set, as today's read keeps them.
+pub fn turn_facts(ordinal: u64, assistant: &Message, events: &[CallEvent]) -> TurnFacts {
+    struct Slot<'a> {
+        id: &'a ToolCallId,
+        tool_name: &'a str,
+        key: Option<String>,
+        schema_pin: Option<String>,
+        dispatched_to: Option<String>,
+        dispatched: bool,
+        closed: bool,
+        started: Option<u64>,
+        finished: Option<u64>,
+        unanswered: Option<Unanswered>,
+    }
+    let mut slots: Vec<Slot<'_>> = assistant
         .content
         .iter()
         .filter_map(|block| match block {
-            ContentBlock::ToolCall(call) => match intent_of(&call.tool_call_id) {
-                Some(intent) => Some(CallFacts {
-                    tool_call_id: call.tool_call_id.clone(),
-                    call_key: intent.call_key.clone()?,
-                    schema_pin: intent.schema_pin.clone(),
-                    carrier: None,
-                    dispatched_to: intent.module_id.clone(),
-                    dispatched_at_ms: intent.dispatched_at_ms,
-                    finished_at_ms: None,
-                }),
-                None => Some(CallFacts {
-                    tool_call_id: call.tool_call_id.clone(),
-                    call_key: outcome_key_of(&call.tool_call_id)?.clone(),
-                    schema_pin: None,
-                    carrier: None,
-                    dispatched_to: None,
-                    dispatched_at_ms: None,
-                    finished_at_ms: None,
-                }),
-            },
+            ContentBlock::ToolCall(call) => Some(Slot {
+                id: &call.tool_call_id,
+                tool_name: &call.tool_name,
+                key: None,
+                schema_pin: None,
+                dispatched_to: None,
+                dispatched: false,
+                closed: false,
+                started: None,
+                finished: None,
+                unanswered: None,
+            }),
             _ => None,
         })
         .collect();
+    // Intents whose seq isn't known were recorded when their batch started, before anything the
+    // writer saw after.
+    let mut ordered: Vec<&CallEvent> = events.iter().collect();
+    ordered.sort_by_key(|event| event.seq().map_or((0, 0), |seq| (1, seq)));
+    for event in ordered {
+        match event {
+            CallEvent::Intent(intent, _) => {
+                let id = &intent.tool_call_id;
+                if let Some(slot) = slots
+                    .iter_mut()
+                    .find(|slot| slot.id == id && !slot.dispatched && !slot.closed)
+                {
+                    slot.dispatched = true;
+                    if intent.call_key.is_some() {
+                        slot.key.clone_from(&intent.call_key);
+                    }
+                    slot.dispatched_to.clone_from(&intent.module_id);
+                    slot.schema_pin = intent.schema_pin.as_ref().and_then(|pin| {
+                        served_schema_pin(
+                            intent.tool_name.as_deref().unwrap_or(slot.tool_name),
+                            pin,
+                        )
+                    });
+                }
+                if let Some(first) = slots.iter_mut().find(|slot| slot.id == id) {
+                    first.started = intent.dispatched_at_ms;
+                }
+            }
+            CallEvent::Terminal(terminal) => {
+                let id = &terminal.tool_call_id;
+                let open = |slot: &Slot<'_>| slot.id == id && !slot.closed;
+                let position = if terminal.refused {
+                    slots
+                        .iter()
+                        .position(|slot| open(slot) && slot.key.is_none())
+                        .or_else(|| slots.iter().position(open))
+                } else {
+                    slots.iter().position(open)
+                };
+                if let Some(slot) = position.map(|position| &mut slots[position]) {
+                    if slot.key.is_none() {
+                        slot.key.clone_from(&terminal.call_key);
+                    }
+                    slot.closed = true;
+                }
+                if let Some(first) = slots.iter_mut().find(|slot| slot.id == id) {
+                    if terminal.answered {
+                        first.finished = terminal.finished_at_ms;
+                    } else if terminal.unanswered.is_some() {
+                        first.unanswered = terminal.unanswered;
+                    }
+                }
+            }
+        }
+    }
+    let calls = slots
+        .into_iter()
+        .filter_map(|slot| {
+            Some(CallFacts {
+                tool_call_id: slot.id.clone(),
+                call_key: slot.key?,
+                schema_pin: slot.schema_pin.map(serde_json::Value::String),
+                carrier: None,
+                dispatched_to: slot.dispatched_to,
+                dispatched_at_ms: slot.started,
+                finished_at_ms: slot.finished,
+                unanswered: slot.unanswered,
+            })
+        })
+        .collect();
     TurnFacts { ordinal, calls }
+}
+
+/// The summaries `message`'s reasoning blocks carry, as `session.read` serves them with display
+/// facts (llm-runner's `display::reasoning_summary`): one per block that has one, with the
+/// block's position among the message's content blocks. Only an assistant message has any.
+pub fn reasoning_summaries(message: &Message) -> Vec<ReasoningSummary> {
+    if message.role != Role::Assistant {
+        return Vec::new();
+    }
+    message
+        .content
+        .iter()
+        .enumerate()
+        .filter_map(|(part, block)| {
+            let stored = serde_json::to_value(block).ok()?;
+            let text = cortexkit_role_llm_runner::display::reasoning_summary(&stored)?;
+            Some(ReasoningSummary {
+                part: u32::try_from(part).ok()?,
+                text,
+            })
+        })
+        .collect()
+}
+
+/// A run's Rich UI stamp as its messages' entry facts record it.
+pub fn rich_ui(stamp: &broca_protocol::RichUiStamp) -> Option<RichUi> {
+    let stamp = serde_json::to_value(stamp).ok()?;
+    Some(RichUi {
+        dialect: stamp.get("dialect")?.as_str()?.to_owned(),
+        catalog_digest: stamp.get("catalog_digest")?.as_str()?.to_owned(),
+    })
+}
+
+/// A dispatch intent's schema pin (`ToolIntent::schema_pin`, the pin its tool provider declared)
+/// as reads serve it: llm-runner's encoded `SchemaPin` for the tool `tool_name`.
+pub fn served_schema_pin(tool_name: &str, pin: &serde_json::Value) -> Option<String> {
+    let pin: broca_wal::DispatchSchemaPin = serde_json::from_value(pin.clone()).ok()?;
+    cortexkit_role_tool_provider::call::SchemaPin::new(tool_name, &pin.schema_digest, pin.semantics)
+        .encode()
+        .ok()
+}
+
+/// The facts of the conversation's newest assistant message, when it made tool calls that have
+/// all been answered: the turn today's reads restate when its run ends cancelled.
+fn newest_turn(conversation: &Conversation) -> Option<TurnFacts> {
+    if conversation.open_tool_turn().is_some() {
+        return None;
+    }
+    conversation
+        .messages
+        .iter()
+        .zip(&conversation.entries)
+        .rev()
+        .find(|(message, _)| message.role == Role::Assistant)
+        .and_then(|(_, entry)| entry.turn.clone())
+}
+
+/// `turn` with each call abandoned as interrupted restated as cancelled, as today's reads state
+/// a run's last turn once the run ends cancelled; `None` when none was.
+fn cancelled(mut turn: TurnFacts) -> Option<TurnFacts> {
+    let mut changed = false;
+    for call in &mut turn.calls {
+        if call.unanswered == Some(Unanswered::Interrupted) {
+            call.unanswered = Some(Unanswered::Cancelled);
+            changed = true;
+        }
+    }
+    changed.then_some(turn)
+}
+
+/// Who sent the send that placed a message, and the `client_message_id` it carried, as today's
+/// display facts name them for every message of a run's input or of a steer or delivered send.
+#[derive(Debug, Clone, Default)]
+struct SendFacts {
+    sender: Option<String>,
+    client_message_id: Option<String>,
+}
+
+/// The send facts of the input of the run `start` starts, by today's rules: for a fresh run, the
+/// queued send it consumes names them (`operations` holds it in its queue until the run starts),
+/// else the run's own start: its sender's module (whoever sent on the owner's behalf, else the
+/// run's principal), and the `client_message_id` its request identity carries. A run that isn't
+/// fresh has none.
+fn run_send_facts(
+    start: &broca_session_store::record::RunStart,
+    operations: &Operations,
+) -> SendFacts {
+    let fresh = start
+        .origin
+        .as_ref()
+        .and_then(|origin| origin.get("kind"))
+        .and_then(serde_json::Value::as_str)
+        == Some("fresh");
+    if !fresh {
+        return SendFacts::default();
+    }
+    let queued = start.submission_id.as_ref().and_then(|submission| {
+        operations
+            .queue
+            .iter()
+            .find(|pending| &pending.submission_id == submission)
+    });
+    let decode = |value: Option<&serde_json::Value>| {
+        value.and_then(|value| {
+            serde_json::from_value::<broca_protocol::BindPrincipal>(value.clone()).ok()
+        })
+    };
+    let principal = decode(
+        start
+            .run_choices
+            .as_ref()
+            .and_then(|choices| choices.get("record"))
+            .and_then(|record| record.get("sent_by")),
+    )
+    .or_else(|| decode(start.principal.as_ref()));
+    let module = match principal {
+        Some(broca_protocol::BindPrincipal::Reserved { module_id }) => Some(module_id),
+        _ => None,
+    };
+    SendFacts {
+        sender: queued.and_then(|send| send.sender.clone()).or(module),
+        client_message_id: queued
+            .and_then(|send| send.request_identity_digest.as_deref())
+            .and_then(broca_core::digest_client_message_id)
+            .or_else(|| {
+                start
+                    .request_identity_digest
+                    .as_deref()
+                    .and_then(broca_core::digest_client_message_id)
+            }),
+    }
+}
+
+/// The send facts of a steer or delivered send's message placed by `input`, from the pending
+/// input it was accepted as (`receipt_seq`).
+fn held_send_facts(input: &broca_session_store::record::Input, at: &Placing<'_>) -> SendFacts {
+    let Some(pending) = at.operations.run.as_ref().and_then(|run| {
+        run.pending_steers
+            .iter()
+            .find(|pending| pending.seq.is_some() && pending.seq == input.receipt_seq)
+    }) else {
+        return SendFacts::default();
+    };
+    SendFacts {
+        sender: pending.sender.clone(),
+        client_message_id: pending
+            .request_identity_digest
+            .as_deref()
+            .and_then(broca_core::digest_client_message_id),
+    }
 }
 
 /// When an input message was accepted: a steer's or delivered send's acceptance, kept across
@@ -643,9 +1142,39 @@ fn accepted_at(input: &broca_session_store::record::Input, at: &Placing<'_>) -> 
     }
 }
 
+/// The id a message converted from today's storage takes at `position` (its ordinal less one),
+/// in the form of `announced`: `m<position>`, or `m<lineage>.<position>` on the compaction
+/// contract, as `broca_core::message_mid` writes them and `Session::find_message` reads them.
+/// `None` when `announced` is no position id: a minted id, or an imported one.
+fn positioned(announced: &str, position: u64) -> Option<String> {
+    let digits = |text: &str| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
+    let rest = announced.strip_prefix('m')?;
+    match rest.split_once('.') {
+        Some((lineage, number)) if digits(number) => Some(format!("m{lineage}.{position}")),
+        None if digits(rest) => Some(format!("m{position}")),
+        _ => None,
+    }
+}
+
+/// Whether the newest assistant message `conversation` holds, held for its tool results or
+/// placed, has the id `mid`.
+fn newest_assistant_is(conversation: &Conversation, mid: &str) -> bool {
+    let named = |facts: Option<&EntryFacts>| facts.is_some_and(|facts| facts.mid == mid);
+    if let Some((_, _, state)) = conversation.open_entry() {
+        return named(state.facts.as_ref());
+    }
+    (conversation.window_start()..=conversation.placed)
+        .rev()
+        .filter_map(|ordinal| conversation.window_entry(ordinal))
+        .find(|(message, _)| message.role == Role::Assistant)
+        .is_some_and(|(_, state)| named(state.facts.as_ref()))
+}
+
 fn flush(out: &mut Vec<Record>, pending: &mut Vec<EntryFacts>, at: &Placing<'_>) {
     for mut facts in pending.drain(..) {
-        facts.mid = format!("{}.{}", at.prefix, at.first_seq + out.len() as u64);
+        if facts.mid.is_empty() {
+            facts.mid = format!("{}.{}", at.prefix, at.first_seq + out.len() as u64);
+        }
         out.push(Record::EntryFacts(facts));
     }
 }
@@ -701,6 +1230,8 @@ struct Described {
     generated_under: Option<ViewRef>,
     native: bool,
     clean_reply: bool,
+    /// Who sent the send that placed the message, and its `client_message_id`.
+    send: SendFacts,
 }
 
 /// Whether the message `record` places was written by broca itself (a model step's message, a
@@ -720,6 +1251,7 @@ fn describe<'r>(
     record: &'r Record,
     at: &Placing<'_>,
     run_sender: Option<&Notice>,
+    run_send: &SendFacts,
 ) -> Result<(Option<&'r Message>, Described), String> {
     Ok(match record {
         // A budget reminder is the runner's own message, sent as a notice from broca, as
@@ -739,6 +1271,7 @@ fn describe<'r>(
                 generated_under: None,
                 native: native(record),
                 clean_reply: false,
+                send: SendFacts::default(),
             },
         ),
         Record::Input(input) => (
@@ -765,6 +1298,15 @@ fn describe<'r>(
                 generated_under: None,
                 native: native(record),
                 clean_reply: at.tags.clean_replies && input.message.role == Role::Assistant,
+                send: match input.placement {
+                    Placement::RunInput => run_send.clone(),
+                    Placement::Steer | Placement::Delivered | Placement::DeliveredTurnSystem => {
+                        held_send_facts(input, at)
+                    }
+                    Placement::BudgetNudge | Placement::Imported | Placement::DamageNotice => {
+                        SendFacts::default()
+                    }
+                },
             },
         ),
         Record::Assistant(assistant) => (
@@ -806,6 +1348,7 @@ fn describe<'r>(
                 generated_under: at.view.clone(),
                 native: native(record),
                 clean_reply: at.tags.clean_replies,
+                send: SendFacts::default(),
             },
         ),
         Record::ToolReply(reply) => (
@@ -821,6 +1364,7 @@ fn describe<'r>(
                 generated_under: None,
                 native: native(record),
                 clean_reply: false,
+                send: SendFacts::default(),
             },
         ),
         other => return Err(format!("entry facts: {} places no message", other.name())),

@@ -121,6 +121,7 @@ fn ledger_records_and_misplaced_records_refuse() {
     let ledger = Record::StepStart(StepStart {
         run_id: "r".into(),
         step_id: 1,
+        mid: None,
     });
     assert_eq!(
         fold(&[ledger], false).unwrap_err(),
@@ -259,6 +260,9 @@ fn facts(ordinal: u64, tag_base: u64) -> Record {
         client_message_id: None,
         sender: None,
         marks: None,
+        no_display_facts: None,
+        reasoning_summaries: Vec::new(),
+        rich_ui: None,
         ordinal,
         written_at_ms: Some(1_000 + ordinal),
         tag_base,

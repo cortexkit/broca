@@ -4480,6 +4480,19 @@ where
                         .await;
                         return;
                     }
+                    if let Delivery::AccessEnded(refusal) = &delivery {
+                        // Read access ended with a change the session accepted: the stream ends
+                        // with the refusal a new subscribe would get now.
+                        let error = ServeError::ScopeRefused((**refusal).clone());
+                        let _ = send_subscribe_scope_error(
+                            &writer,
+                            (ver, channel, epoch, corr),
+                            next_seq,
+                            &error,
+                        )
+                        .await;
+                        return;
+                    }
                     if let Delivery::Error(message) = &delivery {
                         // A replay failure is a typed stream terminal, not an empty successful stream.
                         // `Error` is already terminal in the existing subc vocabulary, so do not append
@@ -4769,6 +4782,7 @@ fn encode_delivery(delivery: &Delivery, seq: u64) -> EncodedDelivery {
         Delivery::CursorExpired
         | Delivery::Expired { .. }
         | Delivery::Error(_)
+        | Delivery::AccessEnded(_)
         | Delivery::Detached => return EncodedDelivery::Detached,
     };
     match encoded {
@@ -5110,6 +5124,8 @@ fn served_on_new_storage(method: &str, params: &serde_json::Value) -> bool {
     match method {
         // Reads served from the store (`store_read`, `store_head`).
         OP_READ | OP_HEAD => true,
+        // The store actor's subscriptions (`store_fanout`).
+        OP_SUBSCRIBE => true,
         // Run and send facts built from the store's own records (`store_status`).
         OP_STATUS | OP_RUN_RESULT | OP_SEND_STATUS | OP_SESSION_SEND_STATUS => true,
         // The store actor serves sends, cancels and retractions.
@@ -5943,6 +5959,30 @@ async fn send_error_body(
     body: ErrorBody,
 ) -> Result<(), ServeIoError> {
     let body = serde_json::to_vec(&body).map_err(|e| ServeIoError(e.to_string()))?;
+    send_error_bytes(writer, ver, channel, epoch, corr, body).await
+}
+
+/// Ends a subscribe stream with a scope refusal's wire body, carrying the stream's next seq and
+/// a display reset as every subscribe stream error does.
+async fn send_subscribe_scope_error(
+    writer: &EgressSender<Frame>,
+    (ver, channel, epoch, corr): (u8, u16, u32, u64),
+    seq: u64,
+    error: &ServeError,
+) -> Result<(), ServeIoError> {
+    let mut body: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_slice(&scope_error_bytes(error)?)
+            .map_err(|error| ServeIoError(error.to_string()))?;
+    if let Some(code) = body.get("code").and_then(serde_json::Value::as_str) {
+        record_request_outcome(code);
+    }
+    body.insert("seq".into(), seq.into());
+    body.insert(
+        "event".into(),
+        serde_json::to_value(cortexkit_role_llm_runner::live::LiveEvent::DisplayReset)
+            .map_err(|error| ServeIoError(error.to_string()))?,
+    );
+    let body = serde_json::to_vec(&body).map_err(|error| ServeIoError(error.to_string()))?;
     send_error_bytes(writer, ver, channel, epoch, corr, body).await
 }
 

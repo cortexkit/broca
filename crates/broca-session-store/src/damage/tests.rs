@@ -30,6 +30,7 @@ fn step(step_id: u64) -> Record {
     Record::StepStart(StepStart {
         run_id: "r".into(),
         step_id,
+        mid: None,
     })
 }
 

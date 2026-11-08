@@ -945,9 +945,9 @@ impl CursorWire {
 impl From<broca_core::Cursor> for CursorWire {
     fn from(cursor: broca_core::Cursor) -> Self {
         let mut wire = Self::new(cursor.wal_seq, cursor.sub_index);
-        if let Some((lineage, identity)) = cursor.frame_identity() {
-            wire.incarnation = Some(lineage.to_string());
-            wire.digest = Some(identity.digest_hex());
+        if let Some((incarnation, digest)) = cursor.wire_identity() {
+            wire.incarnation = Some(incarnation);
+            wire.digest = Some(digest);
         }
         wire
     }

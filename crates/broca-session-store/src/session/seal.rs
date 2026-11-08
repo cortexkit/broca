@@ -254,7 +254,19 @@ impl<B: SessionBackend> Session<B> {
         if kind == ChangeKind::Cold {
             created.cold_since_ms = Some(now_ms);
         }
-        self.commit(change, intent_seq, created, now_ms).await
+        // The carried records took the last seqs of the new log.
+        let carried = created.encoder.next_seq() - carry.records.len() as u64;
+        let sealed = self.commit(change, intent_seq, created, now_ms).await?;
+        // The commit made every record before it durable.
+        self.observed(super::Appended::Synced);
+        if !carry.records.is_empty() {
+            self.observed(super::Appended::Records {
+                first: carried,
+                records: carry.records,
+                durable: true,
+            });
+        }
+        Ok(sealed)
     }
 
     /// The open log's records, its batches and its checkpoint, read back from the backend.

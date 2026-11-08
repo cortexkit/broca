@@ -156,7 +156,9 @@ pub struct SessionReadTools {
 /// The last `RunStarted` in `records`, which opens the latest episode among them. A resumed
 /// run continues its episode without writing a new `RunStarted`, so the last one is the
 /// current episode's.
-fn latest_run_started_tools(records: &[broca_wal::FramedRecord]) -> Option<SessionReadTools> {
+pub(crate) fn latest_run_started_tools(
+    records: &[broca_wal::FramedRecord],
+) -> Option<SessionReadTools> {
     records
         .iter()
         .rev()

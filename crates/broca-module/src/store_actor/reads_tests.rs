@@ -443,6 +443,7 @@ impl Module {
             settled: Some((&settled, &addr)),
             session_name: &self.key.session,
             live_step: None,
+            stream_head: None,
         };
         execute(&view, &context, request).await
     }
@@ -480,6 +481,26 @@ impl Module {
             .await;
         assert!(sent.is_ok(), "the actor takes the read");
         answer.await.unwrap()
+    }
+
+    /// The open actor answers each page with every opt-in from memory whenever it answers the
+    /// same page without them from memory: what the opt-ins add is in the session it holds.
+    async fn opt_ins_stay_in_memory(&self, when: &str) {
+        for page in pages() {
+            let plain = matches!(
+                self.ask_actor(StoreReadRequest::Page(page.clone())).await,
+                StoreReadOutcome::Served(_)
+            );
+            let all = matches!(
+                self.ask_actor(StoreReadRequest::Page(opted(page.clone())))
+                    .await,
+                StoreReadOutcome::Served(_)
+            );
+            assert_eq!(
+                all, plain,
+                "{when}: {page:?} with every opt-in is answered where it is without them"
+            );
+        }
     }
 
     /// The served `run.status` of `run`, as JSON.
@@ -610,7 +631,8 @@ fn active(outcome: SendOutcome) {
 }
 
 /// The reads each comparison makes: every run's `run.status` and `run.result`, the head, the
-/// newest page and a page from the first message, the session's entries, and its ownership.
+/// newest page and a page from the first message, each also with every opt-in, the session's
+/// entries, and its ownership.
 fn reads(runs: &[&str]) -> Vec<StoreReadRequest> {
     let mut reads: Vec<StoreReadRequest> = runs
         .iter()
@@ -632,6 +654,9 @@ fn reads(runs: &[&str]) -> Vec<StoreReadRequest> {
             limit: Some(3),
             ..PageRequest::default()
         }),
+    ]);
+    reads.extend(pages().map(|page| StoreReadRequest::Page(opted(page))));
+    reads.extend([
         StoreReadRequest::Entries {
             from: 1,
             limit: 200,
@@ -639,6 +664,31 @@ fn reads(runs: &[&str]) -> Vec<StoreReadRequest> {
         StoreReadRequest::Ownership,
     ]);
     reads
+}
+
+/// The pages the comparisons read: the newest two messages, and three from the first.
+fn pages() -> [PageRequest; 2] {
+    [
+        PageRequest {
+            limit: Some(2),
+            ..PageRequest::default()
+        },
+        PageRequest {
+            from_ordinal: Some(1),
+            limit: Some(3),
+            ..PageRequest::default()
+        },
+    ]
+}
+
+/// `page` with every opt-in: display facts, tools and Rich UI stamps.
+fn opted(page: PageRequest) -> PageRequest {
+    PageRequest {
+        include_display_facts: true,
+        include_tools: true,
+        include_rich_ui: true,
+        ..page
+    }
 }
 
 /// The ordinal and id of the window message whose text is `text`.
@@ -717,11 +767,13 @@ async fn every_read_equals_a_fresh_views_at_every_step() {
     m.gate.notify_one();
     m.ended("r1", "completed").await;
     m.compare(&reads(&["r1"]), "r1 ended, the actor open").await;
+    m.opt_ins_stay_in_memory("r1 ended, the actor open").await;
 
     // Run r2, then the session closes.
     active(m.send("r2", "second").await);
     m.in_step("r2", 1).await;
     m.compare(&reads(&["r1", "r2"]), "r2 in flight").await;
+    m.opt_ins_stay_in_memory("r2 in flight").await;
     m.gate.notify_one();
     m.ended("r2", "completed").await;
     m.close().await;
@@ -769,6 +821,8 @@ async fn every_read_equals_a_fresh_views_at_every_step() {
         "r3 in flight over sealed history",
     )
     .await;
+    m.opt_ins_stay_in_memory("r3 in flight over sealed history")
+        .await;
     // The running run and the newest page are in memory; the first page is sealed, and is read
     // from storage at the position the actor names.
     assert!(matches!(

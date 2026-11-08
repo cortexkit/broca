@@ -2481,7 +2481,8 @@ async fn ids_resolve(session: &Session<&MemoryBackend>) {
 
 /// Every tool turn the session placed carries the facts of its calls (`TurnFacts`), whichever
 /// way the turn closed: its results arriving, a crash's close-out, a cancel, or a batch that
-/// sent nothing. `session.read` serves each call's key and dispatch from them.
+/// sent nothing. `session.read` serves each call's key and dispatch from them, and no two calls
+/// of a turn share a key.
 async fn turns_have_facts(session: &Session<&MemoryBackend>) {
     for entry in session
         .entries(1, usize::MAX)
@@ -2498,6 +2499,23 @@ async fn turns_have_facts(session: &Session<&MemoryBackend>) {
                 entry.state.turn.is_some(),
                 "tool turn {} has no turn facts",
                 entry.ordinal
+            );
+        }
+        // Each occurrence of a call has its own key, a repeated call id's copies included.
+        if let Some(turn) = &entry.state.turn {
+            let mut keys: Vec<&str> = turn
+                .calls
+                .iter()
+                .map(|call| call.call_key.as_str())
+                .collect();
+            keys.sort_unstable();
+            keys.dedup();
+            assert_eq!(
+                keys.len(),
+                turn.calls.len(),
+                "tool turn {} shares a key between calls: {:?}",
+                entry.ordinal,
+                turn.calls
             );
         }
     }
@@ -4370,9 +4388,10 @@ fn rides_name_their_carrier(records: &[Record]) {
 }
 
 /// A loop run that doesn't finish within ten seconds fails the comparison rather than hanging
-/// it, such as a run left waiting on a held call it should have paused for.
+/// it, such as a run left waiting on a held call it should have paused for. The run is boxed:
+/// a loop's future is large enough to overflow a test thread's stack where it is built.
 async fn finishes<F: std::future::Future>(run: F) -> F::Output {
-    tokio::time::timeout(std::time::Duration::from_secs(10), run)
+    tokio::time::timeout(std::time::Duration::from_secs(10), Box::pin(run))
         .await
         .expect("the loop finished")
 }
@@ -5172,6 +5191,73 @@ async fn every_cut_of_a_system_or_steer_send_resumes_alike() {
             .scope(
                 Some(anthropic_route(supported)),
                 compare_actions_every_cut(calling("read", 0), vec![system_note("q1")]),
+            )
+            .await;
+    }
+}
+
+/// In a session that began in the new storage, a step that announced its message's id and
+/// stopped before writing it keeps that minted id when it runs again, even when a delivery lands
+/// before it at the retried step's boundary: a minted id names the record that announced it,
+/// wherever the message lands. (A converted session's position id is derived again instead,
+/// which `every_cut_of_a_system_or_steer_send_resumes_alike` checks.)
+#[tokio::test]
+async fn a_retried_steps_minted_id_survives_a_delivery_before_it() {
+    let scenario = calling("read", 0);
+    for layout in LAYOUTS {
+        let scenario = scenario.clone();
+        let run = async move {
+            let (_, _, full, _) = Box::pin(today_with_actions(
+                &scenario,
+                None,
+                scenario.steps.clone(),
+                vec![system_note("q1")],
+                None,
+            ))
+            .await;
+            // The log up to the queued send: the run started, its first step announced its
+            // message, and the send waits.
+            let cut = full
+                .framed()
+                .iter()
+                .position(|frame| serde_json::to_value(&frame.record).unwrap()["type"] == "queued")
+                .expect("the send was queued")
+                + 1;
+            let image = LogImage::parse(broca_crash_harness::cut_log(&full, cut, false));
+            let mut converted = convert_unbilled(&image.framed(), lineage(&image).as_deref())
+                .expect("the cut converts");
+            // As a session begun in the new storage holds it: the step announced a minted id,
+            // naming its own record, which takes the seq after the session's `WriterOpened`.
+            let index = converted
+                .records
+                .iter()
+                .position(|record| matches!(record, Record::StepStart(_)))
+                .expect("the step started");
+            if let Record::StepStart(start) = &mut converted.records[index] {
+                start.mid = Some(format!("g0123456789abcdef.{}", index + 2));
+            }
+            let announced = normalized(&converted.records)[index]["StepStart"]["mid"].clone();
+            let new = new_from(&scenario, Some(converted), scenario.steps.clone()).await;
+            let retried = new
+                .records
+                .iter()
+                .find(|record| record["StepStart"]["step_id"] == 1)
+                .expect("the step ran again");
+            assert_eq!(
+                retried["StepStart"]["mid"], announced,
+                "the minted id is kept"
+            );
+            assert!(
+                new.records
+                    .iter()
+                    .any(|record| record["Input"]["placement"] == "DeliveredTurnSystem"),
+                "the send was delivered before the retried step"
+            );
+        };
+        LAYOUT
+            .scope(
+                layout,
+                TURN_SYSTEM.scope(Some(anthropic_route(true)), Box::pin(run)),
             )
             .await;
     }
@@ -6046,6 +6132,31 @@ fn cancel_before_batch_with_a_repeated_id_scenario() -> Scenario {
 #[tokio::test]
 async fn a_refused_batch_still_answers_a_repeated_call_id_as_a_duplicate() {
     compare(cancel_before_batch_with_a_repeated_id_scenario()).await;
+}
+
+/// A step that repeats a call id: the first copy is sent, and the second gets the duplicate
+/// error without being sent. Both loops key each copy by its own record, the first by its intent
+/// and the second by its outcome, so the turn's facts name two keys.
+#[tokio::test]
+async fn a_repeated_call_id_keys_each_copy_by_its_own_record() {
+    compare(Scenario {
+        input: vec![user("read a twice")],
+        tools: vec![tool("read", ExecutionMode::Parallel)],
+        manifest: None,
+        stop_when: Vec::new(),
+        steps: vec![
+            answer(
+                "a1",
+                vec![
+                    call("c1", "read", json!({"path": "a"})),
+                    call("c1", "read", json!({"path": "b"})),
+                ],
+                FinishReason::ToolCalls,
+            ),
+            text_step("a2", "done"),
+        ],
+    })
+    .await;
 }
 
 /// Runs [`compare_in`] once, on the current compaction contract, with a compaction provider

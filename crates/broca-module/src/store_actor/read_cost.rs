@@ -182,6 +182,10 @@ fn moved(record: &Record, run: &str, ordinal_shift: i64, mid: &str) -> Record {
             facts.mid = mid.to_owned();
         }
         Record::TurnFacts(turn) => turn.ordinal = shift(turn.ordinal),
+        // The builder names each message by the seq of its own facts, so no step or batch start
+        // announces an id.
+        Record::StepStart(start) => start.mid = None,
+        Record::BatchStart(batch) => batch.mid = None,
         _ => {}
     }
     record
@@ -400,6 +404,7 @@ async fn measure(built: &Built, parts: &SharedParts, sealed: bool, written: Dura
         live: &'a crate::store_reads::LiveStep,
         open: bool,
         settled: &'a SettledRuns,
+        stream_head: Option<Option<broca_core::Cursor>>,
     ) -> ReadContext<'a> {
         ReadContext {
             parts,
@@ -408,6 +413,7 @@ async fn measure(built: &Built, parts: &SharedParts, sealed: bool, written: Dura
             settled: Some((settled, addr)),
             session_name,
             live_step: open.then_some(live),
+            stream_head,
         }
     }
     let (session_triple, key) = (triple(), deployment());
@@ -418,6 +424,17 @@ async fn measure(built: &Built, parts: &SharedParts, sealed: bool, written: Dura
     let mut writer = Session::load(backend(), built.addr.clone(), &triple(), &deployment())
         .await
         .unwrap();
+    // The actor seeds its live projection when it opens, in the background, reading the open
+    // log from its checkpoint; its reads then take `session.read`'s head from that projection.
+    let mut seedings = Vec::new();
+    let mut seed = None;
+    for _ in 0..slow.max(10) {
+        let started = Instant::now();
+        seed = Some(crate::store_fanout::measure_seed(&writer).await.unwrap());
+        seedings.push(started.elapsed());
+    }
+    let (seed_bytes, stream_head) = seed.unwrap();
+    let seeded = percentiles(seedings);
     // Kept whatever its size, to measure a read served from a kept view; whether the module's
     // own bound keeps a view this large is reported beside the table.
     let cache = ViewCache::new(4, u64::MAX);
@@ -433,6 +450,7 @@ async fn measure(built: &Built, parts: &SharedParts, sealed: bool, written: Dura
                 &live,
                 true,
                 if kept { &settled } else { &walked },
+                Some(stream_head),
             );
             let started = Instant::now();
             let outcome = answer_in_memory(&mut writer, &ctx, &request).await;
@@ -511,6 +529,7 @@ async fn measure(built: &Built, parts: &SharedParts, sealed: bool, written: Dura
                 &live,
                 false,
                 if kept { &settled } else { &walked },
+                None,
             );
             let started = Instant::now();
             let position = Session::stored_position(&backend(), &built.addr, &deployment())
@@ -579,7 +598,7 @@ async fn measure(built: &Built, parts: &SharedParts, sealed: bool, written: Dura
         let mut samples = Vec::new();
         for _ in 0..cold {
             let walked = SettledRuns::default();
-            let ctx = context(parts, &addr, &session_name, &live, false, &walked);
+            let ctx = context(parts, &addr, &session_name, &live, false, &walked, None);
             let started = Instant::now();
             let view = load().await.unwrap();
             std::hint::black_box(execute(&view, &ctx, &request).await);
@@ -640,6 +659,11 @@ async fn measure(built: &Built, parts: &SharedParts, sealed: bool, written: Dura
         percentiles(open_notice),
         percentiles(cached_notice),
         percentiles(cold_notice),
+    ));
+    section.push_str(&format!(
+        "\nLive projection seeding at the actor's open (off the actor): {seeded} ms p50 / p99; \
+         projector state held afterwards: about {:.1} KB.\n",
+        seed_bytes as f64 / 1e3,
     ));
     section
 }

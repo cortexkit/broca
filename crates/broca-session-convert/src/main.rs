@@ -30,6 +30,11 @@
 //! possible cut. Every fact must be equal field for field, fact id included. The report names
 //! counts, run ids and field names only.
 //!
+//! `session-convert subscribe <path>...`: for every session log, today's `session.subscribe`
+//! control stream against the new storage's, from the converted records (see
+//! `subscribe_check`). `session-convert subscribe-cost --dir <scratch> <path>...` times a
+//! subscriber's catch-up on the largest log given.
+//!
 //! Point it only at a copy of a state root (an APFS clone, `cp -c`), never at live files: it opens
 //! each log read-only, but a measurement run should never share a disk path with the daemon.
 
@@ -55,7 +60,9 @@ use serde::Serialize;
 mod calls_check;
 mod entries_check;
 mod heads;
+mod pages;
 mod serve_check;
+mod subscribe_check;
 
 /// Measurements encrypt with a fixed throwaway key: only the cost matters, not secrecy.
 fn measurement_key() -> FrameKey {
@@ -161,7 +168,9 @@ fn usage() -> ! {
          session-convert append --dir SCRATCH [--sample N] [--out FILE] PATH...\n       \
          session-convert split [--dir SCRATCH] [--out FILE] [--limit N] PATH...\n       \
          session-convert entries [--dir SCRATCH] [--out FILE] [--limit N] PATH...\n       \
-         session-convert billing [--dir SCRATCH] [--out FILE] [--limit N] PATH..."
+         session-convert billing [--dir SCRATCH] [--out FILE] [--limit N] PATH...\n       \
+         session-convert subscribe [--dir SCRATCH] [--out FILE] [--limit N] PATH...\n       \
+         session-convert subscribe-cost --dir SCRATCH [--out FILE] PATH..."
     );
     std::process::exit(64);
 }
@@ -259,14 +268,17 @@ fn main() {
         "split" => run_split(&args),
         "seal" => run_seal(&args),
         "entries" => run_entries(&args),
-        "pages" => run_pages(&args),
+        "pages" => pages::run(&args),
+        "read-cost" => pages::run_read_cost(&args),
         "heads" => heads::run(&args),
         "billing" => run_billing(&args),
         "episodes" => run_episodes(&args),
         "render" => run_render(&args),
+        "serve-check" => serve_check::run(&args),
+        "subscribe" => subscribe_check::run(&args),
+        "subscribe-cost" => subscribe_check::cost(&args),
         "entries-check" => entries_check::run(&args),
         "calls-check" => calls_check::run(&args),
-        "serve-check" => serve_check::run(&args),
         _ => usage(),
     }
 }
@@ -898,392 +910,6 @@ fn run_entries(args: &Args) {
         report.sealed_logs += u64::from(sealed);
         report.ids_resolved += resolved;
         report.equal_sealed += compare(&after, &mut report.mismatches);
-    });
-    write_report(&report, args.out_file.as_deref());
-}
-
-#[derive(Default, Serialize)]
-struct PagesReport {
-    logs: u64,
-    mode3_logs: u64,
-    /// Messages today's `session.read` serves for those logs, walking every page.
-    messages: u64,
-    /// Messages the store's page serves equal to today's, from the open log, and again after
-    /// sealing at the newest possible cut.
-    equal_open: u64,
-    equal_sealed: u64,
-    sealed_logs: u64,
-    /// Of today's messages compared after sealing, the opaque payloads the seal pruned from a
-    /// finished run (the four `OpaqueField`s: encrypted reasoning, reasoning signatures, a text
-    /// block's provider state, a tool call's thought signature). The store serves those as
-    /// emptied or removed, so the comparison after sealing sets them aside, and counts them.
-    pruned_payloads: u64,
-    /// Logs whose page state (lineage state, length and paging) equals today's.
-    state_equal: u64,
-    /// Of today's messages, how many carry each fact, so an equal count covers it.
-    with_created_at: u64,
-    with_completed_at: u64,
-    with_run: u64,
-    finals: u64,
-    /// Of today's messages, how many have no written time.
-    without_written_at: u64,
-    /// The first difference of each mismatching log, by field.
-    mismatches: BTreeMap<String, u64>,
-    /// A few mismatching logs per difference, to read by hand.
-    examples: BTreeMap<String, Vec<String>>,
-    failures: BTreeMap<String, u64>,
-}
-
-/// A page message as JSON, for comparing two pages field by field.
-fn page_message_json(message: &broca_core::SessionReadMessage) -> serde_json::Value {
-    serde_json::json!({
-        "ordinal": message.ordinal,
-        "created_at": message.created_at,
-        "written_at": message.written_at,
-        "completed_at": message.completed_at,
-        "message": message.message,
-        "run": message.run,
-    })
-}
-
-/// Every page of a transcript, walked from the start by `next_from_ordinal`, `limit` messages at
-/// a time, with each page's state (lineage state, length, next ordinal).
-fn walk_pages<F>(mut page: F, limit: u64) -> Result<(Vec<serde_json::Value>, Vec<String>), String>
-where
-    F: FnMut(u64, u64) -> Result<broca_core::SessionReadPage, String>,
-{
-    let mut messages = Vec::new();
-    let mut states = Vec::new();
-    let mut from = 0;
-    loop {
-        let read = page(from, limit)?;
-        states.push(format!(
-            "{:?} len {} next {:?}",
-            read.lineage_state, read.prompt_len, read.next_from_ordinal
-        ));
-        messages.extend(read.messages.iter().map(page_message_json));
-        match read.next_from_ordinal {
-            Some(next) if next > from => from = next,
-            _ => return Ok((messages, states)),
-        }
-    }
-}
-
-/// [`walk_pages`] over the pages the new format serves for `session`.
-async fn walk_store_pages(
-    session: &Session<&MemoryBackend>,
-    limit: u64,
-) -> Result<(Vec<serde_json::Value>, Vec<String>), String> {
-    let mut messages = Vec::new();
-    let mut states = Vec::new();
-    let mut from = 0;
-    loop {
-        let read = broca_module::store_read::read_page(session, Some(from), Some(limit))
-            .await
-            .map_err(|e| format!("{e:?}"))?
-            .page;
-        states.push(format!(
-            "{:?} len {} next {:?}",
-            read.lineage_state, read.prompt_len, read.next_from_ordinal
-        ));
-        messages.extend(read.messages.iter().map(page_message_json));
-        match read.next_from_ordinal {
-            Some(next) if next > from => from = next,
-            _ => return Ok((messages, states)),
-        }
-    }
-}
-
-/// For every mode-3 session: today's `session.read` pages, built from the WAL alone, against
-/// the pages the new format serves from the converted records (`broca_module::store_read`),
-/// from the open log and again after sealing. Every message must be equal, times and run
-/// included, and so must each page's state.
-fn run_pages(args: &Args) {
-    let mut report = PagesReport::default();
-    let deployment = DeploymentKey::new(1, &[0x5a; 32]);
-    // Small pages, so paging and the final-message rule across a page boundary are exercised.
-    // `PAGES_LIMIT` sets another size, for a quicker pass over every log.
-    let limit = std::env::var("PAGES_LIMIT")
-        .ok()
-        .and_then(|limit| limit.parse().ok())
-        .unwrap_or(7);
-    each_log(args, |item| {
-        let Item::Log {
-            name, old: Ok(old), ..
-        } = item
-        else {
-            return;
-        };
-        report.logs += 1;
-        let records: Vec<broca_wal::WalRecord> = old.iter().map(|f| f.record.clone()).collect();
-        // `PAGES_ALL=1` takes every log, not only those on the current compaction contract.
-        if !broca_core::is_mode3_log(&records) && std::env::var("PAGES_ALL").is_err() {
-            return;
-        }
-        report.mode3_logs += u64::from(broca_core::is_mode3_log(&records));
-        let mut fail = |what: &str, e: String| {
-            let key: String = format!("{what}: {e}").chars().take(100).collect();
-            *report.failures.entry(key.clone()).or_default() += 1;
-            let examples = report.examples.entry(key).or_default();
-            if examples.len() < 5 {
-                examples.push(name.clone());
-            }
-        };
-        let framed: Vec<broca_wal::FramedRecord> = old.iter().cloned().collect();
-        let today = walk_pages(
-            |from, limit| {
-                broca_core::read_session_page(
-                    &broca_core::StorePageSnapshot::empty(),
-                    &framed,
-                    Some(from),
-                    Some(limit),
-                )
-                .map_err(|e| e.to_string())
-            },
-            limit,
-        );
-        let (today, today_states) = match today {
-            Ok(today) => today,
-            Err(e) => return fail("today's pages", e),
-        };
-        for message in &today {
-            report.with_created_at += u64::from(!message["created_at"].is_null());
-            report.with_completed_at += u64::from(!message["completed_at"].is_null());
-            report.with_run += u64::from(!message["run"].is_null());
-            report.finals += u64::from(message["run"]["final"] == serde_json::json!(true));
-            report.without_written_at += u64::from(message["written_at"].is_null());
-        }
-        report.messages += today.len() as u64;
-        let converted = match convert_log(&old) {
-            Ok(converted) => converted,
-            Err(e) => return fail("convert", e.0),
-        };
-        if std::env::var("PAGES_SHOW").is_ok_and(|show| show == name) {
-            let delivered: Vec<(u64, Option<String>)> = converted
-                .records
-                .iter()
-                .filter_map(|record| match record {
-                    Record::EntryFacts(facts) if facts.delivery_mode.is_some() => {
-                        Some((facts.ordinal, facts.delivery_mode.clone()))
-                    }
-                    _ => None,
-                })
-                .collect();
-            let replayed = broca_core::replay(&records).map(|state| {
-                state
-                    .prompt
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, message)| message.tags.delivery().is_some())
-                    .map(|(position, _)| position)
-                    .collect::<Vec<_>>()
-            });
-            eprintln!("facts with delivery: {delivered:?}\nreplay prompt delivery positions: {replayed:?}");
-            let kinds: Vec<String> = converted
-                .records
-                .iter()
-                .take(12)
-                .map(|r| r.name().to_string())
-                .collect();
-            let facts = converted
-                .records
-                .iter()
-                .filter(|r| matches!(r, Record::EntryFacts(_)))
-                .count();
-            eprintln!("first records: {kinds:?}\nentry facts: {facts}");
-        }
-        let served = block_on(async {
-            let backend = MemoryBackend::default();
-            let addr = SessionAddr(name.clone());
-            let triple = triple(&name);
-            let mut session =
-                Session::create(&backend, addr.clone(), triple.clone(), &deployment, false)
-                    .await
-                    .map_err(|e| format!("create: {e:?}"))?;
-            let mut run_inputs = Vec::new();
-            for record in &converted.records {
-                let seq = session
-                    .append(std::slice::from_ref(record), false)
-                    .await
-                    .map_err(|e| format!("append {}: {e:?}", record.name()))?;
-                if matches!(record, Record::Input(input) if input.placement == broca_session_store::record::Placement::RunInput)
-                {
-                    run_inputs.push(seq);
-                }
-            }
-            if std::env::var("PAGES_SHOW").is_ok_and(|show| show == name) {
-                let first = session.entries(1, 4).await.map_err(|e| format!("{e:?}"))?;
-                for entry in &first {
-                    eprintln!(
-                        "entry {} role {:?} facts {} next {}",
-                        entry.ordinal,
-                        entry.message.role,
-                        entry.state.facts.is_some(),
-                        entry.next.is_some()
-                    );
-                }
-                eprintln!(
-                    "window start {} placed {} entries {}",
-                    session.conversation.window_start(),
-                    session.conversation.placed,
-                    session.conversation.entries.len()
-                );
-            }
-            let open = walk_store_pages(&session, limit)
-                .await
-                .map_err(|e| format!("open: {e}"))?;
-            let mut sealed = false;
-            for cut in run_inputs.iter().rev() {
-                match session.seal(Some(*cut), 0).await {
-                    Ok(_) => {
-                        sealed = true;
-                        break;
-                    }
-                    Err(broca_session_store::session::SessionError::BadCut(_)) => continue,
-                    // A session that names compaction views can only be sealed by a caller that
-                    // carries them, which this check doesn't: its pages are read open instead.
-                    Err(broca_session_store::session::SessionError::ViewNotCarried) => break,
-                    Err(e) => return Err(format!("seal: {e:?}")),
-                }
-            }
-            session.close().await.map_err(|e| format!("close: {e:?}"))?;
-            let view = Session::view(&backend, addr, &triple, &deployment)
-                .await
-                .map_err(|e| format!("view: {e:?}"))?;
-            let after = walk_store_pages(&view, limit)
-                .await
-                .map_err(|e| format!("sealed: {e}"))?;
-            Ok::<_, String>((open, sealed, after))
-        });
-        let ((open, open_states), sealed, (after, _)) = match served {
-            Ok(served) => served,
-            Err(e) => return fail("session", e),
-        };
-        report.state_equal += u64::from(open_states == today_states);
-        if open_states != today_states {
-            let key = "page state".to_string();
-            *report.mismatches.entry(key.clone()).or_default() += 1;
-            let examples = report.examples.entry(key).or_default();
-            if examples.len() < 5 {
-                examples.push(format!(
-                    "{name}: {:?} vs {:?}",
-                    open_states.last(),
-                    today_states.last()
-                ));
-            }
-        }
-        // After sealing, today's message with the payloads the store pruned set aside, and how
-        // many were. A payload counts as pruned only where the store's message holds it empty.
-        let set_aside = |got: &serde_json::Value, expected: &serde_json::Value| {
-            let mut expected = expected.clone();
-            let mut pruned = 0;
-            let blocks = got["message"]["content"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default();
-            if let Some(content) = expected["message"]["content"].as_array_mut() {
-                for (block, served) in content.iter_mut().zip(&blocks) {
-                    if block["type"] == "redacted_reasoning"
-                        && served["type"] == "redacted_reasoning"
-                        && served["data"] == ""
-                        && block["data"] != ""
-                    {
-                        block["data"] = serde_json::json!("");
-                        pruned += 1;
-                    }
-                    if block["type"] == "reasoning"
-                        && served["type"] == "reasoning"
-                        && served.get("signature").is_none()
-                        && block.get("signature").is_some()
-                    {
-                        block.as_object_mut().map(|block| block.remove("signature"));
-                        pruned += 1;
-                    }
-                    // A text block's provider state, emptied (`OpaqueField::TextProviderState`).
-                    if block["type"] == served["type"]
-                        && served["provider_state"]["data"] == ""
-                        && block["provider_state"]["data"]
-                            .as_str()
-                            .is_some_and(|d| !d.is_empty())
-                    {
-                        block["provider_state"]["data"] = serde_json::json!("");
-                        pruned += 1;
-                    }
-                    // A tool call's thought signature, removed (`ToolCallThoughtSignature`).
-                    if block["type"] == "tool_call"
-                        && served["type"] == "tool_call"
-                        && served.get("thought_signature").is_none()
-                        && block.get("thought_signature").is_some()
-                    {
-                        block
-                            .as_object_mut()
-                            .map(|block| block.remove("thought_signature"));
-                        pruned += 1;
-                    }
-                }
-            }
-            (expected, pruned)
-        };
-        let mut pruned_payloads = 0;
-        let mut compare = |served: &[serde_json::Value], sealed: bool| -> u64 {
-            if served.len() != today.len() {
-                *report
-                    .mismatches
-                    .entry(format!(
-                        "{} messages served, {} today",
-                        served.len(),
-                        today.len()
-                    ))
-                    .or_default() += 1;
-                return 0;
-            }
-            let mut equal = 0;
-            for (got, expected) in served.iter().zip(&today) {
-                let expected = if sealed {
-                    let (expected, pruned) = set_aside(got, expected);
-                    pruned_payloads += pruned;
-                    expected
-                } else {
-                    expected.clone()
-                };
-                let expected = &expected;
-                if got == expected {
-                    equal += 1;
-                } else {
-                    let path = broca_session_convert::inverse::first_difference(got, expected, "")
-                        .unwrap_or_else(|| "?".into());
-                    // `PAGES_SHOW=<log name>` prints that log's first differing message both ways.
-                    if std::env::var("PAGES_SHOW").is_ok_and(|show| show == name) {
-                        let brief = |value: &serde_json::Value| {
-                            serde_json::json!({
-                                "ordinal": value["ordinal"],
-                                "role": value["message"]["role"],
-                                "tags": value["message"]["tags"],
-                                "run": value["run"],
-                                "created_at": value["created_at"],
-                                "completed_at": value["completed_at"],
-                                "parts": value["message"]["content"].as_array().map(|parts| {
-                                    parts.iter().map(|part| part["type"].clone()).collect::<Vec<_>>()
-                                }),
-                            })
-                        };
-                        eprintln!("store: {}\ntoday: {}", brief(got), brief(expected));
-                    }
-                    let key: String = path.chars().take(80).collect();
-                    *report.mismatches.entry(key.clone()).or_default() += 1;
-                    let examples = report.examples.entry(key).or_default();
-                    if examples.len() < 5 {
-                        examples.push(format!("{name} @{}", expected["ordinal"]));
-                    }
-                    return equal;
-                }
-            }
-            equal
-        };
-        report.equal_open += compare(&open, false);
-        report.sealed_logs += u64::from(sealed);
-        report.equal_sealed += compare(&after, true);
-        report.pruned_payloads += pruned_payloads;
     });
     write_report(&report, args.out_file.as_deref());
 }

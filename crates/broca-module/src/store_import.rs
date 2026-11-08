@@ -378,6 +378,7 @@ pub fn seed(history: HeadHistory, at: &SeedFacts<'_>) -> Result<Seed, ImportRefu
                         dispatched_to: None,
                         dispatched_at_ms: None,
                         finished_at_ms: None,
+                        unanswered: None,
                     })
                     .collect(),
             }));
@@ -445,6 +446,9 @@ pub fn seed(history: HeadHistory, at: &SeedFacts<'_>) -> Result<Seed, ImportRefu
             client_message_id: send.and_then(|send| send.client_message_id.clone()),
             sender: send.map(|send| send.sender.clone()),
             marks: send.and_then(|send| send.marks.clone()),
+            no_display_facts: None,
+            reasoning_summaries: broca_session_loop::entries::reasoning_summaries(&message.message),
+            rich_ui: None,
         }));
         high = high
             .checked_add(broca_core::compaction_v2::metadata::numbered_parts(

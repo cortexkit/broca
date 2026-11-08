@@ -132,6 +132,9 @@ fn facts(ordinal: u64, mid: &str) -> Record {
         client_message_id: None,
         sender: None,
         marks: None,
+        no_display_facts: None,
+        reasoning_summaries: Vec::new(),
+        rich_ui: None,
     })
 }
 
@@ -398,6 +401,7 @@ fn turn_facts_attach_to_their_message() {
                 dispatched_to: None,
                 dispatched_at_ms: None,
                 finished_at_ms: None,
+                unanswered: None,
             }],
         };
         let records = vec![

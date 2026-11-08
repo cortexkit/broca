@@ -89,6 +89,33 @@ impl DataKey {
     pub fn derive(&self, context: &[u8]) -> [u8; 32] {
         crate::prune::keyed_digest(&self.bytes, context).0
     }
+
+    /// The key subscribe cursors of this session are digested under.
+    pub fn cursor_key(&self) -> CursorKey {
+        CursorKey(self.derive(CURSOR_CONTEXT))
+    }
+}
+
+/// What a subscribe cursor's key is derived for, so no other key derived from the data key
+/// equals it.
+const CURSOR_CONTEXT: &[u8] = b"broca-subscribe-cursor-v1";
+
+/// The key a subscribe cursor's digest is made with: derived from the session's data key, so
+/// a cursor proves which record it names without letting anyone holding it guess a short
+/// stored value from the digest.
+#[derive(Clone)]
+pub struct CursorKey([u8; 32]);
+
+impl CursorKey {
+    /// The digest a cursor naming `record` carries: the first 8 bytes of HMAC-SHA256 over the
+    /// record's canonical encoding (its kind number, little-endian, then its body), read as a
+    /// big-endian number.
+    pub fn digest(&self, record: &crate::record::Record) -> u64 {
+        let mut encoding = record.kind().to_le_bytes().to_vec();
+        encoding.extend(record.encode_body());
+        let digest = crate::prune::keyed_digest(&self.0, &encoding);
+        u64::from_be_bytes(digest.0[..8].try_into().expect("a digest has 32 bytes"))
+    }
 }
 
 /// Why a wrapped key couldn't be unwrapped.
@@ -226,5 +253,52 @@ mod tests {
         assert!(!verify(&key, b"head", b"bytez", &tag));
         assert!(!verify(&key, b"frame", b"bytes", &tag));
         assert!(!verify(&DataKey::generate(1), b"head", b"bytes", &tag));
+    }
+
+    /// HMAC-SHA256 as RFC 2104 defines it, for a key of at most one block.
+    fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+        use sha2::{Digest as _, Sha256};
+        let mut block = [0u8; 64];
+        block[..key.len()].copy_from_slice(key);
+        let inner = Sha256::new()
+            .chain_update(block.map(|byte| byte ^ 0x36))
+            .chain_update(data)
+            .finalize();
+        Sha256::new()
+            .chain_update(block.map(|byte| byte ^ 0x5c))
+            .chain_update(inner)
+            .finalize()
+            .into()
+    }
+
+    /// A subscribe cursor's digest is the first 8 bytes of HMAC-SHA256 over its record's kind
+    /// and body, under a key derived from the session's data key for cursors alone: another
+    /// session's key, or the data key itself, digests the same record differently.
+    #[test]
+    fn a_cursor_digest_is_a_keyed_hmac_of_its_record() {
+        // RFC 4231 test case 2 pins the construction itself.
+        assert_eq!(
+            crate::codec::hex(&hmac_sha256(b"Jefe", b"what do ya want for nothing?")),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+        let key = DataKey::generate(1);
+        let record = crate::record::Record::Event(crate::record::Event {
+            name: "a".into(),
+            run_id: None,
+            body: None,
+        });
+        let derived = hmac_sha256(&key.bytes, b"broca-subscribe-cursor-v1");
+        let mut encoding = record.kind().to_le_bytes().to_vec();
+        encoding.extend(record.encode_body());
+        let full = hmac_sha256(&derived, &encoding);
+        let expected = u64::from_be_bytes(full[..8].try_into().unwrap());
+        assert_eq!(key.cursor_key().digest(&record), expected);
+        assert_ne!(DataKey::generate(1).cursor_key().digest(&record), expected);
+        let other = crate::record::Record::Event(crate::record::Event {
+            name: "b".into(),
+            run_id: None,
+            body: None,
+        });
+        assert_ne!(key.cursor_key().digest(&other), expected);
     }
 }
