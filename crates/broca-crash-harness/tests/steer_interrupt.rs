@@ -374,6 +374,17 @@ impl Session {
             inherit_frozen_cache: false,
             structured_output: None,
         };
+        let mut submission = request.to_submission();
+        // Only the creating key declares tools. Replaying that key repeats its payload;
+        // distinct sends inherit the surface even after this harness reopens the WAL.
+        if self.wal_path().exists()
+            && self.log().records().iter().find_map(|record| match record {
+                WalRecord::RunStarted { send_id, .. } => Some(send_id.as_deref()),
+                _ => None,
+            }) != Some(Some(send_id))
+        {
+            submission.tools = None;
+        }
         self.registry
             .send(SendRequest {
                 session_class: None,
@@ -384,7 +395,7 @@ impl Session {
                 session: session(),
                 run_id: request.run_id.clone(),
                 send_id: Some(send_id.into()),
-                request: Box::new(request.to_submission()),
+                request: Box::new(submission),
                 skip_materialization: false,
                 kind: RunKind::FreshOrResume,
                 delivery,
@@ -431,7 +442,7 @@ impl Session {
                 return Ok(log);
             }
             Err(format!(
-                "root={}, idle={idle}, records={}, pending={}, all_ended={}",
+                "root={}, idle={idle}, records={}, pending={}, all_ended={}; replay_records={records:?}",
                 self.root.display(),
                 records.len(),
                 broca_core::pending_submissions(&records).len(),
@@ -1034,7 +1045,19 @@ async fn recover(scenario: Scenario, cut: &[u8]) -> (LogImage, LogImage, Vec<Str
     let sweep = recovery
         .registry
         .mark_crash_orphans(recovery.wal.as_ref(), candidates, started);
-    recovery.registry.seal_marked_crash_orphans(sweep).await;
+    assert_eq!(
+        sweep.marked,
+        sweep.candidate_runs,
+        "crash-orphan recovery did not mark its fixture: {sweep:?}; records={:?}",
+        cut.records(),
+    );
+    let sweep = recovery.registry.seal_marked_crash_orphans(sweep).await;
+    assert_eq!(
+        sweep.open_failed,
+        0,
+        "crash-orphan recovery could not open its fixture: {sweep:?}; records={:?}",
+        cut.records(),
+    );
     // A steer-only ordered send can remain queued after a crash seals its target run: it
     // must wait for some later run, never start one merely to empty the queue.
     let after = recovery

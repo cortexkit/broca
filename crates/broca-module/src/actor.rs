@@ -1362,6 +1362,10 @@ fn submission_from_config(
     input: Vec<broca_protocol::Message>,
 ) -> SubmissionRequest {
     let policy_allowed = config.tools.iter().map(|tool| tool.name.clone()).collect();
+    // A send's retry digest distinguishes omitted tools from an explicit tool list.
+    // Reconstruct that omission, not just the inherited execution surface, or core
+    // refuses to finish the original run after a crash as a different send.
+    let tools = (!config.tools_were_omitted).then(|| Arc::unwrap_or_clone(config.tools));
     SubmissionRequest {
         route_decision_id: config.route_decision_id,
         account_route: config.account_route,
@@ -1376,7 +1380,7 @@ fn submission_from_config(
         principal: None,
         model: config.model,
         input,
-        tools: Some(Arc::unwrap_or_clone(config.tools)),
+        tools,
         policy_allowed,
         tool_choice: config.tool_choice,
         generation: config.generation,
@@ -1398,6 +1402,32 @@ fn submission_from_config(
 
 #[cfg(test)]
 mod account_route_resume_tests {
+    #[test]
+    fn reconstructed_omitted_tools_keep_the_original_send_identity() {
+        let model = serde_json::json!({"provider_module_id":"stub","model_id":"m"});
+        let input = serde_json::json!([
+            {"role":"user","content":[{"type":"text","text":"continue"}]}
+        ]);
+        let original: broca_protocol::SubmissionRequest = serde_json::from_value(
+            serde_json::json!({"model":model,"input":input,"tools":null,"policy_allowed":["work"]}),
+        )
+        .unwrap();
+        let config: broca_wal::RunConfig = serde_json::from_value(serde_json::json!({
+            "model":model,
+            "tools":[{"name":"work","description":"does work","input_schema":{"type":"object"}}],
+            "tools_were_omitted":true,
+            "tool_choice":{"type":"auto"},"generation":{},
+            "response_format":{"type":"text"},"context_epoch":0,"renderer_version":1
+        }))
+        .unwrap();
+        let reconstructed = super::submission_from_config(config, original.input.clone());
+        assert!(reconstructed.tools.is_none());
+        assert_eq!(
+            broca_core::admission::submission_identity_digest(&original),
+            broca_core::admission::submission_identity_digest(&reconstructed),
+        );
+    }
+
     #[test]
     fn account_route_resume_reconstructs_the_frozen_route_not_render_names() {
         let config: broca_wal::RunConfig = serde_json::from_value(serde_json::json!({
@@ -2115,6 +2145,29 @@ impl<W: WalStore + 'static> LineageActor<W> {
             match recovered {
                 Ok(()) => break,
                 Err(error) => {
+                    let run_id = self
+                        .prior_snapshot
+                        .as_ref()
+                        .and_then(|snapshot| snapshot.checkpoint_at_head.last_episode.as_ref())
+                        .map(|episode| episode.run_id.clone());
+                    let send_id = self.prior_snapshot.as_ref().and_then(|snapshot| {
+                        snapshot.tail.iter().find_map(|frame| match &frame.record {
+                            WalRecord::RunStarted {
+                                run_id: recorded_run,
+                                send_id,
+                                ..
+                            } if Some(recorded_run) == run_id.as_ref() => send_id.as_deref(),
+                            _ => None,
+                        })
+                    });
+                    tracing::warn!(
+                        target: "lifecycle",
+                        session = ?self.key,
+                        run_id = ?run_id.as_ref().map(|id| id.0.as_str()),
+                        send_id = ?send_id,
+                        error = %error,
+                        "startup durable-work recovery refused"
+                    );
                     let now = self
                         .registry
                         .retention_service()
@@ -8144,10 +8197,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 episode.run_id == *run_id && episode.disposition == EpisodeDisposition::Paused
             })
             .map(|episode| {
-                let mut request = submission_from_episode(&episode);
-                if episode.config.tools_were_omitted {
-                    request.tools = None;
-                }
+                let request = submission_from_episode(&episode);
                 (request, episode.request_identity_digest)
             }))
     }
@@ -8176,10 +8226,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             let episode = episode
                 .filter(|e| e.run_id == target)
                 .ok_or_else(|| "run is no longer durably paused".to_string())?;
-            let mut request = submission_from_episode(&episode);
-            if episode.config.tools_were_omitted {
-                request.tools = None;
-            }
+            let request = submission_from_episode(&episode);
             return self
                 .start_paused_cancel_request(
                     run_id,
@@ -8212,12 +8259,11 @@ impl<W: WalStore + 'static> LineageActor<W> {
             })
             .ok_or_else(|| "run is no longer durably paused".to_string())?;
         let mut request = submission_from_episode(episode);
-        let tools_were_omitted = episode.config.tools_were_omitted
-            || self
-                .admitted_request_identities
-                .get(run_id)
-                .is_some_and(|identity| identity.tools_were_omitted);
-        if tools_were_omitted {
+        if self
+            .admitted_request_identities
+            .get(run_id)
+            .is_some_and(|identity| identity.tools_were_omitted)
+        {
             request.tools = None;
         }
         // The episode's own `RunStarted` holds the digest; the run index is asked only for an
