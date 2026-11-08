@@ -1265,6 +1265,345 @@ async fn routed_unavailable_or_unready_never_sends_or_stores() {
     }
 }
 
+async fn assert_invalid_pin_is_unrecorded(model: &str, code: &str, kind: Option<&str>) {
+    let rig = routed_rig(true, true);
+    let mut params: Value =
+        serde_json::from_str(&routed_request(&["valid-after-refusal"])).unwrap();
+    params["model"] = json!(model);
+    let refusal = call(&rig, &params.to_string()).await.unwrap_err();
+    assert_eq!(refusal["code"], code);
+    assert_eq!(refusal["detail"]["model"], model);
+    assert_eq!(refusal["detail"]["kind"].as_str(), kind);
+    assert!(rig.router.calls.lock().unwrap().is_empty());
+    assert!(rig.provider.bodies.lock().unwrap().is_empty());
+    assert!(rig.credentials.lock().unwrap().is_empty());
+    assert!(rig.store.lookup(STORE_ROLE, "routed").unwrap().is_none());
+    assert!(rig.store.routing(STORE_ROLE, "routed").unwrap().is_none());
+    assert!(rig.service.claims.lock().unwrap().is_empty());
+
+    rig.provider.script(
+        "valid-after-refusal",
+        vec![Script::Answer(answered(Some(7)))],
+    );
+    params["model"] = json!(JEV);
+    call(&rig, &params.to_string()).await.unwrap();
+    assert_eq!(rig.provider.calls("valid-after-refusal"), 1);
+}
+
+#[tokio::test]
+async fn routed_unknown_pin_is_refused_before_routing_and_writes() {
+    assert_invalid_pin_is_unrecorded("no-such-provider/unknown", "model_unknown", None).await;
+}
+
+#[tokio::test]
+async fn routed_non_classifier_pin_is_refused_before_routing_and_writes() {
+    assert_invalid_pin_is_unrecorded("openai/gpt-chat", "model_not_classifier", Some("chat")).await;
+}
+
+#[tokio::test]
+async fn routed_kindless_pin_is_refused_before_routing_and_writes() {
+    assert_invalid_pin_is_unrecorded("openai/kindless", "model_not_classifier", None).await;
+}
+
+async fn assert_validation_is_unrecorded(params: Value, field: &str) {
+    let rig = routed_rig(true, true);
+    let id = params["batch_id"].as_str().unwrap();
+    let refusal = call(&rig, &params.to_string()).await.unwrap_err();
+    assert_eq!(refusal["code"], "invalid_params", "{field}: {refusal}");
+    assert_eq!(refusal["detail"]["field"], field);
+    assert!(rig.router.calls.lock().unwrap().is_empty(), "{field}");
+    assert!(rig.provider.bodies.lock().unwrap().is_empty(), "{field}");
+    assert!(rig.credentials.lock().unwrap().is_empty(), "{field}");
+    assert!(
+        rig.store.lookup(STORE_ROLE, id).unwrap().is_none(),
+        "{field}"
+    );
+    assert!(
+        rig.store.routing(STORE_ROLE, id).unwrap().is_none(),
+        "{field}"
+    );
+    assert!(rig.service.claims.lock().unwrap().is_empty(), "{field}");
+
+    rig.provider.script(
+        "valid-after-validation",
+        vec![Script::Answer(answered(Some(7)))],
+    );
+    let mut valid: Value =
+        serde_json::from_str(&routed_request(&["valid-after-validation"])).unwrap();
+    valid["model"] = json!(JEV);
+    call(&rig, &valid.to_string()).await.unwrap();
+    assert_eq!(rig.provider.calls("valid-after-validation"), 1);
+}
+
+fn over_limit_questions() -> Value {
+    Value::Object(
+        (0..=64)
+            .map(|i| {
+                (
+                    format!("q{i}"),
+                    json!({"type":"noul","instructions":"true?"}),
+                )
+            })
+            .collect(),
+    )
+}
+
+#[tokio::test]
+async fn routed_pinned_max_questions_refusal_leaves_id_reusable_before_routing() {
+    let mut params: Value = serde_json::from_str(&routed_request(&["invalid-questions"])).unwrap();
+    params["model"] = json!(JEV);
+    params["questions"] = over_limit_questions();
+    assert_validation_is_unrecorded(params, "questions").await;
+}
+
+#[tokio::test]
+async fn routed_image_preparation_checks_pinned_limits_before_resolving() {
+    struct UnusedResolver;
+    #[async_trait]
+    impl crate::system_one::images::ImageResolver for UnusedResolver {
+        async fn resolve(
+            &self,
+            _handle: &str,
+            _scope_ref: &str,
+            _parent_scope_ref: Option<&str>,
+        ) -> Result<broca_subc::ResolvedImage, broca_subc::ImageResolveError> {
+            panic!("invalid pinned requests must not resolve images");
+        }
+    }
+    let mut rig = routed_rig(true, true);
+    Arc::get_mut(&mut rig.service).unwrap().image_resolver = Some(Arc::new(UnusedResolver));
+    let mut params: Value = serde_json::from_str(&routed_request(&["invalid-questions"])).unwrap();
+    params["model"] = json!(JEV);
+    params["questions"] = over_limit_questions();
+    let refusal = rig
+        .service
+        .prepare_images(
+            &params.to_string(),
+            &broca_protocol::SendScope::Internal,
+            None,
+        )
+        .await
+        .err()
+        .expect("image preparation must check the pinned model's limits");
+    let refusal = serde_json::to_value(refusal).unwrap();
+    assert_eq!(refusal["code"], "invalid_params");
+    assert_eq!(refusal["detail"]["field"], "questions");
+    assert!(rig.router.calls.lock().unwrap().is_empty());
+    assert!(rig.provider.bodies.lock().unwrap().is_empty());
+    assert!(rig.store.lookup(STORE_ROLE, "routed").unwrap().is_none());
+    assert!(rig.store.routing(STORE_ROLE, "routed").unwrap().is_none());
+
+    params["questions"] = json!({"q":{"type":"noul","instructions":"true?"}});
+    rig.service
+        .prepare_images(
+            &params.to_string(),
+            &broca_protocol::SendScope::Internal,
+            None,
+        )
+        .await
+        .unwrap();
+    rig.provider
+        .script("invalid-questions", vec![Script::Answer(answered(Some(7)))]);
+    call(&rig, &params.to_string()).await.unwrap();
+    assert_eq!(rig.provider.calls("invalid-questions"), 1);
+}
+
+#[tokio::test]
+async fn routed_validation_refusals_leave_ids_reusable_before_routing() {
+    let base: Value = serde_json::from_str(&routed_request(&["invalid-shape"])).unwrap();
+    let mut cases = Vec::new();
+    let mut params = base.clone();
+    params["questions"] = json!({"Bad":{"type":"noul","instructions":"true?"}});
+    cases.push((params, "questions.Bad"));
+    let mut params = base.clone();
+    params["questions"] =
+        json!({"pick":{"type":"choice","instructions":"Which?","criteria":{"only":"One"}}});
+    cases.push((params, "questions.pick.criteria"));
+    let mut params = base.clone();
+    params["questions"] = json!({"level":{"type":"score","instructions":"How much?","criteria":(0..11).map(|i| format!("level {i}")).collect::<Vec<_>>()}});
+    cases.push((params, "questions.level.criteria"));
+    let mut params = base.clone();
+    params["items"] = json!([{"state":"invalid-shape"},{"state":7}]);
+    cases.push((params, "items[1].state"));
+    let mut params = base.clone();
+    params["items"][0]["images"] = json!(["data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="]);
+    cases.push((params, "items[0].images"));
+    let mut params = base.clone();
+    params["model"] = json!(CLEF);
+    params["items"][0]["images"] = json!(vec!["data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="; 5]);
+    cases.push((params, "items[0].images"));
+    let mut params = base.clone();
+    params["items"] = json!((0..=16)
+        .map(|_| json!({"state":"invalid-shape"}))
+        .collect::<Vec<_>>());
+    cases.push((params, "items"));
+    let mut params = base.clone();
+    params["items"][0]["state"] = json!("x".repeat(1024 * 1024 + 1));
+    cases.push((params, "params"));
+    let mut params = base.clone();
+    params["batch_id"] = json!("bad\tid");
+    cases.push((params, "batch_id"));
+    let mut params = base;
+    params["max_cost_usd"] = json!(-1);
+    cases.push((params, "max_cost_usd"));
+    for (mut params, field) in cases {
+        params
+            .as_object_mut()
+            .unwrap()
+            .entry("model")
+            .or_insert(json!(JEV));
+        assert_validation_is_unrecorded(params, field).await;
+    }
+}
+
+#[tokio::test]
+async fn routed_modelless_max_questions_refusal_reports_and_leaves_id_reusable() {
+    let rig = routed_rig(true, true);
+    let mut params: Value = serde_json::from_str(&routed_request(&["invalid-questions"])).unwrap();
+    params["questions"] = over_limit_questions();
+    let refusal = call(&rig, &params.to_string()).await.unwrap_err();
+    assert_eq!(refusal["code"], "invalid_params");
+    assert_eq!(refusal["detail"]["field"], "questions");
+    assert!(rig.provider.bodies.lock().unwrap().is_empty());
+    assert!(rig.router.bodies("route.account_for").is_empty());
+    assert!(!rig.router.pin_held.load(Ordering::SeqCst));
+    assert_eq!(rig.router.bodies("route.report").len(), 1);
+    assert!(rig.service.claims.lock().unwrap().is_empty());
+
+    rig.provider.script(
+        "valid-after-validation",
+        vec![Script::Answer(answered(Some(7)))],
+    );
+    call(&rig, &routed_request(&["valid-after-validation"]))
+        .await
+        .unwrap();
+    assert_eq!(rig.provider.calls("valid-after-validation"), 1);
+    assert_eq!(rig.router.bodies("route.select").len(), 2);
+}
+
+#[tokio::test]
+async fn routed_modelless_validation_report_crash_keeps_only_cleanup_until_recovery() {
+    let rig = routed_rig(true, true);
+    let store = rig.store.clone();
+    let router = rig.router.clone();
+    *router.check_expired_content.lock().unwrap() = Some(store.clone());
+    router
+        .panic_after_initial_report
+        .store(true, Ordering::SeqCst);
+    let mut params: Value = serde_json::from_str(&routed_request(&["invalid-questions"])).unwrap();
+    params["questions"] = over_limit_questions();
+    assert_eq!(
+        call(&rig, &params.to_string()).await.unwrap_err()["code"],
+        "internal_error"
+    );
+    assert!(rig.provider.bodies.lock().unwrap().is_empty());
+    assert!(router.bodies("route.account_for").is_empty());
+    let report = router.bodies("route.report")[0].clone();
+    let row = store.lookup(STORE_ROLE, "routed").unwrap().unwrap();
+    assert_eq!(row.identity, "{}");
+    assert!(row.outcomes.is_empty());
+    let debt = store.routing(STORE_ROLE, "routed").unwrap().unwrap();
+    assert!(debt.pending);
+    assert_eq!(debt.choice, "null");
+    broca_test_support::wait_until(
+        "refused call releases its cleanup hold after a report panic",
+        || {
+            std::future::ready(
+                if store.routing_batch_running(STORE_ROLE, "routed").unwrap() {
+                    Err("the fallback store release is still running".into())
+                } else {
+                    Ok(())
+                },
+            )
+        },
+    )
+    .await;
+    drop(rig);
+    let mut resumed = routed_rig_with_store(store.clone(), router.clone());
+    Arc::get_mut(&mut resumed.service)
+        .unwrap()
+        .routing_content_retention = false;
+    let valid = routed_request(&["valid-after-validation"]);
+    assert_eq!(
+        call(&resumed, &valid).await.unwrap_err()["code"],
+        "routing_unavailable"
+    );
+    resumed.service.recover_routing().await.unwrap();
+    assert_eq!(router.bodies("route.report")[1], report);
+    assert!(store.lookup(STORE_ROLE, "routed").unwrap().is_none());
+    assert!(store.routing(STORE_ROLE, "routed").unwrap().is_none());
+    *router.check_expired_content.lock().unwrap() = None;
+    resumed.provider.script(
+        "valid-after-validation",
+        vec![Script::Answer(answered(Some(7)))],
+    );
+    call(&resumed, &valid).await.unwrap();
+    assert_eq!(resumed.provider.calls("valid-after-validation"), 1);
+}
+
+#[tokio::test]
+async fn routed_acknowledged_validation_cleanup_recovers_before_id_reuse() {
+    let rig = routed_rig(true, true);
+    let store = rig.store.clone();
+    let router = rig.router.clone();
+    router.lose_ack.store(true, Ordering::SeqCst);
+    let mut params: Value = serde_json::from_str(&routed_request(&["invalid-questions"])).unwrap();
+    params["questions"] = over_limit_questions();
+    assert_eq!(
+        call(&rig, &params.to_string()).await.unwrap_err()["code"],
+        "invalid_params"
+    );
+    assert!(rig.provider.bodies.lock().unwrap().is_empty());
+    assert!(router.bodies("route.account_for").is_empty());
+    assert_eq!(router.reports.lock().unwrap().len(), 1);
+
+    // Reconstruct the durable acknowledgement just before the final archive step,
+    // as if the process stopped there. The pending predicate has its own unit test.
+    let debt = store.routing(STORE_ROLE, "routed").unwrap().unwrap();
+    let mut journal: Value = serde_json::from_str(&debt.runs).unwrap();
+    for rpc in journal["outbox"].as_array_mut().unwrap() {
+        rpc["closed"] = json!(true);
+    }
+    assert!(store
+        .claim_routing_recovery(
+            STORE_ROLE,
+            "routed",
+            &rig.service.owner,
+            router.now() as i64
+        )
+        .unwrap());
+    assert!(store
+        .save_routing_runs(
+            STORE_ROLE,
+            "routed",
+            &rig.service.owner,
+            &journal.to_string(),
+            true
+        )
+        .unwrap());
+    store
+        .release(STORE_ROLE, "routed", &rig.service.owner)
+        .unwrap();
+    drop(rig);
+
+    let mut resumed = routed_rig_with_store(store.clone(), router.clone());
+    Arc::get_mut(&mut resumed.service)
+        .unwrap()
+        .routing_content_retention = false;
+    resumed.service.recover_routing().await.unwrap();
+    assert_eq!(router.bodies("route.report").len(), 1);
+    assert!(store.lookup(STORE_ROLE, "routed").unwrap().is_none());
+    assert!(store.routing(STORE_ROLE, "routed").unwrap().is_none());
+    resumed.provider.script(
+        "valid-after-validation",
+        vec![Script::Answer(answered(Some(7)))],
+    );
+    call(&resumed, &routed_request(&["valid-after-validation"]))
+        .await
+        .unwrap();
+    assert_eq!(resumed.provider.calls("valid-after-validation"), 1);
+}
+
 #[tokio::test]
 async fn routed_unknown_adapter_and_gated_openai_are_refused_and_reported() {
     for model in ["elsewhere/unknown", OPENAI_DECISIONS] {
@@ -1360,6 +1699,121 @@ async fn routed_account_failure_reselects_once_before_any_answer() {
             .filter(|body| body["kind"] == "run_finished")
             .count(),
         2
+    );
+}
+
+#[tokio::test]
+async fn routed_model_unavailable_is_unstored_and_resend_retries_only_unanswered() {
+    let rig = routed_rig(true, true);
+    rig.provider
+        .script("done", vec![Script::Answer(answered(Some(10)))]);
+    rig.provider.script(
+        "missing",
+        vec![Script::Status(404, None), Script::Answer(answered(Some(7)))],
+    );
+    rig.provider
+        .script("not-sent", vec![Script::Answer(answered(Some(11)))]);
+    let params = routed_request(&["done", "missing", "not-sent"]);
+    let first: Value = serde_json::from_str(call(&rig, &params).await.unwrap().get()).unwrap();
+    assert_eq!(first["items"][1]["error"]["code"], "model_unavailable");
+    assert_eq!(first["items"][2]["error"], first["items"][1]["error"]);
+    assert_eq!(rig.provider.calls("missing"), 1);
+    assert_eq!(rig.provider.calls("not-sent"), 0);
+    let batch = rig.store.lookup(STORE_ROLE, "routed").unwrap().unwrap();
+    assert_eq!(batch.outcomes.len(), 1);
+    assert_eq!(batch.outcomes[0].index, 0);
+    assert!(!rig.router.pin_held.load(Ordering::SeqCst));
+    assert_eq!(rig.router.bodies("route.report").len(), 1);
+    let choice = rig
+        .store
+        .routing(STORE_ROLE, "routed")
+        .unwrap()
+        .unwrap()
+        .choice;
+
+    rig.router.clear();
+    rig.catalog.forbidden.store(true, Ordering::SeqCst);
+    let second: Value = serde_json::from_str(call(&rig, &params).await.unwrap().get()).unwrap();
+    assert_eq!(first["model"], second["model"]);
+    assert_eq!(first["decision_id"], second["decision_id"]);
+    assert_eq!(first["items"][0], second["items"][0]);
+    assert!(second["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|item| item["answers"].is_object()));
+    assert_eq!(rig.provider.calls("done"), 1);
+    assert_eq!(rig.provider.calls("missing"), 2);
+    assert_eq!(rig.provider.calls("not-sent"), 1);
+    assert!(rig.router.bodies("route.select").is_empty());
+    assert_eq!(
+        rig.router.bodies("route.account_for")[0]["requested_account"]["credential_id"],
+        "apikey:a"
+    );
+    assert_eq!(
+        rig.store
+            .routing(STORE_ROLE, "routed")
+            .unwrap()
+            .unwrap()
+            .choice,
+        choice
+    );
+}
+
+#[tokio::test]
+async fn routed_first_call_model_unavailable_refuses_after_release_and_retries_frozen_choice() {
+    let rig = routed_rig(true, true);
+    rig.provider.script(
+        "missing-first",
+        vec![Script::Status(404, None), Script::Answer(answered(Some(7)))],
+    );
+    rig.provider
+        .script("not-sent", vec![Script::Answer(answered(Some(11)))]);
+    let params = routed_request(&["missing-first", "not-sent"]);
+    let refusal = call(&rig, &params).await.unwrap_err();
+    assert_eq!(refusal["code"], "model_unavailable");
+    assert_eq!(refusal["detail"]["model"], JEV);
+    assert_eq!(refusal["detail"]["class"], "permanent");
+    assert_eq!(rig.provider.calls("not-sent"), 0);
+    assert!(rig
+        .store
+        .lookup(STORE_ROLE, "routed")
+        .unwrap()
+        .unwrap()
+        .outcomes
+        .is_empty());
+    assert!(!rig.router.pin_held.load(Ordering::SeqCst));
+    assert_eq!(rig.router.bodies("route.report").len(), 1);
+    let choice = rig
+        .store
+        .routing(STORE_ROLE, "routed")
+        .unwrap()
+        .unwrap()
+        .choice;
+    rig.router.clear();
+    rig.catalog.forbidden.store(true, Ordering::SeqCst);
+
+    let reply: Value = serde_json::from_str(call(&rig, &params).await.unwrap().get()).unwrap();
+    assert_eq!(reply["model"], JEV);
+    assert!(reply["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|item| item["answers"].is_object()));
+    assert_eq!(rig.provider.calls("missing-first"), 2);
+    assert_eq!(rig.provider.calls("not-sent"), 1);
+    assert!(rig.router.bodies("route.select").is_empty());
+    assert_eq!(
+        rig.router.bodies("route.account_for")[0]["requested_account"]["credential_id"],
+        "apikey:a"
+    );
+    assert_eq!(
+        rig.store
+            .routing(STORE_ROLE, "routed")
+            .unwrap()
+            .unwrap()
+            .choice,
+        choice
     );
 }
 

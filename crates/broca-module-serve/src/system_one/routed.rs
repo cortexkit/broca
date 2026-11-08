@@ -28,6 +28,7 @@ use super::{
     internal_refusal, ModelPin, SystemOne,
 };
 use crate::account_routing::{self, Candidates, RoutingCallError, RoutingClient};
+use crate::llm_tools::spend::MarkedItemError;
 
 pub struct Routing {
     pub client: Arc<RoutingClient>,
@@ -246,7 +247,10 @@ struct Rpc {
 
 impl Journal {
     fn pending(&self) -> bool {
-        self.pending_admission.is_some()
+        // A content-free row must remain discoverable after its final report is
+        // acknowledged, until archive_expired permits deletion by the owner's release.
+        self.expired
+            || self.pending_admission.is_some()
             || self.admission_refusal_pending
             || pending_reselection(self)
             || self.runs.iter().any(|run| !run.finished)
@@ -325,6 +329,25 @@ pub(super) fn validation_entry(
         "",
     )
     .with_images(cortexkit_role_classifier::describe::ImageSupport::new(4))
+}
+
+pub(super) fn pinned_entry(
+    service: &SystemOne,
+    request: &ClassifyRequest,
+) -> Result<Option<cortexkit_role_classifier::describe::ModelEntry>, Refusal> {
+    let Some(model) = request.model.as_deref() else {
+        return Ok(None);
+    };
+    let row = service.catalog.row(model);
+    cortexkit_role_classifier::request::check_catalog_row(
+        model,
+        classify::catalog_row(row.as_ref()),
+    )?;
+    let row = row.expect("catalog admission checked presence");
+    let pin = service
+        .pin(model)
+        .ok_or_else(|| Refusal::model_unavailable(model))?;
+    Ok(Some(service.model_entry(pin, &row)))
 }
 
 impl SystemOne {
@@ -682,7 +705,7 @@ pub(super) fn retained(outcome: &StoredOutcome) -> bool {
     match &outcome.outcome {
         Outcome::Answered(_) => true,
         Outcome::Failed(body) => serde_json::from_str::<ItemError>(body).map_or(true, |error| {
-            account_error(&error) || !error.is_retried_on_resend()
+            account_error(&error) || (error.is_stored() && !error.is_retried_on_resend())
         }),
     }
 }
@@ -1202,7 +1225,9 @@ async fn recover_batch(service: &Arc<SystemOne>, batch_id: &str) -> Result<(), E
             recover_claimed(service, batch_id, &mut journal).await?;
         }
         flush(service, batch_id, &mut journal).await?;
-        if journal.expired && service.routing_content_retention {
+        // Content-free rows track pending routing reports. Once acknowledged, cleanup
+        // must finish even when ordinary content retention is disabled.
+        if journal.expired {
             archive_expired(service, batch_id, &journal).await?;
         }
         Ok(())
@@ -1286,8 +1311,9 @@ pub(super) async fn run(
         service.role.clone(),
         request.batch_id.clone(),
     );
-    if classify::blocking(move || store.routing(&role, &id))
-        .await?
+    let routing = classify::blocking(move || store.routing(&role, &id)).await?;
+    if routing
+        .as_ref()
         .and_then(|row| serde_json::from_str::<Value>(&row.runs).ok())
         .is_some_and(|journal| journal["expired"] == true)
     {
@@ -1296,7 +1322,6 @@ pub(super) async fn run(
             request.batch_id
         )));
     }
-    flush_facts(service).await?;
     let snapshot = service
         .stored_batch(&request.batch_id)
         .await
@@ -1305,26 +1330,31 @@ pub(super) async fn run(
         (service.clock)().saturating_sub(batch.admitted_at_ms)
             < broca_store::system_one::RETENTION_MS
     });
-    if snapshot.is_some() {
-        let (store, role, id) = (
-            service.store.clone(),
-            service.role.clone(),
-            request.batch_id.clone(),
-        );
-        if classify::blocking(move || store.routing(&role, &id))
-            .await?
-            .is_none()
-        {
-            return Ok(None);
-        }
+    if snapshot.is_some() && routing.is_none() {
+        return Ok(None);
     }
+    // A caller-pinned model has known question, item and image limits before routing.
+    // Retries validate against their frozen entry rather than live catalog rows.
+    let entry = if snapshot.is_none() {
+        pinned_entry(service, &request)?.unwrap_or_else(|| validation_entry(service))
+    } else {
+        let routing = routing.as_ref().expect("routed snapshot checked presence");
+        let choice: Option<Choice> = serde_json::from_str(&routing.choice)
+            .map_err(|_| internal_refusal("stored routing choice does not decode"))?;
+        let journal: Journal = serde_json::from_str(&routing.runs)
+            .map_err(|_| internal_refusal("stored routing journal does not decode"))?;
+        choice
+            .or(journal.selected)
+            .and_then(|choice| choice.entry)
+            .unwrap_or_else(|| validation_entry(service))
+    };
+    check_model_request(service, &request, &entry, prepared)?;
+    estimates(&request)?;
     let identity =
         BatchIdentity::of(&request).map_err(|error| Refusal::invalid_params("items", error.0))?;
     let identity_json = serde_json::to_string(&identity).expect("identity encodes");
     let digest = classify::sha256_hex(&identity_json);
-    // Shape validation is independent of routing. Model-specific bounds are checked against
-    // the selected entry before any provider request.
-    service.check_images_request(&request, &validation_entry(service))?;
+    flush_facts(service).await?;
     {
         let mut claims = service
             .claims
@@ -1584,6 +1614,32 @@ fn validate_choice(
         .entry
         .as_ref()
         .ok_or_else(|| Refusal::model_unavailable(&choice.model))?;
+    check_model_request(service, request, entry, prepared)?;
+    reprice(estimates, &choice.frozen);
+    if let Some(ceiling) = ceiling {
+        let wanted = slots
+            .iter()
+            .zip(estimates)
+            .filter(|(slot, _)| replacement || slot.is_none())
+            .fold(0u64, |total, (_, estimate)| {
+                total.saturating_add(estimate.cost_nanos)
+            });
+        if wanted > ceiling {
+            return Err(Refusal::cost_exceeded(
+                nanos_to_usd(wanted),
+                nanos_to_usd(ceiling),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn check_model_request(
+    service: &SystemOne,
+    request: &ClassifyRequest,
+    entry: &cortexkit_role_classifier::describe::ModelEntry,
+    prepared: &super::images::PreparedImages,
+) -> Result<(), Refusal> {
     service.check_images_request(request, entry)?;
     for (index, images) in prepared.0.iter().enumerate() {
         if let Some(images) = images {
@@ -1599,22 +1655,6 @@ fn validate_choice(
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             cortexkit_role_classifier::request::check_resolved_item_images(entry, index, &decoded)?;
-        }
-    }
-    reprice(estimates, &choice.frozen);
-    if let Some(ceiling) = ceiling {
-        let wanted = slots
-            .iter()
-            .zip(estimates)
-            .filter(|(slot, _)| replacement || slot.is_none())
-            .fold(0u64, |total, (_, estimate)| {
-                total.saturating_add(estimate.cost_nanos)
-            });
-        if wanted > ceiling {
-            return Err(Refusal::cost_exceeded(
-                nanos_to_usd(wanted),
-                nanos_to_usd(ceiling),
-            ));
         }
     }
     Ok(())
@@ -1644,6 +1684,26 @@ async fn reject_choice(
             .with_runner_code(refusal["code"].as_str().unwrap_or("internal_error")),
         choice.describe.capabilities.clone(),
     );
+    // A fresh choice refusal never admitted an immutable body (model-batch RULES.md
+    // §§2, 7-8), so free its id. If replacement selection fails after an account
+    // failure, keep the original admitted batch and replay its account errors rather
+    // than routing them again (classifier CONTRACT.md §6.3).
+    if original.is_none()
+        && journal.runs.is_empty()
+        && choice.account.is_none()
+        && journal.pending_admission.is_none()
+    {
+        let outbox = std::mem::take(&mut journal.outbox);
+        *journal = Journal {
+            expired: true,
+            outbox,
+            ..Default::default()
+        };
+        archive_expired(service, &request.batch_id, journal).await?;
+        flush(service, &request.batch_id, journal).await?;
+        archive_expired(service, &request.batch_id, journal).await?;
+        return Err(Error::Runner(Box::new(refusal)));
+    }
     let mut rejected = choice.clone();
     rejected.refusal = Some(refusal.clone());
     freeze(
@@ -1723,18 +1783,6 @@ async fn dispatch(
     let raw: RawParams<'_> = serde_json::from_str(params)
         .map_err(|_| Refusal::invalid_params("params", "request did not decode"))?;
     let mut estimates = estimates(request)?;
-    let mut choice = match choice {
-        Some(choice) => choice,
-        None => match journal.selected.clone() {
-            Some(choice) => choice,
-            None => {
-                let choice = select(service, request, &estimates).await?;
-                journal.selected = Some(choice.clone());
-                save(service, &request.batch_id, journal).await?;
-                choice
-            }
-        },
-    };
     let mut slots: Vec<Option<Slot>> = (0..request.items.len()).map(|_| None).collect();
     for outcome in stored {
         if retained(&outcome) {
@@ -1744,6 +1792,38 @@ async fn dispatch(
             }
         }
     }
+    let mut choice = match choice {
+        Some(choice) => choice,
+        None => match journal.selected.clone() {
+            Some(choice) => choice,
+            None => {
+                let choice = select(service, request, &estimates).await?;
+                journal.selected = Some(choice.clone());
+                // Persist a newly selected model's validation refusal and its report
+                // together, never a replayable body waiting to be refused after a crash.
+                let refusal = choice.refusal.clone().or_else(|| {
+                    validate_choice(
+                        service,
+                        request,
+                        &choice,
+                        prepared,
+                        &mut estimates,
+                        &slots,
+                        ceiling,
+                        false,
+                    )
+                    .err()
+                    .map(|refusal| serde_json::to_value(refusal).expect("refusal encodes"))
+                });
+                if let Some(refusal) = refusal {
+                    return reject_choice(service, request, &choice, None, journal, slots, refusal)
+                        .await;
+                }
+                save(service, &request.batch_id, journal).await?;
+                choice
+            }
+        },
+    };
     recover_claimed(service, &request.batch_id, journal).await?;
     if let Some(refusal) = journal.admission_refusal.clone() {
         return refuse_admission(service, request, &choice, journal, slots, refusal).await;
@@ -2244,6 +2324,10 @@ async fn dispatch_items(
             continue;
         }
         if let Some(error) = &stop {
+            if !account_error(error) && !error.is_stored() {
+                slots[index] = Some(Slot::Unsent(MarkedItemError::new(error.clone(), None)));
+                continue;
+            }
             let outcome = StoredOutcome {
                 index: index as u64,
                 outcome: Outcome::Failed(classify::item_error_json(error)),
@@ -2288,10 +2372,12 @@ async fn dispatch_items(
             raw.items[index].state.get(),
             raw.questions.get()
         );
+        let first_provider_call = journal.runs[run_index].dispatched == 0;
         journal.runs[run_index].dispatched += 1;
         save(service, &request.batch_id, journal).await?;
         let answer =
             provider_call(service, &request.batch_id, pin, body, journal, run_index).await?;
+        let mut unstored = None;
         let (outcome, cost, fact) = match answer {
             Ok(classify::PaidAnswer {
                 answers,
@@ -2346,8 +2432,17 @@ async fn dispatch_items(
             }
             Err(error) => {
                 journal.runs[run_index].note_error(error.clone());
+                if first_provider_call && error.code == errors::MODEL_UNAVAILABLE {
+                    // Account failures freeze as item errors, but a missing model still
+                    // refuses admission. dispatch releases and reports the run before
+                    // returning the refusal.
+                    return Err(Refusal::model_unavailable(&choice.model).into());
+                }
                 if account_error(&error) || error.stops_the_call() {
                     stop = Some(error.clone());
+                }
+                if !account_error(&error) && !error.is_stored() {
+                    unstored = Some(error.clone());
                 }
                 (
                     StoredOutcome {
@@ -2361,10 +2456,16 @@ async fn dispatch_items(
                 )
             }
         };
-        // Account failures are stored too. Unlike a legacy batch, a routed batch cannot
-        // discard the account that failed and silently choose another one on a resend.
-        record(service, &request.batch_id, &outcome, cost, fact, journal).await?;
-        slots[index] = Some(Slot::Stored(outcome));
+        if let Some(error) = unstored {
+            // Keep run progress durable without making a missing model a permanent item
+            // result: the same frozen choice must be tried again after an operator's fix.
+            save(service, &request.batch_id, journal).await?;
+            slots[index] = Some(Slot::Unsent(MarkedItemError::new(error, None)));
+        } else {
+            // Account failures remain frozen so a resend cannot silently change accounts.
+            record(service, &request.batch_id, &outcome, cost, fact, journal).await?;
+            slots[index] = Some(Slot::Stored(outcome));
+        }
         flush(service, &request.batch_id, journal).await?;
         if journal.runs[run_index].renew_failed {
             stop = journal.runs[run_index].error.clone();
@@ -2530,6 +2631,24 @@ fn renew_at(now_ms: u64, expiry_ms: u64) -> u64 {
 #[cfg(test)]
 mod refusal_tests {
     use super::*;
+
+    #[test]
+    fn expired_cleanup_remains_pending_after_report_acknowledgement() {
+        let mut journal = Journal {
+            expired: true,
+            ..Default::default()
+        };
+        journal.report(
+            ReportRequest::new("decision", ReportOutcome::LaunchFailed)
+                .with_runner_code("invalid_params"),
+            vec![],
+        );
+        journal.outbox[0].closed = true;
+        assert!(
+            journal.pending(),
+            "recovery must still find the row until archive_expired permits its deletion"
+        );
+    }
 
     #[test]
     fn answered_request_contract_refusals_preserve_routing_code() {
