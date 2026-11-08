@@ -108,6 +108,7 @@ impl SendParamsExt for SendParams {
         })?;
         let SendParams {
             route_decision_id,
+            account_route,
             content,
             directives,
             session_class,
@@ -221,6 +222,7 @@ impl SendParamsExt for SendParams {
             .transpose()?;
         let submission = SubmissionRequest {
             route_decision_id,
+            account_route,
             service_tier_level: None,
             staged_uploads: None,
             content,
@@ -401,6 +403,7 @@ mod tests {
 
     fn make_send_params(system: Option<String>, prompt: &str) -> SendParams {
         SendParams {
+            account_route: None,
             route_decision_id: None,
             content: Vec::new(),
             directives: None,

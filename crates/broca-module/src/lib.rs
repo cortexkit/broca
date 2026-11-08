@@ -22,6 +22,7 @@ pub mod late_results_store;
 pub mod opener;
 pub mod output_refs;
 pub mod person_media;
+mod plan_change;
 mod plan_episode;
 pub mod registry;
 pub mod retention;

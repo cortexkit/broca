@@ -1026,6 +1026,7 @@ fn raw(lost: Option<Spend>, value: Value) -> Answer {
 fn convert(reply: &RawValue) -> Answer {
     #[derive(serde::Deserialize)]
     struct BatchReply<'a> {
+        model: String,
         #[serde(borrow)]
         items: Vec<ItemReply<'a>>,
         cost_usd: Option<serde_json::Number>,
@@ -1039,6 +1040,7 @@ fn convert(reply: &RawValue) -> Answer {
     }
     #[derive(serde::Serialize)]
     struct ToolResult<'a> {
+        model: &'a str,
         answers: &'a RawValue,
         usage: cortexkit_llm_tools::Usage,
         cost_usd: serde_json::Number,
@@ -1076,6 +1078,7 @@ fn convert(reply: &RawValue) -> Answer {
     // Validate the shared result type without re-serializing provider answers. Unknown fields,
     // object order and JSON number spellings remain exactly as the provider returned them.
     let result = serde_json::value::to_raw_value(&ToolResult {
+        model: &batch.model,
         answers,
         usage: item.usage.unwrap_or_default(),
         cost_usd,
@@ -1107,6 +1110,23 @@ fn convert(reply: &RawValue) -> Answer {
         )
     })?;
     Ok(result)
+}
+
+#[cfg(test)]
+mod contract03_tests {
+    #[test]
+    fn llm_classify_result_names_used_model_and_passes_contract03_parser() {
+        let reply = serde_json::value::RawValue::from_string(r#"{"model":"typesafe/jev-1.13.0","items":[{"answers":{"q":{"type":"noul","noul":0.50}},"usage":{"input_tokens":10,"output_tokens":0}}],"cost_usd":0.00000042}"#.into()).unwrap();
+        let result = super::convert(&reply).unwrap();
+        let parsed: cortexkit_llm_tools::classify::Result =
+            serde_json::from_str(result.get()).unwrap();
+        cortexkit_llm_tools::classify::validate_result(&parsed).unwrap();
+        assert_eq!(parsed.model, "typesafe/jev-1.13.0");
+        assert!(
+            result.get().contains(r#""noul":0.50"#),
+            "provider numeric spelling remains unchanged"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -55,6 +55,69 @@ async fn routed_auth_pool_and_credential_preference_reach_account_for() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+#[tokio::test]
+async fn account_route_admission_uses_routing_names_and_keeps_auth_hints() {
+    if !run_catalog_drift_child("account_route_admission_uses_routing_names_and_keeps_auth_hints") { return; }
+    install_queued_ultrafast_catalog();
+    let root = fresh_vault_root("account-route-send");
+    let daemon = CapturingVaultDaemon::start(&root).await;
+    let http = resume_http_fixture().await;
+    let routing = Arc::new(AuthHintRouting::default());
+    let live = auth_hint_executor(&root, &daemon, routing.clone(), &http.url).await;
+    let mut rig = TierServeRig::start_with_executor(&root, None, None, live, None).await;
+    let reply = rig.call("session.send", serde_json::json!({"send_id":"routed-names","prompt":"hello",
+        "model":{"provider":"openai","model":"test-ultrafast"},
+        "account_route":{"provider":"routing-openai","model":"routing-model"},
+        "route_decision_id":"caller-decision",
+        "auth":{"method":"oauth","pool":"selected-pool","credential_id":"preferred-credential"}})).await;
+    assert_eq!(reply.header.ty, subc_protocol::FrameType::Error);
+    {
+        let requests = routing.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let params = &requests[0]["params"];
+        assert_eq!(params["provider"], "routing-openai");
+        assert_eq!(params["model"], "routing-model");
+        assert_eq!(params["affinity_model"], "routing-model");
+        assert_eq!(params["decision_id"], "caller-decision");
+        assert_eq!(params["pool"], "selected-pool");
+        assert_eq!(params["requested_account"]["credential_id"], "preferred-credential");
+    }
+    assert!(http.requests.lock().unwrap().is_empty());
+    rig.close().await;
+    drop(daemon);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn account_route_refuses_unlisted_default_method_before_any_write() {
+    use broca_core::WalStore as _;
+    if !run_catalog_drift_child("account_route_refuses_unlisted_default_method_before_any_write") { return; }
+    install_queued_ultrafast_catalog();
+    let root = fresh_vault_root("account-route-method");
+    let daemon = CapturingVaultDaemon::start(&root).await;
+    let http = resume_http_fixture().await;
+    let routing = Arc::new(AuthHintRouting::default());
+    let mut live = auth_hint_executor(&root, &daemon, routing.clone(), &http.url).await;
+    let config_path = root.join("methods.json");
+    std::fs::write(&config_path, r#"{"defaults":{"openai":"antigravity"}}"#).unwrap();
+    Arc::get_mut(live.vault.as_mut().unwrap()).unwrap().methods = broca_module_serve::MethodConfig::load(&config_path).unwrap();
+    let store = live.wal_store.clone();
+    let mut rig = TierServeRig::start_with_executor(&root, None, None, live, None).await;
+    let reply = rig.call("session.send", serde_json::json!({"send_id":"unsupported-route","prompt":"hello",
+        "model":{"provider":"openai","model":"test-ultrafast"},
+        "account_route":{"provider":"routing-openai","model":"routing-model"}})).await;
+    assert_eq!(reply.header.ty, subc_protocol::FrameType::Error);
+    let error: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+    assert_eq!(error["code"], "invalid_params", "{error}");
+    assert_eq!(error["detail"]["field"], "account_route", "{error}");
+    assert!(routing.requests.lock().unwrap().is_empty());
+    assert!(http.requests.lock().unwrap().is_empty());
+    assert!(store.read_records(&rig.session).unwrap().is_empty());
+    rig.close().await;
+    drop(daemon);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 async fn refuse_mixed_auth_hint(hint: &str) {
     use broca_core::WalStore as _;
     let root = fresh_vault_root("auth-hint-conflict");

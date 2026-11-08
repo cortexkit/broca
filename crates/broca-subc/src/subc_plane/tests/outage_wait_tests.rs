@@ -65,6 +65,7 @@ pub(super) fn request(tag: &str, root: &std::path::Path) -> RunRequest {
         reply: None,
     };
     RunRequest {
+        account_route: None,
         route_decision_id: None,
         input_written_at_ms: None,
         directives: None,

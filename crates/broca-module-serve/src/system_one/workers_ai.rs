@@ -175,6 +175,18 @@ pub(crate) fn reply_from(status: u16, retry_after_ms: Option<u64>, body: &[u8]) 
 
 #[async_trait]
 impl ClassifierProvider for WorkersAi {
+    fn with_credential(
+        &self,
+        credential: Arc<dyn CredentialSource>,
+    ) -> Option<Arc<dyn ClassifierProvider>> {
+        Some(Arc::new(Self {
+            http: self.http.clone(),
+            base: self.base.clone(),
+            model_path: self.model_path,
+            credential,
+            attempt_timeout: self.attempt_timeout,
+        }))
+    }
     fn egress_host(&self) -> String {
         self.base.host_str().unwrap_or_default().to_owned()
     }

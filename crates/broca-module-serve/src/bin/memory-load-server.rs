@@ -177,6 +177,7 @@ async fn serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             .import(SessionImportRequest {
                 project_id: None,
                 principal: None,
+                scope: broca_protocol::SendScope::Internal,
                 session: BindIdentity::new(
                     root.join("project"),
                     "memory-load",

@@ -74,6 +74,7 @@ impl WithdrawTransport for NoWithdraw {
 
 fn config() -> broca_wal::RunConfig {
     broca_wal::RunConfig {
+        account_route: None,
         global_system: None,
         route_decision_id: None,
         account_limit_pause: false,

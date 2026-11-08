@@ -60,7 +60,7 @@ async fn repair_one_wrong_root_restores_full_session_read_and_preserves_stub() {
     rig.store.apply_session_root_repair(&plan).unwrap();
     let resolved = rig
         .registry
-        .resolve_session_address(&real, None)
+        .resolve_session_address(&real, None, None)
         .await
         .unwrap();
     assert_eq!(resolved, real);
@@ -186,7 +186,7 @@ async fn legacy_null_lineage_stub_read_refuses_and_repair_restores_all_runs() {
     rig.store.apply_session_root_repair(&plan).unwrap();
     let resolved = rig
         .registry
-        .resolve_session_address(&real, None)
+        .resolve_session_address(&real, None, None)
         .await
         .unwrap();
     assert_eq!(resolved, real);

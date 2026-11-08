@@ -196,6 +196,7 @@ fn assistant_one_call() -> AssistantMessage {
 fn min_config() -> RunConfig {
     RunConfig {
         global_system: None,
+        account_route: None,
         route_decision_id: None,
         account_limit_pause: false,
         turn_directives_v1: None,
@@ -314,6 +315,7 @@ impl LineageOpener for FreeOpener {
 
 fn text_req(key: &BindIdentity, run: &str) -> RunRequest {
     RunRequest {
+        account_route: None,
         route_decision_id: None,
         input_written_at_ms: None,
         directives: None,

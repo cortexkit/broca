@@ -1697,8 +1697,8 @@ async fn subscriber_task<W: WalStore + 'static>(
                     broca_wal::access_counter::inherit(move || {
                         source.with_reader(&session, Some(h), |reader| {
                             // Without a materialized store, each notice-bearing suffix replay reads
-                            // the key prefix once; only the daemon's disabled overhaul state format
-                            // currently has no store.
+                            // the key prefix once. Only a state root in the `broca-state/2` format,
+                            // which production does not run, has no store.
                             let mut load = || {
                                 durable_notice_index(
                                     wal.as_ref(),
@@ -2171,6 +2171,7 @@ mod tests {
             session: session.clone(),
             config: Box::new(RunConfig {
                 global_system: None,
+                account_route: None,
                 route_decision_id: None,
                 account_limit_pause: false,
                 turn_directives_v1: None,
@@ -3876,6 +3877,7 @@ mod tests {
                     run_id: RunId("r1".into()),
                     session: BindIdentity::new("/tmp/project-a", "runner", "restart"),
                     config: Box::new(RunConfig {
+                        account_route: None,
                         global_system: None,
                         route_decision_id: None,
                         account_limit_pause: false,
@@ -4289,6 +4291,7 @@ mod episode_attach_tests {
             session: broca_protocol::BindIdentity::new("/tmp/project", "runner", "attach"),
             config: Box::new(RunConfig {
                 global_system: None,
+                account_route: None,
                 route_decision_id: None,
                 account_limit_pause: false,
                 turn_directives_v1: None,
@@ -5554,7 +5557,11 @@ mod database_attach_tests {
             .reads
             .iter()
             .all(|read| read.class != broca_wal::access_counter::ReadClass::Origin));
+        // Close every handle into the folders first: Windows refuses to remove a file that is
+        // still open, and the episode reader holds the log.
+        drop(reader);
         drop(wal);
+        drop(store);
         drop(db);
         drop(facts);
         std::fs::remove_dir_all(root).unwrap();
@@ -5630,7 +5637,11 @@ mod database_attach_tests {
             );
             assert!(operation.seed_fallbacks.is_empty(), "{operation:?}");
         }
+        // Close every handle into the folder first: Windows refuses to remove a file that is
+        // still open, and the episode reader holds the log.
+        drop(reader);
         drop(wal);
+        drop(store);
         drop(db);
         std::fs::remove_dir_all(root).unwrap();
     }

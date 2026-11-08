@@ -54,6 +54,7 @@ async fn import_then_read_returns_the_canonical_transcript() {
         .import(SessionImportRequest {
             project_id: None,
             principal: None,
+            scope: broca_protocol::SendScope::Internal,
             session: key.clone(),
             run_id: broca_protocol::RunId("run-import".into()),
             messages: messages.clone(),
@@ -128,6 +129,7 @@ async fn import_naming_media_inline_is_refused_before_anything_is_written() {
         .import(SessionImportRequest {
             project_id: None,
             principal: None,
+            scope: broca_protocol::SendScope::Internal,
             session: key.clone(),
             run_id: broca_protocol::RunId("run-import-media".into()),
             messages,
