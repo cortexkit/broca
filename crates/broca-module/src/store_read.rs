@@ -22,6 +22,7 @@ use broca_session_store::fold::operations::Run;
 use broca_session_store::record::Record;
 use broca_session_store::session::{Session, SessionError, StoredEntry};
 
+pub mod history_sides;
 pub mod todays;
 
 /// Why a store read refused.
@@ -121,6 +122,10 @@ pub struct StorePage {
     /// The Rich UI stamp of each run whose assistant messages the page holds, as their entry
     /// facts recorded it.
     pub stamps: BTreeMap<String, Option<broca_protocol::RichUiStamp>>,
+    /// For each message a run numbered under its computed part-number rules, by zero-based
+    /// ordinal: that run's id and the number before the message's first part
+    /// (`EntryFacts::runner_tag_base`).
+    pub numbering: BTreeMap<u64, (String, u64)>,
 }
 
 /// A `session.read` page: up to `limit` messages from `from_ordinal` (counting from 0, as
@@ -156,6 +161,7 @@ pub async fn read_page<B: SessionBackend>(
     let mut withheld = std::collections::BTreeSet::new();
     let mut summaries = crate::serve::RecordedSummaries::new();
     let mut stamps = BTreeMap::new();
+    let mut numbering = BTreeMap::new();
     for (index, entry) in entries.iter().enumerate() {
         let next = entries.get(index + 1).or(after.as_ref());
         messages.push(page_message(entry, next, latest)?);
@@ -170,6 +176,9 @@ pub async fn read_page<B: SessionBackend>(
         if let Some(facts) = &entry.state.facts {
             if facts.no_display_facts == Some(true) {
                 withheld.insert(entry.ordinal - 1);
+            }
+            if let (Some(run), Some(base)) = (&facts.run_id, facts.runner_tag_base) {
+                numbering.insert(entry.ordinal - 1, (run.clone(), base));
             }
             if let (Some(run), Role::Assistant) = (&facts.run_id, entry.message.role) {
                 let stamp = facts.rich_ui.as_ref().and_then(|stamp| {
@@ -226,6 +235,7 @@ pub async fn read_page<B: SessionBackend>(
         withheld,
         summaries,
         stamps,
+        numbering,
     })
 }
 
@@ -296,8 +306,10 @@ fn finish(
 
 /// The `session.read` reply `request` asks of `session`, as far as the session decides it: the
 /// page, from the message `after_mid` names or the ordinal asked for, refused when the session's
-/// history version isn't the one asked for; each model-written message marked for reply cleaning
-/// by its run's tag rules; each message's tool calls attributed from its turn facts; and what
+/// history version isn't the one asked for; each message's part numbers attached as its run's
+/// tag rules number it, and each model-written message marked for reply cleaning by them
+/// (`store_entries::attach_part_tags`); each message's tool calls attributed from its turn
+/// facts; and what
 /// each opt-in adds, from the page's own entry and turn facts and the session's folds. The
 /// session's actor runs this over the session it holds, so all of it reads from memory or none of
 /// it is served there. What doesn't depend on the session (media mode, the byte cap) is the
@@ -331,10 +343,11 @@ pub(crate) async fn page<B: SessionBackend>(
         withheld,
         summaries,
         stamps,
+        numbering,
     } = read_page(session, from_ordinal, request.limit)
         .await
         .map_err(refused)?;
-    crate::store_entries::mark_reply_cleaning(session, parts, &mut page.messages)
+    crate::store_entries::attach_part_tags(session, parts, &mut page.messages, &numbering)
         .await
         .map_err(|error| {
             // A backend failure and a damaged start read alike here, so no class is claimed.

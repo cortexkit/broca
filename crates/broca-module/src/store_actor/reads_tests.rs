@@ -608,6 +608,8 @@ fn shape(reply: StoreReadReply) -> String {
             Err(refusal) => format!("{refusal:?}"),
         },
         StoreReadReply::HistoryHead(head) => format!("{head:?}"),
+        StoreReadReply::TagLocation(location) => format!("{location:?}"),
+        StoreReadReply::WritingView(view) => format!("{view:?}"),
         StoreReadReply::Entries(entries) => format!("{entries:?}"),
         StoreReadReply::Ownership(ownership) => format!("{ownership:?}"),
         StoreReadReply::RunResult(reply) => match reply {

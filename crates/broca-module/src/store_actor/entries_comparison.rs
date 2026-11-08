@@ -524,14 +524,55 @@ async fn compare_history(today: &Side, store: &Side, label: &str) {
             );
         }
     }
-    // The display form needs facts the new storage doesn't serve yet: refused by name.
-    let display = store.history(json!({"form": "display"})).await;
-    assert_eq!(
-        masked(&display),
-        json!({"refused": crate::store_entries::NOT_SERVED_ON_NEW_STORAGE}),
-        "{label}"
-    );
-    assert!(today.history(json!({"form": "display"})).await.is_ok());
+    // The display form, newest page and from the first message, compared alike.
+    for params in [
+        json!({"form": "display"}),
+        json!({"form": "display", "from_ordinal": 1, "limit": 3}),
+    ] {
+        let old = today.history(params.clone()).await;
+        let new = store.history(params.clone()).await;
+        assert!(old.is_ok(), "{label}: today's display history {params}");
+        assert_eq!(
+            masked_display(&new),
+            masked_display(&old),
+            "{label}: display {params}"
+        );
+    }
+}
+
+/// A display reply as compared: [`masked`], and every member that names a position in each
+/// storage's own log or its own identity, at any depth, kept as whether present: message ids,
+/// call keys, output-reference set ids and the digests computed over them, and times.
+fn masked_display(reply: &Result<Value, crate::history::HistoryError>) -> Value {
+    fn mask(value: &mut Value) {
+        const OWN: [&str; 9] = [
+            "mid",
+            "call_key",
+            "set_id",
+            "digest",
+            "written_at",
+            "created_at",
+            "completed_at",
+            "started_at",
+            "finished_at",
+        ];
+        match value {
+            Value::Object(object) => {
+                for (key, member) in object.iter_mut() {
+                    if OWN.contains(&key.as_str()) {
+                        *member = json!(!member.is_null());
+                    } else {
+                        mask(member);
+                    }
+                }
+            }
+            Value::Array(items) => items.iter_mut().for_each(mask),
+            _ => {}
+        }
+    }
+    let mut value = masked(reply);
+    mask(&mut value);
+    value
 }
 
 /// The compaction route on a session off the compaction contract: every method is refused

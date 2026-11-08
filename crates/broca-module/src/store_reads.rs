@@ -68,6 +68,12 @@ pub enum StoreReadRequest {
     /// What `session.history` reads about the session besides its pages, resolving the message
     /// `mid` names when it names one (see `store_entries::HistoryHead`).
     HistoryHead { mid: Option<String> },
+    /// Where part number `tag` sits, for output references (see
+    /// `store_output_refs::tag_location`).
+    TagLocation(u64),
+    /// The compaction view the model step that wrote message `ordinal` (counting from 0) was
+    /// rendered under, for output references (see `store_output_refs::writing_view`).
+    WritingView { ordinal: u64 },
 }
 
 /// What a `session.read` page asks of the session itself.
@@ -127,6 +133,8 @@ pub enum StoreReadReply {
         >,
     ),
     HistoryHead(Result<crate::store_entries::HistoryHead, ServeError>),
+    TagLocation(Result<broca_core::TagLocation, ServeError>),
+    WritingView(Result<Option<broca_core::compaction_provider::view::CompactionView>, ServeError>),
 }
 
 /// How the session's store actor answered a read.
@@ -268,7 +276,26 @@ pub async fn execute<B: SessionBackend>(
         StoreReadRequest::HistoryHead { mid } => StoreReadReply::HistoryHead(
             crate::store_entries::history_head_of(session, mid.as_deref()).await,
         ),
+        StoreReadRequest::TagLocation(tag) => StoreReadReply::TagLocation(
+            crate::store_output_refs::tag_location(session, ctx.parts, *tag)
+                .await
+                .map_err(output_refs_failed),
+        ),
+        StoreReadRequest::WritingView { ordinal } => StoreReadReply::WritingView(
+            crate::store_output_refs::writing_view(session, *ordinal)
+                .await
+                .map_err(output_refs_failed),
+        ),
     }
+}
+
+/// A read output references make of the session that failed: a backend failure and damaged
+/// facts read alike here, so no class is claimed.
+fn output_refs_failed(error: String) -> ServeError {
+    ServeError::Open(
+        format!("the session's output reference facts can't be read: {error}"),
+        None,
+    )
 }
 
 /// Answers `request` from `session` as its actor holds it: durable first, then from memory only.

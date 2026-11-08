@@ -604,6 +604,64 @@ impl<B: SessionBackend> Session<B> {
         Ok(found)
     }
 
+    /// The ledger record with `seq`, by lookup, never a scan: a sealed one from the one block of
+    /// the one segment the ledger directory names for it (the directory's pages above it, then
+    /// that segment), an open one from the records the session keeps in memory, else from the
+    /// open log, which a seal bounds. `None` when the session holds no record with that seq, or
+    /// the one it holds is a transcript record.
+    pub async fn ledger_record(&self, seq: u64) -> Result<Option<Record>, SessionError> {
+        let sealed = self
+            .head
+            .ledger_dir
+            .as_ref()
+            .is_some_and(|root| seq <= root.last_seq);
+        if sealed {
+            self.storage_read()?;
+            let key = self.key.frame_key();
+            let pages = Pages {
+                backend: &self.backend,
+                addr: &self.addr,
+                session: self.head.session_id,
+                key: &key,
+                fanout: crate::directory::FANOUT,
+            };
+            let entry = pages
+                .find(self.head.ledger_dir.as_ref(), seq)
+                .await
+                .map_err(SessionError::Directory)?;
+            // A record a seal carried into the open log is read from there.
+            if let Some(entry) = entry.filter(|entry| entry.keeps(seq)) {
+                let bytes = self
+                    .backend
+                    .get_object(&self.addr, &entry.object)
+                    .await?
+                    .ok_or_else(|| {
+                        SessionError::Fold(format!(
+                            "the directory names a missing segment {}",
+                            entry.object
+                        ))
+                    })?;
+                let segment = Segment::open(&bytes, &key, entry.object.as_bytes())
+                    .map_err(SessionError::Segment)?;
+                if let Some(record) = segment.find(seq).map_err(SessionError::Segment)? {
+                    return Ok(Some(record));
+                }
+            }
+        }
+        let kept = self
+            .reads_kept()
+            .then(|| self.kept.between(seq, seq))
+            .flatten();
+        let open = match kept {
+            Some(kept) => kept,
+            None => self.open_log_records().await?,
+        };
+        Ok(open
+            .into_iter()
+            .find(|(at, record)| *at == seq && record.stream() == crate::record::Stream::Ledger)
+            .map(|(_, record)| record))
+    }
+
     /// The sealed ledger records with `seqs`, each read from the one block that holds it.
     async fn ledger_records(&self, seqs: &[u64]) -> Result<Vec<(u64, Record)>, SessionError> {
         let key = self.key.frame_key();

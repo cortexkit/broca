@@ -37,6 +37,7 @@ pub mod store_entries;
 pub mod store_head;
 pub mod store_import;
 pub mod store_open;
+pub mod store_output_refs;
 pub mod store_read;
 pub mod store_reads;
 pub mod store_status;
