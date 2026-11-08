@@ -5127,6 +5127,8 @@ fn served_on_new_storage(method: &str, params: &serde_json::Value) -> bool {
         OP_STATUS | OP_RUN_RESULT | OP_SEND_STATUS | OP_SESSION_SEND_STATUS => true,
         // The store actor serves sends, cancels and retractions.
         OP_SEND | OP_CANCEL | OP_RETRACT => true,
+        // Plan refreshes, through today's preflight, decided and written by the store actor.
+        OP_REFRESH | OP_REFRESH_POLICY | OP_FLUSH_PREFIX => true,
         // A head import from a file creates the session in the new storage. An import carrying
         // its messages inline is today's import, which writes a WAL.
         OP_IMPORT => params.get("source").is_some(),

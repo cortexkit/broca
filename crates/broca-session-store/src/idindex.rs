@@ -63,6 +63,13 @@ crate::values! {
         4 CallKey,
         /// A session refresh's generation.
         5 RefreshGeneration,
+        /// The `send_id` of a `session.refresh_policy`, a namespace of its own: the same string
+        /// as a send's or a flush's send id is another key.
+        6 RefreshPolicySendId,
+        /// The `send_id` of a `session.flush_prefix`.
+        7 PrefixFlushSendId,
+        /// The generation of a refresh a run start applied, named by that application.
+        8 AppliedGeneration,
     }
 }
 
@@ -74,6 +81,9 @@ impl IdKind {
             IdKind::SendId => 3,
             IdKind::CallKey => 4,
             IdKind::RefreshGeneration => 5,
+            IdKind::RefreshPolicySendId => 6,
+            IdKind::PrefixFlushSendId => 7,
+            IdKind::AppliedGeneration => 8,
         }
     }
 }
@@ -145,6 +155,16 @@ pub fn record_ids(record: &Record) -> Vec<(IdKind, String)> {
             push(
                 IdKind::RefreshGeneration,
                 Some(&refresh.generation.to_string()),
+            );
+        }
+        Record::RefreshPolicy(policy) => {
+            push(IdKind::RefreshPolicySendId, Some(&policy.send_id));
+        }
+        Record::PrefixFlush(flush) => push(IdKind::PrefixFlushSendId, Some(&flush.send_id)),
+        Record::RefreshApplied(applied) => {
+            push(
+                IdKind::AppliedGeneration,
+                Some(&applied.generation.to_string()),
             );
         }
         // A steer's send id is part of its receipt, which the queue owns.

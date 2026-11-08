@@ -20,6 +20,9 @@ use broca_protocol::usage::Usage;
 
 use crate::fold::Bound;
 use crate::record::{BudgetFiring, CallOutcome, CancelPoint, Record, Stream};
+use broca_protocol::session_change::{
+    model_key, Applying, Pending as PendingTransition, Transitions,
+};
 
 /// Why the ledger can't be folded.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -838,8 +841,289 @@ state! {
             reset: "never",
             bound: Bound::Fixed,
         },
+        /// The session's plan changes and the manifests in force, as today's
+        /// `SessionChangeState` folds them: absent until the session's first run start or
+        /// refresh. Only fixed-size facts are kept; what was recorded under one generation or
+        /// one `send_id` is found by looking up that id.
+        24 opt pub plan: Plan => {
+            owner: "admission",
+            reset: "never",
+            bound: Bound::Declared,
+        },
     }
 }
+
+state! {
+    /// A plan manifest, referenced as a run start references the manifest it froze: the setup
+    /// parts it is stored as (its plan, each provider's answer, its tools, its system text and its
+    /// declarations, in that order) and the rest of its members.
+    #[derive(Debug, Clone, Default, PartialEq)]
+    pub struct ManifestRef {
+        1 rep pub parts: crate::record::PartRef => {
+            owner: "admission",
+            reset: "a run start or a refresh",
+            bound: Bound::Config("one part per manifest member: its plan, its tools, its system text, its declarations, and one answer per provider its plan names"),
+        },
+        2 opt pub rest: serde_json::Value => {
+            owner: "admission",
+            reset: "a run start or a refresh",
+            bound: Bound::Fixed,
+        },
+    }
+}
+
+state! {
+    /// The refresh accepted and not yet applied.
+    #[derive(Debug, Clone, Default, PartialEq)]
+    pub struct PendingChange {
+        1 req pub generation: u64 => { owner: "admission", reset: "session_refresh", bound: Bound::Fixed },
+        2 req pub policy: String => { owner: "admission", reset: "session_refresh", bound: Bound::Fixed },
+        3 req pub manifest: ManifestRef => {
+            owner: "admission",
+            reset: "session_refresh",
+            bound: Bound::Declared,
+        },
+    }
+}
+
+state! {
+    /// The latest applied refresh, with the facts its application recorded for the baseline.
+    #[derive(Debug, Clone, Default, PartialEq)]
+    pub struct EffectiveChange {
+        1 req pub generation: u64 => { owner: "admission", reset: "refresh_applied", bound: Bound::Fixed },
+        2 req pub applied_by: String => { owner: "admission", reset: "refresh_applied", bound: Bound::Fixed },
+        3 req pub manifest_digest: String => {
+            owner: "admission",
+            reset: "refresh_applied",
+            bound: Bound::Fixed,
+        },
+        4 opt pub composition_digest: String => {
+            owner: "admission",
+            reset: "refresh_applied",
+            bound: Bound::Fixed,
+        },
+        /// Owned by the fetch-plan code: each plan item the applied manifest's fetch left absent.
+        5 rep pub absent_items: serde_json::Value => {
+            owner: "admission",
+            reset: "refresh_applied",
+            bound: Bound::Config("the applied plan's items"),
+        },
+    }
+}
+
+state! {
+    /// The session's plan changes, folded by the transitions today's fold makes
+    /// (`broca_protocol::session_change::Transitions`): what was accepted and applied, the change
+    /// still pending, and the manifests the latest run and the latest prefix rebuild froze.
+    #[derive(Debug, Clone, Default, PartialEq)]
+    pub struct Plan {
+        1 req pub accepted_generation: u64 => {
+            owner: "admission",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
+        2 req pub applied_generation: u64 => {
+            owner: "admission",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
+        3 opt pub pending: PendingChange => {
+            owner: "admission",
+            reset: "refresh_applied",
+            bound: Bound::Declared,
+        },
+        4 opt pub effective: EffectiveChange => {
+            owner: "admission",
+            reset: "refresh_applied",
+            bound: Bound::Declared,
+        },
+        /// The latest run's frozen manifest; absent when it froze none.
+        5 opt pub current: ManifestRef => {
+            owner: "admission",
+            reset: "run_start",
+            bound: Bound::Declared,
+        },
+        /// The manifest of the latest prefix rebuild, or of the first run before any.
+        6 opt pub prefix: ManifestRef => {
+            owner: "admission",
+            reset: "a prefix rebuild",
+            bound: Bound::Declared,
+        },
+        /// A real prefix rebuild happened since the pending acceptance: a compaction view
+        /// applied, a model switch between runs, or a prefix flush.
+        7 req pub rebuild_since_accept: bool => {
+            owner: "admission",
+            reset: "session_refresh",
+            bound: Bound::Fixed,
+        },
+        /// A flush has not reached a new run yet.
+        8 req pub flushed_since_accept: bool => {
+            owner: "admission",
+            reset: "run_start",
+            bound: Bound::Fixed,
+        },
+        /// The latest run's model, as `provider:model`.
+        9 opt pub last_model: String => {
+            owner: "admission",
+            reset: "run_start",
+            bound: Bound::Fixed,
+        },
+        /// The latest accepted refresh's manifest, applied or not: the session's senders follow
+        /// it from its acceptance, as today's head and sender checks do.
+        10 opt pub accepted: ManifestRef => {
+            owner: "admission",
+            reset: "session_refresh",
+            bound: Bound::Declared,
+        },
+        /// The model the latest refresh that chooses one chose for the session's next runs, as
+        /// that refresh recorded it. Before any does, the session's first run's plan decides.
+        11 opt pub selection: serde_json::Value => {
+            owner: "admission",
+            reset: "a refresh that chooses a model",
+            bound: Bound::Fixed,
+        },
+    }
+}
+
+impl ManifestRef {
+    /// The manifest `start` froze, as its setup parts from its plan on and the rest its choices
+    /// keep; `None` for a run started without a plan.
+    pub fn of_start(start: &crate::record::RunStart) -> Option<Self> {
+        let first = start
+            .setup
+            .iter()
+            .position(|part| part.kind == crate::record::PartKind::Plan)?;
+        Some(Self {
+            parts: start.setup[first..].to_vec(),
+            rest: start
+                .run_choices
+                .as_ref()
+                .and_then(|choices| choices.get("manifest"))
+                .cloned(),
+        })
+    }
+
+    /// The manifest `refresh` fetched.
+    pub fn of_refresh(refresh: &crate::record::SessionRefresh) -> Self {
+        Self {
+            parts: refresh.setup.clone(),
+            rest: refresh.manifest.clone(),
+        }
+    }
+
+    /// The referenced manifest's plan identity, which stays with the rest of its members.
+    pub fn plan_identity(&self) -> Option<&str> {
+        self.rest.as_ref()?.get("plan_identity")?.as_str()
+    }
+}
+
+impl Plan {
+    /// The shared transitions over this state, which the fold applies a record through.
+    fn transitions(&mut self) -> Transitions<ManifestRef> {
+        let plan = std::mem::take(self);
+        // What the shared transitions don't touch stays here.
+        self.effective = plan.effective;
+        self.accepted = plan.accepted;
+        self.selection = plan.selection;
+        Transitions {
+            accepted_generation: plan.accepted_generation,
+            applied_generation: plan.applied_generation,
+            pending: plan.pending.map(|pending| PendingTransition {
+                generation: pending.generation,
+                policy: pending.policy,
+                manifest: pending.manifest,
+            }),
+            current: plan.current,
+            prefix: plan.prefix,
+            rebuild_since_accept: plan.rebuild_since_accept,
+            flushed_since_accept: plan.flushed_since_accept,
+            last_model: plan.last_model,
+        }
+    }
+
+    /// This state, back from `transitions`.
+    fn settle(&mut self, transitions: Transitions<ManifestRef>) {
+        self.accepted_generation = transitions.accepted_generation;
+        self.applied_generation = transitions.applied_generation;
+        self.pending = transitions.pending.map(|pending| PendingChange {
+            generation: pending.generation,
+            policy: pending.policy,
+            manifest: pending.manifest,
+        });
+        self.current = transitions.current;
+        self.prefix = transitions.prefix;
+        self.rebuild_since_accept = transitions.rebuild_since_accept;
+        self.flushed_since_accept = transitions.flushed_since_accept;
+        self.last_model = transitions.last_model;
+    }
+
+    /// Folds one ledger record's effect on the session's plan changes. A run start that applied
+    /// the pending change is followed in its batch by a `RefreshApplied` naming it, which applies
+    /// it after the start's own transitions, as today's fold applies it at the start.
+    fn apply(plan: &mut Option<Plan>, record: &Record) {
+        let changes_plan = match record {
+            Record::Event(event) => event.name == FIRST_PROTOCOL_VIEW_APPLIED,
+            Record::SessionRefresh(_)
+            | Record::RefreshPolicy(_)
+            | Record::PrefixFlush(_)
+            | Record::ViewApplied(_)
+            | Record::RunStart(_)
+            | Record::RefreshApplied(_) => true,
+            _ => false,
+        };
+        if !changes_plan {
+            return;
+        }
+        let state = plan.get_or_insert_with(Plan::default);
+        if let Record::SessionRefresh(refresh) = record {
+            state.accepted = Some(ManifestRef::of_refresh(refresh));
+            if refresh.selection.is_some() {
+                state.selection.clone_from(&refresh.selection);
+            }
+        }
+        let mut change = state.transitions();
+        match record {
+            Record::SessionRefresh(refresh) => change.accepted(
+                refresh.generation,
+                &refresh.policy,
+                ManifestRef::of_refresh(refresh),
+            ),
+            Record::RefreshPolicy(policy) => {
+                change.policy_changed(policy.generation, &policy.policy);
+            }
+            Record::PrefixFlush(_) => change.flushed(),
+            Record::ViewApplied(_) | Record::Event(_) => change.view_applied(),
+            Record::RunStart(start) => {
+                change.run_started(model_key(&start.model), ManifestRef::of_start(start));
+            }
+            Record::RefreshApplied(applied) => {
+                let applying = Applying {
+                    generation: applied.generation,
+                    applied_by: if applied.applied_by == "fold" {
+                        "fold"
+                    } else {
+                        "append"
+                    },
+                };
+                if change.applied(applying).is_some() {
+                    state.effective = Some(EffectiveChange {
+                        generation: applied.generation,
+                        applied_by: applied.applied_by.clone(),
+                        manifest_digest: applied.manifest_digest.clone(),
+                        composition_digest: applied.composition_digest.clone(),
+                        absent_items: applied.absent_items.clone(),
+                    });
+                }
+            }
+            _ => {}
+        }
+        state.settle(change);
+    }
+}
+
+/// The name the first compaction protocol's applied view keeps as a generic ledger event. Today's
+/// fold counts it as a prefix rebuild, as it counts the current contract's.
+const FIRST_PROTOCOL_VIEW_APPLIED: &str = "compaction_view_applied";
 
 state! {
     /// The session's usage summed over every step, as the runner contract's `SessionUsage`
@@ -1407,6 +1691,7 @@ impl Operations {
         self.apply_sends(record);
         self.apply_title(record);
         self.apply_billing(record);
+        Plan::apply(&mut self.plan, record);
         if let Record::RunStart(start) = record {
             self.run = Some(Run::new(start));
             self.refusal_schedule = start.refusal_schedule.clone();

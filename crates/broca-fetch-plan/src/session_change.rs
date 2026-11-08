@@ -140,6 +140,21 @@ impl EffectiveState {
             absent_items: facts.absent_items,
         }
     }
+
+    /// These facts as the new storage records them in the applying run start's batch.
+    pub fn applied_change(&self) -> broca_protocol::session_change::AppliedChange {
+        broca_protocol::session_change::AppliedChange {
+            generation: self.generation,
+            applied_by: self.applied_by.clone(),
+            manifest_digest: self.manifest_digest.clone(),
+            composition_digest: self.composition_digest.clone(),
+            absent_items: self
+                .absent_items
+                .iter()
+                .map(|item| serde_json::to_value(item).expect("an absent item encodes"))
+                .collect(),
+        }
+    }
 }
 
 /// The session-change facts a WAL folds, for the baseline and for repeat classification.

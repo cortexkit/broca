@@ -178,6 +178,8 @@ fn session_refresh(
         }
         object.insert("manifest".into(), finish_manifest(manifest));
     }
+    // The recorded model choice (`selection`) is the new storage's own: today's storage reads
+    // it from the manifest each time.
     Ok(Value::Object(object))
 }
 
@@ -398,6 +400,9 @@ pub fn invert(records: &[Record], parts: &BTreeMap<Digest, Vec<u8>>) -> Result<V
             // A converted run's billing was settled by today's storage when the run ended; the
             // converter records that, and today's log has no record of it.
             Record::Billed(_) => {}
+            // Derived from today's fold at the run start that applied the refresh: today's log
+            // decides the application again on replay and keeps no record of it.
+            Record::RefreshApplied(_) => {}
             Record::Input(Input {
                 receipt_seq: Some(_),
                 ..
@@ -506,6 +511,23 @@ pub fn invert(records: &[Record], parts: &BTreeMap<Digest, Vec<u8>>) -> Result<V
                     Record::ToolIntent(intent) => tool_intent(intent, &calls),
                     Record::QueuedSend(send) => queued(send, parts)?,
                     Record::SessionRefresh(refresh) => session_refresh(refresh, parts)?,
+                    Record::RefreshPolicy(policy) => serde_json::json!({
+                        "type": "session_refresh_policy_changed",
+                        "generation": policy.generation,
+                        "policy": policy.policy,
+                        "send_id": policy.send_id,
+                    }),
+                    Record::PrefixFlush(flush) => {
+                        let mut object = Map::new();
+                        object.insert("type".into(), json("session_prefix_flushed"));
+                        object.insert("send_id".into(), json(&flush.send_id));
+                        set(
+                            &mut object,
+                            "pending_generation",
+                            flush.pending_generation.as_ref(),
+                        );
+                        Value::Object(object)
+                    }
                     Record::StructuredResult(result) => serde_json::json!({
                         "type": "structured_output_result",
                         "run_id": result.run_id,

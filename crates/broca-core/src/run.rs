@@ -801,6 +801,10 @@ pub struct RunControl {
     /// Replace the provider-view system text only after a recorded refresh applies. A
     /// difference between legacy transcript text and manifest metadata is not a refresh.
     pub manifest_system_override: bool,
+    /// The pending plan change a fresh run applies by freezing `manifest`, with its baseline
+    /// facts. The new storage's run loop records it in the batch of the run's start; today's
+    /// loop ignores it, because today's storage works the application out again from the WAL.
+    pub applies_refresh: Option<broca_protocol::session_change::AppliedChange>,
     /// Told the WAL position of a fresh run's `RunStarted` once it is durable, and of each
     /// provider attempt record as it is appended, so the caller can report them to the routing
     /// module that chooses provider accounts. `None` reports nothing; either way the loop writes
@@ -959,6 +963,7 @@ impl Default for RunControl {
             live_steer_after_seq: None,
             manifest: None,
             manifest_system_override: false,
+            applies_refresh: None,
             account_reporter: None,
             keep_warm: None,
             elicitation_plane: None,

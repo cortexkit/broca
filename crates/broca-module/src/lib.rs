@@ -38,6 +38,7 @@ pub mod store_entries;
 pub mod store_head;
 pub mod store_import;
 pub mod store_open;
+mod store_plan_change;
 pub mod store_read;
 pub mod store_reads;
 pub mod store_status;

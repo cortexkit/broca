@@ -616,6 +616,7 @@ version = "0.3.326"
 dependencies = [
  "async-trait",
  "broca-core",
+ "broca-fetch-plan",
  "broca-module",
  "broca-module-serve",
  "broca-protocol",

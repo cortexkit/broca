@@ -2876,6 +2876,31 @@ impl crate::LineageRegistry {
         send_id: Option<&str>,
         wal_error: fn(String) -> String,
     ) -> Result<ChangeRead, SessionChangeError> {
+        use crate::store_reads::{StoreReadReply, StoreReadRequest};
+        // A session kept in the new storage is read from its fold and its id index.
+        if let Some(store) = self
+            .store_holding(session)
+            .map_err(|error| SessionChangeError::Transient(wal_error(format!("{error:?}"))))?
+        {
+            let request = StoreReadRequest::PlanChange {
+                generation,
+                send_id: send_id.map(str::to_owned),
+            };
+            return match store.read(self, session, request).await {
+                Ok(Some(StoreReadReply::PlanChange(Ok(read)))) => Ok(read.0),
+                Ok(Some(StoreReadReply::PlanChange(Err(error)))) => {
+                    Err(SessionChangeError::Transient(wal_error(error)))
+                }
+                // The session's creation never committed, so it has no run to change.
+                Ok(None) => Ok(ChangeRead::default()),
+                Ok(Some(_)) => Err(SessionChangeError::Transient(
+                    "a store read was answered with another read's reply".into(),
+                )),
+                Err(error) => Err(SessionChangeError::Transient(wal_error(format!(
+                    "{error:?}"
+                )))),
+            };
+        }
         let (records, _) = self
             .read_durable_wal(session)
             .await
@@ -4671,6 +4696,17 @@ impl ServeHandler for crate::LineageRegistry {
         &self,
         session: &LineageKey,
     ) -> Option<(Option<String>, Option<String>)> {
+        use crate::store_reads::{StoreReadReply, StoreReadRequest};
+        if let Some(store) = self.store_holding(session).ok()? {
+            return match store
+                .read(self, session, StoreReadRequest::PlanIdentities)
+                .await
+                .ok()??
+            {
+                StoreReadReply::PlanIdentities(identities) => identities.ok()?,
+                _ => None,
+            };
+        }
         let (records, _) = self.read_durable_wal(session).await.ok()?;
         let change = broca_fetch_plan::session_change::SessionChangeState::fold(&records);
         if change.accepted_generation == 0 {

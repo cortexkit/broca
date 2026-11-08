@@ -11,6 +11,8 @@
 //! switch between runs, or a prefix flush. A new run alone is not a rebuild, because stateless
 //! requests still hit the provider's prompt cache across runs.
 
+use serde::{Deserialize, Serialize};
+
 use crate::request::ModelHandle;
 
 /// A pending change: the highest accepted generation not yet applied, with its latest policy and
@@ -31,6 +33,18 @@ pub struct Pending<M> {
 pub struct Applying {
     pub generation: u64,
     pub applied_by: &'static str,
+}
+
+/// A pending change a run start applied, with the facts the session's baseline reports for it:
+/// the applied manifest's digest, its composition digest when it has one, and the plan items its
+/// fetch left absent. The new storage records it in the batch of the run start that applied it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AppliedChange {
+    pub generation: u64,
+    pub applied_by: String,
+    pub manifest_digest: String,
+    pub composition_digest: Option<String>,
+    pub absent_items: Vec<serde_json::Value>,
 }
 
 /// The key a run's model is compared by when deciding whether the model switched between runs.
