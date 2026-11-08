@@ -131,10 +131,11 @@ struct State {
     /// In a mode-3 log: who delivered each tool-result delivery's text, by the delivering
     /// record's seq (see `entry_facts`).
     delivery_notices: HashMap<u64, Notice>,
-    /// The current step's calls that a record already anchored, as today's call keys read them:
-    /// `None` for a dispatch intent, which holds the call's key, or the seq of the deferral that
-    /// prepared a call for an approval.
-    anchored: HashMap<String, Option<u64>>,
+    /// Each occurrence of a tool call the current step made, as today's call keys anchor it
+    /// (see [`anchor`]).
+    anchors: Vec<Anchor>,
+    /// The key the outcome of the terminal record being converted records (see [`anchor`]).
+    outcome_key: Option<String>,
 }
 
 /// Writes the held copies as transcript entries at the boundary that places them.
@@ -275,23 +276,14 @@ pub fn convert(old: &[FramedRecord], lineage: Option<&str>) -> Result<Converted,
             }
         }
         state.seq = framed.seq;
-        // Today's call keys come from the record that first anchors each call of a step.
-        match &framed.record {
-            WalRecord::RunStarted { .. }
-            | WalRecord::ModelStepFinished { .. }
-            | WalRecord::TurnFinished { .. }
-            | WalRecord::RunFinished { .. } => state.anchored.clear(),
-            WalRecord::ToolDispatchIntent { tool_call_id, .. } => {
-                state.anchored.insert(tool_call_id.0.clone(), None);
-            }
-            WalRecord::ToolCallDeferred { call_id, .. } => {
-                state
-                    .anchored
-                    .entry(call_id.0.clone())
-                    .or_insert(Some(framed.seq));
-            }
-            _ => {}
-        }
+        // Today's call keys come from the record that first anchors each occurrence of a step's
+        // calls.
+        state.outcome_key = anchor(
+            &mut state.anchors,
+            &framed.record,
+            framed.seq,
+            state.lineage.as_deref(),
+        );
         let before = out.records.len();
         convert_one(&framed.record, &mut state, &mut out)?;
         // Today's display facts of each message this record gave a new version, by today's
@@ -1524,6 +1516,107 @@ struct Terminal {
     tags: Option<Value>,
 }
 
+/// One occurrence of a tool call the current step made, as today's call keys anchor it
+/// (`broca_core::call_identity`).
+#[derive(Debug, Clone, Default)]
+struct Anchor {
+    id: String,
+    /// The seq of the record that first anchored it: its dispatch intent, its deferral, or the
+    /// terminal record that closed it.
+    seq: Option<u64>,
+    /// A dispatch intent anchored it, so the intent holds its key.
+    dispatched: bool,
+    /// A terminal record closed it.
+    terminal: bool,
+}
+
+/// Notes what `record`, at `seq`, anchors among the current step's call occurrences `anchors`,
+/// matching it to an occurrence as today's call keys do: an intent or a deferral takes the first
+/// occurrence of its call id neither sent nor closed, a refusal the first not yet anchored, and
+/// any other terminal the first not yet closed, so a repeated call id keys each copy by its own
+/// record. For a terminal record, returns the key its outcome records: none for an occurrence a
+/// dispatch intent anchored, whose intent holds its key; otherwise the log's lineage and the seq
+/// of the record that first anchored it, its deferral or this terminal.
+fn anchor(
+    anchors: &mut Vec<Anchor>,
+    record: &WalRecord,
+    seq: u64,
+    lineage: Option<&str>,
+) -> Option<String> {
+    let (id, terminal) = match record {
+        WalRecord::RunStarted { .. }
+        | WalRecord::TurnFinished { .. }
+        | WalRecord::RunFinished { .. } => {
+            anchors.clear();
+            return None;
+        }
+        WalRecord::ModelStepFinished {
+            assistant_message, ..
+        } => {
+            *anchors = assistant_message
+                .tool_calls()
+                .map(|call| Anchor {
+                    id: call.tool_call_id.0.clone(),
+                    ..Anchor::default()
+                })
+                .collect();
+            return None;
+        }
+        WalRecord::ToolDispatchIntent { tool_call_id, .. }
+        | WalRecord::ToolCallDeferred {
+            call_id: tool_call_id,
+            ..
+        } => (tool_call_id, false),
+        WalRecord::ToolNoDispatch { tool_call_id, .. } => (tool_call_id, true),
+        WalRecord::ToolResult { result, .. } => (&result.tool_call_id, true),
+        WalRecord::ApprovalRecorded {
+            call_id,
+            closing_result,
+            ..
+        } => {
+            // An approval that closes its call closes the first occurrence still open.
+            if let Some(open) = anchors
+                .iter_mut()
+                .find(|anchor| anchor.id == call_id.0 && !anchor.terminal)
+            {
+                open.terminal |= closing_result.is_some();
+            }
+            return None;
+        }
+        _ => return None,
+    };
+    let open = |anchor: &Anchor| anchor.id == id.0 && !anchor.terminal;
+    let index = match record {
+        // A refusal can follow the results of siblings already sent.
+        WalRecord::ToolNoDispatch { .. } => anchors
+            .iter()
+            .position(|anchor| open(anchor) && anchor.seq.is_none())
+            .or_else(|| anchors.iter().position(open)),
+        _ if terminal => anchors.iter().position(open),
+        _ => anchors
+            .iter()
+            .position(|anchor| open(anchor) && !anchor.dispatched),
+    };
+    let Some(index) = index else {
+        // Not one of the step's calls: today keys it by this record.
+        return terminal
+            .then(|| broca_core::context::tool_call_key(lineage, seq, None))
+            .flatten();
+    };
+    let slot = &mut anchors[index];
+    if matches!(record, WalRecord::ToolDispatchIntent { .. }) {
+        slot.seq = Some(seq);
+        slot.dispatched = true;
+    } else {
+        slot.seq.get_or_insert(seq);
+    }
+    slot.terminal |= terminal;
+    if !terminal || slot.dispatched {
+        return None;
+    }
+    broca_core::context::tool_call_key(lineage, slot.seq?, None)
+}
+
 fn reply_and_outcome(terminal: Terminal, state: &State, out: &mut Converted) {
     let Terminal {
         result,
@@ -1538,15 +1631,9 @@ fn reply_and_outcome(terminal: Terminal, state: &State, out: &mut Converted) {
     let result_digest = sha256(&result.encode());
     let tool_call_id = result.tool_call_id.clone();
     let is_error = result.is_error;
-    // A call no dispatch intent anchored keeps the key today's projection gives it: the log's
-    // lineage and the seq of the record that first anchored it, its deferral or this terminal.
-    let call_key = match state.anchored.get(&tool_call_id.0) {
-        Some(None) => None,
-        Some(Some(deferred)) => {
-            broca_core::context::tool_call_key(state.lineage.as_deref(), *deferred, None)
-        }
-        None => broca_core::context::tool_call_key(state.lineage.as_deref(), state.seq, None),
-    };
+    // A call no dispatch intent anchored keeps the key today's projection gives it (see
+    // [`anchor`]).
+    let call_key = state.outcome_key.clone();
     out.records.push(Record::ToolReply(ToolReply {
         run_id: state.run_id.clone(),
         batch_id: Some(batch_id.clone()),

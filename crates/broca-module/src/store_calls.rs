@@ -30,14 +30,17 @@ use broca_wire::{SessionReadResponse, SessionReadToolCall};
 pub enum TurnOf {
     /// A placed message, with the turn facts its writer recorded, if any.
     Placed(Option<TurnFacts>),
-    /// The assistant message whose calls are still running.
-    Open,
+    /// The assistant message whose calls are still running, served from the open batch. Once
+    /// all its results are placed it has its facts, though reads serve it as running until its
+    /// batch closes (`store_read::results_await_close`); those name the key of a copy the open
+    /// batch can't.
+    Open(Option<TurnFacts>),
 }
 
 impl TurnOf {
     pub fn of(entry: &StoredEntry) -> Self {
         if entry.open {
-            TurnOf::Open
+            TurnOf::Open(entry.state.turn.clone())
         } else {
             TurnOf::Placed(entry.state.turn.clone())
         }
@@ -100,11 +103,14 @@ fn served_call(
     }
 }
 
-/// The facts of the open turn's call `id`, from the open batch. A call is indeterminate when it
-/// has an intent and no copy of its id has a result yet.
+/// The facts of copy `copy` (counting from 0) of the open turn's call `id`, from the open
+/// batch. The fold marks every copy of an id with the intent that anchored its first copy, so
+/// only that copy is the intent's: a later copy of the id was never sent. A dispatched call is
+/// indeterminate while no copy of its id has a result.
 async fn open_call<B: SessionBackend>(
     session: &Session<B>,
     id: &str,
+    copy: usize,
 ) -> Result<SessionReadToolCall, SessionError> {
     let Some(batch) = session
         .operations
@@ -117,24 +123,26 @@ async fn open_call<B: SessionBackend>(
     let positions: Vec<usize> = (0..batch.calls.len())
         .filter(|position| batch.id(*position).0 == id)
         .collect();
+    let Some(&position) = positions.get(copy) else {
+        return Ok(unattributed(id));
+    };
     let answered = positions
         .iter()
         .any(|position| batch.state(*position) == CallState::Terminated);
-    let Some(dispatched) = positions
+    let call = &batch.calls[position];
+    let dispatched = positions
         .iter()
         .find(|position| batch.calls[**position].intent)
-    else {
-        // A call answered without an intent has the key its outcome recorded, and nothing
-        // else; one not answered yet has neither.
+        .is_some_and(|first| *first == position);
+    if !dispatched {
+        // A copy answered without an intent has the key its outcome recorded, and nothing
+        // else; one not answered yet, or a later copy of a dispatched id, has neither.
         return Ok(SessionReadToolCall {
-            call_key: positions
-                .iter()
-                .find_map(|position| batch.key(*position))
-                .map(str::to_owned),
+            call_key: call.key.clone().filter(|_| !call.intent),
             ..unattributed(id)
         });
-    };
-    let Some(key) = batch.key(*dispatched).map(str::to_owned) else {
+    }
+    let Some(key) = call.key.clone() else {
         return Ok(unattributed(id));
     };
     let intent = session
@@ -173,8 +181,28 @@ pub async fn attribute_tool_calls<B: SessionBackend>(
         if !ids.is_empty() {
             let mut calls = Vec::with_capacity(ids.len());
             for (position, id) in ids.iter().enumerate() {
+                // Which copy of its id the call is, counting from 0.
+                let copy = ids[..position]
+                    .iter()
+                    .filter(|earlier| *earlier == id)
+                    .count();
                 calls.push(match turns.get(index) {
-                    Some(TurnOf::Open) => open_call(session, id).await?,
+                    Some(TurnOf::Open(turn)) => {
+                        let mut call = open_call(session, id, copy).await?;
+                        // A copy answered without an intent whose key the open batch lost to
+                        // its id's intent (see `open_call`) takes the key its turn's facts name.
+                        if call.call_key.is_none() {
+                            let names: Vec<&str> = ids.iter().map(String::as_str).collect();
+                            call.call_key = turn
+                                .as_ref()
+                                .and_then(|turn| {
+                                    crate::store_read::facts_by_call(&names, turn)[position]
+                                })
+                                .filter(|facts| facts.carrier.is_none())
+                                .map(|facts| facts.call_key.clone());
+                        }
+                        call
+                    }
                     Some(TurnOf::Placed(turn)) => placed_turn_call(turn.as_ref(), &ids, position),
                     None => unattributed(id),
                 });

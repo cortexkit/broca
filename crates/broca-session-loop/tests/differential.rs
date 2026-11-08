@@ -2429,7 +2429,8 @@ async fn ids_resolve(session: &Session<&MemoryBackend>) {
 
 /// Every tool turn the session placed carries the facts of its calls (`TurnFacts`), whichever
 /// way the turn closed: its results arriving, a crash's close-out, a cancel, or a batch that
-/// sent nothing. `session.read` serves each call's key and dispatch from them.
+/// sent nothing. `session.read` serves each call's key and dispatch from them, and no two calls
+/// of a turn share a key.
 async fn turns_have_facts(session: &Session<&MemoryBackend>) {
     for entry in session
         .entries(1, usize::MAX)
@@ -2446,6 +2447,23 @@ async fn turns_have_facts(session: &Session<&MemoryBackend>) {
                 entry.state.turn.is_some(),
                 "tool turn {} has no turn facts",
                 entry.ordinal
+            );
+        }
+        // Each occurrence of a call has its own key, a repeated call id's copies included.
+        if let Some(turn) = &entry.state.turn {
+            let mut keys: Vec<&str> = turn
+                .calls
+                .iter()
+                .map(|call| call.call_key.as_str())
+                .collect();
+            keys.sort_unstable();
+            keys.dedup();
+            assert_eq!(
+                keys.len(),
+                turn.calls.len(),
+                "tool turn {} shares a key between calls: {:?}",
+                entry.ordinal,
+                turn.calls
             );
         }
     }
@@ -5433,6 +5451,31 @@ fn cancel_before_batch_with_a_repeated_id_scenario() -> Scenario {
 #[tokio::test]
 async fn a_refused_batch_still_answers_a_repeated_call_id_as_a_duplicate() {
     compare(cancel_before_batch_with_a_repeated_id_scenario()).await;
+}
+
+/// A step that repeats a call id: the first copy is sent, and the second gets the duplicate
+/// error without being sent. Both loops key each copy by its own record, the first by its intent
+/// and the second by its outcome, so the turn's facts name two keys.
+#[tokio::test]
+async fn a_repeated_call_id_keys_each_copy_by_its_own_record() {
+    compare(Scenario {
+        input: vec![user("read a twice")],
+        tools: vec![tool("read", ExecutionMode::Parallel)],
+        manifest: None,
+        stop_when: Vec::new(),
+        steps: vec![
+            answer(
+                "a1",
+                vec![
+                    call("c1", "read", json!({"path": "a"})),
+                    call("c1", "read", json!({"path": "b"})),
+                ],
+                FinishReason::ToolCalls,
+            ),
+            text_step("a2", "done"),
+        ],
+    })
+    .await;
 }
 
 /// Runs [`compare_in`] once, on the current compaction contract, with a compaction provider

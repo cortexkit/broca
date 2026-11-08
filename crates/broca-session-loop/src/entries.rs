@@ -511,25 +511,33 @@ pub fn with_facts(batch: Vec<Record>, at: &Placing<'_>) -> Result<Vec<Record>, S
         .run
         .as_ref()
         .and_then(|run| run.open_batch.as_ref());
-    // The calls a dispatch intent anchored whose outcome isn't recorded yet, one entry per
-    // intent: each outcome for one of them answers it, and any other outcome answers a call
-    // that took no intent.
-    let mut dispatched: Vec<ToolCallId> = open_batch
+    // The fold marks every copy of a call id with the intent that anchored its first copy, so
+    // each intent is its first copy's: the open batch's intents, each once, by that copy.
+    let anchored: Vec<&broca_session_store::fold::operations::Call> = open_batch
         .map(|batch| {
+            let mut seen = std::collections::HashSet::new();
             batch
                 .calls
                 .iter()
-                .filter(|call| call.intent && call.terminal.is_none())
-                .map(|call| call.id.clone())
+                .filter(|call| call.intent)
+                .filter(|call| call.key.as_ref().is_none_or(|key| seen.insert(key)))
                 .collect()
         })
         .unwrap_or_default();
+    // The calls a dispatch intent anchored whose outcome isn't recorded yet, one entry per
+    // intent: each outcome for one of them answers it, and any other outcome answers a call
+    // that took no intent.
+    let mut dispatched: Vec<ToolCallId> = anchored
+        .iter()
+        .filter(|call| call.terminal.is_none())
+        .map(|call| call.id.clone())
+        .collect();
     let mut events: Vec<CallEvent> = Vec::new();
     if let Some(batch) = open_batch {
-        for call in &batch.calls {
+        for call in &anchored {
             // A call answered without an intent has its outcome's key, which its terminal
             // carries.
-            let Some(key) = call.key.as_deref().filter(|_| call.intent) else {
+            let Some(key) = call.key.as_deref() else {
                 continue;
             };
             let (intent, seq) =

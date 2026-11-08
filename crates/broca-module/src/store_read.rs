@@ -420,10 +420,18 @@ async fn open_turn_times<B: SessionBackend>(
         });
         *copy += 1;
         let mut time = ToolTime::new(&call.tool_call_id.0);
+        // The fold marks every copy of an id with the intent that anchored its first copy
+        // (`store_calls::open_call`): only that copy is the intent's.
         let (key, dispatched) = batch
             .zip(position)
             .map_or((None, false), |(batch, position)| {
-                (batch.key(position), batch.calls[position].intent)
+                let first = (0..batch.calls.len())
+                    .find(|at| batch.id(*at) == &call.tool_call_id && batch.calls[*at].intent);
+                let own = &batch.calls[position];
+                match first == Some(position) {
+                    true => (batch.key(position), true),
+                    false => (own.key.as_deref().filter(|_| !own.intent), false),
+                }
             });
         if let (Some(key), false) = (key, dispatched) {
             time = time.with_call_key(key);

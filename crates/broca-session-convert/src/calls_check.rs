@@ -558,6 +558,70 @@ mod tests {
         }
     }
 
+    /// A step that repeats a call id: the first copy is sent, and the second is answered with
+    /// the duplicate error without being sent. Today keys each copy by its own record, the first
+    /// by its intent and the second by its answer, and the store serves the same two keys, at
+    /// every cut and on the closed turn.
+    #[test]
+    fn a_repeated_call_id_keys_each_copy_by_its_own_record() {
+        let lines = [
+            RUN,
+            r#"{"type":"step_started","step_id":1}"#,
+            r#"{"type":"model_step_finished","step_id":1,"assistant_message":{"message_id":"m1","content":[{"type":"tool_call","tool_call_id":"c1","tool_name":"bash","input":{"cmd":"ls"}},{"type":"tool_call","tool_call_id":"c1","tool_name":"bash","input":{"cmd":"pwd"}}]},"usage":{"input_tokens":3},"finish_reason":"tool_calls","retries_used":0}"#,
+            r#"{"type":"tool_batch_started","batch_id":"b1","step_id":1,"planned_calls":["c1","c1"]}"#,
+            r#"{"type":"tool_dispatch_intent","batch_id":"b1","tool_call_id":"c1","args":{"cmd":"ls"},"module_id":"tools"}"#,
+            r#"{"type":"tool_result","batch_id":"b1","result":{"tool_call_id":"c1","output":{"kind":"text","text":"ok"},"is_error":false},"outcome":"completed"}"#,
+            r#"{"type":"tool_result","batch_id":"b1","result":{"tool_call_id":"c1","output":{"kind":"error","message":"duplicate tool_call_id from provider"},"is_error":true},"outcome":"completed"}"#,
+            r#"{"type":"tool_batch_finished","batch_id":"b1"}"#,
+        ];
+        let old = log(&lines);
+        for end in [5, 6, 7, 8] {
+            let framed = &old[..end];
+            let today = today(framed, Some("l1"), 50).unwrap();
+            let keys: Vec<&Value> = today
+                .iter()
+                .flat_map(|message| message["tool_calls"].as_array().into_iter().flatten())
+                .map(|call| &call["call_key"])
+                .collect();
+            if end >= 7 {
+                assert_eq!(
+                    keys,
+                    [&json!("l1:5"), &json!("l1:7")],
+                    "today keys each copy by its own record, after record {end}"
+                );
+            }
+            assert_eq!(store_of(framed, "l1"), today, "after record {end}");
+        }
+        // The conversion keys the second copy's outcome by its answer, and its turn's facts name
+        // both keys.
+        use broca_session_store::record::Record;
+        let converted = broca_session_convert::convert(&old, Some("l1")).unwrap();
+        let outcome_keys: Vec<Option<&str>> = converted
+            .records
+            .iter()
+            .filter_map(|record| match record {
+                Record::ToolOutcome(outcome) => Some(outcome.call_key.as_deref()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(outcome_keys, [None, Some("l1:7")]);
+        let turn = converted
+            .records
+            .iter()
+            .rev()
+            .find_map(|record| match record {
+                Record::TurnFacts(turn) => Some(turn),
+                _ => None,
+            })
+            .expect("the turn has facts");
+        let turn_keys: Vec<&str> = turn
+            .calls
+            .iter()
+            .map(|call| call.call_key.as_str())
+            .collect();
+        assert_eq!(turn_keys, ["l1:5", "l1:7"]);
+    }
+
     /// A batch's results enter the transcript only once the batch closes, on both storages:
     /// broca may still join a delivered note to the last result as the batch closes, so a read
     /// between the batch's last result and its end shows the assistant message without them,
