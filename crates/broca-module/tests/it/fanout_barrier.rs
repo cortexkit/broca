@@ -32,7 +32,6 @@ use tokio::sync::{mpsc, Notify};
 fn record_sequence(run: &RunId, session: &BindIdentity) -> Vec<WalRecord> {
     vec![
         WalRecord::RunStarted {
-            message_marks: None,
             compaction_plan_version: None,
             sent_by: None,
             written_at_ms: None,

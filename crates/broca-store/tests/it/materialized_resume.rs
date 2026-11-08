@@ -113,7 +113,6 @@ fn queued_title(request: &RunRequest, index: usize, bytes: usize) -> [WalRecord;
     let submission_id = broca_protocol::SubmissionId(format!("noise-{index}"));
     [
         WalRecord::Queued {
-            message_marks: None,
             sent_by: None,
             written_at_ms: None,
             retention: None,

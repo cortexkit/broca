@@ -36,9 +36,6 @@ use serde::{Deserialize, Serialize};
 /// with the SAME config it was submitted with.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PendingSubmission {
-    /// Display marks are retained in admission checkpoints as well as their Queued source.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub message_marks: Option<broca_protocol::MessageMarks>,
     /// Display provenance is restored from the Queued record because checkpoint
     /// serialization omits it; sender labels must not change admission identities.
     #[serde(skip)]
@@ -175,7 +172,6 @@ pub fn pending_submissions(records: &[WalRecord]) -> Vec<PendingSubmission> {
             orders.insert(submission_id, (order, sent_by));
         }
         if let WalRecord::Queued {
-            message_marks,
             sent_by: display_sent_by,
             written_at_ms,
             ts_ms,
@@ -198,7 +194,6 @@ pub fn pending_submissions(records: &[WalRecord]) -> Vec<PendingSubmission> {
             insert_in_drain_order(
                 &mut pending,
                 PendingSubmission {
-                    message_marks: message_marks.clone(),
                     display_sent_by: display_sent_by.clone(),
                     admitted_at_ms: written_at_ms.or(*ts_ms),
                     hooks: hooks.clone(),
@@ -369,7 +364,6 @@ mod tests {
 
     fn queued_as(id: &str, text: &str, delivery: Option<broca_protocol::Delivery>) -> WalRecord {
         WalRecord::Queued {
-            message_marks: None,
             sent_by: None,
             written_at_ms: None,
             retention: None,
@@ -466,7 +460,6 @@ mod tests {
 
     fn consumed(run: &str, sub: &str) -> WalRecord {
         WalRecord::RunStarted {
-            message_marks: None,
             compaction_plan_version: None,
             sent_by: None,
             written_at_ms: None,

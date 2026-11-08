@@ -313,7 +313,6 @@ async fn start_probe(actor: &mut LineageActor<ProbeWal>) -> Result<RunId, StartR
             RunKind::FreshOrResume,
             None,
             SendIdentity {
-                message_marks: None,
                 display_sent_by: None,
                 title: None,
                 conversation_key: None,

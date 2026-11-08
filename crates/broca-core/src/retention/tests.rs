@@ -13,7 +13,6 @@ pub(crate) const MARKER: &str = "retention-content-must-not-be-projected-5d8e7b"
 
 pub(crate) fn started(run: &str, retention: Option<u64>) -> WalRecord {
     WalRecord::RunStarted {
-        message_marks: None,
         compaction_plan_version: None,
         sent_by: None,
         written_at_ms: None,
@@ -179,7 +178,6 @@ fn retention_last_title_tail_has_no_title() {
     .unwrap();
     let sends = [
         WalRecord::Steered {
-            message_marks: None,
             sent_by: None,
             written_at_ms: None,
             tags: None,
@@ -193,7 +191,6 @@ fn retention_last_title_tail_has_no_title() {
             request_identity_digest: None,
         },
         WalRecord::Queued {
-            message_marks: None,
             sent_by: None,
             written_at_ms: None,
             retention: None,

@@ -1270,7 +1270,6 @@ impl AdmissionCheckpointV1 {
             }
             WalRecord::Queued {
                 keep_warm,
-                message_marks,
                 sent_by: display_sent_by,
                 written_at_ms,
                 ts_ms,
@@ -1287,7 +1286,6 @@ impl AdmissionCheckpointV1 {
             } => crate::queue::insert_in_drain_order(
                 Arc::make_mut(&mut self.pending_fifo),
                 PendingSubmission {
-                    message_marks: message_marks.clone(),
                     display_sent_by: display_sent_by.clone(),
                     admitted_at_ms: written_at_ms.or(*ts_ms),
                     hooks: hooks.clone(),
@@ -3491,7 +3489,6 @@ mod tests {
         frame(
             seq,
             WalRecord::RunStarted {
-                message_marks: None,
                 compaction_plan_version: None,
                 sent_by: None,
                 written_at_ms: None,
@@ -3705,7 +3702,6 @@ mod tests {
             frame(
                 6,
                 WalRecord::Queued {
-                    message_marks: None,
                     sent_by: None,
                     submission_id: SubmissionId("q".into()),
                     request: Box::new(request("private queued input")),
@@ -5710,7 +5706,6 @@ mod tests {
             frame(
                 1,
                 WalRecord::Queued {
-                    message_marks: None,
                     sent_by: None,
                     written_at_ms: None,
                     retention: None,
@@ -5730,7 +5725,6 @@ mod tests {
             frame(
                 2,
                 WalRecord::Queued {
-                    message_marks: None,
                     sent_by: None,
                     written_at_ms: None,
                     retention: None,
@@ -5789,7 +5783,6 @@ mod tests {
             frame(
                 10,
                 WalRecord::Queued {
-                    message_marks: None,
                     sent_by: None,
                     written_at_ms: None,
                     retention: None,
@@ -6524,7 +6517,6 @@ mod tests {
             at_seq: 7,
             last_episode: None,
             pending_fifo: Arc::new(vec![PendingSubmission {
-                message_marks: None,
                 display_sent_by: None,
                 admitted_at_ms: None,
                 order: None,

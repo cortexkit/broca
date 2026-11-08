@@ -117,7 +117,6 @@ fn result(output: ToolOutput) -> Message {
 
 fn frozen_ride(id: &str) -> broca_wal::record::RideMetadata {
     broca_wal::record::RideMetadata {
-        speaks_for: None,
         call_key: "frozen-carrier-key".into(),
         send_id: id.into(),
         sender: "ck-mc".into(),

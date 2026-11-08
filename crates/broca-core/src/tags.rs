@@ -534,7 +534,6 @@ mod tests {
 
     fn steer(blocks: usize) -> WalRecord {
         WalRecord::Steered {
-            message_marks: None,
             sent_by: None,
             written_at_ms: None,
             tags: None,

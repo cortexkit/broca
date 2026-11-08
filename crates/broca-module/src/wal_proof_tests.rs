@@ -143,7 +143,6 @@ fn queued_record(
     ts_ms: Option<u64>,
 ) -> WalRecord {
     WalRecord::Queued {
-        message_marks: None,
         sent_by: None,
         written_at_ms: None,
         retention,
@@ -282,8 +281,7 @@ impl Fixture {
             tail_limit: AtomicUsize::new(0),
             after_read: Default::default(),
         });
-        let mut request = submission_from_config(min_config(), text_req(&key, "old").input);
-        request.tools = None;
+        let request = submission_from_config(min_config(), text_req(&key, "old").input);
         let digest = send_identity_digest(&request, broca_protocol::Delivery::Queue, None);
         let mut wal = wal_store
             .inner
@@ -293,7 +291,6 @@ impl Fixture {
             wal.append(
                 1,
                 &WalRecord::RunStarted {
-                    message_marks: None,
                     compaction_plan_version: None,
                     sent_by: None,
                     written_at_ms: None,
@@ -505,7 +502,6 @@ async fn refused_queue_and_retract_leave_memory_unchanged() {
             RunId("refused".into()),
             queue.request.clone(),
             SendIdentity {
-                message_marks: None,
                 display_sent_by: None,
                 conversation_key: None,
                 title: None,
@@ -553,7 +549,6 @@ async fn refused_queue_and_retract_leave_memory_unchanged() {
             RunId("queued".into()),
             retract.request.clone(),
             SendIdentity {
-                message_marks: None,
                 display_sent_by: None,
                 conversation_key: None,
                 title: None,
@@ -775,7 +770,6 @@ async fn retained_first_send_cut_before_its_index_sync_is_recovered_at_boot() {
     let digest = send_identity_digest(&request, broca_protocol::Delivery::Queue, None);
     writer
         .record(WalRecord::RunStarted {
-            message_marks: None,
             compaction_plan_version: None,
             sent_by: None,
             written_at_ms: None,

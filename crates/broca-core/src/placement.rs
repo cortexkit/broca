@@ -363,7 +363,6 @@ mod tests {
     fn held_steers_wait_for_step_or_terminal() {
         let mut placement = Placement::new(7);
         let steer = WalRecord::Steered {
-            message_marks: None,
             sent_by: None,
             written_at_ms: None,
             input: vec![user()].into(),

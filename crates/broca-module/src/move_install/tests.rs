@@ -10,7 +10,6 @@ fn root(tag: &str) -> std::path::PathBuf {
 }
 pub(crate) fn started(session: &BindIdentity, id: &str) -> WalRecord {
     WalRecord::RunStarted {
-        message_marks: None,
         compaction_plan_version: None,
         sent_by: None,
         written_at_ms: None,

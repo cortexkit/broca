@@ -77,7 +77,6 @@ pub fn run_attribution_follows_each_episode<S: SessionStore>(store: S) {
         framed(
             8,
             WalRecord::Steered {
-                message_marks: None,
                 sent_by: None,
                 written_at_ms: None,
                 tags: None,

@@ -239,7 +239,6 @@ fn accept(dir: &std::path::Path, mode: DeliveryMode) -> [WalRecord; 2] {
             sent_by: None,
         },
         WalRecord::Queued {
-            message_marks: None,
             sent_by: None,
             written_at_ms: None,
             retention: None,

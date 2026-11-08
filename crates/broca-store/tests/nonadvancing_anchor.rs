@@ -12,7 +12,6 @@ use broca_wal::{wal_bytes_read, RunConfig, RunOrigin, WalRecord};
 
 fn run_started(session: &BindIdentity) -> WalRecord {
     WalRecord::RunStarted {
-        message_marks: None,
         compaction_plan_version: None,
         sent_by: None,
         written_at_ms: None,

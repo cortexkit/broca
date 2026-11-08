@@ -106,7 +106,6 @@ fn config() -> broca_wal::RunConfig {
 fn records(bind: &BindIdentity) -> Vec<WalRecord> {
     vec![
         WalRecord::RunStarted {
-            message_marks: None,
             sent_by: None,
             written_at_ms: None,
             tags: None,

@@ -235,7 +235,6 @@ fn seed_resume_without_terminal(
     let mut seeded = FileWal::open(wal.wal_path(session)).expect("open wal");
     let recs = vec![
         WalRecord::RunStarted {
-            message_marks: None,
             compaction_plan_version: None,
             sent_by: None,
             written_at_ms: None,

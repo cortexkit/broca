@@ -15,7 +15,6 @@ fn pin_values() -> [(&'static str, Vec<u8>, &'static str); 4] {
         .into_send_request(session.clone(), RunId("run".into()))
         .unwrap();
     let queued = WalRecord::Queued {
-        message_marks: None,
         sent_by: None,
         submission_id: SubmissionId("queued".into()),
         request: request.request,

@@ -194,7 +194,6 @@ pub fn written_at_ms(req: &RunRequest, now: impl FnOnce() -> Option<u64>) -> Opt
 /// leaves one without the other. A resume treats it as the run's authority.
 pub fn run_started(req: &RunRequest, control: &RunControl, start: EpisodeStart) -> WalRecord {
     WalRecord::RunStarted {
-        message_marks: control.display_message_marks.clone(),
         compaction_plan_version: start
             .mode3
             .then_some(cortexkit_compaction_view::PLAN_VERSION),

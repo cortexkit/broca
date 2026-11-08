@@ -375,7 +375,6 @@ pub async fn run_import_with_store<W: WalStore>(
 
     let session = request.session.clone();
     writer.record(WalRecord::RunStarted {
-        message_marks: None,
         compaction_plan_version: Some(cortexkit_compaction_view::PLAN_VERSION),
         sent_by: None,
         written_at_ms: None,

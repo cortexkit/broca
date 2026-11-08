@@ -594,16 +594,9 @@ pub const RIDES_V2_WRITER_ENABLED: bool = true;
 #[derive(Default)]
 pub(crate) struct RideLedger {
     anchors: crate::call_identity::CallAnchors,
-    sends: std::collections::HashMap<String, RideOrigin>,
+    sends: std::collections::HashMap<String, (String, String, Vec<String>)>,
     orders: std::collections::HashMap<String, (Option<broca_protocol::BindPrincipal>, Vec<String>)>,
 }
-
-type RideOrigin = (
-    String,
-    String,
-    Vec<String>,
-    Option<broca_protocol::SpeaksFor>,
-);
 
 impl RideLedger {
     pub(crate) fn observe(&mut self, record: &WalRecord, seq: u64) {
@@ -629,7 +622,6 @@ impl RideLedger {
             WalRecord::Queued {
                 submission_id,
                 send_id,
-                message_marks,
                 sent_by,
                 principal,
                 ..
@@ -655,9 +647,6 @@ impl RideLedger {
                         send_id.clone().unwrap_or_else(|| submission_id.0.clone()),
                         sender,
                         forms,
-                        message_marks
-                            .as_ref()
-                            .and_then(|marks| marks.speaks_for.clone()),
                     ),
                 );
             }
@@ -702,10 +691,6 @@ impl RideLedger {
                     .unwrap_or_else(|| pending.submission_id.0.clone()),
                 sender,
                 forms,
-                pending
-                    .message_marks
-                    .as_ref()
-                    .and_then(|marks| marks.speaks_for.clone()),
             ),
         );
     }
@@ -724,9 +709,8 @@ impl RideLedger {
         else {
             return None;
         };
-        let (send_id, sender, forms, speaks_for) = self.sends.get(&submission_id.0)?;
+        let (send_id, sender, forms) = self.sends.get(&submission_id.0)?;
         Some(broca_wal::record::RideMetadata {
-            speaks_for: speaks_for.clone(),
             call_key: self
                 .anchors
                 .slots()
@@ -743,44 +727,6 @@ impl RideLedger {
 
 #[cfg(test)]
 mod ride_v2_tests {
-    #[test]
-    fn recorded_agent_marks_reach_rides_from_wal_and_checkpoint() {
-        let record = |value| serde_json::from_value::<broca_wal::WalRecord>(value).unwrap();
-        let mut checkpoint: serde_json::Value = serde_json::from_str(include_str!(
-            "../tests/golden/admission_before_message_marks.json"
-        ))
-        .unwrap();
-        checkpoint["pending_fifo"][0]["message_marks"] =
-            serde_json::json!({"speaks_for":{"agent_id":"Ada"}});
-        checkpoint["pending_fifo"][0]["order"] = serde_json::json!({"modes":["tool_result"]});
-        let checkpoint: crate::AdmissionCheckpointV1 = serde_json::from_value(checkpoint).unwrap();
-        let pending = &checkpoint.pending_fifo[0];
-        let mut queued: serde_json::Value = serde_json::from_str(include_str!(
-            "../../broca-wal/tests/golden/pre_step_transforms/queued.json"
-        ))
-        .unwrap();
-        queued["message_marks"] = serde_json::json!({"speaks_for":{"agent_id":"Ada"}});
-        for from_checkpoint in [false, true] {
-            let mut ledger = super::RideLedger::default();
-            if from_checkpoint {
-                ledger.seed_pending(pending);
-            } else {
-                ledger.observe(&record(serde_json::json!({"type":"delivery_ordered","submission_id":"sub-run-8","order":{"modes":["tool_result"]}})), 1);
-                ledger.observe(&record(queued.clone()), 2);
-            }
-            ledger.observe(&record(serde_json::json!({"type":"model_step_finished","step_id":1,"assistant_message":{"message_id":"m","content":[{"type":"tool_call","tool_call_id":"c","tool_name":"work","input":{}}]},"usage":{}})), 3);
-            ledger.observe(&record(serde_json::json!({"type":"tool_dispatch_intent","batch_id":"batch","tool_call_id":"c","args":{}})), 4);
-            let delivery = record(
-                serde_json::json!({"type":"send_delivered","submission_id":"sub-run-8","run_id":"r","mode":"tool_result","tool_call_id":"c","appended_text":"\n\nhello"}),
-            );
-            let envelope = ledger.envelope(&delivery, Some("lineage")).unwrap();
-            assert_eq!(
-                envelope.speaks_for.unwrap().agent_id,
-                "Ada",
-                "checkpoint {from_checkpoint}"
-            );
-        }
-    }
     use super::*;
     use broca_protocol::{MediaKind, MediaRef, ToolOutputPart};
     use cortexkit_role_llm_runner::rides::Ride;

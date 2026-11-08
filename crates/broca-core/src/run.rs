@@ -696,7 +696,6 @@ pub struct RunControl {
     pub new_log_compaction_plan_version: Option<u32>,
     /// Attested input route, kept out of request rendering and admission identity.
     pub display_sent_by: Option<broca_protocol::BindPrincipal>,
-    pub display_message_marks: Option<broca_protocol::MessageMarks>,
     #[cfg(test)]
     pub(crate) held_prompt_probe: Option<Arc<held_prompt::Probe>>,
     #[cfg(test)]
@@ -926,7 +925,6 @@ impl Default for RunControl {
             compaction_changes: None,
             new_log_compaction_plan_version: None,
             display_sent_by: None,
-            display_message_marks: None,
             #[cfg(test)]
             held_prompt_probe: None,
             #[cfg(test)]

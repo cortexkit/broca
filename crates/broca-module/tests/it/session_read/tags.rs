@@ -203,7 +203,6 @@ async fn live_tail_and_steer_rows_cover_parts_before_materialization() {
         &[
             WalRecord::StepStarted { step_id: StepId(0) },
             WalRecord::Steered {
-                message_marks: None,
                 sent_by: None,
                 tags: None,
                 retention: None,

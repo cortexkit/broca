@@ -29,7 +29,6 @@ impl RunExecutor for ClosedInboxExecutor {
     ) -> Result<RunSummary, RunError> {
         let run = self.runs.fetch_add(1, Ordering::SeqCst);
         job.writer.record(WalRecord::RunStarted {
-            message_marks: None,
             compaction_plan_version: None,
             sent_by: None,
             written_at_ms: None,
@@ -118,7 +117,6 @@ async fn refused_live_steer_is_queued_for_next_turn() {
     )];
     let mut request = text_req(&key, "next").to_submission();
     request.input = late.clone();
-    request.tools = None;
     let outcome = registry
         .route_submission_with_delivery(
             &key,

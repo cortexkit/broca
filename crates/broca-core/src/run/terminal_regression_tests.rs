@@ -146,7 +146,6 @@ fn try_late_steer(inbox: &crate::SteerInbox, writer: &WalHandle) -> bool {
     inbox.deliver(input.clone(), || {
         writer
             .record(WalRecord::Steered {
-                message_marks: None,
                 sent_by: None,
                 written_at_ms: None,
                 tags: None,

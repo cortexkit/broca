@@ -447,7 +447,6 @@ mod tests {
             wal.append(
                 1,
                 &WalRecord::RunStarted {
-                    message_marks: None,
                     compaction_plan_version: None,
                     sent_by: None,
                     written_at_ms: None,
@@ -826,7 +825,6 @@ mod identity_tests {
         wal.append(
             1,
             &broca_wal::WalRecord::RunStarted {
-                message_marks: None,
                 compaction_plan_version: None,
                 sent_by: None,
                 written_at_ms: None,
