@@ -372,7 +372,7 @@ pub(super) fn run(args: &Args) {
             report.runs += 1;
             *report.states.entry(state_of(&today)).or_default() += 1;
             report.statuses_equal += u64::from(compare("run.status", today, store));
-            let today = reply(todays::run_result(&old, &id, &name));
+            let today = reply(todays::run_result(&old, &id, &name, old.lineage_id));
             let store = reply(block_on(reader.run_result(&view, &id)));
             report.results_equal += u64::from(compare("run.result", today, store));
         }

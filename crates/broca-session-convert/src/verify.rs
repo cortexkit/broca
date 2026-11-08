@@ -372,7 +372,7 @@ async fn runs<B: SessionBackend>(
             RUN_RESULT,
             run,
             &reply(reader.run_result(view, &id).await),
-            &reply(todays::run_result(records, &id, name)),
+            &reply(todays::run_result(records, &id, name, verify.lineage)),
         )?;
     }
     let unknown = RunId("store-move-no-such-run".into());

@@ -662,6 +662,94 @@ fn a_legacy_notes_send_status_names_its_carrier_key_alike() {
     note_status_alike(false);
 }
 
+/// `run.result` names a completed run's final message by the id today's handler serves for it,
+/// in the new storage as today's storage does: on a log whose runs froze a compaction plan
+/// version, the form with the log's lineage. Read from such a log converted into a session in
+/// each of the new storage's modes.
+#[test]
+fn a_final_message_is_named_alike_on_a_log_with_a_compaction_plan() {
+    use broca_module::store_status::{todays, Reader};
+    use broca_session_store::backend::MemoryBackend;
+    use broca_session_store::keys::Cipher;
+    let root = scratch("final-mid");
+    // The lineage a log's header names, which the final message's id carries.
+    let lineage = broca_wal::FileWal::open(root.join("session.wal"))
+        .unwrap()
+        .lineage_id();
+    let mut start = run_started("r1", 1_000, "Hello.");
+    if let WalRecord::RunStarted {
+        compaction_plan_version,
+        ..
+    } = &mut start
+    {
+        *compaction_plan_version = Some(broca_core::compaction_v2::PLAN_VERSION);
+    }
+    let mut records = vec![start];
+    records.extend(
+        [
+            json!({"type": "step_started", "step_id": 1}),
+            json!({"type": "model_step_finished", "step_id": 1,
+                "assistant_message": {"message_id": "m1",
+                    "content": [{"type": "text", "text": "One."}]},
+                "usage": {"input_tokens": 3, "output_tokens": 1},
+                "finish_reason": "stop", "retries_used": 0}),
+            json!({"type": "run_finished", "reason": "completed", "ts_ms": 1_003,
+                "usage": {"input_tokens": 3, "output_tokens": 1}, "retries_used": 0}),
+        ]
+        .into_iter()
+        .map(record),
+    );
+    let framed: Vec<FramedRecord> = (1u64..)
+        .zip(records)
+        .map(|(seq, record)| FramedRecord {
+            seq,
+            fence: 1,
+            record,
+        })
+        .collect();
+    let run = broca_protocol::RunId("r1".into());
+    let today =
+        serde_json::to_value(todays::run_result(&framed, &run, "s", lineage).unwrap()).unwrap();
+    let lineage_text = lineage.map(|id| id.to_string());
+    assert_eq!(
+        today["final_message"]["mid"],
+        json!(broca_core::message_mid(true, lineage_text.as_deref(), 1).unwrap()),
+        "{today}"
+    );
+    let converted = crate::convert(&framed, lineage_text.as_deref()).unwrap();
+    assert!(converted.lost.is_empty(), "{:?}", converted.lost);
+    for cipher in Cipher::ALL {
+        let backend = MemoryBackend::default();
+        let mut store = block_on(Session::create(
+            &backend,
+            SessionAddr(broca_core::session_addr(&session())),
+            crate::stage::triple(&session()),
+            &deployment().creating(cipher),
+            false,
+        ))
+        .unwrap();
+        block_on(store.append(&converted.records, false)).unwrap();
+        let parts = broca_session_loop::parts::MemoryParts {
+            parts: converted.parts.clone(),
+        };
+        let reader = Reader {
+            parts: &parts,
+            live: false,
+            settled: None,
+            session_name: "s",
+            live_step: None,
+        };
+        let served = block_on(reader.run_result(&store, &run)).unwrap();
+        assert_eq!(
+            serde_json::to_value(served).unwrap(),
+            today,
+            "{}",
+            cipher.label()
+        );
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Compares today's and the new storage's `send.status` of a note delivered with a tool result,
 /// with a ride envelope when `enveloped`.
 fn note_status_alike(enveloped: bool) {

@@ -77,12 +77,15 @@ pub fn run_status(
     crate::serve::checked_run_status(response, &run_id.0)
 }
 
-/// `run.result` for the run `run_id` of the session `session_name`. The final message's id is
-/// today's position form, `m<ordinal>`, whatever form its log spells message ids in.
+/// `run.result` for the run `run_id` of the session `session_name`, whose log has the lineage
+/// `lineage`. The final message's id is the one today's handler serves
+/// (`ServeHandler::run_result`): its position form, `m<position>`, on a log whose runs froze no
+/// compaction plan version, and the form with the log's lineage on one whose runs did.
 pub fn run_result(
     records: &[FramedRecord],
     run_id: &RunId,
     session_name: &str,
+    lineage: Option<broca_wal::WalLineageId>,
 ) -> Result<broca_wire::RunResultResponse, ServeError> {
     let state =
         broca_core::reconcile_run_state(records.iter().map(|frame| &frame.record), &run_id.0);
@@ -108,11 +111,17 @@ pub fn run_result(
     }
     let mut directives = None;
     let final_message = if state == "completed" {
-        let message = crate::serve::final_message_of(
+        let mut message = crate::serve::final_message_of(
             records,
             run_id,
             crate::serve::clean_reply_of(records, run_id),
         )?;
+        let mode3 = broca_core::is_mode3_log(records.iter().map(|frame| &frame.record));
+        let lineage = lineage.map(|id| id.to_string());
+        message.mid = broca_core::message_mid(mode3, lineage.as_deref(), message.ordinal - 1)
+            .map_err(|error| {
+                ServeError::Open(error, Some(broca_protocol::ErrorClass::Permanent))
+            })?;
         directives = crate::serve::completed_directives(records, run_id, &message.text);
         Some(message)
     } else {
