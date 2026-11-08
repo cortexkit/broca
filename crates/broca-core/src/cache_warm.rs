@@ -285,6 +285,109 @@ pub fn last_cache_send(records: &[WalRecord]) -> Option<(u64, RunConfig)> {
     Some((sent_at_ms, config))
 }
 
+/// Expiry evidence for the next serving model, never a touch from before a model switch.
+/// This is separate from the keep-warm clock: a conservative unknown must not reschedule warms.
+pub(crate) fn last_cache_send_for_model(
+    records: &[WalRecord],
+    model: &broca_protocol::request::ModelHandle,
+    variant: Option<&str>,
+) -> Option<(u64, RunConfig)> {
+    let (index, sent_at_ms) = latest_cache_send(records)?;
+    // A warm reuses an earlier request. Recover that request's route and frozen policy, not
+    // whichever run happened to be active when the warm finished.
+    let attempt_at = match &records[index] {
+        WalRecord::CacheWarmed {
+            run_id,
+            step_id,
+            request_body_sha256,
+            ..
+        } => {
+            let start = records[..index].iter().rposition(
+                |record| matches!(record, WalRecord::RunStarted { run_id: id, .. } if id == run_id),
+            )?;
+            (start..index).rev().find(|at| {
+                matches!(&records[*at], WalRecord::ModelAttemptFinished {
+                    step_id: id, request_body_sha256: digest, ..
+                } if id == step_id && digest == request_body_sha256)
+            })?
+        }
+        _ => index,
+    };
+    let start = records[..=attempt_at]
+        .iter()
+        .rposition(|record| matches!(record, WalRecord::RunStarted { .. }))?;
+    let (_, source) = effective_config(records, start, attempt_at)?;
+    let WalRecord::ModelAttemptFinished { step_id, .. } = &records[attempt_at] else {
+        return None;
+    };
+    // The first terminal for this attempt distinguishes a refused source attempt from its
+    // fallback resend, even though both have the same step id.
+    let terminal = records[attempt_at + 1..]
+        .iter()
+        .take_while(|record| {
+            !matches!(
+                record,
+                WalRecord::RunStarted { .. } | WalRecord::StepStarted { .. }
+            )
+        })
+        .find(|record| {
+            matches!(record,
+            WalRecord::ModelStepFinished { step_id: id, .. }
+                | WalRecord::ModelStepRefused { step_id: id, .. } if id == step_id)
+        });
+    let serving = terminal.and_then(crate::refusal_fallback::StepServing::of_record);
+    let mut sent_under = source.clone();
+    if let Some(route) = serving.and_then(|serving| serving.route_model) {
+        sent_under.model = route.clone();
+        sent_under.variant = None;
+        // The renderer selects the fallback's own frozen config, including its cache markers.
+        let fallback = source.frozen_render_config.get("refusal_fallback")?;
+        let frozen_model: broca_protocol::request::ModelHandle =
+            serde_json::from_value(fallback.get("model")?.clone()).ok()?;
+        if &frozen_model != route {
+            return None;
+        }
+        sent_under.frozen_render_config = fallback.get("frozen")?.clone();
+    } else if terminal.is_none()
+        && source
+            .frozen_render_config
+            .get("refusal_fallback")
+            .is_some_and(|value| !value.is_null())
+    {
+        // Without a committed route a scheduled fallback is only a guess, not expiry proof.
+        return None;
+    }
+    if serving.is_some_and(|serving| serving.served_model.is_some()) {
+        // A server-side handoff names the answering model, not the cache lifetime it applied.
+        return None;
+    }
+    if &sent_under.model != model || sent_under.variant.as_deref() != variant {
+        return None;
+    }
+    let mut config = source.clone();
+    for record in &records[attempt_at + 1..] {
+        if let WalRecord::RunStarted { config: next, .. } = record {
+            if next.model != source.model || next.variant != source.variant {
+                return None;
+            }
+            config = (**next).clone();
+        } else {
+            fold_refreeze(&mut config, record);
+        }
+        if let Some(serving) = crate::refusal_fallback::StepServing::of_record(record) {
+            let (provider, served, served_variant) =
+                serving.model(&config.model, config.variant.as_deref());
+            if provider != model.provider_module_id
+                || served != model.model_id
+                || served_variant != variant
+            {
+                return None;
+            }
+        }
+    }
+    Some((sent_at_ms, sent_under))
+}
+
 // A standby source warm can finish after a fallback request. Its digest identifies another
 // request and must not extend the active route's clock or replace its token-count evidence.
 fn latest_cache_request_digest(records: &[WalRecord]) -> Option<&str> {

@@ -6251,7 +6251,31 @@ where
             let raw: Vec<_> = frames.iter().map(|frame| frame.record.clone()).collect();
             // Expiry counts from the last request that reached the cache, by the lifetime that
             // request asked the provider for, which a refresh may have changed since.
-            let last_send = crate::cache_warm::last_cache_send(&raw);
+            // Session conditions stay on the source model, but cache proof follows the route
+            // the upcoming step will serve, including a scheduled refusal fallback.
+            let fallback_fits = match (
+                provider.refusal_fallback_context_limit(),
+                compaction_history
+                    .previous_native_usage
+                    .and_then(|usage| usage.fill_tokens()),
+            ) {
+                (Some(limit), Some(fill)) => fill < limit,
+                _ => true,
+            };
+            let fallback = provider.refusal_fallback_model().filter(|_| {
+                fallback_fits
+                    && (refused_steps.contains(&step_id)
+                        || crate::refusal_fallback::route(refusal_schedule.as_ref(), true)
+                            == crate::refusal_fallback::StepRoute::Fallback)
+            });
+            let serving_model = fallback.as_ref().unwrap_or(&config.model);
+            let serving_variant = if fallback.is_some() {
+                None
+            } else {
+                config.variant.as_deref()
+            };
+            let last_send =
+                crate::cache_warm::last_cache_send_for_model(&raw, serving_model, serving_variant);
             let requested_ttl = |config: &RunConfig| {
                 control
                     .keep_warm

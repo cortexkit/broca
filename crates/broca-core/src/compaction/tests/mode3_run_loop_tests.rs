@@ -6,6 +6,7 @@ use crate::compaction_v2::{
         view::{Edit, EditOp, View},
     },
 };
+use broca_wal::RunConfig;
 
 #[derive(Default)]
 struct Plane {
@@ -105,6 +106,342 @@ async fn drive_events(
     .await;
     writer.shutdown().await.unwrap();
     (result, model)
+}
+
+struct RequestedLifetime;
+
+#[async_trait::async_trait]
+impl crate::keep_warm_wait::KeepWarmDriver for RequestedLifetime {
+    fn timing(&self, _: &RunConfig) -> Result<crate::keep_warm_wait::WarmTiming, String> {
+        panic!("these runs do not wait for tools")
+    }
+    fn requested_ttl_ms(&self, config: &RunConfig) -> Option<u64> {
+        config.frozen_render_config["cache_ttl_ms"].as_u64()
+    }
+    fn last_sent_at_ms(&self) -> Option<u64> {
+        None
+    }
+    fn costs(&self, _: &RunConfig) -> Result<crate::keep_warm::WarmCosts, String> {
+        panic!("these runs do not warm")
+    }
+    async fn warm(
+        &self,
+        _: &RunConfig,
+        _: &broca_protocol::RunId,
+    ) -> crate::keep_warm_wait::WarmTick {
+        panic!("these runs do not warm")
+    }
+}
+
+struct CacheProofProvider(crate::StubProvider);
+
+#[async_trait::async_trait]
+impl crate::Provider for CacheProofProvider {
+    async fn step(
+        &self,
+        step_id: broca_protocol::StepId,
+        opts: &CallOptions,
+    ) -> tokio::sync::mpsc::Receiver<broca_protocol::NormalizedEvent> {
+        self.0.step(step_id, opts).await
+    }
+    fn reasoning_is_prefix_bound(&self) -> bool {
+        true
+    }
+    fn render_config_blob(&self) -> Value {
+        json!({"cache_ttl_ms":300_000, "refusal_fallback":{
+            "model":{"provider_module_id":"stub","model_id":"fallback"},
+            "frozen":{"cache_ttl_ms":3_600_000}
+        }})
+    }
+    fn refusal_fallback_model(&self) -> Option<broca_protocol::request::ModelHandle> {
+        Some(broca_protocol::request::ModelHandle::new(
+            "stub", "fallback",
+        ))
+    }
+}
+
+async fn drive_cache_identity(
+    shared: &Shared,
+    plane: Arc<Plane>,
+    run: &str,
+    model: broca_protocol::request::ModelHandle,
+    variant: Option<&str>,
+) {
+    let writer = shared.writer();
+    let (mut request, mut control, _) = history_request();
+    request.run_id = broca_protocol::RunId(run.into());
+    request.model = model;
+    request.variant = variant.map(str::to_owned);
+    request.context_limit = Some(100_000);
+    control.admitted_context_limit = request.context_limit;
+    control.new_log_compaction_plan_version = Some(cortexkit_compaction_view::PLAN_VERSION);
+    control.compaction_plane = Some(plane);
+    control.compaction_views = None;
+    control.keep_warm = Some(Arc::new(RequestedLifetime));
+    assert!(!control.compaction_cache_proven_expired);
+    let provider = CacheProofProvider(crate::StubProvider::new(vec![model_events()]));
+    let (out, _events) = tokio::sync::mpsc::channel(256);
+    let result = crate::run_loop_on_writer(
+        request,
+        &writer,
+        crate::StartMode::FreshOrResume,
+        &provider,
+        &crate::StubToolPlane::new(),
+        &crate::AllowAll,
+        shared,
+        None,
+        control,
+        &out,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.reason, RunFinishReason::Completed);
+    writer.shutdown().await.unwrap();
+}
+
+async fn expired_cache_history() -> Shared {
+    let shared = Shared::default();
+    drive_cache_identity(
+        &shared,
+        Arc::new(Plane::default()),
+        "first",
+        broca_protocol::request::ModelHandle::new("stub", "model"),
+        None,
+    )
+    .await;
+    let mut records = shared.records();
+    let at = records
+        .iter()
+        .position(|record| matches!(record, WalRecord::ModelStepFinished { .. }))
+        .unwrap();
+    let WalRecord::ModelStepFinished { step_id, .. } = records[at] else {
+        unreachable!()
+    };
+    records.insert(
+        at,
+        serde_json::from_value(json!({
+            "type":"model_attempt_finished", "step_id":step_id, "attempt":0,
+            "request_body_len":1, "request_body_sha256":"cache-prefix",
+            "response_body_len":1, "response_body_sha256":"response",
+            "http_status":200, "outcome":"complete", "sent_at_ms":1, "ts_ms":2
+        }))
+        .unwrap(),
+    );
+    Shared::with_records(records)
+}
+
+fn cache_ride_causes(plane: &Plane) -> Vec<Value> {
+    plane
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(method, _)| method == "compaction.ride")
+        .flat_map(|(_, params)| params["causes"].as_array().unwrap().clone())
+        .collect()
+}
+
+#[tokio::test]
+async fn compaction_v2_model_change_does_not_claim_another_models_cache_expiry() {
+    use broca_protocol::request::ModelHandle;
+    for (model, variant) in [
+        (ModelHandle::new("stub", "other"), None),
+        (ModelHandle::new("other-provider", "model"), None),
+        (ModelHandle::new("stub", "model"), Some("reasoning")),
+    ] {
+        let shared = expired_cache_history().await;
+        let plane = Arc::new(Plane::default());
+        drive_cache_identity(&shared, plane.clone(), "second", model, variant).await;
+        let causes = cache_ride_causes(&plane);
+        assert!(causes.contains(&json!("model_change")), "{causes:?}");
+        assert!(!causes.contains(&json!("cache_expired")), "{causes:?}");
+    }
+}
+
+#[tokio::test]
+async fn compaction_v2_same_model_claims_proven_cache_expiry() {
+    let shared = expired_cache_history().await;
+    let plane = Arc::new(Plane::default());
+    drive_cache_identity(
+        &shared,
+        plane.clone(),
+        "second",
+        broca_protocol::request::ModelHandle::new("stub", "model"),
+        None,
+    )
+    .await;
+    let causes = cache_ride_causes(&plane);
+    assert!(causes.contains(&json!("cache_expired")), "{causes:?}");
+    assert!(!causes.contains(&json!("model_change")), "{causes:?}");
+}
+
+#[tokio::test]
+async fn compaction_v2_return_to_previous_model_does_not_reuse_its_old_touch() {
+    use broca_protocol::request::ModelHandle;
+    let shared = expired_cache_history().await;
+    drive_cache_identity(
+        &shared,
+        Arc::new(Plane::default()),
+        "second",
+        ModelHandle::new("stub", "other"),
+        None,
+    )
+    .await;
+    let plane = Arc::new(Plane::default());
+    drive_cache_identity(
+        &shared,
+        plane.clone(),
+        "third",
+        ModelHandle::new("stub", "model"),
+        None,
+    )
+    .await;
+    let causes = cache_ride_causes(&plane);
+    assert!(causes.contains(&json!("model_change")), "{causes:?}");
+    assert!(!causes.contains(&json!("cache_expired")), "{causes:?}");
+}
+
+#[tokio::test]
+async fn compaction_v2_warm_cannot_restore_a_touch_across_a_model_change() {
+    use broca_protocol::request::ModelHandle;
+    for switched in [false, true] {
+        let shared = expired_cache_history().await;
+        if switched {
+            drive_cache_identity(
+                &shared,
+                Arc::new(Plane::default()),
+                "second",
+                ModelHandle::new("stub", "other"),
+                None,
+            )
+            .await;
+        }
+        let mut records = shared.records();
+        let step_id = records
+            .iter()
+            .find_map(|record| match record {
+                WalRecord::ModelAttemptFinished { step_id, .. } => Some(*step_id),
+                _ => None,
+            })
+            .unwrap();
+        records.push(
+            serde_json::from_value(json!({
+                "type":"cache_warmed", "run_id":"first", "step_id":step_id,
+                "request_body_sha256":"cache-prefix", "warm_body_sha256":"warm",
+                "usage":{}, "sent_at_ms":10_000
+            }))
+            .unwrap(),
+        );
+        let shared = Shared::with_records(records);
+        let plane = Arc::new(Plane::default());
+        drive_cache_identity(
+            &shared,
+            plane.clone(),
+            "third",
+            ModelHandle::new("stub", "model"),
+            None,
+        )
+        .await;
+        assert_eq!(
+            cache_ride_causes(&plane).contains(&json!("cache_expired")),
+            !switched
+        );
+    }
+}
+
+async fn scheduled_cache_history(fallback_sent: bool, sent_at_ms: u64) -> Shared {
+    let shared = expired_cache_history().await;
+    let schedule = json!({
+        "source":{"provider_module_id":"stub","model_id":"model"},
+        "fallback":{"provider_module_id":"stub","model_id":"fallback"},
+        "phase":{"kind":"fallback","remaining":9}, "re_refusals":0
+    });
+    let mut records = shared.records();
+    for record in &mut records {
+        match record {
+            WalRecord::ModelStepFinished { fallback, .. } => {
+                fallback.refusal_fallback = Some(serde_json::from_value(schedule.clone()).unwrap());
+                if fallback_sent {
+                    fallback.route = Some(broca_wal::StepRoute {
+                        model: broca_protocol::request::ModelHandle::new("stub", "fallback"),
+                        reason: broca_wal::StepRouteReason::Schedule,
+                    });
+                }
+            }
+            WalRecord::ModelAttemptFinished {
+                sent_at_ms: sent, ..
+            } => *sent = Some(sent_at_ms),
+            _ => {}
+        }
+    }
+    Shared::with_records(records)
+}
+
+#[tokio::test]
+async fn compaction_v2_first_fallback_request_cannot_use_the_source_touch() {
+    let shared = scheduled_cache_history(false, 1).await;
+    let plane = Arc::new(Plane::default());
+    drive_cache_identity(
+        &shared,
+        plane.clone(),
+        "second",
+        broca_protocol::request::ModelHandle::new("stub", "model"),
+        None,
+    )
+    .await;
+    assert!(!cache_ride_causes(&plane).contains(&json!("cache_expired")));
+    assert!(shared.records().iter().rev().any(|record| matches!(record,
+        WalRecord::ModelStepFinished { fallback, .. } if fallback.route.is_some())));
+}
+
+#[tokio::test]
+async fn compaction_v2_fallback_expiry_uses_the_fallback_requests_own_lifetime() {
+    for expired in [false, true] {
+        let sent_at_ms = if expired {
+            1
+        } else {
+            crate::compaction::now() - 600_000
+        };
+        let shared = scheduled_cache_history(true, sent_at_ms).await;
+        let plane = Arc::new(Plane::default());
+        drive_cache_identity(
+            &shared,
+            plane.clone(),
+            "second",
+            broca_protocol::request::ModelHandle::new("stub", "model"),
+            None,
+        )
+        .await;
+        assert_eq!(
+            cache_ride_causes(&plane).contains(&json!("cache_expired")),
+            expired,
+            "ten minutes expires the source's five-minute policy, not the fallback's hour"
+        );
+    }
+}
+
+#[tokio::test]
+async fn compaction_v2_server_side_handoff_cannot_prove_source_expiry() {
+    for model in ["model", "server-fallback"] {
+        let shared = expired_cache_history().await;
+        let mut records = shared.records();
+        for record in &mut records {
+            if let WalRecord::ModelStepFinished { fallback, .. } = record {
+                fallback.served_model = Some("server-fallback".into());
+            }
+        }
+        let shared = Shared::with_records(records);
+        let plane = Arc::new(Plane::default());
+        drive_cache_identity(
+            &shared,
+            plane.clone(),
+            "second",
+            broca_protocol::request::ModelHandle::new("stub", model),
+            None,
+        )
+        .await;
+        assert!(!cache_ride_causes(&plane).contains(&json!("cache_expired")));
+    }
 }
 
 #[tokio::test]
