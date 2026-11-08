@@ -14,7 +14,10 @@ broca-memory-relief = { path = "../broca-memory-relief" }
 broca-protocol = { path = "../broca-protocol" }
 broca-wire = { path = "../broca-wire" }
 broca-core = { path = "../broca-core" }
-broca-provider = { path = "../broca-provider" }
+# `live` carries the media request renderer, which `wal_render` and `store_media` call to build
+# image-bearing requests. Without it here, this crate compiles only when another crate in the
+# same build happens to enable the feature.
+broca-provider = { path = "../broca-provider", features = ["live"] }
 broca-wal = { path = "../broca-wal" }
 # Owner-only files for the Claude Code persona's identity (`claude_code_identity`).
 broca-owner-only.workspace = true
