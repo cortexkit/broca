@@ -588,5 +588,6 @@ fn read_context<'a>(
         settled: Some((settled, name)),
         session_name: name,
         live_step: None,
+        stream_head: None,
     }
 }

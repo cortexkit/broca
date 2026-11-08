@@ -1,6 +1,76 @@
 //! Operator policy for model tools. Missing configuration is deliberately conservative:
 //! private content stays within the explicitly trusted provider set.
 
+/// The routed classifier rollout is independent of LLM account selection. Enabling it never
+/// permits fixed-credential fallback when routing is unavailable.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ClassifierRoutingConfig {
+    pub enabled: bool,
+}
+
+impl ClassifierRoutingConfig {
+    pub fn load_default() -> Result<Self, String> {
+        match crate::CacheTtlTable::default_path() {
+            crate::config_home::ConfigHome::Unresolvable => Ok(Self::default()),
+            crate::config_home::ConfigHome::Resolved { path, .. } => {
+                match std::fs::read_to_string(&path) {
+                    Ok(text) => Self::parse(&text),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        Ok(Self::default())
+                    }
+                    Err(error) => Err(format!(
+                        "read classifier_routing from {}: {error}",
+                        path.display()
+                    )),
+                }
+            }
+        }
+    }
+
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let text = crate::cache_routing::strip_trailing_commas(
+            &crate::cache_routing::strip_jsonc_comments(text),
+        );
+        let mut file: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&text)
+            .map_err(|error| format!("parse classifier_routing.enabled: {error}"))?;
+        match file.remove("classifier_routing") {
+            None => Ok(Self::default()),
+            Some(value) => serde_json::from_value(value)
+                .map_err(|error| format!("classifier_routing.enabled: {error}")),
+        }
+    }
+}
+
+#[cfg(test)]
+mod classifier_routing_config_tests {
+    use super::ClassifierRoutingConfig;
+    #[test]
+    fn classifier_routing_is_explicit_and_defaults_off() {
+        for text in [
+            "{}",
+            r#"{"classifier_routing":{}}"#,
+            r#"{"classifier_routing":{"enabled":false}}"#,
+        ] {
+            assert!(!ClassifierRoutingConfig::parse(text).unwrap().enabled);
+        }
+        assert!(
+            ClassifierRoutingConfig::parse(r#"{"classifier_routing":{"enabled":true}}"#)
+                .unwrap()
+                .enabled
+        );
+        for text in [
+            r#"{"classifier_routing":null}"#,
+            r#"{"classifier_routing":{"enabled":1}}"#,
+            r#"{"classifier_routing":{"typo":true}}"#,
+        ] {
+            assert!(ClassifierRoutingConfig::parse(text)
+                .unwrap_err()
+                .contains("classifier_routing"));
+        }
+    }
+}
+
 /// Operator-selected wire names, keyed by credential routing key rather than account identity.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ToolNameAliasesConfig(pub std::collections::BTreeMap<String, ToolAliasRoute>);
@@ -1001,6 +1071,89 @@ impl ImportConfig {
             ));
         }
         Ok(Self { roots })
+    }
+}
+
+/// Which deployment key the new session storage is opened with:
+/// `session_storage.deployment_key_id` in `broca.jsonc`, 1 when absent. The key itself is the
+/// vault record `opaque:broca-deployment:<id>` (see `store_key`). Keys form a ring: a rotation
+/// adds a record under a new id and names it here, and never rewrites an existing record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SessionStorageConfig {
+    pub deployment_key_id: u16,
+}
+
+impl Default for SessionStorageConfig {
+    fn default() -> Self {
+        Self {
+            deployment_key_id: crate::store_key::DEFAULT_KEY_ID,
+        }
+    }
+}
+
+impl SessionStorageConfig {
+    pub fn load_default() -> Result<Self, String> {
+        use crate::config_home::ConfigHome;
+        match crate::config_home::config_file(crate::cache_routing::CONFIG_PATH_ENV, "broca.jsonc")
+        {
+            ConfigHome::Resolved { path, .. } => match std::fs::read_to_string(&path) {
+                Ok(text) => Self::parse(&text).map_err(|e| format!("{}: {e}", path.display())),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+                Err(e) => Err(format!("read session_storage from {}: {e}", path.display())),
+            },
+            ConfigHome::Unresolvable => Ok(Self::default()),
+        }
+    }
+
+    pub fn parse(text: &str) -> Result<Self, String> {
+        #[derive(serde::Deserialize)]
+        struct File {
+            #[serde(default)]
+            session_storage: Option<Section>,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Section {
+            #[serde(default)]
+            deployment_key_id: Option<u16>,
+        }
+        let text = crate::cache_routing::strip_trailing_commas(
+            &crate::cache_routing::strip_jsonc_comments(text),
+        );
+        let file = serde_json::from_str::<File>(&text)
+            .map_err(|e| format!("parse session_storage: {e}"))?;
+        Ok(file
+            .session_storage
+            .and_then(|section| section.deployment_key_id)
+            .map_or_else(Self::default, |deployment_key_id| Self {
+                deployment_key_id,
+            }))
+    }
+}
+
+#[cfg(test)]
+mod session_storage_config_tests {
+    use super::SessionStorageConfig;
+
+    #[test]
+    fn the_deployment_key_id_defaults_to_1_and_is_named_by_session_storage() {
+        assert_eq!(
+            SessionStorageConfig::parse("{}").unwrap(),
+            SessionStorageConfig {
+                deployment_key_id: 1
+            }
+        );
+        let config = SessionStorageConfig::parse(
+            r#"{"session_storage": {"deployment_key_id": 2,}, // the rotated key
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(config.deployment_key_id, 2);
+        assert!(SessionStorageConfig::parse(r#"{"session_storage": {"key_id": 2}}"#).is_err());
+        assert!(
+            SessionStorageConfig::parse(r#"{"session_storage": {"deployment_key_id": -1}}"#)
+                .is_err()
+        );
     }
 }
 

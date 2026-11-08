@@ -84,7 +84,7 @@ async fn gated_module(
 }
 
 /// Today's module and one whose sessions start in the new storage, over the same script.
-async fn both(
+pub(super) async fn both(
     steps: Vec<Vec<NormalizedEvent>>,
     gated: bool,
 ) -> (Module, Module, Option<Arc<Notify>>, Option<Arc<Notify>>) {
@@ -96,7 +96,7 @@ async fn both(
 }
 
 /// A send through the registry's own route, with the title and plan the serve layer hands over.
-async fn send_titled(
+pub(super) async fn send_titled(
     module: &Module,
     run_id: &str,
     request: SubmissionRequest,
@@ -127,7 +127,10 @@ async fn send_titled(
 
 /// The module's head for `principal`, as JSON with what each storage keeps for itself taken out.
 /// `mode3` isn't on the wire, so it is added under its own name.
-async fn head_json(module: &Module, principal: Option<&BindPrincipal>) -> serde_json::Value {
+pub(super) async fn head_json(
+    module: &Module,
+    principal: Option<&BindPrincipal>,
+) -> serde_json::Value {
     let head = module
         .registry
         .head_for(&module.key, principal, &SendScope::default())
@@ -155,13 +158,13 @@ async fn head_json(module: &Module, principal: Option<&BindPrincipal>) -> serde_
     value
 }
 
-fn core() -> BindPrincipal {
+pub(super) fn core() -> BindPrincipal {
     BindPrincipal::Reserved {
         module_id: "prefrontal-core".into(),
     }
 }
 
-fn occipital() -> BindPrincipal {
+pub(super) fn occipital() -> BindPrincipal {
     BindPrincipal::Reserved {
         module_id: "occipital".into(),
     }
@@ -269,6 +272,15 @@ async fn a_cancelled_run_heads_alike() {
     run_out(&store, &store_gate).await;
     let head = heads_alike(&today, &store, "cancelled").await;
     assert_eq!(head["last_run_state"]["state"], "cancelled");
+    streams_alike(&today, &store).await;
+}
+
+/// A subscriber from the start of each module's session gets the same control stream.
+async fn streams_alike(today: &Module, store: &Module) {
+    super::streams::assert_alike(
+        &super::streams::routed(&store.registry, &store.key).await,
+        &super::streams::routed(&today.registry, &today.key).await,
+    );
 }
 
 /// A send queued behind a running run: while the run runs, the head names it active and the
@@ -296,6 +308,7 @@ async fn a_queued_send_behind_a_running_run_heads_alike() {
     let ended = heads_alike(&today, &store, "after both runs").await;
     assert_eq!(ended["last_run_state"]["run_id"], "r2");
     assert_eq!(ended["last_run_state"]["state"], "completed");
+    streams_alike(&today, &store).await;
 }
 
 /// A run paused for sign-in: the head names the pause and the input profile the run froze,

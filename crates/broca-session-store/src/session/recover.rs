@@ -505,6 +505,7 @@ impl<B: SessionBackend> Session<B> {
             window: OpenLogIndex::default(),
             imported: Default::default(),
             sealed_entries: Default::default(),
+            observer: None,
             kept: super::kept::KeptRecords::from_next(intent_seq + 1, false),
             memory_only: Default::default(),
             memory_refused: Default::default(),
@@ -661,15 +662,7 @@ async fn rebuild_checkpoint<B: SessionBackend>(
         .map_err(SessionError::Directory)?;
     let Some(entry) = newest else {
         // The session's first log, which creation started from empty state.
-        return Ok(Checkpoint {
-            covers_through: 0,
-            next_seq: 1,
-            conversation: Conversation::new(head.appends_in_conversation.unwrap_or(false)),
-            operational: Default::default(),
-            transcript_base: None,
-            ledger_base: None,
-        }
-        .encode());
+        return Ok(super::stored::first_log_checkpoint(head).encode());
     };
     if entry.object != format!("{}/l", hex(&log.0)) {
         return Err(SessionError::CheckpointLost);

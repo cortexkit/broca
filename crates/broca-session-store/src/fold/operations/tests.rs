@@ -49,6 +49,7 @@ fn step_start() -> Record {
     Record::StepStart(StepStart {
         run_id: "r".into(),
         step_id: 1,
+        mid: None,
     })
 }
 
@@ -78,6 +79,7 @@ fn batch(ids: &[&str]) -> Record {
         batch_id: "b".into(),
         step_id: 1,
         planned: ids.iter().map(|id| ToolCallId((*id).into())).collect(),
+        mid: None,
     })
 }
 
@@ -664,5 +666,41 @@ fn the_title_is_the_newest_one_any_send_carried() {
         ])
         .as_deref(),
         Some("first"),
+    );
+}
+
+fn refresh(generation: u64, identity: &str, selection: Option<serde_json::Value>) -> Record {
+    Record::SessionRefresh(crate::record::SessionRefresh {
+        generation,
+        policy: "on_prefix_rebuild".into(),
+        run_in_progress: false,
+        applies_from_next_run: false,
+        setup: Vec::new(),
+        manifest: Some(serde_json::json!({"plan_identity": identity})),
+        selection,
+    })
+}
+
+#[test]
+fn the_latest_refresh_gives_the_senders_manifest_and_the_latest_choice_gives_the_model() {
+    let chosen = serde_json::json!({"provider": "p", "model": "m2"});
+    let operations = fold(&[
+        start(),
+        refresh(1, "plan-2", Some(chosen.clone())),
+        refresh(2, "plan-3", None),
+    ])
+    .unwrap();
+    let plan = operations.plan.expect("the session took refreshes");
+    assert_eq!(
+        plan.accepted
+            .as_ref()
+            .and_then(|accepted| accepted.plan_identity()),
+        Some("plan-3"),
+        "the latest refresh's manifest, from its acceptance"
+    );
+    assert_eq!(
+        plan.selection,
+        Some(chosen),
+        "a refresh choosing no model keeps the earlier choice"
     );
 }

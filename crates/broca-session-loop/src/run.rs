@@ -145,6 +145,10 @@ pub struct Admission {
     /// then ends with this error before any step, as today's loop ends it. Unlike every other
     /// field it isn't frozen into the start, and a run read back from its start has none.
     pub pre_model_error: Option<ProviderError>,
+    /// The pending plan change this run applies by freezing its manifest, recorded after the
+    /// run's input in the batch of its start. Like `pre_model_error`, a run read back from its
+    /// start has none: the record that followed the start keeps it.
+    pub applies_refresh: Option<broca_protocol::session_change::AppliedChange>,
 }
 
 /// What the send that started a run recorded about itself, as today's run start records it.
@@ -889,6 +893,7 @@ fn never_dispatched_close_out<W: Writer>(writer: &W, run_id: &str, now: u64) -> 
                 batch_id: batch_id.clone(),
                 step_id: run.completed_steps,
                 planned: planned.clone(),
+                mid: None,
             }));
             batch_id
         }
@@ -1056,7 +1061,7 @@ fn decode<T: serde::de::DeserializeOwned>(value: Option<Value>) -> Result<Option
 /// Stores a plan manifest's shared members as setup parts, in a fixed order: the plan, each
 /// provider's answer, the manifest's tools, its system text and its hook declarations. Returns
 /// what remains of the manifest, or `None` when nothing does.
-fn manifest_parts(
+pub fn manifest_parts(
     manifest: &broca_wal::PlanManifest,
     parts: &mut dyn Parts,
     setup: &mut Vec<broca_session_store::record::PartRef>,
@@ -1096,23 +1101,23 @@ pub fn frozen_manifest(
     start: &broca_session_store::record::RunStart,
     parts: &dyn Parts,
 ) -> Result<Option<std::sync::Arc<broca_wal::PlanManifest>>, LoopError> {
-    let Some(first) = start
-        .setup
-        .iter()
-        .position(|part| part.kind == PartKind::Plan)
-    else {
-        return Ok(None);
-    };
-    let mut members = match start
-        .run_choices
-        .as_ref()
-        .and_then(|choices| choices.get("manifest"))
-    {
+    broca_session_store::fold::operations::ManifestRef::of_start(start)
+        .map(|manifest| stored_manifest(&manifest, parts))
+        .transpose()
+}
+
+/// The plan manifest `manifest` references, rebuilt from its setup parts and the rest of its
+/// members.
+pub fn stored_manifest(
+    manifest: &broca_session_store::fold::operations::ManifestRef,
+    parts: &dyn Parts,
+) -> Result<std::sync::Arc<broca_wal::PlanManifest>, LoopError> {
+    let mut members = match &manifest.rest {
         Some(Value::Object(rest)) => rest.clone(),
         _ => serde_json::Map::new(),
     };
     let mut fetches = Vec::new();
-    for part in &start.setup[first..] {
+    for part in &manifest.parts {
         let value = parts.get(part).map_err(LoopError::Parts)?;
         match part.kind {
             PartKind::Plan => {
@@ -1133,7 +1138,7 @@ pub fn frozen_manifest(
     }
     members.insert("fetches".into(), Value::Array(fetches));
     serde_json::from_value(Value::Object(members))
-        .map(|manifest| Some(std::sync::Arc::new(manifest)))
+        .map(std::sync::Arc::new)
         .map_err(|e| LoopError::Parts(format!("the frozen manifest: {e}")))
 }
 
@@ -1345,7 +1350,22 @@ pub fn admission_of_start(
             hooks: decode(start.hooks.clone())?,
         },
         pre_model_error: None,
+        applies_refresh: None,
     })
+}
+
+/// A run start's application of a pending plan change, as the record that follows the run's
+/// input in the start's batch keeps it.
+pub fn refresh_applied(
+    applied: &broca_protocol::session_change::AppliedChange,
+) -> broca_session_store::record::RefreshApplied {
+    broca_session_store::record::RefreshApplied {
+        generation: applied.generation,
+        applied_by: applied.applied_by.clone(),
+        manifest_digest: applied.manifest_digest.clone(),
+        composition_digest: applied.composition_digest.clone(),
+        absent_items: applied.absent_items.clone(),
+    }
 }
 
 /// A session compacted under the first compaction protocol keeps rendering under that protocol's
@@ -1737,6 +1757,8 @@ where
                     batch.push(Record::StepStart(StepStart {
                         run_id: run_id.clone(),
                         step_id,
+                        // Minted by the entry-facts writer once the batch's seqs are known.
+                        mid: None,
                     }));
                     batch
                 },
@@ -1776,6 +1798,9 @@ where
         if finalizing {
             opts.tool_choice = Arc::new(ToolChoice::None);
         }
+        // The session's original system message, which a plan's system text takes the place of
+        // in the provider view below.
+        let durable_system: Vec<Message> = opts.prompt.first().cloned().into_iter().collect();
         if let Some(ctx) = compaction {
             let marked = writer.conversation().marker.clone();
             match crate::compaction::prepare(writer, admission, seams, ctx, step_id, opts).await? {
@@ -1814,6 +1839,25 @@ where
             {
                 crate::compaction::seal_at_cut(writer, seams, ctx, marker.first_kept_ordinal)
                     .await?;
+            }
+        }
+        // Once a refresh applied, the model sees the system text of the plan the run froze in
+        // place of the session's original system message, as a view of the request only, as
+        // today's loop shows it. A session on the current compaction contract renders its
+        // system text from its entries instead.
+        if admission.compaction_plan_version.is_none()
+            && writer
+                .operations()
+                .plan
+                .as_ref()
+                .is_some_and(|plan| plan.applied_generation > 0)
+        {
+            if let Some(manifest) = &admission.manifest {
+                if let Some(view) =
+                    broca_core::plan_system::view(&opts, &durable_system, &manifest.system_text)
+                {
+                    opts = view;
+                }
             }
         }
         // Client-side refusal fallback: the step goes to the run's refusal-fallback model while
@@ -2090,6 +2134,7 @@ where
                 batch_id: batch_id.clone(),
                 step_id,
                 planned: calls.iter().map(|call| call.tool_call_id.clone()).collect(),
+                mid: None,
             }));
             for garbage in &step.cuts {
                 terminal_with_reason(
@@ -2455,6 +2500,11 @@ async fn admit<W: Writer>(
             receipt_seq: None,
             pruned: Vec::new(),
         }));
+    }
+    // The pending plan change this run applies is recorded after its input, so the start is
+    // still followed directly by its input.
+    if let Some(applied) = &admission.applies_refresh {
+        records.push(Record::RefreshApplied(refresh_applied(applied)));
     }
     // The start's seq is the one the batch took, which a writer shared with the session actor
     // knows only once it is appended.
@@ -3162,6 +3212,7 @@ where
                             .iter()
                             .map(|call| call.tool_call_id.clone())
                             .collect(),
+                        mid: None,
                     }));
                 }
                 for ((call, plan), intent) in calls.iter().zip(&plans).zip(&prepared) {
@@ -4133,6 +4184,7 @@ async fn submitted<W: Writer, P, T>(
             batch_id: batch_id.clone(),
             step_id,
             planned: calls.iter().map(|call| call.tool_call_id.clone()).collect(),
+            mid: None,
         }));
     }
     for call in calls {
@@ -4202,6 +4254,7 @@ async fn hard_stop<W: Writer, P, T>(
         batch_id: batch_id.clone(),
         step_id,
         planned: calls.iter().map(|call| call.tool_call_id.clone()).collect(),
+        mid: None,
     })];
     let now = (seams.now_ms)();
     for call in calls {
@@ -4259,6 +4312,7 @@ async fn stopped_batch<W: Writer, P, T>(
         batch_id: batch_id.clone(),
         step_id,
         planned: calls.iter().map(|call| call.tool_call_id.clone()).collect(),
+        mid: None,
     })];
     let mut seen = std::collections::HashSet::new();
     for call in calls {

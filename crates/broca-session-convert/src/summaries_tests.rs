@@ -85,6 +85,9 @@ fn comparable(reply: &broca_module::serve::SessionReadResponse) -> Value {
     let object = value.as_object_mut().unwrap();
     object.remove("incarnation");
     object.remove("history_version");
+    // The stream's head names the last unit of the session's durable records: the open pages
+    // were read before the seal made the records appended without a barrier durable.
+    object.remove("head");
     for message in value["messages"].as_array_mut().unwrap() {
         for block in message["message"]["content"].as_array_mut().unwrap() {
             if block["type"] == "redacted_reasoning" {

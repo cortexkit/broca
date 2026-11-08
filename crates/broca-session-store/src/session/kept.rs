@@ -243,6 +243,7 @@ impl<B: SessionBackend> Session<B> {
         self.encoder.written(&encoded);
         self.encoder.synced();
         self.poisoned = false;
+        self.observed(super::Appended::Synced);
         Ok(())
     }
 }

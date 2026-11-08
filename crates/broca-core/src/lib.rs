@@ -18,7 +18,8 @@ pub mod billing;
 pub mod budget_kernel;
 pub use budget_kernel::{next_due, DueFiring};
 pub mod cache_warm;
-mod call_identity;
+/// Which copy of a tool call each durable record answers, and the key today's readers give it.
+pub mod call_identity;
 pub mod capability;
 pub mod clock;
 pub mod compaction;
@@ -193,4 +194,4 @@ pub use account_limit_pause::{
 };
 pub mod keep_warm;
 pub mod keep_warm_wait;
-mod plan_system;
+pub mod plan_system;

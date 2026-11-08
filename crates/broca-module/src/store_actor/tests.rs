@@ -280,7 +280,8 @@ pub(super) async fn actor_with(
     )
     .await
     .unwrap();
-    let actor = StoreActor::new(bind(), session, Arc::new(executor), Box::new(parts));
+    let actor = StoreActor::new(bind(), session, Arc::new(executor), Box::new(parts))
+        .with_readers(Arc::new(move || backend));
     let (commands, receiver) = mpsc::unbounded_channel();
     let served = tokio::spawn(actor.serve(receiver));
     (commands, served, backend)
@@ -313,7 +314,8 @@ pub(super) async fn reopen(
     let session = Session::load(backend, SessionAddr(ADDR.into()), &triple(), &deployment())
         .await
         .unwrap();
-    let actor = StoreActor::new(bind(), session, executor, Box::new(parts.clone()));
+    let actor = StoreActor::new(bind(), session, executor, Box::new(parts.clone()))
+        .with_readers(Arc::new(move || backend));
     let (commands, receiver) = mpsc::unbounded_channel();
     (commands, tokio::spawn(actor.serve(receiver)))
 }

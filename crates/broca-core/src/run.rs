@@ -99,6 +99,7 @@ pub enum OutputEvent {
 #[derive(Clone, Debug, PartialEq)]
 pub struct RunRequest {
     pub route_decision_id: Option<String>,
+    pub account_route: Option<cortexkit_role_llm_runner::send::AccountRoute>,
     pub input_written_at_ms: Option<u64>,
     pub directives: Option<Vec<cortexkit_role_llm_runner::directives::DirectiveName>>,
     pub session_class: Option<String>,
@@ -199,6 +200,7 @@ impl RunRequest {
     pub fn to_submission(&self) -> SubmissionRequest {
         SubmissionRequest {
             route_decision_id: self.route_decision_id.clone(),
+            account_route: self.account_route.clone(),
             service_tier_level: None,
             staged_uploads: None,
             content: Vec::new(),
@@ -248,6 +250,7 @@ impl RunRequest {
     ) -> Self {
         RunRequest {
             route_decision_id: req.route_decision_id,
+            account_route: req.account_route,
             input_written_at_ms: None,
             directives: req.directives,
             session_class: None,
@@ -798,6 +801,10 @@ pub struct RunControl {
     /// Replace the provider-view system text only after a recorded refresh applies. A
     /// difference between legacy transcript text and manifest metadata is not a refresh.
     pub manifest_system_override: bool,
+    /// The pending plan change a fresh run applies by freezing `manifest`, with its baseline
+    /// facts. The new storage's run loop records it in the batch of the run's start; today's
+    /// loop ignores it, because today's storage works the application out again from the WAL.
+    pub applies_refresh: Option<broca_protocol::session_change::AppliedChange>,
     /// Told the WAL position of a fresh run's `RunStarted` once it is durable, and of each
     /// provider attempt record as it is appended, so the caller can report them to the routing
     /// module that chooses provider accounts. `None` reports nothing; either way the loop writes
@@ -956,6 +963,7 @@ impl Default for RunControl {
             live_steer_after_seq: None,
             manifest: None,
             manifest_system_override: false,
+            applies_refresh: None,
             account_reporter: None,
             keep_warm: None,
             elicitation_plane: None,
@@ -6063,19 +6071,23 @@ where
             let transcript = crate::compaction_v2::transcript::project(&frames, &lineage)
                 .map_err(RunError::Wal)?;
             let (config, _) = crate::compaction_v2::host::frozen(&frames).map_err(RunError::Wal)?;
-            let conditions =
-                match crate::compaction_v2::host::conditions(&config, &transcript.entries, false) {
-                    Ok(conditions) => conditions,
-                    Err(message) => {
-                        terminal_error = Some(crate::compaction::runtime::error(
-                            None,
-                            &message,
-                            Some("compaction_unavailable".into()),
-                            false,
-                        ));
-                        break RunFinishReason::Error;
-                    }
-                };
+            let conditions = match crate::compaction_v2::host::conditions(
+                &config,
+                &transcript.entries,
+                false,
+                None,
+            ) {
+                Ok(conditions) => conditions,
+                Err(message) => {
+                    terminal_error = Some(crate::compaction::runtime::error(
+                        None,
+                        &message,
+                        Some("compaction_unavailable".into()),
+                        false,
+                    ));
+                    break RunFinishReason::Error;
+                }
+            };
             let next_mid =
                 crate::message_mid(true, Some(&lineage), transcript.entries.len() as u64)
                     .map_err(RunError::Wal)?;
@@ -6270,20 +6282,23 @@ where
                 == Some(crate::compaction_provider::notice::HistoryEditCost::FullResend);
             // A missing frozen limit ends the run as `compaction_unavailable` before any model
             // I/O, the same way the step boundary does; it is never a WAL error.
-            let conditions =
-                match crate::compaction_v2::host::conditions(&config, &transcript.entries, chained)
-                {
-                    Ok(conditions) => conditions,
-                    Err(message) => {
-                        terminal_error = Some(crate::compaction::runtime::error(
-                            None,
-                            &message,
-                            Some("compaction_unavailable".into()),
-                            false,
-                        ));
-                        break RunFinishReason::Error;
-                    }
-                };
+            let conditions = match crate::compaction_v2::host::conditions(
+                &config,
+                &transcript.entries,
+                chained,
+                transcript.newest_step_fill(),
+            ) {
+                Ok(conditions) => conditions,
+                Err(message) => {
+                    terminal_error = Some(crate::compaction::runtime::error(
+                        None,
+                        &message,
+                        Some("compaction_unavailable".into()),
+                        false,
+                    ));
+                    break RunFinishReason::Error;
+                }
+            };
             let current = crate::compaction_v2::host::context(&config, manifest);
             let previous = crate::compaction_v2::host::previous(&frames);
             let now = control.now_ms().unwrap_or_else(crate::compaction::now);
@@ -14155,6 +14170,7 @@ mod tests {
         prior.render_episodes = None;
         prior.run_config = Some(RunConfig {
             global_system: None,
+            account_route: None,
             route_decision_id: None,
             account_limit_pause: false,
             turn_directives_v1: None,
@@ -14287,6 +14303,7 @@ mod tests {
             reply: None,
         };
         let mut req = RunRequest {
+            account_route: None,
             route_decision_id: None,
             input_written_at_ms: None,
             directives: None,
@@ -16182,6 +16199,7 @@ mod tests {
 
         let config = RunConfig {
             global_system: None,
+            account_route: None,
             route_decision_id: None,
             account_limit_pause: false,
             turn_directives_v1: None,

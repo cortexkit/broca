@@ -43,6 +43,7 @@ use tokio::sync::{mpsc, Notify};
 
 fn full_request(run: &str, session: &BindIdentity) -> RunRequest {
     RunRequest {
+        account_route: None,
         route_decision_id: None,
         input_written_at_ms: None,
         directives: None,
@@ -354,6 +355,7 @@ impl LineageOpener for RecOpener {
 
 fn text(run: &str, msg: &str, session: &BindIdentity) -> RunRequest {
     RunRequest {
+        account_route: None,
         route_decision_id: None,
         input_written_at_ms: None,
         directives: None,
@@ -506,6 +508,7 @@ async fn run_started_submission_id(
             }
             Delivery::Display(_) => {}
             Delivery::Error(error) => panic!("control-stream replay failed: {error}"),
+            Delivery::AccessEnded(refusal) => panic!("read access ended: {refusal:?}"),
             Delivery::Expired { .. } => panic!("forever subscriber expired"),
             Delivery::Detached => panic!("control stream detached before RunStarted"),
             Delivery::CursorExpired => panic!("control cursor expired before RunStarted"),
@@ -657,6 +660,7 @@ async fn drained_run_renders_identical_bytes_to_idle_send() {
 
 fn recovered_stop_config() -> broca_wal::RunConfig {
     broca_wal::RunConfig {
+        account_route: None,
         global_system: None,
         route_decision_id: None,
         account_limit_pause: false,

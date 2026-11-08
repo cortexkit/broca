@@ -621,6 +621,13 @@ message! {
     pub struct StepStart {
         1 req run_id: String,
         2 req step_id: u64,
+        /// The id of the assistant message this step writes, decided here so a live subscriber
+        /// can name the message from the step's start. The new loop mints it from its writer
+        /// generation and this record's seq; a step converted from a WAL log keeps the id the
+        /// WAL projection gives the message at that position. The message's `EntryFacts`
+        /// carries the same id, and a fold refuses one that doesn't. A step that writes no
+        /// message leaves it unused. Absent on steps written before it was recorded.
+        3 opt mid: String,
     }
 }
 
@@ -717,6 +724,9 @@ message! {
         2 req batch_id: String,
         3 req step_id: u64,
         4 rep planned: ToolCallId,
+        /// The id of the tool-results message this batch's replies make, decided here as
+        /// `StepStart::mid` is for the step's assistant message, with the same rules.
+        5 opt mid: String,
     }
 }
 
@@ -893,6 +903,52 @@ message! {
         5 rep setup: PartRef,
         /// The rest of the refreshed manifest, owned by the fetch-plan code.
         6 opt manifest: serde_json::Value,
+        /// The model the refreshed plan chooses for the session's next runs (its `model`), as
+        /// admission read it from the plan; absent when the plan chooses none. A send that
+        /// leaves its model to the session, and `session.head`, follow the latest refresh that
+        /// chooses one.
+        7 opt selection: serde_json::Value,
+    }
+}
+
+message! {
+    /// The pending refresh's policy changed (`session.refresh_policy`), durable before the
+    /// caller is answered. `send_id` is the change's idempotency key: a repeat is answered from
+    /// this record.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct RefreshPolicy {
+        1 req generation: u64,
+        2 req policy: String,
+        3 req send_id: String,
+    }
+}
+
+message! {
+    /// The session's frozen prefix was flushed (`session.flush_prefix`): the next run applies any
+    /// pending refresh, whatever its policy. `pending_generation` is the refresh pending when the
+    /// flush was accepted, which a repeat under the same `send_id` is answered with.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct PrefixFlush {
+        1 req send_id: String,
+        2 opt pending_generation: u64,
+    }
+}
+
+message! {
+    /// The run whose start shares this record's batch applied the pending refresh `generation`:
+    /// `applied_by` is `fold` when a prefix rebuild applied it and `append` when the run applied
+    /// it with the prefix intact. It carries the facts the session's baseline reports for the
+    /// applied change, decided with it: the whole manifest's digest, its composition digest when
+    /// it has one, and the plan items its fetch left absent. Written after the run's input
+    /// records, so the run's start is still followed directly by its input.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct RefreshApplied {
+        1 req generation: u64,
+        2 req applied_by: String,
+        3 req manifest_digest: String,
+        4 opt composition_digest: String,
+        /// Owned by the fetch-plan code: each absent item as the baseline reports it.
+        5 rep absent_items: serde_json::Value,
     }
 }
 
@@ -1520,6 +1576,9 @@ records! {
         99 AuthRefrozen,
         100 StepRefused,
         101 Billed,
+        102 RefreshPolicy,
+        103 PrefixFlush,
+        104 RefreshApplied,
     }
 }
 

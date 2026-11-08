@@ -121,6 +121,7 @@ fn ledger_records_and_misplaced_records_refuse() {
     let ledger = Record::StepStart(StepStart {
         run_id: "r".into(),
         step_id: 1,
+        mid: None,
     });
     assert_eq!(
         fold(&[ledger], false).unwrap_err(),

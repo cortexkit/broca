@@ -226,6 +226,7 @@ pub fn small_record(input: &mut Input<'_>) -> Record {
         0 => Record::StepStart(StepStart {
             run_id: input.string(),
             step_id: input.number(),
+            mid: None,
         }),
         1 => Record::Marker(Marker {
             view_version: input.number(),

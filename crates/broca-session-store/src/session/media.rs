@@ -21,8 +21,9 @@ use crate::record::{MediaObject, Record};
 /// replaced and kept current on every append.
 #[derive(Debug, Default)]
 pub(crate) struct OpenLogIndex {
-    /// The ordinal each `EntryFacts` record names, by that record's seq, so `find_message`
-    /// finds a new message's id before it's sealed.
+    /// The ordinal each `EntryFacts` record names, by that record's seq and, for a message whose
+    /// id an earlier record announced (a step's or a batch's start), by that record's seq too,
+    /// so `find_message` finds a new message's id before it's sealed.
     pub facts: BTreeMap<u64, u64>,
     /// The object each media digest the open log names is stored as.
     pub media: BTreeMap<String, MediaObject>,
@@ -41,6 +42,9 @@ impl OpenLogIndex {
         match record {
             Record::EntryFacts(facts) => {
                 self.facts.insert(seq, facts.ordinal);
+                if let Some(announced) = super::read::minted_seq(&facts.mid) {
+                    self.facts.entry(announced).or_insert(facts.ordinal);
+                }
             }
             Record::ToolReply(reply) => {
                 for object in &reply.media {

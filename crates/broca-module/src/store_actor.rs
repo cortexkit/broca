@@ -95,6 +95,9 @@ pub struct StoreActor<B: SessionBackend> {
     /// The module's stop, once the actor serves in a module: work a send waits on, such as its
     /// input transforms, gives up when it fires.
     seal: CancellationToken,
+    /// The session's subscriptions, once the actor can read its records apart from the writer
+    /// (see [`StoreActor::with_readers`]); without it `session.subscribe` is refused by name.
+    fanout: Option<crate::store_fanout::StoreFanout<B>>,
     /// Where finished runs' facts are kept, shared with the module's reads (see `with_settled`).
     settled: Option<Arc<crate::store_status::SettledRuns>>,
 }
@@ -219,6 +222,9 @@ struct Prepared {
     hooks: Option<Box<broca_wal::Hooks>>,
     /// The error the run ends with before any model call, when a transform refused its input.
     pre_model_error: Option<broca_protocol::ProviderError>,
+    /// The pending plan refresh the run applies by freezing its manifest, which its start's
+    /// batch records.
+    applies_refresh: Option<broca_protocol::session_change::AppliedChange>,
 }
 
 /// What a run drained from the queue starts from.
@@ -267,8 +273,54 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             compaction_session: Arc::default(),
             pending_views: Vec::new(),
             seal: CancellationToken::new(),
+            fanout: None,
             settled: None,
         }
+    }
+
+    /// The actor serves `session.subscribe`, catching subscribers up over backends `readers`
+    /// makes: handles on the session's storage that only read.
+    pub fn with_readers(mut self, readers: Arc<dyn Fn() -> B + Send + Sync>) -> Self {
+        self.fanout = Some(crate::store_fanout::StoreFanout::new(
+            &mut self.session,
+            readers,
+        ));
+        self
+    }
+
+    /// [`StoreActor::with_readers`], with each seeding of the live projection held until `gate`
+    /// is notified.
+    #[cfg(test)]
+    pub(crate) fn with_readers_held(
+        mut self,
+        readers: Arc<dyn Fn() -> B + Send + Sync>,
+        gate: Arc<tokio::sync::Notify>,
+    ) -> Self {
+        self.fanout = Some(crate::store_fanout::StoreFanout::held(
+            &mut self.session,
+            readers,
+            gate,
+        ));
+        self
+    }
+
+    /// Attaches a subscriber from `from`, or after the session's last record when `live`.
+    fn subscribe(
+        &mut self,
+        from: crate::fanout::FromCursor,
+        live: bool,
+        sink: mpsc::Sender<crate::fanout::Delivery>,
+    ) -> crate::actor::SubscribeOutcome {
+        let Some(fanout) = self.fanout.as_mut() else {
+            return crate::actor::SubscribeOutcome::Error(unserved("subscribe"));
+        };
+        let from = if live {
+            crate::fanout::AttachFrom::Live
+        } else {
+            crate::fanout::AttachFrom::Cursor(from)
+        };
+        fanout.attach(&self.session, from, sink);
+        crate::actor::SubscribeOutcome::Attached
     }
 
     /// The actor serves finished runs' facts from `settled`, and keeps the ones it reads there,
@@ -284,6 +336,14 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         &mut self,
         request: &crate::store_reads::StoreReadRequest,
     ) -> crate::store_reads::StoreReadOutcome {
+        // Made durable first, so the live projection has published every batch the read sees
+        // and its last unit is the read's head.
+        if let Some(refused) = crate::store_reads::durable_for_read(&mut self.session).await {
+            return refused;
+        }
+        if let Some(fanout) = self.fanout.as_mut() {
+            fanout.ensure_seeded(&self.session);
+        }
         let addr = broca_core::session_addr(&self.key);
         let live_step = self
             .run
@@ -302,6 +362,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 .map(|settled| (settled, addr.as_str())),
             session_name: &self.key.session,
             live_step: live_step.as_ref(),
+            stream_head: self.fanout.as_ref().and_then(|fanout| fanout.head()),
         };
         crate::store_reads::answer_in_memory(&mut self.session, &context, request).await
     }
@@ -666,8 +727,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                                 return false;
                             }
                         }
-                    } else if let Err(refusal) = broca_fetch_plan::check_later_plan(
+                    } else if let Err(refusal) = crate::plan_change::later_send_plan(
                         frozen.as_ref().map(|frozen| frozen.plan_identity.as_str()),
+                        self.refreshed_identities(),
                         &plan.identity,
                     ) {
                         let _ = reply.send(SendOutcome::PlanRefused(refusal));
@@ -752,16 +814,30 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 let steering = delivery == broca_protocol::Delivery::Steer;
                 // Today's actor lets a plain send leave its model to the session only when a
                 // plan selected the session's next-run model (`plan.model`), and then runs it on
-                // that model. A steer may leave it: it joins a run whose model is already frozen.
+                // that model: the latest refresh's choice, else the first run's plan's. A steer
+                // may leave it: it joins a run whose model is already frozen.
                 if !steering
                     && request
                         .inherit_frozen
                         .contains(&broca_protocol::request::InheritedParam::Model)
                 {
-                    let Some(selection) = manifest
-                        .as_deref()
-                        .and_then(broca_core::head::manifest_selection)
-                    else {
+                    // A session's first send runs on the plan it fetched; a later one on the
+                    // session's choice.
+                    let selection = if self.session.operations().owner.episodes == 0 {
+                        Ok(manifest
+                            .as_deref()
+                            .and_then(broca_core::head::manifest_selection))
+                    } else {
+                        broca_session_loop::plan::selection(self.session.operations(), &self.parts)
+                    };
+                    let selection = match selection {
+                        Ok(selection) => selection,
+                        Err(error) => {
+                            let _ = reply.send(SendOutcome::Transient(error));
+                            return false;
+                        }
+                    };
+                    let Some(selection) = selection else {
                         let _ = reply.send(SendOutcome::DeliveryRefused {
                             code: "invalid_params",
                             field: "model",
@@ -904,6 +980,39 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 let _ = reply.send(self.retract(submission_id).await);
                 false
             }
+            LineageCmd::SessionRefresh {
+                generation,
+                policy,
+                manifest,
+                reply,
+            } => {
+                let _ = reply.send(self.session_refresh(generation, policy, manifest).await);
+                false
+            }
+            LineageCmd::SessionRefreshPolicy {
+                generation,
+                policy,
+                send_id,
+                reply,
+            } => {
+                let _ = reply.send(
+                    self.session_refresh_policy(generation, policy, send_id)
+                        .await,
+                );
+                false
+            }
+            LineageCmd::SessionFlushPrefix { send_id, reply } => {
+                let _ = reply.send(self.session_flush_prefix(send_id).await);
+                false
+            }
+            // The registry decides whether a sender may cancel from the session's stored owner
+            // summary, which carries the senders the latest accepted refresh grants
+            // (`broca_session_loop::owner::ownership_with_plan`), as it decides for a session no
+            // actor holds. This actor keeps no cached answer of its own to give first.
+            LineageCmd::SenderPolicy { reply, .. } => {
+                let _ = reply.send(Ok(None));
+                false
+            }
             LineageCmd::IdleTick => self.run.is_none(),
             LineageCmd::Store {
                 command: crate::store_import::StoreCommand::ApplyView(command),
@@ -916,6 +1025,15 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 let (outcome, exit) = self.store_command(command).await;
                 let _ = reply.send(outcome);
                 exit
+            }
+            LineageCmd::Subscribe {
+                from,
+                live,
+                sink,
+                reply,
+            } if self.fanout.is_some() => {
+                let _ = reply.send(self.subscribe(from, live, sink));
+                false
             }
             LineageCmd::StoreRead { request, reply } => {
                 let _ = reply.send(self.store_read(&request).await);
@@ -997,15 +1115,23 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             tools_were_omitted: prepared.tools_were_omitted,
             input_hooks: prepared.hooks,
             pre_model_error: prepared.pre_model_error,
+            applies_refresh: prepared.applies_refresh,
             ..Default::default()
         };
         let (writer, link) = ActorWriter::new(&self.session, None);
         let parts: Box<dyn Parts> = Box::new(self.parts.clone());
         let executor = Arc::clone(&self.executor);
         let (out, mut events) = mpsc::channel(256);
-        // Nothing subscribes to a store session's events yet; they're drained so the run never
-        // waits on a full channel.
-        tokio::spawn(async move { while events.recv().await.is_some() {} });
+        match &self.fanout {
+            Some(fanout) => {
+                crate::store_fanout::drain_display(events, fanout.display());
+            }
+            // Without subscriptions the run's output is drained so it never waits on a full
+            // channel.
+            None => {
+                tokio::spawn(async move { while events.recv().await.is_some() {} });
+            }
+        }
         let job = StoreRunJob {
             req,
             auth,
@@ -1238,16 +1364,117 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             .map_err(|error| format!("the session's first run start: {error:?}"))
     }
 
+    /// What a later send's plan is checked against once the session took a refresh, as today's
+    /// actor checks it (`crate::plan_change::later_send_plan`): the plan identities of the latest
+    /// run's manifest and of the latest accepted refresh. `None` before any refresh.
+    fn refreshed_identities(&self) -> Option<(Option<&str>, Option<&str>)> {
+        let plan = self
+            .session
+            .operations()
+            .plan
+            .as_ref()
+            .filter(|plan| plan.accepted_generation > 0)?;
+        Some((
+            plan.current
+                .as_ref()
+                .and_then(|current| current.plan_identity()),
+            plan.accepted
+                .as_ref()
+                .and_then(|accepted| accepted.plan_identity()),
+        ))
+    }
+
+    /// The manifest a new run on `model` and `variant` freezes on a session that already ran,
+    /// chosen by today's rule (`crate::plan_change::run_manifest`) from the session's fold: the
+    /// pending refresh's once its policy's trigger came and its model-bearing items accept the
+    /// run's model, else the latest run's. With the pending refresh's, also what the run start
+    /// records about applying it. A pending refresh whose plan refuses the model refuses the
+    /// run, as today's does.
+    fn run_plan(
+        &self,
+        model: &broca_protocol::ModelHandle,
+        variant: Option<&str>,
+    ) -> Result<
+        (
+            Option<Arc<broca_wal::PlanManifest>>,
+            Option<broca_protocol::session_change::AppliedChange>,
+        ),
+        SendOutcome,
+    > {
+        use broca_fetch_plan::session_change::{
+            applies_at_run_start, model_key, Applying, EffectiveState, PendingState,
+        };
+        let default = broca_session_store::fold::operations::Plan::default();
+        let plan = self.session.operations().plan.as_ref().unwrap_or(&default);
+        let stored = |manifest| {
+            broca_session_loop::run::stored_manifest(manifest, &self.parts).map_err(|error| {
+                SendOutcome::Transient(format!("a plan manifest the session froze: {error:?}"))
+            })
+        };
+        // The latest run's manifest; a session whose runs froze none has none.
+        let current = match &plan.current {
+            Some(current) => Some(stored(current)?),
+            None => self.frozen_manifest().map_err(SendOutcome::Transient)?,
+        };
+        let pending = plan
+            .pending
+            .as_ref()
+            .map(|pending| {
+                Ok::<_, SendOutcome>(PendingState {
+                    generation: pending.generation,
+                    policy: pending.policy.clone(),
+                    manifest: stored(&pending.manifest)?,
+                })
+            })
+            .transpose()?;
+        let applying = crate::plan_change::pending_applying(
+            pending.as_ref(),
+            plan.rebuild_since_accept,
+            plan.flushed_since_accept,
+            plan.last_model.as_deref(),
+            model,
+        );
+        let manifest = crate::plan_change::run_manifest(current, applying, false, model, variant)
+            .map_err(SendOutcome::PlanRefused)?;
+        let applies = applying.map(|pending| {
+            let applied_by = applies_at_run_start(
+                &pending.policy,
+                plan.rebuild_since_accept,
+                plan.flushed_since_accept,
+                plan.last_model.as_deref(),
+                &model_key(model),
+            )
+            .expect("the pending change applies at this run");
+            EffectiveState::of(
+                &pending.manifest,
+                Applying {
+                    generation: pending.generation,
+                    applied_by,
+                },
+            )
+            .applied_change()
+        });
+        Ok((manifest, applies))
+    }
+
     /// Freezes the session's fetch plan into a run about to start, by the rules today's actor
     /// applies on every path that starts an episode (`crate::plan_episode`): a plan that confines
     /// its tools needs a scope, and the run takes the manifest's tools and, as the session's
-    /// first run, its system text first. Answers the refusal a sender gets otherwise. Whether
+    /// first run, its system text first. A later run first takes the manifest today's rule
+    /// chooses (see [`Self::run_plan`]). Answers the refusal a sender gets otherwise. Whether
     /// the send named tools of its own is noted first, for the run's start to record.
     fn freeze_plan(&self, start: &mut Start) -> Result<(), SendOutcome> {
         // Today's actor records whether the send named tools as the send arrived, before its
         // plan's tools fill them in.
         let tools_were_omitted = start.request.tools.is_none();
         start.prepared.tools_were_omitted = tools_were_omitted;
+        let first_run = self.session.operations().owner.episodes == 0;
+        if !first_run {
+            let (manifest, applies) =
+                self.run_plan(&start.request.model, start.request.variant.as_deref())?;
+            start.manifest = manifest;
+            start.prepared.applies_refresh = applies;
+        }
         crate::plan_episode::require_confining_scope(
             start.manifest.as_deref(),
             start.scope.as_ref(),
@@ -1256,7 +1483,6 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         let Some(manifest) = start.manifest.clone() else {
             return Ok(());
         };
-        let first_run = self.session.operations().owner.episodes == 0;
         crate::plan_episode::freeze_manifest(
             &manifest,
             &mut start.request,
@@ -1850,6 +2076,149 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         }
     }
 
+    /// Appends `record`, which this actor decided on its own, durable before it returns, and
+    /// tells a running run's copy of the folds about it.
+    async fn append_own(&mut self, record: Record) -> Result<(), String> {
+        let seq = Writer::append(&mut self.durable(), std::slice::from_ref(&record), true)
+            .await
+            .map_err(|error| format!("{error:?}"))?;
+        if let Some(active) = self.run.as_mut() {
+            active.link.note_own(seq, &[record]);
+        }
+        Ok(())
+    }
+
+    /// The plan-change facts the session holds, for a request naming `generation` and
+    /// `send_id`.
+    async fn change_facts(
+        &self,
+        generation: Option<u64>,
+        send_id: Option<&str>,
+    ) -> Result<crate::plan_change::ChangeFacts, String> {
+        crate::store_plan_change::facts(&self.session, &self.parts, generation, send_id).await
+    }
+
+    /// Accepts a plan refresh the serve layer fetched, by the checks today's actor makes where
+    /// it writes (`crate::plan_change::accept_refresh`): an identical repeat is answered with its
+    /// original flags, and a new refresh is answered once its record, with the fetched
+    /// manifest's parts, is durable.
+    async fn session_refresh(
+        &mut self,
+        generation: u64,
+        policy: String,
+        manifest: Box<broca_wal::PlanManifest>,
+    ) -> crate::actor::SessionRefreshOutcome {
+        use crate::actor::SessionRefreshOutcome;
+        use crate::plan_change::RefreshAcceptance;
+        let facts = match self.change_facts(Some(generation), None).await {
+            Ok(facts) => facts,
+            Err(error) => return SessionRefreshOutcome::Error(error),
+        };
+        let (run_in_progress, applies_from_next_run) = match crate::plan_change::accept_refresh(
+            &facts,
+            generation,
+            &policy,
+            &manifest,
+            self.run.is_some(),
+        ) {
+            RefreshAcceptance::Repeat {
+                run_in_progress,
+                applies_from_next_run,
+            } => {
+                return SessionRefreshOutcome::Accepted {
+                    run_in_progress,
+                    applies_from_next_run,
+                }
+            }
+            RefreshAcceptance::Refused(refusal) => return SessionRefreshOutcome::Refused(refusal),
+            RefreshAcceptance::Accept {
+                run_in_progress,
+                applies_from_next_run,
+            } => (run_in_progress, applies_from_next_run),
+        };
+        let mut setup = Vec::new();
+        let rest =
+            match broca_session_loop::run::manifest_parts(&manifest, &mut self.parts, &mut setup) {
+                Ok(rest) => rest,
+                Err(error) => return SessionRefreshOutcome::Error(format!("{error:?}")),
+            };
+        let record = Record::SessionRefresh(broca_session_store::record::SessionRefresh {
+            generation,
+            policy,
+            run_in_progress,
+            applies_from_next_run,
+            setup,
+            manifest: rest,
+            selection: broca_session_loop::plan::recorded_selection(&manifest),
+        });
+        match self.append_own(record).await {
+            Ok(()) => SessionRefreshOutcome::Accepted {
+                run_in_progress,
+                applies_from_next_run,
+            },
+            Err(error) => SessionRefreshOutcome::Error(error),
+        }
+    }
+
+    /// Changes the pending refresh's policy, by today's checks (`crate::plan_change::check_policy`):
+    /// a repeat under the same `send_id` is answered as before, and a new change is answered once
+    /// its record is durable.
+    async fn session_refresh_policy(
+        &mut self,
+        generation: u64,
+        policy: String,
+        send_id: String,
+    ) -> crate::actor::SessionRefreshPolicyOutcome {
+        use crate::actor::SessionRefreshPolicyOutcome;
+        let facts = match self.change_facts(Some(generation), Some(&send_id)).await {
+            Ok(facts) => facts,
+            Err(error) => return SessionRefreshPolicyOutcome::Error(error),
+        };
+        match crate::plan_change::check_policy(&facts, generation, &policy, &send_id) {
+            Ok(true) => return SessionRefreshPolicyOutcome::Changed,
+            Err(refusal) => return SessionRefreshPolicyOutcome::Refused(refusal),
+            Ok(false) => {}
+        }
+        let record = Record::RefreshPolicy(broca_session_store::record::RefreshPolicy {
+            generation,
+            policy,
+            send_id,
+        });
+        match self.append_own(record).await {
+            Ok(()) => SessionRefreshPolicyOutcome::Changed,
+            Err(error) => SessionRefreshPolicyOutcome::Error(error),
+        }
+    }
+
+    /// Flushes the session's frozen prefix, so the next run applies any pending refresh, by
+    /// today's rule (`crate::plan_change::flush`): a repeat under the same `send_id` is answered
+    /// with the pending generation it reported, and a new flush is answered once its record is
+    /// durable.
+    async fn session_flush_prefix(
+        &mut self,
+        send_id: String,
+    ) -> crate::actor::SessionFlushPrefixOutcome {
+        use crate::actor::SessionFlushPrefixOutcome;
+        let facts = match self.change_facts(None, Some(&send_id)).await {
+            Ok(facts) => facts,
+            Err(error) => return SessionFlushPrefixOutcome::Error(error),
+        };
+        let pending_generation = match crate::plan_change::flush(&facts) {
+            Err(pending_generation) => {
+                return SessionFlushPrefixOutcome::Flushed { pending_generation }
+            }
+            Ok(pending_generation) => pending_generation,
+        };
+        let record = Record::PrefixFlush(broca_session_store::record::PrefixFlush {
+            send_id,
+            pending_generation,
+        });
+        match self.append_own(record).await {
+            Ok(()) => SessionFlushPrefixOutcome::Flushed { pending_generation },
+            Err(error) => SessionFlushPrefixOutcome::Error(error),
+        }
+    }
+
     /// Joins `start` to the running run as a steer, as today's actor steers it: refused when it
     /// names a setting the run froze otherwise, and queued as a steer when the run has already
     /// written its end. Otherwise its input goes through the session's `pre_user` transforms,
@@ -2335,26 +2704,6 @@ fn refuse(command: LineageCmd) {
                 "a cancel from a scoped route",
             )));
         }
-        LineageCmd::SenderPolicy { reply, .. } => {
-            let _ = reply.send(Err(crate::serve::ServeError::Transient(unserved(
-                "a sender check",
-            ))));
-        }
-        LineageCmd::SessionRefresh { reply, .. } => {
-            let _ = reply.send(crate::actor::SessionRefreshOutcome::Error(unserved(
-                "session.refresh",
-            )));
-        }
-        LineageCmd::SessionRefreshPolicy { reply, .. } => {
-            let _ = reply.send(crate::actor::SessionRefreshPolicyOutcome::Error(unserved(
-                "a refresh policy change",
-            )));
-        }
-        LineageCmd::SessionFlushPrefix { reply, .. } => {
-            let _ = reply.send(crate::actor::SessionFlushPrefixOutcome::Error(unserved(
-                "a prefix flush",
-            )));
-        }
         LineageCmd::RunState { reply, .. } => {
             let _ = reply.send(Err(unserved("run.status")));
         }
@@ -2391,6 +2740,10 @@ fn refuse(command: LineageCmd) {
         | LineageCmd::Status { .. }
         | LineageCmd::Cancel { .. }
         | LineageCmd::Retract { .. }
+        | LineageCmd::SenderPolicy { .. }
+        | LineageCmd::SessionRefresh { .. }
+        | LineageCmd::SessionRefreshPolicy { .. }
+        | LineageCmd::SessionFlushPrefix { .. }
         | LineageCmd::IdleTick => unreachable!("served by the actor"),
     }
 }
@@ -2407,10 +2760,14 @@ mod entries_comparison;
 #[cfg(test)]
 mod import_tests;
 #[cfg(test)]
+mod key_tests;
+#[cfg(test)]
 mod read_cost;
 #[cfg(test)]
 mod reads_tests;
 #[cfg(test)]
 mod status_tests;
+#[cfg(test)]
+mod subscribe_tests;
 #[cfg(test)]
 mod tests;

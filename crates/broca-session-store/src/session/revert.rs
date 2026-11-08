@@ -242,6 +242,7 @@ impl<B: SessionBackend> Session<B> {
         };
         let mid = facts.mid.clone();
         self.commit(change, intent_seq, created, now_ms).await?;
+        self.observed(super::Appended::Replaced);
         Ok(Reverted::Applied {
             change,
             ordinal,

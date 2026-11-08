@@ -442,6 +442,12 @@ async fn compare(script: Vec<Vec<NormalizedEvent>>, gated: bool, steps: Vec<Step
             }
         }
     }
+    if all_same {
+        streams::assert_alike(
+            &streams::store(&commands).await,
+            &streams::routed(&today.registry, &today.key).await,
+        );
+    }
     drop(commands);
     let session: Session<&'static MemoryBackend> = served.await.unwrap();
     if all_same {
@@ -1539,3 +1545,5 @@ async fn a_store_session_reads_as_the_same_history_on_todays_storage() {
 
 mod controls;
 mod head;
+mod refresh;
+mod streams;

@@ -443,6 +443,7 @@ impl Module {
             settled: Some((&settled, &addr)),
             session_name: &self.key.session,
             live_step: None,
+            stream_head: None,
         };
         execute(&view, &context, request).await
     }
@@ -610,6 +611,8 @@ fn shape(reply: StoreReadReply) -> String {
         StoreReadReply::HistoryHead(head) => format!("{head:?}"),
         StoreReadReply::TagLocation(location) => format!("{location:?}"),
         StoreReadReply::WritingView(view) => format!("{view:?}"),
+        StoreReadReply::PlanChange(read) => format!("{:?}", read.map(|read| read.0)),
+        StoreReadReply::PlanIdentities(identities) => format!("{identities:?}"),
         StoreReadReply::Entries(entries) => format!("{entries:?}"),
         StoreReadReply::Ownership(ownership) => format!("{ownership:?}"),
         StoreReadReply::RunResult(reply) => match reply {

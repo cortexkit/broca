@@ -8,11 +8,12 @@
 //! store.
 //!
 //! Where each member comes from:
-//! - the model: the latest run start's model and variant, unless the session's first run froze
-//!   a plan that chooses one (`manifest_selection`). The store takes no plan refresh, so no
-//!   later plan can change that choice;
+//! - the model: the latest run start's model and variant, unless the session's plan chooses one
+//!   (`broca_session_loop::plan::selection`): the latest refresh that chooses one, else the
+//!   first run's plan;
 //! - the sender: today's rule ([`broca_core::head::head_sender`]) over the owner summary the
-//!   run starts folded and the senders of the first run's plan;
+//!   run starts folded and the senders the session admits (`broca_session_loop::plan::senders`):
+//!   the latest accepted refresh's, else the first run's plan's;
 //! - the usage: the session's usage by model, which the operational fold sums step by step;
 //! - the title: the newest title any send carried, which the operational fold keeps;
 //! - the latest run's state: as `session.read` reports it, except that a run still running
@@ -228,21 +229,17 @@ pub async fn build<B: SessionBackend>(
         .map(|run| run.start.as_ref().ok_or(StoreHeadError::NoRunStart))
         .transpose()?;
     let first_start = operations.owner.first_start.as_ref();
-    let first_manifest = first_start
-        .map(|start| frozen_manifest(start, parts))
+    let latest_manifest = latest_start
+        .map(|latest| frozen_manifest(latest, parts))
         .transpose()?
         .flatten();
-    let latest_manifest = match latest_start {
-        Some(latest) if first_start.is_some_and(|first| first.run_id == latest.run_id) => {
-            first_manifest.clone()
-        }
-        Some(latest) => frozen_manifest(latest, parts)?,
-        None => None,
-    };
-    let senders = first_manifest
+    let senders = broca_session_loop::plan::sender_manifest(operations, parts)
+        .map_err(StoreHeadError::Setup)?
         .as_deref()
         .map(broca_core::head::head_senders)
         .unwrap_or_default();
+    let selection =
+        broca_session_loop::plan::selection(operations, parts).map_err(StoreHeadError::Setup)?;
     let ownership =
         broca_session_loop::owner::ownership(&operations.owner).map_err(StoreHeadError::Owner)?;
     let interrupt_reason = match (latest, state.state) {
@@ -270,9 +267,7 @@ pub async fn build<B: SessionBackend>(
         lineage_state: state,
         prompt_len: page.prompt_len,
         interrupt_reason,
-        selection: first_manifest
-            .as_deref()
-            .and_then(broca_core::head::manifest_selection),
+        selection,
         run_model: latest_start.map(run_model),
         rich_ui: latest_manifest.and_then(|manifest| manifest.rich_ui.clone()),
         usage: crate::store_read::session_usage(operations.session_usage.as_ref()),

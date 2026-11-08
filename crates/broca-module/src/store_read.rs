@@ -280,7 +280,13 @@ pub async fn serve_view<B: SessionBackend>(
     parts: &dyn Parts,
     req: &crate::serve::SessionReadRequest,
 ) -> Result<broca_wire::SessionReadResponse, crate::serve::ServeError> {
-    let answer = page(session, parts, &crate::store_reads::PageRequest::of(req)).await?;
+    let answer = page(
+        session,
+        parts,
+        &crate::store_reads::PageRequest::of(req),
+        None,
+    )
+    .await?;
     finish(answer, req)
 }
 
@@ -318,6 +324,7 @@ pub(crate) async fn page<B: SessionBackend>(
     session: &Session<B>,
     parts: &dyn broca_session_loop::parts::Parts,
     request: &crate::store_reads::PageRequest,
+    stream_head: Option<Option<broca_core::Cursor>>,
 ) -> Result<crate::store_reads::PageAnswer, crate::serve::ServeError> {
     use crate::serve::ServeError;
     let head = session.head();
@@ -367,6 +374,21 @@ pub(crate) async fn page<B: SessionBackend>(
     let mut response = crate::serve::session_read_response(page, tools);
     response.history_version = head.history_version;
     response.incarnation = broca_session_store::codec::hex(&head.incarnation.0);
+    // The cursor at the read's durable end, which a subscribe resumes from with nothing missed
+    // or repeated: the actor's live projection knows it; otherwise it is projected from the open
+    // log, a read of storage, so a read from memory only is then served from a view instead.
+    let stream_head = match stream_head {
+        Some(known) => known,
+        None => crate::store_fanout::last_cursor(session)
+            .await
+            .map_err(|error| {
+                ServeError::Open(
+                    format!("the session's control stream can't be projected: {error}"),
+                    Some(broca_protocol::ErrorClass::Permanent),
+                )
+            })?,
+    };
+    response.head = stream_head.map(broca_wire::CursorWire::from);
     for (entry, mid) in response.messages.iter_mut().zip(mids) {
         entry.mid = mid;
     }

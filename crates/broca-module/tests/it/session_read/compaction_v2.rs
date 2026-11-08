@@ -1,6 +1,145 @@
 use super::*;
 use serde_json::{json, Value};
 
+async fn assert_reply_exposure(compaction: bool, mode: &str) {
+    let rig = Rig::new("reply-exposure", Arc::new(NoopExec));
+    let key = rig.key("reply-exposure");
+    let raw = if mode == "final_text" {
+        r#"{"answer":"§2§ answer §99§"}"#
+    } else {
+        "§2§ answer §99§"
+    };
+    let expected = if compaction && mode != "final_text" {
+        "answer"
+    } else {
+        raw
+    };
+    let mut start = started(&key, "r1", "§1§ question");
+    if let WalRecord::RunStarted {
+        config,
+        manifest,
+        compaction_plan_version,
+        ..
+    } = &mut start
+    {
+        *compaction_plan_version = Some(broca_core::compaction_v2::PLAN_VERSION);
+        config.render_tags = false;
+        config.computed_tags = Some(broca_wal::ComputedTagRules { checkpoint: 0 });
+        config.frozen_render_config = json!({
+            "render_config":"stateless",
+            "structured_output":{
+                "mode":mode,"name":"result","schema_jcs":"{}",
+                "enforcement":"enforced","delivery":"strict"
+            }
+        });
+        *manifest = Some(Box::new(broca_wal::PlanManifest {
+            plan: broca_wal::OpaqueJson::from_json_text(
+                json!({
+                    "compaction_item": compaction.then(|| json!({
+                        "provider":"provider","preset":"head","params":{}
+                    })),
+                    "composition":{},"render_tags":false
+                })
+                .to_string(),
+            )
+            .unwrap(),
+            plan_identity: "plan".into(),
+            composition_digest: "digest".into(),
+            tools: Arc::new(vec![]),
+            system_text: String::new(),
+            system_digest: String::new(),
+            join_version: 1,
+            role_versions: Default::default(),
+            fetches: vec![],
+            declarations: vec![],
+            rich_ui: None,
+        }));
+    }
+    let mut next = start.clone();
+    if let WalRecord::RunStarted {
+        run_id, manifest, ..
+    } = &mut next
+    {
+        *run_id = RunId("r2".into());
+        let plan = manifest.as_mut().unwrap();
+        let mut json: Value = serde_json::from_str(plan.plan.as_json_text()).unwrap();
+        json["compaction_item"] = if compaction {
+            Value::Null
+        } else {
+            json!({"provider":"provider","preset":"head","params":{}})
+        };
+        plan.plan = broca_wal::OpaqueJson::from_json_text(json.to_string()).unwrap();
+    }
+    append_seed(
+        &rig.wal_store,
+        &key,
+        &[
+            start,
+            WalRecord::StepStarted { step_id: StepId(1) },
+            assistant_text(1, raw),
+            WalRecord::TurnFinished { step_id: StepId(1) },
+            finished_ok(),
+            next,
+            WalRecord::StepStarted { step_id: StepId(1) },
+            assistant_text(1, raw),
+            WalRecord::TurnFinished { step_id: StepId(1) },
+            finished_ok(),
+        ],
+    );
+    let frames = rig.wal_store.read_records(&key).unwrap();
+    let lineage = stored_lineage_id(&rig.wal_store, &key).unwrap();
+    let entries = broca_core::compaction_v2::transcript::project(&frames, &lineage).unwrap();
+    let entry = serde_json::to_value(&entries.entries[1]).unwrap();
+    if compaction && mode != "final_text" {
+        assert_eq!(entry["parts"][0]["text"], expected, "session.entries");
+    }
+    for projected in [false, true] {
+        if projected {
+            materialize_all(&rig, &key);
+        }
+        let result = rig
+            .registry
+            .run_result(&key, RunId("r1".into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            result.final_message.unwrap().text,
+            expected,
+            "run.result, projected={projected}"
+        );
+        let result = rig
+            .registry
+            .run_result(&key, RunId("r2".into()))
+            .await
+            .unwrap();
+        let next_expected = if !compaction && mode != "final_text" {
+            "answer"
+        } else {
+            raw
+        };
+        assert_eq!(
+            result.final_message.unwrap().text,
+            next_expected,
+            "run.result after plan refresh, projected={projected}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn compaction_item_reply_exposure_matches_entries_without_legacy_render_tags() {
+    assert_reply_exposure(true, "submit_tool").await;
+}
+
+#[tokio::test]
+async fn compaction_item_final_text_reply_exposure_stays_raw() {
+    assert_reply_exposure(true, "final_text").await;
+}
+
+#[tokio::test]
+async fn unnumbered_reply_exposure_stays_raw() {
+    assert_reply_exposure(false, "submit_tool").await;
+}
+
 fn metadata() -> Vec<WalRecord> {
     include_str!("../../../../broca-wal/tests/fixtures/compaction_v2_records.jsonl")
         .lines()

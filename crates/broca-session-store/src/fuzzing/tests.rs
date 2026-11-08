@@ -202,6 +202,7 @@ fn reading_a_small_block_allocates_in_proportion_to_it() {
         Record::StepStart(crate::record::StepStart {
             run_id: "r".into(),
             step_id: 1,
+            mid: None,
         }),
     )];
     let meta = segment::SegmentMeta {

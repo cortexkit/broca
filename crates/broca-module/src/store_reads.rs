@@ -74,6 +74,15 @@ pub enum StoreReadRequest {
     /// The compaction view the model step that wrote message `ordinal` (counting from 0) was
     /// rendered under, for output references (see `store_output_refs::writing_view`).
     WritingView { ordinal: u64 },
+    /// What a plan-change op's preflight reads about the session, for a request naming
+    /// `generation` and `send_id` (see `store_plan_change::change_read`).
+    PlanChange {
+        generation: Option<u64>,
+        send_id: Option<String>,
+    },
+    /// The plan identities a later send's plan is checked against once the session took a
+    /// refresh (see `store_plan_change::identities`).
+    PlanIdentities,
 }
 
 /// What a `session.read` page asks of the session itself.
@@ -135,7 +144,16 @@ pub enum StoreReadReply {
     HistoryHead(Result<crate::store_entries::HistoryHead, ServeError>),
     TagLocation(Result<broca_core::TagLocation, ServeError>),
     WritingView(Result<Option<broca_core::compaction_provider::view::CompactionView>, ServeError>),
+    PlanChange(Result<PlanChangeRead, String>),
+    PlanIdentities(Result<RefreshedIdentities, String>),
 }
+
+/// The plan identities a later send's plan is checked against once the session took a refresh:
+/// the applied plan's and the latest accepted one's; `None` before any refresh.
+pub type RefreshedIdentities = Option<(Option<String>, Option<String>)>;
+
+/// What a plan-change op's preflight read about a session kept in the new storage.
+pub struct PlanChangeRead(pub(crate) crate::serve::ChangeRead);
 
 /// How the session's store actor answered a read.
 pub enum StoreReadOutcome {
@@ -177,6 +195,10 @@ pub struct ReadContext<'a> {
     pub session_name: &'a str,
     /// The in-flight step of the actor's running run, if any.
     pub live_step: Option<&'a LiveStep>,
+    /// The cursor of the session's last control unit, as the actor's live projection holds it
+    /// (`Some(None)` for a stream with no unit yet), or `None` when no seeded projection knows
+    /// it, so a page projects it from storage.
+    pub stream_head: Option<Option<broca_core::Cursor>>,
 }
 
 impl ReadContext<'_> {
@@ -242,20 +264,17 @@ pub async fn execute<B: SessionBackend>(
                 .map(Box::new)
                 .map_err(crate::store_head::head_failed),
         ),
-        StoreReadRequest::Page(page) => {
-            StoreReadReply::Page(crate::store_read::page(session, ctx.parts, page).await)
-        }
+        StoreReadRequest::Page(page) => StoreReadReply::Page(
+            crate::store_read::page(session, ctx.parts, page, ctx.stream_head).await,
+        ),
         StoreReadRequest::Entries { from, limit } => StoreReadReply::Entries(
             crate::store_read::served_entries(session, *from, *limit)
                 .await
                 .map_err(crate::store_read::read_failed),
         ),
         StoreReadRequest::Ownership => StoreReadReply::Ownership(
-            broca_session_loop::owner::ownership_with_first_episode(
-                &session.operations.owner,
-                ctx.parts,
-            )
-            .map_err(|error| format!("the session's stored owner can't be read: {error}")),
+            broca_session_loop::owner::ownership_with_plan(&session.operations, ctx.parts)
+                .map_err(|error| format!("the session's stored owner can't be read: {error}")),
         ),
         StoreReadRequest::Compaction {
             key,
@@ -286,6 +305,22 @@ pub async fn execute<B: SessionBackend>(
                 .await
                 .map_err(output_refs_failed),
         ),
+        StoreReadRequest::PlanChange {
+            generation,
+            send_id,
+        } => StoreReadReply::PlanChange(
+            crate::store_plan_change::change_read(
+                session,
+                ctx.parts,
+                *generation,
+                send_id.as_deref(),
+            )
+            .await
+            .map(PlanChangeRead),
+        ),
+        StoreReadRequest::PlanIdentities => {
+            StoreReadReply::PlanIdentities(crate::store_plan_change::identities(session).await)
+        }
     }
 }
 
@@ -298,6 +333,27 @@ fn output_refs_failed(error: String) -> ServeError {
     )
 }
 
+/// Makes `session`'s latest records durable before a read reports them: the read's refusal when
+/// they can't be.
+pub(crate) async fn durable_for_read<B: SessionBackend>(
+    session: &mut Session<B>,
+) -> Option<StoreReadOutcome> {
+    if session.unsynced() {
+        // A batch appended without a barrier isn't durable yet; a read must not report it until
+        // it is. Making it durable early is harmless.
+        if let Err(error) = session.sync().await {
+            return Some(StoreReadOutcome::Refused(ServeError::Open(
+                format!(
+                    "durability_flush_failed: the session's latest records could not be made \
+                     durable before reading them: {error:?}"
+                ),
+                Some(broca_protocol::ErrorClass::Transient),
+            )));
+        }
+    }
+    None
+}
+
 /// Answers `request` from `session` as its actor holds it: durable first, then from memory only.
 /// `None` from `answer` means the read needed storage. The actor calls this between its commands,
 /// with nothing else appending.
@@ -307,18 +363,8 @@ pub async fn answer_in_memory<B: SessionBackend>(
     request: &StoreReadRequest,
 ) -> StoreReadOutcome {
     use futures::FutureExt as _;
-    if session.unsynced() {
-        // A batch appended without a barrier isn't durable yet; a read must not report it until
-        // it is. Making it durable early is harmless.
-        if let Err(error) = session.sync().await {
-            return StoreReadOutcome::Refused(ServeError::Open(
-                format!(
-                    "durability_flush_failed: the session's latest records could not be made \
-                     durable before reading them: {error:?}"
-                ),
-                Some(broca_protocol::ErrorClass::Transient),
-            ));
-        }
+    if let Some(refused) = durable_for_read(session).await {
+        return refused;
     }
     let session: &Session<B> = session;
     let memory = session.in_memory();

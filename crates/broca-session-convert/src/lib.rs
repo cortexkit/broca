@@ -25,10 +25,11 @@ use broca_session_store::record::{
     Assistant, Attempt, AuthRefrozen, BatchEnd, BatchStart, Billed, BudgetFire, BudgetFiring,
     CallFacts, CallOutcome, CancelPoint, CancelRequest, CeilingDecided, Compaction, ConfigRefrozen,
     Delivery, DeliveryOrdered, Event, Input, Marker, ModelStepUsage, Notice, OutputCapLowered,
-    PartKind, PartRef, Pause, Placement, QueuedSend, Record, Redo, ResultAppend, Resumed,
-    Retraction, RunEnd, RunStart, SendEnded, SessionRefresh, SetupStub, Steer, StepEnd,
-    StepRefused, StepStart, Stream, StructuredDowngraded, StructuredResult, ToolHeld, ToolIntent,
-    ToolOutcome, ToolReply, TurnFacts, Unanswered, View, ViewApplied, Warmed,
+    PartKind, PartRef, Pause, Placement, PrefixFlush, QueuedSend, Record, Redo, RefreshApplied,
+    RefreshPolicy, ResultAppend, Resumed, Retraction, RunEnd, RunStart, SendEnded, SessionRefresh,
+    SetupStub, Steer, StepEnd, StepRefused, StepStart, Stream, StructuredDowngraded,
+    StructuredResult, ToolHeld, ToolIntent, ToolOutcome, ToolReply, TurnFacts, Unanswered, View,
+    ViewApplied, Warmed,
 };
 use broca_wal::{FramedRecord, WalRecord};
 use serde::de::DeserializeOwned;
@@ -132,11 +133,17 @@ struct State {
     /// In a mode-3 log: who delivered each tool-result delivery's text, by the delivering
     /// record's seq (see `entry_facts`).
     delivery_notices: HashMap<u64, Notice>,
-    /// Each occurrence of a tool call the current step made, as today's call keys anchor it
-    /// (see [`anchor`]).
-    anchors: Vec<Anchor>,
-    /// The key the outcome of the terminal record being converted records (see [`anchor`]).
-    outcome_key: Option<String>,
+    /// The copies of the current step's calls and the records that anchored them, as today's
+    /// readers key them (`broca_core::call_identity`).
+    anchors: broca_core::call_identity::CallAnchors,
+    /// The copy the record being converted is about, if it is about one.
+    call: Option<broca_core::call_identity::CallAnchor>,
+    /// Whether today's message ids carry the log's lineage (`broca_core::message_mid`).
+    mode3: bool,
+    /// For the step or batch start being converted: today's id of the message it announces,
+    /// the step's assistant message or the batch's tool-results message, at the position
+    /// today's placement gives it.
+    announced_mid: Option<String>,
     /// The seq, in the converted session, of the newest first-protocol compaction view event
     /// (`compaction_view_applied`, kept whole as a ledger event) converted so far.
     legacy_view: Option<u64>,
@@ -183,6 +190,7 @@ pub fn convert(old: &[FramedRecord], lineage: Option<&str>) -> Result<Converted,
         .map_err(err)?
         .map(|legacy| {
             state.delivery_notices = legacy.delivery_notices.clone();
+            state.mode3 = !legacy.page_only;
             (legacy, Conversation::new(false), 0u64)
         });
     // Today's placement and budget rules decide what older records left implicit: the firing a
@@ -216,6 +224,9 @@ pub fn convert(old: &[FramedRecord], lineage: Option<&str>) -> Result<Converted,
     let mut stamps: HashMap<String, Option<broca_session_store::record::RichUi>> = HashMap::new();
     // The provider serving the run in force, which decides what lifetime its requests ask for.
     let mut provider_id = String::new();
+    // Today's plan-change fold, record by record, so the run start that applied each refresh is
+    // known: the new storage records that application after the run's input.
+    let mut plan_changes = broca_fetch_plan::session_change::SessionChangeFold::default();
     for framed in old {
         match &framed.record {
             WalRecord::RunStarted { config, ts_ms, .. } => {
@@ -254,6 +265,17 @@ pub fn convert(old: &[FramedRecord], lineage: Option<&str>) -> Result<Converted,
         // A record today's placement refuses is one today's replay refuses too; the conversion
         // still carries it, and the conversation check reports the log.
         let actions = placement.observe(&framed.record).unwrap_or_default();
+        // A step announces its assistant message at the position placement now gives the next
+        // message, after any steers the step's start placed; a batch announces the tool-results
+        // message that follows the assistant message it holds.
+        let announced = match &framed.record {
+            WalRecord::StepStarted { .. } => Some(placement.next_ordinal()),
+            WalRecord::ToolBatchStarted { .. } => placement.held_tool_result_ordinal(),
+            _ => None,
+        };
+        state.announced_mid = announced.and_then(|position| {
+            broca_core::message_mid(state.mode3, state.lineage.as_deref(), position).ok()
+        });
         // A step taken after the budget's finalize firing enters today's conversation at once,
         // calls and all.
         state.finalize_step = actions.iter().any(|action| {
@@ -288,16 +310,15 @@ pub fn convert(old: &[FramedRecord], lineage: Option<&str>) -> Result<Converted,
             }
         }
         state.seq = framed.seq;
-        // Today's call keys come from the record that first anchors each occurrence of a step's
-        // calls.
-        state.outcome_key = anchor(
-            &mut state.anchors,
-            &framed.record,
-            framed.seq,
-            state.lineage.as_deref(),
-        );
+        // Today's call keys come from the record that first anchors each copy of a step's calls.
+        state.call = state
+            .anchors
+            .observe(&framed.record, framed.seq)
+            .map(|(_, copy)| copy);
         let before = out.records.len();
+        let applied = plan_changes.record(&framed.record).map(refresh_applied);
         convert_one(&framed.record, &mut state, &mut out)?;
+        out.records.extend(applied.map(Record::RefreshApplied));
         // Today's display facts of each message this record gave a new version, by today's
         // ordinal; a fold today's read refuses leaves them as they were.
         let mut changed = Vec::new();
@@ -456,6 +477,12 @@ pub fn convert(old: &[FramedRecord], lineage: Option<&str>) -> Result<Converted,
         }
     }
     Ok(out)
+}
+
+/// The record of a refresh's application, from the facts today's fold reports for it, as the
+/// store's run loop records it.
+fn refresh_applied(effective: &broca_fetch_plan::session_change::EffectiveState) -> RefreshApplied {
+    broca_session_loop::run::refresh_applied(&effective.applied_change())
 }
 
 /// The facts of the tool turn whose assistant message is at `ordinal`, from today's display
@@ -638,7 +665,20 @@ fn convert_one(
     }
     convert_record(record, state, out)?;
     record_model_shares(record, state, out);
+    record_refresh_selection(record, out);
     Ok(())
+}
+
+/// Records on the refresh just written the model its plan chooses, as the store actor records it
+/// when it accepts one (`broca_session_loop::plan::recorded_selection`).
+fn record_refresh_selection(record: &WalRecord, out: &mut Converted) {
+    if let (
+        WalRecord::SessionRefreshAccepted { manifest, .. },
+        Some(Record::SessionRefresh(refresh)),
+    ) = (record, out.records.last_mut())
+    {
+        refresh.selection = broca_session_loop::plan::recorded_selection(manifest);
+    }
 }
 
 /// Records which model each part of a step's usage counts under, by today's own rule
@@ -715,6 +755,7 @@ fn convert_record(
             out.records.push(Record::StepStart(StepStart {
                 run_id: state.run_id.clone(),
                 step_id: f.req_u64("step_id"),
+                mid: state.announced_mid.take(),
             }));
         }
         "tool_batch_started" => {
@@ -724,6 +765,7 @@ fn convert_record(
                 batch_id: f.req_string("batch_id"),
                 step_id: f.req_u64("step_id"),
                 planned,
+                mid: state.announced_mid.take(),
             }));
         }
         "tool_batch_finished" => out.records.push(Record::BatchEnd(BatchEnd {
@@ -990,6 +1032,21 @@ fn convert_record(
                 applies_from_next_run: f.req_bool("applies_from_next_run"),
                 setup,
                 manifest,
+                // Filled in from the record's manifest once converted (`record_refresh_selection`).
+                selection: None,
+            }));
+        }
+        "session_refresh_policy_changed" => {
+            out.records.push(Record::RefreshPolicy(RefreshPolicy {
+                generation: f.req_u64("generation"),
+                policy: f.req_string("policy"),
+                send_id: f.req_string("send_id"),
+            }));
+        }
+        "session_prefix_flushed" => {
+            out.records.push(Record::PrefixFlush(PrefixFlush {
+                send_id: f.req_string("send_id"),
+                pending_generation: f.u64("pending_generation"),
             }));
         }
         "structured_output_result" => {
@@ -1539,107 +1596,6 @@ struct Terminal {
     tags: Option<Value>,
 }
 
-/// One occurrence of a tool call the current step made, as today's call keys anchor it
-/// (`broca_core::call_identity`).
-#[derive(Debug, Clone, Default)]
-struct Anchor {
-    id: String,
-    /// The seq of the record that first anchored it: its dispatch intent, its deferral, or the
-    /// terminal record that closed it.
-    seq: Option<u64>,
-    /// A dispatch intent anchored it, so the intent holds its key.
-    dispatched: bool,
-    /// A terminal record closed it.
-    terminal: bool,
-}
-
-/// Notes what `record`, at `seq`, anchors among the current step's call occurrences `anchors`,
-/// matching it to an occurrence as today's call keys do: an intent or a deferral takes the first
-/// occurrence of its call id neither sent nor closed, a refusal the first not yet anchored, and
-/// any other terminal the first not yet closed, so a repeated call id keys each copy by its own
-/// record. For a terminal record, returns the key its outcome records: none for an occurrence a
-/// dispatch intent anchored, whose intent holds its key; otherwise the log's lineage and the seq
-/// of the record that first anchored it, its deferral or this terminal.
-fn anchor(
-    anchors: &mut Vec<Anchor>,
-    record: &WalRecord,
-    seq: u64,
-    lineage: Option<&str>,
-) -> Option<String> {
-    let (id, terminal) = match record {
-        WalRecord::RunStarted { .. }
-        | WalRecord::TurnFinished { .. }
-        | WalRecord::RunFinished { .. } => {
-            anchors.clear();
-            return None;
-        }
-        WalRecord::ModelStepFinished {
-            assistant_message, ..
-        } => {
-            *anchors = assistant_message
-                .tool_calls()
-                .map(|call| Anchor {
-                    id: call.tool_call_id.0.clone(),
-                    ..Anchor::default()
-                })
-                .collect();
-            return None;
-        }
-        WalRecord::ToolDispatchIntent { tool_call_id, .. }
-        | WalRecord::ToolCallDeferred {
-            call_id: tool_call_id,
-            ..
-        } => (tool_call_id, false),
-        WalRecord::ToolNoDispatch { tool_call_id, .. } => (tool_call_id, true),
-        WalRecord::ToolResult { result, .. } => (&result.tool_call_id, true),
-        WalRecord::ApprovalRecorded {
-            call_id,
-            closing_result,
-            ..
-        } => {
-            // An approval that closes its call closes the first occurrence still open.
-            if let Some(open) = anchors
-                .iter_mut()
-                .find(|anchor| anchor.id == call_id.0 && !anchor.terminal)
-            {
-                open.terminal |= closing_result.is_some();
-            }
-            return None;
-        }
-        _ => return None,
-    };
-    let open = |anchor: &Anchor| anchor.id == id.0 && !anchor.terminal;
-    let index = match record {
-        // A refusal can follow the results of siblings already sent.
-        WalRecord::ToolNoDispatch { .. } => anchors
-            .iter()
-            .position(|anchor| open(anchor) && anchor.seq.is_none())
-            .or_else(|| anchors.iter().position(open)),
-        _ if terminal => anchors.iter().position(open),
-        _ => anchors
-            .iter()
-            .position(|anchor| open(anchor) && !anchor.dispatched),
-    };
-    let Some(index) = index else {
-        // Not one of the step's calls: today keys it by this record.
-        return terminal
-            .then(|| broca_core::context::tool_call_key(lineage, seq, None))
-            .flatten();
-    };
-    let slot = &mut anchors[index];
-    if matches!(record, WalRecord::ToolDispatchIntent { .. }) {
-        slot.seq = Some(seq);
-        slot.dispatched = true;
-    } else {
-        slot.seq.get_or_insert(seq);
-    }
-    slot.terminal |= terminal;
-    if !terminal || slot.dispatched {
-        return None;
-    }
-    broca_core::context::tool_call_key(lineage, slot.seq?, None)
-}
-
 fn reply_and_outcome(terminal: Terminal, state: &State, out: &mut Converted) {
     let Terminal {
         result,
@@ -1654,9 +1610,19 @@ fn reply_and_outcome(terminal: Terminal, state: &State, out: &mut Converted) {
     let result_digest = sha256(&result.encode());
     let tool_call_id = result.tool_call_id.clone();
     let is_error = result.is_error;
-    // A call no dispatch intent anchored keeps the key today's projection gives it (see
-    // [`anchor`]).
-    let call_key = state.outcome_key.clone();
+    // A copy no dispatch intent anchored keeps the key today's projection gives it: the log's
+    // lineage and the seq of the record that first anchored that copy, its deferral or this
+    // terminal, or the key an approval recorded for it. So a repeated id's refused copy has a
+    // key of its own, apart from the dispatched copy's. A terminal for a call the step didn't
+    // make is keyed by its own seq.
+    let call_key = match &state.call {
+        Some(copy) if copy.id == tool_call_id => copy
+            .intent_seq
+            .is_none()
+            .then(|| copy.key(state.lineage.as_deref()))
+            .flatten(),
+        _ => broca_core::context::tool_call_key(state.lineage.as_deref(), state.seq, None),
+    };
     out.records.push(Record::ToolReply(ToolReply {
         run_id: state.run_id.clone(),
         batch_id: Some(batch_id.clone()),

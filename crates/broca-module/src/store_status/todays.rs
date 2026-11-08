@@ -66,7 +66,7 @@ pub fn run_status(
         RunStatusResponse::Completed { directives, .. }
             if crate::serve::wake_directive_requested(records, run_id) =>
         {
-            *directives = crate::serve::final_message_of(records, run_id)
+            *directives = crate::serve::final_message_of(records, run_id, None)
                 .ok()
                 .and_then(|message| {
                     crate::serve::completed_directives(records, run_id, &message.text)
@@ -108,7 +108,11 @@ pub fn run_result(
     }
     let mut directives = None;
     let final_message = if state == "completed" {
-        let message = crate::serve::final_message_of(records, run_id)?;
+        let message = crate::serve::final_message_of(
+            records,
+            run_id,
+            crate::serve::clean_reply_of(records, run_id),
+        )?;
         directives = crate::serve::completed_directives(records, run_id, &message.text);
         Some(message)
     } else {

@@ -379,6 +379,84 @@ fn message_ids_resolve_in_the_window_and_sealed_history() {
     });
 }
 
+/// An answer whose id its step's start announced (`StepStart::mid`, minted from that record's
+/// seq) resolves by that id in the window, once sealed and after a reload. A step's start whose
+/// step wrote no message announces an id that resolves to nothing.
+#[test]
+fn an_id_a_steps_start_announced_resolves_in_the_window_and_sealed_history() {
+    let backend = MemoryBackend::default();
+    block_on(async {
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(), false)
+            .await
+            .unwrap();
+        // Two rounds, then a third whose final answer comes from a step that announced its id.
+        for n in 0..3 {
+            for (part, batch) in round(n).into_iter().enumerate() {
+                if n < 2 || part < 3 {
+                    session.append(&batch, true).await.unwrap();
+                }
+            }
+        }
+        let step_start = |mid: &String| {
+            Record::StepStart(StepStart {
+                run_id: "r".into(),
+                step_id: 9,
+                mid: Some(mid.clone()),
+            })
+        };
+        // A step that wrote nothing, then one whose answer is the next message.
+        let unused = session.message_id(0);
+        session.append(&[step_start(&unused)], true).await.unwrap();
+        let announced = session.message_id(0);
+        let ordinal = session.conversation.placed + 1;
+        let Record::EntryFacts(mut answer_facts) = facts(ordinal) else {
+            unreachable!()
+        };
+        answer_facts.mid = announced.clone();
+        session
+            .append(
+                &[
+                    step_start(&announced),
+                    assistant(vec![ContentBlock::Text { text: "a".into() }]),
+                    Record::EntryFacts(answer_facts),
+                ],
+                true,
+            )
+            .await
+            .unwrap();
+        let mut cut = 0;
+        for n in 3..6 {
+            for (part, batch) in round(n).into_iter().enumerate() {
+                let seq = session.append(&batch, true).await.unwrap();
+                if part == 0 && n == 4 {
+                    cut = seq;
+                }
+            }
+        }
+        async fn check(
+            session: &Session<&MemoryBackend>,
+            announced: &str,
+            ordinal: u64,
+            unused: &str,
+        ) {
+            assert_eq!(
+                session.find_message(announced).await.unwrap(),
+                Some(ordinal)
+            );
+            assert_eq!(session.find_message(unused).await.unwrap(), None);
+        }
+        check(&session, &announced, ordinal, &unused).await;
+        session.seal(Some(cut), 0).await.unwrap();
+        assert!(session.conversation.window_start() > ordinal);
+        check(&session, &announced, ordinal, &unused).await;
+        session.close().await.unwrap();
+        let loaded = Session::load(&backend, addr(), &triple(), &deployment())
+            .await
+            .unwrap();
+        check(&loaded, &announced, ordinal, &unused).await;
+    });
+}
+
 /// An assistant message waiting for its tool results is read last, at its reserved ordinal,
 /// with its facts and no next message.
 #[test]
@@ -426,6 +504,7 @@ fn records_from_a_seq_read_both_streams_sealed_and_open() {
                     Record::StepStart(StepStart {
                         run_id: "r".into(),
                         step_id: (4 * n + part) as u64,
+                        mid: None,
                     }),
                 );
                 let first = session.append(&batch, true).await.unwrap();

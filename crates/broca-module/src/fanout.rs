@@ -155,6 +155,10 @@ pub enum Delivery {
     /// The subscriber could not replay the durable prefix; the serve adapter emits a typed
     /// stream Error frame instead of misreporting a clean empty stream.
     Error(String),
+    /// The subscriber's read access ended with a change the session accepted: a refresh that
+    /// dropped it, or an adoption that changed the owner. The stream ends with the refusal a new
+    /// subscribe would get, and no event recorded after the change is sent.
+    AccessEnded(Box<broca_core::ScopeRefusal>),
     Detached,
 }
 
@@ -194,8 +198,16 @@ impl ResumeCursorProof {
         })
     }
 
-    fn matches(self, cursor: Cursor) -> bool {
+    pub(crate) fn matches(self, cursor: Cursor) -> bool {
         use sha2::{Digest, Sha256};
+        if let Some((incarnation, digest)) = cursor.store_identity() {
+            let text: String = incarnation
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            let incarnation: [u8; 32] = Sha256::digest(text.as_bytes()).into();
+            return incarnation == self.incarnation && digest == self.digest;
+        }
         let Some((lineage, identity)) = cursor.frame_identity() else {
             return false;
         };
@@ -208,14 +220,14 @@ impl ResumeCursorProof {
 
 impl FromCursor {
     /// Should an event at `cursor` be delivered for this attach point?
-    fn includes(&self, cursor: Cursor) -> bool {
+    pub(crate) fn includes(&self, cursor: Cursor) -> bool {
         match self {
             FromCursor::Start => true,
             FromCursor::After(c) | FromCursor::Resume { cursor: c, .. } => cursor > *c,
         }
     }
 
-    fn position(self) -> Option<Cursor> {
+    pub(crate) fn position(self) -> Option<Cursor> {
         match self {
             Self::Start => None,
             Self::After(cursor) | Self::Resume { cursor, .. } => Some(cursor),
@@ -709,12 +721,12 @@ fn replay_for_database_attach_with_lookup(
 /// ring-published after the subscriber registered would be delivered twice. Pure so the
 /// dedup is unit-testable in isolation (the integration stress proves it fires under real
 /// concurrency; this proves the decision itself is correct).
-fn deliver_from_ring(cursor: Cursor, h: u64, from: FromCursor) -> bool {
+pub(crate) fn deliver_from_ring(cursor: Cursor, h: u64, from: FromCursor) -> bool {
     cursor.wal_seq > h && from.includes(cursor)
 }
 
 /// How many live control events the ring buffers before a slow subscriber lags + detaches.
-const RING_CAPACITY: usize = 1024;
+pub(crate) const RING_CAPACITY: usize = 1024;
 /// The writer-to-projector queue is bounded independently from the subscriber ring. If the
 /// projector falls behind, its receiver reports lag and detaches subscribers so they recover
 /// through the existing WAL replay path.
@@ -724,7 +736,7 @@ const OBSERVER_RING_CAPACITY: usize = 1024;
 /// slow display subscriber drops frames (a `DisplayGap` marks the gap), it never detaches
 /// or backpressures the run. Smaller than the control ring: display is a render
 /// convenience, not durable.
-const DISPLAY_RING_CAPACITY: usize = 256;
+pub(crate) const DISPLAY_RING_CAPACITY: usize = 256;
 
 /// A broadcast ring that allocates its slot buffer when the first receiver subscribes.
 ///
@@ -1697,8 +1709,8 @@ async fn subscriber_task<W: WalStore + 'static>(
                     broca_wal::access_counter::inherit(move || {
                         source.with_reader(&session, Some(h), |reader| {
                             // Without a materialized store, each notice-bearing suffix replay reads
-                            // the key prefix once; only the daemon's disabled overhaul state format
-                            // currently has no store.
+                            // the key prefix once. Only a state root in the `broca-state/2` format,
+                            // which production does not run, has no store.
                             let mut load = || {
                                 durable_notice_index(
                                     wal.as_ref(),
@@ -1967,7 +1979,7 @@ pub fn display_gaps() -> u64 {
 
 /// Deliver one item to the sink, honoring cancellation. Returns `Break` if the subscriber
 /// should stop (the sink closed = the client went away, or cancelled = close teardown).
-async fn deliver(
+pub(crate) async fn deliver(
     sink: &mpsc::Sender<Delivery>,
     cancel: &CancellationToken,
     item: Delivery,
@@ -2171,6 +2183,7 @@ mod tests {
             session: session.clone(),
             config: Box::new(RunConfig {
                 global_system: None,
+                account_route: None,
                 route_decision_id: None,
                 account_limit_pause: false,
                 turn_directives_v1: None,
@@ -3349,6 +3362,7 @@ mod tests {
                 }
                 Delivery::Control(_) | Delivery::Display(_) => {}
                 Delivery::Error(error) => panic!("replay failed: {error}"),
+                Delivery::AccessEnded(refusal) => panic!("read access ended: {refusal:?}"),
                 Delivery::Expired { .. } => panic!("forever subscriber expired"),
                 Delivery::Detached => panic!("subscriber B detached during replay"),
                 Delivery::CursorExpired => panic!("subscriber B cursor expired during replay"),
@@ -3385,6 +3399,7 @@ mod tests {
                 }
                 Delivery::Display(_) => {}
                 Delivery::Error(error) => panic!("live delivery failed: {error}"),
+                Delivery::AccessEnded(refusal) => panic!("read access ended: {refusal:?}"),
                 Delivery::Expired { .. } => panic!("forever subscriber expired"),
                 Delivery::Detached => panic!("subscriber B detached before terminal"),
                 Delivery::CursorExpired => panic!("subscriber B cursor expired before terminal"),
@@ -3876,6 +3891,7 @@ mod tests {
                     run_id: RunId("r1".into()),
                     session: BindIdentity::new("/tmp/project-a", "runner", "restart"),
                     config: Box::new(RunConfig {
+                        account_route: None,
                         global_system: None,
                         route_decision_id: None,
                         account_limit_pause: false,
@@ -4289,6 +4305,7 @@ mod episode_attach_tests {
             session: broca_protocol::BindIdentity::new("/tmp/project", "runner", "attach"),
             config: Box::new(RunConfig {
                 global_system: None,
+                account_route: None,
                 route_decision_id: None,
                 account_limit_pause: false,
                 turn_directives_v1: None,
@@ -5554,7 +5571,11 @@ mod database_attach_tests {
             .reads
             .iter()
             .all(|read| read.class != broca_wal::access_counter::ReadClass::Origin));
+        // Close every handle into the folders first: Windows refuses to remove a file that is
+        // still open, and the episode reader holds the log.
+        drop(reader);
         drop(wal);
+        drop(store);
         drop(db);
         drop(facts);
         std::fs::remove_dir_all(root).unwrap();
@@ -5630,7 +5651,11 @@ mod database_attach_tests {
             );
             assert!(operation.seed_fallbacks.is_empty(), "{operation:?}");
         }
+        // Close every handle into the folder first: Windows refuses to remove a file that is
+        // still open, and the episode reader holds the log.
+        drop(reader);
         drop(wal);
+        drop(store);
         drop(db);
         std::fs::remove_dir_all(root).unwrap();
     }

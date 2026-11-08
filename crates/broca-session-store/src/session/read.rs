@@ -51,6 +51,18 @@ pub(super) fn canonical_u64(digits: &str) -> Option<u64> {
     canonical.then(|| digits.parse().ok()).flatten()
 }
 
+/// The seq an id broca minted names (`g<generation>.<seq>`), or `None` for any other id.
+pub(super) fn minted_seq(mid: &str) -> Option<u64> {
+    mid.strip_prefix('g')?
+        .split_once('.')
+        .and_then(|(_, seq)| canonical_u64(seq))
+}
+
+/// How many `EntryFacts` records after a step's or a batch's start a lookup of the message it
+/// announced reads before giving up. The message's facts are normally the first after it; a
+/// retried step's are later, but a paused or refused step places nothing before its retry.
+const ANNOUNCED_FACTS_READ: usize = 16;
+
 /// The window's entries as `session.entries` serves them: the placed messages, then the
 /// assistant message whose tool calls are still running, at the ordinal reserved for it.
 pub fn served_window(conversation: &Conversation) -> Vec<StoredEntry> {
@@ -423,18 +435,20 @@ impl<B: SessionBackend> Session<B> {
     }
 
     /// The ordinal of the message with id `mid`, if it's on the current branch. The id tells
-    /// where to look: a new id names the seq of its `EntryFacts` record, a converted one its
-    /// position in today's history. Either way, the entry found there must carry exactly that
-    /// id, so an id from an abandoned branch, or from another session, never resolves to the
-    /// message that took its place. Messages converted from a session without entry facts have
-    /// none, and their `m<position>` ids resolve by position alone: no message written since
-    /// lacks facts, so nothing else can sit at a converted message's ordinal.
+    /// where to look: a new id names the seq of the record that announced it, the `StepStart`
+    /// or `BatchStart` of the step or batch that writes the message, or for any other message
+    /// its `EntryFacts`; an id converted from a WAL log names its position in that log's
+    /// history. Either way, the entry found there must carry exactly that id, so an id from an
+    /// abandoned branch, or from another session, never resolves to the message that took its
+    /// place. Messages converted from a session without entry facts have none, and their
+    /// `m<position>` ids resolve by position alone: no message written since lacks facts, so
+    /// nothing else can sit at a converted message's ordinal.
     pub async fn find_message(&self, mid: &str) -> Result<Option<u64>, SessionError> {
-        let candidate = if let Some(rest) = mid.strip_prefix('g') {
-            let Some(seq) = rest.split_once('.').and_then(|(_, seq)| canonical_u64(seq)) else {
+        let candidate = if mid.starts_with('g') {
+            let Some(seq) = minted_seq(mid) else {
                 return self.imported_ordinal_checked(mid).await;
             };
-            self.facts_ordinal(seq).await?
+            self.facts_ordinal(seq, mid).await?
         } else if let Some(rest) = mid.strip_prefix('m') {
             let digits = rest.split_once('.').map_or(rest, |(_, digits)| digits);
             match canonical_u64(digits) {
@@ -476,8 +490,10 @@ impl<B: SessionBackend> Session<B> {
         Ok((entry.ordinal == ordinal && matches).then_some(ordinal))
     }
 
-    /// The ordinal an `EntryFacts` record at `seq` names, from the window or a sealed segment.
-    async fn facts_ordinal(&self, seq: u64) -> Result<Option<u64>, SessionError> {
+    /// The ordinal of the message with id `mid`, whose id names seq `seq`: the `EntryFacts`
+    /// record at `seq`, or the first `EntryFacts` carrying `mid` after the step's or batch's
+    /// start at `seq` that announced it. Read from the window, else from sealed segments.
+    async fn facts_ordinal(&self, seq: u64, mid: &str) -> Result<Option<u64>, SessionError> {
         if let Some(ordinal) = self.window.facts.get(&seq) {
             return Ok(Some(*ordinal));
         }
@@ -490,25 +506,45 @@ impl<B: SessionBackend> Session<B> {
             key: &key,
             fanout: crate::directory::FANOUT,
         };
-        let Some(entry) = pages
-            .find(self.head.transcript_dir.as_ref(), seq)
+        let mut read = 0;
+        for entry in pages
+            .entries_from(self.head.transcript_dir.as_ref(), seq)
             .await
             .map_err(SessionError::Directory)?
-        else {
-            return Ok(None);
-        };
-        let damaged = || SessionError::Fold(format!("directory names a missing segment for {seq}"));
-        let bytes = self
-            .backend
-            .get_object(&self.addr, &entry.object)
-            .await?
-            .ok_or_else(damaged)?;
-        let segment =
-            Segment::open(&bytes, &key, entry.object.as_bytes()).map_err(SessionError::Segment)?;
-        Ok(match segment.find(seq).map_err(SessionError::Segment)? {
-            Some(Record::EntryFacts(facts)) => Some(facts.ordinal),
-            _ => None,
-        })
+        {
+            let damaged =
+                || SessionError::Fold(format!("directory names a missing segment for {seq}"));
+            let bytes = self
+                .backend
+                .get_object(&self.addr, &entry.object)
+                .await?
+                .ok_or_else(damaged)?;
+            let segment = Segment::open(&bytes, &key, entry.object.as_bytes())
+                .map_err(SessionError::Segment)?;
+            for position in 0..segment.index.blocks.len() {
+                // A block whose successor starts at or before `seq` ends before it.
+                let next = segment.index.blocks.get(position + 1);
+                if next.is_some_and(|next| next.first_seq <= seq) {
+                    continue;
+                }
+                for (at, record) in segment.block(position).map_err(SessionError::Segment)? {
+                    let Record::EntryFacts(facts) = record else {
+                        continue;
+                    };
+                    if at < seq || !entry.keeps(at) {
+                        continue;
+                    }
+                    if at == seq || facts.mid == mid {
+                        return Ok(Some(facts.ordinal));
+                    }
+                    read += 1;
+                    if read == ANNOUNCED_FACTS_READ {
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// The message with `ordinal` (counting from 1 over the whole conversation), or `None` when
@@ -720,56 +756,12 @@ impl<B: SessionBackend> Session<B> {
         first: u64,
         last: u64,
     ) -> Result<Vec<(u64, Record)>, SessionError> {
-        let key = self.key.frame_key();
-        let pages = Pages {
-            backend: &self.backend,
-            addr: &self.addr,
-            session: self.head.session_id,
-            key: &key,
-            fanout: crate::directory::FANOUT,
-        };
-        let mut records = BTreeMap::new();
-        for dir in [&self.head.ledger_dir, &self.head.transcript_dir] {
-            if dir.as_ref().is_none_or(|root| root.last_seq < first) {
-                continue;
-            }
+        let mut records = if self.place().sealed_reach(first) {
             self.storage_read()?;
-            for entry in pages
-                .entries_from(dir.as_ref(), first)
-                .await
-                .map_err(SessionError::Directory)?
-                .into_iter()
-                .filter(|entry| entry.first_seq <= last)
-            {
-                let bytes = self
-                    .backend
-                    .get_object(&self.addr, &entry.object)
-                    .await?
-                    .ok_or_else(|| {
-                        SessionError::Fold(format!(
-                            "the directory names a missing segment {}",
-                            entry.object
-                        ))
-                    })?;
-                let segment = Segment::open(&bytes, &key, entry.object.as_bytes())
-                    .map_err(SessionError::Segment)?;
-                for position in 0..segment.index.blocks.len() {
-                    // A block whose successor starts at or before `first` ends before it, and a
-                    // block that starts after `last` holds nothing in the range.
-                    let next = segment.index.blocks.get(position + 1);
-                    if next.is_some_and(|next| next.first_seq <= first)
-                        || segment.index.blocks[position].first_seq > last
-                    {
-                        continue;
-                    }
-                    for (seq, record) in segment.block(position).map_err(SessionError::Segment)? {
-                        if (first..=last).contains(&seq) && entry.keeps(seq) {
-                            records.insert(seq, record);
-                        }
-                    }
-                }
-            }
-        }
+            self.place().sealed_between(first, last).await?
+        } else {
+            BTreeMap::new()
+        };
         let kept = self
             .reads_kept()
             .then(|| self.kept.between(first, last))
