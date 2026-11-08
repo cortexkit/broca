@@ -1542,3 +1542,88 @@ pub fn project(stored: &StoredEntry) -> Result<Entry, String> {
         .next()
         .ok_or_else(|| "empty projection".into())
 }
+
+#[cfg(test)]
+mod lifetime_tag_high_tests {
+    use broca_protocol::content::{ContentBlock, Message, Role};
+    use broca_session_store::codec::Id128;
+    use broca_session_store::fold::conversation::{Conversation, EntryState};
+    use broca_session_store::fold::operations::{Enrollment, Operations};
+    use broca_session_store::record::{EnrollmentOverlayRef, EntryFacts};
+
+    use super::{lifetime_tag_high, numbered_parts};
+
+    /// A session holding two messages, the newest numbered from `tag_base`.
+    fn two_messages(tag_base: u64) -> Conversation {
+        let mut conversation = Conversation::new(false);
+        for (ordinal, text) in [(1, "first"), (2, "second")] {
+            conversation.messages.push(Message::new(
+                Role::User,
+                vec![ContentBlock::Text { text: text.into() }],
+            ));
+            conversation.entries.push(EntryState {
+                facts: Some(EntryFacts {
+                    ordinal,
+                    written_at_ms: None,
+                    tag_base: if ordinal == 2 { tag_base } else { 0 },
+                    notice: None,
+                    usage: None,
+                    generated_under: None,
+                    native: false,
+                    render_tags: false,
+                    clean_reply: false,
+                    mid: format!("g0.{ordinal}"),
+                    run_id: None,
+                    created_at_ms: None,
+                    delivery_mode: None,
+                    delivery_tool_call_id: None,
+                    client_message_id: None,
+                    sender: None,
+                    marks: None,
+                    no_display_facts: None,
+                    reasoning_summaries: Vec::new(),
+                    rich_ui: None,
+                    runner_tag_base: None,
+                    legacy_view_seq: None,
+                }),
+                ..EntryState::default()
+            });
+        }
+        conversation.placed = 2;
+        conversation
+    }
+
+    /// The highest number the session ever gave: its newest message's last one, unless a revert
+    /// dropped higher ones (the fold's high-water), and while the newest message was placed
+    /// before the session enrolled, the enrollment's last number, which its own facts (recorded
+    /// off the contract) don't hold.
+    #[test]
+    fn the_next_number_follows_the_highest_one_the_session_ever_gave() {
+        let conversation = two_messages(5);
+        let newest = 5 + numbered_parts(conversation.messages.last().unwrap());
+        assert_eq!(newest, 6);
+        let mut operations = Operations::default();
+        assert_eq!(lifetime_tag_high(&conversation, &operations), Ok(6));
+        // A revert dropped messages numbered up to 20: the next numbers follow 20.
+        operations.tag_high_water = 20;
+        assert_eq!(lifetime_tag_high(&conversation, &operations), Ok(20));
+        // Off-contract facts carry no projection numbers; the enrollment's last number stands
+        // for the messages placed before it.
+        operations.tag_high_water = 9;
+        operations.enrolled = Some(Enrollment {
+            through_ordinal: 2,
+            tag_floor: 3,
+            tag_high: 9,
+            overlay: EnrollmentOverlayRef {
+                log: Id128([1; 16]),
+                generation: Id128([2; 16]),
+                seq: 3,
+            },
+            run_id: "r".into(),
+        });
+        assert_eq!(lifetime_tag_high(&two_messages(0), &operations), Ok(9));
+        // A message placed since numbers from its own facts.
+        operations.enrolled.as_mut().unwrap().through_ordinal = 1;
+        assert_eq!(lifetime_tag_high(&two_messages(12), &operations), Ok(13));
+    }
+}
