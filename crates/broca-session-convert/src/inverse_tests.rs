@@ -284,6 +284,7 @@ fn a_ride_envelope_converts_onto_the_append_and_round_trips() {
             sender: "broca".into(),
             forms: vec!["tool_result".into(), "turn_system".into()],
             form: RideForm::Append,
+            speaks_for: None,
         })
     );
     assert_round_trip(&old);

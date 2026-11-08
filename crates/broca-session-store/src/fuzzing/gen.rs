@@ -602,7 +602,8 @@ mod records {
         call_key,
         sender,
         forms,
-        form
+        form,
+        speaks_for,
     });
     crate::fuzzing::gen::fields!(StepUsage {
         prompt_tokens,
@@ -642,7 +643,8 @@ mod records {
         send_id,
         sender,
         call_key,
-        text
+        text,
+        speaks_for,
     });
     crate::fuzzing::gen::fields!(ReasoningSummary { part, text });
     crate::fuzzing::gen::fields!(RichUi {
@@ -684,6 +686,7 @@ mod records {
         seeded,
         refusal_schedule,
         imported_ids,
+        message_marks,
     });
     crate::fuzzing::gen::fields!(RunEnd {
         run_id,
@@ -810,6 +813,7 @@ mod records {
         receipt,
         delivery,
         media,
+        message_marks,
     });
     crate::fuzzing::gen::fields!(SessionRefresh {
         generation,
@@ -866,6 +870,7 @@ mod records {
         tags_v1,
         receipt,
         media,
+        message_marks,
     });
     crate::fuzzing::gen::fields!(Delivery {
         submission_id,
@@ -1107,6 +1112,7 @@ mod operations {
         sender,
         request_identity_digest,
         media,
+        message_marks,
     });
     crate::fuzzing::gen::fields!(NaturalEnd { stop, extendable });
     crate::fuzzing::gen::fields!(Budget {
@@ -1172,6 +1178,7 @@ mod operations {
         ordered,
         sender,
         request_identity_digest,
+        message_marks,
     });
     crate::fuzzing::gen::fields!(Operations {
         run,

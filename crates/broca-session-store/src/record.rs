@@ -281,6 +281,10 @@ message! {
         /// The send's delivery list restricted to `tool_result` and `turn_system`, in order.
         3 rep forms: String,
         4 req form: RideForm,
+        /// The agent the sending module spoke for (llm-runner's `SpeaksFor` JSON), which reads
+        /// serve on the ride's notice. A reader that doesn't know the field would serve the
+        /// notice without it, so it is must-understand.
+        5 opt [must] speaks_for: serde_json::Value,
     }
 }
 
@@ -322,6 +326,10 @@ message! {
         /// The text the send delivered, without the blank line that separates it from the
         /// result when it is rendered.
         5 req text: String,
+        /// The agent the sending module spoke for, as the ride's envelope recorded it
+        /// (llm-runner's `SpeaksFor` JSON). A reader that doesn't know the field would serve the
+        /// notice without it, so it is must-understand.
+        6 opt [must] speaks_for: serde_json::Value,
     }
 }
 
@@ -616,6 +624,11 @@ message! {
         /// source id to its ordinal. Message ids broca mints name where their message is, and
         /// an imported id doesn't, so a reader resolving an imported id needs the map.
         28 opt [must] imported_ids: ImportedIds,
+        /// The display marks of the send whose input the run places (llm-runner's
+        /// `MessageMarks` JSON: `speaks_for` and a true `notice`), which reads serve on each of
+        /// those messages. A reader that doesn't know the field would serve them without their
+        /// marks, so it is must-understand.
+        29 opt [must] message_marks: serde_json::Value,
     }
 }
 
@@ -970,6 +983,10 @@ message! {
         /// A reader that places or renders the messages needs them, so a record carrying any is
         /// refused by a reader that doesn't know the field.
         10 rep [must] media: SendMedia,
+        /// The send's display marks (llm-runner's `MessageMarks` JSON), which reads serve on the
+        /// messages it places. A reader that doesn't know the field would place them without
+        /// their marks, so it is must-understand.
+        11 opt [must] message_marks: serde_json::Value,
     }
 }
 
@@ -1244,6 +1261,10 @@ message! {
         /// messages' transcript copies point at. A record carrying any is refused by a reader
         /// that doesn't know the field.
         5 rep [must] media: SendMedia,
+        /// The steer's display marks (llm-runner's `MessageMarks` JSON), which reads serve on the
+        /// messages it places. A reader that doesn't know the field would place them without
+        /// their marks, so it is must-understand.
+        6 opt [must] message_marks: serde_json::Value,
     }
 }
 

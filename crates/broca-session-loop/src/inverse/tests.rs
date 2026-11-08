@@ -36,6 +36,7 @@ fn steer(text: &str) -> Record {
         tags_v1: None,
         receipt: None,
         media: Vec::new(),
+        message_marks: None,
     })
 }
 

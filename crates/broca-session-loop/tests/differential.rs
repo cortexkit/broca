@@ -3892,6 +3892,7 @@ impl SteerSink for NewSink {
                 written_at_ms,
                 tags_v1,
                 receipt,
+                message_marks: None,
             }));
     }
 

@@ -13,6 +13,7 @@ use crate::record::{
 fn start() -> Record {
     Record::RunStart(Box::new(RunStart {
         imported_ids: None,
+        message_marks: None,
         run_id: "r".into(),
         model: serde_json::from_value::<ModelHandle>(
             serde_json::json!({"provider_module_id": "p", "model_id": "m"}),
@@ -243,6 +244,7 @@ fn a_no_tool_step_ends_the_run_unless_a_steer_extends_it() {
         written_at_ms: None,
         tags_v1: None,
         receipt: None,
+        message_marks: None,
     });
     let extended = [start(), step_start(), step_end(0, false), steer];
     assert_eq!(resolution(&extended), Resolution::Resume);
@@ -336,6 +338,7 @@ fn queued(id: &str, delivery: Option<&str>) -> Record {
         request: None,
         receipt: None,
         delivery: delivery.map(str::to_owned),
+        message_marks: None,
     })
 }
 
@@ -637,6 +640,7 @@ fn the_title_is_the_newest_one_any_send_carried() {
             written_at_ms: None,
             tags_v1: None,
             receipt,
+            message_marks: None,
         })
     };
     let title = |records: &[Record]| fold(records).unwrap().title;

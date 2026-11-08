@@ -67,6 +67,7 @@ fn image(bytes: &[u8]) -> MediaRef {
 fn start(run: &str, send: &str) -> Record {
     Record::RunStart(Box::new(RunStart {
         imported_ids: None,
+        message_marks: None,
         run_id: run.into(),
         model: model(),
         setup: Vec::new(),
@@ -567,6 +568,7 @@ fn queued(submission: &str, images: &[&[u8]]) -> Record {
         request: None,
         receipt: None,
         delivery: None,
+        message_marks: None,
     })
 }
 
@@ -623,6 +625,7 @@ fn a_sends_media_are_stored_under_its_record_and_its_copies_point_at_them(cipher
             written_at_ms: None,
             tags_v1: None,
             receipt: None,
+            message_marks: None,
         });
         let (steer_at, _) = session
             .append_input_media(&[steer], blocks(0, 0, &[b]), true)

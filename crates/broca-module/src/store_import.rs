@@ -620,6 +620,7 @@ fn seed_start(
         seeded: Some(true),
         refusal_schedule: None,
         imported_ids: None,
+        message_marks: None,
     })
 }
 

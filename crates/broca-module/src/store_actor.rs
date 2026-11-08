@@ -271,6 +271,9 @@ struct Drained {
     hooks: Option<Box<broca_wal::Hooks>>,
     /// Where the queued record stored the send's media, which the run's input points at.
     media: broca_session_loop::HeldInputMedia,
+    /// The send's display marks, as its record kept them, which the run's start records, as
+    /// today's drain records the queued send's.
+    message_marks: Option<broca_protocol::MessageMarks>,
 }
 
 /// How a keyed send is answered.
@@ -1417,6 +1420,11 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             compaction_plane: self.executor.compaction_plane(),
             compaction_session: Some(Arc::clone(&self.compaction_session)),
             display_sent_by: sent_by,
+            // A drained send's marks, as its queued record kept them; a send that starts its run
+            // directly carries none, as today's actor's doesn't.
+            display_message_marks: drained
+                .as_ref()
+                .and_then(|drained| drained.message_marks.clone()),
             // The version the run's plan asks for. The loop decides the session's mode from it
             // and the session's latest run: a session on the compaction contract stays on it,
             // and one that ran outside it moves onto it at the first run whose plan names a
@@ -2522,6 +2530,12 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             .transpose()
             .map_err(|error| format!("the queued send's hooks: {error}"))?;
         let written_at_ms = send.written_at_ms;
+        let message_marks = send
+            .message_marks
+            .as_ref()
+            .map(|marks| serde_json::from_value(marks.clone()))
+            .transpose()
+            .map_err(|error| format!("the queued send's marks: {error}"))?;
         let mut media = broca_session_loop::HeldInputMedia::default();
         media.hold_stored(&Record::QueuedSend(send));
         Ok((
@@ -2531,6 +2545,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 written_at_ms,
                 hooks,
                 media,
+                message_marks,
             },
         ))
     }

@@ -435,6 +435,7 @@ async fn ridden_session() -> (&'static MemoryBackend, u64, Session<&'static Memo
                 sender: "occi".into(),
                 forms: vec!["tool_result".into()],
                 form: RideForm::Append,
+                speaks_for: None,
             }),
         })
     };

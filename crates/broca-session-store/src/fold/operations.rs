@@ -229,6 +229,9 @@ crate::message! {
         /// Where the bytes of the messages' media are stored, as the accepting record named
         /// them, so each placed copy points at the same objects.
         9 rep [must] media: crate::record::SendMedia,
+        /// The send's display marks, as its record kept them (llm-runner's `MessageMarks`
+        /// JSON), which the placed messages' facts carry.
+        10 opt [must] message_marks: serde_json::Value,
     }
 }
 
@@ -699,6 +702,9 @@ crate::message! {
         4 opt sender: String,
         /// The send's request identity digest, as its receipt kept it.
         5 opt request_identity_digest: String,
+        /// The send's display marks, as its record kept them (llm-runner's `MessageMarks`
+        /// JSON), which the messages it places carry.
+        6 opt [must] message_marks: serde_json::Value,
     }
 }
 
@@ -1494,6 +1500,7 @@ impl Operations {
                             send.receipt.as_ref(),
                             "request_identity_digest",
                         ),
+                        message_marks: send.message_marks.clone(),
                     };
                 let at = if pending.interrupt {
                     self.queue
@@ -1711,7 +1718,8 @@ impl Operations {
         if record.stream() != Stream::Ledger {
             return Err(FoldError::TranscriptRecord(record.name()));
         }
-        // A delivery takes its send out of the queue; the messages it delivers keep who sent it.
+        // A delivery takes its send out of the queue; the messages it delivers keep who sent it,
+        // and the send's marks.
         let delivered_send = match record {
             Record::Delivery(delivery) => self
                 .queue
@@ -1721,6 +1729,7 @@ impl Operations {
                     (
                         pending.sender.clone(),
                         pending.request_identity_digest.clone(),
+                        pending.message_marks.clone(),
                     )
                 }),
             _ => None,
@@ -2065,9 +2074,11 @@ impl Operations {
                     "request_identity_digest",
                 ),
                 media: steer.media.clone(),
+                message_marks: steer.message_marks.clone(),
             }),
             Record::Delivery(delivery) if !delivery.input.is_empty() => {
-                let (sender, request_identity_digest) = delivered_send.unwrap_or_default();
+                let (sender, request_identity_digest, message_marks) =
+                    delivered_send.unwrap_or_default();
                 run.pending_steers.push(PendingInput {
                     seq,
                     placement: if delivery.mode == "turn_system" {
@@ -2084,6 +2095,7 @@ impl Operations {
                     // A delivery names no stored media of its own. The loop writes one only for an
                     // ordered send, which a session in the new storage doesn't take yet.
                     media: Vec::new(),
+                    message_marks,
                 })
             }
             Record::BudgetFire(fire) => match fire.firing {
