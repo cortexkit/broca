@@ -36,6 +36,8 @@ fn core() -> BindPrincipal {
 const AFT: &str = "aft";
 /// A module the plan names as a sender, granted `idle_start`.
 const MC: &str = "magic-context";
+/// A module the plan names as a sender, granted `interrupt`.
+const OCCI: &str = "occi";
 
 fn module(name: &str) -> BindPrincipal {
     BindPrincipal::Reserved {
@@ -68,6 +70,7 @@ fn plan() -> Arc<PlanManifest> {
     let plan = json!({"senders": [
         {"module": AFT, "templates": [reminder(), pointer()]},
         {"module": MC, "idle_start": true},
+        {"module": OCCI, "interrupt": true},
     ]});
     Arc::new(PlanManifest {
         rich_ui: None,
@@ -184,6 +187,20 @@ impl Pair {
         plan: Option<Arc<PlanManifest>>,
         key: Option<&str>,
     ) -> (SendOutcome, SendOutcome) {
+        self.send_as(run_id, request, Delivery::Queue, order, plan, key)
+            .await
+    }
+
+    /// [`Self::send`] with the string `delivery` beside the order.
+    async fn send_as(
+        &self,
+        run_id: &str,
+        request: SubmissionRequest,
+        delivery: Delivery,
+        order: Option<Value>,
+        plan: Option<Arc<PlanManifest>>,
+        key: Option<&str>,
+    ) -> (SendOutcome, SendOutcome) {
         let order: Option<broca_protocol::DeliveryOrder> =
             order.map(|order| serde_json::from_value(order).unwrap());
         let send_plan = || {
@@ -207,7 +224,7 @@ impl Pair {
                 RunKind::FreshOrResume,
                 send_key(),
                 false,
-                Delivery::Queue,
+                delivery,
                 send_plan(),
                 None,
                 None,
@@ -231,13 +248,28 @@ impl Pair {
                 kind: RunKind::FreshOrResume,
                 key: send_key(),
                 skip_materialization: false,
-                delivery: Delivery::Queue,
+                delivery,
                 plan: send_plan().map(Box::new),
                 order: order.map(Box::new),
                 reply,
             })
             .unwrap();
         (old, answer.await.unwrap())
+    }
+
+    /// A send with the string `delivery` and no list, on both sides; the replies must be equal.
+    /// Returns today's.
+    async fn alike_as(
+        &self,
+        run_id: &str,
+        request: SubmissionRequest,
+        delivery: Delivery,
+    ) -> SendOutcome {
+        let (old, new) = self
+            .send_as(run_id, request, delivery, None, None, None)
+            .await;
+        assert_eq!(new, old, "the replies to {run_id} differ");
+        old
     }
 
     /// Sends on both sides, and the replies must be equal; returns today's.
@@ -792,4 +824,115 @@ async fn a_queued_ordered_sends_retry_is_answered_alike() {
     pair.idle().await;
     let (_, queue, _) = pair.assert_alike().await;
     assert_eq!(queue, vec!["sub-r-k1".to_owned()], "the keyed send waits");
+}
+
+/// A plan-named sender's string `delivery` is admitted as today's actor admits it: `steer` from
+/// a sender granted `idle_start` joins the running run as the list `[steer, idle_start]`, and
+/// `queue` starts a run on the idle session as `[idle_start]`; a sender without the grant is
+/// refused both, and an `interrupt` it isn't granted; a module the plan doesn't name is left to
+/// the owner check. Alike, records and reads included.
+#[tokio::test]
+async fn string_sends_from_plan_named_senders_are_admitted_alike() {
+    let mut script = hello();
+    script.push(store::text_step("a4", "last"));
+    let pair = Pair::new(script, true).await;
+    pair.first("r1").await;
+    let refused = |outcome: &SendOutcome| {
+        assert!(
+            matches!(
+                outcome,
+                SendOutcome::DeliveryRefused {
+                    field: "delivery",
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+    };
+    let outcome = pair
+        .alike_as("s1", from(module(MC), "steered in"), Delivery::Steer)
+        .await;
+    assert!(
+        !matches!(
+            outcome,
+            SendOutcome::DeliveryRefused { .. } | SendOutcome::Error(_)
+        ),
+        "{outcome:?}"
+    );
+    refused(
+        &pair
+            .alike_as("s2", from(module(AFT), "steered in"), Delivery::Steer)
+            .await,
+    );
+    refused(
+        &pair
+            .alike_as("s3", from(module(AFT), "queued"), Delivery::Queue)
+            .await,
+    );
+    refused(
+        &pair
+            .alike_as("s4", from(module(AFT), "stop"), Delivery::Interrupt)
+            .await,
+    );
+    pair.release();
+    pair.release();
+    pair.idle().await;
+    let outcome = pair
+        .alike_as("s6", from(module(MC), "wake up"), Delivery::Queue)
+        .await;
+    assert!(matches!(outcome, SendOutcome::Active { .. }), "{outcome:?}");
+    pair.release();
+    pair.idle().await;
+    // A module the plan doesn't name is left to the owner check, which on this unscoped session
+    // admits its send as today's actor does while no refresh has set the session's senders.
+    let outcome = pair
+        .alike_as("s7", from(module("stranger"), "hi"), Delivery::Queue)
+        .await;
+    assert!(matches!(outcome, SendOutcome::Active { .. }), "{outcome:?}");
+    pair.release();
+    pair.idle().await;
+    let (ledger, _, _) = pair.assert_alike().await;
+    // Each admitted string send was recorded as the list it stands for, under its sender.
+    for (submission, modes) in [
+        ("sub-s1", json!(["steer", "idle_start"])),
+        ("sub-s6", json!(["idle_start"])),
+    ] {
+        assert!(
+            ledger.iter().any(|entry| entry["ordered"] == submission
+                && entry["order"]["modes"] == modes
+                && entry["sent_by"].to_string().contains(MC)),
+            "{submission}: {ledger:#?}"
+        );
+    }
+}
+
+/// A plan-named sender's granted `interrupt` is admitted as today's actor admits it, then
+/// refused by name: the store actor serves no interrupt yet. Today's actor serves it.
+#[tokio::test]
+async fn a_granted_interrupt_is_admitted_then_refused_by_name() {
+    let pair = Pair::new(hello(), false).await;
+    pair.first("r1").await;
+    pair.idle().await;
+    let (old, new) = pair
+        .send_as(
+            "i1",
+            from(module(OCCI), "stop"),
+            Delivery::Interrupt,
+            None,
+            None,
+            None,
+        )
+        .await;
+    assert!(
+        !matches!(
+            old,
+            SendOutcome::DeliveryRefused { .. } | SendOutcome::Error(_)
+        ),
+        "{old:?}"
+    );
+    assert_eq!(
+        new,
+        SendOutcome::Error(super::super::unserved("an interrupt"))
+    );
+    assert!(pair.today.registry.stop_and_seal().await);
 }

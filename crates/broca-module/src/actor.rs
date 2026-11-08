@@ -1410,7 +1410,7 @@ fn submission_from_config(
 }
 
 /// How a send with a legacy string `delivery` is admitted ([`LineageActor::string_sender`]).
-enum StringSender {
+pub(crate) enum StringSender {
     /// The session's owner, or a caller the plan does not name: admitted as before.
     Owner,
     /// A plan-named sender's `queue` or `steer`, admitted and delivered as the list it stands

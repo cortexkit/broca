@@ -637,8 +637,10 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 mut reply,
             } => {
                 // An ordered send is admitted below, by today's rules; how it is delivered is the
-                // order's, not the string `delivery` beside it.
-                if let Some(what) = unserved_delivery(false, delivery, conversation_key.is_some()) {
+                // order's, not the string `delivery` beside it. An interrupt is admitted below
+                // too, before it is refused, so a sender the plan doesn't grant one hears today's
+                // refusal.
+                if let Some(what) = unserved_route(conversation_key.is_some()) {
                     let _ = reply.send(SendOutcome::Error(unserved(what)));
                     return false;
                 }
@@ -686,20 +688,32 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 }
                 // As in today's actor, a send from a module other than the session's owner is
                 // admitted next: an ordered list from a module the plan names, or a string
-                // `queue` or `steer` from one, which stands for its list. Its template renders
-                // now, and the send then continues under the session's frozen principal, as an
-                // internal send. The sender is recorded on its `DeliveryOrdered` record alone.
+                // `queue` or `steer` from one, which stands for its list, or its granted
+                // `interrupt`. Its template renders now, and the send then continues under the
+                // session's frozen principal, as an internal send. The sender is recorded on its
+                // `DeliveryOrdered` record alone.
                 let mut request = request;
                 let mut order = order.map(|order| *order);
                 let mut ordered_by = None;
                 if order.is_none() {
                     match self.string_sender(&request, delivery) {
-                        Ok(as_order) => order = as_order,
+                        Ok(crate::actor::StringSender::Owner) => {}
+                        Ok(crate::actor::StringSender::AsOrder(as_order)) => order = Some(as_order),
+                        Ok(crate::actor::StringSender::Interrupt(owner)) => {
+                            ordered_by = request.principal.replace(owner);
+                            request.scope = broca_protocol::SendScope::Internal;
+                        }
                         Err(outcome) => {
                             let _ = reply.send(outcome);
                             return false;
                         }
                     }
+                }
+                // An interrupt, from the owner or a sender the plan grants one, is admitted as
+                // today's actor admits it, and then refused: this actor doesn't serve one yet.
+                if order.is_none() && delivery == broca_protocol::Delivery::Interrupt {
+                    let _ = reply.send(SendOutcome::Error(unserved("an interrupt")));
+                    return false;
                 }
                 if let Some(order) = &order {
                     let admitted = self.ordered_sender(&request, order).and_then(|owner| {
@@ -2437,13 +2451,16 @@ fn unserved_delivery(
         Some("an ordered delivery")
     } else if delivery == broca_protocol::Delivery::Interrupt {
         Some("an interrupt")
-    } else if conversation_key {
-        // Routing reads it when it picks the run's account, which a store session's runs don't
-        // do yet.
-        Some("a send naming a conversation key")
     } else {
-        None
+        unserved_route(conversation_key)
     }
+}
+
+/// How a send asks to be routed, where this actor doesn't serve it yet.
+fn unserved_route(conversation_key: bool) -> Option<&'static str> {
+    // Routing reads a conversation key when it picks the run's account, which a store session's
+    // runs don't do yet.
+    conversation_key.then_some("a send naming a conversation key")
 }
 
 /// What a send's request asks for, where this actor doesn't serve it yet.
