@@ -1996,6 +1996,136 @@ async fn envelope_ride_entries_share_native_coordinates_with_materialized_read()
 }
 
 #[tokio::test]
+async fn recorded_owner_marks_are_projected_on_the_real_compaction_entries_route() {
+    use broca_core::compaction_v2::protocol::read::{Detail, ReadRequest, Select};
+    use broca_core::{FileWalStore, WalStore};
+    let mut pages = Vec::new();
+    for (name, principal, marks, notice) in [
+        (
+            "notice",
+            broca_protocol::BindPrincipal::Reserved {
+                module_id: "core".into(),
+            },
+            Some(json!({"notice":true})),
+            true,
+        ),
+        (
+            "speaks-for",
+            broca_protocol::BindPrincipal::Reserved {
+                module_id: "core".into(),
+            },
+            Some(json!({"speaks_for":{"agent_id":"Ada"}})),
+            false,
+        ),
+        (
+            "unmarked-module",
+            broca_protocol::BindPrincipal::Reserved {
+                module_id: "core".into(),
+            },
+            None,
+            true,
+        ),
+        ("person", broca_protocol::BindPrincipal::Direct, None, false),
+        (
+            "direct-notice",
+            broca_protocol::BindPrincipal::Direct,
+            Some(json!({"notice":true})),
+            false,
+        ),
+    ] {
+        let mut rig = Rig::start(&format!("recorded-owner-{name}")).await;
+        let mut start: serde_json::Value = serde_json::from_str(
+            include_str!("../../broca-wal/tests/fixtures/before_message_times.jsonl")
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        let input = vec![broca_protocol::Message::new(
+            broca_protocol::Role::User,
+            vec![broca_protocol::ContentBlock::Text {
+                text: "synthetic owner words".into(),
+            }],
+        )];
+        start["run_id"] = json!("owner-run");
+        start["submission_id"] = json!("owner-send");
+        start["session"] = serde_json::to_value(&rig.session).unwrap();
+        start["input"] = json!(input);
+        start["principal"] = json!(principal);
+        start["sent_by"] = json!(principal);
+        start["written_at_ms"] = json!(10);
+        start["ts_ms"] = json!(10);
+        start["compaction_plan_version"] = json!(3);
+        // The compaction-runner bind admits only the compactor the session's recorded plan
+        // selects, so the run records a plan naming "provider" as its compaction item.
+        start["manifest"] = json!({
+            "plan":json!({"compaction_item":{"provider":"provider","preset":"head","params":{}},"composition":{},"render_tags":false}).to_string(),
+            "plan_identity":"plan", "composition_digest":"digest", "tools":[],
+            "system_text":"", "system_digest":"", "join_version":1,
+            "role_versions":{}, "fetches":[], "declarations":[]
+        });
+        if let Some(marks) = &marks {
+            start["message_marks"] = marks.clone();
+        }
+        let store = FileWalStore::new(rig.dir.join("wal"));
+        {
+            let mut wal = store.open(&rig.session).unwrap();
+            for value in [
+                json!({"type":"delivery_ordered","submission_id":"owner-send","order":{"modes":["idle_start"]}}),
+                json!({"type":"queued","submission_id":"owner-send","principal":principal,"sent_by":principal,"message_marks":marks,
+                    "request":{"model":{"provider_module_id":"fake","model_id":"fake"},"input":input}}),
+                start,
+                json!({"type":"step_started","step_id":1}),
+                json!({"type":"model_step_finished","step_id":1,"written_at_ms":11,"assistant_message":{"message_id":"answer","content":[{"type":"text","text":"synthetic answer"}]},"usage":{},"finish_reason":"stop","retries_used":0}),
+                json!({"type":"turn_finished","step_id":1}),
+                json!({"type":"run_finished","reason":"completed","ts_ms":12,"usage":{},"retries_used":0}),
+            ] {
+                wal.append(1, &serde_json::from_value(value).unwrap(), true)
+                    .unwrap();
+            }
+        }
+        rig.bind_compaction(9, "provider").await;
+        let params = serde_json::to_value(ReadRequest::new(
+            Select::After {
+                after_ordinal: None,
+                limit: Some(100),
+            },
+            Detail::Full,
+        ))
+        .unwrap();
+        let reply = rig
+            .request(9, json!({"method":"session.entries","params":params}))
+            .await;
+        assert_eq!(
+            reply.header.ty,
+            subc_protocol::FrameType::Response,
+            "{reply:?}"
+        );
+        capture(&format!("compaction-owner-{name}.json"), &reply.body);
+        let page: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+        pages.push((name, page, notice));
+        rig.finish().await;
+    }
+    // Entry digests served before recorded marks were read. The unmarked sends and the
+    // marked notice keep them exactly; a speaks_for send loses its module notice, so its
+    // entry hashes like the person's identical words. A direct caller's marked notice has
+    // no module id to name, so it stays without a notice origin.
+    let module_notice = "8195639b2f45a63087cb57d33c29ef9ddf8ee7436cd5013e8b6e0fd5ec82bcaf";
+    let no_notice = "4ec526a1786c4c6f5db988974368617dd8a7640270ea1d7650890ea7571eca9b";
+    for (name, page, notice) in pages {
+        let entry = &page["entries"][0];
+        assert_eq!(entry["role"], "user", "{name}: {entry}");
+        if notice {
+            assert_eq!(entry["notice"], json!({"sender":"core"}), "{name}: {entry}");
+            assert_eq!(entry["digest"], module_notice, "{name}: {entry}");
+        } else {
+            assert!(entry.get("notice").is_none(), "{name}: {entry}");
+            assert_eq!(entry["digest"], no_notice, "{name}: {entry}");
+        }
+    }
+}
+
+#[tokio::test]
 async fn recorded_rides_keep_native_output_on_the_compaction_entries_serve_path() {
     use broca_core::compaction_v2::protocol::read::{Detail, ReadRequest, Select};
     for envelope in [false, true] {

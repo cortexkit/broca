@@ -68,6 +68,202 @@ fn terminal() -> WalRecord {
     serde_json::from_value(json!({"type":"tool_result","batch_id":"b","result":ToolResult { tool_call_id:ToolCallId("call".into()), output:ToolOutput::Json { value:json!({"a":1}) }, is_error:false },"outcome":"completed","finished_at_ms":30})).unwrap()
 }
 
+fn marked_input_entry(
+    principal: broca_protocol::BindPrincipal,
+    marks: Option<serde_json::Value>,
+) -> cortexkit_role_compaction::read::Entry {
+    let message = text("owner words");
+    let mut record = started(vec![message.clone()]);
+    let WalRecord::RunStarted {
+        sent_by,
+        principal: owner,
+        message_marks,
+        ..
+    } = &mut record
+    else {
+        unreachable!()
+    };
+    *sent_by = Some(principal.clone());
+    *owner = Some(principal);
+    *message_marks = marks.map(|value| serde_json::from_value(value).unwrap());
+    let frames = [frame(1, record)];
+    let mut fold = Fold::default();
+    let rows = fold.observe(&frames[0]).unwrap().rows;
+    metadata::project_entry(&message, &rows[&0], 0, "m0", 10, &frames).unwrap()
+}
+
+#[test]
+fn compaction_v2_recorded_notice_preserves_its_module_owner_sender() {
+    let entry = marked_input_entry(
+        broca_protocol::BindPrincipal::Reserved {
+            module_id: "core".into(),
+        },
+        Some(json!({"notice":true})),
+    );
+    let value = serde_json::to_value(entry).unwrap();
+    assert_eq!(value["notice"]["sender"], "core");
+    assert!(value["notice"].get("template").is_none());
+}
+
+#[test]
+fn compaction_v2_recorded_speaks_for_is_not_a_module_notice() {
+    let entry = marked_input_entry(
+        broca_protocol::BindPrincipal::Reserved {
+            module_id: "core".into(),
+        },
+        Some(json!({"speaks_for":{"agent_id":"Ada"}})),
+    );
+    assert!(entry.notice.is_none());
+}
+
+#[test]
+fn compaction_v2_recorded_notice_from_a_direct_caller_names_no_sender() {
+    let marked = marked_input_entry(
+        broca_protocol::BindPrincipal::Direct,
+        Some(json!({"notice":true})),
+    );
+    let unmarked = marked_input_entry(broca_protocol::BindPrincipal::Direct, None);
+    assert!(marked.notice.is_none());
+    assert_eq!(
+        serde_json::to_vec(&marked).unwrap(),
+        serde_json::to_vec(&unmarked).unwrap()
+    );
+}
+
+#[test]
+fn compaction_v2_recorded_queued_marks_survive_projection_checkpoint() {
+    for (marks, notice) in [
+        (Some(json!({"notice":true})), Some("core")),
+        (Some(json!({"speaks_for":{"agent_id":"Ada"}})), None),
+        (None, Some("core")),
+    ] {
+        let owner = broca_protocol::BindPrincipal::Reserved {
+            module_id: "core".into(),
+        };
+        let start = started(vec![text("question")]);
+        let WalRecord::RunStarted { run_id, .. } = &start else {
+            unreachable!()
+        };
+        let delivered = frame(
+            4,
+            serde_json::from_value(json!({
+                "type":"send_delivered", "submission_id":"queued", "run_id":run_id,
+                "mode":"steer", "input":[text("owner words")]
+            }))
+            .unwrap(),
+        );
+        let before = [
+            frame(1, start),
+            frame(2, serde_json::from_value(json!({"type":"delivery_ordered", "submission_id":"queued", "order":{"modes":["steer"]}})).unwrap()),
+            frame(3, serde_json::from_value(json!({
+                "type":"queued", "submission_id":"queued", "principal":owner, "sent_by":owner,
+                "message_marks":marks,
+                "request":{"model":broca_protocol::ModelHandle::new("fake","fake"),"input":[text("owner words")]}
+            })).unwrap()),
+        ];
+        let mut fold = Fold::default();
+        for record in &before {
+            fold.observe(record).unwrap();
+        }
+        let checkpoint = serde_json::to_vec(&fold).unwrap();
+        let checkpoint_text = String::from_utf8_lossy(&checkpoint);
+        assert!(!checkpoint_text.contains("owner words"));
+        // An unmarked send's checkpoint keeps the bytes it had before marks were recorded.
+        assert_eq!(
+            checkpoint_text.contains("\"marks\""),
+            marks.is_some(),
+            "{checkpoint_text}"
+        );
+        let mut resumed: Fold = serde_json::from_slice(&checkpoint).unwrap();
+        let mut rows = resumed.observe(&delivered).unwrap().rows;
+        let next = frame(
+            5,
+            serde_json::from_value(json!({"type":"step_started","step_id":1})).unwrap(),
+        );
+        rows.extend(resumed.observe(&next).unwrap().rows);
+        let entry = metadata::project_entry(
+            &text("owner words"),
+            &rows[&1],
+            1,
+            "m1",
+            10,
+            &[delivered, next],
+        )
+        .unwrap();
+        let value = serde_json::to_value(&entry).unwrap();
+        assert_eq!(value["notice"]["sender"].as_str(), notice, "{marks:?}");
+    }
+}
+
+#[test]
+fn compaction_v2_unmarked_principals_keep_their_legacy_notice_and_digest() {
+    use super::entries::{project, EntryFacts};
+    for (principal, notice) in [
+        (
+            broca_protocol::BindPrincipal::Reserved {
+                module_id: "core".into(),
+            },
+            Some(cortexkit_role_compaction::read::NoticeOrigin::new("core")),
+        ),
+        (broca_protocol::BindPrincipal::Direct, None),
+    ] {
+        let actual = marked_input_entry(principal, None);
+        let expected = project(
+            &[text("owner words")],
+            &[EntryFacts {
+                mid: "m0".into(),
+                ordinal: 1,
+                tag_base: Some(0),
+                written_at: 10,
+                completed_at: None,
+                notice: notice.clone(),
+                usage: None,
+                generated_under: None,
+            }],
+            &Default::default(),
+            true,
+        )
+        .remove(0);
+        assert_eq!(actual.notice, notice);
+        assert_eq!(actual.digest, expected.digest);
+        assert_eq!(
+            serde_json::to_vec(&actual).unwrap(),
+            serde_json::to_vec(&expected).unwrap()
+        );
+    }
+}
+
+#[test]
+fn compaction_v2_recorded_steer_marks_decide_its_notice() {
+    let owner = broca_protocol::BindPrincipal::Reserved {
+        module_id: "core".into(),
+    };
+    for (marks, notice) in [
+        (Some(json!({"notice":true})), Some("core")),
+        (Some(json!({"speaks_for":{"agent_id":"Ada"}})), None),
+        (None, Some("core")),
+    ] {
+        let assistant = assistant();
+        let records = [
+            frame(1, started(vec![text("question")])),
+            frame(2, serde_json::from_value(json!({"type":"step_started","step_id":0})).unwrap()),
+            frame(3, model_step(&assistant)),
+            frame(4, serde_json::from_value(json!({"type":"steered","input":[text("owner steer")],"sent_by":owner,"message_marks":marks})).unwrap()),
+            frame(5, serde_json::from_value(json!({"type":"tool_batch_started","batch_id":"b","step_id":0,"planned_calls":["call"]})).unwrap()),
+            frame(6, terminal()),
+            frame(7, serde_json::from_value(json!({"type":"tool_batch_finished","batch_id":"b"})).unwrap()),
+            frame(8, serde_json::from_value(json!({"type":"step_started","step_id":1})).unwrap()),
+        ];
+        let mut fold = Fold::default();
+        let mut rows = std::collections::BTreeMap::new();
+        for record in &records {
+            rows.extend(fold.observe(record).unwrap().rows);
+        }
+        let steer = serde_json::to_value(rows[&3].notice.as_ref()).unwrap();
+        assert_eq!(steer["sender"].as_str(), notice, "{marks:?}");
+    }
+}
+
 #[test]
 fn compaction_v2_metadata_reserves_pending_assistant_across_restart_and_held_steer() {
     let assistant = assistant();

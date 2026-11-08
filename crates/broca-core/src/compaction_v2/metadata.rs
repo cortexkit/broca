@@ -98,10 +98,29 @@ pub struct Delta {
 struct Origin {
     principal: Option<BindPrincipal>,
     template: Option<String>,
+    /// The marks recorded with the send. Absent for every unmarked send, so a projection
+    /// checkpoint without marks keeps its earlier bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    marks: Option<broca_protocol::MessageMarks>,
 }
 
 impl Origin {
+    /// A module's send is a notice unless its recorded marks say it carries an agent's
+    /// words (`speaks_for`). A recorded `notice: true` is a notice whoever owns the
+    /// session, including the owner's own sends. Unmarked sends keep the attribution
+    /// they had before marks existed, so their entry digests do not move.
+    ///
+    /// The compaction contract defines a notice's `sender` as a module id. A direct or
+    /// unverified caller has no module id to name, so its send carries no notice origin,
+    /// even when it was recorded with `notice: true`.
     fn notice(&self) -> Option<NoticeOrigin> {
+        if self
+            .marks
+            .as_ref()
+            .is_some_and(|marks| marks.speaks_for.is_some() && !marks.notice)
+        {
+            return None;
+        }
         let sender = super::entries::delivery_sender(self.principal.as_ref(), DeliveryMode::Steer)?;
         let mut notice = NoticeOrigin::new(sender);
         notice.template = self.template.clone();
@@ -311,6 +330,7 @@ impl Fold {
                     Origin {
                         principal: sent_by.clone(),
                         template: order.template.as_ref().map(|template| template.id.clone()),
+                        marks: None,
                     },
                 );
             }
@@ -318,12 +338,14 @@ impl Fold {
                 submission_id,
                 sent_by,
                 principal,
+                message_marks,
                 ..
             } => {
                 let origin = self.origins.entry(submission_id.0.clone()).or_default();
                 if origin.principal.is_none() {
                     origin.principal = sent_by.clone().or_else(|| principal.clone());
                 }
+                origin.marks = message_marks.clone();
             }
             WalRecord::Retracted { submission_id, .. }
             | WalRecord::SendEnded { submission_id, .. } => {
@@ -337,6 +359,7 @@ impl Fold {
                 origin,
                 config,
                 manifest,
+                message_marks,
                 ..
             } => {
                 self.held_inputs.clear();
@@ -354,13 +377,19 @@ impl Fold {
                 )
                 .then_some(self.high);
                 let notice_input = matches!(origin, broca_wal::RunOrigin::Fresh);
-                let origin = submission_id
+                let mut origin = submission_id
                     .as_ref()
                     .and_then(|id| self.origins.remove(&id.0))
                     .unwrap_or_else(|| Origin {
                         principal: sent_by.clone().or_else(|| principal.clone()),
                         template: None,
+                        marks: None,
                     });
+                // The run records the marks of the send that started it; a queued send's
+                // marks recorded earlier remain the fallback.
+                if message_marks.is_some() {
+                    origin.marks = message_marks.clone();
+                }
                 inputs = input
                     .iter()
                     .enumerate()
@@ -431,10 +460,16 @@ impl Fold {
                 ));
                 self.assistant = None;
             }
-            WalRecord::Steered { input, sent_by, .. } => {
+            WalRecord::Steered {
+                input,
+                sent_by,
+                message_marks,
+                ..
+            } => {
                 let origin = Origin {
                     principal: sent_by.clone(),
                     template: None,
+                    marks: message_marks.clone(),
                 };
                 inputs = input
                     .iter()
