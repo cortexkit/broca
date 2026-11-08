@@ -478,20 +478,69 @@ async fn each_precondition_refuses_by_name_and_writes_nothing() {
     assert_refused(&rig, mover, &bytes, "session_busy").await;
     drop(rig);
 
-    // Media, until the new storage can store a message's media.
-    let rig = Rig::start("refuse-media").await;
+    // A medium today's media store doesn't hold, then one whose bytes no longer match its
+    // digest: `media_missing`, naming the medium, how it can't be read and how many can't.
+    for (state, object) in [
+        ("absent", None),
+        ("corrupt", Some(b"other bytes".as_slice())),
+    ] {
+        let rig = Rig::start(&format!("refuse-media-{state}")).await;
+        let digest = with_media(&rig, object);
+        let bytes = std::fs::read(rig.wal()).unwrap();
+        let media = tree(&rig.dir.join("media"));
+        let refused = rig.mover().move_to_store(&key()).await.unwrap_err();
+        assert_eq!(refused.code, "not_movable", "{refused:?}");
+        assert_eq!(
+            refused.detail.unwrap(),
+            json!({"reason": "media_missing", "digest": digest, "state": state, "missing": 1})
+        );
+        assert_today(&rig, &bytes);
+        assert_eq!(
+            tree(&rig.dir.join("media")),
+            media,
+            "today's media store is unchanged"
+        );
+    }
+}
+
+/// The bytes of the image [`with_media`] names.
+const IMAGE: &[u8] = b"image bytes";
+
+/// Writes the session's WAL with its first run's input holding [`IMAGE`], in a state root whose
+/// media stores exist, as a module's do. Today's media store holds `object` as the image's
+/// bytes, or nothing when `None`. Returns the image's digest.
+fn with_media(rig: &Rig, object: Option<&[u8]>) -> String {
+    broca_core::media_store::create_media_directories(&rig.dir).unwrap();
+    let digest = broca_wal::migration::digest(IMAGE);
     let mut records = session_records(&rig.wal());
     if let WalRecord::RunStarted { input, .. } = &mut records[0] {
         *input = std::sync::Arc::new(vec![serde_json::from_value(json!({
             "role": "user", "content": [{"type": "media", "kind": "image",
-                "mime": "image/png", "byte_size": 3, "width": 1, "height": 1,
-                "sha256": "a".repeat(64)}],
+                "mime": "image/png", "byte_size": IMAGE.len(), "width": 1, "height": 1,
+                "sha256": digest}],
         }))
         .unwrap()]);
     }
+    if let Some(object) = object {
+        std::fs::write(rig.dir.join("media/objects").join(&digest), object).unwrap();
+    }
     rig.write(&records);
+    digest
+}
+
+/// A session whose media today's store holds is staged with them, and the staged copy is checked
+/// against the request each step sent. Here the WAL's recorded requests predate the image its
+/// input was given, so the check of its last step differs: the move aborts naming that check,
+/// and leaves today's storage as it was, with no staged object behind.
+#[tokio::test]
+async fn a_session_holding_media_is_staged_and_its_abort_leaves_nothing() {
+    let rig = Rig::start("media-abort").await;
+    with_media(&rig, Some(IMAGE));
     let bytes = std::fs::read(rig.wal()).unwrap();
-    assert_refused(&rig, rig.mover(), &bytes, "media").await;
+    let refused = rig.mover().move_to_store(&key()).await.unwrap_err();
+    assert_eq!(refused.code, "move_verification_failed", "{refused:?}");
+    assert_eq!(refused.detail.unwrap()["check"], "last_step");
+    assert_today(&rig, &bytes);
 }
 
 #[tokio::test]

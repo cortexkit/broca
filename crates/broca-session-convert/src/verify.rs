@@ -44,6 +44,9 @@ pub struct Verify<'a> {
     /// What the staging writer wrote, whose records name the setup parts to read back.
     pub converted: &'a crate::Converted,
     pub mode: Mode,
+    /// Today's media store for the session, which every medium the staged session holds must
+    /// read back equal to; `None` where there is none.
+    pub media: Option<&'a dyn broca_core::media_store::MediaBytes>,
 }
 
 /// How much to check.
@@ -179,13 +182,7 @@ pub async fn verify(verify: Verify<'_>) -> Result<Verified, Mismatch> {
         ));
     }
     checks.push(BILLING);
-    let media = crate::stage::media_digests(verify.records);
-    if !media.is_empty() {
-        return Err(mismatch(
-            MEDIA,
-            format!("{} media the staged session can't hold yet", media.len()),
-        ));
-    }
+    let media = staged_media(&verify, staged).await?;
     checks.push(MEDIA);
     let steps = recorded_steps(verify.records);
     if let Some(last) = steps.last() {
@@ -204,9 +201,47 @@ pub async fn verify(verify: Verify<'_>) -> Result<Verified, Mismatch> {
     Ok(Verified {
         runs: verify.converted.runs,
         messages: broca_module::store_read::transcript_len(staged),
-        media: 0,
+        media,
         checks,
     })
+}
+
+/// Every medium the WAL names must be one the staged session stores, whose object reads back
+/// byte for byte as today's media store holds it. Returns how many there are.
+async fn staged_media(
+    verify: &Verify<'_>,
+    staged: &Session<LocalBackend>,
+) -> Result<u64, Mismatch> {
+    let digests = crate::stage::media_digests(verify.records);
+    for digest in &digests {
+        let named = staged
+            .named_media(digest)
+            .await
+            .map_err(|error| mismatch(MEDIA, format!("find the medium {digest}: {error:?}")))?
+            .filter(|named| named.stored())
+            .ok_or_else(|| mismatch(MEDIA, format!("no object holds the medium {digest}")))?;
+        let stored = staged
+            .named_media_bytes(&named)
+            .await
+            .map_err(|error| mismatch(MEDIA, format!("read the medium {digest}: {error:?}")))?;
+        let today = verify
+            .media
+            .ok_or_else(|| mismatch(MEDIA, "today's media store isn't open to compare against"))?
+            .read_verified(&named.reference)
+            .map_err(|error| {
+                mismatch(
+                    MEDIA,
+                    format!("today's media store can't read the medium {digest}: {error:?}"),
+                )
+            })?;
+        if stored != today {
+            return Err(mismatch(
+                MEDIA,
+                format!("the medium {digest} differs from today's bytes"),
+            ));
+        }
+    }
+    Ok(digests.len() as u64)
 }
 
 /// The setup parts the staged session's records name, read back from the new storage's setup
@@ -913,6 +948,78 @@ fn render(
     Ok(family.render_with_provenance(&frozen.for_step(opts), opts, None))
 }
 
+/// Today's render of the request step `step` of run `run` sends, from the WAL `prefix` through
+/// the step's start, with `cap` as the step's lowered output cap: the request a copy of the
+/// session must render byte for byte. When the prefix names media (`holds_media`), the request
+/// renders through today's media preparation, reading the bytes from `media`; no offline render
+/// of today's storage offers that yet, so such a request is refused by name, and the check that
+/// asked for it stops a move of a session holding media.
+#[allow(clippy::too_many_arguments)]
+fn todays_request(
+    lineage: Option<&str>,
+    prefix: &[WalRecord],
+    config: &broca_wal::RunConfig,
+    run: &str,
+    step: u64,
+    cap: Option<u32>,
+    holds_media: bool,
+    _media: Option<&dyn broca_core::media_store::MediaBytes>,
+) -> Result<Vec<u8>, String> {
+    if holds_media {
+        return Err("today's offline render can't render a request holding media yet".into());
+    }
+    broca_module::wal_render::render_step_with_lineage(
+        lineage, prefix, config, run, step, cap, None,
+    )
+    .map(|(_, _, body)| body)
+}
+
+/// The frozen render config of a run whose config is `config`.
+fn frozen_of(
+    config: &broca_wal::RunConfig,
+) -> Result<broca_provider::wire::FrozenRenderConfig, String> {
+    serde_json::from_value(config.frozen_render_config.clone())
+        .map_err(|error| format!("decode the frozen render config: {error}"))
+}
+
+/// The request the new run loop builds for step `step` of `session` and renders under `frozen`,
+/// with `cap` as the step's output cap. A session holding media (`holds_media`) renders it as a
+/// run of a session in the new storage does, through the media renderer over the session's own
+/// media objects, read from the backend root `objects`.
+#[allow(clippy::too_many_arguments)]
+async fn store_request<B: SessionBackend>(
+    session: &Session<B>,
+    objects: &Path,
+    parts: &MemoryParts,
+    bind: &BindIdentity,
+    step: u64,
+    config: &broca_wal::RunConfig,
+    cap: Option<u32>,
+    holds_media: bool,
+) -> Result<Vec<u8>, String> {
+    let frozen = frozen_of(config)?;
+    if holds_media {
+        return broca_module::store_media::offline_render(
+            session,
+            LocalBackend::new(objects),
+            parts,
+            bind,
+            step,
+            &frozen,
+            config.render_tags,
+            cap,
+        )
+        .await;
+    }
+    let mut opts = broca_session_loop::run::offline_request(session, parts, bind, step)
+        .await
+        .map_err(|error| format!("the new run loop: {error:?}"))?;
+    if let Some(context) = opts.step_context.as_mut() {
+        context.max_output_tokens = cap;
+    }
+    render(&frozen, &opts)
+}
+
 /// The recorded step `recorded`, rebuilt by the new run loop from the converted WAL up to its
 /// start, must render to the bytes today's renderer builds for it, and those to the bytes the
 /// provider was sent.
@@ -947,50 +1054,95 @@ async fn step(
     let prefix = &wal[..=end];
     let cap =
         broca_core::output_reservation::recorded_cap(prefix, broca_protocol::StepId(recorded.step));
-    let (frozen, _, today) = broca_module::wal_render::render_step_with_lineage(
+    let holds_media = !crate::stage::media_digests(&records[..=end]).is_empty();
+    let converted = crate::convert(&records[..=end], lineage)
+        .map_err(|error| at(format!("the conversion: {}", error.0)))?;
+    let parts = MemoryParts {
+        parts: converted.parts.clone(),
+    };
+    let addr = SessionAddr(broca_core::session_addr(verify.session));
+    let triple = crate::stage::triple(verify.session);
+    let rebuilt = if holds_media {
+        // The media renderer reads the session's own objects through a backend of its own, so
+        // the rebuild is written to a folder, with the bytes of every medium it names.
+        let scratch = verify.staging.join("step-rebuild");
+        let _ = std::fs::remove_dir_all(&scratch);
+        let rebuilt = async {
+            let media =
+                crate::stage::read_media(&records[..=end], &converted.records, verify.media)
+                    .map_err(|error| format!("the media: {error}"))?;
+            let mut session = Session::create(
+                LocalBackend::new(&scratch),
+                addr,
+                triple,
+                verify.deployment,
+                !contract,
+            )
+            .await
+            .map_err(|error| format!("a session for the rebuild: {error:?}"))?;
+            crate::stage::append_batch(&mut session, &converted.records, &media)
+                .await
+                .map_err(|error| format!("a session for the rebuild: {error}"))?;
+            let rebuilt = store_request(
+                &session,
+                &scratch,
+                &parts,
+                verify.session,
+                recorded.step,
+                &recorded.config,
+                cap,
+                true,
+            )
+            .await;
+            let _ = session.close().await;
+            rebuilt
+        }
+        .await;
+        let _ = std::fs::remove_dir_all(&scratch);
+        rebuilt
+    } else {
+        let backend = MemoryBackend::default();
+        async {
+            let mut session = Session::create(&backend, addr, triple, verify.deployment, !contract)
+                .await
+                .map_err(|error| format!("a session for the rebuild: {error:?}"))?;
+            session
+                .append(&converted.records, false)
+                .await
+                .map_err(|error| format!("a session for the rebuild: {error:?}"))?;
+            store_request(
+                &session,
+                verify.staging,
+                &parts,
+                verify.session,
+                recorded.step,
+                &recorded.config,
+                cap,
+                false,
+            )
+            .await
+        }
+        .await
+    }
+    .map_err(|error| at(format!("the new run loop's rebuild: {error}")))?;
+    if sha256_hex(&rebuilt) != recorded.digest {
+        return Err(at(
+            "the request differs from the one the provider was sent".into()
+        ));
+    }
+    let today = todays_request(
         lineage,
         prefix,
         &recorded.config,
         &recorded.run,
         recorded.step,
         cap,
-        None,
+        holds_media,
+        verify.media,
     )
     .map_err(|error| at(format!("today's renderer: {error}")))?;
-    let converted = crate::convert(&records[..=end], lineage)
-        .map_err(|error| at(format!("the conversion: {}", error.0)))?;
-    let parts = MemoryParts {
-        parts: converted.parts.clone(),
-    };
-    let backend = MemoryBackend::default();
-    let mut session = Session::create(
-        &backend,
-        SessionAddr(broca_core::session_addr(verify.session)),
-        crate::stage::triple(verify.session),
-        verify.deployment,
-        !contract,
-    )
-    .await
-    .map_err(|error| at(format!("a session for the rebuild: {error:?}")))?;
-    session
-        .append(&converted.records, false)
-        .await
-        .map_err(|error| at(format!("a session for the rebuild: {error:?}")))?;
-    let mut opts =
-        broca_session_loop::run::offline_request(&session, &parts, verify.session, recorded.step)
-            .await
-            .map_err(|error| at(format!("the new run loop's rebuild: {error:?}")))?;
-    if let Some(context) = opts.step_context.as_mut() {
-        context.max_output_tokens = cap;
-    }
-    let rebuilt = render(&frozen, &opts).map_err(at)?;
     if rebuilt != today {
         return Err(at("the rebuilt request differs from today's render".into()));
-    }
-    if sha256_hex(&rebuilt) != recorded.digest {
-        return Err(at(
-            "the request differs from the one the provider was sent".into()
-        ));
     }
     Ok(())
 }
@@ -1122,17 +1274,20 @@ async fn next_request(
         let extended =
             with_next_send(verify.records).map_err(|error| mismatch(NEXT_REQUEST, error))?;
         let wal: Vec<WalRecord> = extended.iter().map(|frame| frame.record.clone()).collect();
-        let (frozen, _, today) = broca_module::wal_render::render_step_with_lineage(
+        let config = match &wal[wal.len() - 2] {
+            WalRecord::RunStarted { config, .. } => config,
+            _ => unreachable!("with_next_send ends with a run start and its step"),
+        };
+        let holds_media = !crate::stage::media_digests(&extended).is_empty();
+        let today = todays_request(
             lineage,
             &wal,
-            match &wal[wal.len() - 2] {
-                WalRecord::RunStarted { config, .. } => config,
-                _ => unreachable!("with_next_send ends with a run start and its step"),
-            },
+            config,
             NEXT_RUN,
             1,
             None,
-            None,
+            holds_media,
+            verify.media,
         )
         .map_err(|error| mismatch(NEXT_REQUEST, format!("today's renderer: {error}")))?;
         let converted = crate::convert(&extended, lineage)
@@ -1151,10 +1306,18 @@ async fn next_request(
         let parts = MemoryParts {
             parts: converted.parts.clone(),
         };
-        let opts = broca_session_loop::run::offline_request(&session, &parts, verify.session, 1)
-            .await
-            .map_err(|error| mismatch(NEXT_REQUEST, format!("the new run loop: {error:?}")))?;
-        let rebuilt = render(&frozen, &opts).map_err(|error| mismatch(NEXT_REQUEST, error))?;
+        let rebuilt = store_request(
+            &session,
+            &scratch,
+            &parts,
+            verify.session,
+            1,
+            config,
+            None,
+            holds_media,
+        )
+        .await
+        .map_err(|error| mismatch(NEXT_REQUEST, error))?;
         session
             .close()
             .await

@@ -69,6 +69,7 @@ fn reason(mismatch: &broca_session_convert::verify::Mismatch) -> String {
 fn refused(report: &mut MoveCheckReport, name: &str, error: StageError) {
     let (map, key) = match &error {
         StageError::NotMovable(reason) => (&mut report.not_movable, (*reason).to_owned()),
+        StageError::MediaMissing(_) => (&mut report.not_movable, "media_missing".to_owned()),
         StageError::Lossy(lost) => (&mut report.lossy, lost.clone()),
         StageError::Failed(failed) => (&mut report.stage_failed, failed.clone()),
     };
@@ -131,8 +132,10 @@ pub(super) fn run(args: &Args) {
             report.example(refusal, &name);
             return;
         }
+        // A corpus of logs carries no media store, so a log naming any medium is refused as a
+        // move with no bytes for it would be: `media_missing`.
         let prepared =
-            match broca_session_convert::stage::prepare(&old.records, old.lineage.as_deref())
+            match broca_session_convert::stage::prepare(&old.records, old.lineage.as_deref(), None)
                 .and_then(|prepared| {
                     match block_on(broca_session_convert::preconditions::converted_refusal(
                         &prepared,
@@ -153,6 +156,7 @@ pub(super) fn run(args: &Args) {
             deployment: &deployment,
             store_root: &store_root,
             staging: &staging,
+            media: None,
         };
         let staged = match block_on(broca_session_convert::stage::write(&stage, prepared)) {
             Ok(staged) => staged,
@@ -170,6 +174,7 @@ pub(super) fn run(args: &Args) {
             staging: &staging,
             converted: &staged.converted,
             mode,
+            media: None,
         }));
         match verified {
             Ok(verified) => {

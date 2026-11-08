@@ -1571,6 +1571,7 @@ async fn a_store_session_reads_as_the_same_history_on_todays_storage() {
 mod controls;
 mod head;
 mod media;
+mod media_render;
 mod photo_sends;
 mod refresh;
 mod streams;

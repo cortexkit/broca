@@ -151,7 +151,7 @@ impl Index {
         }
     }
 
-    fn restore(self, store: Option<MediaStore>) -> SessionMedia {
+    fn restore(self, store: Option<std::sync::Arc<dyn MediaBytes>>) -> SessionMedia {
         let mut session = SessionMedia::metadata(store);
         session.placement = self.placement;
         session.records = self.records;
@@ -381,12 +381,59 @@ impl MediaCheckpoint {
 
     pub fn into_session(
         mut self,
-        store: MediaStore,
+        store: impl MediaBytes + 'static,
         budget: Option<broca_protocol::request::BudgetConfig>,
     ) -> (SessionMedia, Vec<MediaHistory>, bool, u64) {
-        self.session.store = Some(store);
+        self.session.store = Some(std::sync::Arc::new(store));
         self.session.placement = Placement::from_index_seed(self.session.placement, budget);
         (self.session, self.history, self.step_open, self.at_seq)
+    }
+}
+
+/// A session's media checkpoint folded record by record from its first record, with the seed
+/// today's admission gives a run at any point (see `initialize_media_checkpoint`): the whole
+/// fold once any record captured media, and before that only the position and placement, as
+/// `WalHandle::empty_media_checkpoint` gives a session that never captured any.
+#[derive(Debug, Clone)]
+pub struct MediaSeedFold {
+    checkpoint: MediaCheckpoint,
+    captured: bool,
+}
+
+impl Default for MediaSeedFold {
+    fn default() -> Self {
+        Self {
+            checkpoint: MediaCheckpoint::empty(),
+            captured: false,
+        }
+    }
+}
+
+impl MediaSeedFold {
+    /// Folds the record at `seq`, the one after the last folded.
+    pub fn fold(&mut self, seq: u64, record: &WalRecord) -> Result<(), String> {
+        if seq != self.checkpoint.at_seq + 1 {
+            return Err(format!(
+                "media fold expected record {} and got record {seq}",
+                self.checkpoint.at_seq + 1
+            ));
+        }
+        self.captured |= crate::compaction::CapturedMedia::captures_any(record);
+        self.checkpoint.fold(seq, record)
+    }
+
+    /// The seq of the last record folded.
+    pub fn at_seq(&self) -> u64 {
+        self.checkpoint.at_seq
+    }
+
+    /// The checkpoint a run renders from, through the last record folded.
+    pub fn seed(&self) -> MediaCheckpoint {
+        if self.captured {
+            self.checkpoint.clone()
+        } else {
+            MediaCheckpoint::empty_at(self.checkpoint.session.placement.clone(), self.at_seq())
+        }
     }
 }
 

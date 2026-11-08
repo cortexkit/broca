@@ -2982,6 +2982,7 @@ mod executor {
             auth_selection,
             // The actor's in-flight step, which `run.status` serves for its active run.
             step_progress: control.step_progress.clone(),
+            model_call_ready: None,
         }
     }
 
@@ -4575,6 +4576,7 @@ mod executor {
             writer: &mut broca_session_loop::shared::ActorWriter,
             parts: &mut dyn broca_session_loop::parts::Parts,
             mode: broca_module::executor::StoreRunMode,
+            media: Option<broca_module::store_media::StoreRunMediaWait>,
             out: &mpsc::Sender<OutputEvent>,
         ) -> Result<broca_session_loop::Finished, broca_module::executor::StoreRunError> {
             use broca_module::executor::{StoreRunError, StoreRunMode};
@@ -4655,29 +4657,61 @@ mod executor {
                         .into(),
                 )));
             }
-            if resolved.provider.supports_media_renderer() && !req.tools.is_empty() {
-                // Today's media renderer reads captured images from the WAL. Until one reads a
-                // store session's media objects, a run that could carry tool images refuses
-                // rather than send a request without them.
-                return Err(StoreRunError::Admission(RunError::Config(
-                    "a run whose provider renders tool images isn't served on the new session \
-                     storage yet"
-                        .into(),
-                )));
-            }
             let holds_media = req
                 .input
                 .iter()
                 .chain(writer.conversation().messages.iter())
                 .any(|message| !broca_session_store::session::message_media(message).is_empty());
-            if resolved.provider.supports_media_renderer() && holds_media {
-                // Likewise for a send's attachments and the media the session's messages hold:
-                // they are stored as the session's own objects, which no renderer reads yet.
-                return Err(StoreRunError::Admission(RunError::Config(
-                    "a run whose provider renders images isn't served on the new session \
-                     storage yet"
-                        .into(),
-                )));
+            let mut model_call_ready = None;
+            if resolved.provider.supports_media_renderer() && (holds_media || !req.tools.is_empty())
+            {
+                // As `execute` installs today's renderer for a run that may carry media: the
+                // same projection, folded from the session's records turned back into today's
+                // (see `broca_module::store_media`), reading the session's own media objects.
+                // The session's first such run may still be waiting for the fold to be built;
+                // each model call waits for it first, and a request whose media can't be
+                // rendered is refused by name before anything is sent.
+                let media = media.ok_or_else(|| {
+                    StoreRunError::Admission(RunError::Wal(
+                        "store_media_unavailable: the run was started without its media fold"
+                            .into(),
+                    ))
+                })?;
+                let frozen: broca_provider::wire::FrozenRenderConfig =
+                    serde_json::from_value(resolved.provider.render_config_blob())
+                        .expect("resolved provider has a frozen config");
+                let budget = history
+                    .prior_run
+                    .as_ref()
+                    .and_then(|prior| prior.config.budget.clone());
+                let lazy = broca_module::store_media::LazyRenderer::new(
+                    media,
+                    Box::new(move |bytes, checkpoint, read_tail| {
+                        let media = broca_provider::media_request::LiveMedia::from_checkpoint(
+                            bytes,
+                            checkpoint,
+                            budget,
+                            frozen.media,
+                            read_tail,
+                        )?;
+                        Ok(Arc::new(
+                            move |frozen: &serde_json::Value,
+                                  opts: &broca_protocol::request::CallOptions,
+                                  tags: bool,
+                                  commit: bool,
+                                  provenance: Option<
+                                &mut broca_protocol::render_provenance::RenderProvenance,
+                            >| {
+                                media.render_with_provenance(frozen, opts, tags, commit, provenance)
+                            },
+                        )
+                            as Arc<broca_core::provider::MediaRequestRenderer>)
+                    }),
+                );
+                resolved
+                    .provider
+                    .set_media_request_renderer(lazy.renderer());
+                model_call_ready = Some(lazy as Arc<dyn broca_session_loop::run::ModelCallReady>);
             }
             if broca_provider::person_media::references(&req.input)
                 .next()
@@ -4731,7 +4765,7 @@ mod executor {
                 Arc::new(StoreAccountReports(reporter))
                     as Arc<dyn broca_session_loop::AccountReports>
             });
-            let seams = store_seams(
+            let mut seams = store_seams(
                 &resolved.provider,
                 tools,
                 req,
@@ -4744,6 +4778,7 @@ mod executor {
                 resolution.selection.clone(),
                 self.max_same_account_wait,
             );
+            seams.model_call_ready = model_call_ready;
             let finished = if fresh_episode {
                 match broca_session_loop::admit::admission(
                     req,
@@ -6095,6 +6130,7 @@ mod executor {
                 mut writer,
                 mut parts,
                 mode,
+                media,
             } = job;
             let result = self
                 .run_on_store(
@@ -6104,6 +6140,7 @@ mod executor {
                     &mut writer,
                     parts.as_mut(),
                     mode,
+                    media,
                     &out,
                 )
                 .await;

@@ -31,6 +31,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use broca_core::media_store::{MediaBytes, MediaStore};
 use broca_core::RunIndexRow;
 use broca_module::registry::store_move::{FenceRefusal, MoveRefusal, StoreMoveFence, StoreMover};
 use broca_module::LineageRegistry;
@@ -323,6 +324,40 @@ fn read_wal(path: &Path) -> Result<(Vec<FramedRecord>, Option<WalLineageId>), Mo
     }
 }
 
+/// Today's media store for the session whose live WAL is `wal`: the store of the class the WAL's
+/// folder chooses, where the module publishes the session's media. `None` when the session's
+/// `records` name no medium, or when that store doesn't exist, since opening it would create it:
+/// a session naming media then has none to copy, and its move is refused for them.
+fn todays_media(
+    wal_store: &broca_core::FileWalStore,
+    state_root: &Path,
+    wal: &Path,
+    records: &[FramedRecord],
+) -> Result<Option<MediaStore>, MoveRefusal> {
+    use broca_core::media_store::MediaStoreClass;
+    if broca_session_convert::stage::media_digests(records).is_empty() {
+        return Ok(None);
+    }
+    let class = if wal.parent() == Some(wal_store.durable_root().as_path()) {
+        MediaStoreClass::Durable
+    } else if wal.parent() == Some(wal_store.ephemeral_root().as_path()) {
+        MediaStoreClass::Ephemeral
+    } else {
+        MediaStoreClass::NonDurable
+    };
+    let root = state_root.join(class.directory());
+    if !(root.join("objects").is_dir() && root.join("refs").is_dir()) {
+        return Ok(None);
+    }
+    MediaStore::open(state_root, class)
+        .map(Some)
+        .map_err(io_failed("today's media store couldn't be opened"))
+}
+
+fn media_bytes(media: &Option<MediaStore>) -> Option<&dyn MediaBytes> {
+    media.as_ref().map(|store| store as &dyn MediaBytes)
+}
+
 /// The move's paths, from its journal.
 struct Paths {
     wal: PathBuf,
@@ -384,7 +419,8 @@ impl StoreMove {
             return Err(not_movable("no_run").into());
         }
         self.check_idle(key, &records, lineage)?;
-        self.prepare(&records, lineage).await?;
+        let media = todays_media(&self.wal_store, &state_root, &wal, &records)?;
+        self.prepare(&records, lineage, media_bytes(&media)).await?;
 
         let move_id = new_move_id()?;
         let journal = MoveJournal {
@@ -471,24 +507,35 @@ impl StoreMove {
     }
 
     /// Converts the session, refusing what the move can't carry and what the new run loop
-    /// refuses. Writes nothing.
+    /// refuses, and reads the bytes of its media from `media`, today's media store for it.
+    /// Writes nothing.
     async fn prepare(
         &self,
         records: &[FramedRecord],
         lineage: Option<WalLineageId>,
+        media: Option<&dyn MediaBytes>,
     ) -> Result<broca_session_convert::stage::Prepared, MoveRefusal> {
         let lineage = lineage.map(|id| id.to_string());
-        let prepared = match broca_session_convert::stage::prepare(records, lineage.as_deref()) {
-            Ok(prepared) => prepared,
-            Err(StageError::NotMovable(reason)) => return Err(not_movable(reason)),
-            Err(StageError::Lossy(lost)) => {
-                return Err(not_movable("conversion_lossy").with_detail(json!({
-                    "reason": "conversion_lossy",
-                    "lost": lost,
-                })))
-            }
-            Err(StageError::Failed(error)) => return Err(unavailable("conversion", error)),
-        };
+        let prepared =
+            match broca_session_convert::stage::prepare(records, lineage.as_deref(), media) {
+                Ok(prepared) => prepared,
+                Err(StageError::NotMovable(reason)) => return Err(not_movable(reason)),
+                Err(StageError::MediaMissing(missing)) => {
+                    return Err(not_movable("media_missing").with_detail(json!({
+                        "reason": "media_missing",
+                        "digest": missing.digest,
+                        "state": missing.state,
+                        "missing": missing.missing,
+                    })))
+                }
+                Err(StageError::Lossy(lost)) => {
+                    return Err(not_movable("conversion_lossy").with_detail(json!({
+                        "reason": "conversion_lossy",
+                        "lost": lost,
+                    })))
+                }
+                Err(StageError::Failed(error)) => return Err(unavailable("conversion", error)),
+            };
         match broca_session_convert::preconditions::converted_refusal(&prepared).await {
             Ok(None) => Ok(prepared),
             Ok(Some(reason)) => Err(not_movable(reason)),
@@ -596,7 +643,13 @@ impl StoreMove {
         // The preconditions again, on exactly the frozen prefix.
         let (records, lineage) = before!(read_wal(&paths.wal));
         before!(self.check_idle(key, &records, lineage));
-        let prepared = before!(self.prepare(&records, lineage).await);
+        let media = before!(todays_media(
+            &self.wal_store,
+            &state_root,
+            &paths.wal,
+            &records
+        ));
+        let prepared = before!(self.prepare(&records, lineage, media_bytes(&media)).await);
         journal.appends_in_conversation = Some(prepared.appends_in_conversation);
         before!(write_journal(&state_root, &journal)
             .map_err(io_failed("the move's journal couldn't be written")));
@@ -611,6 +664,7 @@ impl StoreMove {
             deployment: new_session_cipher(runtime),
             store_root: &store,
             staging: &paths.staging,
+            media: media_bytes(&media),
         };
         let staged = before!(broca_session_convert::stage::write(&stage, prepared)
             .await
@@ -628,6 +682,7 @@ impl StoreMove {
             staging: &paths.staging,
             converted: &staged.converted,
             mode: Mode::Move,
+            media: media_bytes(&media),
         })
         .await
         .map_err(|mismatch| {

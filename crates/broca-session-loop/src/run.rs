@@ -230,6 +230,18 @@ pub struct Seams<'a, P, T> {
     /// today's loop does (`RunControl::step_progress`): the session's owner serves it as an
     /// active run's `step`. It is cleared when the step's call ends. Never a durability input.
     pub step_progress: Option<broca_core::provider::LiveStepProgress>,
+    /// What each model call waits for before the provider is asked to render and send it, such
+    /// as the media its requests are rendered with while they are still being prepared. A cancel
+    /// during the wait ends the step cancelled, as a cancel during the call does.
+    pub model_call_ready: Option<Arc<dyn ModelCallReady>>,
+}
+
+/// Something a run's model calls wait for (see [`Seams::model_call_ready`]).
+#[async_trait::async_trait]
+pub trait ModelCallReady: Send + Sync {
+    /// Returns once a model call may be rendered, or why none can be: the step then fails with
+    /// that error, never sending a request.
+    async fn ready(&self) -> Result<(), ProviderError>;
 }
 
 /// The run loop's account reports, as today's `broca_core::AccountReporter` receives them. Each
@@ -1479,6 +1491,28 @@ pub async fn offline_request<W: Writer>(
     bind: &broca_protocol::BindIdentity,
     step_id: u64,
 ) -> Result<CallOptions, LoopError> {
+    offline_request_for(writer, parts, bind, step_id, false).await
+}
+
+/// [`offline_request`] for a run whose provider renders media: each message holding media is
+/// left untagged, as the run loop leaves it for a media renderer that tags its own copy of the
+/// request after preparing the media.
+pub async fn offline_media_request<W: Writer>(
+    writer: &W,
+    parts: &dyn Parts,
+    bind: &broca_protocol::BindIdentity,
+    step_id: u64,
+) -> Result<CallOptions, LoopError> {
+    offline_request_for(writer, parts, bind, step_id, true).await
+}
+
+async fn offline_request_for<W: Writer>(
+    writer: &W,
+    parts: &dyn Parts,
+    bind: &broca_protocol::BindIdentity,
+    step_id: u64,
+    defer_media_tags: bool,
+) -> Result<CallOptions, LoopError> {
     refuse_first_protocol_compaction(writer)?;
     let run = writer
         .operations()
@@ -1499,7 +1533,15 @@ pub async fn offline_request<W: Writer>(
     let run_rules = run_tag_rules(writer, &episodes).await?;
     let tools = Arc::new(admission.tools.clone());
     let opts = call_options(
-        writer, &admission, &tools, &episodes, &run_rules, None, step_id, compacted,
+        writer,
+        &admission,
+        &tools,
+        &episodes,
+        &run_rules,
+        None,
+        step_id,
+        compacted,
+        defer_media_tags,
     )?;
     if !compacted {
         return Ok(opts);
@@ -1529,6 +1571,12 @@ where
     let episodes = render_episodes(writer, parts)?;
     let tools = Arc::new(admission.tools.clone());
     let manifest = ToolManifest::from_tools(admission.tools.clone());
+    // As today's loop asks once per run: a provider whose media renderer tags its own copy of
+    // each request takes the run's tag choice here, and the loop leaves media-holding messages
+    // untagged, since preparing their media needs the parts where the model put them.
+    let defer_media_tags = seams
+        .provider
+        .defer_media_tags(frozen_render_tags(admission));
     let mut structured = structured_of(admission);
     let hook_plan = hook_plan(admission, seams)?;
     let hooks = hook_plan
@@ -1784,6 +1832,7 @@ where
             seams.session_address.clone(),
             step_id,
             compaction.is_some(),
+            defer_media_tags,
         )?;
         // The step names the account routing gives the run now, as today's does.
         if let Some(context) = opts.step_context.as_mut() {
@@ -2619,6 +2668,7 @@ fn call_options<W: Writer>(
     session_address: Option<String>,
     step_id: u64,
     compacted: bool,
+    defer_media_tags: bool,
 ) -> Result<CallOptions, LoopError> {
     let mut prompt = writer.conversation().messages.clone();
     repetition_guidance(
@@ -2661,7 +2711,24 @@ fn call_options<W: Writer>(
                 .map_err(overflow)?;
         }
     }
-    if !contract && frozen_render_tags(admission) {
+    if !contract && defer_media_tags {
+        // The provider's media renderer tags a message holding media itself, on its own copy of
+        // the request, after preparing that message's media (see `defer_media_tags` above).
+        let render = frozen_render_tags(admission);
+        for message in prompt.iter_mut() {
+            if !broca_session_store::session::message_media(message).is_empty() {
+                continue;
+            }
+            if render {
+                render_tags_into(
+                    std::slice::from_mut(message),
+                    TagRendering::for_render_config(&admission.render_config),
+                );
+            } else {
+                clean_computed_into(std::slice::from_mut(message));
+            }
+        }
+    } else if !contract && frozen_render_tags(admission) {
         // A run frozen with part numbers in the model's view sends user and tool-result text with
         // its numbers in front, as today's loop renders it.
         render_tags_into(
@@ -2929,6 +2996,16 @@ async fn model_step<W: Writer, P: Provider, T>(
             max_content_gap_ms: None,
             max_content_gap_ended_at_ms: None,
         });
+    }
+    if let Some(ready) = &seams.model_call_ready {
+        tokio::select! {
+            ready = ready.ready() => {
+                if let Err(error) = ready {
+                    return Ok(Err(StepFailure::Error(Box::new(error), 0, None)));
+                }
+            }
+            _ = seams.cancel.cancelled() => return Ok(Err(StepFailure::Cancelled)),
+        }
     }
     let runtime = StepRuntime {
         cancel: seams.cancel.clone(),

@@ -168,6 +168,7 @@ impl RunExecutor for Loops {
                 max_same_account_wait: Default::default(),
                 auth_selection: None,
                 step_progress: control.step_progress.clone(),
+                model_call_ready: None,
             };
             match mode {
                 StoreRunMode::Fresh => {

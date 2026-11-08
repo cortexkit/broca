@@ -49,21 +49,29 @@ impl OpenLogIndex {
                     self.facts.entry(announced).or_insert(facts.ordinal);
                 }
             }
-            Record::ToolReply(reply) => {
-                for object in &reply.media {
-                    if let Some(media) = media_part(&reply.result, object.part) {
-                        self.media
-                            .entry(media.sha256.clone())
-                            .or_insert_with(|| object.clone());
-                    }
-                }
-            }
             _ => {
-                for (sha256, object) in stored_media(record) {
+                for (sha256, object) in record_objects(record) {
                     self.media.entry(sha256).or_insert(object);
                 }
             }
         }
+    }
+}
+
+/// Every medium `record` says where the bytes of are, by digest, with the object they are: a
+/// tool result's media parts, and an input message's, a queued send's or a steer's media. In
+/// record order; a digest the record names twice is listed twice.
+pub fn record_objects(record: &Record) -> Vec<(String, MediaObject)> {
+    match record {
+        Record::ToolReply(reply) => reply
+            .media
+            .iter()
+            .filter_map(|object| {
+                media_part(&reply.result, object.part)
+                    .map(|media| (media.sha256.clone(), object.clone()))
+            })
+            .collect(),
+        _ => stored_media(record),
     }
 }
 
@@ -303,16 +311,96 @@ fn matches(media: &MediaRef, bytes: &[u8]) -> bool {
     media.byte_size == bytes.len() as u64 && media.sha256 == hex(&Sha256::digest(bytes))
 }
 
+/// The name of the media object written under `log` by writer `generation`, named by the record
+/// at `seq`, for bytes whose digest is `sha256`. The digest is hashed with a key derived from the
+/// session key, so a name says nothing about the content outside the session, and the same bytes
+/// always get the same name.
+fn object_name(
+    key: &crate::keys::DataKey,
+    log: &crate::codec::Id128,
+    generation: &crate::codec::Id128,
+    seq: u64,
+    sha256: &str,
+) -> String {
+    let key = key.derive(b"media-object-name");
+    let h = crate::prune::keyed_digest(&key, sha256.as_bytes()).0;
+    format!(
+        "{}/a/{}.{}-media-{}",
+        hex(&log.0),
+        &hex(&generation.0)[..16],
+        seq,
+        &hex(&h)[..32],
+    )
+}
+
+/// The bytes of the object named `name`, opened under the session key and checked against
+/// `reference`.
+async fn read_object<B: SessionBackend>(
+    backend: &B,
+    addr: &crate::backend::SessionAddr,
+    key: &crate::keys::DataKey,
+    name: String,
+    reference: &MediaRef,
+) -> Result<Vec<u8>, SessionError> {
+    let sealed = backend
+        .get_object(addr, &name)
+        .await?
+        .ok_or_else(|| SessionError::Media(MediaError::Missing(name.clone())))?;
+    let bytes = key
+        .frame_key()
+        .open_unit(name.as_bytes(), &sealed)
+        .ok_or_else(|| SessionError::Media(MediaError::Corrupt(name.clone())))?;
+    if !matches(reference, &bytes) {
+        return Err(SessionError::Media(MediaError::Corrupt(name)));
+    }
+    Ok(bytes)
+}
+
+/// A session's media objects, read apart from its writer over a handle on the same storage that
+/// only reads, as [`crate::session::StoredRecords`] reads its records. A render reads a medium's
+/// bytes through it while the session's actor keeps writing.
+pub struct MediaObjects<R> {
+    backend: R,
+    addr: crate::backend::SessionAddr,
+    key: crate::keys::DataKey,
+}
+
+impl<R: SessionBackend> MediaObjects<R> {
+    /// The bytes of the object `object` points at, which must be `reference`'s bytes.
+    pub async fn read(
+        &self,
+        object: &MediaObject,
+        reference: &MediaRef,
+    ) -> Result<Vec<u8>, SessionError> {
+        let name = object_name(
+            &self.key,
+            &object.log,
+            &object.generation,
+            object.seq,
+            &reference.sha256,
+        );
+        read_object(&self.backend, &self.addr, &self.key, name, reference).await
+    }
+}
+
 impl<B: SessionBackend> Session<B> {
-    /// The name of the object `object` points at, for bytes whose digest is `sha256`. The digest
-    /// is hashed with a key derived from the session key, so a name says nothing about the
-    /// content outside the session, and the same bytes always get the same name.
+    /// This session's media objects, read over `backend`, a handle on the same storage that only
+    /// reads.
+    pub fn media_objects<R: SessionBackend>(&self, backend: R) -> MediaObjects<R> {
+        MediaObjects {
+            backend,
+            addr: self.addr.clone(),
+            key: self.key.clone(),
+        }
+    }
+
+    /// The name of the object `object` points at, for bytes whose digest is `sha256`.
     fn media_name(&self, object: &MediaObject, sha256: &str) -> String {
         self.media_name_at(&object.log, &object.generation, object.seq, sha256)
     }
 
     /// The name of the media object written under `log` by writer `generation`, named by the
-    /// record at `seq`, for bytes whose digest is `sha256`.
+    /// record at `seq`, for bytes whose digest is `sha256` (see [`object_name`]).
     pub(super) fn media_name_at(
         &self,
         log: &crate::codec::Id128,
@@ -320,15 +408,7 @@ impl<B: SessionBackend> Session<B> {
         seq: u64,
         sha256: &str,
     ) -> String {
-        let key = self.key.derive(b"media-object-name");
-        let h = crate::prune::keyed_digest(&key, sha256.as_bytes()).0;
-        format!(
-            "{}/a/{}.{}-media-{}",
-            hex(&log.0),
-            &hex(&generation.0)[..16],
-            seq,
-            &hex(&h)[..32],
-        )
+        object_name(&self.key, log, generation, seq, sha256)
     }
 
     /// Appends `records` as [`append`](Self::append) does, after storing the bytes of each media
@@ -623,20 +703,7 @@ impl<B: SessionBackend> Session<B> {
         name: String,
         reference: &MediaRef,
     ) -> Result<Vec<u8>, SessionError> {
-        let sealed = self
-            .backend
-            .get_object(&self.addr, &name)
-            .await?
-            .ok_or_else(|| SessionError::Media(MediaError::Missing(name.clone())))?;
-        let bytes = self
-            .key
-            .frame_key()
-            .open_unit(name.as_bytes(), &sealed)
-            .ok_or_else(|| SessionError::Media(MediaError::Corrupt(name.clone())))?;
-        if !matches(reference, &bytes) {
-            return Err(SessionError::Media(MediaError::Corrupt(name)));
-        }
-        Ok(bytes)
+        read_object(&self.backend, &self.addr, &self.key, name, reference).await
     }
 
     /// The name of the object the open log stores `reference`'s bytes under. Tests only.

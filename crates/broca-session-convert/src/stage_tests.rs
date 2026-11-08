@@ -153,6 +153,7 @@ fn staged_in(
         deployment,
         store_root: &root.join("session-store"),
         staging: &root.join("session-store/staging/store-move-test"),
+        media: None,
     }))
     .unwrap()
 }
@@ -185,6 +186,7 @@ fn verified_in(
         staging: &root.join("session-store/staging/store-move-test"),
         converted,
         mode,
+        media: None,
     }))
 }
 
@@ -356,32 +358,254 @@ fn a_planted_difference_fails_the_check_that_compares_it() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// A session that names a medium isn't staged until the new storage can store input media:
-/// it is refused by name, and nothing is written.
-#[test]
-fn a_session_holding_media_is_refused_before_anything_is_written() {
-    let root = scratch("media");
-    let (mut records, lineage) = written(&root);
+/// Media bytes by digest, as today's media store would give them back: a medium it holds whole,
+/// one whose bytes no longer match their digest, or none.
+#[derive(Debug, Default)]
+struct Media {
+    whole: std::collections::BTreeMap<String, Vec<u8>>,
+    corrupt: std::collections::BTreeSet<String>,
+}
+
+impl broca_core::media_store::MediaBytes for Media {
+    fn read_verified(
+        &self,
+        reference: &broca_protocol::MediaRef,
+    ) -> Result<Vec<u8>, broca_core::media_store::MediaReadError> {
+        use broca_core::media_store::MediaReadError;
+        if self.corrupt.contains(&reference.sha256) {
+            return Err(MediaReadError::Corrupt(reference.sha256.clone()));
+        }
+        self.whole
+            .get(&reference.sha256)
+            .cloned()
+            .ok_or_else(|| MediaReadError::Missing(reference.sha256.clone()))
+    }
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    crate::verify::sha256_hex(bytes)
+}
+
+/// The reference of an image holding `bytes`.
+fn image_ref(bytes: &[u8]) -> serde_json::Value {
+    json!({"kind": "image", "mime": "image/png", "byte_size": bytes.len(), "width": 1,
+        "height": 1, "sha256": sha256(bytes)})
+}
+
+/// An image block holding `bytes`.
+fn image(bytes: &[u8]) -> serde_json::Value {
+    let mut block = image_ref(bytes);
+    block["type"] = json!("media");
+    block
+}
+
+/// The WAL of [`written`], its first run's input holding `images` beside its text.
+fn with_images(root: &Path, images: &[&[u8]]) -> (Vec<FramedRecord>, Option<WalLineageId>) {
+    let (mut records, lineage) = written(root);
     if let WalRecord::RunStarted { input, .. } = &mut records[0].record {
+        let mut content = vec![json!({"type": "text", "text": "Hello."})];
+        content.extend(images.iter().map(|bytes| image(bytes)));
         *input = std::sync::Arc::new(vec![serde_json::from_value(json!({
-            "role": "user", "content": [{"type": "media", "kind": "image",
-                "mime": "image/png", "byte_size": 3, "width": 1, "height": 1,
-                "sha256": "a".repeat(64)}],
+            "role": "user", "content": content,
         }))
         .unwrap()]);
     }
+    (records, lineage)
+}
+
+fn stage_with(
+    root: &Path,
+    records: &[FramedRecord],
+    lineage: Option<WalLineageId>,
+    media: &Media,
+) -> Result<Staged, StageError> {
     let lineage = lineage.map(|id| id.to_string());
-    let refused = block_on(stage(Stage {
-        records: &records,
+    block_on(stage(Stage {
+        records,
         lineage: lineage.as_deref(),
         session: &session(),
         deployment: &deployment(),
         store_root: &root.join("session-store"),
         staging: &root.join("session-store/staging/store-move-test"),
+        media: Some(media),
+    }))
+}
+
+/// A session naming a medium today's media store doesn't hold, or holds with bytes that no
+/// longer match its digest, is refused as `media_missing`, naming the first such medium, whether
+/// it is absent or corrupt, and how many there are; nothing is written.
+#[test]
+fn a_session_whose_media_cant_be_read_is_refused_before_anything_is_written() {
+    let (one, two): (&[u8], &[u8]) = (b"first image", b"second image");
+    let (first, second) = if sha256(one) < sha256(two) {
+        (one, two)
+    } else {
+        (two, one)
+    };
+    for (state, media) in [
+        ("absent", Media::default()),
+        (
+            "corrupt",
+            Media {
+                corrupt: [sha256(first), sha256(second)].into(),
+                ..Media::default()
+            },
+        ),
+    ] {
+        let root = scratch(&format!("media-{state}"));
+        let (records, lineage) = with_images(&root, &[first, second]);
+        let refused = stage_with(&root, &records, lineage, &media).unwrap_err();
+        assert_eq!(
+            refused,
+            StageError::MediaMissing(crate::stage::MediaMissing {
+                digest: sha256(first),
+                state,
+                missing: 2,
+            })
+        );
+        assert!(!root.join("session-store").exists(), "{state}");
+        // With no media store at all, every medium is absent.
+        let lineage_text = lineage.map(|id| id.to_string());
+        let none = crate::stage::prepare(&records, lineage_text.as_deref(), None).unwrap_err();
+        assert!(
+            matches!(&none, StageError::MediaMissing(missing) if missing.state == "absent"),
+            "{none:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+/// A session holding media is staged with an object for each, which reads back as today's bytes
+/// on the verifier's media check; a staged object whose bytes differ fails that check by name.
+#[test]
+fn a_session_holding_media_is_staged_with_its_bytes() {
+    let root = scratch("media-staged");
+    let (one, two): (&[u8], &[u8]) = (b"first image", b"second image");
+    let (records, lineage) = with_images(&root, &[one, two]);
+    let media = Media {
+        whole: [(sha256(one), one.to_vec()), (sha256(two), two.to_vec())].into(),
+        ..Media::default()
+    };
+    let staged = stage_with(&root, &records, lineage, &media).unwrap();
+    assert_eq!(staged.media, 2);
+    let staging = root.join("session-store/staging/store-move-test");
+    let view = block_on(Session::view(
+        LocalBackend::new(&staging),
+        SessionAddr(broca_core::session_addr(&session())),
+        &crate::stage::triple(&session()),
+        &deployment(),
+    ))
+    .unwrap();
+    for bytes in [one, two] {
+        let named = block_on(view.named_media(&sha256(bytes)))
+            .unwrap()
+            .expect("the staged session names the medium");
+        assert!(named.stored(), "an object holds it");
+        assert_eq!(block_on(view.named_media_bytes(&named)).unwrap(), bytes);
+    }
+    drop(view);
+    let check = |media: &Media| {
+        block_on(verify(Verify {
+            records: &records,
+            lineage,
+            session: &session(),
+            deployment: &deployment(),
+            store_root: &root.join("session-store"),
+            staging: &staging,
+            converted: &staged.converted,
+            mode: Mode::Move,
+            media: Some(media),
+        }))
+        .unwrap_err()
+    };
+    // The media agree, so the checks past them run. The WAL's recorded requests were rendered
+    // before its input held the images, so its last step is the first check to differ.
+    let past = check(&media);
+    assert_eq!(past.check, crate::verify::LAST_STEP, "{past}");
+    let mut changed = media;
+    changed.whole.insert(sha256(two), b"other bytes".to_vec());
+    let failed = check(&changed);
+    assert_eq!(failed.check, crate::verify::MEDIA, "{failed}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A tool's image is staged as the object of the tool result naming it, and reads back as
+/// today's bytes on the verifier's media check.
+#[test]
+fn a_tool_results_image_is_staged_with_its_bytes() {
+    let root = scratch("media-tool");
+    let (mut records, lineage) = written(&root);
+    let shot: &[u8] = b"a screenshot";
+    let last = records.last().unwrap().seq;
+    let run = [
+        json!({"type": "step_started", "step_id": 3}),
+        json!({"type": "model_step_finished", "step_id": 3,
+            "assistant_message": {"message_id": "m3", "content": [{"type": "tool_call",
+                "tool_call_id": "c1", "tool_name": "photo", "input": {}}]},
+            "usage": {"input_tokens": 3, "output_tokens": 1},
+            "finish_reason": "tool_calls", "retries_used": 0}),
+        json!({"type": "tool_batch_started", "batch_id": "b1", "step_id": 3,
+            "planned_calls": ["c1"]}),
+        json!({"type": "tool_dispatch_intent", "batch_id": "b1", "tool_call_id": "c1",
+            "args": {}}),
+        json!({"type": "tool_result", "batch_id": "b1", "result": {"tool_call_id": "c1",
+            "output": {"kind": "parts", "parts": [{"kind": "text", "text": "the screen"},
+                {"kind": "media", "media": image_ref(shot)}]}, "is_error": false},
+            "outcome": "completed"}),
+        json!({"type": "tool_batch_finished", "batch_id": "b1"}),
+        json!({"type": "step_started", "step_id": 4}),
+        json!({"type": "model_step_finished", "step_id": 4,
+            "assistant_message": {"message_id": "m4",
+                "content": [{"type": "text", "text": "Seen."}]},
+            "usage": {"input_tokens": 3, "output_tokens": 1},
+            "finish_reason": "stop", "retries_used": 0}),
+        json!({"type": "run_finished", "reason": "completed", "ts_ms": 3_003,
+            "usage": {"input_tokens": 6, "output_tokens": 2}, "retries_used": 0}),
+    ];
+    let start = std::iter::once(run_started("r3", 3_000, "Look."));
+    for (at, record) in start.chain(run.into_iter().map(self::record)).enumerate() {
+        records.push(FramedRecord {
+            seq: last + 1 + at as u64,
+            fence: 1,
+            record,
+        });
+    }
+    let media = Media {
+        whole: [(sha256(shot), shot.to_vec())].into(),
+        ..Media::default()
+    };
+    let staged = stage_with(&root, &records, lineage, &media).unwrap();
+    assert_eq!(staged.media, 1);
+    let staging = root.join("session-store/staging/store-move-test");
+    let view = block_on(Session::view(
+        LocalBackend::new(&staging),
+        SessionAddr(broca_core::session_addr(&session())),
+        &crate::stage::triple(&session()),
+        &deployment(),
+    ))
+    .unwrap();
+    let named = block_on(view.named_media(&sha256(shot)))
+        .unwrap()
+        .expect("the staged session names the image");
+    assert!(named.stored(), "an object holds it");
+    assert_eq!(block_on(view.named_media_bytes(&named)).unwrap(), shot);
+    drop(view);
+    // The media agree, so the checks past them run, up to the session's next request: today's
+    // offline render can't render a request holding media yet, which that check names.
+    let failed = block_on(verify(Verify {
+        records: &records,
+        lineage,
+        session: &session(),
+        deployment: &deployment(),
+        store_root: &root.join("session-store"),
+        staging: &staging,
+        converted: &staged.converted,
+        mode: Mode::Move,
+        media: Some(&media),
     }))
     .unwrap_err();
-    assert_eq!(refused, StageError::NotMovable("media"));
-    assert!(!root.join("session-store").exists());
+    assert_eq!(failed.check, crate::verify::NEXT_REQUEST, "{failed}");
+    assert!(failed.detail.contains("media"), "{failed}");
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -394,7 +618,7 @@ fn the_wal_preconditions_name_open_work_and_an_open_batch() {
     let (records, lineage) = written(&root);
     assert_eq!(wal_refusal(&records, lineage), None);
     let prepared =
-        crate::stage::prepare(&records, lineage.map(|id| id.to_string()).as_deref()).unwrap();
+        crate::stage::prepare(&records, lineage.map(|id| id.to_string()).as_deref(), None).unwrap();
     assert_eq!(block_on(converted_refusal(&prepared)).unwrap(), None);
     // The last run hasn't ended.
     assert_eq!(

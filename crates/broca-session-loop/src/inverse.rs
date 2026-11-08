@@ -1,0 +1,867 @@
+//! Converts new records back into today's record JSON. Comparing the result with the original
+//! log proves a conversion lost nothing: every field of every old record was placed somewhere it
+//! can be read back from.
+//!
+//! The forward conversion writes each old record as one ledger *anchor* (`RunStart`, `StepEnd`,
+//! `ToolOutcome`, an `Event`, ...), with any transcript records it split off written just before
+//! the anchor, except a run start's input entries, which follow it. So the inverse buffers
+//! transcript records until the next ledger record claims them, and refuses a log where a
+//! transcript record is left unclaimed or claimed by the wrong anchor.
+//!
+//! Steered and delivered messages are the exception: their ledger record keeps them whole, and
+//! the transcript holds copies where the conversation places them, each naming its record by
+//! seq. The inverse rebuilds those records from the ledger alone and checks each copy against
+//! the record it names.
+
+use std::collections::{BTreeMap, HashMap};
+
+use crate::today::{
+    self, fill_manifest, finish_manifest, hex, json, members, model_step_finished, set,
+};
+use broca_protocol::content::Message;
+use broca_session_store::codec::Digest;
+use broca_session_store::record::{
+    Attempt, BudgetFire, BudgetFiring, CallOutcome, CancelPoint, Delivery, Event, Input, PartKind,
+    PartRef, Placement, QueuedSend, Record, ResultAppend, SessionRefresh, Steer, ToolIntent,
+    ToolOutcome, ToolReply,
+};
+use serde_json::{Map, Value};
+
+fn part_value(parts: &BTreeMap<Digest, Vec<u8>>, part: &PartRef) -> Result<Value, String> {
+    let bytes = parts
+        .get(&part.digest)
+        .ok_or_else(|| format!("setup part {} is missing", hex(&part.digest)))?;
+    serde_json::from_slice(bytes).map_err(|e| format!("setup part {}: {e}", hex(&part.digest)))
+}
+
+fn model_attempt(attempt: &Attempt) -> Result<Value, String> {
+    let mut object = members(attempt.telemetry.as_ref())?;
+    object.extend(members(attempt.billing.as_ref())?);
+    object.insert("type".into(), json("model_attempt_finished"));
+    object.insert("step_id".into(), json(attempt.step_id));
+    object.insert("attempt".into(), json(attempt.attempt));
+    set(&mut object, "attempt_id", attempt.attempt_id.as_ref());
+    object.insert("outcome".into(), json(&attempt.outcome));
+    set(&mut object, "http_status", attempt.http_status);
+    object.insert("request_body_len".into(), json(attempt.request_body_len));
+    object.insert(
+        "request_body_sha256".into(),
+        json(hex(&attempt.request_body_sha256)),
+    );
+    object.insert("response_body_len".into(), json(attempt.response_body_len));
+    object.insert(
+        "response_body_sha256".into(),
+        json(hex(&attempt.response_body_sha256)),
+    );
+    object.insert("ts_ms".into(), json(attempt.ts_ms));
+    set(&mut object, "sent_at_ms", attempt.sent_at_ms);
+    set(
+        &mut object,
+        "first_content_at_ms",
+        attempt.first_content_at_ms,
+    );
+    set(
+        &mut object,
+        "last_content_at_ms",
+        attempt.last_content_at_ms,
+    );
+    set(&mut object, "transport", attempt.transport.as_ref());
+    set(
+        &mut object,
+        "served_account_ref",
+        attempt.served_account_ref.as_ref(),
+    );
+    Ok(Value::Object(object))
+}
+
+fn tool_intent(intent: &ToolIntent, calls: &HashMap<String, Value>) -> Value {
+    let mut object = Map::new();
+    object.insert("type".into(), json("tool_dispatch_intent"));
+    object.insert("batch_id".into(), json(&intent.batch_id));
+    object.insert("tool_call_id".into(), json(&intent.tool_call_id));
+    // Arguments equal to the call's own input were not stored a second time.
+    let args = intent
+        .args
+        .clone()
+        .or_else(|| calls.get(&intent.tool_call_id.0).cloned())
+        .unwrap_or(Value::Null);
+    object.insert("args".into(), args);
+    set(&mut object, "tool_name", intent.tool_name.as_ref());
+    set(&mut object, "module_id", intent.module_id.as_ref());
+    // A key the converter derived wasn't in today's record.
+    if intent.key_derived != Some(true) {
+        set(&mut object, "call_key", intent.call_key.as_ref());
+    }
+    set(
+        &mut object,
+        "approval_digest",
+        intent.approval_digest.as_ref(),
+    );
+    set(&mut object, "dispatched_at_ms", intent.dispatched_at_ms);
+    set(&mut object, "schema_pin", intent.schema_pin.as_ref());
+    set(&mut object, "hooks", intent.hooks.as_ref());
+    Value::Object(object)
+}
+
+/// Today's `tool_result` or `tool_no_dispatch`. The outcome's `call_key` is left out: today's
+/// record holds no key, and the converter made it from the record's position.
+fn tool_terminal(reply: &ToolReply, outcome: &ToolOutcome) -> Result<Value, String> {
+    if reply.result.tool_call_id != outcome.tool_call_id {
+        return Err("a tool outcome claims another call's reply".into());
+    }
+    if outcome.outcome == CallOutcome::NotDispatched {
+        let mut object = Map::new();
+        object.insert("type".into(), json("tool_no_dispatch"));
+        set(&mut object, "dispatched_at_ms", outcome.finished_at_ms);
+        object.insert("batch_id".into(), json(&outcome.batch_id));
+        object.insert("tool_call_id".into(), json(&outcome.tool_call_id));
+        set(&mut object, "reason", outcome.detail.as_ref());
+        set(&mut object, "hooks", outcome.hooks.as_ref());
+        set(&mut object, "tags", reply.tags_v1.as_ref());
+        return Ok(Value::Object(object));
+    }
+    let mut object = members(outcome.detail.as_ref())?;
+    object.insert("type".into(), json("tool_result"));
+    object.insert("result".into(), json(&reply.result));
+    let name = match outcome.outcome {
+        CallOutcome::Completed => "completed",
+        CallOutcome::Unknown => "unknown",
+        CallOutcome::Interrupted => "interrupted",
+        CallOutcome::MaxSteps => "max_steps",
+        CallOutcome::NotDispatched => unreachable!("handled above"),
+    };
+    object.insert("outcome".into(), json(name));
+    set(&mut object, "tags", reply.tags_v1.as_ref());
+    object.insert("batch_id".into(), json(&outcome.batch_id));
+    set(&mut object, "finished_at_ms", outcome.finished_at_ms);
+    set(&mut object, "reason", outcome.reason.as_ref());
+    set(&mut object, "hooks", outcome.hooks.as_ref());
+    Ok(Value::Object(object))
+}
+
+fn queued(
+    send: &QueuedSend,
+    parts: &dyn Fn(&PartRef) -> Result<Value, String>,
+) -> Result<Value, String> {
+    let mut object = members(send.receipt.as_ref())?;
+    object.insert("type".into(), json("queued"));
+    object.insert("submission_id".into(), json(&send.submission_id));
+    set(&mut object, "send_id", send.send_id.as_ref());
+    set(&mut object, "written_at_ms", send.written_at_ms);
+    set(&mut object, "ts_ms", send.ts_ms);
+    set(&mut object, "delivery", send.delivery.as_ref());
+    let mut request = members(send.request.as_ref())?;
+    request.insert("input".into(), json(&send.input));
+    for part in &send.setup {
+        if part.kind == PartKind::Tools {
+            request.insert("tools".into(), parts(part)?);
+        }
+    }
+    object.insert("request".into(), Value::Object(request));
+    Ok(Value::Object(object))
+}
+
+fn session_refresh(
+    refresh: &SessionRefresh,
+    parts: &dyn Fn(&PartRef) -> Result<Value, String>,
+) -> Result<Value, String> {
+    let mut object = Map::new();
+    object.insert("type".into(), json("session_refresh_accepted"));
+    object.insert("generation".into(), json(refresh.generation));
+    object.insert("policy".into(), json(&refresh.policy));
+    object.insert("run_in_progress".into(), json(refresh.run_in_progress));
+    object.insert(
+        "applies_from_next_run".into(),
+        json(refresh.applies_from_next_run),
+    );
+    if refresh.manifest.is_some() || !refresh.setup.is_empty() {
+        let mut manifest = members(refresh.manifest.as_ref())?;
+        for part in &refresh.setup {
+            fill_manifest(&mut manifest, part.kind, parts(part)?);
+        }
+        object.insert("manifest".into(), finish_manifest(manifest));
+    }
+    // The recorded model choice (`selection`) is the new storage's own: today's storage reads
+    // it from the manifest each time.
+    Ok(Value::Object(object))
+}
+
+/// An event's old record, with whatever transcript records were split off it put back.
+/// The transcript records a ledger record claimed, by kind.
+struct Claimed<'a> {
+    inputs: Vec<&'a Input>,
+    replies: Vec<&'a ToolReply>,
+    appends: Vec<&'a ResultAppend>,
+}
+
+impl<'a> Claimed<'a> {
+    fn of(claimed: &[&'a Record]) -> Self {
+        let mut sorted = Claimed {
+            inputs: Vec::new(),
+            replies: Vec::new(),
+            appends: Vec::new(),
+        };
+        for record in claimed {
+            match record {
+                Record::Input(input) => sorted.inputs.push(input),
+                Record::ToolReply(reply) => sorted.replies.push(reply),
+                Record::ResultAppend(append) => sorted.appends.push(append),
+                _ => {}
+            }
+        }
+        sorted
+    }
+}
+
+fn expect(ok: bool, name: &str) -> Result<(), String> {
+    ok.then_some(())
+        .ok_or_else(|| format!("{name} claimed records it doesn't split into"))
+}
+
+/// Checks that each placed transcript copy equals the record's message in the same position.
+/// Copies exist only for messages the conversation placed, so there are none or all of them.
+fn check_copies(inputs: &[&Input], messages: &[Message], name: &str) -> Result<(), String> {
+    expect(
+        inputs.is_empty()
+            || (inputs.len() == messages.len()
+                && inputs.iter().zip(messages).all(|(i, m)| &i.message == m)),
+        name,
+    )
+}
+
+fn steered(steer: &Steer, claimed: &[&Record]) -> Result<Value, String> {
+    let claimed = Claimed::of(claimed);
+    expect(
+        claimed.replies.is_empty() && claimed.appends.is_empty(),
+        "steered",
+    )?;
+    check_copies(&claimed.inputs, &steer.input, "steered")?;
+    let mut object = members(steer.receipt.as_ref())?;
+    object.insert("type".into(), json("steered"));
+    object.insert("input".into(), json(&steer.input));
+    set(&mut object, "written_at_ms", steer.written_at_ms);
+    set(&mut object, "tags", steer.tags_v1.as_ref());
+    Ok(Value::Object(object))
+}
+
+fn send_delivered(delivery: &Delivery, claimed: &[&Record]) -> Result<Value, String> {
+    let claimed = Claimed::of(claimed);
+    expect(
+        claimed.replies.is_empty() && claimed.appends.len() <= 1,
+        "send_delivered",
+    )?;
+    check_copies(&claimed.inputs, &delivery.input, "send_delivered")?;
+    if let Some(append) = claimed.appends.first() {
+        expect(
+            delivery.appended_text.as_ref() == Some(&append.text)
+                && delivery.tool_call_id.as_ref() == Some(&append.tool_call_id),
+            "send_delivered",
+        )?;
+    }
+    let mut object = Map::new();
+    object.insert("type".into(), json("send_delivered"));
+    object.insert("submission_id".into(), json(&delivery.submission_id));
+    object.insert("run_id".into(), json(&delivery.run_id));
+    object.insert("mode".into(), json(&delivery.mode));
+    if delivery.input_listed == Some(true) {
+        object.insert("input".into(), json(&delivery.input));
+    }
+    set(&mut object, "tool_call_id", delivery.tool_call_id.as_ref());
+    set(
+        &mut object,
+        "appended_text",
+        delivery.appended_text.as_ref(),
+    );
+    set(&mut object, "written_at_ms", delivery.written_at_ms);
+    set(&mut object, "tags", delivery.tags_v1.as_ref());
+    Ok(Value::Object(object))
+}
+
+/// The transcript copy of a budget firing is the message the conversation took: the stored
+/// text when there is one, else the text the budget had due, which older records didn't store.
+fn budget_fired(fire: &BudgetFire, claimed: &[&Record]) -> Result<Value, String> {
+    let claimed = Claimed::of(claimed);
+    expect(
+        claimed.replies.is_empty() && claimed.appends.is_empty() && claimed.inputs.len() <= 1,
+        "budget_fired",
+    )?;
+    if let Some(input) = claimed.inputs.first() {
+        let text = match input.message.content.as_slice() {
+            [broca_protocol::content::ContentBlock::Text { text }] => text,
+            _ => return Err("budget nudge is not one text block".into()),
+        };
+        expect(
+            fire.caller_text
+                .as_ref()
+                .is_none_or(|stored| stored == text)
+                && input.tags_v1 == fire.tags_v1,
+            "budget_fired",
+        )?;
+    }
+    let mut object = Map::new();
+    object.insert("type".into(), json("budget_fired"));
+    object.insert("run_id".into(), json(&fire.run_id));
+    let kind = match fire.firing {
+        BudgetFiring::Nudge => "nudge",
+        BudgetFiring::Finalize => "finalize",
+    };
+    object.insert("kind".into(), json(kind));
+    object.insert("threshold".into(), json(fire.threshold));
+    object.insert("ordinal".into(), json(fire.ordinal));
+    set(&mut object, "caller_text", fire.caller_text.as_ref());
+    set(&mut object, "tags", fire.tags_v1.as_ref());
+    Ok(Value::Object(object))
+}
+
+fn event(event: &Event, claimed: &[&Record]) -> Result<Value, String> {
+    let mut object = members(event.body.as_ref())?;
+    object.insert("type".into(), json(&event.name));
+    set(&mut object, "run_id", event.run_id.as_ref());
+    let inputs: Vec<&Input> = claimed
+        .iter()
+        .filter_map(|r| match r {
+            Record::Input(input) => Some(input),
+            _ => None,
+        })
+        .collect();
+    let replies: Vec<&ToolReply> = claimed
+        .iter()
+        .filter_map(|r| match r {
+            Record::ToolReply(reply) => Some(reply),
+            _ => None,
+        })
+        .collect();
+    let appends: Vec<&ResultAppend> = claimed
+        .iter()
+        .filter_map(|r| match r {
+            Record::ResultAppend(append) => Some(append),
+            _ => None,
+        })
+        .collect();
+    let expect = |ok: bool| {
+        ok.then_some(())
+            .ok_or_else(|| format!("{} claimed records it doesn't split into", event.name))
+    };
+    match event.name.as_str() {
+        "recovery_call_closed" => {
+            expect(inputs.is_empty() && appends.is_empty() && replies.len() == 1)?;
+            let reply = replies[0];
+            object.insert("result".into(), json(&reply.result));
+            object.insert("run_id".into(), json(&reply.run_id));
+            set(&mut object, "batch_id", reply.batch_id.as_ref());
+        }
+        "approval_recorded" => {
+            expect(inputs.is_empty() && appends.is_empty() && replies.len() <= 1)?;
+            if let Some(reply) = replies.first() {
+                object.insert("closing_result".into(), json(&reply.result));
+                set(&mut object, "closed_at_ms", reply.finished_at_ms);
+                set(&mut object, "tags", reply.tags_v1.as_ref());
+            }
+        }
+        _ => expect(claimed.is_empty())?,
+    }
+    Ok(Value::Object(object))
+}
+
+/// Why a session's records can't be turned back into today's records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InverseError {
+    /// A record only the new storage writes that changes which messages exist: a transcript
+    /// revert or a recovery cut. Today's log has no record for either, so no fold of today's
+    /// records can follow a session past one.
+    NoTodayRecord(&'static str),
+    /// The records aren't laid out the way the forward conversion and the new loop write them.
+    Layout(String),
+}
+
+impl std::fmt::Display for InverseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoTodayRecord(name) => write!(f, "{name} has no record in today's log"),
+            Self::Layout(reason) => f.write_str(reason),
+        }
+    }
+}
+
+impl From<String> for InverseError {
+    fn from(reason: String) -> Self {
+        Self::Layout(reason)
+    }
+}
+
+/// Turns a session's records back into today's records as they are appended, one batch at a
+/// time, so a reader can follow a live session without inverting it from its start again.
+///
+/// A batch is inverted whole: a run start claims the input entries after it in the same batch,
+/// and a delivered message's placed copies are written in the batch of the record that accepted
+/// it. Transcript records still waiting for the ledger record that claims them carry over to
+/// the next batch. A steer's messages are placed at a later step boundary, usually in a later
+/// batch, so a steer whose copies haven't been seen is kept until they are, and they are checked
+/// against it then.
+pub struct Inverse {
+    /// Transcript records waiting for the ledger record that claims them.
+    pending: Vec<Record>,
+    /// The tool calls of the latest assistant message, with their inputs, by call id: a
+    /// dispatch intent whose arguments equal its call's input didn't store them again.
+    calls: HashMap<String, Value>,
+    /// Steers whose placed copies haven't been seen yet, by seq.
+    unplaced: HashMap<u64, Steer>,
+    /// The seq the next batch must start at: records are taken in order, none skipped.
+    next: u64,
+}
+
+impl Default for Inverse {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Inverse {
+    /// An inverse at the start of a session's log, whose first record has seq 1.
+    pub fn new() -> Self {
+        Self {
+            pending: Vec::new(),
+            calls: HashMap::new(),
+            unplaced: HashMap::new(),
+            next: 1,
+        }
+    }
+
+    /// The seq the next batch must start at.
+    pub fn next_seq(&self) -> u64 {
+        self.next
+    }
+
+    /// Today's record JSON for each old record `records` complete, in order. `records` are the
+    /// log's next records, the first at seq `first`, and must start where the last batch ended.
+    /// `parts` reads a setup part a record names.
+    pub fn push(
+        &mut self,
+        first: u64,
+        records: &[Record],
+        parts: &dyn Fn(&PartRef) -> Result<Value, String>,
+    ) -> Result<Vec<Value>, InverseError> {
+        if first != self.next {
+            return Err(InverseError::Layout(format!(
+                "records from seq {first} follow records that ended before seq {}",
+                self.next
+            )));
+        }
+        let mut out = Vec::new();
+        let unclaimed = |pending: &[Record], at: &str| {
+            if pending.is_empty() {
+                Ok(())
+            } else {
+                Err(InverseError::Layout(format!(
+                    "{} transcript record(s) unclaimed before {at}",
+                    pending.len()
+                )))
+            }
+        };
+        // Steered and delivered messages are recorded where the conversation places them, after
+        // the record that accepted them; each names that record by seq, which claims it back.
+        let mut placed_later: HashMap<u64, Vec<&Record>> = HashMap::new();
+        for record in records {
+            if let Record::Input(Input {
+                receipt_seq: Some(seq),
+                ..
+            }) = record
+            {
+                placed_later.entry(*seq).or_default().push(record);
+            }
+        }
+        let mut index = 0;
+        while index < records.len() {
+            let record = &records[index];
+            let seq = first + index as u64;
+            index += 1;
+            match record {
+                // All three are derived from today's records, and none is one of its own: entry and
+                // turn facts are what today's reads compute from the log.
+                Record::SetupStub(_) | Record::EntryFacts(_) | Record::TurnFacts(_) => {}
+                // A converted run's billing was settled by today's storage when the run ended; the
+                // converter records that, and today's log has no record of it.
+                Record::Billed(_) => {}
+                // Derived from today's fold at the run start that applied the refresh: today's
+                // log decides the application again on replay and keeps no record of it.
+                Record::RefreshApplied(_) => {}
+                // The new storage's own bookkeeping: a writer opening the log, and a change to
+                // where records are stored. Records keep their seqs and bytes through a change,
+                // so no message comes or goes with one.
+                Record::WriterOpened(_) | Record::ChangeIntent(_) | Record::ChangeAborted(_) => {}
+                Record::TranscriptReverted(_) | Record::RecoveryCut(_) => {
+                    return Err(InverseError::NoTodayRecord(record.name()));
+                }
+                Record::Input(Input {
+                    receipt_seq: Some(_),
+                    ..
+                }) => {}
+                Record::Input(input) if input.placement == Placement::RunInput => {
+                    return Err(InverseError::Layout(
+                        "a run's input entry is not right after its run start".into(),
+                    ));
+                }
+                Record::Input(_)
+                | Record::Assistant(_)
+                | Record::ToolReply(_)
+                | Record::ResultAppend(_) => {
+                    if let Record::Assistant(assistant) = record {
+                        self.calls.clear();
+                        for block in &assistant.message.content {
+                            if let broca_protocol::content::ContentBlock::ToolCall(call) = block {
+                                self.calls
+                                    .insert(call.tool_call_id.0.clone(), call.input.clone());
+                            }
+                        }
+                    }
+                    self.pending.push(record.clone());
+                }
+                Record::Compaction(compaction) => {
+                    unclaimed(&self.pending, "a compaction boundary")?;
+                    let mut object = members(Some(&compaction.body))?;
+                    let name = match compaction.version {
+                        1 => "compaction_message",
+                        other => {
+                            return Err(InverseError::Layout(format!("compaction version {other}")))
+                        }
+                    };
+                    object.insert("type".into(), json(name));
+                    out.push(Value::Object(object));
+                }
+                Record::Marker(marker) => {
+                    unclaimed(&self.pending, "a compaction marker")?;
+                    let mut object = Map::new();
+                    object.insert("type".into(), json("compaction_marker"));
+                    set(&mut object, "harness", marker.harness.as_ref());
+                    set(&mut object, "session", marker.session.as_ref());
+                    object.insert("view_version".into(), json(marker.view_version));
+                    object.insert("first_kept_mid".into(), json(&marker.first_kept_mid));
+                    object.insert("first_kept_ordinal".into(), json(marker.first_kept_ordinal));
+                    object.insert("checkpoint".into(), json(marker.checkpoint));
+                    out.push(Value::Object(object));
+                }
+                Record::RunStart(start) => {
+                    unclaimed(&self.pending, "a run start")?;
+                    let mut inputs = Vec::new();
+                    while let Some(Record::Input(input)) = records.get(index) {
+                        if input.placement != Placement::RunInput || input.run_id != start.run_id {
+                            break;
+                        }
+                        inputs.push(input);
+                        index += 1;
+                    }
+                    self.calls.clear();
+                    out.push(today::run_started(start, &inputs, parts)?);
+                }
+                Record::StepEnd(end) => {
+                    let [Record::Assistant(assistant)] = self.pending.as_slice() else {
+                        return Err(InverseError::Layout(
+                            "a step end without exactly its assistant message".into(),
+                        ));
+                    };
+                    if assistant.step_id != end.step_id {
+                        return Err(InverseError::Layout(
+                            "a step end claims another step's message".into(),
+                        ));
+                    }
+                    out.push(model_step_finished(assistant, end)?);
+                    self.pending.clear();
+                }
+                Record::ToolOutcome(outcome) => {
+                    let [Record::ToolReply(reply)] = self.pending.as_slice() else {
+                        return Err(InverseError::Layout(
+                            "a tool outcome without exactly its reply".into(),
+                        ));
+                    };
+                    out.push(tool_terminal(reply, outcome)?);
+                    self.pending.clear();
+                }
+                Record::Event(_)
+                | Record::Steer(_)
+                | Record::Delivery(_)
+                | Record::BudgetFire(_) => {
+                    let pending = std::mem::take(&mut self.pending);
+                    let copies = placed_later.remove(&seq).unwrap_or_default();
+                    let placed = !copies.is_empty();
+                    let mut claimed: Vec<&Record> = pending.iter().collect();
+                    claimed.extend(copies);
+                    out.push(match record {
+                        Record::Event(e) => event(e, &claimed)?,
+                        Record::Steer(s) => steered(s, &claimed)?,
+                        Record::Delivery(d) => send_delivered(d, &claimed)?,
+                        Record::BudgetFire(b) => budget_fired(b, &claimed)?,
+                        _ => unreachable!("matched above"),
+                    });
+                    if let (Record::Steer(steer), false) = (record, placed) {
+                        self.unplaced.insert(seq, steer.clone());
+                    }
+                }
+                other => {
+                    unclaimed(&self.pending, other.name())?;
+                    out.push(self.ledger(other, parts)?);
+                }
+            }
+        }
+        // Copies naming a record outside this batch: a steer an earlier batch accepted is placed
+        // now, and is checked against its copies as it would have been had they come with it.
+        for (seq, copies) in placed_later {
+            match self.unplaced.remove(&seq) {
+                Some(steer) => {
+                    steered(&steer, &copies)?;
+                }
+                None => {
+                    return Err(InverseError::Layout(
+                        "a placed message names a record that didn't accept it".into(),
+                    ))
+                }
+            }
+        }
+        self.next = first + records.len() as u64;
+        Ok(out)
+    }
+
+    /// Checks the log ended with every transcript record claimed.
+    pub fn finish(&self) -> Result<(), InverseError> {
+        if self.pending.is_empty() {
+            Ok(())
+        } else {
+            Err(InverseError::Layout(format!(
+                "{} transcript record(s) unclaimed before the end of the log",
+                self.pending.len()
+            )))
+        }
+    }
+
+    /// Today's record for a ledger record that claims no transcript records.
+    fn ledger(
+        &self,
+        record: &Record,
+        parts: &dyn Fn(&PartRef) -> Result<Value, String>,
+    ) -> Result<Value, InverseError> {
+        Ok(match record {
+            Record::RunEnd(end) => today::run_finished(end),
+            // Today's records have no message id on a step or batch start: the converter filled
+            // it from today's id rule, so it is left out here.
+            Record::StepStart(start) => serde_json::json!({
+                "type": "step_started",
+                "step_id": start.step_id,
+            }),
+            Record::Attempt(attempt) => model_attempt(attempt)?,
+            Record::BatchStart(batch) => serde_json::json!({
+                "type": "tool_batch_started",
+                "batch_id": batch.batch_id,
+                "step_id": batch.step_id,
+                "planned_calls": batch.planned,
+            }),
+            Record::BatchEnd(batch) => serde_json::json!({
+                "type": "tool_batch_finished",
+                "batch_id": batch.batch_id,
+            }),
+            Record::ToolIntent(intent) => tool_intent(intent, &self.calls),
+            Record::QueuedSend(send) => queued(send, parts)?,
+            Record::SessionRefresh(refresh) => session_refresh(refresh, parts)?,
+            Record::RefreshPolicy(policy) => serde_json::json!({
+                "type": "session_refresh_policy_changed",
+                "generation": policy.generation,
+                "policy": policy.policy,
+                "send_id": policy.send_id,
+            }),
+            Record::PrefixFlush(flush) => {
+                let mut object = Map::new();
+                object.insert("type".into(), json("session_prefix_flushed"));
+                object.insert("send_id".into(), json(&flush.send_id));
+                set(
+                    &mut object,
+                    "pending_generation",
+                    flush.pending_generation.as_ref(),
+                );
+                Value::Object(object)
+            }
+            Record::StructuredResult(result) => serde_json::json!({
+                "type": "structured_output_result",
+                "run_id": result.run_id,
+                "result": result.result,
+            }),
+            Record::Resumed(resumed) => serde_json::json!({
+                "type": "resume_started",
+                "episode": resumed.run_id,
+                "resumed_from_seq": resumed.resumed_from_seq,
+                "replayed": {
+                    "messages": resumed.messages,
+                    "model_steps": resumed.model_steps,
+                    "tool_results": resumed.tool_results,
+                },
+                "redone": resumed.redone.iter().map(|redo| match (&redo.step_id, &redo.tool_call_id) {
+                    (Some(step_id), _) => serde_json::json!({"kind": "model_step", "step_id": step_id}),
+                    (None, Some(call)) => serde_json::json!({"kind": "tool_dispatch", "tool_call_id": call.0}),
+                    (None, None) => serde_json::json!({}),
+                }).collect::<Vec<_>>(),
+                "indeterminate": resumed.indeterminate,
+            }),
+            Record::Pause(pause) => today::run_paused(pause),
+            Record::ToolHeld(held) => {
+                let mut object = Map::new();
+                object.insert("type".into(), json("tool_call_provider_held"));
+                object.insert("batch_id".into(), json(&held.batch_id));
+                object.insert("tool_call_id".into(), json(&held.tool_call_id));
+                object.insert("call_key".into(), json(&held.call_key));
+                object.insert("module".into(), json(&held.module));
+                object.insert("reason".into(), json(&held.reason));
+                set(&mut object, "detail_digest", held.detail_digest.as_ref());
+                object.insert("held_at_ms".into(), json(held.held_at_ms));
+                object.insert("sequential".into(), json(held.sequential));
+                Value::Object(object)
+            }
+            Record::View(view) => serde_json::json!({
+                "type": "compaction_view_v2",
+                "version": view.version,
+                "checksum": view.checksum,
+                "edits": view.edits,
+            }),
+            Record::ViewApplied(applied) => serde_json::json!({
+                "type": "compaction_view_applied_v2",
+                "step_id": applied.step_id,
+                "version": applied.version,
+                "checksum": applied.checksum,
+            }),
+            Record::SendEnded(ended) => {
+                let mut object = Map::new();
+                object.insert("type".into(), json("send_ended"));
+                object.insert("submission_id".into(), json(&ended.submission_id));
+                set(&mut object, "reason", ended.reason.as_ref());
+                Value::Object(object)
+            }
+            Record::DeliveryOrdered(ordered) => {
+                let mut object = Map::new();
+                object.insert("type".into(), json("delivery_ordered"));
+                object.insert("submission_id".into(), json(&ordered.submission_id));
+                object.insert("order".into(), ordered.order.clone());
+                set(&mut object, "sent_by", ordered.sent_by.as_ref());
+                Value::Object(object)
+            }
+            Record::Retraction(retraction) => {
+                let mut object = Map::new();
+                object.insert("type".into(), json("retracted"));
+                object.insert("submission_id".into(), json(&retraction.submission_id));
+                set(&mut object, "failure", retraction.failure.as_ref());
+                Value::Object(object)
+            }
+            Record::StepRefused(refused) => today::model_step_refused(refused),
+            Record::ConfigRefrozen(refrozen) => today::run_config_refrozen(refrozen),
+            Record::AuthRefrozen(refrozen) => today::run_auth_refrozen(refrozen),
+            Record::Warmed(warmed) => today::cache_warmed(warmed)?,
+            Record::StructuredDowngraded(downgraded) => serde_json::json!({
+                "type": "structured_output_downgraded",
+                "run_id": downgraded.run_id,
+            }),
+            Record::OutputCapLowered(lowered) => serde_json::json!({
+                "type": "output_reservation_clamped",
+                "step_id": lowered.step_id,
+                "max_output_tokens": lowered.max_output_tokens,
+                "estimated_input_tokens": lowered.estimated_input_tokens,
+                "context_limit": lowered.context_limit,
+            }),
+            Record::CeilingDecided(decided) => {
+                let mut object = Map::new();
+                object.insert("type".into(), json("context_ceiling_decided"));
+                object.insert("step_id".into(), json(decided.step_id));
+                set(&mut object, "detail", decided.detail.as_ref());
+                Value::Object(object)
+            }
+            Record::CancelRequest(cancel) => serde_json::json!({
+                "type": "run_cancel_requested",
+                "run_id": cancel.run_id,
+                "at": match cancel.at {
+                    CancelPoint::Now => "now",
+                    CancelPoint::StepBoundary => "step_boundary",
+                },
+            }),
+            other => {
+                return Err(InverseError::Layout(format!(
+                    "{} is not a ledger record that claims nothing",
+                    other.name()
+                )))
+            }
+        })
+    }
+}
+
+/// Today's record JSON for each old record the new records were converted from, in order.
+pub fn invert(records: &[Record], parts: &BTreeMap<Digest, Vec<u8>>) -> Result<Vec<Value>, String> {
+    let mut inverse = Inverse::new();
+    let out = inverse
+        .push(1, records, &|part| part_value(parts, part))
+        .map_err(|error| error.to_string())?;
+    inverse.finish().map_err(|error| error.to_string())?;
+    Ok(out)
+}
+
+/// Today's records as the inverse should rebuild them. `turn_finished` and `visibility_late`
+/// are left out, since the new format retires them. A run start's `session` and `project_id`
+/// are removed: every run repeats them, and the new format stores them once per session, in the
+/// session's head object. Null members are dropped.
+pub fn comparable(old: &[broca_wal::FramedRecord]) -> Vec<Value> {
+    old.iter()
+        .filter_map(|framed| {
+            let mut value = json(&framed.record);
+            let object = value.as_object_mut()?;
+            match object.get("type").and_then(Value::as_str) {
+                Some("turn_finished" | "visibility_late") => return None,
+                Some("run_started") => {
+                    object.remove("session");
+                    object.remove("project_id");
+                }
+                _ => {}
+            }
+            Some(without_nulls(&value))
+        })
+        .collect()
+}
+
+/// Drops null members at every level, since an old record reads a null member and an absent
+/// one the same way, and the forward conversion doesn't keep the difference.
+pub fn without_nulls(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => Value::Object(
+            object
+                .iter()
+                .filter(|(_, v)| !v.is_null())
+                .map(|(k, v)| (k.clone(), without_nulls(v)))
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(without_nulls).collect()),
+        other => other.clone(),
+    }
+}
+
+/// The path of the first place two values differ, naming only keys and indexes, never values,
+/// so a report can be shown without exposing session content.
+pub fn first_difference(a: &Value, b: &Value, path: &str) -> Option<String> {
+    match (a, b) {
+        (Value::Object(x), Value::Object(y)) => {
+            let mut keys: Vec<&String> = x.keys().chain(y.keys()).collect();
+            keys.sort();
+            keys.dedup();
+            keys.into_iter()
+                .find_map(|key| match (x.get(key), y.get(key)) {
+                    (Some(p), Some(q)) => first_difference(p, q, &format!("{path}.{key}")),
+                    (Some(_), None) => Some(format!("{path}.{key} (only in the original)")),
+                    (None, Some(_)) => Some(format!("{path}.{key} (only in the rebuilt record)")),
+                    (None, None) => None,
+                })
+        }
+        (Value::Array(x), Value::Array(y)) if x.len() == y.len() => x
+            .iter()
+            .zip(y)
+            .enumerate()
+            .find_map(|(i, (p, q))| first_difference(p, q, &format!("{path}[{i}]"))),
+        (Value::Array(x), Value::Array(y)) => {
+            Some(format!("{path} (length {} against {})", x.len(), y.len()))
+        }
+        _ if a == b => None,
+        _ => Some(format!("{path} (value)")),
+    }
+}
+
+#[cfg(test)]
+mod tests;

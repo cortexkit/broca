@@ -69,7 +69,7 @@ pub(super) fn stored_mode(dir: &std::path::Path, key: &BindIdentity) -> Cipher {
 }
 
 /// The media profile of a model that takes images.
-fn image_profile() -> broca_provider::media_profile::MediaProfile {
+pub(super) fn image_profile() -> broca_provider::media_profile::MediaProfile {
     broca_provider::media_profile::select_media_profile(
         broca_provider::spec::WireFamilyId::AnthropicMessages,
         Some(broca_provider::media_profile::MediaQuirk::Anthropic),

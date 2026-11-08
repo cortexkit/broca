@@ -1,6 +1,6 @@
 use broca_wal::{FramedRecord, WalRecord};
 
-use super::{comparable, first_difference, invert, without_nulls};
+use super::inverse::{comparable, first_difference, invert, without_nulls};
 use crate::convert;
 
 fn log(lines: &[&str]) -> Vec<FramedRecord> {
