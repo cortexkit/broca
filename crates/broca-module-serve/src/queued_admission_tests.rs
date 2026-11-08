@@ -153,3 +153,180 @@ async fn routing_admission_refusal_keeps_direct_send_reply_bytes() {
         assert_eq!(frame.body.as_slice(), expected);
     }
 }
+
+#[tokio::test]
+async fn head_send_and_send_status_capture_serve_reply_bytes() {
+    async fn dispatch(
+        handler: &Arc<LineageRegistry>,
+        session: &BrocaBindIdentity,
+        bind: &BindObservation,
+        method: &str,
+        params: &serde_json::Value,
+    ) -> Frame {
+        broca_test_support::wait_for(
+            method,
+            async {
+                let (tx, mut rx) = broca_diagnostics::channel(1, Arc::default());
+                // Dispatch through the real handlers so send conversion, result envelopes
+                // and error bodies cannot drift from the served bytes.
+                execute_route_request_inner(
+                    RouteRequest {
+                        method: method.into(),
+                        params: params.clone(),
+                    },
+                    &tx,
+                    PROTOCOL_VERSION,
+                    7,
+                    3,
+                    11,
+                    session,
+                    bind,
+                    handler,
+                )
+                .await
+                .unwrap();
+                rx.recv().await.unwrap()
+            },
+            || format!("params: {params}"),
+        )
+        .await
+    }
+
+    fn capture(step: &str, params: &serde_json::Value, frame: &Frame) -> serde_json::Value {
+        if let Some(dir) = std::env::var_os("BROCA_HEAD_SEND_SAMPLES") {
+            let dir = std::path::Path::new(&dir);
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(
+                dir.join(format!("{step}.request.json")),
+                serde_json::to_vec_pretty(params).unwrap(),
+            )
+            .unwrap();
+            // Preserve the frame body, not a parsed and reserialized approximation.
+            std::fs::write(dir.join(format!("{step}.reply.json")), &frame.body).unwrap();
+        }
+        serde_json::from_slice(&frame.body).unwrap()
+    }
+
+    async fn status_in_state(
+        handler: &Arc<LineageRegistry>,
+        session: &BrocaBindIdentity,
+        bind: &BindObservation,
+        params: &serde_json::Value,
+        state: &str,
+    ) -> Frame {
+        broca_test_support::wait_until(&format!("send status {state}"), || async {
+            let frame = dispatch(handler, session, bind, OP_SESSION_SEND_STATUS, params).await;
+            assert_eq!(frame.header.ty, FrameType::Response);
+            let reply: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
+            if reply["result"]["state"] == state {
+                Ok(frame)
+            } else {
+                Err(reply.to_string())
+            }
+        })
+        .await
+    }
+
+    let (exec, gate) = FakeExecutor::gated();
+    let rig = Rig::new("head-send-samples", exec.clone(), Duration::from_secs(60));
+    let session = rig.key("alfonso:head:agent_sample");
+    let handler = Arc::new(rig.registry.clone());
+    let head = broca_protocol::BindPrincipal::Reserved {
+        module_id: "prefrontal-core".into(),
+    };
+    let bind = BindObservation {
+        principal: Some(head.clone()),
+        scope: broca_protocol::SendScope::Unstamped,
+        ..Default::default()
+    };
+    let send_a = serde_json::json!({
+        "model": {"provider": "fake", "model": "fake"},
+        "prompt": "Synthetic head inbox message A",
+        "delivery": "queue",
+        "send_id": "inbox-send_sample_a"
+    });
+    let status_a = serde_json::json!({"send_id": "inbox-send_sample_a"});
+    let send_b = serde_json::json!({
+        "model": {"provider": "fake", "model": "fake"},
+        "prompt": "Synthetic head inbox message B",
+        "delivery": "queue",
+        "send_id": "inbox-send_sample_b"
+    });
+    let status_b = serde_json::json!({"send_id": "inbox-send_sample_b"});
+
+    let frame = dispatch(&handler, &session, &bind, OP_SEND, &send_a).await;
+    assert_eq!(frame.header.ty, FrameType::Response);
+    let accepted_a = capture("01-send-a", &send_a, &frame);
+    assert_eq!(accepted_a["result"]["state"], "active", "{accepted_a}");
+    let run_a = accepted_a["result"]["run_id"].as_str().unwrap();
+    assert!(!run_a.is_empty());
+
+    let frame = dispatch(&handler, &session, &bind, OP_SESSION_SEND_STATUS, &status_a).await;
+    assert_eq!(frame.header.ty, FrameType::Response);
+    let active_a = capture("02-status-a-active", &status_a, &frame);
+    assert_eq!(active_a["result"]["state"], "active", "{active_a}");
+    assert_eq!(active_a["result"]["run_id"], run_a);
+
+    let frame = dispatch(&handler, &session, &bind, OP_SEND, &send_b).await;
+    assert_eq!(frame.header.ty, FrameType::Response);
+    let accepted_b = capture("03-send-b", &send_b, &frame);
+    assert_eq!(accepted_b["result"]["state"], "pending", "{accepted_b}");
+    let submission_b = accepted_b["result"]["submission_id"].as_str().unwrap();
+    assert!(!submission_b.is_empty());
+
+    let frame = dispatch(&handler, &session, &bind, OP_SESSION_SEND_STATUS, &status_b).await;
+    assert_eq!(frame.header.ty, FrameType::Response);
+    let pending_b = capture("04-status-b-pending", &status_b, &frame);
+    assert_eq!(pending_b["result"]["state"], "pending", "{pending_b}");
+    assert_eq!(pending_b["result"]["submission_id"], submission_b);
+    assert_eq!(exec.started_count(), 1);
+    assert_eq!(exec.finished_count(), 0);
+
+    gate.release().await;
+    let frame = status_in_state(&handler, &session, &bind, &status_a, "finished").await;
+    let finished_a = capture("05-status-a-completed", &status_a, &frame);
+    assert_eq!(finished_a["result"]["state"], "finished", "{finished_a}");
+    assert_eq!(finished_a["result"]["reason"], "completed", "{finished_a}");
+    assert_eq!(finished_a["result"]["run_id"], run_a);
+
+    let frame = status_in_state(&handler, &session, &bind, &status_b, "active").await;
+    let active_b = capture("06-status-b-active", &status_b, &frame);
+    assert_eq!(active_b["result"]["state"], "active", "{active_b}");
+    let run_b = active_b["result"]["run_id"].as_str().unwrap();
+    assert!(!run_b.is_empty());
+    assert_ne!(run_b, run_a);
+    assert_eq!(exec.started_count(), 2);
+    assert_eq!(exec.finished_count(), 1);
+    assert!(exec
+        .seen
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|run| run.principal.as_ref() == Some(&head)));
+
+    gate.release().await;
+    let frame = status_in_state(&handler, &session, &bind, &status_b, "finished").await;
+    let finished_b = capture("07-status-b-finished", &status_b, &frame);
+    assert_eq!(finished_b["result"]["state"], "finished", "{finished_b}");
+    assert_eq!(finished_b["result"]["reason"], "completed", "{finished_b}");
+    assert_eq!(finished_b["result"]["run_id"], run_b);
+
+    let other_bind = BindObservation {
+        principal: Some(broca_protocol::BindPrincipal::Reserved {
+            module_id: "occipital".into(),
+        }),
+        ..bind
+    };
+    let frame = dispatch(
+        &handler,
+        &session,
+        &other_bind,
+        OP_SESSION_SEND_STATUS,
+        &status_a,
+    )
+    .await;
+    assert_eq!(frame.header.ty, FrameType::Error);
+    let unknown = capture("08-status-a-occipital", &status_a, &frame);
+    assert_eq!(unknown["code"], "unknown_send", "{unknown}");
+    assert!(rig.registry.stop_and_seal().await);
+}
