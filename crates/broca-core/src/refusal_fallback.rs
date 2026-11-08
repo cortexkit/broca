@@ -171,6 +171,48 @@ pub fn route(schedule: Option<&RefusalFallbackSchedule>, eligible: bool) -> Step
     }
 }
 
+pub(crate) struct StepRouting {
+    pub route: StepRoute,
+    pub reason: broca_wal::StepRouteReason,
+    pub fallback_fits: bool,
+    pub skipped_for_context: bool,
+}
+
+/// The cache-expiry proof given to compaction and the model send must agree on the serving route.
+/// A scheduled fallback is skipped when the measured prompt already fills its window, even when
+/// resuming a refused step.
+pub(crate) fn decide_step_route(
+    schedule: Option<&RefusalFallbackSchedule>,
+    eligible: bool,
+    resent: bool,
+    context_limit: Option<u64>,
+    previous_usage: Option<broca_protocol::Usage>,
+) -> StepRouting {
+    let fallback_fits = match (
+        context_limit,
+        previous_usage.and_then(|usage| usage.fill_tokens()),
+    ) {
+        (Some(limit), Some(fill)) => fill < limit,
+        _ => true,
+    };
+    let scheduled = eligible && (resent || route(schedule, true) == StepRoute::Fallback);
+    let route = if scheduled && fallback_fits {
+        StepRoute::Fallback
+    } else {
+        StepRoute::Source
+    };
+    StepRouting {
+        route,
+        reason: if route == StepRoute::Fallback && resent {
+            broca_wal::StepRouteReason::Refusal
+        } else {
+            broca_wal::StepRouteReason::Schedule
+        },
+        fallback_fits,
+        skipped_for_context: scheduled && !fallback_fits,
+    }
+}
+
 /// What a durable step records about how it was served: the client-side fallback route's
 /// model, if the step was routed there; the model a server-side fallback served the response
 /// with; the step's usage; and each model's iterations when the provider split it.
@@ -464,6 +506,38 @@ mod tests {
         assert_eq!(route(None, true), StepRoute::Source);
         // An ineligible run never routes to the fallback, whatever the schedule says.
         assert_eq!(route(Some(&refuse(None)), false), StepRoute::Source);
+    }
+
+    #[test]
+    fn step_routing_preserves_refusal_reason_and_context_skip() {
+        let schedule = refuse(None);
+        let usage = Some(broca_protocol::Usage {
+            input_tokens: Some(1_000),
+            ..Default::default()
+        });
+        for resent in [false, true] {
+            let selected = decide_step_route(Some(&schedule), true, resent, Some(1_001), usage);
+            assert_eq!(selected.route, StepRoute::Fallback);
+            assert_eq!(
+                selected.reason,
+                if resent {
+                    broca_wal::StepRouteReason::Refusal
+                } else {
+                    broca_wal::StepRouteReason::Schedule
+                }
+            );
+            assert!(selected.fallback_fits);
+            assert!(!selected.skipped_for_context);
+
+            let skipped = decide_step_route(Some(&schedule), true, resent, Some(1_000), usage);
+            assert_eq!(skipped.route, StepRoute::Source);
+            assert_eq!(skipped.reason, broca_wal::StepRouteReason::Schedule);
+            assert!(!skipped.fallback_fits);
+            assert!(skipped.skipped_for_context);
+        }
+        let ineligible = decide_step_route(Some(&schedule), false, true, Some(1_000), usage);
+        assert_eq!(ineligible.route, StepRoute::Source);
+        assert!(!ineligible.skipped_for_context);
     }
 
     #[test]

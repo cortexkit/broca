@@ -133,7 +133,10 @@ impl crate::keep_warm_wait::KeepWarmDriver for RequestedLifetime {
     }
 }
 
-struct CacheProofProvider(crate::StubProvider);
+struct CacheProofProvider {
+    inner: crate::StubProvider,
+    fallback_context_limit: Option<u64>,
+}
 
 #[async_trait::async_trait]
 impl crate::Provider for CacheProofProvider {
@@ -142,7 +145,7 @@ impl crate::Provider for CacheProofProvider {
         step_id: broca_protocol::StepId,
         opts: &CallOptions,
     ) -> tokio::sync::mpsc::Receiver<broca_protocol::NormalizedEvent> {
-        self.0.step(step_id, opts).await
+        self.inner.step(step_id, opts).await
     }
     fn reasoning_is_prefix_bound(&self) -> bool {
         true
@@ -158,6 +161,12 @@ impl crate::Provider for CacheProofProvider {
             "stub", "fallback",
         ))
     }
+    fn refusal_fallback_context_limit(&self) -> Option<u64> {
+        self.fallback_context_limit
+    }
+    fn set_step_route(&self, route: crate::refusal_fallback::StepRoute) {
+        self.inner.set_step_route(route);
+    }
 }
 
 async fn drive_cache_identity(
@@ -167,6 +176,17 @@ async fn drive_cache_identity(
     model: broca_protocol::request::ModelHandle,
     variant: Option<&str>,
 ) {
+    drive_cache_identity_with_fallback_window(shared, plane, run, model, variant, None).await;
+}
+
+async fn drive_cache_identity_with_fallback_window(
+    shared: &Shared,
+    plane: Arc<Plane>,
+    run: &str,
+    model: broca_protocol::request::ModelHandle,
+    variant: Option<&str>,
+    fallback_context_limit: Option<u64>,
+) -> CacheProofProvider {
     let writer = shared.writer();
     let (mut request, mut control, _) = history_request();
     request.run_id = broca_protocol::RunId(run.into());
@@ -179,7 +199,10 @@ async fn drive_cache_identity(
     control.compaction_views = None;
     control.keep_warm = Some(Arc::new(RequestedLifetime));
     assert!(!control.compaction_cache_proven_expired);
-    let provider = CacheProofProvider(crate::StubProvider::new(vec![model_events()]));
+    let provider = CacheProofProvider {
+        inner: crate::StubProvider::new(vec![model_events()]),
+        fallback_context_limit,
+    };
     let (out, _events) = tokio::sync::mpsc::channel(256);
     let result = crate::run_loop_on_writer(
         request,
@@ -197,6 +220,7 @@ async fn drive_cache_identity(
     .unwrap();
     assert_eq!(result.reason, RunFinishReason::Completed);
     writer.shutdown().await.unwrap();
+    provider
 }
 
 async fn expired_cache_history() -> Shared {
@@ -392,6 +416,57 @@ async fn compaction_v2_first_fallback_request_cannot_use_the_source_touch() {
     assert!(!cache_ride_causes(&plane).contains(&json!("cache_expired")));
     assert!(shared.records().iter().rev().any(|record| matches!(record,
         WalRecord::ModelStepFinished { fallback, .. } if fallback.route.is_some())));
+}
+
+#[tokio::test]
+async fn compaction_v2_ride_and_send_skip_a_scheduled_fallback_that_does_not_fit() {
+    use broca_protocol::request::ModelHandle;
+    for fallback_window in [999, 1_000] {
+        let shared = scheduled_cache_history(false, 1).await;
+        let mut records = shared.records();
+        for record in &mut records {
+            if let WalRecord::ModelStepFinished { usage, .. } = record {
+                usage.input_tokens = Some(1_000);
+            }
+        }
+        let shared = Shared::with_records(records);
+        let plane = Arc::new(Plane::default());
+        let source = ModelHandle::new("stub", "model");
+        let provider = drive_cache_identity_with_fallback_window(
+            &shared,
+            plane.clone(),
+            "second",
+            source.clone(),
+            None,
+            Some(fallback_window),
+        )
+        .await;
+        assert!(
+            cache_ride_causes(&plane).contains(&json!("cache_expired")),
+            "the source's expired cache, not the untouched fallback cache, dates this ride"
+        );
+        assert_eq!(
+            provider.inner.calls()[0].target_model.as_ref(),
+            Some(&source)
+        );
+        assert_eq!(
+            provider.inner.routes(),
+            [crate::refusal_fallback::StepRoute::Source]
+        );
+        let last = shared
+            .records()
+            .into_iter()
+            .rev()
+            .find(|record| matches!(record, WalRecord::ModelStepFinished { .. }))
+            .unwrap();
+        let WalRecord::ModelStepFinished { fallback, .. } = last else {
+            unreachable!()
+        };
+        assert!(
+            fallback.route.is_none(),
+            "the oversized fallback must not serve the step"
+        );
+    }
 }
 
 #[tokio::test]
