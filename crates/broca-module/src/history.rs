@@ -439,15 +439,6 @@ pub async fn read<H: ServeHandler + ?Sized>(
              storage",
         ));
     }
-    // Raw history reads its pages with display facts (each message's sender), which a store
-    // session's `session.read` doesn't serve yet. Remove this once it serves them.
-    if store.is_some() {
-        return Err(refused(
-            crate::store_entries::NOT_SERVED_ON_NEW_STORAGE,
-            "session.history is not served yet for a session kept in the new storage: it \
-             waits on display facts for such sessions",
-        ));
-    }
     // The store's own ids aren't positions, so it resolves a named message itself.
     let store_mid = store.as_ref().map(|store| store.mid_ordinal);
     let head = match store {

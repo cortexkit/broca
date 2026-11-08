@@ -5120,6 +5120,11 @@ const NOT_SERVED_ON_NEW_STORAGE: &str = "not_served_on_new_storage";
 /// Whether `method` is served for a session kept in the new storage. Every other op is refused
 /// `not_served_on_new_storage` for such a session, so none can fall through to today's WAL
 /// reads. An op joins this list in the change that gives it a store implementation.
+///
+/// The list covers the session's own route. A `compaction-runner/v1` route (`bind`,
+/// `session.entries`, `session.applied_view`, `session.apply_view`) is dispatched by its role
+/// before this check, and the registry sends a store session's calls on it to the store
+/// (`LineageRegistry::route_compaction_v2`).
 fn served_on_new_storage(method: &str, params: &serde_json::Value) -> bool {
     match method {
         // Reads served from the store (`store_read`, `store_head`).
@@ -5136,6 +5141,11 @@ fn served_on_new_storage(method: &str, params: &serde_json::Value) -> bool {
         OP_INSTALL_VIEW => true,
         // Describes the module, not the session.
         OP_ROLE_DESCRIBE => true,
+        // The raw form pages through the store's `session.read` (`crate::history`). The display
+        // form needs per-call facts the store doesn't serve yet, so it is refused here.
+        cortexkit_role_llm_runner::ops::SESSION_HISTORY => {
+            params.get("form").and_then(serde_json::Value::as_str) != Some("display")
+        }
         _ => false,
     }
 }
