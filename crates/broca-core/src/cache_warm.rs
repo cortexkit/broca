@@ -287,6 +287,9 @@ pub fn last_cache_send(records: &[WalRecord]) -> Option<(u64, RunConfig)> {
 
 /// Expiry evidence for the next serving model, never a touch from before a model switch.
 /// This is separate from the keep-warm clock: a conservative unknown must not reschedule warms.
+/// A frozen source-model change also invalidates evidence when both runs could serve the same
+/// fallback model (for example source A via fallback B, then directly B). That can under-claim
+/// expiry, but cannot claim that rewriting a still-warm prefix is free.
 pub(crate) fn last_cache_send_for_model(
     records: &[WalRecord],
     model: &broca_protocol::request::ModelHandle,
