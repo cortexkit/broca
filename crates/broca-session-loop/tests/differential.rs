@@ -7414,6 +7414,86 @@ async fn a_finalize_steps_offline_request_disables_calls_as_sent() {
         .await;
 }
 
+/// A session whose run froze no cache marker order (one converted from a log written before
+/// runs froze one) keeps rendering without one, as today's loop does: a step rebuilt from it
+/// names none, and a new run admitted on it freezes none. A session's first run takes the
+/// current order.
+#[tokio::test]
+async fn a_session_whose_run_froze_no_marker_order_keeps_none() {
+    use broca_session_loop::run::MARKER_ORDER_VERSION;
+    let scenario = Scenario {
+        input: vec![user("hello")],
+        tools: vec![tool("read", ExecutionMode::Parallel)],
+        manifest: None,
+        stop_when: Vec::new(),
+        steps: vec![text_step("a1", "hi")],
+    };
+    let (today, image, _) = today_from(&scenario, None, scenario.steps.clone()).await;
+    assert_eq!(
+        today.requests[0].marker_order_version,
+        Some(MARKER_ORDER_VERSION)
+    );
+    let frames = image.framed();
+    let mut converted =
+        convert_unbilled(&frames, lineage(&image).as_deref()).expect("the log converts");
+    // As a log written before runs froze a marker order: its start records none.
+    for record in &mut converted.records {
+        if let Record::RunStart(start) = record {
+            let recorded = start
+                .run_choices
+                .as_mut()
+                .and_then(|choices| choices.get_mut("record"))
+                .and_then(Value::as_object_mut)
+                .expect("the start records today's members");
+            assert!(recorded.remove("marker_order_version").is_some());
+        }
+    }
+    let backend = MemoryBackend::default();
+    let mut session = Session::create(
+        &backend,
+        SessionAddr("0123456789abcdef".into()),
+        SessionTriple {
+            project_root: "/project".into(),
+            harness: "differential".into(),
+            session: "s1".into(),
+        },
+        &DeploymentKey::new(1, &[7; 32]),
+        true,
+    )
+    .await
+    .unwrap();
+    session.append(&converted.records, true).await.unwrap();
+    let parts = MemoryParts {
+        parts: converted.parts,
+    };
+    let rebuilt = broca_session_loop::run::offline_request(&session, &parts, &bind(), 1)
+        .await
+        .expect("the step rebuilds");
+    assert_eq!(rebuilt.marker_order_version, None, "the rebuilt step");
+    let provider = ScriptedProvider::new(Vec::new());
+    let admit = |operations| {
+        let mut request = scenario.request_for("r2", &[user("again")]);
+        broca_session_loop::admit::admission(
+            &mut request,
+            &admission_control(&scenario),
+            &provider,
+            operations,
+            Some(2),
+        )
+        .expect("the run is admitted")
+    };
+    assert_eq!(
+        admit(&session.operations).marker_order_version,
+        None,
+        "a later run"
+    );
+    assert_eq!(
+        admit(&Default::default()).marker_order_version,
+        Some(MARKER_ORDER_VERSION),
+        "a session's first run"
+    );
+}
+
 #[tokio::test]
 async fn nudges_and_finalize_due_together_are_placed_in_order() {
     BUDGET

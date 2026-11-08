@@ -81,6 +81,12 @@ pub fn admission<P: Provider>(
         context_management: req.context_management.clone(),
         directives: req.directives.clone(),
         tools_were_omitted: control.tools_were_omitted,
+        // The session's first run takes the current order; a later one keeps its previous
+        // run's, even none, as today's loop does.
+        marker_order_version: match operations.run.as_ref().and_then(|run| run.start.as_ref()) {
+            Some(previous) => crate::run::frozen_marker_order(previous),
+            None => Some(crate::run::MARKER_ORDER_VERSION),
+        },
         send: SendFacts {
             submission_id: req.submission_id.as_ref().map(|id| id.0.clone()),
             send_id: req.send_id.clone(),

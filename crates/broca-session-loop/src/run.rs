@@ -136,6 +136,12 @@ pub struct Admission {
     pub directives: Option<Vec<broca_protocol::request::DirectiveName>>,
     /// Whether the send left its tools out, so the plan's or the session's apply.
     pub tools_were_omitted: bool,
+    /// The cache marker order the run's requests are rendered with, frozen into its start. A
+    /// session's first run takes the current order ([`MARKER_ORDER_VERSION`]). Every later run
+    /// takes the order the session's previous run froze, even when that run froze none (a run
+    /// written before the order existed), as today's loop does; a run read back from its start
+    /// takes what the start froze.
+    pub marker_order_version: Option<u32>,
     /// What the send said about itself. None of it changes a request; all of it is recorded
     /// on the run's start, where status, retries and reads find it.
     pub send: SendFacts,
@@ -1209,6 +1215,18 @@ fn frozen_admission(
     Ok(admission)
 }
 
+/// The cache marker order `start` froze, which its record keeps beside its config; `None` for a
+/// run that froze none.
+pub fn frozen_marker_order(start: &broca_session_store::record::RunStart) -> Option<u32> {
+    start
+        .run_choices
+        .as_ref()
+        .and_then(|choices| choices.get("record"))
+        .and_then(|record| record.get("marker_order_version"))
+        .and_then(Value::as_u64)
+        .and_then(|version| u32::try_from(version).ok())
+}
+
 /// A run's config members, as `RunStarted.config` spells them, and its plan manifest's setup
 /// parts, in order.
 pub type ConfigMembers = (serde_json::Map<String, Value>, Vec<(PartKind, Value)>);
@@ -1352,6 +1370,7 @@ pub fn admission_of_start(
         render_tags: member("render_tags")
             .and_then(|value| value.as_bool())
             .unwrap_or(false),
+        marker_order_version: frozen_marker_order(start),
         budget: decode::<broca_protocol::request::BudgetConfig>(member("budget"))?
             .filter(|budget| *budget != broca_protocol::request::BudgetConfig::default()),
         route_decision_id: start.route_decision_id.clone(),
@@ -2579,7 +2598,9 @@ async fn admit<W: Writer>(
         choices.insert("manifest".into(), rest);
     }
     let mut record = serde_json::Map::new();
-    record.insert("marker_order_version".into(), json!(MARKER_ORDER_VERSION));
+    if let Some(version) = admission.marker_order_version {
+        record.insert("marker_order_version".into(), json!(version));
+    }
     if let Some(sent_by) = to_value(admission.send.sent_by.as_ref())? {
         record.insert("sent_by".into(), sent_by);
     }
@@ -2862,7 +2883,7 @@ fn call_options<W: Writer>(
         clean_computed_into(&mut prompt);
     }
     let mut opts = CallOptions::new(prompt);
-    opts.marker_order_version = Some(MARKER_ORDER_VERSION);
+    opts.marker_order_version = admission.marker_order_version;
     opts.render_episodes = Arc::new(episodes.into());
     opts.tools = Arc::clone(tools);
     opts.tool_choice = Arc::new(admission.tool_choice.clone());
