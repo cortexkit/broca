@@ -392,6 +392,49 @@ enum FixtureMode {
     GlobalSystem,
 }
 
+fn fixture_request(session: BindIdentity, tools: Vec<Tool>) -> RunRequest {
+    RunRequest {
+        account_route: None,
+        route_decision_id: None,
+        input_written_at_ms: None,
+        directives: None,
+        session_class: None,
+        retention: None,
+        title: None,
+        on_restart: None,
+        keep_warm: None,
+        scope: None,
+        send_id: None,
+        request_identity_digest: None,
+        project_id: None,
+        principal: None,
+        run_id: RunId("fixture/run".into()),
+        session,
+        model: ModelHandle::new("test", "m"),
+        input: vec![Message::new(
+            Role::User,
+            vec![ContentBlock::Text {
+                text: "fixture".into(),
+            }],
+        )],
+        policy_allowed: tools.iter().map(|t| t.name.clone()).collect(),
+        tools,
+        tool_choice: ToolChoice::Auto,
+        generation: GenerationConfig::default(),
+        cache: None,
+        stop_when: vec![StopCondition::StepCount { n: 5 }],
+        submission_id: None,
+        budget: None,
+        context_limit: None,
+        work_class: None,
+        context_management: None,
+        variant: None,
+        service_tier: None,
+        inherit_frozen_cache: false,
+        structured_output: None,
+    }
+}
+
 async fn fixture_with_mode<F: WireFamily + 'static>(
     tag: &str,
     family: F,
@@ -428,51 +471,7 @@ async fn fixture_with_mode<F: WireFamily + 'static>(
     } else {
         vec![]
     };
-    let mut request = RunRequest {
-        account_route: None,
-        route_decision_id: None,
-        input_written_at_ms: None,
-        directives: None,
-        session_class: None,
-        retention: None,
-        title: None,
-        on_restart: None,
-        keep_warm: None,
-        scope: None,
-        send_id: None,
-        request_identity_digest: None,
-        project_id: None,
-        principal: None,
-        run_id: RunId("fixture/run".into()),
-        session: session.clone(),
-        model: ModelHandle::new("test", "m"),
-        input: vec![Message {
-            turn_system: false,
-            cache_prefix_blocks: None,
-            origin: None,
-            ordinal: None,
-            tags: Default::default(),
-            role: Role::User,
-            content: vec![ContentBlock::Text {
-                text: "fixture".into(),
-            }],
-        }],
-        policy_allowed: tools.iter().map(|t| t.name.clone()).collect(),
-        tools,
-        tool_choice: ToolChoice::Auto,
-        generation: GenerationConfig::default(),
-        cache: None,
-        stop_when: vec![StopCondition::StepCount { n: 5 }],
-        submission_id: None,
-        budget: None,
-        context_limit: None,
-        work_class: None,
-        context_management: None,
-        variant: None,
-        service_tier: None,
-        inherit_frozen_cache: false,
-        structured_output: None,
-    };
+    let mut request = fixture_request(session.clone(), tools);
     let wal = FileWalStore::new(root.join("wal"));
     let (tx, mut rx) = mpsc::channel(4096);
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
@@ -630,6 +629,474 @@ fn check_bodies(out: &Path, captured: &[Vec<u8>]) {
             "export must equal independently captured request bytes"
         );
     }
+}
+
+const TOOL_PNG: &[u8] =
+    include_bytes!("../../broca-provider/examples/media-live/fixtures/tool-image.png");
+
+struct NativeImageTool;
+
+#[async_trait::async_trait]
+impl broca_core::tool_plane::ToolPlane for NativeImageTool {
+    async fn batch_started(
+        &self,
+        _: &broca_core::tool_plane::BatchCtx,
+        _: &[broca_protocol::ToolCall],
+        _: &broca_core::ToolManifest,
+    ) -> Result<(), broca_core::ToolPlaneError> {
+        Ok(())
+    }
+    async fn batch_finished(
+        &self,
+        _: &broca_core::tool_plane::BatchCtx,
+    ) -> Result<(), broca_core::ToolPlaneError> {
+        Ok(())
+    }
+    async fn dispatch(
+        &self,
+        ctx: &broca_core::tool_plane::BatchCtx,
+        call: &broca_protocol::ToolCall,
+    ) -> broca_core::tool_plane::DispatchResult {
+        let media = ctx
+            .media_capture
+            .as_ref()
+            .expect("live tool capture installed")
+            .capture(
+                &ctx.batch_id,
+                &call.tool_call_id,
+                TOOL_PNG.to_vec(),
+                "image/png".into(),
+            )
+            .await
+            .unwrap();
+        broca_core::tool_plane::DispatchResult::Completed(broca_protocol::ToolResult {
+            tool_call_id: call.tool_call_id.clone(),
+            output: broca_protocol::ToolOutput::Parts {
+                parts: vec![broca_protocol::ToolOutputPart::Media { media }],
+            },
+            is_error: false,
+        })
+    }
+}
+
+fn native_provider(
+    wal: Arc<FileWalStore>,
+    session: &BindIdentity,
+    frozen: FrozenRenderConfig,
+    captured: Arc<Mutex<Vec<Vec<u8>>>>,
+) -> LiveProvider<broca_provider::families::OpenAiResponsesChatgpt> {
+    use broca_core::media_request::MediaCheckpoint;
+    use broca_core::provider::Provider;
+    let mut checkpoint = MediaCheckpoint::empty();
+    for frame in wal.read_records(session).unwrap() {
+        checkpoint.fold(frame.seq, &frame.record).unwrap();
+    }
+    let checkpoint = MediaCheckpoint::decode(&checkpoint.encode()).unwrap();
+    let store = wal.uploads().unwrap().session_media_store(session).unwrap();
+    let key = session.clone();
+    let media = broca_provider::media_request::LiveMedia::from_checkpoint(
+        store,
+        checkpoint,
+        None,
+        frozen.media.clone(),
+        Box::new(move |after| {
+            wal.read_records_range(&key, after, None, None)
+                .map_err(|error| error.to_string())
+                .and_then(|range| match range.into_records() {
+                    broca_wal::WalRangeRecords::Complete(records) => Ok(records),
+                    _ => Err("native image fixture requires complete WAL tail".into()),
+                })
+        }),
+    )
+    .unwrap();
+    let provider = LiveProvider::new(
+        broca_provider::families::OpenAiResponsesChatgpt,
+        frozen,
+        AuthHandle::Bearer("fixture".into()),
+    );
+    provider.set_media_request_renderer(Arc::new(move |config, opts, tags, commit, provenance| {
+        let body = media.render_with_provenance(config, opts, tags, commit, provenance)?;
+        // This is the transport's render hook, before endpoint construction and WebSocket framing.
+        // Admission estimates are not sent requests and must not enter the byte oracle.
+        if commit {
+            captured.lock().unwrap().push(body.clone());
+        }
+        Ok(body)
+    }));
+    provider
+}
+
+async fn chatgpt_media_fixture(
+    tag: &str,
+    mode3: bool,
+) -> (PathBuf, BindIdentity, Vec<WalRecord>, Vec<Vec<u8>>) {
+    use futures::{SinkExt, StreamExt};
+    let root = scratch(tag);
+    let session = BindIdentity::new(root.join("proj"), "test", tag);
+    let wal = Arc::new(FileWalStore::new(root.join("wal")));
+    drop(wal.open(&session).unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut frozen =
+        broca_provider::families::openai_responses_chatgpt_frozen_config("gpt-5.3-codex");
+    frozen.base_url = Some(format!("http://{}", listener.local_addr().unwrap()));
+    frozen.media = Some(broca_provider::media_profile::select_media_profile(
+        WireFamilyId::OpenAiResponsesChatgpt,
+        None,
+        "gpt-5.3-codex",
+        broca_provider::spec::InputModalities::from_value(&json!(["text", "image"])),
+        Some(128000),
+    ));
+    let server = tokio::spawn(async move {
+        let mut call = 0;
+        for count in [2, 1, 1] {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default();
+            config.extensions.permessage_deflate = Some(tokio_tungstenite::tungstenite::extensions::compression::deflate::DeflateConfig::default());
+            let mut socket = tokio_tungstenite::accept_async_with_config(socket, Some(config))
+                .await
+                .unwrap();
+            for _ in 0..count {
+                let request = socket.next().await.unwrap().unwrap();
+                let request: Value = serde_json::from_str(request.to_text().unwrap()).unwrap();
+                assert_eq!(request["type"], "response.create");
+                let mut events = if call == 0 {
+                    vec![
+                        json!({"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc","call_id":"image-call","name":"read","arguments":""}}),
+                        json!({"type":"response.function_call_arguments.delta","output_index":0,"delta":"{}"}),
+                    ]
+                } else {
+                    vec![json!({"type":"response.output_text.delta","delta":"done"})]
+                };
+                events.push(json!({"type":"response.completed","response":{"id":format!("r{call}"),"status":"completed","usage":{"input_tokens":12,"output_tokens":1}}}));
+                for event in events {
+                    socket
+                        .send(tokio_tungstenite::tungstenite::Message::Text(
+                            event.to_string().into(),
+                        ))
+                        .await
+                        .unwrap();
+                }
+                call += 1;
+            }
+        }
+        assert_eq!(call, 4);
+    });
+    let tools = vec![Tool {
+        name: "read".into(),
+        description: "Screenshot".into(),
+        input_schema: json!({"type":"object"}),
+        module: None,
+        execution_mode: Default::default(),
+        reply: None,
+    }];
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let (tx, mut rx) = mpsc::channel(4096);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let mut request = fixture_request(session.clone(), tools);
+    request.run_id = RunId("media-1".into());
+    request.model = ModelHandle::new("openai", "gpt-5.3-codex");
+    request.context_limit = Some(128000);
+    let provider = native_provider(wal.clone(), &session, frozen.clone(), captured.clone());
+    let mut manifest = (*mode3_manifest()).clone();
+    manifest.plan =
+        broca_wal::OpaqueJson::from_json_text(json!({"render_tags":true}).to_string()).unwrap();
+    manifest.tools = Arc::new(request.tools.clone());
+    let control = broca_core::RunControl {
+        new_log_compaction_plan_version: mode3.then_some(broca_core::compaction_v2::PLAN_VERSION),
+        admitted_context_limit: request.context_limit,
+        manifest: Some(Arc::new(manifest)),
+        ..Default::default()
+    };
+    broca_core::run::run_loop_with_control(
+        request.clone(),
+        &provider,
+        &NativeImageTool,
+        &FileLeaseStore::new(root.join("leases")),
+        &AllowAll,
+        &*wal,
+        None,
+        control,
+        &tx,
+    )
+    .await
+    .unwrap();
+    drop(provider);
+    for (id, mode, pause) in [
+        ("media-2", broca_core::StartMode::AppendEpisode, false),
+        ("media-3", broca_core::StartMode::AppendEpisode, true),
+        ("media-3", broca_core::StartMode::ResumeAfterAuth, false),
+    ] {
+        request.run_id = RunId(id.into());
+        request.input = vec![Message::new(
+            Role::User,
+            vec![ContentBlock::Text { text: id.into() }],
+        )];
+        let provider = native_provider(wal.clone(), &session, frozen.clone(), captured.clone());
+        let writer =
+            broca_core::wal_writer::WalHandle::spawn(wal.open(&session).unwrap(), 1).unwrap();
+        let control = broca_core::RunControl {
+            pause_for_auth_at_start: pause.then(|| {
+                serde_json::from_value(json!({"class":"auth_required","message":"fixture pause"}))
+                    .unwrap()
+            }),
+            ..Default::default()
+        };
+        let result = broca_core::run_loop_on_writer(
+            request.clone(),
+            &writer,
+            mode,
+            &provider,
+            &NativeImageTool,
+            &AllowAll,
+            &*wal,
+            None,
+            control,
+            &tx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.paused.is_some(), pause);
+        writer.shutdown().await.unwrap();
+    }
+    drop(tx);
+    drain.await.unwrap();
+    server.await.unwrap();
+    let records: Vec<_> = wal
+        .read_records(&session)
+        .unwrap()
+        .into_iter()
+        .map(|frame| frame.record)
+        .collect();
+    let terminal_ms = records
+        .iter()
+        .filter_map(|record| match record {
+            WalRecord::ModelAttemptFinished { ts_ms, .. } => Some(*ts_ms as i64 + 1),
+            _ => None,
+        })
+        .max()
+        .unwrap();
+    index_bind(&index(&root), &session, "completed", Some(terminal_ms));
+    let bodies = captured.lock().unwrap().clone();
+    assert_eq!(bodies.len(), 4);
+    assert!(records
+        .iter()
+        .any(|record| matches!(record, WalRecord::RunPaused { .. })));
+    for body in &bodies[1..] {
+        use base64::Engine;
+        let text = std::str::from_utf8(body).unwrap();
+        assert!(text.contains("\"type\":\"input_image\""));
+        assert!(text.contains(&format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(TOOL_PNG)
+        )));
+    }
+    (root, session, records, bodies)
+}
+
+#[tokio::test]
+async fn chatgpt_media_cache_dump_matches_live_first_later_and_resumed_requests() {
+    use broca_core::media_store::MediaStoreClass;
+    for class in [
+        MediaStoreClass::NonDurable,
+        MediaStoreClass::Durable,
+        MediaStoreClass::Ephemeral,
+    ] {
+        let tag = format!("native-{}", class.directory());
+        let (root, session, records, captured) = chatgpt_media_fixture(&tag, true).await;
+        let wal = FileWalStore::new(root.join("wal"));
+        let path = match class {
+            MediaStoreClass::NonDurable => wal.wal_path(&session),
+            MediaStoreClass::Durable => wal.durable_wal_path(&session),
+            MediaStoreClass::Ephemeral => wal.ephemeral_wal_path(&session),
+        };
+        if class != MediaStoreClass::NonDurable {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::rename(wal.wal_path(&session), path).unwrap();
+            std::fs::rename(root.join("media"), root.join(class.directory())).unwrap();
+        }
+        let media = root.join(class.directory());
+        for entry in std::fs::read_dir(&media).unwrap() {
+            let entry = entry.unwrap().path();
+            if entry.file_name().unwrap() != "objects" {
+                if entry.is_dir() {
+                    std::fs::remove_dir_all(entry).unwrap();
+                } else {
+                    std::fs::remove_file(entry).unwrap();
+                }
+            }
+        }
+        let out = root.join("out");
+        let summary = export(&root, &[tag], None, &out).unwrap();
+        assert_eq!(summary.calls_exported, 4);
+        assert_eq!(summary.calls_verified, 4);
+        assert_eq!(summary.digest_mismatches, 0);
+        assert!(summary.calls_skipped.is_empty());
+        let mut run = None;
+        let mut calls = 0;
+        for record in &records {
+            match record {
+                WalRecord::RunStarted { run_id, .. } => run = Some(&run_id.0),
+                WalRecord::ModelAttemptFinished {
+                    step_id,
+                    request_body_sha256,
+                    transport,
+                    ..
+                } => {
+                    assert_eq!(transport.as_deref(), Some("websocket"));
+                    let filename = broca_provider::request_dump::request_dump_filename(
+                        None,
+                        run.unwrap(),
+                        step_id.0,
+                    );
+                    let body =
+                        std::fs::read(out.join(filename.replace(".json", ".body.json"))).unwrap();
+                    assert_eq!(
+                        body, captured[calls],
+                        "export differs from live canonical body"
+                    );
+                    assert_eq!(format!("{:x}", Sha256::digest(&body)), *request_body_sha256);
+                    calls += 1;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(calls, 4);
+        assert_eq!(
+            std::fs::read_dir(&media).unwrap().count(),
+            1,
+            "export must not initialize refs, locks or identities"
+        );
+        if class == MediaStoreClass::Durable {
+            let options = broca_core::wal_fold::FoldOptions {
+                write: true,
+                ..Default::default()
+            };
+            let report = broca_core::wal_fold::fold(
+                &root,
+                broca_core::wal_fold::FoldSettings {
+                    options: &options,
+                    cold_ms: 0,
+                },
+            )
+            .unwrap();
+            assert_eq!(report.removed, 1);
+            let archived = root.join("out-archived");
+            let summary = export(&root, &[session.session], None, &archived).unwrap();
+            assert_eq!(summary.calls_verified, 4);
+            assert_eq!(summary.digest_mismatches, 0);
+            check_bodies(&archived, &captured);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+fn assert_native_refusal(root: &Path, session: &BindIdentity, code: &str) -> String {
+    let out = root.join("refused-out");
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_broca-session"))
+        .args(["cache-dump", "--state-root"])
+        .arg(root)
+        .args(["--session", &session.session, "--out"])
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(
+        !result.status.success(),
+        "missing native inputs must refuse"
+    );
+    assert!(
+        result.stdout.is_empty(),
+        "refused command must not print a success summary"
+    );
+    let error = String::from_utf8(result.stderr).unwrap();
+    assert!(error.contains(code), "{error}");
+    assert!(error.contains(&session.session), "{error}");
+    assert!(
+        error.contains("media-1") && error.contains("step=2"),
+        "{error}"
+    );
+    assert!(
+        !error.contains("digest_mismatch") && !error.contains("render_unavailable"),
+        "{error}"
+    );
+    for suffix in [".body.json", ".response.json", ".meta.json"] {
+        let written = files(&out, suffix);
+        assert_eq!(
+            written.len(),
+            1,
+            "only the earlier text-only call may remain"
+        );
+        assert!(written[0]
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("media-1-s1"));
+    }
+    error
+}
+
+#[tokio::test]
+async fn chatgpt_media_cache_dump_missing_store_refuses_without_creating_directories() {
+    let (root, session, _, _) = chatgpt_media_fixture("native-missing-store", true).await;
+    std::fs::remove_dir_all(root.join("media")).unwrap();
+    let error = assert_native_refusal(&root, &session, "media_store_missing");
+    assert!(
+        error.contains(root.join("media").to_str().unwrap()),
+        "{error}"
+    );
+    for directory in ["media", "media-durable", "media-ephemeral"] {
+        assert!(!root.join(directory).exists());
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn chatgpt_media_cache_dump_missing_object_refuses_without_cross_class_fallback() {
+    let (root, session, _, _) = chatgpt_media_fixture("native-missing-object", true).await;
+    let digest = format!("{:x}", Sha256::digest(TOOL_PNG));
+    let wrong = root.join("media-durable/objects");
+    std::fs::create_dir_all(&wrong).unwrap();
+    std::fs::rename(
+        root.join("media/objects").join(&digest),
+        wrong.join(&digest),
+    )
+    .unwrap();
+    let error = assert_native_refusal(&root, &session, "media_object_missing");
+    assert!(error.contains(&digest), "{error}");
+    assert!(!root.join("media/objects").join(&digest).exists());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn cache_dump_text_only_needs_no_media_directory() {
+    let (root, _, captured) = fixture(
+        "text-no-media",
+        OpenAiResponses,
+        openai_responses_frozen_config("m"),
+        vec![responses()],
+        false,
+    )
+    .await;
+    let out = root.join("out");
+    let summary = export(&root, &["text-no-media".into()], None, &out).unwrap();
+    assert_eq!(summary.calls_verified, 1);
+    assert_eq!(summary.digest_mismatches, 0);
+    check_bodies(&out, &captured);
+    for directory in ["media", "media-durable", "media-ephemeral"] {
+        assert!(!root.join(directory).exists());
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn chatgpt_media_cache_dump_defers_legacy_media_only_tags() {
+    let (root, session, _, captured) = chatgpt_media_fixture("native-legacy-tags", false).await;
+    let out = root.join("out");
+    let summary = export(&root, &[session.session], None, &out).unwrap();
+    assert_eq!(summary.calls_verified, 4);
+    assert_eq!(summary.digest_mismatches, 0);
+    check_bodies(&out, &captured);
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test]

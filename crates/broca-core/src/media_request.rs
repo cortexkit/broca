@@ -13,7 +13,7 @@ use broca_protocol::{
 use broca_wal::WalRecord;
 use serde::{Deserialize, Serialize};
 
-use crate::media_store::{MediaReadError, MediaStore};
+use crate::media_store::{MediaReadError, MediaStore, MediaStoreClass, ReadOnlyMediaStore};
 use crate::placement::{AppendKind, Placement, PlacementAction};
 
 mod initialization;
@@ -133,11 +133,12 @@ pub enum MediaChange {
     View(Vec<MediaBinding>),
 }
 
-/// Metadata-only projection paired with one session's media store. The caller must retain
-/// the session lease while reading, just as it does while registering captures.
+/// Metadata-only projection paired with one session's media store. Live callers retain
+/// the session lease; offline readers verify afresh and refuse objects reclaimed meanwhile.
 #[derive(Debug, Clone)]
 pub struct SessionMedia {
     store: Option<MediaStore>,
+    read_only: Option<(std::path::PathBuf, MediaStoreClass)>,
     placement: Placement,
     records: u64,
     boundary: u64,
@@ -166,9 +167,18 @@ impl SessionMedia {
         Self::metadata(Some(store))
     }
 
+    /// Resolve no files until preparation actually requires an eligible native object.
+    /// Historical references hidden by compaction or aging need no store on disk.
+    pub fn read_only(state_root: &std::path::Path, class: MediaStoreClass) -> Self {
+        let mut session = Self::metadata(None);
+        session.read_only = Some((state_root.to_owned(), class));
+        session
+    }
+
     fn metadata(store: Option<MediaStore>) -> Self {
         Self {
             store,
+            read_only: None,
             placement: Placement::default(),
             records: 0,
             boundary: 0,
@@ -687,11 +697,28 @@ impl SessionMedia {
         }) {
             return Err(MediaReadError::Corrupt(reference.sha256.clone()));
         }
-        let bytes = self
-            .store
-            .as_ref()
-            .expect("render session has a media store")
-            .read_verified(reference)?;
+        let bytes = if let Some((state_root, class)) = &self.read_only {
+            ReadOnlyMediaStore::open_existing(state_root, *class)
+                .map_err(|source| {
+                    if source.kind() == std::io::ErrorKind::NotFound {
+                        MediaReadError::StoreMissing {
+                            root: state_root.join(class.directory()),
+                            digest: reference.sha256.clone(),
+                        }
+                    } else {
+                        MediaReadError::Io {
+                            digest: reference.sha256.clone(),
+                            source,
+                        }
+                    }
+                })?
+                .read_verified(reference)?
+        } else {
+            self.store
+                .as_ref()
+                .expect("render session has a media store")
+                .read_verified(reference)?
+        };
         if crate::media_validation::validate_media(&bytes, &reference.mime).as_ref()
             != Ok(reference)
         {

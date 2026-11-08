@@ -62,18 +62,141 @@ pub fn render_step_with_lineage(
     max_output_tokens: Option<u32>,
     provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
 ) -> Result<(FrozenRenderConfig, CallOptions, Vec<u8>), String> {
-    let (frozen, mut opts, state) =
-        boundary_options_with_lineage(lineage, prefix, config, run_id, step)?;
+    let (frozen, opts) = selected_options(
+        lineage,
+        prefix,
+        config,
+        run_id,
+        step,
+        max_output_tokens,
+        false,
+    )?;
     let family = broca_provider::registry::wire_family(frozen.family_id)
         .ok_or("no wire family implementation for the frozen family id")?;
+    let body = family.render_with_provenance(&frozen.for_step(&opts), &opts, provenance);
+    Ok((frozen, opts, body))
+}
+
+pub struct OfflineMediaContext<'a> {
+    pub state_root: &'a std::path::Path,
+    pub identity: &'a broca_protocol::BindIdentity,
+    pub class: broca_core::media_store::MediaStoreClass,
+    pub lineage: Option<&'a str>,
+}
+
+#[derive(Debug)]
+pub enum OfflineRenderError {
+    Unavailable(String),
+    Media { code: &'static str, message: String },
+}
+
+impl std::fmt::Display for OfflineRenderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable(message) => f.write_str(message),
+            Self::Media { code, message } => write!(f, "{code}: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for OfflineRenderError {}
+
+/// Reconstruct the selected request using verified, read-only native media inputs.
+/// Missing native inputs are source-read failures, not alternate requests whose
+/// digests can meaningfully be compared. References replaced by eligibility or aging
+/// rules with `[media not shown: …]` notices require no store to be opened.
+pub fn render_step_with_media(
+    context: &OfflineMediaContext<'_>,
+    prefix: &[WalRecord],
+    config: &RunConfig,
+    run_id: &str,
+    step: u64,
+    max_output_tokens: Option<u32>,
+) -> Result<(FrozenRenderConfig, CallOptions, Vec<u8>), OfflineRenderError> {
+    use broca_provider::media_request::{prepare, render_prepared_with_provenance, MediaAging};
+
+    let (frozen, opts) = selected_options(
+        context.lineage,
+        prefix,
+        config,
+        run_id,
+        step,
+        max_output_tokens,
+        true,
+    )
+    .map_err(OfflineRenderError::Unavailable)?;
+    let family = broca_provider::registry::wire_family(frozen.family_id).ok_or_else(|| {
+        OfflineRenderError::Unavailable(
+            "no wire family implementation for the frozen family id".into(),
+        )
+    })?;
+    let frozen_step = frozen.for_step(&opts);
+    if broca_core::media_provenance::find_supplied_media(&opts.prompt).is_none() {
+        let body = family.render_with_provenance(&frozen_step, &opts, None);
+        return Ok((frozen, opts, body));
+    }
+    let refusal = |code, message| OfflineRenderError::Media {
+        code,
+        message: format!(
+            "session={} run={run_id} step={step}: {message}",
+            context.identity.session
+        ),
+    };
+    let mut session =
+        broca_core::media_request::SessionMedia::read_only(context.state_root, context.class);
+    let aging = if let Some(profile) = &frozen.media {
+        MediaAging::replay_wal(profile, &mut session, prefix)
+            .map_err(|error| refusal("media_wal", error))?
+    } else {
+        for record in prefix {
+            session
+                .fold(record)
+                .map_err(|error| refusal("media_wal", error))?;
+        }
+        MediaAging::default()
+    };
+    let mut bundle = prepare(&session, frozen.media.as_ref(), &opts.prompt, &aging)
+        .map_err(|error| refusal(error.code(), error.to_string()))?;
+    let tag_config = serde_json::to_value(&frozen_step).expect("frozen render config serializes");
+    let body = render_prepared_with_provenance(
+        &*family,
+        &frozen_step,
+        &opts,
+        Some(&mut bundle),
+        &|prompt| {
+            let mut prompt = prompt.to_vec();
+            broca_core::run::render_prompt_tags(
+                &mut prompt,
+                config.render_tags,
+                false,
+                &tag_config,
+            );
+            prompt
+        },
+        None,
+    )
+    .map_err(|error| refusal(error.code(), error.to_string()))?;
+    Ok((frozen, opts, body))
+}
+
+fn selected_options(
+    lineage: Option<&str>,
+    prefix: &[WalRecord],
+    config: &RunConfig,
+    run_id: &str,
+    step: u64,
+    max_output_tokens: Option<u32>,
+    defer_media_tags: bool,
+) -> Result<(FrozenRenderConfig, CallOptions), String> {
+    let (frozen, mut opts, state) =
+        boundary_options_with_media_tags(lineage, prefix, config, run_id, step, defer_media_tags)?;
     if let Some(state) = state.state() {
         opts = broca_core::compaction::model_options(&opts, state).map_err(|e| e.to_string())?;
     }
     if let Some(step_context) = opts.step_context.as_mut() {
         step_context.max_output_tokens = max_output_tokens;
     }
-    let body = family.render_with_provenance(&frozen.for_step(&opts), &opts, provenance);
-    Ok((frozen, opts, body))
+    Ok((frozen, opts))
 }
 
 pub fn boundary_options(
@@ -98,6 +221,24 @@ pub fn boundary_options_with_lineage(
     config: &RunConfig,
     run_id: &str,
     step: u64,
+) -> Result<
+    (
+        FrozenRenderConfig,
+        CallOptions,
+        broca_core::compaction::CompactionCheckpoint,
+    ),
+    String,
+> {
+    boundary_options_with_media_tags(lineage, prefix, config, run_id, step, false)
+}
+
+fn boundary_options_with_media_tags(
+    lineage: Option<&str>,
+    prefix: &[WalRecord],
+    config: &RunConfig,
+    run_id: &str,
+    step: u64,
+    defer_media_tags: bool,
 ) -> Result<
     (
         FrozenRenderConfig,
@@ -136,15 +277,13 @@ pub fn boundary_options_with_lineage(
         restore_repetition_guidance(&mut prior.prompt[span]);
     }
     // A run frozen with `render_tags` sent tagged user and tool-result text with its tag prefix.
-    if !mode3 && config.render_tags {
-        broca_protocol::tags::render_tags_into(
+    if !mode3 {
+        broca_core::run::render_prompt_tags(
             &mut prior.prompt,
-            broca_protocol::tags::TagRendering::for_render_config(&config.frozen_render_config),
+            config.render_tags,
+            defer_media_tags,
+            &config.frozen_render_config,
         );
-    } else if !mode3 {
-        // Model text a run under the computed rules marked for cleaning went out cleaned on
-        // every request since; a structured-output run's final text went out unchanged.
-        broca_protocol::tags::clean_computed_into(&mut prior.prompt);
     }
     let frozen: FrozenRenderConfig = serde_json::from_value(config.frozen_render_config.clone())
         .map_err(|e| format!("decode frozen_render_config: {e}"))?;

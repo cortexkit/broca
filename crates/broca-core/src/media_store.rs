@@ -63,6 +63,32 @@ pub struct MediaStore {
     root: PathBuf,
 }
 
+/// An existing store opened without registration, locks, or directory creation.
+/// Offline inspection must not turn a missing source into a newly initialized store.
+#[derive(Clone, Debug)]
+pub struct ReadOnlyMediaStore {
+    store: MediaStore,
+}
+
+impl ReadOnlyMediaStore {
+    pub fn open_existing(state_root: &Path, class: MediaStoreClass) -> io::Result<Self> {
+        let root = state_root.join(class.directory());
+        if !fs::metadata(&root)?.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotADirectory,
+                root.display().to_string(),
+            ));
+        }
+        Ok(Self {
+            store: MediaStore { root },
+        })
+    }
+
+    pub fn read_verified(&self, reference: &MediaRef) -> Result<Vec<u8>, MediaReadError> {
+        self.store.read_verified(reference)
+    }
+}
+
 impl MediaStore {
     /// Startup must have created the state root. This also pays creation barriers
     /// when a store is opened independently of the serving process.
@@ -240,6 +266,7 @@ impl MediaManifest {
 
 #[derive(Debug)]
 pub enum MediaReadError {
+    StoreMissing { root: PathBuf, digest: String },
     Missing(String),
     Corrupt(String),
     Io { digest: String, source: io::Error },
@@ -250,6 +277,7 @@ impl MediaReadError {
     /// retain their source error for the caller's ordinary storage-error path.
     pub fn code(&self) -> Option<&'static str> {
         match self {
+            Self::StoreMissing { .. } => Some("media_store_missing"),
             Self::Missing(_) => Some("media_object_missing"),
             Self::Corrupt(_) => Some("media_object_corrupt"),
             Self::Io { .. } => None,
@@ -258,7 +286,10 @@ impl MediaReadError {
 
     pub fn digest(&self) -> &str {
         match self {
-            Self::Missing(digest) | Self::Corrupt(digest) | Self::Io { digest, .. } => digest,
+            Self::StoreMissing { digest, .. }
+            | Self::Missing(digest)
+            | Self::Corrupt(digest)
+            | Self::Io { digest, .. } => digest,
         }
     }
 }
@@ -271,6 +302,9 @@ impl std::fmt::Display for MediaReadError {
             self.code().unwrap_or("read media object"),
             self.digest()
         )?;
+        if let Self::StoreMissing { root, .. } = self {
+            write!(f, " at {}", root.display())?;
+        }
         if let Self::Io { source, .. } = self {
             write!(f, ": {source}")?;
         }

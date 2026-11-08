@@ -3582,6 +3582,24 @@ async fn seal_size_refusal<W: WalStore>(
     result
 }
 
+/// Apply the live tag projection to a replayed prompt. Defer media-bearing messages
+/// until preparation fixes their part locations, just as the live incremental loop does.
+pub fn render_prompt_tags(
+    prompt: &mut [Message],
+    render_tags: bool,
+    defer_media_tags: bool,
+    frozen_render_config: &serde_json::Value,
+) {
+    render_new_tags(
+        prompt,
+        &mut 0,
+        render_tags,
+        defer_media_tags,
+        frozen_render_config,
+        None,
+    );
+}
+
 /// Render the tags of the messages appended to `prompt` since `rendered_len`: a run that
 /// renders tags shows numbers (by the rules each message was written under); any run shows
 /// the model's text cleaned where an earlier tag-rendering run under the computed rules wrote

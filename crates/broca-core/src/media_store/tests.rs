@@ -50,6 +50,38 @@ fn record(reference: &MediaRef) -> WalRecord {
     }
 }
 
+#[test]
+fn read_only_media_store_never_initializes_or_registers() {
+    let (root, _, manifest) = fixture();
+    drop(manifest);
+    fs::remove_dir_all(root.join("media-durable")).unwrap();
+    let missing = ReadOnlyMediaStore::open_existing(&root, MediaStoreClass::Durable).unwrap_err();
+    assert_eq!(missing.kind(), io::ErrorKind::NotFound);
+    assert!(!root.join("media-durable").exists());
+
+    let objects = root.join("media-durable/objects");
+    fs::create_dir_all(&objects).unwrap();
+    let reference = reference();
+    fs::write(objects.join(&reference.sha256), BYTES).unwrap();
+    let reader = ReadOnlyMediaStore::open_existing(&root, MediaStoreClass::Durable).unwrap();
+    assert_eq!(reader.read_verified(&reference).unwrap(), BYTES);
+    fs::write(objects.join(&reference.sha256), b"corrupt").unwrap();
+    assert_eq!(
+        reader.read_verified(&reference).unwrap_err().code(),
+        Some("media_object_corrupt")
+    );
+    fs::remove_file(objects.join(&reference.sha256)).unwrap();
+    assert_eq!(
+        reader.read_verified(&reference).unwrap_err().code(),
+        Some("media_object_missing")
+    );
+    assert_eq!(fs::read_dir(root.join("media-durable")).unwrap().count(), 1);
+    assert!(!root.join("media-durable/refs").exists());
+    assert!(!root.join("media-durable/store.lock").exists());
+    assert!(!root.join("media-durable/identities").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
 #[derive(Default)]
 struct Probe {
     events: Vec<Step>,
