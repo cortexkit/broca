@@ -6251,7 +6251,26 @@ where
             let raw: Vec<_> = frames.iter().map(|frame| frame.record.clone()).collect();
             // Expiry counts from the last request that reached the cache, by the lifetime that
             // request asked the provider for, which a refresh may have changed since.
-            let last_send = crate::cache_warm::last_cache_send(&raw);
+            // Session conditions stay on the source model, but cache proof follows the route
+            // the upcoming step will serve, including a scheduled refusal fallback.
+            let fallback = provider.refusal_fallback_model();
+            let routing = crate::refusal_fallback::decide_step_route(
+                refusal_schedule.as_ref(),
+                fallback.is_some(),
+                refused_steps.contains(&step_id),
+                provider.refusal_fallback_context_limit(),
+                compaction_history.previous_native_usage,
+            );
+            let fallback =
+                fallback.filter(|_| routing.route == crate::refusal_fallback::StepRoute::Fallback);
+            let serving_model = fallback.as_ref().unwrap_or(&config.model);
+            let serving_variant = if fallback.is_some() {
+                None
+            } else {
+                config.variant.as_deref()
+            };
+            let last_send =
+                crate::cache_warm::last_cache_send_for_model(&raw, serving_model, serving_variant);
             let requested_ttl = |config: &RunConfig| {
                 control
                     .keep_warm
@@ -6869,31 +6888,21 @@ where
         // froze a fallback at admission has a `fallback_model`; every other run skips all of
         // this, and its steps, records and bytes are exactly what they were without it.
         let fallback_model = provider.refusal_fallback_model();
-        // A prompt that already fills the fallback model's window would only overflow it.
-        let fallback_fits = match (
-            provider.refusal_fallback_context_limit(),
-            compaction_history
-                .previous_native_usage
-                .and_then(|usage| usage.fill_tokens()),
-        ) {
-            (Some(limit), Some(fill)) => fill < limit,
-            _ => true,
-        };
         // Set once this step has been refused and re-sent, live or before a crash: a step is
         // re-sent at most once, and a refusal on the re-send passes through.
         let mut fallback_resent = refused_steps.contains(&step_id);
-        let mut step_route = crate::refusal_fallback::StepRoute::Source;
-        let mut route_reason = broca_wal::StepRouteReason::Schedule;
+        let routing = crate::refusal_fallback::decide_step_route(
+            refusal_schedule.as_ref(),
+            fallback_model.is_some(),
+            fallback_resent,
+            provider.refusal_fallback_context_limit(),
+            compaction_history.previous_native_usage,
+        );
+        let fallback_fits = routing.fallback_fits;
+        let mut step_route = routing.route;
+        let mut route_reason = routing.reason;
         if let Some(fallback) = &fallback_model {
-            let scheduled = fallback_resent
-                || crate::refusal_fallback::route(refusal_schedule.as_ref(), true)
-                    == crate::refusal_fallback::StepRoute::Fallback;
-            if scheduled && fallback_fits {
-                step_route = crate::refusal_fallback::StepRoute::Fallback;
-                if fallback_resent {
-                    route_reason = broca_wal::StepRouteReason::Refusal;
-                }
-            } else if scheduled {
+            if routing.skipped_for_context {
                 tracing::warn!(
                     target: "broca::refusal_fallback",
                     session = %req.session.session,
