@@ -47,7 +47,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use broca_core::{AccountDecision, AccountSelectionRefusal, RoutingUnavailable};
-use broca_protocol::{BindIdentity, ErrorClass, ModelAttempt, RunFinishReason};
+use broca_protocol::{AttemptOutcome, BindIdentity, ErrorClass, ModelAttempt, RunFinishReason};
 use broca_subc::vault::{ScopedCredential, ScopedList};
 use broca_wal::WalLineageId;
 use serde::Deserialize;
@@ -1844,7 +1844,7 @@ impl RunReporter {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ReportEvent>();
         tokio::spawn(async move {
             let mut latest_headers: Option<BTreeMap<String, String>> = None;
-            let mut last_attempt_at_ms: Option<u64> = None;
+            let mut last_failed_attempt_at_ms: Option<u64> = None;
             while let Some(event) = rx.recv().await {
                 match event {
                     ReportEvent::Started { lineage, wal_seq } => {
@@ -1860,7 +1860,7 @@ impl RunReporter {
                         wal_seq,
                         retry_after_secs,
                     } => {
-                        let Some(observed_at_ms) = last_attempt_at_ms else {
+                        let Some(observed_at_ms) = last_failed_attempt_at_ms else {
                             continue;
                         };
                         let delay_ms = (retry_after_secs * 1000.0).ceil();
@@ -1902,6 +1902,7 @@ impl RunReporter {
                         wal_seq,
                         attempt,
                     } => {
+                        last_failed_attempt_at_ms = None;
                         if !attempt.account_observation.ratelimit_headers.is_empty() {
                             latest_headers =
                                 Some(attempt.account_observation.ratelimit_headers.clone());
@@ -1918,7 +1919,28 @@ impl RunReporter {
                         let Some(id) = event_id_or_count(&client, lineage, wal_seq) else {
                             continue;
                         };
-                        last_attempt_at_ms = Some(attempt.ts_ms);
+                        // Only a failed final attempt can block its account. A successful or
+                        // cancelled attempt clears older failures before an internal error can
+                        // reuse their receipt time. Attempt records do not link terminal causes:
+                        // an unrelated internal error after a final failed attempt can still
+                        // cause a five-second false block. This bounded cost is accepted instead
+                        // of adding a separate core signal identifying the error that ended the run.
+                        last_failed_attempt_at_ms = matches!(
+                            &attempt.outcome,
+                            AttemptOutcome::EofBeforeCompletion
+                                | AttemptOutcome::ChunkError
+                                | AttemptOutcome::IdleTimeout
+                                | AttemptOutcome::ContentTimeout
+                                | AttemptOutcome::ByteLimit
+                                | AttemptOutcome::DecodeError
+                                | AttemptOutcome::RateFloor
+                                | AttemptOutcome::HttpError
+                                | AttemptOutcome::ProviderError
+                                | AttemptOutcome::ConnectFailed
+                                | AttemptOutcome::HeaderTimeout
+                                | AttemptOutcome::NoStatus
+                        )
+                        .then_some(attempt.ts_ms);
                         client
                             .observe(attempt_body(
                                 &id,
@@ -1961,23 +1983,24 @@ impl RunReporter {
         });
     }
 
-    /// Report a terminal rate limit using the final attempt's receipt time. A rate limit
-    /// cleared by the provider's own retries never reaches this hook and is not reported.
-    /// The executor calls this only for an API-key run admitted by routing.
-    pub fn terminal_rate_limit(
+    /// Report an uncleared transient using the final attempt's receipt time. Account limits
+    /// have their own reports; other transients use the structured retry delay or five seconds.
+    /// Exhausted transport failures use their shared transient classification.
+    /// The executor calls this only for an error finish on a run admitted by routing.
+    pub fn terminal_transient(
         &self,
         lineage: Option<WalLineageId>,
         wal_seq: u64,
         error: &broca_protocol::ProviderError,
     ) {
-        if error.is_rate_limited() {
-            if let Some(retry_after_secs) = error.retry_after_secs {
-                let _ = self.tx.send(ReportEvent::Backoff {
-                    lineage,
-                    wal_seq,
-                    retry_after_secs,
-                });
-            }
+        if error.class.shared_class() == ErrorClass::Transient
+            && !error.is_account_limit_exhausted()
+        {
+            let _ = self.tx.send(ReportEvent::Backoff {
+                lineage,
+                wal_seq,
+                retry_after_secs: error.retry_after_secs.unwrap_or(5.0),
+            });
         }
     }
 
