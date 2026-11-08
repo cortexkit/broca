@@ -59,6 +59,117 @@ fn tool_part(value: &serde_json::Value) -> Option<&serde_json::Value> {
 }
 
 #[tokio::test]
+async fn known_roles_are_served_on_every_read_message_envelope() {
+    use std::time::Duration;
+    let mut rig = Rig::start("known-read-roles").await;
+    rig.script
+        .push(&[Step::Call("role-call"), Step::Text("synthetic role answer")]);
+    let sent = rig.send("role-send", "synthetic role prompt", None).await;
+    let run_id = result(&sent)["run_id"].as_str().unwrap().to_owned();
+    rig.wait_idle().await;
+
+    let mut pages = Vec::new();
+    for (name, method, params) in [
+        ("read-default", "session.read", json!({})),
+        ("read-head", "session.read", json!({"limit":4})),
+        (
+            "read-range",
+            "session.read",
+            json!({"from_ordinal":1,"limit":4}),
+        ),
+        (
+            "read-facts",
+            "session.read",
+            json!({"from_ordinal":1,"limit":4,"include_display_facts":true}),
+        ),
+        (
+            "read-descriptors",
+            "session.read",
+            json!({"from_ordinal":1,"limit":4,"media":"descriptors"}),
+        ),
+        ("history-raw", "session.history", json!({"limit":4})),
+        (
+            "history-display",
+            "session.history",
+            json!({"form":"display","limit":4}),
+        ),
+    ] {
+        let reply = rig
+            .request(7, json!({"method":method,"params":params}))
+            .await;
+        assert_eq!(reply.header.ty, subc_protocol::FrameType::Response);
+        capture(&format!("read-role.{name}.json"), &reply.body);
+        pages.push((name, result(&reply)));
+    }
+    let mut paged = Vec::new();
+    for ordinal in 1..=4 {
+        let reply = rig
+            .request(
+                7,
+                json!({"method":"session.read","params":{"from_ordinal":ordinal,"limit":1}}),
+            )
+            .await;
+        assert_eq!(reply.header.ty, subc_protocol::FrameType::Response);
+        capture(&format!("read-role.read-page-{ordinal}.json"), &reply.body);
+        let page = result(&reply);
+        assert_eq!(page["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(page["messages"][0]["ordinal"], ordinal);
+        paged.push(page["messages"][0].clone());
+    }
+    for (method, params, name) in [
+        ("session.head", json!({}), "head-control"),
+        ("run.result", json!({"run_id":run_id}), "run-result-control"),
+    ] {
+        let reply = rig
+            .request(7, json!({"method":method,"params":params}))
+            .await;
+        assert_eq!(reply.header.ty, subc_protocol::FrameType::Response);
+        capture(&format!("read-role.{name}.json"), &reply.body);
+    }
+    let frames = rig
+        .subscribe_collect_until(
+            8,
+            json!({"from":"start"}),
+            Duration::from_millis(30),
+            |frame| {
+                serde_json::from_slice::<serde_json::Value>(&frame.body)
+                    .is_ok_and(|value| value["event"]["type"] == "tool_finished")
+            },
+        )
+        .await;
+    for (index, frame) in frames.iter().enumerate() {
+        capture(
+            &format!("read-role.subscribe-control-{index}.json"),
+            &frame.body,
+        );
+    }
+    rig.finish().await;
+
+    for (name, page) in &pages {
+        let entries = page["messages"].as_array().unwrap();
+        assert_eq!(entries.len(), 4, "{name}: {page}");
+        for (entry, expected) in entries
+            .iter()
+            .zip(["user", "assistant", "tool", "assistant"])
+        {
+            let envelope = if *name == "history-display" {
+                &entry["row"]
+            } else {
+                entry
+            };
+            assert_eq!(envelope["role"], expected, "{name}: {entry}");
+        }
+        if *name != "history-display" {
+            assert_eq!(entries[1]["message"]["content"][0]["type"], "tool_call");
+            assert_eq!(entries[2]["message"]["content"][0]["type"], "tool_result");
+        }
+    }
+    for (entry, expected) in paged.iter().zip(["user", "assistant", "tool", "assistant"]) {
+        assert_eq!(entry["role"], expected);
+    }
+}
+
+#[tokio::test]
 async fn tool_identity_and_bus_contract_samples() {
     use broca_core::{FileWalStore, WalStore};
     use std::time::Duration;
