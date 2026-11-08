@@ -453,27 +453,8 @@ fn mid_at(reply: &Value, ordinal: u64) -> String {
 /// Compares every raw `session.history` read worth telling apart on both sides: the newest
 /// page whole and in short pages, each side following its own cursors, seeks by ordinal and by
 /// each side's own message ids, and the refusals of a position the session doesn't hold.
-/// Whether `session.history` on the store session is still refused while it waits on display
-/// facts for store sessions; today's storage serves the same request. While it is, the raw
-/// history comparisons are skipped; once the refusal is gone they run again unchanged.
-async fn raw_history_waits(today: &Side, store: &Side, label: &str) -> bool {
-    match store.history(json!({})).await {
-        Err(crate::history::HistoryError::Refused { code, message })
-            if code == crate::store_entries::NOT_SERVED_ON_NEW_STORAGE
-                && message.contains("display facts") =>
-        {
-            assert!(today.history(json!({})).await.is_ok(), "{label}");
-            true
-        }
-        _ => false,
-    }
-}
-
 async fn compare_history(today: &Side, store: &Side, label: &str) {
     assert!(store.holds() && !today.holds(), "{label}: the storages");
-    if raw_history_waits(today, store, label).await {
-        return;
-    }
     let both = |request: Value| async move {
         (
             today.history(request.clone()).await,
@@ -1109,14 +1090,12 @@ async fn reads_clean_replies_where_todays_reads_clean_them() {
             expected,
             "today's history, renders {renders}"
         );
-        if !raw_history_waits(&today, &store, "cleaning").await {
-            let new = store.history(json!({"from_ordinal": 1})).await.unwrap();
-            assert_eq!(
-                texts(new["messages"].as_array().unwrap()),
-                expected,
-                "the store's history, renders {renders}"
-            );
-        }
+        let new = store.history(json!({"from_ordinal": 1})).await.unwrap();
+        assert_eq!(
+            texts(new["messages"].as_array().unwrap()),
+            expected,
+            "the store's history, renders {renders}"
+        );
         let read = store
             .registry
             .read(SessionReadRequest::new(store.key.clone(), Some(1), None))

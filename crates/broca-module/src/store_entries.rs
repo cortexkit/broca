@@ -24,11 +24,11 @@
 //!   store actor doesn't take one yet, so it is refused by name (`not_served_on_new_storage`).
 //!
 //! `session.history` on a store session (`crate::history::read`) takes its head facts from
-//! [`history_head`] and its pages from `session.read`, which a store session serves from the
-//! store. Message ids name the store's own ids, which only the store resolves. The raw form is
-//! served whole. The display form needs per-call times and statuses, the Rich UI dialect and
-//! catalog digest each run froze at its start (`rich_ui`), and output references, which the
-//! store doesn't serve yet, so it is refused by name.
+//! [`history_head`] and its pages from `session.read` with display facts, which a store session
+//! serves from the store, so the raw form carries each message's sender as today's does. Message
+//! ids name the store's own ids, which only the store resolves. The raw form is served whole.
+//! The display form also needs output references, which the store doesn't serve yet, so it is
+//! refused by name.
 //!
 //! A read cleans tag notation out of a reply wherever the run that wrote it cleans, as today's
 //! read does: [`mark_reply_cleaning`] marks each message from the tag rules its run froze.
