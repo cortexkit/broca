@@ -313,6 +313,22 @@ fn project_attach_with_identities(
     project_attach_with_index(durable_prefix, state, from, identities, None)
 }
 
+fn in_flight_step_start(records: &[broca_wal::FramedRecord]) -> Option<usize> {
+    let mut start = None;
+    for (index, frame) in records.iter().enumerate() {
+        match frame.record {
+            broca_wal::WalRecord::StepStarted { .. } => start = Some(index),
+            broca_wal::WalRecord::RunStarted { .. }
+            | broca_wal::WalRecord::ToolBatchFinished { .. }
+            | broca_wal::WalRecord::TurnFinished { .. }
+            | broca_wal::WalRecord::RunFinished { .. }
+            | broca_wal::WalRecord::RunPaused { .. } => start = None,
+            _ => {}
+        }
+    }
+    start
+}
+
 fn project_attach_with_index(
     durable_prefix: &[broca_wal::FramedRecord],
     mut state: ControlProjectionState,
@@ -325,18 +341,30 @@ fn project_attach_with_index(
     send_keys.observe(durable_prefix);
     Ok(match from {
         AttachFrom::Live => {
-            let last = advance_control_projection_state(durable_prefix, &mut state);
+            // Model completion does not close the step while its tool calls are running.
+            // Fold earlier records without building units, then replay only the open step.
+            let start = in_flight_step_start(durable_prefix).unwrap_or(durable_prefix.len());
+            let before = advance_control_projection_state(&durable_prefix[..start], &mut state);
             if let Some(error) = state.placement_error() {
                 return Err(error.to_owned());
             }
+            let placed = placed_events_with_identities(
+                &durable_prefix[start..],
+                &mut state,
+                &mut send_keys,
+                identities,
+            )?;
+            let last = placed.last().map(|frame| frame.cursor).or(before);
+            let units = visible_control_events(placed, &send_keys)?;
+            let built = units.len();
             AttachReplay {
                 state,
                 send_keys,
                 cursor_valid: true,
                 seeded_h,
                 from: last.map_or(FromCursor::Start, FromCursor::After),
-                units: Vec::new(),
-                built: 0,
+                units,
+                built,
             }
         }
         AttachFrom::Cursor(from) => {
@@ -1522,14 +1550,19 @@ fn control_projection_state_from_seed(
     ControlProjectionState::from_projection_seed(seed)
 }
 
-/// Restore the control projection at `h` without decoding the materialized WAL prefix.
+struct LiveProjectionSeed {
+    state: ControlProjectionState,
+    can_skip_replay: bool,
+}
+
+/// Restore the projection at `h`, and prove separately whether control replay can be omitted.
 /// Every miss or inconsistency returns `None` so the caller takes the unchanged full replay path.
 async fn try_live_projection_seed<W: WalStore + 'static>(
     wal_store: Arc<W>,
     session: BindIdentity,
     store: Option<Arc<dyn SessionStore>>,
     h: u64,
-) -> Option<ControlProjectionState> {
+) -> Option<LiveProjectionSeed> {
     let store = store?;
     spawn_blocking(JobKind::WalRead, move || {
         let seed = store.projection_seed(&session).ok().flatten()?;
@@ -1538,8 +1571,15 @@ async fn try_live_projection_seed<W: WalStore + 'static>(
         }
 
         let mut state = control_projection_state_from_seed(&seed)?;
+        let mut can_skip_replay = !matches!(
+            seed.admission_checkpoint.last_episode.as_ref()?.disposition,
+            broca_core::EpisodeDisposition::Running
+        );
         if seed.watermark_seq == h {
-            return Some(state);
+            return Some(LiveProjectionSeed {
+                state,
+                can_skip_replay,
+            });
         }
 
         let anchor = seed.anchor.as_ref()?;
@@ -1564,11 +1604,25 @@ async fn try_live_projection_seed<W: WalStore + 'static>(
         {
             return None;
         }
+        for record in records {
+            match record.record {
+                broca_wal::WalRecord::StepStarted { .. }
+                | broca_wal::WalRecord::RunStarted { .. } => can_skip_replay = false,
+                broca_wal::WalRecord::ToolBatchFinished { .. }
+                | broca_wal::WalRecord::TurnFinished { .. }
+                | broca_wal::WalRecord::RunFinished { .. }
+                | broca_wal::WalRecord::RunPaused { .. } => can_skip_replay = true,
+                _ => {}
+            }
+        }
         advance_control_projection_state(records, &mut state);
         if state.placement_error().is_some() {
             return None;
         }
-        Some(state)
+        Some(LiveProjectionSeed {
+            state,
+            can_skip_replay,
+        })
     })
     .await
     .ok()
@@ -1660,6 +1714,11 @@ async fn subscriber_task<W: WalStore + 'static>(
             h,
         )
         .await
+        // Today's projection seed has no step-start position, so a Running or ambiguous
+        // legacy session reads its history. Migrating the session's state root to indexed
+        // storage supplies EpisodeReadSource, which bounds the replay by episode instead.
+        .filter(|seed| seed.can_skip_replay)
+        .map(|seed| seed.state)
     } else {
         None
     };
@@ -2646,7 +2705,8 @@ mod tests {
             h,
         )
         .await
-        .expect("valid seed and suffix use the fast path");
+        .expect("valid seed and suffix reconstruct projection state")
+        .state;
         let (full_records, lineage) = wal_store
             .read_records_with_lineage(&session)
             .expect("read full oracle");
@@ -2719,6 +2779,153 @@ mod tests {
         fanout.teardown().await;
         let _ = writer.shutdown().await;
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(all(any(unix, windows), feature = "test-clock"))]
+    async fn assert_legacy_seed_attach_path(running: bool) {
+        let root = broca_test_support::scratch_root()
+            .join(format!("legacy-step-seed-{running}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let wal = Arc::new(broca_core::FileWalStore::new(root.join("wal")));
+        let session = BindIdentity::new(root.join("project"), "runner", "seed-path");
+        let (mut fanout, observer) = Fanout::new(wal.clone(), session.clone());
+        let writer =
+            broca_core::WalHandle::spawn_observed(wal.open(&session).unwrap(), 1, Some(observer))
+                .unwrap();
+        let mut records = vec![
+            run_started(&session),
+            WalRecord::StepStarted { step_id: StepId(1) },
+            tool_step(),
+            WalRecord::ToolBatchStarted {
+                batch_id: broca_protocol::BatchId("b1".into()),
+                step_id: StepId(1),
+                planned_calls: vec![ToolCallId("c1".into())],
+            },
+            WalRecord::ToolDispatchIntent {
+                dispatched_at_ms: None,
+                hooks: None,
+                batch_id: broca_protocol::BatchId("b1".into()),
+                tool_call_id: ToolCallId("c1".into()),
+                tool_name: Some("lookup".into()),
+                args: serde_json::json!({}).into(),
+                module_id: None,
+                schema_pin: None,
+                approval_digest: None,
+                call_key: None,
+            },
+        ];
+        if !running {
+            records.extend([
+                WalRecord::ToolResult {
+                    finished_at_ms: None,
+                    tags: None,
+                    hooks: None,
+                    batch_id: broca_protocol::BatchId("b1".into()),
+                    result: broca_protocol::ToolResult {
+                        tool_call_id: ToolCallId("c1".into()),
+                        output: broca_protocol::ToolOutput::Text {
+                            text: "done".into(),
+                        },
+                        is_error: false,
+                    }
+                    .into(),
+                    outcome: broca_wal::DispatchOutcome::Completed,
+                    reason: None,
+                    withdraw_elicitation: None,
+                    provider_held: None,
+                },
+                WalRecord::ToolBatchFinished {
+                    batch_id: broca_protocol::BatchId("b1".into()),
+                },
+                WalRecord::TurnFinished { step_id: StepId(1) },
+                run_finished(),
+            ]);
+        }
+        for record in &records {
+            writer.record(record.clone());
+        }
+        let h = writer.sync().await.unwrap();
+        let range = wal.read_records_range(&session, 0, Some(h), None).unwrap();
+        let mut seed = fixed_projection_seed(
+            h,
+            range.anchor_at(h).unwrap(),
+            broca_core::replay::replay(&records).unwrap().prompt.len() as u64,
+            Some(FinishReason::ToolCalls),
+        );
+        let broca_wal::WalRangeRecords::Complete(frames) = range.records() else {
+            panic!("complete seed fixture");
+        };
+        seed.admission_checkpoint = broca_core::AdmissionCheckpointV1::from_frames(frames).unwrap();
+        seed.admission_checkpoint
+            .last_episode
+            .as_mut()
+            .unwrap()
+            .budget_replay_state = Some(broca_core::BudgetReplayStateV1 {
+            tool_call_count: 1,
+            ..Default::default()
+        });
+        let store = Arc::new(FixedProjectionSeedStore { seed: Some(seed) });
+        let seeded = try_live_projection_seed(wal.clone(), session.clone(), Some(store.clone()), h)
+            .await
+            .unwrap();
+        assert_eq!(seeded.can_skip_replay, !running);
+        let expected = if running {
+            replay_for_attach_range(range, h, AttachFrom::Cursor(FromCursor::Start))
+                .unwrap()
+                .units
+                .into_iter()
+                .filter(|(cursor, _, _)| cursor.wal_seq >= 2)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        if running {
+            assert!(expected.iter().any(|(_, _, event)| matches!(
+                event,
+                cortexkit_role_llm_runner::live::LiveEvent::ToolStarted(_)
+            )));
+        }
+        let (slot, rx, detach_rx) = fanout.prepare_attach();
+        let (sink, mut deliveries) = mpsc::channel(32);
+        let reads = wal.range_reads_for_test();
+        fanout.spawn_subscriber(slot, AttachFrom::Live, h, rx, detach_rx, sink, Some(store));
+        let mut actual = Vec::new();
+        loop {
+            let delivery = broca_test_support::event_timeout(
+                "legacy attach replay then reset",
+                deliveries.recv(),
+                || "waiting for replay and display reset".into(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            match delivery {
+                Delivery::Control(event) => actual.push(event.as_ref().clone()),
+                Delivery::Display(event)
+                    if matches!(*event, broca_protocol::DisplayEvent::DisplayReset) =>
+                {
+                    break
+                }
+                _ => panic!("unexpected attach delivery"),
+            }
+        }
+        assert_eq!(actual, expected);
+        assert_eq!(wal.range_reads_for_test() - reads, u64::from(running));
+        fanout.teardown().await;
+        let _ = writer.shutdown().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(all(any(unix, windows), feature = "test-clock"))]
+    #[tokio::test]
+    async fn legacy_running_seed_uses_one_full_read_and_replays_its_step() {
+        assert_legacy_seed_attach_path(true).await;
+    }
+
+    #[cfg(all(any(unix, windows), feature = "test-clock"))]
+    #[tokio::test]
+    async fn legacy_idle_seed_keeps_zero_history_reads() {
+        assert_legacy_seed_attach_path(false).await;
     }
 
     #[cfg(any(unix, windows))]
@@ -2797,7 +3004,8 @@ mod tests {
         let recovered =
             try_live_projection_seed(wal_store.clone(), session.clone(), Some(store), h)
                 .await
-                .expect("real store seed uses the fast path");
+                .expect("terminal suffix proves the real store seed can skip replay")
+                .state;
         assert_eq!(
             recovered,
             state_through_with_lineage(
@@ -4648,6 +4856,54 @@ mod episode_attach_tests {
         )
         .unwrap();
         (replay, fallback, decoded.get())
+    }
+
+    #[test]
+    fn live_attach_replays_only_the_running_step_with_original_cursors() {
+        let mut records = vec![run_started("running", vec![user("task")])];
+        records.extend(tool_step(1, "old-batch", &["old-call"]));
+        let first = records.len() as u64 + 1;
+        let current = tool_step(2, "current-batch", &["current-call"]);
+        for cut in 1..=5 {
+            let mut prefix = records.clone();
+            prefix.extend_from_slice(&current[..cut]);
+            let (live, fallback, _) = attach(&prefix, AttachFrom::Live, None);
+            assert_eq!(fallback, None);
+            let (cursor, _, _) = attach(&prefix, AttachFrom::Cursor(FromCursor::Start), None);
+            let expected: Vec<_> = cursor
+                .units
+                .into_iter()
+                .filter(|(cursor, _, _)| cursor.wal_seq >= first)
+                .collect();
+            assert!(!expected.is_empty());
+            assert_eq!(live.units, expected, "current step cut {cut}");
+            if cut >= 4 {
+                assert!(live.units.iter().any(|(_, _, event)| matches!(event,
+                    cortexkit_role_llm_runner::live::LiveEvent::ToolStarted(call)
+                        if call.tool_call_id == "current-call")));
+            }
+            assert!(live
+                .units
+                .iter()
+                .all(|(cursor, _, _)| cursor.wal_seq >= first));
+        }
+    }
+
+    #[test]
+    fn live_attach_between_steps_and_after_terminal_replays_no_controls() {
+        let mut records = vec![run_started("running", vec![user("task")])];
+        let step = tool_step(1, "batch", &["call"]);
+        for cut in [6, 7] {
+            let mut prefix = records.clone();
+            prefix.extend_from_slice(&step[..cut]);
+            let (live, fallback, _) = attach(&prefix, AttachFrom::Live, None);
+            assert_eq!(fallback, None);
+            assert!(live.units.is_empty(), "closed step cut {cut}");
+        }
+        records.extend_from_slice(&step[..4]);
+        records.push(run_finished());
+        let (live, _, _) = attach(&records, AttachFrom::Live, None);
+        assert!(live.units.is_empty());
     }
 
     #[test]
