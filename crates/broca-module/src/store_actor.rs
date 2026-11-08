@@ -716,12 +716,16 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 let interrupting =
                     order.is_none() && delivery == broca_protocol::Delivery::Interrupt;
                 if let Some(order) = &order {
-                    let admitted = self.ordered_sender(&request, order).and_then(|owner| {
-                        if let Some(template) = &order.template {
-                            self.render_ordered_template(&mut request, template)?;
-                        }
-                        Ok(owner)
-                    });
+                    let admitted = match self.ordered_sender(&request, order) {
+                        Ok(owner) => match &order.template {
+                            Some(template) => self
+                                .render_ordered_template(&mut request, template)
+                                .await
+                                .map(|()| owner),
+                            None => Ok(owner),
+                        },
+                        Err(outcome) => Err(outcome),
+                    };
                     match admitted {
                         Ok(Some(owner)) => {
                             ordered_by = request.principal.replace(owner);

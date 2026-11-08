@@ -27,7 +27,7 @@ use cortexkit_role_llm_runner::delivery_order as role;
 use cortexkit_role_llm_runner::errors;
 use tokio::sync::oneshot;
 
-use super::{retry_of_queued, unserved, Start, StoreActor};
+use super::{retry_of_queued, Start, StoreActor};
 use crate::actor::{SendOutcome, StringSender};
 
 /// One ordered send waiting in the queue, read back from its records.
@@ -203,10 +203,10 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
 
     /// Renders the send's template once, at admission, from the attested sender's plan entry,
     /// as today's actor renders it: the queued request carries the text, so a later boundary
-    /// places those bytes and never renders the slots again. A template with a `part_tag` slot
-    /// is refused by name: its slot renders the number the next request shows for a part, which
-    /// this storage doesn't look up yet.
-    pub(super) fn render_ordered_template(
+    /// places those bytes and never renders the slots again. A `part_tag` slot renders the
+    /// number the session's next request shows for the part it names ([`Self::shown_numbers`]);
+    /// a part that request doesn't show ends the send `template_part_gone`, naming the slot.
+    pub(super) async fn render_ordered_template(
         &self,
         request: &mut SubmissionRequest,
         template: &role::TemplateUse,
@@ -225,17 +225,19 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             .find(|sender| &sender.module == module_id)
             .map(|sender| sender.templates.as_slice())
             .unwrap_or_default();
-        if templates
+        let numbers = if templates
             .iter()
             .filter(|declared| declared.id == template.id)
             .flat_map(|declared| declared.slots.values())
             .any(|slot| matches!(slot, role::Slot::PartTag))
         {
-            return Err(SendOutcome::Error(unserved(
-                "a template with a part_tag slot",
-            )));
-        }
-        let text = match role::render(templates, template, |_| None) {
+            self.shown_numbers().await.map_err(SendOutcome::Error)?
+        } else {
+            Default::default()
+        };
+        let text = match role::render(templates, template, |part| {
+            broca_core::compaction_v2::shown::lookup(&numbers, &part.mid, &part.part)
+        }) {
             Ok(text) => text,
             Err(role::TemplateProblem::PartGone(slot)) => {
                 return Err(SendOutcome::TemplatePartGone { slot })
@@ -247,6 +249,64 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             vec![broca_protocol::ContentBlock::Text { text }],
         )];
         Ok(())
+    }
+
+    /// The number the session's next request shows for each part, by its message id and part
+    /// id, as `LineageActor::next_request_numbers` (today's storage) looks them up for a
+    /// template's `part_tag` slots: that request renders the newest accepted compaction view when
+    /// it still passes the boundary check under the latest run's frozen rules, else the applied
+    /// one (`compaction_v2::shown::next_request`). The views come from the compaction state this
+    /// actor keeps for the session, read from the open log the first time, as
+    /// `session.apply_view` reads it; the entries are the session's own. A session with no
+    /// compaction provider has no views, and its next request shows every part's number.
+    ///
+    /// Only a session on the current compaction contract numbers its parts: off it, its
+    /// requests render no part numbers, so none is shown and every `part_tag` slot's part is
+    /// gone. `LineageActor` reads such a session's numbers from its replayed transcript, which
+    /// holds numbers only where runs on today's storage rendered them.
+    async fn shown_numbers(
+        &self,
+    ) -> Result<std::collections::HashMap<(String, String), u64>, String> {
+        use broca_core::compaction_v2 as v2;
+        if !crate::store_entries::on_contract(&self.session) {
+            return Ok(Default::default());
+        }
+        let Some(start) = self
+            .session
+            .operations
+            .run
+            .as_ref()
+            .and_then(|run| run.start.as_ref())
+        else {
+            return Ok(Default::default());
+        };
+        let config = broca_session_loop::run::run_config_of_start(start, &self.parts)
+            .map_err(|error| format!("{error:?}"))?;
+        let entries = crate::store_entries::all_entries(&self.session).await?;
+        let conditions = v2::host::conditions(&config, &entries, false, None)?;
+        if crate::store_entries::frozen_provider(&self.parts, &self.session)?.is_none() {
+            return v2::shown::next_request(&Default::default(), &entries, &conditions);
+        }
+        let restored = || async {
+            let records = self
+                .session
+                .open_log_records()
+                .await
+                .map_err(|error| format!("{error:?}"))?;
+            broca_session_loop::compaction::restore(&records, &self.key, &self.session.operations)
+        };
+        let compaction = std::sync::Arc::clone(&self.compaction_session);
+        if !compaction.is_initialized() {
+            compaction.restore(restored().await?).await;
+        }
+        let numbers = match compaction.state.try_lock() {
+            Ok(state) => v2::shown::next_request(&state, &entries, &conditions),
+            // A run holds the state while it writes a view of its own through this actor, and
+            // the run waits for this actor to serve that write: until it does, the session's
+            // records hold the same views as the state.
+            Err(_) => v2::shown::next_request(&restored().await?, &entries, &conditions),
+        };
+        numbers
     }
 
     /// The ordered send `submission_id` while it waits in the queue, read from its records.

@@ -57,7 +57,7 @@ fn reminder() -> cortexkit_role_llm_runner::delivery_order::Template {
     .unwrap()
 }
 
-/// A template whose slot names a part of the session, which this storage doesn't render yet.
+/// A template whose slot names a part of the session.
 fn pointer() -> cortexkit_role_llm_runner::delivery_order::Template {
     serde_json::from_value(json!({
         "id": "pointer",
@@ -656,27 +656,27 @@ async fn ordered_admission_refusals_are_answered_alike() {
         matches!(&outcome, SendOutcome::SendEnded { .. }),
         "{outcome:?}"
     );
-    // A template naming a part of the session renders a number this storage doesn't look up
-    // yet: the store actor refuses it by name, while today's actor answers it.
+    // A template naming a part the session's next request doesn't show ends the send by name,
+    // naming the slot.
     let (request, template) = templated(
         module(AFT),
         &pointer(),
         None,
-        json!({"part": {"mid": "m-gone", "part": 0}}),
+        json!({"part": {"mid": "m-gone", "part": "m-gone#0"}}),
     );
-    let (old, new) = pair
-        .send(
+    let outcome = pair
+        .alike(
             "p1",
             request,
             Some(json!({"modes": ["steer"], "template": template})),
             None,
-            None,
         )
         .await;
-    assert!(!matches!(old, SendOutcome::Error(_)), "{old:?}");
     assert_eq!(
-        new,
-        SendOutcome::Error(super::super::unserved("a template with a part_tag slot"))
+        outcome,
+        SendOutcome::TemplatePartGone {
+            slot: "part".into()
+        }
     );
     let (_, queue, _) = pair.assert_alike().await;
     assert!(queue.is_empty(), "nothing refused is queued: {queue:?}");
