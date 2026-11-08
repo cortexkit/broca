@@ -3,7 +3,7 @@
 //! Admission follows today's actor (`string_sender`, `ordered_sender`,
 //! `render_ordered_template` and `queue_ordered_submission` in `crate::actor`), built from the
 //! same shared rules: the owner check (`broca_core::scope_admission::decide_owner_access`), the
-//! plan's senders (`SessionOwnershipV1::effective_senders`), llm-runner's `admit_delivery`,
+//! plan's current senders (`broca_session_loop::plan::senders`), llm-runner's `admit_delivery`,
 //! `legacy_equivalent` and `render`, and broca-core's `OrderedSend::replaced_by` and
 //! `DeliveryOrder::expired_at`.
 //!
@@ -53,32 +53,32 @@ fn ended(submission_id: &str, reason: &SendEndReason) -> Result<Record, String> 
 }
 
 impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
-    /// The session's owner summary with its first run's fetch plan, for the owner check.
+    /// The session's owner summary for the owner check, with the sender policy its latest
+    /// accepted refresh set, as today's summary carries it.
     fn sender_ownership(&self) -> Result<broca_core::SessionOwnershipV1, SendOutcome> {
-        broca_session_loop::owner::ownership_with_first_episode(
-            &self.session.operations().owner,
-            &self.parts,
-        )
-        .map_err(|error| {
-            SendOutcome::Transient(format!(
-                "cannot read the session's history for the sender check: {error}"
-            ))
-        })
+        broca_session_loop::owner::ownership_with_plan(self.session.operations(), &self.parts)
+            .map_err(|error| {
+                SendOutcome::Transient(format!(
+                    "cannot read the session's history for the sender check: {error}"
+                ))
+            })
     }
 
-    /// The modules other than the owner whose sends the session admits, from its current plan,
-    /// and whether a plan refresh set them, as today's actor reads them
-    /// (`effective_plan_senders`): every sender read goes through here. The new storage takes
-    /// no plan refresh yet, so `ownership` holds the first plan's senders, which are the
-    /// session's current ones.
-    fn plan_senders(&self, ownership: &broca_core::SessionOwnershipV1) -> PlanSenders {
-        PlanSenders {
-            senders: ownership.effective_senders(),
-            refreshed: ownership
-                .sender_admission
-                .as_ref()
-                .is_some_and(|fold| fold.accepted_senders.is_some()),
-        }
+    /// The modules other than the owner whose sends the session admits, from its current plan
+    /// (the latest accepted refresh's, else the first run's), and whether a refresh set them, as
+    /// today's actor reads them (`effective_plan_senders`): every sender read goes through here.
+    fn plan_senders(&self) -> Result<PlanSenders, SendOutcome> {
+        let operations = self.session.operations();
+        Ok(PlanSenders {
+            senders: broca_session_loop::plan::senders(operations, &self.parts).map_err(
+                |error| {
+                    SendOutcome::Transient(format!(
+                        "cannot read the session's plan senders: {error}"
+                    ))
+                },
+            )?,
+            refreshed: broca_session_loop::plan::refreshed(operations),
+        })
     }
 
     /// How a send with a string `delivery` is admitted, as today's actor admits it
@@ -105,7 +105,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         {
             return Ok(StringSender::Owner);
         }
-        let PlanSenders { senders, refreshed } = self.plan_senders(&ownership);
+        let PlanSenders { senders, refreshed } = self.plan_senders()?;
         // Without a sender policy from a refresh, a module the plan doesn't name is left to the
         // owner check further on, as today's actor leaves it.
         if !senders.iter().any(|sender| &sender.module == module_id) {
@@ -185,7 +185,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                     .into(),
             ));
         };
-        let senders = self.plan_senders(&ownership).senders;
+        let senders = self.plan_senders()?.senders;
         let Some(sender) = senders.iter().find(|sender| &sender.module == module_id) else {
             return Err(refused(
                 errors::SCOPE_OWNER_MISMATCH,
@@ -216,11 +216,10 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             field: "template",
             message: format!("cannot render the sender's template: {problem}"),
         };
-        let ownership = self.sender_ownership()?;
         let Some(BindPrincipal::Reserved { module_id }) = &request.principal else {
             return Err(refused("no template is declared for this caller".into()));
         };
-        let senders = self.plan_senders(&ownership).senders;
+        let senders = self.plan_senders()?.senders;
         let templates = senders
             .iter()
             .find(|sender| &sender.module == module_id)

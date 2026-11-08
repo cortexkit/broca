@@ -576,3 +576,55 @@ async fn a_refresh_changes_the_inherited_model_and_the_senders_alike() {
         );
     }
 }
+
+/// Once a refresh sets the session's sender policy, a module its plan doesn't name is refused
+/// `scope_owner_mismatch`, even with a string `delivery`, alike: here `occipital`, which the
+/// first plan named and the refresh's plan drops, and a module neither plan named.
+#[tokio::test]
+async fn a_refreshed_sender_policy_refuses_a_module_it_doesnt_name_alike() {
+    let without_occipital = {
+        let mut plan = plan("you are a worker", &["read"], None, None);
+        plan["senders"] = json!([{"module": "magic-context"}]);
+        manifest(&plan, "plan-2")
+    };
+    let (today, store, answers, _) = compare(
+        &first_plan(),
+        &[
+            send("r1", "plan-1"),
+            Step::Refresh {
+                generation: 1,
+                policy: "immediately",
+                manifest: without_occipital,
+            },
+        ],
+    )
+    .await;
+    assert_eq!(answers[0], "active", "{answers:?}");
+    let stranger = broca_protocol::BindPrincipal::Reserved {
+        module_id: "stranger".into(),
+    };
+    for (run_id, principal) in [("s1", occipital()), ("s2", stranger)] {
+        let mut answers = Vec::new();
+        for module in [&today, &store] {
+            let mut request = request("hello");
+            request.principal = Some(principal.clone());
+            request.tools = None;
+            request.policy_allowed = Default::default();
+            answers.push(send_titled(module, run_id, request, None, None).await);
+            module.closed().await;
+        }
+        assert_eq!(answers[1], answers[0], "{principal:?}");
+        assert!(
+            matches!(
+                &answers[0],
+                SendOutcome::DeliveryRefused {
+                    code: cortexkit_role_llm_runner::errors::SCOPE_OWNER_MISMATCH,
+                    field: "delivery",
+                    ..
+                }
+            ),
+            "{principal:?}: {:?}",
+            answers[0]
+        );
+    }
+}
