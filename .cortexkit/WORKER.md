@@ -15,6 +15,15 @@ them. Start with `CONTRIBUTING.md` and the public contracts under `docs/`.
   regenerates in `return_paths`.
 - Never run the native kill-conformance, real-daemon or crash-harness release lanes yourself. The
   integrating agent runs them once per merged batch. List the native tests your change needs.
+- **One exception the head may make:** when this machine is overloaded, the head's brief may move
+  your builds and tests to the Linux build server. Follow the brief then, without asking. Commit
+  through a server attestation:
+  1. Run `bash scripts/linux-quickcheck-attest.sh --output .cortexkit/linux-attestation.txt
+     <crates>` with `runon: "linux,8c"` and `return_paths: [".cortexkit/linux-attestation.txt"]`.
+  2. Run `cp .cortexkit/linux-attestation.txt "$(git rev-parse --git-path
+     broca-linux-quickcheck-attestation)"` locally.
+  3. Run `scripts/gated-commit.sh`. It reuses the attestation when the tree matches, and runs only
+     fmt and the layout check here. Change no tracked file between steps 1 and 3.
 
 ## Test only what you changed
 
