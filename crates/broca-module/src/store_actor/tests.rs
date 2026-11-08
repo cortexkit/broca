@@ -130,6 +130,22 @@ pub(super) struct LoopExecutor {
     pub(super) approval_gate: Option<(Arc<Notify>, Arc<Notify>)>,
     /// What the `read` tool answers.
     pub(super) tool_text: String,
+    /// Whether each model call first waits for the media the actor sends the run, as a run
+    /// whose provider renders media does.
+    pub(super) waits_for_media: bool,
+}
+
+/// Waits for the media the actor sends a run, without rendering any.
+struct MediaWait(tokio::sync::Mutex<Option<crate::store_media::StoreRunMediaWait>>);
+
+#[async_trait]
+impl broca_session_loop::run::ModelCallReady for MediaWait {
+    async fn ready(&self) -> Result<(), broca_protocol::ProviderError> {
+        if let Some(wait) = self.0.lock().await.take() {
+            let _ = wait.await;
+        }
+        Ok(())
+    }
 }
 
 /// Allows every call, once the test lets it (see [`LoopExecutor::approval_gate`]).
@@ -170,6 +186,7 @@ pub(super) fn executor(
         planes: Planes::default(),
         approval_gate: None,
         tool_text: "file contents".into(),
+        waits_for_media: false,
     }
 }
 
@@ -202,8 +219,13 @@ impl RunExecutor for LoopExecutor {
             mut writer,
             mut parts,
             mode,
+            media,
             ..
         } = job;
+        let media_wait = media.filter(|_| self.waits_for_media).map(|media| {
+            Arc::new(MediaWait(tokio::sync::Mutex::new(Some(media))))
+                as Arc<dyn broca_session_loop::run::ModelCallReady>
+        });
         // The module's executor admits a run's context limit from the caller's override when
         // the send names one.
         control.admitted_context_limit = control.admitted_context_limit.or(req.context_limit);
@@ -251,6 +273,7 @@ impl RunExecutor for LoopExecutor {
                 max_same_account_wait: Default::default(),
                 auth_selection: None,
                 step_progress: control.step_progress.clone(),
+                model_call_ready: media_wait,
             };
             // The test's credential is always ready, so a sign-in pause resumes.
             match (admission, mode) {

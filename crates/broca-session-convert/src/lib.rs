@@ -38,7 +38,8 @@ use sha2::{Digest as _, Sha256};
 pub mod billing;
 pub mod counting;
 pub mod entry_facts;
-pub mod inverse;
+/// The inverse lives with the new run loop, where a session's media fold reads it too.
+pub use broca_session_loop::inverse;
 pub mod measure;
 pub mod read_cost;
 pub mod split;
@@ -1706,6 +1707,8 @@ fn send_delivered(
     Ok(())
 }
 
+#[cfg(test)]
+mod inverse_tests;
 #[cfg(test)]
 mod read_cost_tests;
 #[cfg(test)]

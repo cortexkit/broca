@@ -882,7 +882,10 @@ mod kept;
 pub use kept::InMemory;
 mod media;
 use media::OpenLogIndex;
-pub use media::{message_media, sent_messages, stored_media, MediaError, NamedMedium, NewMedia};
+pub use media::{
+    message_media, record_objects, sent_messages, stored_media, MediaError, MediaObjects,
+    NamedMedium, NewMedia,
+};
 mod import;
 pub use import::{is_broca_id_form, NewInputMedia};
 

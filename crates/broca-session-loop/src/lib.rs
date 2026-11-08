@@ -35,6 +35,7 @@ pub mod budget;
 pub mod compaction;
 pub mod durable;
 pub mod entries;
+pub mod inverse;
 pub mod media;
 pub mod output;
 pub mod owner;
