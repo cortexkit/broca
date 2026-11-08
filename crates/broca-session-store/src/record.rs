@@ -1034,6 +1034,73 @@ message! {
 }
 
 message! {
+    /// A session that ran outside the current compaction contract moved onto it: the run whose
+    /// start shares this record's batch is its first run on the contract. The messages already
+    /// placed, ordinals 1 through `through_ordinal`, keep their records and their facts; what
+    /// `session.entries` serves about them on the contract was decided here, once, and is stored
+    /// in the session object `overlay` names. Written after the run's input records, so the run's
+    /// start is still followed directly by its input. A session enrolls at most once.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct CompactionEnrolled {
+        /// The newest message placed before the enrolling run.
+        1 req through_ordinal: u64,
+        /// The highest part number any request before the enrolling run showed the model, or 0:
+        /// the earlier messages' parts are numbered after it.
+        2 req tag_floor: u64,
+        /// The last part number the earlier messages took. The enrolling run's own messages are
+        /// numbered after it.
+        3 req tag_high: u64,
+        4 req overlay: EnrollmentOverlayRef,
+    }
+}
+
+message! {
+    /// Where an enrollment's per-message decisions are stored: a session object written under the
+    /// open log, as an import's id map is, and durable before the batch whose
+    /// `CompactionEnrolled` names it. Its body is an [`EnrolledEntries`].
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    pub struct EnrollmentOverlayRef {
+        1 req log: crate::codec::Id128,
+        2 req generation: crate::codec::Id128,
+        /// The seq the session's next record would take when the object was written, which the
+        /// enrolling run's start batch then takes unless another record came first. It keeps the
+        /// object's name apart from every other enrollment object the session could write: a
+        /// later one is written at a later seq, unless no batch named this one.
+        3 req seq: u64,
+    }
+}
+
+message! {
+    /// What `session.entries` serves about one message placed before a session enrolled in the
+    /// current compaction contract, in place of its own facts' contract members, which were
+    /// recorded off the contract.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct EnrolledEntry {
+        1 req ordinal: u64,
+        /// The part number before the message's first numbered part, in the projection's
+        /// numbering.
+        2 req tag_base: u64,
+        /// The message's own time, else the newest earlier entry's, else 0.
+        3 req written_at_ms: u64,
+        /// A global system message: the enrolling run's system text takes its place, so it is
+        /// neither served nor rendered, and takes no part numbers.
+        4 req suppressed: bool,
+        /// Who delivered it, where the session's records show a module other than the owner
+        /// sent it.
+        5 opt notice: Notice,
+    }
+}
+
+message! {
+    /// An enrollment's per-message decisions, the body of the object [`EnrollmentOverlayRef`]
+    /// names: one entry per ordinal from 1 through the enrollment's `through_ordinal`, in order.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct EnrolledEntries {
+        1 rep entries: EnrolledEntry,
+    }
+}
+
+message! {
     /// A structured-output run's final result.
     #[derive(Debug, Clone, PartialEq, Serialize)]
     pub struct StructuredResult {
@@ -1543,6 +1610,12 @@ message! {
         4 req ordinal: u64,
         /// The session's history version after the revert.
         5 req history_version: u64,
+        /// On a session on the current compaction contract: the highest part number any message
+        /// had taken before the revert, which the dropped branch's messages may have held. Part
+        /// numbers never repeat in a session, so later messages are numbered above it. A reader
+        /// that ignored it would number them again from the kept branch, so it is
+        /// must-understand. Absent off the contract, where part numbers aren't served.
+        6 opt [must] tag_high: u64,
     }
 }
 
@@ -1664,6 +1737,7 @@ records! {
         102 RefreshPolicy,
         103 PrefixFlush,
         104 RefreshApplied,
+        105 CompactionEnrolled,
     }
 }
 

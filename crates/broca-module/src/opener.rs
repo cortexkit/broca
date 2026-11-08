@@ -257,6 +257,12 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> LineageOpener for DefaultOp
     > {
         self.executor.check_plan_selection(plan).await
     }
+    async fn compaction_context_limit(
+        &self,
+        model: &cortexkit_role_llm_runner::head_selection::PlanModel,
+    ) -> Result<Option<u64>, String> {
+        self.executor.compaction_context_limit(model).await
+    }
     fn on_session_deleted(&self, session: &LineageKey) {
         self.executor.on_session_deleted(session);
     }

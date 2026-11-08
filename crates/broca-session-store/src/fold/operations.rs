@@ -36,6 +36,9 @@ pub enum FoldError {
     /// A record arrived after a change's intent closed the log, other than that change's abort;
     /// or an abort with no open change.
     LogClosed(&'static str),
+    /// A second `CompactionEnrolled`, or one that follows no run start: a session enrolls once,
+    /// in its enrolling run's start batch.
+    Enrollment(&'static str),
 }
 
 /// The ledger events that change a run's state but aren't folded yet.
@@ -880,6 +883,42 @@ state! {
             reset: "never",
             bound: Bound::Declared,
         },
+        /// The session's move onto the current compaction contract, once a run made it
+        /// (`CompactionEnrolled`). A session moves at most once, and never back.
+        25 opt pub enrolled: Enrollment => {
+            owner: "admission",
+            reset: "never",
+            bound: Bound::Declared,
+        },
+        /// The highest part number the projection's numbering is known to have given, from the
+        /// records that set or lower it: an enrollment, and a revert that dropped messages.
+        /// Never decreases. The highest part number any message ever took is the larger of this
+        /// and the newest message's (`broca_session_loop::entries::lifetime_tag_high`).
+        26 req pub tag_high_water: u64 => {
+            owner: "admission",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
+    }
+}
+
+state! {
+    /// A session's move onto the current compaction contract: the enrollment record's facts,
+    /// and the run that made it.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct Enrollment {
+        1 req pub through_ordinal: u64 => { owner: "admission", reset: "never", bound: Bound::Fixed },
+        2 req pub tag_floor: u64 => { owner: "admission", reset: "never", bound: Bound::Fixed },
+        3 req pub tag_high: u64 => { owner: "admission", reset: "never", bound: Bound::Fixed },
+        /// Where the per-message decisions are stored: one object per enrollment, sized by the
+        /// messages placed before it.
+        4 req pub overlay: crate::record::EnrollmentOverlayRef => {
+            owner: "admission",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
+        /// The enrolling run, whose start the record's batch holds.
+        5 req pub run_id: String => { owner: "admission", reset: "never", bound: Bound::Fixed },
     }
 }
 
@@ -1497,6 +1536,25 @@ impl Operations {
         self.apply_at(None, record)
     }
 
+    /// The newest message placed before the session enrolled in the current compaction
+    /// contract, if it enrolled.
+    pub fn enrolled_through(&self) -> Option<u64> {
+        self.enrolled
+            .as_ref()
+            .map(|enrolled| enrolled.through_ordinal)
+    }
+
+    /// Whether the session is on the current compaction contract: its latest run started under
+    /// a compaction plan version. A session moves onto the contract at the run that enrolls it
+    /// and never moves back, so its earlier runs may have started off it. Every reader on the
+    /// new storage asks here.
+    pub fn on_contract(&self) -> bool {
+        self.run
+            .as_ref()
+            .and_then(|run| run.start.as_ref())
+            .is_some_and(|start| start.compaction_plan_version.is_some())
+    }
+
     /// A run's end makes its billing owed, unless the latest run it ends was seeded and never
     /// called a provider; `Billed` settles it. Applied before the run fold, which reads the
     /// same end.
@@ -1706,6 +1764,25 @@ impl Operations {
                         .map_or(reverted.ordinal, |owed| owed.min(reverted.ordinal)),
                 );
                 self.history_version = reverted.history_version;
+                if let Some(high) = reverted.tag_high {
+                    self.tag_high_water = self.tag_high_water.max(high);
+                }
+            }
+            Record::CompactionEnrolled(enrolled) => {
+                if self.enrolled.is_some() {
+                    return Err(FoldError::Enrollment("the session already enrolled"));
+                }
+                let Some(run) = self.run.as_ref() else {
+                    return Err(FoldError::Enrollment("no run start precedes it"));
+                };
+                self.enrolled = Some(Enrollment {
+                    through_ordinal: enrolled.through_ordinal,
+                    tag_floor: enrolled.tag_floor,
+                    tag_high: enrolled.tag_high,
+                    overlay: enrolled.overlay.clone(),
+                    run_id: run.run_id.clone(),
+                });
+                self.tag_high_water = self.tag_high_water.max(enrolled.tag_high);
             }
             Record::ViewApplied(applied) => {
                 self.view_applied = Some(AppliedView {

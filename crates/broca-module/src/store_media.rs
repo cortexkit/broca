@@ -530,6 +530,20 @@ impl<B: SessionBackend> broca_session_loop::Writer for RunAppends<'_, B> {
         self.session.open_log_records().await
     }
 
+    async fn enrollment(
+        &self,
+    ) -> Result<Option<broca_session_store::session::EnrollmentOverlay>, SessionError> {
+        broca_session_loop::Writer::enrollment(&*self.session).await
+    }
+
+    // Stores an object, not records: the media fold has nothing to catch up on.
+    async fn put_enrollment(
+        &mut self,
+        entries: &broca_session_store::record::EnrolledEntries,
+    ) -> Result<broca_session_store::record::EnrollmentOverlayRef, SessionError> {
+        broca_session_loop::Writer::put_enrollment(&mut *self.session, entries).await
+    }
+
     async fn run_start(
         &self,
         run_id: &str,

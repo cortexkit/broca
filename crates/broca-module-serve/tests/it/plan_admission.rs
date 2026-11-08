@@ -598,7 +598,8 @@ async fn later_scoped_planless_tool_declarations_refuse_without_writing() {
             json!({"delivery": delivery, "tools": legacy_tools()}),
         )
         .await;
-        assert_eq!(error_body(&reply)["code"], "scoped_tools_require_plan");
+        assert_eq!(error_body(&reply)["code"], "invalid_params");
+        assert_eq!(error_body(&reply)["detail"]["field"], "tools");
         assert_eq!(rig.wal_bytes(), before);
     }
     let plan = vector("plans/broca-head-no-compaction.json");
@@ -642,7 +643,7 @@ async fn an_admitted_legacy_tool_run_keeps_its_keyed_answer_after_scope_adoption
     rig.wait_idle().await;
     rig.bind_with_scope(8, Some(scope_owner()), Some(scope_stamp(false)))
         .await;
-    let adopted = send_plan(&mut rig, 8, "turn-2", "adopt", None, json!({"tools": []})).await;
+    let adopted = send_plan(&mut rig, 8, "turn-2", "adopt", None, json!({})).await;
     result(&adopted);
     rig.wait_for_finished(2).await;
     rig.wait_idle().await;
@@ -2279,6 +2280,111 @@ async fn later_plan_tools_are_refused_in_every_delivery_without_writes() {
     rig.finish().await;
 }
 
+#[tokio::test]
+async fn creating_planless_send_accepts_tools() {
+    let (mut rig, admitter) = plan_rig("creating-planless-tools").await;
+    let mut tools = legacy_tools();
+    tools[0]["execution_mode"] = json!("parallel");
+    result(&send_plan(&mut rig, 7, "first", "hi", None, json!({"tools": tools})).await);
+    let records = rig.wait_for_finished(1).await;
+    let WalRecord::RunStarted { config, .. } = run_started(&records)[0] else {
+        unreachable!()
+    };
+    assert_eq!(serde_json::to_value(config.tools.as_ref()).unwrap(), tools);
+    assert!(admitter.calls().is_empty());
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn identical_creating_tools_retry_replays_without_writing() {
+    let (mut rig, _) = plan_rig("identical-creating-tools-retry").await;
+    rig.script.hold_model(true);
+    let tools = json!({"tools":legacy_tools()});
+    let first = send_plan(&mut rig, 7, "first", "hi", None, tools.clone()).await;
+    let admitted = result(&first);
+    rig.wait_entered().await;
+    let before = rig.wal_bytes();
+    let retry = send_plan(&mut rig, 7, "first", "hi", None, tools.clone()).await;
+    assert_eq!(result(&retry), admitted);
+    assert_eq!(retry.body, first.body);
+    assert_eq!(rig.wal_bytes(), before);
+
+    rig.script.hold_model(false);
+    rig.wait_for_finished(1).await;
+    rig.wait_idle().await;
+    let before = rig.wal_bytes();
+    let finished = send_plan(&mut rig, 7, "first", "hi", None, tools.clone()).await;
+    let answer = result(&finished);
+    assert_eq!(answer["state"], "finished");
+    assert_eq!(answer["run_id"], admitted["run_id"]);
+    let replay = send_plan(&mut rig, 7, "first", "hi", None, tools.clone()).await;
+    assert_eq!(replay.body, finished.body);
+    assert_eq!(rig.wal_bytes(), before);
+
+    let changed = send_plan(&mut rig, 7, "first", "hi", None, json!({"tools":[]})).await;
+    assert_eq!(error_body(&changed)["code"], "send_id_reuse");
+    assert_eq!(error_body(&changed)["detail"]["field"], "tools");
+    assert_eq!(rig.wal_bytes(), before);
+
+    assert!(rig.registry().stop_and_seal().await);
+    let mut rig = rig.restart().await;
+    let before = rig.wal_bytes();
+    let replay = send_plan(&mut rig, 7, "first", "hi", None, tools).await;
+    assert_eq!(replay.body, finished.body);
+    assert_eq!(rig.wal_bytes(), before);
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn later_planless_tools_are_refused_in_every_delivery_without_writes() {
+    let (mut rig, _) = plan_rig("later-planless-tools").await;
+    rig.script.hold_model(true);
+    result(
+        &send_plan(
+            &mut rig,
+            7,
+            "first",
+            "hi",
+            None,
+            json!({"tools": legacy_tools()}),
+        )
+        .await,
+    );
+    rig.wait_entered().await;
+    for tools in [json!([]), legacy_tools()] {
+        for delivery in ["queue", "steer", "interrupt"] {
+            let before = rig.wal_bytes();
+            let reply = send_plan(
+                &mut rig,
+                7,
+                &format!("{delivery}-{tools}"),
+                "next",
+                None,
+                json!({"tools": tools, "delivery": delivery}),
+            )
+            .await;
+            if std::env::var_os("BROCA_CAPTURE_SAMPLES").is_some() {
+                println!(
+                    "BROCA_SAMPLE later-tools.json {}",
+                    String::from_utf8_lossy(&reply.body)
+                );
+            }
+            assert_eq!(error_body(&reply)["code"], "invalid_params");
+            assert_eq!(error_body(&reply)["detail"]["field"], "tools");
+            assert_eq!(rig.wal_bytes(), before);
+        }
+    }
+    rig.script.hold_model(false);
+    rig.wait_for_finished(1).await;
+    rig.wait_idle().await;
+    let before = rig.wal_bytes();
+    let reply = send_plan(&mut rig, 7, "idle", "next", None, json!({"tools": []})).await;
+    assert_eq!(error_body(&reply)["code"], "invalid_params");
+    assert_eq!(error_body(&reply)["detail"]["field"], "tools");
+    assert_eq!(rig.wal_bytes(), before);
+    rig.finish().await;
+}
+
 /// A steer that omits `model` takes the session's frozen model, and a resent plan's
 /// model-bearing items are checked against that model, not against an empty placeholder: the
 /// frozen plan naming the session's own model is accepted, and once a later episode moved the
@@ -2482,5 +2588,119 @@ async fn a_classed_session_with_declaring_providers_frames_its_run_started() {
             );
         }
         rig.finish().await;
+    }
+}
+
+async fn carrier_owner_rig(tag: &str, run_scope: bool) -> (Rig, Value) {
+    let mut rig = Rig::start_with_scopes(&format!("{tag}-{run_scope}")).await;
+    let carrier = subc_protocol::Principal::Reserved {
+        module_id: "basal".into(),
+    };
+    rig.bind_with_scope(
+        8,
+        Some(carrier),
+        Some(if run_scope {
+            agent_run_stamp()
+        } else {
+            scope_stamp(true)
+        }),
+    )
+    .await;
+    rig.script.hold_model(true);
+    let sent = result(&send_plan(&mut rig, 8, "first", "hold", None, json!({})).await);
+    rig.wait_entered().await;
+    (rig, sent)
+}
+
+async fn finish_carrier_rig(mut rig: Rig) {
+    rig.script.hold_model(false);
+    rig.wait_for_finished(1).await;
+    rig.wait_idle().await;
+    rig.finish().await;
+}
+
+fn assert_carrier_owner_refusal(rig: &Rig, before: &[u8], reply: &subc_protocol::Frame) {
+    if std::env::var_os("BROCA_CAPTURE_SAMPLES").is_some() {
+        println!(
+            "BROCA_SAMPLE owner-refusal.json {}",
+            String::from_utf8_lossy(&reply.body)
+        );
+    }
+    assert_eq!(error_body(reply)["code"], "scope_owner_mismatch");
+    assert_eq!(rig.wal_bytes(), before);
+}
+
+#[tokio::test]
+async fn flow_and_run_carrier_cannot_cancel_as_owner() {
+    for run_scope in [false, true] {
+        let (mut rig, sent) = carrier_owner_rig("carrier-cancel", run_scope).await;
+        let before = rig.wal_bytes();
+        let reply = rig
+            .request(
+                8,
+                json!({"method":"run.cancel","params":{"run_id":sent["run_id"]}}),
+            )
+            .await;
+        assert_carrier_owner_refusal(&rig, &before, &reply);
+        finish_carrier_rig(rig).await;
+    }
+}
+
+#[tokio::test]
+async fn flow_and_run_carrier_cannot_retract_as_owner() {
+    for run_scope in [false, true] {
+        let (mut rig, _) = carrier_owner_rig("carrier-retract", run_scope).await;
+        let before = rig.wal_bytes();
+        // No recorded send has this submission ID, so the sender cannot retract its own send.
+        let reply = rig.request(8, json!({"method":"session.retract","params":{"submission_id":"other-sender-submission"}})).await;
+        assert_carrier_owner_refusal(&rig, &before, &reply);
+        finish_carrier_rig(rig).await;
+    }
+}
+
+#[tokio::test]
+async fn flow_and_run_carrier_cannot_upload_as_owner() {
+    for run_scope in [false, true] {
+        let (mut rig, _) = carrier_owner_rig("carrier-upload", run_scope).await;
+        broca_core::media_store::create_media_directories(&rig.dir).unwrap();
+        let before = rig.wal_bytes();
+        let reply = rig.request(8, json!({"method":"session.upload_begin","params":{"mime":"image/png","bytes":1,"sha256":"0".repeat(64)}})).await;
+        assert_carrier_owner_refusal(&rig, &before, &reply);
+        for tree in ["objects", "refs"] {
+            assert_eq!(
+                std::fs::read_dir(rig.dir.join("media-uploads").join(tree))
+                    .unwrap()
+                    .count(),
+                0
+            );
+        }
+        finish_carrier_rig(rig).await;
+    }
+}
+
+#[tokio::test]
+async fn flow_and_run_carrier_head_has_no_owner_grant() {
+    for run_scope in [false, true] {
+        let (mut rig, _) = carrier_owner_rig("carrier-head", run_scope).await;
+        let before = rig.wal_bytes();
+        let reply = rig
+            .request(8, json!({"method":"session.head","params":{}}))
+            .await;
+        let head = result(&reply);
+        if std::env::var_os("BROCA_CAPTURE_SAMPLES").is_some() {
+            println!(
+                "BROCA_SAMPLE owner-head.json {}",
+                String::from_utf8_lossy(&reply.body)
+            );
+        }
+        assert_ne!(head["sender"]["owner"], true);
+        assert_eq!(rig.wal_bytes(), before);
+        rig.bind_as(9, Some(scope_owner())).await;
+        let owner_head = result(
+            &rig.request(9, json!({"method":"session.head","params":{}}))
+                .await,
+        );
+        assert_eq!(owner_head["sender"]["owner"], true);
+        finish_carrier_rig(rig).await;
     }
 }

@@ -227,7 +227,7 @@ fn a_revert_drops_what_the_session_kept_of_its_sealed_history(cipher: Cipher) {
         assert!(session.sealed_derived().is_some());
 
         session
-            .revert(&mids[2], resend("r9", "s9", "edited"), 2_000)
+            .revert(&mids[2], resend("r9", "s9", "edited"), None, 2_000)
             .await
             .unwrap();
         assert_eq!(session.kept_sealed_entries(), 0);
@@ -283,7 +283,7 @@ fn a_revert_in_the_open_log_keeps_the_messages_before_it(cipher: Cipher) {
             .unwrap();
         let (mids, _) = runs(&mut session, 0, 4).await;
         let reverted = session
-            .revert(&mids[4], resend("r9", "s9", "edited"), 1_000)
+            .revert(&mids[4], resend("r9", "s9", "edited"), None, 1_000)
             .await
             .unwrap();
         let Reverted::Applied {
@@ -324,7 +324,7 @@ fn a_revert_in_the_open_log_keeps_the_messages_before_it(cipher: Cipher) {
         check(&session, &mids, &mid).await;
         assert!(matches!(
             session
-                .revert(&mids[4], resend("r9", "s9", "edited"), 1_000)
+                .revert(&mids[4], resend("r9", "s9", "edited"), None, 1_000)
                 .await,
             Ok(Reverted::Already { .. })
         ));
@@ -355,7 +355,7 @@ fn a_revert_into_sealed_history_cuts_the_directory_and_leaves_no_window(cipher: 
         let objects = backend.object_names(&addr()).len();
 
         let reverted = session
-            .revert(&mids[2], resend("r9", "s9", "edited"), 2_000)
+            .revert(&mids[2], resend("r9", "s9", "edited"), None, 2_000)
             .await
             .unwrap();
         let Reverted::Applied {
@@ -430,25 +430,29 @@ fn a_revert_refuses_open_work_and_wrong_targets(cipher: Cipher) {
         assert_eq!(
             refused(
                 session
-                    .revert("g0000000000000000.3", resend("r9", "s9", "x"), 1)
+                    .revert("g0000000000000000.3", resend("r9", "s9", "x"), None, 1)
                     .await
             ),
             RevertRefusal::UnknownMessage
         );
         assert_eq!(
-            refused(session.revert(&mids[1], resend("r9", "s9", "x"), 1).await),
+            refused(
+                session
+                    .revert(&mids[1], resend("r9", "s9", "x"), None, 1)
+                    .await
+            ),
             RevertRefusal::NotRunInput
         );
         let mut wrong = resend("r9", "s9", "x");
         wrong.pop();
         assert!(matches!(
-            refused(session.revert(&mids[0], wrong, 1).await),
+            refused(session.revert(&mids[0], wrong, None, 1).await),
             RevertRefusal::BadResend(_)
         ));
         let mut wrong = resend("r9", "s9", "x");
         wrong[1] = input("other", "x");
         assert!(matches!(
-            refused(session.revert(&mids[0], wrong, 1).await),
+            refused(session.revert(&mids[0], wrong, None, 1).await),
             RevertRefusal::BadResend(_)
         ));
         assert_eq!(unchanged(&session), before);
@@ -472,7 +476,11 @@ fn a_revert_refuses_open_work_and_wrong_targets(cipher: Cipher) {
             .await
             .unwrap();
         assert_eq!(
-            refused(session.revert(&mids[0], resend("r9", "s9", "x"), 1).await),
+            refused(
+                session
+                    .revert(&mids[0], resend("r9", "s9", "x"), None, 1)
+                    .await
+            ),
             RevertRefusal::QueueNotEmpty
         );
 
@@ -491,7 +499,11 @@ fn a_revert_refuses_open_work_and_wrong_targets(cipher: Cipher) {
             .await
             .unwrap();
         assert_eq!(
-            refused(session.revert(&mids[0], resend("r9", "s9", "x"), 1).await),
+            refused(
+                session
+                    .revert(&mids[0], resend("r9", "s9", "x"), None, 1)
+                    .await
+            ),
             RevertRefusal::RunOpen
         );
     });
@@ -514,7 +526,7 @@ fn a_revert_that_fails_before_its_commit_undoes_itself(cipher: Cipher) {
             let logs = backend.log_names(&addr());
             backend.fail_once(failing);
             if session
-                .revert(&mids[2], resend("r9", "s9", "edited"), 1_000)
+                .revert(&mids[2], resend("r9", "s9", "edited"), None, 1_000)
                 .await
                 .is_ok()
             {
@@ -568,7 +580,7 @@ fn a_crash_at_any_point_of_a_revert_loads_to_before_or_after_it(cipher: Cipher) 
             let before = texts(&session.conversation.messages);
             backend.crash_after(Some(crash));
             let _ = session
-                .revert(&mids[2], resend("r9", "s9", "edited"), 1_000)
+                .revert(&mids[2], resend("r9", "s9", "edited"), None, 1_000)
                 .await;
             (before, mids)
         });

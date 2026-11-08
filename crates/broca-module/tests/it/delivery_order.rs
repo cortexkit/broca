@@ -539,6 +539,7 @@ async fn retract_own_send_without_recorded_sender_stays_owner_only_after_restart
         .append(
             1,
             &WalRecord::Queued {
+                message_marks: None,
                 sent_by: None,
                 written_at_ms: None,
                 retention: None,

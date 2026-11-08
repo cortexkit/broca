@@ -74,6 +74,8 @@ fn request_kind(request: &broca_session_loop::shared::Request) -> &'static str {
         Request::EntriesByMid { .. } => "entries by mid",
         Request::SealedDerived { .. } => "sealed derived",
         Request::KeepSealedDerived { .. } => "keep sealed derived",
+        Request::Enrollment { .. } => "enrollment",
+        Request::PutEnrollment { .. } => "put enrollment",
         Request::Seal { .. } => "seal",
     }
 }

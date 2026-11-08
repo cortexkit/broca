@@ -229,6 +229,9 @@ pub const PROVIDER_DECLARATIONS_FEATURE: &str = "provider-declarations/v1";
 /// dispatch a resumed run without its admitted tool definition's schema pin.
 pub const TOOL_SCHEMA_PINS_FEATURE: &str = "tool-schema-pins/v1";
 
+/// Display marks stored beside send bodies and notices appended to tool results.
+pub const MESSAGE_MARKS_FEATURE: &str = "message-marks/v1";
+
 /// The feature names this build understands in a gated frame's `requires` list.
 ///
 /// THIS IS THE ONLY TABLE. Every reader path (replay, the anchored range read behind
@@ -257,6 +260,7 @@ pub const KNOWN_FEATURES: &[&str] = &[
     CLIENT_MESSAGE_ID_FEATURE,
     COMPACTION_RIDE_WAIT_FEATURE,
     COMPACTION_V2_FEATURE,
+    COMPACTION_VIEW_META_FEATURE,
     COMPACTION_VIEW_NEGOTIATION_FEATURE,
     COMPACTION_VIEW_FEATURE,
     COMPACTION_WAIT_FEATURE,
@@ -271,6 +275,7 @@ pub const KNOWN_FEATURES: &[&str] = &[
     GOOGLE_RPC_ERROR_DETAILS_FEATURE,
     INPUT_TOKEN_CAP_FEATURE,
     MEDIA_CONTENT_FEATURE,
+    MESSAGE_MARKS_FEATURE,
     OPENROUTER_REASONING_FEATURE,
     OUTPUT_RESERVATION_FEATURE,
     PLAN_MANIFEST_FEATURE,
@@ -307,6 +312,10 @@ pub const ACCOUNT_LIMIT_PAUSE_FEATURE: &str = "account-limit-pause/v1";
 
 /// Mode-3 accepted views, applied-view selections, cut markers and the frozen plan version.
 pub const COMPACTION_V2_FEATURE: &str = "compaction-v2/v1";
+
+/// Checksummed view policy and attested applying-module provenance. Older readers
+/// cannot reconstruct the policy's checksum or safely omit its rendering effect.
+pub const COMPACTION_VIEW_META_FEATURE: &str = "compaction-view-meta/v1";
 
 /// Whether this build runs `compaction-v2/v1` sessions. A reader-only build sets it false: it
 /// decodes those frames but marks the log read-only, so a rollback never runs a mode-3 session.
@@ -1729,6 +1738,7 @@ mod tests {
                 CLIENT_MESSAGE_ID_FEATURE,
                 COMPACTION_RIDE_WAIT_FEATURE,
                 COMPACTION_V2_FEATURE,
+                COMPACTION_VIEW_META_FEATURE,
                 COMPACTION_VIEW_NEGOTIATION_FEATURE,
                 COMPACTION_VIEW_FEATURE,
                 COMPACTION_WAIT_FEATURE,
@@ -1743,6 +1753,7 @@ mod tests {
                 GOOGLE_RPC_ERROR_DETAILS_FEATURE,
                 INPUT_TOKEN_CAP_FEATURE,
                 MEDIA_CONTENT_FEATURE,
+                MESSAGE_MARKS_FEATURE,
                 OPENROUTER_REASONING_FEATURE,
                 OUTPUT_RESERVATION_FEATURE,
                 PLAN_MANIFEST_FEATURE,
@@ -3436,5 +3447,64 @@ mod ride_reader_release_tests {
         assert!(
             matches!(super::decode_next(&bytes), super::DecodeStep::Record { framed, .. } if framed.record == record)
         );
+    }
+}
+
+#[cfg(test)]
+mod message_marks_tests {
+    use super::*;
+    use serde_json::{json, Value};
+
+    const OLD_SENDS: [&str; 3] = [
+        include_str!("../tests/golden/pre_step_transforms/run_started.json"),
+        include_str!("../tests/golden/pre_step_transforms/queued.json"),
+        include_str!("../tests/golden/pre_step_transforms/steered.json"),
+    ];
+    const OLD_RIDE: &str = r#"{"type":"send_delivered","ride":{"call_key":"call-1","send_id":"send-1","sender":"prefrontal-core","forms":["append"],"form":"append"},"submission_id":"sub-1","run_id":"run-1","mode":"tool_result","tool_call_id":"call-1","appended_text":"\n\nhello"}"#;
+
+    #[test]
+    fn old_send_and_ride_bytes_remain_exactly_unmarked() {
+        for payload in OLD_SENDS.into_iter().chain([OLD_RIDE]) {
+            let payload = payload.trim();
+            let record: WalRecord = serde_json::from_str(payload).unwrap();
+            assert_eq!(serde_json::to_string(&record).unwrap(), payload);
+            assert!(!record.required_features().contains(&MESSAGE_MARKS_FEATURE));
+        }
+    }
+
+    #[test]
+    fn marked_sends_and_rides_require_an_understanding_reader() {
+        for payload in OLD_SENDS.into_iter().chain([OLD_RIDE]) {
+            let mut value: Value = serde_json::from_str(payload).unwrap();
+            let ride = value["type"] == "send_delivered";
+            if ride {
+                value["ride"]["speaks_for"] = json!({"agent_id":"Ada"});
+            } else {
+                value["message_marks"] = json!({"speaks_for":{"agent_id":"Ada"}});
+            }
+            let record: WalRecord = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(&record).unwrap(), value);
+            assert!(record.required_features().contains(&MESSAGE_MARKS_FEATURE));
+            let bytes = encode(1, 1, &record).unwrap();
+            let known: Vec<_> = KNOWN_FEATURES
+                .iter()
+                .copied()
+                .filter(|name| *name != MESSAGE_MARKS_FEATURE)
+                .collect();
+            assert!(
+                matches!(decode_next_with(&bytes, &known), DecodeStep::NewerWriter { missing, .. }
+                if missing == [MESSAGE_MARKS_FEATURE])
+            );
+            assert!(
+                matches!(decode_next(&bytes), DecodeStep::Record { framed, .. }
+                if framed.record == record)
+            );
+            if !ride {
+                value["message_marks"] = json!({"notice":true});
+                let notice: WalRecord = serde_json::from_value(value.clone()).unwrap();
+                assert_eq!(serde_json::to_value(&notice).unwrap(), value);
+                assert!(notice.required_features().contains(&MESSAGE_MARKS_FEATURE));
+            }
+        }
     }
 }

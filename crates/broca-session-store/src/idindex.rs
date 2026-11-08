@@ -167,6 +167,8 @@ pub fn record_ids(record: &Record) -> Vec<(IdKind, String)> {
                 Some(&applied.generation.to_string()),
             );
         }
+        // A session enrolls once, and the operational fold keeps the enrollment whole.
+        Record::CompactionEnrolled(_) => {}
         // A steer's send id is part of its receipt, which the queue owns.
         Record::Steer(steer) => push(IdKind::SendId, json_str(steer.receipt.as_ref(), "send_id")),
         // Events carry the old record's fields whole; their idempotency keys keep their names.

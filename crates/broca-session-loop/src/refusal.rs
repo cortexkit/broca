@@ -28,11 +28,15 @@ pub(crate) struct Route {
 
 impl Route {
     /// Decides the step's route from the session's schedule, as today's loop does before each
-    /// step, and tells the provider which model it renders for.
+    /// step, and tells the provider which model it renders for. `own_estimate` is the prepared
+    /// request's own size estimate, given on the run that moved the session onto the current
+    /// compaction contract: the newest step's usage predates the request that move rebuilt, so
+    /// there the request's own estimate decides whether it fits the fallback's window.
     pub fn decide<W: Writer, P: Provider>(
         writer: &W,
         provider: &P,
         step_id: u64,
+        own_estimate: Option<u64>,
     ) -> Result<Self, LoopError> {
         let fallback = provider.refusal_fallback_model();
         let operations = writer.operations();
@@ -43,12 +47,15 @@ impl Route {
         // A prompt that already fills the fallback model's window would only overflow it. The
         // prompt is measured by the newest step's own model, as today's compaction history
         // measures it.
-        let fill = operations
-            .estimate
-            .as_ref()
-            .map(crate::compaction::history)
-            .and_then(|history| history.previous_native_usage)
-            .and_then(|usage| usage.fill_tokens());
+        let fill = match own_estimate {
+            Some(estimate) => Some(estimate),
+            None => operations
+                .estimate
+                .as_ref()
+                .map(crate::compaction::history)
+                .and_then(|history| history.previous_native_usage)
+                .and_then(|usage| usage.fill_tokens()),
+        };
         let fits = match (provider.refusal_fallback_context_limit(), fill) {
             (Some(limit), Some(fill)) => fill < limit,
             _ => true,

@@ -293,6 +293,9 @@ fn send_delivered(delivery: &Delivery, claimed: &[&Record]) -> Result<Value, Str
                 sender: ride.sender.clone(),
                 forms: ride.forms.clone(),
                 form,
+                // The forward conversion counts a ride's message marks as lost, so a stored
+                // ride never had any.
+                speaks_for: None,
             };
             object.insert("ride".into(), json(&ride));
         }
@@ -508,6 +511,12 @@ impl Inverse {
                 // Derived from today's fold at the run start that applied the refresh: today's
                 // log decides the application again on replay and keeps no record of it.
                 Record::RefreshApplied(_) => {}
+                // A session's move onto the current compaction contract, which only the new
+                // storage makes: no message comes or goes with it, and the records after it are
+                // the ones a session created on the contract writes. A reader following the
+                // session takes it in silently; turning the whole log back refuses it
+                // ([`invert`]).
+                Record::CompactionEnrolled(_) => {}
                 // The new storage's own bookkeeping: a writer opening the log, and a change to
                 // where records are stored. Records keep their seqs and bytes through a change,
                 // so no message comes or goes with one.
@@ -810,7 +819,20 @@ impl Inverse {
 }
 
 /// Today's record JSON for each old record the new records were converted from, in order.
+/// A session that moved onto the current compaction contract partway through its life has no
+/// form in today's storage, which keeps one layout for a log's whole life and reads a log as on
+/// the contract only when every run is: it is refused.
 pub fn invert(records: &[Record], parts: &BTreeMap<Digest, Vec<u8>>) -> Result<Vec<Value>, String> {
+    if records
+        .iter()
+        .any(|record| matches!(record, Record::CompactionEnrolled(_)))
+    {
+        return Err(
+            "the session enrolled in the current compaction contract on the new storage, which \
+             today's storage can't hold"
+                .into(),
+        );
+    }
     let mut inverse = Inverse::new();
     let out = inverse
         .push(1, records, &|part| part_value(parts, part))

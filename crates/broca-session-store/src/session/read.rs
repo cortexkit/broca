@@ -126,6 +126,14 @@ pub(super) type SealedEntries = std::sync::Mutex<SealedCaches>;
 const READ_TOGETHER: u64 = 64;
 
 impl<B: SessionBackend> Session<B> {
+    /// An empty conversation that folds a sealed block of this session's history as the session
+    /// folded it: joining delivered text into results exactly where the session does.
+    fn block_conversation(&self) -> Conversation {
+        let mut conversation = Conversation::new(self.conversation.appends_in_conversation);
+        conversation.enrolled(self.operations.enrolled_through());
+        conversation
+    }
+
     /// The sealed caches, emptied first when the history version moved since they were filled.
     fn sealed_caches(&self) -> std::sync::MutexGuard<'_, SealedCaches> {
         let version = self.operations.history_version;
@@ -143,7 +151,8 @@ impl<B: SessionBackend> Session<B> {
     /// sealed history; `None` when no entry of the session has that id. The id is found as
     /// [`Session::find_message`] finds it, so an import's source id is found too. An entry read
     /// from sealed history is kept while the session is open, so asking for it again reads
-    /// nothing.
+    /// nothing. Entries are served as compaction reads them ([`Session::compaction_entries`]): a
+    /// message an enrollment suppressed has none.
     pub async fn entry_by_mid(&self, mid: &str) -> Result<Option<StoredEntry>, SessionError> {
         if let Some(entry) = self.sealed_caches().entries.get(mid) {
             return Ok(Some(entry.clone()));
@@ -152,7 +161,13 @@ impl<B: SessionBackend> Session<B> {
         let Some(ordinal) = self.find_message(mid).await? else {
             return Ok(None);
         };
-        let Some(entry) = self.entries(ordinal, 1).await?.into_iter().next() else {
+        let Some(entry) = self
+            .compaction_entries(ordinal, 1)
+            .await?
+            .into_iter()
+            .next()
+            .filter(|entry| entry.ordinal == ordinal)
+        else {
             return Ok(None);
         };
         if ordinal < self.conversation.window_start() {
@@ -169,6 +184,7 @@ impl<B: SessionBackend> Session<B> {
     /// entries are read together: named entries close to each other are read in one pass over
     /// the history between them, not one read each. Nothing is kept: a caller that reads the
     /// same entries at every step keeps what it derives from them (see `keep_sealed_derived`).
+    /// Entries are served as compaction reads them ([`Session::compaction_entries`]).
     pub async fn entries_by_mid(&self, mids: &[String]) -> Result<Vec<StoredEntry>, SessionError> {
         let mut ordinals = Vec::with_capacity(mids.len());
         for mid in mids {
@@ -187,7 +203,9 @@ impl<B: SessionBackend> Session<B> {
         }
         let mut out = Vec::with_capacity(ordinals.len());
         for (start, end) in runs {
-            let read = self.entries(start, (end - start + 1) as usize).await?;
+            let read = self
+                .compaction_entries(start, (end - start + 1) as usize)
+                .await?;
             out.extend(
                 read.into_iter()
                     .filter(|entry| ordinals.binary_search(&entry.ordinal).is_ok()),
@@ -250,7 +268,7 @@ impl<B: SessionBackend> Session<B> {
                 let first = segment.index.blocks[position]
                     .first_ordinal
                     .expect("block_for_ordinal only answers when every block has an ordinal");
-                let mut conversation = Conversation::new(self.conversation.appends_in_conversation);
+                let mut conversation = self.block_conversation();
                 conversation.placed = first - 1;
                 for (_, record) in segment
                     .block(position)
@@ -417,7 +435,7 @@ impl<B: SessionBackend> Session<B> {
             let Some(first) = opened.index.blocks[position].first_ordinal else {
                 continue;
             };
-            let mut conversation = Conversation::new(self.conversation.appends_in_conversation);
+            let mut conversation = self.block_conversation();
             conversation.placed = first - 1;
             for (_, record) in opened
                 .block(position)
@@ -583,7 +601,7 @@ impl<B: SessionBackend> Session<B> {
         let first = segment.index.blocks[position]
             .first_ordinal
             .expect("block_for_ordinal only answers when every block has an ordinal");
-        let mut conversation = Conversation::new(self.conversation.appends_in_conversation);
+        let mut conversation = self.block_conversation();
         conversation.placed = first - 1;
         for (_, record) in segment
             .block(position)

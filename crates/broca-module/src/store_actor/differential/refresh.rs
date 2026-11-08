@@ -21,7 +21,10 @@ use super::Module;
 use crate::actor::{SendOutcome, SendPlan};
 use crate::serve::ServeHandler;
 
-cipher_tests!(a_refreshed_sender_policy_refuses_a_module_it_doesnt_name_alike);
+cipher_tests!(
+    a_refreshed_sender_policy_refuses_a_module_it_doesnt_name_alike,
+    only_the_new_storage_takes_a_refresh_that_adds_a_compaction_provider,
+);
 
 /// A plan whose system text is `text`, offering the tools `tools` from one provider. With
 /// `pinned`, its system text item names the model it was written for, so a run on another
@@ -667,4 +670,53 @@ async fn a_refreshed_sender_policy_refuses_a_module_it_doesnt_name_alike(
             answers[0]
         );
     }
+}
+
+/// A refresh that adds a compaction provider: today's storage refuses it with today's exact
+/// refusal, and the new storage takes it, against the latest accepted plan. Accepting it
+/// enrolls nothing: the session moves only at the run that applies it.
+async fn only_the_new_storage_takes_a_refresh_that_adds_a_compaction_provider(
+    cipher: broca_session_store::keys::Cipher,
+) {
+    let mut compacted = plan("you compact", &["read"], None, None);
+    compacted["compaction_item"] = json!({"provider": "ck-mc", "preset": "head", "params": {}});
+    let compacted = manifest(&compacted, "plan-compacted");
+    let steps = [
+        send("r1", "plan-1"),
+        Step::Refresh {
+            generation: 1,
+            policy: "immediately",
+            manifest: compacted,
+        },
+    ];
+    let (today, store) = super::head::both_in(
+        (0..steps.len())
+            .map(|n| text_step(&format!("a{n}"), "hello"))
+            .collect(),
+        cipher,
+    )
+    .await;
+    let today_answers = drive(&today, &first_plan(), &steps).await;
+    let store_answers = drive(&store, &first_plan(), &steps).await;
+    assert_eq!(
+        today_answers[1],
+        format!(
+            "{:?}",
+            crate::actor::SessionRefreshOutcome::Refused(
+                crate::serve::SessionChangeError::InvalidParams {
+                    field: "plan.compaction_item".into(),
+                    message: "the session's compaction provider, preset and params are fixed \
+                              for its life"
+                        .into(),
+                }
+            )
+        )
+    );
+    assert!(
+        store_answers[1].contains("applies_from_next_run: true"),
+        "{store_answers:?}"
+    );
+    let session = store.load().await;
+    assert!(session.operations.enrolled.is_none());
+    assert!(!session.operations.on_contract());
 }

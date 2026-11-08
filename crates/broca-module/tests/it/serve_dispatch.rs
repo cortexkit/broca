@@ -21,6 +21,8 @@ const LONG_TTL: Duration = Duration::from_secs(3600);
 
 fn send_req(key: &broca_protocol::BindIdentity, run: &str) -> SendRequest {
     let req = req(key, run);
+    let mut submission = req.to_submission();
+    submission.tools = None;
     SendRequest {
         session_class: None,
         retention: None,
@@ -31,7 +33,7 @@ fn send_req(key: &broca_protocol::BindIdentity, run: &str) -> SendRequest {
         session: key.clone(),
         run_id: req.run_id.clone(),
         send_id: Some(format!("send-{run}")),
-        request: Box::new(req.to_submission()),
+        request: Box::new(submission),
         skip_materialization: false,
         kind: RunKind::FreshOrResume,
         plan: None,

@@ -2018,6 +2018,7 @@ mod tests {
                 seq,
                 fence: 1,
                 record: WalRecord::Steered {
+                    message_marks: None,
                     sent_by: None,
                     written_at_ms: None,
                     tags: None,

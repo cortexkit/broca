@@ -47,7 +47,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use broca_core::{AccountDecision, AccountSelectionRefusal, RoutingUnavailable};
-use broca_protocol::{BindIdentity, ErrorClass, ModelAttempt, RunFinishReason};
+use broca_protocol::{AttemptOutcome, BindIdentity, ErrorClass, ModelAttempt, RunFinishReason};
 use broca_subc::vault::{ScopedCredential, ScopedList};
 use broca_wal::WalLineageId;
 use serde::Deserialize;
@@ -731,10 +731,19 @@ pub fn unmapped_field(row: &ScopedCredential) -> Option<&'static str> {
 // for authentication. Unknown or absent adapters remain in scope.
 const NON_MODEL_REFRESH_ADAPTERS: &[&str] = &["cursor"];
 
+/// The vault category every model credential carries. broca's model grant is a category grant
+/// on it; every other row broca lists reached it through an exact grant.
+const MODEL_CATEGORY: &str = "llm-provider";
+
 pub fn metadata_in_chooser_scope(row: &ScopedCredential) -> bool {
+    // Only model credentials are judged for routing metadata. broca's grants also list
+    // non-model records, such as the new session storage's deployment key, which have no
+    // category and no auth_method. The row's `type` can't tell them apart: the vault derives it
+    // from the id's prefix and reports "unknown" for such records.
+    row.categories.iter().any(|category| category == MODEL_CATEGORY)
     // API-key pool candidates can lack provider ids, so this subscription metadata check
     // must not mark a loadable, provider-unmapped key as ineligible for routing.
-    row.auth_method
+        && row.auth_method
         .as_deref()
         .and_then(AuthMethod::from_token)
         .map(|method| matches!(method, AuthMethod::Oauth | AuthMethod::Chatgpt))
@@ -1883,7 +1892,7 @@ impl RunReporter {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ReportEvent>();
         tokio::spawn(async move {
             let mut latest_headers: Option<BTreeMap<String, String>> = None;
-            let mut last_attempt_at_ms: Option<u64> = None;
+            let mut last_failed_attempt_at_ms: Option<u64> = None;
             while let Some(event) = rx.recv().await {
                 match event {
                     ReportEvent::Started { lineage, wal_seq } => {
@@ -1901,7 +1910,7 @@ impl RunReporter {
                         wal_seq,
                         retry_after_secs,
                     } => {
-                        let Some(observed_at_ms) = last_attempt_at_ms else {
+                        let Some(observed_at_ms) = last_failed_attempt_at_ms else {
                             continue;
                         };
                         let delay_ms = (retry_after_secs * 1000.0).ceil();
@@ -1947,6 +1956,7 @@ impl RunReporter {
                         wal_seq,
                         attempt,
                     } => {
+                        last_failed_attempt_at_ms = None;
                         if !attempt.account_observation.ratelimit_headers.is_empty() {
                             latest_headers =
                                 Some(attempt.account_observation.ratelimit_headers.clone());
@@ -1965,7 +1975,28 @@ impl RunReporter {
                         else {
                             continue;
                         };
-                        last_attempt_at_ms = Some(attempt.ts_ms);
+                        // Only a failed final attempt can block its account. A successful or
+                        // cancelled attempt clears older failures before an internal error can
+                        // reuse their receipt time. Attempt records do not link terminal causes:
+                        // an unrelated internal error after a final failed attempt can still
+                        // cause a five-second false block. This bounded cost is accepted instead
+                        // of adding a separate core signal identifying the error that ended the run.
+                        last_failed_attempt_at_ms = matches!(
+                            &attempt.outcome,
+                            AttemptOutcome::EofBeforeCompletion
+                                | AttemptOutcome::ChunkError
+                                | AttemptOutcome::IdleTimeout
+                                | AttemptOutcome::ContentTimeout
+                                | AttemptOutcome::ByteLimit
+                                | AttemptOutcome::DecodeError
+                                | AttemptOutcome::RateFloor
+                                | AttemptOutcome::HttpError
+                                | AttemptOutcome::ProviderError
+                                | AttemptOutcome::ConnectFailed
+                                | AttemptOutcome::HeaderTimeout
+                                | AttemptOutcome::NoStatus
+                        )
+                        .then_some(attempt.ts_ms);
                         client
                             .observe(attempt_body(
                                 &id,
@@ -2010,23 +2041,24 @@ impl RunReporter {
         });
     }
 
-    /// Report a terminal rate limit using the final attempt's receipt time. A rate limit
-    /// cleared by the provider's own retries never reaches this hook and is not reported.
-    /// The executor calls this only for an API-key run admitted by routing.
-    pub fn terminal_rate_limit(
+    /// Report an uncleared transient using the final attempt's receipt time. Account limits
+    /// have their own reports; other transients use the structured retry delay or five seconds.
+    /// Exhausted transport failures use their shared transient classification.
+    /// The executor calls this only for an error finish on a run admitted by routing.
+    pub fn terminal_transient(
         &self,
         lineage: Option<WalLineageId>,
         wal_seq: u64,
         error: &broca_protocol::ProviderError,
     ) {
-        if error.is_rate_limited() {
-            if let Some(retry_after_secs) = error.retry_after_secs {
-                let _ = self.tx.send(ReportEvent::Backoff {
-                    lineage,
-                    wal_seq,
-                    retry_after_secs,
-                });
-            }
+        if error.class.shared_class() == ErrorClass::Transient
+            && !error.is_account_limit_exhausted()
+        {
+            let _ = self.tx.send(ReportEvent::Backoff {
+                lineage,
+                wal_seq,
+                retry_after_secs: error.retry_after_secs.unwrap_or(5.0),
+            });
         }
     }
 

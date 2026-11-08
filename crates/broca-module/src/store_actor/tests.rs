@@ -430,6 +430,40 @@ pub(super) fn request(text: &str) -> SubmissionRequest {
     .unwrap()
 }
 
+/// One caller of one session, which shapes each send as a real caller does. Only the session's
+/// creating send names its tools: the session freezes them, and a later send that names tools is
+/// refused. A later new send leaves them out and runs on the latest run's tools. A retry, under
+/// the run id or send id of an earlier send, names tools exactly when that earlier send did, so
+/// it repeats the earlier request. Each side of a comparison keeps its own caller and gets the
+/// same sends, so both sides send the same requests.
+#[derive(Debug, Default)]
+pub(super) struct Caller {
+    /// Every send so far: its run id, its send id, and whether it named tools.
+    sends: std::sync::Mutex<Vec<(String, Option<String>, bool)>>,
+}
+
+impl Caller {
+    /// `request` as this caller sends it as the run `run_id` under `key`.
+    pub(super) fn shape(
+        &self,
+        run_id: &str,
+        key: &SendKey,
+        mut request: SubmissionRequest,
+    ) -> SubmissionRequest {
+        let mut sends = self.sends.lock().unwrap();
+        let send_id = key.send_id();
+        let earlier = sends
+            .iter()
+            .find(|(run, id, _)| run == run_id || (send_id.is_some() && id.as_deref() == send_id));
+        let names_tools = earlier.map_or(sends.is_empty(), |(_, _, named)| *named);
+        if !names_tools {
+            request.tools = None;
+        }
+        sends.push((run_id.to_owned(), send_id.map(str::to_owned), names_tools));
+        request
+    }
+}
+
 pub(super) async fn send(
     commands: &mpsc::UnboundedSender<LineageCmd>,
     run_id: &str,

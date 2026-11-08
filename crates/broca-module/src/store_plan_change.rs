@@ -15,7 +15,7 @@ use broca_session_store::idindex::IdKind;
 use broca_session_store::record::Record;
 use broca_session_store::session::Session;
 
-use crate::plan_change::{Accepted, ChangeFacts};
+use crate::plan_change::{Accepted, ChangeFacts, EnrollmentFacts};
 
 /// The facts the plan-change rules read about `session`, for a request naming `generation` and
 /// `send_id`, with its manifests read back from `parts`.
@@ -48,6 +48,7 @@ pub(crate) async fn facts<B: SessionBackend>(
         pending,
         current_manifest,
         flushed: plan.flushed_since_accept,
+        enrollment: Some(enrollment_facts(session, parts)?),
         ..ChangeFacts::default()
     };
     if let Some(generation) = generation {
@@ -88,6 +89,41 @@ pub(crate) async fn facts<B: SessionBackend>(
             });
     }
     Ok(facts)
+}
+
+/// What a refresh that adds a compaction provider is checked against (see
+/// `broca_session_loop::enroll`): the window, the global system messages the session's runs
+/// carried, and the model its next run takes when the refresh chooses none.
+fn enrollment_facts<B: SessionBackend>(
+    session: &Session<B>,
+    parts: &dyn Parts,
+) -> Result<EnrollmentFacts, String> {
+    let latest_model = session
+        .operations
+        .run
+        .as_ref()
+        .and_then(|run| run.start.as_ref())
+        .map(|start| {
+            let admission = broca_session_loop::run::admission_of_start(start, parts)
+                .map_err(|error| format!("the session's latest run start: {error:?}"))?;
+            let model = cortexkit_role_llm_runner::head_selection::PlanModel::new(
+                start.model.provider_module_id.as_str(),
+                start.model.model_id.as_str(),
+            );
+            Ok::<_, String>(match admission.variant {
+                Some(variant) => model.with_variant(variant),
+                None => model,
+            })
+        })
+        .transpose()?;
+    Ok(EnrollmentFacts {
+        window_whole: broca_session_loop::enroll::window_whole(&session.conversation),
+        carries_global_system: broca_session_loop::enroll::carries_global_system(
+            &session.conversation,
+        ),
+        session_model: broca_session_loop::plan::selection(&session.operations, parts)?
+            .or(latest_model),
+    })
 }
 
 /// What a plan-change op's preflight reads about `session`, as `ChangeRead::of_wal` reads it

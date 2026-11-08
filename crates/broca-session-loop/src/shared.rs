@@ -94,6 +94,13 @@ pub enum Request {
         value: Arc<dyn std::any::Any + Send + Sync>,
         reply: Reply<()>,
     },
+    Enrollment {
+        reply: Reply<Option<broca_session_store::session::EnrollmentOverlay>>,
+    },
+    PutEnrollment {
+        entries: broca_session_store::record::EnrolledEntries,
+        reply: Reply<broca_session_store::record::EnrollmentOverlayRef>,
+    },
     Seal {
         /// `Some` for a cut before the entry with this ordinal, `None` for a ledger seal.
         ordinal: Option<u64>,
@@ -313,6 +320,23 @@ impl Writer for ActorWriter {
         .await
     }
 
+    async fn enrollment(
+        &self,
+    ) -> Result<Option<broca_session_store::session::EnrollmentOverlay>, SessionError> {
+        self.ask(|reply| Request::Enrollment { reply }).await
+    }
+
+    async fn put_enrollment(
+        &mut self,
+        entries: &broca_session_store::record::EnrolledEntries,
+    ) -> Result<broca_session_store::record::EnrollmentOverlayRef, SessionError> {
+        self.ask(|reply| Request::PutEnrollment {
+            entries: entries.clone(),
+            reply,
+        })
+        .await
+    }
+
     async fn tool_intent(
         &self,
         call_key: &str,
@@ -454,6 +478,12 @@ impl RunLink {
             }
             Request::KeepSealedDerived { value, reply } => {
                 let _ = reply.send(session.keep_sealed_derived(value).await);
+            }
+            Request::Enrollment { reply } => {
+                let _ = reply.send(session.enrollment().await);
+            }
+            Request::PutEnrollment { entries, reply } => {
+                let _ = reply.send(session.put_enrollment(&entries).await);
             }
             Request::Seal {
                 ordinal,

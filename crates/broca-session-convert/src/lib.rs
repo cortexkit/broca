@@ -1769,6 +1769,14 @@ fn send_delivered(
     // The envelope today's writer adds to a ride (llm-runner 0.8.11). A delivery recorded
     // before envelopes existed has none, and keeps rendering its joined bytes as before.
     let ride: Option<broca_wal::record::RideMetadata> = f.parse("ride")?;
+    // The new storage doesn't keep message marks yet, so a ride carrying `speaks_for` is
+    // counted as lost, never dropped silently, and the session doesn't convert exactly.
+    if let Some(speaks_for) = ride.as_ref().and_then(|ride| ride.speaks_for.as_ref()) {
+        f.lose(
+            "ride.speaks_for (message marks)".into(),
+            json_len(&serde_json::to_value(speaks_for).unwrap_or(Value::Null)),
+        );
+    }
     let delivery = Delivery {
         submission_id: f.req_string("submission_id"),
         run_id: f.req_string("run_id"),

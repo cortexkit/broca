@@ -468,3 +468,29 @@ fn plan_changes_round_trip_and_record_their_application() {
     assert_eq!(plan.effective.unwrap().generation, 1);
     assert_round_trip(&old);
 }
+
+/// A session that enrolled in the current compaction contract on the new storage can't be
+/// converted back: today's storage keeps one layout for a log's whole life.
+#[test]
+fn an_enrolled_session_does_not_convert_back() {
+    let converted = convert(&log(&[RUN]), None).unwrap();
+    let mut records = converted.records.clone();
+    records.push(broca_session_store::record::Record::CompactionEnrolled(
+        broca_session_store::record::CompactionEnrolled {
+            through_ordinal: 1,
+            tag_floor: 0,
+            tag_high: 1,
+            overlay: broca_session_store::record::EnrollmentOverlayRef {
+                log: broca_session_store::codec::Id128([1; 16]),
+                generation: broca_session_store::codec::Id128([2; 16]),
+                seq: 3,
+            },
+        },
+    ));
+    let refused = invert(&records, &converted.parts).unwrap_err();
+    assert!(
+        refused.contains("enrolled in the current compaction contract"),
+        "{refused}"
+    );
+    invert(&converted.records, &converted.parts).expect("the same log without it converts back");
+}

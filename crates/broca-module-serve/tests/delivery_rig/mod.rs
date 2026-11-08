@@ -758,6 +758,7 @@ impl RunExecutor for CoreExec {
             mut writer,
             mut parts,
             mode,
+            media,
             ..
         } = job;
         control.hook_plane = self.hook_plane();
@@ -766,6 +767,64 @@ impl RunExecutor for CoreExec {
         let approval = ScriptedApproval(self.script.clone());
         let result = async {
             let now = || 1;
+            // As the module's executor installs it for a store run that may carry media, when
+            // the scripted model takes media: a renderer reading the session's own media
+            // objects, which each model call waits for until the media the session names have
+            // been read from its records (`StoreRunMediaWait`).
+            let holds_media = req
+                .input
+                .iter()
+                .chain(writer.conversation().messages.iter())
+                .any(|message| !broca_session_store::session::message_media(message).is_empty());
+            let frozen = self.script.media_frozen.lock().unwrap().clone();
+            let mut model_call_ready = None;
+            if let Some(frozen) = frozen.filter(|_| {
+                !matches!(mode, StoreRunMode::Seal(_)) && (holds_media || !req.tools.is_empty())
+            }) {
+                let media = media.ok_or_else(|| {
+                    StoreRunError::Admission(broca_core::RunError::Wal(
+                        "store_media_unavailable: the run was started without its media fold"
+                            .into(),
+                    ))
+                })?;
+                let budget = writer
+                    .operations()
+                    .run
+                    .as_ref()
+                    .and_then(|run| run.start.as_ref())
+                    .map(|start| {
+                        broca_session_loop::run::run_config_of_start(start, parts.as_ref())
+                    })
+                    .transpose()
+                    .map_err(StoreRunError::Loop)?
+                    .and_then(|config| config.budget);
+                let lazy = broca_module::store_media::LazyRenderer::new(
+                    media,
+                    Box::new(move |bytes, checkpoint, read_tail| {
+                        let media = broca_provider::media_request::LiveMedia::from_checkpoint(
+                            bytes,
+                            checkpoint,
+                            budget,
+                            frozen.media,
+                            read_tail,
+                        )?;
+                        Ok(Arc::new(
+                            move |frozen: &serde_json::Value,
+                                  opts: &CallOptions,
+                                  tags: bool,
+                                  commit: bool,
+                                  provenance: Option<
+                                &mut broca_protocol::render_provenance::RenderProvenance,
+                            >| {
+                                media.render_with_provenance(frozen, opts, tags, commit, provenance)
+                            },
+                        )
+                            as Arc<broca_core::provider::MediaRequestRenderer>)
+                    }),
+                );
+                provider.set_media_request_renderer(lazy.renderer());
+                model_call_ready = Some(lazy as Arc<dyn broca_session_loop::run::ModelCallReady>);
+            }
             let seams = broca_session_loop::run::Seams {
                 provider: &provider,
                 tools: &tools,
@@ -786,7 +845,7 @@ impl RunExecutor for CoreExec {
                 max_same_account_wait: Default::default(),
                 auth_selection: None,
                 step_progress: control.step_progress.clone(),
-                model_call_ready: None,
+                model_call_ready,
             };
             match mode {
                 StoreRunMode::Fresh => {
@@ -1573,6 +1632,20 @@ impl Rig {
                 "input_schema": {"type": "object"}
             }]
         });
+        // New keys inherit the frozen surface; retries of the creating key repeat its
+        // original declaration so the request identity stays identical after a restart too.
+        // Explicit overrides below still exercise forbidden later declarations.
+        let records = self.records();
+        if records
+            .iter()
+            .find_map(|record| match record {
+                WalRecord::RunStarted { send_id, .. } => Some(send_id.as_deref()),
+                _ => None,
+            })
+            .is_some_and(|first| first != Some(send_id))
+        {
+            params.as_object_mut().unwrap().remove("tools");
+        }
         if let Some(delivery) = delivery {
             params["delivery"] = serde_json::json!(delivery);
         }

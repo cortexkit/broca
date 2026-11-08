@@ -142,7 +142,9 @@ pub struct HeadFacts {
     pub usage: Option<SessionUsage>,
     /// The newest title a send carried.
     pub title: Option<String>,
-    /// Whether the session's first run froze a compaction plan version.
+    /// Whether the session is on the current compaction contract: for today's storage, whether
+    /// its first run froze a compaction plan version; for the new storage, whether its latest
+    /// run did (`Operations::on_contract`).
     pub mode3: bool,
     /// When the session last changed.
     pub updated_at: Option<u64>,
@@ -228,7 +230,6 @@ pub async fn build<B: SessionBackend>(
     let latest_start = latest
         .map(|run| run.start.as_ref().ok_or(StoreHeadError::NoRunStart))
         .transpose()?;
-    let first_start = operations.owner.first_start.as_ref();
     let latest_manifest = latest_start
         .map(|latest| frozen_manifest(latest, parts))
         .transpose()?
@@ -272,9 +273,10 @@ pub async fn build<B: SessionBackend>(
         rich_ui: latest_manifest.and_then(|manifest| manifest.rich_ui.clone()),
         usage: crate::store_read::session_usage(operations.session_usage.as_ref()),
         title: operations.title.clone(),
-        // Today's head reads mode 3 from the session's first run: whether it froze a compaction
-        // plan version.
-        mode3: first_start.is_some_and(|start| start.compaction_plan_version.is_some()),
+        // Mode 3 is the session being on the current compaction contract, read from its latest
+        // run as every reader on the new storage reads it (`Operations::on_contract`): a
+        // session that moved onto it serves as mode 3 from that run on.
+        mode3: operations.on_contract(),
         updated_at: Some(updated_at),
     });
     let head = session.head();

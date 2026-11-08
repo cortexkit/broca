@@ -308,6 +308,7 @@ async fn cursors_resume_across_a_revert() {
                 Record::Input(resent_input),
                 Record::EntryFacts(facts),
             ],
+            None,
             2,
         )
         .await

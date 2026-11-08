@@ -2776,8 +2776,6 @@ async fn a_repaired_credential_resumes_the_paused_episode() {
         "Pause, then resume once the credential is repaired.",
         "--model",
         "openai/gpt-4o-mini",
-        "--tools",
-        "[]",
         "--send-id",
         "resume-probe",
     ];
@@ -2952,8 +2950,6 @@ async fn context_management_is_chosen_per_session_and_frozen_at_first_admission(
                 "Answer without tools.",
                 "--model",
                 "mock/mock-model",
-                "--tools",
-                "[]",
             ];
             args.extend_from_slice(extra);
             timeout(

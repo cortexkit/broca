@@ -124,6 +124,14 @@ fn seed_first_run(
     start["session"] = serde_json::to_value(key).unwrap();
     start["run_id"] = json!(run_id);
     start["title"] = json!(title);
+    // Later sends inherit this surface, including the held tool calls used by the
+    // retention fault fixtures. The stock WAL golden deliberately has no tools.
+    start["config"]["tools"] = json!([{
+        "name": SCRIPTED_TOOL,
+        "description": "Answers each call with its scripted result.",
+        "input_schema": {"type": "object"},
+        "module": TOOL_MODULE,
+    }]);
     // The system prompt is fixed at a session's first episode, so it is the one every later
     // send from this rig repeats (see `send_fields`).
     start["input"] = json!([

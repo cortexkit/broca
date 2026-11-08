@@ -36,13 +36,28 @@ pub const TOOLS_RUNGS: &[&str] = &["on_prefix_rebuild", "immediately"];
 /// together on the applying `RunStarted`.
 pub const SYSTEM_TEXT_RUNGS: &[&str] = &["on_prefix_rebuild", "immediately"];
 
-/// Compaction authority and preset state are session-lived. Refreshes may change
-/// composition, tools and system text, but never the compaction item itself.
-pub fn check_compaction_item(
-    current: Option<&PlanManifest>,
+/// How a refresh's plan changes the session's compaction item, compared with the latest plan
+/// the session accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionItemChange {
+    /// Both name the same item, or neither names one.
+    Same,
+    /// The refresh names an item where the session had none.
+    Added,
+    /// The refresh names none where the session had one.
+    Removed,
+    /// Both name an item, with a different provider, preset or params.
+    Changed,
+}
+
+/// How `next`'s compaction item compares with `latest`'s: the latest plan the session accepted,
+/// which is its pending refresh's when one waits to apply, else the one its latest run froze.
+/// Each storage decides which changes it takes; [`check_compaction_item`] is today's.
+pub fn compaction_item_change(
+    latest: Option<&PlanManifest>,
     next: &serde_json::Value,
-) -> Result<(), crate::Refusal> {
-    let current = current
+) -> Result<CompactionItemChange, crate::Refusal> {
+    let latest = latest
         .map(|manifest| {
             serde_json::from_str::<serde_json::Value>(manifest.plan.as_json_text())
                 .expect("frozen plan is JSON")
@@ -54,10 +69,34 @@ pub fn check_compaction_item(
             .cloned()
             .unwrap_or(serde_json::Value::Null)
     };
-    if crate::plan_identity(&item(&current))? != crate::plan_identity(&item(next))? {
-        return Err(crate::Refusal::invalid("plan.compaction_item"));
+    let (old, new) = (item(&latest), item(next));
+    let same = crate::plan_identity(&old)? == crate::plan_identity(&new)?;
+    Ok(match (old.is_null(), new.is_null(), same) {
+        (_, _, true) => CompactionItemChange::Same,
+        (true, _, false) => CompactionItemChange::Added,
+        (false, true, false) => CompactionItemChange::Removed,
+        (false, false, false) => CompactionItemChange::Changed,
+    })
+}
+
+/// The refusal of a refresh that changes or removes the session's compaction item, and on
+/// today's storage of one that adds an item: compaction authority and preset state are
+/// session-lived.
+pub fn compaction_item_refusal() -> crate::Refusal {
+    crate::Refusal::invalid("plan.compaction_item")
+}
+
+/// Today's storage's rule: compaction authority and preset state are session-lived, so a
+/// refresh may change composition, tools and system text, but never the compaction item itself,
+/// and can't add one either.
+pub fn check_compaction_item(
+    latest: Option<&PlanManifest>,
+    next: &serde_json::Value,
+) -> Result<(), crate::Refusal> {
+    match compaction_item_change(latest, next)? {
+        CompactionItemChange::Same => Ok(()),
+        _ => Err(compaction_item_refusal()),
     }
-    Ok(())
 }
 
 /// Name the first changed surface that cannot detect the requested rebuild point. Removing
@@ -362,6 +401,44 @@ mod tests {
         removed.as_object_mut().unwrap().remove("compaction_item");
         assert!(check_compaction_item(Some(&current), &removed).is_err());
         assert!(check_compaction_item(None, &plan).is_err());
+    }
+
+    /// The classifier names each change against the latest accepted plan, and today's rule
+    /// refuses every one but keeping the item, an added one included, with the same refusal.
+    #[test]
+    fn a_refresh_keeps_adds_removes_or_changes_the_compaction_item() {
+        let item = serde_json::json!({"provider":"ck-mc","preset":"head","params":{"n":1}});
+        let with_item = serde_json::json!({"compaction_item": item, "composition": {}});
+        let without = serde_json::json!({"compaction_item": null, "composition": {}});
+        let mut compacted = test_manifest("old", "c");
+        compacted.plan = broca_wal::OpaqueJson::from_json_text(with_item.to_string()).unwrap();
+        let mut plain = test_manifest("old", "c");
+        plain.plan = broca_wal::OpaqueJson::from_json_text(without.to_string()).unwrap();
+        let mut changed = with_item.clone();
+        changed["compaction_item"]["preset"] = serde_json::json!("worker");
+        for (latest, next, expected) in [
+            (Some(&compacted), &with_item, CompactionItemChange::Same),
+            (Some(&plain), &without, CompactionItemChange::Same),
+            (None, &without, CompactionItemChange::Same),
+            (Some(&plain), &with_item, CompactionItemChange::Added),
+            (None, &with_item, CompactionItemChange::Added),
+            (Some(&compacted), &without, CompactionItemChange::Removed),
+            (Some(&compacted), &changed, CompactionItemChange::Changed),
+        ] {
+            assert_eq!(compaction_item_change(latest, next).unwrap(), expected);
+            let checked = check_compaction_item(latest, next);
+            if expected == CompactionItemChange::Same {
+                checked.unwrap();
+            } else {
+                let refusal = checked.unwrap_err();
+                assert_eq!(refusal.code(), "invalid_params");
+                assert_eq!(
+                    refusal.detail(),
+                    serde_json::json!({"field":"plan.compaction_item"})
+                );
+                assert_eq!(refusal.detail(), compaction_item_refusal().detail());
+            }
+        }
     }
 
     #[test]

@@ -241,7 +241,10 @@ pub(crate) fn read_media(
             Ok(read) => {
                 bytes.insert(digest.clone(), read);
             }
-            Err(MediaReadError::Missing(_)) => missing.push((digest, "absent")),
+            // No store to read it from, as when there is none at all.
+            Err(MediaReadError::Missing(_) | MediaReadError::StoreMissing { .. }) => {
+                missing.push((digest, "absent"))
+            }
             Err(MediaReadError::Corrupt(_)) => missing.push((digest, "corrupt")),
             Err(MediaReadError::Io { digest, source }) => {
                 return Err(StageError::Failed(format!(

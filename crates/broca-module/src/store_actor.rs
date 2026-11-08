@@ -1395,9 +1395,11 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             compaction_plane: self.executor.compaction_plane(),
             compaction_session: Some(Arc::clone(&self.compaction_session)),
             display_sent_by: sent_by,
-            // By the rule today's actor applies: a new log whose plan names a compaction
-            // provider starts on the compaction contract; an existing log keeps its own mode.
-            new_log_compaction_plan_version: crate::plan_episode::new_log_compaction_plan_version(
+            // The version the run's plan asks for. The loop decides the session's mode from it
+            // and the session's latest run: a session on the compaction contract stays on it,
+            // and one that ran outside it moves onto it at the first run whose plan names a
+            // compaction provider (`broca_session_loop::admit::session_contract`).
+            new_log_compaction_plan_version: crate::plan_episode::plan_compaction_version(
                 manifest.as_deref(),
             ),
             manifest,
@@ -1807,9 +1809,15 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 })
             })
             .transpose()?;
+        let rebuild = plan.rebuild_since_accept
+            || crate::plan_change::adds_compaction(
+                self.session.operations().on_contract(),
+                current.as_deref(),
+                pending.as_ref(),
+            );
         let applying = crate::plan_change::pending_applying(
             pending.as_ref(),
-            plan.rebuild_since_accept,
+            rebuild,
             plan.flushed_since_accept,
             plan.last_model.as_deref(),
             model,
@@ -1819,7 +1827,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         let applies = applying.map(|pending| {
             let applied_by = applies_at_run_start(
                 &pending.policy,
-                plan.rebuild_since_accept,
+                rebuild,
                 plan.flushed_since_accept,
                 plan.last_model.as_deref(),
                 &model_key(model),
@@ -1861,6 +1869,21 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         )
         .map_err(SendOutcome::ScopeRefused)?;
         let Some(manifest) = start.manifest.clone() else {
+            // Without a plan, a send that leaves its tools out runs on the latest run's, as
+            // today's actor does; the session's first run has none to take, so it runs with none.
+            if tools_were_omitted {
+                let inherited = if first_run {
+                    Vec::new()
+                } else {
+                    self.latest_admission()
+                        .map_err(SendOutcome::Transient)?
+                        .map(|latest| latest.tools)
+                        .unwrap_or_default()
+                };
+                start.request.policy_allowed =
+                    inherited.iter().map(|tool| tool.name.clone()).collect();
+                start.request.tools = Some(inherited);
+            }
             return Ok(());
         };
         crate::plan_episode::freeze_manifest(

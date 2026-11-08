@@ -157,8 +157,7 @@ async fn refused_busy_move_leaves_real_websocket_stream_and_generation_untouched
     let session = rig.driver.plans[0].session.clone();
     let mut request: broca_protocol::request::SubmissionRequest = serde_json::from_value(json!({
         "model":broca_protocol::ModelHandle::new("openai","m"),
-        "input":[{"role":"user","content":[{"type":"text","text":"hold the response"}]}],
-        "tools":[]
+        "input":[{"role":"user","content":[{"type":"text","text":"hold the response"}]}]
     }))
     .unwrap();
     request.scope = broca_protocol::SendScope::Internal;

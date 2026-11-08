@@ -308,6 +308,7 @@ mod gated {
         wal.append(
             1,
             &WalRecord::RunStarted {
+                message_marks: None,
                 compaction_plan_version: mode3.then_some(broca_core::compaction_v2::PLAN_VERSION),
                 sent_by: None,
                 written_at_ms: None,

@@ -290,6 +290,10 @@ pub enum SessionChangeError {
     AlreadyApplied { generation: u64, applied_by: String },
     /// Fetching the refreshed plan's providers failed as at admission.
     FetchRefused(broca_fetch_plan::Refusal),
+    /// A refresh would add a compaction provider to a session that can gain one, but the
+    /// session or the plan can't take it: `invalid_params` on `plan.compaction_item`, its
+    /// detail naming the reason (`broca_session_loop::enroll::Refusal::reason`).
+    CompactionNotAddable(broca_session_loop::enroll::Refusal),
     /// The session has no baseline yet, or the writer failed. Retryable when transient.
     Transient(String),
     /// The op is not served (no session-change state, or the handler cannot tell).
@@ -312,6 +316,7 @@ impl SessionChangeError {
             Self::PendingSuperseded { .. } => cortexkit_role_llm_runner::errors::PENDING_SUPERSEDED,
             Self::AlreadyApplied { .. } => cortexkit_role_llm_runner::errors::ALREADY_APPLIED,
             Self::FetchRefused(refusal) => refusal.code(),
+            Self::CompactionNotAddable(_) => cortexkit_role_llm_runner::errors::INVALID_PARAMS,
             Self::Transient(_) => cortexkit_role_llm_runner::errors::TRANSIENT,
             Self::Unsupported(_) => "open_failed",
         }
@@ -324,6 +329,35 @@ impl SessionChangeError {
             Self::Transient(_) => true,
             _ => cortexkit_role_llm_runner::errors::is_retryable(self.code()),
         }
+    }
+}
+
+/// The detail of a [`SessionChangeError::CompactionNotAddable`] reply: the field, as the
+/// refusal of a changed or removed compaction item names it, and the reason's stable name.
+pub fn compaction_not_addable_detail(
+    refusal: broca_session_loop::enroll::Refusal,
+) -> serde_json::Value {
+    serde_json::json!({"field": "plan.compaction_item", "reason": refusal.reason()})
+}
+
+/// What a refresh that adds a compaction provider is answered once the context limit of its
+/// run's `model` was resolved (`resolved`): accepted with a limit; refused `no_context_limit`
+/// when resolution gave none; refused transiently, with its cause, when resolution couldn't run.
+/// Only the resolved limit counts: a refresh carries no `context_limit` of its own, and a later
+/// send's can't be counted on.
+pub(crate) fn context_limit_outcome(
+    resolved: Result<Option<u64>, String>,
+    model: &cortexkit_role_llm_runner::head_selection::PlanModel,
+) -> Result<(), SessionChangeError> {
+    match resolved {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(SessionChangeError::CompactionNotAddable(
+            broca_session_loop::enroll::Refusal::NoContextLimit,
+        )),
+        Err(cause) => Err(SessionChangeError::Transient(format!(
+            "the context limit of {}/{} couldn't be resolved: {cause}",
+            model.provider, model.model
+        ))),
     }
 }
 
@@ -607,7 +641,7 @@ pub type RecordedSummaries =
 
 /// What `include_display_facts` adds to each message of `response`, the same for both storages:
 /// its creation time; for an assistant message its completion time and reasoning summaries; the
-/// sender, notices and per-call times `facts` holds for it (by zero-based ordinal), and for a
+/// sender, message marks (`speaks_for`, `notice`), notices and per-call times `facts` holds for it (by zero-based ordinal), and for a
 /// user message its send's `client_message_id`. A message that makes tool calls and has no
 /// per-call facts names each call with no times.
 ///
@@ -646,6 +680,10 @@ pub fn apply_display_facts(
             };
         }
         if let Some(facts) = facts.get(&(entry.ordinal - 1)) {
+            if let Some(marks) = &facts.message_marks {
+                entry.speaks_for = marks.speaks_for.clone();
+                entry.notice = marks.notice;
+            }
             entry.sender = facts.sender.clone();
             entry.notices = facts
                 .notices
@@ -730,6 +768,8 @@ pub fn session_read_response(
             .messages
             .into_iter()
             .map(|message| SessionReadMessage {
+                speaks_for: None,
+                notice: false,
                 sender: None,
                 notices: Vec::new(),
                 created_at: None,
@@ -3038,6 +3078,44 @@ pub trait ServeHandler: Send + Sync {
 }
 
 impl crate::LineageRegistry {
+    /// The preflight's check of a refresh's compaction item against the latest plan the session
+    /// accepted (`ChangeFacts::latest_manifest`). Keeping the item is always fine; removing or
+    /// changing it is refused, and so is adding one on today's storage. On the new storage a
+    /// session may gain one: the window must be whole, and a context limit must resolve for the
+    /// plan's model (`plan_model`), else the session's, since a run on the compaction contract
+    /// can't run without one and the provider can't be removed again. A limit resolution that
+    /// couldn't run refuses transiently, with its cause. The plan's system text is checked once
+    /// it's fetched, where the actor writes the refresh (`plan_change::accept_refresh`).
+    async fn check_compaction_change(
+        &self,
+        facts: &crate::plan_change::ChangeFacts,
+        plan: &serde_json::Value,
+        plan_model: Option<cortexkit_role_llm_runner::head_selection::PlanModel>,
+    ) -> Result<(), SessionChangeError> {
+        use broca_fetch_plan::session_change::{
+            compaction_item_change, compaction_item_refusal, CompactionItemChange,
+        };
+        use broca_session_loop::enroll::Refusal;
+        let change = compaction_item_change(facts.latest_manifest(), plan)
+            .map_err(SessionChangeError::FetchRefused)?;
+        let enrollment = match (change, &facts.enrollment) {
+            (CompactionItemChange::Same, _) => return Ok(()),
+            (CompactionItemChange::Added, Some(enrollment)) => enrollment,
+            _ => return Err(SessionChangeError::FetchRefused(compaction_item_refusal())),
+        };
+        if !enrollment.window_whole {
+            return Err(SessionChangeError::CompactionNotAddable(
+                Refusal::WindowNotWhole,
+            ));
+        }
+        let Some(model) = plan_model.or_else(|| enrollment.session_model.clone()) else {
+            return Err(SessionChangeError::CompactionNotAddable(
+                Refusal::NoContextLimit,
+            ));
+        };
+        context_limit_outcome(self.compaction_context_limit(&model).await, &model)
+    }
+
     /// What a plan-change op's preflight reads about `session`, for a request naming
     /// `generation` and `send_id`. `wal_error` words a failure to read the session's WAL, as
     /// each op words it.
@@ -4982,18 +5060,16 @@ impl ServeHandler for crate::LineageRegistry {
                 applies_from_next_run,
             ));
         }
-        self.check_plan_selection(&plan_value)
+        let plan_model = self
+            .check_plan_selection(&plan_value)
             .await
             .map_err(|problem| {
                 SessionChangeError::FetchRefused(broca_fetch_plan::Refusal::InvalidParams {
                     detail: problem.detail(),
                 })
             })?;
-        broca_fetch_plan::session_change::check_compaction_item(
-            read.facts.current_manifest.as_deref(),
-            &plan_value,
-        )
-        .map_err(SessionChangeError::FetchRefused)?;
+        self.check_compaction_change(&read.facts, &plan_value, plan_model)
+            .await?;
         // Fetch with the same admission code as a first send, never a second copy: parse
         // the plan, then admit its providers under the deadline. Refusals write nothing.
         let output_refs = if self
@@ -5790,6 +5866,7 @@ mod offset_head_tests {
 
     fn run_started() -> WalRecord {
         WalRecord::RunStarted {
+            message_marks: None,
             compaction_plan_version: None,
             sent_by: None,
             written_at_ms: None,

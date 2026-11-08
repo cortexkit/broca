@@ -385,6 +385,8 @@ pub fn project(entry: &SessionReadMessage, limits: Option<&Limits>) -> DisplayRo
     let mut row = DisplayRow::new(role, parts);
     row.notices.clone_from(&entry.notices);
     row.sender.clone_from(&entry.sender);
+    row.speaks_for.clone_from(&entry.speaks_for);
+    row.notice = entry.notice;
     if let Some(origin) = &entry.message.origin {
         row = row.with_model(format!("{}/{}", origin.provider_module_id, origin.model_id));
     }

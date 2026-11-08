@@ -34,18 +34,21 @@ pub struct Ctx {
     pub preset: String,
     /// The send context of the newest accepted request, when an earlier run made it: what this
     /// run's first ride compares with. Once this run's own request is accepted, its own context
-    /// is the previous one.
-    pub earlier: Option<(String, v2::conditions::SendContext)>,
+    /// is the previous one. The context is `None` when that run started outside the current
+    /// compaction contract, before the session enrolled: no request on the contract preceded
+    /// this run's, so its first ride compares with none.
+    pub earlier: Option<(String, Option<v2::conditions::SendContext>)>,
 }
 
 /// The send context of the session's newest accepted request when an earlier run than
 /// `admission`'s made it, rebuilt from that run's start, which the session's id lookup finds
-/// sealed or open. A run the fold names but the session can't find is damage.
+/// sealed or open; `None` in place of the context when that run started outside the current
+/// compaction contract. A run the fold names but the session can't find is damage.
 pub async fn earlier_context<W: Writer>(
     writer: &W,
     admission: &Admission,
     parts: &dyn crate::parts::Parts,
-) -> Result<Option<(String, v2::conditions::SendContext)>, LoopError> {
+) -> Result<Option<(String, Option<v2::conditions::SendContext>)>, LoopError> {
     let Some(run) = writer
         .operations()
         .last_send_run
@@ -59,9 +62,12 @@ pub async fn earlier_context<W: Writer>(
             "the session names run {run} as its newest request's, but holds no start for it"
         ))
     })?;
+    if start.compaction_plan_version.is_none() {
+        return Ok(Some((run, None)));
+    }
     let earlier = crate::run::admission_of_start(&start, parts)?;
     let context = v2::host::context_of(&frozen(&earlier), earlier.manifest.as_deref());
-    Ok(Some((run, context)))
+    Ok(Some((run, Some(context))))
 }
 
 /// Today's compaction state, rebuilt from the open log's records (see
@@ -92,6 +98,11 @@ pub fn restore(
                 checksum: view.checksum.clone(),
                 edits: serde_json::from_value(view.edits.clone())
                     .map_err(|error| format!("a stored compaction view's edits: {error}"))?,
+                // The new storage doesn't keep a view's build metadata yet; conversion counts
+                // it as lost, so a stored view never had any.
+                built_through: None,
+                new_signed: None,
+                applied_by: None,
             }),
             Record::ViewApplied(applied) => WalRecord::CompactionViewAppliedV2 {
                 step_id: applied.step_id,
@@ -342,7 +353,13 @@ async fn sealed_transcript<W: Writer>(writer: &W) -> Result<Arc<SealedTranscript
 pub async fn transcript<W: Writer>(writer: &W, ctx: &Ctx) -> Result<Transcript, LoopError> {
     use cortexkit_role_compaction::view::{EditOp, InsertAt};
     let conversation = writer.conversation();
-    let window = broca_session_store::session::served_window(conversation);
+    // A session that enrolled serves its earlier messages as its enrollment decided, leaving
+    // out the global system messages it suppressed, as the request's prompt leaves them out.
+    let enrollment = writer.enrollment().await?;
+    let window = broca_session_store::session::EnrollmentOverlay::serve(
+        enrollment.as_ref(),
+        broca_session_store::session::served_window(conversation),
+    );
     let window_entries = window
         .iter()
         .map(crate::entries::project)
@@ -742,12 +759,29 @@ fn previous<W: Writer>(
             admission.manifest.as_deref(),
         ))),
         Some(run) => match &ctx.earlier {
-            Some((earlier, context)) if earlier == run => Ok(Some(context.clone())),
+            Some((earlier, context)) if earlier == run => Ok(context.clone()),
             _ => Err(LoopError::Parts(format!(
                 "the newest request's run {run} has no context loaded"
             ))),
         },
     }
+}
+
+/// The conditions a step's compaction calls state, by today's rule (`host::conditions_of`). On a
+/// session that enrolled in the current compaction contract, the messages placed before it
+/// report no usage, so until a step on the contract reports its own, the session's fill is the
+/// prompt size the newest step before the enrollment reported (`crate::enroll::last_prompt_tokens`).
+fn conditions_for<W: Writer>(
+    writer: &W,
+    admission: &Admission,
+    entries: &[cortexkit_role_compaction::read::Entry],
+    chained: bool,
+) -> Result<cortexkit_role_compaction::notice::Conditions, String> {
+    let mut conditions = v2::host::conditions_of(&frozen(admission), entries, chained, None)?;
+    if conditions.last_prompt_tokens.is_none() && writer.operations().enrolled.is_some() {
+        conditions.last_prompt_tokens = crate::enroll::last_prompt_tokens(writer.operations());
+    }
+    Ok(conditions)
 }
 
 /// `prompt` with the run's settings, the rendering inputs and the system text above it, as
@@ -774,7 +808,7 @@ pub async fn apply_boundary<W: Writer, P, T>(
     let entries = transcript(writer, ctx).await?.entries;
     // The last serving model's fill isn't measured on this storage yet, so the newest entry's
     // own reported prompt stands for the session's fill.
-    let conditions = match v2::host::conditions_of(&frozen(admission), &entries, false, None) {
+    let conditions = match conditions_for(writer, admission, &entries, false) {
         Ok(conditions) => conditions,
         Err(message) => return Ok(Err(message)),
     };
@@ -815,7 +849,7 @@ pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
     let last_cache = writer.operations().last_cache_send.clone();
     let chained = seams.provider.history_edit_cost()
         == Some(broca_core::compaction_provider::notice::HistoryEditCost::FullResend);
-    let conditions = match v2::host::conditions_of(&frozen(admission), &entries, chained, None) {
+    let conditions = match conditions_for(writer, admission, &entries, chained) {
         Ok(conditions) => conditions,
         Err(message) => return Ok(Send::Unavailable(message)),
     };
@@ -917,8 +951,8 @@ pub async fn notice<W: Writer, P, T>(
         return Ok(());
     }
     let entries = transcript(writer, ctx).await?.entries;
-    let conditions = v2::host::conditions_of(&frozen(admission), &entries, false, None)
-        .map_err(LoopError::Parts)?;
+    let conditions =
+        conditions_for(writer, admission, &entries, false).map_err(LoopError::Parts)?;
     let applied = ctx.session.state.lock().await.applied_identity();
     let mut setup =
         v2::conditions::setup_request(&ctx.preset, &conditions, (seams.now_ms)(), false);

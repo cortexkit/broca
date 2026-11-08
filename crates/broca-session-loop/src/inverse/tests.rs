@@ -85,6 +85,7 @@ fn a_revert_or_a_recovery_cut_is_refused_by_name_never_a_panic() {
         through_seq: 3,
         ordinal: 1,
         history_version: 1,
+        tag_high: None,
     });
     let cut = Record::RecoveryCut(RecoveryCut {
         change,

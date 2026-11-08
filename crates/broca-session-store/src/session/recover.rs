@@ -272,13 +272,26 @@ impl<B: SessionBackend> Session<B> {
             .iter()
             .any(|region| region.ledger == Lost::CantProve);
 
+        // In seq order: a session's enrollment in the current compaction contract changes how
+        // the conversation folds the transcript records after it (`Conversation::enrolled`).
         let mut conversation = checkpoint.conversation.clone();
-        for (_, _, record) in &transcript {
-            conversation.apply(record).map_err(fold_error)?;
-        }
         let mut operations = checkpoint.operational.clone();
-        for (_, record) in &ledger {
+        conversation.enrolled(operations.enrolled_through());
+        let mut kept_transcript = transcript
+            .iter()
+            .map(|(seq, _, record)| (*seq, record))
+            .peekable();
+        for (seq, record) in &ledger {
+            while let Some((_, kept)) =
+                kept_transcript.next_if(|(transcript_seq, _)| transcript_seq < seq)
+            {
+                conversation.apply(kept).map_err(fold_error)?;
+            }
             operations.apply(record).map_err(fold_error)?;
+            conversation.enrolled(operations.enrolled_through());
+        }
+        for (_, kept) in kept_transcript {
+            conversation.apply(kept).map_err(fold_error)?;
         }
 
         // A change whose intent the damaged log holds never committed: the head's open log is
@@ -504,6 +517,7 @@ impl<B: SessionBackend> Session<B> {
             open_ids: OpenIds::default(),
             window: OpenLogIndex::default(),
             imported: Default::default(),
+            enrollment: Default::default(),
             sealed_entries: Default::default(),
             observer: None,
             kept: super::kept::KeptRecords::from_next(intent_seq + 1, false),

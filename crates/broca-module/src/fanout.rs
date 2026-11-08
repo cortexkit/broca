@@ -2161,6 +2161,7 @@ mod tests {
 
     fn run_started(session: &BindIdentity) -> WalRecord {
         WalRecord::RunStarted {
+            message_marks: None,
             compaction_plan_version: None,
             sent_by: None,
             written_at_ms: None,
@@ -3870,6 +3871,7 @@ mod tests {
                 seq: 1,
                 fence: 1,
                 record: WalRecord::RunStarted {
+                    message_marks: None,
                     compaction_plan_version: None,
                     sent_by: None,
                     written_at_ms: None,
@@ -4283,6 +4285,7 @@ mod episode_attach_tests {
 
     fn run_started(run_id: &str, input: Vec<Message>) -> WalRecord {
         WalRecord::RunStarted {
+            message_marks: None,
             compaction_plan_version: None,
             sent_by: None,
             written_at_ms: None,
@@ -4448,6 +4451,7 @@ mod episode_attach_tests {
         records.extend(tool_step(1, "r1-b1", &["a", "b"]));
         records.extend(step(2, text("done")));
         records.push(WalRecord::Steered {
+            message_marks: None,
             sent_by: None,
             written_at_ms: None,
             tags: None,

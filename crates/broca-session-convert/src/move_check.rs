@@ -175,6 +175,7 @@ pub(super) fn run(args: &Args) {
             converted: &staged.converted,
             mode,
             media: None,
+            media_root: None,
         }));
         match verified {
             Ok(verified) => {

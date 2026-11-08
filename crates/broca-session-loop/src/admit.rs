@@ -12,13 +12,13 @@ use broca_session_store::fold::operations::Operations;
 
 use crate::run::{Admission, SendFacts};
 
-/// Whether the session follows the current compaction contract: as its runs started, or, before
-/// its first run, as the first run asks.
-pub fn session_contract(operations: &Operations, first_run_version: Option<u32>) -> bool {
-    match operations.run.as_ref().and_then(|run| run.start.as_ref()) {
-        Some(start) => start.compaction_plan_version.is_some(),
-        None => first_run_version.is_some(),
-    }
+/// Whether a new run is on the current compaction contract: the session already is (its latest
+/// run started on it, [`Operations::on_contract`]), or the plan the run freezes names a
+/// compaction provider, which `plan_version` says (the caller sets it from that plan). A session
+/// that ran outside the contract moves onto it at the first run whose plan names one, and never
+/// moves back, since that provider can't be removed again (see `crate::enroll`).
+pub fn session_contract(operations: &Operations, plan_version: Option<u32>) -> bool {
+    operations.on_contract() || plan_version.is_some()
 }
 
 /// The admission of a new run of `req` on a session whose operational fold is `operations`.

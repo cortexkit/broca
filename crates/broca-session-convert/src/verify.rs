@@ -47,6 +47,17 @@ pub struct Verify<'a> {
     /// Today's media store for the session, which every medium the staged session holds must
     /// read back equal to; `None` where there is none.
     pub media: Option<&'a dyn broca_core::media_store::MediaBytes>,
+    /// Where that store lives, which today's offline render reads a request's media from; `None`
+    /// where there is none, which refuses a request holding media.
+    pub media_root: Option<MediaRoot<'a>>,
+}
+
+/// Where today's media store for a session lives: the state root, and the class of store the
+/// folder of the session's WAL chooses.
+#[derive(Debug, Clone, Copy)]
+pub struct MediaRoot<'a> {
+    pub state_root: &'a Path,
+    pub class: broca_core::media_store::MediaStoreClass,
 }
 
 /// How much to check.
@@ -973,12 +984,14 @@ fn render(
 
 /// Today's render of the request step `step` of run `run` sends, from the WAL `prefix` through
 /// the step's start, with `cap` as the step's lowered output cap: the request a copy of the
-/// session must render byte for byte. When the prefix names media (`holds_media`), the request
-/// renders through today's media preparation, reading the bytes from `media`; no offline render
-/// of today's storage offers that yet, so such a request is refused by name, and the check that
-/// asked for it stops a move of a session holding media.
+/// session must render byte for byte. Where the move found today's media store for the session
+/// (`verify.media_root`), it renders as today's offline render does
+/// (`wal_render::render_step_with_media`), preparing the request's media from that store read
+/// only, and refusing by name a medium it can't read. Without that store a request whose prefix
+/// names media (`holds_media`) is refused.
 #[allow(clippy::too_many_arguments)]
 fn todays_request(
+    verify: &Verify<'_>,
     lineage: Option<&str>,
     prefix: &[WalRecord],
     config: &broca_wal::RunConfig,
@@ -986,15 +999,31 @@ fn todays_request(
     step: u64,
     cap: Option<u32>,
     holds_media: bool,
-    _media: Option<&dyn broca_core::media_store::MediaBytes>,
 ) -> Result<Vec<u8>, String> {
-    if holds_media {
-        return Err("today's offline render can't render a request holding media yet".into());
+    match verify.media_root {
+        Some(root) => broca_module::wal_render::render_step_with_media(
+            &broca_module::wal_render::OfflineMediaContext {
+                state_root: root.state_root,
+                identity: verify.session,
+                class: root.class,
+                lineage,
+            },
+            prefix,
+            config,
+            run,
+            step,
+            cap,
+        )
+        .map(|(_, _, body)| body)
+        .map_err(|error| error.to_string()),
+        None if holds_media => {
+            Err("no media store of today's is open to render the request's media from".into())
+        }
+        None => broca_module::wal_render::render_step_with_lineage(
+            lineage, prefix, config, run, step, cap, None,
+        )
+        .map(|(_, _, body)| body),
     }
-    broca_module::wal_render::render_step_with_lineage(
-        lineage, prefix, config, run, step, cap, None,
-    )
-    .map(|(_, _, body)| body)
 }
 
 /// The frozen render config of a run whose config is `config`.
@@ -1154,6 +1183,7 @@ async fn step(
         ));
     }
     let today = todays_request(
+        verify,
         lineage,
         prefix,
         &recorded.config,
@@ -1161,7 +1191,6 @@ async fn step(
         recorded.step,
         cap,
         holds_media,
-        verify.media,
     )
     .map_err(|error| at(format!("today's renderer: {error}")))?;
     if rebuilt != today {
@@ -1303,6 +1332,7 @@ async fn next_request(
         };
         let holds_media = !crate::stage::media_digests(&extended).is_empty();
         let today = todays_request(
+            verify,
             lineage,
             &wal,
             config,
@@ -1310,7 +1340,6 @@ async fn next_request(
             1,
             None,
             holds_media,
-            verify.media,
         )
         .map_err(|error| mismatch(NEXT_REQUEST, format!("today's renderer: {error}")))?;
         let converted = crate::convert(&extended, lineage)

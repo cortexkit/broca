@@ -368,6 +368,19 @@ impl<W: Writer> Writer for Placed<'_, W> {
         self.inner.open_log_records().await
     }
 
+    async fn enrollment(
+        &self,
+    ) -> Result<Option<broca_session_store::session::EnrollmentOverlay>, SessionError> {
+        self.inner.enrollment().await
+    }
+
+    async fn put_enrollment(
+        &mut self,
+        entries: &broca_session_store::record::EnrolledEntries,
+    ) -> Result<broca_session_store::record::EnrollmentOverlayRef, SessionError> {
+        self.inner.put_enrollment(entries).await
+    }
+
     async fn run_start(
         &self,
         run_id: &str,
@@ -517,10 +530,17 @@ pub fn with_facts(batch: Vec<Record>, at: &Placing<'_>) -> Result<Vec<Record>, S
     let mut known = known_of(&counts);
     let mut inserted = false;
     let entries = at.tags.entries;
-    let mut high = if entries {
-        high_water(at.conversation)?
-    } else {
-        0
+    // A batch that moves the session onto the current compaction contract (its run's start
+    // batch, which records the enrollment) numbers its messages after the last number the
+    // enrollment gave the earlier ones, which the folds don't hold until the batch is in.
+    let enrolling = batch.iter().find_map(|record| match record {
+        Record::CompactionEnrolled(enrolled) => Some(enrolled.tag_high),
+        _ => None,
+    });
+    let mut high = match (entries, enrolling) {
+        (false, _) => 0,
+        (true, Some(tag_high)) => tag_high.max(at.operations.tag_high_water),
+        (true, None) => lifetime_tag_high(at.conversation, at.operations)?,
     };
     let mut time = last_time(at.conversation);
     // The run's own numbering continues from the newest message it placed, or from its
@@ -1350,7 +1370,7 @@ fn flush(out: &mut Vec<Record>, pending: &mut Vec<EntryFacts>, at: &Placing<'_>)
 /// (`delivery_sender`). A person's input has none. A run that consumes a queued send takes that
 /// send's origin instead, which needs the queued send's records: not built yet, so such a run's
 /// input names no sender.
-fn input_sender(start: &broca_session_store::record::RunStart) -> Option<Notice> {
+pub(crate) fn input_sender(start: &broca_session_store::record::RunStart) -> Option<Notice> {
     let fresh = start
         .origin
         .as_ref()
@@ -1591,29 +1611,43 @@ fn runner_high_water(conversation: &Conversation, runner: &RunnerTags) -> u64 {
     high
 }
 
-/// The highest part number so far: the newest message's base plus its own numbered parts, or
-/// the marker's checkpoint when the window is empty.
-fn high_water(conversation: &Conversation) -> Result<u64, String> {
+/// The highest part number any message of the session has taken, in the projection's
+/// numbering, which the next message's parts are numbered after: the newest message's base plus
+/// its own numbered parts, or the marker's checkpoint when the window is empty, and never below
+/// the highest number the session recorded (`Operations::tag_high_water`: an enrollment's, or
+/// that of the messages a revert dropped). A message placed before the session enrolled in the
+/// current compaction contract was numbered by the enrollment, not by its own facts (recorded off
+/// the contract), so while it is the newest the enrollment's last number stands for it. The next
+/// run's numbering and every reader of the session's part numbers ask here.
+pub fn lifetime_tag_high(
+    conversation: &Conversation,
+    operations: &Operations,
+) -> Result<u64, String> {
     let newest = match (&conversation.open_entry, conversation.open_tool_turn()) {
-        (Some(entry), Some(message)) => Some((message, entry)),
+        (Some(entry), Some(message)) => Some((conversation.placed + 1, message, entry)),
         _ => conversation
             .messages
             .last()
-            .zip(conversation.entries.last()),
+            .zip(conversation.entries.last())
+            .map(|(message, entry)| (conversation.placed, message, entry)),
     };
-    match newest {
-        Some((message, entry)) => {
+    let high = match (newest, operations.enrolled.as_ref()) {
+        (Some((ordinal, _, _)), Some(enrolled)) if ordinal <= enrolled.through_ordinal => {
+            enrolled.tag_high
+        }
+        (Some((_, message, entry)), _) => {
             let facts = entry
                 .facts
                 .as_ref()
                 .ok_or("entry facts: the newest message has none")?;
-            Ok(facts.tag_base + numbered_parts(message))
+            facts.tag_base + numbered_parts(message)
         }
-        None => Ok(conversation
+        (None, _) => conversation
             .marker
             .as_ref()
-            .map_or(0, |marker| marker.checkpoint)),
-    }
+            .map_or(0, |marker| marker.checkpoint),
+    };
+    Ok(high.max(operations.tag_high_water))
 }
 
 /// The newest entry's time, which a message without its own time takes.
@@ -1733,6 +1767,9 @@ pub fn ride_metadata(delivered: &Delivered) -> Option<broca_wal::record::RideMet
         form: match ride.form {
             RideForm::Append => broca_wal::record::RideForm::Append,
         },
+        // The new storage doesn't keep message marks yet; conversion counts a ride's marks as
+        // lost, so a stored ride never had any.
+        speaks_for: None,
     })
 }
 
@@ -1805,5 +1842,91 @@ pub fn render_rides(prompt: &mut [Message], conversation: &Conversation) {
                 broca_core::delivery_order::append_ride(result, &ride, &delivered.text);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod lifetime_tag_high_tests {
+    use broca_protocol::content::{ContentBlock, Message, Role};
+    use broca_session_store::codec::Id128;
+    use broca_session_store::fold::conversation::{Conversation, EntryState};
+    use broca_session_store::fold::operations::{Enrollment, Operations};
+    use broca_session_store::record::{EnrollmentOverlayRef, EntryFacts};
+
+    use super::{lifetime_tag_high, numbered_parts};
+
+    /// A session holding two messages, the newest numbered from `tag_base`.
+    fn two_messages(tag_base: u64) -> Conversation {
+        let mut conversation = Conversation::new(false);
+        for (ordinal, text) in [(1, "first"), (2, "second")] {
+            conversation.messages.push(Message::new(
+                Role::User,
+                vec![ContentBlock::Text { text: text.into() }],
+            ));
+            conversation.entries.push(EntryState {
+                facts: Some(EntryFacts {
+                    ordinal,
+                    written_at_ms: None,
+                    tag_base: if ordinal == 2 { tag_base } else { 0 },
+                    notice: None,
+                    usage: None,
+                    generated_under: None,
+                    native: false,
+                    render_tags: false,
+                    clean_reply: false,
+                    mid: format!("g0.{ordinal}"),
+                    run_id: None,
+                    created_at_ms: None,
+                    delivery_mode: None,
+                    delivery_tool_call_id: None,
+                    client_message_id: None,
+                    sender: None,
+                    marks: None,
+                    no_display_facts: None,
+                    reasoning_summaries: Vec::new(),
+                    rich_ui: None,
+                    runner_tag_base: None,
+                    legacy_view_seq: None,
+                    notices: Vec::new(),
+                }),
+                ..EntryState::default()
+            });
+        }
+        conversation.placed = 2;
+        conversation
+    }
+
+    /// The highest number the session ever gave: its newest message's last one, unless a revert
+    /// dropped higher ones (the fold's high-water), and while the newest message was placed
+    /// before the session enrolled, the enrollment's last number, which its own facts (recorded
+    /// off the contract) don't hold.
+    #[test]
+    fn the_next_number_follows_the_highest_one_the_session_ever_gave() {
+        let conversation = two_messages(5);
+        let newest = 5 + numbered_parts(conversation.messages.last().unwrap());
+        assert_eq!(newest, 6);
+        let mut operations = Operations::default();
+        assert_eq!(lifetime_tag_high(&conversation, &operations), Ok(6));
+        // A revert dropped messages numbered up to 20: the next numbers follow 20.
+        operations.tag_high_water = 20;
+        assert_eq!(lifetime_tag_high(&conversation, &operations), Ok(20));
+        // Off-contract facts carry no projection numbers; the enrollment's last number stands
+        // for the messages placed before it.
+        operations.tag_high_water = 9;
+        operations.enrolled = Some(Enrollment {
+            through_ordinal: 2,
+            tag_floor: 3,
+            tag_high: 9,
+            overlay: EnrollmentOverlayRef {
+                log: Id128([1; 16]),
+                generation: Id128([2; 16]),
+                seq: 3,
+            },
+            run_id: "r".into(),
+        });
+        assert_eq!(lifetime_tag_high(&two_messages(0), &operations), Ok(9));
+        // A message placed since numbers from its own facts.
+        operations.enrolled.as_mut().unwrap().through_ordinal = 1;
+        assert_eq!(lifetime_tag_high(&two_messages(12), &operations), Ok(13));
     }
 }

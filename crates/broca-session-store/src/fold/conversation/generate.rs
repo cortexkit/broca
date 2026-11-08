@@ -44,4 +44,5 @@ fields!(Conversation {
     window_repetition,
     first_protocol_compaction,
     human_prompts,
+    joined_through,
 });

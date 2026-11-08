@@ -34,6 +34,7 @@ pub mod billing;
 pub mod budget;
 pub mod compaction;
 pub mod durable;
+pub mod enroll;
 pub mod entries;
 pub mod inverse;
 pub mod media;

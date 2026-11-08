@@ -307,6 +307,7 @@ fn export_legacy_with_bind(
                 (
                     address,
                     lineage,
+                    key,
                     frames
                         .into_iter()
                         .map(|frame| frame.record)
@@ -316,9 +317,19 @@ fn export_legacy_with_bind(
         })
         .collect::<Result<Vec<_>, _>>()?;
     private_directory(out)?;
-    for (address, lineage, records) in selected {
+    for (address, lineage, key, records) in selected {
         summary.sessions_read += 1;
         let lineage = lineage.map(|lineage| lineage.to_string());
+        let class = store
+            .media_store_class(&address)
+            .map_err(|error| format!("resolve media class for {}: {error}", key.session))?
+            .ok_or_else(|| format!("cannot resolve WAL media class for {}", key.session))?;
+        let media = crate::wal_render::OfflineMediaContext {
+            state_root: root,
+            identity: &key,
+            class,
+            lineage: lineage.as_deref(),
+        };
         export_records_since(
             &address,
             lineage.as_deref(),
@@ -326,6 +337,7 @@ fn export_legacy_with_bind(
             out,
             &mut summary,
             since,
+            Some(&media),
         )?;
     }
     Ok(summary)
@@ -404,7 +416,7 @@ pub fn export_records(
     out: &Path,
     summary: &mut Summary,
 ) -> Result<(), String> {
-    export_records_since(address, None, records, out, summary, None)
+    export_records_since(address, None, records, out, summary, None, None)
 }
 
 fn export_records_since(
@@ -414,6 +426,7 @@ fn export_records_since(
     out: &Path,
     summary: &mut Summary,
     since: Option<u64>,
+    media: Option<&crate::wal_render::OfflineMediaContext<'_>>,
 ) -> Result<(), String> {
     let starts: Vec<_> = records
         .iter()
@@ -507,20 +520,38 @@ fn export_records_since(
             ) {
                 meta["input_transformations"] = report;
             }
-            let rendered = boundaries.get(&step).and_then(|_| {
+            let rendered = if boundaries.contains_key(&step) {
                 // The runner can apply a compaction provider's view after StepStarted. Rebuild
                 // through this attempt, not a later acceptance or the earlier prompt boundary.
-                crate::wal_render::render_step_with_lineage(
-                    lineage,
-                    &records[..attempt_at],
-                    config,
-                    &run_id.0,
-                    step,
-                    output_caps.get(&step).copied(),
-                    None,
-                )
-                .ok()
-            });
+                if let Some(media) = media {
+                    crate::wal_render::render_step_with_media(
+                        media,
+                        &records[..attempt_at],
+                        config,
+                        &run_id.0,
+                        step,
+                        output_caps.get(&step).copied(),
+                    )
+                    .map(Some)
+                    .or_else(|error| match error {
+                        crate::wal_render::OfflineRenderError::Unavailable(_) => Ok(None),
+                        error => Err(error.to_string()),
+                    })?
+                } else {
+                    crate::wal_render::render_step_with_lineage(
+                        lineage,
+                        &records[..attempt_at],
+                        config,
+                        &run_id.0,
+                        step,
+                        output_caps.get(&step).copied(),
+                        None,
+                    )
+                    .ok()
+                }
+            } else {
+                None
+            };
             if let Some((frozen, _, body)) = rendered {
                 meta["wire_family"] = json!(frozen.family_id);
                 let actual = format!("{:x}", Sha256::digest(&body));

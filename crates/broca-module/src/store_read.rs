@@ -93,7 +93,29 @@ pub async fn served_entries<B: SessionBackend>(
     from: u64,
     limit: usize,
 ) -> Result<Vec<StoredEntry>, SessionError> {
-    let mut entries = session.entries(from, limit).await?;
+    let entries = session.entries(from, limit).await?;
+    Ok(held_back(session, entries))
+}
+
+/// [`served_entries`] as compaction reads them (`Session::compaction_entries`): a session that
+/// enrolled in the current compaction contract serves the messages placed before it as the
+/// enrollment decided, and not the global system messages it suppressed, which don't count
+/// toward `limit`. What `session.entries` serves and a view is checked against.
+pub async fn served_compaction_entries<B: SessionBackend>(
+    session: &Session<B>,
+    from: u64,
+    limit: usize,
+) -> Result<Vec<StoredEntry>, SessionError> {
+    let entries = session.compaction_entries(from, limit).await?;
+    Ok(held_back(session, entries))
+}
+
+/// `entries` with the results of a batch that hasn't closed held back, and the turn they answer
+/// served as still running (see [`results_await_close`]).
+fn held_back<B: SessionBackend>(
+    session: &Session<B>,
+    mut entries: Vec<StoredEntry>,
+) -> Vec<StoredEntry> {
     if results_await_close(session) {
         let held = session.conversation.placed;
         entries.retain(|entry| entry.ordinal < held);
@@ -102,7 +124,7 @@ pub async fn served_entries<B: SessionBackend>(
             turn.open = true;
         }
     }
-    Ok(entries)
+    entries
 }
 
 /// A `session.read` page, each of its messages' stable id (`EntryFacts::mid`), in order, and

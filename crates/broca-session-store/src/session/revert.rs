@@ -56,6 +56,13 @@ pub enum RevertRefusal {
     NotRunInput,
     /// The resend isn't a run start with a send id, the run's input, and its entry facts.
     BadResend(&'static str),
+    /// The message was placed before the session enrolled in the current compaction contract.
+    /// Its ordinal would be taken again by a message numbered on the contract, while what
+    /// `session.entries` serves at that ordinal was decided at enrollment.
+    BeforeEnrollment,
+    /// The highest part number before the revert (`TranscriptReverted::tag_high`) was given for
+    /// a session off the current compaction contract, or not given for one on it.
+    TagHigh,
 }
 
 /// What a revert did.
@@ -144,11 +151,15 @@ fn check_resend(resend: &[Record]) -> Result<String, SessionError> {
 impl<B: SessionBackend> Session<B> {
     /// Ends the branch before the message `target` names, and starts the run `resend` describes
     /// there: its run start (with a send id), its input, and the input's entry facts, whose
-    /// ordinal and id the revert fills in.
+    /// ordinal and id the revert fills in. On a session on the current compaction contract,
+    /// `tag_high` is the highest part number any message took before the revert, which the
+    /// caller counts (the store can't count a message's numbered parts) and the revert records;
+    /// off the contract it is `None`.
     pub async fn revert(
         &mut self,
         target: &str,
         mut resend: Vec<Record>,
+        tag_high: Option<u64>,
         now_ms: u64,
     ) -> Result<Reverted, SessionError> {
         if self.poisoned {
@@ -179,9 +190,20 @@ impl<B: SessionBackend> Session<B> {
         if !self.operations.queue.is_empty() {
             return refuse(RevertRefusal::QueueNotEmpty);
         }
+        if self.operations.on_contract() != tag_high.is_some() {
+            return refuse(RevertRefusal::TagHigh);
+        }
         let Some(ordinal) = self.find_message(target).await? else {
             return refuse(RevertRefusal::UnknownMessage);
         };
+        if self
+            .operations
+            .enrolled
+            .as_ref()
+            .is_some_and(|enrolled| ordinal <= enrolled.through_ordinal)
+        {
+            return refuse(RevertRefusal::BeforeEnrollment);
+        }
         let (records, batches, checkpoint) = self.read_open_log().await?;
         let located = if ordinal >= self.conversation.window_start() {
             locate(
@@ -225,10 +247,11 @@ impl<B: SessionBackend> Session<B> {
                 &batches,
                 &checkpoint,
                 &mut resend,
+                tag_high,
                 now_ms,
             )
             .await;
-        let created = match created {
+        let created = match created.and_then(|created| self.check_enrollment_carried(created)) {
             Ok(created) => created,
             Err(error) => {
                 self.abort(change).await;
@@ -315,6 +338,7 @@ impl<B: SessionBackend> Session<B> {
         batches: &[std::ops::Range<usize>],
         checkpoint: &Checkpoint,
         resend: &mut [Record],
+        tag_high: Option<u64>,
         now_ms: u64,
     ) -> Result<Created, SessionError> {
         let name = hex(&change.0);
@@ -327,6 +351,7 @@ impl<B: SessionBackend> Session<B> {
             through_seq: through,
             ordinal,
             history_version,
+            tag_high,
         });
         let mut ledger: Vec<(u64, Record)> = records
             .iter()

@@ -191,6 +191,7 @@ impl ClosedSession {
 
     fn steer(&mut self, text: &str) {
         self.append(WalRecord::Steered {
+            message_marks: None,
             sent_by: None,
             written_at_ms: None,
             tags: None,

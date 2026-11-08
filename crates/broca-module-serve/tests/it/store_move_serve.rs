@@ -2,7 +2,8 @@
 //! as an operator moves one: `session.move_to_store` on the operator's own route, into a module
 //! whose runs go through the real core loop on today's storage and the new loop on the new one.
 //! Afterwards the session answers every read as it did before the move, refuses a cursor
-//! today's storage issued, takes a send, and serves the same after a restart.
+//! today's storage issued, takes a send whose request carries the session's photo from the new
+//! storage's copy, and serves the same after a restart.
 
 use std::time::Duration;
 
@@ -107,16 +108,62 @@ fn run_of(sent: &Frame) -> String {
         .to_owned()
 }
 
+/// The photo a person sends the session.
+const PHOTO: &[u8] =
+    include_bytes!("../../../broca-provider/examples/media-live/fixtures/image.png");
+
+/// The render config of a model that takes images, as its provider freezes it.
+fn image_config() -> broca_provider::wire::FrozenRenderConfig {
+    use broca_provider::spec::WireFamilyId;
+    let mut frozen =
+        broca_provider::families::frozen_config_for_family(WireFamilyId::AnthropicMessages, "fake");
+    frozen.media = Some(broca_provider::media_profile::select_media_profile(
+        WireFamilyId::AnthropicMessages,
+        Some(broca_provider::media_profile::MediaQuirk::Anthropic),
+        &frozen.wire_model_id,
+        broca_provider::spec::InputModalities::from_value(&json!(["text", "image"])),
+        Some(200_000),
+    ));
+    frozen
+}
+
+/// Uploads `bytes` as a PNG to the session and returns the upload's id.
+async fn upload(rig: &mut Rig, bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    use sha2::Digest as _;
+    let begin = json!({"mime": "image/png", "bytes": bytes.len(),
+        "sha256": format!("{:x}", sha2::Sha256::digest(bytes))});
+    let id = result(&call(rig, "session.upload_begin", begin).await)["upload_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+    let append = json!({"upload_id": id, "offset": 0, "data": data});
+    result(&call(rig, "session.upload_append", append).await);
+    result(&call(rig, "session.upload_commit", json!({"upload_id": id})).await);
+    id
+}
+
+/// Whether the newest request the scripted model was sent carries `bytes` as an image.
+fn last_request_carries(rig: &Rig, bytes: &[u8]) -> bool {
+    use base64::Engine as _;
+    let sent = rig.script.rendered.lock().unwrap();
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    sent.last()
+        .is_some_and(|body| String::from_utf8_lossy(body).contains(&encoded))
+}
+
 #[tokio::test]
 async fn a_live_session_moves_to_the_new_storage_and_keeps_serving() {
     let mut rig = Rig::start_movable("move-to-store").await;
-    // Requests render under a real render config, which the move checks the copy's next
-    // request against.
-    let frozen = || Some(broca_provider::families::openai_chat_frozen_config("fake"));
+    // Requests render under a real render config of a model that takes images, which the move
+    // checks the copy's requests against; today's media stores exist, as a module's do.
+    let frozen = || Some(image_config());
     *rig.script.media_frozen.lock().unwrap() = frozen();
+    broca_core::media_store::create_media_directories(&rig.dir).unwrap();
 
-    // History: a tool turn whose result carries a note sent while the tool ran, then a plain
-    // turn.
+    // History: a tool turn whose result carries a note sent while the tool ran, a plain turn,
+    // then a turn with a photo.
     rig.script
         .push(&[Step::Call("call-1"), Step::Text("answer")]);
     rig.script.hold_tool(true);
@@ -140,6 +187,20 @@ async fn a_live_session_moves_to_the_new_storage_and_keeps_serving() {
     runs.push(run_of(&rig.send("turn-2", "again", None).await));
     rig.wait_for_finished(2).await;
     rig.wait_idle().await;
+    let photo = upload(&mut rig, PHOTO).await;
+    rig.script.push(&[Step::Text("a photo")]);
+    let sent = rig
+        .send_with(
+            "turn-3",
+            "look at this",
+            None,
+            json!({"content": [{"type": "upload", "upload_id": photo}]}),
+        )
+        .await;
+    runs.push(run_of(&sent));
+    rig.wait_for_finished(3).await;
+    rig.wait_idle().await;
+    assert!(last_request_carries(&rig, PHOTO), "the photo was sent");
     let shown = result(
         &call(
             &mut rig,
@@ -175,8 +236,8 @@ async fn a_live_session_moves_to_the_new_storage_and_keeps_serving() {
     );
     let moved = result(&moved);
     assert_eq!(moved["moved"], true, "{moved}");
-    assert_eq!(moved["runs"], 2, "{moved}");
-    assert_eq!(moved["media"], 0, "{moved}");
+    assert_eq!(moved["runs"], 3, "{moved}");
+    assert_eq!(moved["media"], 1, "{moved}");
     assert!(
         moved["checks"]
             .as_array()
@@ -215,11 +276,16 @@ async fn a_live_session_moves_to_the_new_storage_and_keeps_serving() {
     let expired = call(&mut rig, "session.history", json!({ "cursor": old_cursor })).await;
     assert_eq!(refusal(&expired)["code"], "cursor_expired");
 
-    // A send after the move runs on the new storage and writes nothing to today's.
+    // A send after the move runs on the new storage and writes nothing to today's. Its request
+    // carries the photo, which the new storage renders from its own copy of the bytes.
     rig.script.push(&[Step::Text("after the move")]);
-    runs.push(run_of(&rig.send("turn-3", "moved now", None).await));
+    runs.push(run_of(&rig.send("turn-4", "moved now", None).await));
     rig.wait_idle().await;
     assert!(texts(&mut rig).await.contains("after the move"));
+    assert!(
+        last_request_carries(&rig, PHOTO),
+        "the moved photo was sent"
+    );
     assert_eq!(rig.wal_bytes(), sealed, "today's WAL is untouched");
     // A new subscriber reads the session's stream from the new storage.
     let frames = rig
@@ -246,9 +312,13 @@ async fn a_live_session_moves_to_the_new_storage_and_keeps_serving() {
         assert_eq!(after, before, "{asked} after a restart");
     }
     rig.script.push(&[Step::Text("after the restart")]);
-    result(&rig.send("turn-4", "restarted", None).await);
+    result(&rig.send("turn-5", "restarted", None).await);
     rig.wait_idle().await;
     assert!(texts(&mut rig).await.contains("after the restart"));
+    assert!(
+        last_request_carries(&rig, PHOTO),
+        "the photo after a restart"
+    );
     assert_eq!(rig.wal_bytes(), sealed, "today's WAL is untouched");
     rig.finish().await;
 }

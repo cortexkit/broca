@@ -2537,7 +2537,7 @@ async fn client_message_id_is_part_of_the_send_identity_and_never_read() {
     rig.script.hold_model(true);
     rig.send("turn-2", "busy", None).await;
     rig.wait_entered().await;
-    let queued_with = serde_json::json!({"client_message_id": "msg-3"});
+    let queued_with = serde_json::json!({"client_message_id": "msg-3", "tools":null});
     let queued = call(
         &mut rig,
         "session.send",
@@ -2556,8 +2556,8 @@ async fn client_message_id_is_part_of_the_send_identity_and_never_read() {
     let again = call(&mut rig, "session.send", keyed("turn-3", queued_with)).await;
     assert_eq!(result(&again)["state"], "pending", "{}", result(&again));
     for extra in [
-        serde_json::json!({"client_message_id": "msg-4"}),
-        serde_json::json!({}),
+        serde_json::json!({"client_message_id": "msg-4", "tools":null}),
+        serde_json::json!({"tools":null}),
     ] {
         let body =
             refused_writing_nothing(&mut rig, "session.send", keyed("turn-3", extra.clone())).await;

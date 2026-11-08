@@ -82,7 +82,6 @@ async fn send_and_settle(rig: &mut Rig, channel: u16, send_id: &str) -> String {
                 "prompt": "hi",
                 "send_id": send_id,
                 "model": {"provider": "fake", "model": "fake"},
-                "tools": [],
             }}),
         )
         .await;

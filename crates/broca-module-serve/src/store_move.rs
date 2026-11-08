@@ -37,7 +37,7 @@ use broca_module::registry::store_move::{FenceRefusal, MoveRefusal, StoreMoveFen
 use broca_module::LineageRegistry;
 use broca_protocol::BindIdentity;
 use broca_session_convert::stage::{Stage, StageError};
-use broca_session_convert::verify::{Mode, Verify};
+use broca_session_convert::verify::{MediaRoot, Mode, Verify};
 use broca_session_loop::parts::Parts as _;
 use broca_session_store::backend::{LocalBackend, SessionAddr, SessionBackend as _};
 use broca_wal::migration::{self, Freeze, MoveRefusal as MarkerRefusal};
@@ -324,6 +324,12 @@ fn read_wal(path: &Path) -> Result<(Vec<FramedRecord>, Option<WalLineageId>), Mo
     }
 }
 
+/// Today's media store for a session, and the class of store the folder of its WAL chooses.
+struct TodaysMedia {
+    store: MediaStore,
+    class: broca_core::media_store::MediaStoreClass,
+}
+
 /// Today's media store for the session whose live WAL is `wal`: the store of the class the WAL's
 /// folder chooses, where the module publishes the session's media. `None` when the session's
 /// `records` name no medium, or when that store doesn't exist, since opening it would create it:
@@ -333,7 +339,7 @@ fn todays_media(
     state_root: &Path,
     wal: &Path,
     records: &[FramedRecord],
-) -> Result<Option<MediaStore>, MoveRefusal> {
+) -> Result<Option<TodaysMedia>, MoveRefusal> {
     use broca_core::media_store::MediaStoreClass;
     if broca_session_convert::stage::media_digests(records).is_empty() {
         return Ok(None);
@@ -350,12 +356,12 @@ fn todays_media(
         return Ok(None);
     }
     MediaStore::open(state_root, class)
-        .map(Some)
+        .map(|store| Some(TodaysMedia { store, class }))
         .map_err(io_failed("today's media store couldn't be opened"))
 }
 
-fn media_bytes(media: &Option<MediaStore>) -> Option<&dyn MediaBytes> {
-    media.as_ref().map(|store| store as &dyn MediaBytes)
+fn media_bytes(media: &Option<TodaysMedia>) -> Option<&dyn MediaBytes> {
+    media.as_ref().map(|media| &media.store as &dyn MediaBytes)
 }
 
 /// The move's paths, from its journal.
@@ -683,6 +689,10 @@ impl StoreMove {
             converted: &staged.converted,
             mode: Mode::Move,
             media: media_bytes(&media),
+            media_root: media.as_ref().map(|media| MediaRoot {
+                state_root: &state_root,
+                class: media.class,
+            }),
         })
         .await
         .map_err(|mismatch| {

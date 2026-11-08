@@ -71,6 +71,7 @@ fn run_config() -> RunConfig {
 
 fn started(run: &str) -> WalRecord {
     WalRecord::RunStarted {
+        message_marks: None,
         compaction_plan_version: None,
         sent_by: None,
         written_at_ms: None,
@@ -1187,6 +1188,7 @@ fn all_projection_record_variants() -> Vec<FramedRecord> {
             },
         },
         WalRecord::Queued {
+            message_marks: None,
             sent_by: None,
             written_at_ms: None,
             retention: None,
@@ -1249,6 +1251,7 @@ fn cursor_only_projection_matches_full_projection_for_every_record_prefix() {
 #[test]
 fn a_steered_record_has_no_unit_until_placement_boundary() {
     let steered = WalRecord::Steered {
+        message_marks: None,
         sent_by: None,
         written_at_ms: None,
         tags: None,

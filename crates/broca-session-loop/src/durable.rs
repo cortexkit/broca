@@ -155,6 +155,19 @@ impl<W: Writer, S: PartStore> Writer for Durable<'_, W, S> {
         self.writer.open_log_records().await
     }
 
+    async fn enrollment(
+        &self,
+    ) -> Result<Option<broca_session_store::session::EnrollmentOverlay>, SessionError> {
+        self.writer.enrollment().await
+    }
+
+    async fn put_enrollment(
+        &mut self,
+        entries: &broca_session_store::record::EnrolledEntries,
+    ) -> Result<broca_session_store::record::EnrollmentOverlayRef, SessionError> {
+        self.writer.put_enrollment(entries).await
+    }
+
     async fn run_start(
         &self,
         run_id: &str,

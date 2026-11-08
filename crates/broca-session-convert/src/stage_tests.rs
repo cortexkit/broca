@@ -187,6 +187,7 @@ fn verified_in(
         converted,
         mode,
         media: None,
+        media_root: None,
     }))
 }
 
@@ -515,6 +516,7 @@ fn a_session_holding_media_is_staged_with_its_bytes() {
             converted: &staged.converted,
             mode: Mode::Move,
             media: Some(media),
+            media_root: None,
         }))
         .unwrap_err()
     };
@@ -590,8 +592,9 @@ fn a_tool_results_image_is_staged_with_its_bytes() {
     assert!(named.stored(), "an object holds it");
     assert_eq!(block_on(view.named_media_bytes(&named)).unwrap(), shot);
     drop(view);
-    // The media agree, so the checks past them run, up to the session's next request: today's
-    // offline render can't render a request holding media yet, which that check names.
+    // The media agree, so the checks past them run, up to the session's next request: with no
+    // media store of today's to render its media from, today's offline render refuses it, which
+    // that check names.
     let failed = block_on(verify(Verify {
         records: &records,
         lineage,
@@ -602,6 +605,7 @@ fn a_tool_results_image_is_staged_with_its_bytes() {
         converted: &staged.converted,
         mode: Mode::Move,
         media: Some(&media),
+        media_root: None,
     }))
     .unwrap_err();
     assert_eq!(failed.check, crate::verify::NEXT_REQUEST, "{failed}");

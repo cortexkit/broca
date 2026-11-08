@@ -31,6 +31,8 @@ struct Side {
     key: BindIdentity,
     /// Removes the folder when dropped.
     owns_dir: bool,
+    /// The caller whose sends reach the side's session.
+    caller: super::tests::Caller,
 }
 
 impl Drop for Side {
@@ -106,6 +108,7 @@ async fn side_at(
         registry,
         key,
         owns_dir: true,
+        caller: Default::default(),
     }
 }
 
@@ -128,12 +131,14 @@ async fn pair(
 }
 
 impl Side {
+    /// Sends `text` as the side's caller sends it.
     async fn send_keyed(&self, run_id: &str, text: &str, key: SendKey) -> SendOutcome {
+        let request = self.caller.shape(run_id, &key, request(text));
         self.registry
             .route_submission_with_order(
                 &self.key,
                 RunId(run_id.into()),
-                request(text),
+                request,
                 RunKind::FreshOrResume,
                 key,
                 false,

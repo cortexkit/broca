@@ -208,6 +208,7 @@ impl SteerOnce {
         let writer = self.writer.lock().unwrap().clone().expect("writer set");
         let input = vec![Message::new(Role::User, vec![self::text(text)])];
         let record = WalRecord::Steered {
+            message_marks: None,
             sent_by: None,
             written_at_ms: None,
             tags: None,

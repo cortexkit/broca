@@ -31,6 +31,8 @@ struct Side {
     dir: std::path::PathBuf,
     registry: LineageRegistry,
     key: BindIdentity,
+    /// The caller whose sends reach the side's session.
+    caller: super::tests::Caller,
     /// Removes the folder when dropped.
     owns_dir: bool,
 }
@@ -123,6 +125,7 @@ async fn side_at(
         dir,
         registry,
         key,
+        caller: Default::default(),
         owns_dir: true,
     }
 }
@@ -149,12 +152,14 @@ async fn pair(
 }
 
 impl Side {
+    /// Sends `text` as the side's caller sends it.
     async fn send(&self, run_id: &str, text: &str) -> SendOutcome {
+        let request = self.caller.shape(run_id, &SendKey::Minted, request(text));
         self.registry
             .route_submission_with_order(
                 &self.key,
                 RunId(run_id.into()),
-                request(text),
+                request,
                 RunKind::FreshOrResume,
                 SendKey::Minted,
                 false,

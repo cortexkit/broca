@@ -1215,6 +1215,10 @@ fn serialize_read_message<S: serde::Serializer>(
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct SessionReadMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speaks_for: Option<broca_protocol::SpeaksFor>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub notice: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sender: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notices: Vec<cortexkit_role_llm_runner::read::NoticeFact>,
@@ -1289,6 +1293,10 @@ impl Serialize for SessionReadMessage {
         #[derive(Serialize)]
         struct Wire<'a> {
             #[serde(skip_serializing_if = "Option::is_none")]
+            speaks_for: &'a Option<broca_protocol::SpeaksFor>,
+            #[serde(skip_serializing_if = "std::ops::Not::not")]
+            notice: bool,
+            #[serde(skip_serializing_if = "Option::is_none")]
             sender: &'a Option<String>,
             #[serde(skip_serializing_if = "<[_]>::is_empty")]
             notices: &'a [cortexkit_role_llm_runner::read::NoticeFact],
@@ -1326,6 +1334,8 @@ impl Serialize for SessionReadMessage {
             reasoning_summaries: &'a [cortexkit_role_llm_runner::read::ReasoningSummary],
         }
         Wire {
+            speaks_for: &self.speaks_for,
+            notice: self.notice,
             sender: &self.sender,
             notices: &self.notices,
             written_at: self.written_at,
@@ -6217,6 +6227,8 @@ mod caller_message_tests {
 
     fn read_message(content: Vec<ContentBlock>) -> SessionReadMessage {
         SessionReadMessage {
+            speaks_for: None,
+            notice: false,
             sender: None,
             notices: Vec::new(),
             created_at: None,
@@ -6608,6 +6620,8 @@ mod caller_message_tests {
         );
         message.cache_prefix_blocks = Some(1);
         let response = SessionReadMessage {
+            speaks_for: None,
+            notice: false,
             sender: None,
             notices: Vec::new(),
             created_at: None,
