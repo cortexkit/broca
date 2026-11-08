@@ -6,8 +6,9 @@
 //! registry marked the send creating it as one the store actor serves. Every other session stays
 //! on today's storage, which refuses a session kept here by name.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use broca_protocol::BindIdentity;
@@ -123,18 +124,15 @@ impl StoreRuntime {
         self
     }
 
+    /// The id of the deployment key this runtime opens sessions with.
+    pub fn key_id(&self) -> u16 {
+        self.deployment.id()
+    }
+
     /// Whether the session `key` is kept in the new storage: whether its head exists. A head
     /// that can't be checked is an error, never read as absent.
     pub fn holds(&self, key: &BindIdentity) -> Result<bool, OpenError> {
-        let head =
-            broca_wal::session_storage_head(&self.state_root, &broca_core::session_addr(key));
-        match std::fs::symlink_metadata(head) {
-            Ok(_) => Ok(true),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(error) => Err(OpenError::Open(format!(
-                "the new storage's head of this session could not be checked: {error}"
-            ))),
-        }
+        head_exists(&self.state_root, key)
     }
 
     /// The session `key` as it stands now, read-only: writing nothing and taking no lease (see
@@ -326,6 +324,170 @@ impl StoreRuntime {
             approvals: Arc::new(crate::approval_state::ApprovalState::default()),
             first_episode: Arc::new(std::sync::OnceLock::new()),
         })
+    }
+}
+
+/// What the module opens its new storage's runtime with, besides the deployment key. The key
+/// comes from the vault and may load after the module has started, so the runtime is opened from
+/// this once it has (see [`StoreSlot::load`]).
+#[derive(Clone)]
+pub struct StoreRuntimeSetup {
+    pub state_root: PathBuf,
+    pub executor: Arc<dyn RunExecutor>,
+    pub idle_ttl: Duration,
+    /// `import.roots` from `broca.jsonc` (see [`StoreRuntime::with_import_roots`]).
+    pub import_roots: Option<Vec<PathBuf>>,
+    /// Where spend facts are written (see [`StoreRuntime::with_billing`]).
+    pub billing: Option<crate::store_billing::StoreBilling>,
+}
+
+impl StoreRuntimeSetup {
+    /// The runtime this setup describes, opened under `deployment`.
+    pub async fn open(&self, deployment: DeploymentKey) -> Result<StoreRuntime, String> {
+        let mut runtime = StoreRuntime::open(
+            &self.state_root,
+            deployment,
+            Arc::clone(&self.executor),
+            self.idle_ttl,
+        )
+        .await?
+        .with_import_roots(self.import_roots.clone());
+        if let Some(billing) = &self.billing {
+            runtime = runtime.with_billing(billing.clone());
+        }
+        Ok(runtime)
+    }
+}
+
+/// The new storage as the opener sees it from the module's start. Whether a session is kept
+/// there needs only the state root, so such a session is told apart from today's from the first
+/// open. Serving it needs the deployment key, which comes from the vault and may load after the
+/// module has started; the runtime is installed here once it has. Until then a session kept
+/// here is refused `key_unavailable`, a transient refusal, and never served from today's
+/// storage.
+pub struct StoreSlot {
+    state_root: PathBuf,
+    key_id: u16,
+    runtime: OnceLock<Arc<StoreRuntime>>,
+    /// The sessions refused while no key was loaded. Opening a session runs the recovery its
+    /// store actor performs on open (a crashed run sealed, an owed run billed, a queued send
+    /// drained), which the refusal put off; the module opens these once the key loads.
+    refused: Mutex<HashSet<BindIdentity>>,
+}
+
+impl StoreSlot {
+    /// The new storage under `state_root`, whose deployment key `key_id` hasn't loaded yet.
+    pub fn awaiting_key(state_root: &Path, key_id: u16) -> Self {
+        Self {
+            state_root: state_root.to_path_buf(),
+            key_id,
+            runtime: OnceLock::new(),
+            refused: Mutex::default(),
+        }
+    }
+
+    /// The new storage served by `runtime`, its key already loaded.
+    pub fn loaded(runtime: Arc<StoreRuntime>) -> Self {
+        let slot = Self::awaiting_key(&runtime.state_root, runtime.key_id());
+        let _ = slot.runtime.set(runtime);
+        slot
+    }
+
+    /// The id of the deployment key the new storage is opened with.
+    pub fn key_id(&self) -> u16 {
+        self.key_id
+    }
+
+    /// Whether the deployment key has loaded, so sessions kept here are served.
+    pub fn key_loaded(&self) -> bool {
+        self.runtime.get().is_some()
+    }
+
+    /// The runtime, once the key has loaded.
+    pub fn runtime(&self) -> Option<Arc<StoreRuntime>> {
+        self.runtime.get().cloned()
+    }
+
+    /// Opens the runtime `setup` describes under `deployment` and installs it, so sessions kept
+    /// here are served from now on. `deployment` must be the key this slot names. The first
+    /// runtime installed stays: a second load changes nothing.
+    pub async fn load(
+        &self,
+        setup: &StoreRuntimeSetup,
+        deployment: DeploymentKey,
+    ) -> Result<(), String> {
+        if deployment.id() != self.key_id {
+            return Err(format!(
+                "deployment key {} was offered for the new storage, which is opened with key {}",
+                deployment.id(),
+                self.key_id
+            ));
+        }
+        if self.key_loaded() {
+            return Ok(());
+        }
+        let runtime = Arc::new(setup.open(deployment).await?);
+        // Set under the lock `holding` records refusals under, so a session refused just
+        // before the runtime arrived is in the set `take_refused` returns afterwards.
+        let _refused = self.refused.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = self.runtime.set(runtime);
+        Ok(())
+    }
+
+    /// Whether the session `key` is kept in the new storage, whether or not the deployment key
+    /// has loaded: one `symlink_metadata` of its head.
+    pub fn holds(&self, key: &BindIdentity) -> Result<bool, OpenError> {
+        head_exists(&self.state_root, key)
+    }
+
+    /// The runtime when the new storage keeps the session `key`; `None` for a session it
+    /// doesn't keep. A session it keeps is refused `key_unavailable` while the key hasn't
+    /// loaded, and remembered, so the module opens it once the key loads (`take_refused`).
+    pub fn holding(&self, key: &BindIdentity) -> Result<Option<Arc<StoreRuntime>>, OpenError> {
+        if !self.holds(key)? {
+            return Ok(None);
+        }
+        if let Some(runtime) = self.runtime.get() {
+            return Ok(Some(Arc::clone(runtime)));
+        }
+        let mut refused = self.refused.lock().unwrap_or_else(|e| e.into_inner());
+        // The key may have loaded since the check above; `load` installs under this lock.
+        if let Some(runtime) = self.runtime.get() {
+            return Ok(Some(Arc::clone(runtime)));
+        }
+        refused.insert(key.clone());
+        Err(key_unavailable(self.key_id))
+    }
+
+    /// The sessions refused since the last call because no key had loaded.
+    pub fn take_refused(&self) -> Vec<BindIdentity> {
+        let mut refused = self.refused.lock().unwrap_or_else(|e| e.into_inner());
+        refused.drain().collect()
+    }
+}
+
+/// The refusal of a session kept in the new storage while its deployment key `key_id` hasn't
+/// loaded. Transient: the key loads without a restart, and the session is served then.
+pub fn key_unavailable(key_id: u16) -> OpenError {
+    OpenError::Classified {
+        reason: format!(
+            "key_unavailable: the new storage's deployment key {key_id} has not loaded yet; \
+             retry once it has"
+        ),
+        class: broca_protocol::ErrorClass::Transient,
+    }
+}
+
+/// Whether the session `key` has a head in the new storage under `state_root`: one
+/// `symlink_metadata`. A head that can't be checked is an error, never read as absent.
+fn head_exists(state_root: &Path, key: &BindIdentity) -> Result<bool, OpenError> {
+    let head = broca_wal::session_storage_head(state_root, &broca_core::session_addr(key));
+    match std::fs::symlink_metadata(head) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(OpenError::Open(format!(
+            "the new storage's head of this session could not be checked: {error}"
+        ))),
     }
 }
 

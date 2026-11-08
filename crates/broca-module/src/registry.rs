@@ -642,6 +642,16 @@ pub trait LineageOpener: Send + Sync {
     fn store_runtime(&self) -> Option<Arc<crate::store_open::StoreRuntime>> {
         None
     }
+    /// The runtime when the new storage keeps the session `key`, which then has no WAL; `None`
+    /// for a session on today's storage, or an opener without the new storage. A session the new
+    /// storage keeps is refused `key_unavailable` while its deployment key hasn't loaded, never
+    /// read as one of today's. A head that can't be checked is an error, never `None`.
+    fn store_holding(
+        &self,
+        _key: &LineageKey,
+    ) -> Result<Option<Arc<crate::store_open::StoreRuntime>>, OpenError> {
+        Ok(None)
+    }
     fn run_index_reader(&self) -> Option<Arc<dyn broca_core::RunIndex>> {
         None
     }
@@ -2559,20 +2569,17 @@ impl LineageRegistry {
     {
         use broca_core::compaction_v2::protocol::wire::Refusal;
         let internal = |message: String| Refusal::new("internal_error", message, None);
-        if let Some(store) = self.store_runtime() {
-            if store
-                .holds(key)
-                .map_err(|error| internal(error.to_string()))?
-            {
-                if method == "session.apply_view" {
-                    return crate::store_entries::apply_view(self, &store, key, caller, params)
-                        .await;
-                }
-                return crate::store_entries::compaction_runner(
-                    self, &store, key, caller, method, params,
-                )
-                .await;
+        if let Some(store) = self
+            .store_holding(key)
+            .map_err(|error| internal(error.to_string()))?
+        {
+            if method == "session.apply_view" {
+                return crate::store_entries::apply_view(self, &store, key, caller, params).await;
             }
+            return crate::store_entries::compaction_runner(
+                self, &store, key, caller, method, params,
+            )
+            .await;
         }
         self.check_move(key, true)
             .map_err(|error| internal(error.to_string()))?;
@@ -3521,12 +3528,10 @@ impl LineageRegistry {
         // A session kept in the new storage has no WAL to read. Its ownership comes from the
         // owner summary the stored session keeps (`Operations::owner`), which records the same
         // facts `durable_session_ownership` gathers from a WAL.
-        if let Some(store) = self.store_runtime() {
-            match store.holds(key) {
-                Ok(true) => return store_bind_ownership(self, &store, key).await,
-                Ok(false) => {}
-                Err(error) => return BindOwnership::Unreadable(error.to_string()),
-            }
+        match self.store_holding(key) {
+            Ok(Some(store)) => return store_bind_ownership(self, &store, key).await,
+            Ok(None) => {}
+            Err(error) => return BindOwnership::Unreadable(error.to_string()),
         }
         let Some(reader) = self.inner.reader.clone() else {
             return BindOwnership::NoHistorySource;
@@ -4974,15 +4979,13 @@ impl LineageRegistry {
     }
 
     /// The new storage's runtime when it keeps the session `key`, which then has no WAL; `None`
-    /// for a session on today's storage, or a module without the new storage.
+    /// for a session on today's storage, or a module without the new storage. A session it keeps
+    /// is refused `key_unavailable` while the deployment key hasn't loaded.
     pub(crate) fn store_holding(
         &self,
         key: &LineageKey,
     ) -> Result<Option<Arc<crate::store_open::StoreRuntime>>, OpenError> {
-        match self.store_runtime() {
-            Some(store) if store.holds(key)? => Ok(Some(store)),
-            _ => Ok(None),
-        }
+        self.inner.opener.store_holding(key)
     }
 
     /// Whether the session has a WAL, live or archived: a stat, and an archive index lookup

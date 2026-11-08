@@ -2481,6 +2481,8 @@ mod entries_comparison;
 #[cfg(test)]
 mod import_tests;
 #[cfg(test)]
+mod key_tests;
+#[cfg(test)]
 mod read_cost;
 #[cfg(test)]
 mod reads_tests;

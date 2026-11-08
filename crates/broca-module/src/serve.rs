@@ -2933,10 +2933,8 @@ impl ServeHandler for crate::LineageRegistry {
         session: &LineageKey,
         tag: u64,
     ) -> Result<Option<broca_core::TagLocation>, ServeError> {
-        if let Some(store) = self.store_runtime() {
-            if store.holds(session)? {
-                return Err(crate::store_entries::tag_location_unserved());
-            }
+        if self.store_holding(session)?.is_some() {
+            return Err(crate::store_entries::tag_location_unserved());
         }
         self.route_tag_location(session, tag)
             .await
@@ -3555,10 +3553,8 @@ impl ServeHandler for crate::LineageRegistry {
     }
 
     async fn read(&self, req: SessionReadRequest) -> Result<SessionReadResponse, ServeError> {
-        if let Some(store) = self.store_runtime() {
-            if store.holds(&req.session)? {
-                return crate::store_read::serve_read(self, &store, req).await;
-            }
+        if let Some(store) = self.store_holding(&req.session)? {
+            return crate::store_read::serve_read(self, &store, req).await;
         }
         let before_history = self.history_read_version(&req.session).await?;
         let late_only = req.late_after.is_some();
@@ -3791,13 +3787,11 @@ impl ServeHandler for crate::LineageRegistry {
         session: &LineageKey,
         mid: Option<&str>,
     ) -> Result<Option<crate::store_entries::HistoryHead>, ServeError> {
-        match self.store_runtime() {
-            Some(store) if store.holds(session)? => {
-                crate::store_entries::history_head(self, &store, session, mid)
-                    .await
-                    .map(Some)
-            }
-            _ => Ok(None),
+        match self.store_holding(session)? {
+            Some(store) => crate::store_entries::history_head(self, &store, session, mid)
+                .await
+                .map(Some),
+            None => Ok(None),
         }
     }
 
@@ -3829,11 +3823,8 @@ impl ServeHandler for crate::LineageRegistry {
         principal: Option<&broca_protocol::BindPrincipal>,
         scope: &broca_protocol::SendScope,
     ) -> Result<broca_wire::HeadResponse, ServeError> {
-        if let Some(store) = self.store_runtime() {
-            if store.holds(session)? {
-                return crate::store_head::serve_head(self, &store, session, principal, scope)
-                    .await;
-            }
+        if let Some(store) = self.store_holding(session)? {
+            return crate::store_head::serve_head(self, &store, session, principal, scope).await;
         }
         let before_history = self.history_read_version(session).await?;
         // The newest page of one message: the store's last row and the WAL past its watermark,
