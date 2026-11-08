@@ -5796,7 +5796,7 @@ fn scope_error_bytes(err: &ServeError) -> Result<Vec<u8>, ServeIoError> {
                     }
                     _ => format!("'{first}'"),
                 };
-                body.message = format!("this session accepts cancellation and retraction only from {accepted}, on any route and at any scope epoch");
+                body.message = format!("owner operations require {accepted} on a plain or unscoped route; flow- and run-stamped routes are senders, never owners");
             }
             serde_json::to_vec(&body)
         }

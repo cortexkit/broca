@@ -2550,3 +2550,117 @@ async fn a_classed_session_with_declaring_providers_frames_its_run_started() {
         rig.finish().await;
     }
 }
+
+async fn carrier_owner_rig(tag: &str, run_scope: bool) -> (Rig, Value) {
+    let mut rig = Rig::start_with_scopes(&format!("{tag}-{run_scope}")).await;
+    let carrier = subc_protocol::Principal::Reserved {
+        module_id: "basal".into(),
+    };
+    rig.bind_with_scope(
+        8,
+        Some(carrier),
+        Some(if run_scope {
+            agent_run_stamp()
+        } else {
+            scope_stamp(true)
+        }),
+    )
+    .await;
+    rig.script.hold_model(true);
+    let sent = result(&send_plan(&mut rig, 8, "first", "hold", None, json!({})).await);
+    rig.wait_entered().await;
+    (rig, sent)
+}
+
+async fn finish_carrier_rig(mut rig: Rig) {
+    rig.script.hold_model(false);
+    rig.wait_for_finished(1).await;
+    rig.wait_idle().await;
+    rig.finish().await;
+}
+
+fn assert_carrier_owner_refusal(rig: &Rig, before: &[u8], reply: &subc_protocol::Frame) {
+    if std::env::var_os("BROCA_CAPTURE_SAMPLES").is_some() {
+        println!(
+            "BROCA_SAMPLE owner-refusal.json {}",
+            String::from_utf8_lossy(&reply.body)
+        );
+    }
+    assert_eq!(error_body(reply)["code"], "scope_owner_mismatch");
+    assert_eq!(rig.wal_bytes(), before);
+}
+
+#[tokio::test]
+async fn flow_and_run_carrier_cannot_cancel_as_owner() {
+    for run_scope in [false, true] {
+        let (mut rig, sent) = carrier_owner_rig("carrier-cancel", run_scope).await;
+        let before = rig.wal_bytes();
+        let reply = rig
+            .request(
+                8,
+                json!({"method":"run.cancel","params":{"run_id":sent["run_id"]}}),
+            )
+            .await;
+        assert_carrier_owner_refusal(&rig, &before, &reply);
+        finish_carrier_rig(rig).await;
+    }
+}
+
+#[tokio::test]
+async fn flow_and_run_carrier_cannot_retract_as_owner() {
+    for run_scope in [false, true] {
+        let (mut rig, _) = carrier_owner_rig("carrier-retract", run_scope).await;
+        let before = rig.wal_bytes();
+        // No recorded send has this submission ID, so the sender cannot retract its own send.
+        let reply = rig.request(8, json!({"method":"session.retract","params":{"submission_id":"other-sender-submission"}})).await;
+        assert_carrier_owner_refusal(&rig, &before, &reply);
+        finish_carrier_rig(rig).await;
+    }
+}
+
+#[tokio::test]
+async fn flow_and_run_carrier_cannot_upload_as_owner() {
+    for run_scope in [false, true] {
+        let (mut rig, _) = carrier_owner_rig("carrier-upload", run_scope).await;
+        broca_core::media_store::create_media_directories(&rig.dir).unwrap();
+        let before = rig.wal_bytes();
+        let reply = rig.request(8, json!({"method":"session.upload_begin","params":{"mime":"image/png","bytes":1,"sha256":"0".repeat(64)}})).await;
+        assert_carrier_owner_refusal(&rig, &before, &reply);
+        for tree in ["objects", "refs"] {
+            assert_eq!(
+                std::fs::read_dir(rig.dir.join("media-uploads").join(tree))
+                    .unwrap()
+                    .count(),
+                0
+            );
+        }
+        finish_carrier_rig(rig).await;
+    }
+}
+
+#[tokio::test]
+async fn flow_and_run_carrier_head_has_no_owner_grant() {
+    for run_scope in [false, true] {
+        let (mut rig, _) = carrier_owner_rig("carrier-head", run_scope).await;
+        let before = rig.wal_bytes();
+        let reply = rig
+            .request(8, json!({"method":"session.head","params":{}}))
+            .await;
+        let head = result(&reply);
+        if std::env::var_os("BROCA_CAPTURE_SAMPLES").is_some() {
+            println!(
+                "BROCA_SAMPLE owner-head.json {}",
+                String::from_utf8_lossy(&reply.body)
+            );
+        }
+        assert_ne!(head["sender"]["owner"], true);
+        assert_eq!(rig.wal_bytes(), before);
+        rig.bind_as(9, Some(scope_owner())).await;
+        let owner_head = result(
+            &rig.request(9, json!({"method":"session.head","params":{}}))
+                .await,
+        );
+        assert_eq!(owner_head["sender"]["owner"], true);
+        finish_carrier_rig(rig).await;
+    }
+}
