@@ -134,6 +134,14 @@ const GRAMMAR_REFUSED: &str = "scripted_grammar_too_large";
 
 #[async_trait]
 impl Provider for ScriptedProvider {
+    /// Whether the route takes a turn-scoped system message here, by the provider's own rules for
+    /// the route the comparison names; a comparison naming none takes none, as the stub route.
+    fn turn_system_possible(&self, preceding: Option<&Message>, followed_by_user: bool) -> bool {
+        turn_system_route().is_some_and(|frozen| {
+            broca_provider::turn_system::possible_after(&frozen, preceding, followed_by_user)
+        })
+    }
+
     /// Adds the cache evidence a live provider would, so a loop that skips it records a
     /// different attempt.
     fn annotate_cache_evidence(&self, attempt: &mut broca_protocol::ModelAttempt) {
@@ -649,6 +657,24 @@ impl ToolPlane for Spy {
                 is_error: false,
             });
         }
+        // A structured result, which no ride rides on off the compaction contract.
+        if call.tool_name == "json" {
+            return DispatchResult::Completed(ToolResult {
+                tool_call_id: call.tool_call_id.clone(),
+                output: ToolOutput::Json {
+                    value: json!({"rows": 2}),
+                },
+                is_error: false,
+            });
+        }
+        // An error result, which a ride may ride on.
+        if call.tool_name == "broken" {
+            return DispatchResult::Completed(ToolResult {
+                tool_call_id: call.tool_call_id.clone(),
+                output: ToolOutput::error("no such file"),
+                is_error: true,
+            });
+        }
         self.inner.dispatch_guarded(ctx, call, key, guard).await
     }
 
@@ -851,6 +877,23 @@ tokio::task_local! {
 
 fn cache() -> bool {
     CACHE.try_with(|cache| *cache).unwrap_or(false)
+}
+
+tokio::task_local! {
+    /// The route both loops' providers judge turn-scoped system messages by, for a comparison of
+    /// sends delivered that way. `None` judges by the stub route, which takes none.
+    static TURN_SYSTEM: Option<broca_provider::wire::FrozenRenderConfig>;
+}
+
+fn turn_system_route() -> Option<broca_provider::wire::FrozenRenderConfig> {
+    TURN_SYSTEM.try_with(Clone::clone).unwrap_or(None)
+}
+
+/// A first-party Anthropic route, with or without confirmed mid-conversation system messages.
+fn anthropic_route(turn_system: bool) -> broca_provider::wire::FrozenRenderConfig {
+    let mut frozen = broca_provider::families::anthropic_frozen_config("m");
+    frozen.anthropic_turn_system = turn_system;
+    frozen
 }
 
 /// A first-party Anthropic config whose cache markers ask for five minutes.
@@ -2090,12 +2133,21 @@ async fn new_from(
         harness: "differential".into(),
         session: "s1".into(),
     };
+    // A session converted from today's log off the compaction contract keeps text delivered
+    // before ride envelopes existed joined into its results, as the converter sets it up.
+    let converted_off_contract = layout().is_none()
+        && start.as_ref().is_some_and(|converted| {
+            converted
+                .records
+                .iter()
+                .any(|r| matches!(r, Record::RunStart(_)))
+        });
     let mut session = Session::create(
         &backend,
         SessionAddr("0123456789abcdef".into()),
         triple,
         &DeploymentKey::new(1, &[7; 32]),
-        false,
+        converted_off_contract,
     )
     .await
     .unwrap();
@@ -3455,10 +3507,11 @@ enum Action {
     /// Asks the run to stop, as the runner does when it shuts down.
     Stop,
     /// Queues a send with a delivery order, as the actor does for a running run: its
-    /// `delivery_ordered` and `queued` records, in today's format.
+    /// `delivery_ordered` and `queued` records, in today's format, after the `send_ended` of
+    /// the send it supersedes when it replaces one.
     Ordered {
         send: Box<broca_core::delivery_order::OrderedSend>,
-        records: Box<[WalRecord; 2]>,
+        records: Vec<WalRecord>,
     },
 }
 
@@ -3468,6 +3521,18 @@ fn ordered(id: &str, modes: &[&str], text: &str, expires_at_ms: Option<u64>) -> 
     if let Some(expires) = expires_at_ms {
         order["expires_at_ms"] = json!(expires);
     }
+    ordered_with(id, order, text, None)
+}
+
+/// A template use a send names, for a send that may go out as turn-scoped system text: its
+/// text is the template's rendering, which admission did.
+fn template_use() -> Value {
+    json!({"id": "nudge", "digest": "0".repeat(64), "slots": {}})
+}
+
+/// A send queued with the delivery order `order`, in today's form. `supersedes` names the
+/// undelivered send under the same dedupe key that it replaces, which ends first.
+fn ordered_with(id: &str, order: Value, text: &str, supersedes: Option<&str>) -> Action {
     let input = vec![user(text)];
     let send = broca_core::delivery_order::OrderedSend {
         admitted_at_ms: Some(HARNESS_TIME_MS),
@@ -3476,7 +3541,18 @@ fn ordered(id: &str, modes: &[&str], text: &str, expires_at_ms: Option<u64>) -> 
         principal: None,
         input: input.clone(),
     };
-    let records = [
+    let mut records: Vec<WalRecord> = supersedes
+        .map(|old| {
+            broca_core::delivery_order::ended(
+                &broca_protocol::SubmissionId(old.into()),
+                broca_wal::record::SendEndReason::Superseded {
+                    by: broca_protocol::SubmissionId(id.into()),
+                },
+            )
+        })
+        .into_iter()
+        .collect();
+    records.extend([
         serde_json::from_value(json!({
             "type": "delivery_ordered", "submission_id": id, "order": order,
         }))
@@ -3495,10 +3571,10 @@ fn ordered(id: &str, modes: &[&str], text: &str, expires_at_ms: Option<u64>) -> 
             "written_at_ms": HARNESS_TIME_MS,
         }))
         .unwrap(),
-    ];
+    ]);
     Action::Ordered {
         send: Box::new(send),
-        records: Box::new(records),
+        records,
     }
 }
 
@@ -3512,7 +3588,7 @@ trait SteerSink: Send + Sync {
     /// Asks the run to stop, as the runner does when it shuts down.
     fn stop(&self);
     /// Queues an ordered send into the running run, as the actor does.
-    async fn ordered(&self, send: broca_core::delivery_order::OrderedSend, records: [WalRecord; 2]);
+    async fn ordered(&self, send: broca_core::delivery_order::OrderedSend, records: Vec<WalRecord>);
 }
 
 /// Today's actor: the record is written under the run's steer inbox lock and synced.
@@ -3551,11 +3627,18 @@ impl SteerSink for TodaySink {
     async fn ordered(
         &self,
         send: broca_core::delivery_order::OrderedSend,
-        records: [WalRecord; 2],
+        records: Vec<WalRecord>,
     ) {
         let writer = Arc::clone(&self.writer);
         let accepted = self.inbox.accept_ordered(send, move |superseded| {
-            assert!(superseded.is_none(), "no send is replaced");
+            let expected = match records.first() {
+                Some(WalRecord::SendEnded { submission_id, .. }) => Some(submission_id),
+                _ => None,
+            };
+            assert_eq!(
+                superseded, expected,
+                "the send replaces what the scenario says"
+            );
             for record in records {
                 writer.record(record);
             }
@@ -3615,7 +3698,7 @@ impl SteerSink for NewSink {
     async fn ordered(
         &self,
         _send: broca_core::delivery_order::OrderedSend,
-        records: [WalRecord; 2],
+        records: Vec<WalRecord>,
     ) {
         let framed: Vec<broca_wal::FramedRecord> = records
             .into_iter()
@@ -3642,6 +3725,10 @@ struct SteeringProvider {
 
 #[async_trait]
 impl Provider for SteeringProvider {
+    fn turn_system_possible(&self, preceding: Option<&Message>, followed_by_user: bool) -> bool {
+        self.inner.turn_system_possible(preceding, followed_by_user)
+    }
+
     async fn step(&self, step_id: StepId, opts: &CallOptions) -> mpsc::Receiver<NormalizedEvent> {
         let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
         let due: Vec<Action> = {
@@ -3655,7 +3742,7 @@ impl Provider for SteeringProvider {
                 Action::Steer(messages) => self.sink.steer(steered(call, index, messages)).await,
                 Action::CancelAtBoundary => self.sink.cancel_at_boundary().await,
                 Action::Stop => self.sink.stop(),
-                Action::Ordered { send, records } => self.sink.ordered(*send, *records).await,
+                Action::Ordered { send, records } => self.sink.ordered(*send, records).await,
             }
         }
         self.inner.step(step_id, opts).await
@@ -3722,27 +3809,75 @@ async fn compare_actions_in(
     .await;
 }
 
-async fn compare_actions_in_once(
-    scenario: Scenario,
+/// The summary each of a comparison's runs reported: how it ended, and why it paused.
+type Summaries = Vec<(broca_protocol::caller::RunFinishReason, Option<PauseReason>)>;
+
+tokio::task_local! {
+    /// Whether today's loop writes a ride's envelope (the carrying call's key, the sender and
+    /// the send's forms), as production has since llm-runner 0.8.11. A comparison of rides
+    /// recorded without one turns it off.
+    static RIDES_WRITER: bool;
+}
+
+fn rides_writer() -> bool {
+    RIDES_WRITER.try_with(|on| *on).unwrap_or(true)
+}
+
+/// Today's loop running `scenario` while the session actor does `steers`, on a writer this test
+/// owns so its actor side can write steers and queue sends. With `start`, it resumes that log,
+/// as today's actor resumes one: the run may deliver every ordered send the log holds queued.
+/// Returns what it did, how each run reported, and its whole log with the log's file name.
+async fn today_with_actions(
+    scenario: &Scenario,
+    start: Option<(&str, &[u8])>,
+    steps: Vec<Vec<NormalizedEvent>>,
     steers: Vec<(usize, Action)>,
     on_restart: Option<OnRestart>,
-) {
-    // Today's loop, on a writer this test owns so its actor side can write steers.
+) -> (Outcome, Summaries, LogImage, String) {
     let dir = broca_test_support::scratch_root().join(format!(
         "session-loop-differential-{}-{}",
         std::process::id(),
         rand_suffix()
     ));
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(dir.join("wal")).unwrap();
+    if let Some((name, bytes)) = start {
+        std::fs::write(dir.join("wal").join(name), bytes).unwrap();
+    }
     let wal = FileWalStore::new(dir.join("wal"));
     let mut request = scenario.request();
     request.on_restart = on_restart;
     let writer = Arc::new(WalHandle::spawn(wal.open(&request.session).unwrap(), 1).unwrap());
+    if rides_writer() {
+        writer.enable_ride_writer_for_test();
+    }
     let inbox = SteerInbox::new();
+    if let Some((_, bytes)) = start {
+        // Today's actor seeds a resumed run with the sends still queued: their ride facts, and
+        // the ordered ones for the run's boundaries.
+        let records: Vec<WalRecord> = LogImage::parse(bytes.to_vec())
+            .framed()
+            .into_iter()
+            .map(|framed| framed.record)
+            .collect();
+        let pending = broca_core::queue::pending_submissions(&records);
+        for queued in &pending {
+            writer.note_queued_ride(queued);
+        }
+        inbox.seed_ordered(
+            pending
+                .iter()
+                .filter_map(broca_core::delivery_order::OrderedSend::from_pending)
+                .collect(),
+        );
+    }
     let stop = CancellationToken::new();
+    let scripted = ScriptedProvider::new(steps);
+    if start.is_some() {
+        scripted.resuming();
+    }
     let provider = SteeringProvider {
-        inner: ScriptedProvider::new(scenario.steps.clone()),
+        inner: scripted,
         calls: Default::default(),
         steers: Mutex::new(steers.clone()),
         sink: Arc::new(TodaySink {
@@ -3777,7 +3912,7 @@ async fn compare_actions_in_once(
         provider_held_lifecycle: Some(plane.lifecycle()),
         cancel: Some(cancel),
         new_log_compaction_plan_version: layout(),
-        ..admission_control(&scenario)
+        ..admission_control(scenario)
     };
     let first = run_loop_on_writer(
         request.clone(),
@@ -3816,7 +3951,7 @@ async fn compare_actions_in_once(
                     .map_or_else(Default::default, |script| script.wait),
                 provider_held_lifecycle: Some(plane.lifecycle()),
                 new_log_compaction_plan_version: layout(),
-                ..admission_control(&scenario)
+                ..admission_control(scenario)
             },
             &tx,
         )
@@ -3840,11 +3975,10 @@ async fn compare_actions_in_once(
         .map(|entry| entry.unwrap().path())
         .find(|path| path.extension().is_some_and(|ext| ext == "wal"))
         .expect("today's loop wrote a log");
-    let converted = {
-        let image = LogImage::read(&file);
-        convert_unbilled(&image.framed(), lineage(&image).as_deref())
-    }
-    .expect("the log converts");
+    let image = LogImage::read(&file);
+    let name = file.file_name().unwrap().to_string_lossy().into_owned();
+    let converted =
+        convert_unbilled(&image.framed(), lineage(&image).as_deref()).expect("the log converts");
     let _ = std::fs::remove_dir_all(&dir);
     let today = Outcome {
         records: normalized(&converted.records),
@@ -3855,6 +3989,24 @@ async fn compare_actions_in_once(
             .map(|event| format!("{event:?}"))
             .collect(),
     };
+    (today, summaries, image, name)
+}
+
+async fn compare_actions_in_once(
+    scenario: Scenario,
+    steers: Vec<(usize, Action)>,
+    on_restart: Option<OnRestart>,
+) {
+    // Today's run is boxed: its future is large enough to overflow a test thread's stack where
+    // it is built.
+    let (today, summaries, _, _) = Box::pin(today_with_actions(
+        &scenario,
+        None,
+        scenario.steps.clone(),
+        steers.clone(),
+        on_restart,
+    ))
+    .await;
 
     // The new loop.
     let backend = MemoryBackend::default();
@@ -3962,6 +4114,259 @@ async fn compare_actions_in_once(
             .collect(),
     };
     assert_same(&today, &new);
+    rides_name_their_carrier(&writer.records);
+    // Reloading the session from a checkpoint at any record gives the state folding every
+    // record does, rides kept beside their calls included.
+    let points: Vec<usize> = (0..=writer.records.len()).collect();
+    let check = broca_session_convert::split::check_splits(&writer.records, false, &points)
+        .expect("the session's records fold");
+    assert!(
+        check.differing.is_empty(),
+        "a checkpoint at {:?} reloads another state than the whole fold",
+        check.differing
+    );
+}
+
+/// Cuts today's log of `scenario`, run while the actor does `steers`, after each of its records,
+/// as a crash could, and resumes the cut in both loops, as `compare_every_cut` does: today's loop
+/// on the cut log, with the sends it holds queued, and the new loop on the same records
+/// converted. Nothing the actor did after the cut happens again. Runs in both layouts and both
+/// writer modes.
+async fn compare_actions_every_cut(scenario: Scenario, steers: Vec<(usize, Action)>) {
+    compare_actions_cut(scenario, steers, Cuts::default()).await;
+}
+
+/// Where a cut comparison cuts, and what the resumes run on.
+#[derive(Clone, Default)]
+struct Cuts {
+    /// Cut only after the first record of this type: the loops write differently before it.
+    after: Option<&'static str>,
+    /// The route the resumes judge and render turn-scoped system messages by, when it isn't the
+    /// one the run delivered under, as after a switch to another model.
+    resume_route: Option<Option<broca_provider::wire::FrozenRenderConfig>>,
+}
+
+async fn compare_actions_cut(scenario: Scenario, steers: Vec<(usize, Action)>, cuts: Cuts) {
+    for layout in LAYOUTS {
+        LAYOUT
+            .scope(
+                layout,
+                Box::pin(with_each_writer(|| {
+                    Box::pin(compare_actions_every_cut_once(
+                        scenario.clone(),
+                        steers.clone(),
+                        cuts.clone(),
+                    ))
+                })),
+            )
+            .await;
+    }
+}
+
+async fn compare_actions_every_cut_once(
+    scenario: Scenario,
+    steers: Vec<(usize, Action)>,
+    cuts: Cuts,
+) {
+    let (_, _, full, name) = Box::pin(today_with_actions(
+        &scenario,
+        None,
+        scenario.steps.clone(),
+        steers,
+        None,
+    ))
+    .await;
+    let records = full.framed().len();
+    assert!(records > 2, "the scenario wrote a log to cut");
+    let first = match cuts.after {
+        Some(kind) => {
+            full.framed()
+                .iter()
+                .position(|frame| serde_json::to_value(&frame.record).unwrap()["type"] == kind)
+                .unwrap_or_else(|| panic!("the scenario wrote a {kind} record"))
+                + 1
+        }
+        None => 1,
+    };
+    let route = cuts.resume_route.clone().unwrap_or_else(turn_system_route);
+    for cut in first..records {
+        let bytes = broca_crash_harness::cut_log(&full, cut, false);
+        let cut_image = LogImage::parse(bytes.clone());
+        let frames = cut_image.framed();
+        // The provider serves the steps the cut log has no answer for yet.
+        let answered = frames
+            .iter()
+            .filter(|frame| {
+                serde_json::to_value(&frame.record).unwrap()["type"] == "model_step_finished"
+            })
+            .count();
+        let steps = scenario.steps[answered..].to_vec();
+        let envelope_lost = loses_ride_envelopes(&frames);
+        let converted =
+            convert_unbilled(&frames, lineage(&cut_image).as_deref()).expect("the cut converts");
+        let cut_records = converted.records.clone();
+        let before = converted.records.len();
+        let (today, _, _, _) = TURN_SYSTEM
+            .scope(
+                route.clone(),
+                Box::pin(today_with_actions(
+                    &scenario,
+                    Some((&name, &bytes)),
+                    steps.clone(),
+                    Vec::new(),
+                    None,
+                )),
+            )
+            .await;
+        let new = TURN_SYSTEM
+            .scope(
+                route.clone(),
+                Box::pin(new_from(&scenario, Some(converted), steps)),
+            )
+            .await;
+        let today_appended = &today.records[before.min(today.records.len())..];
+        let context = format!("cut after record {cut} of {records}");
+        if std::env::var_os("DIFFERENTIAL_DUMP").is_some() {
+            for (index, record) in today_appended.iter().enumerate() {
+                eprintln!("{context} today {index}: {record}");
+            }
+            for (index, record) in new.records.iter().enumerate() {
+                eprintln!("{context} new   {index}: {record}");
+            }
+        }
+        assert_eq!(
+            new.requests.len(),
+            today.requests.len(),
+            "{context}: request count"
+        );
+        for (index, (new, today)) in new.requests.iter().zip(&today.requests).enumerate() {
+            let new = resumed_as_today(new, today);
+            assert_eq!(&new, today, "{context}: request {index}");
+        }
+        for (index, (new, today)) in new.records.iter().zip(today_appended).enumerate() {
+            if envelope_lost && today["ResultAppend"]["ride"].is_null() {
+                let without = |record: &Value| {
+                    let mut record = record.clone();
+                    if let Some(append) = record["ResultAppend"].as_object_mut() {
+                        append.remove("ride");
+                        append.remove("send_id");
+                    }
+                    record
+                };
+                assert_eq!(without(new), without(today), "{context}: record {index}");
+                continue;
+            }
+            assert_eq!(new, today, "{context}: record {index}");
+        }
+        assert_eq!(
+            new.records.len(),
+            today_appended.len(),
+            "{context}: record count"
+        );
+        let expected_calls = if resumes_an_answered_batch(&cut_records) {
+            without_empty_resumed_batch(&today.calls)
+        } else {
+            today.calls.clone()
+        };
+        assert_eq!(new.calls, expected_calls, "{context}: tool calls");
+        // On a route that can't take a turn-scoped system message, the provider renders a stored
+        // one as user-authority text, never dropping it.
+        if let Some(route) = route
+            .as_ref()
+            .filter(|route| !broca_provider::turn_system::supported(route))
+        {
+            for request in &new.requests {
+                let rendered = broca_provider::turn_system::prepare(route, request);
+                assert!(
+                    !rendered
+                        .prompt
+                        .iter()
+                        .any(|message| message.role == Role::System && message.turn_system),
+                    "{context}: a turn-scoped system message goes out as one"
+                );
+                let stored = request
+                    .prompt
+                    .iter()
+                    .filter(|message| message.turn_system)
+                    .count();
+                let notes = rendered
+                    .prompt
+                    .iter()
+                    .filter(|message| {
+                        message.role == Role::User
+                            && message.content.iter().any(|block| {
+                                matches!(block,
+                                ContentBlock::Text { text } if text.starts_with("<context-note>"))
+                            })
+                    })
+                    .count();
+                assert_eq!(
+                    notes, stored,
+                    "{context}: each stored entry goes out as a note"
+                );
+            }
+        }
+    }
+}
+
+/// Whether today's loop resumes `frames` without the envelope of a ride it then writes: a cut
+/// after a tool step's `model_step_finished` and before that step's batch commits
+/// (`tool_batch_finished`). On a legacy state root today's writer replays no ride ledger when it
+/// reopens a log, and its actor seeds the ledger again only with the queued sends, not the
+/// step's calls, so the ride's carrier has no key there and the ride goes out with none. The new
+/// loop reads the key from its own records and always writes the envelope. A gap in today's loop,
+/// reached only by a crash in that window; the request bytes are the same either way.
+fn loses_ride_envelopes(frames: &[broca_wal::FramedRecord]) -> bool {
+    let kind = |frame: &broca_wal::FramedRecord| {
+        serde_json::to_value(&frame.record).unwrap()["type"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let Some(step) = frames.iter().rposition(|frame| {
+        matches!(
+            &frame.record,
+            WalRecord::ModelStepFinished { assistant_message, .. }
+                if assistant_message.tool_calls().next().is_some()
+        )
+    }) else {
+        return false;
+    };
+    !frames[step..]
+        .iter()
+        .any(|frame| kind(frame) == "tool_batch_finished")
+}
+
+/// Each ride names the key of the call whose result carries it: the key of that call's intent,
+/// else of its outcome, as the session recorded them before the ride. Comparisons normalize keys,
+/// so this is what checks the new loop's.
+fn rides_name_their_carrier(records: &[Record]) {
+    let mut keys: std::collections::HashMap<ToolCallId, String> = Default::default();
+    for record in records {
+        match record {
+            Record::ToolIntent(intent) => {
+                if let Some(key) = &intent.call_key {
+                    keys.insert(intent.tool_call_id.clone(), key.clone());
+                }
+            }
+            Record::ToolOutcome(outcome) => {
+                if let Some(key) = &outcome.call_key {
+                    keys.entry(outcome.tool_call_id.clone())
+                        .or_insert_with(|| key.clone());
+                }
+            }
+            Record::ResultAppend(append) => {
+                if let Some(ride) = &append.ride {
+                    assert_eq!(
+                        Some(&ride.call_key),
+                        keys.get(&append.tool_call_id),
+                        "a ride names its carrier's key"
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// A loop run that doesn't finish within ten seconds fails the comparison rather than hanging
@@ -4650,6 +5055,214 @@ async fn ordered_sends_deliver_in_queue_order_after_steers() {
         ],
     )
     .await;
+}
+
+/// A run that calls `first` once, with `calls` more calls of `read` beside it, then answers.
+fn calling(first: &str, calls: usize) -> Scenario {
+    let mut content = vec![call("c1", first, json!({"path": "a"}))];
+    content.extend((0..calls).map(|index| {
+        call(
+            &format!("c{}", index + 2),
+            "read",
+            json!({"path": format!("b{index}")}),
+        )
+    }));
+    Scenario {
+        input: vec![user("read a")],
+        tools: ["read", "json", "broken"]
+            .into_iter()
+            .map(|name| tool(name, ExecutionMode::Parallel))
+            .collect(),
+        manifest: None,
+        stop_when: Vec::new(),
+        steps: vec![
+            answer("a1", content, FinishReason::ToolCalls),
+            text_step("a2", "done"),
+        ],
+    }
+}
+
+/// A send that may only ride on a tool result, queued while the model asks for a call.
+fn a_note(id: &str) -> (usize, Action) {
+    (
+        1,
+        ordered(id, &["tool_result"], &format!("note {id}"), None),
+    )
+}
+
+/// A send rides on the result of the batch that follows it: its text goes out after the
+/// result in the next request, the result itself is stored as the tool returned it, and the
+/// ride's envelope names the carrying call's key.
+#[tokio::test]
+async fn a_ride_on_a_text_result() {
+    compare_steered(calling("read", 0), vec![a_note("q1")]).await;
+}
+
+#[tokio::test]
+async fn every_cut_of_a_ride_on_a_text_result_resumes_alike() {
+    compare_actions_every_cut(calling("read", 0), vec![a_note("q1")]).await;
+}
+
+/// An error result carries a ride as a text result does.
+#[tokio::test]
+async fn a_ride_on_an_error_result() {
+    compare_steered(calling("broken", 0), vec![a_note("q1")]).await;
+}
+
+#[tokio::test]
+async fn every_cut_of_a_ride_on_an_error_result_resumes_alike() {
+    compare_actions_every_cut(calling("broken", 0), vec![a_note("q1")]).await;
+}
+
+/// Several sends ride on one batch's carrier, in queue order.
+#[tokio::test]
+async fn several_rides_in_one_batch() {
+    compare_steered(calling("read", 1), vec![a_note("q1"), a_note("q2")]).await;
+}
+
+#[tokio::test]
+async fn every_cut_of_several_rides_in_one_batch_resumes_alike() {
+    compare_actions_every_cut(calling("read", 1), vec![a_note("q1"), a_note("q2")]).await;
+}
+
+/// A batch with no result to carry text leaves the send queued, past the run's end. On the
+/// compaction contract every result carries one, so there it rides.
+#[tokio::test]
+async fn a_batch_without_a_carrier_leaves_the_send_queued() {
+    compare_steered(calling("json", 0), vec![a_note("q1")]).await;
+}
+
+#[tokio::test]
+async fn every_cut_of_a_batch_without_a_carrier_resumes_alike() {
+    compare_actions_every_cut(calling("json", 0), vec![a_note("q1")]).await;
+}
+
+/// A send that may go out as turn-scoped system text, else steer.
+fn system_note(id: &str) -> (usize, Action) {
+    let order = json!({"modes": ["turn_system", "steer"], "template": template_use()});
+    (1, ordered_with(id, order, "nudge text", None))
+}
+
+/// On a route that takes a turn-scoped system message after the tool results, the send goes out
+/// as one at the next step; on a route that doesn't, it steers.
+#[tokio::test]
+async fn a_system_or_steer_send_on_a_route_with_system_text() {
+    TURN_SYSTEM
+        .scope(
+            Some(anthropic_route(true)),
+            compare_steered(calling("read", 0), vec![system_note("q1")]),
+        )
+        .await;
+}
+
+#[tokio::test]
+async fn a_system_or_steer_send_on_a_route_without_system_text() {
+    TURN_SYSTEM
+        .scope(
+            Some(anthropic_route(false)),
+            compare_steered(calling("read", 0), vec![system_note("q1")]),
+        )
+        .await;
+}
+
+#[tokio::test]
+async fn every_cut_of_a_system_or_steer_send_resumes_alike() {
+    for supported in [true, false] {
+        TURN_SYSTEM
+            .scope(
+                Some(anthropic_route(supported)),
+                compare_actions_every_cut(calling("read", 0), vec![system_note("q1")]),
+            )
+            .await;
+    }
+}
+
+/// A turn-scoped system entry delivered on a route that takes one is sent again, after a switch
+/// to a route that doesn't, as user-authority text the provider renders from the stored entry.
+#[tokio::test]
+async fn a_stored_system_entry_after_a_switch_to_a_route_without_it() {
+    TURN_SYSTEM
+        .scope(
+            Some(anthropic_route(true)),
+            compare_actions_cut(
+                calling("read", 0),
+                vec![system_note("q1")],
+                Cuts {
+                    after: Some("send_delivered"),
+                    resume_route: Some(Some(anthropic_route(false))),
+                },
+            ),
+        )
+        .await;
+}
+
+/// A send that can start a run waits while one runs, and stays queued at its end.
+#[tokio::test]
+async fn every_cut_of_an_idle_start_send_resumes_alike() {
+    compare_actions_every_cut(
+        calling("read", 0),
+        vec![(1, ordered("q1", &["idle_start"], "later", None))],
+    )
+    .await;
+}
+
+/// A send that expired before the batch closed ends there instead of riding.
+#[tokio::test]
+async fn an_expired_send_ends_at_the_batch_it_would_ride() {
+    compare_steered(
+        calling("read", 0),
+        vec![(1, ordered("q1", &["tool_result"], "too late", Some(0)))],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn every_cut_of_an_expired_send_resumes_alike() {
+    compare_actions_every_cut(
+        calling("read", 0),
+        vec![(1, ordered("q1", &["tool_result"], "too late", Some(0)))],
+    )
+    .await;
+}
+
+/// A send under the same dedupe key supersedes an undelivered one; only the newer one rides.
+fn deduped() -> Vec<(usize, Action)> {
+    let order = json!({"modes": ["tool_result"], "dedupe_key": "status"});
+    vec![
+        (1, ordered_with("q1", order.clone(), "old status", None)),
+        (1, ordered_with("q2", order, "new status", Some("q1"))),
+    ]
+}
+
+#[tokio::test]
+async fn a_dedupe_key_supersedes_the_undelivered_send() {
+    compare_steered(calling("read", 0), deduped()).await;
+}
+
+#[tokio::test]
+async fn every_cut_of_a_superseded_send_resumes_alike() {
+    compare_actions_every_cut(calling("read", 0), deduped()).await;
+}
+
+/// A ride recorded before llm-runner 0.8.11, with no envelope, converts and goes out as today's
+/// loop sends it, joined to its result, in every request after it.
+#[tokio::test]
+async fn a_ride_without_an_envelope_resumes_alike() {
+    for tool in ["read", "broken"] {
+        RIDES_WRITER
+            .scope(
+                false,
+                compare_actions_cut(
+                    calling(tool, 0),
+                    vec![a_note("q1")],
+                    Cuts {
+                        after: Some("send_delivered"),
+                        resume_route: None,
+                    },
+                ),
+            )
+            .await;
+    }
 }
 
 #[tokio::test]

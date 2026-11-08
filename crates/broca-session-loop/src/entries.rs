@@ -346,6 +346,15 @@ pub fn with_facts(batch: Vec<Record>, at: &Placing<'_>) -> Result<Vec<Record>, S
     // Who sent the input of a run started in this batch, read from its start as today's entry
     // metadata reads it from the run's start.
     let mut run_sender = None;
+    // Whether a run started in this batch takes its input from a queued send delivered by its
+    // `idle_start` mode, whose messages today's reads name as delivered that way.
+    let mut run_idle_start = false;
+    // The call whose result a queued send rides on in this batch: the results message the batch
+    // places is named as carrying it, as today's reads name the message its last ride took.
+    let riding: Option<ToolCallId> = batch.iter().rev().find_map(|record| match record {
+        Record::ResultAppend(append) if append.ride.is_some() => Some(append.tool_call_id.clone()),
+        _ => None,
+    });
     // The calls a dispatch intent anchored, before this batch and in it: their key is the
     // intent's.
     let mut dispatched: Vec<broca_protocol::ToolCallId> = at
@@ -399,9 +408,31 @@ pub fn with_facts(batch: Vec<Record>, at: &Placing<'_>) -> Result<Vec<Record>, S
     while let Some(mut record) = records.next() {
         if let Record::RunStart(start) = &record {
             run_sender = input_sender(start);
+            run_idle_start = start.submission_id.as_ref().is_some_and(|id| {
+                at.operations
+                    .queue
+                    .iter()
+                    .any(|pending| pending.ordered && &pending.submission_id == id)
+            });
         }
         match &mut record {
             Record::BatchStart(_) => dispatched.clear(),
+            // A ride names its carrier by the call's key, which only now is known for a call
+            // answered in this batch without an intent: the intent's key, else the outcome's.
+            Record::ResultAppend(append) => {
+                if let Some(ride) = append.ride.as_mut().filter(|ride| ride.call_key.is_empty()) {
+                    ride.call_key = intent_of
+                        .get(&append.tool_call_id)
+                        .and_then(|intent| intent.call_key.clone())
+                        .or_else(|| outcome_key_of.get(&append.tool_call_id).cloned())
+                        .ok_or_else(|| {
+                            format!(
+                                "entry facts: the call {} a send rides on has no key",
+                                append.tool_call_id.0
+                            )
+                        })?;
+                }
+            }
             Record::ToolIntent(intent) => {
                 dispatched.push(intent.tool_call_id.clone());
                 intent_of
@@ -456,6 +487,19 @@ pub fn with_facts(batch: Vec<Record>, at: &Placing<'_>) -> Result<Vec<Record>, S
                 } else {
                     own.filter(|at| *at != 0)
                 };
+                // A results message a send rides on, and the input of a run an `idle_start`
+                // delivery started, are named as delivered that way, as today's reads name them.
+                let (delivery_mode, delivery_tool_call_id) = match (&record, &riding) {
+                    (Record::ToolReply(_), Some(call)) => {
+                        (Some("tool_result".to_owned()), Some(call.0.clone()))
+                    }
+                    (Record::Input(input), _)
+                        if run_idle_start && input.placement == Placement::RunInput =>
+                    {
+                        (Some("idle_start".to_owned()), None)
+                    }
+                    _ => (facts.delivery_mode.map(str::to_owned), None),
+                };
                 pending.push(EntryFacts {
                     client_message_id: None,
                     sender: None,
@@ -472,8 +516,8 @@ pub fn with_facts(batch: Vec<Record>, at: &Placing<'_>) -> Result<Vec<Record>, S
                     mid: String::new(),
                     run_id: facts.run_id,
                     created_at_ms: facts.created_at_ms,
-                    delivery_mode: facts.delivery_mode.map(str::to_owned),
-                    delivery_tool_call_id: None,
+                    delivery_mode,
+                    delivery_tool_call_id,
                 });
                 high = high
                     .checked_add(if entries {
@@ -704,9 +748,9 @@ fn describe<'r>(
                 // An imported seed belongs to no run.
                 run_id: (input.placement != Placement::Imported).then(|| input.run_id.clone()),
                 created_at_ms: accepted_at(input, at),
-                // A run started from a queued send with a delivery order (`idle_start`) and a send
-                // riding on a tool result (`tool_result`) aren't named here: a session in the new
-                // storage takes neither yet, and refuses both by name.
+                // A run started by a queued send's `idle_start` delivery and a send riding on a
+                // tool result (`tool_result`) aren't named here: `with_facts` names them, from
+                // the run's start and the batch's rides.
                 delivery_mode: match input.placement {
                     Placement::Delivered => Some("steer"),
                     Placement::DeliveredTurnSystem => Some("turn_system"),

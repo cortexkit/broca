@@ -41,9 +41,9 @@ use broca_protocol::{DeliveryMode, DeliveryOrder};
 use broca_session_store::codec::{Digest, Message as _};
 use broca_session_store::fold::operations::{CallState, Operations, Resolution};
 use broca_session_store::record::{
-    Assistant, Attempt, BatchEnd, BatchStart, CallOutcome, CeilingDecided, Delivery, Input,
-    PartKind, Pause, Placement, Record, Redo, Resumed, RunEnd, RunStart, SendEnded, SetupStub,
-    StepEnd, StepStart, ToolHeld, ToolIntent, ToolOutcome, ToolReply,
+    Assistant, Attempt, BatchEnd, BatchStart, CallOutcome, CeilingDecided, Delivery, Input, Notice,
+    PartKind, Pause, Placement, Record, Redo, ResultAppend, Resumed, RunEnd, RunStart, SendEnded,
+    SetupStub, StepEnd, StepStart, ToolHeld, ToolIntent, ToolOutcome, ToolReply,
 };
 use broca_session_store::session::SessionError;
 use broca_wal::ComputedTagRules;
@@ -1528,6 +1528,7 @@ where
             started,
             warming.as_ref(),
             changes.as_ref(),
+            admission.compaction_plan_version.is_some(),
         )
         .await?
         {
@@ -1609,10 +1610,10 @@ where
         }
         // Queued sends with a delivery order are read before the batch is built, since their
         // records may be sealed. One queued after this read waits for the next boundary.
-        let ordered = ordered_sends(writer).await?;
+        let ordered = Box::pin(ordered_sends(writer)).await?;
         let boundary = writer
             .append_with(
-                &mut |_, operations, first_seq| {
+                &mut |conversation, operations, first_seq| {
                     let run = operations.run.as_ref().expect("a run is active");
                     if !(cancelled_now || run.cancel.is_some()) && stopping && resumes {
                         return restart_pause.take().into_iter().collect();
@@ -1627,16 +1628,40 @@ where
                         batch.extend(stopped_end.take());
                         return batch;
                     }
-                    // A step starts: ordered sends whose first possible mode here is `steer`
-                    // are delivered, and expired ones end, in queue order. Their records come
-                    // first, then every waiting message's copy (steers before deliveries), then
-                    // the step's start.
+                    // A step starts: ordered sends whose first possible mode here is `steer` or
+                    // `turn_system` are delivered, and expired ones end, in queue order, by
+                    // today's rules (`broca_core::delivery_order`). Their records come first,
+                    // then every waiting message's copy (steers before deliveries), then the
+                    // step's start.
                     let mut batch = Vec::new();
                     let mut delivered = Vec::new();
-                    for pending in operations.queue.iter().filter(|pending| pending.ordered) {
-                        let Some(send) = ordered.get(&pending.submission_id) else {
-                            continue;
-                        };
+                    let queued: Vec<_> = operations
+                        .queue
+                        .iter()
+                        .filter(|pending| pending.ordered)
+                        .filter_map(|pending| {
+                            ordered
+                                .get(&pending.submission_id)
+                                .map(|send| (pending, send))
+                        })
+                        .collect();
+                    // A turn-scoped system message is possible only where the route takes one:
+                    // after the message it would follow (the last one placed here so far, else
+                    // the last steered, else the conversation's last) and, on a route that needs
+                    // it last, with no user message to follow it in this request. As in today's
+                    // loop, any later send that may steer counts as one.
+                    let mut preceding: Option<Message> = run
+                        .pending_steers
+                        .iter()
+                        .rev()
+                        .find_map(|pending| pending.messages.last())
+                        .or(conversation.messages.last())
+                        .cloned();
+                    let last_user = queued.iter().rposition(|(_, send)| {
+                        !send.order.expired_at(now)
+                            && send.order.modes.contains(&DeliveryMode::Steer)
+                    });
+                    for (index, (pending, send)) in queued.iter().enumerate() {
                         if send.order.expired_at(now) {
                             batch.push(Record::SendEnded(SendEnded {
                                 submission_id: pending.submission_id.clone(),
@@ -1645,17 +1670,31 @@ where
                             continue;
                         }
                         let has_text = appended_text(&send.input).is_some();
-                        if choose_mode(&send.order, Boundary::STEP, has_text)
-                            != Some(DeliveryMode::Steer)
-                        {
-                            continue;
-                        }
+                        let followed_by_user = last_user.is_some_and(|last| last > index);
+                        let boundary = Boundary {
+                            turn_system: seams
+                                .provider
+                                .turn_system_possible(preceding.as_ref(), followed_by_user),
+                            ..Boundary::STEP
+                        };
+                        let (mode, placement, input) =
+                            match choose_mode(&send.order, boundary, has_text) {
+                                Some(DeliveryMode::Steer) => {
+                                    ("steer", Placement::Delivered, send.input.clone())
+                                }
+                                Some(DeliveryMode::TurnSystem) => (
+                                    "turn_system",
+                                    Placement::DeliveredTurnSystem,
+                                    turn_system_input(send, &pending.submission_id, &run_id),
+                                ),
+                                _ => continue,
+                            };
                         let seq = first_seq + batch.len() as u64;
-                        delivered.extend(send.input.iter().map(|message| {
+                        delivered.extend(input.iter().map(|message| {
                             Record::Input(Input {
                                 media: Vec::new(),
                                 run_id: run_id.clone(),
-                                placement: Placement::Delivered,
+                                placement,
                                 message: message.clone(),
                                 written_at_ms: send.written_at_ms,
                                 submission_id: Some(pending.submission_id.clone()),
@@ -1665,11 +1704,14 @@ where
                                 pruned: Vec::new(),
                             })
                         }));
+                        if let Some(last) = input.last() {
+                            preceding = Some(last.clone());
+                        }
                         batch.push(Record::Delivery(Delivery {
                             submission_id: pending.submission_id.clone(),
                             run_id: run_id.clone(),
-                            mode: "steer".into(),
-                            input: send.input.clone(),
+                            mode: mode.into(),
+                            input,
                             tool_call_id: None,
                             appended_text: None,
                             written_at_ms: send.written_at_ms,
@@ -2192,6 +2234,7 @@ where
             !step.cuts.is_empty(),
             warming.as_ref(),
             changes.as_ref(),
+            admission.compaction_plan_version.is_some(),
         )
         .await?
         {
@@ -3026,9 +3069,12 @@ async fn batch<W, P, T>(
     started: bool,
     warming: Option<&Warming<'_>>,
     changes: Option<&crate::compaction::Changes<'_>>,
+    // Whether the session is on the compaction contract, which picks a ride's carrier.
+    contract: bool,
 ) -> Result<BatchOutcome, LoopError>
 where
     W: Writer,
+    P: Provider,
     T: ToolPlane,
 {
     let batch_id = format!("{run_id}-b{step_id}");
@@ -3103,6 +3149,14 @@ where
     let dispatching = plans
         .iter()
         .any(|plan| matches!(plan, CallPlan::Dispatch(_)));
+    // A batch that sends nothing closes in this barrier, and delivers queued sends with its
+    // results there; one that sends reads them again when its answers are in.
+    let ordered = if dispatching {
+        Default::default()
+    } else {
+        Box::pin(ordered_sends(writer)).await?
+    };
+    let system_after = system_after_results(seams.provider);
     let written = writer
         .append_with(
             &mut |conversation, operations, first_seq| {
@@ -3194,6 +3248,19 @@ where
                         run_id: run_id.into(),
                         batch_id: batch_id.clone(),
                     }));
+                    // Queued sends ride on the batch's results in the barrier that closes it,
+                    // after its end, as today's loop records them.
+                    let rides = tool_batch_deliveries(
+                        conversation,
+                        operations,
+                        &records,
+                        &ordered,
+                        run_id,
+                        contract,
+                        system_after,
+                        now,
+                    );
+                    records.extend(rides);
                     // The budget firings the step's calls made due go in the barrier that
                     // closes its batch, as today's loop writes them.
                     let placing = closing_places(conversation);
@@ -3345,13 +3412,27 @@ where
         batch_id,
     }));
     // The budget firings the step's calls made due go in the barrier that closes its batch, as
-    // today's loop writes them; a batch that closed held calls on a cancel makes none.
+    // today's loop writes them; a batch that closed held calls on a cancel makes none. Queued
+    // sends ride on its results in the same barrier, after its end, read as it closes.
+    let ordered = Box::pin(ordered_sends(writer)).await?;
+    let closed_at = (seams.now_ms)();
     let mut records = Some(records);
     let cancelling = !closed.is_empty();
     writer
         .append_with(
             &mut |conversation, operations, first_seq| {
                 let mut batch = records.take().expect("one batch");
+                let rides = tool_batch_deliveries(
+                    conversation,
+                    operations,
+                    &batch,
+                    &ordered,
+                    run_id,
+                    contract,
+                    system_after,
+                    closed_at,
+                );
+                batch.extend(rides);
                 if !cancelling {
                     let placing = closing_places(conversation);
                     let firings = crate::budget::due(
@@ -4267,15 +4348,29 @@ async fn stopped_batch<W: Writer, P, T>(
 /// A queued send with a delivery order, as a boundary delivers it.
 struct OrderedSend {
     order: DeliveryOrder,
-    /// The user messages a `steer` delivery places: the input after the send's `pre_user`
-    /// hooks, without system messages, as today's queue holds it.
+    /// The user messages a `steer` or `turn_system` delivery places: the input after the send's
+    /// `pre_user` hooks, without system messages, as today's queue holds it.
     input: Vec<Message>,
     written_at_ms: Option<u64>,
+    /// The send's id as a ride names it: the caller's `send_id`, else its submission id.
+    send_id: String,
+    /// Who a ride names as its sender: the module that sent it, else `broca`.
+    ride_sender: String,
+    /// What a ride's text is shown as having come from: its sender and the plan template it was
+    /// rendered from.
+    notice: Notice,
 }
 
-/// The queue's sends that carry a delivery order, read from their records. Only `steer` and
-/// `idle_start` orders are delivered by this loop yet: an order naming `tool_result` or
-/// `turn_system` refuses by name rather than delivering it differently from today.
+/// The module a principal names, else `broca`, as today's ride envelope names a sender.
+fn module_or_broca(principal: Option<&broca_protocol::BindPrincipal>) -> String {
+    match principal {
+        Some(broca_protocol::BindPrincipal::Reserved { module_id }) => module_id.clone(),
+        _ => "broca".into(),
+    }
+}
+
+/// The queue's sends that carry a delivery order, read from their records, with what today's
+/// loop reads about each: the order, the input, who sent it and the time it was accepted.
 async fn ordered_sends<W: Writer>(
     writer: &mut W,
 ) -> Result<std::collections::BTreeMap<String, OrderedSend>, LoopError> {
@@ -4304,15 +4399,44 @@ async fn ordered_sends<W: Writer>(
         };
         let order: DeliveryOrder =
             serde_json::from_value(order).map_err(|e| LoopError::Parts(e.to_string()))?;
-        if order
-            .modes
-            .iter()
-            .any(|mode| matches!(mode, DeliveryMode::ToolResult | DeliveryMode::TurnSystem))
-        {
-            return Err(LoopError::Unsupported(
-                "a queued send delivered as a tool result or turn-scoped system message",
-            ));
-        }
+        let principal = |value: Option<&Value>| -> Result<_, LoopError> {
+            value
+                .map(|value| serde_json::from_value::<broca_protocol::BindPrincipal>(value.clone()))
+                .transpose()
+                .map_err(|e| LoopError::Parts(format!("queued send {id}'s sender: {e}")))
+        };
+        let ordered_by = principal(records.iter().find_map(|record| match record {
+            Record::DeliveryOrdered(ordered) => ordered.sent_by.as_ref(),
+            _ => None,
+        }))?;
+        let receipt = |name: &str| {
+            queued
+                .receipt
+                .as_ref()
+                .and_then(|receipt| receipt.get(name))
+        };
+        let queued_by = principal(receipt("sent_by"))?;
+        let queued_as = principal(receipt("principal"))?;
+        // A ride names the module its queued record says sent it, as today's ride ledger reads
+        // it; the notice names the one its order says, as today's projection reads it.
+        let ride_sender = module_or_broca(
+            queued_by
+                .as_ref()
+                .or(ordered_by.as_ref())
+                .or(queued_as.as_ref()),
+        );
+        let notice_sender = broca_core::compaction_v2::entries::delivery_sender(
+            ordered_by
+                .as_ref()
+                .or(queued_by.as_ref())
+                .or(queued_as.as_ref()),
+            DeliveryMode::ToolResult,
+        )
+        .unwrap_or_else(|| "broca".into());
+        let notice = Notice {
+            sender: notice_sender,
+            template: order.template.as_ref().map(|template| template.id.clone()),
+        };
         let hooked = queued
             .receipt
             .as_ref()
@@ -4325,16 +4449,173 @@ async fn ordered_sends<W: Writer>(
             .into_iter()
             .filter(|message| message.role != Role::System)
             .collect();
+        let send_id = queued.send_id.clone().unwrap_or_else(|| id.clone());
         sends.insert(
             id,
             OrderedSend {
                 order,
                 input,
                 written_at_ms: queued.written_at_ms,
+                send_id,
+                ride_sender,
+                notice,
             },
         );
     }
     Ok(sends)
+}
+
+/// The records that deliver queued sends at the close of a tool batch, as today's loop decides
+/// them under its inbox lock when the batch commits: an expired send ends, and one whose first
+/// possible mode here is `tool_result` rides on the batch's carrier result (`ResultAppend` with
+/// its envelope, then `Delivery`), in queue order. Every other send waits for the next boundary.
+/// `batch` is the closing batch so far, whose replies place the turn's results unless an earlier
+/// batch placed them; `system_after_results` is whether the run's route would take a
+/// turn-scoped system message right after them, which a send listing `turn_system` first waits
+/// for. On the compaction contract the carrier is the batch's last result, whatever it holds;
+/// off it, the last text or error result.
+#[allow(clippy::too_many_arguments)]
+fn tool_batch_deliveries(
+    conversation: &broca_session_store::fold::conversation::Conversation,
+    operations: &Operations,
+    batch: &[Record],
+    ordered: &std::collections::BTreeMap<String, OrderedSend>,
+    run_id: &str,
+    contract: bool,
+    system_after_results: bool,
+    now: u64,
+) -> Vec<Record> {
+    use broca_session_store::record::{RideEnvelope, RideForm};
+    let pending: Vec<&OrderedSend> = operations
+        .queue
+        .iter()
+        .filter(|pending| pending.ordered)
+        .filter_map(|pending| ordered.get(&pending.submission_id))
+        .collect();
+    if pending.is_empty() {
+        return Vec::new();
+    }
+    // The batch's results in planned order: the results message its replies place, or the one an
+    // earlier batch placed when every reply was already durable.
+    // A record the fold refuses here is refused again when the batch is appended, which
+    // reports it; until then it places nothing.
+    let mut placing = conversation.without_window();
+    for record in batch
+        .iter()
+        .filter(|record| record.stream() == broca_session_store::record::Stream::Transcript)
+    {
+        let _ = placing.apply(record);
+    }
+    let results: Vec<&ToolResult> = placing
+        .messages
+        .last()
+        .or(conversation.messages.last())
+        .filter(|message| message.role == Role::Tool)
+        .map(|message| {
+            message
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    broca_protocol::content::ContentBlock::ToolResult(result) => Some(result),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let carrier = if contract {
+        broca_core::delivery_order::carrier_mode3(results.iter().copied())
+    } else {
+        broca_core::delivery_order::carrier(results.iter().copied())
+    }
+    .cloned();
+    let boundary = Boundary {
+        turn_system: system_after_results,
+        ..Boundary::tool_batch(carrier.is_some())
+    };
+    let mut records = Vec::new();
+    for pending in operations.queue.iter().filter(|pending| pending.ordered) {
+        let Some(send) = ordered.get(&pending.submission_id) else {
+            continue;
+        };
+        if send.order.expired_at(now) {
+            records.push(Record::SendEnded(SendEnded {
+                submission_id: pending.submission_id.clone(),
+                reason: Some(json!({"kind": "expired"})),
+            }));
+            continue;
+        }
+        let text = appended_text(&send.input);
+        let (Some(DeliveryMode::ToolResult), Some(carrier), Some(text)) = (
+            choose_mode(&send.order, boundary, text.is_some()),
+            &carrier,
+            text,
+        ) else {
+            continue;
+        };
+        records.push(Record::ResultAppend(ResultAppend {
+            run_id: run_id.into(),
+            tool_call_id: carrier.clone(),
+            text: text.clone(),
+            // Who the text came from is an entry fact of the compaction contract, as today's
+            // projection keeps it; off the contract the envelope alone names the sender.
+            notice: contract.then(|| send.notice.clone()),
+            written_at_ms: send.written_at_ms,
+            send_id: Some(send.send_id.clone()),
+            ride: Some(RideEnvelope {
+                // The carrier's key is known once the batch's records are placed: the entry
+                // facts writer fills it in from the call's intent, or from its outcome.
+                call_key: String::new(),
+                sender: send.ride_sender.clone(),
+                forms: send
+                    .order
+                    .modes
+                    .iter()
+                    .filter_map(|mode| match mode {
+                        DeliveryMode::ToolResult => Some("tool_result".to_owned()),
+                        DeliveryMode::TurnSystem => Some("turn_system".to_owned()),
+                        _ => None,
+                    })
+                    .collect(),
+                form: RideForm::Append,
+            }),
+        }));
+        records.push(Record::Delivery(Delivery {
+            submission_id: pending.submission_id.clone(),
+            run_id: run_id.into(),
+            mode: "tool_result".into(),
+            input: Vec::new(),
+            tool_call_id: Some(carrier.clone()),
+            appended_text: Some(text),
+            written_at_ms: send.written_at_ms,
+            tags_v1: None,
+            input_listed: None,
+        }));
+    }
+    records
+}
+
+/// Whether the run's route would take a turn-scoped system message right after a tool batch's
+/// results, as today's loop asks its provider before a batch commits.
+fn system_after_results<P: Provider>(provider: &P) -> bool {
+    provider.turn_system_possible(Some(&Message::new(Role::Tool, Vec::new())), false)
+}
+
+/// The messages a `turn_system` delivery of `send` places: its text as turn-scoped system text,
+/// frozen as today's loop freezes it (`broca_core::delivery_order::system_delivered`).
+fn turn_system_input(send: &OrderedSend, submission_id: &str, run_id: &str) -> Vec<Message> {
+    let core = broca_core::delivery_order::OrderedSend {
+        admitted_at_ms: send.written_at_ms,
+        submission_id: broca_protocol::SubmissionId(submission_id.into()),
+        order: send.order.clone(),
+        principal: None,
+        input: send.input.clone(),
+    };
+    match broca_core::delivery_order::system_delivered(&core, &RunId(run_id.into())) {
+        broca_wal::WalRecord::SendDelivered {
+            input: Some(input), ..
+        } => input.as_ref().clone(),
+        _ => unreachable!("a turn-scoped system delivery records the messages it places"),
+    }
 }
 
 /// The result a call gets when the run stopped before the call was dispatched.
