@@ -98,6 +98,8 @@ struct Rig {
     root: PathBuf,
     state: PathBuf,
     provider: Arc<Provider>,
+    // Coordinate the held-launch test with an actual pending catalog observation.
+    registration_pending: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl Rig {
@@ -108,6 +110,18 @@ impl Rig {
         input: Option<u64>,
         output: u64,
         cut: bool,
+    ) -> Option<Self> {
+        Self::start_with_program(name, tags, trusted, input, output, cut, None).await
+    }
+
+    async fn start_with_program(
+        name: &str,
+        tags: bool,
+        trusted: bool,
+        input: Option<u64>,
+        output: u64,
+        cut: bool,
+        program: Option<PathBuf>,
     ) -> Option<Self> {
         let subc = broca_test_support::subc_bin("ck-subc", "SUBC_CORE_BIN");
         if !subc.exists() {
@@ -168,7 +182,13 @@ impl Rig {
         if cut {
             env["BROCA_TEST_SYSTEM_ONE_ANSWER_GATE"] = json!(root.join("answer-cut"));
         }
-        modules["broca"] = json!({"program":broca_test_support::ckdev_binary(Path::new(env!("CARGO_BIN_EXE_ck-broca")), broca_test_support::scratch_root()),"args":[],"enabled":true,"env":env});
+        let program = program.unwrap_or_else(|| {
+            broca_test_support::ckdev_binary(
+                Path::new(env!("CARGO_BIN_EXE_ck-broca")),
+                broca_test_support::scratch_root(),
+            )
+        });
+        modules["broca"] = json!({"program":program,"args":[],"enabled":true,"env":env});
         std::fs::write(
             root.join("config/cortexkit/subc.jsonc"),
             json!({"version":1,"scope_authority_owners":["owner"],"modules":modules}).to_string(),
@@ -198,6 +218,7 @@ impl Rig {
             root,
             state,
             provider: provider_state,
+            registration_pending: None,
         };
         broca_test_support::wait_until("tool scope sync", || async {
             let events = std::fs::read_to_string(rig.root.join("owner.events")).unwrap_or_default();
@@ -251,37 +272,29 @@ impl Rig {
                 Some(1),
             )
         });
-        let route = broca_test_support::wait_until("tool-provider route", || {
-            let connection = connection.clone();
-            let identity = identity.clone();
-            let scope = scope.clone();
-            async move {
-                match connection
-                    .route_open_tool_provider_v1(target, &identity, scope)
+        // A child PID is published before HELLO. Observe the daemon's registered grants,
+        // not a route-open refusal, so a crash teardown cannot look like a missing grant.
+        broca_test_support::wait_until(
+            "tool-provider registration and route.bind grant",
+            || async {
+                let observed = connection
+                    .catalog_list()
                     .await
-                {
-                    Ok(route) => Ok(route),
-                    // Peers register asynchronously, so unknown_module is also a startup state.
-                    // Capability refusals cannot become ready and must fail without retrying.
-                    Err(error)
-                        if matches!(
-                            error.code(),
-                            Some(
-                                "target_unavailable"
-                                    | "unknown_module"
-                                    | "module_warming"
-                                    | "module_reloading"
-                                    | "module_timeout"
-                            )
-                        ) =>
-                    {
-                        Err(error.to_string())
+                    .map_err(|error| error.to_string())
+                    .and_then(|entries| registered_for_bind(&entries, target));
+                if observed.is_err() {
+                    if let Some(pending) = &self.registration_pending {
+                        pending.notify_one();
                     }
-                    Err(error) => panic!("tool-provider route to {target} refused: {error}"),
                 }
-            }
-        })
+                observed
+            },
+        )
         .await;
+        let route = connection
+            .route_open_tool_provider_v1(target, &identity, scope)
+            .await
+            .unwrap_or_else(|error| panic!("tool-provider route to {target} refused: {error}"));
         Route { connection, route }
     }
 
@@ -472,21 +485,83 @@ async fn reported_overrun_is_returned_and_missing_input_cost_is_a_durable_failur
     assert!(unknown.get("cost_usd").is_none());
 }
 
-/// SIGKILL the broca module the rig daemon supervises, found through the daemon's live-child
-/// roster in this rig's own data home. The late-results cursor can't name the process: its
-/// incarnation is a hash of the process's launch nonce and the caller's principal.
+fn registered_for_bind(entries: &[subc_control::CatalogEntry], target: &str) -> Result<(), String> {
+    let entry = entries
+        .iter()
+        .find(|entry| entry.module_id == target)
+        .ok_or_else(|| format!("{target} has not registered in catalog.list"))?;
+    if !entry.control_ops.iter().any(|op| op == "route.bind") {
+        return Err(format!(
+            "{target} registered without the route.bind grant: {:?}",
+            entry.control_ops
+        ));
+    }
+    if !entry.ready {
+        return Err(format!(
+            "{target} registered with route.bind but is not ready: {:?}",
+            entry.not_ready
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn registration_barrier_distinguishes_absence_missing_grant_and_warming() {
+    use subc_control::CatalogEntry;
+
+    assert_eq!(
+        registered_for_bind(&[], "broca").unwrap_err(),
+        "broca has not registered in catalog.list"
+    );
+    let entry = CatalogEntry::new("broca", vec![], vec![]);
+    assert_eq!(
+        registered_for_bind(&[entry], "broca").unwrap_err(),
+        "broca registered without the route.bind grant: []"
+    );
+    let mut entry = CatalogEntry::new("broca", vec![], vec!["route.bind".into()]);
+    entry.ready = false;
+    assert!(registered_for_bind(&[entry.clone()], "broca")
+        .unwrap_err()
+        .contains("registered with route.bind but is not ready"));
+    entry.ready = true;
+    assert_eq!(registered_for_bind(&[entry], "broca"), Ok(()));
+}
+
+/// Read the supervised PID from this rig's own roster. The late-results incarnation is a
+/// nonce-derived hash, not a process ID, so it cannot identify a child to signal.
 #[cfg(unix)]
-async fn kill_broca(rig: &Rig) {
+fn broca_pid(rig: &Rig) -> Result<u32, String> {
     let roster = rig.root.join("data/cortexkit/run/live-children.json");
-    let record: Value = serde_json::from_slice(&std::fs::read(&roster).unwrap()).unwrap();
+    let record: Value =
+        serde_json::from_slice(&std::fs::read(&roster).map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string())?;
     let pid = record["children"]
         .as_array()
-        .unwrap()
+        .ok_or("live-child roster has no children array")?
         .iter()
         .find(|child| child["module_id"] == "broca")
         .and_then(|child| child["pid"].as_u64())
-        .expect("the rig daemon supervises a live broca");
-    sigkill(u32::try_from(pid).unwrap());
+        .ok_or("the rig daemon has no live broca child")?;
+    u32::try_from(pid).map_err(|error| error.to_string())
+}
+
+#[cfg(unix)]
+async fn kill_broca(rig: &Rig) {
+    let pid = broca_pid(rig).expect("the rig daemon supervises a live broca");
+    sigkill(pid);
+    // The supervisor releases the old registration before spawning its replacement. Waiting
+    // for a different child prevents the catalog barrier from accepting the dying process.
+    broca_test_support::wait_until("replacement broca process", || async {
+        let next = broca_pid(rig)?;
+        if next == pid {
+            Err(format!(
+                "broca has not respawned; the roster still names PID {pid}"
+            ))
+        } else {
+            Ok(())
+        }
+    })
+    .await;
 }
 
 #[cfg(unix)]
@@ -496,6 +571,95 @@ fn sigkill(pid: u32) {
         .status()
         .unwrap()
         .success());
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restart_route_waits_for_broca_registration() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let script = broca_test_support::scratch_root()
+        .join(format!("broca-registration-hold-{}.sh", std::process::id()));
+    let binary = broca_test_support::ckdev_binary(
+        Path::new(env!("CARGO_BIN_EXE_ck-broca")),
+        broca_test_support::scratch_root(),
+    );
+    // Hold the replacement before exec, so its PID exists but it cannot send HELLO until
+    // the test has observed the registration barrier waiting. No scheduler delay is assumed.
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nif [ -p \"$BROCA_STATE_ROOT/hold-registration\" ]; then\n  : > \"$BROCA_STATE_ROOT/registration-held\"\n  read -r release < \"$BROCA_STATE_ROOT/hold-registration\"\nfi\nexec '{}' \"$@\"\n",
+            binary.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let Some(mut rig) = Rig::start_with_program(
+        "registration-barrier",
+        true,
+        true,
+        Some(42_000_000),
+        0,
+        false,
+        Some(script),
+    )
+    .await
+    else {
+        return;
+    };
+    let catalog = SubcConnection::connect(&rig.root.join("runtime/subc-connection.json"))
+        .await
+        .unwrap();
+    broca_test_support::wait_until("initial broca registration", || async {
+        let entries = catalog
+            .catalog_list()
+            .await
+            .map_err(|error| error.to_string())?;
+        registered_for_bind(&entries, "broca")
+    })
+    .await;
+    let pending = Arc::new(tokio::sync::Notify::new());
+    rig.registration_pending = Some(pending.clone());
+    let hold = rig.state.join("hold-registration");
+    assert!(std::process::Command::new("mkfifo")
+        .arg(&hold)
+        .status()
+        .unwrap()
+        .success());
+    let reopen = async {
+        kill_broca(&rig).await;
+        rig.open(true, false).await
+    };
+    tokio::pin!(reopen);
+    tokio::select! {
+        _ = &mut reopen => panic!("route opened before broca's replacement registered"),
+        observed = broca_test_support::event_timeout(
+            "registration barrier observes the held replacement",
+            pending.notified(),
+            || "the replacement has not reached the registration barrier".to_owned(),
+        ) => { observed.expect("the registration barrier did not observe the held replacement"); }
+    }
+    broca_test_support::wait_until("replacement held before HELLO", || async {
+        std::fs::read(rig.state.join("registration-held")).map_err(|error| error.to_string())
+    })
+    .await;
+    assert!(
+        !catalog
+            .catalog_list()
+            .await
+            .unwrap()
+            .iter()
+            .any(|entry| entry.module_id == "broca"),
+        "the held replacement must not have registered"
+    );
+    tokio::fs::write(hold, b"continue\n").await.unwrap();
+    let restarted = reopen.await;
+    restarted
+        .call(args(), Some("after-registration"))
+        .await
+        .unwrap();
+    assert_eq!(rig.calls(), 1);
 }
 
 #[cfg(unix)]
