@@ -6041,6 +6041,7 @@ where
                 &session.state,
                 &session.runtime,
                 &crate::compaction_v2::journal::WalJournal {
+                    applied_by: None,
                     writer,
                     session: &req.session,
                 },
@@ -6303,6 +6304,7 @@ where
                 &session.state,
                 &session.runtime,
                 &crate::compaction_v2::journal::WalJournal {
+                    applied_by: None,
                     writer,
                     session: &req.session,
                 },

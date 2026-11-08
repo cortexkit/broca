@@ -266,7 +266,7 @@ fn mode3_manifest() -> Arc<broca_wal::PlanManifest> {
     })
 }
 
-struct DumpCompactionPlane(Arc<broca_core::wal_writer::WalHandle>);
+struct DumpCompactionPlane(Arc<broca_core::wal_writer::WalHandle>, bool);
 
 #[async_trait::async_trait]
 impl broca_core::compaction::CompactionPlane for DumpCompactionPlane {
@@ -300,7 +300,18 @@ impl broca_core::compaction::CompactionPlane for DumpCompactionPlane {
             "compaction.ride" => {
                 let lineage = self.0.lineage_id().unwrap().to_string();
                 let through = broca_core::message_mid(true, Some(&lineage), 0).unwrap();
-                json!({"answer":"view","view":View::seal(1, vec![Edit::new(1, EditOp::Cut { through })])})
+                let edits = vec![Edit::new(1, EditOp::Cut { through })];
+                let view = if self.1 {
+                    View::seal_with_policy(
+                        1,
+                        edits,
+                        Some(broca_core::message_mid(true, Some(&lineage), 1).unwrap()),
+                        Some("strip".into()),
+                    )
+                } else {
+                    View::seal(1, edits)
+                };
+                json!({"answer":"view","view":view})
             }
             _ => panic!("unexpected compaction method {method}"),
         };
@@ -377,6 +388,7 @@ async fn fixture<F: WireFamily + 'static>(
 enum FixtureMode {
     Legacy,
     Compaction,
+    StripSigned,
     GlobalSystem,
 }
 
@@ -468,7 +480,7 @@ async fn fixture_with_mode<F: WireFamily + 'static>(
     let run = async {
         if !matches!(mode, FixtureMode::Legacy) {
             request.context_limit = Some(4000);
-            if matches!(mode, FixtureMode::Compaction) {
+            if matches!(mode, FixtureMode::Compaction | FixtureMode::StripSigned) {
                 request.input.insert(
                     0,
                     Message::new(
@@ -478,6 +490,34 @@ async fn fixture_with_mode<F: WireFamily + 'static>(
                         }],
                     ),
                 );
+                if matches!(mode, FixtureMode::StripSigned) {
+                    request.model = ModelHandle::new("anthropic", "claude-opus-5-5");
+                    request.input.push(Message::new(
+                        Role::Assistant,
+                        vec![
+                            ContentBlock::Reasoning {
+                                text: "private".into(),
+                                signature: Some("signature".into()),
+                            },
+                            ContentBlock::ToolCall(broca_protocol::ToolCall {
+                                tool_call_id: broca_protocol::ToolCallId("prior-call".into()),
+                                tool_name: "read".into(),
+                                input: json!({"path":"a"}),
+                                thought_signature: None,
+                            }),
+                        ],
+                    ));
+                    request.input.push(Message::new(
+                        Role::Tool,
+                        vec![ContentBlock::ToolResult(broca_protocol::ToolResult {
+                            tool_call_id: broca_protocol::ToolCallId("prior-call".into()),
+                            output: broca_protocol::ToolOutput::Text {
+                                text: "prior result".into(),
+                            },
+                            is_error: false,
+                        })],
+                    ));
+                }
             } else {
                 request.input.insert(
                     0,
@@ -495,9 +535,16 @@ async fn fixture_with_mode<F: WireFamily + 'static>(
             let control = broca_core::RunControl {
                 new_log_compaction_plan_version: Some(broca_core::compaction_v2::PLAN_VERSION),
                 admitted_context_limit: request.context_limit,
-                manifest: matches!(mode, FixtureMode::Compaction).then(mode3_manifest),
-                compaction_plane: if matches!(mode, FixtureMode::Compaction) {
-                    Some(Arc::new(DumpCompactionPlane(writer.clone())))
+                manifest: matches!(mode, FixtureMode::Compaction | FixtureMode::StripSigned)
+                    .then(mode3_manifest),
+                compaction_plane: if matches!(
+                    mode,
+                    FixtureMode::Compaction | FixtureMode::StripSigned
+                ) {
+                    Some(Arc::new(DumpCompactionPlane(
+                        writer.clone(),
+                        matches!(mode, FixtureMode::StripSigned),
+                    )))
                 } else {
                     None
                 },
@@ -815,6 +862,72 @@ async fn mode3_cache_dump_exports_every_call_verified_without_skips() {
     assert_eq!(summary.calls_examined, 2);
     assert_eq!(summary.calls_verified, 2);
     assert_eq!(summary.calls_exported, 2);
+    assert_eq!(summary.digest_mismatches, 0);
+    assert!(
+        summary.calls_skipped.is_empty(),
+        "{:?}",
+        summary.calls_skipped
+    );
+    check_bodies(&out, &bodies);
+}
+
+#[tokio::test]
+async fn mode3_cache_dump_matches_live_newest_signed_strip() {
+    let (root, records, bodies) = fixture_with_mode(
+        "mode3-strip",
+        AnthropicMessages,
+        anthropic_frozen_config("claude-opus-5-5"),
+        vec![anthropic(false)],
+        true,
+        FixtureMode::StripSigned,
+    )
+    .await;
+    let stored = records
+        .iter()
+        .find_map(|record| match record {
+            WalRecord::CompactionViewV2(view) => Some(view),
+            _ => None,
+        })
+        .unwrap();
+    assert!(stored.built_through.is_some());
+    assert_eq!(stored.new_signed.as_deref(), Some("strip"));
+    assert!(
+        stored.applied_by.is_none(),
+        "ride responses are not attested apply_view calls"
+    );
+    let rebuilt = broca_core::compaction_v2::storage::rebuild(
+        None,
+        stored.version,
+        stored.checksum.clone(),
+        &stored.edits,
+        stored.built_through.clone(),
+        stored.new_signed.clone(),
+    )
+    .unwrap();
+    assert!(rebuilt.view().verify());
+    assert_eq!(bodies.len(), 1);
+    let body: Value = serde_json::from_slice(&bodies[0]).unwrap();
+    let content: Vec<_> = body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|message| message["content"].as_array().unwrap())
+        .collect();
+    assert!(content
+        .iter()
+        .any(|part| part["type"] == "tool_use" && part["id"] == "prior-call"));
+    assert!(content
+        .iter()
+        .any(|part| part["type"] == "tool_result" && part["tool_use_id"] == "prior-call"));
+    assert!(!content
+        .iter()
+        .any(|part| part["type"] == "thinking" || part["type"] == "redacted_thinking"));
+    assert!(!String::from_utf8_lossy(&bodies[0]).contains("old context"));
+    let out = root.join("out");
+    let summary = export(&root, &["mode3-strip".into()], None, &out).unwrap();
+    assert_eq!(summary.calls_examined, 1);
+    assert_eq!(summary.calls_verified, 1);
+    assert_eq!(summary.calls_exported, 1);
     assert_eq!(summary.digest_mismatches, 0);
     assert!(
         summary.calls_skipped.is_empty(),

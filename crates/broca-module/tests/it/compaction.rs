@@ -407,7 +407,7 @@ fn seed_mode3(rig: &Rig) {
 }
 
 #[tokio::test]
-async fn compaction_v2_metadata_requires_writer_support() {
+async fn compaction_v2_metadata_is_durable_when_writer_enabled() {
     use broca_core::compaction_v2::protocol::{
         read::{Detail, ReadPage, ReadRequest, Select},
         view::View,
@@ -438,6 +438,7 @@ async fn compaction_v2_metadata_requires_writer_support() {
             && event.fields.get("session_ref") == Some(&session_ref)
     });
     let before = rig.wal.read_records(&rig.key).unwrap().len();
+    let mut expected = Vec::new();
     for (version, new_signed) in [(1, None), (2, Some("strip".into()))] {
         let view = View::seal_with_policy(
             version,
@@ -446,7 +447,8 @@ async fn compaction_v2_metadata_requires_writer_support() {
             new_signed,
         );
         assert!(view.verify());
-        let refusal = rig
+        expected.push((version, view.new_signed.clone(), view.checksum.clone()));
+        let answer = rig
             .registry
             .route_compaction_v2(
                 &rig.key,
@@ -455,22 +457,45 @@ async fn compaction_v2_metadata_requires_writer_support() {
                 serde_json::value::to_raw_value(&json!({"view":view})).unwrap(),
             )
             .await
-            .unwrap_err();
-        assert_eq!(refusal.code, "internal_error");
-        assert!(refusal
-            .message
-            .contains("requires the metadata writer release"));
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(answer.get()).unwrap(),
+            json!({"answer":"accepted"})
+        );
     }
     let events = capture.events();
-    assert_eq!(events.len(), 2, "{events:?}");
-    for (event, (version, new_signed)) in events.iter().zip([("1", "false"), ("2", "true")]) {
-        assert_eq!(event.level, tracing::Level::WARN);
-        assert_eq!(event.fields["view_version"], version);
-        assert_eq!(event.fields["refusal_code"], "internal_error");
-        assert_eq!(event.fields["built_through"], "true");
-        assert_eq!(event.fields["new_signed"], new_signed);
+    assert!(
+        events.is_empty(),
+        "accepted publications must not warn: {events:?}"
+    );
+    let records = rig.wal.read_records(&rig.key).unwrap();
+    assert_eq!(records.len(), before + 2);
+    let stored: Vec<_> = records
+        .iter()
+        .filter_map(|frame| match &frame.record {
+            broca_wal::WalRecord::CompactionViewV2(view) => Some(view),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(stored.len(), 2);
+    for (stored, (version, new_signed, checksum)) in stored.iter().zip(&expected) {
+        assert_eq!(stored.version, *version);
+        assert_eq!(
+            stored.built_through.as_deref(),
+            Some(page.entries[0].mid.as_str())
+        );
+        assert_eq!(&stored.new_signed, new_signed);
+        assert_eq!(&stored.checksum, checksum);
+        assert_eq!(stored.applied_by.as_deref(), Some("provider"));
     }
-    assert_eq!(rig.wal.read_records(&rig.key).unwrap().len(), before);
+    let mut restored = broca_core::compaction_v2::state::State::default();
+    for frame in records {
+        broca_core::compaction_v2::fold::fold(&mut restored, &frame.record, &rig.key).unwrap();
+    }
+    let latest = restored.latest().unwrap();
+    assert!(latest.verify());
+    assert_eq!(latest.checksum, expected[1].2);
+    assert_eq!(latest.new_signed.as_deref(), Some("strip"));
     rig.close().await;
 }
 
@@ -600,7 +625,7 @@ async fn compaction_v2_bound_ops_check_provider_and_store_before_accepted_withou
             &rig.key,
             Some("provider".into()),
             "session.apply_view".into(),
-            raw(json!({"view":view})),
+            raw(json!({"view":view,"applied_by":"spoofed-module"})),
         )
         .await
         .unwrap();
@@ -642,6 +667,15 @@ async fn compaction_v2_bound_ops_check_provider_and_store_before_accepted_withou
         serde_json::from_str::<serde_json::Value>(applied.get()).unwrap()["view"]["version"],
         1
     );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(applied.get()).unwrap()["applied_by"],
+        "provider"
+    );
+    let mut restored = broca_core::compaction_v2::state::State::default();
+    for frame in rig.wal.read_records(&rig.key).unwrap() {
+        broca_core::compaction_v2::fold::fold(&mut restored, &frame.record, &rig.key).unwrap();
+    }
+    assert_eq!(restored.applied_by(), Some("provider"));
     rig.model.finish.add_permits(1);
     rig.close().await;
 }
