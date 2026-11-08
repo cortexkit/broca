@@ -19,7 +19,8 @@
 //!   `broca_session_loop::entries::project`, whose output the converter's `entries` command
 //!   compares, entry by entry, with today's projection of the same live logs.
 //! - `session.applied_view` serves the view the session's latest step applied, rebuilt from the
-//!   open log by the same fold the run loop restores its compaction state with.
+//!   open log by the same fold the run loop restores its compaction state with, and the provider
+//!   that handed it over (`applied_by`), as today's actor names it.
 //! - `session.apply_view` writes an accepted view, which only the session's writer may do. The
 //!   store actor doesn't take one yet, so it is refused by name (`not_served_on_new_storage`).
 //!
@@ -189,7 +190,15 @@ pub async fn serve_compaction<B: SessionBackend>(
             let state = broca_session_loop::compaction::restore(&records, key, &session.operations)
                 .map_err(internal)?;
             let answer = match state.applied_received() {
-                Some(view) => serde_json::json!({ "view": view }),
+                Some(view) => {
+                    let mut answer = serde_json::json!({ "view": view });
+                    // Named as today's actor names it: the provider that handed the applied
+                    // view over, absent for a view a run's step accepted.
+                    if let Some(module) = state.applied_by() {
+                        answer["applied_by"] = serde_json::json!(module);
+                    }
+                    answer
+                }
                 None => serde_json::json!({}),
             };
             to_raw_value(&answer).map_err(|error| internal(error.to_string()))
@@ -249,7 +258,7 @@ pub async fn apply_view(
         registry,
         store,
         key,
-        caller,
+        caller.clone(),
         "bind".into(),
         RawValue::from_string("{}".into()).map_err(|error| internal(error.to_string()))?,
     )
@@ -259,7 +268,10 @@ pub async fn apply_view(
     broca_core::compaction_v2::received::ReceivedView::parse(&request.view)
         .map_err(|error| Refusal::invalid_params("view", error.to_string()))?;
     let command = crate::store_import::StoreCommand::ApplyView(Box::new(
-        crate::store_import::ApplyViewCommand { view: request.view },
+        crate::store_import::ApplyViewCommand {
+            view: request.view,
+            caller,
+        },
     ));
     use crate::store_import::StoreOutcome;
     match registry.route_store_command(key, command).await {

@@ -945,6 +945,17 @@ message! {
         /// provider's edit as raw JSON or the index of the identical edit in the previous
         /// accepted view.
         3 req edits: serde_json::Value,
+        /// The view's build metadata as the provider sealed it: the entry it was built
+        /// through, and its policy for blocks signed after that. Both are part of the view's
+        /// checksum, so a reader that doesn't know them can't rebuild the view; they are
+        /// must-understand.
+        4 opt [must] built_through: String,
+        5 opt [must] new_signed: String,
+        /// The compaction provider that handed the view over through `session.apply_view`, as
+        /// its route admitted it. Absent for a view a run's step accepted or an import installed.
+        /// `session.applied_view` names it, so a reader that doesn't know it would serve the
+        /// applied view without it; it is must-understand.
+        6 opt [must] applied_by: String,
     }
 }
 

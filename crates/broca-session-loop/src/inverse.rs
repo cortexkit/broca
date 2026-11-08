@@ -749,12 +749,17 @@ impl Inverse {
                 object.insert("sequential".into(), json(held.sequential));
                 Value::Object(object)
             }
-            Record::View(view) => serde_json::json!({
-                "type": "compaction_view_v2",
-                "version": view.version,
-                "checksum": view.checksum,
-                "edits": view.edits,
-            }),
+            Record::View(view) => {
+                let mut object = Map::new();
+                object.insert("type".into(), json("compaction_view_v2"));
+                object.insert("version".into(), json(view.version));
+                object.insert("checksum".into(), json(&view.checksum));
+                object.insert("edits".into(), view.edits.clone());
+                set(&mut object, "built_through", view.built_through.as_ref());
+                set(&mut object, "new_signed", view.new_signed.as_ref());
+                set(&mut object, "applied_by", view.applied_by.as_ref());
+                Value::Object(object)
+            }
             Record::ViewApplied(applied) => serde_json::json!({
                 "type": "compaction_view_applied_v2",
                 "step_id": applied.step_id,

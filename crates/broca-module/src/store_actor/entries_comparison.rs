@@ -867,14 +867,28 @@ async fn contract_sessions_with(
     more: Vec<Vec<NormalizedEvent>>,
     idle: Duration,
 ) -> (Side, Side) {
+    contract_sessions_in(renders, more, idle, || {
+        broca_session_store::keys::DeploymentKey::new(1, &[7; 32])
+    })
+    .await
+}
+
+/// [`contract_sessions_with`], whose new storage creates sessions under the key `deployment`
+/// makes.
+async fn contract_sessions_in(
+    renders: bool,
+    more: Vec<Vec<NormalizedEvent>>,
+    idle: Duration,
+    deployment: impl Fn() -> broca_session_store::keys::DeploymentKey,
+) -> (Side, Side) {
     let mut steps = vec![
         text_step("a1", "§2§ Done."),
         tool_step("a2"),
         text_step("a3", "§5§ §6§ It says file contents."),
     ];
     steps.extend(more);
-    let today = side_idling(false, steps.clone(), false, true, idle).await;
-    let store = side_idling(true, steps, false, true, idle).await;
+    let today = side_in(false, steps.clone(), false, true, idle, deployment()).await;
+    let store = side_in(true, steps, false, true, idle, deployment()).await;
     for side in [&today, &store] {
         assert!(matches!(
             side.send_request(
@@ -1707,6 +1721,171 @@ async fn an_idle_apply_view_reaches_the_next_runs_first_step_as_today() {
         })
         .collect();
     assert_eq!(applied, [1], "r3's first step applied the view");
+}
+
+/// A view the compaction provider applies with its build metadata (the entry it was built
+/// through and its policy for newly signed blocks, both covered by its checksum) is recorded
+/// alike by both storages, with the provider that applied it. Once the next run's first step
+/// applies it, that step's request renders it alike, and `session.applied_view` serves the same
+/// view and names the same provider.
+mod a_view_keeps_its_build_metadata_and_applier_alike {
+    use broca_session_store::keys::Cipher;
+
+    #[tokio::test]
+    async fn encrypted() {
+        super::a_view_keeps_its_build_metadata_and_applier_alike(Cipher::XChaCha20Poly1305).await;
+    }
+
+    #[tokio::test]
+    async fn plain() {
+        super::a_view_keeps_its_build_metadata_and_applier_alike(Cipher::None).await;
+    }
+}
+
+async fn a_view_keeps_its_build_metadata_and_applier_alike(
+    cipher: broca_session_store::keys::Cipher,
+) {
+    use broca_core::compaction_v2::protocol::view::{Edit, EditOp, View};
+    use broca_core::WalStore as _;
+    use std::collections::BTreeMap;
+    let (today, store) = contract_sessions_in(
+        false,
+        vec![text_step("a4", "after the view")],
+        Duration::from_secs(60),
+        || broca_session_store::keys::DeploymentKey::new(1, &[7; 32]).creating(cipher),
+    )
+    .await;
+    // Each storage mints its own message ids, so what names one is compared by the ordinal of
+    // the entry it names; the checksum covers the ids, so it is kept as whether present.
+    fn by_ordinal(value: &mut Value, mids: &BTreeMap<u64, String>) {
+        match value {
+            Value::String(text) => {
+                if let Some((ordinal, _)) = mids.iter().find(|(_, mid)| *mid == text) {
+                    *value = json!(format!("entry {ordinal}"));
+                }
+            }
+            Value::Object(members) => {
+                for (key, member) in members.iter_mut() {
+                    if key == "checksum" {
+                        *member = json!(member.is_string());
+                    } else {
+                        by_ordinal(member, mids);
+                    }
+                }
+            }
+            Value::Array(items) => items.iter_mut().for_each(|item| by_ordinal(item, mids)),
+            _ => {}
+        }
+    }
+    let mut ids = Vec::new();
+    for side in [&today, &store] {
+        let mids = entry_mids(side).await;
+        // The view drops the first run's reply, entry 2, and was built through the newest entry.
+        let newest = mids.values().next_back().unwrap().clone();
+        let view = View::seal_with_policy(
+            1,
+            vec![Edit::new(
+                1,
+                EditOp::Drop {
+                    mid: mids[&2].clone(),
+                    part: None,
+                },
+            )],
+            Some(newest),
+            Some("strip".into()),
+        );
+        assert_eq!(
+            side.compaction(Some("ck-mc"), "session.apply_view", json!({ "view": view }))
+                .await,
+            Ok(json!({"answer": "accepted"}))
+        );
+        ids.push(mids);
+    }
+    let old: Vec<Value> = FileWalStore::new(today.dir.join("wal"))
+        .read_records(&today.key)
+        .unwrap()
+        .into_iter()
+        .filter_map(|frame| match frame.record {
+            broca_wal::WalRecord::CompactionViewV2(view) => Some(json!({
+                "version": view.version,
+                "built_through": view.built_through,
+                "new_signed": view.new_signed,
+                "applied_by": view.applied_by,
+            })),
+            _ => None,
+        })
+        .collect();
+    let session = store
+        .registry
+        .store_runtime()
+        .unwrap()
+        .current_view(&store.key)
+        .await
+        .unwrap()
+        .unwrap();
+    let new: Vec<Value> = session
+        .open_log_records()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|(_, record)| match record {
+            broca_session_store::record::Record::View(view) => Some(json!({
+                "version": view.version,
+                "built_through": view.built_through,
+                "new_signed": view.new_signed,
+                "applied_by": view.applied_by,
+            })),
+            _ => None,
+        })
+        .collect();
+    let [mut old, mut new] = [Value::from(old), Value::from(new)];
+    by_ordinal(&mut old, &ids[0]);
+    by_ordinal(&mut new, &ids[1]);
+    assert_eq!(new, old, "both logs record the view alike");
+    let through = format!("entry {}", ids[0].keys().next_back().unwrap());
+    assert_eq!(
+        old,
+        json!([{"version": 1, "built_through": through, "new_signed": "strip",
+                "applied_by": "ck-mc"}])
+    );
+    for side in [&today, &store] {
+        assert!(matches!(
+            side.send_request("r3", untooled("again"), Some(planned("plan-1", None)))
+                .await,
+            SendOutcome::Active { .. } | SendOutcome::Pending { .. }
+        ));
+        side.settled("r3").await;
+        side.assert_completed("r3").await;
+    }
+    // r3's first step is the provider's fourth request.
+    let prompt = |side: &Side| serde_json::to_value(&side.provider.calls()[3].prompt).unwrap();
+    assert_eq!(prompt(&store), prompt(&today));
+    let mut served = Vec::new();
+    for (side, mids) in [&today, &store].into_iter().zip(&ids) {
+        let mut reply = side
+            .compaction(Some("ck-mc"), "session.applied_view", json!({}))
+            .await
+            .unwrap();
+        by_ordinal(&mut reply, mids);
+        served.push(reply);
+    }
+    assert_eq!(
+        served[1], served[0],
+        "the store serves the applied view as today's"
+    );
+    assert_eq!(served[0]["applied_by"], json!("ck-mc"), "{}", served[0]);
+    assert_eq!(
+        served[0]["view"]["built_through"],
+        json!(through),
+        "{}",
+        served[0]
+    );
+    assert_eq!(
+        served[0]["view"]["new_signed"],
+        json!("strip"),
+        "{}",
+        served[0]
+    );
 }
 
 /// The template the plan gives the session's owner: a pointer at one part of the session.

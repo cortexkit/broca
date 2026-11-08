@@ -461,6 +461,9 @@ fn a_seal_carries_ledger_records_into_the_new_log(cipher: Cipher) {
             version: 3,
             checksum: "c3".into(),
             edits: serde_json::json!([]),
+            built_through: None,
+            new_signed: None,
+            applied_by: None,
         });
         loaded
             .seal_carrying(

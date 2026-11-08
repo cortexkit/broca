@@ -380,6 +380,9 @@ fn an_accepted_view_waits_for_a_step_to_apply_it() {
             version,
             checksum: format!("c{version}"),
             edits: serde_json::json!([]),
+            built_through: None,
+            new_signed: None,
+            applied_by: None,
         })
     };
     let applied = Record::ViewApplied(crate::record::ViewApplied {

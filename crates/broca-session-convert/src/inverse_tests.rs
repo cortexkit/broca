@@ -240,6 +240,40 @@ fn current_compaction_records_round_trip() {
     assert_round_trip(&old);
 }
 
+/// An accepted view keeps its build metadata (the entry it was built through and its policy for
+/// newly signed blocks, both part of its checksum) and the provider that applied it: the
+/// converted `View` record holds all three, nothing is counted lost, and the inverse writes
+/// them back.
+#[test]
+fn a_views_build_metadata_and_applier_round_trip() {
+    use broca_session_store::record::Record;
+    let old = log(&[
+        &RUN.replace("RUN", "r"),
+        r#"{"type":"compaction_view_v2","version":3,"checksum":"c3","edits":[{"kind":"full","edit":{"op":"drop","mid":"m1"}}],"built_through":"m2","new_signed":"strip","applied_by":"ck-mc"}"#,
+        r#"{"type":"step_started","step_id":1}"#,
+        r#"{"type":"compaction_view_applied_v2","step_id":1,"version":3,"checksum":"c3"}"#,
+        STEP,
+    ]);
+    let converted = convert(&old, None).unwrap();
+    let view = converted
+        .records
+        .iter()
+        .find_map(|record| match record {
+            Record::View(view) => Some(view),
+            _ => None,
+        })
+        .expect("the accepted view converts");
+    assert_eq!(
+        (
+            view.built_through.as_deref(),
+            view.new_signed.as_deref(),
+            view.applied_by.as_deref()
+        ),
+        (Some("m2"), Some("strip"), Some("ck-mc"))
+    );
+    assert_round_trip(&old);
+}
+
 /// A tool batch carrying a queued send's text: `delivery` is the delivery record, written after
 /// the batch finishes, as today's loop writes it.
 fn ride_log(delivery: &str) -> Vec<FramedRecord> {

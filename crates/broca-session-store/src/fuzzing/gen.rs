@@ -795,7 +795,10 @@ mod records {
     crate::fuzzing::gen::fields!(View {
         version,
         checksum,
-        edits
+        edits,
+        built_through,
+        new_signed,
+        applied_by
     });
     crate::fuzzing::gen::fields!(ViewApplied {
         step_id,

@@ -1119,6 +1119,9 @@ fn convert_record(
                 version,
                 checksum,
                 edits,
+                built_through: f.string("built_through"),
+                new_signed: f.string("new_signed"),
+                applied_by: f.string("applied_by"),
             }));
         }
         "compaction_view_applied_v2" => out.records.push(Record::ViewApplied(ViewApplied {
