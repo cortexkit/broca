@@ -98,5 +98,6 @@ pub fn admission<P: Provider>(
             }),
         },
         pre_model_error: control.pre_model_error.clone(),
+        applies_refresh: control.applies_refresh.clone(),
     })
 }

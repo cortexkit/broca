@@ -510,10 +510,11 @@ pub fn with_facts(batch: Vec<Record>, at: &Placing<'_>) -> Result<Vec<Record>, S
     // Whether a run started in this batch takes its input from a queued send delivered by its
     // `idle_start` mode, whose messages today's reads name as delivered that way.
     let mut run_idle_start = false;
-    // The call whose result a queued send rides on in this batch: the results message the batch
-    // places is named as carrying it, as today's reads name the message its last ride took.
+    // Text a send delivered on a tool result without an envelope names the results message as
+    // delivered that way, as today's reads keep naming such deliveries. A ride with an envelope
+    // belongs to its call, never to the message.
     let riding: Option<ToolCallId> = batch.iter().rev().find_map(|record| match record {
-        Record::ResultAppend(append) if append.ride.is_some() => Some(append.tool_call_id.clone()),
+        Record::ResultAppend(append) if append.ride.is_none() => Some(append.tool_call_id.clone()),
         _ => None,
     });
     let mut records = batch.into_iter().peekable();
@@ -758,8 +759,9 @@ pub fn with_facts(batch: Vec<Record>, at: &Placing<'_>) -> Result<Vec<Record>, S
                 } else {
                     own.filter(|at| *at != 0)
                 };
-                // A results message a send rides on, and the input of a run an `idle_start`
-                // delivery started, are named as delivered that way, as today's reads name them.
+                // A results message text without an envelope was delivered on, and the input of a
+                // run an `idle_start` delivery started, are named as delivered that way, as
+                // today's reads name them.
                 let (delivery_mode, delivery_tool_call_id) = match (&record, &riding) {
                     (Record::ToolReply(_), Some(call)) => {
                         (Some("tool_result".to_owned()), Some(call.0.clone()))
@@ -1208,15 +1210,14 @@ pub fn ride_notice(append: &ResultAppend, calls: &[ToolCallId]) -> Option<RideNo
     })
 }
 
-/// `facts`, the facts of the tool results message the ride `append` landed on, restated with the
-/// ride's `notice` added, naming the message as delivered as a tool result on the ride's call,
-/// as today's reads name the message a ride took. The converter and the run loop both write one
-/// right after each ride, so a session reads the same whichever wrote it.
-pub fn with_ride(facts: &EntryFacts, append: &ResultAppend, notice: RideNotice) -> EntryFacts {
+/// `facts`, the facts of the tool results message a ride landed on, restated with the ride's
+/// `notice` added. The message keeps its own delivery attribution: a ride with an envelope belongs
+/// to its call, not to the message, so today's reads attribute no delivery to the message it
+/// took. The converter and the run loop both write one right after each ride, so a session reads
+/// the same whichever wrote it.
+pub fn with_ride(facts: &EntryFacts, notice: RideNotice) -> EntryFacts {
     let mut facts = facts.clone();
     facts.notices.push(notice);
-    facts.delivery_mode = Some("tool_result".into());
-    facts.delivery_tool_call_id = Some(append.tool_call_id.0.clone());
     facts
 }
 
@@ -1261,7 +1262,7 @@ fn restate_for_ride(
         .ok_or_else(|| {
             format!("entry facts: the results message {ordinal} a send rides on has no facts")
         })?;
-    Ok(Some(with_ride(facts, append, notice)))
+    Ok(Some(with_ride(facts, notice)))
 }
 
 /// The id a message converted from today's storage takes at `position` (its ordinal less one),
@@ -1403,9 +1404,9 @@ fn describe<'r>(
                 // An imported seed belongs to no run.
                 run_id: (input.placement != Placement::Imported).then(|| input.run_id.clone()),
                 created_at_ms: accepted_at(input, at),
-                // A run started by a queued send's `idle_start` delivery and a send riding on a
-                // tool result (`tool_result`) aren't named here: `with_facts` names them, from
-                // the run's start and the batch's rides.
+                // A run started by a queued send's `idle_start` delivery and text delivered on a
+                // tool result without an envelope aren't named here: `with_facts` names them,
+                // from the run's start and the batch's deliveries.
                 delivery_mode: match input.placement {
                     Placement::Delivered => Some("steer"),
                     Placement::DeliveredTurnSystem => Some("turn_system"),

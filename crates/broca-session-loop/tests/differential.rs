@@ -1849,6 +1849,7 @@ impl Scenario {
     fn plain_request_for(&self, run_id: &str, input: &[Message]) -> RunRequest {
         RunRequest {
             route_decision_id: None,
+            account_route: None,
             input_written_at_ms: None,
             directives: None,
             session_class: None,
@@ -4354,11 +4355,20 @@ async fn compare_actions_every_cut_once(
             .collect();
         for (index, (new, today)) in new_records.iter().zip(today_appended).enumerate() {
             if envelope_lost && today["ResultAppend"]["ride"].is_null() {
+                // Without its envelope today's ride is a delivery of the old kind, which names
+                // the results message as delivered on its call; the new loop's ride, with its
+                // envelope, names nothing on the message.
                 let without = |record: &Value| {
                     let mut record = record.clone();
                     if let Some(append) = record["ResultAppend"].as_object_mut() {
                         append.remove("ride");
                         append.remove("send_id");
+                    }
+                    if let Some(facts) = record["EntryFacts"].as_object_mut() {
+                        if facts["delivery_mode"] == "tool_result" {
+                            facts.insert("delivery_mode".into(), Value::Null);
+                            facts.insert("delivery_tool_call_id".into(), Value::Null);
+                        }
                     }
                     record
                 };

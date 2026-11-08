@@ -391,6 +391,7 @@ pub enum ImportOutcome {
 #[derive(Debug, Clone, PartialEq)]
 pub enum SendOutcome {
     RouteDecisionFixed,
+    AccountRouteFixed,
     SessionMoving {
         cut_id: String,
     },
@@ -1378,6 +1379,7 @@ fn submission_from_config(
     let policy_allowed = config.tools.iter().map(|tool| tool.name.clone()).collect();
     SubmissionRequest {
         route_decision_id: config.route_decision_id,
+        account_route: config.account_route,
         service_tier_level: None,
         staged_uploads: None,
         content: Vec::new(),
@@ -1406,6 +1408,35 @@ fn submission_from_config(
         inherit_frozen: Default::default(),
         structured_output: None,
         client_message_id: None,
+    }
+}
+
+#[cfg(test)]
+mod account_route_resume_tests {
+    #[test]
+    fn account_route_resume_reconstructs_the_frozen_route_not_render_names() {
+        let config: broca_wal::RunConfig = serde_json::from_value(serde_json::json!({
+            "model":{"provider_module_id":"vendor","model_id":"vendor-model"},
+            "tools":[],"tool_choice":{"type":"auto"},"generation":{},
+            "response_format":{"type":"text"},"context_epoch":0,"renderer_version":1,
+            "account_route":{"provider":"routing-provider","model":"routing-model"}
+        }))
+        .unwrap();
+        let request = super::submission_from_config(config, vec![]);
+        let run = broca_core::RunRequest::from_submission(
+            request,
+            broca_protocol::RunId("resume".into()),
+            broca_protocol::BindIdentity::new("/project", "runner", "session"),
+            broca_protocol::SubmissionId("sub-resume".into()),
+        );
+        assert_eq!(
+            run.account_route.as_ref().unwrap().provider,
+            "routing-provider"
+        );
+        assert_eq!(run.account_route.as_ref().unwrap().model, "routing-model");
+        assert_eq!(run.model.provider_module_id, "vendor");
+        assert_eq!(run.model.model_id, "vendor-model");
+        assert_eq!(run.to_submission().account_route, run.account_route);
     }
 }
 
@@ -2574,21 +2605,22 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 let prior_reply = self.send_reply.replace(reply);
                 // Input preparation carries admission and staging state; heap-own its
                 // future so ordinary command polling does not copy that state on the stack.
-                let outcome = Box::pin(self.on_send(
-                    run_id,
-                    *request,
-                    kind,
-                    key,
-                    skip_materialization,
-                    delivery,
-                    plan.map(|plan| *plan),
-                    conversation_key,
-                    title,
-                    retention,
-                    session_class,
-                    stop_sequences_named,
-                ))
-                .await;
+                let outcome = self
+                    .on_send(
+                        run_id,
+                        *request,
+                        kind,
+                        key,
+                        skip_materialization,
+                        delivery,
+                        plan.map(|plan| *plan),
+                        conversation_key,
+                        title,
+                        retention,
+                        session_class,
+                        stop_sequences_named,
+                    )
+                    .await;
                 let _ = self.sync_retention_index().await;
                 self.admitting_retention = None;
                 self.admitting_order = None;
@@ -3620,8 +3652,43 @@ impl<W: WalStore + 'static> LineageActor<W> {
     /// Start a run (idle), acknowledge an idempotent retry, or durably queue new work. With
     /// a run active, `delivery` decides what the new message does: wait for it as the next turn
     /// (`Queue`), join it at its next step (`Steer`), or replace it (`Interrupt`).
+    ///
+    /// Returns the send's future boxed (see [`ActorFuture`]): command polling nests it above
+    /// admission recovery and delivery.
     #[allow(clippy::too_many_arguments)]
-    async fn on_send(
+    fn on_send(
+        &mut self,
+        run_id: RunId,
+        request: SubmissionRequest,
+        kind: RunKind,
+        key: SendKey,
+        skip_materialization: bool,
+        delivery: broca_protocol::Delivery,
+        plan: Option<SendPlan>,
+        conversation_key: Option<String>,
+        title: Option<String>,
+        retention: Option<u64>,
+        session_class: Option<String>,
+        stop_sequences_named: bool,
+    ) -> ActorFuture<'_, SendOutcome> {
+        Box::pin(self.on_send_inline(
+            run_id,
+            request,
+            kind,
+            key,
+            skip_materialization,
+            delivery,
+            plan,
+            conversation_key,
+            title,
+            retention,
+            session_class,
+            stop_sequences_named,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn on_send_inline(
         &mut self,
         run_id: RunId,
         mut request: SubmissionRequest,
@@ -3866,6 +3933,10 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     ))
                 }
             };
+            let ownership = match self.with_scope_reservation(ownership).await {
+                Ok(ownership) => ownership,
+                Err(error) => return SendOutcome::Transient(error),
+            };
             self.session_change_recorded |= ownership.session_change_recorded;
             if let Some(first) = &ownership.first_episode {
                 let _ = self.first_episode.set(first.clone());
@@ -3983,7 +4054,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 if let Err(error) = self.sync_session_change_from_wal().await {
                     return SendOutcome::Transient(error);
                 }
-                let drift = if self.session_change.accepted_generation > 0 {
+                let refreshed = (self.session_change.accepted_generation > 0).then(|| {
                     let effective = self
                         .session_change
                         .current_manifest
@@ -3994,19 +4065,11 @@ impl<W: WalStore + 'static> LineageActor<W> {
                         .accepted
                         .get(&self.session_change.accepted_generation)
                         .map(|(identity, _)| identity.as_str());
-                    cortexkit_role_llm_runner::session_change::check_send_drift(
-                        effective,
-                        accepted,
-                        &plan.identity,
-                    )
-                    .map_err(|detail| broca_fetch_plan::Refusal::PlanDrift {
-                        frozen: detail.frozen,
-                        sent: detail.sent,
-                    })
-                } else {
-                    broca_fetch_plan::check_later_plan(frozen, &plan.identity)
-                };
-                if let Err(refusal) = drift {
+                    (effective, accepted)
+                });
+                if let Err(refusal) =
+                    crate::plan_change::later_send_plan(frozen, refreshed, &plan.identity)
+                {
                     return SendOutcome::PlanRefused(refusal);
                 }
             }
@@ -4051,6 +4114,24 @@ impl<W: WalStore + 'static> LineageActor<W> {
             .as_ref()
             .filter(|_| running)
             .map(|episode| episode.config.route_decision_id.clone());
+        let joins_run = delivery == broca_protocol::Delivery::Steer
+            || self.admitting_order.as_ref().is_some_and(|order| {
+                order
+                    .modes
+                    .iter()
+                    .any(|mode| *mode != broca_protocol::request::DeliveryMode::IdleStart)
+            });
+        let fixed_account_route = checkpoint
+            .last_episode
+            .as_ref()
+            .filter(|episode| running && (joins_run || episode.run_id == run_id))
+            .map(|episode| episode.config.account_route.clone());
+        let joining_frozen_run = fixed_account_route.is_some();
+        if let (Some(requested), Some(fixed)) = (&request.account_route, &fixed_account_route) {
+            if Some(requested) != fixed.as_ref() {
+                return SendOutcome::AccountRouteFixed;
+            }
+        }
         if let (Some(requested), Some(fixed)) = (&request.route_decision_id, &fixed_route_decision)
         {
             if Some(requested) != fixed.as_ref() {
@@ -4379,6 +4460,9 @@ impl<W: WalStore + 'static> LineageActor<W> {
         if let Some(fixed) = fixed_route_decision {
             request.route_decision_id = fixed;
         }
+        if let Some(fixed) = fixed_account_route {
+            request.account_route = fixed;
+        }
         let selection = checkpoint
             .head
             .as_ref()
@@ -4440,6 +4524,19 @@ impl<W: WalStore + 'static> LineageActor<W> {
                         broca_protocol::ModelHandle::new(&selection.provider, &selection.model);
                     request.variant = selection.variant.clone();
                 }
+            }
+        }
+        if request.account_route.is_some() && !resume_indexed_run && !joining_frozen_run {
+            let mut effective = request.clone();
+            if let Some(episode) = &checkpoint.last_episode {
+                inherit_frozen_parameters(&mut effective, &episode.config);
+            }
+            if let Err(message) = self.executor.check_account_route(&effective) {
+                return SendOutcome::DeliveryRefused {
+                    code: "invalid_params",
+                    field: "account_route",
+                    message,
+                };
             }
         }
         if (broca_protocol::service_tier_enabled() || selection.is_some()) && !resume_indexed_run {
@@ -4664,8 +4761,33 @@ impl<W: WalStore + 'static> LineageActor<W> {
 
     /// A send with no run to steer into or interrupt: start it now when the lineage is idle,
     /// or durably queue it (as `delivery`) behind the active run or the queued work.
+    ///
+    /// Returns the plain send's future boxed (see [`ActorFuture`]): send, steer, and interrupt
+    /// delivery await it deep in the send path.
     #[allow(clippy::too_many_arguments)]
-    async fn send_plain(
+    fn send_plain(
+        &mut self,
+        run_id: RunId,
+        request: SubmissionRequest,
+        kind: RunKind,
+        identity: SendIdentity,
+        skip_materialization: bool,
+        resume_indexed_run: bool,
+        delivery: broca_protocol::Delivery,
+    ) -> ActorFuture<'_, SendOutcome> {
+        Box::pin(self.send_plain_inline(
+            run_id,
+            request,
+            kind,
+            identity,
+            skip_materialization,
+            resume_indexed_run,
+            delivery,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn send_plain_inline(
         &mut self,
         run_id: RunId,
         request: SubmissionRequest,
@@ -4893,7 +5015,29 @@ impl<W: WalStore + 'static> LineageActor<W> {
     /// and synced before the reply, which names the running run: the message is then durably in
     /// the transcript. With no run active this is a plain send. A restart-paused run accepts
     /// durable steers for its next step; other pauses refuse messages they cannot render.
-    async fn steer_submission(
+    ///
+    /// Returns the steer's future boxed (see [`ActorFuture`]): send delivery awaits it above
+    /// checkpoint recovery and plain-send fallback.
+    fn steer_submission(
+        &mut self,
+        run_id: RunId,
+        request: SubmissionRequest,
+        kind: RunKind,
+        identity: SendIdentity,
+        skip_materialization: bool,
+        stop_sequences_named: bool,
+    ) -> ActorFuture<'_, SendOutcome> {
+        Box::pin(self.steer_submission_inline(
+            run_id,
+            request,
+            kind,
+            identity,
+            skip_materialization,
+            stop_sequences_named,
+        ))
+    }
+
+    async fn steer_submission_inline(
         &mut self,
         run_id: RunId,
         mut request: SubmissionRequest,
@@ -5255,7 +5399,27 @@ impl<W: WalStore + 'static> LineageActor<W> {
     /// by the startup sweep, if the process dies first), and the queue then drains the
     /// interrupt ahead of every plain entry. A paused run is ended the same way; with no run
     /// at all this is a plain send.
-    async fn interrupt_submission(
+    ///
+    /// Returns the interrupt's future boxed (see [`ActorFuture`]): send delivery awaits it
+    /// above queue admission and plain-send fallback.
+    fn interrupt_submission(
+        &mut self,
+        run_id: RunId,
+        request: SubmissionRequest,
+        kind: RunKind,
+        identity: SendIdentity,
+        skip_materialization: bool,
+    ) -> ActorFuture<'_, SendOutcome> {
+        Box::pin(self.interrupt_submission_inline(
+            run_id,
+            request,
+            kind,
+            identity,
+            skip_materialization,
+        ))
+    }
+
+    async fn interrupt_submission_inline(
         &mut self,
         run_id: RunId,
         request: SubmissionRequest,
@@ -5461,6 +5625,19 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 "the admission snapshot carries no ownership summary".into(),
             ));
         };
+        // A caller's send that would open the session's first episode meets the scope
+        // reservation, if a scoped bind recorded one; sends made inside broca take none.
+        let reserved;
+        let ownership =
+            if ownership.episodes == 0 && request.scope != broca_protocol::SendScope::Internal {
+                reserved = self
+                    .with_scope_reservation(ownership.clone())
+                    .await
+                    .map_err(StartRunFailure::Infrastructure)?;
+                &reserved
+            } else {
+                ownership
+            };
         let episode_scope = self
             .decide_session_scope(ownership, request.principal.as_ref(), &request.scope)
             .map_err(StartRunFailure::Scope)?
@@ -5579,22 +5756,14 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     .as_ref()
                     .and_then(|first| first.manifest.clone())
             });
-            if resuming {
-                // A pending refresh cannot change an episode re-driven after a crash.
-                current
-            } else {
-                if let Some(pending) = self.pending_for_model(&resolved_request.model) {
-                    broca_fetch_plan::session_change::check_applying_model(
-                        pending,
-                        &resolved_request.model,
-                        resolved_request.variant.as_deref(),
-                    )
-                    .map_err(StartRunFailure::PlanRefused)?;
-                    Some(pending.manifest.clone())
-                } else {
-                    current
-                }
-            }
+            crate::plan_change::run_manifest(
+                current,
+                self.pending_for_model(&resolved_request.model),
+                resuming,
+                &resolved_request.model,
+                resolved_request.variant.as_deref(),
+            )
+            .map_err(StartRunFailure::PlanRefused)?
         };
         // Every path that starts an episode passes here (a direct send, a drained queue, a
         // queue rebuilt after a crash), so an episode whose plan asks a provider to confine its
@@ -6584,7 +6753,18 @@ impl<W: WalStore + 'static> LineageActor<W> {
 
     /// Render once at admission from the attested sender's effective template. The queued
     /// request contains the resulting text, so recovery replays bytes rather than slots.
-    async fn render_ordered_template(
+    ///
+    /// Returns the template-rendering future boxed (see [`ActorFuture`]): send admission
+    /// awaits rendering before it queues or starts delivery.
+    fn render_ordered_template<'a>(
+        &'a mut self,
+        request: &'a mut SubmissionRequest,
+        template: &'a cortexkit_role_llm_runner::delivery_order::TemplateUse,
+    ) -> ActorFuture<'a, Result<(), SendOutcome>> {
+        Box::pin(self.render_ordered_template_inline(request, template))
+    }
+
+    async fn render_ordered_template_inline(
         &mut self,
         request: &mut SubmissionRequest,
         template: &cortexkit_role_llm_runner::delivery_order::TemplateUse,
@@ -6667,7 +6847,27 @@ impl<W: WalStore + 'static> LineageActor<W> {
     /// written under its inbox lock, so a send the turn already delivered is never replaced and
     /// the turn sees the new send at its next boundary. On an idle session a list naming
     /// `idle_start` then drains into a run at once; any other list waits.
-    async fn queue_ordered_submission(
+    ///
+    /// Returns ordered queue admission's future boxed (see [`ActorFuture`]): send delivery
+    /// awaits it above submission preparation and durable queue writes.
+    fn queue_ordered_submission(
+        &mut self,
+        run_id: RunId,
+        request: SubmissionRequest,
+        identity: SendIdentity,
+        skip_materialization: bool,
+        order: broca_protocol::DeliveryOrder,
+    ) -> ActorFuture<'_, SendOutcome> {
+        Box::pin(self.queue_ordered_submission_inline(
+            run_id,
+            request,
+            identity,
+            skip_materialization,
+            order,
+        ))
+    }
+
+    async fn queue_ordered_submission_inline(
         &mut self,
         run_id: RunId,
         mut request: SubmissionRequest,
@@ -7108,17 +7308,25 @@ impl<W: WalStore + 'static> LineageActor<W> {
         &self,
         model: &broca_protocol::ModelHandle,
     ) -> Option<&broca_fetch_plan::session_change::PendingState> {
-        let model = format!("{}:{}", model.provider_module_id, model.model_id);
-        let switched = self
-            .session_change_last_model
-            .as_ref()
-            .is_some_and(|previous| previous != &model);
-        self.session_change.pending.as_ref().filter(|pending| {
-            pending.policy == "immediately"
-                || self.session_change_flushed
-                || (pending.policy == "on_prefix_rebuild"
-                    && (self.session_change_rebuild || switched))
-        })
+        crate::plan_change::pending_applying(
+            self.session_change.pending.as_ref(),
+            self.session_change_rebuild,
+            self.session_change_flushed,
+            self.session_change_last_model.as_deref(),
+            model,
+        )
+    }
+
+    /// The plan-change facts this actor holds, for a request naming `generation` and `send_id`.
+    fn change_facts(
+        &self,
+        generation: Option<u64>,
+        send_id: Option<&str>,
+    ) -> crate::plan_change::ChangeFacts {
+        let mut facts =
+            crate::plan_change::ChangeFacts::of(&self.session_change, generation, send_id);
+        facts.flushed = self.session_change_flushed;
+        facts
     }
 
     /// Serialize acceptance against episode starts and other changes. The fetched manifest and
@@ -7129,63 +7337,35 @@ impl<W: WalStore + 'static> LineageActor<W> {
         policy: String,
         manifest: Box<broca_wal::PlanManifest>,
     ) -> SessionRefreshOutcome {
-        use crate::serve::SessionChangeError;
-        use cortexkit_role_llm_runner::session_change::{refresh_order, RefreshOrder};
+        use crate::plan_change::RefreshAcceptance;
         if self.wal_store.check_move(&self.key, true).is_err() {
             return SessionRefreshOutcome::Reopen;
         }
         if let Err(error) = self.sync_session_change_from_wal().await {
             return SessionRefreshOutcome::Error(error);
         }
-        match refresh_order(
-            self.session_change.accepted_generation,
+        let (run_in_progress, applies_from_next_run) = match crate::plan_change::accept_refresh(
+            &self.change_facts(Some(generation), None),
             generation,
-            &manifest.plan_identity,
             &policy,
-            self.session_change.earlier(generation),
+            &manifest,
+            matches!(self.state, RunState::Active { .. }),
         ) {
-            RefreshOrder::Repeat => {
-                let (run_in_progress, applies_from_next_run) =
-                    self.session_change.accepted_replies[&generation];
+            RefreshAcceptance::Repeat {
+                run_in_progress,
+                applies_from_next_run,
+            } => {
                 return SessionRefreshOutcome::Accepted {
                     run_in_progress,
                     applies_from_next_run,
-                };
+                }
             }
-            RefreshOrder::Stale => {
-                return SessionRefreshOutcome::Refused(SessionChangeError::GenerationStale {
-                    accepted: self.session_change.accepted_generation,
-                })
-            }
-            RefreshOrder::New => {}
-        }
-        let next_plan =
-            serde_json::from_str(manifest.plan.as_json_text()).expect("admitted plan is JSON");
-        if broca_fetch_plan::session_change::check_compaction_item(
-            self.session_change.current_manifest.as_deref(),
-            &next_plan,
-        )
-        .is_err()
-        {
-            return SessionRefreshOutcome::Refused(SessionChangeError::InvalidParams {
-                field: "plan.compaction_item".into(),
-                message:
-                    "the session's compaction provider, preset and params are fixed for its life"
-                        .into(),
-            });
-        }
-        if let Some(surface) = broca_fetch_plan::session_change::unsupported_surface(
-            self.session_change.current_manifest.as_deref(),
-            &manifest,
-            &policy,
-        ) {
-            return SessionRefreshOutcome::Refused(SessionChangeError::RungUnsupported {
-                surface: surface.into(),
-                rung: policy,
-            });
-        }
-        let run_in_progress = matches!(self.state, RunState::Active { .. });
-        let applies_from_next_run = policy == "immediately" || self.session_change_flushed;
+            RefreshAcceptance::Refused(refusal) => return SessionRefreshOutcome::Refused(refusal),
+            RefreshAcceptance::Accept {
+                run_in_progress,
+                applies_from_next_run,
+            } => (run_in_progress, applies_from_next_run),
+        };
         let writer = self
             .writer
             .as_ref()
@@ -7227,8 +7407,8 @@ impl<W: WalStore + 'static> LineageActor<W> {
         if let Err(error) = self.sync_session_change_from_wal().await {
             return SessionRefreshPolicyOutcome::Error(error);
         }
-        match crate::serve::check_session_policy(
-            &self.session_change,
+        match crate::plan_change::check_policy(
+            &self.change_facts(Some(generation), Some(&send_id)),
             generation,
             &policy,
             &send_id,
@@ -7266,20 +7446,17 @@ impl<W: WalStore + 'static> LineageActor<W> {
         if let Err(error) = self.sync_session_change_from_wal().await {
             return SessionFlushPrefixOutcome::Error(error);
         }
-        if let Some(pending_generation) = self.session_change.flush_send_ids.get(&send_id) {
-            return SessionFlushPrefixOutcome::Flushed {
-                pending_generation: *pending_generation,
+        let pending_generation =
+            match crate::plan_change::flush(&self.change_facts(None, Some(&send_id))) {
+                Err(pending_generation) => {
+                    return SessionFlushPrefixOutcome::Flushed { pending_generation }
+                }
+                Ok(pending_generation) => pending_generation,
             };
-        }
         if let Err(error) = self.wal_store.check_move(&self.key, true) {
             let _ = error;
             return SessionFlushPrefixOutcome::Reopen;
         }
-        let pending_generation = self
-            .session_change
-            .pending
-            .as_ref()
-            .map(|pending| pending.generation);
         let writer = self
             .writer
             .as_ref()
@@ -10025,6 +10202,19 @@ impl<W: WalStore + 'static> LineageActor<W> {
         broca_core::scope_admission::AGENT_RUN_SCOPES_WRITER_ENABLED
     }
 
+    /// `ownership` with the session's scope reservation filled in while it has no episode, so
+    /// admission can refuse a first send from anyone but the owner whose scoped bind reserved
+    /// the address. A session with episodes is returned unchanged, without a read.
+    async fn with_scope_reservation(
+        &self,
+        mut ownership: broca_core::SessionOwnershipV1,
+    ) -> Result<broca_core::SessionOwnershipV1, String> {
+        if ownership.episodes == 0 {
+            ownership.reservation = self.registry.scope_reservation(&self.key).await?;
+        }
+        Ok(ownership)
+    }
+
     fn decide_session_scope(
         &self,
         ownership: &broca_core::SessionOwnershipV1,
@@ -12217,6 +12407,12 @@ mod tests {
 
     #[async_trait]
     impl RunExecutor for CancelPresenceExecutor {
+        fn check_account_route(
+            &self,
+            request: &broca_protocol::request::SubmissionRequest,
+        ) -> Result<(), String> {
+            self.gate.check_account_route(request)
+        }
         async fn execute(
             &self,
             job: RunJob,
@@ -13016,6 +13212,7 @@ mod tests {
 
     pub(super) fn min_config() -> broca_wal::RunConfig {
         broca_wal::RunConfig {
+            account_route: None,
             global_system: None,
             route_decision_id: None,
             account_limit_pause: false,
@@ -13108,6 +13305,7 @@ mod tests {
     pub(super) fn text_req(key: &BindIdentity, run: &str) -> RunRequest {
         use broca_protocol::content::{ContentBlock, Message, Role};
         RunRequest {
+            account_route: None,
             route_decision_id: None,
             input_written_at_ms: None,
             directives: None,
@@ -14266,6 +14464,12 @@ mod tests {
 
     #[async_trait]
     impl RunExecutor for HeldRetentionCompletion {
+        fn check_account_route(
+            &self,
+            request: &broca_protocol::request::SubmissionRequest,
+        ) -> Result<(), String> {
+            RetentionDone.check_account_route(request)
+        }
         async fn execute(
             &self,
             job: RunJob,
@@ -15454,15 +15658,41 @@ mod tests {
     /// `recover_startup_admission_view`), a whole recover-and-start chain deeper than the
     /// recovery `run` starts with, and recovery awaits `start_run` and `drain_queue_one` at a
     /// dozen sites. Inline, unoptimized Windows builds overflowed a 2 MiB thread running
-    /// `startup_recovery_budget_exhaustion_fails_send_closed`. These must stay boxed.
+    /// `startup_recovery_budget_exhaustion_fails_send_closed`. The send path also nests
+    /// `on_send`, `steer_submission`, `interrupt_submission`, and `send_plain`, along with
+    /// ordered template rendering and queue admission. Send-path growth overflowed the test
+    /// thread on Windows running
+    /// `scheduler_multiple_multimessage_steers_keep_identical_boundary_inputs_and_queue`.
+    /// These must stay boxed.
     #[test]
     fn deeply_awaited_actor_futures_are_boxed() {
         fn future_size<'a, T: 'a, Fut>(_: impl FnOnce(&'a mut T) -> Fut) -> usize {
             std::mem::size_of::<Fut>()
         }
+        fn future_size_2<'a, T: 'a, A, B, Fut>(_: impl FnOnce(&'a mut T, A, B) -> Fut) -> usize {
+            std::mem::size_of::<Fut>()
+        }
+        #[allow(clippy::too_many_arguments)]
+        fn future_size_5<'a, T: 'a, A, B, C, D, E, Fut>(
+            _: impl FnOnce(&'a mut T, A, B, C, D, E) -> Fut,
+        ) -> usize {
+            std::mem::size_of::<Fut>()
+        }
         #[allow(clippy::too_many_arguments)]
         fn future_size_6<'a, T: 'a, A, B, C, D, E, G, Fut>(
             _: impl FnOnce(&'a mut T, A, B, C, D, E, G) -> Fut,
+        ) -> usize {
+            std::mem::size_of::<Fut>()
+        }
+        #[allow(clippy::too_many_arguments)]
+        fn future_size_7<'a, T: 'a, A, B, C, D, E, F, G, Fut>(
+            _: impl FnOnce(&'a mut T, A, B, C, D, E, F, G) -> Fut,
+        ) -> usize {
+            std::mem::size_of::<Fut>()
+        }
+        #[allow(clippy::too_many_arguments)]
+        fn future_size_12<'a, T: 'a, A, B, C, D, E, F, G, H, I, J, K, L, Fut>(
+            _: impl FnOnce(&'a mut T, A, B, C, D, E, F, G, H, I, J, K, L) -> Fut,
         ) -> usize {
             std::mem::size_of::<Fut>()
         }
@@ -15476,6 +15706,21 @@ mod tests {
             ),
             ("drain_queue_one", future_size(Actor::drain_queue_one)),
             ("start_run", future_size_6(Actor::start_run)),
+            ("on_send", future_size_12(Actor::on_send)),
+            ("steer_submission", future_size_6(Actor::steer_submission)),
+            (
+                "interrupt_submission",
+                future_size_5(Actor::interrupt_submission),
+            ),
+            ("send_plain", future_size_7(Actor::send_plain)),
+            (
+                "render_ordered_template",
+                future_size_2(Actor::render_ordered_template),
+            ),
+            (
+                "queue_ordered_submission",
+                future_size_5(Actor::queue_ordered_submission),
+            ),
         ] {
             assert!(
                 size <= 4096,

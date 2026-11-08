@@ -36,7 +36,11 @@ async fn interrupted_first_send_resumes_under_its_reserved_workdir_address() {
         .unwrap();
         assert_eq!(
             index
-                .resolve_session_address(&bind, Some(std::path::Path::new("/stamped/worktree")))
+                .resolve_session_address(
+                    &bind,
+                    Some(std::path::Path::new("/stamped/worktree")),
+                    None
+                )
                 .unwrap(),
             request().session
         );
@@ -99,7 +103,11 @@ async fn interrupted_first_send_resumes_under_its_reserved_workdir_address() {
         let index = broca_store::SqliteStore::open(&recovered_database).unwrap();
         let rebound = BindIdentity::new("/different/transport", "runner", "address-crash");
         let recovered = index
-            .resolve_session_address(&rebound, Some(std::path::Path::new("/stamped/worktree")))
+            .resolve_session_address(
+                &rebound,
+                Some(std::path::Path::new("/stamped/worktree")),
+                None,
+            )
             .unwrap();
         assert_eq!(recovered, request().session, "{}", kill.label());
         let resumed = handle.resume(&kill).await;

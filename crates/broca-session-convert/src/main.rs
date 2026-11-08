@@ -1377,6 +1377,9 @@ struct OpsReport {
     /// For each compared field that is usually empty, how many compared states had a value on
     /// today's side. A field that is never set anywhere compares nothing.
     set_on_today: BTreeMap<&'static str, u64>,
+    /// Visited logs with a refresh, refresh-policy or prefix-flush record: the logs whose plan
+    /// changes the comparison exercises beyond the manifests runs froze.
+    plan_change_logs: u64,
 }
 
 /// Serializing values of different types through one closure.
@@ -1461,7 +1464,9 @@ fn compare_ops(old: &[FramedRecord], lineage: Option<&str>) -> OpsOutcome {
     };
     let owner_differs = owner_difference(old, &operations)
         .or_else(|| first_episode_difference(old, &operations, &parts))
-        .or_else(|| session_usage_difference(&records, &operations));
+        .or_else(|| session_usage_difference(&records, &operations))
+        .or_else(|| plan_difference(old, &converted.records, &operations, &parts))
+        .or_else(|| head_plan_difference(&records, &operations, &parts));
     let Some(run) = operations.run else {
         // Nothing to compare only when today's replay has no run either.
         return if today.run_id.is_none() && owner_differs.is_none() {
@@ -1709,6 +1714,205 @@ fn session_usage_difference(
     (json(&today.usage) != json(&folded)).then(|| "session_usage".to_owned())
 }
 
+/// Whether the fold's plan changes differ from today's `SessionChangeState` folded from the same
+/// log, naming the first field that does: what was accepted and applied, the pending change, the
+/// latest applied change's baseline facts, the manifests of the latest run and the latest prefix
+/// rebuild, the rebuild and flush marks and the latest run's model. Today's per-generation and
+/// per-`send_id` answers are compared with the newest of the converted `records` the session's id
+/// index names under the same key (`record_ids`), which is where the store reads them.
+fn plan_difference(
+    old: &[FramedRecord],
+    records: &[broca_session_store::record::Record],
+    operations: &broca_session_store::fold::operations::Operations,
+    parts: &broca_session_loop::parts::MemoryParts,
+) -> Option<String> {
+    use broca_session_store::fold::operations::{ManifestRef, Plan};
+    use broca_session_store::idindex::IdKind;
+    use broca_session_store::record::Record;
+    let today = broca_fetch_plan::session_change::SessionChangeState::fold(old);
+    let default = Plan::default();
+    let plan = operations.plan.as_ref().unwrap_or(&default);
+    // The newest ledger record under each id the index keeps for plan changes.
+    let mut indexed: BTreeMap<(u8, String), &Record> = BTreeMap::new();
+    for record in records {
+        if record.stream() != Stream::Ledger {
+            continue;
+        }
+        for (kind, id) in broca_session_store::idindex::record_ids(record) {
+            let code = match kind {
+                IdKind::RefreshGeneration => 5,
+                IdKind::RefreshPolicySendId => 6,
+                IdKind::PrefixFlushSendId => 7,
+                IdKind::AppliedGeneration => 8,
+                _ => continue,
+            };
+            indexed.insert((code, id), record);
+        }
+    }
+    let index_of = |code: u8| {
+        indexed
+            .iter()
+            .filter(move |((indexed, _), _)| *indexed == code)
+            .map(|((_, id), record)| (id.clone(), *record))
+    };
+    let accepted: BTreeMap<String, (String, String, bool, bool)> = index_of(5)
+        .filter_map(|(id, record)| match record {
+            Record::SessionRefresh(refresh) => Some((
+                id,
+                (
+                    ManifestRef::of_refresh(refresh)
+                        .plan_identity()
+                        .unwrap_or_default()
+                        .to_owned(),
+                    refresh.policy.clone(),
+                    refresh.run_in_progress,
+                    refresh.applies_from_next_run,
+                ),
+            )),
+            _ => None,
+        })
+        .collect();
+    let today_accepted: BTreeMap<String, (String, String, bool, bool)> = today
+        .accepted
+        .iter()
+        .map(|(generation, (identity, policy))| {
+            let (run_in_progress, applies) = today.accepted_replies[generation];
+            (
+                generation.to_string(),
+                (identity.clone(), policy.clone(), run_in_progress, applies),
+            )
+        })
+        .collect();
+    let policy_sends: BTreeMap<String, (u64, String)> = index_of(6)
+        .filter_map(|(id, record)| match record {
+            Record::RefreshPolicy(policy) => Some((id, (policy.generation, policy.policy.clone()))),
+            _ => None,
+        })
+        .collect();
+    let flush_sends: BTreeMap<String, Option<u64>> = index_of(7)
+        .filter_map(|(id, record)| match record {
+            Record::PrefixFlush(flush) => Some((id, flush.pending_generation)),
+            _ => None,
+        })
+        .collect();
+    let applied: BTreeMap<String, String> = index_of(8)
+        .filter_map(|(id, record)| match record {
+            Record::RefreshApplied(applied) => Some((id, applied.applied_by.clone())),
+            _ => None,
+        })
+        .collect();
+    let today_applied: BTreeMap<String, String> = today
+        .applied
+        .iter()
+        .map(|(generation, applied_by)| (generation.to_string(), applied_by.clone()))
+        .collect();
+    let manifest = |manifest: Option<&ManifestRef>| {
+        manifest
+            .map(|manifest| broca_session_loop::run::stored_manifest(manifest, parts))
+            .transpose()
+    };
+    let (pending, current, prefix) = match (
+        manifest(plan.pending.as_ref().map(|pending| &pending.manifest)),
+        manifest(plan.current.as_ref()),
+        manifest(plan.prefix.as_ref()),
+    ) {
+        (Ok(pending), Ok(current), Ok(prefix)) => (pending, current, prefix),
+        _ => return Some("plan (a manifest is unreadable)".into()),
+    };
+    let today_effective = today.effective.as_ref().map(|effective| {
+        (
+            effective.generation,
+            effective.applied_by.clone(),
+            effective.manifest_digest.clone(),
+            effective.composition_digest.clone(),
+            serde_json::to_value(&effective.absent_items).unwrap_or_default(),
+        )
+    });
+    let folded_effective = plan.effective.as_ref().map(|effective| {
+        (
+            effective.generation,
+            effective.applied_by.clone(),
+            effective.manifest_digest.clone(),
+            effective.composition_digest.clone(),
+            serde_json::Value::Array(effective.absent_items.clone()),
+        )
+    });
+    [
+        (
+            "plan.accepted_generation",
+            today.accepted_generation == plan.accepted_generation,
+        ),
+        (
+            "plan.applied_generation",
+            today.applied_generation == plan.applied_generation,
+        ),
+        (
+            "plan.pending",
+            today
+                .pending
+                .as_ref()
+                .map(|pending| (pending.generation, &pending.policy, &pending.manifest))
+                == plan
+                    .pending
+                    .as_ref()
+                    .zip(pending.as_ref())
+                    .map(|(folded, manifest)| (folded.generation, &folded.policy, manifest)),
+        ),
+        ("plan.effective", today_effective == folded_effective),
+        ("plan.current", today.current_manifest == current),
+        ("plan.prefix", today.prefix_manifest == prefix),
+        (
+            "plan.rebuild_since_accept",
+            today.rebuild_pending == plan.rebuild_since_accept,
+        ),
+        (
+            "plan.flushed_since_accept",
+            today.flush_pending == plan.flushed_since_accept,
+        ),
+        ("plan.last_model", today.last_model == plan.last_model),
+        ("index refresh:<generation>", today_accepted == accepted),
+        (
+            "index refresh-policy:<send_id>",
+            today.policy_send_ids == policy_sends,
+        ),
+        ("index flush:<send_id>", today.flush_send_ids == flush_sends),
+        ("index applied:<generation>", today_applied == applied),
+    ]
+    .into_iter()
+    .find(|(_, equal)| !equal)
+    .map(|(field, _)| field.to_owned())
+}
+
+/// Whether the model a send leaving its model to the session runs on (`plan.model`) and the
+/// senders the session admits, as the new storage reads them (`broca_session_loop::plan`), differ
+/// from what today's head folds from the same records (`HeadProjection::selection` and its
+/// senders).
+fn head_plan_difference(
+    records: &[broca_wal::WalRecord],
+    operations: &broca_session_store::fold::operations::Operations,
+    parts: &broca_session_loop::parts::MemoryParts,
+) -> Option<String> {
+    let mut today = broca_core::head::HeadProjection::default();
+    for record in records {
+        today.observe(record);
+    }
+    let selection = match broca_session_loop::plan::selection(operations, parts) {
+        Ok(selection) => selection,
+        Err(error) => return Some(format!("plan selection (unreadable: {error})")),
+    };
+    if today.selection != selection {
+        return Some("plan selection".into());
+    }
+    let senders = match broca_session_loop::plan::sender_manifest(operations, parts) {
+        Ok(manifest) => manifest
+            .as_deref()
+            .map(broca_core::head::head_senders)
+            .unwrap_or_default(),
+        Err(error) => return Some(format!("plan senders (unreadable: {error})")),
+    };
+    (today.senders() != senders.as_slice()).then(|| "plan senders".to_owned())
+}
+
 /// Whether the folded owner summary differs from the one today's admission folds from the same
 /// log (`SessionOwnershipV1::fold_owner_records`), naming the first field that does. The fold
 /// keeps only the first two distinct principals, so those are compared with today's first two.
@@ -1839,6 +2043,16 @@ fn run_ops(args: &Args) {
         if args.prefixes && args.max_records.is_some_and(|max| old.len() > max) {
             report.not_visited += 1;
             return;
+        }
+        if old.iter().any(|framed| {
+            matches!(
+                framed.record,
+                broca_wal::WalRecord::SessionRefreshAccepted { .. }
+                    | broca_wal::WalRecord::SessionRefreshPolicyChanged { .. }
+                    | broca_wal::WalRecord::SessionPrefixFlushed { .. }
+            )
+        }) {
+            report.plan_change_logs += 1;
         }
         let ends: Vec<usize> = if args.prefixes {
             (1..=old.len()).collect()

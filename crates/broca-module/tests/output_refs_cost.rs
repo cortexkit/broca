@@ -145,6 +145,7 @@ impl Drop for Rig {
 fn tagged_config() -> RunConfig {
     RunConfig {
         global_system: None,
+        account_route: None,
         route_decision_id: None,
         account_limit_pause: false,
         turn_directives_v1: None,

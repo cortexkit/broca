@@ -39,6 +39,7 @@ pub mod media;
 pub mod output;
 pub mod owner;
 pub mod parts;
+pub mod plan;
 pub mod queue;
 mod refusal;
 pub mod run;

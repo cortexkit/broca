@@ -320,6 +320,11 @@ impl HeadProjection {
     ) -> Option<cortexkit_role_llm_runner::read::HeadSender> {
         head_sender(&self.ownership, &self.senders, principal, scope, modes)
     }
+
+    /// The plan senders the head grants from, without their templates.
+    pub fn senders(&self) -> &[cortexkit_role_llm_runner::delivery_order::PlanSender] {
+        &self.senders
+    }
 }
 
 /// The plan's senders as `session.head` reads them: each sender's grants without its templates,

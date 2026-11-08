@@ -282,7 +282,10 @@ fn null_lineage_exact_prefix_is_repaired_without_changing_live_history() {
         16
     );
     f.store.apply_session_root_repair(&plan).unwrap();
-    let resolved = f.store.resolve_session_address(&f.stale, None).unwrap();
+    let resolved = f
+        .store
+        .resolve_session_address(&f.stale, None, None)
+        .unwrap();
     assert_eq!(resolved, f.live);
     for n in 0..24 {
         assert_eq!(
@@ -399,7 +402,7 @@ fn historical_harness_rekey_repairs_by_run_id_and_preserves_all_24_runs() {
     let bytes = std::fs::read(f.wal_path()).unwrap();
     assert_eq!(
         f.store
-            .resolve_session_address(&f.live, None)
+            .resolve_session_address(&f.live, None, None)
             .unwrap_err()
             .code(),
         "session_address_ambiguous"
@@ -420,7 +423,10 @@ fn historical_harness_rekey_repairs_by_run_id_and_preserves_all_24_runs() {
         "runner"
     );
     f.store.apply_session_root_repair(&plan).unwrap();
-    let resolved = f.store.resolve_session_address(&f.stale, None).unwrap();
+    let resolved = f
+        .store
+        .resolve_session_address(&f.stale, None, None)
+        .unwrap();
     assert_eq!(resolved, f.live);
     for n in 0..24 {
         let row = f.store.lookup_run(&format!("run-{n:02}")).unwrap().unwrap();
@@ -557,7 +563,9 @@ fn run_row_lineage_must_match_the_verified_surviving_log() {
             assert_eq!(plan.repoint_runs[0].row_lineage_id.as_ref(), Some(&lineage));
             f.store.apply_session_root_repair(&plan).unwrap();
             assert_eq!(
-                f.store.resolve_session_address(&f.stale, None).unwrap(),
+                f.store
+                    .resolve_session_address(&f.stale, None, None)
+                    .unwrap(),
                 f.live
             );
         } else {
@@ -578,7 +586,7 @@ fn orphaned_projection_repair_preserves_all_24_run_transcript() {
     let bytes = std::fs::read(f.wal_path()).unwrap();
     assert_eq!(
         f.store
-            .resolve_session_address(&f.live, None)
+            .resolve_session_address(&f.live, None, None)
             .unwrap_err()
             .code(),
         "session_address_ambiguous"
@@ -639,7 +647,10 @@ fn orphaned_projection_repair_preserves_all_24_run_transcript() {
         "preview must not delete orphaned projections"
     );
     f.store.apply_session_root_repair(&plan).unwrap();
-    let resolved = f.store.resolve_session_address(&f.stale, None).unwrap();
+    let resolved = f
+        .store
+        .resolve_session_address(&f.stale, None, None)
+        .unwrap();
     assert_eq!(resolved, f.live);
     let transcript = f.store.read_prefix_with_watermark(&resolved).unwrap();
     assert_eq!(transcript, live_before);
@@ -713,7 +724,10 @@ fn orphaned_projection_without_live_meta_is_rebuildable_from_live_or_archived_lo
             f.projection_rows(&f.live).values().all(Vec::is_empty),
             "repair must not write a live projection"
         );
-        let resolved = f.store.resolve_session_address(&f.stale, None).unwrap();
+        let resolved = f
+            .store
+            .resolve_session_address(&f.stale, None, None)
+            .unwrap();
         let range = broca_core::FileWalStore::new(f.root.join("wal"))
             .read_records_range(&resolved, 0, None, None)
             .unwrap();
@@ -867,7 +881,10 @@ fn unknown_stale_key_table_refuses_instead_of_discarding_authority() {
 #[test]
 fn split_root_repair_resolves_bind_and_preserves_all_24_runs() {
     let f = Fixture::new();
-    let error = f.store.resolve_session_address(&f.live, None).unwrap_err();
+    let error = f
+        .store
+        .resolve_session_address(&f.live, None, None)
+        .unwrap_err();
     assert_eq!(error.code(), "session_address_ambiguous");
     let bytes = std::fs::read(f.wal_path()).unwrap();
     let mut original: Vec<_> = (0..24)
@@ -886,7 +903,10 @@ fn split_root_repair_resolves_bind_and_preserves_all_24_runs() {
         SqliteStore::open_existing_for_session_root_repair(&f.root.join("run-index.db")).unwrap();
     maintenance.apply_session_root_repair(&plan).unwrap();
     drop(maintenance);
-    let resolved = f.store.resolve_session_address(&f.stale, None).unwrap();
+    let resolved = f
+        .store
+        .resolve_session_address(&f.stale, None, None)
+        .unwrap();
     assert_eq!(resolved, f.live);
     let history = broca_core::FileWalStore::new(f.root.join("wal"))
         .read_records(&resolved)
@@ -936,7 +956,9 @@ fn split_root_repair_resolves_bind_and_preserves_all_24_runs() {
     )
     .unwrap();
     assert_eq!(
-        reopened.resolve_session_address(&f.stale, None).unwrap(),
+        reopened
+            .resolve_session_address(&f.stale, None, None)
+            .unwrap(),
         f.live
     );
 }
@@ -1005,7 +1027,7 @@ fn dry_run_is_read_only_and_reports_each_change() {
     assert!(!f.root.join("leases").exists());
     assert_eq!(
         f.store
-            .resolve_session_address(&f.live, None)
+            .resolve_session_address(&f.live, None, None)
             .unwrap_err()
             .code(),
         "session_address_ambiguous"
@@ -1054,7 +1076,9 @@ fn archived_survivor_is_repaired_without_extraction() {
             .apply_session_root_repair(&f.preview().unwrap())
             .unwrap();
         assert_eq!(
-            f.store.resolve_session_address(&f.stale, None).unwrap(),
+            f.store
+                .resolve_session_address(&f.stale, None, None)
+                .unwrap(),
             f.live
         );
         let (records, size) = ReadOnlyWalReader::new(&f.root)

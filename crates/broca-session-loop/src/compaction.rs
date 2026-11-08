@@ -772,7 +772,9 @@ pub async fn apply_boundary<W: Writer, P, T>(
     step: u64,
 ) -> Result<Result<(), String>, LoopError> {
     let entries = transcript(writer, ctx).await?.entries;
-    let conditions = match v2::host::conditions_of(&frozen(admission), &entries, false) {
+    // The last serving model's fill isn't measured on this storage yet, so the newest entry's
+    // own reported prompt stands for the session's fill.
+    let conditions = match v2::host::conditions_of(&frozen(admission), &entries, false, None) {
         Ok(conditions) => conditions,
         Err(message) => return Ok(Err(message)),
     };
@@ -813,7 +815,7 @@ pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
     let last_cache = writer.operations().last_cache_send.clone();
     let chained = seams.provider.history_edit_cost()
         == Some(broca_core::compaction_provider::notice::HistoryEditCost::FullResend);
-    let conditions = match v2::host::conditions_of(&frozen(admission), &entries, chained) {
+    let conditions = match v2::host::conditions_of(&frozen(admission), &entries, chained, None) {
         Ok(conditions) => conditions,
         Err(message) => return Ok(Send::Unavailable(message)),
     };
@@ -915,8 +917,8 @@ pub async fn notice<W: Writer, P, T>(
         return Ok(());
     }
     let entries = transcript(writer, ctx).await?.entries;
-    let conditions =
-        v2::host::conditions_of(&frozen(admission), &entries, false).map_err(LoopError::Parts)?;
+    let conditions = v2::host::conditions_of(&frozen(admission), &entries, false, None)
+        .map_err(LoopError::Parts)?;
     let applied = ctx.session.state.lock().await.applied_identity();
     let mut setup =
         v2::conditions::setup_request(&ctx.preset, &conditions, (seams.now_ms)(), false);
