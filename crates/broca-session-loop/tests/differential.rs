@@ -7364,6 +7364,56 @@ async fn a_nudge_is_placed_after_the_batch_that_reaches_it() {
         .await;
 }
 
+/// The step after a finalize budget firing, rebuilt offline from a copy of the session cut at
+/// that step's start, disables tool calls as the request today's loop sent for it did, and keeps
+/// the declared tools.
+#[tokio::test]
+async fn a_finalize_steps_offline_request_disables_calls_as_sent() {
+    BUDGET
+        .scope(Some(budgeted(&[], Some(1))), async {
+            let scenario = reads(1, text_step("z", "done"));
+            let (today, image, _) = today_from(&scenario, None, scenario.steps.clone()).await;
+            assert_eq!(
+                today.requests.len(),
+                2,
+                "a tool step, then the finalize step"
+            );
+            let sent = &today.requests[1];
+            assert_eq!(*sent.tool_choice, broca_protocol::ToolChoice::None);
+            let frames = image.framed();
+            let start = frames
+                .iter()
+                .rposition(|frame| matches!(frame.record, broca_wal::WalRecord::StepStarted { .. }))
+                .expect("the finalize step started");
+            let converted = convert_unbilled(&frames[..=start], lineage(&image).as_deref())
+                .expect("the cut converts");
+            let backend = MemoryBackend::default();
+            let mut session = Session::create(
+                &backend,
+                SessionAddr("0123456789abcdef".into()),
+                SessionTriple {
+                    project_root: "/project".into(),
+                    harness: "differential".into(),
+                    session: "s1".into(),
+                },
+                &DeploymentKey::new(1, &[7; 32]),
+                true,
+            )
+            .await
+            .unwrap();
+            session.append(&converted.records, true).await.unwrap();
+            let parts = MemoryParts {
+                parts: converted.parts,
+            };
+            let rebuilt = broca_session_loop::run::offline_request(&session, &parts, &bind(), 2)
+                .await
+                .expect("the finalize step rebuilds");
+            assert_eq!(rebuilt.tool_choice, sent.tool_choice, "the tool choice");
+            assert_eq!(rebuilt.tools, sent.tools, "the declared tools");
+        })
+        .await;
+}
+
 #[tokio::test]
 async fn nudges_and_finalize_due_together_are_placed_in_order() {
     BUDGET

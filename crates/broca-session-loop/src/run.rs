@@ -1552,7 +1552,7 @@ async fn offline_request_for<W: Writer>(
     let run_rules = run_tag_rules(writer, &episodes).await?;
     let tools = Arc::new(admission.tools.clone());
     let enrollment = writer.enrollment().await?;
-    let opts = call_options(
+    let mut opts = call_options(
         writer,
         &admission,
         &tools,
@@ -1564,10 +1564,23 @@ async fn offline_request_for<W: Writer>(
         defer_media_tags,
         enrollment.as_ref(),
     )?;
+    finalize_tool_choice(writer, &mut opts);
     if !compacted {
         return Ok(opts);
     }
     crate::compaction::offline_prompt(writer, &admission, bind, step_id, opts).await
+}
+
+/// Disables tool calls on the budget's finalize step, and says whether the step is one. The step
+/// keeps the declared tools byte for byte and disables calls through the tool choice, as today's
+/// loop does: dropping the tools would change the request's cached prefix on the run's last
+/// step. A step's live request and its offline rebuild both take it from here.
+fn finalize_tool_choice<W: Writer>(writer: &W, opts: &mut CallOptions) -> bool {
+    let finalizing = crate::budget::finalizing(writer.operations());
+    if finalizing {
+        opts.tool_choice = Arc::new(ToolChoice::None);
+    }
+    finalizing
 }
 
 /// Model steps and tool batches from the run's current state until a decision ends the run.
@@ -1907,13 +1920,7 @@ where
             context.credential_id = selection.map(|selection| selection.credential_id.clone());
             context.account_ref = selection.and_then(|selection| selection.account_ref.clone());
         }
-        // The budget's finalize step keeps the declared tools byte for byte and disables calls
-        // through the tool choice, as today's loop does: dropping the tools would change the
-        // request's cached prefix on the run's last step.
-        let finalizing = crate::budget::finalizing(writer.operations());
-        if finalizing {
-            opts.tool_choice = Arc::new(ToolChoice::None);
-        }
+        let finalizing = finalize_tool_choice(writer, &mut opts);
         // The session's original system message, which a plan's system text takes the place of
         // in the provider view below.
         let durable_system: Vec<Message> = opts.prompt.first().cloned().into_iter().collect();
