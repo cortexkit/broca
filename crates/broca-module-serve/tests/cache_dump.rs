@@ -387,6 +387,8 @@ async fn fixture<F: WireFamily + 'static>(
 #[derive(Clone, Copy)]
 enum FixtureMode {
     Legacy,
+    /// [`FixtureMode::Legacy`] with a budget whose finalize fires after the first tool call.
+    Finalize,
     Compaction,
     StripSigned,
     GlobalSystem,
@@ -477,7 +479,14 @@ async fn fixture_with_mode<F: WireFamily + 'static>(
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
     let provider = LiveProvider::new(family, frozen, AuthHandle::Bearer("fixture".into()));
     let run = async {
-        if !matches!(mode, FixtureMode::Legacy) {
+        if matches!(mode, FixtureMode::Finalize) {
+            request.budget = Some(broca_protocol::request::BudgetConfig {
+                finalize_at_tool_calls: 1,
+                finalize_text: "Answer now.".into(),
+                ..Default::default()
+            });
+        }
+        if !matches!(mode, FixtureMode::Legacy | FixtureMode::Finalize) {
             request.context_limit = Some(4000);
             if matches!(mode, FixtureMode::Compaction | FixtureMode::StripSigned) {
                 request.input.insert(
@@ -1149,6 +1158,65 @@ async fn mode3_offline_rebuild_matches_every_received_step_after_a_ride() {
         if let WalRecord::ModelAttemptFinished { step_id, .. } = record {
             let (_, _, rebuilt) = broca_module_serve::wal_render::render_step_with_lineage(
                 Some(&lineage),
+                &records[..index],
+                config,
+                &run_id.0,
+                step_id.0,
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(
+                rebuilt == bodies[step_id.0 as usize - 1],
+                "step {} body differs",
+                step_id.0
+            );
+        }
+    }
+}
+
+/// The step after a finalize budget firing is sent with tool calls disabled (`tool_choice`
+/// none) on a log whose run froze no compaction plan version too, and the offline rebuild
+/// reproduces every step the server received byte for byte.
+#[tokio::test]
+async fn legacy_offline_rebuild_matches_a_finalize_step() {
+    let (root, records, bodies) = fixture_with_mode(
+        "legacy-finalize",
+        AnthropicMessages,
+        anthropic_frozen_config("m"),
+        vec![anthropic(true), anthropic(false)],
+        true,
+        FixtureMode::Finalize,
+    )
+    .await;
+    assert_eq!(bodies.len(), 2);
+    assert!(!broca_core::is_mode3_log(&records));
+    assert!(records
+        .iter()
+        .any(|record| matches!(record, WalRecord::BudgetFired { .. })));
+    let last: Value = serde_json::from_slice(&bodies[1]).unwrap();
+    assert_eq!(
+        last["tool_choice"]["type"], "none",
+        "{}",
+        last["tool_choice"]
+    );
+    let (run_id, config) = records
+        .iter()
+        .find_map(|record| match record {
+            WalRecord::RunStarted { run_id, config, .. } => Some((run_id, config)),
+            _ => None,
+        })
+        .unwrap();
+    let bind = BindIdentity::new(root.join("proj"), "test", "legacy-finalize");
+    let lineage = FileWalStore::new(root.join("wal"))
+        .read_records_range(&bind, 0, None, None)
+        .unwrap()
+        .lineage_id
+        .map(|id| id.to_string());
+    for (index, record) in records.iter().enumerate() {
+        if let WalRecord::ModelAttemptFinished { step_id, .. } = record {
+            let (_, _, rebuilt) = broca_module_serve::wal_render::render_step_with_lineage(
+                lineage.as_deref(),
                 &records[..index],
                 config,
                 &run_id.0,
