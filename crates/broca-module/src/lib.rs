@@ -41,6 +41,7 @@ pub mod store_fanout;
 pub mod store_head;
 pub mod store_import;
 pub mod store_open;
+pub mod store_output_refs;
 mod store_plan_change;
 pub mod store_read;
 pub mod store_reads;

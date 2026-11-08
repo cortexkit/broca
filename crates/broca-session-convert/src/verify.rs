@@ -449,13 +449,18 @@ async fn history<B: SessionBackend>(
     let mut store = Vec::new();
     let mut from = 0;
     loop {
-        let mut page = broca_module::store_read::read_page(view, Some(from), Some(PAGE))
+        let read = broca_module::store_read::read_page(view, Some(from), Some(PAGE))
             .await
-            .map_err(|error| mismatch(HISTORY_RAW, format!("the staged history: {error:?}")))?
-            .page;
-        broca_module::store_entries::mark_reply_cleaning(view, parts, &mut page.messages)
-            .await
-            .map_err(|error| mismatch(HISTORY_RAW, format!("the staged history: {error}")))?;
+            .map_err(|error| mismatch(HISTORY_RAW, format!("the staged history: {error:?}")))?;
+        let mut page = read.page;
+        broca_module::store_entries::attach_part_tags(
+            view,
+            parts,
+            &mut page.messages,
+            &read.numbering,
+        )
+        .await
+        .map_err(|error| mismatch(HISTORY_RAW, format!("the staged history: {error}")))?;
         let next = page.next_from_ordinal;
         store.extend(broca_module::store_entries::raw_history_entries(page));
         match next {

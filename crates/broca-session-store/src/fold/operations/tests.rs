@@ -235,6 +235,7 @@ fn a_no_tool_step_ends_the_run_unless_a_steer_extends_it() {
         Resolution::Idle(RunFinishReason::Completed)
     );
     let steer = Record::Steer(Steer {
+        media: Vec::new(),
         input: vec![Message::new(
             broca_protocol::content::Role::User,
             Vec::new(),
@@ -325,6 +326,7 @@ fn an_account_limit_pause_clears_when_the_run_continues() {
 
 fn queued(id: &str, delivery: Option<&str>) -> Record {
     Record::QueuedSend(crate::record::QueuedSend {
+        media: Vec::new(),
         submission_id: id.into(),
         send_id: None,
         input: Vec::new(),
@@ -630,6 +632,7 @@ fn the_title_is_the_newest_one_any_send_carried() {
     }
     let steer = |receipt: Option<serde_json::Value>| {
         Record::Steer(Steer {
+            media: Vec::new(),
             input: Vec::new(),
             written_at_ms: None,
             tags_v1: None,

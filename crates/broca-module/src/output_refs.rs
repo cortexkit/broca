@@ -551,26 +551,36 @@ async fn writing_request<H: ServeHandler + ?Sized>(
         from = last + 1;
     }
     let view = if compacts && !found.is_empty() {
-        if messages.records.is_none() {
-            messages.records = Some(
-                messages
-                    .handler
-                    .session_log(messages.session, run_id)
-                    .await?
-                    .ok_or_else(|| {
-                        ServeError::Open(
-                    "the session log is not readable here, so output references cannot tell \
-                     which parts a compaction view left out"
-                        .into(),
-                    Some(broca_protocol::ErrorClass::Transient),
-                )
-                    })?,
-            );
+        match messages
+            .handler
+            .store_writing_view(messages.session, ordinal)
+            .await?
+        {
+            // A session kept in the new storage recorded the view beside the message.
+            Some(view) => view,
+            None => {
+                if messages.records.is_none() {
+                    messages.records = Some(
+                        messages
+                            .handler
+                            .session_log(messages.session, run_id)
+                            .await?
+                            .ok_or_else(|| {
+                                ServeError::Open(
+                                    "the session log is not readable here, so output references \
+                                     cannot tell which parts a compaction view left out"
+                                        .into(),
+                                    Some(broca_protocol::ErrorClass::Transient),
+                                )
+                            })?,
+                    );
+                }
+                view_at_writing_step(
+                    messages.records.as_deref().expect("loaded session log"),
+                    ordinal,
+                )?
+            }
         }
-        view_at_writing_step(
-            messages.records.as_deref().expect("loaded session log"),
-            ordinal,
-        )?
     } else {
         None
     };

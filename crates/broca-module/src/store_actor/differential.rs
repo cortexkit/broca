@@ -116,6 +116,7 @@ fn today_with(
     let wal = Arc::new(FileWalStore::new(dir.join("wal")));
     let executor = Arc::new(TodayLoop {
         provider: Gated {
+            render_config: None,
             inner: broca_core::provider::StubProvider::new(steps),
             gate,
         },
@@ -1227,6 +1228,7 @@ async fn module(on: bool, steps: Vec<Vec<NormalizedEvent>>) -> Module {
     let executor: Arc<dyn RunExecutor> = Arc::new(BothLoops {
         today: TodayLoop {
             provider: Gated {
+                render_config: None,
                 inner: broca_core::provider::StubProvider::new(steps.clone()),
                 gate: None,
             },
@@ -1545,5 +1547,8 @@ async fn a_store_session_reads_as_the_same_history_on_todays_storage() {
 
 mod controls;
 mod head;
+mod media;
+mod photo_sends;
 mod refresh;
 mod streams;
+mod warm;

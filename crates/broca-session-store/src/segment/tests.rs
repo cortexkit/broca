@@ -103,6 +103,8 @@ fn facts(ordinal: u64) -> Record {
         no_display_facts: None,
         reasoning_summaries: Vec::new(),
         rich_ui: None,
+        runner_tag_base: None,
+        legacy_view_seq: None,
         ordinal,
         written_at_ms: None,
         tag_base: 0,

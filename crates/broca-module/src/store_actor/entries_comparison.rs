@@ -245,6 +245,7 @@ async fn side_idling(
     let wal = Arc::new(FileWalStore::new(dir.join("wal")));
     let provider = broca_core::provider::StubProvider::new(steps.clone());
     let scripted = || Gated {
+        render_config: None,
         inner: provider.clone(),
         gate: gate.clone(),
     };
@@ -453,27 +454,8 @@ fn mid_at(reply: &Value, ordinal: u64) -> String {
 /// Compares every raw `session.history` read worth telling apart on both sides: the newest
 /// page whole and in short pages, each side following its own cursors, seeks by ordinal and by
 /// each side's own message ids, and the refusals of a position the session doesn't hold.
-/// Whether `session.history` on the store session is still refused while it waits on display
-/// facts for store sessions; today's storage serves the same request. While it is, the raw
-/// history comparisons are skipped; once the refusal is gone they run again unchanged.
-async fn raw_history_waits(today: &Side, store: &Side, label: &str) -> bool {
-    match store.history(json!({})).await {
-        Err(crate::history::HistoryError::Refused { code, message })
-            if code == crate::store_entries::NOT_SERVED_ON_NEW_STORAGE
-                && message.contains("display facts") =>
-        {
-            assert!(today.history(json!({})).await.is_ok(), "{label}");
-            true
-        }
-        _ => false,
-    }
-}
-
 async fn compare_history(today: &Side, store: &Side, label: &str) {
     assert!(store.holds() && !today.holds(), "{label}: the storages");
-    if raw_history_waits(today, store, label).await {
-        return;
-    }
     let both = |request: Value| async move {
         (
             today.history(request.clone()).await,
@@ -543,14 +525,55 @@ async fn compare_history(today: &Side, store: &Side, label: &str) {
             );
         }
     }
-    // The display form needs facts the new storage doesn't serve yet: refused by name.
-    let display = store.history(json!({"form": "display"})).await;
-    assert_eq!(
-        masked(&display),
-        json!({"refused": crate::store_entries::NOT_SERVED_ON_NEW_STORAGE}),
-        "{label}"
-    );
-    assert!(today.history(json!({"form": "display"})).await.is_ok());
+    // The display form, newest page and from the first message, compared alike.
+    for params in [
+        json!({"form": "display"}),
+        json!({"form": "display", "from_ordinal": 1, "limit": 3}),
+    ] {
+        let old = today.history(params.clone()).await;
+        let new = store.history(params.clone()).await;
+        assert!(old.is_ok(), "{label}: today's display history {params}");
+        assert_eq!(
+            masked_display(&new),
+            masked_display(&old),
+            "{label}: display {params}"
+        );
+    }
+}
+
+/// A display reply as compared: [`masked`], and every member that names a position in each
+/// storage's own log or its own identity, at any depth, kept as whether present: message ids,
+/// call keys, output-reference set ids and the digests computed over them, and times.
+fn masked_display(reply: &Result<Value, crate::history::HistoryError>) -> Value {
+    fn mask(value: &mut Value) {
+        const OWN: [&str; 9] = [
+            "mid",
+            "call_key",
+            "set_id",
+            "digest",
+            "written_at",
+            "created_at",
+            "completed_at",
+            "started_at",
+            "finished_at",
+        ];
+        match value {
+            Value::Object(object) => {
+                for (key, member) in object.iter_mut() {
+                    if OWN.contains(&key.as_str()) {
+                        *member = json!(!member.is_null());
+                    } else {
+                        mask(member);
+                    }
+                }
+            }
+            Value::Array(items) => items.iter_mut().for_each(mask),
+            _ => {}
+        }
+    }
+    let mut value = masked(reply);
+    mask(&mut value);
+    value
 }
 
 /// The compaction route on a session off the compaction contract: every method is refused
@@ -1109,14 +1132,12 @@ async fn reads_clean_replies_where_todays_reads_clean_them() {
             expected,
             "today's history, renders {renders}"
         );
-        if !raw_history_waits(&today, &store, "cleaning").await {
-            let new = store.history(json!({"from_ordinal": 1})).await.unwrap();
-            assert_eq!(
-                texts(new["messages"].as_array().unwrap()),
-                expected,
-                "the store's history, renders {renders}"
-            );
-        }
+        let new = store.history(json!({"from_ordinal": 1})).await.unwrap();
+        assert_eq!(
+            texts(new["messages"].as_array().unwrap()),
+            expected,
+            "the store's history, renders {renders}"
+        );
         let read = store
             .registry
             .read(SessionReadRequest::new(store.key.clone(), Some(1), None))

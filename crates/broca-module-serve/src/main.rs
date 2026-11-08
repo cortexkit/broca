@@ -4652,6 +4652,38 @@ mod executor {
                         .into(),
                 )));
             }
+            let holds_media = req
+                .input
+                .iter()
+                .chain(writer.conversation().messages.iter())
+                .any(|message| !broca_session_store::session::message_media(message).is_empty());
+            if resolved.provider.supports_media_renderer() && holds_media {
+                // Likewise for a send's attachments and the media the session's messages hold:
+                // they are stored as the session's own objects, which no renderer reads yet.
+                return Err(StoreRunError::Admission(RunError::Config(
+                    "a run whose provider renders images isn't served on the new session \
+                     storage yet"
+                        .into(),
+                )));
+            }
+            if broca_provider::person_media::references(&req.input)
+                .next()
+                .is_some()
+            {
+                // As today's executor admits a send's attachments: against the media the
+                // resolved model takes, as its frozen render config states them.
+                let frozen = serde_json::from_value::<broca_provider::wire::FrozenRenderConfig>(
+                    resolved.provider.render_config_blob(),
+                )
+                .ok();
+                let model = format!("{}/{}", req.model.provider_module_id, req.model.model_id);
+                broca_module::person_media::check(
+                    frozen.as_ref().and_then(|frozen| frozen.media.as_ref()),
+                    &model,
+                    &req.input,
+                )
+                .map_err(StoreRunError::Admission)?;
+            }
             let frozen_context_limit = context_limit_for_episode(
                 fresh_episode,
                 req.context_limit,

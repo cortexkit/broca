@@ -5162,6 +5162,11 @@ const NOT_SERVED_ON_NEW_STORAGE: &str = "not_served_on_new_storage";
 /// Whether `method` is served for a session kept in the new storage. Every other op is refused
 /// `not_served_on_new_storage` for such a session, so none can fall through to today's WAL
 /// reads. An op joins this list in the change that gives it a store implementation.
+///
+/// The list covers the session's own route. A `compaction-runner/v1` route (`bind`,
+/// `session.entries`, `session.applied_view`, `session.apply_view`) is dispatched by its role
+/// before this check, and the registry sends a store session's calls on it to the store
+/// (`LineageRegistry::route_compaction_v2`).
 pub(crate) fn served_on_new_storage(method: &str, params: &serde_json::Value) -> bool {
     match method {
         // Reads served from the store (`store_read`, `store_head`).
@@ -5178,8 +5183,22 @@ pub(crate) fn served_on_new_storage(method: &str, params: &serde_json::Value) ->
         // its messages inline is today's import, which writes a WAL.
         OP_IMPORT => params.get("source").is_some(),
         OP_INSTALL_VIEW => true,
+        // The store actor warms the request its loop would send next, dated by the store's own
+        // cache clock (`store_actor::warm`).
+        OP_WARM => true,
         // Describes the module, not the session.
         OP_ROLE_DESCRIBE => true,
+        // Media the store's own records name, read from the objects they stored
+        // (`uploads::media_read`). Uploads are staged beside the session, whichever storage
+        // keeps it; only the owner check reads the session, from the store.
+        cortexkit_role_llm_runner::ops::SESSION_MEDIA_READ => true,
+        "session.upload_begin"
+        | "session.upload_append"
+        | "session.upload_commit"
+        | "session.upload_status" => true,
+        // Both forms page through the store (`crate::history`): the raw form through its
+        // `session.read`, the display form with the per-call facts the store records.
+        cortexkit_role_llm_runner::ops::SESSION_HISTORY => true,
         _ => false,
     }
 }

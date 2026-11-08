@@ -65,7 +65,9 @@ use serde::Serialize;
 mod calls_check;
 mod entries_check;
 mod heads;
+mod history_check;
 mod move_check;
+mod numbering;
 mod pages;
 mod serve_check;
 mod subscribe_check;
@@ -280,6 +282,8 @@ fn main() {
         "seal" => run_seal(&args),
         "entries" => run_entries(&args),
         "pages" => pages::run(&args),
+        "history" => history_check::run(&args),
+        "numbering" => numbering::run(&args),
         "read-cost" => pages::run_read_cost(&args),
         "heads" => heads::run(&args),
         "billing" => run_billing(&args),
