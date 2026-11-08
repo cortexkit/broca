@@ -92,6 +92,9 @@ pub fn setup_request(
     now: u64,
     detects_cache_expired: bool,
 ) -> SetupRequest {
+    // Broca hosts the session and creates sessions on their first session.send.
+    // Leave child_harness absent so provider children inherit the session's harness
+    // (compaction contract W5.1, CONTRACT.md:520).
     let mut setup = SetupRequest::new(
         preset,
         conditions.model.clone(),
@@ -102,7 +105,14 @@ pub fn setup_request(
         now,
     );
     setup.accepts_images = conditions.accepts_images;
+    enable_metadata_writer_view_anchor(&mut setup);
     setup
+}
+
+fn enable_metadata_writer_view_anchor(_setup: &mut SetupRequest) {
+    // When cortexkit-role-compaction exposes Setup's view_anchor, set it to
+    // Some(true) here: this common constructor covers both live and serving Setup,
+    // and this activation point belongs only to builds that durably store anchors.
 }
 
 /// The library, rather than host-local tables, owns the rule defaults.

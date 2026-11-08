@@ -273,15 +273,13 @@ impl<W: WalStore + 'static> super::LineageActor<W> {
                     .map_err(internal)?;
                 let conditions =
                     v2::host::conditions(config, &entries, false, None).map_err(internal)?;
-                let answer = match self
-                    .compaction_session
-                    .state
-                    .lock()
-                    .await
+                let mut state = self.compaction_session.state.lock().await;
+                let answer = match state
                     .accept(
                         &v2::journal::WalJournal {
                             writer: &writer,
                             session: &self.key,
+                            applied_by: caller,
                         },
                         &entries,
                         received,
@@ -291,9 +289,13 @@ impl<W: WalStore + 'static> super::LineageActor<W> {
                     .await
                     .map_err(internal)?
                 {
-                    Ok(()) => ApplyViewAnswer::Accepted,
+                    Ok(()) => {
+                        state.restore_accepted_by(caller.map(str::to_owned));
+                        ApplyViewAnswer::Accepted
+                    }
                     Err(refusal) => ApplyViewAnswer::Refused { refusal },
                 };
+                drop(state);
                 self.discard_stale_admission_view();
                 to_raw_value(&answer).map_err(|error| internal(error.to_string()))
             }

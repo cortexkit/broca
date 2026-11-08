@@ -10,6 +10,8 @@ use super::{received::ReceivedView, state::Journal, storage};
 pub struct WalJournal<'a> {
     pub writer: &'a crate::WalHandle,
     pub session: &'a BindIdentity,
+    /// Caller identity already checked against the session's selected provider route.
+    pub applied_by: Option<&'a str>,
 }
 
 impl WalJournal<'_> {
@@ -37,18 +39,13 @@ impl Journal for WalJournal<'_> {
         received: &ReceivedView,
     ) -> Result<(), String> {
         let view = received.view();
-        if view.built_through.is_some() || view.new_signed.is_some() {
-            return Err(
-                "writing compaction-view-meta/v1 requires the metadata writer release".into(),
-            );
-        }
         self.commit(WalRecord::CompactionViewV2(CompactionViewV2 {
             version: view.version,
             checksum: view.checksum.clone(),
             edits: storage::encode(previous, received),
-            built_through: None,
-            new_signed: None,
-            applied_by: None,
+            built_through: view.built_through.clone(),
+            new_signed: view.new_signed.clone(),
+            applied_by: self.applied_by.map(str::to_owned),
         }))
         .await
     }

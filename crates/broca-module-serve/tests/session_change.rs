@@ -186,7 +186,12 @@ async fn compaction_item_refresh_is_refused_before_fetch_and_actor_write() {
     );
     let before = rig.wal_bytes();
     let fetched = admitter.0.load(Ordering::SeqCst);
-    let refused = error(&refresh(&mut rig, &changed, "immediately", 1).await);
+    let response = refresh(&mut rig, &changed, "immediately", 1).await;
+    assert_eq!(
+        std::str::from_utf8(&response.body).unwrap(),
+        r#"{"code":"invalid_params","message":"invalid plan or send: {\"field\":\"plan.compaction_item\"}","detail":{"field":"plan.compaction_item"}}"#,
+    );
+    let refused = error(&response);
     assert_eq!(refused["code"], "invalid_params");
     assert_eq!(refused["detail"]["field"], "plan.compaction_item");
     assert_eq!(rig.wal_bytes(), before);
