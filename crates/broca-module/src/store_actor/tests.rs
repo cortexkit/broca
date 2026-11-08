@@ -76,14 +76,33 @@ pub(super) fn bind() -> BindIdentity {
 }
 
 /// A scripted provider whose first step waits for `gate`, so a test can act while a run's start
-/// is durable and its first model call is in flight.
+/// is durable and its first model call is in flight. With `render_config`, it freezes that render
+/// config into its runs, as a provider whose model takes media freezes its media profile.
 pub(super) struct Gated {
     pub(super) inner: StubProvider,
     pub(super) gate: Option<Arc<Notify>>,
+    pub(super) render_config: Option<serde_json::Value>,
 }
 
 #[async_trait]
 impl broca_core::provider::Provider for Gated {
+    fn render_config_blob(&self) -> serde_json::Value {
+        match &self.render_config {
+            Some(config) => config.clone(),
+            None => broca_core::provider::Provider::render_config_blob(&self.inner),
+        }
+    }
+
+    fn render_config_blob_for_version(&self, renderer_version: u32) -> serde_json::Value {
+        match &self.render_config {
+            Some(config) => config.clone(),
+            None => broca_core::provider::Provider::render_config_blob_for_version(
+                &self.inner,
+                renderer_version,
+            ),
+        }
+    }
+
     async fn step(
         &self,
         step_id: broca_protocol::StepId,
@@ -111,6 +130,22 @@ pub(super) struct LoopExecutor {
     pub(super) approval_gate: Option<(Arc<Notify>, Arc<Notify>)>,
     /// What the `read` tool answers.
     pub(super) tool_text: String,
+    /// Whether each model call first waits for the media the actor sends the run, as a run
+    /// whose provider renders media does.
+    pub(super) waits_for_media: bool,
+}
+
+/// Waits for the media the actor sends a run, without rendering any.
+struct MediaWait(tokio::sync::Mutex<Option<crate::store_media::StoreRunMediaWait>>);
+
+#[async_trait]
+impl broca_session_loop::run::ModelCallReady for MediaWait {
+    async fn ready(&self) -> Result<(), broca_protocol::ProviderError> {
+        if let Some(wait) = self.0.lock().await.take() {
+            let _ = wait.await;
+        }
+        Ok(())
+    }
 }
 
 /// Allows every call, once the test lets it (see [`LoopExecutor::approval_gate`]).
@@ -130,11 +165,61 @@ impl broca_core::capability::ApprovalPolicy for GatedApproval {
 }
 
 /// The hook and compaction planes a test executor offers, standing in for the ones the module's
-/// executor reaches over the daemon; none by default.
+/// executor reaches over the daemon; none by default. With `tool_gate`, each tool call's
+/// dispatch signals the first `Notify` and waits on the second, so a test can act while a call
+/// is in flight (see [`GatedTools`]).
 #[derive(Clone, Default)]
 pub(super) struct Planes {
     pub(super) hooks: Option<Arc<dyn broca_core::HookPlane>>,
     pub(super) compaction: Option<Arc<dyn broca_core::CompactionPlane>>,
+    pub(super) tool_gate: Option<(Arc<Notify>, Arc<Notify>)>,
+}
+
+/// The test executors' tool plane: the stub plane answering the `read` tool with `text`, whose
+/// dispatches each wait on `gate` when one is set, after the call was sent.
+pub(super) struct GatedTools {
+    inner: StubToolPlane,
+    gate: Option<(Arc<Notify>, Arc<Notify>)>,
+}
+
+impl GatedTools {
+    pub(super) fn new(text: &str, gate: Option<(Arc<Notify>, Arc<Notify>)>) -> Self {
+        Self {
+            inner: StubToolPlane::new().with_canned_text("read", text),
+            gate,
+        }
+    }
+}
+
+#[async_trait]
+impl broca_core::tool_plane::ToolPlane for GatedTools {
+    async fn batch_started(
+        &self,
+        ctx: &broca_core::tool_plane::BatchCtx,
+        calls: &[broca_protocol::ToolCall],
+        manifest: &broca_core::ToolManifest,
+    ) -> Result<(), broca_core::tool_plane::ToolPlaneError> {
+        self.inner.batch_started(ctx, calls, manifest).await
+    }
+
+    async fn dispatch(
+        &self,
+        ctx: &broca_core::tool_plane::BatchCtx,
+        call: &broca_protocol::ToolCall,
+    ) -> broca_core::tool_plane::DispatchResult {
+        if let Some((reached, release)) = &self.gate {
+            reached.notify_one();
+            release.notified().await;
+        }
+        self.inner.dispatch(ctx, call).await
+    }
+
+    async fn batch_finished(
+        &self,
+        ctx: &broca_core::tool_plane::BatchCtx,
+    ) -> Result<(), broca_core::tool_plane::ToolPlaneError> {
+        self.inner.batch_finished(ctx).await
+    }
 }
 
 pub(super) fn executor(
@@ -145,11 +230,13 @@ pub(super) fn executor(
         provider: Gated {
             inner: StubProvider::new(steps),
             gate,
+            render_config: None,
         },
         drain_gate: None,
         planes: Planes::default(),
         approval_gate: None,
         tool_text: "file contents".into(),
+        waits_for_media: false,
     }
 }
 
@@ -182,8 +269,13 @@ impl RunExecutor for LoopExecutor {
             mut writer,
             mut parts,
             mode,
+            media,
             ..
         } = job;
+        let media_wait = media.filter(|_| self.waits_for_media).map(|media| {
+            Arc::new(MediaWait(tokio::sync::Mutex::new(Some(media))))
+                as Arc<dyn broca_session_loop::run::ModelCallReady>
+        });
         // The module's executor admits a run's context limit from the caller's override when
         // the send names one.
         control.admitted_context_limit = control.admitted_context_limit.or(req.context_limit);
@@ -206,8 +298,10 @@ impl RunExecutor for LoopExecutor {
                     .map_err(StoreRunError::Admission)?,
                 )
             };
-            let tools = StubToolPlane::new().with_canned_text("read", &self.tool_text);
-            let now = || 1;
+            let tools = GatedTools::new(&self.tool_text, self.planes.tool_gate.clone());
+            // The wall clock, as the module's executor reads it: a queued ordered send's expiry
+            // is judged at a run's boundaries by the same clock today's loop reads.
+            let now = || broca_core::run::epoch_millis().unwrap_or(0);
             let approval = GatedApproval(self.approval_gate.clone());
             let seams = Seams {
                 provider: &self.provider,
@@ -231,6 +325,7 @@ impl RunExecutor for LoopExecutor {
                 max_same_account_wait: Default::default(),
                 auth_selection: None,
                 step_progress: control.step_progress.clone(),
+                model_call_ready: media_wait,
             };
             // The test's credential is always ready, so a sign-in pause resumes.
             match (admission, mode) {
@@ -444,7 +539,7 @@ pub(super) fn auth_failure() -> Vec<NormalizedEvent> {
     })]
 }
 
-async fn status(commands: &mpsc::UnboundedSender<LineageCmd>) -> LineageStatus {
+pub(super) async fn status(commands: &mpsc::UnboundedSender<LineageCmd>) -> LineageStatus {
     let (reply, answer) = oneshot::channel();
     commands.send(LineageCmd::Status { reply }).unwrap();
     answer.await.unwrap()
@@ -579,6 +674,28 @@ async fn an_unserved_send_is_refused_by_name() {
     );
     drop(commands);
     assert!(served.await.unwrap().operations().run.is_none());
+}
+
+/// A send attaching an upload to an actor that can't read uploads is refused before anything is
+/// written, as today's actor refuses it, never run with its attachment dropped.
+#[tokio::test]
+async fn a_send_attaching_an_upload_without_upload_staging_is_refused() {
+    let (commands, served, _) = actor(executor(vec![text_step("a1", "never sent")], None)).await;
+    let mut attaching = request("look");
+    attaching.content =
+        serde_json::from_value(serde_json::json!([{"type": "upload", "upload_id": "u1"}])).unwrap();
+    let outcome = send_with(&commands, "r1", attaching, SendKey::Minted).await;
+    let SendOutcome::Error(message) = &outcome else {
+        panic!("the send is refused: {outcome:?}");
+    };
+    assert!(
+        message.contains("upload staging is unavailable"),
+        "{message}"
+    );
+    drop(commands);
+    let session = served.await.unwrap();
+    assert!(session.operations().run.is_none(), "nothing was written");
+    assert!(session.conversation().messages.is_empty());
 }
 
 /// A cancel at the step boundary is durable before its reply. The run, whose first model call is

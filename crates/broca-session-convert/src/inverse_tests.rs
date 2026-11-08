@@ -1,6 +1,6 @@
 use broca_wal::{FramedRecord, WalRecord};
 
-use super::{comparable, first_difference, invert, without_nulls};
+use super::inverse::{comparable, first_difference, invert, without_nulls};
 use crate::convert;
 
 fn log(lines: &[&str]) -> Vec<FramedRecord> {
@@ -238,6 +238,135 @@ fn current_compaction_records_round_trip() {
         .collect();
     assert_eq!(kinds, ["View", "ViewApplied", "Marker"]);
     assert_round_trip(&old);
+}
+
+/// A tool batch carrying a queued send's text: `delivery` is the delivery record, written after
+/// the batch finishes, as today's loop writes it.
+fn ride_log(delivery: &str) -> Vec<FramedRecord> {
+    log(&[
+        &RUN.replace("RUN", "r"),
+        r#"{"type":"delivery_ordered","submission_id":"sub-q","order":{"modes":["tool_result","turn_system","steer"]}}"#,
+        r#"{"type":"queued","submission_id":"sub-q","send_id":"q","request":{"model":{"provider_module_id":"p","model_id":"m"},"input":[{"role":"user","content":[{"type":"text","text":"note"}]}],"policy_allowed":[],"tool_choice":{"type":"auto"},"generation":{},"stop_when":[]},"written_at_ms":5}"#,
+        r#"{"type":"step_started","step_id":1}"#,
+        r#"{"type":"model_step_finished","step_id":1,"assistant_message":{"message_id":"m1","content":[{"type":"tool_call","tool_call_id":"c1","tool_name":"bash","input":{"cmd":"ls"}}]},"usage":{},"finish_reason":"tool_calls","retries_used":0}"#,
+        r#"{"type":"tool_batch_started","batch_id":"b1","step_id":1,"planned_calls":["c1"]}"#,
+        r#"{"type":"tool_dispatch_intent","batch_id":"b1","tool_call_id":"c1","args":{"cmd":"ls"}}"#,
+        r#"{"type":"tool_result","batch_id":"b1","result":{"tool_call_id":"c1","output":{"kind":"text","text":"ok"},"is_error":false},"outcome":"completed"}"#,
+        r#"{"type":"tool_batch_finished","batch_id":"b1"}"#,
+        delivery,
+        r#"{"type":"turn_finished","step_id":1}"#,
+    ])
+}
+
+/// The ride envelope today's writer records since llm-runner 0.8.11 becomes the append's own
+/// envelope, and goes back into today's `ride` member whole.
+#[test]
+fn a_ride_envelope_converts_onto_the_append_and_round_trips() {
+    use broca_session_store::record::{Record, RideEnvelope, RideForm};
+    let old = ride_log(
+        r#"{"type":"send_delivered","submission_id":"sub-q","run_id":"r","mode":"tool_result","tool_call_id":"c1","appended_text":"\n\nnote","written_at_ms":5,"ride":{"call_key":"lineage:7","send_id":"q","sender":"broca","forms":["tool_result","turn_system"],"form":"append"}}"#,
+    );
+    let converted = convert(&old, None).unwrap();
+    let appends: Vec<_> = converted
+        .records
+        .iter()
+        .filter_map(|record| match record {
+            Record::ResultAppend(append) => Some(append),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(appends.len(), 1);
+    assert_eq!(appends[0].send_id.as_deref(), Some("q"));
+    assert_eq!(
+        appends[0].ride,
+        Some(RideEnvelope {
+            call_key: "lineage:7".into(),
+            sender: "broca".into(),
+            forms: vec!["tool_result".into(), "turn_system".into()],
+            form: RideForm::Append,
+        })
+    );
+    assert_round_trip(&old);
+}
+
+/// A ride recorded before envelopes existed converts with no envelope and no send id, and
+/// round-trips without gaining a `ride` member.
+#[test]
+fn a_ride_without_an_envelope_converts_without_one_and_round_trips() {
+    use broca_session_store::record::Record;
+    let old = ride_log(
+        r#"{"type":"send_delivered","submission_id":"sub-q","run_id":"r","mode":"tool_result","tool_call_id":"c1","appended_text":"\n\nnote","written_at_ms":5}"#,
+    );
+    let converted = convert(&old, None).unwrap();
+    let append = converted
+        .records
+        .iter()
+        .find_map(|record| match record {
+            Record::ResultAppend(append) => Some(append),
+            _ => None,
+        })
+        .expect("the delivery's append");
+    assert_eq!(
+        (append.send_id.as_ref(), append.ride.as_ref()),
+        (None, None)
+    );
+    assert_round_trip(&old);
+}
+
+/// A steer's and a queued send's images round-trip. Today's log keeps their bytes in its own
+/// media store, so the converted records name no stored object; and where the new storage stored
+/// them (`media`), that is the new storage's own bookkeeping, which today's records don't carry:
+/// records naming stored objects invert to the same records of today's log.
+#[test]
+fn a_sends_images_round_trip_and_where_the_store_keeps_them_stays_its_own() {
+    use broca_session_store::record::{Record, SendMedia};
+    let image = r#"{"type":"media","kind":"image","mime":"image/png","byte_size":3,"sha256":"0000000000000000000000000000000000000000000000000000000000000001","width":1,"height":1}"#;
+    let steer = format!(
+        r#"{{"type":"steered","input":[{{"role":"user","content":[{{"type":"text","text":"also this"}},{image}]}}],"written_at_ms":7}}"#
+    );
+    let queued = format!(
+        r#"{{"type":"queued","submission_id":"q1","request":{{"model":{{"provider_module_id":"p","model_id":"m"}},"input":[{{"role":"user","content":[{{"type":"text","text":"later"}},{image}]}}]}}}}"#
+    );
+    let old = log(&[
+        &RUN.replace("RUN", "r"),
+        r#"{"type":"step_started","step_id":1}"#,
+        &steer,
+        &queued,
+        STEP,
+        r#"{"type":"step_started","step_id":2}"#,
+    ]);
+    assert_round_trip(&old);
+    let mut converted = convert(&old, None).unwrap();
+    let stored = SendMedia {
+        message: 0,
+        block: 1,
+        part: None,
+        log: broca_session_store::codec::Id128([1; 16]),
+        generation: broca_session_store::codec::Id128([2; 16]),
+        seq: 9,
+    };
+    let mut named = 0;
+    for record in &mut converted.records {
+        let media = match record {
+            Record::QueuedSend(send) => &mut send.media,
+            Record::Steer(steer) => &mut steer.media,
+            _ => continue,
+        };
+        assert!(media.is_empty(), "a converted send names no stored object");
+        media.push(stored.clone());
+        named += 1;
+    }
+    assert_eq!(named, 2);
+    let rebuilt: Vec<_> = invert(&converted.records, &converted.parts)
+        .unwrap()
+        .iter()
+        .map(without_nulls)
+        .collect();
+    let original = comparable(&old);
+    assert_eq!(rebuilt.len(), original.len());
+    for (i, (a, b)) in original.iter().zip(&rebuilt).enumerate() {
+        assert_eq!(first_difference(a, b, ""), None, "record {i}");
+    }
 }
 
 /// A refresh, a policy change and a flush keep records of their own, and the run start that

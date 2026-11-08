@@ -22,7 +22,6 @@ use broca_module::store_read::history_sides::TodaysHistory;
 use broca_session_convert::stored_history::{history, Backend, StoredHistory};
 use broca_session_loop::parts::MemoryParts;
 use broca_session_store::backend::{MemoryBackend, SessionAddr};
-use broca_session_store::keys::DeploymentKey;
 use broca_session_store::session::Session;
 use futures::executor::block_on;
 use serde::Serialize;
@@ -313,7 +312,7 @@ fn todays_walks(
 
 pub(super) fn run(args: &Args) {
     let mut report = HistoryReport::default();
-    let deployment = DeploymentKey::new(1, &[0x5a; 32]);
+    let deployment = crate::deployment();
     let limit = std::env::var("HISTORY_LIMIT")
         .ok()
         .and_then(|limit| limit.parse().ok())

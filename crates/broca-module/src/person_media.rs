@@ -187,6 +187,34 @@ pub fn publish(
     Ok(())
 }
 
+/// Refuses an ordered send holding media whose delivery list names no mode that can carry them:
+/// only a steer or an idle-start run places the send's own messages, while a tool result carries
+/// text only and turn-scoped system text is a template's text. `model` is the model the refusal
+/// names.
+pub(crate) fn ordered_carrier(
+    order: &broca_protocol::DeliveryOrder,
+    input: &[Message],
+    model: &str,
+) -> Result<(), RunError> {
+    let carried = order.modes.iter().any(|mode| {
+        matches!(
+            mode,
+            broca_protocol::DeliveryMode::Steer | broca_protocol::DeliveryMode::IdleStart
+        )
+    });
+    match broca_provider::person_media::references(input).next() {
+        Some(medium) if !carried => Err(RunError::MediaUnsupported(
+            broca_provider::person_media::refusal(
+                model,
+                medium.kind,
+                broca_protocol::MediaMarkerReason::Carrier,
+            )
+            .to_string(),
+        )),
+        _ => Ok(()),
+    }
+}
+
 pub(crate) fn outcome(error: RunError) -> crate::actor::SendOutcome {
     match error {
         RunError::Upload(error) => crate::actor::SendOutcome::Upload(error),

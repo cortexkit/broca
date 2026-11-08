@@ -8,7 +8,8 @@ fields!(Delivered {
     part,
     notice,
     text,
-    send_id
+    send_id,
+    ride
 });
 fields!(EntryState {
     facts,

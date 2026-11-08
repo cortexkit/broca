@@ -10,20 +10,32 @@ use super::*;
 /// A fuzz target's entry point.
 type EntryPoint = fn(&[u8]);
 
+cipher_tests!(
+    an_empty_log_is_a_torn_tail_not_a_clean_log,
+    a_segment_footer_whose_index_range_overflows_refuses,
+    reading_a_small_block_allocates_in_proportion_to_it,
+    a_directory_page_naming_itself_refuses_instead_of_looping,
+    abandoning_pages_that_name_one_page_many_times_reads_it_once,
+    an_index_merge_counting_more_runs_than_its_level_holds_refuses,
+    an_index_merge_whose_written_count_would_overflow_refuses,
+    a_frame_of_an_unknown_kind_refuses_the_log,
+);
+
 /// Every committed input of every fuzz target: its seed corpus, and the inputs of crashes a fuzz
 /// run found, run through the same entry point the target calls.
 #[test]
 fn every_committed_fuzz_input_replays_clean() {
     let fuzz = Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz");
-    let targets: [(&str, EntryPoint); 5] = [
+    let targets: [(&str, EntryPoint); 6] = [
         ("record", record),
         ("frame_log", frame_log),
         ("segment", segment),
         ("head_checkpoint", head_checkpoint),
         ("directory_idindex", directory_idindex),
+        ("plain", plain),
     ];
-    let mut replayed = 0;
     for (target, entry) in targets {
+        let mut replayed = 0;
         for dir in ["corpus", "regressions"] {
             for file in files(&fuzz.join(dir).join(target)) {
                 let data = std::fs::read(&file).unwrap();
@@ -31,12 +43,14 @@ fn every_committed_fuzz_input_replays_clean() {
                 replayed += 1;
             }
         }
+        // Every target has a seed corpus, so a target whose inputs went missing fails here
+        // rather than replaying nothing.
+        assert!(
+            replayed > 0,
+            "no committed fuzz input for {target} under {}",
+            fuzz.display()
+        );
     }
-    assert!(
-        replayed > 0,
-        "no committed fuzz input found under {}",
-        fuzz.display()
-    );
 }
 
 fn files(dir: &Path) -> Vec<PathBuf> {
@@ -143,9 +157,8 @@ fn an_absent_opaque_field_refuses() {
 
 /// A log cut to nothing has lost its checkpoint, which creation synced, so it is a torn tail at
 /// 0, and the analysis finds it below the durable bound: never a clean, empty log.
-#[test]
-fn an_empty_log_is_a_torn_tail_not_a_clean_log() {
-    let key = frame_key();
+fn an_empty_log_is_a_torn_tail_not_a_clean_log(cipher: Cipher) {
+    let key = frame_key(cipher);
     let read = crate::log::read(&[], &key, BIND, 92, chain_base).unwrap();
     assert_eq!(read.end, crate::log::LogEnd::TornTail { at: 0 });
     match crate::damage::analyse(&[], &key, BIND, 92, chain_base, None).unwrap() {
@@ -159,8 +172,7 @@ fn an_empty_log_is_a_torn_tail_not_a_clean_log() {
 }
 
 /// A segment's footer offsets come from the stored bytes, so adding them must not overflow.
-#[test]
-fn a_segment_footer_whose_index_range_overflows_refuses() {
+fn a_segment_footer_whose_index_range_overflows_refuses(cipher: Cipher) {
     let header = SegmentHeader {
         format: 1,
         session_id: SESSION,
@@ -177,7 +189,7 @@ fn a_segment_footer_whose_index_range_overflows_refuses() {
     bytes.extend_from_slice(&u64::MAX.to_le_bytes());
     bytes.extend_from_slice(&1u32.to_le_bytes());
     bytes.extend_from_slice(b"BSEG");
-    let key = frame_key();
+    let key = frame_key(cipher);
     assert!(segment::Segment::open(&bytes, &key, SEGMENT_NAME).is_err());
     let mut input = vec![0x00];
     input.extend_from_slice(&bytes);
@@ -195,8 +207,7 @@ fn a_block_entry_whose_range_overflows_refuses() {
 
 /// Reading a block allocates what its compressed frame says it holds, not the most a block may
 /// hold: before, every block read took 64 MiB, whatever its size.
-#[test]
-fn reading_a_small_block_allocates_in_proportion_to_it() {
+fn reading_a_small_block_allocates_in_proportion_to_it(cipher: Cipher) {
     let records = vec![(
         1,
         Record::StepStart(crate::record::StepStart {
@@ -214,7 +225,7 @@ fn reading_a_small_block_allocates_in_proportion_to_it() {
         log_start: None,
         placed_before: Vec::new(),
     };
-    let key = frame_key();
+    let key = frame_key(cipher);
     let bytes = segment::build(&key, SEGMENT_NAME, &records, meta).unwrap();
     let opened = segment::Segment::open(&bytes, &key, SEGMENT_NAME).unwrap();
     let read = bounded(bytes.len(), 0, || opened.block(0)).unwrap();
@@ -227,12 +238,11 @@ fn reading_a_small_block_allocates_in_proportion_to_it() {
 
 /// A directory page naming itself as a child (or any child not one level below it) is refused,
 /// so every walk ends. Before, `find` looped forever on such a page.
-#[test]
-fn a_directory_page_naming_itself_refuses_instead_of_looping() {
+fn a_directory_page_naming_itself_refuses_instead_of_looping(cipher: Cipher) {
     let (done, finished) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let (backend, addr) = memory_backend();
-        let key = frame_key();
+        let key = frame_key(cipher);
         let looping = PageRef {
             object: "p0".into(),
             level: 1,
@@ -281,12 +291,11 @@ fn a_directory_page_naming_itself_refuses_instead_of_looping() {
 /// Pages that name one page many times make a walk over every path read it once per path, which
 /// grows exponentially with the levels. `abandoned` reads each page once: a tree names each page
 /// once, so the pages it lists don't change.
-#[test]
-fn abandoning_pages_that_name_one_page_many_times_reads_it_once() {
+fn abandoning_pages_that_name_one_page_many_times_reads_it_once(cipher: Cipher) {
     let (done, finished) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let (backend, addr) = memory_backend();
-        let key = frame_key();
+        let key = frame_key(cipher);
         let reference = |object: &str, level| PageRef {
             object: object.into(),
             level,
@@ -330,10 +339,9 @@ fn abandoning_pages_that_name_one_page_many_times_reads_it_once() {
 /// A merge names the runs it reads by counting from its level's oldest, so a root whose merge
 /// counts more runs than its level holds refuses as corrupt. Before, `update` sliced past the
 /// level's runs and panicked.
-#[test]
-fn an_index_merge_counting_more_runs_than_its_level_holds_refuses() {
+fn an_index_merge_counting_more_runs_than_its_level_holds_refuses(cipher: Cipher) {
     let (backend, addr) = memory_backend();
-    let key = frame_key();
+    let key = frame_key(cipher);
     let pages = IndexPages {
         backend: &backend,
         addr: &addr,
@@ -360,10 +368,9 @@ fn an_index_merge_counting_more_runs_than_its_level_holds_refuses() {
 
 /// A merge's count of entries written comes from the stored root, so adding a step's entries to
 /// it refuses rather than overflowing. Before, a count near the largest number overflowed.
-#[test]
-fn an_index_merge_whose_written_count_would_overflow_refuses() {
+fn an_index_merge_whose_written_count_would_overflow_refuses(cipher: Cipher) {
     let (backend, addr) = memory_backend();
-    let key = frame_key();
+    let key = frame_key(cipher);
     let pages = IndexPages {
         backend: &backend,
         addr: &addr,
@@ -543,17 +550,30 @@ proptest! {
         // A head also round-trips through its stored, authenticated form.
         let deployment = DeploymentKey::new(DEPLOYMENT_ID, &DEPLOYMENT);
         let key = DataKey::from_bytes(1, DATA_KEY);
-        let head = Head {
+        let encrypted = Head {
             format: head::HEAD_FORMAT,
             keys: vec![head::WrappedKey {
                 id: 1,
                 deployment: DEPLOYMENT_ID,
-                wrapped: ByteBuf(crate::keys::wrap(&deployment, &head.session_id, &key)),
+                wrapped: ByteBuf(
+                    crate::keys::wrap(&deployment, &head.session_id, &key).unwrap(),
+                ),
             }],
+            cipher: None,
+            ..head.clone()
+        };
+        let (opened, _) = head::open(&head::seal(&encrypted, &key), &deployment).unwrap();
+        prop_assert_eq!(opened, encrypted);
+        // And through a plain head's stored form, which opens without the deployment key.
+        let plain = Head {
+            format: head::HEAD_FORMAT,
+            keys: Vec::new(),
+            cipher: Some(Cipher::None),
             ..head
         };
-        let (opened, _) = head::open(&head::seal(&head, &key), &deployment).unwrap();
-        prop_assert_eq!(opened, head);
+        let sealed = head::seal(&plain, &DataKey::plain());
+        let (opened, _) = head::open(&sealed, &DeploymentKey::unloaded(DEPLOYMENT_ID)).unwrap();
+        prop_assert_eq!(opened, plain);
     }
 
     /// Valid encodings with a few bytes changed decode only to values whose encoding is
@@ -622,6 +642,7 @@ proptest! {
         segment(&bytes);
         head_checkpoint(&bytes);
         directory_idindex(&bytes);
+        plain(&bytes);
     }
 }
 
@@ -631,7 +652,8 @@ proptest! {
     /// A log of generated batches, cut at every offset and changed at many, reads soundly: only
     /// written records, only whole batches, never clean when damaged (see `fuzzing::log`).
     #[test]
-    fn a_log_reads_soundly_cut_or_changed_anywhere(bytes in seed()) {
+    fn a_log_reads_soundly_cut_or_changed_anywhere(bytes in seed(), plain_mode in any::<bool>()) {
+        let cipher = if plain_mode { Cipher::None } else { Cipher::XChaCha20Poly1305 };
         let mut input = Input::new(&bytes);
         let next_seq = 1 + input.number() % 1000;
         let base = ChainBase {
@@ -646,7 +668,7 @@ proptest! {
                 _ => LogOp::Claim,
             });
         }
-        let log = write_log(next_seq, base, &ops);
+        let log = write_log(cipher, next_seq, base, &ops);
         check_log(&log, &Mutation::None);
         for at in 0..log.bytes.len() {
             check_log(&log, &Mutation::Truncate(at));
@@ -665,9 +687,8 @@ proptest! {
 
 /// A record frame of a kind this build doesn't know, without the skippable flag, refuses the
 /// log as written by a newer build: it authenticates, so it is never damage.
-#[test]
-fn a_frame_of_an_unknown_kind_refuses_the_log() {
-    let log = write_log(1, ChainBase::default(), &[]);
+fn a_frame_of_an_unknown_kind_refuses_the_log(cipher: Cipher) {
+    let log = write_log(cipher, 1, ChainBase::default(), &[]);
     let header = crate::frame::FrameHeader {
         flags: 0,
         stream: crate::frame::FrameStream::Ledger,
@@ -682,8 +703,8 @@ fn a_frame_of_an_unknown_kind_refuses_the_log() {
         prev_in_stream: None,
     };
     let mut bytes = log.bytes.clone();
-    bytes.extend(crate::frame::seal(&header, &[], &frame_key(), BIND).unwrap());
-    let key = frame_key();
+    bytes.extend(crate::frame::seal(&header, &[], &frame_key(cipher), BIND).unwrap());
+    let key = frame_key(cipher);
     let refused = |result: Result<(), crate::log::LogError>| match result {
         Err(crate::log::LogError::Undecodable { offset, error }) => {
             assert_eq!(offset, log.bytes.len() as u64);
@@ -723,25 +744,14 @@ fn the_memory_bound_measures_allocations() {
     assert!(caught.is_err(), "an allocation over the bound passed it");
 }
 
-/// Writes the seed corpus every fuzz target starts from: valid encodings of each family. Run by
-/// hand, when the formats change: `cargo test -p broca-session-store --lib write_fuzz_seeds --
-/// --ignored`.
-#[test]
-#[ignore = "writes the committed seed corpus"]
-fn write_fuzz_seeds() {
-    let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz/corpus");
-    let write = |target: &str, name: &str, data: &[u8]| {
-        let dir = corpus.join(target);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(format!("seed-{name}")), data).unwrap();
-    };
-    let pattern = |n: usize| -> Vec<u8> { (0..96).map(|i| (i * 7 + n * 13) as u8).collect() };
-    for (n, kind) in KINDS.iter().enumerate() {
-        let record = record_of(n, &mut G::new(&pattern(n)));
-        let mut data = vec![*kind as u8];
-        data.extend(record.encode_body());
-        write("record", &format!("{kind:02}-{}", record.name()), &data);
-    }
+/// Input bytes for generating a seed, varied by `n`.
+fn pattern(n: usize) -> Vec<u8> {
+    (0..96).map(|i| (i * 7 + n * 13) as u8).collect()
+}
+
+/// The log the `frame_log` seeds hold: batches of both streams, a barrier and a claim-only frame,
+/// sealed in mode `cipher`.
+fn seed_log(cipher: Cipher) -> WrittenLog {
     let ops = [
         LogOp::Batch(vec![small_record(&mut Input::new(b"\x00\x03run\x05"))]),
         LogOp::Barrier,
@@ -751,30 +761,19 @@ fn write_fuzz_seeds() {
         ]),
         LogOp::Claim,
     ];
-    let log = write_log(
+    write_log(
+        cipher,
         5,
         ChainBase {
             transcript: Some(2),
             ledger: None,
         },
         &ops,
-    );
-    write("frame_log", "raw-log", &[&[0x00][..], &log.bytes].concat());
-    write(
-        "frame_log",
-        "sealed-frames",
-        &[
-            0x01, 0x00, 0x00, 0x05, 0x00, 0x00, 0x01, 0x00, 0x03, b'r', b'u', b'n', 0x05,
-        ],
-    );
-    write(
-        "frame_log",
-        "written-log",
-        &[
-            0x02, 0x04, 0x01, 0x02, 0x00, 0x06, 0x00, 0x01, 0x00, 0x03, b'r', b'u', b'n', 0x05,
-            0x02, 0x03, 0x01, 0x03, 0x01, 0x00, 0x00, 0x00, 0x00,
-        ],
-    );
+    )
+}
+
+/// The segment the `segment` seeds hold: generated ledger records, sealed in mode `cipher`.
+fn seed_segment(cipher: Cipher) -> Vec<u8> {
     let records: Vec<(u64, Record)> = (0..6)
         .map(|n| {
             (
@@ -793,7 +792,45 @@ fn write_fuzz_seeds() {
         log_start: None,
         placed_before: Vec::new(),
     };
-    let built = segment::build(&frame_key(), SEGMENT_NAME, &records, meta).unwrap();
+    segment::build(&frame_key(cipher), SEGMENT_NAME, &records, meta).unwrap()
+}
+
+/// Writes the seed corpus every fuzz target starts from: valid encodings of each family. Run by
+/// hand, when the formats change: `cargo test -p broca-session-store --lib write_fuzz_seeds --
+/// --ignored`.
+#[test]
+#[ignore = "writes the committed seed corpus"]
+fn write_fuzz_seeds() {
+    let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz/corpus");
+    let write = |target: &str, name: &str, data: &[u8]| {
+        let dir = corpus.join(target);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("seed-{name}")), data).unwrap();
+    };
+    for (n, kind) in KINDS.iter().enumerate() {
+        let record = record_of(n, &mut G::new(&pattern(n)));
+        let mut data = vec![*kind as u8];
+        data.extend(record.encode_body());
+        write("record", &format!("{kind:02}-{}", record.name()), &data);
+    }
+    let log = seed_log(Cipher::XChaCha20Poly1305);
+    write("frame_log", "raw-log", &[&[0x00][..], &log.bytes].concat());
+    write(
+        "frame_log",
+        "sealed-frames",
+        &[
+            0x01, 0x00, 0x00, 0x05, 0x00, 0x00, 0x01, 0x00, 0x03, b'r', b'u', b'n', 0x05,
+        ],
+    );
+    write(
+        "frame_log",
+        "written-log",
+        &[
+            0x02, 0x04, 0x01, 0x02, 0x00, 0x06, 0x00, 0x01, 0x00, 0x03, b'r', b'u', b'n', 0x05,
+            0x02, 0x03, 0x01, 0x03, 0x01, 0x00, 0x00, 0x00, 0x00,
+        ],
+    );
+    let built = seed_segment(Cipher::XChaCha20Poly1305);
     write("segment", "raw-segment", &[&[0x00][..], &built].concat());
     write(
         "segment",
@@ -874,4 +911,60 @@ fn the_generators_cover_every_record_kind() {
         .filter(|kind| crate::record::kind_stream(*kind).is_some())
         .collect();
     assert_eq!(declared, KINDS.to_vec());
+}
+
+/// Writes the `plain` target's seed corpus: each encrypted target's seeds that its entry point
+/// seals itself, behind the family byte the `plain` entry point reads, and a log, a segment and a
+/// head stored in the plain mode. Plain units carry no nonce, so these seeds are the same bytes
+/// each time. Run by hand after `write_fuzz_seeds`: `cargo test -p broca-session-store --lib
+/// write_plain_fuzz_seeds -- --ignored`.
+#[test]
+#[ignore = "writes the committed seed corpus"]
+fn write_plain_fuzz_seeds() {
+    let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz/corpus");
+    let dir = corpus.join("plain");
+    std::fs::create_dir_all(&dir).unwrap();
+    let write = |name: &str, family: u8, data: &[u8]| {
+        std::fs::write(
+            dir.join(format!("seed-{name}")),
+            [&[family][..], data].concat(),
+        )
+        .unwrap();
+    };
+    let families: [(u8, &str, &[&str]); 4] = [
+        (0, "frame_log", &["sealed-frames", "written-log"]),
+        (1, "segment", &["sealed-units", "built-segment"]),
+        (
+            2,
+            "head_checkpoint",
+            &["head", "checkpoint", "empty-checkpoint"],
+        ),
+        (
+            3,
+            "directory_idindex",
+            &["page", "index-root", "directory-walk", "index-walk"],
+        ),
+    ];
+    for (family, target, seeds) in families {
+        for seed in seeds {
+            let data = std::fs::read(corpus.join(target).join(format!("seed-{seed}"))).unwrap();
+            write(&format!("{target}-{seed}"), family, &data);
+        }
+    }
+    let log = seed_log(Cipher::None);
+    write("frame_log-raw-log", 0, &[&[0x00][..], &log.bytes].concat());
+    let built = seed_segment(Cipher::None);
+    write("segment-raw-segment", 1, &[&[0x00][..], &built].concat());
+    let head = Head {
+        format: head::HEAD_FORMAT,
+        keys: Vec::new(),
+        cipher: Some(Cipher::None),
+        ..gen::<Head>(&mut G::new(&pattern(3)))
+    };
+    let stored = head::seal(&head, &DataKey::plain());
+    write(
+        "head_checkpoint-stored-head",
+        2,
+        &[&[0x00][..], &stored].concat(),
+    );
 }

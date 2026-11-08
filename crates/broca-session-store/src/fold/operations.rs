@@ -226,10 +226,28 @@ crate::message! {
         /// The send's request identity digest, as its record kept it, which names the
         /// `client_message_id` the caller gave it.
         8 opt request_identity_digest: String,
+        /// Where the bytes of the messages' media are stored, as the accepting record named
+        /// them, so each placed copy points at the same objects.
+        9 rep [must] media: crate::record::SendMedia,
     }
 }
 
 impl PendingInput {
+    /// Where the media of the `index`th message are stored, as its transcript copy names them.
+    pub fn media_at(&self, index: usize) -> Vec<crate::record::InputMedia> {
+        self.media
+            .iter()
+            .filter(|medium| medium.message as usize == index)
+            .map(|medium| crate::record::InputMedia {
+                block: medium.block,
+                part: medium.part,
+                log: medium.log,
+                generation: medium.generation,
+                seq: medium.seq,
+            })
+            .collect()
+    }
+
     /// The v1 part numbers of the `index`th message, when the record lists one entry per
     /// message.
     pub fn tags_at(&self, index: usize) -> Option<serde_json::Value> {
@@ -2046,6 +2064,7 @@ impl Operations {
                     steer.receipt.as_ref(),
                     "request_identity_digest",
                 ),
+                media: steer.media.clone(),
             }),
             Record::Delivery(delivery) if !delivery.input.is_empty() => {
                 let (sender, request_identity_digest) = delivered_send.unwrap_or_default();
@@ -2062,6 +2081,9 @@ impl Operations {
                     submission_id: Some(delivery.submission_id.clone()),
                     sender,
                     request_identity_digest,
+                    // A delivery names no stored media of its own. The loop writes one only for an
+                    // ordered send, which a session in the new storage doesn't take yet.
+                    media: Vec::new(),
                 })
             }
             Record::BudgetFire(fire) => match fire.firing {

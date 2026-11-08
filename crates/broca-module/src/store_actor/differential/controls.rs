@@ -27,6 +27,8 @@ use super::{today_with, Today};
 use crate::actor::{LineageCmd, SendKey, SendOutcome, SendPlan};
 use crate::executor::RunKind;
 
+cipher_tests!(a_view_handed_over_at_a_ride_is_applied_alike);
+
 /// A `pre_user` provider that puts a note before the text of each user message it is asked
 /// about, as Magic Context's input transform does in production. Once `unavailable` is set, it
 /// can't be reached.
@@ -67,7 +69,7 @@ impl Noter {
 /// message at its next ride. It keeps each call it is sent: its method, and for a notice its
 /// sequence number and the ordinals of the entries it carries.
 #[derive(Default)]
-struct Compactor {
+pub(super) struct Compactor {
     methods: Mutex<Vec<String>>,
     calls: Mutex<Vec<Value>>,
     /// The id of each entry the notices carried, by its ordinal. Each storage mints its own ids,
@@ -83,11 +85,11 @@ struct Compactor {
 
 impl Compactor {
     /// Answers the next ride with a view dropping the message at `ordinal`.
-    fn drop_at_next_ride(&self, ordinal: u64) {
+    pub(super) fn drop_at_next_ride(&self, ordinal: u64) {
         *self.drop_at_ride.lock().unwrap() = Some(ordinal);
     }
 
-    fn views(&self) -> usize {
+    pub(super) fn views(&self) -> usize {
         self.views.lock().unwrap().len()
     }
 
@@ -188,7 +190,7 @@ impl broca_core::CompactionPlane for Compactor {
 
 /// A fetch plan's manifest: `plan` as the caller sent it, the `read` tool both sides' tool
 /// planes answer, a system text, and what each subscribed provider declared.
-fn manifest(plan: Value, declarations: Vec<FrozenDeclaration>) -> Arc<PlanManifest> {
+pub(super) fn manifest(plan: Value, declarations: Vec<FrozenDeclaration>) -> Arc<PlanManifest> {
     Arc::new(PlanManifest {
         rich_ui: None,
         plan: OpaqueJson::from_json_text(plan.to_string()).unwrap(),
@@ -236,7 +238,7 @@ fn noting_plan(on_unavailable: &str) -> Arc<PlanManifest> {
 }
 
 /// A plan naming a compaction provider.
-fn compacting_plan() -> Arc<PlanManifest> {
+pub(super) fn compacting_plan() -> Arc<PlanManifest> {
     manifest(
         json!({"compaction_item": {"provider": "compactor", "preset": "default"}}),
         vec![],
@@ -255,6 +257,7 @@ fn noting(noter: &Arc<Noter>) -> Planes {
     Planes {
         hooks: Some(Arc::clone(noter) as Arc<dyn HookPlane>),
         compaction: None,
+        tool_gate: None,
     }
 }
 
@@ -288,6 +291,24 @@ impl Pair {
         today_planes: Planes,
         store_planes: Planes,
     ) -> Self {
+        Self::new_in(
+            script,
+            gated,
+            today_planes,
+            store_planes,
+            broca_session_store::keys::Cipher::XChaCha20Poly1305,
+        )
+        .await
+    }
+
+    /// [`Pair::new`], with the store's session in mode `cipher`.
+    async fn new_in(
+        script: Vec<Vec<NormalizedEvent>>,
+        gated: bool,
+        today_planes: Planes,
+        store_planes: Planes,
+        cipher: broca_session_store::keys::Cipher,
+    ) -> Self {
         let today_gate = gated.then(|| Arc::new(Notify::new()));
         let store_gate = gated.then(|| Arc::new(Notify::new()));
         let today = today_with(script.clone(), today_gate.clone(), today_planes);
@@ -299,7 +320,7 @@ impl Pair {
             backend,
             SessionAddr(store::ADDR.into()),
             store::triple(),
-            &store::deployment(),
+            &store::deployment().creating(cipher),
             false,
         )
         .await
@@ -834,12 +855,13 @@ fn compacting(compactor: &Arc<Compactor>) -> Planes {
     Planes {
         hooks: None,
         compaction: Some(Arc::clone(compactor) as Arc<dyn broca_core::CompactionPlane>),
+        tool_gate: None,
     }
 }
 
 /// A send with no tools of its own and a context window, which a run on the compaction
 /// contract needs.
-fn limited(text: &str) -> SubmissionRequest {
+pub(super) fn limited(text: &str) -> SubmissionRequest {
     let mut request = untooled(text);
     request.context_limit = Some(200_000);
     request
@@ -851,11 +873,25 @@ async fn compacting_pair(
     script: Vec<Vec<NormalizedEvent>>,
     gated: bool,
 ) -> (Pair, Arc<Compactor>, Arc<Compactor>) {
+    compacting_pair_in(
+        script,
+        gated,
+        broca_session_store::keys::Cipher::XChaCha20Poly1305,
+    )
+    .await
+}
+
+/// [`compacting_pair`], with the store's session in mode `cipher`.
+async fn compacting_pair_in(
+    script: Vec<Vec<NormalizedEvent>>,
+    gated: bool,
+    cipher: broca_session_store::keys::Cipher,
+) -> (Pair, Arc<Compactor>, Arc<Compactor>) {
     let (old, new) = (
         Arc::new(Compactor::default()),
         Arc::new(Compactor::default()),
     );
-    let pair = Pair::new(script, gated, compacting(&old), compacting(&new)).await;
+    let pair = Pair::new_in(script, gated, compacting(&old), compacting(&new), cipher).await;
     (pair, old, new)
 }
 
@@ -930,14 +966,14 @@ async fn a_tool_batchs_results_are_told_once_durable_alike() {
 /// starts with, is accepted and applied at that step's boundary, alike: both sessions record
 /// the view and its application, the model is sent the same messages with the dropped message
 /// left out, and a subscriber from each session's start gets the same control stream.
-#[tokio::test]
-async fn a_view_handed_over_at_a_ride_is_applied_alike() {
-    let (pair, old, new) = compacting_pair(
+async fn a_view_handed_over_at_a_ride_is_applied_alike(cipher: broca_session_store::keys::Cipher) {
+    let (pair, old, new) = compacting_pair_in(
         vec![
             store::text_step("a1", "hello"),
             store::text_step("a2", "again"),
         ],
         false,
+        cipher,
     )
     .await;
     let plan = compacting_plan();

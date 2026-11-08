@@ -63,6 +63,28 @@ pub struct MediaStore {
     root: PathBuf,
 }
 
+/// Where a render reads the bytes of a medium its session captured. Today's sessions read their
+/// [`MediaStore`] files; a session kept in the new storage reads its own media objects. Every
+/// source returns only bytes that match the reference's digest and size, and refuses with the
+/// same [`MediaReadError`] codes, so the render rules in `media_request` stay one set. A source
+/// is unwind safe, as the projection holding it is: a read leaves nothing half changed.
+pub trait MediaBytes: std::fmt::Debug + Send + Sync + std::panic::RefUnwindSafe {
+    /// The medium's bytes, read afresh and checked against `reference`.
+    fn read_verified(&self, reference: &MediaRef) -> Result<Vec<u8>, MediaReadError>;
+}
+
+impl MediaBytes for MediaStore {
+    fn read_verified(&self, reference: &MediaRef) -> Result<Vec<u8>, MediaReadError> {
+        MediaStore::read_verified(self, reference)
+    }
+}
+
+impl<T: MediaBytes + ?Sized> MediaBytes for std::sync::Arc<T> {
+    fn read_verified(&self, reference: &MediaRef) -> Result<Vec<u8>, MediaReadError> {
+        (**self).read_verified(reference)
+    }
+}
+
 impl MediaStore {
     /// Startup must have created the state root. This also pays creation barriers
     /// when a store is opened independently of the serving process.

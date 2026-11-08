@@ -14,6 +14,10 @@
 //!   parts there under that deployment's names.
 //! - **Encryption:** each part is encrypted under the deployment's setup key, with its name in
 //!   the authenticated data, so a part served under another name fails to open.
+//! - **Plain sessions** keep their parts in a name space of their own (names start with
+//!   `plain/`), named under a key derived from the published key and stored with an unkeyed
+//!   check instead of encrypted (see `SetupKey::plain`). A session reads parts only in its own
+//!   mode, so a plain part and an encrypted part never collide or get read in the wrong mode.
 //! - **Verification:** a read checks the decrypted bytes against the digest the record names. A
 //!   missing or corrupt part is damage to the session that names it, never an absent value.
 //! - **Lifetime:** parts are never deleted: they amount to a few megabytes a month, and deleting
@@ -38,11 +42,14 @@ use crate::record::PartRef;
 
 const AAD_CONTEXT: &[u8] = b"broca-setup-part-v1";
 
+/// What the names of plain sessions' parts start with: their name space.
+pub const PLAIN_PREFIX: &str = "plain/";
+
 /// Parts the in-memory cache holds before it starts over. The deployment's distinct parts number
 /// in the hundreds, so this only bounds a cache that would otherwise grow without limit.
 const CACHE_CAP: usize = 4096;
 
-/// The deployment's setup-store keys: one to name parts, one to encrypt them.
+/// The deployment's setup-store keys for one cipher mode: one to name parts, one to seal them.
 pub struct SetupKey {
     naming: [u8; 32],
     cipher: FrameKey,
@@ -56,9 +63,41 @@ impl SetupKey {
         }
     }
 
-    /// The name part `digest` is stored under.
+    /// The setup-store keys of plain sessions: parts named under a key derived from the
+    /// published key as an encrypted part's naming key is derived from the deployment key, and
+    /// sealed with the plain check. The same in every deployment.
+    pub fn plain() -> Self {
+        Self {
+            naming: crate::prune::keyed_digest(
+                &crate::keys::published_key(),
+                b"broca-setup-name-v1",
+            )
+            .0,
+            cipher: FrameKey::plain(),
+        }
+    }
+
+    /// The mode of the parts this key stores and reads.
+    pub fn cipher(&self) -> crate::keys::Cipher {
+        self.cipher.cipher()
+    }
+
+    /// The name part `digest` is stored under, in this key's name space.
     pub fn name(&self, digest: &Digest) -> String {
-        hex(&crate::prune::keyed_digest(&self.naming, &digest.0).0)
+        let name = hex(&crate::prune::keyed_digest(&self.naming, &digest.0).0);
+        match self.cipher() {
+            crate::keys::Cipher::XChaCha20Poly1305 => name,
+            crate::keys::Cipher::None => format!("{PLAIN_PREFIX}{name}"),
+        }
+    }
+
+    /// Whether a stored name is in this key's name space: plain names carry their prefix, and
+    /// encrypted names are bare.
+    fn owns(&self, name: &str) -> bool {
+        match self.cipher() {
+            crate::keys::Cipher::XChaCha20Poly1305 => !name.contains('/'),
+            crate::keys::Cipher::None => name.starts_with(PLAIN_PREFIX),
+        }
     }
 }
 
@@ -160,12 +199,16 @@ impl<'a, B: SessionBackend> SetupStore<'a, B> {
         Ok(bytes)
     }
 
-    /// Every part the deployment's setup store holds, with its digest. Each is read and checked
-    /// as `get` checks it, and its stored name must be the one its digest gives, so a part
-    /// copied under another name is damage, not a part.
+    /// Every part the deployment's setup store holds in this store's name space, with its
+    /// digest. Each is read and checked as `get` checks it, and its stored name must be the one
+    /// its digest gives, so a part copied under another name is damage, not a part. Parts of the
+    /// other mode's name space are not this store's and are skipped unread.
     pub async fn load_all(&self) -> Result<Vec<(Digest, Arc<[u8]>)>, SetupError> {
         let mut parts = Vec::new();
         for name in self.backend.list_setup().await? {
+            if !self.key.owns(&name) {
+                continue;
+            }
             let corrupt = || SetupError::CorruptStored(name.clone());
             let sealed = self.backend.get_setup(&name).await?.ok_or_else(corrupt)?;
             let bytes = self

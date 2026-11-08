@@ -2,12 +2,25 @@ use broca_protocol::content::{ContentBlock, Message, Role};
 
 use super::{read, ChainBase, Damage, LogEnd, LogWriter};
 use crate::frame::{FrameError, FrameKey};
+use crate::keys::Cipher;
 use crate::record::{Input, Placement, Record, StepStart};
 
 const BIND: &[u8] = b"session-1/log-1";
 
-fn key() -> FrameKey {
-    FrameKey::new(1, &[7; 32])
+cipher_tests!(
+    a_clean_log_reads_back_every_record_in_order,
+    a_cut_inside_a_batch_is_a_torn_tail_and_drops_the_whole_batch,
+    a_flipped_byte_is_damage_never_a_torn_tail,
+    a_removed_batch_is_an_index_gap,
+    a_log_read_under_another_name_fails_authentication,
+    the_durable_bound_follows_barriers_and_claim_only_frames,
+    a_file_backed_log_reads_back,
+    a_copied_batch_keeps_its_seqs_and_stays_all_or_nothing,
+);
+
+/// The test key in mode `cipher`.
+fn key(cipher: Cipher) -> FrameKey {
+    FrameKey::for_tests(cipher, 1, &[7; 32])
 }
 
 fn input(text: &str) -> Record {
@@ -35,10 +48,10 @@ fn step(step_id: u64) -> Record {
 
 /// A log of a checkpoint and three batches, the second of two records, with a barrier after
 /// the first batch. Returns the bytes and where each batch starts.
-fn sample() -> (Vec<u8>, Vec<u64>) {
+fn sample(cipher: Cipher) -> (Vec<u8>, Vec<u64>) {
     let mut writer = LogWriter::create(
         Vec::new(),
-        key(),
+        key(cipher),
         BIND.to_vec(),
         b"checkpoint",
         1,
@@ -60,14 +73,13 @@ fn no_base(_: &[u8]) -> Result<ChainBase, String> {
     Ok(ChainBase::default())
 }
 
-fn read_all(bytes: &[u8]) -> super::ReadLog {
-    read(bytes, &key(), BIND, 0, no_base).unwrap()
+fn read_all(bytes: &[u8], cipher: Cipher) -> super::ReadLog {
+    read(bytes, &key(cipher), BIND, 0, no_base).unwrap()
 }
 
-#[test]
-fn a_clean_log_reads_back_every_record_in_order() {
-    let (bytes, _) = sample();
-    let log = read_all(&bytes);
+fn a_clean_log_reads_back_every_record_in_order(cipher: Cipher) {
+    let (bytes, _) = sample(cipher);
+    let log = read_all(&bytes, cipher);
     assert_eq!(log.end, LogEnd::Clean);
     assert_eq!(log.checkpoint, b"checkpoint");
     let seqs: Vec<u64> = log.records.iter().map(|(seq, _)| *seq).collect();
@@ -78,9 +90,8 @@ fn a_clean_log_reads_back_every_record_in_order() {
 
 /// A crash in the middle of a write leaves an incomplete batch, and none of its records count,
 /// even the frames that arrived whole.
-#[test]
-fn a_cut_inside_a_batch_is_a_torn_tail_and_drops_the_whole_batch() {
-    let (bytes, starts) = sample();
+fn a_cut_inside_a_batch_is_a_torn_tail_and_drops_the_whole_batch(cipher: Cipher) {
+    let (bytes, starts) = sample(cipher);
     let second = starts[1] as usize;
     let third = starts[2] as usize;
     // Cut exactly after the batch's first frame arrived whole, and in the middle of a frame.
@@ -88,7 +99,7 @@ fn a_cut_inside_a_batch_is_a_torn_tail_and_drops_the_whole_batch() {
     let first_frame_end = second + 4 + length;
     assert!(first_frame_end < third, "the batch has a second frame");
     for cut in [first_frame_end, second + 10, third - 10] {
-        let log = read_all(&bytes[..cut]);
+        let log = read_all(&bytes[..cut], cipher);
         assert_eq!(
             log.end,
             LogEnd::TornTail { at: second as u64 },
@@ -99,15 +110,15 @@ fn a_cut_inside_a_batch_is_a_torn_tail_and_drops_the_whole_batch() {
     }
 }
 
-#[test]
-fn a_flipped_byte_is_damage_never_a_torn_tail() {
-    let (bytes, starts) = sample();
+fn a_flipped_byte_is_damage_never_a_torn_tail(cipher: Cipher) {
+    let (bytes, starts) = sample(cipher);
     let second = starts[1] as usize;
-    // In the body: authentication fails.
+    // In the body, which starts after the header and, in an encrypted frame, its nonce:
+    // authentication fails, or the plain check does.
     let mut body = bytes.clone();
-    body[second + 70] ^= 1;
+    body[second + key(cipher).unit_overhead() + 30] ^= 1;
     assert_eq!(
-        read_all(&body).end,
+        read_all(&body, cipher).end,
         LogEnd::Damaged {
             at: second as u64,
             damage: Damage::Frame(FrameError::Authentication),
@@ -118,7 +129,7 @@ fn a_flipped_byte_is_damage_never_a_torn_tail() {
     let mut length = bytes.clone();
     length[second] ^= 0x40;
     assert_eq!(
-        read_all(&length).end,
+        read_all(&length, cipher).end,
         LogEnd::Damaged {
             at: second as u64,
             damage: Damage::Frame(FrameError::HeaderChecksum),
@@ -128,13 +139,12 @@ fn a_flipped_byte_is_damage_never_a_torn_tail() {
 
 /// A frame removed from the middle of a log fails the index check, even though every
 /// remaining frame authenticates.
-#[test]
-fn a_removed_batch_is_an_index_gap() {
-    let (bytes, starts) = sample();
+fn a_removed_batch_is_an_index_gap(cipher: Cipher) {
+    let (bytes, starts) = sample(cipher);
     let mut spliced = bytes[..starts[1] as usize].to_vec();
     spliced.extend_from_slice(&bytes[starts[2] as usize..]);
     assert_eq!(
-        read_all(&spliced).end,
+        read_all(&spliced, cipher).end,
         LogEnd::Damaged {
             at: starts[1],
             damage: Damage::IndexGap {
@@ -146,10 +156,9 @@ fn a_removed_batch_is_an_index_gap() {
 }
 
 /// The same bytes under another log's name don't authenticate.
-#[test]
-fn a_log_read_under_another_name_fails_authentication() {
-    let (bytes, _) = sample();
-    let log = read(&bytes, &key(), b"session-1/log-2", 0, no_base).unwrap();
+fn a_log_read_under_another_name_fails_authentication(cipher: Cipher) {
+    let (bytes, _) = sample(cipher);
+    let log = read(&bytes, &key(cipher), b"session-1/log-2", 0, no_base).unwrap();
     assert_eq!(
         log.end,
         LogEnd::Damaged {
@@ -161,18 +170,17 @@ fn a_log_read_under_another_name_fails_authentication() {
 
 /// Frames claim the last completed barrier, and a claim-only frame claims the barrier no later
 /// batch did.
-#[test]
-fn the_durable_bound_follows_barriers_and_claim_only_frames() {
-    let (bytes, starts) = sample();
+fn the_durable_bound_follows_barriers_and_claim_only_frames(cipher: Cipher) {
+    let (bytes, starts) = sample(cipher);
     // The barrier after the first batch covers it; later frames claim that much.
-    assert_eq!(read_all(&bytes).durable_bound, starts[1]);
+    assert_eq!(read_all(&bytes, cipher).durable_bound, starts[1]);
     // The length synced when the log was created counts too.
-    let created = read(&bytes, &key(), BIND, starts[0], no_base).unwrap();
+    let created = read(&bytes, &key(cipher), BIND, starts[0], no_base).unwrap();
     assert_eq!(created.durable_bound, starts[1]);
 
     let mut writer = LogWriter::create(
         Vec::new(),
-        key(),
+        key(cipher),
         BIND.to_vec(),
         b"checkpoint",
         1,
@@ -184,22 +192,25 @@ fn the_durable_bound_follows_barriers_and_claim_only_frames() {
     let synced = writer.offset();
     writer.claim().unwrap();
     let bytes = writer.into_file();
-    let log = read_all(&bytes);
+    let log = read_all(&bytes, cipher);
     assert_eq!(log.end, LogEnd::Clean);
     assert_eq!(log.durable_bound, synced);
     assert_eq!(log.complete_through, bytes.len() as u64);
 }
 
 /// A log written to a real file and synced reads back the same.
-#[test]
-fn a_file_backed_log_reads_back() {
-    let dir = std::env::temp_dir().join(format!("broca-log-test-{}", std::process::id()));
+fn a_file_backed_log_reads_back(cipher: Cipher) {
+    let dir = std::env::temp_dir().join(format!(
+        "broca-log-test-{}-{}",
+        std::process::id(),
+        cipher.label()
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("log");
     let file = std::fs::File::create(&path).unwrap();
     let mut writer = LogWriter::create(
         file,
-        key(),
+        key(cipher),
         BIND.to_vec(),
         b"checkpoint",
         5,
@@ -211,7 +222,7 @@ fn a_file_backed_log_reads_back() {
     drop(writer);
     let bytes = std::fs::read(&path).unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
-    let log = read_all(&bytes);
+    let log = read_all(&bytes, cipher);
     assert_eq!(log.end, LogEnd::Clean);
     let seqs: Vec<u64> = log.records.iter().map(|(seq, _)| *seq).collect();
     assert_eq!(seqs, [5, 6]);
@@ -219,11 +230,10 @@ fn a_file_backed_log_reads_back() {
 
 /// A batch copied into a new log keeps its records' seqs, which may skip, and reads back as one
 /// batch. A frame cut out of it still reads as damage, and copied seqs that go backwards refuse.
-#[test]
-fn a_copied_batch_keeps_its_seqs_and_stays_all_or_nothing() {
+fn a_copied_batch_keeps_its_seqs_and_stays_all_or_nothing(cipher: Cipher) {
     use super::{LogEncoder, LogError};
     let mut encoder = LogEncoder::new(
-        key(),
+        key(cipher),
         BIND.to_vec(),
         20,
         ChainBase {
@@ -257,7 +267,7 @@ fn a_copied_batch_keeps_its_seqs_and_stays_all_or_nothing() {
             ledger: Some(19),
         })
     };
-    let log = read(&bytes, &key(), BIND, 0, base).unwrap();
+    let log = read(&bytes, &key(cipher), BIND, 0, base).unwrap();
     assert_eq!(log.end, LogEnd::Clean);
     let seqs: Vec<u64> = log.records.iter().map(|(seq, _)| *seq).collect();
     assert_eq!(seqs, [5, 8, 20]);
@@ -266,7 +276,7 @@ fn a_copied_batch_keeps_its_seqs_and_stays_all_or_nothing() {
     // Cutting the copied batch's second frame out leaves a frame-index gap. Every frame of
     // `one` has the same length, so the first frame ends where a one-record copy would.
     let first_frame_end = {
-        let mut only = LogEncoder::new(key(), BIND.to_vec(), 20, ChainBase::default());
+        let mut only = LogEncoder::new(key(cipher), BIND.to_vec(), 20, ChainBase::default());
         let checkpoint = only
             .checkpoint(b"checkpoint")
             .unwrap()
@@ -275,7 +285,7 @@ fn a_copied_batch_keeps_its_seqs_and_stays_all_or_nothing() {
     };
     let mut gap = bytes[..first_frame_end].to_vec();
     gap.extend_from_slice(&bytes[after_copy..]);
-    let log = read(&gap, &key(), BIND, 0, base).unwrap();
+    let log = read(&gap, &key(cipher), BIND, 0, base).unwrap();
     assert!(matches!(log.end, LogEnd::Damaged { .. }), "{:?}", log.end);
     assert!(log.records.is_empty());
 
@@ -284,7 +294,7 @@ fn a_copied_batch_keeps_its_seqs_and_stays_all_or_nothing() {
         encoder.copy_batch(&[(9, &one)]),
         Err(LogError::CopiedSeqs)
     ));
-    let mut fresh = LogEncoder::new(key(), BIND.to_vec(), 20, ChainBase::default());
+    let mut fresh = LogEncoder::new(key(cipher), BIND.to_vec(), 20, ChainBase::default());
     fresh.checkpoint(b"c").unwrap().into_written(&mut fresh);
     assert!(matches!(
         fresh.copy_batch(&[(8, &one), (5, &three)]),

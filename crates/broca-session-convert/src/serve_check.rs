@@ -213,7 +213,7 @@ async fn stored<B: SessionBackend>(
 
 pub(super) fn run(args: &Args) {
     let mut report = Report::default();
-    let deployment = DeploymentKey::new(1, &[0x5a; 32]);
+    let deployment = crate::deployment();
     let mut largest: Option<Largest> = None;
     each_log(args, |item| {
         let Item::Log {

@@ -22,6 +22,7 @@ async fn serve_store_run(
         writer,
         parts: Box::new(parts.clone()),
         mode,
+        media: None,
     };
     let (out, mut events) = mpsc::channel(256);
     tokio::spawn(async move { while events.recv().await.is_some() {} });
@@ -43,6 +44,7 @@ async fn serve_store_run(
                 writer: &mut *session,
                 parts: &mut own_parts,
                 store: None,
+                media: None,
             };
             link.serve(&mut writer, request).await;
         }

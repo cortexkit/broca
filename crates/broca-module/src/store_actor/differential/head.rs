@@ -28,6 +28,22 @@ async fn gated_module(
     steps: Vec<Vec<NormalizedEvent>>,
     gate: Option<Arc<Notify>>,
 ) -> Module {
+    gated_module_in(
+        on,
+        steps,
+        gate,
+        broca_session_store::keys::DeploymentKey::new(1, &[7; 32]),
+    )
+    .await
+}
+
+/// [`gated_module`], whose new storage creates sessions under `deployment`.
+async fn gated_module_in(
+    on: bool,
+    steps: Vec<Vec<NormalizedEvent>>,
+    gate: Option<Arc<Notify>>,
+    deployment: broca_session_store::keys::DeploymentKey,
+) -> Module {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let dir = broca_test_support::scratch_root().join(format!(
@@ -40,6 +56,7 @@ async fn gated_module(
     let executor: Arc<dyn RunExecutor> = Arc::new(BothLoops {
         today: TodayLoop {
             provider: Gated {
+                render_config: None,
                 inner: broca_core::provider::StubProvider::new(steps.clone()),
                 gate: gate.clone(),
             },
@@ -48,14 +65,10 @@ async fn gated_module(
         },
         store: executor(steps, gate),
     });
-    let runtime = crate::store_open::StoreRuntime::open(
-        &dir,
-        broca_session_store::keys::DeploymentKey::new(1, &[7; 32]),
-        Arc::clone(&executor),
-        IDLE,
-    )
-    .await
-    .unwrap();
+    let runtime =
+        crate::store_open::StoreRuntime::open(&dir, deployment, Arc::clone(&executor), IDLE)
+            .await
+            .unwrap();
     let registry = LineageRegistry::new_with_reader(
         Arc::new(
             crate::opener::DefaultOpener::new(
@@ -93,6 +106,17 @@ pub(super) async fn both(
     let today = gated_module(false, steps.clone(), today_gate.clone()).await;
     let store = gated_module(true, steps, store_gate.clone()).await;
     (today, store, today_gate, store_gate)
+}
+
+/// [`both`] without gates, whose store module creates sessions in mode `cipher`.
+pub(super) async fn both_in(
+    steps: Vec<Vec<NormalizedEvent>>,
+    cipher: broca_session_store::keys::Cipher,
+) -> (Module, Module) {
+    let deployment = || broca_session_store::keys::DeploymentKey::new(1, &[7; 32]).creating(cipher);
+    let today = gated_module_in(false, steps.clone(), None, deployment()).await;
+    let store = gated_module_in(true, steps, None, deployment()).await;
+    (today, store)
 }
 
 /// A send through the registry's own route, with the title and plan the serve layer hands over.

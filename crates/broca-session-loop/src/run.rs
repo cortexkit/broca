@@ -41,9 +41,9 @@ use broca_protocol::{DeliveryMode, DeliveryOrder};
 use broca_session_store::codec::{Digest, Message as _};
 use broca_session_store::fold::operations::{CallState, Operations, Resolution};
 use broca_session_store::record::{
-    Assistant, Attempt, BatchEnd, BatchStart, CallOutcome, CeilingDecided, Delivery, Input,
-    PartKind, Pause, Placement, Record, Redo, Resumed, RunEnd, RunStart, SendEnded, SetupStub,
-    StepEnd, StepStart, ToolHeld, ToolIntent, ToolOutcome, ToolReply,
+    Assistant, Attempt, BatchEnd, BatchStart, CallOutcome, CeilingDecided, Delivery, Input, Notice,
+    PartKind, Pause, Placement, Record, Redo, ResultAppend, Resumed, RunEnd, RunStart, SendEnded,
+    SetupStub, StepEnd, StepStart, ToolHeld, ToolIntent, ToolOutcome, ToolReply,
 };
 use broca_session_store::session::SessionError;
 use broca_wal::ComputedTagRules;
@@ -230,6 +230,18 @@ pub struct Seams<'a, P, T> {
     /// today's loop does (`RunControl::step_progress`): the session's owner serves it as an
     /// active run's `step`. It is cleared when the step's call ends. Never a durability input.
     pub step_progress: Option<broca_core::provider::LiveStepProgress>,
+    /// What each model call waits for before the provider is asked to render and send it, such
+    /// as the media its requests are rendered with while they are still being prepared. A cancel
+    /// during the wait ends the step cancelled, as a cancel during the call does.
+    pub model_call_ready: Option<Arc<dyn ModelCallReady>>,
+}
+
+/// Something a run's model calls wait for (see [`Seams::model_call_ready`]).
+#[async_trait::async_trait]
+pub trait ModelCallReady: Send + Sync {
+    /// Returns once a model call may be rendered, or why none can be: the step then fails with
+    /// that error, never sending a request.
+    async fn ready(&self) -> Result<(), ProviderError>;
 }
 
 /// The run loop's account reports, as today's `broca_core::AccountReporter` receives them. Each
@@ -1527,6 +1539,7 @@ pub async fn offline_request<W: Writer>(
         None,
         step_id,
         compacted,
+        false,
         enrollment.as_ref(),
     )?;
     if !compacted {
@@ -1557,6 +1570,12 @@ where
     let episodes = render_episodes(writer, parts)?;
     let tools = Arc::new(admission.tools.clone());
     let manifest = ToolManifest::from_tools(admission.tools.clone());
+    // As today's loop asks once per run: a provider whose media renderer tags its own copy of
+    // each request takes the run's tag choice here, and the loop leaves media-holding messages
+    // untagged, since preparing their media needs the parts where the model put them.
+    let defer_media_tags = seams
+        .provider
+        .defer_media_tags(frozen_render_tags(admission));
     let mut structured = structured_of(admission);
     let hook_plan = hook_plan(admission, seams)?;
     let hooks = hook_plan
@@ -1631,6 +1650,7 @@ where
             started,
             warming.as_ref(),
             changes.as_ref(),
+            admission.compaction_plan_version.is_some(),
         )
         .await?
         {
@@ -1712,10 +1732,10 @@ where
         }
         // Queued sends with a delivery order are read before the batch is built, since their
         // records may be sealed. One queued after this read waits for the next boundary.
-        let ordered = ordered_sends(writer).await?;
+        let ordered = Box::pin(ordered_sends(writer)).await?;
         let boundary = writer
             .append_with(
-                &mut |_, operations, first_seq| {
+                &mut |conversation, operations, first_seq| {
                     let run = operations.run.as_ref().expect("a run is active");
                     if !(cancelled_now || run.cancel.is_some()) && stopping && resumes {
                         return restart_pause.take().into_iter().collect();
@@ -1730,16 +1750,40 @@ where
                         batch.extend(stopped_end.take());
                         return batch;
                     }
-                    // A step starts: ordered sends whose first possible mode here is `steer`
-                    // are delivered, and expired ones end, in queue order. Their records come
-                    // first, then every waiting message's copy (steers before deliveries), then
-                    // the step's start.
+                    // A step starts: ordered sends whose first possible mode here is `steer` or
+                    // `turn_system` are delivered, and expired ones end, in queue order, by
+                    // today's rules (`broca_core::delivery_order`). Their records come first,
+                    // then every waiting message's copy (steers before deliveries), then the
+                    // step's start.
                     let mut batch = Vec::new();
                     let mut delivered = Vec::new();
-                    for pending in operations.queue.iter().filter(|pending| pending.ordered) {
-                        let Some(send) = ordered.get(&pending.submission_id) else {
-                            continue;
-                        };
+                    let queued: Vec<_> = operations
+                        .queue
+                        .iter()
+                        .filter(|pending| pending.ordered)
+                        .filter_map(|pending| {
+                            ordered
+                                .get(&pending.submission_id)
+                                .map(|send| (pending, send))
+                        })
+                        .collect();
+                    // A turn-scoped system message is possible only where the route takes one:
+                    // after the message it would follow (the last one placed here so far, else
+                    // the last steered, else the conversation's last) and, on a route that needs
+                    // it last, with no user message to follow it in this request. As in today's
+                    // loop, any later send that may steer counts as one.
+                    let mut preceding: Option<Message> = run
+                        .pending_steers
+                        .iter()
+                        .rev()
+                        .find_map(|pending| pending.messages.last())
+                        .or(conversation.messages.last())
+                        .cloned();
+                    let last_user = queued.iter().rposition(|(_, send)| {
+                        !send.order.expired_at(now)
+                            && send.order.modes.contains(&DeliveryMode::Steer)
+                    });
+                    for (index, (pending, send)) in queued.iter().enumerate() {
                         if send.order.expired_at(now) {
                             batch.push(Record::SendEnded(SendEnded {
                                 submission_id: pending.submission_id.clone(),
@@ -1748,17 +1792,33 @@ where
                             continue;
                         }
                         let has_text = appended_text(&send.input).is_some();
-                        if choose_mode(&send.order, Boundary::STEP, has_text)
-                            != Some(DeliveryMode::Steer)
-                        {
-                            continue;
-                        }
+                        let followed_by_user = last_user.is_some_and(|last| last > index);
+                        let boundary = Boundary {
+                            turn_system: seams
+                                .provider
+                                .turn_system_possible(preceding.as_ref(), followed_by_user),
+                            ..Boundary::STEP
+                        };
+                        let (mode, placement, input) =
+                            match choose_mode(&send.order, boundary, has_text) {
+                                Some(DeliveryMode::Steer) => {
+                                    ("steer", Placement::Delivered, send.input.clone())
+                                }
+                                Some(DeliveryMode::TurnSystem) => (
+                                    "turn_system",
+                                    Placement::DeliveredTurnSystem,
+                                    turn_system_input(send, &pending.submission_id, &run_id),
+                                ),
+                                _ => continue,
+                            };
                         let seq = first_seq + batch.len() as u64;
-                        delivered.extend(send.input.iter().map(|message| {
+                        delivered.extend(input.iter().map(|message| {
                             Record::Input(Input {
-                                media: Vec::new(),
+                                // A delivered copy's media are stored where the send's queued
+                                // record stored them.
+                                media: send.media_of(message),
                                 run_id: run_id.clone(),
-                                placement: Placement::Delivered,
+                                placement,
                                 message: message.clone(),
                                 written_at_ms: send.written_at_ms,
                                 submission_id: Some(pending.submission_id.clone()),
@@ -1768,11 +1828,14 @@ where
                                 pruned: Vec::new(),
                             })
                         }));
+                        if let Some(last) = input.last() {
+                            preceding = Some(last.clone());
+                        }
                         batch.push(Record::Delivery(Delivery {
                             submission_id: pending.submission_id.clone(),
                             run_id: run_id.clone(),
-                            mode: "steer".into(),
-                            input: send.input.clone(),
+                            mode: mode.into(),
+                            input,
                             tool_call_id: None,
                             appended_text: None,
                             written_at_ms: send.written_at_ms,
@@ -1813,6 +1876,7 @@ where
             seams.session_address.clone(),
             step_id,
             compaction.is_some(),
+            defer_media_tags,
             enrollment.as_ref(),
         )?;
         // The step names the account routing gives the run now, as today's does.
@@ -2345,6 +2409,7 @@ where
             !step.cuts.is_empty(),
             warming.as_ref(),
             changes.as_ref(),
+            admission.compaction_plan_version.is_some(),
         )
         .await?
         {
@@ -2682,9 +2747,17 @@ fn call_options<W: Writer>(
     session_address: Option<String>,
     step_id: u64,
     compacted: bool,
+    defer_media_tags: bool,
     enrollment: Option<&broca_session_store::session::EnrollmentOverlay>,
 ) -> Result<CallOptions, LoopError> {
     let mut prompt = writer.conversation().messages.clone();
+    let contract = admission.compaction_plan_version.is_some();
+    // Off the compaction contract a ride renders into its result's copy here, before anything
+    // else edits the results, where today's replay joins it as it reads the ride's record. On
+    // the contract the entries below render it.
+    if !contract {
+        crate::entries::render_rides(&mut prompt, writer.conversation());
+    }
     repetition_guidance(
         &mut prompt,
         episodes,
@@ -2697,10 +2770,6 @@ fn call_options<W: Writer>(
     for (index, message) in prompt.iter_mut().enumerate() {
         message.ordinal = Some(first + index as u64);
     }
-    // A session on the current compaction contract renders its numbers from the entries below;
-    // one on the established layout numbers each run's messages by that run's frozen rules, in
-    // the order they were placed, as today's loop numbers them, and renders them in place.
-    let contract = admission.compaction_plan_version.is_some();
     // The global system messages a session that enrolled carried in its transcript before are
     // left out, as a session on the contract never holds them: the run's system text takes
     // their place above the conversation, and the entries leave them out alike.
@@ -2709,6 +2778,9 @@ fn call_options<W: Writer>(
         crate::enroll::without_suppressed(&mut prompt, enrollment);
         crate::enroll::translate_episodes(&mut episodes, enrollment);
     }
+    // A session on the current compaction contract renders its numbers from the entries below;
+    // one on the established layout numbers each run's messages by that run's frozen rules, in
+    // the order they were placed, as today's loop numbers them, and renders them in place.
     let overflow = |_| LoopError::Unsupported("part numbers past the numbering limit");
     if contract {
         TagNumbering::for_run(
@@ -2733,7 +2805,24 @@ fn call_options<W: Writer>(
                 .map_err(overflow)?;
         }
     }
-    if !contract && frozen_render_tags(admission) {
+    if !contract && defer_media_tags {
+        // The provider's media renderer tags a message holding media itself, on its own copy of
+        // the request, after preparing that message's media (see `defer_media_tags` above).
+        let render = frozen_render_tags(admission);
+        for message in prompt.iter_mut() {
+            if !broca_session_store::session::message_media(message).is_empty() {
+                continue;
+            }
+            if render {
+                render_tags_into(
+                    std::slice::from_mut(message),
+                    TagRendering::for_render_config(&admission.render_config),
+                );
+            } else {
+                clean_computed_into(std::slice::from_mut(message));
+            }
+        }
+    } else if !contract && frozen_render_tags(admission) {
         // A run frozen with part numbers in the model's view sends user and tool-result text with
         // its numbers in front, as today's loop renders it.
         render_tags_into(
@@ -2783,8 +2872,13 @@ fn call_options<W: Writer>(
     .map(crate::entries::project)
     .collect::<Result<Vec<_>, _>>()
     .map_err(LoopError::Parts)?;
-    let prompt = broca_core::compaction_v2::render::deliveries_only(&opts.prompt, &entries)
-        .map_err(LoopError::Parts)?;
+    let rides = crate::entries::ride_envelopes(conversation);
+    let prompt = broca_core::compaction_v2::render::deliveries_only_with_rides(
+        &opts.prompt,
+        &entries,
+        &rides,
+    )
+    .map_err(LoopError::Parts)?;
     let opts = broca_core::compaction_v2::render::options(&opts, prompt);
     Ok(
         broca_core::compaction_v2::systems::view(&opts, &admission.global_system)
@@ -3005,6 +3099,16 @@ async fn model_step<W: Writer, P: Provider, T>(
             max_content_gap_ended_at_ms: None,
         });
     }
+    if let Some(ready) = &seams.model_call_ready {
+        tokio::select! {
+            ready = ready.ready() => {
+                if let Err(error) = ready {
+                    return Ok(Err(StepFailure::Error(Box::new(error), 0, None)));
+                }
+            }
+            _ = seams.cancel.cancelled() => return Ok(Err(StepFailure::Cancelled)),
+        }
+    }
     let runtime = StepRuntime {
         cancel: seams.cancel.clone(),
         deadline: None,
@@ -3013,20 +3117,28 @@ async fn model_step<W: Writer, P: Provider, T>(
         first_attempt: 0,
         attempt_hook: None,
     };
-    let mut events = seams
-        .provider
-        .step_with_runtime(StepId(step_id), Arc::new(opts), runtime)
-        .await;
+    // A cancel drops the call while it hasn't returned its stream yet, as today's loop drops its
+    // step future, so a call slow to answer never holds the run's end back.
+    let mut events = tokio::select! {
+        biased;
+        _ = seams.cancel.cancelled() => return Ok(Err(StepFailure::Cancelled)),
+        events = seams
+            .provider
+            .step_with_runtime(StepId(step_id), Arc::new(opts), runtime) => events,
+    };
     let mut message = None;
     // The provider's `StepFinished` usage wins; its final `Finished` fills it only when the
     // step reported none, as today's loop takes them.
     let mut step_usage = Usage::default();
     let mut served = Served::default();
     let mut cuts = Vec::new();
-    loop {
+    let outcome = loop {
+        // Biased: the cancel is checked before each event, as broca-core's run loop checks it
+        // before its step.
         let event = tokio::select! {
+            biased;
+            _ = seams.cancel.cancelled() => break Err(StepFailure::Cancelled),
             event = events.recv() => event,
-            _ = seams.cancel.cancelled() => return Ok(Err(StepFailure::Cancelled)),
         };
         match event {
             Some(NormalizedEvent::Display(display)) => {
@@ -3069,85 +3181,138 @@ async fn model_step<W: Writer, P: Provider, T>(
                     step_usage
                 };
                 let Some(message) = message.take() else {
-                    return Ok(Err(StepFailure::Error(
+                    break Err(StepFailure::Error(
                         Box::new(incomplete_stream()),
                         retries_used,
                         limited,
-                    )));
+                    ));
                 };
-                return Ok(Ok(Step {
+                break Ok(Step {
                     message,
                     usage,
                     finish_reason,
                     retries_used,
                     served,
                     cuts,
-                }));
+                });
             }
             Some(NormalizedEvent::Control(ProviderControl::Error {
                 error,
                 retries_used,
-            })) => {
-                return Ok(Err(StepFailure::Error(
-                    Box::new(error),
-                    retries_used,
-                    limited,
-                )))
-            }
-            // Each attempt's record, around the same hooks today's loop calls: keep-warm learns
-            // its send time and rate-limit headers, its input transformations are reported, and
-            // the provider adds its cache evidence before the record is written and learns which
-            // record holds it after. A failed attempt is durable at once (it may have been billed
-            // and no step's end will follow it); a completed one rides the step's end.
-            Some(NormalizedEvent::Control(ProviderControl::AttemptFinished { mut attempt })) => {
-                if let Some(warm) = &seams.keep_warm {
-                    warm.note_attempt(&attempt);
-                }
-                broca_core::run::report_input_transformations(
-                    &seams.bind,
-                    &broca_protocol::RunId(run_id.into()),
-                    StepId(step_id),
-                    &attempt,
-                );
-                seams.provider.annotate_cache_evidence(&mut attempt);
-                let durable = attempt.outcome != broca_protocol::AttemptOutcome::Complete;
-                // The seq the record took, which a writer shared with the session actor knows
-                // only once it is appended.
-                let seq = writer
-                    .append(
-                        &[attempt_record(
-                            run_id,
-                            step_id,
-                            attempt.clone(),
-                            requested_ttl_ms,
-                            account_limit_pause,
-                        )?],
-                        durable,
-                    )
-                    .await?;
-                limited = attempt.account_observation.limit.is_some().then(|| {
-                    Box::new(FailedAccountLimitAttempt {
-                        seq,
-                        attempt: attempt.clone(),
-                    })
-                });
-                seams
-                    .provider
-                    .cache_attempt_recorded(Some(event_id(writer, seq)));
-                if let Some(reports) = &seams.account_reports {
-                    reports.attempt_recorded(&event_id(writer, seq), seq, &attempt);
-                }
+            })) => break Err(StepFailure::Error(Box::new(error), retries_used, limited)),
+            Some(NormalizedEvent::Control(ProviderControl::AttemptFinished { attempt })) => {
+                limited = record_attempt(
+                    writer,
+                    seams,
+                    run_id,
+                    step_id,
+                    attempt,
+                    requested_ttl_ms,
+                    account_limit_pause,
+                )
+                .await?;
             }
             None => {
-                return Ok(Err(StepFailure::Error(
+                break Err(StepFailure::Error(
                     Box::new(incomplete_stream()),
                     0,
                     limited,
-                )))
+                ))
             }
             Some(NormalizedEvent::Control(_)) => {}
         }
+    };
+    // A step that failed while the run's cancel was tripped is a cancellation, as broca-core's
+    // run loop attributes it (`attribute_step_failure_to_cancel`): the provider may see the
+    // cancel and close its stream before this loop looks at the token again.
+    let outcome = match outcome {
+        Err(StepFailure::Error(..)) if seams.cancel.is_cancelled() => Err(StepFailure::Cancelled),
+        outcome => outcome,
+    };
+    // A cancel stops the step cooperatively: a provider that reports attempt evidence records
+    // its attempt in flight and then closes the stream. Its record is read until then, for at
+    // most `CANCELLED_STEP_ATTEMPT_DRAIN`, so the attempt is recorded and reported before the
+    // run ends, as broca-core's run loop does. Only attempt records are taken: nothing else of
+    // a step that no longer counts is.
+    if matches!(outcome, Err(StepFailure::Cancelled)) && seams.provider.reports_attempt_evidence() {
+        let drained = tokio::time::timeout(broca_core::run::CANCELLED_STEP_ATTEMPT_DRAIN, async {
+            while let Some(event) = events.recv().await {
+                if let NormalizedEvent::Control(ProviderControl::AttemptFinished { attempt }) =
+                    event
+                {
+                    record_attempt(
+                        writer,
+                        seams,
+                        run_id,
+                        step_id,
+                        attempt,
+                        requested_ttl_ms,
+                        account_limit_pause,
+                    )
+                    .await?;
+                }
+            }
+            Ok::<(), LoopError>(())
+        })
+        .await;
+        if let Ok(result) = drained {
+            result?;
+        }
     }
+    Ok(outcome)
+}
+
+/// Records one attempt's evidence, around the hooks broca-core's run loop calls: keep-warm
+/// learns its send time and rate-limit headers, its input transformations are reported, and the
+/// provider adds its cache evidence before the record is written and learns which record holds
+/// it after. A failed attempt is durable at once (it may have been billed and no step's end will
+/// follow it); a completed one rides the step's end. Returns the attempt, with its record's seq,
+/// when the provider refused it for the account's limit.
+async fn record_attempt<W: Writer, P: Provider, T>(
+    writer: &mut W,
+    seams: &Seams<'_, P, T>,
+    run_id: &str,
+    step_id: u64,
+    mut attempt: broca_protocol::ModelAttempt,
+    requested_ttl_ms: Option<u64>,
+    account_limit_pause: bool,
+) -> Result<Option<Box<FailedAccountLimitAttempt>>, LoopError> {
+    if let Some(warm) = &seams.keep_warm {
+        warm.note_attempt(&attempt);
+    }
+    broca_core::run::report_input_transformations(
+        &seams.bind,
+        &broca_protocol::RunId(run_id.into()),
+        StepId(step_id),
+        &attempt,
+    );
+    seams.provider.annotate_cache_evidence(&mut attempt);
+    let durable = attempt.outcome != broca_protocol::AttemptOutcome::Complete;
+    // The seq the record took, which a writer shared with the session actor knows only once it
+    // is appended.
+    let seq = writer
+        .append(
+            &[attempt_record(
+                run_id,
+                step_id,
+                attempt.clone(),
+                requested_ttl_ms,
+                account_limit_pause,
+            )?],
+            durable,
+        )
+        .await?;
+    seams
+        .provider
+        .cache_attempt_recorded(Some(event_id(writer, seq)));
+    if let Some(reports) = &seams.account_reports {
+        reports.attempt_recorded(&event_id(writer, seq), seq, &attempt);
+    }
+    Ok(attempt
+        .account_observation
+        .limit
+        .is_some()
+        .then(|| Box::new(FailedAccountLimitAttempt { seq, attempt })))
 }
 
 /// A call of a batch that already has an intent, from before the run paused or crashed: it is
@@ -3197,9 +3362,12 @@ async fn batch<W, P, T>(
     started: bool,
     warming: Option<&Warming<'_>>,
     changes: Option<&crate::compaction::Changes<'_>>,
+    // Whether the session is on the compaction contract, which picks a ride's carrier.
+    contract: bool,
 ) -> Result<BatchOutcome, LoopError>
 where
     W: Writer,
+    P: Provider,
     T: ToolPlane,
 {
     let batch_id = format!("{run_id}-b{step_id}");
@@ -3274,6 +3442,14 @@ where
     let dispatching = plans
         .iter()
         .any(|plan| matches!(plan, CallPlan::Dispatch(_)));
+    // A batch that sends nothing closes in this barrier, and delivers queued sends with its
+    // results there; one that sends reads them again when its answers are in.
+    let ordered = if dispatching {
+        Default::default()
+    } else {
+        Box::pin(ordered_sends(writer)).await?
+    };
+    let system_after = system_after_results(seams.provider);
     let written = writer
         .append_with(
             &mut |conversation, operations, first_seq| {
@@ -3366,6 +3542,19 @@ where
                         run_id: run_id.into(),
                         batch_id: batch_id.clone(),
                     }));
+                    // Queued sends ride on the batch's results in the barrier that closes it,
+                    // after its end, as today's loop records them.
+                    let rides = tool_batch_deliveries(
+                        conversation,
+                        operations,
+                        &records,
+                        &ordered,
+                        run_id,
+                        contract,
+                        system_after,
+                        now,
+                    );
+                    records.extend(rides);
                     // The budget firings the step's calls made due go in the barrier that
                     // closes its batch, as today's loop writes them.
                     let placing = closing_places(conversation);
@@ -3517,13 +3706,27 @@ where
         batch_id,
     }));
     // The budget firings the step's calls made due go in the barrier that closes its batch, as
-    // today's loop writes them; a batch that closed held calls on a cancel makes none.
+    // today's loop writes them; a batch that closed held calls on a cancel makes none. Queued
+    // sends ride on its results in the same barrier, after its end, read as it closes.
+    let ordered = Box::pin(ordered_sends(writer)).await?;
+    let closed_at = (seams.now_ms)();
     let mut records = Some(records);
     let cancelling = !closed.is_empty();
     writer
         .append_with(
             &mut |conversation, operations, first_seq| {
                 let mut batch = records.take().expect("one batch");
+                let rides = tool_batch_deliveries(
+                    conversation,
+                    operations,
+                    &batch,
+                    &ordered,
+                    run_id,
+                    contract,
+                    system_after,
+                    closed_at,
+                );
+                batch.extend(rides);
                 if !cancelling {
                     let placing = closing_places(conversation);
                     let firings = crate::budget::due(
@@ -4442,15 +4645,54 @@ async fn stopped_batch<W: Writer, P, T>(
 /// A queued send with a delivery order, as a boundary delivers it.
 struct OrderedSend {
     order: DeliveryOrder,
-    /// The user messages a `steer` delivery places: the input after the send's `pre_user`
-    /// hooks, without system messages, as today's queue holds it.
+    /// The user messages a `steer` or `turn_system` delivery places: the input after the send's
+    /// `pre_user` hooks, without system messages, as today's queue holds it.
     input: Vec<Message>,
     written_at_ms: Option<u64>,
+    /// The send's id as a ride names it: the caller's `send_id`, else its submission id.
+    send_id: String,
+    /// Who a ride names as its sender: the module that sent it, else `broca`.
+    ride_sender: String,
+    /// What a ride's text is shown as having come from: its sender and the plan template it was
+    /// rendered from.
+    notice: Notice,
+    /// Where the queued record stored the bytes of each medium the send's messages carry, by
+    /// digest: a delivered copy of a message points at the same objects.
+    media: std::collections::HashMap<String, broca_session_store::record::MediaObject>,
 }
 
-/// The queue's sends that carry a delivery order, read from their records. Only `steer` and
-/// `idle_start` orders are delivered by this loop yet: an order naming `tool_result` or
-/// `turn_system` refuses by name rather than delivering it differently from today.
+impl OrderedSend {
+    /// Where each medium of `message`, a message this send delivers, is stored. Matched by
+    /// digest, since the send's `pre_user` transforms may have rewritten the messages its
+    /// queued record kept.
+    fn media_of(&self, message: &Message) -> Vec<broca_session_store::record::InputMedia> {
+        broca_session_store::session::message_media(message)
+            .into_iter()
+            .filter_map(|(block, part, reference)| {
+                self.media.get(&reference.sha256).map(|object| {
+                    broca_session_store::record::InputMedia {
+                        block,
+                        part,
+                        log: object.log,
+                        generation: object.generation,
+                        seq: object.seq,
+                    }
+                })
+            })
+            .collect()
+    }
+}
+
+/// The module a principal names, else `broca`, as today's ride envelope names a sender.
+fn module_or_broca(principal: Option<&broca_protocol::BindPrincipal>) -> String {
+    match principal {
+        Some(broca_protocol::BindPrincipal::Reserved { module_id }) => module_id.clone(),
+        _ => "broca".into(),
+    }
+}
+
+/// The queue's sends that carry a delivery order, read from their records, with what today's
+/// loop reads about each: the order, the input, who sent it and the time it was accepted.
 async fn ordered_sends<W: Writer>(
     writer: &mut W,
 ) -> Result<std::collections::BTreeMap<String, OrderedSend>, LoopError> {
@@ -4479,15 +4721,44 @@ async fn ordered_sends<W: Writer>(
         };
         let order: DeliveryOrder =
             serde_json::from_value(order).map_err(|e| LoopError::Parts(e.to_string()))?;
-        if order
-            .modes
-            .iter()
-            .any(|mode| matches!(mode, DeliveryMode::ToolResult | DeliveryMode::TurnSystem))
-        {
-            return Err(LoopError::Unsupported(
-                "a queued send delivered as a tool result or turn-scoped system message",
-            ));
-        }
+        let principal = |value: Option<&Value>| -> Result<_, LoopError> {
+            value
+                .map(|value| serde_json::from_value::<broca_protocol::BindPrincipal>(value.clone()))
+                .transpose()
+                .map_err(|e| LoopError::Parts(format!("queued send {id}'s sender: {e}")))
+        };
+        let ordered_by = principal(records.iter().find_map(|record| match record {
+            Record::DeliveryOrdered(ordered) => ordered.sent_by.as_ref(),
+            _ => None,
+        }))?;
+        let receipt = |name: &str| {
+            queued
+                .receipt
+                .as_ref()
+                .and_then(|receipt| receipt.get(name))
+        };
+        let queued_by = principal(receipt("sent_by"))?;
+        let queued_as = principal(receipt("principal"))?;
+        // A ride names the module its queued record says sent it, as today's ride ledger reads
+        // it; the notice names the one its order says, as today's projection reads it.
+        let ride_sender = module_or_broca(
+            queued_by
+                .as_ref()
+                .or(ordered_by.as_ref())
+                .or(queued_as.as_ref()),
+        );
+        let notice_sender = broca_core::compaction_v2::entries::delivery_sender(
+            ordered_by
+                .as_ref()
+                .or(queued_by.as_ref())
+                .or(queued_as.as_ref()),
+            DeliveryMode::ToolResult,
+        )
+        .unwrap_or_else(|| "broca".into());
+        let notice = Notice {
+            sender: notice_sender,
+            template: order.template.as_ref().map(|template| template.id.clone()),
+        };
         let hooked = queued
             .receipt
             .as_ref()
@@ -4500,16 +4771,177 @@ async fn ordered_sends<W: Writer>(
             .into_iter()
             .filter(|message| message.role != Role::System)
             .collect();
+        let send_id = queued.send_id.clone().unwrap_or_else(|| id.clone());
+        let media = broca_session_store::session::stored_media(&Record::QueuedSend(queued.clone()))
+            .into_iter()
+            .collect();
         sends.insert(
             id,
             OrderedSend {
                 order,
                 input,
                 written_at_ms: queued.written_at_ms,
+                send_id,
+                ride_sender,
+                notice,
+                media,
             },
         );
     }
     Ok(sends)
+}
+
+/// The records that deliver queued sends at the close of a tool batch, as today's loop decides
+/// them under its inbox lock when the batch commits: an expired send ends, and one whose first
+/// possible mode here is `tool_result` rides on the batch's carrier result (`ResultAppend` with
+/// its envelope, then `Delivery`), in queue order. Every other send waits for the next boundary.
+/// `batch` is the closing batch so far, whose replies place the turn's results unless an earlier
+/// batch placed them; `system_after_results` is whether the run's route would take a
+/// turn-scoped system message right after them, which a send listing `turn_system` first waits
+/// for. On the compaction contract the carrier is the batch's last result, whatever it holds;
+/// off it, the last text or error result.
+#[allow(clippy::too_many_arguments)]
+fn tool_batch_deliveries(
+    conversation: &broca_session_store::fold::conversation::Conversation,
+    operations: &Operations,
+    batch: &[Record],
+    ordered: &std::collections::BTreeMap<String, OrderedSend>,
+    run_id: &str,
+    contract: bool,
+    system_after_results: bool,
+    now: u64,
+) -> Vec<Record> {
+    use broca_session_store::record::{RideEnvelope, RideForm};
+    let pending: Vec<&OrderedSend> = operations
+        .queue
+        .iter()
+        .filter(|pending| pending.ordered)
+        .filter_map(|pending| ordered.get(&pending.submission_id))
+        .collect();
+    if pending.is_empty() {
+        return Vec::new();
+    }
+    // The batch's results in planned order: the results message its replies place, or the one an
+    // earlier batch placed when every reply was already durable.
+    // A record the fold refuses here is refused again when the batch is appended, which
+    // reports it; until then it places nothing.
+    let mut placing = conversation.without_window();
+    for record in batch
+        .iter()
+        .filter(|record| record.stream() == broca_session_store::record::Stream::Transcript)
+    {
+        let _ = placing.apply(record);
+    }
+    let results: Vec<&ToolResult> = placing
+        .messages
+        .last()
+        .or(conversation.messages.last())
+        .filter(|message| message.role == Role::Tool)
+        .map(|message| {
+            message
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    broca_protocol::content::ContentBlock::ToolResult(result) => Some(result),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let carrier = if contract {
+        broca_core::delivery_order::carrier_mode3(results.iter().copied())
+    } else {
+        broca_core::delivery_order::carrier(results.iter().copied())
+    }
+    .cloned();
+    let boundary = Boundary {
+        turn_system: system_after_results,
+        ..Boundary::tool_batch(carrier.is_some())
+    };
+    let mut records = Vec::new();
+    for pending in operations.queue.iter().filter(|pending| pending.ordered) {
+        let Some(send) = ordered.get(&pending.submission_id) else {
+            continue;
+        };
+        if send.order.expired_at(now) {
+            records.push(Record::SendEnded(SendEnded {
+                submission_id: pending.submission_id.clone(),
+                reason: Some(json!({"kind": "expired"})),
+            }));
+            continue;
+        }
+        let text = appended_text(&send.input);
+        let (Some(DeliveryMode::ToolResult), Some(carrier), Some(text)) = (
+            choose_mode(&send.order, boundary, text.is_some()),
+            &carrier,
+            text,
+        ) else {
+            continue;
+        };
+        records.push(Record::ResultAppend(ResultAppend {
+            run_id: run_id.into(),
+            tool_call_id: carrier.clone(),
+            text: text.clone(),
+            // Who the text came from is an entry fact of the compaction contract, as today's
+            // projection keeps it; off the contract the envelope alone names the sender.
+            notice: contract.then(|| send.notice.clone()),
+            written_at_ms: send.written_at_ms,
+            send_id: Some(send.send_id.clone()),
+            ride: Some(RideEnvelope {
+                // The carrier's key is known once the batch's records are placed: the entry
+                // facts writer fills it in from the call's intent, or from its outcome.
+                call_key: String::new(),
+                sender: send.ride_sender.clone(),
+                forms: send
+                    .order
+                    .modes
+                    .iter()
+                    .filter_map(|mode| match mode {
+                        DeliveryMode::ToolResult => Some("tool_result".to_owned()),
+                        DeliveryMode::TurnSystem => Some("turn_system".to_owned()),
+                        _ => None,
+                    })
+                    .collect(),
+                form: RideForm::Append,
+            }),
+        }));
+        records.push(Record::Delivery(Delivery {
+            submission_id: pending.submission_id.clone(),
+            run_id: run_id.into(),
+            mode: "tool_result".into(),
+            input: Vec::new(),
+            tool_call_id: Some(carrier.clone()),
+            appended_text: Some(text),
+            written_at_ms: send.written_at_ms,
+            tags_v1: None,
+            input_listed: None,
+        }));
+    }
+    records
+}
+
+/// Whether the run's route would take a turn-scoped system message right after a tool batch's
+/// results, as today's loop asks its provider before a batch commits.
+fn system_after_results<P: Provider>(provider: &P) -> bool {
+    provider.turn_system_possible(Some(&Message::new(Role::Tool, Vec::new())), false)
+}
+
+/// The messages a `turn_system` delivery of `send` places: its text as turn-scoped system text,
+/// frozen as today's loop freezes it (`broca_core::delivery_order::system_delivered`).
+fn turn_system_input(send: &OrderedSend, submission_id: &str, run_id: &str) -> Vec<Message> {
+    let core = broca_core::delivery_order::OrderedSend {
+        admitted_at_ms: send.written_at_ms,
+        submission_id: broca_protocol::SubmissionId(submission_id.into()),
+        order: send.order.clone(),
+        principal: None,
+        input: send.input.clone(),
+    };
+    match broca_core::delivery_order::system_delivered(&core, &RunId(run_id.into())) {
+        broca_wal::WalRecord::SendDelivered {
+            input: Some(input), ..
+        } => input.as_ref().clone(),
+        _ => unreachable!("a turn-scoped system delivery records the messages it places"),
+    }
 }
 
 /// The result a call gets when the run stopped before the call was dispatched.
@@ -5294,7 +5726,8 @@ fn placed_copies(operations: &Operations, run_id: &str) -> Vec<Record> {
                 .enumerate()
                 .map(move |(index, message)| {
                     Record::Input(Input {
-                        media: Vec::new(),
+                        // The copy's media are stored where the accepting record stored them.
+                        media: pending.media_at(index),
                         run_id: run_id.to_string(),
                         placement: pending.placement,
                         message: message.clone(),

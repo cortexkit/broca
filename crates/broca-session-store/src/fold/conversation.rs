@@ -11,8 +11,9 @@
 //! a request is rendered, never to the conversation itself.
 //!
 //! Beside each window message the fold keeps what `session.entries` serves about it: its
-//! `EntryFacts` record, and the text delivered with its tool calls (from `ResultAppend`, in
-//! sessions that keep delivered text apart from results). An assistant message still waiting for
+//! `EntryFacts` record, and the text delivered with its tool calls (from `ResultAppend`: every
+//! ride, which carries an envelope, and in sessions that keep delivered text apart from results,
+//! text delivered before envelopes existed too). An assistant message still waiting for
 //! its tool results already has an ordinal reserved, one past the last placed message, and its
 //! facts are kept with it until it is placed.
 
@@ -22,7 +23,8 @@ use broca_protocol::ids::ToolCallId;
 use crate::codec::Digest;
 use crate::fold::Bound;
 use crate::record::{
-    EntryFacts, Marker, Notice, PartKind, PartRef, Placement, Record, Stream, TurnFacts,
+    EntryFacts, Marker, Notice, PartKind, PartRef, Placement, Record, RideEnvelope, Stream,
+    TurnFacts,
 };
 
 /// Why a record can't be folded into the conversation. Each one means the records don't
@@ -57,6 +59,9 @@ crate::message! {
         3 req text: String,
         /// The id of the send the text is, when its record names one.
         4 opt send_id: String,
+        /// The ride envelope, when the text was delivered with one: requests render it after
+        /// the result through the runner's ride rules, and never join it into the result.
+        5 opt ride: RideEnvelope,
     }
 }
 
@@ -120,10 +125,10 @@ state! {
             reset: "tool replies",
             bound: Bound::OpenWork("one assistant message's tool calls"),
         },
-        /// Whether text delivered with a tool result becomes part of that result in the
-        /// conversation. Sessions on the first compaction protocol stored it that way; sessions
-        /// on the current contract keep the result as returned and add the text when a request
-        /// renders.
+        /// Whether text delivered with a tool result without a ride envelope becomes part of
+        /// that result in the conversation. Sessions on the first compaction protocol stored it
+        /// that way; sessions on the current contract keep the result as returned and add the
+        /// text when a request renders. A ride is always kept apart.
         3 req pub appends_in_conversation: bool => {
             owner: "admission",
             reset: "never",
@@ -529,7 +534,13 @@ impl Conversation {
                 }
             }
             Record::ResultAppend(append) => {
-                if self.joins_delivered_text() {
+                // A ride (text with an envelope) is never joined into the stored result, in
+                // either layout: requests render it after the result through the runner's ride
+                // rules, and reads serve the result as the tool returned it. Text without one is
+                // joined on a session that joins delivered text, unless the result was placed
+                // after the session enrolled in the current compaction contract
+                // (`joined_through`).
+                if append.ride.is_none() && self.joins_delivered_text() {
                     append_to_newest_result(&mut self.messages, &append.tool_call_id, &append.text);
                 } else {
                     self.attach_delivery(append);
@@ -593,6 +604,7 @@ impl Conversation {
                     notice: append.notice.clone(),
                     text: append.text.clone(),
                     send_id: append.send_id.clone(),
+                    ride: append.ride.clone(),
                 });
                 return;
             }

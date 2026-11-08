@@ -128,6 +128,9 @@ pub(crate) async fn media_read(
             &request.sha256,
         )));
     }
+    if let Some(store) = registry.store_holding(session)? {
+        return store_media_read(registry, &store, session, &request).await;
+    }
     // The object trees are shared. Authorize against durable capture records in this
     // bound session before opening any object, including for metadata-only probes.
     let reference = registry
@@ -152,17 +155,59 @@ pub(crate) async fn media_read(
             .map_err(|error| {
                 ServeError::Open(format!("read media {}: {error}", request.sha256), None)
             })?;
-        let mut reply = wire::MediaReadReply::new(reference.byte_size, reference.mime);
-        if request.length != 0 {
-            let start = request.offset as usize;
-            let end = bytes
-                .len()
-                .min(start.saturating_add(request.length as usize));
-            reply = reply
-                .with_data(base64::engine::general_purpose::STANDARD.encode(&bytes[start..end]));
-        }
-        serde_json::to_value(reply).map_err(|error| ServeError::Open(error.to_string(), None))
+        media_reply(&request, reference, &bytes)
     })
     .await
     .map_err(|error| ServeError::Open(format!("media read worker failed: {error}"), None))?
+}
+
+/// `session.media_read` on a session kept in the new storage. As on today's storage, only a
+/// medium the session's own durable records name authorizes a digest: the store's records play
+/// the part of today's captured history. Another session's media, and an upload no send named,
+/// read as `unknown_media`. The bytes come from the object the naming record stored, checked
+/// against the reference.
+async fn store_media_read(
+    registry: &LineageRegistry,
+    store: &crate::store_open::StoreRuntime,
+    session: &LineageKey,
+    request: &wire::MediaReadRequest,
+) -> Result<serde_json::Value, ServeError> {
+    use crate::store_reads::{StoreReadReply, StoreReadRequest};
+    let read = StoreReadRequest::Media {
+        sha256: request.sha256.clone(),
+    };
+    let media = match store.read(registry, session, read).await? {
+        Some(StoreReadReply::Media(media)) => media?,
+        Some(_) => return Err(crate::store_reads::mismatched()),
+        // The session's creation never committed, so no record names anything.
+        None => None,
+    };
+    let media = media
+        .ok_or_else(|| ServeError::Upload(UploadError::new("unknown_media", &request.sha256)))?;
+    request
+        .check(media.reference.byte_size)
+        .map_err(|field| ServeError::Upload(UploadError::invalid(field, &request.sha256)))?;
+    let bytes = media.bytes.map_err(|error| {
+        ServeError::Open(format!("read media {}: {error}", request.sha256), None)
+    })?;
+    media_reply(request, media.reference, &bytes)
+}
+
+/// The reply to `request` for the medium `reference`, whose verified bytes are `bytes`: its size
+/// and type, with the requested range of its bytes unless the request asked for none.
+fn media_reply(
+    request: &wire::MediaReadRequest,
+    reference: broca_protocol::MediaRef,
+    bytes: &[u8],
+) -> Result<serde_json::Value, ServeError> {
+    let mut reply = wire::MediaReadReply::new(reference.byte_size, reference.mime);
+    if request.length != 0 {
+        let start = request.offset as usize;
+        let end = bytes
+            .len()
+            .min(start.saturating_add(request.length as usize));
+        reply =
+            reply.with_data(base64::engine::general_purpose::STANDARD.encode(&bytes[start..end]));
+    }
+    serde_json::to_value(reply).map_err(|error| ServeError::Open(error.to_string(), None))
 }

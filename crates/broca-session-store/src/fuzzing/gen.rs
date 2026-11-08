@@ -553,6 +553,14 @@ mod records {
         generation,
         seq
     });
+    crate::fuzzing::gen::fields!(SendMedia {
+        message,
+        block,
+        part,
+        log,
+        generation,
+        seq
+    });
     crate::fuzzing::gen::fields!(ImportedIds {
         log,
         generation,
@@ -587,6 +595,14 @@ mod records {
         notice,
         written_at_ms,
         send_id,
+        ride,
+    });
+    variants!(RideForm: RideForm::Append);
+    crate::fuzzing::gen::fields!(RideEnvelope {
+        call_key,
+        sender,
+        forms,
+        form
     });
     crate::fuzzing::gen::fields!(StepUsage {
         prompt_tokens,
@@ -617,8 +633,16 @@ mod records {
         no_display_facts,
         reasoning_summaries,
         rich_ui,
+        notices,
         runner_tag_base,
         legacy_view_seq,
+    });
+    crate::fuzzing::gen::fields!(RideNotice {
+        part,
+        send_id,
+        sender,
+        call_key,
+        text
     });
     crate::fuzzing::gen::fields!(ReasoningSummary { part, text });
     crate::fuzzing::gen::fields!(RichUi {
@@ -785,6 +809,7 @@ mod records {
         request,
         receipt,
         delivery,
+        media,
     });
     crate::fuzzing::gen::fields!(SessionRefresh {
         generation,
@@ -839,7 +864,8 @@ mod records {
         input,
         written_at_ms,
         tags_v1,
-        receipt
+        receipt,
+        media,
     });
     crate::fuzzing::gen::fields!(Delivery {
         submission_id,
@@ -1080,6 +1106,7 @@ mod operations {
         submission_id,
         sender,
         request_identity_digest,
+        media,
     });
     crate::fuzzing::gen::fields!(NaturalEnd { stop, extendable });
     crate::fuzzing::gen::fields!(Budget {
@@ -1323,7 +1350,12 @@ mod stored {
         id_index,
         cold_since_ms,
         appends_in_conversation,
+        cipher,
     });
+    variants!(
+        crate::keys::Cipher: crate::keys::Cipher::XChaCha20Poly1305,
+        crate::keys::Cipher::None,
+    );
     crate::fuzzing::gen::fields!(DirEntry {
         object,
         first_seq,

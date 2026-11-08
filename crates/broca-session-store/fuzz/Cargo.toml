@@ -53,3 +53,10 @@ path = "fuzz_targets/directory_idindex.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "plain"
+path = "fuzz_targets/plain.rs"
+test = false
+doc = false
+bench = false

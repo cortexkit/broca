@@ -10,7 +10,7 @@ use broca_session_store::fold::conversation::Conversation;
 use broca_session_store::fold::operations::Operations;
 use broca_session_store::idindex::IdKind;
 use broca_session_store::record::Record;
-use broca_session_store::session::{Session, SessionError};
+use broca_session_store::session::{MediaError, NewInputMedia, Session, SessionError};
 
 /// Declared with native async methods, so whether a run's future is `Send` follows from the
 /// concrete writer: a run over [`crate::shared::ActorWriter`] can be spawned on a multi-threaded
@@ -20,6 +20,24 @@ pub trait Writer {
     /// Appends `records` as one all-or-nothing batch and returns the first record's seq. With
     /// `barrier`, it returns only once the batch is durable.
     async fn append(&mut self, records: &[Record], barrier: bool) -> Result<u64, SessionError>;
+
+    /// Appends `records` as [`Writer::append`] does, after storing the bytes of each medium
+    /// `media` lists, durable before the batch, and recording in each record naming one where
+    /// its bytes are (see `Session::append_input_media`). Returns the seq of the first record and
+    /// the records as appended. A writer that keeps no media objects refuses a batch naming any,
+    /// appending nothing.
+    async fn append_input_media(
+        &mut self,
+        records: &[Record],
+        media: Vec<NewInputMedia>,
+        barrier: bool,
+    ) -> Result<(u64, Vec<Record>), SessionError> {
+        if media.is_empty() {
+            let first = self.append(records, barrier).await?;
+            return Ok((first, records.to_vec()));
+        }
+        Err(SessionError::Media(MediaError::NoStore))
+    }
 
     /// Every ledger record that names the queued send `submission_id`, oldest first, from the
     /// open log or sealed history: what the loop reads to deliver the send at a boundary.
@@ -158,6 +176,15 @@ pub trait Writer {
 impl<B: SessionBackend> Writer for Session<B> {
     async fn append(&mut self, records: &[Record], barrier: bool) -> Result<u64, SessionError> {
         Session::append(self, records, barrier).await
+    }
+
+    async fn append_input_media(
+        &mut self,
+        records: &[Record],
+        media: Vec<NewInputMedia>,
+        barrier: bool,
+    ) -> Result<(u64, Vec<Record>), SessionError> {
+        Session::append_input_media(self, records, media, barrier).await
     }
 
     async fn send_records(&mut self, submission_id: &str) -> Result<Vec<Record>, SessionError> {

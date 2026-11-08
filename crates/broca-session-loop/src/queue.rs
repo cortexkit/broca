@@ -82,6 +82,9 @@ pub fn queued_send(
         None => None,
     };
     Ok(QueuedSend {
+        // Filled as the record is appended, by the append that stores the media's bytes
+        // (`Session::append_input_media`).
+        media: Vec::new(),
         submission_id: submission_id.to_owned(),
         send_id: send_id.map(str::to_owned),
         input,
@@ -151,6 +154,8 @@ pub fn steer(
         receipt => Some(receipt),
     };
     Ok(Steer {
+        // Filled as the record is appended, by the append that stores the media's bytes.
+        media: Vec::new(),
         input,
         written_at_ms,
         tags_v1: None,

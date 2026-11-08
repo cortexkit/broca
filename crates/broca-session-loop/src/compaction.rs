@@ -16,6 +16,7 @@ use broca_core::compaction_v2::{
     state::{Journal, State},
 };
 use broca_protocol::BindIdentity;
+use broca_session_store::fold::conversation::Delivered;
 use broca_session_store::fold::operations::{Estimate, Operations};
 use broca_session_store::record::{Marker, Record, View, ViewApplied};
 use broca_wal::WalRecord;
@@ -277,6 +278,8 @@ pub struct Transcript {
     pub entries: Arc<Vec<cortexkit_role_compaction::read::Entry>>,
     /// The sealed messages put in front of the window's, for the stored prompt, with ordinals.
     pub sealed: Arc<Vec<(u64, broca_protocol::Message)>>,
+    /// The ride envelopes of the entries' delivered texts, for rendering each ride.
+    pub rides: Arc<v2::entries::RideEnvelopes>,
 }
 
 /// What the transcript keeps, for the open session, of the sealed entries its views name: the
@@ -289,16 +292,18 @@ struct SealedTranscript(std::sync::Mutex<SealedParts>);
 
 #[derive(Default)]
 struct SealedParts {
-    /// Each sealed entry read so far, by message id: its projection, and its ordinal and message.
-    by_mid: std::collections::HashMap<
-        String,
-        (
-            cortexkit_role_compaction::read::Entry,
-            (u64, broca_protocol::Message),
-        ),
-    >,
+    /// Each sealed entry read so far, by message id.
+    by_mid: std::collections::HashMap<String, SealedEntry>,
     /// The transcript last built.
     built: Option<Built>,
+}
+
+/// One sealed entry as read: its projection, its ordinal and message, and the texts delivered
+/// with its calls, which give their rides' envelopes.
+struct SealedEntry {
+    entry: cortexkit_role_compaction::read::Entry,
+    message: (u64, broca_protocol::Message),
+    delivered: Vec<Delivered>,
 }
 
 /// A transcript as built for `key`: the sealed entries its views name, then the window's.
@@ -308,6 +313,8 @@ struct Built {
     sealed: usize,
     entries: Arc<Vec<cortexkit_role_compaction::read::Entry>>,
     messages: Arc<Vec<(u64, broca_protocol::Message)>>,
+    /// The sealed entries' delivered texts, by message id, for their ride envelopes.
+    delivered: Arc<Vec<(String, Vec<Delivered>)>>,
 }
 
 /// What decides which sealed entries a transcript holds: where the window starts, and the
@@ -354,10 +361,24 @@ pub async fn transcript<W: Writer>(writer: &W, ctx: &Ctx) -> Result<Transcript, 
         .collect::<Result<Vec<_>, _>>()
         .map_err(LoopError::Parts)?;
     let window_start = conversation.window_start();
+    // Each entry's rides, sealed ones first, keyed as the entries key their deliveries.
+    let rides_with = |sealed: &[(String, Vec<Delivered>)]| {
+        let mut rides = v2::entries::RideEnvelopes::default();
+        for (mid, delivered) in sealed {
+            crate::entries::push_rides(&mut rides, mid, delivered);
+        }
+        for entry in &window {
+            if let Some(facts) = &entry.state.facts {
+                crate::entries::push_rides(&mut rides, &facts.mid, &entry.state.delivered);
+            }
+        }
+        Arc::new(rides)
+    };
     if window_start <= 1 {
         return Ok(Transcript {
             entries: Arc::new(window_entries),
             sealed: Arc::default(),
+            rides: rides_with(&[]),
         });
     }
     let key = {
@@ -380,6 +401,7 @@ pub async fn transcript<W: Writer>(writer: &W, ctx: &Ctx) -> Result<Transcript, 
             return Ok(Transcript {
                 entries: built.entries.clone(),
                 sealed: built.messages.clone(),
+                rides: rides_with(&built.delivered),
             });
         }
     }
@@ -436,7 +458,14 @@ pub async fn transcript<W: Writer>(writer: &W, ctx: &Ctx) -> Result<Transcript, 
             continue;
         };
         let entry = crate::entries::project(&stored).map_err(LoopError::Parts)?;
-        read.push((mid, (entry, (stored.ordinal, stored.message))));
+        read.push((
+            mid,
+            SealedEntry {
+                entry,
+                message: (stored.ordinal, stored.message),
+                delivered: stored.state.delivered,
+            },
+        ));
     }
     let mut parts = kept.0.lock().expect("sealed transcript");
     parts.by_mid.extend(read);
@@ -452,10 +481,14 @@ pub async fn transcript<W: Writer>(writer: &W, ctx: &Ctx) -> Result<Transcript, 
         .iter()
         .filter_map(|mid| parts.by_mid.get(mid.as_str()))
         .collect();
-    sealed.sort_by_key(|named| named.1 .0);
-    sealed.dedup_by_key(|named| named.1 .0);
-    let mut entries: Vec<_> = sealed.iter().map(|(entry, _)| entry.clone()).collect();
-    let messages: Vec<_> = sealed.iter().map(|(_, message)| message.clone()).collect();
+    sealed.sort_by_key(|named| named.message.0);
+    sealed.dedup_by_key(|named| named.message.0);
+    let mut entries: Vec<_> = sealed.iter().map(|named| named.entry.clone()).collect();
+    let messages: Vec<_> = sealed.iter().map(|named| named.message.clone()).collect();
+    let delivered: Vec<_> = sealed
+        .iter()
+        .map(|named| (named.entry.mid.clone(), named.delivered.clone()))
+        .collect();
     let count = entries.len();
     entries.extend(window_entries);
     let built = Built {
@@ -463,10 +496,12 @@ pub async fn transcript<W: Writer>(writer: &W, ctx: &Ctx) -> Result<Transcript, 
         sealed: count,
         entries: Arc::new(entries),
         messages: Arc::new(messages),
+        delivered: Arc::new(delivered),
     };
     let transcript = Transcript {
         entries: built.entries.clone(),
         sealed: built.messages.clone(),
+        rides: rides_with(&built.delivered),
     };
     parts.built = Some(built);
     Ok(transcript)
@@ -550,9 +585,10 @@ pub async fn offline_prompt<W: Writer>(
     };
     let transcript = transcript(writer, &ctx).await?;
     let opts = with_sealed(opts, &transcript);
-    let prompt = v2::render::prompt(
+    let prompt = v2::render::prompt_with_rides(
         &opts.prompt,
         &transcript.entries,
+        &transcript.rides,
         view.as_ref().map_or(&[][..], |view| view.edits.as_slice()),
         |_| Err("a compaction view's inserted images aren't stored yet".into()),
     )
@@ -803,6 +839,7 @@ pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
     let transcript = transcript(writer, ctx).await?;
     let opts = with_sealed(opts, &transcript);
     let entries = transcript.entries;
+    let transcript_rides = transcript.rides;
     let now = (seams.now_ms)();
     let last_cache = writer.operations().last_cache_send.clone();
     let chained = seams.provider.history_edit_cost()
@@ -826,11 +863,9 @@ pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
         scope: admission.send.scope.as_ref(),
     };
     let journal = StoreJournal::new(writer, &seams.bind);
-    // The store records no ride envelope yet, so every delivered notice renders the way a
-    // delivery recorded before envelopes existed does, as `render::prompt` and
-    // `render::deliveries_only` render them here. That is also what today's loop renders while
-    // its envelope writer (`RIDES_V2_WRITER_ENABLED`) is off.
-    let rides = v2::entries::RideEnvelopes::default();
+    // A ride renders by its envelope, as today's loop renders a ride recorded with one; text
+    // delivered before envelopes existed renders the way it always did.
+    let rides = Arc::clone(&transcript_rides);
     let prepared = v2::request::prepare(
         &ctx.session.state,
         &ctx.session.runtime,

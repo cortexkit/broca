@@ -437,7 +437,7 @@ impl Module {
         let settled = SettledRuns::default();
         let addr = self.addr().0;
         let context = ReadContext {
-            parts: runtime.parts(),
+            parts: runtime.parts_for(broca_session_store::keys::Cipher::XChaCha20Poly1305),
             held: slot.is_some(),
             open: slot == Some("open"),
             settled: Some((&settled, &addr)),
@@ -609,6 +609,7 @@ fn shape(reply: StoreReadReply) -> String {
             Err(refusal) => format!("{refusal:?}"),
         },
         StoreReadReply::HistoryHead(head) => format!("{head:?}"),
+        StoreReadReply::Media(media) => format!("{media:?}"),
         StoreReadReply::TagLocation(location) => format!("{location:?}"),
         StoreReadReply::WritingView(view) => format!("{view:?}"),
         StoreReadReply::PlanChange(read) => format!("{:?}", read.map(|read| read.0)),

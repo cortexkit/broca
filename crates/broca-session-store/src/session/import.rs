@@ -14,19 +14,20 @@
 
 use std::sync::Arc;
 
-use super::media::{bytes_match, input_medium, MediaError};
+use super::media::MediaError;
 use super::{Session, SessionError};
 use crate::backend::SessionBackend;
 use crate::codec::{hex, Message as _};
-use crate::record::{
-    ImportReceipt, ImportedId, ImportedIdMap, ImportedIds, InputMedia, MediaObject, Record,
-};
+use crate::record::{ImportReceipt, ImportedId, ImportedIdMap, ImportedIds, Record};
 
-/// The bytes of one medium of an input message in a batch about to be appended.
+/// The bytes of one medium of a message in a batch about to be appended: an input message's, or
+/// one of the messages a queued send or a steer carries.
 #[derive(Debug, Clone)]
 pub struct NewInputMedia {
-    /// The `Input` record's position in the batch.
+    /// The record's position in the batch.
     pub record: usize,
+    /// The message's position in the record's messages: 0 for an `Input`, which holds one.
+    pub message: u32,
     /// The message's content block holding the medium.
     pub block: u32,
     /// For a medium inside a tool result block: its position in the result's parts.
@@ -91,71 +92,18 @@ impl<B: SessionBackend> Session<B> {
         }
         let first = self.next_seq();
         let mut records = records.to_vec();
-        // Objects this batch writes, by digest: later media of the batch with the same bytes
-        // point at the same object. The open log's index learns them only once the batch is
-        // appended, so a failed import leaves it naming nothing the log doesn't.
-        let mut stored: std::collections::HashMap<String, MediaObject> =
-            std::collections::HashMap::new();
-        for new in media {
-            let (record, block, part) = (new.record, new.block, new.part);
-            let not_media = || {
-                SessionError::Media(MediaError::NotMedia {
-                    record,
-                    part: block as usize,
-                })
-            };
-            let Some(Record::Input(input)) = records.get(record) else {
-                return Err(not_media());
-            };
-            let reference = input_medium(&input.message, block, part)
-                .cloned()
-                .ok_or_else(not_media)?;
-            if !bytes_match(&reference, &new.bytes) {
-                return Err(SessionError::Media(MediaError::Mismatch {
-                    record,
-                    part: block as usize,
-                }));
-            }
-            let known = self
-                .window
-                .media
-                .get(&reference.sha256)
-                .or_else(|| stored.get(&reference.sha256))
-                .cloned();
-            let object = match known {
-                Some(object) => object,
-                None => {
-                    let object = MediaObject {
-                        part: 0,
-                        log: self.log,
-                        generation: self.head.generation,
-                        seq: first + record as u64,
-                    };
-                    let name = self.media_name_at(
-                        &object.log,
-                        &object.generation,
-                        object.seq,
-                        &reference.sha256,
-                    );
-                    let sealed = self.key.frame_key().seal_unit(name.as_bytes(), &new.bytes);
-                    self.backend
-                        .put_object(&self.addr, &name, &sealed, self.version)
-                        .await?;
-                    stored.insert(reference.sha256.clone(), object.clone());
-                    object
-                }
-            };
-            let Some(Record::Input(input)) = records.get_mut(record) else {
-                unreachable!("checked above");
-            };
-            input.media.push(InputMedia {
-                block,
-                part,
-                log: object.log,
-                generation: object.generation,
-                seq: object.seq,
-            });
+        // An import's media are its messages' only; the objects are synced with the id map's
+        // and receipt's below.
+        if let Some(new) = media
+            .iter()
+            .find(|new| !matches!(records.get(new.record), Some(Record::Input(_))))
+        {
+            return Err(SessionError::Media(MediaError::NotMedia {
+                record: new.record,
+                part: new.block as usize,
+            }));
         }
+        self.store_input_media(&mut records, first, media).await?;
         let Some(Record::RunStart(start)) = records.first_mut() else {
             return Err(SessionError::Fold(
                 "an import's batch starts with its seeded run start".into(),

@@ -157,6 +157,25 @@ message! {
 }
 
 message! {
+    /// The stored bytes of one medium of a message accepted before it is placed: a queued send's
+    /// or a steer's. The object is written under the accepting record, as an input message's is
+    /// (see [`InputMedia`]), and the message's copy in the transcript points at the same object.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    pub struct SendMedia {
+        /// The message's position in the record's messages.
+        1 req message: u32,
+        /// The message's content block holding the medium.
+        2 req block: u32,
+        /// For a medium inside a tool result block: its position in the result's parts.
+        3 opt part: u32,
+        /// The open log the object was written under.
+        4 req log: crate::codec::Id128,
+        5 req generation: crate::codec::Id128,
+        6 req seq: u64,
+    }
+}
+
+message! {
     /// One model step's assistant message: text, reasoning and tool calls, with the model that
     /// produced it as the message's origin.
     #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -230,6 +249,38 @@ message! {
         /// that doesn't know the field would serve the text without it, so it is
         /// must-understand.
         6 opt [must] send_id: String,
+        /// The ride envelope (llm-runner 0.8.11): the carrying call's key, the sender and the
+        /// forms the send allowed, fixed when the text was delivered. Text with an envelope is
+        /// a ride: it is never joined into the stored result, and every request renders it
+        /// after the result through the runner's own ride rules. Text without one was delivered
+        /// before envelopes existed and keeps its historical rendering. A reader that doesn't
+        /// know the field would render a ride the old way, so it is must-understand.
+        7 opt [must] ride: RideEnvelope,
+    }
+}
+
+values! {
+    /// How a ride renders. Only the append form is ever recorded: broca never renders a ride
+    /// as system text.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+    pub enum RideForm {
+        1 Append,
+    }
+}
+
+message! {
+    /// What a ride carries besides its text and its send's id, as today's `SendDelivered`
+    /// record holds it in its `ride` member.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    pub struct RideEnvelope {
+        /// The key of the tool call whose result carries the ride, recorded at delivery and
+        /// never looked up again: a call id can repeat in a session, a key can't.
+        1 req call_key: String,
+        /// The module that sent it, or `broca`.
+        2 req sender: String,
+        /// The send's delivery list restricted to `tool_result` and `turn_system`, in order.
+        3 rep forms: String,
+        4 req form: RideForm,
     }
 }
 
@@ -256,12 +307,32 @@ message! {
 }
 
 message! {
+    /// A note a send delivered riding on one of a tool results message's results, as
+    /// `session.read` serves it among the message's display facts (llm-runner's `NoticeFact`).
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    pub struct RideNotice {
+        /// The result's position among the message's results: its call's position among the
+        /// tool calls of the assistant message before it.
+        1 req part: u32,
+        2 req send_id: String,
+        /// The module that sent it, or `broca`.
+        3 req sender: String,
+        /// The key of the call whose result carries it.
+        4 req call_key: String,
+        /// The text the send delivered, without the blank line that separates it from the
+        /// result when it is rendered.
+        5 req text: String,
+    }
+}
+
+message! {
     /// What `session.entries` serves about one conversation message besides the message itself,
     /// decided when the message was placed and never derived again. Written right after the
     /// record that places the message (or, for an assistant message still waiting for its tool
     /// results, the record that reserves its ordinal), in the same batch. A later `EntryFacts`
-    /// for the same ordinal replaces it. Content-free but for the reasoning summaries reads show:
-    /// delivered text stays in its `ResultAppend`.
+    /// for the same ordinal replaces it. Content-free but for the reasoning summaries and ride
+    /// notices reads show: delivered text itself stays in its `ResultAppend`, and a notice
+    /// repeats it so a read of the message needs no other record.
     #[derive(Debug, Clone, PartialEq, Serialize)]
     pub struct EntryFacts {
         /// The message's place in the whole conversation, counting from 1.
@@ -340,6 +411,11 @@ message! {
         /// sent its request, which output references check a named part against. Absent when no
         /// such view had applied; the run loop never writes first-protocol views.
         22 opt legacy_view_seq: u64,
+        /// For a tool results message: each send that rode on one of its results, in the order
+        /// delivered, as `session.read` serves it in the message's `notices` display fact. Only
+        /// a ride delivered with its envelope has one; text delivered before envelopes existed
+        /// stays joined into its result and has none.
+        23 rep notices: RideNotice,
     }
 }
 
@@ -889,6 +965,11 @@ message! {
         /// How the send asked to be delivered, as the caller named it (`interrupt` drains ahead
         /// of every plain send). Absent for a plain queued send.
         9 opt delivery: String,
+        /// Where the bytes of each medium the send's messages carry are stored. The run or
+        /// boundary that places the messages points their transcript copies at the same objects.
+        /// A reader that places or renders the messages needs them, so a record carrying any is
+        /// refused by a reader that doesn't know the field.
+        10 rep [must] media: SendMedia,
     }
 }
 
@@ -1159,6 +1240,10 @@ message! {
         3 opt tags_v1: serde_json::Value,
         /// The receipt: sender, send id, delivery, retention, title and hooks.
         4 opt receipt: serde_json::Value,
+        /// Where the bytes of each medium the steer's messages carry are stored, which the
+        /// messages' transcript copies point at. A record carrying any is refused by a reader
+        /// that doesn't know the field.
+        5 rep [must] media: SendMedia,
     }
 }
 

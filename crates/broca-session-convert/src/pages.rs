@@ -478,7 +478,7 @@ pub(super) fn seal_at_newest_input<B: SessionBackend>(
 
 pub(super) fn run(args: &Args) {
     let mut report = PagesReport::default();
-    let deployment = DeploymentKey::new(1, &[0x5a; 32]);
+    let deployment = crate::deployment();
     let limit = std::env::var("PAGES_LIMIT")
         .ok()
         .and_then(|limit| limit.parse().ok())

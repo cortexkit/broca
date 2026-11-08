@@ -53,7 +53,6 @@ use crate::checkpoint::Checkpoint;
 use crate::codec::{hex, Digest, Id128, Message as _};
 use crate::damage::{self, Lost, Verdict};
 use crate::fold::conversation::Conversation;
-use crate::frame::FRAME_OVERHEAD;
 use crate::head::{self, PendingDeletion, Residence, SessionTriple};
 use crate::idindex::OpenIds;
 use crate::keys::{random_id, DeploymentKey};
@@ -451,7 +450,8 @@ impl<B: SessionBackend> Session<B> {
             }));
         }
 
-        // Seqs above every seq the removed bytes could hold.
+        // Seqs above every seq the removed bytes could hold: no frame is smaller than the
+        // overhead its session's key seals a frame with.
         let highest = debris
             .harvested
             .iter()
@@ -462,7 +462,7 @@ impl<B: SessionBackend> Session<B> {
             .max(head.next_seq.saturating_sub(1))
             .max(checkpoint.next_seq.saturating_sub(1));
         let removed_len = bytes.len() as u64 - first_damage;
-        let ceiling = highest + removed_len.div_ceil(FRAME_OVERHEAD as u64);
+        let ceiling = highest + removed_len.div_ceil(frame_key.frame_overhead() as u64);
         let before_damage = debris
             .harvested
             .iter()

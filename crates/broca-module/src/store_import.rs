@@ -360,6 +360,7 @@ pub fn seed(history: HeadHistory, at: &SeedFacts<'_>) -> Result<Seed, ImportRefu
         let input_at = records.len() - 1;
         media.extend(message.media.iter().map(|medium| NewInputMedia {
             record: input_at,
+            message: 0,
             block: medium.block,
             part: medium.part,
             bytes: medium.bytes.clone(),
@@ -396,6 +397,7 @@ pub fn seed(history: HeadHistory, at: &SeedFacts<'_>) -> Result<Seed, ImportRefu
                 }),
                 written_at_ms: None,
                 send_id: Some(ride.send_id.clone()),
+                ride: None,
             }));
         }
         let mid = match &message.mid {
@@ -448,6 +450,8 @@ pub fn seed(history: HeadHistory, at: &SeedFacts<'_>) -> Result<Seed, ImportRefu
             no_display_facts: None,
             reasoning_summaries: broca_session_loop::entries::reasoning_summaries(&message.message),
             rich_ui: None,
+            // An imported message's rides keep only their delivery mode and carrying call.
+            notices: Vec::new(),
             runner_tag_base: None,
             legacy_view_seq: None,
         }));

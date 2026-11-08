@@ -43,7 +43,10 @@ tracing.workspace = true
 # CancellationToken: cooperative cancel of a run + per-subscriber fan-out tasks.
 tokio-util.workspace = true
 async-trait.workspace = true
-futures.workspace = true
+# `executor`: the store actor's media fold runs on a blocking thread and drives its store
+# reads there (`futures::executor::block_on`). Declared here because the workspace leaves it
+# off and a build of this crate alone must not depend on another member enabling it.
+futures = { workspace = true, features = ["executor"] }
 
 [dev-dependencies]
 broca-crash-harness = { path = "../broca-crash-harness" }

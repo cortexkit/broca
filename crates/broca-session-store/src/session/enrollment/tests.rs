@@ -12,12 +12,22 @@ use crate::backend::{MemoryBackend, SessionAddr, SessionBackend};
 use crate::fold::conversation::Conversation;
 use crate::fold::operations::{FoldError, Operations};
 use crate::head::SessionTriple;
-use crate::keys::DeploymentKey;
+use crate::keys::{Cipher, DeploymentKey};
 use crate::record::{
     Assistant, CompactionEnrolled, EnrolledEntries, EnrolledEntry, EntryFacts, Input, Notice,
     Placement, Record, ResultAppend, RunEnd, RunStart, ToolReply, TranscriptReverted,
 };
 use crate::session::{RevertRefusal, Session, SessionError};
+
+cipher_tests!(
+    compaction_reads_the_earlier_messages_through_the_enrollment_and_reads_serve_them_as_stored,
+    a_seal_through_the_enrollment_and_a_reload_serve_the_same_entries,
+    a_damaged_enrollment_object_refuses_by_name,
+    rides_joined_before_the_enrollment_keep_their_bytes_and_later_rides_stay_apart,
+    a_revert_across_the_enrollment_refuses_and_a_later_one_records_its_high,
+    a_revert_off_the_contract_records_no_high,
+    a_seal_that_would_change_the_enrollment_refuses_before_it_commits,
+);
 
 fn triple() -> SessionTriple {
     SessionTriple {
@@ -27,8 +37,9 @@ fn triple() -> SessionTriple {
     }
 }
 
-fn deployment() -> DeploymentKey {
-    DeploymentKey::new(1, &[5; 32])
+/// The test deployment key, creating sessions in mode `cipher`.
+fn deployment(cipher: Cipher) -> DeploymentKey {
+    DeploymentKey::new(1, &[5; 32]).creating(cipher)
 }
 
 fn addr() -> SessionAddr {
@@ -129,6 +140,7 @@ fn facts(ordinal: u64, mid: String, written_at: Option<u64>) -> Record {
         rich_ui: None,
         runner_tag_base: None,
         legacy_view_seq: None,
+        notices: Vec::new(),
         ordinal,
         written_at_ms: written_at,
         tag_base: 0,
@@ -295,11 +307,12 @@ fn expected() -> Vec<(u64, u64, Option<u64>, Option<String>)> {
 /// Compaction reads every earlier message through the enrollment's decisions, without the
 /// suppressed system message, on every read path: a page, a page split anywhere, and by id. What
 /// `session.read` reads (`Session::entries`) is every message as stored.
-#[test]
-fn compaction_reads_the_earlier_messages_through_the_enrollment_and_reads_serve_them_as_stored() {
+fn compaction_reads_the_earlier_messages_through_the_enrollment_and_reads_serve_them_as_stored(
+    cipher: Cipher,
+) {
     let backend = MemoryBackend::default();
     block_on(async {
-        let mut session = Session::create(&backend, addr(), triple(), &deployment(), false)
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(cipher), false)
             .await
             .unwrap();
         let mids = two_runs(&mut session).await;
@@ -347,11 +360,10 @@ fn compaction_reads_the_earlier_messages_through_the_enrollment_and_reads_serve_
 /// A seal through the enrollment point and a reload read the same entries back: the sealed
 /// history is read a block at a time and overlaid alike, and the decisions are read from their
 /// object, since only the fold names it once the enrollment record is sealed.
-#[test]
-fn a_seal_through_the_enrollment_and_a_reload_serve_the_same_entries() {
+fn a_seal_through_the_enrollment_and_a_reload_serve_the_same_entries(cipher: Cipher) {
     let backend = MemoryBackend::default();
     block_on(async {
-        let mut session = Session::create(&backend, addr(), triple(), &deployment(), false)
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(cipher), false)
             .await
             .unwrap();
         two_runs(&mut session).await;
@@ -371,7 +383,7 @@ fn a_seal_through_the_enrollment_and_a_reload_serve_the_same_entries() {
             session.compaction_entries(1, usize::MAX).await.unwrap(),
             before
         );
-        let loaded = Session::load(&backend, addr(), &triple(), &deployment())
+        let loaded = Session::load(&backend, addr(), &triple(), &deployment(cipher))
             .await
             .unwrap();
         assert_eq!(loaded.operations.enrolled, session.operations.enrolled);
@@ -386,11 +398,10 @@ fn a_seal_through_the_enrollment_and_a_reload_serve_the_same_entries() {
 
 /// The decisions' object is damage when it's missing or unreadable: a read refuses by name,
 /// never serves the earlier messages without their decisions.
-#[test]
-fn a_damaged_enrollment_object_refuses_by_name() {
+fn a_damaged_enrollment_object_refuses_by_name(cipher: Cipher) {
     let backend = MemoryBackend::default();
     block_on(async {
-        let mut session = Session::create(&backend, addr(), triple(), &deployment(), false)
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(cipher), false)
             .await
             .unwrap();
         two_runs(&mut session).await;
@@ -401,7 +412,7 @@ fn a_damaged_enrollment_object_refuses_by_name() {
             .find(|name| name.ends_with("-compaction-enrollment"))
             .unwrap();
         backend.set_object(&addr(), &name, b"not an enrollment".to_vec());
-        let loaded = Session::load(&backend, addr(), &triple(), &deployment())
+        let loaded = Session::load(&backend, addr(), &triple(), &deployment(cipher))
             .await
             .unwrap();
         assert!(matches!(
@@ -410,6 +421,50 @@ fn a_damaged_enrollment_object_refuses_by_name() {
         ));
         // What reads serve doesn't depend on it.
         assert_eq!(loaded.entries(1, usize::MAX).await.unwrap().len(), 6);
+    });
+}
+
+/// A seal whose new log would hold a different enrollment than the session refuses before it
+/// commits, and leaves the session as it was. Here the seal carries an enrollment record into
+/// the new log, which would enroll the session there without the run that enrolls it.
+fn a_seal_that_would_change_the_enrollment_refuses_before_it_commits(cipher: Cipher) {
+    let backend = MemoryBackend::default();
+    block_on(async {
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(cipher), false)
+            .await
+            .unwrap();
+        two_runs(&mut session).await;
+        let overlay = session.put_enrollment(&decisions()).await.unwrap();
+        let before = session.entries(1, usize::MAX).await.unwrap();
+        let carried = [Record::CompactionEnrolled(CompactionEnrolled {
+            through_ordinal: 5,
+            tag_floor: 7,
+            tag_high: 11,
+            overlay,
+        })];
+        let carry = crate::session::Carry {
+            records: &carried,
+            ..Default::default()
+        };
+        assert!(matches!(
+            session.seal_carrying(None, &carry, 1_000).await,
+            Err(SessionError::EnrollmentNotCarried)
+        ));
+        assert!(session.operations.enrolled.is_none());
+        assert!(
+            session.operations.open_change.is_none(),
+            "the seal was undone"
+        );
+        let mut loaded = Session::load(&backend, addr(), &triple(), &deployment(cipher))
+            .await
+            .unwrap();
+        assert!(loaded.operations.enrolled.is_none());
+        assert_eq!(loaded.head.open_log, session.head.open_log);
+        assert_eq!(loaded.entries(1, usize::MAX).await.unwrap(), before);
+        // A seal that keeps the enrollment as it is goes ahead. Loading fenced the first copy
+        // out of the session's log, so the loaded copy seals.
+        loaded.seal(None, 2_000).await.unwrap();
+        assert!(loaded.operations.enrolled.is_none());
     });
 }
 
@@ -492,6 +547,7 @@ fn ride(run: &str, id: &str, text: &str) -> Record {
         notice: None,
         written_at_ms: None,
         send_id: None,
+        ride: None,
     })
 }
 
@@ -533,11 +589,10 @@ fn result_and_rides(conversation: &Conversation, id: &str) -> (String, Vec<Strin
 /// A session that joined delivered text into its results keeps the text joined into the results
 /// it placed before it enrolled, and keeps text delivered with a later result apart from it, as
 /// the contract does. A sealed block is folded the same way.
-#[test]
-fn rides_joined_before_the_enrollment_keep_their_bytes_and_later_rides_stay_apart() {
+fn rides_joined_before_the_enrollment_keep_their_bytes_and_later_rides_stay_apart(cipher: Cipher) {
     let backend = MemoryBackend::default();
     block_on(async {
-        let mut session = Session::create(&backend, addr(), triple(), &deployment(), true)
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(cipher), true)
             .await
             .unwrap();
         place(
@@ -636,11 +691,10 @@ fn rides_joined_before_the_enrollment_keep_their_bytes_and_later_rides_stay_apar
 /// A revert to a message placed before the enrollment is refused: its ordinal would be taken
 /// again by a message numbered on the contract. A revert after it records the highest part
 /// number before it, which the fold keeps; a revert must say it on the contract, and only there.
-#[test]
-fn a_revert_across_the_enrollment_refuses_and_a_later_one_records_its_high() {
+fn a_revert_across_the_enrollment_refuses_and_a_later_one_records_its_high(cipher: Cipher) {
     let backend = MemoryBackend::default();
     block_on(async {
-        let mut session = Session::create(&backend, addr(), triple(), &deployment(), false)
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(cipher), false)
             .await
             .unwrap();
         let mids = two_runs(&mut session).await;
@@ -681,7 +735,7 @@ fn a_revert_across_the_enrollment_refuses_and_a_later_one_records_its_high() {
             .await
             .unwrap();
         assert_eq!(session.operations.tag_high_water, 20);
-        let loaded = Session::load(&backend, addr(), &triple(), &deployment())
+        let loaded = Session::load(&backend, addr(), &triple(), &deployment(cipher))
             .await
             .unwrap();
         assert_eq!(loaded.operations.tag_high_water, 20);
@@ -690,11 +744,10 @@ fn a_revert_across_the_enrollment_refuses_and_a_later_one_records_its_high() {
 }
 
 /// Off the contract a revert records no high: there the part numbers aren't served.
-#[test]
-fn a_revert_off_the_contract_records_no_high() {
+fn a_revert_off_the_contract_records_no_high(cipher: Cipher) {
     let backend = MemoryBackend::default();
     block_on(async {
-        let mut session = Session::create(&backend, addr(), triple(), &deployment(), false)
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(cipher), false)
             .await
             .unwrap();
         let mids = two_runs(&mut session).await;

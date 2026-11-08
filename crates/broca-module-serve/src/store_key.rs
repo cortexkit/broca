@@ -6,12 +6,12 @@
 //! as 64 lowercase hex characters. `session_storage.deployment_key_id` in `broca.jsonc` names the
 //! key the module uses (see `config::SessionStorageConfig`).
 //!
-//! The module starts without waiting for the key. Until the key loads, a session kept in the new
-//! storage is refused `key_unavailable`, a transient refusal, while today's sessions are served
-//! as before. The read is retried with backoff until it succeeds, and the runtime is then
-//! installed with no restart. The key never reaches disk or a log: only its id is logged or
-//! reported, and the vault's reply is never echoed, since a reply that fails to decode can
-//! carry its value.
+//! The module starts without waiting for the key. Until the key loads, an encrypted session kept
+//! in the new storage is refused `key_unavailable`, a transient refusal, while plain sessions
+//! kept there and today's sessions are served as before. The read is retried with backoff until
+//! it succeeds, and the key is then installed with no restart. The key never reaches disk or a
+//! log: only its id is logged or reported, and the vault's reply is never echoed, since a reply
+//! that fails to decode can carry its value.
 
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
@@ -227,8 +227,8 @@ fn warn_missing(key_id: u16, reason: KeyUnavailable) {
         target: "session_storage",
         key_id,
         reason = reason.as_str(),
-        "the new storage's deployment key {key_id} is not loaded; sessions kept in the new \
-         storage are refused key_unavailable until it loads"
+        "the new storage's deployment key {key_id} is not loaded; encrypted sessions kept in the \
+         new storage are refused key_unavailable until it loads"
     );
 }
 
@@ -243,8 +243,9 @@ pub fn publish(slot: Arc<StoreSlot>) {
         .unwrap_or_else(|e| e.into_inner()) = Some(slot);
 }
 
-/// `{key_id, loaded}` for the published slot: which deployment key the new storage is opened
-/// with, and whether it has loaded. Null in a process that published none.
+/// `{key_id, loaded, new_sessions}` for the published slot: which deployment key the new storage
+/// opens encrypted sessions with, whether it has loaded, and the mode the sessions it creates
+/// take (`"encrypted"` or `"plain"`). Null in a process that published none.
 pub fn health() -> serde_json::Value {
     PUBLISHED
         .get()
@@ -252,9 +253,13 @@ pub fn health() -> serde_json::Value {
         .map_or(serde_json::Value::Null, |slot| health_of(&slot))
 }
 
-/// `{key_id, loaded}` for `slot`.
+/// `{key_id, loaded, new_sessions}` for `slot`.
 pub fn health_of(slot: &StoreSlot) -> serde_json::Value {
-    serde_json::json!({"key_id": slot.key_id(), "loaded": slot.key_loaded()})
+    serde_json::json!({
+        "key_id": slot.key_id(),
+        "loaded": slot.key_loaded(),
+        "new_sessions": slot.new_sessions().label(),
+    })
 }
 
 #[cfg(test)]
@@ -287,5 +292,20 @@ mod tests {
         assert_eq!(credential_id(1), "opaque:broca-deployment:1");
         assert_eq!(credential_id(DEFAULT_KEY_ID), "opaque:broca-deployment:1");
         assert_eq!(credential_id(12), "opaque:broca-deployment:12");
+    }
+
+    /// Health names the mode new sessions take, as the slot was configured.
+    #[test]
+    fn health_names_the_mode_of_new_sessions() {
+        use broca_session_store::keys::Cipher;
+        let root = std::path::Path::new("/unused");
+        assert_eq!(
+            health_of(&StoreSlot::awaiting_key(root, 2)),
+            serde_json::json!({"key_id": 2, "loaded": false, "new_sessions": "encrypted"})
+        );
+        assert_eq!(
+            health_of(&StoreSlot::awaiting_key(root, 2).creating(Cipher::None)),
+            serde_json::json!({"key_id": 2, "loaded": false, "new_sessions": "plain"})
+        );
     }
 }
