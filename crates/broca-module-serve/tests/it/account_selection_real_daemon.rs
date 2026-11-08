@@ -920,6 +920,12 @@ where
 
 impl Rig {
     async fn start() -> Option<Rig> {
+        Self::start_with(json!({})).await
+    }
+
+    /// A rig whose `broca.jsonc` also holds the members of `broca_config`, such as
+    /// `session_storage`, beside the provider endpoints every rig sets.
+    async fn start_with(broca_config: Value) -> Option<Rig> {
         let daemon_bin = sibling_bin("ck-subc", "SUBC_CORE_BIN");
         if !daemon_bin.exists() {
             assert!(
@@ -1020,22 +1026,22 @@ impl Rig {
         .unwrap();
         let upstream = Arc::new(Upstream::default());
         let upstream_url = serve_upstream(Arc::clone(&upstream)).await;
-        let broca_config = root.join("broca.jsonc");
-        std::fs::write(
-            &broca_config,
-            json!({
-                "providers": {
-                    "anthropic": { "base_url": upstream_url },
-                    "xai": { "base_url": upstream_url },
-                    "openrouter": { "base_url": upstream_url },
-                    "google": { "base_url": upstream_url },
-                    "openai": { "base_url": upstream_url },
-                    "meta": { "base_url": upstream_url },
-                }
-            })
-            .to_string(),
-        )
-        .unwrap();
+        let broca_config_path = root.join("broca.jsonc");
+        let mut broca_settings = json!({
+            "providers": {
+                "anthropic": { "base_url": upstream_url },
+                "xai": { "base_url": upstream_url },
+                "openrouter": { "base_url": upstream_url },
+                "google": { "base_url": upstream_url },
+                "openai": { "base_url": upstream_url },
+                "meta": { "base_url": upstream_url },
+            }
+        });
+        broca_settings
+            .as_object_mut()
+            .unwrap()
+            .extend(broca_config.as_object().unwrap().clone());
+        std::fs::write(&broca_config_path, broca_settings.to_string()).unwrap();
         let methods = root.join("auth-methods.json");
         std::fs::write(
             &methods,
@@ -1058,7 +1064,7 @@ impl Rig {
                         "env": {
                             "BROCA_STATE_ROOT": state_root,
                             "XDG_DATA_HOME": data_home,
-                            "BROCA_CONFIG_PATH": broca_config,
+                            "BROCA_CONFIG_PATH": broca_config_path,
                             "BROCA_AUTH_METHODS_PATH": methods,
                             "BROCA_TOOL_MODULE": "unused-tools",
                         },
@@ -1446,6 +1452,133 @@ impl Rig {
 
     fn session(&self, name: &str) -> broca_protocol::BindIdentity {
         broca_protocol::BindIdentity::new(self.project_root.clone(), "runner", name)
+    }
+
+    /// The identity the daemon keys session `name` by. A route to the session binds it through
+    /// the daemon, which records the session's address in its session inventory; the address
+    /// resolver the daemon's inventory serves reads it back. A management route opened without a
+    /// scope keys its session under `UNSCOPED_SESSION_ROOT`, not the rig's project folder, so
+    /// state written for the session under any other identity is state the daemon never reads.
+    async fn served_identity(&self, name: &str) -> broca_protocol::BindIdentity {
+        let conn = SubcConnection::connect(&self.connection_file)
+            .await
+            .unwrap();
+        conn.route_open_management_within(
+            "broca",
+            &self.session(name),
+            broca_subc::RouteOpenRetry::within(Duration::from_secs(10), Duration::from_millis(200)),
+        )
+        .await
+        .unwrap();
+        let identity =
+            broca_test_support::resolve_session_address(&self.state_root, &self.session(name))
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "{name}: the daemon recorded no address when it bound the session: {error}"
+                    )
+                });
+        assert_eq!(
+            identity,
+            broca_protocol::BindIdentity::new(
+                broca_protocol::session::UNSCOPED_SESSION_ROOT,
+                "runner",
+                name
+            ),
+            "an unscoped route's session is keyed under the unscoped namespace"
+        );
+        identity
+    }
+
+    /// Creates the session `identity` in the new storage, in the mode `deployment` creates
+    /// sessions in, and returns the incarnation its head names, which `session.history` reports
+    /// for a session served from there. Asserts the head is where the daemon looks for it:
+    /// `session_storage_head` of the session's address, the path the daemon's check of whether
+    /// the new storage keeps a session reads.
+    async fn create_held(
+        &self,
+        identity: &broca_protocol::BindIdentity,
+        deployment: &broca_session_store::keys::DeploymentKey,
+    ) -> String {
+        let session = broca_session_store::session::Session::create(
+            broca_session_store::backend::LocalBackend::new(
+                self.state_root.join(broca_wal::SESSION_STORAGE_DIR),
+            ),
+            broca_session_store::backend::SessionAddr(broca_core::session_addr(identity)),
+            broca_session_store::head::SessionTriple {
+                project_root: identity.project_root.display().to_string(),
+                harness: identity.harness.clone(),
+                session: identity.session.clone(),
+            },
+            deployment,
+            false,
+        )
+        .await
+        .unwrap();
+        let incarnation = broca_session_store::codec::hex(&session.head().incarnation.0);
+        drop(session);
+        let head =
+            broca_wal::session_storage_head(&self.state_root, &broca_core::session_addr(identity));
+        assert!(
+            head.exists(),
+            "{}: the session's head is where the daemon looks for it: {}",
+            identity.session,
+            head.display()
+        );
+        incarnation
+    }
+
+    /// Whether today's storage holds a log for the session `identity`: its WAL at the path
+    /// today's storage gives the daemon's identity of the session.
+    fn has_todays_wal(&self, identity: &broca_protocol::BindIdentity) -> bool {
+        broca_core::FileWalStore::new(self.state_root.join("wal"))
+            .wal_path(identity)
+            .exists()
+    }
+
+    /// The refusal of a `session.subscribe` on session `name`, shaped as [`Self::raw_request`]
+    /// shapes one (code, message and detail), or a panic if the stream opened.
+    async fn subscribe_refusal(&self, name: &str) -> Value {
+        let conn = SubcConnection::connect(&self.connection_file)
+            .await
+            .unwrap();
+        let route = conn
+            .route_open_management_within(
+                "broca",
+                &self.session(name),
+                broca_subc::RouteOpenRetry::within(
+                    Duration::from_secs(10),
+                    Duration::from_millis(200),
+                ),
+            )
+            .await
+            .unwrap();
+        let mut stream = conn
+            .subscribe(
+                &route,
+                serde_json::to_vec(
+                    &json!({"method": "session.subscribe", "params": {"from": "start"}}),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let first = broca_test_support::wait_for(
+            &format!("{name}: session.subscribe's first frame"),
+            stream.next(),
+            || self.log_diagnostics(name),
+        )
+        .await;
+        match first {
+            Err(broca_subc::ConnError::Rejected(refusal)) => json!({
+                "code": refusal.code(),
+                "message": refusal.message(),
+                "detail": refusal.provider_detail(),
+            }),
+            other => panic!(
+                "session.subscribe on {name} was not refused: {other:?}\n{}",
+                self.diagnostics(name).await
+            ),
+        }
     }
 
     async fn client(&self, name: &str) -> SessionClient {
@@ -3748,51 +3881,60 @@ async fn grammar_too_large_status_and_memo_through_real_serve() {
 }
 
 /// A SESSION KEPT IN THE NEW STORAGE IS SERVED BY THE REAL DAEMON ONCE THE VAULT HOLDS ITS
-/// DEPLOYMENT KEY.
+/// DEPLOYMENT KEY, WITH NEW SESSIONS ENCRYPTED.
 ///
-/// The real `ck-broca`, supervised by the real `ck-subc`, reads `opaque:broca-deployment:1` from
-/// the `claustrum` stand-in on its own when it starts. While the stand-in answers `not_found`, a
-/// session kept in the new storage is refused `open_failed`, class transient, its reason naming
-/// `key_unavailable`, and nothing of it is served from today's storage; a session on today's
-/// storage is served. Once the record exists, the daemon reads it again without being asked and
-/// serves the held session, with no restart. The missing record is never reported to the vault
-/// as an auth failure. Unix only: the session's address hashes its project root as the module
-/// spells it, which the test matches by creating the session under both spellings it can name,
-/// as given and canonical; on Windows the module's spelling may be neither.
-#[cfg(unix)]
+/// See [`held_sessions_across_the_deployment_key`].
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_real_daemon_serves_a_held_session_once_the_vault_holds_its_deployment_key() {
-    let Some(rig) = Rig::start().await else {
+    held_sessions_across_the_deployment_key("on").await;
+}
+
+/// THE SAME, WITH NEW SESSIONS PLAIN: `session_storage.encryption` chooses only the mode of the
+/// sessions the module creates, so an encrypted session it keeps is still refused until the key
+/// loads, and a plain one is still served without it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_real_daemon_creating_plain_sessions_still_refuses_an_encrypted_one_until_its_key_loads(
+) {
+    held_sessions_across_the_deployment_key("off").await;
+}
+
+/// The real `ck-broca`, supervised by the real `ck-subc` with `session_storage.encryption` set to
+/// `encryption`, reads `opaque:broca-deployment:1` from the `claustrum` stand-in on its own when
+/// it starts.
+///
+/// Both held sessions are written at the identity the daemon itself recorded for them when their
+/// routes bound ([`Rig::served_identity`]), with each head checked at the path the daemon reads
+/// ([`Rig::create_held`]). While the stand-in answers `not_found`, every read of the encrypted
+/// session (`session.head`, `session.read`, raw and display `session.history`, `run.status`,
+/// `run.result`, `session.send_status` and `session.subscribe`) is refused `open_failed`, class
+/// transient, its reason naming `key_unavailable`. The daemon refuses so only a session it found
+/// in the new storage, so each refusal also shows it found the head written here. None of those
+/// reads leaves a log in today's storage. The plain session is
+/// served from the new storage meanwhile, and a session on today's storage is served too. Once
+/// the record exists, the daemon reads it again without being asked and serves the encrypted
+/// session from the new storage (its own incarnation, not today's empty answer), with no restart.
+/// The missing record is never reported to the vault as an auth failure.
+async fn held_sessions_across_the_deployment_key(encryption: &str) {
+    let Some(rig) = Rig::start_with(json!({"session_storage": {"encryption": encryption}})).await
+    else {
         return;
     };
     let key: [u8; 32] = std::array::from_fn(|i| (i as u8).wrapping_mul(29).wrapping_add(3));
-    let name = "held-in-new-storage";
-    let spellings = [
-        rig.session(name),
-        broca_protocol::BindIdentity::new(rig.root.join("project"), "runner", name),
-    ];
-    for held in &spellings {
-        let head =
-            broca_wal::session_storage_head(&rig.state_root, &broca_core::session_addr(held));
-        if head.exists() {
-            continue;
-        }
-        broca_session_store::session::Session::create(
-            broca_session_store::backend::LocalBackend::new(
-                rig.state_root.join(broca_wal::SESSION_STORAGE_DIR),
-            ),
-            broca_session_store::backend::SessionAddr(broca_core::session_addr(held)),
-            broca_session_store::head::SessionTriple {
-                project_root: held.project_root.display().to_string(),
-                harness: held.harness.clone(),
-                session: held.session.clone(),
-            },
+    let (encrypted_name, plain_name) = ("held-encrypted", "held-plain");
+    let encrypted = rig.served_identity(encrypted_name).await;
+    let plain = rig.served_identity(plain_name).await;
+    let encrypted_incarnation = rig
+        .create_held(
+            &encrypted,
             &broca_session_store::keys::DeploymentKey::new(1, &key),
-            false,
         )
-        .await
-        .unwrap();
-    }
+        .await;
+    let plain_incarnation = rig
+        .create_held(
+            &plain,
+            &broca_session_store::keys::DeploymentKey::unloaded(1),
+        )
+        .await;
     broca_test_support::wait_until("the daemon to read its deployment key", || async {
         match rig.vault.deployment_key_reads() {
             0 => Err("no read yet".to_string()),
@@ -3801,54 +3943,94 @@ async fn the_real_daemon_serves_a_held_session_once_the_vault_holds_its_deployme
     })
     .await;
 
-    let refusal = rig
-        .expect_refused(
-            name,
-            "session.head before the deployment key loads",
-            rig.raw_request(name, "session.head", json!({})).await,
+    let assert_key_unavailable = |what: &str, refusal: &Value| {
+        assert_eq!(refusal["code"], "open_failed", "{what}: {refusal}");
+        assert_eq!(refusal["detail"]["class"], "transient", "{what}: {refusal}");
+        assert!(
+            refusal["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("key_unavailable")),
+            "{what}: {refusal}"
+        );
+    };
+    for (method, params) in [
+        ("session.head", json!({})),
+        ("session.read", json!({})),
+        ("session.history", json!({})),
+        ("session.history", json!({"form": "display"})),
+        ("run.status", json!({})),
+        ("run.result", json!({"run_id": "never-ran"})),
+        ("session.send_status", json!({"send_id": "never-sent"})),
+    ] {
+        let what = format!("{method} {params} before the deployment key loads");
+        let refusal = rig
+            .expect_refused(
+                encrypted_name,
+                &what,
+                rig.raw_request(encrypted_name, method, params).await,
+            )
+            .await;
+        assert_key_unavailable(&what, &refusal);
+    }
+    assert_key_unavailable(
+        "session.subscribe before the deployment key loads",
+        &rig.subscribe_refusal(encrypted_name).await,
+    );
+    assert!(
+        !rig.has_todays_wal(&encrypted),
+        "no read of the held session was served from today's storage"
+    );
+
+    let history = rig
+        .expect_ok(
+            plain_name,
+            "session.history on a plain session before the deployment key loads",
+            rig.raw_request(plain_name, "session.history", json!({}))
+                .await,
         )
         .await;
-    assert_eq!(refusal["code"], "open_failed", "{refusal}");
-    assert_eq!(refusal["detail"]["class"], "transient", "{refusal}");
-    assert!(
-        refusal["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("key_unavailable")),
-        "{refusal}"
+    assert_eq!(
+        history["incarnation"], plain_incarnation,
+        "the plain session is served from the new storage: {history}"
     );
-    for held in &spellings {
-        assert!(
-            !rig.state_root
-                .join("wal")
-                .join(format!("{}.wal", broca_core::session_addr(held)))
-                .exists(),
-            "the held session was not served from today's storage"
-        );
-    }
     let today = rig.raw_request("today", "session.head", json!({})).await;
     rig.expect_ok("today", "session.head on today's storage", today)
         .await;
 
     let hex: String = key.iter().map(|byte| format!("{byte:02x}")).collect();
     *rig.vault.deployment_key.lock().unwrap() = Some(hex.into_bytes());
-    broca_test_support::wait_until("the held session served once the key loads", || async {
-        match rig.raw_request(name, "session.head", json!({})).await {
-            Ok(head) => Ok(head),
-            Err(refusal)
-                if refusal["message"]
-                    .as_str()
-                    .is_some_and(|message| message.contains("key_unavailable")) =>
+    let history = broca_test_support::wait_until(
+        "the encrypted session served once the key loads",
+        || async {
+            match rig
+                .raw_request(encrypted_name, "session.history", json!({}))
+                .await
             {
-                Err(refusal_summary(&refusal))
+                Ok(history) => Ok(history),
+                Err(refusal)
+                    if refusal["message"]
+                        .as_str()
+                        .is_some_and(|message| message.contains("key_unavailable")) =>
+                {
+                    Err(refusal_summary(&refusal))
+                }
+                Err(refusal) => panic!(
+                    "the held session was refused for another reason: {}\n{}",
+                    refusal_summary(&refusal),
+                    rig.diagnostics(encrypted_name).await
+                ),
             }
-            Err(refusal) => panic!(
-                "the held session was refused for another reason: {}\n{}",
-                refusal_summary(&refusal),
-                rig.diagnostics(name).await
-            ),
-        }
-    })
+        },
+    )
     .await;
+    assert_eq!(
+        history["incarnation"], encrypted_incarnation,
+        "the encrypted session is served from the new storage: {history}"
+    );
+    assert!(
+        !rig.has_todays_wal(&encrypted),
+        "the held session was not served from today's storage"
+    );
     assert!(
         rig.vault
             .requests
