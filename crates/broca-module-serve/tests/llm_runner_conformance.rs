@@ -4383,6 +4383,11 @@ fn expected_0821_cases() -> Vec<(&'static str, CaseOutcome)> {
                     assert!(reason.is_empty());
                     CaseOutcome::Passed
                 }
+                // An admitted unkeyed send need not return a submission id. The kit verifies
+                // absence instead; pin that exact rule rather than requiring an optional id.
+                "PASS_WITH_INAPPLICABLE_RULE" => CaseOutcome::PassedWithInapplicableRule {
+                    reason: reason.into(),
+                },
                 _ => panic!("unknown applicability status {status}"),
             };
             (name, outcome)
@@ -4406,6 +4411,55 @@ fn check_0821_cases(
 }
 
 #[test]
+fn runner_0821_unkeyed_send_identity_pins_the_exact_optional_rule() {
+    use cortexkit_role_llm_runner_conformance::{CaseReport, CASES};
+    const CASE: &str = "read_display_facts_send_id_when_present";
+    const REASON: &str = "read_display_facts_send_id_unkeyed: runner returned no submission_id; verified absence instead";
+    let mut cases: Vec<_> = expected_0821_cases()
+        .into_iter()
+        .map(|(name, outcome)| {
+            let spec = CASES.iter().find(|spec| spec.name == name).unwrap();
+            CaseReport {
+                case: spec.name,
+                requires: spec.requires.to_vec(),
+                outcome,
+            }
+        })
+        .collect();
+    let index = cases.iter().position(|case| case.case == CASE).unwrap();
+    cases[index].outcome = CaseOutcome::PassedWithInapplicableRule {
+        reason: REASON.into(),
+    };
+    check_0821_cases(&cases).unwrap();
+    for reason in [
+        "",
+        "runner returned no submission_id",
+        "read_display_facts_send_id_unkeyed: runner does not admit unkeyed non-owner sends",
+    ] {
+        let mut changed = cases.clone();
+        changed[index].outcome = CaseOutcome::PassedWithInapplicableRule {
+            reason: reason.into(),
+        };
+        assert!(check_0821_cases(&changed).unwrap_err().contains(CASE));
+    }
+    for outcome in [
+        CaseOutcome::Passed,
+        CaseOutcome::Inapplicable {
+            reason: REASON.into(),
+        },
+    ] {
+        let mut changed = cases.clone();
+        changed[index].outcome = outcome;
+        assert!(check_0821_cases(&changed).unwrap_err().contains(CASE));
+    }
+    cases.remove(index);
+    assert_eq!(
+        check_0821_cases(&cases).unwrap_err(),
+        format!("the suite has no case {CASE}")
+    );
+}
+
+#[test]
 fn runner_0821_cases_pin_exact_native_outcomes() {
     use cortexkit_role_llm_runner_conformance::{CaseReport, CASES};
     let cases: Vec<_> = expected_0821_cases()
@@ -4424,6 +4478,9 @@ fn runner_0821_cases_pin_exact_native_outcomes() {
     for index in 0..cases.len() {
         for outcome in [
             CaseOutcome::Passed,
+            CaseOutcome::PassedWithInapplicableRule {
+                reason: "a different optional rule".into(),
+            },
             CaseOutcome::Failed {
                 reason: "failed".into(),
             },

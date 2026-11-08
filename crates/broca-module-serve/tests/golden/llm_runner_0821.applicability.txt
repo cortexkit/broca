@@ -55,5 +55,5 @@ N/A media_refs_media_are_refs: missing groups: media_refs
 N/A media_refs_large_payloads_inline: missing groups: media_refs
 N/A media_refs_descriptor_digests: missing groups: media_refs
 N/A read_display_facts_send_id: missing groups: send_ids
-PASS read_display_facts_send_id_when_present
+PASS_WITH_INAPPLICABLE_RULE read_display_facts_send_id_when_present: read_display_facts_send_id_unkeyed: runner returned no submission_id; verified absence instead
 N/A call_identity_imported_call_carrier: adapter hook seed_imported_tool_call is unavailable
