@@ -89,6 +89,7 @@ fn a_group_never_splits_across_blocks(cipher: Cipher) {
                 text: "y".repeat(1_000),
                 notice: None,
                 written_at_ms: None,
+                ride: None,
             }),
         ));
     }
@@ -127,6 +128,7 @@ fn facts(ordinal: u64) -> Record {
         created_at_ms: None,
         delivery_mode: None,
         delivery_tool_call_id: None,
+        notices: Vec::new(),
     })
 }
 

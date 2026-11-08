@@ -595,6 +595,14 @@ mod records {
         notice,
         written_at_ms,
         send_id,
+        ride,
+    });
+    variants!(RideForm: RideForm::Append);
+    crate::fuzzing::gen::fields!(RideEnvelope {
+        call_key,
+        sender,
+        forms,
+        form
     });
     crate::fuzzing::gen::fields!(StepUsage {
         prompt_tokens,
@@ -625,8 +633,16 @@ mod records {
         no_display_facts,
         reasoning_summaries,
         rich_ui,
+        notices,
         runner_tag_base,
         legacy_view_seq,
+    });
+    crate::fuzzing::gen::fields!(RideNotice {
+        part,
+        send_id,
+        sender,
+        call_key,
+        text
     });
     crate::fuzzing::gen::fields!(ReasoningSummary { part, text });
     crate::fuzzing::gen::fields!(RichUi {

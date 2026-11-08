@@ -40,6 +40,9 @@ cipher_tests!(
     a_photo_whose_bytes_cant_be_read_refuses_alike_and_nothing_is_sent,
     a_run_after_a_view_drops_a_photo_renders_alike,
     a_photo_between_numbered_messages_renders_alike,
+    an_ordered_steer_photo_lands_with_its_bytes_where_today_marks_it,
+    an_idle_start_photo_starts_its_run_and_renders_alike,
+    an_ordered_photo_no_mode_can_carry_is_refused_alike,
 );
 
 /// What a side's model was asked to send, in order: each request's body, or the code of the
@@ -781,6 +784,178 @@ async fn a_steered_photo_renders_alike(cipher: Cipher) {
         "the step after the steer carries the steered image"
     );
     sent_alike(&today, &store, "the step that places the steered photo");
+}
+
+/// Uploads the image `hex` names on `side` and sends it with the ordered delivery list `modes`.
+async fn send_ordered_image(
+    side: &Rendered,
+    run_id: &str,
+    modes: &[&str],
+    hex: &str,
+) -> SendOutcome {
+    let upload = side.side.uploaded(&bytes_of(hex)).await;
+    side.side
+        .registry
+        .route_submission_with_order(
+            &side.side.key,
+            broca_protocol::RunId(run_id.into()),
+            photo("look", &[&upload]),
+            RunKind::FreshOrResume,
+            crate::actor::SendKey::Minted,
+            false,
+            broca_protocol::Delivery::Queue,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            Some(serde_json::from_value(json!({ "modes": modes })).unwrap()),
+        )
+        .await
+        .expect("the session opens")
+}
+
+/// A photo sent with the ordered list `[tool_result, steer]` while a run's model step is in
+/// flight is queued alike. A tool result can't carry a photo, so it lands as a steer at the
+/// run's next step boundary (the one a plain steer sent alongside makes the run take). Both
+/// storages write that boundary in the same order: the run's start, the send's delivery, then
+/// the step's start.
+///
+/// Every request before that step is the same on both. That step's request is not, and the
+/// difference is pinned here: today's renders the delivered photo as a `provenance` marker, not
+/// its bytes, while the new storage sends the photo. Today's own media fold, run over today's
+/// records from the first, binds the photo to the delivered message (it holds a delivered send's
+/// input until the step starts, then places it), so the marker comes from today's live renderer
+/// during the run that delivers the send, not from a rule the new storage should follow. The new
+/// storage's delivered copy points at the bytes the queued record stored, and its fold binds the
+/// photo as today's fold does.
+async fn an_ordered_steer_photo_lands_with_its_bytes_where_today_marks_it(cipher: Cipher) {
+    let (today, store) = both(three_texts(), true, cipher).await;
+    for side in [&today, &store] {
+        side.side.release_to_idle().await;
+        let sent = send_photo(side, "r2", broca_protocol::Delivery::Queue).await;
+        assert!(matches!(sent, SendOutcome::Active { .. }), "{sent:?}");
+        let sent = send_ordered_image(side, "o1", &["tool_result", "steer"], WIDE).await;
+        assert!(matches!(sent, SendOutcome::Pending { .. }), "{sent:?}");
+        let sent = side
+            .side
+            .deliver("r3", text("and this"), broca_protocol::Delivery::Steer)
+            .await;
+        assert!(matches!(sent, SendOutcome::Active { .. }), "{sent:?}");
+        side.side.release_to_idle().await;
+    }
+    // Today's own fold, run over today's records from the first, binds the delivered photo.
+    let wide = {
+        use sha2::Digest as _;
+        hex_of(&sha2::Sha256::digest(bytes_of(WIDE)))
+    };
+    assert!(
+        today_fold_binds(&today, &wide),
+        "today's media fold binds the delivered photo"
+    );
+    let (old, new) = (today.sent(), store.sent());
+    assert_eq!(new.len(), old.len(), "how many requests");
+    let (old_last, old_earlier) = old.split_last().expect("a request");
+    let (new_last, new_earlier) = new.split_last().expect("a request");
+    assert_eq!(
+        new_earlier, old_earlier,
+        "every request before the delivering step"
+    );
+    let old_last =
+        String::from_utf8_lossy(old_last.as_ref().expect("today's was sent")).into_owned();
+    let new_last =
+        String::from_utf8_lossy(new_last.as_ref().expect("the store's was sent")).into_owned();
+    let photo = base64(&bytes_of(WIDE));
+    assert!(
+        old_last.contains("reason=provenance") && !old_last.contains(&photo),
+        "today's live render marks the delivered photo: {old_last}"
+    );
+    assert!(
+        new_last.contains(&photo) && !new_last.contains("reason=provenance"),
+        "the store sends the delivered photo: {new_last}"
+    );
+}
+
+/// Lowercase hex of `bytes`.
+fn hex_of(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Whether today's media fold, run over `side`'s whole log from its first record, binds a medium
+/// with digest `sha256` somewhere in the transcript that log replays to.
+fn today_fold_binds(side: &Rendered, sha256: &str) -> bool {
+    use broca_core::WalStore as _;
+    /// The fold only reads bytes when a request is prepared; binding never does.
+    #[derive(Debug)]
+    struct NoBytes;
+    impl broca_core::media_store::MediaBytes for NoBytes {
+        fn read_verified(
+            &self,
+            _: &broca_protocol::MediaRef,
+        ) -> Result<Vec<u8>, broca_core::media_store::MediaReadError> {
+            unreachable!("binding reads no bytes")
+        }
+    }
+    let records: Vec<_> = FileWalStore::new(side.side.dir.join("wal"))
+        .read_records(&side.side.key)
+        .unwrap()
+        .into_iter()
+        .map(|frame| frame.record)
+        .collect();
+    let mut media = broca_core::media_request::SessionMedia::new(NoBytes);
+    for record in &records {
+        media.fold(record).unwrap();
+    }
+    let mut prompt = broca_core::replay(&records).unwrap().prompt;
+    broca_protocol::content::stamp_ordinals(&mut prompt);
+    media
+        .bindings(&prompt)
+        .iter()
+        .any(|binding| binding.reference.sha256 == sha256)
+}
+
+/// A photo sent with the ordered list `[idle_start]` to an idle session starts its run alike,
+/// and the run's request carries its image alike.
+async fn an_idle_start_photo_starts_its_run_and_renders_alike(cipher: Cipher) {
+    let (today, store) = both(three_texts(), false, cipher).await;
+    for side in [&today, &store] {
+        let sent = send_ordered_image(side, "o1", &["idle_start"], PNG).await;
+        assert!(matches!(sent, SendOutcome::Active { .. }), "{sent:?}");
+        side.side.idle().await;
+    }
+    sent_alike(&today, &store, "the run the ordered photo started");
+}
+
+/// A photo sent with an ordered list naming neither `steer` nor `idle_start` has no mode that
+/// can carry it: a tool result carries text only, and turn-scoped system text is text. Both
+/// refuse it alike, as media the carrier can't take, and neither side sends anything for it.
+async fn an_ordered_photo_no_mode_can_carry_is_refused_alike(cipher: Cipher) {
+    let (today, store) = both(three_texts(), false, cipher).await;
+    for modes in [&["tool_result"][..], &["turn_system"][..]] {
+        let mut replies = Vec::new();
+        for side in [&today, &store] {
+            let before = side.sent().len();
+            replies.push(send_ordered_image(side, "o1", modes, PNG).await);
+            side.side.idle().await;
+            assert_eq!(side.sent().len(), before, "{modes:?}: nothing is sent");
+        }
+        assert_eq!(
+            replies[1], replies[0],
+            "{modes:?}: the store answers as today's"
+        );
+        assert!(
+            matches!(
+                replies[0],
+                SendOutcome::DeliveryRefused {
+                    code: "media_unsupported",
+                    ..
+                }
+            ),
+            "{modes:?}: {:?}",
+            replies[0]
+        );
+    }
 }
 
 /// After a restart, a run's request still carries the photo an earlier run's input held: the

@@ -55,6 +55,14 @@ fn scratch() -> std::path::PathBuf {
     dir
 }
 
+/// Each side's gate on its tool dispatches: a dispatch signals the first `Notify` and waits for
+/// a release of the second.
+type ToolGate = (Arc<Notify>, Arc<Notify>);
+
+fn tool_gate() -> ToolGate {
+    (Arc::new(Notify::new()), Arc::new(Notify::new()))
+}
+
 /// A module over `dir` whose scripted provider answers `steps`, and whose tool dispatches each
 /// wait for a release of `tools` when it is given. With `store`, a session that exists nowhere
 /// starts in the new storage, in mode `cipher`.
@@ -62,7 +70,7 @@ async fn side_at(
     dir: std::path::PathBuf,
     store: bool,
     steps: Vec<Vec<NormalizedEvent>>,
-    tools: Option<Arc<Notify>>,
+    tools: Option<ToolGate>,
     cipher: Cipher,
 ) -> Side {
     let wal = Arc::new(FileWalStore::new(dir.join("wal")));
@@ -125,8 +133,8 @@ async fn pair(
     steps: impl Fn() -> Vec<Vec<NormalizedEvent>>,
     gated: bool,
     cipher: Cipher,
-) -> [(Side, Option<Arc<Notify>>); 2] {
-    let gate = || gated.then(|| Arc::new(Notify::new()));
+) -> [(Side, Option<ToolGate>); 2] {
+    let gate = || gated.then(tool_gate);
     let (today_gate, store_gate) = (gate(), gate());
     [
         (
@@ -397,7 +405,7 @@ async fn a_batch_in_flight_lists_alike() {
                 SendOutcome::Active { .. }
             ));
             // The first batch's dispatch goes through; the second's waits.
-            gate.as_ref().unwrap().notify_one();
+            gate.as_ref().unwrap().1.notify_one();
             broca_test_support::wait_until("the second call is dispatched", || async {
                 let page = reply(side.calls("r1", None, None).await);
                 match outcomes(&page).as_slice() {
@@ -420,7 +428,7 @@ async fn a_batch_in_flight_lists_alike() {
             );
         }
         for (side, gate) in [(&today, &today_gate), (&store, &store_gate)] {
-            gate.as_ref().unwrap().notify_one();
+            gate.as_ref().unwrap().1.notify_one();
             side.idle().await;
         }
         let pages = [today.pages("r1", None).await, store.pages("r1", None).await];
@@ -442,7 +450,7 @@ async fn crash_mid_dispatch(dir: std::path::PathBuf, store: bool, cipher: Cipher
             .unwrap();
         let side = runtime.block_on(async {
             let steps = vec![read_step("a1"), text_step("a2", "done")];
-            let mut side = side_at(dir, store, steps, Some(Arc::new(Notify::new())), cipher).await;
+            let mut side = side_at(dir, store, steps, Some(tool_gate()), cipher).await;
             side.owns_dir = false;
             assert!(matches!(
                 side.send("r1", "first").await,

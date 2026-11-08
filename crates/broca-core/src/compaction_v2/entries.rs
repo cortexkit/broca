@@ -48,12 +48,9 @@ impl RideEnvelopes {
         self.0.get(&(mid.into(), part.into()))?.get(index)?.as_ref()
     }
 
-    pub(crate) fn push(
-        &mut self,
-        mid: &str,
-        part: &str,
-        ride: Option<broca_wal::record::RideMetadata>,
-    ) {
+    /// Adds the envelope of the next text delivered with the part `part` of message `mid`:
+    /// `None` for text delivered without one. Calls follow the part's delivered order.
+    pub fn push(&mut self, mid: &str, part: &str, ride: Option<broca_wal::record::RideMetadata>) {
         self.0
             .entry((mid.into(), part.into()))
             .or_default()
@@ -61,7 +58,9 @@ impl RideEnvelopes {
     }
 }
 
-pub(crate) fn attach_ride_envelope(
+/// Copies a ride's envelope onto the delivered text a compaction part carries, as the ride's
+/// own record names it. Text without an envelope keeps what it has.
+pub fn attach_ride_envelope(
     delivered: &mut Delivered,
     ride: Option<&broca_wal::record::RideMetadata>,
 ) {

@@ -249,6 +249,38 @@ message! {
         /// that doesn't know the field would serve the text without it, so it is
         /// must-understand.
         6 opt [must] send_id: String,
+        /// The ride envelope (llm-runner 0.8.11): the carrying call's key, the sender and the
+        /// forms the send allowed, fixed when the text was delivered. Text with an envelope is
+        /// a ride: it is never joined into the stored result, and every request renders it
+        /// after the result through the runner's own ride rules. Text without one was delivered
+        /// before envelopes existed and keeps its historical rendering. A reader that doesn't
+        /// know the field would render a ride the old way, so it is must-understand.
+        7 opt [must] ride: RideEnvelope,
+    }
+}
+
+values! {
+    /// How a ride renders. Only the append form is ever recorded: broca never renders a ride
+    /// as system text.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+    pub enum RideForm {
+        1 Append,
+    }
+}
+
+message! {
+    /// What a ride carries besides its text and its send's id, as today's `SendDelivered`
+    /// record holds it in its `ride` member.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    pub struct RideEnvelope {
+        /// The key of the tool call whose result carries the ride, recorded at delivery and
+        /// never looked up again: a call id can repeat in a session, a key can't.
+        1 req call_key: String,
+        /// The module that sent it, or `broca`.
+        2 req sender: String,
+        /// The send's delivery list restricted to `tool_result` and `turn_system`, in order.
+        3 rep forms: String,
+        4 req form: RideForm,
     }
 }
 
@@ -275,12 +307,32 @@ message! {
 }
 
 message! {
+    /// A note a send delivered riding on one of a tool results message's results, as
+    /// `session.read` serves it among the message's display facts (llm-runner's `NoticeFact`).
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    pub struct RideNotice {
+        /// The result's position among the message's results: its call's position among the
+        /// tool calls of the assistant message before it.
+        1 req part: u32,
+        2 req send_id: String,
+        /// The module that sent it, or `broca`.
+        3 req sender: String,
+        /// The key of the call whose result carries it.
+        4 req call_key: String,
+        /// The text the send delivered, without the blank line that separates it from the
+        /// result when it is rendered.
+        5 req text: String,
+    }
+}
+
+message! {
     /// What `session.entries` serves about one conversation message besides the message itself,
     /// decided when the message was placed and never derived again. Written right after the
     /// record that places the message (or, for an assistant message still waiting for its tool
     /// results, the record that reserves its ordinal), in the same batch. A later `EntryFacts`
-    /// for the same ordinal replaces it. Content-free but for the reasoning summaries reads show:
-    /// delivered text stays in its `ResultAppend`.
+    /// for the same ordinal replaces it. Content-free but for the reasoning summaries and ride
+    /// notices reads show: delivered text itself stays in its `ResultAppend`, and a notice
+    /// repeats it so a read of the message needs no other record.
     #[derive(Debug, Clone, PartialEq, Serialize)]
     pub struct EntryFacts {
         /// The message's place in the whole conversation, counting from 1.
@@ -359,6 +411,11 @@ message! {
         /// sent its request, which output references check a named part against. Absent when no
         /// such view had applied; the run loop never writes first-protocol views.
         22 opt legacy_view_seq: u64,
+        /// For a tool results message: each send that rode on one of its results, in the order
+        /// delivered, as `session.read` serves it in the message's `notices` display fact. Only
+        /// a ride delivered with its envelope has one; text delivered before envelopes existed
+        /// stays joined into its result and has none.
+        23 rep notices: RideNotice,
     }
 }
 

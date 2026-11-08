@@ -10413,7 +10413,7 @@ struct AttemptCallbacks<'a> {
 /// How long a cancelled step's stream is read for its last attempt record. The transport sends
 /// that record and closes the stream without any network wait, so this bound is only reached
 /// if the provider task is starved; the record is then lost rather than the cancel delayed.
-const CANCELLED_STEP_ATTEMPT_DRAIN: std::time::Duration = std::time::Duration::from_secs(5);
+pub const CANCELLED_STEP_ATTEMPT_DRAIN: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Drive ONE model step: forward display deltas, capture the assembled message +
 /// usage, end on the provider's terminal `Finished`/`Error`.

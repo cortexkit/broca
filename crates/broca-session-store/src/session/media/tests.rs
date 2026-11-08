@@ -169,6 +169,7 @@ fn facts(ordinal: u64, mid: String) -> Record {
         created_at_ms: None,
         delivery_mode: None,
         delivery_tool_call_id: None,
+        notices: Vec::new(),
     })
 }
 
