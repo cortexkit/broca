@@ -164,7 +164,7 @@ pub async fn verify(verify: Verify<'_>) -> Result<Verified, Mismatch> {
     runs(&verify, staged, &parts, &mut checks).await?;
     reads(&verify, lineage.as_deref(), staged, &parts).await?;
     checks.push(READ);
-    history(verify.records, staged, &parts).await?;
+    history(verify.records, lineage.as_deref(), staged, &parts).await?;
     checks.push(HISTORY_RAW);
     history_walks(&verify, lineage.as_deref(), staged, &parts).await?;
     checks.push(HISTORY_DISPLAY);
@@ -490,20 +490,43 @@ where
     }
 }
 
-/// `session.history` in its raw form, every entry.
+/// `session.history` in its raw form, every entry. `lineage` is the log's lineage id.
 async fn history<B: SessionBackend>(
     records: &[FramedRecord],
+    lineage: Option<&str>,
     view: &Session<B>,
     parts: &MemoryParts,
 ) -> Result<(), Mismatch> {
+    // Today's reads serve the output of a tool result a send rode on as the tool returned it,
+    // from the display facts folded from the log, not with the ride's text joined to it as its
+    // stored record keeps it (`LineageRegistry::read`, and `store_read::todays` beside it).
+    let native = match lineage {
+        Some(lineage) => broca_core::display_facts::native_tool_outputs(records, lineage)
+            .map_err(|error| mismatch(HISTORY_RAW, format!("today's tool outputs: {error}")))?,
+        None => Default::default(),
+    };
     let today = walk_history(|from| {
-        broca_core::read_session_page(
+        let mut page = broca_core::read_session_page(
             &broca_core::StorePageSnapshot::empty(),
             records,
             Some(from),
             Some(PAGE),
         )
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+        for entry in &mut page.messages {
+            // Page ordinals count from 0, as the folded facts key them.
+            let Some(outputs) = native.get(&entry.ordinal) else {
+                continue;
+            };
+            for (part, block) in entry.message.content.iter_mut().enumerate() {
+                if let broca_protocol::ContentBlock::ToolResult(result) = block {
+                    if let Some(output) = outputs.get(&(part as u32)) {
+                        result.output = output.clone();
+                    }
+                }
+            }
+        }
+        Ok(page)
     })
     .map_err(|error| mismatch(HISTORY_RAW, format!("today's history: {error}")))?;
     let mut store = Vec::new();

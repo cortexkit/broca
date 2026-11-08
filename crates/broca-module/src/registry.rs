@@ -834,7 +834,7 @@ pub struct MoveSessionGuard {
 /// One actor generation a mutating cut retired; see [`MoveSessionGuard`].
 struct RetiredActor {
     key: LineageKey,
-    tenure: Option<broca_core::wal_writer::ClosedWriterTenure>,
+    tenure: Option<crate::actor::CutTenure>,
     close: CloseToken,
 }
 
@@ -876,6 +876,11 @@ pub enum CutLockMode {
     /// lease to the guard; the guard commits its slot closed when released. Other actors
     /// pause as for `Inspect`; a busy actor refuses without changing its writer.
     Mutate,
+    /// The move takes the session out of today's storage (`session.move_to_store`): any idle
+    /// actor closes, tearing down its subscribers and joining its writer, and hands its
+    /// session lease to the guard, whether its writer or the actor itself held it. A busy
+    /// actor refuses without changing its writer.
+    Retire,
 }
 
 type ToolRouteHealth = dyn Fn(&[LineageKey]) -> serde_json::Value + Send + Sync;
@@ -2298,7 +2303,7 @@ impl LineageRegistry {
                 guard.actors.push(release);
                 if let Some(crate::actor::RetiredForCut { tenure, close }) = retired {
                     // Only a mutating cut may retire an actor or take its session lease.
-                    debug_assert_eq!(mode, CutLockMode::Mutate);
+                    debug_assert_ne!(mode, CutLockMode::Inspect);
                     guard.retired.push(RetiredActor {
                         key: key.clone(),
                         tenure,

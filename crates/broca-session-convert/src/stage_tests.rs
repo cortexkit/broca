@@ -642,3 +642,134 @@ fn the_wal_preconditions_name_open_work_and_an_open_batch() {
     assert_eq!(wal_refusal(&open, lineage), Some(OPEN_TOOL_BATCH));
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// `send.status` of a send delivered with a tool result names the call whose result carried it,
+/// in the new storage as today's storage does. Read from a WAL of a run whose tool batch carried
+/// a queued send's text, converted into a session in each of the new storage's modes.
+#[test]
+fn an_enveloped_notes_send_status_names_its_ride_key_alike() {
+    note_status_alike(true);
+}
+
+/// [`an_enveloped_notes_send_status_names_its_ride_key_alike`] for a note delivered before ride
+/// envelopes existed: its `send.status` names the carrier call's own key.
+#[test]
+fn a_legacy_notes_send_status_names_its_carrier_key_alike() {
+    note_status_alike(false);
+}
+
+/// Compares today's and the new storage's `send.status` of a note delivered with a tool result,
+/// with a ride envelope when `enveloped`.
+fn note_status_alike(enveloped: bool) {
+    use broca_module::store_status::{todays, Reader};
+    use broca_session_store::backend::MemoryBackend;
+    use broca_session_store::keys::Cipher;
+    for cipher in Cipher::ALL {
+        {
+            let root = scratch(&format!("note-status-{}-{enveloped}", cipher.label()));
+            // A WAL of today's, for the lineage its header names, which a key derived from the
+            // log names; the records are read as they would be appended.
+            let lineage = broca_wal::FileWal::open(root.join("session.wal"))
+                .unwrap()
+                .lineage_id();
+            let mut delivered = json!({"type": "send_delivered", "submission_id": "sub-q",
+                "run_id": "r1", "mode": "tool_result", "tool_call_id": "c1",
+                "appended_text": "\n\nnote", "written_at_ms": 5});
+            if enveloped {
+                delivered["ride"] = json!({"call_key": "lineage:enveloped", "send_id": "q",
+                    "sender": "broca", "forms": ["tool_result"], "form": "append"});
+            }
+            let mut records = vec![run_started("r1", 1_000, "Hello.")];
+            records.extend(
+                [
+                    json!({"type": "delivery_ordered", "submission_id": "sub-q",
+                        "order": {"modes": ["tool_result"]}}),
+                    json!({"type": "queued", "submission_id": "sub-q", "send_id": "q",
+                        "request": {"model": {"provider_module_id": "p", "model_id": "m"},
+                            "input": [{"role": "user",
+                                "content": [{"type": "text", "text": "note"}]}],
+                            "policy_allowed": [], "tool_choice": {"type": "auto"},
+                            "generation": {}, "stop_when": []},
+                        "written_at_ms": 5}),
+                    json!({"type": "step_started", "step_id": 1}),
+                    json!({"type": "model_step_finished", "step_id": 1,
+                        "assistant_message": {"message_id": "m1", "content": [
+                            {"type": "tool_call", "tool_call_id": "c1", "tool_name": "read",
+                                "input": {}}]},
+                        "usage": {"input_tokens": 3, "output_tokens": 1},
+                        "finish_reason": "tool_calls", "retries_used": 0}),
+                    json!({"type": "tool_batch_started", "batch_id": "b1", "step_id": 1,
+                        "planned_calls": ["c1"]}),
+                    json!({"type": "tool_dispatch_intent", "batch_id": "b1",
+                        "tool_call_id": "c1", "args": {}}),
+                    json!({"type": "tool_result", "batch_id": "b1", "result": {
+                        "tool_call_id": "c1", "output": {"kind": "text", "text": "ok"},
+                        "is_error": false}, "outcome": "completed"}),
+                    json!({"type": "tool_batch_finished", "batch_id": "b1"}),
+                    delivered,
+                    json!({"type": "turn_finished", "step_id": 1}),
+                    json!({"type": "step_started", "step_id": 2}),
+                    json!({"type": "model_step_finished", "step_id": 2,
+                        "assistant_message": {"message_id": "m2",
+                            "content": [{"type": "text", "text": "Done."}]},
+                        "usage": {"input_tokens": 3, "output_tokens": 1},
+                        "finish_reason": "stop", "retries_used": 0}),
+                    json!({"type": "run_finished", "reason": "completed", "ts_ms": 1_003,
+                        "usage": {"input_tokens": 6, "output_tokens": 2},
+                        "retries_used": 0}),
+                ]
+                .into_iter()
+                .map(record),
+            );
+            let framed: Vec<FramedRecord> = (1u64..)
+                .zip(records)
+                .map(|(seq, record)| FramedRecord {
+                    seq,
+                    fence: 1,
+                    record,
+                })
+                .collect();
+            let today =
+                todays::send_status(&framed, lineage, broca_protocol::RunId("q".into()), "q")
+                    .unwrap();
+            let lineage_text = lineage.map(|id| id.to_string());
+            let converted = crate::convert(&framed, lineage_text.as_deref()).unwrap();
+            assert!(converted.lost.is_empty(), "{:?}", converted.lost);
+            let backend = MemoryBackend::default();
+            let mut store = block_on(Session::create(
+                &backend,
+                SessionAddr(broca_core::session_addr(&session())),
+                crate::stage::triple(&session()),
+                &deployment().creating(cipher),
+                true,
+            ))
+            .unwrap();
+            block_on(store.append(&converted.records, false)).unwrap();
+            let parts = broca_session_loop::parts::MemoryParts {
+                parts: converted.parts.clone(),
+            };
+            let reader = Reader {
+                parts: &parts,
+                live: false,
+                settled: None,
+                session_name: "s",
+                live_step: None,
+            };
+            let served =
+                block_on(reader.send_status(&store, broca_protocol::RunId("q".into()), "q", None))
+                    .unwrap();
+            let what = format!("{} enveloped={enveloped}", cipher.label());
+            let today = serde_json::to_value(today).unwrap();
+            assert_eq!(serde_json::to_value(served).unwrap(), today, "{what}");
+            let key = today["delivered"]["call_key"]
+                .as_str()
+                .unwrap_or_else(|| panic!("today's names the carrier, {what}: {today}"));
+            if enveloped {
+                assert_eq!(key, "lineage:enveloped", "{what}");
+            } else {
+                assert_ne!(key, "lineage:enveloped", "{what}");
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+}

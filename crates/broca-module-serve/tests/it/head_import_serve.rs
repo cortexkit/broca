@@ -513,10 +513,12 @@ async fn a_store_session_refuses_unbuilt_ops_by_name_and_checks_owners_from_the_
 }
 
 /// `session.move_to_store` through real dispatch. Only the operator's own connection may call
-/// it. Until the new storage serves every operation the move requires, the move refuses
-/// `not_movable` naming the first operation it doesn't serve, and writes nothing.
+/// it. The new storage serves every operation a move requires, so precondition 1 passes; a
+/// session with no WAL on today's storage then has nothing to move, and the move refuses
+/// `not_movable {no_live_wal}`, writing nothing. The full move is
+/// `store_move_serve::a_live_session_moves_to_the_new_storage_and_keeps_serving`.
 #[tokio::test]
-async fn a_move_to_the_new_storage_is_refused_until_every_operation_is_served() {
+async fn a_move_is_operator_only_and_refuses_a_session_with_no_wal() {
     let mut rig = Rig::start("move-to-store", true).await;
     rig.bind(1, core(), None).await;
     assert_eq!(
@@ -534,18 +536,14 @@ async fn a_move_to_the_new_storage_is_refused_until_every_operation_is_served() 
     assert_eq!(reply.header.ty, FrameType::Error);
     let body: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
     let served = broca_module_serve::store_move::served_by_serve_layer();
-    let unserved = broca_module_serve::store_move::REQUIRED_OPERATIONS
-        .iter()
-        .find(|op| !served(op));
-    let Some(op) = unserved else {
-        panic!(
-            "the new storage serves every operation a move requires: extend this test to the \
-             full move (a session with a tool-result note and a live subscriber, then a send, \
-             reads, an old cursor refused cursor_expired, and a restart)"
-        );
-    };
+    assert!(
+        broca_module_serve::store_move::REQUIRED_OPERATIONS
+            .iter()
+            .all(|op| served(op)),
+        "the new storage serves every operation a move requires"
+    );
     assert_eq!(body["code"], "not_movable", "{body}");
-    assert_eq!(body["detail"]["reason"], *op, "{body}");
+    assert_eq!(body["detail"]["reason"], "no_live_wal", "{body}");
     assert!(
         !rig.dir
             .join(broca_wal::SESSION_STORAGE_DIR)

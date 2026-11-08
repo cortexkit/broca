@@ -742,6 +742,84 @@ impl RunExecutor for CoreExec {
             self.script.failures.lock().unwrap().push(error.to_string());
         })
     }
+
+    /// A session kept in the new storage (one a move took there) runs through the new loop over
+    /// the same scripted provider, tools and approvals today's runs use.
+    async fn execute_on_store(
+        &self,
+        job: broca_module::executor::StoreRunJob,
+        out: mpsc::Sender<OutputEvent>,
+    ) -> broca_module::executor::StoreRunEnd {
+        use broca_module::executor::{StoreRunError, StoreRunMode};
+        use broca_session_loop::writer::Writer as _;
+        let broca_module::executor::StoreRunJob {
+            mut req,
+            mut control,
+            mut writer,
+            mut parts,
+            mode,
+            ..
+        } = job;
+        control.hook_plane = self.hook_plane();
+        let provider = ScriptedProvider(self.script.clone(), None, std::sync::RwLock::new(None));
+        let tools = ScriptedTools(self.script.clone());
+        let approval = ScriptedApproval(self.script.clone());
+        let result = async {
+            let now = || 1;
+            let seams = broca_session_loop::run::Seams {
+                provider: &provider,
+                tools: &tools,
+                bind: req.session.clone(),
+                out: Some(&out),
+                cancel: control.cancel.clone().unwrap_or_default(),
+                stop: Default::default(),
+                held: None,
+                approval: &approval,
+                hook_plane: control.hook_plane.clone(),
+                now_ms: &now,
+                session_address: None,
+                compaction_plane: control.compaction_plane.as_deref(),
+                compaction_session: control.compaction_session.clone(),
+                compaction_changes: true,
+                keep_warm: None,
+                account_reports: None,
+                max_same_account_wait: Default::default(),
+                auth_selection: None,
+                step_progress: control.step_progress.clone(),
+                model_call_ready: None,
+            };
+            match mode {
+                StoreRunMode::Fresh => {
+                    let admission = broca_session_loop::admit::admission(
+                        &mut req,
+                        &control,
+                        &provider,
+                        writer.operations(),
+                        Some(1),
+                    )
+                    .map_err(StoreRunError::Admission)?;
+                    broca_session_loop::run::run(&mut writer, parts.as_mut(), admission, &seams)
+                        .await
+                }
+                StoreRunMode::Seal(cause) => {
+                    broca_session_loop::seal(&mut writer, parts.as_ref(), &seams, cause).await
+                }
+                StoreRunMode::Resume => {
+                    broca_session_loop::run::resume(&mut writer, parts.as_ref(), &seams).await
+                }
+            }
+            .map_err(StoreRunError::Loop)
+        }
+        .await;
+        if let Err(error) = &result {
+            self.script
+                .failures
+                .lock()
+                .unwrap()
+                .push(format!("{error:?}"));
+        }
+        broca_module::executor::StoreRunEnd { parts, result }
+    }
 }
 
 pub struct Rig {
@@ -758,6 +836,12 @@ pub struct Rig {
     daemon_scopes: bool,
     corr: u64,
     next_subscription_read_delay: Option<Duration>,
+    /// Whether the module keeps the new session storage beside today's and can move the
+    /// rig's session there (`session.move_to_store`), as a production module does.
+    movable: bool,
+    /// Frames [`Rig::request`] read that weren't its reply, such as a still-open
+    /// subscription's, in the order they arrived.
+    pub skipped: Vec<Frame>,
 }
 
 pub struct FailureDiagnostics {
@@ -867,7 +951,26 @@ impl Rig {
         daemon_scopes: bool,
         harness: &str,
     ) -> Self {
-        Self::open_existing_as_with_ride_writer(dir, idle_ttl, daemon_scopes, harness, false).await
+        Self::open_with(dir, idle_ttl, daemon_scopes, harness, false, false).await
+    }
+
+    /// A rig whose module keeps the new session storage beside today's, with a mover for the
+    /// rig's session as a production module installs one: its sessions start on today's
+    /// storage, and `session.move_to_store` on an operator's route moves one.
+    pub async fn start_movable(tag: &str) -> Self {
+        let dir = broca_test_support::scratch_root()
+            .join(format!("broca-send-delivery-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("proj")).unwrap();
+        Self::open_with(
+            dir,
+            Duration::from_millis(100),
+            false,
+            "runner",
+            false,
+            true,
+        )
+        .await
     }
 
     async fn open_existing_as_with_ride_writer(
@@ -876,6 +979,17 @@ impl Rig {
         daemon_scopes: bool,
         harness: &str,
         ride_writer: bool,
+    ) -> Self {
+        Self::open_with(dir, idle_ttl, daemon_scopes, harness, ride_writer, false).await
+    }
+
+    async fn open_with(
+        dir: PathBuf,
+        idle_ttl: Duration,
+        daemon_scopes: bool,
+        harness: &str,
+        ride_writer: bool,
+        movable: bool,
     ) -> Self {
         let wal = Arc::new(FileWalStore::new(dir.join("wal")));
         let store = Arc::new(broca_store::SqliteStore::open(dir.join("store.db")).unwrap());
@@ -895,11 +1009,40 @@ impl Rig {
         let opener = DefaultOpener::new(
             Arc::new(FileLeaseStore::new(dir.join("leases"))),
             wal.clone(),
-            exec,
+            exec.clone(),
         )
         .with_idle_ttl(idle_ttl)
         .with_run_index(store.clone())
         .with_materialized_store(store.clone());
+        // What drops a moved session's materialized rows, as the module's startup and its mover
+        // drop them.
+        let forget: broca_module_serve::store_move::ForgetProjection = {
+            let store = store.clone();
+            Arc::new(move |session: &BindIdentity| store.drop_session_projection(session))
+        };
+        let runtime = if movable {
+            // As the module's startup does, before anything serves: a move a crash interrupted
+            // is finished or undone.
+            let recovered =
+                broca_module_serve::store_move::finish_at_startup(&dir, Some(&forget), None);
+            assert!(recovered.refused.is_empty(), "{:?}", recovered.refused);
+            Some(Arc::new(
+                broca_module::store_open::StoreRuntime::open(
+                    &dir,
+                    broca_session_store::keys::DeploymentKey::new(1, &[7; 32]),
+                    exec.clone() as Arc<dyn RunExecutor>,
+                    idle_ttl,
+                )
+                .await
+                .unwrap(),
+            ))
+        } else {
+            None
+        };
+        let opener = match &runtime {
+            Some(runtime) => opener.with_store_runtime(runtime.clone()),
+            None => opener,
+        };
         #[cfg(feature = "test-clock")]
         let opener = if ride_writer {
             opener.with_ride_writer_for_test()
@@ -915,6 +1058,22 @@ impl Rig {
             Some(store.clone()),
         ));
         registry.set_session_address_inventory(store.clone());
+        if let Some(runtime) = runtime {
+            let runs = store.clone();
+            let mover = broca_module_serve::store_move::StoreMove::new(
+                registry.as_ref().clone(),
+                &dir,
+                Arc::new(broca_module::store_open::StoreSlot::loaded(runtime)),
+                wal.clone(),
+                Arc::new(FileLeaseStore::new(dir.join("leases"))),
+                broca_module_serve::store_move::served_by_serve_layer(),
+            )
+            .with_forget_projection(forget)
+            .with_run_rows(Arc::new(move |session: &BindIdentity| {
+                runs.session_runs(session)
+            }));
+            registry.set_store_mover(Arc::new(mover));
+        }
         let (client, server) = tokio::io::duplex(64 * 1024);
         let (mut reader, mut writer) = tokio::io::split(client);
         let (server_read, server_write) = tokio::io::split(server);
@@ -975,6 +1134,8 @@ impl Rig {
             daemon_scopes,
             corr: 1,
             next_subscription_read_delay: None,
+            movable,
+            skipped: Vec::new(),
         };
         rig.bind(7).await;
         rig
@@ -1003,6 +1164,57 @@ impl Rig {
             if reply.header.corr == self.corr {
                 return reply;
             }
+            self.skipped.push(reply);
+        }
+    }
+
+    /// Opens `session.subscribe` with `params` on `channel` and returns its correlation id
+    /// without waiting for any of its frames: they arrive among [`Rig::skipped`] as later
+    /// requests read past them.
+    pub async fn subscribe_open(&mut self, channel: u16, params: serde_json::Value) -> u64 {
+        self.request_open(
+            channel,
+            serde_json::json!({"method":"session.subscribe","params":params}),
+        )
+        .await
+    }
+
+    /// Writes the request `body` on `channel` and returns its correlation id without waiting
+    /// for its reply, which [`Rig::reply_to`] reads.
+    pub async fn request_open(&mut self, channel: u16, body: serde_json::Value) -> u64 {
+        self.corr += 1;
+        let frame = Frame::build(
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            channel,
+            u32::from(channel != 0),
+            self.corr,
+            serde_json::to_vec(&body).unwrap(),
+        )
+        .unwrap();
+        write_frame(&mut self.writer, &frame).await.unwrap();
+        self.corr
+    }
+
+    /// The reply to the request [`Rig::request_open`] wrote as `corr`.
+    pub async fn reply_to(&mut self, corr: u64) -> Frame {
+        if let Some(at) = self
+            .skipped
+            .iter()
+            .position(|frame| frame.header.corr == corr)
+        {
+            return self.skipped.remove(at);
+        }
+        loop {
+            let reply = tokio::time::timeout(Duration::from_secs(20), read_frame(&mut self.reader))
+                .await
+                .expect("a reply")
+                .unwrap()
+                .unwrap();
+            if reply.header.corr == corr {
+                return reply;
+            }
+            self.skipped.push(reply);
         }
     }
 
@@ -1579,6 +1791,7 @@ impl Rig {
             session,
             wal_path,
             store,
+            movable,
             ..
         } = self;
         drop(writer);
@@ -1596,11 +1809,13 @@ impl Rig {
                 }
             }
         }
-        Self::open_existing_as(
+        Self::open_with(
             dir,
             Duration::from_millis(100),
             daemon_scopes,
             &session.harness,
+            false,
+            movable,
         )
         .await
     }

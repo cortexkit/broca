@@ -77,6 +77,7 @@ mod single_turn_module_e2e;
 mod state_root_isolation;
 mod state_root_lock;
 mod step_transforms;
+mod store_move_serve;
 mod store_ops_serve;
 mod structured_output;
 mod wal_known_features;

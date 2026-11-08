@@ -242,7 +242,7 @@ impl LineageRegistry {
             },
         };
         let guard = self
-            .lock_move_sessions_with_mode(std::slice::from_ref(key), false, CutLockMode::Mutate)
+            .lock_move_sessions_with_mode(std::slice::from_ref(key), false, CutLockMode::Retire)
             .await
             .map_err(|error| FenceRefusal::Busy(format!("unknown: {error}")))?;
         let busy = guard.busy.iter().find_map(|(_, reason)| reason.clone());

@@ -1420,6 +1420,29 @@ struct SendLookup<'a, B: SessionBackend> {
     session: &'a Session<B>,
 }
 
+/// The key of the call `call` in `step`, a step's records from its assistant message on, as
+/// today's reads key the call a tool-result delivery rode on: the last copy of the call's id the
+/// step dispatched or answered, keyed by its intent, or by its outcome when it had no intent.
+fn carrier_key(step: &[(u64, Record)], call: &broca_protocol::ToolCallId) -> Option<String> {
+    let mut key = None;
+    for (_, record) in step {
+        match record {
+            Record::ToolIntent(intent) if &intent.tool_call_id == call => {
+                if let Some(recorded) = &intent.call_key {
+                    key = Some(recorded.clone());
+                }
+            }
+            Record::ToolOutcome(outcome) if &outcome.tool_call_id == call => {
+                if let Some(recorded) = &outcome.call_key {
+                    key = Some(recorded.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    key
+}
+
 impl<B: SessionBackend> SendLookup<'_, B> {
     /// Every record naming the queued submission minted from `run`, in seq order.
     async fn submission(&self, run: &RunId) -> Result<Vec<(u64, Record)>, StatusError> {
@@ -1427,6 +1450,82 @@ impl<B: SessionBackend> SendLookup<'_, B> {
             .session
             .find_id(IdKind::SubmissionId, &format!("sub-{}", run.0))
             .await?)
+    }
+
+    /// The call key the delivery of the submission minted from `run`, delivered as `mode`,
+    /// names, by the rule today's reads take (`send_fate::delivered_call_key`): the key of the
+    /// ride envelope its text was appended with, else, for a tool-result delivery recorded
+    /// before envelopes existed, the key of the call whose result carried it.
+    async fn delivered_call_key(
+        &self,
+        run: &RunId,
+        mode: broca_protocol::DeliveryMode,
+    ) -> Result<Option<String>, StatusError> {
+        use crate::send_fate::{delivered_call_key, DeliveredCallKey};
+        let submission = format!("sub-{}", run.0);
+        let Some((seq, delivery)) =
+            self.submission(run)
+                .await?
+                .into_iter()
+                .find_map(|(seq, record)| match record {
+                    Record::Delivery(delivery) if delivery.submission_id == submission => {
+                        Some((seq, delivery))
+                    }
+                    _ => None,
+                })
+        else {
+            return Ok(None);
+        };
+        let Some(call) = delivery.tool_call_id.clone() else {
+            return Ok(None);
+        };
+        let step = self.step_through(seq).await?;
+        // Both writers place the text a delivery appended before the delivery itself, in the
+        // batch of the step whose call carried it.
+        let ride = step
+            .iter()
+            .rev()
+            .find_map(|(_, record)| match record {
+                Record::ResultAppend(append)
+                    if append.tool_call_id == call
+                        && Some(&append.text) == delivery.appended_text.as_ref() =>
+                {
+                    Some(append.ride.clone())
+                }
+                _ => None,
+            })
+            .flatten();
+        Ok(
+            match delivered_call_key(ride.as_ref().map(|ride| ride.call_key.as_str()), mode) {
+                DeliveredCallKey::Ride(key) => Some(key),
+                DeliveredCallKey::Carrier => carrier_key(&step, &call),
+                DeliveredCallKey::Nothing => None,
+            },
+        )
+    }
+
+    /// The records from the latest assistant message at or before `seq` through `seq`: the
+    /// step whose batch a record at `seq` belongs to. Empty when no assistant message precedes.
+    async fn step_through(&self, seq: u64) -> Result<Vec<(u64, Record)>, StatusError> {
+        const WINDOW: u64 = 64;
+        let mut read: Vec<(u64, Record)> = Vec::new();
+        let mut end = seq;
+        loop {
+            let start = end.saturating_sub(WINDOW - 1).max(1);
+            let mut window = self.session.records_between(start, end).await?;
+            window.append(&mut read);
+            read = window;
+            if let Some(at) = read
+                .iter()
+                .rposition(|(_, record)| matches!(record, Record::Assistant(_)))
+            {
+                return Ok(read.split_off(at));
+            }
+            if start == 1 {
+                return Ok(Vec::new());
+            }
+            end = start - 1;
+        }
     }
 
     /// The first start of the run `run`, with its seq.
@@ -1818,8 +1917,11 @@ impl Reader<'_> {
                 reason,
             },
             QueuedSendFate::Retracted => SendOutcome::Retracted { submission_id },
-            QueuedSendFate::Delivered { run_id, .. } => {
-                let delivered = Delivered::new(delivered_as::STEP).with_ref(run_id.0.clone());
+            QueuedSendFate::Delivered { run_id, mode } => {
+                let mut delivered = Delivered::new(delivered_as::STEP).with_ref(run_id.0.clone());
+                if let Some(key) = lookup.delivered_call_key(own_run, mode).await? {
+                    delivered = delivered.with_call_key(key);
+                }
                 self.run_outcome(session, &run_id, Some(delivered), true)
                     .await?
             }
