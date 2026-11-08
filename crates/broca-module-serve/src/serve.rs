@@ -5139,6 +5139,9 @@ fn served_on_new_storage(method: &str, params: &serde_json::Value) -> bool {
         // its messages inline is today's import, which writes a WAL.
         OP_IMPORT => params.get("source").is_some(),
         OP_INSTALL_VIEW => true,
+        // The store actor warms the request its loop would send next, dated by the store's own
+        // cache clock (`store_actor::warm`).
+        OP_WARM => true,
         // Describes the module, not the session.
         OP_ROLE_DESCRIBE => true,
         // Media the store's own records name, read from the objects they stored

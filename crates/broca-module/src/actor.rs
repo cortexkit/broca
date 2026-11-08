@@ -1076,7 +1076,7 @@ fn steer_auth_pin_matches(
 }
 
 /// Now, in milliseconds since the Unix epoch.
-fn epoch_ms() -> u64 {
+pub(crate) fn epoch_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis() as u64)
@@ -1084,7 +1084,7 @@ fn epoch_ms() -> u64 {
 }
 
 /// The reply to a warm the executor did not complete.
-fn warm_error_outcome(
+pub(crate) fn warm_error_outcome(
     error: crate::executor::WarmError,
     request_body_sha256: String,
 ) -> WarmOutcome {

@@ -768,3 +768,18 @@ async fn media_read_and_uploads_reach_the_store_through_serve() {
         "an upload no record names is not readable"
     );
 }
+
+/// `session.warm` reaches the store through the serve path. A session the new storage keeps is
+/// answered by the store actor's warm rules (here: this module reads no session's cache policy),
+/// never refused as an operation the new storage doesn't serve.
+#[tokio::test]
+async fn warm_reaches_the_store_through_serve() {
+    let mut rig = Rig::start("warm", vec![text_step("a1", "hello")]).await;
+    rig.send("r1", "hi", None).await;
+    rig.assert_store_only();
+    rig.bind_session(1, core()).await;
+    assert_eq!(
+        rig.refused(1, "session.warm", json!({})).await,
+        "warm_unsupported"
+    );
+}

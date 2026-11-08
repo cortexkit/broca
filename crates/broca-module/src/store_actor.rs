@@ -31,7 +31,9 @@
 //!   send, as today's actor runs them; a queued send's run reuses what they did when it
 //!   drains;
 //! - a send's attachments, staged from its uploads and stored as the session's own objects
-//!   before the record that names them: a send's run start, its queued record or its steer.
+//!   before the record that names them: a send's run start, its queued record or its steer;
+//! - `session.warm` on an idle session, re-sending the request its loop would send next (see
+//!   `warm`).
 //!
 //! Every other command, and every send that needs an admission rule not built here yet, is
 //! refused by name with nothing written. Today's actor is the reference for each rule still to
@@ -109,6 +111,11 @@ pub struct StoreActor<B: SessionBackend> {
     /// The media of the send whose run is starting, held until the run's start that places its
     /// messages is appended, which stores them first (see `HeldInputMedia`).
     held: broca_session_loop::HeldInputMedia,
+    /// The module's registry, once the actor serves in one: what a warm reads the session's
+    /// cache policy from. Without it no warm is supported.
+    registry: Option<crate::registry::RegistryHandle>,
+    /// The warm the executor is sending, if any.
+    warm: Option<warm::PendingStoreWarm>,
 }
 
 /// How an actor lives in the module's registry. Tests serve an actor without one.
@@ -260,6 +267,10 @@ enum Event {
     Command(Option<LineageCmd>),
     Request(Option<broca_session_loop::shared::Request>),
     Done(Result<StoreRunEnd, tokio::task::JoinError>),
+    /// A warm's task ended.
+    Warmed(
+        Result<Result<broca_core::WarmSent, crate::executor::WarmError>, tokio::task::JoinError>,
+    ),
 }
 
 impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
@@ -285,6 +296,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             settled: None,
             uploads: None,
             held: broca_session_loop::HeldInputMedia::default(),
+            registry: None,
+            warm: None,
         }
     }
 
@@ -450,6 +463,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     pub async fn serve_in_registry(mut self, commands: impl Into<Commands>, life: Lifecycle) {
         let mut commands = commands.into();
         let seal = life.registry.seal_signal();
+        self.registry = Some(life.registry.clone());
         let exit = self
             .serve_until_exit(
                 &mut commands,
@@ -508,6 +522,15 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                     std::sync::atomic::Ordering::SeqCst,
                 );
             }
+            // A warm the executor is sending ends whatever else the actor waits on.
+            let has_warm = self.warm.is_some();
+            let warm_task = self.warm.as_mut().map(|pending| &mut pending.task);
+            let warmed = async move {
+                match warm_task {
+                    Some(task) => task.await,
+                    None => std::future::pending().await,
+                }
+            };
             let event = match self.run.as_mut() {
                 // Until the run's start is durable, commands wait, as they wait in today's actor
                 // while it awaits a run's admission, a drained run's included: a cancel, a
@@ -517,18 +540,20 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                     _ = seal.cancelled() => return Exit::Stop,
                     request = active.link.next(), if !active.writer_gone => Event::Request(request),
                     end = &mut active.done => Event::Done(end),
+                    result = warmed, if has_warm => Event::Warmed(result),
                     command = commands.recv(), if active.started => Event::Command(command),
                 },
                 None => tokio::select! {
                     biased;
                     _ = seal.cancelled() => return Exit::Stop,
+                    result = warmed, if has_warm => Event::Warmed(result),
                     command = commands.recv() => Event::Command(command),
                     _ = async {
                         match idle_deadline {
                             Some(deadline) => tokio::time::sleep_until(deadline).await,
                             None => std::future::pending().await,
                         }
-                    } => return Exit::Idle,
+                    }, if !has_warm => return Exit::Idle,
                 },
             };
             match event {
@@ -539,6 +564,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                     }
                 }
                 Event::Done(end) => self.finish_run(end).await,
+                Event::Warmed(result) => self.finish_warm(result).await,
                 Event::Command(None) => return Exit::Closed,
                 Event::Command(Some(command)) => {
                     idle_deadline = idle_after(tokio::time::Instant::now());
@@ -594,7 +620,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                     }
                 }
                 Event::Done(end) => return self.finish_run(end).await,
-                Event::Command(_) => unreachable!("no command is read here"),
+                Event::Command(_) | Event::Warmed(_) => unreachable!("no command is read here"),
             }
         }
     }
@@ -1016,7 +1042,15 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 let _ = reply.send(self.retract(submission_id).await);
                 false
             }
-            LineageCmd::IdleTick => self.run.is_none(),
+            LineageCmd::IdleTick => self.run.is_none() && self.warm.is_none(),
+            LineageCmd::Warm { lineage_id, reply } => {
+                if self.stopping {
+                    let _ = reply.send(crate::actor::WarmOutcome::Reopen);
+                } else {
+                    self.warm(lineage_id, reply).await;
+                }
+                false
+            }
             LineageCmd::Store {
                 command: crate::store_import::StoreCommand::ApplyView(command),
                 reply,
@@ -2598,6 +2632,7 @@ fn refuse(command: LineageCmd) {
 
 mod apply_view;
 mod import;
+mod warm;
 
 #[cfg(test)]
 mod billing_tests;
