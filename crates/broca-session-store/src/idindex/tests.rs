@@ -103,6 +103,7 @@ fn records_name_their_ids() {
         BTreeSet::from([(IdKind::RunId, "r1".into())])
     );
     let steer = Record::Steer(Steer {
+        media: Vec::new(),
         input: Vec::new(),
         written_at_ms: None,
         tags_v1: None,
@@ -125,6 +126,7 @@ fn records_name_their_ids() {
         ])
     );
     let queued = Record::QueuedSend(QueuedSend {
+        media: Vec::new(),
         submission_id: "sub-9".into(),
         send_id: Some("send-9".into()),
         input: Vec::new(),

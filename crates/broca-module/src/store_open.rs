@@ -292,7 +292,10 @@ impl StoreRuntime {
             Box::new(self.parts.clone()),
         )
         .with_storage(storage)
-        .with_settled(Arc::clone(&self.settled));
+        .with_settled(Arc::clone(&self.settled))
+        // A send's attachments are uploaded beside the session, under the state root, whichever
+        // storage keeps it.
+        .with_uploads(broca_core::media_uploads::Uploads::at(&self.state_root));
         let readers_root = store_root(&self.state_root);
         actor = actor.with_readers(Arc::new(move || LocalBackend::new(readers_root.clone())));
         if let Some(billing) = &self.billing {

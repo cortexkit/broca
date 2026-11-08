@@ -10,8 +10,11 @@ use crate::backend::{MemoryBackend, SessionAddr, SessionBackend};
 use crate::codec::hex;
 use crate::head::SessionTriple;
 use crate::keys::DeploymentKey;
-use crate::record::{Assistant, EntryFacts, Input, Placement, Record, RunEnd, RunStart, ToolReply};
-use crate::session::{Reverted, Session, SessionError};
+use crate::record::{
+    Assistant, EntryFacts, Input, MediaObject, Placement, QueuedSend, Record, RunEnd, RunStart,
+    Steer, ToolReply,
+};
+use crate::session::{NewInputMedia, Reverted, Session, SessionError};
 
 fn triple() -> SessionTriple {
     SessionTriple {
@@ -527,4 +530,220 @@ fn a_named_medium_is_found_by_digest_in_sealed_history_and_the_open_log() {
             None
         );
     });
+}
+
+/// A user message holding `text` and then one media block per image.
+fn photo_message(text: &str, images: &[&[u8]]) -> Message {
+    let mut content = vec![ContentBlock::Text { text: text.into() }];
+    content.extend(images.iter().map(|bytes| ContentBlock::Media(image(bytes))));
+    Message::new(Role::User, content)
+}
+
+/// A queued send whose one message holds `images` after its text.
+fn queued(submission: &str, images: &[&[u8]]) -> Record {
+    Record::QueuedSend(QueuedSend {
+        media: Vec::new(),
+        submission_id: submission.into(),
+        send_id: None,
+        input: vec![photo_message("queued look", images)],
+        setup: Vec::new(),
+        written_at_ms: None,
+        ts_ms: None,
+        request: None,
+        receipt: None,
+        delivery: None,
+    })
+}
+
+/// The bytes of each image after a message's text, as an append takes them for the message at
+/// `message` of record `record`.
+fn blocks(record: usize, message: u32, images: &[&[u8]]) -> Vec<NewInputMedia> {
+    (1u32..)
+        .zip(images)
+        .map(|(block, bytes)| NewInputMedia {
+            record,
+            message,
+            block,
+            part: None,
+            bytes: bytes.to_vec(),
+        })
+        .collect()
+}
+
+/// A queued send's and a steer's media are stored under the record that accepts them, durable
+/// before it, and the record says where. A later message naming the same bytes, as the copy that
+/// places a queued send does, points at that object instead of writing another; a steer's
+/// pointers reach the run state its boundary places copies from. Every medium reads back by
+/// digest after a reload, and `stored_media` lists where each record keeps its bytes.
+#[test]
+fn a_sends_media_are_stored_under_its_record_and_its_copies_point_at_them() {
+    let backend = MemoryBackend::default();
+    let (a, b) = (b"image a".as_slice(), b"image b".as_slice());
+    block_on(async {
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(), false)
+            .await
+            .unwrap();
+        let mid = session.message_id(2);
+        session
+            .append(
+                &[start("r0", "send-r0"), input("r0", "go"), facts(1, mid)],
+                true,
+            )
+            .await
+            .unwrap();
+        let (queued_at, appended) = session
+            .append_input_media(&[queued("sub-1", &[a])], blocks(0, 0, &[a]), true)
+            .await
+            .unwrap();
+        let Record::QueuedSend(send) = &appended[0] else {
+            unreachable!()
+        };
+        assert_eq!(send.media.len(), 1);
+        assert_eq!((send.media[0].message, send.media[0].block), (0, 1));
+        assert_eq!(send.media[0].seq, queued_at);
+        assert_eq!(media_objects(&backend).len(), 1);
+
+        let steer = Record::Steer(Steer {
+            media: Vec::new(),
+            input: vec![photo_message("steer look", &[b])],
+            written_at_ms: None,
+            tags_v1: None,
+            receipt: None,
+        });
+        let (steer_at, _) = session
+            .append_input_media(&[steer], blocks(0, 0, &[b]), true)
+            .await
+            .unwrap();
+        let pending = &session.operations.run.as_ref().unwrap().pending_steers[0];
+        let placed = pending.media_at(0);
+        assert_eq!(placed.len(), 1);
+        assert_eq!(
+            (placed[0].block, placed[0].part, placed[0].seq),
+            (1, None, steer_at)
+        );
+        assert_eq!(media_objects(&backend).len(), 2);
+
+        // The run that places the queued send names its image again: it points at the queued
+        // record's object.
+        let Record::Input(mut copy) = input("r0", "") else {
+            unreachable!()
+        };
+        copy.message = photo_message("queued look", &[a]);
+        let (_, placed) = session
+            .append_input_media(&[Record::Input(copy)], blocks(0, 0, &[a]), true)
+            .await
+            .unwrap();
+        let Record::Input(copy) = &placed[0] else {
+            unreachable!()
+        };
+        assert_eq!(copy.media[0].seq, queued_at);
+        assert_eq!(
+            media_objects(&backend).len(),
+            2,
+            "no second object for the same bytes"
+        );
+        assert_eq!(
+            super::stored_media(&appended[0]),
+            vec![(
+                image(a).sha256,
+                MediaObject {
+                    part: 0,
+                    log: send.media[0].log,
+                    generation: send.media[0].generation,
+                    seq: queued_at,
+                }
+            )]
+        );
+        session.close().await.unwrap();
+
+        let loaded = Session::load(&backend, addr(), &triple(), &deployment())
+            .await
+            .unwrap();
+        for bytes in [a, b] {
+            let found = loaded
+                .named_media(&image(bytes).sha256)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(found.stored());
+            assert_eq!(loaded.named_media_bytes(&found).await.unwrap(), bytes);
+            assert_eq!(loaded.window_media(&image(bytes)).await.unwrap(), bytes);
+        }
+    });
+}
+
+/// Bytes that don't match the medium their message names, and a block that isn't a medium, are
+/// refused before anything is written: no object, no record.
+#[test]
+fn a_sends_media_that_dont_match_are_refused_before_anything_is_written() {
+    let backend = MemoryBackend::default();
+    block_on(async {
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(), false)
+            .await
+            .unwrap();
+        let before = session.next_seq();
+        let (a, b) = (b"image a".as_slice(), b"image b".as_slice());
+        let record = queued("sub-1", &[a]);
+        let wrong = blocks(0, 0, &[b]);
+        assert!(matches!(
+            session
+                .append_input_media(std::slice::from_ref(&record), wrong, true)
+                .await,
+            Err(SessionError::Media(MediaError::Mismatch {
+                record: 0,
+                part: 1
+            }))
+        ));
+        let mut text = blocks(0, 0, &[a]);
+        text[0].block = 0;
+        assert!(matches!(
+            session.append_input_media(&[record], text, true).await,
+            Err(SessionError::Media(MediaError::NotMedia {
+                record: 0,
+                part: 0
+            }))
+        ));
+        assert_eq!(session.next_seq(), before);
+        assert!(media_objects(&backend).is_empty());
+    });
+}
+
+/// A crash at any point of storing a send's media and appending its record leaves a session
+/// whose every stored medium reads back: the record never lands before its bytes are durable.
+#[test]
+fn a_crash_while_storing_a_sends_media_never_leaves_a_record_without_its_bytes() {
+    let image_a = b"image a".as_slice();
+    let mut landed = 0;
+    for crash in 0..6 {
+        let backend = MemoryBackend::default();
+        block_on(async {
+            let mut session = Session::create(&backend, addr(), triple(), &deployment(), false)
+                .await
+                .unwrap();
+            backend.crash_after(Some(crash));
+            let _ = session
+                .append_input_media(
+                    &[queued("sub-1", &[image_a])],
+                    blocks(0, 0, &[image_a]),
+                    true,
+                )
+                .await;
+        });
+        backend.crash_after(None);
+        block_on(async {
+            let loaded = Session::load(&backend, addr(), &triple(), &deployment())
+                .await
+                .unwrap();
+            if let Some(found) = loaded.named_media(&image(image_a).sha256).await.unwrap() {
+                landed += 1;
+                assert!(found.stored(), "crash {crash}");
+                assert_eq!(
+                    loaded.named_media_bytes(&found).await.unwrap(),
+                    image_a,
+                    "crash {crash}: the record landed before its bytes"
+                );
+            }
+        });
+    }
+    assert!((1..6).contains(&landed), "{landed}");
 }

@@ -245,6 +245,7 @@ async fn side_idling(
     let wal = Arc::new(FileWalStore::new(dir.join("wal")));
     let provider = broca_core::provider::StubProvider::new(steps.clone());
     let scripted = || Gated {
+        render_config: None,
         inner: provider.clone(),
         gate: gate.clone(),
     };

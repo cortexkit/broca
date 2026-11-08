@@ -63,7 +63,7 @@ pub enum SessionError {
     Index(crate::idindex::IndexError),
     /// A revert was refused; nothing was written.
     RevertRefused(revert::RevertRefusal),
-    /// A tool result's media couldn't be stored or read back.
+    /// A medium's bytes couldn't be stored or read back.
     Media(media::MediaError),
     /// The open log holds debris, or a recovery a crash interrupted: run
     /// [`Session::recover`], then load again.
@@ -882,7 +882,7 @@ mod kept;
 pub use kept::InMemory;
 mod media;
 use media::OpenLogIndex;
-pub use media::{MediaError, NamedMedium, NewMedia};
+pub use media::{message_media, sent_messages, stored_media, MediaError, NamedMedium, NewMedia};
 mod import;
 pub use import::{is_broca_id_form, NewInputMedia};
 

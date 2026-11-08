@@ -1,11 +1,14 @@
-//! A tool result's media bytes, stored as append objects (design 11.1, 11.5).
+//! Media bytes, stored as append objects: a tool result's media parts, and the media an input
+//! message carries, or a message a queued send or a steer carries before it is placed.
 //!
-//! Each media part's bytes live in one object, written under the open log by the append whose
-//! record first names them, and made durable before that record (I8). The record keeps, for each
-//! media part, where its object is ([`MediaObject`]), so a reader names the object without a
-//! lookup. Bytes the open log already names are pointed at again, not written again; bytes it
-//! doesn't name are written again, so a branch after a revert never names an object created on
-//! the abandoned one.
+//! Each medium's bytes live in one object, written under the open log by the append whose record
+//! first names them, and made durable before that record, so no record ever names bytes a crash
+//! could lose. The record keeps, for each medium, where its object is ([`MediaObject`],
+//! [`crate::record::InputMedia`], [`crate::record::SendMedia`]), so a reader names the object
+//! without a lookup. Bytes the open log already names are pointed at again, not written again;
+//! bytes it doesn't name are written again, so a branch after a revert never names an object
+//! created on the abandoned one. The copy that places a queued send's or a steer's message points
+//! at the object its accepting record stored.
 
 use std::collections::BTreeMap;
 
@@ -15,7 +18,7 @@ use sha2::{Digest as _, Sha256};
 use super::{Session, SessionError};
 use crate::backend::SessionBackend;
 use crate::codec::hex;
-use crate::record::{MediaObject, Record};
+use crate::record::{InputMedia, MediaObject, Record, SendMedia};
 
 /// What the session keeps about the open log's records, rebuilt whenever the open log is
 /// replaced and kept current on every append.
@@ -55,22 +58,89 @@ impl OpenLogIndex {
                     }
                 }
             }
-            Record::Input(input) => {
-                for object in &input.media {
-                    if let Some(media) = input_medium(&input.message, object.block, object.part) {
-                        self.media
-                            .entry(media.sha256.clone())
-                            .or_insert_with(|| MediaObject {
-                                part: 0,
-                                log: object.log,
-                                generation: object.generation,
-                                seq: object.seq,
-                            });
-                    }
+            _ => {
+                for (sha256, object) in stored_media(record) {
+                    self.media.entry(sha256).or_insert(object);
                 }
+            }
+        }
+    }
+}
+
+/// The media whose bytes a record of messages stores: an input message's, or a queued send's or
+/// a steer's messages', each by digest with the object its bytes are (`part` is 0). In record
+/// order; a digest the record names twice is listed twice.
+pub fn stored_media(record: &Record) -> Vec<(String, MediaObject)> {
+    let object = |log, generation, seq| MediaObject {
+        part: 0,
+        log,
+        generation,
+        seq,
+    };
+    match record {
+        Record::Input(input) => input
+            .media
+            .iter()
+            .filter_map(|stored| {
+                input_medium(&input.message, stored.block, stored.part).map(|medium| {
+                    (
+                        medium.sha256.clone(),
+                        object(stored.log, stored.generation, stored.seq),
+                    )
+                })
+            })
+            .collect(),
+        _ => {
+            let Some((messages, media)) = sent_messages(record) else {
+                return Vec::new();
+            };
+            media
+                .iter()
+                .filter_map(|stored| {
+                    messages
+                        .get(stored.message as usize)
+                        .and_then(|message| input_medium(message, stored.block, stored.part))
+                        .map(|medium| {
+                            (
+                                medium.sha256.clone(),
+                                object(stored.log, stored.generation, stored.seq),
+                            )
+                        })
+                })
+                .collect()
+        }
+    }
+}
+
+/// Every medium `message` holds, with where: its content block and, for a medium inside a tool
+/// result there, its position in the result's parts.
+pub fn message_media(
+    message: &broca_protocol::content::Message,
+) -> Vec<(u32, Option<u32>, &MediaRef)> {
+    use broca_protocol::content::ContentBlock;
+    let mut found = Vec::new();
+    for (block, content) in message.content.iter().enumerate() {
+        let block = block as u32;
+        match content {
+            ContentBlock::Media(media) => found.push((block, None, media)),
+            ContentBlock::ToolResult(result) => {
+                found.extend(media_parts(result).map(|(part, media)| (block, Some(part), media)))
             }
             _ => {}
         }
+    }
+    found
+}
+
+/// The messages a queued send or a steer carries before they are placed, with where their media
+/// are stored. `None` for any other record.
+pub fn sent_messages(
+    record: &Record,
+) -> Option<(&[broca_protocol::content::Message], &[SendMedia])> {
+    match record {
+        Record::QueuedSend(send) => Some((&send.input, &send.media)),
+        Record::Steer(steer) => Some((&steer.input, &steer.media)),
+        _ => None,
     }
 }
 
@@ -87,7 +157,8 @@ pub struct NewMedia {
 /// Why a media append or read was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MediaError {
-    /// The named record isn't a tool result, or the named part isn't a media part.
+    /// The named record isn't a tool result, an input message, a queued send or a steer, or the
+    /// named part or block isn't a medium.
     NotMedia { record: usize, part: usize },
     /// The bytes don't match the part's reference: another digest or size.
     Mismatch { record: usize, part: usize },
@@ -96,6 +167,8 @@ pub enum MediaError {
     /// The object didn't decrypt under the session key and its name, or its bytes don't match
     /// the reference.
     Corrupt(String),
+    /// The writer asked to store media bytes keeps no media objects. Nothing was appended.
+    NoStore,
 }
 
 fn media_part(result: &ToolResult, part: u32) -> Option<&MediaRef> {
@@ -154,34 +227,43 @@ fn media_parts(result: &ToolResult) -> impl Iterator<Item = (u32, &MediaRef)> {
         })
 }
 
+/// Where a record stored a medium's bytes: the open log, writer generation and seq its object is
+/// named by.
+type StoredAt = (crate::codec::Id128, crate::codec::Id128, u64);
+
+/// Every place the input message `message` names the medium with digest `sha256`, each with
+/// where `stored` says the bytes at that content block (and tool result part) are.
+fn named_in_message(
+    message: &broca_protocol::content::Message,
+    sha256: &str,
+    stored: impl Fn(u32, Option<u32>) -> Option<StoredAt>,
+    named: &mut Vec<NamedMedium>,
+) {
+    for (block, part, media) in message_media(message) {
+        if media.sha256 == sha256 {
+            named.push(NamedMedium {
+                reference: media.clone(),
+                stored: stored(block, part),
+            });
+        }
+    }
+}
+
 /// Every place `record` names the medium with digest `sha256`, each with where the record stored
-/// its bytes, if it did.
+/// its bytes, if it did: an input message, a queued send's or a steer's messages, or a tool
+/// result.
 fn named_in(record: &Record, sha256: &str) -> Vec<NamedMedium> {
-    use broca_protocol::content::ContentBlock;
     let mut named = Vec::new();
     match record {
         Record::Input(input) => {
-            for (block, content) in input.message.content.iter().enumerate() {
-                let block = block as u32;
-                let found: Vec<(Option<u32>, &MediaRef)> = match content {
-                    ContentBlock::Media(media) => vec![(None, media)],
-                    ContentBlock::ToolResult(result) => media_parts(result)
-                        .map(|(part, media)| (Some(part), media))
-                        .collect(),
-                    _ => Vec::new(),
-                };
-                for (part, media) in found.into_iter().filter(|(_, m)| m.sha256 == sha256) {
-                    let stored = input
-                        .media
-                        .iter()
-                        .find(|object| object.block == block && object.part == part)
-                        .map(|object| (object.log, object.generation, object.seq));
-                    named.push(NamedMedium {
-                        reference: media.clone(),
-                        stored,
-                    });
-                }
-            }
+            let stored = |block, part| {
+                input
+                    .media
+                    .iter()
+                    .find(|object| object.block == block && object.part == part)
+                    .map(|object| (object.log, object.generation, object.seq))
+            };
+            named_in_message(&input.message, sha256, stored, &mut named);
         }
         Record::ToolReply(reply) => {
             for (part, media) in media_parts(&reply.result).filter(|(_, m)| m.sha256 == sha256) {
@@ -196,18 +278,29 @@ fn named_in(record: &Record, sha256: &str) -> Vec<NamedMedium> {
                 });
             }
         }
-        _ => {}
+        _ => {
+            if let Some((messages, media)) = sent_messages(record) {
+                for (index, message) in messages.iter().enumerate() {
+                    let stored = |block, part| {
+                        media
+                            .iter()
+                            .find(|object| {
+                                object.message as usize == index
+                                    && object.block == block
+                                    && object.part == part
+                            })
+                            .map(|object| (object.log, object.generation, object.seq))
+                    };
+                    named_in_message(message, sha256, stored, &mut named);
+                }
+            }
+        }
     }
     named
 }
 
 fn matches(media: &MediaRef, bytes: &[u8]) -> bool {
     media.byte_size == bytes.len() as u64 && media.sha256 == hex(&Sha256::digest(bytes))
-}
-
-/// Whether `bytes` are the bytes `media` names.
-pub(super) fn bytes_match(media: &MediaRef, bytes: &[u8]) -> bool {
-    matches(media, bytes)
 }
 
 impl<B: SessionBackend> Session<B> {
@@ -303,6 +396,123 @@ impl<B: SessionBackend> Session<B> {
         }
         let first = self.append(&records, barrier).await?;
         Ok((first, records))
+    }
+
+    /// Appends `records` as [`append`](Self::append) does, after storing the bytes of each medium
+    /// `media` lists: a medium of an input message, or of a message a queued send or a steer
+    /// carries. Each medium's bytes must match the reference its message holds. Bytes the open
+    /// log already names are pointed at; others are written as new objects, all durable before
+    /// the batch is appended. The batch's records record where each medium's bytes are. Returns
+    /// the seq of the first record and the records as appended.
+    pub async fn append_input_media(
+        &mut self,
+        records: &[Record],
+        media: Vec<super::NewInputMedia>,
+        barrier: bool,
+    ) -> Result<(u64, Vec<Record>), SessionError> {
+        if self.poisoned {
+            return Err(SessionError::Poisoned);
+        }
+        let first = self.next_seq();
+        let mut records = records.to_vec();
+        if self.store_input_media(&mut records, first, media).await? {
+            self.backend
+                .sync_objects(&self.addr, &self.log, self.version)
+                .await?;
+        }
+        let at = self.append(&records, barrier).await?;
+        Ok((at, records))
+    }
+
+    /// Writes the object of each medium `media` lists that the open log doesn't name yet, under
+    /// the record of `records` naming it, which takes seq `first` plus its position, and records
+    /// in that record where the medium's bytes are. The objects aren't synced: the caller syncs
+    /// them before appending `records`. Returns whether any object was written.
+    pub(super) async fn store_input_media(
+        &mut self,
+        records: &mut [Record],
+        first: u64,
+        media: Vec<super::NewInputMedia>,
+    ) -> Result<bool, SessionError> {
+        // Objects written here, by digest: later media of the batch with the same bytes point at
+        // the same object. The open log's index learns them only once the batch is appended, so
+        // a failed append leaves it naming nothing the log doesn't.
+        let mut stored: std::collections::HashMap<String, StoredAt> =
+            std::collections::HashMap::new();
+        let mut written = false;
+        for new in media {
+            let (record, message, block, part) = (new.record, new.message, new.block, new.part);
+            let not_media = || {
+                SessionError::Media(MediaError::NotMedia {
+                    record,
+                    part: block as usize,
+                })
+            };
+            let reference = match records.get(record) {
+                Some(Record::Input(input)) if message == 0 => {
+                    input_medium(&input.message, block, part)
+                }
+                Some(other) => sent_messages(other)
+                    .and_then(|(messages, _)| messages.get(message as usize))
+                    .and_then(|message| input_medium(message, block, part)),
+                None => None,
+            }
+            .cloned()
+            .ok_or_else(not_media)?;
+            if !matches(&reference, &new.bytes) {
+                return Err(SessionError::Media(MediaError::Mismatch {
+                    record,
+                    part: block as usize,
+                }));
+            }
+            let known = self
+                .window
+                .media
+                .get(&reference.sha256)
+                .map(|object| (object.log, object.generation, object.seq))
+                .or_else(|| stored.get(&reference.sha256).copied());
+            let (log, generation, seq) = match known {
+                Some(at) => at,
+                None => {
+                    let at = (self.log, self.head.generation, first + record as u64);
+                    let name = self.media_name_at(&at.0, &at.1, at.2, &reference.sha256);
+                    let sealed = self.key.frame_key().seal_unit(name.as_bytes(), &new.bytes);
+                    self.backend
+                        .put_object(&self.addr, &name, &sealed, self.version)
+                        .await?;
+                    stored.insert(reference.sha256.clone(), at);
+                    written = true;
+                    at
+                }
+            };
+            match &mut records[record] {
+                Record::Input(input) => input.media.push(InputMedia {
+                    block,
+                    part,
+                    log,
+                    generation,
+                    seq,
+                }),
+                Record::QueuedSend(send) => send.media.push(SendMedia {
+                    message,
+                    block,
+                    part,
+                    log,
+                    generation,
+                    seq,
+                }),
+                Record::Steer(steer) => steer.media.push(SendMedia {
+                    message,
+                    block,
+                    part,
+                    log,
+                    generation,
+                    seq,
+                }),
+                _ => unreachable!("checked above"),
+            }
+        }
+        Ok(written)
     }
 
     /// The bytes of a media part in the window, checked against its reference. Every message

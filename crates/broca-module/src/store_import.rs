@@ -360,6 +360,7 @@ pub fn seed(history: HeadHistory, at: &SeedFacts<'_>) -> Result<Seed, ImportRefu
         let input_at = records.len() - 1;
         media.extend(message.media.iter().map(|medium| NewInputMedia {
             record: input_at,
+            message: 0,
             block: medium.block,
             part: medium.part,
             bytes: medium.bytes.clone(),

@@ -157,6 +157,25 @@ message! {
 }
 
 message! {
+    /// The stored bytes of one medium of a message accepted before it is placed: a queued send's
+    /// or a steer's. The object is written under the accepting record, as an input message's is
+    /// (see [`InputMedia`]), and the message's copy in the transcript points at the same object.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    pub struct SendMedia {
+        /// The message's position in the record's messages.
+        1 req message: u32,
+        /// The message's content block holding the medium.
+        2 req block: u32,
+        /// For a medium inside a tool result block: its position in the result's parts.
+        3 opt part: u32,
+        /// The open log the object was written under.
+        4 req log: crate::codec::Id128,
+        5 req generation: crate::codec::Id128,
+        6 req seq: u64,
+    }
+}
+
+message! {
     /// One model step's assistant message: text, reasoning and tool calls, with the model that
     /// produced it as the message's origin.
     #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -875,6 +894,11 @@ message! {
         /// How the send asked to be delivered, as the caller named it (`interrupt` drains ahead
         /// of every plain send). Absent for a plain queued send.
         9 opt delivery: String,
+        /// Where the bytes of each medium the send's messages carry are stored. The run or
+        /// boundary that places the messages points their transcript copies at the same objects.
+        /// A reader that places or renders the messages needs them, so a record carrying any is
+        /// refused by a reader that doesn't know the field.
+        10 rep [must] media: SendMedia,
     }
 }
 
@@ -1032,6 +1056,10 @@ message! {
         3 opt tags_v1: serde_json::Value,
         /// The receipt: sender, send id, delivery, retention, title and hooks.
         4 opt receipt: serde_json::Value,
+        /// Where the bytes of each medium the steer's messages carry are stored, which the
+        /// messages' transcript copies point at. A record carrying any is refused by a reader
+        /// that doesn't know the field.
+        5 rep [must] media: SendMedia,
     }
 }
 

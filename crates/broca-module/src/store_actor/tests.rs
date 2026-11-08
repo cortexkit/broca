@@ -76,14 +76,33 @@ pub(super) fn bind() -> BindIdentity {
 }
 
 /// A scripted provider whose first step waits for `gate`, so a test can act while a run's start
-/// is durable and its first model call is in flight.
+/// is durable and its first model call is in flight. With `render_config`, it freezes that render
+/// config into its runs, as a provider whose model takes media freezes its media profile.
 pub(super) struct Gated {
     pub(super) inner: StubProvider,
     pub(super) gate: Option<Arc<Notify>>,
+    pub(super) render_config: Option<serde_json::Value>,
 }
 
 #[async_trait]
 impl broca_core::provider::Provider for Gated {
+    fn render_config_blob(&self) -> serde_json::Value {
+        match &self.render_config {
+            Some(config) => config.clone(),
+            None => broca_core::provider::Provider::render_config_blob(&self.inner),
+        }
+    }
+
+    fn render_config_blob_for_version(&self, renderer_version: u32) -> serde_json::Value {
+        match &self.render_config {
+            Some(config) => config.clone(),
+            None => broca_core::provider::Provider::render_config_blob_for_version(
+                &self.inner,
+                renderer_version,
+            ),
+        }
+    }
+
     async fn step(
         &self,
         step_id: broca_protocol::StepId,
@@ -145,6 +164,7 @@ pub(super) fn executor(
         provider: Gated {
             inner: StubProvider::new(steps),
             gate,
+            render_config: None,
         },
         drain_gate: None,
         planes: Planes::default(),
@@ -581,19 +601,21 @@ async fn an_unserved_send_is_refused_by_name() {
     assert!(served.await.unwrap().operations().run.is_none());
 }
 
-/// A send attaching an upload is refused by name before anything is written, never run with
-/// its attachment dropped.
+/// A send attaching an upload to an actor that can't read uploads is refused before anything is
+/// written, as today's actor refuses it, never run with its attachment dropped.
 #[tokio::test]
-async fn a_send_attaching_an_upload_is_refused_by_name() {
+async fn a_send_attaching_an_upload_without_upload_staging_is_refused() {
     let (commands, served, _) = actor(executor(vec![text_step("a1", "never sent")], None)).await;
     let mut attaching = request("look");
     attaching.content =
         serde_json::from_value(serde_json::json!([{"type": "upload", "upload_id": "u1"}])).unwrap();
-    assert_eq!(
-        send_with(&commands, "r1", attaching, SendKey::Minted).await,
-        SendOutcome::Error(
-            "a send with media is not served yet for a session kept in the new storage".into()
-        )
+    let outcome = send_with(&commands, "r1", attaching, SendKey::Minted).await;
+    let SendOutcome::Error(message) = &outcome else {
+        panic!("the send is refused: {outcome:?}");
+    };
+    assert!(
+        message.contains("upload staging is unavailable"),
+        "{message}"
     );
     drop(commands);
     let session = served.await.unwrap();

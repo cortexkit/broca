@@ -239,3 +239,59 @@ fn current_compaction_records_round_trip() {
     assert_eq!(kinds, ["View", "ViewApplied", "Marker"]);
     assert_round_trip(&old);
 }
+
+/// A steer's and a queued send's images round-trip. Today's log keeps their bytes in its own
+/// media store, so the converted records name no stored object; and where the new storage stored
+/// them (`media`), that is the new storage's own bookkeeping, which today's records don't carry:
+/// records naming stored objects invert to the same records of today's log.
+#[test]
+fn a_sends_images_round_trip_and_where_the_store_keeps_them_stays_its_own() {
+    use broca_session_store::record::{Record, SendMedia};
+    let image = r#"{"type":"media","kind":"image","mime":"image/png","byte_size":3,"sha256":"0000000000000000000000000000000000000000000000000000000000000001","width":1,"height":1}"#;
+    let steer = format!(
+        r#"{{"type":"steered","input":[{{"role":"user","content":[{{"type":"text","text":"also this"}},{image}]}}],"written_at_ms":7}}"#
+    );
+    let queued = format!(
+        r#"{{"type":"queued","submission_id":"q1","request":{{"model":{{"provider_module_id":"p","model_id":"m"}},"input":[{{"role":"user","content":[{{"type":"text","text":"later"}},{image}]}}]}}}}"#
+    );
+    let old = log(&[
+        &RUN.replace("RUN", "r"),
+        r#"{"type":"step_started","step_id":1}"#,
+        &steer,
+        &queued,
+        STEP,
+        r#"{"type":"step_started","step_id":2}"#,
+    ]);
+    assert_round_trip(&old);
+    let mut converted = convert(&old, None).unwrap();
+    let stored = SendMedia {
+        message: 0,
+        block: 1,
+        part: None,
+        log: broca_session_store::codec::Id128([1; 16]),
+        generation: broca_session_store::codec::Id128([2; 16]),
+        seq: 9,
+    };
+    let mut named = 0;
+    for record in &mut converted.records {
+        let media = match record {
+            Record::QueuedSend(send) => &mut send.media,
+            Record::Steer(steer) => &mut steer.media,
+            _ => continue,
+        };
+        assert!(media.is_empty(), "a converted send names no stored object");
+        media.push(stored.clone());
+        named += 1;
+    }
+    assert_eq!(named, 2);
+    let rebuilt: Vec<_> = invert(&converted.records, &converted.parts)
+        .unwrap()
+        .iter()
+        .map(without_nulls)
+        .collect();
+    let original = comparable(&old);
+    assert_eq!(rebuilt.len(), original.len());
+    for (i, (a, b)) in original.iter().zip(&rebuilt).enumerate() {
+        assert_eq!(first_difference(a, b, ""), None, "record {i}");
+    }
+}

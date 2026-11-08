@@ -27,22 +27,22 @@ use crate::registry::LineageRegistry;
 use crate::serve::ServeHandler;
 
 /// A one-pixel PNG: the image both sessions hold.
-const PNG: &str = "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de0000000c49444154789c63f8cfc0000003010100c9fe92ef0000000049454e44ae426082";
+pub(super) const PNG: &str = "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de0000000c49444154789c63f8cfc0000003010100c9fe92ef0000000049454e44ae426082";
 /// A three-by-two PNG: uploaded to each session and never sent.
-const WIDE: &str = "89504e470d0a1a0a0000000d49484452000000030000000208020000001216f14d0000001049444154789c63f8cfc000410c70160041d205fb87f0b9480000000049454e44ae426082";
+pub(super) const WIDE: &str = "89504e470d0a1a0a0000000d49484452000000030000000208020000001216f14d0000001049444154789c63f8cfc000410c70160041d205fb87f0b9480000000049454e44ae426082";
 
-fn bytes_of(hex: &str) -> Vec<u8> {
+pub(super) fn bytes_of(hex: &str) -> Vec<u8> {
     (0..hex.len())
         .step_by(2)
         .map(|at| u8::from_str_radix(&hex[at..at + 2], 16).unwrap())
         .collect()
 }
 
-fn digest(bytes: &[u8]) -> String {
+pub(super) fn digest(bytes: &[u8]) -> String {
     format!("{:x}", sha2::Sha256::digest(bytes))
 }
 
-fn base64(bytes: &[u8]) -> String {
+pub(super) fn base64(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
@@ -63,19 +63,24 @@ fn image_profile() -> broca_provider::media_profile::MediaProfile {
     )
 }
 
+/// The frozen render config of a model that takes images, as its provider freezes it.
+pub(super) fn image_render_config() -> Value {
+    let mut config = broca_provider::families::frozen_config_for_family(
+        broca_provider::spec::WireFamilyId::AnthropicMessages,
+        "m",
+    );
+    config.media = Some(image_profile());
+    serde_json::to_value(config).unwrap()
+}
+
 /// The scripted model, whose frozen render config accepts images, as a provider's does when
 /// its model takes them.
-struct ImageModel(broca_core::provider::StubProvider);
+struct ImageModel(super::super::tests::Gated);
 
 #[async_trait]
 impl broca_core::provider::Provider for ImageModel {
     fn render_config_blob(&self) -> Value {
-        let mut config = broca_provider::families::frozen_config_for_family(
-            broca_provider::spec::WireFamilyId::AnthropicMessages,
-            "m",
-        );
-        config.media = Some(image_profile());
-        serde_json::to_value(config).unwrap()
+        image_render_config()
     }
 
     async fn step(
@@ -83,7 +88,7 @@ impl broca_core::provider::Provider for ImageModel {
         step_id: broca_protocol::StepId,
         opts: &broca_protocol::request::CallOptions,
     ) -> mpsc::Receiver<NormalizedEvent> {
-        self.0.step(step_id, opts).await
+        broca_core::provider::Provider::step(&self.0, step_id, opts).await
     }
 }
 
@@ -152,6 +157,8 @@ pub(super) struct Side {
     pub(super) dir: std::path::PathBuf,
     pub(super) registry: LineageRegistry,
     pub(super) key: BindIdentity,
+    /// What each model step waits for, when the side's steps are gated.
+    pub(super) gate: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl Drop for Side {
@@ -163,6 +170,11 @@ impl Drop for Side {
 /// A module whose sessions start in the new storage when `store`, else on today's storage, over
 /// the scripted model `steps`.
 pub(super) async fn side(store: bool, steps: Vec<Vec<NormalizedEvent>>) -> Side {
+    side_gated(store, steps, false).await
+}
+
+/// [`side`], with every model step waiting for the side's gate when `gated`.
+pub(super) async fn side_gated(store: bool, steps: Vec<Vec<NormalizedEvent>>, gated: bool) -> Side {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let dir = broca_test_support::scratch_root().join(format!(
@@ -172,9 +184,15 @@ pub(super) async fn side(store: bool, steps: Vec<Vec<NormalizedEvent>>) -> Side 
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let registry = registry_at(&dir, store, steps).await;
+    let gate = gated.then(|| Arc::new(tokio::sync::Notify::new()));
+    let registry = registry_gated(&dir, store, steps, gate.clone()).await;
     let key = BindIdentity::new(dir.join("project"), "store-actor", "s1");
-    Side { dir, registry, key }
+    Side {
+        dir,
+        registry,
+        key,
+        gate,
+    }
 }
 
 /// A module over the state root `dir`, as a process starting there opens it: its sessions
@@ -184,12 +202,29 @@ pub(super) async fn registry_at(
     store: bool,
     steps: Vec<Vec<NormalizedEvent>>,
 ) -> LineageRegistry {
+    registry_gated(dir, store, steps, None).await
+}
+
+/// [`registry_at`], with every model step waiting for `gate` when there is one.
+async fn registry_gated(
+    dir: &std::path::Path,
+    store: bool,
+    steps: Vec<Vec<NormalizedEvent>>,
+    gate: Option<Arc<tokio::sync::Notify>>,
+) -> LineageRegistry {
     broca_core::media_store::create_media_directories(dir).unwrap();
     let wal = Arc::new(FileWalStore::new(dir.join("wal")));
+    // The new storage's runs freeze the same media profile today's runs do.
+    let mut store_executor = crate::store_actor::tests::executor(steps.clone(), gate.clone());
+    store_executor.provider.render_config = Some(image_render_config());
     let executor: Arc<dyn RunExecutor> = Arc::new(Executor {
-        today: ImageModel(broca_core::provider::StubProvider::new(steps.clone())),
+        today: ImageModel(super::super::tests::Gated {
+            inner: broca_core::provider::StubProvider::new(steps),
+            gate,
+            render_config: None,
+        }),
         wal: Arc::clone(&wal),
-        store: crate::store_actor::tests::executor(steps, None),
+        store: store_executor,
     });
     let runtime = crate::store_open::StoreRuntime::open(
         dir,
@@ -221,6 +256,17 @@ pub(super) async fn registry_at(
 
 impl Side {
     pub(super) async fn send(&self, run_id: &str, request: SubmissionRequest) -> SendOutcome {
+        self.deliver(run_id, request, broca_protocol::Delivery::Queue)
+            .await
+    }
+
+    /// A send asking to be delivered as `delivery`.
+    pub(super) async fn deliver(
+        &self,
+        run_id: &str,
+        request: SubmissionRequest,
+        delivery: broca_protocol::Delivery,
+    ) -> SendOutcome {
         self.registry
             .route_submission_with_order(
                 &self.key,
@@ -229,7 +275,7 @@ impl Side {
                 RunKind::FreshOrResume,
                 SendKey::Minted,
                 false,
-                broca_protocol::Delivery::Queue,
+                delivery,
                 None,
                 None,
                 None,
@@ -244,6 +290,20 @@ impl Side {
 
     pub(super) async fn idle(&self) {
         broca_test_support::wait_until("the session is idle", || async {
+            match self.registry.route_status(&self.key).await {
+                Ok(LineageStatus::Idle) => Ok(()),
+                other => Err(format!("{other:?}")),
+            }
+        })
+        .await;
+    }
+
+    /// Lets the side's gated model steps through, one at a time, until its session is idle.
+    pub(super) async fn release_to_idle(&self) {
+        broca_test_support::wait_until("the session is idle", || async {
+            if let Some(gate) = &self.gate {
+                gate.notify_one();
+            }
             match self.registry.route_status(&self.key).await {
                 Ok(LineageStatus::Idle) => Ok(()),
                 other => Err(format!("{other:?}")),

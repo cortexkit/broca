@@ -65,6 +65,7 @@ async fn side_at(
     let executor: Arc<dyn RunExecutor> = Arc::new(BothLoops {
         today: TodayLoop {
             provider: Gated {
+                render_config: None,
                 inner: broca_core::provider::StubProvider::new(steps.clone()),
                 gate: gate.clone(),
             },

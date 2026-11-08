@@ -758,6 +758,7 @@ fn convert_record(
             // The record keeps everything it accepted: the messages, and the receipt (send id,
             // delivery, retention, sender) the queue reads.
             out.records.push(Record::Steer(Steer {
+                media: Vec::new(),
                 input,
                 written_at_ms: written,
                 tags_v1: tags,
@@ -1188,6 +1189,7 @@ fn queued(f: &mut Fields, out: &mut Converted) -> Result<(), ConvertError> {
     let request_rest = request.rest();
     request.finish(out);
     out.records.push(Record::QueuedSend(QueuedSend {
+        media: Vec::new(),
         submission_id,
         send_id: f.string("send_id"),
         input,

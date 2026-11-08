@@ -5131,7 +5131,8 @@ fn placed_copies(operations: &Operations, run_id: &str) -> Vec<Record> {
                 .enumerate()
                 .map(move |(index, message)| {
                     Record::Input(Input {
-                        media: Vec::new(),
+                        // The copy's media are stored where the accepting record stored them.
+                        media: pending.media_at(index),
                         run_id: run_id.to_string(),
                         placement: pending.placement,
                         message: message.clone(),

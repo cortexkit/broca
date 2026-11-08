@@ -29,7 +29,9 @@
 //!   provider's first view before the session's first step (see `store_import`);
 //! - a plan's `pre_user` input transforms, on a send that starts a run, a steer and a queued
 //!   send, as today's actor runs them; a queued send's run reuses what they did when it
-//!   drains.
+//!   drains;
+//! - a send's attachments, staged from its uploads and stored as the session's own objects
+//!   before the record that names them: a send's run start, its queued record or its steer.
 //!
 //! Every other command, and every send that needs an admission rule not built here yet, is
 //! refused by name with nothing written. Today's actor is the reference for each rule still to
@@ -48,7 +50,7 @@ use broca_session_store::idindex::IdKind;
 use broca_session_store::record::{
     Billed, CancelPoint, CancelRequest, QueuedSend, Record, Retraction,
 };
-use broca_session_store::session::Session;
+use broca_session_store::session::{Session, SessionError};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -100,6 +102,13 @@ pub struct StoreActor<B: SessionBackend> {
     fanout: Option<crate::store_fanout::StoreFanout<B>>,
     /// Where finished runs' facts are kept, shared with the module's reads (see `with_settled`).
     settled: Option<Arc<crate::store_status::SettledRuns>>,
+    /// Where a send's attachments are read from: the uploads its `content` names, committed
+    /// beside the session. Without it a send attaching any is refused, as today's actor refuses
+    /// one when upload staging is unavailable.
+    uploads: Option<broca_core::media_uploads::Uploads>,
+    /// The media of the send whose run is starting, held until the run's start that places its
+    /// messages is appended, which stores them first (see `HeldInputMedia`).
+    held: broca_session_loop::HeldInputMedia,
 }
 
 /// How an actor lives in the module's registry. Tests serve an actor without one.
@@ -231,6 +240,8 @@ struct Drained {
     written_at_ms: Option<u64>,
     /// What the send's input transforms did when it was queued, as its record kept it.
     hooks: Option<Box<broca_wal::Hooks>>,
+    /// Where the queued record stored the send's media, which the run's input points at.
+    media: broca_session_loop::HeldInputMedia,
 }
 
 /// How a keyed send is answered.
@@ -272,7 +283,15 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             seal: CancellationToken::new(),
             fanout: None,
             settled: None,
+            uploads: None,
+            held: broca_session_loop::HeldInputMedia::default(),
         }
+    }
+
+    /// The actor reads a send's attachments from `uploads`.
+    pub fn with_uploads(mut self, uploads: broca_core::media_uploads::Uploads) -> Self {
+        self.uploads = Some(uploads);
+        self
     }
 
     /// The actor serves `session.subscribe`, catching subscribers up over backends `readers`
@@ -388,7 +407,30 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             writer: &mut self.session,
             parts: &mut self.parts,
             store: self.storage.as_ref(),
+            media: None,
         }
+    }
+
+    /// Appends `record`, one the actor writes on its own, synced, after storing the bytes of each
+    /// medium of `staged` its messages name, and tells the active run's copy of the folds. Returns
+    /// the record as appended, which says where those bytes are.
+    async fn append_own(
+        &mut self,
+        record: Record,
+        staged: &[crate::person_media::StagedMedia],
+    ) -> Result<Record, SessionError> {
+        let mut media = broca_session_loop::HeldInputMedia::default();
+        for item in staged {
+            media.hold(&item.reference, Arc::clone(&item.bytes));
+        }
+        let (seq, mut appended) = media
+            .append(&mut self.durable(), std::slice::from_ref(&record), true)
+            .await?;
+        let record = appended.pop().expect("one record was appended");
+        if let Some(running) = self.run.as_mut() {
+            running.link.note_own(seq, std::slice::from_ref(&record));
+        }
+        Ok(record)
     }
 
     /// Serves `commands` until the session goes away: when the channel closes, or when it is
@@ -519,6 +561,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             writer: &mut self.session,
             parts: &mut self.parts,
             store: self.storage.as_ref(),
+            // The run's start names the media of the send it places, which are stored with it.
+            media: Some(&mut self.held),
         };
         active.link.serve(&mut writer, request).await;
         self.answer_admission();
@@ -920,15 +964,25 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 } else {
                     let mut start = start;
                     let admitted = match self.freeze_plan(&mut start) {
-                        Ok(()) => {
-                            self.transform_fresh_input(&mut start, delivery, &mut reply)
-                                .await
-                        }
+                        // As today's actor starts a run, the send's attachments are staged into its
+                        // input before its transforms, and held until the run's start, which
+                        // stores them, is appended.
+                        Ok(()) => match self.stage_media(&mut start.request, None).await {
+                            Ok(staged) => {
+                                for item in &staged {
+                                    self.held.hold(&item.reference, Arc::clone(&item.bytes));
+                                }
+                                self.transform_fresh_input(&mut start, delivery, &mut reply)
+                                    .await
+                            }
+                            Err(outcome) => Err(outcome),
+                        },
                         Err(outcome) => Err(outcome),
                     };
                     match admitted {
                         Ok(()) => self.start_run(start, None, Some(reply), StoreRunMode::Fresh),
                         Err(outcome) => {
+                            self.held.clear();
                             let _ = reply.send(outcome);
                         }
                     }
@@ -1655,6 +1709,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         let Some(active) = self.run.take() else {
             return;
         };
+        // Whatever the run's start stored of its send's media is the session's now; a run that
+        // never wrote its start leaves nothing for the next one.
+        self.held.clear();
         let result = match end {
             Ok(end) => end.result,
             Err(error) => Err(StoreRunError::Admission(broca_core::RunError::Config(
@@ -1767,6 +1824,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                         drained.hooks.take(),
                         &start.request.input,
                     );
+                    // The run's input points at the media the queued record stored.
+                    self.held = std::mem::take(&mut drained.media);
                     self.start_run(start, Some(drained), None, StoreRunMode::Fresh)
                 }
                 Err(outcome) => {
@@ -1841,12 +1900,16 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             .map(|hooks| serde_json::from_value(hooks.clone()))
             .transpose()
             .map_err(|error| format!("the queued send's hooks: {error}"))?;
+        let written_at_ms = send.written_at_ms;
+        let mut media = broca_session_loop::HeldInputMedia::default();
+        media.hold_stored(&Record::QueuedSend(send));
         Ok((
             start,
             Drained {
                 submission,
-                written_at_ms: send.written_at_ms,
+                written_at_ms,
                 hooks,
+                media,
             },
         ))
     }
@@ -1968,6 +2031,25 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         {
             return SendOutcome::SteerSettingsConflict { field };
         }
+        // As today's actor steers, the attachments are checked against the media the running
+        // run's model takes, as its start froze them.
+        let mut start = start;
+        let profile = serde_json::from_value::<broca_provider::wire::FrozenRenderConfig>(
+            frozen.render_config.clone(),
+        )
+        .ok()
+        .and_then(|config| config.media.map(Box::new));
+        let model = format!(
+            "{}/{}",
+            frozen.model.provider_module_id, frozen.model.model_id
+        );
+        let staged = match self
+            .stage_media(&mut start.request, Some((profile, model)))
+            .await
+        {
+            Ok(staged) => staged,
+            Err(outcome) => return outcome,
+        };
         // The running run already has its system prompt; a steer adds conversation only.
         let input = start
             .request
@@ -2010,13 +2092,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             Ok(steer) => Record::Steer(steer),
             Err(error) => return SendOutcome::Error(error),
         };
-        match Writer::append(&mut self.durable(), std::slice::from_ref(&record), true).await {
-            Ok(seq) => {
-                if let Some(running) = self.run.as_mut() {
-                    running.link.note_own(seq, &[record]);
-                }
-            }
-            Err(error) => return SendOutcome::Error(format!("{error:?}")),
+        if let Err(error) = self.append_own(record, &staged).await {
+            return SendOutcome::Error(format!("{error:?}"));
         }
         SendOutcome::Active {
             run_id: active,
@@ -2039,7 +2116,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     ) -> SendOutcome {
         let Start {
             run_id,
-            request,
+            mut request,
             title,
             send_id,
             identity,
@@ -2066,6 +2143,12 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             }
             Ok(None) => {}
         }
+        // As today's actor queues a send, its attachments are staged into its input and checked
+        // before its input transforms, and the queued record keeps them.
+        let staged = match self.stage_media(&mut request, None).await {
+            Ok(staged) => staged,
+            Err(outcome) => return outcome,
+        };
         let manifest = match self.frozen_manifest() {
             Ok(manifest) => manifest,
             Err(error) => return SendOutcome::Error(error),
@@ -2087,6 +2170,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         if let Some(provider) = prepared.refused.clone() {
             return SendOutcome::PreUserUnavailable { provider };
         }
+        request.staged_uploads = None;
         let receipt = queue::Receipt {
             sent_by,
             principal: request.principal.clone(),
@@ -2111,15 +2195,51 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             Ok(send) => Record::QueuedSend(send),
             Err(error) => return SendOutcome::Error(error),
         };
-        match Writer::append(&mut self.durable(), std::slice::from_ref(&record), true).await {
-            Ok(seq) => {
-                if let Some(active) = self.run.as_mut() {
-                    active.link.note_own(seq, &[record]);
-                }
-            }
-            Err(error) => return SendOutcome::Error(format!("{error:?}")),
+        if let Err(error) = self.append_own(record, &staged).await {
+            return SendOutcome::Error(format!("{error:?}"));
         }
         SendOutcome::Pending { submission_id }
+    }
+
+    /// Stages the attachments a send's `content` names into its last user message, as today's
+    /// actor stages them, and checks every medium its input then holds against the media its
+    /// model takes: `frozen`'s profile and model for a steer, which joins a running run, else the
+    /// profile the executor quotes for the send's model. Returns the staged bytes, or the
+    /// refusal today's actor answers.
+    async fn stage_media(
+        &self,
+        request: &mut SubmissionRequest,
+        frozen: Option<(
+            Option<Box<broca_provider::media_profile::MediaProfile>>,
+            String,
+        )>,
+    ) -> Result<Vec<crate::person_media::StagedMedia>, SendOutcome> {
+        let staged = crate::person_media::stage(self.uploads.as_ref(), &self.key, request)
+            .map_err(crate::person_media::outcome)?;
+        let (profile, model) = match frozen {
+            Some(frozen) => frozen,
+            None => {
+                let profile = if broca_provider::person_media::references(&request.input)
+                    .next()
+                    .is_some()
+                {
+                    self.executor
+                        .media_profile(request)
+                        .await
+                        .map_err(crate::person_media::outcome)?
+                } else {
+                    None
+                };
+                let model = format!(
+                    "{}/{}",
+                    request.model.provider_module_id, request.model.model_id
+                );
+                (profile, model)
+            }
+        };
+        crate::person_media::check(profile.as_deref(), &model, &request.input)
+            .map_err(crate::person_media::outcome)?;
+        Ok(staged)
     }
 
     /// Cancels the active run `run_id`. The request is durable before the run is told, so a
@@ -2146,6 +2266,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             writer: &mut self.session,
             parts: &mut self.parts,
             store: self.storage.as_ref(),
+            media: None,
         };
         match Writer::append(&mut writer, std::slice::from_ref(&record), true).await {
             Ok(seq) => active.link.note_own(seq, &[record]),
@@ -2239,7 +2360,9 @@ fn finished(run_id: &RunId, reason: broca_protocol::RunFinishReason) -> SendOutc
 /// Whether a send creating a session asks only for what this actor serves, so the session may
 /// start in the new storage. It makes the same checks the actor makes on a send before writing
 /// anything; a send failing one creates its session on today's storage instead, where it is
-/// served.
+/// served. A send carrying media creates its session there too: a model that takes media renders
+/// them from today's media store, and a run on the new storage refuses to render them until it
+/// reads them from the session's own objects.
 pub fn serves_creating_send(
     request: &SubmissionRequest,
     kind: RunKind,
@@ -2250,6 +2373,7 @@ pub fn serves_creating_send(
 ) -> bool {
     unserved_delivery(ordered, delivery, conversation_key).is_none()
         && unserved_request(request, kind, retention).is_none()
+        && !carries_media(request)
 }
 
 /// How a send asks to be delivered, where this actor doesn't serve it yet.
@@ -2293,17 +2417,17 @@ fn refuse_unbuilt_request(request: &SubmissionRequest) -> Option<&'static str> {
         Some("keep-warm")
     } else if request.service_tier_level.is_some() {
         Some("a service tier level")
-    } else if !request.content.is_empty()
-        || broca_provider::person_media::references(&request.input)
-            .next()
-            .is_some()
-    {
-        // A send's attachments arrive as upload references (`content`), which today's actor
-        // stages into its input; a store session would otherwise run the send without them.
-        Some("a send with media")
     } else {
         None
     }
+}
+
+/// Whether `request` carries media: attachments its `content` names, or media in its input.
+fn carries_media(request: &SubmissionRequest) -> bool {
+    !request.content.is_empty()
+        || broca_provider::person_media::references(&request.input)
+            .next()
+            .is_some()
 }
 
 /// Answers a command that raced the session's close, as today's actor answers one: the caller

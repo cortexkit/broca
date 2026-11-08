@@ -188,6 +188,7 @@ fn import_batch(a: &[u8]) -> (Vec<Record>, Vec<NewInputMedia>, Vec<(String, u64)
     ];
     let media = vec![NewInputMedia {
         record: 1,
+        message: 0,
         block: 1,
         part: None,
         bytes: a.to_vec(),
