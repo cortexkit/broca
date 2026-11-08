@@ -130,11 +130,61 @@ impl broca_core::capability::ApprovalPolicy for GatedApproval {
 }
 
 /// The hook and compaction planes a test executor offers, standing in for the ones the module's
-/// executor reaches over the daemon; none by default.
+/// executor reaches over the daemon; none by default. With `tool_gate`, each tool call's
+/// dispatch signals the first `Notify` and waits on the second, so a test can act while a call
+/// is in flight (see [`GatedTools`]).
 #[derive(Clone, Default)]
 pub(super) struct Planes {
     pub(super) hooks: Option<Arc<dyn broca_core::HookPlane>>,
     pub(super) compaction: Option<Arc<dyn broca_core::CompactionPlane>>,
+    pub(super) tool_gate: Option<(Arc<Notify>, Arc<Notify>)>,
+}
+
+/// The test executors' tool plane: the stub plane answering the `read` tool with `text`, whose
+/// dispatches each wait on `gate` when one is set, after the call was sent.
+pub(super) struct GatedTools {
+    inner: StubToolPlane,
+    gate: Option<(Arc<Notify>, Arc<Notify>)>,
+}
+
+impl GatedTools {
+    pub(super) fn new(text: &str, gate: Option<(Arc<Notify>, Arc<Notify>)>) -> Self {
+        Self {
+            inner: StubToolPlane::new().with_canned_text("read", text),
+            gate,
+        }
+    }
+}
+
+#[async_trait]
+impl broca_core::tool_plane::ToolPlane for GatedTools {
+    async fn batch_started(
+        &self,
+        ctx: &broca_core::tool_plane::BatchCtx,
+        calls: &[broca_protocol::ToolCall],
+        manifest: &broca_core::ToolManifest,
+    ) -> Result<(), broca_core::tool_plane::ToolPlaneError> {
+        self.inner.batch_started(ctx, calls, manifest).await
+    }
+
+    async fn dispatch(
+        &self,
+        ctx: &broca_core::tool_plane::BatchCtx,
+        call: &broca_protocol::ToolCall,
+    ) -> broca_core::tool_plane::DispatchResult {
+        if let Some((reached, release)) = &self.gate {
+            reached.notify_one();
+            release.notified().await;
+        }
+        self.inner.dispatch(ctx, call).await
+    }
+
+    async fn batch_finished(
+        &self,
+        ctx: &broca_core::tool_plane::BatchCtx,
+    ) -> Result<(), broca_core::tool_plane::ToolPlaneError> {
+        self.inner.batch_finished(ctx).await
+    }
 }
 
 pub(super) fn executor(
@@ -206,8 +256,10 @@ impl RunExecutor for LoopExecutor {
                     .map_err(StoreRunError::Admission)?,
                 )
             };
-            let tools = StubToolPlane::new().with_canned_text("read", &self.tool_text);
-            let now = || 1;
+            let tools = GatedTools::new(&self.tool_text, self.planes.tool_gate.clone());
+            // The wall clock, as the module's executor reads it: a queued ordered send's expiry
+            // is judged at a run's boundaries by the same clock today's loop reads.
+            let now = || broca_core::run::epoch_millis().unwrap_or(0);
             let approval = GatedApproval(self.approval_gate.clone());
             let seams = Seams {
                 provider: &self.provider,
@@ -444,7 +496,7 @@ pub(super) fn auth_failure() -> Vec<NormalizedEvent> {
     })]
 }
 
-async fn status(commands: &mpsc::UnboundedSender<LineageCmd>) -> LineageStatus {
+pub(super) async fn status(commands: &mpsc::UnboundedSender<LineageCmd>) -> LineageStatus {
     let (reply, answer) = oneshot::channel();
     commands.send(LineageCmd::Status { reply }).unwrap();
     answer.await.unwrap()

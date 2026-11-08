@@ -3,9 +3,8 @@
 //! Today's side is the module's real path: a registry over a file lease store and a file WAL,
 //! today's actor, and today's loop ([`broca_core::run_loop_on_writer_admitted_with_prior_snapshot`])
 //! over a scripted provider. The store side is [`super::StoreActor`] over the new loop and the
-//! same script. Where the store actor serves a send, both replies must be equal. Where it doesn't
-//! yet, the scenario says so, and the store actor must refuse it by name while today's actor
-//! serves it.
+//! same script. Both replies must be equal; what the store actor doesn't serve yet is pinned by
+//! its own tests, each refused by name.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,7 +12,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use broca_core::{
     run_loop_on_writer_admitted_with_prior_snapshot, AllowAll, FileLeaseStore, FileWalStore,
-    OutputEvent, RunError, RunSummary, StartMode, StubToolPlane, WalStore,
+    OutputEvent, RunError, RunSummary, StartMode, WalStore,
 };
 use broca_protocol::content::ContentBlock;
 use broca_protocol::{BindIdentity, NormalizedEvent, RunId, SubmissionRequest};
@@ -60,7 +59,7 @@ impl RunExecutor for TodayLoop {
             RunKind::FreshOrResume | RunKind::ResumeAfterAuth => StartMode::ResumeAfterAuth,
             RunKind::AppendEpisode => StartMode::AppendEpisode,
         };
-        let tools = StubToolPlane::new().with_canned_text("read", "file contents");
+        let tools = super::tests::GatedTools::new("file contents", self.planes.tool_gate.clone());
         Box::pin(run_loop_on_writer_admitted_with_prior_snapshot(
             job.req,
             &job.writer,
@@ -111,16 +110,16 @@ fn today_with(
 /// [`today`] whose WAL writer records each ride with its envelope (its call's key, sender and
 /// forms), as the writer does once rides are enabled, where a ride is a notice and its text
 /// isn't joined into the result. The new storage always records rides that way.
-fn today_riding(steps: Vec<Vec<NormalizedEvent>>, gate: Option<Arc<Notify>>) -> Today {
-    today_opened(steps, gate, super::tests::Planes::default(), true)
-}
-
-fn today_opened(
+fn today_riding(
     steps: Vec<Vec<NormalizedEvent>>,
     gate: Option<Arc<Notify>>,
     planes: super::tests::Planes,
-    rides: bool,
 ) -> Today {
+    today_opened(steps, gate, planes, true)
+}
+
+/// A fresh scratch folder for one of today's modules.
+fn scratch_dir() -> std::path::PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let dir = broca_test_support::scratch_root().join(format!(
@@ -129,6 +128,56 @@ fn today_opened(
         N.fetch_add(1, Ordering::SeqCst)
     ));
     let _ = std::fs::remove_dir_all(&dir);
+    dir
+}
+
+fn today_opened(
+    steps: Vec<Vec<NormalizedEvent>>,
+    gate: Option<Arc<Notify>>,
+    planes: super::tests::Planes,
+    rides: bool,
+) -> Today {
+    let dir = scratch_dir();
+    let key = BindIdentity::new(dir.join("project"), "store-actor", "s1");
+    today_at(dir, key, steps, gate, planes, rides)
+}
+
+/// Today's module over a copy of `crashed`'s log as it stands, as a process that died now and
+/// started again finds it: no lease held, and nothing but the durable records. It rides as
+/// [`today_riding`]'s module does.
+fn today_restarted(crashed: &Today, steps: Vec<Vec<NormalizedEvent>>) -> Today {
+    fn copy(from: &std::path::Path, to: &std::path::Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+    let dir = scratch_dir();
+    copy(&crashed.dir.join("wal"), &dir.join("wal"));
+    today_at(
+        dir,
+        crashed.key.clone(),
+        steps,
+        None,
+        super::tests::Planes::default(),
+        true,
+    )
+}
+
+fn today_at(
+    dir: std::path::PathBuf,
+    key: BindIdentity,
+    steps: Vec<Vec<NormalizedEvent>>,
+    gate: Option<Arc<Notify>>,
+    planes: super::tests::Planes,
+    rides: bool,
+) -> Today {
     let wal = Arc::new(FileWalStore::new(dir.join("wal")));
     let executor = Arc::new(TodayLoop {
         provider: Gated {
@@ -149,7 +198,6 @@ fn today_opened(
     }
     // A reader over the WAL alone: `session.read` serves from the log when no store is given.
     let registry = LineageRegistry::new_with_reader(Arc::new(opener), wal.clone(), None);
-    let key = BindIdentity::new(dir.join("project"), "store-actor", "s1");
     Today {
         dir,
         registry,
@@ -268,15 +316,6 @@ impl Today {
     }
 }
 
-/// How a step's two replies must relate.
-#[derive(Clone, Copy)]
-enum Expect {
-    /// Both actors give this same answer.
-    Same,
-    /// Today's actor serves it; the store actor refuses it by name, naming this.
-    StoreRefuses(&'static str),
-}
-
 /// One step of a scenario, done on both sides.
 enum Step {
     Send {
@@ -289,7 +328,6 @@ enum Step {
         delivery: broca_protocol::Delivery,
         /// The session label the send names.
         class: Option<&'static str>,
-        expect: Expect,
     },
     /// Retracts the queued send `submission_id` on both sides; the replies must be equal.
     Retract(&'static str),
@@ -308,7 +346,6 @@ fn send(run_id: &'static str, text: &'static str) -> Step {
         tweak: None,
         delivery: broca_protocol::Delivery::Queue,
         class: None,
-        expect: Expect::Same,
     }
 }
 
@@ -323,20 +360,12 @@ fn keyed(key: &'static str, text: &'static str) -> Step {
         tweak: None,
         delivery: broca_protocol::Delivery::Queue,
         class: None,
-        expect: Expect::Same,
     }
 }
 
 fn labelled(mut step: Step, label: &'static str) -> Step {
     if let Step::Send { class, .. } = &mut step {
         *class = Some(label);
-    }
-    step
-}
-
-fn expecting(mut step: Step, expected: Expect) -> Step {
-    if let Step::Send { expect, .. } = &mut step {
-        *expect = expected;
     }
     step
 }
@@ -383,7 +412,6 @@ async fn compare(script: Vec<Vec<NormalizedEvent>>, gated: bool, steps: Vec<Step
     ));
     let (commands, served, _) =
         super::tests::actor_with(executor(script, store_gate.clone()), parts.clone()).await;
-    let mut all_same = true;
     for (index, step) in steps.into_iter().enumerate() {
         match step {
             Step::Send {
@@ -394,7 +422,6 @@ async fn compare(script: Vec<Vec<NormalizedEvent>>, gated: bool, steps: Vec<Step
                 tweak,
                 delivery,
                 class,
-                expect,
             } => {
                 let mut sent = request(text);
                 sent.route_decision_id = route_decision.map(str::to_owned);
@@ -417,21 +444,7 @@ async fn compare(script: Vec<Vec<NormalizedEvent>>, gated: bool, steps: Vec<Step
                     class,
                 )
                 .await;
-                match expect {
-                    Expect::Same => assert_eq!(new, old, "step {index}: replies differ"),
-                    Expect::StoreRefuses(what) => {
-                        all_same = false;
-                        assert!(
-                            !matches!(old, SendOutcome::Error(_)),
-                            "step {index}: today's actor must serve it, got {old:?}"
-                        );
-                        assert_eq!(
-                            new,
-                            SendOutcome::Error(super::unserved(what)),
-                            "step {index}: the store actor must refuse it by name"
-                        );
-                    }
-                }
+                assert_eq!(new, old, "step {index}: replies differ");
             }
             Step::Retract(submission_id) => {
                 let old = today
@@ -456,27 +469,23 @@ async fn compare(script: Vec<Vec<NormalizedEvent>>, gated: bool, steps: Vec<Step
             }
         }
     }
-    if all_same {
-        streams::assert_alike(
-            &streams::store(&commands).await,
-            &streams::routed(&today.registry, &today.key).await,
-        );
-    }
+    streams::assert_alike(
+        &streams::store(&commands).await,
+        &streams::routed(&today.registry, &today.key).await,
+    );
     drop(commands);
     let session: Session<&'static MemoryBackend> = served.await.unwrap();
-    if all_same {
-        assert_eq!(
-            texts(&session),
-            today.texts().await,
-            "the conversations differ"
-        );
-        assert_eq!(
-            store_starts(&session).await,
-            today.starts(),
-            "the run starts record the sends differently"
-        );
-        display_reads_alike(&today, &session, &parts).await;
-    }
+    assert_eq!(
+        texts(&session),
+        today.texts().await,
+        "the conversations differ"
+    );
+    assert_eq!(
+        store_starts(&session).await,
+        today.starts(),
+        "the run starts record the sends differently"
+    );
+    display_reads_alike(&today, &session, &parts).await;
     assert!(today.registry.stop_and_seal().await);
 }
 
@@ -1069,20 +1078,17 @@ async fn a_queued_send_carries_the_frozen_scope_alike() {
     .await;
 }
 
-/// An interrupting send, which today's actor serves (on an idle session it just starts the
-/// message), is refused by name by the store actor, which doesn't serve interrupts yet.
+/// An interrupting send on an idle session just starts its message, on both actors alike.
 #[tokio::test]
-async fn an_interrupt_is_refused_by_name() {
+async fn an_interrupt_on_an_idle_session_starts_alike() {
     compare(
         hello(),
         false,
         vec![
             send("r1", "first"),
             Step::Idle,
-            expecting(
-                interrupting(send("r2", "interrupting")),
-                Expect::StoreRefuses("an interrupt"),
-            ),
+            interrupting(send("r2", "interrupting")),
+            Step::Idle,
         ],
     )
     .await;
