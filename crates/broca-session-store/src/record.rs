@@ -260,8 +260,8 @@ message! {
     /// decided when the message was placed and never derived again. Written right after the
     /// record that places the message (or, for an assistant message still waiting for its tool
     /// results, the record that reserves its ordinal), in the same batch. A later `EntryFacts`
-    /// for the same ordinal replaces it. Content-free: delivered text stays in its
-    /// `ResultAppend`.
+    /// for the same ordinal replaces it. Content-free but for the reasoning summaries reads show:
+    /// delivered text stays in its `ResultAppend`.
     #[derive(Debug, Clone, PartialEq, Serialize)]
     pub struct EntryFacts {
         /// The message's place in the whole conversation, counting from 1.
@@ -313,6 +313,39 @@ message! {
         /// The send's display marks, as llm-runner's `MessageMarks` JSON: `speaks_for` and a
         /// true `notice`.
         17 opt marks: serde_json::Value,
+        /// The message was converted from a log of today's storage that had no lineage, so
+        /// today's read serves it none of what an `include_display_facts` read adds, and nor does
+        /// the new storage's. Absent for every message broca places itself.
+        18 opt no_display_facts: bool,
+        /// For an assistant message: the summaries its reasoning blocks carry, in the order of
+        /// its content blocks, as `session.read` serves them with display facts. Recorded when
+        /// the message is placed because a seal prunes the encrypted reasoning they are read
+        /// from. Absent when it has none.
+        19 rep reasoning_summaries: ReasoningSummary,
+        /// For an assistant message a run placed: the Rich UI stamp the run's plan froze, which
+        /// `session.read` serves on it with `include_rich_ui`. Recorded here so a read finds it
+        /// without looking up the run's start. Absent when the run's plan has none.
+        20 opt rich_ui: RichUi,
+    }
+}
+
+message! {
+    /// A run's Rich UI stamp: which Rich UI dialect its system text taught, and against which
+    /// catalog (llm-runner's `RichUiStamp`).
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct RichUi {
+        1 req dialect: String,
+        2 req catalog_digest: String,
+    }
+}
+
+message! {
+    /// The summary one reasoning block of an assistant message carries.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct ReasoningSummary {
+        /// The block's position among the message's content blocks.
+        1 req part: u32,
+        2 req text: String,
     }
 }
 
@@ -320,12 +353,15 @@ message! {
     /// What reads serve about each tool call of one assistant message besides the message
     /// itself, decided once and never derived again. Written in the batch that places the
     /// message's tool results, so a sealed block never splits it from its turn. A later
-    /// `TurnFacts` for the same ordinal replaces it.
+    /// `TurnFacts` for the same ordinal replaces it: a run that ends cancelled restates its last
+    /// turn's calls it abandoned as cancelled.
     #[derive(Debug, Clone, PartialEq, Serialize)]
     pub struct TurnFacts {
         /// The ordinal of the assistant message that made the calls.
         1 req ordinal: u64,
-        /// One per call, in the order the message made them.
+        /// One per call that has a key, in the order the message made them: a dispatched call's
+        /// is its intent's, a call answered without an intent its outcome's
+        /// (`ToolOutcome::call_key`).
         2 rep calls: CallFacts,
     }
 }
@@ -338,7 +374,9 @@ message! {
         1 req tool_call_id: ToolCallId,
         /// The call's durable key, unique within the runner that minted it.
         2 req call_key: String,
-        /// The schema pin the call ran under, as its runner recorded it.
+        /// The schema pin the call ran under: for a call broca dispatched, the pin as reads
+        /// serve it (llm-runner's encoded `SchemaPin`); for an imported call, as its runner
+        /// recorded it.
         3 opt schema_pin: serde_json::Value,
         /// The attested module id of the runner that minted `call_key`, when that wasn't broca:
         /// a call imported from another runner keeps its key, which is unique only within that
@@ -348,6 +386,48 @@ message! {
         5 opt dispatched_to: String,
         6 opt dispatched_at_ms: u64,
         7 opt finished_at_ms: u64,
+        /// Why the call has no answer from its tool, when it has none: reads serve it as the
+        /// call's `unanswered`. Absent for a call its tool answered.
+        8 opt unanswered: Unanswered,
+    }
+}
+
+values! {
+    /// Why a tool call has no answer from its tool, as reads name it (llm-runner's
+    /// `ToolTime::unanswered`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+    pub enum Unanswered {
+        /// Refused: denied by a person or an approval, or blocked by policy.
+        1 Denied,
+        /// Never run: its input failed validation, or its tool provider couldn't take it.
+        2 NotExecuted,
+        /// Abandoned before it finished, or sent with no answer back.
+        3 Interrupted,
+        /// Stopped by a cancel, or by a step limit while it was pending.
+        4 Cancelled,
+    }
+}
+
+impl Unanswered {
+    /// The name reads serve.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Unanswered::Denied => "denied",
+            Unanswered::NotExecuted => "not_executed",
+            Unanswered::Interrupted => "interrupted",
+            Unanswered::Cancelled => "cancelled",
+        }
+    }
+
+    /// The value read as `name`, if reads serve one by that name.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "denied" => Unanswered::Denied,
+            "not_executed" => Unanswered::NotExecuted,
+            "interrupted" => Unanswered::Interrupted,
+            "cancelled" => Unanswered::Cancelled,
+            _ => return None,
+        })
     }
 }
 

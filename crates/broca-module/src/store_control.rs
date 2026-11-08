@@ -188,6 +188,28 @@ impl Default for StoreControl {
 }
 
 impl StoreControl {
+    /// An estimate of the memory this projection holds: its copies of the folds, as encoded,
+    /// which the store's bound schema bounds, and the facts it keeps of the current run, step and
+    /// batch. It never holds the units it made. Reported by the store actor's read-cost measure
+    /// (`store_actor::read_cost`).
+    pub fn held_bytes(&self) -> usize {
+        use broca_session_store::codec::Message as _;
+        // A rough size for one kept call fact: its id, a key and a message id.
+        const PER_FACT: usize = 128;
+        fn json(value: &impl serde::Serialize) -> usize {
+            serde_json::to_vec(value).map_or(0, |bytes| bytes.len())
+        }
+        self.conversation.encode().len()
+            + self.operations.encode().len()
+            + self.step_message.as_deref().map_or(0, json)
+            + self.assistant_calls.iter().map(json).sum::<usize>()
+            + PER_FACT
+                * (self.started_tools.len()
+                    + self.calls.len()
+                    + self.carriers.len()
+                    + self.input_owners.len()
+                    + self.waiting.len())
+    }
     /// The projection at the start of a log whose checkpoint holds `conversation` and
     /// `operations`, folded through `covers_through`. At a session's first log they are empty.
     ///

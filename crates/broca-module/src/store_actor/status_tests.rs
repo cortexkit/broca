@@ -4,9 +4,10 @@
 //! Each scenario drives the same sends through a module on today's storage and one on the new
 //! storage, then compares the replies as JSON with only what each storage keeps for itself taken
 //! out: message ids, wall-clock times (kept as whether they are present), and an active run's
-//! live `step`, which only today's actor keeps in memory. The crash scenarios read a session the
-//! new storage holds before any actor recovers it, then let its open recover it, and require the
-//! two reads to agree.
+//! live `step`, which each actor keeps in memory and which is compared on its own, while a step is
+//! in flight on both (`an_active_runs_step_is_served_alike`). The crash scenarios read a session
+//! the new storage holds before any actor recovers it, then let its open recover it, and require
+//! the two reads to agree.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,7 +18,7 @@ use serde_json::{json, Value};
 use tokio::sync::Notify;
 
 use super::differential::{BothLoops, TodayLoop, IDLE};
-use super::tests::{executor, request, text_step, Gated};
+use super::tests::{executor, read_step, request, text_step, Gated};
 use crate::actor::{SendKey, SendOutcome};
 use crate::executor::{RunExecutor, RunKind};
 use crate::registry::LineageRegistry;
@@ -252,6 +253,77 @@ fn same(today: &Value, store: &Value, what: &str, state: Option<&str>) {
     if let Some(state) = state {
         assert_eq!(store["state"], json!(state), "{what}: {store}");
     }
+}
+
+/// While a run's model step is in flight, `run.status` serves the step as today's actor serves its
+/// run's in-flight step: the step's id and attempt, and whether each of its times is known. Both
+/// runs' first step calls a tool, so the second step is read too.
+#[tokio::test]
+async fn an_active_runs_step_is_served_alike() {
+    /// The status as served, with only wall-clock times kept as whether they are present, and the
+    /// step left in.
+    fn timeless(mut value: Value) -> Value {
+        fn walk(value: &mut Value) {
+            match value {
+                Value::Object(object) => {
+                    object.remove("mid");
+                    for (name, member) in object.iter_mut() {
+                        if name.ends_with("_ms") || name.ends_with("_at") {
+                            *member = Value::Bool(!member.is_null());
+                        } else {
+                            walk(member);
+                        }
+                    }
+                }
+                Value::Array(items) => items.iter_mut().for_each(walk),
+                _ => {}
+            }
+        }
+        walk(&mut value);
+        value
+    }
+    let steps = || vec![read_step("a1"), text_step("a2", "done")];
+    let [(today, today_gate), (store, store_gate)] = pair(steps, true).await;
+    for side in [&today, &store] {
+        assert!(matches!(
+            side.send("r1", "first").await,
+            SendOutcome::Active { .. }
+        ));
+    }
+    for step in [1, 2] {
+        let mut served = Vec::new();
+        for side in [&today, &store] {
+            let status = broca_test_support::wait_until("the step is in flight", || async {
+                let status = serde_json::to_value(
+                    side.registry
+                        .run_status_reply(&side.key, RunId("r1".into()))
+                        .await
+                        .unwrap(),
+                )
+                .unwrap();
+                match status["step"]["step_id"].as_u64() {
+                    Some(at) if at == step => Ok(status),
+                    _ => Err(status.to_string()),
+                }
+            })
+            .await;
+            served.push(timeless(status));
+        }
+        assert_eq!(served[1], served[0], "step {step} in flight");
+        assert_eq!(served[1]["state"], json!("active"));
+        for gate in [&today_gate, &store_gate] {
+            gate.as_ref().unwrap().notify_one();
+        }
+    }
+    for side in [&today, &store] {
+        side.closed().await;
+    }
+    same(
+        &today.run_status("r1").await,
+        &store.run_status("r1").await,
+        "run.status once the run ended",
+        Some("completed"),
+    );
 }
 
 /// Two finished runs: each run's `run.status` and `run.result`, an id no run carries, and the
@@ -650,7 +722,7 @@ mod open_recovery {
         let session = view(backend).await;
         match run_facts(&session, parts, run_id, false, None).await {
             Ok(facts) => Ok(super::masked(
-                serde_json::to_value(status_response(facts, run_id).unwrap()).unwrap(),
+                serde_json::to_value(status_response(facts, run_id, None).unwrap()).unwrap(),
             )),
             Err(StatusError::EndUnrecorded { run_id }) => Err(format!("unrecorded {run_id}")),
             Err(error) => panic!("{error:?}"),

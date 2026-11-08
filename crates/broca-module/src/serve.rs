@@ -477,7 +477,221 @@ pub(crate) fn apply_media_mode(
     Ok(())
 }
 
-pub(crate) fn session_read_response(
+/// Fills each message's `tool_calls`, and a tool result delivered as a send's carrier call key,
+/// from the dispatch facts of the tool turns the messages belong to, keyed by the 0-based ordinal
+/// of each turn's assistant message (`broca_core::dispatches_of_turns`). `lineage_id` is the
+/// log's, which a call's derived key names.
+pub fn apply_tool_call_dispatches(
+    response: &mut SessionReadResponse,
+    dispatches: &std::collections::BTreeMap<u64, Vec<broca_core::ToolCallDispatch>>,
+    lineage_id: &str,
+) {
+    let calls_of = |message: &broca_protocol::Message| -> Vec<String> {
+        message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                broca_protocol::content::ContentBlock::ToolCall(call) => {
+                    Some(call.tool_call_id.0.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    for message in &mut response.messages {
+        if let Some(carrier) = message
+            .run
+            .as_ref()
+            .and_then(|run| run.delivery.as_ref())
+            .and_then(|delivery| delivery.tool_call_id.as_ref())
+        {
+            if let Some(dispatch) = message
+                .ordinal
+                .checked_sub(2)
+                .and_then(|ordinal| dispatches.get(&ordinal))
+                .and_then(|calls| calls.iter().find(|call| &call.tool_call_id == carrier))
+            {
+                if let Some(receipt) = &mut message.delivered_as {
+                    receipt.call_key = dispatch.key_seq.or(dispatch.intent_seq).and_then(|seq| {
+                        broca_core::tool_call_key(
+                            Some(lineage_id),
+                            seq,
+                            dispatch.recorded_call_key.as_deref(),
+                        )
+                    });
+                }
+            }
+        }
+        let ids = calls_of(&message.message);
+        if ids.is_empty() {
+            continue;
+        }
+        message.tool_calls = match dispatches.get(&message.ordinal.saturating_sub(1)) {
+            // The step that produced this message holds exactly these calls: report them.
+            Some(found) if found.iter().map(|d| &d.tool_call_id).eq(ids.iter()) => found
+                .iter()
+                .map(|dispatch| broca_wire::SessionReadToolCall {
+                    tool_call_id: dispatch.tool_call_id.clone(),
+                    call_key: dispatch.key_seq.or(dispatch.intent_seq).and_then(|seq| {
+                        broca_core::tool_call_key(
+                            Some(lineage_id),
+                            seq,
+                            dispatch.recorded_call_key.as_deref(),
+                        )
+                    }),
+                    dispatched_to: dispatch.dispatched_to.clone(),
+                    indeterminate: dispatch.indeterminate,
+                })
+                .collect(),
+            // No recorded step produced this message (an imported one, say): report each
+            // call with no dispatch fact rather than guess one.
+            _ => ids
+                .into_iter()
+                .map(|tool_call_id| broca_wire::SessionReadToolCall {
+                    tool_call_id,
+                    call_key: None,
+                    dispatched_to: None,
+                    indeterminate: false,
+                })
+                .collect(),
+        };
+    }
+}
+
+/// The creation and completion times of a page's messages, by zero-based ordinal, kept for an
+/// `include_display_facts` read before the page becomes a reply (which serves neither without
+/// the opt-in).
+#[derive(Debug, Clone, Default)]
+pub struct DisplayTimes {
+    creations: std::collections::BTreeMap<u64, u64>,
+    completions: std::collections::BTreeMap<u64, u64>,
+}
+
+impl DisplayTimes {
+    pub fn of(page: &broca_core::SessionReadPage) -> Self {
+        Self {
+            creations: page
+                .messages
+                .iter()
+                .filter_map(|entry| entry.created_at.map(|at| (entry.ordinal, at)))
+                .collect(),
+            completions: page
+                .messages
+                .iter()
+                .filter_map(|entry| entry.completed_at.map(|at| (entry.ordinal, at)))
+                .collect(),
+        }
+    }
+}
+
+/// Reasoning summaries recorded for each message, by zero-based ordinal.
+pub type RecordedSummaries =
+    std::collections::BTreeMap<u64, Vec<cortexkit_role_llm_runner::read::ReasoningSummary>>;
+
+/// What `include_display_facts` adds to each message of `response`, the same for both storages:
+/// its creation time; for an assistant message its completion time and reasoning summaries; the
+/// sender, notices and per-call times `facts` holds for it (by zero-based ordinal), and for a
+/// user message its send's `client_message_id`. A message that makes tool calls and has no
+/// per-call facts names each call with no times.
+///
+/// Today's storage reads reasoning summaries from the message's reasoning blocks (`recorded` is
+/// `None`); the new storage serves the ones it recorded when it placed the message, as a seal
+/// prunes the blocks they are read from.
+pub fn apply_display_facts(
+    response: &mut SessionReadResponse,
+    times: &DisplayTimes,
+    facts: &std::collections::BTreeMap<u64, broca_core::display_facts::DisplayFacts>,
+    recorded: Option<&RecordedSummaries>,
+) {
+    for entry in &mut response.messages {
+        entry.created_at = times.creations.get(&(entry.ordinal - 1)).copied();
+        if entry.message.role == broca_protocol::Role::Assistant {
+            entry.completed_at = times.completions.get(&(entry.ordinal - 1)).copied();
+            entry.reasoning_summaries = match recorded {
+                Some(recorded) => recorded
+                    .get(&(entry.ordinal - 1))
+                    .cloned()
+                    .unwrap_or_default(),
+                None => entry
+                    .message
+                    .content
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(part, block)| {
+                        let stored = serde_json::to_value(block).ok()?;
+                        let text = cortexkit_role_llm_runner::display::reasoning_summary(&stored)?;
+                        Some(cortexkit_role_llm_runner::read::ReasoningSummary::new(
+                            u32::try_from(part).ok()?,
+                            text,
+                        ))
+                    })
+                    .collect(),
+            };
+        }
+        if let Some(facts) = facts.get(&(entry.ordinal - 1)) {
+            entry.sender = facts.sender.clone();
+            entry.notices = facts
+                .notices
+                .iter()
+                .map(|notice| notice.fact.clone())
+                .collect();
+            if entry.message.role == broca_protocol::Role::User {
+                entry.client_message_id = facts.client_message_id.clone();
+            }
+            entry.tool_times = facts.tool_times.clone();
+        }
+        if entry.tool_times.is_empty() {
+            entry.tool_times = entry
+                .message
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    broca_protocol::ContentBlock::ToolCall(call) => Some(
+                        cortexkit_role_llm_runner::read::ToolTime::new(&call.tool_call_id.0),
+                    ),
+                    _ => None,
+                })
+                .collect();
+        }
+    }
+}
+
+/// The runs whose Rich UI stamps an `include_rich_ui` read of `response` needs: the producing
+/// run of each assistant message that names one, each once, in page order.
+pub fn rich_ui_runs(response: &SessionReadResponse) -> Vec<String> {
+    let mut runs: Vec<String> = Vec::new();
+    for entry in &response.messages {
+        if entry.message.role != broca_protocol::Role::Assistant {
+            continue;
+        }
+        if let Some(run) = &entry.run {
+            if !runs.contains(&run.run_id) {
+                runs.push(run.run_id.clone());
+            }
+        }
+    }
+    runs
+}
+
+/// Stamps each assistant message of `response` with its producing run's Rich UI stamp, from
+/// `stamps` (by run id; a run it doesn't name has none).
+pub fn apply_rich_ui(
+    response: &mut SessionReadResponse,
+    stamps: &std::collections::BTreeMap<
+        String,
+        Option<cortexkit_role_llm_runner::rich_ui::RichUiStamp>,
+    >,
+) {
+    for entry in &mut response.messages {
+        if entry.message.role != broca_protocol::Role::Assistant {
+            continue;
+        }
+        let Some(run) = &entry.run else { continue };
+        entry.rich_ui = stamps.get(&run.run_id).cloned().flatten();
+    }
+}
+
+pub fn session_read_response(
     page: broca_core::SessionReadPage,
     tools: Option<crate::registry::SessionReadTools>,
 ) -> SessionReadResponse {
@@ -2410,6 +2624,16 @@ pub trait ServeHandler: Send + Sync {
             .map(|head| (head.mode3, head.lineage_id))
     }
 
+    /// `session.history`'s head for a session kept in the new storage, resolving `mid` when the
+    /// read names a message; `None` for a session on today's storage, which `head` answers.
+    async fn store_history_head(
+        &self,
+        _session: &LineageKey,
+        _mid: Option<&str>,
+    ) -> Result<Option<crate::store_entries::HistoryHead>, ServeError> {
+        Ok(None)
+    }
+
     /// `session.head` — the session's head without message bodies. For retained sessions,
     /// `updated_at` is the durable activity timestamp that sets expiry, not the WAL mtime.
     async fn head(&self, _session: &LineageKey) -> Result<broca_wire::HeadResponse, ServeError> {
@@ -2652,65 +2876,7 @@ impl crate::LineageRegistry {
         let dispatches = self
             .tool_turn_dispatches(session, &lineage_id, tail, &ordinals, prompt_len)
             .await?;
-        for message in &mut response.messages {
-            if let Some(carrier) = message
-                .run
-                .as_ref()
-                .and_then(|run| run.delivery.as_ref())
-                .and_then(|delivery| delivery.tool_call_id.as_ref())
-            {
-                if let Some(dispatch) = message
-                    .ordinal
-                    .checked_sub(2)
-                    .and_then(|ordinal| dispatches.get(&ordinal))
-                    .and_then(|calls| calls.iter().find(|call| &call.tool_call_id == carrier))
-                {
-                    if let Some(receipt) = &mut message.delivered_as {
-                        receipt.call_key =
-                            dispatch.key_seq.or(dispatch.intent_seq).and_then(|seq| {
-                                broca_core::tool_call_key(
-                                    Some(&lineage_id),
-                                    seq,
-                                    dispatch.recorded_call_key.as_deref(),
-                                )
-                            });
-                    }
-                }
-            }
-            let ids = calls_of(&message.message);
-            if ids.is_empty() {
-                continue;
-            }
-            message.tool_calls = match dispatches.get(&message.ordinal.saturating_sub(1)) {
-                // The step that produced this message holds exactly these calls: report them.
-                Some(found) if found.iter().map(|d| &d.tool_call_id).eq(ids.iter()) => found
-                    .iter()
-                    .map(|dispatch| broca_wire::SessionReadToolCall {
-                        tool_call_id: dispatch.tool_call_id.clone(),
-                        call_key: dispatch.key_seq.or(dispatch.intent_seq).and_then(|seq| {
-                            broca_core::tool_call_key(
-                                Some(&lineage_id),
-                                seq,
-                                dispatch.recorded_call_key.as_deref(),
-                            )
-                        }),
-                        dispatched_to: dispatch.dispatched_to.clone(),
-                        indeterminate: dispatch.indeterminate,
-                    })
-                    .collect(),
-                // No recorded step produced this message (an imported one, say): report each
-                // call with no dispatch fact rather than guess one.
-                _ => ids
-                    .into_iter()
-                    .map(|tool_call_id| broca_wire::SessionReadToolCall {
-                        tool_call_id,
-                        call_key: None,
-                        dispatched_to: None,
-                        indeterminate: false,
-                    })
-                    .collect(),
-            };
-        }
+        apply_tool_call_dispatches(response, &dispatches, &lineage_id);
         Ok(())
     }
 }
@@ -2767,6 +2933,11 @@ impl ServeHandler for crate::LineageRegistry {
         session: &LineageKey,
         tag: u64,
     ) -> Result<Option<broca_core::TagLocation>, ServeError> {
+        if let Some(store) = self.store_runtime() {
+            if store.holds(session)? {
+                return Err(crate::store_entries::tag_location_unserved());
+            }
+        }
         self.route_tag_location(session, tag)
             .await
             .map_err(ServeError::from)
@@ -3386,7 +3557,7 @@ impl ServeHandler for crate::LineageRegistry {
     async fn read(&self, req: SessionReadRequest) -> Result<SessionReadResponse, ServeError> {
         if let Some(store) = self.store_runtime() {
             if store.holds(&req.session)? {
-                return crate::store_read::serve_read(&store, req).await;
+                return crate::store_read::serve_read(self, &store, req).await;
             }
         }
         let before_history = self.history_read_version(&req.session).await?;
@@ -3499,21 +3670,10 @@ impl ServeHandler for crate::LineageRegistry {
             page.next_from_ordinal = None;
         }
         let prompt_len = page.prompt_len;
-        let creations: std::collections::BTreeMap<_, _> = if req.include_display_facts {
-            page.messages
-                .iter()
-                .filter_map(|entry| entry.created_at.map(|at| (entry.ordinal, at)))
-                .collect()
+        let times = if req.include_display_facts {
+            DisplayTimes::of(&page)
         } else {
-            Default::default()
-        };
-        let completions: std::collections::BTreeMap<_, _> = if req.include_display_facts {
-            page.messages
-                .iter()
-                .filter_map(|entry| entry.completed_at.map(|at| (entry.ordinal, at)))
-                .collect()
-        } else {
-            Default::default()
+            DisplayTimes::default()
         };
         let mut response = session_read_response(page, tools);
         response.history_version = snapshot.history_version;
@@ -3566,82 +3726,27 @@ impl ServeHandler for crate::LineageRegistry {
             }
         }
         if req.include_display_facts && response.lineage_id.is_some() {
-            for entry in &mut response.messages {
-                entry.created_at = creations.get(&(entry.ordinal - 1)).copied();
-                if entry.message.role == broca_protocol::Role::Assistant {
-                    entry.completed_at = completions.get(&(entry.ordinal - 1)).copied();
-                    entry.reasoning_summaries = entry
-                        .message
-                        .content
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(part, block)| {
-                            let stored = serde_json::to_value(block).ok()?;
-                            let text =
-                                cortexkit_role_llm_runner::display::reasoning_summary(&stored)?;
-                            Some(cortexkit_role_llm_runner::read::ReasoningSummary::new(
-                                u32::try_from(part).ok()?,
-                                text,
-                            ))
-                        })
-                        .collect();
-                }
-                if let Some(facts) = facts.get(&(entry.ordinal - 1)) {
-                    entry.sender = facts.sender.clone();
-                    entry.notices = facts
-                        .notices
-                        .iter()
-                        .map(|notice| notice.fact.clone())
-                        .collect();
-                    if entry.message.role == broca_protocol::Role::User {
-                        entry.client_message_id = facts.client_message_id.clone();
-                    }
-                    entry.tool_times = facts.tool_times.clone();
-                }
-                if entry.tool_times.is_empty() {
-                    entry.tool_times = entry
-                        .message
-                        .content
-                        .iter()
-                        .filter_map(|block| match block {
-                            broca_protocol::ContentBlock::ToolCall(call) => {
-                                Some(cortexkit_role_llm_runner::read::ToolTime::new(
-                                    &call.tool_call_id.0,
-                                ))
-                            }
-                            _ => None,
-                        })
-                        .collect();
-                }
-            }
+            apply_display_facts(&mut response, &times, &facts, None);
         }
         if req.include_rich_ui {
             let mut stamps = std::collections::BTreeMap::new();
-            for entry in &mut response.messages {
-                if entry.message.role != broca_protocol::Role::Assistant {
-                    continue;
-                }
-                let Some(run) = &entry.run else { continue };
-                if let std::collections::btree_map::Entry::Vacant(slot) =
-                    stamps.entry(run.run_id.clone())
-                {
-                    let stamp = self
-                        .session_log(&req.session, &run.run_id)
-                        .await?
-                        .into_iter()
-                        .flatten()
-                        .find_map(|record| match record {
-                            broca_wal::WalRecord::RunStarted {
-                                run_id, manifest, ..
-                            } if run_id.0 == run.run_id => {
-                                manifest.and_then(|manifest| manifest.rich_ui)
-                            }
-                            _ => None,
-                        });
-                    slot.insert(stamp);
-                }
-                entry.rich_ui = stamps[&run.run_id].clone();
+            for run_id in rich_ui_runs(&response) {
+                let stamp = self
+                    .session_log(&req.session, &run_id)
+                    .await?
+                    .into_iter()
+                    .flatten()
+                    .find_map(|record| match record {
+                        broca_wal::WalRecord::RunStarted {
+                            run_id: started,
+                            manifest,
+                            ..
+                        } if started.0 == run_id => manifest.and_then(|manifest| manifest.rich_ui),
+                        _ => None,
+                    });
+                stamps.insert(run_id, stamp);
             }
+            apply_rich_ui(&mut response, &stamps);
         }
         if had_late || late_only {
             response.late_approvals = late;
@@ -3679,6 +3784,21 @@ impl ServeHandler for crate::LineageRegistry {
             &req.session.session,
         )?;
         Ok(response)
+    }
+
+    async fn store_history_head(
+        &self,
+        session: &LineageKey,
+        mid: Option<&str>,
+    ) -> Result<Option<crate::store_entries::HistoryHead>, ServeError> {
+        match self.store_runtime() {
+            Some(store) if store.holds(session)? => {
+                crate::store_entries::history_head(self, &store, session, mid)
+                    .await
+                    .map(Some)
+            }
+            _ => Ok(None),
+        }
     }
 
     async fn head(&self, session: &LineageKey) -> Result<broca_wire::HeadResponse, ServeError> {

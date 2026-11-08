@@ -192,6 +192,11 @@ struct CostReport {
     /// Each catch-up's time, from the read of the log holding the cursor through the resume
     /// check, in microseconds.
     catch_up_us: super::Percentiles,
+    /// Each seeding of the live projection's time, from the read of the open log from its
+    /// checkpoint through the session's end, in microseconds.
+    seed_us: super::Percentiles,
+    /// The estimated memory the seeded projection holds, in bytes.
+    seed_held_bytes: u64,
     failures: Vec<String>,
 }
 
@@ -199,7 +204,8 @@ struct CostReport {
 /// catch-up costs on the largest log given, resuming from the first unit of the session's open
 /// log. The log is converted and written to a session under `--dir` with the batches its run
 /// barriers make, then caught up ten times over that session's files, as a subscriber's task
-/// reads them. The session is removed afterwards.
+/// reads them, and the live projection seeded ten times, as the session's actor seeds it when it
+/// opens. The session is removed afterwards.
 pub(super) fn cost(args: &Args) {
     use broca_session_store::backend::LocalBackend;
     use broca_session_store::head::SessionTriple;
@@ -272,16 +278,25 @@ pub(super) fn cost(args: &Args) {
                 times.push(started.elapsed().as_micros() as u64);
                 report.units = units as u64;
             }
+            // The live projection's seeding, as the session's actor runs it when it opens.
+            let mut seedings = Vec::new();
+            for _ in 0..RUNS {
+                let started = Instant::now();
+                let (held, _) = broca_module::store_fanout::measure_seed(&session).await?;
+                seedings.push(started.elapsed().as_micros() as u64);
+                report.seed_held_bytes = held as u64;
+            }
             session.close().await.map_err(|e| format!("close: {e:?}"))?;
-            Ok::<_, String>(times)
+            Ok::<_, String>((times, seedings))
         });
         let _ = std::fs::remove_dir_all(&root);
         timed
     })();
     match measured {
-        Ok(times) => {
+        Ok((times, seedings)) => {
             report.runs = times.len() as u64;
             report.catch_up_us = super::percentiles(times);
+            report.seed_us = super::percentiles(seedings);
         }
         Err(e) => report.failures.push(e),
     }

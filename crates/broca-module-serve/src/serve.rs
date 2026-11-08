@@ -5176,6 +5176,11 @@ async fn send_store_outcome<H: ServeHandler + ?Sized>(
         // The registry routes a command again when its session closes under it, so it never
         // hands this back.
         Ok(StoreOutcome::Reopen) => unreachable!("route_store_command reopens the session itself"),
+        // Only `session.apply_view` is answered so, and it travels on the compaction-runner
+        // route, whose answers that route sends.
+        Ok(StoreOutcome::ViewApplied(_)) => {
+            unreachable!("session.apply_view isn't routed as a store command here")
+        }
         Err(error) => send_serve_error(writer, ver, channel, epoch, corr, &error).await,
     }
 }

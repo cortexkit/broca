@@ -377,6 +377,8 @@ fn the_seed_keeps_source_ids_and_mints_only_for_messages_broca_makes() {
         .iter()
         .map(|row| (row.mid.as_str(), row.ordinal))
         .collect();
+    // The results broca split off `a1` are listed right after it, under the id minted for them.
+    let minted = format!("gfeed.{}", 10 + results_at);
     assert_eq!(
         moves,
         [
@@ -384,7 +386,8 @@ fn the_seed_keeps_source_ids_and_mints_only_for_messages_broca_makes() {
             ("sys", None),
             ("u2", Some(2)),
             ("u3", Some(3)),
-            ("a1", Some(4))
+            ("a1", Some(4)),
+            (minted.as_str(), Some(5))
         ]
     );
     assert_eq!(seed.receipt.dropped_system_messages, 1);

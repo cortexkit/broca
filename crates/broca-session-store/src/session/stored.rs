@@ -70,6 +70,29 @@ impl<B: SessionBackend> Place<'_, B> {
         first: u64,
         last: u64,
     ) -> Result<Vec<(u64, Record)>, SessionError> {
+        let mut records = self.sealed_between(first, last).await?;
+        for (seq, record) in self.open_log().await?.records {
+            if (first..=last).contains(&seq) {
+                records.insert(seq, record);
+            }
+        }
+        Ok(records.into_iter().collect())
+    }
+
+    /// Whether a sealed segment may hold a record at or past `first`.
+    pub(super) fn sealed_reach(&self, first: u64) -> bool {
+        [&self.head.ledger_dir, &self.head.transcript_dir]
+            .into_iter()
+            .any(|dir| dir.as_ref().is_some_and(|root| root.last_seq >= first))
+    }
+
+    /// The sealed records of both streams from seq `first` through seq `last`, by seq, reading
+    /// only the segments that overlap the range.
+    pub(super) async fn sealed_between(
+        &self,
+        first: u64,
+        last: u64,
+    ) -> Result<BTreeMap<u64, Record>, SessionError> {
         let key = self.key.frame_key();
         let pages = Pages {
             backend: self.backend,
@@ -80,6 +103,9 @@ impl<B: SessionBackend> Place<'_, B> {
         };
         let mut records = BTreeMap::new();
         for dir in [&self.head.ledger_dir, &self.head.transcript_dir] {
+            if dir.as_ref().is_none_or(|root| root.last_seq < first) {
+                continue;
+            }
             for entry in pages
                 .entries_from(dir.as_ref(), first)
                 .await
@@ -116,12 +142,7 @@ impl<B: SessionBackend> Place<'_, B> {
                 }
             }
         }
-        for (seq, record) in self.open_log().await?.records {
-            if (first..=last).contains(&seq) {
-                records.insert(seq, record);
-            }
-        }
-        Ok(records.into_iter().collect())
+        Ok(records)
     }
 
     /// The checkpoint of the sealed log holding `seq`: the newest log start that covers less

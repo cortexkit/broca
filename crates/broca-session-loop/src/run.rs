@@ -222,6 +222,10 @@ pub struct Seams<'a, P, T> {
     /// The account routing gives the session now. A run paused on its account resumes only
     /// on the account it froze; `None` when the caller didn't route one.
     pub auth_selection: Option<broca_wal::AuthSelection>,
+    /// Where the run publishes its in-flight model step while the provider call runs, as
+    /// today's loop does (`RunControl::step_progress`): the session's owner serves it as an
+    /// active run's `step`. It is cleared when the step's call ends. Never a durability input.
+    pub step_progress: Option<broca_core::provider::LiveStepProgress>,
 }
 
 /// The run loop's account reports, as today's `broca_core::AccountReporter` receives them. Each
@@ -309,6 +313,12 @@ where
     }
     admission.input = input;
     let mut placed = Placed {
+        calls: Default::default(),
+        rich_ui: admission
+            .manifest
+            .as_ref()
+            .and_then(|manifest| manifest.rich_ui.as_ref())
+            .and_then(crate::entries::rich_ui),
         facts: Tags::for_session(
             contract,
             admission.manifest.as_deref(),
@@ -538,6 +548,12 @@ where
     }
     let drift = drift.filter(|_| !matches!(resolution, Resolution::Paused(_)));
     let mut placed = Placed {
+        calls: Default::default(),
+        rich_ui: admission
+            .manifest
+            .as_ref()
+            .and_then(|manifest| manifest.rich_ui.as_ref())
+            .and_then(crate::entries::rich_ui),
         facts: Tags::for_session(
             admission.compaction_plan_version.is_some(),
             admission.manifest.as_deref(),
@@ -569,7 +585,17 @@ where
     // bills under the old config or account.
     let barrier = !refrozen.is_empty();
     refrozen.push(Record::Resumed(resumed));
-    writer.append(&refrozen, barrier).await?;
+    let mut batch = Some(refrozen);
+    writer
+        .append_with(
+            &mut |_, _, first_seq| {
+                let mut batch = batch.take().expect("one batch");
+                name_resumed_from(&mut batch, first_seq);
+                batch
+            },
+            barrier,
+        )
+        .await?;
     if let Some(error) = drift {
         return end_with_error(
             writer,
@@ -760,6 +786,12 @@ where
     // The closing results message is placed with the facts its run's frozen rules give it, as a
     // resume places it.
     let mut placed = Placed {
+        calls: Default::default(),
+        rich_ui: admission
+            .manifest
+            .as_ref()
+            .and_then(|manifest| manifest.rich_ui.as_ref())
+            .and_then(crate::entries::rich_ui),
         facts: Tags::for_session(
             admission.compaction_plan_version.is_some(),
             admission.manifest.as_deref(),
@@ -984,6 +1016,8 @@ fn resumed_record<W: Writer>(writer: &W, resolution: &Resolution) -> Resumed {
     }
     Resumed {
         run_id: run.run_id.clone(),
+        // Provisional: the append that writes the record names the seq it resumed from
+        // (`name_resumed_from`).
         resumed_from_seq: writer.next_seq().saturating_sub(1),
         messages: messages as u64,
         model_steps: run.completed_steps,
@@ -2384,13 +2418,14 @@ async fn admit<W: Writer>(
             pruned: Vec::new(),
         }));
     }
-    let start_seq = writer.next_seq()
-        + records
-            .iter()
-            .position(|record| matches!(record, Record::RunStart(_)))
-            .expect("the batch holds the run's start") as u64;
-    writer.append(&records, true).await?;
-    Ok(start_seq)
+    // The start's seq is the one the batch took, which a writer shared with the session actor
+    // knows only once it is appended.
+    let position = records
+        .iter()
+        .position(|record| matches!(record, Record::RunStart(_)))
+        .expect("the batch holds the run's start") as u64;
+    let first = writer.append(&records, true).await?;
+    Ok(first + position)
 }
 
 /// The highest part number the session's requests have shown, which a new run's numbering
@@ -2784,11 +2819,34 @@ async fn model_step<W: Writer, P: Provider, T>(
     account_limit_pause: bool,
 ) -> Result<Result<Step, StepFailure>, LoopError> {
     let mut limited: Option<Box<FailedAccountLimitAttempt>> = None;
+    // The step is in flight from here until the call's stream ends: published for the session's
+    // owner, and cleared however the call ends, as today's loop publishes it.
+    struct InFlight<'a>(Option<&'a broca_core::provider::LiveStepProgress>);
+    impl Drop for InFlight<'_> {
+        fn drop(&mut self) {
+            if let Some(progress) = self.0 {
+                *progress.lock().unwrap() = None;
+            }
+        }
+    }
+    let _in_flight = InFlight(seams.step_progress.as_ref());
+    if let Some(progress) = &seams.step_progress {
+        let now = (seams.now_ms)();
+        *progress.lock().unwrap() = Some(broca_protocol::provider::InFlightStep {
+            step_id: StepId(step_id),
+            started_at_ms: now,
+            attempt: 0,
+            attempt_started_at_ms: now,
+            last_content_at_ms: None,
+            max_content_gap_ms: None,
+            max_content_gap_ended_at_ms: None,
+        });
+    }
     let runtime = StepRuntime {
         cancel: seams.cancel.clone(),
         deadline: None,
         seal: None,
-        progress: None,
+        progress: seams.step_progress.clone(),
         first_attempt: 0,
         attempt_hook: None,
     };
@@ -2890,8 +2948,9 @@ async fn model_step<W: Writer, P: Provider, T>(
                 );
                 seams.provider.annotate_cache_evidence(&mut attempt);
                 let durable = attempt.outcome != broca_protocol::AttemptOutcome::Complete;
-                let seq = writer.next_seq();
-                writer
+                // The seq the record took, which a writer shared with the session actor knows
+                // only once it is appended.
+                let seq = writer
                     .append(
                         &[attempt_record(
                             run_id,
@@ -5032,17 +5091,29 @@ async fn append_end<W: Writer>(
     let mut records = Some(records);
     writer
         .append_with(
-            &mut |_, operations, _| {
+            &mut |_, operations, first_seq| {
                 let mut batch = records.take().expect("one batch");
                 let end = batch.pop().expect("the batch ends with the run's end");
                 batch.extend(placed_copies(operations, &run_id));
                 batch.push(end);
+                name_resumed_from(&mut batch, first_seq);
                 batch
             },
             true,
         )
         .await?;
     Ok(())
+}
+
+/// Names, in each `Resumed` record of a batch, the record just before the batch: the seq before
+/// the batch's first. Only the append knows that seq, since a writer the session actor shares
+/// (`ActorWriter`) can lag the records the actor appended since the run last saw the folds.
+fn name_resumed_from(batch: &mut [Record], first_seq: u64) {
+    for record in batch {
+        if let Record::Resumed(resumed) = record {
+            resumed.resumed_from_seq = first_seq.saturating_sub(1);
+        }
+    }
 }
 
 /// Copies of the messages steered or delivered since the last boundary, as transcript

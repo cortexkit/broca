@@ -303,16 +303,14 @@ pub(crate) async fn serve_head(
     principal: Option<&BindPrincipal>,
     scope: &SendScope,
 ) -> Result<broca_wire::HeadResponse, crate::serve::ServeError> {
-    let Some(session) = store.view(key).await? else {
+    use crate::store_reads::{StoreReadReply, StoreReadRequest};
+    let built = match store.read(registry, key, StoreReadRequest::Head).await? {
+        Some(StoreReadReply::Head(built)) => built?,
+        Some(_) => return Err(crate::store_reads::mismatched()),
         // The session's creation never committed, so it holds nothing: today's answer for a
         // session never written.
-        return Ok(broca_wire::HeadResponse::default());
+        None => return Ok(broca_wire::HeadResponse::default()),
     };
-    // The store actor of a session is the registry's open slot for it.
-    let live = registry.slot_state(key) == Some("open");
-    let built = build(&session, store.parts(), live)
-        .await
-        .map_err(head_failed)?;
     let sender = built.sender(principal, scope);
     let mut reply = built.reply;
     reply.sender = sender;
@@ -335,7 +333,7 @@ pub(crate) async fn serve_head(
 
 /// A head that couldn't be built. Only a backend failure is worth a retry: anything else is the
 /// session's stored bytes or state being wrong, which reading again won't change.
-fn head_failed(error: StoreHeadError) -> crate::serve::ServeError {
+pub(crate) fn head_failed(error: StoreHeadError) -> crate::serve::ServeError {
     use broca_protocol::ErrorClass;
     let class =
         match &error {

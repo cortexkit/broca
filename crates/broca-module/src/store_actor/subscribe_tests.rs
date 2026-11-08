@@ -494,3 +494,121 @@ async fn a_ride_is_a_notice_and_one_without_its_send_still_resumes() {
         "a resume at the note recorded without its send"
     );
 }
+
+/// Asks the actor to read `request` from what it holds.
+async fn read(
+    commands: &Commands,
+    request: crate::store_reads::StoreReadRequest,
+) -> crate::store_reads::StoreReadOutcome {
+    let (reply, answer) = oneshot::channel();
+    commands
+        .send(LineageCmd::StoreRead {
+            request: Box::new(request),
+            reply,
+        })
+        .unwrap();
+    answer.await.unwrap()
+}
+
+/// `session.read`'s `head` on a page the actor serves from memory is the head a fresh view of
+/// the session computes from storage, and the last unit a subscriber gets. While the live
+/// projection is still seeding, the actor leaves such a read to a view instead of waiting; once
+/// seeded, it serves the head from memory.
+#[tokio::test]
+async fn an_actor_served_reads_head_is_the_head_a_fresh_view_computes() {
+    use super::tests::{bind, deployment, triple, ADDR};
+    use crate::store_reads::{PageRequest, StoreReadOutcome, StoreReadReply, StoreReadRequest};
+    use broca_session_store::backend::SessionAddr;
+    let gate = Arc::new(tokio::sync::Notify::new());
+    // Shared with the view read below, which reads the runs' setup parts the actor stored.
+    let parts = broca_session_loop::parts::SharedParts::new(Box::new(MemoryParts::default()));
+    let backend: &'static MemoryBackend = Box::leak(Box::default());
+    let session = Session::create(
+        backend,
+        SessionAddr(ADDR.into()),
+        triple(),
+        &deployment(),
+        false,
+    )
+    .await
+    .unwrap();
+    let actor = super::StoreActor::new(
+        bind(),
+        session,
+        Arc::new(executor(script(), None)),
+        Box::new(parts.clone()),
+    )
+    .with_readers_held(Arc::new(move || backend), Arc::clone(&gate));
+    let (commands, receiver) = mpsc::unbounded_channel();
+    let _served = tokio::spawn(actor.serve(receiver));
+    send(&commands, "r1", "one").await;
+    idle(&commands).await;
+    send(&commands, "r2", "two").await;
+    idle(&commands).await;
+
+    let view = Session::view(backend, SessionAddr(ADDR.into()), &triple(), &deployment())
+        .await
+        .unwrap();
+    let fresh = crate::store_fanout::last_cursor(&view)
+        .await
+        .unwrap()
+        .expect("the session's stream has units");
+    let mut from_start = subscribe(&commands, FromCursor::Start, false).await;
+    let stream = units(quiet(&mut from_start).await);
+    assert_eq!(wire(stream.last().unwrap())["cursor"], json_of(fresh));
+
+    let page = || StoreReadRequest::Page(PageRequest::default());
+    let StoreReadOutcome::Stored { position, .. } = read(&commands, page()).await else {
+        panic!("before the projection is seeded, a page is left to a view");
+    };
+    // The view the module reads at the position the actor names carries the same head.
+    let at = Session::view_at(
+        backend,
+        SessionAddr(ADDR.into()),
+        &triple(),
+        &deployment(),
+        &position,
+    )
+    .await
+    .unwrap();
+    let context = crate::store_reads::ReadContext {
+        parts: &parts,
+        held: true,
+        open: true,
+        settled: None,
+        session_name: "s",
+        live_step: None,
+        stream_head: None,
+    };
+    let answer = match crate::store_reads::execute(&at, &context, &page()).await {
+        StoreReadReply::Page(Ok(answer)) => answer,
+        StoreReadReply::Page(Err(error)) => panic!("a view refuses the page: {error:?}"),
+        _ => panic!("a view answers a page read with a page"),
+    };
+    assert_eq!(
+        answer.response.head,
+        Some(broca_wire::CursorWire::from(fresh))
+    );
+    gate.notify_one();
+    let served = broca_test_support::wait_until("the actor serving a page from memory", || {
+        let commands = commands.clone();
+        async move {
+            match read(&commands, page()).await {
+                StoreReadOutcome::Served(reply) => Ok(reply),
+                _ => Err("the actor left the page to storage".to_owned()),
+            }
+        }
+    })
+    .await;
+    let StoreReadReply::Page(Ok(answer)) = *served else {
+        panic!("the actor answers with a page");
+    };
+    assert_eq!(
+        answer.response.head,
+        Some(broca_wire::CursorWire::from(fresh))
+    );
+}
+
+fn json_of(cursor: Cursor) -> serde_json::Value {
+    serde_json::to_value(broca_wire::CursorWire::from(cursor)).unwrap()
+}

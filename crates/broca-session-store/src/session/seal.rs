@@ -257,10 +257,13 @@ impl<B: SessionBackend> Session<B> {
         // The carried records took the last seqs of the new log.
         let carried = created.encoder.next_seq() - carry.records.len() as u64;
         let sealed = self.commit(change, intent_seq, created, now_ms).await?;
+        // The commit made every record before it durable.
+        self.observed(super::Appended::Synced);
         if !carry.records.is_empty() {
             self.observed(super::Appended::Records {
                 first: carried,
                 records: carry.records,
+                durable: true,
             });
         }
         Ok(sealed)
@@ -705,6 +708,9 @@ impl<B: SessionBackend> Session<B> {
         // facts of messages that left the window are found through the directory.
         self.open_ids = created.open_ids;
         self.window = created.window;
+        // The new log's records up to here were copied or carried, not appended, so none is kept;
+        // a read asking for them reads the log.
+        self.kept = super::kept::KeptRecords::from_next(self.encoder.next_seq(), false);
         self.poisoned = false;
         Ok(created.sealed)
     }

@@ -3,8 +3,9 @@
 //! The no-run `status` stays on the registry's own path (`route_status`), which asks the
 //! session's store actor, opening it when the session needs recovering.
 //!
-//! A reply equals today's for the same history. It is built from the session read-only
-//! (`Session::view`): the operational fold for the latest run, and for any run the run's own
+//! A reply equals today's for the same history. It is built from the session read-only (see
+//! `store_reads`, which serves it from the session's actor or from a kept view): the operational
+//! fold for the latest run, and for any run the run's own
 //! records, found through the id index and read from its start to its end. Today's reconciliation
 //! (`broca_core::reconcile_run_state`) walks today's records; the walk here is the same walk over
 //! the store's records, and every rule it applies to values (the step's normalized finish, the
@@ -12,8 +13,9 @@
 //! tracking) is the one function both walks call.
 //!
 //! Differences from today's reply, by design:
-//! - an active run's `step` (the live actor's in-flight model step) is absent: it is a live hint
-//!   today's actor keeps in memory, and nothing durable holds it;
+//! - an active run's `step` (the in-flight model step) is served only when the session's store
+//!   actor answers the read: it is a live hint the actor keeps in memory, as today's actor does,
+//!   and nothing durable holds it;
 //! - `awaiting_approval` is always absent: the new storage takes no approval questions;
 //! - a final message's `mid` is the id the session stored when it placed the message;
 //! - a final message's text is cleaned of tag notation whenever the message's entry facts say its
@@ -151,9 +153,11 @@ impl RunFacts {
 }
 
 /// The facts of runs that have ended, kept so a polled `run.status` of a finished run doesn't
-/// read its records again. A run that has ended never changes, so an entry never goes stale; a
-/// session deleted and created again under the same id has another incarnation, which is part of
-/// the key. Bounded: the oldest entry makes room for a new one.
+/// read its records again. A run that has ended never changes, so an entry never goes stale,
+/// except through a revert, which can take a finished run's final message out of the transcript:
+/// a revert moves the session's history version, which is part of the key, as is the session's
+/// incarnation, which a session deleted and created again under the same id doesn't share.
+/// Bounded: the oldest entry makes room for a new one.
 pub struct SettledRuns {
     inner: Mutex<SettledInner>,
     capacity: usize,
@@ -165,8 +169,8 @@ struct SettledInner {
     order: VecDeque<SettledKey>,
 }
 
-/// The session's address, its incarnation, and the run id.
-type SettledKey = (String, [u8; 16], String);
+/// The session's address, its incarnation, its history version, and the run id.
+type SettledKey = (String, [u8; 16], u64, String);
 
 impl SettledRuns {
     /// How many finished runs a module keeps the facts of.
@@ -784,6 +788,7 @@ pub async fn run_facts<B: SessionBackend>(
         (
             addr.to_owned(),
             session.head().incarnation.0,
+            session.head().history_version,
             run_id.to_owned(),
         )
     });
@@ -797,11 +802,19 @@ pub async fn run_facts<B: SessionBackend>(
         .run
         .as_ref()
         .filter(|run| run.run_id == run_id);
-    let named = session.find_id(IdKind::RunId, run_id).await?;
-    let first = named
-        .iter()
-        .find(|(_, record)| matches!(record, Record::RunStart(_)))
-        .map(|(seq, _)| *seq);
+    // The latest run's start, when the session keeps it in memory, is the one the id index would
+    // find: a run id names one run start. Reading it from memory leaves the index unread.
+    let kept_start = latest.and_then(|_| session.kept_run_start(run_id));
+    let named = match kept_start {
+        Some(_) => Vec::new(),
+        None => session.find_id(IdKind::RunId, run_id).await?,
+    };
+    let first = kept_start.or_else(|| {
+        named
+            .iter()
+            .find(|(_, record)| matches!(record, Record::RunStart(_)))
+            .map(|(seq, _)| *seq)
+    });
     let records = match (first, latest) {
         // No run started under this id: it may name a queued send that failed its admission.
         (None, _) => {
@@ -1031,7 +1044,7 @@ pub async fn status_needs_actor(
     store: &crate::store_open::StoreRuntime,
     key: &broca_protocol::BindIdentity,
 ) -> Result<bool, crate::registry::OpenError> {
-    let Some(session) = store.view(key).await? else {
+    let Some(session) = store.current_view(key).await? else {
         return Ok(false);
     };
     let unfinished = session
@@ -1042,15 +1055,12 @@ pub async fn status_needs_actor(
     Ok(unfinished || !session.operations.queue.is_empty())
 }
 
-/// What a read of a store session needs from the module: the store, and whether a store actor
-/// holds the session open.
+/// A read of a store session's run and send facts, served by its actor when one holds it open,
+/// else from the session as stored (see `store_reads`).
 pub struct StoreRead<'a> {
     pub store: &'a crate::store_open::StoreRuntime,
     pub key: &'a broca_protocol::BindIdentity,
-    /// Whether the registry holds a slot for the session: an actor is open, opening or closing.
-    pub live: bool,
-    /// The session's address, which keys its finished runs' facts.
-    addr: String,
+    registry: &'a crate::LineageRegistry,
 }
 
 impl<'a> StoreRead<'a> {
@@ -1058,26 +1068,22 @@ impl<'a> StoreRead<'a> {
     pub fn new(
         store: &'a crate::store_open::StoreRuntime,
         key: &'a broca_protocol::BindIdentity,
-        registry: &crate::LineageRegistry,
+        registry: &'a crate::LineageRegistry,
     ) -> Self {
         Self {
             store,
             key,
-            live: registry.slot_state(key).is_some(),
-            addr: broca_core::session_addr(key),
+            registry,
         }
     }
 }
 
 impl StoreRead<'_> {
-    /// The reader of this session's run and send facts.
-    fn reader(&self) -> Reader<'_> {
-        Reader {
-            parts: self.store.parts(),
-            live: self.live,
-            settled: Some((self.store.settled_runs(), &self.addr)),
-            session_name: &self.key.session,
-        }
+    async fn read(
+        &self,
+        request: crate::store_reads::StoreReadRequest,
+    ) -> Result<Option<crate::store_reads::StoreReadReply>, crate::serve::ServeError> {
+        self.store.read(self.registry, self.key, request).await
     }
 
     /// `run.status` for the run `run_id`: its own status, `unknown` when no run carries the id.
@@ -1085,10 +1091,15 @@ impl StoreRead<'_> {
         &self,
         run_id: &RunId,
     ) -> Result<broca_wire::RunStatusResponse, crate::serve::ServeError> {
-        let Some(session) = self.store.view(self.key).await? else {
-            return Ok(broca_wire::RunStatusResponse::Unknown);
-        };
-        self.reader().run_status(&session, run_id).await
+        use crate::store_reads::{StoreReadReply, StoreReadRequest};
+        match self
+            .read(StoreReadRequest::RunStatus(run_id.clone()))
+            .await?
+        {
+            None => Ok(broca_wire::RunStatusResponse::Unknown),
+            Some(StoreReadReply::RunStatus(reply)) => reply,
+            Some(_) => Err(crate::store_reads::mismatched()),
+        }
     }
 
     /// `run.status` for the run id `run_id` as the wire answers it (see
@@ -1097,10 +1108,15 @@ impl StoreRead<'_> {
         &self,
         run_id: &RunId,
     ) -> Result<broca_wire::RunStatusReply, crate::serve::ServeError> {
-        let Some(session) = self.store.view(self.key).await? else {
-            return Ok(broca_wire::RunStatusResponse::Unknown.into());
-        };
-        self.reader().run_status_reply(&session, run_id).await
+        use crate::store_reads::{StoreReadReply, StoreReadRequest};
+        match self
+            .read(StoreReadRequest::RunStatusReply(run_id.clone()))
+            .await?
+        {
+            None => Ok(broca_wire::RunStatusResponse::Unknown.into()),
+            Some(StoreReadReply::RunStatusReply(reply)) => reply,
+            Some(_) => Err(crate::store_reads::mismatched()),
+        }
     }
 
     /// `run.result` for the run `run_id` (see [`Reader::run_result`]).
@@ -1108,10 +1124,15 @@ impl StoreRead<'_> {
         &self,
         run_id: &RunId,
     ) -> Result<broca_wire::RunResultResponse, crate::serve::ServeError> {
-        let Some(session) = self.store.view(self.key).await? else {
-            return Err(crate::serve::ServeError::UnknownRun(run_id.0.clone()));
-        };
-        self.reader().run_result(&session, run_id).await
+        use crate::store_reads::{StoreReadReply, StoreReadRequest};
+        match self
+            .read(StoreReadRequest::RunResult(run_id.clone()))
+            .await?
+        {
+            None => Err(crate::serve::ServeError::UnknownRun(run_id.0.clone())),
+            Some(StoreReadReply::RunResult(reply)) => reply,
+            Some(_) => Err(crate::store_reads::mismatched()),
+        }
     }
 
     /// `send.status` and `session.send_status` (see [`Reader::send_status`]).
@@ -1121,12 +1142,17 @@ impl StoreRead<'_> {
         send_id: &str,
         principal: Option<&broca_protocol::BindPrincipal>,
     ) -> Result<broca_wire::SendReplyWire, crate::serve::ServeError> {
-        let Some(session) = self.store.view(self.key).await? else {
-            return Err(crate::serve::ServeError::UnknownSend);
+        use crate::store_reads::{StoreReadReply, StoreReadRequest};
+        let request = StoreReadRequest::SendStatus {
+            own_run,
+            send_id: send_id.to_owned(),
+            principal: principal.cloned(),
         };
-        self.reader()
-            .send_status(&session, own_run, send_id, principal)
-            .await
+        match self.read(request).await? {
+            None => Err(crate::serve::ServeError::UnknownSend),
+            Some(StoreReadReply::SendStatus(reply)) => reply,
+            Some(_) => Err(crate::store_reads::mismatched()),
+        }
     }
 }
 
@@ -1143,6 +1169,9 @@ pub struct Reader<'a> {
     pub settled: Option<(&'a SettledRuns, &'a str)>,
     /// The session's id, which a reply too large to send names.
     pub session_name: &'a str,
+    /// The in-flight model step of the run the session's actor is running, which an active
+    /// run's status serves as today's does. `None` where no actor answers.
+    pub live_step: Option<&'a crate::store_reads::LiveStep>,
 }
 
 impl Reader<'_> {
@@ -1154,13 +1183,27 @@ impl Reader<'_> {
         run_facts(session, self.parts, run_id, self.live, self.settled).await
     }
 
+    /// The run's `run.status` from its facts, with the actor's in-flight step when the run is
+    /// the one the actor is running and still active.
+    fn status(
+        &self,
+        facts: Option<RunFacts>,
+        run_id: &str,
+    ) -> Result<broca_wire::RunStatusResponse, crate::serve::ServeError> {
+        let live_step = self
+            .live_step
+            .filter(|live| live.run_id == run_id)
+            .and_then(|live| live.step.clone());
+        status_response(facts, run_id, live_step)
+    }
+
     /// `run.status` for the run `run_id`: its own status, `unknown` when no run carries the id.
     pub async fn run_status<B: SessionBackend>(
         &self,
         session: &Session<B>,
         run_id: &RunId,
     ) -> Result<broca_wire::RunStatusResponse, crate::serve::ServeError> {
-        status_response(self.facts(session, &run_id.0).await?, &run_id.0)
+        self.status(self.facts(session, &run_id.0).await?, &run_id.0)
     }
 
     /// `run.status` for the run id `run_id` as the wire answers it: the run's status, or, for a
@@ -1173,7 +1216,7 @@ impl Reader<'_> {
         use broca_core::delivery_order::QueuedSendFate;
         use broca_wire::{QueuedSendState, RunStatusReply};
         if let Some(facts) = self.facts(session, &run_id.0).await? {
-            return status_response(Some(facts), &run_id.0).map(Into::into);
+            return self.status(Some(facts), &run_id.0).map(Into::into);
         }
         // No run carries this id. It may still be the id a queued send was minted from, which
         // callers poll until the send is a run; the session's records say what became of it.
@@ -1188,10 +1231,7 @@ impl Reader<'_> {
             // Delivered into a run that was already going: the send is part of that run now,
             // so its status is that run's, with the receipt naming the run.
             Some(QueuedSendFate::Delivered { run_id: into, .. }) => RunStatusReply::Run {
-                status: Box::new(status_response(
-                    self.facts(session, &into.0).await?,
-                    &into.0,
-                )?),
+                status: Box::new(self.status(self.facts(session, &into.0).await?, &into.0)?),
                 delivered: Some(
                     cortexkit_role_llm_runner::send::Delivered::new(
                         cortexkit_role_llm_runner::send::delivered_as::STEP,
@@ -1269,16 +1309,21 @@ impl Reader<'_> {
     }
 }
 
-/// A run's `run.status` from its facts, as today's builder answers it.
+/// A run's `run.status` from its facts, as today's builder answers it. `live_step` is the
+/// in-flight step an active run serves, from the actor running it.
 pub(crate) fn status_response(
     facts: Option<RunFacts>,
     run_id: &str,
+    live_step: Option<broca_protocol::provider::InFlightStep>,
 ) -> Result<broca_wire::RunStatusResponse, crate::serve::ServeError> {
     use broca_wire::RunStatusResponse;
-    let Some(facts) = facts else {
+    let Some(mut facts) = facts else {
         return Ok(RunStatusResponse::Unknown);
     };
     facts.check_held()?;
+    if facts.state.state == RunIndexState::Active {
+        facts.state.live_step = live_step;
+    }
     let mut response =
         crate::serve::run_status_response_with_reader_policy(Some(facts.state), false);
     match &mut response {

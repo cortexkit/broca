@@ -265,6 +265,8 @@ struct Pair {
     commands: mpsc::UnboundedSender<LineageCmd>,
     served: tokio::task::JoinHandle<Session<&'static MemoryBackend>>,
     store: Arc<LoopExecutor>,
+    /// The store actor's setup parts, which reads of its session name tools and plans from.
+    parts: broca_session_loop::parts::SharedParts,
     /// Each side's gate on its model calls, when the pair is gated: every model call waits for
     /// one release.
     gates: Vec<Arc<Notify>>,
@@ -276,6 +278,7 @@ struct Ended {
     today: Today,
     session: Session<&'static MemoryBackend>,
     store: Arc<LoopExecutor>,
+    parts: broca_session_loop::parts::SharedParts,
 }
 
 impl Pair {
@@ -301,11 +304,12 @@ impl Pair {
         )
         .await
         .unwrap();
+        let parts = broca_session_loop::parts::SharedParts::new(Box::new(MemoryParts::default()));
         let actor = super::super::StoreActor::new(
             store::bind(),
             session,
             executor.clone(),
-            Box::new(MemoryParts::default()),
+            Box::new(parts.clone()),
         )
         .with_readers(Arc::new(move || backend));
         let (commands, receiver) = mpsc::unbounded_channel();
@@ -315,6 +319,7 @@ impl Pair {
             commands,
             served,
             store: executor,
+            parts,
             gates: today_gate.into_iter().chain(store_gate).collect(),
         }
     }
@@ -402,6 +407,7 @@ impl Pair {
             session: self.served.await.unwrap(),
             today: self.today,
             store: self.store,
+            parts: self.parts,
         }
     }
 }
@@ -554,7 +560,8 @@ impl Ended {
     }
 
     /// The two sessions hold the same conversation, their runs' starts record the same
-    /// compaction, tool and hook facts, and every model call was sent the same messages.
+    /// compaction, tool and hook facts, every model call was sent the same messages, and reads
+    /// with each opt-in serve the same.
     async fn assert_alike(&self) {
         assert_eq!(
             store::texts(&self.session),
@@ -568,6 +575,7 @@ impl Ended {
         );
         let (old, new) = self.prompts();
         assert_eq!(new, old, "the model calls were sent different messages");
+        super::display_reads_alike(&self.today, &self.session, &self.parts).await;
     }
 
     async fn stop(self) {

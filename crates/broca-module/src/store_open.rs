@@ -16,7 +16,7 @@ use broca_session_loop::parts::{DeploymentParts, SharedParts};
 use broca_session_store::backend::{LocalBackend, SessionAddr};
 use broca_session_store::head::SessionTriple;
 use broca_session_store::keys::DeploymentKey;
-use broca_session_store::session::{Session, SessionError, SessionView};
+use broca_session_store::session::{Position, Session, SessionError, SessionView};
 use broca_session_store::setup::SetupStore;
 use tokio::sync::mpsc;
 
@@ -42,8 +42,10 @@ pub struct StoreRuntime {
     /// state root unless the operator configured other roots (`with_import_roots`).
     import_roots: Arc<crate::store_import::ImportRoots>,
     /// The facts of runs that have ended, which `run.status` and `run.result` serve again
-    /// without reading the runs' records.
-    settled: crate::store_status::SettledRuns,
+    /// without reading the runs' records. Shared with each store actor, which serves them too.
+    settled: Arc<crate::store_status::SettledRuns>,
+    /// Views of sessions no actor holds, kept by position (see `store_reads`).
+    views: crate::store_reads::ViewCache,
 }
 
 impl StoreRuntime {
@@ -75,7 +77,8 @@ impl StoreRuntime {
                 None,
                 Some(&crate::store_import::default_import_folder(state_root)),
             )),
-            settled: crate::store_status::SettledRuns::default(),
+            settled: Arc::default(),
+            views: crate::store_reads::ViewCache::default(),
         })
     }
 
@@ -108,6 +111,11 @@ impl StoreRuntime {
         &self.settled
     }
 
+    /// The views kept of sessions no actor holds.
+    pub fn views(&self) -> &crate::store_reads::ViewCache {
+        &self.views
+    }
+
     /// Writes the spend facts of every run on the new storage to `billing`, the deployment's
     /// usage export, as today's runs are written.
     pub fn with_billing(mut self, billing: crate::store_billing::StoreBilling) -> Self {
@@ -129,29 +137,114 @@ impl StoreRuntime {
         }
     }
 
-    /// Loads the session `key` for a read, writing nothing and taking no lease (see
-    /// `Session::view`). A session whose creation never committed holds no record, so it reads
-    /// as having none (`None`). A log that needs a recovery refuses, transiently: the session's
-    /// next send opens its actor, which repairs it.
-    pub async fn view(
+    /// The session `key` as it stands now, read-only: writing nothing and taking no lease (see
+    /// `Session::view`). The view is kept, and served again while the session stays where it
+    /// was read (see `store_reads::ViewCache`). A session whose creation never committed holds no
+    /// record, so it reads as having none (`None`). A log that needs a recovery refuses,
+    /// transiently: the session's next send opens its actor, which repairs it.
+    pub async fn current_view(
         &self,
         key: &BindIdentity,
-    ) -> Result<Option<SessionView<LocalBackend>>, OpenError> {
+    ) -> Result<Option<Arc<SessionView<LocalBackend>>>, OpenError> {
         let addr = SessionAddr(broca_core::session_addr(key));
         let backend = LocalBackend::new(store_root(&self.state_root));
-        match Session::view(backend, addr, &triple(key), &self.deployment).await {
-            Ok(view) => Ok(Some(view)),
-            Err(SessionError::Missing) => Ok(None),
-            Err(SessionError::NeedsRecovery) => Err(OpenError::Classified {
-                reason: "session_needs_recovery: the session's log must be repaired before it \
-                         can be read; its next send repairs it"
-                    .into(),
-                class: broca_protocol::ErrorClass::Transient,
-            }),
-            Err(error) => Err(OpenError::Open(format!(
-                "the session could not be read from the new storage: {error:?}"
-            ))),
+        for _ in 0..POSITION_TRIES {
+            let position = match Session::stored_position(&backend, &addr, &self.deployment).await {
+                Ok(Some(position)) => position,
+                Ok(None) => return Ok(None),
+                Err(error) => return Err(view_error(error)),
+            };
+            match self.view_at(key, position).await {
+                // A writer moved the head between the probe and the load: probe again.
+                Err(SessionError::Moved) => continue,
+                Err(SessionError::Missing) => return Ok(None),
+                other => return other.map(Some).map_err(view_error),
+            }
         }
+        // Still moving: read it as it is, without keeping the view.
+        match Session::view(backend, addr, &triple(key), &self.deployment).await {
+            Ok(view) => Ok(Some(Arc::new(view))),
+            Err(SessionError::Missing) => Ok(None),
+            Err(error) => Err(view_error(error)),
+        }
+    }
+
+    /// The session `key` as it stood at `position`: the kept view, or one loaded there and kept.
+    pub async fn view_at(
+        &self,
+        key: &BindIdentity,
+        position: Position,
+    ) -> Result<Arc<SessionView<LocalBackend>>, SessionError> {
+        let addr = broca_core::session_addr(key);
+        let triple = triple(key);
+        let load = Session::view_at(
+            LocalBackend::new(store_root(&self.state_root)),
+            SessionAddr(addr.clone()),
+            &triple,
+            &self.deployment,
+            &position,
+        );
+        self.views.view(&addr, position, load).await
+    }
+
+    /// Serves `request` on the session `key`: by its store actor when the registry holds one open,
+    /// else from the session as stored (see `store_reads`). `None` for a session whose creation
+    /// never committed, which holds no record.
+    pub(crate) async fn read(
+        &self,
+        registry: &crate::LineageRegistry,
+        key: &BindIdentity,
+        request: crate::store_reads::StoreReadRequest,
+    ) -> Result<Option<crate::store_reads::StoreReadReply>, crate::serve::ServeError> {
+        use crate::store_reads::{execute, ReadContext, StoreReadOutcome};
+        let addr = broca_core::session_addr(key);
+        let context = |held: bool, open: bool, live_step| ReadContext {
+            parts: self.parts(),
+            held,
+            open,
+            settled: Some((self.settled_runs(), &addr)),
+            session_name: &key.session,
+            live_step,
+            stream_head: None,
+        };
+        for _ in 0..POSITION_TRIES {
+            let Some(handle) = registry.open_handle(key) else {
+                break;
+            };
+            let (reply, answer) = tokio::sync::oneshot::channel();
+            let command = crate::actor::LineageCmd::StoreRead {
+                request: Box::new(request.clone()),
+                reply,
+            };
+            let outcome = match handle.send(command).await {
+                Ok(()) => answer.await.ok(),
+                Err(_) => None,
+            };
+            match outcome {
+                Some(StoreReadOutcome::Served(reply)) => return Ok(Some(*reply)),
+                Some(StoreReadOutcome::Refused(error)) => return Err(error),
+                Some(StoreReadOutcome::Stored {
+                    position,
+                    live_step,
+                }) => match self.view_at(key, position).await {
+                    Ok(view) => {
+                        let context = context(true, true, live_step.as_ref());
+                        return Ok(Some(execute(&view, &context, &request).await));
+                    }
+                    // The actor sealed since it answered: ask it again.
+                    Err(SessionError::Moved) => continue,
+                    Err(error) => return Err(view_error(error).into()),
+                },
+                // The actor closed under the read: read the session as no actor holds it.
+                Some(StoreReadOutcome::Reopen) | None => break,
+            }
+        }
+        let Some(view) = self.current_view(key).await? else {
+            return Ok(None);
+        };
+        let slot = registry.slot_state(key);
+        let context = context(slot.is_some(), slot == Some("open"), None);
+        Ok(Some(execute(&view, &context, &request).await))
     }
 
     /// Opens the session `key` as the actor for registry slot `gen`, creating it when `create`.
@@ -198,7 +291,8 @@ impl StoreRuntime {
             Arc::clone(&self.executor),
             Box::new(self.parts.clone()),
         )
-        .with_storage(storage);
+        .with_storage(storage)
+        .with_settled(Arc::clone(&self.settled));
         let readers_root = store_root(&self.state_root);
         actor = actor.with_readers(Arc::new(move || LocalBackend::new(readers_root.clone())));
         if let Some(billing) = &self.billing {
@@ -232,6 +326,26 @@ impl StoreRuntime {
             approvals: Arc::new(crate::approval_state::ApprovalState::default()),
             first_episode: Arc::new(std::sync::OnceLock::new()),
         })
+    }
+}
+
+/// How many times a read probes the session's position again after a writer moved its head
+/// between the probe and the load. A head moves on a writer's open, a seal or a revert, never on
+/// an append, so a second probe nearly always holds.
+const POSITION_TRIES: usize = 3;
+
+/// A view that couldn't be loaded, as the opener reports it.
+fn view_error(error: SessionError) -> OpenError {
+    match error {
+        SessionError::NeedsRecovery => OpenError::Classified {
+            reason: "session_needs_recovery: the session's log must be repaired before it can be \
+                     read; its next send repairs it"
+                .into(),
+            class: broca_protocol::ErrorClass::Transient,
+        },
+        error => OpenError::Open(format!(
+            "the session could not be read from the new storage: {error:?}"
+        )),
     }
 }
 

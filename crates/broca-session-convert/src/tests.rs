@@ -56,6 +56,8 @@ fn a_tool_step_splits_into_transcript_and_ledger_records() {
             "ToolReply",
             "ToolOutcome",
             "EntryFacts",
+            // The batch that places the turn's results records the facts of its calls.
+            "TurnFacts",
             "BatchEnd",
             "Event",
             "RunEnd",
@@ -94,18 +96,24 @@ fn a_tool_step_splits_into_transcript_and_ledger_records() {
         Record::Input(input) if input.placement == Placement::RunInput && input.run_id == "run-1"
     ));
     assert!(matches!(
-        &converted.records[14],
+        &converted.records[13],
+        // The turn's assistant message is the run's second message. The log names no lineage,
+        // so its call has no key and the facts list no call.
+        Record::TurnFacts(turn) if turn.ordinal == 2 && turn.calls.is_empty()
+    ));
+    assert!(matches!(
+        &converted.records[15],
         // The event names a run only when the old record did.
         Record::Event(event) if event.name == "input_token_cap_frozen"
             && event.run_id.is_none()
             && event.body == Some(serde_json::json!({"limit": 5}))
     ));
     assert!(matches!(
-        &converted.records[15],
+        &converted.records[16],
         Record::RunEnd(end) if end.run_id == "run-1"
     ));
     assert!(matches!(
-        &converted.records[16],
+        &converted.records[17],
         Record::Billed(billed) if billed.run_id == "run-1"
     ));
 

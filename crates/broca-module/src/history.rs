@@ -391,6 +391,28 @@ pub fn project(entry: &SessionReadMessage, limits: Option<&Limits>) -> DisplayRo
     row
 }
 
+/// One entry of the raw form: the message as `session.read` serves it, with the time it was
+/// written, which the raw form always carries. Of the facts a display-facts read adds, the raw
+/// form keeps only the sender.
+pub fn raw_entry(entry: &SessionReadMessage, written_at: u64) -> Value {
+    let mut value = serde_json::to_value(entry).expect("history entry JSON");
+    for field in [
+        "client_message_id",
+        "created_at",
+        "completed_at",
+        "reasoning_summaries",
+        "tool_times",
+        "notices",
+    ] {
+        value
+            .as_object_mut()
+            .expect("an entry is an object")
+            .remove(field);
+    }
+    value["written_at"] = written_at.into();
+    value
+}
+
 /// Read one page only; output-reference derivation shares the page's entries and target cache.
 pub async fn read<H: ServeHandler + ?Sized>(
     handler: &H,
@@ -401,7 +423,43 @@ pub async fn read<H: ServeHandler + ?Sized>(
         field: field.into(),
         message: format!("session.history does not accept {field} in this request"),
     })?;
-    let head = handler.head(session).await?;
+    let named = match mode {
+        HistoryMode::FromMid(mid) | HistoryMode::BeforeMid(mid) => Some(mid),
+        _ => None,
+    };
+    // A session kept in the new storage is read from it: its head facts here, its pages through
+    // `handler.read`. The display form needs facts the new storage doesn't serve yet (per-call
+    // times, the Rich UI dialect and catalog digest each run froze at its start (`rich_ui`), and
+    // output references), so it is refused by name, never answered without them.
+    let store = handler.store_history_head(session, named).await?;
+    if store.is_some() && request.form() == HistoryForm::Display {
+        return Err(refused(
+            crate::store_entries::NOT_SERVED_ON_NEW_STORAGE,
+            "session.history form display is not served yet for a session kept in the new \
+             storage",
+        ));
+    }
+    // Raw history reads its pages with display facts (each message's sender), which a store
+    // session's `session.read` doesn't serve yet. Remove this once it serves them.
+    if store.is_some() {
+        return Err(refused(
+            crate::store_entries::NOT_SERVED_ON_NEW_STORAGE,
+            "session.history is not served yet for a session kept in the new storage: it \
+             waits on display facts for such sessions",
+        ));
+    }
+    // The store's own ids aren't positions, so it resolves a named message itself.
+    let store_mid = store.as_ref().map(|store| store.mid_ordinal);
+    let head = match store {
+        Some(store) => broca_wire::HeadResponse {
+            incarnation: store.incarnation,
+            history_version: store.history_version,
+            last_ordinal: store.last_ordinal,
+            first_ordinal: store.last_ordinal.map(|_| 1),
+            ..Default::default()
+        },
+        None => handler.head(session).await?,
+    };
     if head.incarnation == "unwritten" {
         if let HistoryMode::Cursor(token) = mode {
             parse_cursor(token)?;
@@ -447,15 +505,18 @@ pub async fn read<H: ServeHandler + ?Sized>(
             (position.boundary, position.backward)
         }
         HistoryMode::FromMid(mid) | HistoryMode::BeforeMid(mid) => {
-            let at = broca_core::position_of_mid(mid, head.mode3, head.lineage_id.as_deref())
-                .map(|position| position + 1)
-                .filter(|at| *at < end)
-                .ok_or_else(|| {
-                    refused(
-                        "unknown_mid",
-                        format!("session.history mid {mid} is not retained"),
-                    )
-                })?;
+            let at = match store_mid {
+                Some(found) => found,
+                None => broca_core::position_of_mid(mid, head.mode3, head.lineage_id.as_deref())
+                    .map(|position| position + 1),
+            }
+            .filter(|at| *at < end)
+            .ok_or_else(|| {
+                refused(
+                    "unknown_mid",
+                    format!("session.history mid {mid} is not retained"),
+                )
+            })?;
             (at, matches!(mode, HistoryMode::BeforeMid(_)))
         }
         HistoryMode::FromOrdinal(at) | HistoryMode::BeforeOrdinal(at) => {
@@ -594,19 +655,7 @@ pub async fn read<H: ServeHandler + ?Sized>(
             )
             .expect("display entry JSON")
         } else {
-            let mut value = serde_json::to_value(entry).expect("history entry JSON");
-            for field in [
-                "client_message_id",
-                "created_at",
-                "completed_at",
-                "reasoning_summaries",
-                "tool_times",
-                "notices",
-            ] {
-                value.as_object_mut().unwrap().remove(field);
-            }
-            value["written_at"] = written_at.into();
-            value
+            raw_entry(entry, written_at)
         };
         messages.push(value);
     }

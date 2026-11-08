@@ -5,14 +5,17 @@
 //! projection, and its display lane is today's lossy one.
 //!
 //! - **The barrier.** The actor registers the subscriber's live receiver and takes the session's
-//!   last seq H in one step between appends. A store append is durable when it returns, so no
-//!   sync is needed. A task then projects the stored records through H, and delivers live units
-//!   only past H ([`crate::fanout::deliver_from_ring`]), so a unit in both is delivered once.
-//! - **Live.** The session calls [`Publisher::appended`] right after each append returns; the
-//!   batch is projected once and its units published on a bounded broadcast. A subscriber that
-//!   falls behind is detached and resumes from its last cursor. The live projection starts from
-//!   the state the first subscriber's catch-up reaches at its H; batches appended meanwhile wait
-//!   for it.
+//!   durable end H in one step between appends: its last seq, short of a batch appended without
+//!   a barrier, which is published once a barrier makes it durable. A task then projects the
+//!   stored records through H, and delivers live units only past H
+//!   ([`crate::fanout::deliver_from_ring`]), so a unit in both is delivered once.
+//! - **Live.** The session calls [`Publisher::appended`] right after each append returns; each
+//!   batch is projected once, when durable, and its units published on a bounded broadcast. A
+//!   subscriber that falls behind is detached and resumes from its last cursor. The actor seeds
+//!   the live projection in the background when it opens, from the open log's checkpoint through
+//!   H, and again after the projection loses continuity; batches made durable meanwhile wait for
+//!   it. The projection keeps its state and the cursor of the stream's last unit, which actor
+//!   reads serve as `session.read`'s `head` from memory.
 //! - **Cursors.** `wal_seq` is the store record's seq and `sub_index` the unit's index among that
 //!   record's units. `incarnation` is the session head's incarnation in hex, as `session.read`
 //!   serves it, and `digest` the first 8 bytes of HMAC-SHA256 over the record's canonical
@@ -81,10 +84,11 @@ pub(crate) enum LiveItem {
 }
 
 enum Live {
-    /// No subscriber has needed the live projection yet.
+    /// Nothing seeds the live projection: before the first seeding, or after it lost
+    /// continuity, until the actor seeds it again (see [`StoreFanout::ensure_seeded`]).
     Unseeded,
-    /// A subscriber's catch-up is projecting through its barrier; the batches appended since
-    /// wait for the state it reaches there.
+    /// A catch-up is projecting through its barrier; the batches made durable since wait for the
+    /// state it reaches there.
     Seeding {
         generation: u64,
         waiting: Vec<(u64, Vec<Record>)>,
@@ -93,12 +97,18 @@ enum Live {
 }
 
 /// The live side of a store session's stream, shared by the session's append hook and the
-/// subscribers that seed it.
+/// catch-ups that seed it. It holds the projector's state, which the session's folds bound, and
+/// the cursor of the stream's last unit, never the units themselves.
 pub(crate) struct Publisher {
     live: Live,
     /// Counts seedings, so a catch-up that started before the projection lost continuity can't
     /// seed the projection a later catch-up is seeding.
     seedings: u64,
+    /// Batches appended without a barrier, published once a barrier makes them durable.
+    unsynced: Vec<(u64, Vec<Record>)>,
+    /// The cursor of the last unit the live projection made through the durable end, while it
+    /// is seeded; `None` when the stream has no unit yet.
+    last: Option<Cursor>,
     ring: broadcast::Sender<LiveItem>,
     display: DisplaySender,
     /// The id of the message the current step writes, which its display deltas name.
@@ -108,24 +118,42 @@ pub(crate) struct Publisher {
 
 impl Publisher {
     /// The hook the session calls right after each append returns (see
-    /// `Session::observe_appends`): the batch's units are projected once and published.
+    /// `Session::observe_appends`): each batch's units are projected once and published, once the
+    /// batch is durable.
     pub(crate) fn appended(&mut self, appended: Appended<'_>) {
         match appended {
-            Appended::Records { first, records } => {
+            Appended::Records {
+                first,
+                records,
+                durable,
+            } => {
                 self.display_context(records);
-                match &mut self.live {
-                    Live::Unseeded => {}
-                    Live::Seeding { waiting, .. } => waiting.push((first, records.to_vec())),
-                    Live::Seeded(control) => {
-                        if let Err(error) =
-                            publish(control, &self.identity, &self.ring, first, records)
-                        {
-                            self.lose_continuity(&error);
-                        }
+                self.unsynced.push((first, records.to_vec()));
+                if durable {
+                    self.publish_durable();
+                }
+            }
+            Appended::Synced => self.publish_durable(),
+            Appended::Replaced => {
+                self.unsynced.clear();
+                self.lose_continuity("a revert replaced the session's history");
+            }
+        }
+    }
+
+    /// Publishes the batches a barrier just made durable, in seq order.
+    fn publish_durable(&mut self) {
+        for (first, records) in std::mem::take(&mut self.unsynced) {
+            match &mut self.live {
+                Live::Unseeded => {}
+                Live::Seeding { waiting, .. } => waiting.push((first, records)),
+                Live::Seeded(control) => {
+                    match publish(control, &self.identity, &self.ring, first, &records) {
+                        Ok(last) => self.last = last.or(self.last),
+                        Err(error) => self.lose_continuity(&error),
                     }
                 }
             }
-            Appended::Replaced => self.lose_continuity("a revert replaced the session's history"),
         }
     }
 
@@ -148,8 +176,8 @@ impl Publisher {
         }
     }
 
-    /// Every subscriber detaches and resumes from its last cursor; the next one seeds the live
-    /// projection again.
+    /// Every subscriber detaches and resumes from its last cursor; the projection is seeded
+    /// again by the actor's next seeding.
     fn lose_continuity(&mut self, why: &str) {
         tracing::warn!(
             target: "broca.store_fanout",
@@ -157,6 +185,7 @@ impl Publisher {
             "the live projection lost continuity; subscribers resume from their cursors",
         );
         self.live = Live::Unseeded;
+        self.last = None;
         let _ = self.ring.send(LiveItem::Detach);
     }
 
@@ -174,9 +203,10 @@ impl Publisher {
         Some(self.seedings)
     }
 
-    /// The state the seeding catch-up reached at its head, or `None` when it failed. The
-    /// batches appended since are projected and published from it.
-    fn seeded(&mut self, generation: u64, control: Option<StoreControl>) {
+    /// The state the seeding catch-up reached at its head and the cursor of the last unit
+    /// through it, or `None` when it failed. The batches made durable since are projected and
+    /// published from it.
+    fn seeded(&mut self, generation: u64, seed: Option<(StoreControl, Option<Cursor>)>) {
         if !matches!(&self.live, Live::Seeding { generation: seeding, .. } if *seeding == generation)
         {
             return;
@@ -185,28 +215,48 @@ impl Publisher {
         else {
             unreachable!("checked above");
         };
-        let Some(mut control) = control else {
+        let Some((mut control, mut last)) = seed else {
             self.lose_continuity("the catch-up seeding the live projection failed");
             return;
         };
         for (first, records) in waiting {
-            if let Err(error) = publish(&mut control, &self.identity, &self.ring, first, &records) {
-                self.lose_continuity(&error);
-                return;
+            match publish(&mut control, &self.identity, &self.ring, first, &records) {
+                Ok(batch_last) => last = batch_last.or(last),
+                Err(error) => {
+                    self.lose_continuity(&error);
+                    return;
+                }
             }
         }
         self.live = Live::Seeded(Box::new(control));
+        self.last = last;
+    }
+
+    /// The cursor of the stream's last unit, when the live projection is seeded: `Some(None)`
+    /// for a stream with no unit yet, `None` while nothing is seeded.
+    pub(crate) fn head(&self) -> Option<Option<Cursor>> {
+        matches!(self.live, Live::Seeded(_)).then_some(self.last)
+    }
+
+    /// The seq of the last durable record, given `last`, the seq of the last record appended:
+    /// the records before the first batch still waiting for a barrier.
+    fn durable_end(&self, last: u64) -> u64 {
+        self.unsynced
+            .first()
+            .map_or(last, |(first, _)| first.saturating_sub(1))
     }
 }
 
 /// Projects `records`, the first at seq `first`, and publishes the units subscribers see.
+/// Returns the cursor of the last unit the batch made, hidden notices included.
 fn publish(
     control: &mut StoreControl,
     identity: &CursorIdentity,
     ring: &broadcast::Sender<LiveItem>,
     first: u64,
     records: &[Record],
-) -> Result<(), String> {
+) -> Result<Option<Cursor>, String> {
+    let mut last = None;
     for (offset, record) in records.iter().enumerate() {
         let seq = first + offset as u64;
         let units = control.project(seq, record, records.get(offset + 1))?;
@@ -214,12 +264,15 @@ fn publish(
             continue;
         }
         let digest = identity.key.digest(record);
-        for unit in units.into_iter().filter(|unit| unit.visible) {
+        for unit in units {
             let cursor = identity.cursor(&unit, digest);
-            let _ = ring.send(LiveItem::Unit(Arc::new((cursor, unit.unit, unit.event))));
+            last = Some(cursor);
+            if unit.visible {
+                let _ = ring.send(LiveItem::Unit(Arc::new((cursor, unit.unit, unit.event))));
+            }
         }
     }
-    Ok(())
+    Ok(last)
 }
 
 /// The subscriptions of one store session, held by its actor.
@@ -230,17 +283,43 @@ pub(crate) struct StoreFanout<B> {
     /// Handles on the session's storage that only read, one per catch-up.
     readers: Arc<dyn Fn() -> B + Send + Sync>,
     subscribers: Vec<(CancellationToken, JoinHandle<()>)>,
+    /// Holds each seeding until notified, so a test can read while nothing is seeded.
+    #[cfg(test)]
+    seed_gate: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl<B: SessionBackend + Send + Sync + 'static> StoreFanout<B> {
     /// The subscriptions of `session`, whose appends it observes from now on. A catch-up reads
-    /// the session's records over a backend `readers` makes.
+    /// the session's records over a backend `readers` makes. The live projection starts seeding
+    /// at once, in the background (see [`StoreFanout::ensure_seeded`]).
     pub(crate) fn new(session: &mut Session<B>, readers: Arc<dyn Fn() -> B + Send + Sync>) -> Self {
+        let mut fanout = Self::unseeded(session, readers);
+        fanout.ensure_seeded(session);
+        fanout
+    }
+
+    /// [`StoreFanout::new`], with each seeding held until `gate` is notified.
+    #[cfg(test)]
+    pub(crate) fn held(
+        session: &mut Session<B>,
+        readers: Arc<dyn Fn() -> B + Send + Sync>,
+        gate: Arc<tokio::sync::Notify>,
+    ) -> Self {
+        let mut fanout = Self::unseeded(session, readers);
+        fanout.seed_gate = Some(gate);
+        fanout.ensure_seeded(session);
+        fanout
+    }
+
+    /// The subscriptions of `session` before anything seeds their live projection.
+    fn unseeded(session: &mut Session<B>, readers: Arc<dyn Fn() -> B + Send + Sync>) -> Self {
         let display = DisplaySender::new(crate::fanout::DISPLAY_RING_CAPACITY);
         let display_mid = Arc::new(Mutex::new(None));
         let publisher = Arc::new(Mutex::new(Publisher {
             live: Live::Unseeded,
             seedings: 0,
+            unsynced: Vec::new(),
+            last: None,
             ring: broadcast::channel(crate::fanout::RING_CAPACITY).0,
             display: display.clone(),
             display_mid: Arc::clone(&display_mid),
@@ -256,11 +335,72 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreFanout<B> {
             display_mid,
             readers,
             subscribers: Vec::new(),
+            #[cfg(test)]
+            seed_gate: None,
         }
     }
 
+    /// Seeds the live projection in the background when nothing seeds it: before the first
+    /// seeding, and after it lost continuity. The seeding reads the open log over a backend of
+    /// its own, from its checkpoint through the session's durable end, and never blocks the
+    /// actor; batches made durable meanwhile wait for the state it reaches. Outside a runtime it
+    /// does nothing; the next call inside one seeds.
+    pub(crate) fn ensure_seeded(&mut self, session: &Session<B>) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let (seeding, head, identity) = {
+            let mut publisher = self.publisher.lock().unwrap();
+            let head = publisher.durable_end(session.next_seq().saturating_sub(1));
+            (publisher.start_seeding(), head, publisher.identity.clone())
+        };
+        let Some(generation) = seeding else {
+            return;
+        };
+        let reader = session.stored_records((self.readers)());
+        let publisher = Arc::clone(&self.publisher);
+        #[cfg(test)]
+        let gate = self.seed_gate.clone();
+        runtime.spawn(async move {
+            #[cfg(test)]
+            if let Some(gate) = gate {
+                gate.notified().await;
+            }
+            let read = tokio::runtime::Handle::current();
+            let seeded = spawn_blocking(JobKind::Projection, move || {
+                read.block_on(seed(&reader, head, &identity))
+            })
+            .await;
+            let seed = match seeded {
+                Ok(Ok(seed)) => Some(seed),
+                Ok(Err(error)) => {
+                    tracing::warn!(
+                        target: "broca.store_fanout",
+                        error = %error,
+                        "seeding the live projection failed",
+                    );
+                    None
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        target: "broca.store_fanout",
+                        error = %error,
+                        "the task seeding the live projection failed",
+                    );
+                    None
+                }
+            };
+            publisher.lock().unwrap().seeded(generation, seed);
+        });
+    }
+
+    /// The cursor of the stream's last unit, when the live projection is seeded.
+    pub(crate) fn head(&self) -> Option<Option<Cursor>> {
+        self.publisher.lock().unwrap().head()
+    }
+
     /// Attaches a subscriber from `from`, delivering to `sink`: registers its live receiver and
-    /// takes the session's last seq as its barrier, then catches it up in a task of its own.
+    /// takes the session's durable end as its barrier, then catches it up in a task of its own.
     pub(crate) fn attach(
         &mut self,
         session: &Session<B>,
@@ -268,12 +408,13 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreFanout<B> {
         sink: mpsc::Sender<Delivery>,
     ) {
         self.subscribers.retain(|(_, task)| !task.is_finished());
-        let head = session.next_seq().saturating_sub(1);
-        let (rx, identity, seeding) = {
-            let mut publisher = self.publisher.lock().unwrap();
+        // The live projection a subscriber's stream continues from.
+        self.ensure_seeded(session);
+        let (rx, identity, head) = {
+            let publisher = self.publisher.lock().unwrap();
             let rx = publisher.ring.subscribe();
-            let seeding = publisher.start_seeding();
-            (rx, publisher.identity.clone(), seeding)
+            let head = publisher.durable_end(session.next_seq().saturating_sub(1));
+            (rx, publisher.identity.clone(), head)
         };
         let cancel = CancellationToken::new();
         let task = subscriber(Attach {
@@ -283,7 +424,6 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreFanout<B> {
             sink,
             reader: session.stored_records((self.readers)()),
             identity,
-            seed: seeding.map(|generation| (Arc::clone(&self.publisher), generation)),
             display: self.display.clone(),
             cancel: cancel.clone(),
         });
@@ -338,25 +478,22 @@ pub(crate) fn drain_display(
 /// One subscriber's attach.
 struct Attach<R> {
     from: AttachFrom,
-    /// The barrier: the session's last seq when the subscriber's receiver was registered.
+    /// The barrier: the session's durable end when the subscriber's receiver was registered.
     head: u64,
     rx: broadcast::Receiver<LiveItem>,
     sink: mpsc::Sender<Delivery>,
     reader: StoredRecords<R>,
     identity: CursorIdentity,
-    /// The live projection this catch-up seeds, and the seeding's number.
-    seed: Option<(Arc<Mutex<Publisher>>, u64)>,
     display: DisplaySender,
     cancel: CancellationToken,
 }
 
-/// What a catch-up delivers, and the projection's state at its end.
+/// What a catch-up delivers.
 pub(crate) struct Replay {
     /// The units after the attach point that subscribers see.
     pub(crate) units: Vec<ControlEvent>,
     /// Whether a resume cursor names a unit of the record it names, as the session holds it.
     pub(crate) cursor_valid: bool,
-    pub(crate) control: StoreControl,
 }
 
 /// Projects `log` through `head` for an attach from `from`, and checks a resume cursor against
@@ -417,8 +554,93 @@ pub(crate) fn replay(
     Ok(Replay {
         units,
         cursor_valid: cursor_valid && found,
-        control,
     })
+}
+
+/// Where a projection reads a session's logs from: the writer's session itself, or a handle that
+/// reads apart from it ([`StoredRecords`]).
+#[allow(async_fn_in_trait)]
+pub(crate) trait Logs {
+    /// The log holding `seq`, from its checkpoint through `last`.
+    async fn log_holding(&self, seq: u64, last: u64) -> Result<LogFrom, String>;
+}
+
+impl<B: SessionBackend> Logs for Session<B> {
+    async fn log_holding(&self, seq: u64, last: u64) -> Result<LogFrom, String> {
+        self.from_log_holding(seq, last)
+            .await
+            .map_err(|error| format!("the session's records can't be read: {error:?}"))
+    }
+}
+
+impl<R: SessionBackend> Logs for StoredRecords<R> {
+    async fn log_holding(&self, seq: u64, last: u64) -> Result<LogFrom, String> {
+        self.from_log_holding(seq, last)
+            .await
+            .map_err(|error| format!("the session's records can't be read: {error:?}"))
+    }
+}
+
+/// `log` projected from its checkpoint: the projector's state at its end, and the cursor of the
+/// last unit it made.
+fn project_log(
+    log: LogFrom,
+    identity: &CursorIdentity,
+) -> Result<(StoreControl, Option<Cursor>), String> {
+    let mut control = StoreControl::at_checkpoint(
+        &log.checkpoint.conversation,
+        &log.checkpoint.operational,
+        log.checkpoint.covers_through,
+    );
+    let mut last = None;
+    for (at, (seq, record)) in log.records.iter().enumerate() {
+        let next = log.records.get(at + 1).map(|(_, next)| next);
+        if let Some(unit) = control.project(*seq, record, next)?.pop() {
+            last = Some(identity.cursor(&unit, identity.key.digest(record)));
+        }
+    }
+    Ok((control, last))
+}
+
+/// The cursor of the stream's last unit through seq `through`, starting from the log holding
+/// `seq`: that log's last unit, else the newest earlier log's that has one, reading one log at a
+/// time. `None` when the stream has no unit through `through`.
+async fn last_unit(
+    logs: &impl Logs,
+    mut seq: u64,
+    mut through: u64,
+    identity: &CursorIdentity,
+) -> Result<Option<Cursor>, String> {
+    loop {
+        let log = logs.log_holding(seq, through).await?;
+        let covers = log.checkpoint.covers_through;
+        if let (_, Some(last)) = project_log(log, identity)? {
+            return Ok(Some(last));
+        }
+        if covers == 0 {
+            return Ok(None);
+        }
+        (seq, through) = (covers, covers);
+    }
+}
+
+/// The live projection's seed: the open log projected from its checkpoint through `head`, the
+/// session's durable end, and the cursor of the stream's last unit through it.
+async fn seed(
+    logs: &impl Logs,
+    head: u64,
+    identity: &CursorIdentity,
+) -> Result<(StoreControl, Option<Cursor>), String> {
+    let log = logs.log_holding(head + 1, head).await?;
+    let covers = log.checkpoint.covers_through;
+    let (control, last) = project_log(log, identity)?;
+    let last = match last {
+        Some(last) => Some(last),
+        None if covers == 0 => None,
+        // The open log has no unit yet: the last one is in sealed history.
+        None => last_unit(logs, covers, covers, identity).await?,
+    };
+    Ok((control, last))
 }
 
 /// The cursor of the last unit of `session`'s control stream, which `session.read` serves as its
@@ -428,30 +650,21 @@ pub(crate) async fn last_cursor<B: SessionBackend>(
     session: &Session<B>,
 ) -> Result<Option<Cursor>, String> {
     let head = session.next_seq().saturating_sub(1);
-    let identity = CursorIdentity::of(session);
-    // The open log's last unit, or, when the open log yields none yet, the session's.
-    for start in [head + 1, 1] {
-        let log = session
-            .from_log_holding(start, head)
-            .await
-            .map_err(|error| format!("the session's records can't be read: {error:?}"))?;
-        let mut control = StoreControl::at_checkpoint(
-            &log.checkpoint.conversation,
-            &log.checkpoint.operational,
-            log.checkpoint.covers_through,
-        );
-        let mut last = None;
-        for (at, (seq, record)) in log.records.iter().enumerate() {
-            let next = log.records.get(at + 1).map(|(_, next)| next);
-            if let Some(unit) = control.project(*seq, record, next)?.pop() {
-                last = Some((unit, record));
-            }
-        }
-        if let Some((unit, record)) = last {
-            return Ok(Some(identity.cursor(&unit, identity.key.digest(record))));
-        }
-    }
-    Ok(None)
+    last_unit(session, head + 1, head, &CursorIdentity::of(session)).await
+}
+
+/// Seeds a live projection from `session`'s open log, as the actor does when it opens, and
+/// returns the projector state's estimated memory (see [`StoreControl::held_bytes`]) and the
+/// cursor of the stream's last unit. For the store actor's read-cost measure
+/// (`store_actor::read_cost`) and `session-convert subscribe-cost`; the actor seeds in its own
+/// task.
+#[doc(hidden)]
+pub async fn measure_seed<B: SessionBackend>(
+    session: &Session<B>,
+) -> Result<(usize, Option<Cursor>), String> {
+    let head = session.next_seq().saturating_sub(1);
+    let (control, last) = seed(session, head, &CursorIdentity::of(session)).await?;
+    Ok((control.held_bytes(), last))
 }
 
 /// The cursor of the first unit of `session`'s open log, which a subscriber that followed the
@@ -523,11 +736,11 @@ async fn subscriber<R: SessionBackend + Send + Sync + 'static>(attach: Attach<R>
         sink,
         reader,
         identity,
-        seed,
         display,
         cancel,
     } = attach;
-    if !matches!(from, AttachFrom::Live) || seed.is_some() {
+    // A live attach starts after the barrier: nothing to catch up.
+    if !matches!(from, AttachFrom::Live) {
         let start = match from {
             AttachFrom::Live => head + 1,
             AttachFrom::Cursor(cursor) => cursor
@@ -550,31 +763,15 @@ async fn subscriber<R: SessionBackend + Send + Sync + 'static>(attach: Attach<R>
             Ok(replayed) => replayed,
             Err(error) => Err(format!("the catch-up task failed: {error}")),
         };
-        let replayed = match replayed {
-            Ok(Replay {
-                units,
-                cursor_valid,
-                control,
-            }) => {
-                if let Some((publisher, generation)) = &seed {
-                    publisher.lock().unwrap().seeded(*generation, Some(control));
-                }
-                Ok((units, cursor_valid))
-            }
-            Err(error) => {
-                if let Some((publisher, generation)) = &seed {
-                    publisher.lock().unwrap().seeded(*generation, None);
-                }
-                Err(error)
-            }
-        };
-        drop(seed);
         let units = match replayed {
-            Ok((_, false)) => {
+            Ok(Replay {
+                cursor_valid: false,
+                ..
+            }) => {
                 let _ = deliver(&sink, &cancel, Delivery::CursorExpired).await;
                 return;
             }
-            Ok((units, true)) => units,
+            Ok(Replay { units, .. }) => units,
             Err(error) => {
                 let _ = deliver(&sink, &cancel, Delivery::Error(error)).await;
                 return;

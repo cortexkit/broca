@@ -506,6 +506,9 @@ impl<B: SessionBackend> Session<B> {
             imported: Default::default(),
             sealed_entries: Default::default(),
             observer: None,
+            kept: super::kept::KeptRecords::from_next(intent_seq + 1, false),
+            memory_only: Default::default(),
+            memory_refused: Default::default(),
         };
         let checkpoint_body = Checkpoint {
             covers_through: intent_seq,

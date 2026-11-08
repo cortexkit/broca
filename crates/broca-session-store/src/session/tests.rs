@@ -338,10 +338,17 @@ fn an_append_is_observed_only_once_it_returned() {
             .unwrap();
         let told = Arc::new(Mutex::new(Vec::new()));
         let seen = Arc::clone(&told);
-        session.observe_appends(Box::new(move |appended| {
-            if let super::Appended::Records { first, records } = appended {
-                seen.lock().unwrap().push((first, records.len()));
-            }
+        session.observe_appends(Box::new(move |appended| match appended {
+            super::Appended::Records {
+                first,
+                records,
+                durable,
+            } => seen
+                .lock()
+                .unwrap()
+                .push(format!("{first}+{} {durable}", records.len())),
+            super::Appended::Synced => seen.lock().unwrap().push("synced".into()),
+            super::Appended::Replaced => seen.lock().unwrap().push("replaced".into()),
         }));
         let first = session
             .append(&[input("one"), event("a")], true)
@@ -349,6 +356,34 @@ fn an_append_is_observed_only_once_it_returned() {
             .unwrap();
         backend.fail_once(0);
         assert!(session.append(&[input("two")], true).await.is_err());
-        assert_eq!(*told.lock().unwrap(), [(first, 2)]);
+        assert_eq!(*told.lock().unwrap(), [format!("{first}+2 true")]);
+    });
+}
+
+/// A batch appended without a barrier is told as not yet durable, and the sync that makes it
+/// durable is told after it.
+#[test]
+fn an_append_without_a_barrier_is_told_durable_once_synced() {
+    use std::sync::{Arc, Mutex};
+    let backend = MemoryBackend::default();
+    block_on(async {
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(), false)
+            .await
+            .unwrap();
+        let told = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&told);
+        session.observe_appends(Box::new(move |appended| match appended {
+            super::Appended::Records { durable, .. } => {
+                seen.lock()
+                    .unwrap()
+                    .push(if durable { "durable" } else { "written" })
+            }
+            super::Appended::Synced => seen.lock().unwrap().push("synced"),
+            super::Appended::Replaced => seen.lock().unwrap().push("replaced"),
+        }));
+        session.append(&[event("a")], false).await.unwrap();
+        session.sync().await.unwrap();
+        session.sync().await.unwrap();
+        assert_eq!(*told.lock().unwrap(), ["written", "synced"]);
     });
 }

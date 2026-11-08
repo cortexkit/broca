@@ -231,6 +231,7 @@ impl<B: SessionBackend> Session<B> {
         let map = match cached {
             Some(map) => map,
             None => {
+                self.storage_read()?;
                 let name = self.id_map_name(&pointer);
                 let damaged =
                     |reason: &str| SessionError::ImportedIdsDamaged(format!("{name}: {reason}"));

@@ -480,6 +480,12 @@ mod records {
         CallOutcome::NotDispatched,
     );
     variants!(BudgetFiring: BudgetFiring::Nudge, BudgetFiring::Finalize);
+    variants!(
+        Unanswered: Unanswered::Denied,
+        Unanswered::NotExecuted,
+        Unanswered::Interrupted,
+        Unanswered::Cancelled,
+    );
     variants!(CancelPoint: CancelPoint::Now, CancelPoint::StepBoundary);
     variants!(
         ChangeKind: ChangeKind::Cut,
@@ -572,6 +578,7 @@ mod records {
         dispatched_to,
         dispatched_at_ms,
         finished_at_ms,
+        unanswered,
     });
     crate::fuzzing::gen::fields!(ResultAppend {
         run_id,
@@ -607,6 +614,14 @@ mod records {
         client_message_id,
         sender,
         marks,
+        no_display_facts,
+        reasoning_summaries,
+        rich_ui,
+    });
+    crate::fuzzing::gen::fields!(ReasoningSummary { part, text });
+    crate::fuzzing::gen::fields!(RichUi {
+        dialect,
+        catalog_digest
     });
     crate::fuzzing::gen::fields!(PartRef { kind, digest });
     crate::fuzzing::gen::fields!(SetupStub {
@@ -1019,6 +1034,8 @@ mod operations {
         written_at_ms,
         tags_v1,
         submission_id,
+        sender,
+        request_identity_digest,
     });
     crate::fuzzing::gen::fields!(NaturalEnd { stop, extendable });
     crate::fuzzing::gen::fields!(Budget {
@@ -1081,7 +1098,9 @@ mod operations {
     crate::fuzzing::gen::fields!(Pending {
         submission_id,
         interrupt,
-        ordered
+        ordered,
+        sender,
+        request_identity_digest,
     });
     crate::fuzzing::gen::fields!(Operations {
         run,

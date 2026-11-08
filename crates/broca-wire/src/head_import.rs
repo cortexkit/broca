@@ -80,6 +80,11 @@ pub struct MoveRow {
     /// In the plugin shape only: whether the row is an assistant summary that finished.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finished_summary: Option<bool>,
+    /// The row is a message broca added itself, which no source row is: the tool results split
+    /// off an assistant row, or the results that close a call the source left unanswered. Its
+    /// `mid` is broca's id, and it follows the source row it belongs to. Absent on source rows.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub added: bool,
 }
 
 /// The move list: one row per source message on the session's path, in source order.
@@ -161,10 +166,32 @@ mod tests {
             mid: "m".into(),
             entry: None,
             finished_summary: None,
+            added: false,
         };
         assert_eq!(
             serde_json::to_value(row).unwrap(),
             serde_json::json!({"mid": "m", "entry": null})
         );
+    }
+
+    /// A message broca added says so; a source row carries no `added` member, and reads back
+    /// as not added.
+    #[test]
+    fn only_an_added_move_row_carries_added() {
+        let added = MoveRow {
+            mid: "g1.7".into(),
+            entry: Some(3),
+            finished_summary: None,
+            added: true,
+        };
+        let value = serde_json::to_value(&added).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"mid": "g1.7", "entry": 3, "added": true})
+        );
+        assert_eq!(serde_json::from_value::<MoveRow>(value).unwrap(), added);
+        let source: MoveRow =
+            serde_json::from_value(serde_json::json!({"mid": "m", "entry": 1})).unwrap();
+        assert!(!source.added);
     }
 }

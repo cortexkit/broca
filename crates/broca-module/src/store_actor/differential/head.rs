@@ -168,7 +168,8 @@ fn occipital() -> BindPrincipal {
 }
 
 /// Both heads, for an anonymous caller, core, and a module the session never heard from, must
-/// be equal. Returns the store's head for the anonymous caller, to check what it says.
+/// be equal, and so must reads with each opt-in. Returns the store's head for the anonymous
+/// caller, to check what it says.
 async fn heads_alike(today: &Module, store: &Module, label: &str) -> serde_json::Value {
     assert!(store.head().exists() && !today.head().exists(), "{label}");
     for principal in [None, Some(core()), Some(occipital())] {
@@ -176,6 +177,7 @@ async fn heads_alike(today: &Module, store: &Module, label: &str) -> serde_json:
         let new = head_json(store, principal.as_ref()).await;
         assert_eq!(new, old, "{label}: heads differ for {principal:?}");
     }
+    super::opted_reads_alike(today, store, label).await;
     head_json(store, None).await
 }
 
@@ -370,6 +372,27 @@ async fn a_planned_session_heads_alike() {
         serde_json::json!({"provider": "stub", "model": "m", "variant": "high"})
     );
     assert_eq!(head["last_run_rich_ui"]["dialect"], "1.0");
+    // Reads with Rich UI stamps (compared with today's in `heads_alike`) serve the run's stamp
+    // on its assistant message.
+    let read = {
+        use crate::serve::ServeHandler;
+        store
+            .registry
+            .read(super::opted_request(
+                &store.key,
+                (None, None),
+                (false, false, true),
+            ))
+            .await
+            .expect("the store's session reads")
+    };
+    let stamped: Vec<_> = read
+        .messages
+        .iter()
+        .filter_map(|message| message.rich_ui.as_ref())
+        .collect();
+    assert_eq!(stamped.len(), 1, "{read:?}");
+    assert_eq!(serde_json::to_value(stamped[0]).unwrap()["dialect"], "1.0");
     let planned_sender = head_json(&store, Some(&occipital())).await;
     assert!(planned_sender["sender"].is_object(), "{planned_sender}");
 }

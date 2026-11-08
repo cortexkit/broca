@@ -307,9 +307,16 @@ async fn an_owner_imports_a_head_and_installs_its_first_view_through_serve() {
         .as_array()
         .unwrap()
         .iter()
-        .map(|row| row["mid"].as_str().unwrap().to_owned())
+        .map(|row| {
+            // The results split off `msg_a1` are broca's own message, under broca's id.
+            if row["added"] == true {
+                format!("added {}", row["entry"])
+            } else {
+                row["mid"].as_str().unwrap().to_owned()
+            }
+        })
         .collect();
-    assert_eq!(rows, ["msg_u1", "msg_a1", "msg_a2"], "{reply}");
+    assert_eq!(rows, ["msg_u1", "msg_a1", "added 3", "msg_a2"], "{reply}");
     assert!(
         !rig.import_folder().join("imp-1.json").exists(),
         "the import deletes its source from broca's own folder"
