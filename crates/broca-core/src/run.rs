@@ -6088,6 +6088,7 @@ where
         // first possible mode is `steer` or `turn_system` joins this step after the steered
         // messages, and one that expired ends. Records precede `StepStarted`, exactly where
         // replay places them.
+        let mut delivered_input = false;
         let mut steered = match &control.steer {
             Some(inbox) => match inbox.try_take_at_step_with_system(
                 &resolved_run_id,
@@ -6098,6 +6099,9 @@ where
                     provider.turn_system_possible(preceding, followed_by_user)
                 },
                 |records| {
+                    delivered_input = records.iter().any(|record| {
+                        matches!(record, WalRecord::SendDelivered { input: Some(_), .. })
+                    });
                     let assigned = records
                         .into_iter()
                         .map(|record| writer.record_tagged(record).1)
@@ -6114,6 +6118,11 @@ where
                 Vec::new()
             }
         };
+        if delivered_input {
+            // Live media reads only the durable WAL head. Publish both the delivery's capture
+            // and the StepStarted that places it before any request render can read that head.
+            writer.sync().await?;
+        }
         if control.emit_display_context {
             let _ = send(
                 out,
