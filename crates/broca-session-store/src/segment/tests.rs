@@ -81,6 +81,7 @@ fn a_group_never_splits_across_blocks() {
                 text: "y".repeat(1_000),
                 notice: None,
                 written_at_ms: None,
+                ride: None,
             }),
         ));
     }

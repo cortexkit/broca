@@ -18,10 +18,11 @@ use std::collections::HashMap;
 use broca_core::compaction_v2::metadata::{numbered_parts, step_usage};
 use broca_protocol::content::{ContentBlock, Message, Role};
 use broca_protocol::ToolCallId;
-use broca_session_store::fold::conversation::Conversation;
+use broca_session_store::fold::conversation::{Conversation, Delivered};
 use broca_session_store::fold::operations::Operations;
 use broca_session_store::record::{
-    CallFacts, EntryFacts, Notice, Placement, Record, StepUsage, ToolIntent, TurnFacts, ViewRef,
+    CallFacts, EntryFacts, Notice, Placement, Record, RideForm, StepUsage, ToolIntent, TurnFacts,
+    ViewRef,
 };
 use broca_session_store::session::{SessionError, StoredEntry};
 use cortexkit_role_compaction::read::Entry;
@@ -900,6 +901,12 @@ pub fn project(stored: &StoredEntry) -> Result<Entry, String> {
             .strip_prefix("\n\n")
             .unwrap_or(&delivered.text);
         let mut out = cortexkit_role_compaction::part::Delivered::new(&notice.sender, text);
+        // A ride's part carries its envelope, as today's projection attaches it from the
+        // ride's record; the template comes from the send's order either way.
+        broca_core::compaction_v2::entries::attach_ride_envelope(
+            &mut out,
+            ride_metadata(delivered).as_ref(),
+        );
         out.template = notice.template.clone();
         deliveries
             .entry((mid.to_owned(), delivered.part.to_string()))
@@ -910,4 +917,91 @@ pub fn project(stored: &StoredEntry) -> Result<Entry, String> {
         .into_iter()
         .next()
         .ok_or_else(|| "empty projection".into())
+}
+
+/// The envelope today's `SendDelivered` record holds for a ride the fold kept, or `None` for
+/// text delivered before envelopes existed.
+pub fn ride_metadata(delivered: &Delivered) -> Option<broca_wal::record::RideMetadata> {
+    let ride = delivered.ride.as_ref()?;
+    Some(broca_wal::record::RideMetadata {
+        call_key: ride.call_key.clone(),
+        send_id: delivered.send_id.clone().unwrap_or_default(),
+        sender: ride.sender.clone(),
+        forms: ride.forms.clone(),
+        form: match ride.form {
+            RideForm::Append => broca_wal::record::RideForm::Append,
+        },
+    })
+}
+
+/// The envelopes of the window's delivered texts, keyed as `project` keys the deliveries of each
+/// message's parts, for a request on the compaction contract to render each ride by the
+/// runner's ride rules.
+pub fn ride_envelopes(
+    conversation: &Conversation,
+) -> broca_core::compaction_v2::entries::RideEnvelopes {
+    let mut rides = broca_core::compaction_v2::entries::RideEnvelopes::default();
+    for entry in &conversation.entries {
+        if let Some(facts) = &entry.facts {
+            push_rides(&mut rides, &facts.mid, &entry.delivered);
+        }
+    }
+    rides
+}
+
+/// Adds the envelopes of message `mid`'s delivered texts to `rides`, in the order `project`
+/// lists the deliveries of each of its parts.
+pub fn push_rides(
+    rides: &mut broca_core::compaction_v2::entries::RideEnvelopes,
+    mid: &str,
+    delivered: &[Delivered],
+) {
+    for delivered in delivered {
+        rides.push(mid, &delivered.part.to_string(), ride_metadata(delivered));
+    }
+}
+
+/// Renders each ride of the window after the result that carries it, as today's loop renders a
+/// ride recorded with its envelope: through the runner's own ride rules
+/// (`broca_core::delivery_order::append_ride`), never joined here. `prompt` holds the window's
+/// messages in order. Text delivered without an envelope was joined into its result when it was
+/// recorded, on the layout that stores it there, and is left alone.
+pub fn render_rides(prompt: &mut [Message], conversation: &Conversation) {
+    for (index, entry) in conversation.entries.iter().enumerate() {
+        for delivered in &entry.delivered {
+            let Some(ride) = ride_metadata(delivered) else {
+                continue;
+            };
+            let Some(ContentBlock::ToolCall(call)) = conversation
+                .messages
+                .get(index)
+                .and_then(|message| message.content.get(delivered.part as usize))
+            else {
+                continue;
+            };
+            let Some(results) = prompt
+                .get_mut(index + 1)
+                .filter(|message| message.role == Role::Tool)
+            else {
+                continue;
+            };
+            // A ride selects the last result for its call, as today's live and replayed
+            // renderers select it.
+            let carrier = results
+                .content
+                .iter_mut()
+                .rev()
+                .find_map(|block| match block {
+                    ContentBlock::ToolResult(result)
+                        if result.tool_call_id == call.tool_call_id =>
+                    {
+                        Some(result)
+                    }
+                    _ => None,
+                });
+            if let Some(result) = carrier {
+                broca_core::delivery_order::append_ride(result, &ride, &delivered.text);
+            }
+        }
+    }
 }

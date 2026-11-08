@@ -395,6 +395,7 @@ pub fn seed(history: HeadHistory, at: &SeedFacts<'_>) -> Result<Seed, ImportRefu
                 }),
                 written_at_ms: None,
                 send_id: Some(ride.send_id.clone()),
+                ride: None,
             }));
         }
         let mid = match &message.mid {

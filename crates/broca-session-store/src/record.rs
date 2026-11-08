@@ -230,6 +230,38 @@ message! {
         /// that doesn't know the field would serve the text without it, so it is
         /// must-understand.
         6 opt [must] send_id: String,
+        /// The ride envelope (llm-runner 0.8.11): the carrying call's key, the sender and the
+        /// forms the send allowed, fixed when the text was delivered. Text with an envelope is
+        /// a ride: it is never joined into the stored result, and every request renders it
+        /// after the result through the runner's own ride rules. Text without one was delivered
+        /// before envelopes existed and keeps its historical rendering. A reader that doesn't
+        /// know the field would render a ride the old way, so it is must-understand.
+        7 opt [must] ride: RideEnvelope,
+    }
+}
+
+values! {
+    /// How a ride renders. Only the append form is ever recorded: broca never renders a ride
+    /// as system text.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+    pub enum RideForm {
+        1 Append,
+    }
+}
+
+message! {
+    /// What a ride carries besides its text and its send's id, as today's `SendDelivered`
+    /// record holds it in its `ride` member.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    pub struct RideEnvelope {
+        /// The key of the tool call whose result carries the ride, recorded at delivery and
+        /// never looked up again: a call id can repeat in a session, a key can't.
+        1 req call_key: String,
+        /// The module that sent it, or `broca`.
+        2 req sender: String,
+        /// The send's delivery list restricted to `tool_result` and `turn_system`, in order.
+        3 rep forms: String,
+        4 req form: RideForm,
     }
 }
 

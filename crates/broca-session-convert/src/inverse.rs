@@ -269,6 +269,29 @@ fn send_delivered(delivery: &Delivery, claimed: &[&Record]) -> Result<Value, Str
     );
     set(&mut object, "written_at_ms", delivery.written_at_ms);
     set(&mut object, "tags", delivery.tags_v1.as_ref());
+    // A ride's envelope goes back into today's `ride` member, whole: its send id is kept in
+    // the append's own field.
+    if let Some(append) = claimed.appends.first() {
+        if let Some(ride) = &append.ride {
+            let send_id = append
+                .send_id
+                .as_ref()
+                .ok_or("send_delivered: a ride's envelope has no send id")?;
+            let form = match ride.form {
+                broca_session_store::record::RideForm::Append => {
+                    broca_wal::record::RideForm::Append
+                }
+            };
+            let ride = broca_wal::record::RideMetadata {
+                call_key: ride.call_key.clone(),
+                send_id: send_id.clone(),
+                sender: ride.sender.clone(),
+                forms: ride.forms.clone(),
+                form,
+            };
+            object.insert("ride".into(), json(&ride));
+        }
+    }
     Ok(Value::Object(object))
 }
 

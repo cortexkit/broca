@@ -197,3 +197,76 @@ fn current_compaction_records_round_trip() {
     assert_eq!(kinds, ["View", "ViewApplied", "Marker"]);
     assert_round_trip(&old);
 }
+
+/// A tool batch carrying a queued send's text: `delivery` is the delivery record, written after
+/// the batch finishes, as today's loop writes it.
+fn ride_log(delivery: &str) -> Vec<FramedRecord> {
+    log(&[
+        &RUN.replace("RUN", "r"),
+        r#"{"type":"delivery_ordered","submission_id":"sub-q","order":{"modes":["tool_result","turn_system","steer"]}}"#,
+        r#"{"type":"queued","submission_id":"sub-q","send_id":"q","request":{"model":{"provider_module_id":"p","model_id":"m"},"input":[{"role":"user","content":[{"type":"text","text":"note"}]}],"policy_allowed":[],"tool_choice":{"type":"auto"},"generation":{},"stop_when":[]},"written_at_ms":5}"#,
+        r#"{"type":"step_started","step_id":1}"#,
+        r#"{"type":"model_step_finished","step_id":1,"assistant_message":{"message_id":"m1","content":[{"type":"tool_call","tool_call_id":"c1","tool_name":"bash","input":{"cmd":"ls"}}]},"usage":{},"finish_reason":"tool_calls","retries_used":0}"#,
+        r#"{"type":"tool_batch_started","batch_id":"b1","step_id":1,"planned_calls":["c1"]}"#,
+        r#"{"type":"tool_dispatch_intent","batch_id":"b1","tool_call_id":"c1","args":{"cmd":"ls"}}"#,
+        r#"{"type":"tool_result","batch_id":"b1","result":{"tool_call_id":"c1","output":{"kind":"text","text":"ok"},"is_error":false},"outcome":"completed"}"#,
+        r#"{"type":"tool_batch_finished","batch_id":"b1"}"#,
+        delivery,
+        r#"{"type":"turn_finished","step_id":1}"#,
+    ])
+}
+
+/// The ride envelope today's writer records since llm-runner 0.8.11 becomes the append's own
+/// envelope, and goes back into today's `ride` member whole.
+#[test]
+fn a_ride_envelope_converts_onto_the_append_and_round_trips() {
+    use broca_session_store::record::{Record, RideEnvelope, RideForm};
+    let old = ride_log(
+        r#"{"type":"send_delivered","submission_id":"sub-q","run_id":"r","mode":"tool_result","tool_call_id":"c1","appended_text":"\n\nnote","written_at_ms":5,"ride":{"call_key":"lineage:7","send_id":"q","sender":"broca","forms":["tool_result","turn_system"],"form":"append"}}"#,
+    );
+    let converted = convert(&old, None).unwrap();
+    let appends: Vec<_> = converted
+        .records
+        .iter()
+        .filter_map(|record| match record {
+            Record::ResultAppend(append) => Some(append),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(appends.len(), 1);
+    assert_eq!(appends[0].send_id.as_deref(), Some("q"));
+    assert_eq!(
+        appends[0].ride,
+        Some(RideEnvelope {
+            call_key: "lineage:7".into(),
+            sender: "broca".into(),
+            forms: vec!["tool_result".into(), "turn_system".into()],
+            form: RideForm::Append,
+        })
+    );
+    assert_round_trip(&old);
+}
+
+/// A ride recorded before envelopes existed converts with no envelope and no send id, and
+/// round-trips without gaining a `ride` member.
+#[test]
+fn a_ride_without_an_envelope_converts_without_one_and_round_trips() {
+    use broca_session_store::record::Record;
+    let old = ride_log(
+        r#"{"type":"send_delivered","submission_id":"sub-q","run_id":"r","mode":"tool_result","tool_call_id":"c1","appended_text":"\n\nnote","written_at_ms":5}"#,
+    );
+    let converted = convert(&old, None).unwrap();
+    let append = converted
+        .records
+        .iter()
+        .find_map(|record| match record {
+            Record::ResultAppend(append) => Some(append),
+            _ => None,
+        })
+        .expect("the delivery's append");
+    assert_eq!(
+        (append.send_id.as_ref(), append.ride.as_ref()),
+        (None, None)
+    );
+    assert_round_trip(&old);
+}

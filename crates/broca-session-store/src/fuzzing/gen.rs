@@ -580,6 +580,14 @@ mod records {
         notice,
         written_at_ms,
         send_id,
+        ride,
+    });
+    variants!(RideForm: RideForm::Append);
+    crate::fuzzing::gen::fields!(RideEnvelope {
+        call_key,
+        sender,
+        forms,
+        form
     });
     crate::fuzzing::gen::fields!(StepUsage {
         prompt_tokens,

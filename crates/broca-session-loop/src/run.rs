@@ -2514,6 +2514,13 @@ fn call_options<W: Writer>(
     compacted: bool,
 ) -> Result<CallOptions, LoopError> {
     let mut prompt = writer.conversation().messages.clone();
+    let contract = admission.compaction_plan_version.is_some();
+    // Off the compaction contract a ride renders into its result's copy here, before anything
+    // else edits the results, where today's replay joins it as it reads the ride's record. On
+    // the contract the entries below render it.
+    if !contract {
+        crate::entries::render_rides(&mut prompt, writer.conversation());
+    }
     repetition_guidance(
         &mut prompt,
         episodes,
@@ -2529,7 +2536,6 @@ fn call_options<W: Writer>(
     // A session on the current compaction contract renders its numbers from the entries below;
     // one on the established layout numbers each run's messages by that run's frozen rules, in
     // the order they were placed, as today's loop numbers them, and renders them in place.
-    let contract = admission.compaction_plan_version.is_some();
     let overflow = |_| LoopError::Unsupported("part numbers past the numbering limit");
     if contract {
         TagNumbering::for_run(
@@ -2601,8 +2607,13 @@ fn call_options<W: Writer>(
         .map(crate::entries::project)
         .collect::<Result<Vec<_>, _>>()
         .map_err(LoopError::Parts)?;
-    let prompt = broca_core::compaction_v2::render::deliveries_only(&opts.prompt, &entries)
-        .map_err(LoopError::Parts)?;
+    let rides = crate::entries::ride_envelopes(conversation);
+    let prompt = broca_core::compaction_v2::render::deliveries_only_with_rides(
+        &opts.prompt,
+        &entries,
+        &rides,
+    )
+    .map_err(LoopError::Parts)?;
     let opts = broca_core::compaction_v2::render::options(&opts, prompt);
     Ok(
         broca_core::compaction_v2::systems::view(&opts, &admission.global_system)
