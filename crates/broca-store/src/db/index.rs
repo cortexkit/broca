@@ -3453,6 +3453,7 @@ mod tests {
             error: None,
         };
         let queued = WalRecord::Queued {
+            message_marks: None,
             sent_by: None,
             written_at_ms: None,
             retention: None,

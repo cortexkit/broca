@@ -795,6 +795,7 @@ pub(crate) mod tests {
             seq: 1,
             fence: 1,
             record: WalRecord::RunStarted {
+                message_marks: None,
                 compaction_plan_version: None,
                 sent_by: None,
                 written_at_ms: None,

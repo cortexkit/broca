@@ -1148,6 +1148,7 @@ enum StartRunFailure {
 /// The send key a run or queued submission is admitted under, as its WAL record will carry it.
 #[derive(Debug, Clone, Default)]
 struct SendIdentity {
+    message_marks: Option<broca_protocol::MessageMarks>,
     display_sent_by: Option<broca_protocol::BindPrincipal>,
     conversation_key: Option<String>,
     /// The caller's title, written on the record this send writes (`RunStarted`, `Queued` or
@@ -3320,6 +3321,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     RunKind::FreshOrResume,
                     None,
                     SendIdentity {
+                        message_marks: None,
                         display_sent_by: None,
                         title: None,
                         conversation_key: None,
@@ -3368,6 +3370,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     RunKind::FreshOrResume,
                     None,
                     SendIdentity {
+                        message_marks: None,
                         display_sent_by: None,
                         title: None,
                         conversation_key: None,
@@ -3436,6 +3439,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     RunKind::FreshOrResume,
                     None,
                     SendIdentity {
+                        message_marks: None,
                         display_sent_by: None,
                         title: None,
                         conversation_key: None,
@@ -3579,6 +3583,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     RunKind::FreshOrResume,
                     None,
                     SendIdentity {
+                        message_marks: None,
                         display_sent_by: None,
                         title: None,
                         conversation_key: None,
@@ -4337,6 +4342,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         }
 
         let identity = SendIdentity {
+            message_marks: None,
             display_sent_by: self
                 .admitting_sent_by
                 .clone()
@@ -5027,6 +5033,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                         writer.record(WalRecord::InputTokenCapFrozen { limit });
                     }
                     writer.record(WalRecord::Steered {
+                        message_marks: None,
                         sent_by: identity.display_sent_by,
                         written_at_ms: prepared.at_ms,
                         tags: None,
@@ -5170,6 +5177,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         let input = prepared.input.clone();
         let writer = Arc::clone(self.writer.as_ref().expect("writer live while open"));
         let record = WalRecord::Steered {
+            message_marks: None,
             sent_by: identity.display_sent_by.clone(),
             written_at_ms: prepared.at_ms,
             tags: None,
@@ -5453,6 +5461,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         } = flags;
         let SendIdentity {
             display_sent_by,
+            message_marks,
             conversation_key,
             title,
             send_id,
@@ -5867,6 +5876,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 plane: self.executor.compaction_plane(),
             })),
             display_sent_by,
+            display_message_marks: message_marks,
             // A brand-new log whose plan names a compaction provider starts under the mode-3
             // compaction contract with the view library's current plan version. Sessions with no
             // compaction keep the established log layout. An existing log keeps the mode its
@@ -6263,6 +6273,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         }
         let SendIdentity {
             display_sent_by,
+            message_marks,
             conversation_key,
             title,
             send_id,
@@ -6395,6 +6406,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         request.staged_uploads = None;
         let principal = request.principal.clone();
         let pending = PendingSubmission {
+            message_marks: message_marks.clone(),
             display_sent_by: display_sent_by.clone(),
             admitted_at_ms: prepared.at_ms,
             hooks: hooks.clone(),
@@ -6415,6 +6427,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         // surviving a crash.
         let writer = self.writer.as_ref().expect("writer live while open");
         let queued = writer.record(WalRecord::Queued {
+            message_marks,
             sent_by: display_sent_by,
             written_at_ms: pending.admitted_at_ms,
             retention: self.admitting_retention,
@@ -6880,6 +6893,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         request.staged_uploads = None;
         let SendIdentity {
             display_sent_by,
+            message_marks,
             conversation_key,
             title,
             send_id,
@@ -6888,6 +6902,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         let hooks = prepared.queued_hooks();
         let principal = request.principal.clone();
         let pending = PendingSubmission {
+            message_marks: message_marks.clone(),
             admitted_at_ms: prepared.at_ms,
             display_sent_by: display_sent_by.clone(),
             hooks: hooks.clone(),
@@ -6908,6 +6923,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             unreachable!("an ordered pending entry has an order");
         };
         let queued = WalRecord::Queued {
+            message_marks,
             sent_by: display_sent_by,
             written_at_ms: pending.admitted_at_ms,
             retention: self.admitting_retention,
@@ -8129,6 +8145,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             RunKind::FreshOrResume,
             None,
             SendIdentity {
+                message_marks: None,
                 display_sent_by: None,
                 title: None,
                 conversation_key: None,
@@ -8621,6 +8638,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     // after a restart.
                     SendIdentity {
                         display_sent_by,
+                        message_marks: first.message_marks,
                         conversation_key: first.conversation_key,
                         title: first.title,
                         send_id: first.send_id,
@@ -10728,6 +10746,7 @@ mod tests {
             // normally. The guard's terminal is suppressed by the seam, so this clean
             // return delivers NOTHING to the actor — only the backstop can recover it.
             let _ = job.writer.record(broca_wal::WalRecord::RunStarted {
+                message_marks: None,
                 compaction_plan_version: None,
                 sent_by: None,
                 written_at_ms: None,
@@ -10786,6 +10805,7 @@ mod tests {
         let wal_store = Arc::new(FileWalStore::new(root.join("wal")));
         let mut records = vec![
             WalRecord::RunStarted {
+                message_marks: None,
                 compaction_plan_version: None,
                 sent_by: None,
                 written_at_ms: None,
@@ -10953,6 +10973,7 @@ mod tests {
             let wal_store = Arc::new(FileWalStore::new(root.join("wal")));
             let mut records = vec![
                 WalRecord::RunStarted {
+                    message_marks: None,
                     compaction_plan_version: None,
                     sent_by: None,
                     written_at_ms: None,
@@ -12100,6 +12121,7 @@ mod tests {
             .collect();
         let mut records = vec![
             WalRecord::RunStarted {
+                message_marks: None,
                 compaction_plan_version: None,
                 sent_by: None,
                 written_at_ms: None,
@@ -12509,6 +12531,7 @@ mod tests {
         };
         vec![
             WalRecord::RunStarted {
+                message_marks: None,
                 compaction_plan_version: None,
                 sent_by: None,
                 written_at_ms: None,
@@ -13250,6 +13273,7 @@ mod tests {
             let mut config = min_config();
             config.tools_were_omitted = job.control.tools_were_omitted;
             job.writer.record(WalRecord::RunStarted {
+                message_marks: None,
                 compaction_plan_version: None,
                 sent_by: None,
                 written_at_ms: None,
@@ -13313,6 +13337,7 @@ mod tests {
             _out: mpsc::Sender<OutputEvent>,
         ) -> Result<RunSummary, RunError> {
             let _ = job.writer.record(broca_wal::WalRecord::RunStarted {
+                message_marks: None,
                 compaction_plan_version: None,
                 sent_by: None,
                 written_at_ms: None,
@@ -13381,6 +13406,7 @@ mod tests {
             out: mpsc::Sender<OutputEvent>,
         ) -> Result<RunSummary, RunError> {
             job.writer.record(WalRecord::RunStarted {
+                message_marks: None,
                 compaction_plan_version: None,
                 sent_by: None,
                 written_at_ms: None,
@@ -13611,6 +13637,7 @@ mod tests {
 
             if ordinal == 1 {
                 job.writer.record(WalRecord::RunStarted {
+                    message_marks: None,
                     compaction_plan_version: None,
                     sent_by: None,
                     written_at_ms: None,
@@ -13750,6 +13777,7 @@ mod tests {
         ) -> Result<RunSummary, RunError> {
             let ordinal = self.starts.fetch_add(1, Ordering::SeqCst) + 1;
             job.writer.record(WalRecord::RunStarted {
+                message_marks: None,
                 compaction_plan_version: None,
                 sent_by: None,
                 written_at_ms: None,
@@ -13858,6 +13886,7 @@ mod tests {
             // would discard its held-call metadata before status can observe the live wait.
             if !self.preserve_held_prefix {
                 job.writer.record(WalRecord::RunStarted {
+                    message_marks: None,
                     compaction_plan_version: None,
                     sent_by: None,
                     written_at_ms: None,
@@ -14078,6 +14107,7 @@ mod tests {
         wal.append(
             1,
             &WalRecord::RunStarted {
+                message_marks: None,
                 compaction_plan_version: None,
                 sent_by: None,
                 written_at_ms: None,
@@ -14122,6 +14152,7 @@ mod tests {
         wal.append(
             1,
             &WalRecord::Queued {
+                message_marks: None,
                 sent_by: None,
                 written_at_ms: None,
                 retention: None,
@@ -14691,6 +14722,7 @@ mod tests {
             // The recovery run continues the episode the failed run left open.
             if ordinal <= 2 {
                 job.writer.record(WalRecord::RunStarted {
+                    message_marks: None,
                     compaction_plan_version: None,
                     sent_by: None,
                     written_at_ms: None,
@@ -14930,6 +14962,7 @@ mod tests {
             out: mpsc::Sender<OutputEvent>,
         ) -> Result<RunSummary, RunError> {
             job.writer.record(broca_wal::WalRecord::RunStarted {
+                message_marks: None,
                 compaction_plan_version: None,
                 sent_by: None,
                 written_at_ms: None,
@@ -15310,6 +15343,7 @@ mod tests {
         wal.append(
             1,
             &WalRecord::RunStarted {
+                message_marks: None,
                 compaction_plan_version: None,
                 sent_by: None,
                 written_at_ms: None,
@@ -15404,6 +15438,7 @@ mod tests {
         wal.append(
             1,
             &WalRecord::RunStarted {
+                message_marks: None,
                 compaction_plan_version: None,
                 sent_by: None,
                 written_at_ms: None,
@@ -15733,6 +15768,7 @@ mod tests {
         wal.append(
             1,
             &WalRecord::Queued {
+                message_marks: None,
                 sent_by: None,
                 written_at_ms: None,
                 retention: None,
@@ -15814,6 +15850,7 @@ mod tests {
         wal.append(
             1,
             &WalRecord::Queued {
+                message_marks: None,
                 sent_by: None,
                 written_at_ms: None,
                 retention: None,
@@ -16085,6 +16122,7 @@ mod import_idempotency_tests {
             _out: tokio::sync::mpsc::Sender<OutputEvent>,
         ) -> Result<RunSummary, RunError> {
             job.writer.record(broca_wal::WalRecord::RunStarted {
+                message_marks: None,
                 compaction_plan_version: None,
                 sent_by: None,
                 written_at_ms: None,
@@ -16183,6 +16221,7 @@ mod import_idempotency_tests {
         let writer =
             WalHandle::spawn(wal_store.open(&key).expect("open WAL"), 1).expect("spawn WAL writer");
         writer.record(broca_wal::WalRecord::RunStarted {
+            message_marks: None,
             compaction_plan_version: None,
             sent_by: None,
             written_at_ms: None,
@@ -16923,6 +16962,7 @@ mod owned_cut_tests {
             _out: tokio::sync::mpsc::Sender<OutputEvent>,
         ) -> Result<RunSummary, RunError> {
             job.writer.record(broca_wal::WalRecord::RunStarted {
+                message_marks: None,
                 compaction_plan_version: None,
                 sent_by: None,
                 written_at_ms: None,

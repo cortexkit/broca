@@ -983,6 +983,7 @@ mod tests {
         frame(
             seq,
             WalRecord::RunStarted {
+                message_marks: None,
                 compaction_plan_version: None,
                 sent_by: None,
                 written_at_ms: None,
@@ -1789,6 +1790,7 @@ mod tests {
         frame(
             seq,
             WalRecord::RunStarted {
+                message_marks: None,
                 compaction_plan_version: None,
                 sent_by: None,
                 written_at_ms: None,

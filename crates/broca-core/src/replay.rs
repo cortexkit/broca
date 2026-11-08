@@ -3244,6 +3244,7 @@ fn replay_seeded_with_compaction<'a>(
     // delivery or tag state is synthesized.
     for held in &held_steers {
         let synthetic = WalRecord::Steered {
+            message_marks: None,
             sent_by: None,
             written_at_ms: None,
             input: vec![held.clone()].into(),
@@ -5669,6 +5670,7 @@ pub(crate) mod projection_boundary_tests {
         framed(
             seq,
             WalRecord::RunStarted {
+                message_marks: None,
                 compaction_plan_version: None,
                 sent_by: None,
                 written_at_ms: None,
@@ -7088,6 +7090,7 @@ mod offset_tail_tests {
 
     fn run_started(run_id: &str, input: Vec<Message>) -> WalRecord {
         WalRecord::RunStarted {
+            message_marks: None,
             compaction_plan_version: None,
             sent_by: None,
             written_at_ms: None,
@@ -7130,6 +7133,7 @@ mod offset_tail_tests {
 
     fn steered(text: &str) -> WalRecord {
         WalRecord::Steered {
+            message_marks: None,
             sent_by: None,
             written_at_ms: None,
             tags: None,
@@ -7955,6 +7959,7 @@ mod offset_tail_tests {
         );
         // A queued record, and a steered record, held before unfinished tool work.
         let queued = WalRecord::Queued {
+            message_marks: None,
             sent_by: None,
             written_at_ms: None,
             retention: None,

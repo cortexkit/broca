@@ -6820,6 +6820,8 @@ mod tests {
             lineage_id: None,
             messages: vec![
                 SessionReadMessage {
+                    speaks_for: None,
+                    notice: false,
                     sender: None,
                     notices: Vec::new(),
                     created_at: None,
@@ -6846,6 +6848,8 @@ mod tests {
                     part_digests: None,
                 },
                 SessionReadMessage {
+                    speaks_for: None,
+                    notice: false,
                     sender: None,
                     notices: Vec::new(),
                     created_at: None,
@@ -8206,6 +8210,7 @@ mod tests {
     async fn refused_replacement_goodbye_preserves_published_route_and_stream() {
         let session = BrocaBindIdentity::new("/tmp/project-a", "runner", "published");
         let record = broca_wal::WalRecord::RunStarted {
+            message_marks: None,
             compaction_plan_version: None,
             sent_by: None,
             written_at_ms: None,

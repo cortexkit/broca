@@ -77,6 +77,7 @@ fn run_config() -> RunConfig {
 /// The ONE atomic run-start record (config + input).
 fn start(run: &str, text: &str) -> WalRecord {
     WalRecord::RunStarted {
+        message_marks: None,
         compaction_plan_version: None,
         sent_by: None,
         written_at_ms: None,
@@ -814,6 +815,7 @@ async fn resume_completes_partial_batch_redispatching_only_missing_call() {
         let mut wal = FileWal::open(&wal_path).unwrap();
         let recs = vec![
             WalRecord::RunStarted {
+                message_marks: None,
                 compaction_plan_version: None,
                 sent_by: None,
                 written_at_ms: None,
@@ -1939,6 +1941,7 @@ async fn append_seals_an_inferred_natural_end_before_starting_the_next_episode()
     let mut file = wal.open(&session).expect("open WAL for crash cut");
     let crash_cut = [
         WalRecord::RunStarted {
+            message_marks: None,
             compaction_plan_version: None,
             sent_by: None,
             written_at_ms: None,
@@ -2041,6 +2044,7 @@ async fn append_seals_an_inferred_hard_stop_before_starting_the_next_episode() {
     let mut file = wal.open(&session).expect("open WAL for hard-stop cut");
     let crash_cut = [
         WalRecord::RunStarted {
+            message_marks: None,
             compaction_plan_version: None,
             sent_by: None,
             written_at_ms: None,
@@ -2543,6 +2547,7 @@ async fn cross_episode_resume_is_exactly_once() {
         let mut wal = FileWal::open(&wal_path).unwrap();
         let recs = vec![
             WalRecord::RunStarted {
+                message_marks: None,
                 compaction_plan_version: None,
                 sent_by: None,
                 written_at_ms: None,
@@ -3190,6 +3195,7 @@ fn budgeted_start(run: &str) -> WalRecord {
             submission_id,
             ..
         } => WalRecord::RunStarted {
+            message_marks: None,
             compaction_plan_version: None,
             sent_by: None,
             written_at_ms: None,
@@ -3537,6 +3543,7 @@ async fn a_new_episode_appends_onto_a_lineage_sealed_by_an_interrupt() {
         w.append(
             1,
             &WalRecord::RunStarted {
+                message_marks: None,
                 compaction_plan_version: None,
                 sent_by: None,
                 written_at_ms: None,

@@ -520,8 +520,17 @@ pub fn reader_notices(
                     return Err("notice has no durable delivery source".into());
                 };
                 rows.entry(ordinal).or_default().push(ProjectedNotice {
-                    fact: NoticeFact::new(notice.part, notice.send_id, notice.sender, notice.text)
-                        .with_call_key(notice.call_key),
+                    fact: {
+                        let mut fact = NoticeFact::new(
+                            notice.part,
+                            notice.send_id,
+                            notice.sender,
+                            notice.text,
+                        )
+                        .with_call_key(notice.call_key);
+                        fact.speaks_for = notice.speaks_for;
+                        fact
+                    },
                     submission_id: submission_id.0.clone(),
                 });
             }
@@ -1237,16 +1246,17 @@ fn project_control_record<S: ControlProjectionSink>(
                 if let Some(text) = text.strip_prefix("\n\n") {
                     record_sink.boundary(ordinal, || {
                         key.map(|key| {
-                            LiveEvent::NoticeDelivered(
-                                live::NoticeDelivered::new(
-                                    format!("m{ordinal}"),
-                                    part,
-                                    key,
-                                    send_id,
-                                    sender,
-                                )
-                                .with_text(text),
+                            let mut notice = live::NoticeDelivered::new(
+                                format!("m{ordinal}"),
+                                part,
+                                key,
+                                send_id,
+                                sender,
                             )
+                            .with_text(text);
+                            notice.speaks_for =
+                                ride.as_ref().and_then(|ride| ride.speaks_for.clone());
+                            LiveEvent::NoticeDelivered(notice)
                         })
                         .unwrap_or(LiveEvent::DisplayReset)
                     });
@@ -1975,7 +1985,7 @@ mod notice_origin_tests {
             json!({"type":"queued","submission_id":"sub","send_id":"send","sent_by":{"kind":"reserved","module_id":"m"},"request":{"model":{"provider_module_id":"fake","model_id":"fake"},"input":[]}}),
             json!({"type":"tool_result","batch_id":"b","result":{"tool_call_id":"call","output":{"kind":"text","text":"output"},"is_error":false},"outcome":"completed"}),
             json!({"type":"tool_batch_finished","batch_id":"b"}),
-            json!({"type":"send_delivered","submission_id":"sub","run_id":"run","mode":"tool_result","tool_call_id":"call","appended_text":"\n\nnote","ride":{"call_key":"lineage:3","send_id":"send","sender":"m","forms":["tool_result"],"form":"append"}}),
+            json!({"type":"send_delivered","submission_id":"sub","run_id":"run","mode":"tool_result","tool_call_id":"call","appended_text":"\n\nnote","ride":{"call_key":"lineage:3","send_id":"send","sender":"m","speaks_for":{"agent_id":"Ada"},"forms":["tool_result"],"form":"append"}}),
         ];
         let frames: Vec<_> = values
             .into_iter()
@@ -1989,6 +1999,22 @@ mod notice_origin_tests {
         let mut state = ControlProjectionState::default();
         let projected = project_control_with_mids(&frames, &mut state).unwrap();
         assert!(state.notice_sends.is_empty());
+        let event = projected
+            .iter()
+            .find_map(|frame| match &frame.event {
+                cortexkit_role_llm_runner::live::LiveEvent::NoticeDelivered(notice) => Some(notice),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(event.speaks_for.as_ref().unwrap().agent_id, "Ada");
+        let bounded: Vec<_> = frames
+            .iter()
+            .filter(|frame| !matches!(frame.record, WalRecord::Queued { .. }))
+            .cloned()
+            .collect();
+        let notices = reader_notices(&bounded, None).unwrap();
+        let notice = notices.values().flatten().next().unwrap();
+        assert_eq!(notice.fact.speaks_for.as_ref().unwrap().agent_id, "Ada");
         assert_eq!(
             projected
                 .iter()
