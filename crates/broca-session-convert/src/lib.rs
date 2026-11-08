@@ -42,9 +42,12 @@ pub mod entry_facts;
 /// The inverse lives with the new run loop, where a session's media fold reads it too.
 pub use broca_session_loop::inverse;
 pub mod measure;
+pub mod preconditions;
 pub mod read_cost;
 pub mod split;
+pub mod stage;
 pub mod stored_history;
+pub mod verify;
 
 /// A count of old records, fields or values, and their stored JSON size.
 #[derive(Debug, Default, Clone, Copy, serde::Serialize)]
@@ -1854,6 +1857,8 @@ mod inverse_tests;
 mod marks_tests;
 #[cfg(test)]
 mod read_cost_tests;
+#[cfg(test)]
+mod stage_tests;
 #[cfg(test)]
 mod summaries_tests;
 #[cfg(test)]

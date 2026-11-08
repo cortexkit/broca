@@ -606,6 +606,33 @@ fn tree_shrinks_and_members_equal_prefold_digests() {
     }
 }
 
+/// A session the new session storage holds, or that a move is taking there, keeps its WAL
+/// where it is: the fold never archives and retires the copy a move reads or has retired.
+#[test]
+fn fold_leaves_the_wals_of_sessions_the_new_storage_owns_live() {
+    let f = Fixture::new();
+    let (held, held_bytes) = f.session("held", Some(1));
+    let (moving, moving_bytes) = f.session("moving", Some(1));
+    let (cold, _) = f.session("cold", Some(1));
+    let head = broca_wal::session_storage_head(&f.root, &session_addr(&held));
+    fs::create_dir_all(head.parent().unwrap()).unwrap();
+    fs::write(&head, b"head").unwrap();
+    // A move journal claims its session by existing.
+    let journal = broca_wal::session_storage_move_journal(&f.root, &session_addr(&moving));
+    fs::create_dir_all(journal.parent().unwrap()).unwrap();
+    fs::write(&journal, b"{}").unwrap();
+    let report = f.fold();
+    assert_eq!(report.removed, 1, "only today's cold session is archived");
+    assert!(!f.store.wal_path(&cold).exists());
+    let mut fenced = report.skipped["move_fenced"].clone();
+    fenced.sort();
+    let mut owned = vec![session_addr(&held), session_addr(&moving)];
+    owned.sort();
+    assert_eq!(fenced, owned);
+    assert_eq!(fs::read(f.store.wal_path(&held)).unwrap(), held_bytes);
+    assert_eq!(fs::read(f.store.wal_path(&moving)).unwrap(), moving_bytes);
+}
+
 #[test]
 fn excluded_classes_have_exact_membership_and_report_only_writes_nothing() {
     let f = Fixture::new();

@@ -36,6 +36,7 @@ cipher_tests!(
     a_steered_photo_renders_alike,
     a_run_after_a_restart_renders_an_earlier_photo_alike,
     a_tool_image_renders_alike_after_a_restart,
+    an_input_photo_and_a_tool_image_render_offline_as_sent,
     a_photo_whose_bytes_cant_be_read_refuses_alike_and_nothing_is_sent,
     a_run_after_a_view_drops_a_photo_renders_alike,
     a_photo_between_numbered_messages_renders_alike,
@@ -990,6 +991,125 @@ async fn a_tool_image_renders_alike_after_a_restart(cipher: Cipher) {
         side.side.idle().await;
     }
     sent_alike(&today, &store, "the first run after the restart");
+}
+
+/// [`with_photo_tool`], sent by core: a session whose runs may get a tool's image and whose user
+/// sends a photo core uploaded.
+fn photo_tool_by_core(text: &str) -> SubmissionRequest {
+    let mut sent = with_photo_tool(text);
+    sent.principal = Some(super::core());
+    sent
+}
+
+/// The first request of a session's latest run, rendered offline from the new storage: the
+/// session as the run holds it and its own media objects (`store_media::offline_render`). For a
+/// session holding a tool's image and a photo the user sent, that must be the bytes the store
+/// side's model was asked to send, which are the bytes today's side sent for the same sends. So
+/// a session checked offline (as a move checks the copy it writes) is checked against the request
+/// its run really renders.
+async fn an_input_photo_and_a_tool_image_render_offline_as_sent(cipher: Cipher) {
+    use futures::FutureExt as _;
+    let steps = vec![
+        text_step("a1", "hello"),
+        photo_step("a2"),
+        text_step("a3", "I see it"),
+        text_step("a4", "a photo"),
+    ];
+    let (today, store) = both_from(steps, true, photo_tool_by_core("first"), cipher).await;
+    for side in [&today, &store] {
+        side.side.release_to_idle().await;
+        let sent = side.side.send("r2", photo_tool_by_core("show me")).await;
+        assert!(matches!(sent, SendOutcome::Active { .. }), "{sent:?}");
+        side.side.release_to_idle().await;
+        // A release that found no step waiting leaves a permit; the photo's run must wait.
+        let gate = side.side.gate.as_ref().unwrap();
+        let _ = gate.notified().now_or_never();
+        let before = side.sent().len();
+        let upload = side.side.uploaded(&bytes_of(PNG)).await;
+        let mut photo = photo_tool_by_core("look");
+        photo.content = super::media::photo("look", &[&upload]).content;
+        let sent = side
+            .side
+            .deliver("r3", photo, broca_protocol::Delivery::Queue)
+            .await;
+        assert!(matches!(sent, SendOutcome::Active { .. }), "{sent:?}");
+        broca_test_support::wait_until("the photo run's request is rendered", || async {
+            if side.sent().len() > before {
+                Ok(())
+            } else {
+                Err("not yet".to_owned())
+            }
+        })
+        .await;
+    }
+    let image = base64(&bytes_of(PNG));
+    let last = |side: &Rendered| side.sent().last().unwrap().clone().unwrap();
+    assert!(String::from_utf8_lossy(&last(&today)).contains(&image));
+    let text = String::from_utf8_lossy(&last(&today)).into_owned();
+    assert_eq!(
+        text.matches(&image).count(),
+        2,
+        "the request carries the tool's image and the user's photo"
+    );
+
+    // The new storage's: the session as its run holds it now, and its own media objects.
+    use broca_session_store::backend::{LocalBackend, SessionAddr};
+    let root = store.side.dir.join(broca_wal::SESSION_STORAGE_DIR);
+    let deployment = broca_session_store::keys::DeploymentKey::new(1, &[7; 32]).creating(cipher);
+    let key = &store.side.key;
+    let view = broca_session_store::session::Session::view(
+        LocalBackend::new(&root),
+        SessionAddr(broca_core::session_addr(key)),
+        &broca_session_store::head::SessionTriple {
+            project_root: key.project_root.to_string_lossy().into_owned(),
+            harness: key.harness.clone(),
+            session: key.session.clone(),
+        },
+        &deployment,
+    )
+    .await
+    .unwrap();
+    let setup = LocalBackend::new(&root);
+    let parts = broca_session_loop::parts::DeploymentParts::loaded(
+        broca_session_store::setup::SetupStore::new(
+            &setup,
+            &deployment.setup_key_for(cipher).unwrap(),
+        )
+        .load_all()
+        .await
+        .unwrap(),
+    );
+    // The render config and tag choice the run froze.
+    let start = view
+        .operations
+        .run
+        .as_ref()
+        .and_then(|run| run.start.as_ref())
+        .expect("the photo's run is under way");
+    let config = broca_session_loop::run::run_config_of_start(start, &parts).unwrap();
+    let frozen: broca_provider::wire::FrozenRenderConfig =
+        serde_json::from_value(config.frozen_render_config.clone()).unwrap();
+    let body = crate::store_media::offline_render(
+        &view,
+        LocalBackend::new(&root),
+        &parts,
+        key,
+        1,
+        &frozen,
+        config.render_tags,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(
+        body == last(&store),
+        "the new storage's offline render is the request sent"
+    );
+    drop(view);
+    sent_alike(&today, &store, "the photo run's request");
+    for side in [&today, &store] {
+        side.side.release_to_idle().await;
+    }
 }
 
 /// Media files under `dir` holding the image: today's media store object and the new storage's

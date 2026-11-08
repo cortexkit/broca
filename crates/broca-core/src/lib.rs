@@ -178,9 +178,9 @@ pub use stub_plane::{StubEvent, StubReply, StubToolPlane};
 pub use tags::LineageTags;
 pub use tool_plane::{BatchCtx, DispatchResult, ToolPlane, ToolPlaneError};
 pub use wal_writer::{
-    agent_session_ref, session_addr, FileWalStore, ObservedRecord, ReadOnlyWalReader,
-    RecordObserver, RecordOutcome, SessionRefIndex, WalHandle, WalOpenError, WalStore,
-    WalWriteError, WAL_MANIFEST_FILENAME,
+    agent_session_ref, is_session_storage_refusal, session_addr, session_storage_refusal,
+    FileWalStore, ObservedRecord, ReadOnlyWalReader, RecordObserver, RecordOutcome,
+    SessionRefIndex, WalHandle, WalOpenError, WalStore, WalWriteError, WAL_MANIFEST_FILENAME,
 };
 pub use wal_writer::{
     session_projection_incomplete, ProjectionAdmission, ProjectionRepair,

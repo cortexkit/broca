@@ -84,20 +84,24 @@ pub(crate) fn principal_label(principal: Option<&broca_protocol::BindPrincipal>)
     principal.map_or_else(|| UNATTESTED.clone(), |p| Arc::from(p.as_owner_string()))
 }
 
+/// Every operation the census records readers of.
+pub(crate) const OPERATIONS: [&str; 10] = [
+    "session.read",
+    "session.history",
+    "session.head",
+    "session.subscribe",
+    "run.status",
+    "run.result",
+    "run.tool_calls",
+    "send.status",
+    "session.send_status",
+    "session.media_read",
+];
+
 pub(crate) fn operation(method: &str) -> Option<&'static str> {
-    match method {
-        "session.read" => Some("session.read"),
-        "session.history" => Some("session.history"),
-        "session.head" => Some("session.head"),
-        "session.subscribe" => Some("session.subscribe"),
-        "run.status" => Some("run.status"),
-        "run.result" => Some("run.result"),
-        "run.tool_calls" => Some("run.tool_calls"),
-        "send.status" => Some("send.status"),
-        "session.send_status" => Some("session.send_status"),
-        "session.media_read" => Some("session.media_read"),
-        _ => None,
-    }
+    OPERATIONS
+        .into_iter()
+        .find(|operation| *operation == method)
 }
 
 pub(crate) fn record(principal: Option<&Arc<str>>, op: &'static str, owner: Option<bool>) {

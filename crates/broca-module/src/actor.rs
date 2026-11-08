@@ -156,8 +156,8 @@ pub struct CutLockReply {
     pub busy: Option<String>,
     /// Dropping or signalling this ends the cut's critical section for the actor.
     pub release: oneshot::Sender<()>,
-    /// Set when an idle owned-tenure actor retired for a mutating cut: it closed its
-    /// writer and will not resume when released.
+    /// Set when an idle actor retired for a mutating cut: it closed its writer and will not
+    /// resume when released.
     pub retired: Option<RetiredForCut>,
 }
 
@@ -165,10 +165,23 @@ pub struct CutLockReply {
 pub struct RetiredForCut {
     /// The session lease, handed over only after the writer's descriptor is gone.
     /// `None` when the writer could not be closed and joined cleanly.
-    pub tenure: Option<broca_core::wal_writer::ClosedWriterTenure>,
+    pub tenure: Option<CutTenure>,
     /// The close of the actor's registry slot, already `Closing`. The cut commits it
     /// when it releases its gates, so the slot is absent before anyone else gets in.
     pub close: crate::registry::CloseToken,
+}
+
+/// The session lease a retired actor hands to a cut. Only the actor builds one, once its
+/// writer was joined and its WAL closed, so holding one proves no writer of the session is
+/// live. It can only keep the session locked: dropping it releases the lease.
+pub struct CutTenure(#[allow(dead_code)] CutLease);
+
+enum CutLease {
+    /// The lease the writer task owned, which its close handed back.
+    Writer(#[allow(dead_code)] broca_core::wal_writer::ClosedWriterTenure),
+    /// The lease the actor held itself, beside its writer: an actor opened without an owned
+    /// writer tenure, as a legacy state root opens every actor.
+    Actor(#[allow(dead_code)] Box<dyn LeaseHandle>),
 }
 
 /// Who holds the session lease while an actor serves its session.
@@ -197,7 +210,7 @@ struct WriterClosed {
 pub enum LineageCmd {
     /// Pause dispatch while the cut holds its actor critical section. The reply
     /// carries a release channel whose drop also unblocks a cancelled operation.
-    /// A mutating cut may instead retire an idle owned-tenure actor; see
+    /// A mutating cut may instead retire an idle actor; see
     /// [`crate::registry::CutLockMode`].
     CutLock {
         reply: oneshot::Sender<CutLockReply>,
@@ -2584,11 +2597,17 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     Err(_) => Some("unknown".into()),
                 }
             };
-            if busy.is_none()
-                && mode == crate::registry::CutLockMode::Mutate
-                && !self.restart_admitting
-                && matches!(self.lease, Some(ActorTenure::InWriter))
-            {
+            // A cut that may publish markers retires an idle actor whose writer owns its
+            // tenure. A cut that takes the session out of today's storage retires any idle
+            // actor, whichever holds its lease.
+            let retires = match mode {
+                crate::registry::CutLockMode::Inspect => false,
+                crate::registry::CutLockMode::Mutate => {
+                    matches!(self.lease, Some(ActorTenure::InWriter))
+                }
+                crate::registry::CutLockMode::Retire => self.lease.is_some(),
+            };
+            if busy.is_none() && retires && !self.restart_admitting {
                 return self.retire_for_cut(reply).await;
             }
             let (release, wait) = oneshot::channel();
@@ -9972,12 +9991,24 @@ impl<W: WalStore + 'static> LineageActor<W> {
             self.executor.on_session_close(&self.key),
         )
         .await;
-        // The lease is in `closed.tenure` now (or still with an unjoined writer), so this
-        // generation holds nothing that a later teardown could release again.
-        drop(self.lease.take());
+        // The lease is in `closed.tenure` now (or still with an unjoined writer) when the
+        // writer owned it. A lease the actor held itself is handed over only once its writer
+        // was joined; after a close that wasn't clean it is released as an ordinary close
+        // releases it. Either way this generation holds nothing a later teardown could
+        // release again.
+        let tenure = match (closed.tenure, self.lease.take()) {
+            (Some(writer), _) => Some(CutTenure(CutLease::Writer(writer))),
+            (None, Some(ActorTenure::Lease(lease))) if closed.clean => {
+                Some(CutTenure(CutLease::Actor(lease)))
+            }
+            (None, held) => {
+                drop(held);
+                None
+            }
+        };
         // A failed final sync or a writer that could not be joined leaves the session's
         // durable state unproven, so the cut must not move it this time.
-        let busy = (!closed.clean || closed.tenure.is_none()).then(|| "unknown".to_string());
+        let busy = (!closed.clean || tenure.is_none()).then(|| "unknown".to_string());
         // If the cut has gone away, dropping the unsent reply releases the lease and
         // commits the slot closed (an unresolved close token commits on drop).
         if reply
@@ -9985,7 +10016,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 busy,
                 release,
                 retired: Some(RetiredForCut {
-                    tenure: closed.tenure,
+                    tenure,
                     close: close_token,
                 }),
             })
@@ -17614,6 +17645,45 @@ mod owned_cut_tests {
         );
         assert!(rig.lease_held());
         assert_eq!(std::fs::read(&path).ok(), before);
+        assert!(rig.registry.stop_and_seal().await);
+    }
+
+    /// A cut that takes the session out of today's storage retires an idle actor that holds
+    /// its own lease too: the actor closes its writer and hands its lease to the guard, with no
+    /// moment the lease is free, and its slot is gone once the guard is released. A send that
+    /// reached the retired generation meanwhile is re-routed, never acknowledged by it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_retiring_cut_takes_an_idle_legacy_lease_actors_lease() {
+        let rig = Rig::legacy("legacy-retire");
+        let old = rig.registry.actor_for(&rig.session).await.unwrap();
+        assert!(rig.lease_held());
+        let path = rig.wal.wal_path(&rig.session);
+        let before = std::fs::read(&path).ok();
+
+        let guard = rig.lock(CutLockMode::Retire).await;
+        assert_eq!(guard.busy[0].1, None, "the idle actor reports idle");
+        assert!(
+            guard.holds_tenure(&rig.session),
+            "the actor handed its own lease"
+        );
+        assert_eq!(rig.registry.slot_state(&rig.session), Some("closing"));
+        assert!(
+            rig.lease_held(),
+            "the lease never became free during the handoff"
+        );
+        let (reply, sent) = tokio::sync::oneshot::channel();
+        let reached = old.send(send_cmd(reply)).await.is_ok();
+        assert_eq!(std::fs::read(&path).ok(), before, "the WAL is unchanged");
+        drop(guard);
+
+        assert_eq!(rig.registry.slot_state(&rig.session), None);
+        assert!(!rig.lease_held(), "the guard released the lease");
+        if reached {
+            assert!(matches!(sent.await, Ok(SendOutcome::Reopen) | Err(_)));
+        }
+        let fresh = rig.registry.actor_for(&rig.session).await.unwrap();
+        assert_ne!(fresh.gen, old.gen, "the retired generation is never reused");
+        assert!(rig.lease_held(), "the new generation took the lease");
         assert!(rig.registry.stop_and_seal().await);
     }
 

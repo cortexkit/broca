@@ -1513,6 +1513,28 @@ pub async fn offline_request<W: Writer>(
     bind: &broca_protocol::BindIdentity,
     step_id: u64,
 ) -> Result<CallOptions, LoopError> {
+    offline_request_for(writer, parts, bind, step_id, false).await
+}
+
+/// [`offline_request`] for a run whose provider renders media: each message holding media is
+/// left untagged, as the run loop leaves it for a media renderer that tags its own copy of the
+/// request after preparing the media.
+pub async fn offline_media_request<W: Writer>(
+    writer: &W,
+    parts: &dyn Parts,
+    bind: &broca_protocol::BindIdentity,
+    step_id: u64,
+) -> Result<CallOptions, LoopError> {
+    offline_request_for(writer, parts, bind, step_id, true).await
+}
+
+async fn offline_request_for<W: Writer>(
+    writer: &W,
+    parts: &dyn Parts,
+    bind: &broca_protocol::BindIdentity,
+    step_id: u64,
+    defer_media_tags: bool,
+) -> Result<CallOptions, LoopError> {
     refuse_first_protocol_compaction(writer)?;
     let run = writer
         .operations()
@@ -1542,7 +1564,7 @@ pub async fn offline_request<W: Writer>(
         None,
         step_id,
         compacted,
-        false,
+        defer_media_tags,
         enrollment.as_ref(),
     )?;
     if !compacted {

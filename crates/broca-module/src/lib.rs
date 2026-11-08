@@ -10,6 +10,7 @@
 
 pub mod actor;
 pub mod cache;
+pub mod claude_code_identity;
 mod compaction_watch;
 pub mod diagnostics;
 pub mod executor;
@@ -46,7 +47,9 @@ mod store_plan_change;
 pub mod store_read;
 pub mod store_reads;
 pub mod store_status;
+pub mod store_tool_calls;
 mod uploads;
+pub mod wal_render;
 
 pub use cache::{CacheDeclaration, CacheDeclarer};
 pub use executor::{RunExecutor, RunJob, RunKind, SealedRun, WarmBase, WarmError, WarmJob};

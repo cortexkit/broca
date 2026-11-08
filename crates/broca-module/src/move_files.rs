@@ -643,6 +643,31 @@ impl CutArtifacts for FileCutArtifacts {
         let cut_id = cut_id(request)?;
         let locked = self.locked(&cut_id)?;
         let op = request.op();
+        // A session the new session storage owns, or that a move is taking there, isn't
+        // today's to hand over: its WAL is the copy being moved, or the retired one.
+        if op == Op::Prepare {
+            for plan in &locked.plans {
+                match self
+                    .wal
+                    .store_owner_refusal(&plan.session)
+                    .map_err(unavailable)?
+                {
+                    None => {}
+                    Some(broca_wal::WalError::SessionMoving { .. }) => {
+                        return Err(unavailable(
+                            "source session is moving into the new session storage",
+                        ))
+                    }
+                    Some(_) => {
+                        return Err(refusal(
+                            "not_exportable",
+                            "source session is kept in the new session storage",
+                            Value::Null,
+                        ))
+                    }
+                }
+            }
+        }
         if matches!(op, Op::Prepare | Op::Import | Op::Activate) {
             for plan in &locked.plans {
                 if retained_move_copy(self.wal.as_ref(), &plan.session)? {

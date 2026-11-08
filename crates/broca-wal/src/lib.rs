@@ -20,6 +20,7 @@ pub mod fs_ops;
 pub mod head_proof;
 pub mod record;
 pub mod recovery;
+pub mod session_storage;
 pub mod state_format;
 
 pub use file_wal::{
@@ -60,6 +61,10 @@ pub use record::{
     ACCOUNT_DECISION_DISABLED, ACCOUNT_DECISION_LEGACY_STATIC, ACCOUNT_DECISION_PINNED,
     ACCOUNT_DECISION_ROUTED, ACCOUNT_DECISION_SINGLE_CANDIDATE, ACCOUNT_DECISION_UNREACHABLE,
     ACCOUNT_DECISION_UNSUPPORTED, MAX_REPLACEMENT_BYTES,
+};
+pub use session_storage::{
+    owned_by_store, session_storage_move_journal, store_ownership, FrozenPrefix, MoveJournal,
+    StoreOwnership, MOVE_JOURNAL_DIR,
 };
 pub use state_format::{classify_state_root, StateRootError, WalConfig, WalFormat};
 // `PauseReason` is shared caller/WAL vocabulary; it lives in `broca-protocol` (like

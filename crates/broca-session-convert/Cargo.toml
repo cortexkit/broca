@@ -19,7 +19,6 @@ broca-fetch-plan = { path = "../broca-fetch-plan" }
 # Today's offline request renderer (`wal_render`), which the `render` check compares the new run
 # loop's rebuilt requests with.
 broca-module = { path = "../broca-module" }
-broca-module-serve = { path = "../broca-module-serve" }
 broca-protocol = { path = "../broca-protocol" }
 broca-provider = { path = "../broca-provider" }
 broca-session-loop = { path = "../broca-session-loop" }
@@ -41,4 +40,5 @@ zstd = "0.14"
 futures = { workspace = true, features = ["executor"] }
 
 [dev-dependencies]
+broca-test-support = { path = "../broca-test-support" }
 tokio = { workspace = true, features = ["test-util"] }

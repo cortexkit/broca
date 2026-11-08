@@ -107,20 +107,35 @@ impl Rig {
             wal.clone(),
             executor.clone(),
         );
+        let mut runtime = None;
         if store {
-            let runtime = broca_module::store_open::StoreRuntime::open(
-                &dir,
-                broca_session_store::keys::DeploymentKey::new(1, &[7; 32]),
-                executor,
-                Duration::from_millis(100),
-            )
-            .await
-            .unwrap();
-            opener = opener.with_store_runtime(Arc::new(runtime));
+            let opened = Arc::new(
+                broca_module::store_open::StoreRuntime::open(
+                    &dir,
+                    broca_session_store::keys::DeploymentKey::new(1, &[7; 32]),
+                    executor,
+                    Duration::from_millis(100),
+                )
+                .await
+                .unwrap(),
+            );
+            opener = opener.with_store_runtime(opened.clone());
+            runtime = Some(opened);
         }
-        let mut registry = LineageRegistry::new_with_reader(Arc::new(opener), wal, None);
-        if store {
+        let mut registry = LineageRegistry::new_with_reader(Arc::new(opener), wal.clone(), None);
+        if let Some(runtime) = runtime {
             registry = registry.with_store_new_sessions();
+            // Moves are refused by precondition 1 until the new storage serves every
+            // operation the move requires, read from the serve layer's own allowlist.
+            let mover = broca_module_serve::store_move::StoreMove::new(
+                registry.clone(),
+                &dir,
+                Arc::new(broca_module::store_open::StoreSlot::loaded(runtime)),
+                wal,
+                Arc::new(FileLeaseStore::new(dir.join("leases"))),
+                broca_module_serve::store_move::served_by_serve_layer(),
+            );
+            registry.set_store_mover(Arc::new(mover));
         }
         // A bind resolves the session's address through the deployment's inventory, which
         // today's store keeps.
@@ -416,7 +431,8 @@ async fn a_module_without_the_new_storage_refuses_file_imports_by_name() {
 
 /// On a session kept in the new storage, an op with no store implementation yet is refused by
 /// name before authorization reads anything, never with today's storage's advice to run a newer
-/// build. `role.describe` still answers on the session's route. Cancels are authorized from the
+/// build. `run.tool_calls` is served from the store: a run the session never started is unknown.
+/// `role.describe` still answers on the session's route. Cancels are authorized from the
 /// stored owner: a stranger is refused as not the owner, and the owner's cancel is answered.
 #[tokio::test]
 async fn a_store_session_refuses_unbuilt_ops_by_name_and_checks_owners_from_the_store() {
@@ -425,14 +441,16 @@ async fn a_store_session_refuses_unbuilt_ops_by_name_and_checks_owners_from_the_
     let params = rig.import_params("imp-1");
     rig.result(1, "session.import", params).await;
 
-    for method in ["run.tool_calls", "session.baseline"] {
-        assert_eq!(
-            rig.refused(1, method, serde_json::json!({"run_id": "r1"}))
-                .await,
-            "not_served_on_new_storage",
-            "{method}"
-        );
-    }
+    assert_eq!(
+        rig.refused(1, "session.baseline", serde_json::json!({"run_id": "r1"}))
+            .await,
+        "not_served_on_new_storage"
+    );
+    assert_eq!(
+        rig.refused(1, "run.tool_calls", serde_json::json!({"run_id": "r1"}))
+            .await,
+        broca_wire::UNKNOWN_RUN
+    );
     // Run status is served from the store. With no run named it is the session's status, idle
     // once the import's own run has ended.
     let idle = rig.result(1, "run.status", serde_json::json!({})).await;
@@ -491,5 +509,46 @@ async fn a_store_session_refuses_unbuilt_ops_by_name_and_checks_owners_from_the_
     assert!(
         !body.contains("wal_newer_writer") && !body.contains("not_served_on_new_storage"),
         "the owner's cancel reaches the store actor: {body}"
+    );
+}
+
+/// `session.move_to_store` through real dispatch. Only the operator's own connection may call
+/// it. The new storage serves every operation a move requires, so precondition 1 passes; a
+/// session with no WAL on today's storage then has nothing to move, and the move refuses
+/// `not_movable {no_live_wal}`, writing nothing. The full move is
+/// `store_move_serve::a_live_session_moves_to_the_new_storage_and_keeps_serving`.
+#[tokio::test]
+async fn a_move_is_operator_only_and_refuses_a_session_with_no_wal() {
+    let mut rig = Rig::start("move-to-store", true).await;
+    rig.bind(1, core(), None).await;
+    assert_eq!(
+        rig.refused(1, "session.move_to_store", serde_json::json!({}))
+            .await,
+        "operator_required"
+    );
+    rig.bind(2, Principal::Direct, None).await;
+    let reply = rig
+        .request(
+            2,
+            serde_json::json!({"method": "session.move_to_store", "params": {}}),
+        )
+        .await;
+    assert_eq!(reply.header.ty, FrameType::Error);
+    let body: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+    let served = broca_module_serve::store_move::served_by_serve_layer();
+    assert!(
+        broca_module_serve::store_move::REQUIRED_OPERATIONS
+            .iter()
+            .all(|op| served(op)),
+        "the new storage serves every operation a move requires"
+    );
+    assert_eq!(body["code"], "not_movable", "{body}");
+    assert_eq!(body["detail"]["reason"], "no_live_wal", "{body}");
+    assert!(
+        !rig.dir
+            .join(broca_wal::SESSION_STORAGE_DIR)
+            .join(broca_wal::MOVE_JOURNAL_DIR)
+            .exists(),
+        "a refused move writes no journal"
     );
 }

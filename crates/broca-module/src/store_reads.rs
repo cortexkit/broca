@@ -43,6 +43,8 @@ pub enum StoreReadRequest {
     RunStatusReply(RunId),
     /// `run.result`.
     RunResult(RunId),
+    /// `run.tool_calls`.
+    RunToolCalls(cortexkit_role_llm_runner::tool_calls::ToolCallsRequest),
     /// `send.status` and `session.send_status`.
     SendStatus {
         own_run: RunId,
@@ -133,6 +135,7 @@ pub enum StoreReadReply {
     RunStatus(Result<broca_wire::RunStatusResponse, ServeError>),
     RunStatusReply(Result<broca_wire::RunStatusReply, ServeError>),
     RunResult(Result<broca_wire::RunResultResponse, ServeError>),
+    RunToolCalls(Result<cortexkit_role_llm_runner::tool_calls::ToolCallsPage, ServeError>),
     SendStatus(Result<broca_wire::SendReplyWire, ServeError>),
     Head(Result<Box<crate::store_head::StoreHead>, ServeError>),
     Page(Result<PageAnswer, ServeError>),
@@ -262,6 +265,9 @@ pub async fn execute<B: SessionBackend>(
         StoreReadRequest::RunResult(run_id) => {
             StoreReadReply::RunResult(reader.run_result(session, run_id).await)
         }
+        StoreReadRequest::RunToolCalls(request) => StoreReadReply::RunToolCalls(
+            crate::store_tool_calls::run_tool_calls(session, request).await,
+        ),
         StoreReadRequest::SendStatus {
             own_run,
             send_id,

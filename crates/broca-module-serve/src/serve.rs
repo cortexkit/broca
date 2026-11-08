@@ -57,10 +57,10 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::manifest::{
-    OP_BASELINE, OP_CANCEL, OP_FLUSH_PREFIX, OP_HEAD, OP_IMPORT, OP_INSTALL_VIEW, OP_READ,
-    OP_REFRESH, OP_REFRESH_POLICY, OP_RETRACT, OP_ROLE_DESCRIBE, OP_RUN_EVENT_GET, OP_RUN_RESULT,
-    OP_RUN_TOOL_CALLS, OP_SEND, OP_SEND_STATUS, OP_SESSION_SEND_STATUS, OP_STATUS, OP_SUBSCRIBE,
-    OP_VAULT_AUDIT, OP_WARM,
+    OP_BASELINE, OP_CANCEL, OP_FLUSH_PREFIX, OP_HEAD, OP_IMPORT, OP_INSTALL_VIEW, OP_MOVE_TO_STORE,
+    OP_READ, OP_REFRESH, OP_REFRESH_POLICY, OP_RETRACT, OP_ROLE_DESCRIBE, OP_RUN_EVENT_GET,
+    OP_RUN_RESULT, OP_RUN_TOOL_CALLS, OP_SEND, OP_SEND_STATUS, OP_SESSION_SEND_STATUS, OP_STATUS,
+    OP_SUBSCRIBE, OP_VAULT_AUDIT, OP_WARM,
 };
 use crate::wire::{
     CancelParams, FromWireExt, ImportParams, ImportResult, RetractParams, RouteRequest, SendParams,
@@ -3697,6 +3697,32 @@ where
             )
             .await
         }
+        OP_MOVE_TO_STORE => {
+            // Only the operator's own connection moves a session: the move changes which
+            // storage serves it, and it can't be undone.
+            if !matches!(bind.principal, Some(broca_protocol::BindPrincipal::Direct)) {
+                return send_error(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    "operator_required",
+                    "session.move_to_store is for the operator only",
+                )
+                .await;
+            }
+            match handler.move_to_store(session).await {
+                Ok(reply) => send_json_response(writer, ver, channel, epoch, corr, &reply).await,
+                Err(refusal) => {
+                    let mut body = ErrorBody::new(refusal.code, refusal.message);
+                    if let Some(detail) = refusal.detail {
+                        body = body.with_detail(detail);
+                    }
+                    send_error_body(writer, ver, channel, epoch, corr, body).await
+                }
+            }
+        }
         OP_INSTALL_VIEW => {
             let params: broca_wire::head_import::InstallViewParams =
                 match serde_json::from_value(req.params) {
@@ -5141,14 +5167,16 @@ const NOT_SERVED_ON_NEW_STORAGE: &str = "not_served_on_new_storage";
 /// `session.entries`, `session.applied_view`, `session.apply_view`) is dispatched by its role
 /// before this check, and the registry sends a store session's calls on it to the store
 /// (`LineageRegistry::route_compaction_v2`).
-fn served_on_new_storage(method: &str, params: &serde_json::Value) -> bool {
+pub(crate) fn served_on_new_storage(method: &str, params: &serde_json::Value) -> bool {
     match method {
         // Reads served from the store (`store_read`, `store_head`).
         OP_READ | OP_HEAD => true,
         // The store actor's subscriptions (`store_fanout`).
         OP_SUBSCRIBE => true,
-        // Run and send facts built from the store's own records (`store_status`).
+        // Run and send facts built from the store's own records (`store_status`), and a run's
+        // calls (`store_tool_calls`).
         OP_STATUS | OP_RUN_RESULT | OP_SEND_STATUS | OP_SESSION_SEND_STATUS => true,
+        OP_RUN_TOOL_CALLS => true,
         // The store actor serves sends, cancels and retractions.
         OP_SEND | OP_CANCEL | OP_RETRACT => true,
         // Plan refreshes, through today's preflight, decided and written by the store actor.

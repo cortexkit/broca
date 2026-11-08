@@ -1,0 +1,779 @@
+//! The staging writer and the verifier together: a session staged from its WAL verifies against
+//! it, and a difference planted on either side fails the check that compares it.
+
+use std::path::{Path, PathBuf};
+
+use broca_protocol::BindIdentity;
+use broca_session_store::backend::{LocalBackend, SessionAddr};
+use broca_session_store::keys::DeploymentKey;
+use broca_session_store::record::Record;
+use broca_session_store::session::Session;
+use broca_wal::{FramedRecord, Wal, WalLineageId, WalRecord};
+use futures::executor::block_on;
+use serde_json::json;
+
+use crate::stage::{stage, Stage, StageError, Staged};
+use crate::verify::{verify, Mode, Verified, Verify};
+
+fn session() -> BindIdentity {
+    BindIdentity::new("/project", "runner", "s")
+}
+
+fn deployment() -> DeploymentKey {
+    DeploymentKey::new(1, &[0x5a; 32])
+}
+
+fn scratch(tag: &str) -> PathBuf {
+    let root = broca_test_support::scratch_root().join(format!(
+        "session-convert-stage-{}-{tag}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    root
+}
+
+/// A run start whose frozen render config renders through today's Anthropic family.
+fn run_started(run: &str, at: u64, input: &str) -> WalRecord {
+    let frozen = broca_provider::families::anthropic_frozen_config("claude-test");
+    let mut record: WalRecord = serde_json::from_value(json!({
+        "type": "run_started", "run_id": run, "ts_ms": at,
+        "session": {"project_root": "/project", "harness": "runner", "session": "s"},
+        "config": {
+            "model": {"provider_module_id": "anthropic", "model_id": "claude-test"},
+            "tools": [], "tool_choice": {"type": "auto"}, "generation": {},
+            "response_format": {"type": "text"}, "context_epoch": 0,
+            "renderer_version": frozen.renderer_version,
+            "frozen_render_config": serde_json::to_value(&frozen).unwrap(),
+        },
+        "input": [{"role": "user", "content": [{"type": "text", "text": input}]}],
+        "origin": {"kind": "fresh"},
+    }))
+    .unwrap();
+    if let WalRecord::RunStarted { config, .. } = &mut record {
+        config.frozen_render_config = serde_json::to_value(&frozen).unwrap();
+    }
+    record
+}
+
+fn record(value: serde_json::Value) -> WalRecord {
+    serde_json::from_value(value).unwrap()
+}
+
+/// Writes a WAL of two runs, each one model step answering in text, whose attempts recorded
+/// the digest of the request today's renderer builds for them, and reads it back.
+fn written(root: &Path) -> (Vec<FramedRecord>, Option<WalLineageId>) {
+    let path = root.join("session.wal");
+    let mut wal = broca_wal::FileWal::open(&path).unwrap();
+    let lineage = wal.lineage_id();
+    let mut written: Vec<WalRecord> = Vec::new();
+    let mut append = |record: WalRecord, written: &mut Vec<WalRecord>| {
+        wal.append(1, &record, true).unwrap();
+        written.push(record);
+    };
+    for (run, step, at, input, answer) in [
+        ("r1", 1u64, 1_000u64, "Hello.", "One."),
+        ("r2", 2, 2_000, "Again.", "Two."),
+    ] {
+        let start = run_started(run, at, input);
+        let WalRecord::RunStarted { config, .. } = &start else {
+            unreachable!()
+        };
+        let config = (**config).clone();
+        append(start, &mut written);
+        append(
+            record(json!({"type": "step_started", "step_id": step})),
+            &mut written,
+        );
+        let (_, _, body) = broca_module::wal_render::render_step_with_lineage(
+            lineage.map(|id| id.to_string()).as_deref(),
+            &written,
+            &config,
+            run,
+            step,
+            None,
+            None,
+        )
+        .unwrap();
+        append(
+            record(json!({
+                "type": "model_attempt_finished", "step_id": step, "attempt": 0,
+                "outcome": "complete", "ts_ms": at + 1,
+                "request_body_len": body.len(),
+                "request_body_sha256": crate::verify::sha256_hex(&body),
+                "response_body_len": 0,
+                "response_body_sha256": crate::verify::sha256_hex(b""),
+            })),
+            &mut written,
+        );
+        append(
+            record(json!({
+                "type": "model_step_finished", "step_id": step,
+                "assistant_message": {"message_id": format!("m{step}"),
+                    "content": [{"type": "text", "text": answer}]},
+                "usage": {"input_tokens": 3, "output_tokens": 1},
+                "finish_reason": "stop", "retries_used": 0,
+            })),
+            &mut written,
+        );
+        append(
+            record(json!({
+                "type": "run_finished", "reason": "completed", "ts_ms": at + 3,
+                "usage": {"input_tokens": 3, "output_tokens": 1}, "retries_used": 0,
+            })),
+            &mut written,
+        );
+    }
+    drop(wal);
+    let read =
+        broca_wal::read_records_range(&path, broca_wal::DEFAULT_MAX_READ_BYTES, 0, None, None)
+            .unwrap();
+    let broca_wal::WalRangeRecords::Complete(records) = read.records() else {
+        panic!("the WAL reads back whole")
+    };
+    (records.to_vec(), read.lineage_id)
+}
+
+fn staged(root: &Path, records: &[FramedRecord], lineage: Option<WalLineageId>) -> Staged {
+    staged_in(root, records, lineage, &deployment())
+}
+
+/// Stages the session with `deployment`, which creates it in its mode.
+fn staged_in(
+    root: &Path,
+    records: &[FramedRecord],
+    lineage: Option<WalLineageId>,
+    deployment: &DeploymentKey,
+) -> Staged {
+    let lineage = lineage.map(|id| id.to_string());
+    block_on(stage(Stage {
+        records,
+        lineage: lineage.as_deref(),
+        session: &session(),
+        deployment,
+        store_root: &root.join("session-store"),
+        staging: &root.join("session-store/staging/store-move-test"),
+        media: None,
+    }))
+    .unwrap()
+}
+
+fn verified(
+    root: &Path,
+    records: &[FramedRecord],
+    lineage: Option<WalLineageId>,
+    converted: &crate::Converted,
+    mode: Mode,
+) -> Result<Verified, crate::verify::Mismatch> {
+    verified_in(root, records, lineage, converted, mode, &deployment())
+}
+
+/// Verifies the staged session with `deployment`, whose mode the session must be stored in.
+fn verified_in(
+    root: &Path,
+    records: &[FramedRecord],
+    lineage: Option<WalLineageId>,
+    converted: &crate::Converted,
+    mode: Mode,
+    deployment: &DeploymentKey,
+) -> Result<Verified, crate::verify::Mismatch> {
+    block_on(verify(Verify {
+        records,
+        lineage,
+        session: &session(),
+        deployment,
+        store_root: &root.join("session-store"),
+        staging: &root.join("session-store/staging/store-move-test"),
+        converted,
+        mode,
+        media: None,
+        media_root: None,
+    }))
+}
+
+/// A session is staged in the mode its deployment key creates sessions in, its setup parts in
+/// that mode's setup store, and it reloads and verifies in that mode, plain and encrypted alike.
+/// Read back expecting the other mode, it fails the staged-session check by name.
+#[test]
+fn a_session_is_staged_and_verified_in_the_mode_new_sessions_take() {
+    use broca_session_store::keys::Cipher;
+    for cipher in Cipher::ALL {
+        let root = scratch(&format!("mode-{}", cipher.label()));
+        let (records, lineage) = written(&root);
+        let creating = deployment().creating(cipher);
+        let staged = staged_in(&root, &records, lineage, &creating);
+        let staging = root.join("session-store/staging/store-move-test");
+        let view = block_on(Session::view(
+            LocalBackend::new(&staging),
+            SessionAddr(broca_core::session_addr(&session())),
+            &crate::stage::triple(&session()),
+            &creating,
+        ))
+        .unwrap();
+        assert_eq!(view.head().cipher(), cipher);
+        drop(view);
+        let setup = match cipher {
+            Cipher::XChaCha20Poly1305 => "setup",
+            Cipher::None => "setup-plain",
+        };
+        assert!(
+            root.join("session-store").join(setup).exists(),
+            "{} parts in {setup}",
+            cipher.label()
+        );
+        let verified = verified_in(
+            &root,
+            &records,
+            lineage,
+            &staged.converted,
+            Mode::Move,
+            &creating,
+        )
+        .unwrap();
+        assert_eq!((verified.runs, verified.messages), (2, 4));
+        assert!(verified.checks.contains(&"next_request"));
+        let other = match cipher {
+            Cipher::XChaCha20Poly1305 => Cipher::None,
+            Cipher::None => Cipher::XChaCha20Poly1305,
+        };
+        let failed = verified_in(
+            &root,
+            &records,
+            lineage,
+            &staged.converted,
+            Mode::Move,
+            &deployment().creating(other),
+        )
+        .unwrap_err();
+        assert_eq!(failed.check, "staged", "{failed}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+/// A staged session is a normal session of the new storage at the session's own address, its
+/// setup parts in the shared setup store, and it agrees with its WAL on every check, the
+/// offline mode's every recorded request included.
+#[test]
+fn a_staged_session_agrees_with_its_wal_on_every_check() {
+    let root = scratch("agrees");
+    let (records, lineage) = written(&root);
+    let staged = staged(&root, &records, lineage);
+    assert_eq!(staged.runs, 2);
+    assert_eq!(staged.messages, 4);
+    assert!(
+        staged.appends_in_conversation,
+        "the WAL is off the contract"
+    );
+    assert!(root.join("session-store/setup").exists());
+    let staging = root.join("session-store/staging/store-move-test");
+    let addr = broca_core::session_addr(&session());
+    assert!(staging.join("heads").join(&addr).join("head").exists());
+    assert!(
+        !root.join("session-store/heads").exists(),
+        "nothing is published"
+    );
+
+    let verified = verified(&root, &records, lineage, &staged.converted, Mode::Offline).unwrap();
+    assert_eq!(
+        verified.checks,
+        [
+            "run_status",
+            "run_result",
+            "send_status",
+            "read",
+            "history_raw",
+            "history_display",
+            "entries",
+            "head",
+            "billing",
+            "media",
+            "last_step",
+            "first_open",
+            "next_request",
+            "all_steps",
+        ]
+    );
+    assert_eq!(
+        (verified.runs, verified.messages, verified.media),
+        (2, 4, 0)
+    );
+    assert!(
+        !staging.join("next-request").exists(),
+        "the next request's copy is gone"
+    );
+    // Today's storage records no marks of a message: every entry's are absent, not empty.
+    let view = block_on(Session::view(
+        LocalBackend::new(&staging),
+        SessionAddr(addr),
+        &crate::stage::triple(&session()),
+        &deployment(),
+    ))
+    .unwrap();
+    let entries = block_on(broca_module::store_entries::all_entries(&*view)).unwrap();
+    assert_eq!(entries.len(), 4);
+    for record in &staged.converted.records {
+        if let Record::EntryFacts(facts) = record {
+            assert_eq!(facts.marks, None);
+        }
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A difference planted in the WAL the staged session is checked against fails the check that
+/// compares it: a changed answer fails `run.result`, a changed prompt fails `session.read`.
+#[test]
+fn a_planted_difference_fails_the_check_that_compares_it() {
+    let root = scratch("planted");
+    let (records, lineage) = written(&root);
+    let staged = staged(&root, &records, lineage);
+    let planted = |change: &dyn Fn(&mut WalRecord) -> bool| {
+        let mut planted = records.clone();
+        assert!(planted.iter_mut().any(|frame| change(&mut frame.record)));
+        planted
+    };
+    let answer = planted(&|record| match record {
+        WalRecord::ModelStepFinished {
+            assistant_message, ..
+        } => {
+            std::sync::Arc::make_mut(assistant_message).content =
+                vec![serde_json::from_value(json!({"type": "text", "text": "Changed."})).unwrap()];
+            true
+        }
+        _ => false,
+    });
+    let failed = verified(&root, &answer, lineage, &staged.converted, Mode::Move).unwrap_err();
+    assert_eq!(failed.check, "run_result", "{failed}");
+
+    let prompt = planted(&|record| match record {
+        WalRecord::RunStarted { input, .. } => {
+            *input = std::sync::Arc::new(vec![serde_json::from_value(json!({
+                "role": "user", "content": [{"type": "text", "text": "Changed."}],
+            }))
+            .unwrap()]);
+            true
+        }
+        _ => false,
+    });
+    let failed = verified(&root, &prompt, lineage, &staged.converted, Mode::Move).unwrap_err();
+    assert_eq!(failed.check, "read", "{failed}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Media bytes by digest, as today's media store would give them back: a medium it holds whole,
+/// one whose bytes no longer match their digest, or none.
+#[derive(Debug, Default)]
+struct Media {
+    whole: std::collections::BTreeMap<String, Vec<u8>>,
+    corrupt: std::collections::BTreeSet<String>,
+}
+
+impl broca_core::media_store::MediaBytes for Media {
+    fn read_verified(
+        &self,
+        reference: &broca_protocol::MediaRef,
+    ) -> Result<Vec<u8>, broca_core::media_store::MediaReadError> {
+        use broca_core::media_store::MediaReadError;
+        if self.corrupt.contains(&reference.sha256) {
+            return Err(MediaReadError::Corrupt(reference.sha256.clone()));
+        }
+        self.whole
+            .get(&reference.sha256)
+            .cloned()
+            .ok_or_else(|| MediaReadError::Missing(reference.sha256.clone()))
+    }
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    crate::verify::sha256_hex(bytes)
+}
+
+/// The reference of an image holding `bytes`.
+fn image_ref(bytes: &[u8]) -> serde_json::Value {
+    json!({"kind": "image", "mime": "image/png", "byte_size": bytes.len(), "width": 1,
+        "height": 1, "sha256": sha256(bytes)})
+}
+
+/// An image block holding `bytes`.
+fn image(bytes: &[u8]) -> serde_json::Value {
+    let mut block = image_ref(bytes);
+    block["type"] = json!("media");
+    block
+}
+
+/// The WAL of [`written`], its first run's input holding `images` beside its text.
+fn with_images(root: &Path, images: &[&[u8]]) -> (Vec<FramedRecord>, Option<WalLineageId>) {
+    let (mut records, lineage) = written(root);
+    if let WalRecord::RunStarted { input, .. } = &mut records[0].record {
+        let mut content = vec![json!({"type": "text", "text": "Hello."})];
+        content.extend(images.iter().map(|bytes| image(bytes)));
+        *input = std::sync::Arc::new(vec![serde_json::from_value(json!({
+            "role": "user", "content": content,
+        }))
+        .unwrap()]);
+    }
+    (records, lineage)
+}
+
+fn stage_with(
+    root: &Path,
+    records: &[FramedRecord],
+    lineage: Option<WalLineageId>,
+    media: &Media,
+) -> Result<Staged, StageError> {
+    let lineage = lineage.map(|id| id.to_string());
+    block_on(stage(Stage {
+        records,
+        lineage: lineage.as_deref(),
+        session: &session(),
+        deployment: &deployment(),
+        store_root: &root.join("session-store"),
+        staging: &root.join("session-store/staging/store-move-test"),
+        media: Some(media),
+    }))
+}
+
+/// A session naming a medium today's media store doesn't hold, or holds with bytes that no
+/// longer match its digest, is refused as `media_missing`, naming the first such medium, whether
+/// it is absent or corrupt, and how many there are; nothing is written.
+#[test]
+fn a_session_whose_media_cant_be_read_is_refused_before_anything_is_written() {
+    let (one, two): (&[u8], &[u8]) = (b"first image", b"second image");
+    let (first, second) = if sha256(one) < sha256(two) {
+        (one, two)
+    } else {
+        (two, one)
+    };
+    for (state, media) in [
+        ("absent", Media::default()),
+        (
+            "corrupt",
+            Media {
+                corrupt: [sha256(first), sha256(second)].into(),
+                ..Media::default()
+            },
+        ),
+    ] {
+        let root = scratch(&format!("media-{state}"));
+        let (records, lineage) = with_images(&root, &[first, second]);
+        let refused = stage_with(&root, &records, lineage, &media).unwrap_err();
+        assert_eq!(
+            refused,
+            StageError::MediaMissing(crate::stage::MediaMissing {
+                digest: sha256(first),
+                state,
+                missing: 2,
+            })
+        );
+        assert!(!root.join("session-store").exists(), "{state}");
+        // With no media store at all, every medium is absent.
+        let lineage_text = lineage.map(|id| id.to_string());
+        let none = crate::stage::prepare(&records, lineage_text.as_deref(), None).unwrap_err();
+        assert!(
+            matches!(&none, StageError::MediaMissing(missing) if missing.state == "absent"),
+            "{none:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+/// A session holding media is staged with an object for each, which reads back as today's bytes
+/// on the verifier's media check; a staged object whose bytes differ fails that check by name.
+#[test]
+fn a_session_holding_media_is_staged_with_its_bytes() {
+    let root = scratch("media-staged");
+    let (one, two): (&[u8], &[u8]) = (b"first image", b"second image");
+    let (records, lineage) = with_images(&root, &[one, two]);
+    let media = Media {
+        whole: [(sha256(one), one.to_vec()), (sha256(two), two.to_vec())].into(),
+        ..Media::default()
+    };
+    let staged = stage_with(&root, &records, lineage, &media).unwrap();
+    assert_eq!(staged.media, 2);
+    let staging = root.join("session-store/staging/store-move-test");
+    let view = block_on(Session::view(
+        LocalBackend::new(&staging),
+        SessionAddr(broca_core::session_addr(&session())),
+        &crate::stage::triple(&session()),
+        &deployment(),
+    ))
+    .unwrap();
+    for bytes in [one, two] {
+        let named = block_on(view.named_media(&sha256(bytes)))
+            .unwrap()
+            .expect("the staged session names the medium");
+        assert!(named.stored(), "an object holds it");
+        assert_eq!(block_on(view.named_media_bytes(&named)).unwrap(), bytes);
+    }
+    drop(view);
+    let check = |media: &Media| {
+        block_on(verify(Verify {
+            records: &records,
+            lineage,
+            session: &session(),
+            deployment: &deployment(),
+            store_root: &root.join("session-store"),
+            staging: &staging,
+            converted: &staged.converted,
+            mode: Mode::Move,
+            media: Some(media),
+            media_root: None,
+        }))
+        .unwrap_err()
+    };
+    // The media agree, so the checks past them run. The WAL's recorded requests were rendered
+    // before its input held the images, so its last step is the first check to differ.
+    let past = check(&media);
+    assert_eq!(past.check, crate::verify::LAST_STEP, "{past}");
+    let mut changed = media;
+    changed.whole.insert(sha256(two), b"other bytes".to_vec());
+    let failed = check(&changed);
+    assert_eq!(failed.check, crate::verify::MEDIA, "{failed}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A tool's image is staged as the object of the tool result naming it, and reads back as
+/// today's bytes on the verifier's media check.
+#[test]
+fn a_tool_results_image_is_staged_with_its_bytes() {
+    let root = scratch("media-tool");
+    let (mut records, lineage) = written(&root);
+    let shot: &[u8] = b"a screenshot";
+    let last = records.last().unwrap().seq;
+    let run = [
+        json!({"type": "step_started", "step_id": 3}),
+        json!({"type": "model_step_finished", "step_id": 3,
+            "assistant_message": {"message_id": "m3", "content": [{"type": "tool_call",
+                "tool_call_id": "c1", "tool_name": "photo", "input": {}}]},
+            "usage": {"input_tokens": 3, "output_tokens": 1},
+            "finish_reason": "tool_calls", "retries_used": 0}),
+        json!({"type": "tool_batch_started", "batch_id": "b1", "step_id": 3,
+            "planned_calls": ["c1"]}),
+        json!({"type": "tool_dispatch_intent", "batch_id": "b1", "tool_call_id": "c1",
+            "args": {}}),
+        json!({"type": "tool_result", "batch_id": "b1", "result": {"tool_call_id": "c1",
+            "output": {"kind": "parts", "parts": [{"kind": "text", "text": "the screen"},
+                {"kind": "media", "media": image_ref(shot)}]}, "is_error": false},
+            "outcome": "completed"}),
+        json!({"type": "tool_batch_finished", "batch_id": "b1"}),
+        json!({"type": "step_started", "step_id": 4}),
+        json!({"type": "model_step_finished", "step_id": 4,
+            "assistant_message": {"message_id": "m4",
+                "content": [{"type": "text", "text": "Seen."}]},
+            "usage": {"input_tokens": 3, "output_tokens": 1},
+            "finish_reason": "stop", "retries_used": 0}),
+        json!({"type": "run_finished", "reason": "completed", "ts_ms": 3_003,
+            "usage": {"input_tokens": 6, "output_tokens": 2}, "retries_used": 0}),
+    ];
+    let start = std::iter::once(run_started("r3", 3_000, "Look."));
+    for (at, record) in start.chain(run.into_iter().map(self::record)).enumerate() {
+        records.push(FramedRecord {
+            seq: last + 1 + at as u64,
+            fence: 1,
+            record,
+        });
+    }
+    let media = Media {
+        whole: [(sha256(shot), shot.to_vec())].into(),
+        ..Media::default()
+    };
+    let staged = stage_with(&root, &records, lineage, &media).unwrap();
+    assert_eq!(staged.media, 1);
+    let staging = root.join("session-store/staging/store-move-test");
+    let view = block_on(Session::view(
+        LocalBackend::new(&staging),
+        SessionAddr(broca_core::session_addr(&session())),
+        &crate::stage::triple(&session()),
+        &deployment(),
+    ))
+    .unwrap();
+    let named = block_on(view.named_media(&sha256(shot)))
+        .unwrap()
+        .expect("the staged session names the image");
+    assert!(named.stored(), "an object holds it");
+    assert_eq!(block_on(view.named_media_bytes(&named)).unwrap(), shot);
+    drop(view);
+    // The media agree, so the checks past them run, up to the session's next request: with no
+    // media store of today's to render its media from, today's offline render refuses it, which
+    // that check names.
+    let failed = block_on(verify(Verify {
+        records: &records,
+        lineage,
+        session: &session(),
+        deployment: &deployment(),
+        store_root: &root.join("session-store"),
+        staging: &staging,
+        converted: &staged.converted,
+        mode: Mode::Move,
+        media: Some(&media),
+        media_root: None,
+    }))
+    .unwrap_err();
+    assert_eq!(failed.check, crate::verify::NEXT_REQUEST, "{failed}");
+    assert!(failed.detail.contains("media"), "{failed}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The WAL's own preconditions name open work and a tool batch left open, and pass a session
+/// whose runs all ended.
+#[test]
+fn the_wal_preconditions_name_open_work_and_an_open_batch() {
+    use crate::preconditions::{converted_refusal, wal_refusal, OPEN_TOOL_BATCH, SESSION_BUSY};
+    let root = scratch("preconditions");
+    let (records, lineage) = written(&root);
+    assert_eq!(wal_refusal(&records, lineage), None);
+    let prepared =
+        crate::stage::prepare(&records, lineage.map(|id| id.to_string()).as_deref(), None).unwrap();
+    assert_eq!(block_on(converted_refusal(&prepared)).unwrap(), None);
+    // The last run hasn't ended.
+    assert_eq!(
+        wal_refusal(&records[..records.len() - 1], lineage),
+        Some(SESSION_BUSY)
+    );
+    // A batch started and never closed, in a run that ended.
+    let mut open = records.clone();
+    let last = open.len() - 1;
+    open.insert(
+        last,
+        FramedRecord {
+            seq: 0,
+            fence: 1,
+            record: record(json!({
+                "type": "tool_batch_started", "batch_id": "b1", "step_id": 2,
+                "planned_calls": [],
+            })),
+        },
+    );
+    assert_eq!(wal_refusal(&open, lineage), Some(OPEN_TOOL_BATCH));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// `send.status` of a send delivered with a tool result names the call whose result carried it,
+/// in the new storage as today's storage does. Read from a WAL of a run whose tool batch carried
+/// a queued send's text, converted into a session in each of the new storage's modes.
+#[test]
+fn an_enveloped_notes_send_status_names_its_ride_key_alike() {
+    note_status_alike(true);
+}
+
+/// [`an_enveloped_notes_send_status_names_its_ride_key_alike`] for a note delivered before ride
+/// envelopes existed: its `send.status` names the carrier call's own key.
+#[test]
+fn a_legacy_notes_send_status_names_its_carrier_key_alike() {
+    note_status_alike(false);
+}
+
+/// Compares today's and the new storage's `send.status` of a note delivered with a tool result,
+/// with a ride envelope when `enveloped`.
+fn note_status_alike(enveloped: bool) {
+    use broca_module::store_status::{todays, Reader};
+    use broca_session_store::backend::MemoryBackend;
+    use broca_session_store::keys::Cipher;
+    for cipher in Cipher::ALL {
+        {
+            let root = scratch(&format!("note-status-{}-{enveloped}", cipher.label()));
+            // A WAL of today's, for the lineage its header names, which a key derived from the
+            // log names; the records are read as they would be appended.
+            let lineage = broca_wal::FileWal::open(root.join("session.wal"))
+                .unwrap()
+                .lineage_id();
+            let mut delivered = json!({"type": "send_delivered", "submission_id": "sub-q",
+                "run_id": "r1", "mode": "tool_result", "tool_call_id": "c1",
+                "appended_text": "\n\nnote", "written_at_ms": 5});
+            if enveloped {
+                delivered["ride"] = json!({"call_key": "lineage:enveloped", "send_id": "q",
+                    "sender": "broca", "forms": ["tool_result"], "form": "append"});
+            }
+            let mut records = vec![run_started("r1", 1_000, "Hello.")];
+            records.extend(
+                [
+                    json!({"type": "delivery_ordered", "submission_id": "sub-q",
+                        "order": {"modes": ["tool_result"]}}),
+                    json!({"type": "queued", "submission_id": "sub-q", "send_id": "q",
+                        "request": {"model": {"provider_module_id": "p", "model_id": "m"},
+                            "input": [{"role": "user",
+                                "content": [{"type": "text", "text": "note"}]}],
+                            "policy_allowed": [], "tool_choice": {"type": "auto"},
+                            "generation": {}, "stop_when": []},
+                        "written_at_ms": 5}),
+                    json!({"type": "step_started", "step_id": 1}),
+                    json!({"type": "model_step_finished", "step_id": 1,
+                        "assistant_message": {"message_id": "m1", "content": [
+                            {"type": "tool_call", "tool_call_id": "c1", "tool_name": "read",
+                                "input": {}}]},
+                        "usage": {"input_tokens": 3, "output_tokens": 1},
+                        "finish_reason": "tool_calls", "retries_used": 0}),
+                    json!({"type": "tool_batch_started", "batch_id": "b1", "step_id": 1,
+                        "planned_calls": ["c1"]}),
+                    json!({"type": "tool_dispatch_intent", "batch_id": "b1",
+                        "tool_call_id": "c1", "args": {}}),
+                    json!({"type": "tool_result", "batch_id": "b1", "result": {
+                        "tool_call_id": "c1", "output": {"kind": "text", "text": "ok"},
+                        "is_error": false}, "outcome": "completed"}),
+                    json!({"type": "tool_batch_finished", "batch_id": "b1"}),
+                    delivered,
+                    json!({"type": "turn_finished", "step_id": 1}),
+                    json!({"type": "step_started", "step_id": 2}),
+                    json!({"type": "model_step_finished", "step_id": 2,
+                        "assistant_message": {"message_id": "m2",
+                            "content": [{"type": "text", "text": "Done."}]},
+                        "usage": {"input_tokens": 3, "output_tokens": 1},
+                        "finish_reason": "stop", "retries_used": 0}),
+                    json!({"type": "run_finished", "reason": "completed", "ts_ms": 1_003,
+                        "usage": {"input_tokens": 6, "output_tokens": 2},
+                        "retries_used": 0}),
+                ]
+                .into_iter()
+                .map(record),
+            );
+            let framed: Vec<FramedRecord> = (1u64..)
+                .zip(records)
+                .map(|(seq, record)| FramedRecord {
+                    seq,
+                    fence: 1,
+                    record,
+                })
+                .collect();
+            let today =
+                todays::send_status(&framed, lineage, broca_protocol::RunId("q".into()), "q")
+                    .unwrap();
+            let lineage_text = lineage.map(|id| id.to_string());
+            let converted = crate::convert(&framed, lineage_text.as_deref()).unwrap();
+            assert!(converted.lost.is_empty(), "{:?}", converted.lost);
+            let backend = MemoryBackend::default();
+            let mut store = block_on(Session::create(
+                &backend,
+                SessionAddr(broca_core::session_addr(&session())),
+                crate::stage::triple(&session()),
+                &deployment().creating(cipher),
+                true,
+            ))
+            .unwrap();
+            block_on(store.append(&converted.records, false)).unwrap();
+            let parts = broca_session_loop::parts::MemoryParts {
+                parts: converted.parts.clone(),
+            };
+            let reader = Reader {
+                parts: &parts,
+                live: false,
+                settled: None,
+                session_name: "s",
+                live_step: None,
+            };
+            let served =
+                block_on(reader.send_status(&store, broca_protocol::RunId("q".into()), "q", None))
+                    .unwrap();
+            let what = format!("{} enveloped={enveloped}", cipher.label());
+            let today = serde_json::to_value(today).unwrap();
+            assert_eq!(serde_json::to_value(served).unwrap(), today, "{what}");
+            let key = today["delivered"]["call_key"]
+                .as_str()
+                .unwrap_or_else(|| panic!("today's names the carrier, {what}: {today}"));
+            if enveloped {
+                assert_eq!(key, "lineage:enveloped", "{what}");
+            } else {
+                assert_ne!(key, "lineage:enveloped", "{what}");
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+}

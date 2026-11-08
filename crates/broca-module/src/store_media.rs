@@ -608,6 +608,57 @@ impl<B: SessionBackend> broca_session_loop::Writer for RunAppends<'_, B> {
     }
 }
 
+/// The request a run of `session` sends for its step `step_id`, built offline: the prompt as the
+/// run loop builds it for a provider that renders media (`offline_media_request`), rendered
+/// through a media fold of every record of `session` and its own media objects, read over
+/// `reader`, under `frozen` with `max_output_tokens` as the step's cap. For checking a session in
+/// the new storage against the request today's storage renders for it.
+#[allow(clippy::too_many_arguments)]
+pub async fn offline_render<B, R>(
+    session: &Session<B>,
+    reader: R,
+    parts: &dyn Parts,
+    bind: &BindIdentity,
+    step_id: u64,
+    frozen: &broca_provider::wire::FrozenRenderConfig,
+    render_tags: bool,
+    max_output_tokens: Option<u32>,
+) -> Result<Vec<u8>, String>
+where
+    B: SessionBackend,
+    R: SessionBackend + Send + Sync + 'static,
+{
+    let mut opts = broca_session_loop::run::offline_media_request(session, parts, bind, step_id)
+        .await
+        .map_err(|error| format!("the new run loop's request: {error:?}"))?;
+    if let Some(context) = opts.step_context.as_mut() {
+        context.max_output_tokens = max_output_tokens;
+    }
+    let mut fold = MediaFold::new(bind.clone());
+    fold.catch_up(session, parts).await;
+    let bytes = fold.bytes(session.media_objects(reader));
+    let (bytes, seed, read_tail) = fold.for_run(Some(bytes)).renderer_inputs()?;
+    let media = broca_provider::media_request::LiveMedia::from_checkpoint(
+        bytes,
+        seed,
+        None,
+        frozen.media.clone(),
+        read_tail,
+    )?;
+    let config = serde_json::to_value(&*frozen.for_step(&opts))
+        .map_err(|error| format!("encode the frozen render config: {error}"))?;
+    // As the transport hands a request to its media renderer: the frozen config with the step's
+    // cap applied, the run's tag choice, and the render's media aging committed.
+    media
+        .render(&config, &opts, render_tags, true)
+        .map_err(|error| {
+            format!(
+                "the media renderer refused: {}",
+                error.provider_code.as_deref().unwrap_or(&error.message)
+            )
+        })
+}
+
 #[cfg(test)]
 #[path = "store_media/tests.rs"]
 mod tests;

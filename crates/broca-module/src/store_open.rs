@@ -188,8 +188,9 @@ impl StoreRuntime {
     }
 
     /// What sessions are opened and created with now: the deployment key once it has loaded,
-    /// and before that a stand-in that opens plain sessions only.
-    fn deployment(&self) -> &DeploymentKey {
+    /// and before that a stand-in that opens plain sessions only. Either creates sessions in
+    /// the mode `session_storage.encryption` chose ([`new_sessions`](Self::new_sessions)).
+    pub fn deployment(&self) -> &DeploymentKey {
         self.deployment.get().unwrap_or(&self.unloaded)
     }
 
@@ -224,6 +225,11 @@ impl StoreRuntime {
     /// The facts of runs that have ended, kept for `run.status` and `run.result`.
     pub fn settled_runs(&self) -> &crate::store_status::SettledRuns {
         &self.settled
+    }
+
+    /// The state root whose new storage this runtime serves.
+    pub fn state_root(&self) -> &Path {
+        &self.state_root
     }
 
     /// The views kept of sessions no actor holds.

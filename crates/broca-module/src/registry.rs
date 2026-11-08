@@ -673,6 +673,12 @@ pub trait LineageOpener: Send + Sync {
     fn serves_from_store(&self, _key: &LineageKey) -> Result<bool, OpenError> {
         Ok(false)
     }
+    /// How a reader of today's storage that doesn't go through [`Self::check_move`] refuses
+    /// `key` when the new session storage owns it, or a move into it is in flight
+    /// (`broca_core::WalStore::store_owner_refusal`). `None` when today's storage owns it.
+    fn store_owner_refusal(&self, _key: &LineageKey) -> Result<Option<OpenError>, OpenError> {
+        Ok(None)
+    }
     /// Best-effort repair through the session's writer fence. The range is already durable;
     /// implementations must not open or modify a WAL while materializing it.
     async fn backfill_attribution(
@@ -762,6 +768,7 @@ mod media;
 pub(crate) mod media_head;
 #[path = "run_rows.rs"]
 mod run_rows;
+pub mod store_move;
 pub use run_rows::OverhaulRunSource;
 
 /// A failed durability boundary. Historical events survive successful session recovery.
@@ -836,7 +843,7 @@ pub struct MoveSessionGuard {
 /// One actor generation a mutating cut retired; see [`MoveSessionGuard`].
 struct RetiredActor {
     key: LineageKey,
-    tenure: Option<broca_core::wal_writer::ClosedWriterTenure>,
+    tenure: Option<crate::actor::CutTenure>,
     close: CloseToken,
 }
 
@@ -878,6 +885,11 @@ pub enum CutLockMode {
     /// lease to the guard; the guard commits its slot closed when released. Other actors
     /// pause as for `Inspect`; a busy actor refuses without changing its writer.
     Mutate,
+    /// The move takes the session out of today's storage (`session.move_to_store`): any idle
+    /// actor closes, tearing down its subscribers and joining its writer, and hands its
+    /// session lease to the guard, whether its writer or the actor itself held it. A busy
+    /// actor refuses without changing its writer.
+    Retire,
 }
 
 type ToolRouteHealth = dyn Fn(&[LineageKey]) -> serde_json::Value + Send + Sync;
@@ -970,6 +982,11 @@ impl ReadOnlyLineage {
 }
 
 struct Inner {
+    /// The sessions a move into the new storage holds (see `store_move`), by address, and the
+    /// lease-free WAL reads in flight per address, which such a move waits out.
+    store_moves: store_move::MoveFences,
+    /// What runs `session.move_to_store`, installed by the daemon with its stores.
+    store_mover: std::sync::OnceLock<Arc<dyn store_move::StoreMover>>,
     run_event_reader: std::sync::OnceLock<Arc<RunEventLookup>>,
     session_address_inventory: std::sync::OnceLock<Arc<dyn broca_store::SessionAddressResolver>>,
     episode_source: std::sync::OnceLock<Arc<EpisodeReadSource>>,
@@ -990,6 +1007,10 @@ struct Inner {
     close_started: tokio::sync::watch::Sender<u64>,
     #[cfg(test)]
     expiry_read_probe: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Runs once, the next time a reader asks who owns a session: a test publishes a head
+    /// there to land between a read's store check and its read of today's storage.
+    #[cfg(test)]
+    store_owner_probe: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(all(test, feature = "test-clock"))]
     status_open_probe: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     repairs: crate::retention::Repairs,
@@ -1745,6 +1766,10 @@ impl LineageRegistry {
             .unwrap_or_default();
         let mut recovered = 0;
         for session in sessions {
+            // A session the new storage owns has no WAL writer here to finish a rewrite.
+            if self.store_owner_refusal(&session)?.is_some() {
+                continue;
+            }
             let actor = self.actor_for(&session).await?;
             let (reply, response) = tokio::sync::oneshot::channel();
             actor
@@ -2296,7 +2321,7 @@ impl LineageRegistry {
                 guard.actors.push(release);
                 if let Some(crate::actor::RetiredForCut { tenure, close }) = retired {
                     // Only a mutating cut may retire an actor or take its session lease.
-                    debug_assert_eq!(mode, CutLockMode::Mutate);
+                    debug_assert_ne!(mode, CutLockMode::Inspect);
                     guard.retired.push(RetiredActor {
                         key: key.clone(),
                         tenure,
@@ -2314,6 +2339,12 @@ impl LineageRegistry {
         if self.inner.opener.serves_from_store(key)? {
             return Ok(());
         }
+        // A move into the new storage holding the session in this process, or one startup
+        // couldn't settle, keeps today's storage from serving it. Both are known in memory, so
+        // this check reads nothing.
+        if let Some(refusal) = self.inner.store_moves.refusal(key) {
+            return Err(refusal);
+        }
         self.inner.opener.check_move(key, write)?;
         if let Some(reader) = &self.inner.reader {
             reader
@@ -2322,6 +2353,31 @@ impl LineageRegistry {
                 .map_err(|e| OpenError::from_wal_read(e.to_string(), &e))?;
         }
         Ok(())
+    }
+
+    /// How a reader of today's storage that doesn't go through [`Self::check_move`] refuses
+    /// `key` when the new session storage owns it (its head exists), or a move into it is in
+    /// flight (a move journal names it): the feature refusal `check_move` gives a session
+    /// whose head exists, or `SessionMoving` under the move's id. `None` when today's storage
+    /// owns the session.
+    pub(crate) fn store_owner_refusal(
+        &self,
+        key: &LineageKey,
+    ) -> Result<Option<OpenError>, OpenError> {
+        #[cfg(test)]
+        if let Some(probe) = self.inner.store_owner_probe.lock().unwrap().take() {
+            probe();
+        }
+        self.inner.opener.store_owner_refusal(key)
+    }
+
+    /// Refuses `key` as [`Self::store_owner_refusal`] says, or passes it when today's storage
+    /// owns it.
+    pub(crate) fn refuse_store_owned(&self, key: &LineageKey) -> Result<(), OpenError> {
+        match self.store_owner_refusal(key)? {
+            Some(refusal) => Err(refusal),
+            None => Ok(()),
+        }
     }
     #[cfg(test)]
     pub(crate) fn actor_panic_count(&self) -> u64 {
@@ -2393,10 +2449,14 @@ impl LineageRegistry {
                     SESSION_CACHE_SESSIONS,
                 )),
                 retention: std::sync::OnceLock::new(),
+                store_moves: Default::default(),
+                store_mover: std::sync::OnceLock::new(),
                 #[cfg(test)]
                 close_started: tokio::sync::watch::channel(0).0,
                 #[cfg(test)]
                 expiry_read_probe: Mutex::new(None),
+                #[cfg(test)]
+                store_owner_probe: Mutex::new(None),
                 #[cfg(all(test, feature = "test-clock"))]
                 status_open_probe: Mutex::new(None),
                 repairs: Default::default(),
@@ -4505,6 +4565,9 @@ impl LineageRegistry {
         OpenError,
     > {
         self.check_expired(key, Some(&run_id.0)).await?;
+        // Today's run state, and the orphan recovery below, read and write today's copy, which
+        // the new storage owns, or is about to.
+        self.refuse_store_owned(key)?;
         if matches!(
             self.check_move(key, true),
             Err(OpenError::SessionMoving { .. })
@@ -4694,6 +4757,9 @@ impl LineageRegistry {
         key: &LineageKey,
         request: ReadRangeRequest,
     ) -> Result<broca_wal::WalRangeRead, OpenError> {
+        // Counted before anything is read, so a move into the new storage that has already
+        // named this session waits for this read to end.
+        let _in_flight = self.inner.store_moves.read(key);
         let ReadRangeRequest {
             after_seq,
             anchor,
@@ -5060,6 +5126,27 @@ impl LineageRegistry {
         self.inner.opener.store_holding(key)
     }
 
+    /// The new storage's runtime for a session today's storage has just refused as kept there:
+    /// a read that takes no lease found no head, and then met the head a move published
+    /// meanwhile. The read is then served once more, from the new storage. `None` for any other
+    /// failure, or when the head is absent.
+    pub(crate) fn store_after_refusal(
+        &self,
+        key: &LineageKey,
+        error: &crate::serve::ServeError,
+    ) -> Result<Option<Arc<crate::store_open::StoreRuntime>>, OpenError> {
+        match error {
+            crate::serve::ServeError::WalNewerWriter { missing, .. }
+                if missing
+                    .iter()
+                    .any(|name| name == broca_wal::SESSION_STORAGE_FEATURE) =>
+            {
+                self.store_holding(key)
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// Whether the session has a WAL, live or archived: a stat, and an archive index lookup
     /// only when there is no live file. `None` means the store cannot tell, not that a WAL exists.
     pub fn wal_written(&self, key: &LineageKey) -> Option<bool> {
@@ -5299,6 +5386,9 @@ impl LineageRegistry {
         tag: u64,
     ) -> Result<Option<broca_core::TagLocation>, OpenError> {
         self.check_expired(key, None).await?;
+        // The materialized tag index and transcript describe today's copy, which the new
+        // storage owns, or is about to.
+        self.refuse_store_owned(key)?;
         if let Some(bundle) = self.inner.raw_pages.get() {
             let bundle = bundle.clone();
             let key = key.clone();
@@ -5438,6 +5528,9 @@ impl LineageRegistry {
         model: Option<&broca_core::ModelPageRequest>,
     ) -> Result<RoutedPage, OpenError> {
         self.check_history_expired(key).await?;
+        // Every page source below (the materialized pages, episodes and today's WAL) reads
+        // today's copy, which the new storage owns, or is about to.
+        self.refuse_store_owned(key)?;
         // Keep the evidence before a format-selected reader can rebuild rows,
         // but let that reader's established errors win over a new refusal.
         let empty_history_check = self.check_session_log(key).await;
@@ -6466,6 +6559,11 @@ impl LineageRegistry {
     /// calls: open the session if it is closed (its open-time recovery runs first), then ask its
     /// actor to resume a run paused on held calls. A live run needs nothing more.
     pub async fn resume_held_run(&self, session: &LineageKey) -> Result<(), String> {
+        // A move into the new storage holds this session: the delivery is retried on a later
+        // pull, which finds the session where the move left it.
+        if self.inner.store_moves.fenced(session) {
+            return Err("session_moving: a move into the new storage holds this session".into());
+        }
         for _ in 0..3 {
             let handle = self
                 .actor_for(session)
@@ -6667,7 +6765,10 @@ impl LineageRegistry {
         }
         let mut marks = self.inner.crash_orphan_marks.lock().unwrap();
         for (key, run_ids) in by_session {
-            if wal_store.check_move(&key, true).is_err() {
+            // A session the new storage owns has no run here to seal: its runs live there.
+            if wal_store.check_move(&key, true).is_err()
+                || !matches!(wal_store.store_owner_refusal(&key), Ok(None))
+            {
                 sweep.not_live += 1;
                 continue;
             }
@@ -6717,6 +6818,13 @@ impl LineageRegistry {
                 .unwrap()
                 .contains_key(&key)
             {
+                continue;
+            }
+            // A session that moved into the new storage after it was marked has no run here
+            // to seal, and opening it would open the new storage's actor instead.
+            if !matches!(self.store_owner_refusal(&key), Ok(None)) {
+                self.inner.crash_orphan_marks.lock().unwrap().remove(&key);
+                sweep.not_live += 1;
                 continue;
             }
             let opened = async {
@@ -8772,6 +8880,11 @@ impl LineageRegistry {
         key: &LineageKey,
         run: Option<&str>,
     ) -> Result<(), OpenError> {
+        // Today's retention doesn't decide a session the new storage owns, or a move is
+        // taking there: its WAL is the copy being moved or the retired one left behind.
+        if self.store_owner_refusal(key)?.is_some() {
+            return Ok(());
+        }
         self.check_move(key, false)?;
         let Some(service) = self.inner.retention.get().cloned() else {
             return Ok(());
@@ -8947,6 +9060,10 @@ impl RegistryHandle {
 #[cfg(test)]
 #[path = "registry_owner_tests.rs"]
 mod owner_tests;
+
+#[cfg(test)]
+#[path = "registry_store_owner_tests.rs"]
+pub(crate) mod store_owner_tests;
 
 /// Offset page assembly: pages and head from WAL offsets, with bounded decodes.
 ///
