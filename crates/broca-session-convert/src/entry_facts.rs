@@ -335,7 +335,6 @@ pub fn record(
         client_message_id: display.and_then(|display| display.client_message_id.clone()),
         sender: display.and_then(|display| display.sender.clone()),
         marks: None,
-        budget_finalize: None,
         no_display_facts: None,
         reasoning_summaries: Vec::new(),
         rich_ui: None,

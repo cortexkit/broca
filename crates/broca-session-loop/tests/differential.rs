@@ -1175,6 +1175,28 @@ fn pause_names_its_attempt(writer: &Recording<'_, '_>) {
     }
 }
 
+/// Every key the new loop gave a call answered without a dispatch intent names the outcome that
+/// carries it, by the writer's generation and that outcome's seq, so no two calls share one. The
+/// comparison masks the key itself, since today's is made of the log's lineage and its own seq;
+/// it still compares which outcomes carry one.
+fn outcome_keys_name_their_place(writer: &Recording<'_, '_>) {
+    let first_seq = writer.session.next_seq() - writer.records.len() as u64;
+    let prefix = writer.session.message_id_prefix();
+    for (index, record) in writer.records.iter().enumerate() {
+        let Record::ToolOutcome(outcome) = record else {
+            continue;
+        };
+        if let Some(key) = &outcome.call_key {
+            assert_eq!(
+                *key,
+                format!("{prefix}.{}", first_seq + index as u64),
+                "key of call {}",
+                outcome.tool_call_id.0
+            );
+        }
+    }
+}
+
 /// Waits until a scripted account limit has reset, when the comparison routes an account.
 async fn reset_passes() {
     if account().is_some_and(|script| script.wait_for_reset) {
@@ -2144,6 +2166,7 @@ async fn new_from(
         }),
         max_same_account_wait: account().map_or_else(Default::default, |script| script.wait),
         auth_selection: account_selection(),
+        step_progress: None,
     };
     let sealing = SEALING.try_with(|cause| *cause).ok();
     through!(
@@ -2161,6 +2184,7 @@ async fn new_from(
     keys_match(writer.session, &plane).await;
     ids_resolve(writer.session).await;
     turns_have_facts(writer.session).await;
+    outcome_keys_name_their_place(&writer);
     if !resuming {
         media_reads_back(writer.session).await;
     }
@@ -3257,6 +3281,7 @@ async fn compare_runs_in_once(scenario: Scenario, runs: &[(&str, Vec<Message>)])
         }),
         max_same_account_wait: account().map_or_else(Default::default, |script| script.wait),
         auth_selection: account_selection(),
+        step_progress: None,
     };
     for (index, (run_id, input)) in runs.iter().enumerate() {
         through!(writer, |w| run(
@@ -3289,6 +3314,7 @@ async fn compare_runs_in_once(scenario: Scenario, runs: &[(&str, Vec<Message>)])
     keys_match(writer.session, &plane).await;
     ids_resolve(writer.session).await;
     turns_have_facts(writer.session).await;
+    outcome_keys_name_their_place(&writer);
     if compaction().is_some_and(|script| {
         script
             .rides
@@ -3889,6 +3915,7 @@ async fn compare_actions_in_once(
         }),
         max_same_account_wait: account().map_or_else(Default::default, |script| script.wait),
         auth_selection: account_selection(),
+        step_progress: None,
     };
     let mut admission = scenario.admission(&provider.inner);
     admission.on_restart = on_restart;
@@ -3924,6 +3951,7 @@ async fn compare_actions_in_once(
     keys_match(writer.session, &plane).await;
     ids_resolve(writer.session).await;
     turns_have_facts(writer.session).await;
+    outcome_keys_name_their_place(&writer);
     let new = Outcome {
         records: normalized(&writer.records),
         requests: sent_requests(&provider.inner),
@@ -4271,6 +4299,7 @@ async fn compare_auth_pause_in_once(
         }),
         max_same_account_wait: account().map_or_else(Default::default, |script| script.wait),
         auth_selection: account_selection(),
+        step_progress: None,
     };
     let first = through!(writer, |w| run(
         w,
@@ -4292,6 +4321,7 @@ async fn compare_auth_pause_in_once(
     keys_match(writer.session, &plane).await;
     ids_resolve(writer.session).await;
     turns_have_facts(writer.session).await;
+    outcome_keys_name_their_place(&writer);
     pause_names_its_attempt(&writer);
     // A run the resume refroze onto another account keeps naming it when nobody routes one,
     // as a later resume or a rebuild of its requests reads the run back.

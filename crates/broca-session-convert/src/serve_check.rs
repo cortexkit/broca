@@ -27,6 +27,9 @@
 use std::collections::BTreeMap;
 use std::time::Instant;
 
+use broca_module::store_reads::{
+    answer_in_memory, execute, ReadContext, StoreReadOutcome, StoreReadRequest, ViewCache,
+};
 use broca_module::store_status::{todays, Reader, SettledRuns};
 use broca_protocol::RunId;
 use broca_session_loop::parts::MemoryParts;
@@ -74,11 +77,29 @@ struct Timing {
     log: String,
     records: usize,
     runs: usize,
-    /// One `run.status` of the latest run read as running, the session loaded from disk.
-    latest_run_us: u128,
-    /// One `run.status` of the first run, uncached and then from the finished-run cache.
-    finished_uncached_us: u128,
-    finished_cached_us: u128,
+    /// How many times each read was timed.
+    samples: usize,
+    /// Loading the session read-only (`Session::view`), p50 and p99 in microseconds.
+    load_us: (u128, u128),
+    /// `run.status` of the latest run, read as running, three ways.
+    latest: Ways,
+    /// `run.status` of the first run, walked from its records each time (no finished-run cache).
+    first_walked: Ways,
+    /// `run.status` of the first run once the finished-run cache holds its facts.
+    first_kept: Ways,
+}
+
+/// One read's p50 and p99, in microseconds: served by the session's actor from what it holds
+/// (`open`; with the time the actor was held), from a view kept for the session's position
+/// (`cached`), and from a fresh load (`cold`).
+#[derive(Default, Serialize)]
+struct Ways {
+    open_us: (u128, u128),
+    open_held_us: (u128, u128),
+    /// Whether the actor handed the read back to be read from storage.
+    open_handed_back: bool,
+    cached_us: (u128, u128),
+    cold_us: (u128, u128),
 }
 
 /// A reply as JSON with what each storage keeps for itself taken out, or its refusal.
@@ -238,6 +259,7 @@ pub(super) fn run(args: &Args) {
             live: false,
             settled: None,
             session_name: &name,
+            live_step: None,
         };
         let (runs, queued, sends) = ids(&old);
         let old_log: &[FramedRecord] = &old;
@@ -440,33 +462,131 @@ fn time_largest(
     let parts = MemoryParts { parts };
     let (runs, _, _) = ids(&old);
     let (first, latest) = (runs.first()?, runs.last()?);
-    let settled = SettledRuns::default();
-    let read = |run: &str, live: bool| {
-        let started = Instant::now();
-        let view = block_on(Session::view(
-            LocalBackend::new(root.clone()),
-            SessionAddr(name.clone()),
-            &triple(&name),
+    let samples = 20;
+    let backend = || LocalBackend::new(root.clone());
+    let addr = SessionAddr(name.clone());
+    let session_triple = triple(&name);
+    let load = || Session::view(backend(), addr.clone(), &session_triple, deployment);
+    let quantiles = |mut times: Vec<u128>| {
+        times.sort_unstable();
+        let at = |q: f64| times[((times.len() - 1) as f64 * q).round() as usize];
+        (at(0.5), at(0.99))
+    };
+    // `kept`: whether the finished-run cache lives across the samples, as the module's does.
+    let ways = |run: &str, kept: bool| -> Ways {
+        let request = StoreReadRequest::RunStatusReply(RunId(run.to_owned()));
+        let shared = SettledRuns::default();
+        let mut ways = Ways::default();
+        // Open: the session as its actor holds it.
+        let mut writer = block_on(Session::load(
+            backend(),
+            addr.clone(),
+            &session_triple,
             deployment,
         ))
-        .expect("the stored session loads");
-        let reader = Reader {
-            parts: &parts,
-            live,
-            settled: Some((&settled, name.as_str())),
-            session_name: &name,
-        };
-        let _ = block_on(reader.run_status_reply(&view, &RunId(run.to_owned())));
-        started.elapsed().as_micros()
+        .expect("the stored session opens");
+        let cache = ViewCache::default();
+        let mut total = Vec::new();
+        let mut held = Vec::new();
+        for _ in 0..samples {
+            let own = SettledRuns::default();
+            let ctx = read_context(&parts, &name, if kept { &shared } else { &own });
+            let started = Instant::now();
+            let outcome = block_on(answer_in_memory(&mut writer, &ctx, &request));
+            held.push(started.elapsed().as_micros());
+            if let StoreReadOutcome::Stored { position, .. } = outcome {
+                ways.open_handed_back = true;
+                let view = block_on(cache.view(
+                    &name,
+                    position,
+                    Session::view_at(
+                        backend(),
+                        addr.clone(),
+                        &session_triple,
+                        deployment,
+                        &position,
+                    ),
+                ))
+                .expect("the stored session loads");
+                let _ = block_on(execute(&view, &ctx, &request));
+            }
+            total.push(started.elapsed().as_micros());
+        }
+        block_on(writer.close()).expect("the session closes");
+        ways.open_us = quantiles(total);
+        ways.open_held_us = quantiles(held);
+        // Closed, cached: the position probed, the kept view served.
+        let cache = ViewCache::default();
+        let mut cached = Vec::new();
+        for _ in 0..samples {
+            let own = SettledRuns::default();
+            let ctx = read_context(&parts, &name, if kept { &shared } else { &own });
+            let started = Instant::now();
+            let position = block_on(Session::stored_position(&backend(), &addr, deployment))
+                .expect("the head reads")
+                .expect("the session exists");
+            let view = block_on(cache.view(
+                &name,
+                position,
+                Session::view_at(
+                    backend(),
+                    addr.clone(),
+                    &session_triple,
+                    deployment,
+                    &position,
+                ),
+            ))
+            .expect("the stored session loads");
+            let _ = block_on(execute(&view, &ctx, &request));
+            cached.push(started.elapsed().as_micros());
+        }
+        ways.cached_us = quantiles(cached);
+        // Closed, cold: a fresh load for every read.
+        let mut cold = Vec::new();
+        for _ in 0..samples {
+            let own = SettledRuns::default();
+            let ctx = read_context(&parts, &name, if kept { &shared } else { &own });
+            let started = Instant::now();
+            let view = block_on(load()).expect("the stored session loads");
+            let _ = block_on(execute(&view, &ctx, &request));
+            cold.push(started.elapsed().as_micros());
+        }
+        ways.cold_us = quantiles(cold);
+        ways
     };
+    let mut loads = Vec::new();
+    for _ in 0..samples {
+        let started = Instant::now();
+        block_on(load()).expect("the stored session loads");
+        loads.push(started.elapsed().as_micros());
+    }
     let timing = Timing {
         log: name.clone(),
         records: old.len(),
         runs: runs.len(),
-        latest_run_us: read(latest, true),
-        finished_uncached_us: read(first, false),
-        finished_cached_us: read(first, false),
+        samples,
+        load_us: quantiles(loads),
+        latest: ways(latest, true),
+        first_walked: ways(first, false),
+        first_kept: ways(first, true),
     };
     let _ = std::fs::remove_dir_all(&root);
     Some(timing)
+}
+
+/// What a timed read of the session `name` needs: the session held by its actor, as a polled
+/// run's session is.
+fn read_context<'a>(
+    parts: &'a MemoryParts,
+    name: &'a str,
+    settled: &'a SettledRuns,
+) -> ReadContext<'a> {
+    ReadContext {
+        parts,
+        held: true,
+        open: true,
+        settled: Some((settled, name)),
+        session_name: name,
+        live_step: None,
+    }
 }

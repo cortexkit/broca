@@ -222,6 +222,10 @@ pub struct Seams<'a, P, T> {
     /// The account routing gives the session now. A run paused on its account resumes only
     /// on the account it froze; `None` when the caller didn't route one.
     pub auth_selection: Option<broca_wal::AuthSelection>,
+    /// Where the run publishes its in-flight model step while the provider call runs, as
+    /// today's loop does (`RunControl::step_progress`): the session's owner serves it as an
+    /// active run's `step`. It is cleared when the step's call ends. Never a durability input.
+    pub step_progress: Option<broca_core::provider::LiveStepProgress>,
 }
 
 /// The run loop's account reports, as today's `broca_core::AccountReporter` receives them. Each
@@ -2811,11 +2815,34 @@ async fn model_step<W: Writer, P: Provider, T>(
     account_limit_pause: bool,
 ) -> Result<Result<Step, StepFailure>, LoopError> {
     let mut limited: Option<Box<FailedAccountLimitAttempt>> = None;
+    // The step is in flight from here until the call's stream ends: published for the session's
+    // owner, and cleared however the call ends, as today's loop publishes it.
+    struct InFlight<'a>(Option<&'a broca_core::provider::LiveStepProgress>);
+    impl Drop for InFlight<'_> {
+        fn drop(&mut self) {
+            if let Some(progress) = self.0 {
+                *progress.lock().unwrap() = None;
+            }
+        }
+    }
+    let _in_flight = InFlight(seams.step_progress.as_ref());
+    if let Some(progress) = &seams.step_progress {
+        let now = (seams.now_ms)();
+        *progress.lock().unwrap() = Some(broca_protocol::provider::InFlightStep {
+            step_id: StepId(step_id),
+            started_at_ms: now,
+            attempt: 0,
+            attempt_started_at_ms: now,
+            last_content_at_ms: None,
+            max_content_gap_ms: None,
+            max_content_gap_ended_at_ms: None,
+        });
+    }
     let runtime = StepRuntime {
         cancel: seams.cancel.clone(),
         deadline: None,
         seal: None,
-        progress: None,
+        progress: seams.step_progress.clone(),
         first_attempt: 0,
         attempt_hook: None,
     };
@@ -3655,6 +3682,8 @@ fn no_dispatch(
         finished_at_ms: Some(now),
         detail: serde_json::to_value(reason).ok(),
         hooks,
+        // Minted by the entry-facts writer, which knows the seq this record takes.
+        call_key: None,
     }));
 }
 
@@ -3728,6 +3757,8 @@ fn terminal_with_reason(
         finished_at_ms: now,
         detail: None,
         hooks: None,
+        // Minted by the entry-facts writer for a call without a dispatch intent.
+        call_key: None,
     }));
 }
 

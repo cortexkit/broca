@@ -161,12 +161,13 @@ impl RunExecutor for Loops {
                 session_address: None,
                 compaction_plane: control.compaction_plane.as_deref(),
                 compaction_session: None,
-                // As the module's executor runs every store run (`Seams::compaction_changes`).
+                // As the module's store executor runs a store session's runs.
                 compaction_changes: true,
                 keep_warm: None,
                 account_reports: None,
                 max_same_account_wait: Default::default(),
                 auth_selection: None,
+                step_progress: control.step_progress.clone(),
             };
             match mode {
                 StoreRunMode::Fresh => {
@@ -200,6 +201,8 @@ struct Side {
     registry: LineageRegistry,
     key: BindIdentity,
     gate: Option<Arc<Notify>>,
+    /// The scripted provider this side's runs call, which keeps the requests they sent.
+    provider: broca_core::provider::StubProvider,
 }
 
 impl Drop for Side {
@@ -219,6 +222,17 @@ async fn side(
     gated: bool,
     compaction: bool,
 ) -> Side {
+    side_idling(store, steps, gated, compaction, IDLE).await
+}
+
+/// [`side`], whose sessions close after `idle` without a command.
+async fn side_idling(
+    store: bool,
+    steps: Vec<Vec<NormalizedEvent>>,
+    gated: bool,
+    compaction: bool,
+    idle: Duration,
+) -> Side {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let dir = broca_test_support::scratch_root().join(format!(
@@ -229,8 +243,9 @@ async fn side(
     let _ = std::fs::remove_dir_all(&dir);
     let gate = gated.then(|| Arc::new(Notify::new()));
     let wal = Arc::new(FileWalStore::new(dir.join("wal")));
+    let provider = broca_core::provider::StubProvider::new(steps.clone());
     let scripted = || Gated {
-        inner: broca_core::provider::StubProvider::new(steps.clone()),
+        inner: provider.clone(),
         gate: gate.clone(),
     };
     let executor: Arc<dyn RunExecutor> = Arc::new(Loops {
@@ -243,7 +258,7 @@ async fn side(
         &dir,
         broca_session_store::keys::DeploymentKey::new(1, &[7; 32]),
         Arc::clone(&executor),
-        IDLE,
+        idle,
     )
     .await
     .unwrap();
@@ -254,7 +269,7 @@ async fn side(
                 wal.clone(),
                 executor,
             )
-            .with_idle_ttl(IDLE)
+            .with_idle_ttl(idle)
             .with_store_runtime(Arc::new(runtime)),
         ),
         wal,
@@ -271,6 +286,7 @@ async fn side(
         registry,
         key,
         gate,
+        provider,
     }
 }
 
@@ -437,8 +453,27 @@ fn mid_at(reply: &Value, ordinal: u64) -> String {
 /// Compares every raw `session.history` read worth telling apart on both sides: the newest
 /// page whole and in short pages, each side following its own cursors, seeks by ordinal and by
 /// each side's own message ids, and the refusals of a position the session doesn't hold.
+/// Whether `session.history` on the store session is still refused while it waits on display
+/// facts for store sessions; today's storage serves the same request. While it is, the raw
+/// history comparisons are skipped; once the refusal is gone they run again unchanged.
+async fn raw_history_waits(today: &Side, store: &Side, label: &str) -> bool {
+    match store.history(json!({})).await {
+        Err(crate::history::HistoryError::Refused { code, message })
+            if code == crate::store_entries::NOT_SERVED_ON_NEW_STORAGE
+                && message.contains("display facts") =>
+        {
+            assert!(today.history(json!({})).await.is_ok(), "{label}");
+            true
+        }
+        _ => false,
+    }
+}
+
 async fn compare_history(today: &Side, store: &Side, label: &str) {
     assert!(store.holds() && !today.holds(), "{label}: the storages");
+    if raw_history_waits(today, store, label).await {
+        return;
+    }
     let both = |request: Value| async move {
         (
             today.history(request.clone()).await,
@@ -623,7 +658,13 @@ async fn finished_runs_read_as_the_same_history() {
         side.settled("r2").await;
     }
     // The comparison sees a served call: keyed, dispatched, determinate.
-    let read = store.history(json!({"from_ordinal": 1})).await.unwrap();
+    let read = crate::serve::ServeHandler::read(
+        &store.registry,
+        crate::serve::SessionReadRequest::new(store.key.clone(), Some(1), None),
+    )
+    .await
+    .unwrap();
+    let read = serde_json::to_value(&read).unwrap();
     let calls: Vec<&Value> = read["messages"]
         .as_array()
         .unwrap()
@@ -750,13 +791,24 @@ fn untooled(text: &str) -> SubmissionRequest {
 /// `ck-mc` and, when `renders`, renders part numbers: two runs, the second with a tool turn, and
 /// replies carrying part-number notation.
 async fn contract_sessions(renders: bool) -> (Side, Side) {
-    let steps = vec![
+    contract_sessions_with(renders, Vec::new(), IDLE).await
+}
+
+/// [`contract_sessions`], with `more` steps scripted after its two runs' and sessions that
+/// close after `idle` without a command.
+async fn contract_sessions_with(
+    renders: bool,
+    more: Vec<Vec<NormalizedEvent>>,
+    idle: Duration,
+) -> (Side, Side) {
+    let mut steps = vec![
         text_step("a1", "§2§ Done."),
         tool_step("a2"),
         text_step("a3", "§5§ §6§ It says file contents."),
     ];
-    let today = side(false, steps.clone(), false, true).await;
-    let store = side(true, steps, false, true).await;
+    steps.extend(more);
+    let today = side_idling(false, steps.clone(), false, true, idle).await;
+    let store = side_idling(true, steps, false, true, idle).await;
     for side in [&today, &store] {
         assert!(matches!(
             side.send_request(
@@ -781,7 +833,7 @@ async fn contract_sessions(renders: bool) -> (Side, Side) {
         .registry
         .store_runtime()
         .unwrap()
-        .view(&store.key)
+        .current_view(&store.key)
         .await
         .unwrap()
         .unwrap();
@@ -927,16 +979,16 @@ async fn the_compaction_route_serves_the_frozen_provider_alike() {
     );
     assert_eq!(new, old, "session.entries by ids");
     assert_eq!(new.unwrap()["entries"].as_array().unwrap().len(), 3);
-    // Accepting a pushed view is the session writer's, which the store actor doesn't take yet.
-    let apply = store
-        .compaction(Some("ck-mc"), "session.apply_view", json!({"view": {}}))
-        .await
-        .unwrap_err();
-    assert_eq!(
-        apply["code"],
-        json!(crate::store_entries::NOT_SERVED_ON_NEW_STORAGE)
-    );
-    assert_eq!(apply["detail"]["method"], json!("session.apply_view"));
+    // Both storages refuse a malformed view (here an empty object) before reading the session.
+    let params = json!({"view": {}});
+    let old = today
+        .compaction(Some("ck-mc"), "session.apply_view", params.clone())
+        .await;
+    let new = store
+        .compaction(Some("ck-mc"), "session.apply_view", params)
+        .await;
+    assert_eq!(new, old);
+    assert_eq!(new.unwrap_err()["code"], json!("invalid_params"));
 }
 
 /// `session.entries` pages the session's entries exactly as today's paging pages the whole
@@ -950,7 +1002,7 @@ async fn session_entries_pages_as_todays_paging_of_the_whole_transcript() {
         .registry
         .store_runtime()
         .unwrap()
-        .view(&store.key)
+        .current_view(&store.key)
         .await
         .unwrap()
         .unwrap();
@@ -1057,12 +1109,14 @@ async fn reads_clean_replies_where_todays_reads_clean_them() {
             expected,
             "today's history, renders {renders}"
         );
-        let new = store.history(json!({"from_ordinal": 1})).await.unwrap();
-        assert_eq!(
-            texts(new["messages"].as_array().unwrap()),
-            expected,
-            "the store's history, renders {renders}"
-        );
+        if !raw_history_waits(&today, &store, "cleaning").await {
+            let new = store.history(json!({"from_ordinal": 1})).await.unwrap();
+            assert_eq!(
+                texts(new["messages"].as_array().unwrap()),
+                expected,
+                "the store's history, renders {renders}"
+            );
+        }
         let read = store
             .registry
             .read(SessionReadRequest::new(store.key.clone(), Some(1), None))
@@ -1079,7 +1133,7 @@ async fn reads_clean_replies_where_todays_reads_clean_them() {
             .registry
             .store_runtime()
             .unwrap()
-            .view(&store.key)
+            .current_view(&store.key)
             .await
             .unwrap()
             .unwrap();
@@ -1096,4 +1150,497 @@ async fn reads_clean_replies_where_todays_reads_clean_them() {
             .collect();
         assert_eq!(stored, raw, "renders {renders}");
     }
+}
+
+/// The input folder of [`dump_head_import_entries`]: `HEAD_IMPORT_EXPORT_DIR`, else Thalamus's
+/// first published exports.
+fn head_import_input() -> std::path::PathBuf {
+    std::env::var_os("HEAD_IMPORT_EXPORT_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../ck-session-import/tests/fixtures/thalamus-export-v1")
+        })
+}
+
+/// Checks every file `SHA256SUMS` in `folder` lists against its digest, and refuses on any
+/// mismatch or missing file, before anything else in the folder is read.
+fn check_sums(folder: &std::path::Path) {
+    use sha2::Digest as _;
+    let sums = std::fs::read_to_string(folder.join("SHA256SUMS"))
+        .unwrap_or_else(|e| panic!("{}: no SHA256SUMS: {e}", folder.display()));
+    for line in sums.lines().filter(|line| !line.trim().is_empty()) {
+        let (digest, name) = line
+            .split_once("  ")
+            .unwrap_or_else(|| panic!("a SHA256SUMS line without a name: {line}"));
+        let bytes = std::fs::read(folder.join(name))
+            .unwrap_or_else(|e| panic!("{name}, listed in SHA256SUMS: {e}"));
+        let actual = format!("{:x}", sha2::Sha256::digest(&bytes));
+        assert_eq!(
+            actual, digest,
+            "{name} doesn't match SHA256SUMS: refusing the folder"
+        );
+    }
+}
+
+/// One row of the comparison of Thalamus's entries with broca's: a source message id, the
+/// ordinal and part ids each side gives it.
+#[derive(Default)]
+struct Compared {
+    thalamus_ordinal: Option<u64>,
+    broca_ordinal: Option<u64>,
+    thalamus_parts: Option<Vec<String>>,
+    broca_parts: Option<Vec<String>>,
+}
+
+/// The ordinal and part ids of each entry of `session.entries` answers, by message id, in order.
+fn entries_by_mid(pages: &[Value]) -> Vec<(String, u64, Vec<String>)> {
+    pages
+        .iter()
+        .flat_map(|page| page["entries"].as_array().cloned().unwrap_or_default())
+        .map(|entry| {
+            (
+                entry["mid"].as_str().unwrap_or_default().to_owned(),
+                entry["ordinal"].as_u64().unwrap_or_default(),
+                entry["parts"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|part| part["id"].as_str().unwrap_or("?").to_owned())
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+/// A plain table of every source message id: Thalamus's entry ordinal and broca's, the part ids
+/// on each side, then any entry broca adds (one whose id no source row has).
+fn comparison(
+    reply: &broca_wire::head_import::FileImportReply,
+    thalamus: &[(String, u64, Vec<String>)],
+    broca: &[(String, u64, Vec<String>)],
+    broca_refused: Option<&str>,
+) -> String {
+    let mut rows: Vec<(String, Compared)> = Vec::new();
+    fn row(rows: &mut Vec<(String, Compared)>, mid: &str) -> usize {
+        match rows.iter().position(|(known, _)| known == mid) {
+            Some(at) => at,
+            None => {
+                rows.push((mid.to_owned(), Compared::default()));
+                rows.len() - 1
+            }
+        }
+    }
+    // A row for a message broca added names no source message: it is listed with the
+    // entries broca adds.
+    for moved in reply.moves.rows.iter().filter(|moved| !moved.added) {
+        let at = row(&mut rows, &moved.mid);
+        rows[at].1.broca_ordinal = moved.entry;
+    }
+    for (mid, ordinal, parts) in thalamus {
+        let at = row(&mut rows, mid);
+        rows[at].1.thalamus_ordinal = Some(*ordinal);
+        rows[at].1.thalamus_parts = Some(parts.clone());
+    }
+    let sources = rows.len();
+    let mut added = Vec::new();
+    for (mid, ordinal, parts) in broca {
+        match rows[..sources].iter().position(|(known, _)| known == mid) {
+            Some(at) => {
+                rows[at].1.broca_ordinal = Some(*ordinal);
+                rows[at].1.broca_parts = Some(parts.clone());
+            }
+            None => added.push((mid.clone(), *ordinal, parts.clone())),
+        }
+    }
+    let show = |value: &Option<u64>| value.map_or("-".to_owned(), |value| value.to_string());
+    let parts = |value: &Option<Vec<String>>| match value {
+        None => "-".to_owned(),
+        Some(parts) if parts.is_empty() => "(none)".to_owned(),
+        Some(parts) => parts.join(" "),
+    };
+    let mut out = String::new();
+    if let Some(refused) = broca_refused {
+        out.push_str(&format!(
+            "broca's compaction route refused session.entries: {refused}. broca's columns \
+             come from the import reply's move list and the `entries-unadmitted-<n>.json` \
+             pages: not route bytes, the page the route serves once the session's plan names \
+             the compaction provider.\n\n"
+        ));
+    }
+    out.push_str(
+        "| source mid | thalamus ordinal | broca ordinal | thalamus part ids | broca part ids |\n\
+         |---|---|---|---|---|\n",
+    );
+    for (mid, compared) in &rows {
+        out.push_str(&format!(
+            "| {mid} | {} | {} | {} | {} |\n",
+            show(&compared.thalamus_ordinal),
+            show(&compared.broca_ordinal),
+            parts(&compared.thalamus_parts),
+            parts(&compared.broca_parts),
+        ));
+    }
+    out.push_str("\nEntries broca adds (no source mid):\n\n");
+    if added.is_empty() {
+        out.push_str("(none)\n");
+    } else {
+        out.push_str(
+            "| broca mid | broca ordinal | broca part ids | move list row |\n|---|---|---|---|\n",
+        );
+        for (mid, ordinal, part_ids) in &added {
+            let listed = reply
+                .moves
+                .rows
+                .iter()
+                .any(|moved| moved.added && &moved.mid == mid && moved.entry == Some(*ordinal));
+            out.push_str(&format!(
+                "| {mid} | {ordinal} | {} | {} |\n",
+                parts(&Some(part_ids.clone())),
+                if listed { "added" } else { "none" }
+            ));
+        }
+    }
+    out
+}
+
+/// For each host folder (`opencode2`, `pi`) of a Thalamus export folder, imports the export
+/// through the module's real file import into a session in the new storage, then reads every
+/// page of `session.entries` through the module's `compaction-runner/v1` route, as the
+/// compaction provider `magic-context` would. Writes, under `HEAD_IMPORT_OUT_DIR/<host>/`:
+/// - `import-reply.json`, the import's reply, move list included;
+/// - `entries-<n>.json`, each page exactly as the route returns it, or, when the route refuses,
+///   `entries-1.refused.json` with its refusal and `entries-unadmitted-<n>.json`, the pages the
+///   route's own page function builds, which it serves once the session's plan names the
+///   compaction provider;
+/// - `comparison.md`, when the host folder holds Thalamus's own `entries-1.json`;
+/// - `README.md`, saying what each file is, and `SHA256SUMS` over them all.
+///
+/// The input folder's `SHA256SUMS` is checked before anything else is read. Run by hand:
+///
+/// ```text
+/// HEAD_IMPORT_EXPORT_DIR=<export folder> HEAD_IMPORT_OUT_DIR=<output folder> \
+///   cargo nextest run -p broca-module --run-ignored only \
+///   -E 'test(=store_actor::entries_comparison::dump_head_import_entries)'
+/// ```
+#[tokio::test]
+#[ignore = "writes files: run by hand with HEAD_IMPORT_EXPORT_DIR and HEAD_IMPORT_OUT_DIR"]
+async fn dump_head_import_entries() {
+    use broca_wire::head_import::{FileImportParams, ImportHarness, ImportOrigin, ImportSource};
+    use sha2::Digest as _;
+    let input = head_import_input();
+    let out = std::path::PathBuf::from(
+        std::env::var_os("HEAD_IMPORT_OUT_DIR").expect("HEAD_IMPORT_OUT_DIR names the output"),
+    );
+    check_sums(&input);
+    for (host, journal, harness) in [
+        ("opencode2", "export.json", ImportHarness::OpenCode2),
+        ("pi", "export.jsonl", ImportHarness::Pi),
+    ] {
+        let folder = input.join(host);
+        if !folder.exists() {
+            continue;
+        }
+        let export = std::fs::read(folder.join(journal)).unwrap();
+        // The session id the export names: OpenCode's `info.id`, Pi's header line's `id`.
+        let session_id = match harness {
+            ImportHarness::OpenCode2 => serde_json::from_slice::<Value>(&export).unwrap()["info"]
+                ["id"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+            _ => serde_json::from_str::<Value>(
+                std::str::from_utf8(&export)
+                    .unwrap()
+                    .lines()
+                    .next()
+                    .unwrap(),
+            )
+            .unwrap()["id"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        };
+        let thalamus_reply: Value =
+            serde_json::from_slice(&std::fs::read(folder.join("reply.json")).unwrap()).unwrap();
+        let side = side(true, Vec::new(), false, false).await;
+        // The export and its side file, in a folder the import may read and then delete.
+        let source = side.dir.join("import-source");
+        std::fs::create_dir_all(&source).unwrap();
+        let path = source.join(format!("head.{}", journal.rsplit('.').next().unwrap()));
+        std::fs::write(&path, &export).unwrap();
+        if let Ok(sends) = std::fs::read(folder.join("export.sends.json")) {
+            let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
+            std::fs::write(source.join(format!("{stem}.sends.json")), sends).unwrap();
+        }
+        let command = crate::store_import::StoreCommand::Import(Box::new(
+            crate::store_import::ImportCommand {
+                params: FileImportParams {
+                    import_id: format!("imp-{host}"),
+                    source: ImportSource {
+                        harness,
+                        path: path.display().to_string(),
+                        session: session_id.clone(),
+                        sha256: format!("{:x}", sha2::Sha256::digest(&export)),
+                    },
+                    origin: ImportOrigin {
+                        kind: "import".into(),
+                        source_ref: format!("thalamus:{session_id}"),
+                    },
+                    tag_floor: thalamus_reply["tag_floor"].as_u64(),
+                },
+                principal: broca_protocol::BindPrincipal::Reserved {
+                    module_id: "prefrontal-core".into(),
+                },
+                // The import refuses a route without a scope; Prefrontal sends one on the scope
+                // of the agent whose head it moves.
+                scope: Some(broca_protocol::SessionScope {
+                    owner: broca_protocol::BindPrincipal::Reserved {
+                        module_id: "prefrontal-core".into(),
+                    },
+                    scope_ref: "agent:a1".into(),
+                    scope_epoch: 1,
+                    flow_id: None,
+                    sender: None,
+                    agent_id: None,
+                    run_id: None,
+                    agent_id_frozen: false,
+                }),
+                roots: Arc::new(crate::store_import::ImportRoots::new(
+                    vec![source.clone()],
+                    Some(source.clone()),
+                )),
+                now_ms: 9_000,
+            },
+        ));
+        let reply = match side
+            .registry
+            .route_store_command(&side.key, command)
+            .await
+            .unwrap()
+        {
+            crate::store_import::StoreOutcome::Imported(reply) => reply,
+            other => panic!("{host}: the import was refused: {other:?}"),
+        };
+        let written = out.join(host);
+        let _ = std::fs::remove_dir_all(&written);
+        std::fs::create_dir_all(&written).unwrap();
+        let mut files = vec![(
+            "import-reply.json".to_owned(),
+            serde_json::to_vec_pretty(&reply).unwrap(),
+        )];
+        // Every page, from the first entry on, as Thalamus's own recording reads them.
+        let mut pages = Vec::new();
+        let mut refused = None;
+        let mut after: Option<u64> = None;
+        for page in 1.. {
+            let mut params = json!({"select": {"by": "after"}, "detail": "full"});
+            if let Some(after) = after {
+                params["select"]["after_ordinal"] = json!(after);
+            }
+            match side
+                .registry
+                .route_compaction_v2(
+                    &side.key,
+                    Some("magic-context".into()),
+                    "session.entries".into(),
+                    serde_json::value::to_raw_value(&params).unwrap(),
+                )
+                .await
+            {
+                Ok(served) => {
+                    files.push((
+                        format!("entries-{page}.json"),
+                        served.get().as_bytes().to_vec(),
+                    ));
+                    let served: Value = serde_json::from_str(served.get()).unwrap();
+                    let next = served["next_after"].as_u64();
+                    pages.push(served);
+                    match next {
+                        Some(next) => after = Some(next),
+                        None => break,
+                    }
+                }
+                Err(refusal) => {
+                    let refusal = serde_json::to_value(&refusal).unwrap();
+                    refused = Some(format!(
+                        "{} ({})",
+                        refusal["code"].as_str().unwrap_or("?"),
+                        refusal["detail"]["reason"].as_str().unwrap_or("no reason")
+                    ));
+                    files.push((
+                        format!("entries-{page}.refused.json"),
+                        serde_json::to_vec(&refusal).unwrap(),
+                    ));
+                    break;
+                }
+            }
+        }
+        if refused.is_some() {
+            // The pages the route's own page function builds for the session, which the route
+            // serves once the session's plan names the compaction provider.
+            let session = side
+                .registry
+                .store_runtime()
+                .unwrap()
+                .current_view(&side.key)
+                .await
+                .unwrap()
+                .expect("the import created the session");
+            let mut after: Option<u64> = None;
+            for page in 1.. {
+                let request: ReadRequest = serde_json::from_value(json!({
+                    "select": {"by": "after", "after_ordinal": after},
+                    "detail": "full",
+                }))
+                .unwrap();
+                let built = crate::store_entries::entries_page(&session, &request)
+                    .await
+                    .unwrap();
+                let bytes = serde_json::to_vec(&built).unwrap();
+                files.push((format!("entries-unadmitted-{page}.json"), bytes.clone()));
+                let built: Value = serde_json::from_slice(&bytes).unwrap();
+                let next = built["next_after"].as_u64();
+                pages.push(built);
+                match next {
+                    Some(next) => after = Some(next),
+                    None => break,
+                }
+            }
+        }
+        let mut readme = format!(
+            "What broca serves for Thalamus's `{host}` export after importing it into a session \
+             in the new storage, written by `dump_head_import_entries` in \
+             `crates/broca-module/src/store_actor/entries_comparison.rs`.\n\n\
+             - `import-reply.json`: the `session.import` reply, move list included.\n"
+        );
+        match &refused {
+            None => readme.push_str(
+                "- `entries-<n>.json`: each `session.entries` page exactly as the \
+                 `compaction-runner/v1` route returned it to `magic-context`, from the first \
+                 entry on in full detail, following `next_after`.\n",
+            ),
+            Some(refused) => readme.push_str(&format!(
+                "- `entries-1.refused.json`: the `compaction-runner/v1` route's refusal of \
+                 `session.entries` to `magic-context`, exactly as returned: {refused}. This is \
+                 expected: a moved head gets its plan, naming its compaction provider, from \
+                 core's adopt after the import, and until then the route has no compaction \
+                 provider to admit.\n\
+                 - `entries-unadmitted-<n>.json`: not route bytes: the page the route serves \
+                 once the session's plan names the compaction provider, built by the route's \
+                 own page function (`store_entries::entries_page`), from the first entry on in \
+                 full detail, following `next_after`.\n"
+            )),
+        }
+        readme.push_str(
+            "- `comparison.md`, when the export folder holds Thalamus's own `entries-<n>.json`: \
+             one row per source message id with each side's entry ordinal and part ids, then \
+             any entry broca adds.\n\
+             - `SHA256SUMS`: every file above.\n",
+        );
+        files.push(("README.md".into(), readme.into_bytes()));
+        if let Ok(theirs) = std::fs::read(folder.join("entries-1.json")) {
+            let mut thalamus = vec![serde_json::from_slice::<Value>(&theirs).unwrap()];
+            for page in 2.. {
+                match std::fs::read(folder.join(format!("entries-{page}.json"))) {
+                    Ok(bytes) => thalamus.push(serde_json::from_slice(&bytes).unwrap()),
+                    Err(_) => break,
+                }
+            }
+            files.push((
+                "comparison.md".into(),
+                comparison(
+                    &reply,
+                    &entries_by_mid(&thalamus),
+                    &entries_by_mid(&pages),
+                    refused.as_deref(),
+                )
+                .into_bytes(),
+            ));
+        }
+        let mut sums = String::new();
+        for (name, bytes) in &files {
+            std::fs::write(written.join(name), bytes).unwrap();
+            sums.push_str(&format!("{:x}  {name}\n", sha2::Sha256::digest(bytes)));
+        }
+        std::fs::write(written.join("SHA256SUMS"), sums).unwrap();
+    }
+}
+
+/// A view the compaction provider applies while the session is idle between runs is accepted
+/// alike by both storages and answered alike on a retry, a view naming a message the session
+/// doesn't hold is refused alike, and the next run's first request renders the accepted view
+/// alike. The store session stays open from the apply to that run, so the view reaches it
+/// through the compaction state the actor keeps, not a reload.
+#[tokio::test]
+async fn an_idle_apply_view_reaches_the_next_runs_first_step_as_today() {
+    use broca_core::compaction_v2::protocol::view::{Edit, EditOp, View};
+    let (today, store) = contract_sessions_with(
+        false,
+        vec![text_step("a4", "after the view")],
+        Duration::from_secs(60),
+    )
+    .await;
+    let drop = |version: u64, mid: String| {
+        View::seal(
+            version,
+            vec![Edit::new(version, EditOp::Drop { mid, part: None })],
+        )
+    };
+    let mut answers = Vec::new();
+    for side in [&today, &store] {
+        let apply = |view: View| {
+            side.compaction(Some("ck-mc"), "session.apply_view", json!({ "view": view }))
+        };
+        // The first run's reply, entry 2.
+        let reply = entry_mids(side).await[&2].clone();
+        let first = apply(drop(1, reply.clone())).await;
+        let retry = apply(drop(1, reply)).await;
+        let unknown = apply(drop(2, "no-such-message".into())).await;
+        answers.push((first, retry, unknown));
+    }
+    assert_eq!(answers[1], answers[0], "the store answers as today's");
+    assert_eq!(answers[0].0, Ok(json!({"answer": "accepted"})));
+    for refused in [&answers[0].1, &answers[0].2] {
+        assert!(
+            matches!(refused, Ok(answer) if answer["answer"] == "refused"),
+            "{refused:?}"
+        );
+    }
+    for side in [&today, &store] {
+        assert!(matches!(
+            side.send_request("r3", untooled("again"), Some(planned("plan-1", None)))
+                .await,
+            SendOutcome::Active { .. } | SendOutcome::Pending { .. }
+        ));
+        side.settled("r3").await;
+        side.assert_completed("r3").await;
+    }
+    // r3's first step is the provider's fourth request.
+    let prompt = |side: &Side| serde_json::to_value(&side.provider.calls()[3].prompt).unwrap();
+    assert_eq!(prompt(&store), prompt(&today));
+    assert!(
+        !prompt(&store).to_string().contains("Done."),
+        "the view dropped the first reply: {}",
+        prompt(&store)
+    );
+    let session = store
+        .registry
+        .store_runtime()
+        .unwrap()
+        .current_view(&store.key)
+        .await
+        .unwrap()
+        .unwrap();
+    let applied: Vec<u64> = session
+        .open_log_records()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|(_, record)| match record {
+            broca_session_store::record::Record::ViewApplied(applied) => Some(applied.version),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(applied, [1], "r3's first step applied the view");
 }

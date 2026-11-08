@@ -13,7 +13,9 @@
 //!   minted (`CallFacts::carrier`), so, as today's read does for a message no step of its log
 //!   produced, each call is served with no dispatch fact.
 //!
-//! A call without an intent never left: it has no key and no module, and isn't indeterminate.
+//! A call without an intent never left: it isn't indeterminate and has no module. Answered (denied,
+//! invalid, synthetic, or refused with its batch), it has the key its outcome recorded, as
+//! today's read keys it by the record that answered it.
 //! A tool result delivered as a send's carrier names the carrier call's key (`delivered_as`).
 
 use broca_protocol::content::ContentBlock;
@@ -115,16 +117,26 @@ async fn open_call<B: SessionBackend>(
     let positions: Vec<usize> = (0..batch.calls.len())
         .filter(|position| batch.id(*position).0 == id)
         .collect();
-    let Some(key) = positions
-        .iter()
-        .find_map(|position| batch.key(*position))
-        .map(str::to_owned)
-    else {
-        return Ok(unattributed(id));
-    };
     let answered = positions
         .iter()
         .any(|position| batch.state(*position) == CallState::Terminated);
+    let Some(dispatched) = positions
+        .iter()
+        .find(|position| batch.calls[**position].intent)
+    else {
+        // A call answered without an intent has the key its outcome recorded, and nothing
+        // else; one not answered yet has neither.
+        return Ok(SessionReadToolCall {
+            call_key: positions
+                .iter()
+                .find_map(|position| batch.key(*position))
+                .map(str::to_owned),
+            ..unattributed(id)
+        });
+    };
+    let Some(key) = batch.key(*dispatched).map(str::to_owned) else {
+        return Ok(unattributed(id));
+    };
     let intent = session
         .find_id(broca_session_store::idindex::IdKind::CallKey, &key)
         .await?

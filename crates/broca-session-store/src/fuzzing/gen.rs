@@ -614,7 +614,6 @@ mod records {
         client_message_id,
         sender,
         marks,
-        budget_finalize,
         no_display_facts,
         reasoning_summaries,
         rich_ui,
@@ -748,6 +747,7 @@ mod records {
         finished_at_ms,
         detail,
         hooks,
+        call_key,
     });
     crate::fuzzing::gen::fields!(Compaction { version, body });
     crate::fuzzing::gen::fields!(Marker {

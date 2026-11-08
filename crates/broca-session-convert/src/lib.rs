@@ -131,6 +131,10 @@ struct State {
     /// In a mode-3 log: who delivered each tool-result delivery's text, by the delivering
     /// record's seq (see `entry_facts`).
     delivery_notices: HashMap<u64, Notice>,
+    /// The current step's calls that a record already anchored, as today's call keys read them:
+    /// `None` for a dispatch intent, which holds the call's key, or the seq of the deferral that
+    /// prepared a call for an approval.
+    anchored: HashMap<String, Option<u64>>,
 }
 
 /// Writes the held copies as transcript entries at the boundary that places them.
@@ -271,6 +275,23 @@ pub fn convert(old: &[FramedRecord], lineage: Option<&str>) -> Result<Converted,
             }
         }
         state.seq = framed.seq;
+        // Today's call keys come from the record that first anchors each call of a step.
+        match &framed.record {
+            WalRecord::RunStarted { .. }
+            | WalRecord::ModelStepFinished { .. }
+            | WalRecord::TurnFinished { .. }
+            | WalRecord::RunFinished { .. } => state.anchored.clear(),
+            WalRecord::ToolDispatchIntent { tool_call_id, .. } => {
+                state.anchored.insert(tool_call_id.0.clone(), None);
+            }
+            WalRecord::ToolCallDeferred { call_id, .. } => {
+                state
+                    .anchored
+                    .entry(call_id.0.clone())
+                    .or_insert(Some(framed.seq));
+            }
+            _ => {}
+        }
         let before = out.records.len();
         convert_one(&framed.record, &mut state, &mut out)?;
         // Today's display facts of each message this record gave a new version, by today's
@@ -301,10 +322,8 @@ pub fn convert(old: &[FramedRecord], lineage: Option<&str>) -> Result<Converted,
         };
         if let Some((legacy, counts, emitted)) = &mut facts {
             let mut known = *emitted;
-            // Whether broca wrote each newly known message, told by the record that placed it,
-            // and whether a step after the budget's finalize firing wrote it.
+            // Whether broca wrote each newly known message, told by the record that placed it.
             let mut native_of = BTreeMap::new();
-            let mut finalize_of = BTreeMap::new();
             // The reasoning summaries of each newly known message, from the record that placed
             // it, as the run loop records them.
             let mut summaries_of = BTreeMap::new();
@@ -331,10 +350,6 @@ pub fn convert(old: &[FramedRecord], lineage: Option<&str>) -> Result<Converted,
                 let now = counts.placed + u64::from(reserved);
                 for ordinal in known + 1..=now {
                     native_of.insert(ordinal, broca_session_loop::entries::native(record));
-                    finalize_of.insert(
-                        ordinal,
-                        matches!(record, Record::Assistant(assistant) if assistant.budget_finalize == Some(true)),
-                    );
                     let placed = match record {
                         Record::Input(input) => Some(&input.message),
                         Record::Assistant(assistant) => Some(&assistant.message),
@@ -383,10 +398,6 @@ pub fn convert(old: &[FramedRecord], lineage: Option<&str>) -> Result<Converted,
                     legacy.deliveries.get(&(ordinal - 1)),
                     legacy.display.get(&(ordinal - 1)),
                 );
-                entry.budget_finalize = finalize_of
-                    .get(&ordinal)
-                    .copied()
-                    .filter(|finalize| *finalize);
                 // Today's read serves display facts only on a log with a lineage.
                 entry.no_display_facts = lineage.is_none().then_some(true);
                 entry.reasoning_summaries = summaries_of.remove(&ordinal).unwrap_or_default();
@@ -1527,6 +1538,15 @@ fn reply_and_outcome(terminal: Terminal, state: &State, out: &mut Converted) {
     let result_digest = sha256(&result.encode());
     let tool_call_id = result.tool_call_id.clone();
     let is_error = result.is_error;
+    // A call no dispatch intent anchored keeps the key today's projection gives it: the log's
+    // lineage and the seq of the record that first anchored it, its deferral or this terminal.
+    let call_key = match state.anchored.get(&tool_call_id.0) {
+        Some(None) => None,
+        Some(Some(deferred)) => {
+            broca_core::context::tool_call_key(state.lineage.as_deref(), *deferred, None)
+        }
+        None => broca_core::context::tool_call_key(state.lineage.as_deref(), state.seq, None),
+    };
     out.records.push(Record::ToolReply(ToolReply {
         run_id: state.run_id.clone(),
         batch_id: Some(batch_id.clone()),
@@ -1546,6 +1566,7 @@ fn reply_and_outcome(terminal: Terminal, state: &State, out: &mut Converted) {
         finished_at_ms,
         detail,
         hooks,
+        call_key,
     }));
 }
 

@@ -429,14 +429,23 @@ pub async fn read<H: ServeHandler + ?Sized>(
     };
     // A session kept in the new storage is read from it: its head facts here, its pages through
     // `handler.read`. The display form needs facts the new storage doesn't serve yet (per-call
-    // times, the Rich UI stamp (`rich_ui`) each run's plan names, and output references), so it
-    // is refused by name, never answered without them.
+    // times, the Rich UI dialect and catalog digest each run froze at its start (`rich_ui`), and
+    // output references), so it is refused by name, never answered without them.
     let store = handler.store_history_head(session, named).await?;
     if store.is_some() && request.form() == HistoryForm::Display {
         return Err(refused(
             crate::store_entries::NOT_SERVED_ON_NEW_STORAGE,
             "session.history form display is not served yet for a session kept in the new \
-             storage; the raw form is",
+             storage",
+        ));
+    }
+    // Raw history reads its pages with display facts (each message's sender), which a store
+    // session's `session.read` doesn't serve yet. Remove this once it serves them.
+    if store.is_some() {
+        return Err(refused(
+            crate::store_entries::NOT_SERVED_ON_NEW_STORAGE,
+            "session.history is not served yet for a session kept in the new storage: it \
+             waits on display facts for such sessions",
         ));
     }
     // The store's own ids aren't positions, so it resolves a named message itself.

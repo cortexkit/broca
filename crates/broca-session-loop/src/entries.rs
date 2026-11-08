@@ -66,9 +66,11 @@ pub struct Terminal {
     unanswered: Option<Unanswered>,
     /// The call never left: it took no dispatch intent.
     refused: bool,
-    /// The seq of the outcome record, which names a call that took no intent (see
-    /// [`turn_facts`]).
+    /// The seq of the outcome record, which orders it among the turn's other call records.
     seq: u64,
+    /// The key the outcome recorded for a call answered without a dispatch intent
+    /// (`ToolOutcome::call_key`).
+    call_key: Option<String>,
 }
 
 impl Terminal {
@@ -108,6 +110,7 @@ impl Terminal {
             unanswered,
             refused: outcome.outcome == CallOutcome::NotDispatched,
             seq,
+            call_key: outcome.call_key.clone(),
         }
     }
 }
@@ -190,8 +193,12 @@ impl<W: Writer> Placed<'_, W> {
         else {
             return Ok(());
         };
-        let missing: Vec<String> = (0..batch.calls.len())
-            .filter_map(|position| batch.key(position))
+        // A call answered without an intent has its outcome's key, and no intent.
+        let missing: Vec<String> = batch
+            .calls
+            .iter()
+            .filter(|call| call.intent)
+            .filter_map(|call| call.key.as_deref())
             .filter(|key| !self.calls.intents.contains_key(*key))
             .map(str::to_owned)
             .collect();
@@ -492,7 +499,8 @@ pub fn with_facts(batch: Vec<Record>, at: &Placing<'_>) -> Result<Vec<Record>, S
     let mut run_send = SendFacts::default();
     let mut records = batch.into_iter().peekable();
     // The tool turn this batch places, written after the records that place it: the ordinal of
-    // its assistant message, and the message.
+    // its assistant message, and the message. Its facts are written once the closing reply's
+    // outcome (which may carry the key of a call answered without an intent) is in.
     let mut placed_turn: Option<(u64, Message)> = None;
     // The facts of the last tool turn this batch wrote.
     let mut latest_turn: Option<TurnFacts> = None;
@@ -503,10 +511,25 @@ pub fn with_facts(batch: Vec<Record>, at: &Placing<'_>) -> Result<Vec<Record>, S
         .run
         .as_ref()
         .and_then(|run| run.open_batch.as_ref());
+    // The calls a dispatch intent anchored whose outcome isn't recorded yet, one entry per
+    // intent: each outcome for one of them answers it, and any other outcome answers a call
+    // that took no intent.
+    let mut dispatched: Vec<ToolCallId> = open_batch
+        .map(|batch| {
+            batch
+                .calls
+                .iter()
+                .filter(|call| call.intent && call.terminal.is_none())
+                .map(|call| call.id.clone())
+                .collect()
+        })
+        .unwrap_or_default();
     let mut events: Vec<CallEvent> = Vec::new();
     if let Some(batch) = open_batch {
-        for position in 0..batch.calls.len() {
-            let Some(key) = batch.key(position) else {
+        for call in &batch.calls {
+            // A call answered without an intent has its outcome's key, which its terminal
+            // carries.
+            let Some(key) = call.key.as_deref().filter(|_| call.intent) else {
                 continue;
             };
             let (intent, seq) =
@@ -526,23 +549,37 @@ pub fn with_facts(batch: Vec<Record>, at: &Placing<'_>) -> Result<Vec<Record>, S
     let mut reply: Option<ToolReply> = None;
     // A run's end restating its last turn's facts after itself, as it places no message.
     let mut restated: Option<TurnFacts> = None;
-    while let Some(record) = records.next() {
-        match &record {
+    while let Some(mut record) = records.next() {
+        // The seq the record takes.
+        let seq = at.first_seq + out.len() as u64;
+        match &mut record {
             Record::RunStart(start) => {
                 run_sender = input_sender(start);
                 run_send = run_send_facts(start, at.operations);
             }
-            Record::ToolIntent(intent) => events.push(CallEvent::Intent(
-                Box::new(intent.clone()),
-                Some(at.first_seq + out.len() as u64),
-            )),
+            Record::BatchStart(_) => dispatched.clear(),
+            Record::ToolIntent(intent) => {
+                dispatched.push(intent.tool_call_id.clone());
+                events.push(CallEvent::Intent(Box::new(intent.clone()), Some(seq)));
+            }
             Record::ToolReply(next) => reply = Some(next.clone()),
             Record::ToolOutcome(outcome) => {
+                // The outcome answers a call an intent anchored, or else a call answered
+                // without a dispatch intent, which takes a key minted from the writer
+                // generation and the seq its outcome takes, in the form of the store's ids.
+                match dispatched.iter().position(|id| *id == outcome.tool_call_id) {
+                    Some(position) => {
+                        dispatched.remove(position);
+                    }
+                    None if outcome.call_key.is_none() => {
+                        outcome.call_key = Some(format!("{}.{seq}", at.prefix));
+                    }
+                    None => {}
+                }
                 if let Some(reply) = reply
                     .take()
                     .filter(|reply| reply.result.tool_call_id == outcome.tool_call_id)
                 {
-                    let seq = at.first_seq + out.len() as u64;
                     events.push(CallEvent::Terminal(Terminal::of(&reply, outcome, seq)));
                 }
             }
@@ -603,7 +640,6 @@ pub fn with_facts(batch: Vec<Record>, at: &Placing<'_>) -> Result<Vec<Record>, S
                     client_message_id: facts.send.client_message_id,
                     sender: facts.send.sender,
                     marks: None,
-                    budget_finalize: facts.budget_finalize,
                     no_display_facts: None,
                     reasoning_summaries: message.map(reasoning_summaries).unwrap_or_default(),
                     rich_ui: stamped,
@@ -663,7 +699,7 @@ pub fn with_facts(batch: Vec<Record>, at: &Placing<'_>) -> Result<Vec<Record>, S
         }
         if !continues {
             if let Some((ordinal, assistant)) = placed_turn.take() {
-                let turn = turn_facts(ordinal, &assistant, at.session, &events);
+                let turn = turn_facts(ordinal, &assistant, &events);
                 out.push(Record::TurnFacts(turn.clone()));
                 latest_turn = Some(turn);
                 inserted = true;
@@ -672,9 +708,7 @@ pub fn with_facts(batch: Vec<Record>, at: &Placing<'_>) -> Result<Vec<Record>, S
     }
     flush(&mut out, &mut pending, at);
     if let Some((ordinal, assistant)) = placed_turn.take() {
-        out.push(Record::TurnFacts(turn_facts(
-            ordinal, &assistant, at.session, &events,
-        )));
+        out.push(Record::TurnFacts(turn_facts(ordinal, &assistant, &events)));
     }
     Ok(out)
 }
@@ -703,17 +737,11 @@ impl CallEvent {
 ///
 /// - Each copy of a call id has its own identity: an intent takes the first copy not yet sent or
 ///   closed, a refusal the first without a key, and a result the first not yet closed. A copy
-///   that took no intent is keyed by the outcome record that closed it, under the session's id,
-///   as an intent's key names the intent (`format!("{session}:{seq}")`). A copy with neither has
-///   no facts.
+///   that took no intent takes the key its outcome recorded (`ToolOutcome::call_key`). A copy
+///   with neither has no facts.
 /// - Times and why a call has no answer go to the first copy of its id, each later record
 ///   overwriting what an earlier one set, as today's read keeps them.
-pub fn turn_facts(
-    ordinal: u64,
-    assistant: &Message,
-    session: &str,
-    events: &[CallEvent],
-) -> TurnFacts {
+pub fn turn_facts(ordinal: u64, assistant: &Message, events: &[CallEvent]) -> TurnFacts {
     struct Slot<'a> {
         id: &'a ToolCallId,
         tool_name: &'a str,
@@ -785,8 +813,9 @@ pub fn turn_facts(
                     slots.iter().position(open)
                 };
                 if let Some(slot) = position.map(|position| &mut slots[position]) {
-                    slot.key
-                        .get_or_insert_with(|| format!("{session}:{}", terminal.seq));
+                    if slot.key.is_none() {
+                        slot.key.clone_from(&terminal.call_key);
+                    }
                     slot.closed = true;
                 }
                 if let Some(first) = slots.iter_mut().find(|slot| slot.id == id) {
@@ -1048,8 +1077,6 @@ struct Described {
     clean_reply: bool,
     /// Who sent the send that placed the message, and its `client_message_id`.
     send: SendFacts,
-    /// A step after the budget's finalize firing wrote it (`EntryFacts::budget_finalize`).
-    budget_finalize: Option<bool>,
 }
 
 /// Whether the message `record` places was written by broca itself (a model step's message, a
@@ -1090,7 +1117,6 @@ fn describe<'r>(
                 native: native(record),
                 clean_reply: false,
                 send: SendFacts::default(),
-                budget_finalize: None,
             },
         ),
         Record::Input(input) => (
@@ -1126,7 +1152,6 @@ fn describe<'r>(
                         SendFacts::default()
                     }
                 },
-                budget_finalize: None,
             },
         ),
         Record::Assistant(assistant) => (
@@ -1169,7 +1194,6 @@ fn describe<'r>(
                 native: native(record),
                 clean_reply: at.tags.clean_replies,
                 send: SendFacts::default(),
-                budget_finalize: assistant.budget_finalize.filter(|finalize| *finalize),
             },
         ),
         Record::ToolReply(reply) => (
@@ -1186,7 +1210,6 @@ fn describe<'r>(
                 native: native(record),
                 clean_reply: false,
                 send: SendFacts::default(),
-                budget_finalize: None,
             },
         ),
         other => return Err(format!("entry facts: {} places no message", other.name())),

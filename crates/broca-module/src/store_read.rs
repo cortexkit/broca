@@ -1,12 +1,13 @@
 //! Reads of a session kept in the new session storage.
 //!
-//! A read loads the session read-only (`Session::view`): it never takes the lease or writes, a
-//! torn tail reads as not yet written, and a log that needs a recovery refuses until a writer
-//! repairs it. Each reply is built from what the session decided when it placed each message
-//! (`EntryFacts`) and from its operational fold, so a read costs a load and the pages it serves,
-//! never a replay. A reply here equals the reply today's reader builds from a WAL for the same
-//! history, apart from the differences the stage-6 design names: no WAL lineage, and cursors
-//! on the store's own record seqs.
+//! A read is served by the session's store actor from the session it holds, or, for a session no
+//! actor holds, from a read-only view (`Session::view_at`) kept while the session stays where it
+//! was loaded (see `store_reads`). A view never takes the lease or writes, a torn tail reads as
+//! not yet written, and a log that needs a recovery refuses until a writer repairs it. Each reply
+//! is built from what the session decided when it placed each message (`EntryFacts`) and from its
+//! operational fold, never from a replay. A reply here equals the reply today's reader builds from
+//! a WAL for the same history, except that it has no WAL lineage and its cursors use the store's
+//! own record seqs.
 
 use std::collections::BTreeMap;
 
@@ -43,10 +44,64 @@ impl From<SessionError> for StoreReadError {
     }
 }
 
-/// How many messages the session's transcript holds: the placed ones, and the assistant
-/// message whose tool calls are still running, at its reserved ordinal.
-fn transcript_len<B: SessionBackend>(session: &Session<B>) -> u64 {
+/// How many messages reads serve of the session's transcript: the placed ones, and the
+/// assistant message whose tool calls are still running, at its reserved ordinal, but not the
+/// results of a batch that hasn't closed (see [`results_await_close`]).
+pub fn transcript_len<B: SessionBackend>(session: &Session<B>) -> u64 {
     session.conversation.placed + u64::from(session.conversation.open_tool_turn().is_some())
+        - u64::from(results_await_close(session))
+}
+
+/// Whether the newest placed message holds the results of a tool batch that hasn't closed. The
+/// session places a turn's results once every call has one, but its batch closes after: as it
+/// closes, a delivered note may still join the last result, and the note's facts land with it.
+/// Reads serve such results only once the batch is closed, as today's do, so no entry they
+/// served changes afterwards; until then the turn reads as still running.
+pub fn results_await_close<B: SessionBackend>(session: &Session<B>) -> bool {
+    let conversation = &session.conversation;
+    let Some(batch) = session
+        .operations
+        .run
+        .as_ref()
+        .and_then(|run| run.open_batch.as_ref())
+    else {
+        return false;
+    };
+    if conversation.open_tool_turn().is_some() {
+        return false;
+    }
+    conversation
+        .window_message(conversation.placed)
+        .is_some_and(|newest| {
+            newest.role == Role::Tool
+                && newest.content.iter().all(|block| match block {
+                    broca_protocol::ContentBlock::ToolResult(result) => batch
+                        .calls
+                        .iter()
+                        .any(|call| call.id == result.tool_call_id),
+                    _ => false,
+                })
+        })
+}
+
+/// Up to `limit` entries from ordinal `from` (counting from 1), as reads serve them: the
+/// results of a batch that hasn't closed held back, and the turn they answer served as still
+/// running (see [`results_await_close`]).
+pub async fn served_entries<B: SessionBackend>(
+    session: &Session<B>,
+    from: u64,
+    limit: usize,
+) -> Result<Vec<StoredEntry>, SessionError> {
+    let mut entries = session.entries(from, limit).await?;
+    if results_await_close(session) {
+        let held = session.conversation.placed;
+        entries.retain(|entry| entry.ordinal < held);
+        if let Some(turn) = entries.iter_mut().find(|entry| entry.ordinal + 1 == held) {
+            turn.next = None;
+            turn.open = true;
+        }
+    }
+    Ok(entries)
 }
 
 /// A `session.read` page, each of its messages' stable id (`EntryFacts::mid`), in order, and
@@ -89,7 +144,7 @@ pub async fn read_page<B: SessionBackend>(
     let wanted = usize::try_from(end - start)
         .unwrap_or(usize::MAX)
         .saturating_add(1);
-    let mut entries = session.entries(start + 1, wanted).await?;
+    let mut entries = served_entries(session, start + 1, wanted).await?;
     let after = (entries.len() as u64 > end - start)
         .then(|| entries.pop())
         .flatten();
@@ -106,7 +161,9 @@ pub async fn read_page<B: SessionBackend>(
         messages.push(page_message(entry, next, latest)?);
         turns.push(crate::store_calls::TurnOf::of(entry));
         let mut served = display_facts(entry).served();
-        if entry.open {
+        // A turn whose results are placed has its facts, though reads still serve it as running
+        // until its batch closes (`results_await_close`).
+        if entry.open && entry.state.turn.is_none() {
             served.tool_times = open_turn_times(session, &entry.message).await?;
         }
         facts.insert(entry.ordinal - 1, served);
@@ -178,10 +235,12 @@ pub async fn read_page<B: SessionBackend>(
 /// A late-approval cursor is refused by name: the new storage takes no approval questions, so no
 /// cursor names one.
 pub async fn serve_read(
+    registry: &crate::LineageRegistry,
     store: &crate::store_open::StoreRuntime,
     req: crate::serve::SessionReadRequest,
 ) -> Result<broca_wire::SessionReadResponse, crate::serve::ServeError> {
     use crate::serve::ServeError;
+    use crate::store_reads::{PageRequest, StoreReadReply, StoreReadRequest};
     if let Some(cursor) = req.late_after.as_deref() {
         let refusal = broca_wire::InvalidLateCursor::new(cursor);
         return Err(ServeError::InvalidParams {
@@ -189,37 +248,80 @@ pub async fn serve_read(
             message: refusal.message,
         });
     }
-    let Some(session) = store.view(&req.session).await? else {
-        // The session's creation never committed, so it holds nothing: an empty transcript.
-        let mut response = crate::serve::session_read_response(empty_page(), None);
-        response.incarnation = "unwritten".into();
-        return Ok(response);
+    let request = StoreReadRequest::Page(PageRequest::of(&req));
+    let answer = match store.read(registry, &req.session, request).await? {
+        Some(StoreReadReply::Page(answer)) => answer?,
+        Some(_) => return Err(crate::store_reads::mismatched()),
+        None => {
+            // The session's creation never committed, so it holds nothing: an empty transcript.
+            let mut response = crate::serve::session_read_response(empty_page(), None);
+            response.incarnation = "unwritten".into();
+            return Ok(response);
+        }
     };
-    serve_view(&session, store.parts(), &req).await
+    finish(answer, &req)
 }
 
 /// The `session.read` reply for `req` from `session`, loaded by the caller, reading its run
-/// starts' setup parts from `parts`: everything [`serve_read`] serves once it has the session.
+/// starts' setup parts from `parts`: what [`serve_read`] serves once it has the session, built
+/// by the same [`page`] the session's actor runs.
 pub async fn serve_view<B: SessionBackend>(
     session: &Session<B>,
     parts: &dyn Parts,
     req: &crate::serve::SessionReadRequest,
 ) -> Result<broca_wire::SessionReadResponse, crate::serve::ServeError> {
+    let answer = page(session, parts, &crate::store_reads::PageRequest::of(req)).await?;
+    finish(answer, req)
+}
+
+/// What a reply takes besides the session: the media mode and the byte cap `req` asks for.
+fn finish(
+    answer: crate::store_reads::PageAnswer,
+    req: &crate::serve::SessionReadRequest,
+) -> Result<broca_wire::SessionReadResponse, crate::serve::ServeError> {
+    let mut response = answer.response;
+    crate::serve::apply_media_mode(&mut response, req.media, &req.session.session)?;
+    let cap = req
+        .max_bytes
+        .unwrap_or(broca_wire::READ_DEFAULT_MAX_BYTES)
+        .min(broca_wire::READ_MAXIMUM_MAX_BYTES);
+    crate::serve::cap_page_bytes(
+        &mut response,
+        cap,
+        answer.from_ordinal.is_none(),
+        &req.session.session,
+    )?;
+    Ok(response)
+}
+
+/// The `session.read` reply `request` asks of `session`, as far as the session decides it: the
+/// page, from the message `after_mid` names or the ordinal asked for, refused when the session's
+/// history version isn't the one asked for; each model-written message marked for reply cleaning
+/// by its run's tag rules; each message's tool calls attributed from its turn facts; and what
+/// each opt-in adds, from the page's own entry and turn facts and the session's folds. The
+/// session's actor runs this over the session it holds, so all of it reads from memory or none of
+/// it is served there. What doesn't depend on the session (media mode, the byte cap) is the
+/// caller's.
+pub(crate) async fn page<B: SessionBackend>(
+    session: &Session<B>,
+    parts: &dyn broca_session_loop::parts::Parts,
+    request: &crate::store_reads::PageRequest,
+) -> Result<crate::store_reads::PageAnswer, crate::serve::ServeError> {
     use crate::serve::ServeError;
     let head = session.head();
-    if req
+    if request
         .history_version
         .is_some_and(|requested| requested != head.history_version)
     {
         return Err(ServeError::HistoryChanged);
     }
-    let from_ordinal = match &req.after_mid {
+    let from_ordinal = match &request.after_mid {
         Some(mid) => match session.find_message(mid).await.map_err(read_failed)? {
             // The 1-based ordinal of the message named, which is the 0-based start after it.
             Some(ordinal) => Some(ordinal),
             None => return Err(ServeError::UnknownMid(mid.clone())),
         },
-        None => req.from_ordinal.map(|at| at.saturating_sub(1)),
+        None => request.from_ordinal.map(|at| at.saturating_sub(1)),
     };
     let StorePage {
         mut page,
@@ -229,7 +331,7 @@ pub async fn serve_view<B: SessionBackend>(
         withheld,
         summaries,
         stamps,
-    } = read_page(session, from_ordinal, req.limit)
+    } = read_page(session, from_ordinal, request.limit)
         .await
         .map_err(refused)?;
     crate::store_entries::mark_reply_cleaning(session, parts, &mut page.messages)
@@ -241,10 +343,10 @@ pub async fn serve_view<B: SessionBackend>(
                 None,
             )
         })?;
-    let times = req
+    let times = request
         .include_display_facts
         .then(|| crate::serve::DisplayTimes::of(&page));
-    let tools = if req.include_tools {
+    let tools = if request.include_tools {
         latest_tools(session, parts).map_err(refused)?
     } else {
         None
@@ -274,33 +376,26 @@ pub async fn serve_view<B: SessionBackend>(
             }
         }
     }
-    if req.include_rich_ui {
+    if request.include_rich_ui {
         crate::serve::apply_rich_ui(&mut response, &stamps);
     }
     crate::store_calls::attribute_tool_calls(session, &mut response, &turns)
         .await
         .map_err(read_failed)?;
-    crate::serve::apply_media_mode(&mut response, req.media, &req.session.session)?;
-    let cap = req
-        .max_bytes
-        .unwrap_or(broca_wire::READ_DEFAULT_MAX_BYTES)
-        .min(broca_wire::READ_MAXIMUM_MAX_BYTES);
-    crate::serve::cap_page_bytes(
-        &mut response,
-        cap,
-        from_ordinal.is_none(),
-        &req.session.session,
-    )?;
-    Ok(response)
+    Ok(crate::store_reads::PageAnswer {
+        response,
+        from_ordinal,
+    })
 }
 
 /// What an `include_display_facts` read serves about each tool call of `message`, the
 /// assistant message whose calls are still running: its tool turn has no facts until its last
 /// call is answered, so each call is served from the open batch the operational fold keeps,
 /// with the key, dispatch time and schema pin its intent recorded (found through the session's
-/// id lookup, as the run loop finds it). A call without an intent is named with none. The open
-/// batch doesn't keep a call's finish time or why it has no answer, so those wait for the
-/// turn's facts.
+/// id lookup, as the run loop finds it, and as `store_calls` attributes the same call). A call
+/// answered without an intent is named with the key its outcome recorded, and one without
+/// either with none. The open batch doesn't keep a call's finish time or why it has no answer,
+/// so those wait for the turn's facts.
 async fn open_turn_times<B: SessionBackend>(
     session: &Session<B>,
     message: &broca_protocol::Message,
@@ -325,10 +420,14 @@ async fn open_turn_times<B: SessionBackend>(
         });
         *copy += 1;
         let mut time = ToolTime::new(&call.tool_call_id.0);
-        let key = batch
+        let (key, dispatched) = batch
             .zip(position)
-            .and_then(|(batch, position)| batch.key(position));
-        if let Some(key) = key {
+            .map_or((None, false), |(batch, position)| {
+                (batch.key(position), batch.calls[position].intent)
+            });
+        if let (Some(key), false) = (key, dispatched) {
+            time = time.with_call_key(key);
+        } else if let Some(key) = key {
             let intent = session
                 .find_id(broca_session_store::idindex::IdKind::CallKey, key)
                 .await?
@@ -449,9 +548,9 @@ fn page_message(
     let completed_at = broca_core::compaction_v2::entries::project_completion(
         &message,
         entry.next.as_ref(),
-        facts.written_at_ms.filter(|_| {
-            facts.native && message.role == Role::Assistant && facts.budget_finalize != Some(true)
-        }),
+        facts
+            .written_at_ms
+            .filter(|_| facts.native && message.role == Role::Assistant),
     );
     let delivery = delivery(facts)?;
     let run = facts.run_id.as_ref().map(|run_id| {

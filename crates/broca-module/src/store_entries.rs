@@ -26,9 +26,9 @@
 //! `session.history` on a store session (`crate::history::read`) takes its head facts from
 //! [`history_head`] and its pages from `session.read`, which a store session serves from the
 //! store. Message ids name the store's own ids, which only the store resolves. The raw form is
-//! served whole. The display form needs per-call times and statuses, the Rich UI stamp
-//! (`rich_ui`) each run's plan names, and output references, which the store doesn't serve yet,
-//! so it is refused by name.
+//! served whole. The display form needs per-call times and statuses, the Rich UI dialect and
+//! catalog digest each run froze at its start (`rich_ui`), and output references, which the
+//! store doesn't serve yet, so it is refused by name.
 //!
 //! A read cleans tag notation out of a reply wherever the run that wrote it cleans, as today's
 //! read does: [`mark_reply_cleaning`] marks each message from the tag rules its run froze.
@@ -55,10 +55,10 @@ fn internal(message: impl Into<String>) -> Refusal {
     Refusal::new("internal_error", message, None)
 }
 
-/// How many messages the session's transcript holds: the placed ones, and the assistant message
-/// whose tool calls are still running, at its reserved ordinal.
+/// How many messages the session's transcript holds as reads serve it
+/// (`store_read::transcript_len`).
 fn transcript_len<B: SessionBackend>(session: &Session<B>) -> u64 {
-    session.conversation.placed + u64::from(session.conversation.open_tool_turn().is_some())
+    crate::store_read::transcript_len(session)
 }
 
 /// Whether the session is on the current compaction contract: its first run froze a compaction
@@ -112,27 +112,49 @@ pub fn frozen_provider<B: SessionBackend>(
 }
 
 /// Serves one `compaction-runner/v1` operation for the session `key`, kept in the new storage.
-/// `caller` is the daemon-attested module id of the route, never a body field.
+/// `caller` is the daemon-attested module id of the route, never a body field. The session's actor
+/// serves it when it holds the session open (see `store_reads`).
 pub async fn compaction_runner(
+    registry: &crate::registry::LineageRegistry,
     store: &StoreRuntime,
     key: &BindIdentity,
     caller: Option<String>,
     method: String,
     params: Box<RawValue>,
 ) -> Result<Box<RawValue>, Refusal> {
-    let session = store
-        .view(key)
-        .await
-        .map_err(|error| internal(error.to_string()))?;
-    serve_compaction(
-        store.parts(),
-        session.as_deref(),
-        key,
-        caller.as_deref(),
-        &method,
-        &params,
-    )
-    .await
+    use crate::store_reads::{StoreReadReply, StoreReadRequest};
+    let request = StoreReadRequest::Compaction {
+        key: key.clone(),
+        caller,
+        method,
+        params,
+    };
+    match store.read(registry, key, request.clone()).await {
+        Ok(Some(StoreReadReply::Compaction(answer))) => answer,
+        Ok(Some(_)) => Err(internal(format!("{:?}", crate::store_reads::mismatched()))),
+        // The session's creation never committed: the route's own refusal for it.
+        Ok(None) => {
+            let StoreReadRequest::Compaction {
+                caller,
+                method,
+                params,
+                ..
+            } = request
+            else {
+                unreachable!("built above");
+            };
+            serve_compaction::<broca_session_store::backend::LocalBackend>(
+                store.parts(),
+                None,
+                key,
+                caller.as_deref(),
+                &method,
+                &params,
+            )
+            .await
+        }
+        Err(error) => Err(internal(format!("{error:?}"))),
+    }
 }
 
 /// [`compaction_runner`] over a loaded `session`, whose runs name their setup parts in `parts`.
@@ -145,20 +167,7 @@ pub async fn serve_compaction<B: SessionBackend>(
     method: &str,
     params: &RawValue,
 ) -> Result<Box<RawValue>, Refusal> {
-    // A session whose creation never committed holds no run, so it isn't on the contract, as
-    // today's storage reads a session with no log.
-    let Some(session) = session else {
-        return Err(Refusal::compaction_not_permitted(
-            not_permitted_reasons::SESSION_NOT_HELD,
-        ));
-    };
-    let contract = on_contract(session);
-    let provider = if contract {
-        frozen_provider(parts, session).map_err(internal)?
-    } else {
-        None
-    };
-    broca_core::compaction_v2::authority::check_bind(contract, provider.as_deref(), caller)?;
+    let session = admit(parts, session, caller)?;
     match method {
         "bind" => to_raw_value(&serde_json::json!({})).map_err(|error| internal(error.to_string())),
         "session.entries" => {
@@ -188,12 +197,85 @@ pub async fn serve_compaction<B: SessionBackend>(
             };
             to_raw_value(&answer).map_err(|error| internal(error.to_string()))
         }
+        // Applied by the session's actor (`apply_view`): a caller that holds no actor, such as
+        // the converter's check over a session built in memory, can't apply one.
         "session.apply_view" => Err(Refusal::new(
             NOT_SERVED_ON_NEW_STORAGE,
-            "session.apply_view is not served yet for a session kept in the new storage",
+            "session.apply_view is applied by the session's actor",
             Some(serde_json::json!({ "method": method })),
         )),
         _ => Err(Refusal::unknown_method(method)),
+    }
+}
+
+/// The route's admission, as every method of it is admitted: only the compaction provider the
+/// plan in force names, on a session on the current compaction contract. The session, once
+/// admitted.
+fn admit<'s, B: SessionBackend>(
+    parts: &dyn Parts,
+    session: Option<&'s Session<B>>,
+    caller: Option<&str>,
+) -> Result<&'s Session<B>, Refusal> {
+    // A session whose creation never committed holds no run, so it isn't on the contract, as
+    // today's storage reads a session with no log.
+    let Some(session) = session else {
+        return Err(Refusal::compaction_not_permitted(
+            not_permitted_reasons::SESSION_NOT_HELD,
+        ));
+    };
+    let contract = on_contract(session);
+    let provider = if contract {
+        frozen_provider(parts, session).map_err(internal)?
+    } else {
+        None
+    };
+    broca_core::compaction_v2::authority::check_bind(contract, provider.as_deref(), caller)?;
+    Ok(session)
+}
+
+/// `session.apply_view` on the route, for the session `key` kept in the new storage: admitted
+/// and read as today's route reads it, then applied by the session's actor, which records the
+/// view and sets it in the compaction state it hands to every run (`StoreCommand::ApplyView`).
+pub async fn apply_view(
+    registry: &crate::registry::LineageRegistry,
+    store: &StoreRuntime,
+    key: &BindIdentity,
+    caller: Option<String>,
+    params: Box<RawValue>,
+) -> Result<Box<RawValue>, Refusal> {
+    #[derive(serde::Deserialize)]
+    struct RawApply {
+        view: Box<RawValue>,
+    }
+    // Admitted as the route admits every method, by the session's actor when one is open.
+    compaction_runner(
+        registry,
+        store,
+        key,
+        caller,
+        "bind".into(),
+        RawValue::from_string("{}".into()).map_err(|error| internal(error.to_string()))?,
+    )
+    .await?;
+    let request: RawApply = serde_json::from_str(params.get())
+        .map_err(|error| Refusal::invalid_params("", error.to_string()))?;
+    broca_core::compaction_v2::received::ReceivedView::parse(&request.view)
+        .map_err(|error| Refusal::invalid_params("view", error.to_string()))?;
+    let command = crate::store_import::StoreCommand::ApplyView(Box::new(
+        crate::store_import::ApplyViewCommand { view: request.view },
+    ));
+    use crate::store_import::StoreOutcome;
+    match registry.route_store_command(key, command).await {
+        Ok(StoreOutcome::ViewApplied(answer)) => {
+            RawValue::from_string(answer).map_err(|error| internal(error.to_string()))
+        }
+        Ok(StoreOutcome::Refused(refusal)) => {
+            Err(Refusal::new(refusal.code, refusal.message, None))
+        }
+        Ok(other) => Err(internal(format!(
+            "session.apply_view was answered {other:?}"
+        ))),
+        Err(error) => Err(internal(error.to_string())),
     }
 }
 
@@ -204,8 +286,7 @@ fn project(stored: &StoredEntry) -> Result<Entry, String> {
 
 /// Every compaction entry of the session, oldest first: what a view is checked against.
 pub async fn all_entries<B: SessionBackend>(session: &Session<B>) -> Result<Vec<Entry>, String> {
-    session
-        .entries(1, usize::MAX)
+    crate::store_read::served_entries(session, 1, usize::MAX)
         .await
         .map_err(|error| format!("{error:?}"))?
         .iter()
@@ -236,8 +317,7 @@ pub async fn entries_page<B: SessionBackend>(
         ),
         _ => (1, usize::MAX),
     };
-    let stored = session
-        .entries(from, count)
+    let stored = crate::store_read::served_entries(session, from, count)
         .await
         .map_err(|error| format!("{error:?}"))?;
     let entries = stored.iter().map(project).collect::<Result<Vec<_>, _>>()?;
@@ -245,8 +325,7 @@ pub async fn entries_page<B: SessionBackend>(
         Some(last) if last.ordinal >= len => Some(cursor(last)),
         _ if len == 0 => None,
         _ => {
-            let last = session
-                .entries(len, 1)
+            let last = crate::store_read::served_entries(session, len, 1)
                 .await
                 .map_err(|error| format!("{error:?}"))?;
             last.first().map(project).transpose()?.as_ref().map(cursor)
@@ -317,21 +396,35 @@ pub struct HistoryHead {
 
 /// The [`HistoryHead`] of the session `key`, resolving `mid` when the read names a message.
 pub async fn history_head(
+    registry: &crate::registry::LineageRegistry,
     store: &StoreRuntime,
     key: &BindIdentity,
     mid: Option<&str>,
 ) -> Result<HistoryHead, crate::serve::ServeError> {
-    let Some(session) = store.view(key).await? else {
+    use crate::store_reads::{StoreReadReply, StoreReadRequest};
+    let request = StoreReadRequest::HistoryHead {
+        mid: mid.map(str::to_owned),
+    };
+    match store.read(registry, key, request).await? {
+        Some(StoreReadReply::HistoryHead(head)) => head,
+        Some(_) => Err(crate::store_reads::mismatched()),
         // The session's creation never committed, so it holds nothing, as `session.read` serves
         // it.
-        return Ok(HistoryHead {
+        None => Ok(HistoryHead {
             incarnation: "unwritten".into(),
             history_version: 0,
             last_ordinal: None,
             mid_ordinal: None,
-        });
-    };
-    let len = transcript_len(&session);
+        }),
+    }
+}
+
+/// The [`HistoryHead`] of a loaded `session`, resolving `mid` when the read names a message.
+pub(crate) async fn history_head_of<B: SessionBackend>(
+    session: &Session<B>,
+    mid: Option<&str>,
+) -> Result<HistoryHead, crate::serve::ServeError> {
+    let len = transcript_len(session);
     let mid_ordinal = match mid {
         Some(mid) => session
             .find_message(mid)

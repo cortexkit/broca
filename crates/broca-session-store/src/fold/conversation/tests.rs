@@ -215,7 +215,6 @@ fn facts(ordinal: u64, tag_base: u64) -> Record {
         client_message_id: None,
         sender: None,
         marks: None,
-        budget_finalize: None,
         no_display_facts: None,
         reasoning_summaries: Vec::new(),
         rich_ui: None,

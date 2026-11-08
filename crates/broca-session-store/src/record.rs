@@ -313,23 +313,19 @@ message! {
         /// The send's display marks, as llm-runner's `MessageMarks` JSON: `speaks_for` and a
         /// true `notice`.
         17 opt marks: serde_json::Value,
-        /// A step taken after the run's budget fired its finalize wrote the message, as its
-        /// `Assistant` record says (`budget_finalize`). `session.read` serves such a message no
-        /// completion time, as today's read doesn't. Absent for every other message.
-        18 opt budget_finalize: bool,
         /// The message was converted from a log of today's storage that had no lineage, so
         /// today's read serves it none of what an `include_display_facts` read adds, and nor does
         /// the new storage's. Absent for every message broca places itself.
-        19 opt no_display_facts: bool,
+        18 opt no_display_facts: bool,
         /// For an assistant message: the summaries its reasoning blocks carry, in the order of
         /// its content blocks, as `session.read` serves them with display facts. Recorded when
         /// the message is placed because a seal prunes the encrypted reasoning they are read
         /// from. Absent when it has none.
-        20 rep reasoning_summaries: ReasoningSummary,
+        19 rep reasoning_summaries: ReasoningSummary,
         /// For an assistant message a run placed: the Rich UI stamp the run's plan froze, which
         /// `session.read` serves on it with `include_rich_ui`. Recorded here so a read finds it
         /// without looking up the run's start. Absent when the run's plan has none.
-        21 opt rich_ui: RichUi,
+        20 opt rich_ui: RichUi,
     }
 }
 
@@ -363,9 +359,9 @@ message! {
     pub struct TurnFacts {
         /// The ordinal of the assistant message that made the calls.
         1 req ordinal: u64,
-        /// One per call that has a key, in the order the message made them. Every call of a
-        /// turn broca placed has one: the key its dispatch intent recorded, or for a call that
-        /// never left, one named after the record that closed it, as today's reads name it.
+        /// One per call that has a key, in the order the message made them: a dispatched call's
+        /// is its intent's, a call answered without an intent its outcome's
+        /// (`ToolOutcome::call_key`).
         2 rep calls: CallFacts,
     }
 }
@@ -785,6 +781,13 @@ message! {
         /// Owned by the tool router: why a call wasn't dispatched, held or withdrawn.
         9 opt detail: serde_json::Value,
         10 opt hooks: serde_json::Value,
+        /// The key of a call answered without a dispatch intent (denied, invalid, synthetic, or
+        /// refused with its batch), which no intent holds: the new loop mints it from this
+        /// record's writer generation and seq, in the form of the store's ids, and a converted
+        /// call keeps today's key, made from the log's lineage and its terminal record's seq.
+        /// Absent for a dispatched call, whose key is its intent's, and on outcomes written
+        /// before it was recorded.
+        11 opt call_key: String,
     }
 }
 

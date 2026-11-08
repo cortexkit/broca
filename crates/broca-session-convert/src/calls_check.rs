@@ -37,6 +37,11 @@ struct CallsCheckReport {
     /// Cut points where today serves at least one call as indeterminate: the comparison sees
     /// the case it checks.
     cuts_with_indeterminate: u64,
+    /// Calls answered without a dispatch intent (denied, invalid, synthetic, or refused with
+    /// their batch), which today keys by the record that answered them, over every cut, and the
+    /// cuts that hold at least one.
+    calls_answered_without_intent: u64,
+    cuts_with_call_answered_without_intent: u64,
     /// Cut points right after a provider-held record, and what today serves for the held call
     /// there: indeterminate or not.
     held_cuts: u64,
@@ -297,6 +302,16 @@ pub(crate) fn run(args: &Args) {
                 }
             };
             report.cuts += 1;
+            let without_intent = broca_core::tool_call_dispatches(framed)
+                .map(|all| {
+                    all.values()
+                        .flatten()
+                        .filter(|call| call.intent_seq.is_none() && call.key_seq.is_some())
+                        .count() as u64
+                })
+                .unwrap_or(0);
+            report.calls_answered_without_intent += without_intent;
+            report.cuts_with_call_answered_without_intent += u64::from(without_intent > 0);
             let calls = || {
                 expected.iter().flat_map(|message| {
                     message["tool_calls"]
@@ -360,6 +375,66 @@ pub(crate) fn run(args: &Args) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A page message as JSON, for comparing two pages field by field.
+    fn page_message_json(message: &broca_core::SessionReadMessage) -> Value {
+        json!({
+            "ordinal": message.ordinal,
+            "created_at": message.created_at,
+            "written_at": message.written_at,
+            "completed_at": message.completed_at,
+            "message": message.message,
+            "run": message.run,
+        })
+    }
+
+    /// Every page of a transcript, walked from the start by `next_from_ordinal`, `limit`
+    /// messages at a time, with each page's state (lineage state, length, next ordinal).
+    fn walk_pages<F>(mut page: F, limit: u64) -> Result<(Vec<Value>, Vec<String>), String>
+    where
+        F: FnMut(u64, u64) -> Result<broca_core::SessionReadPage, String>,
+    {
+        let mut messages = Vec::new();
+        let mut states = Vec::new();
+        let mut from = 0;
+        loop {
+            let read = page(from, limit)?;
+            states.push(format!(
+                "{:?} len {} next {:?}",
+                read.lineage_state, read.prompt_len, read.next_from_ordinal
+            ));
+            messages.extend(read.messages.iter().map(page_message_json));
+            match read.next_from_ordinal {
+                Some(next) if next > from => from = next,
+                _ => return Ok((messages, states)),
+            }
+        }
+    }
+
+    /// [`walk_pages`] over the pages the new format serves for `session`.
+    async fn walk_store_pages(
+        session: &Session<&MemoryBackend>,
+        limit: u64,
+    ) -> Result<(Vec<Value>, Vec<String>), String> {
+        let mut messages = Vec::new();
+        let mut states = Vec::new();
+        let mut from = 0;
+        loop {
+            let read = broca_module::store_read::read_page(session, Some(from), Some(limit))
+                .await
+                .map_err(|e| format!("{e:?}"))?
+                .page;
+            states.push(format!(
+                "{:?} len {} next {:?}",
+                read.lineage_state, read.prompt_len, read.next_from_ordinal
+            ));
+            messages.extend(read.messages.iter().map(page_message_json));
+            match read.next_from_ordinal {
+                Some(next) if next > from => from = next,
+                _ => return Ok((messages, states)),
+            }
+        }
+    }
 
     const RUN: &str = r#"{"type":"run_started","run_id":"r1","session":{"project_root":"/project","harness":"runner","session":"s"},"config":{"model":{"provider_module_id":"p","model_id":"m"},"tools":[{"name":"bash","description":"run","input_schema":{"type":"object"},"execution_mode":"parallel"}],"tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},"context_epoch":0,"renderer_version":1},"input":[{"role":"user","content":[{"type":"text","text":"hi"}]}],"origin":{"kind":"fresh"}}"#;
 
@@ -444,6 +519,104 @@ mod tests {
             assert_eq!(calls[0]["call_key"], json!("l1:5"), "after record {end}");
             assert_eq!(calls[0]["dispatched_to"], json!("tools"));
             assert_eq!(store_of(framed, "l1"), today, "after record {end}");
+        }
+    }
+
+    /// A step with a call the policy denied beside a dispatched one: today keys the denied call
+    /// by the record that answered it, and the store serves the same key from the outcome it
+    /// recorded, at every cut and on the closed turn. The denied call has no module and is never
+    /// indeterminate.
+    #[test]
+    fn a_denied_call_reads_alike_with_its_key() {
+        let lines = [
+            RUN,
+            r#"{"type":"step_started","step_id":1}"#,
+            r#"{"type":"model_step_finished","step_id":1,"assistant_message":{"message_id":"m1","content":[{"type":"tool_call","tool_call_id":"c1","tool_name":"bash","input":{"cmd":"ls"}},{"type":"tool_call","tool_call_id":"c2","tool_name":"bash","input":{"cmd":"rm"}}]},"usage":{"input_tokens":3},"finish_reason":"tool_calls","retries_used":0}"#,
+            r#"{"type":"tool_batch_started","batch_id":"b1","step_id":1,"planned_calls":["c1","c2"]}"#,
+            r#"{"type":"tool_dispatch_intent","batch_id":"b1","tool_call_id":"c1","args":{"cmd":"ls"},"module_id":"tools"}"#,
+            r#"{"type":"tool_no_dispatch","batch_id":"b1","tool_call_id":"c2","reason":{"kind":"denied","reason":"not allowed"}}"#,
+            r#"{"type":"tool_result","batch_id":"b1","result":{"tool_call_id":"c1","output":{"kind":"text","text":"ok"},"is_error":false},"outcome":"completed"}"#,
+            r#"{"type":"tool_batch_finished","batch_id":"b1"}"#,
+        ];
+        let old = log(&lines);
+        for end in [6, 7, 8] {
+            let framed = &old[..end];
+            let today = today(framed, Some("l1"), 50).unwrap();
+            let calls: Vec<&Value> = today
+                .iter()
+                .flat_map(|message| message["tool_calls"].as_array().into_iter().flatten())
+                .collect();
+            assert_eq!(calls[1]["tool_call_id"], json!("c2"), "after record {end}");
+            assert_eq!(
+                calls[1]["call_key"],
+                json!("l1:6"),
+                "today keys the denied call by its answer, after record {end}"
+            );
+            assert_eq!(calls[1]["dispatched_to"], Value::Null);
+            assert_eq!(calls[1]["indeterminate"], json!(false));
+            assert_eq!(store_of(framed, "l1"), today, "after record {end}");
+        }
+    }
+
+    /// A batch's results enter the transcript only once the batch closes, on both storages:
+    /// broca may still join a delivered note to the last result as the batch closes, so a read
+    /// between the batch's last result and its end shows the assistant message without them,
+    /// and a read after the end shows them. Every page message and each page's state agree with
+    /// today's at each cut.
+    #[test]
+    fn a_batch_s_results_are_served_once_it_closes() {
+        let lines = [
+            RUN,
+            r#"{"type":"step_started","step_id":1}"#,
+            r#"{"type":"model_step_finished","step_id":1,"assistant_message":{"message_id":"m1","content":[{"type":"tool_call","tool_call_id":"c1","tool_name":"bash","input":{"cmd":"ls"}}]},"usage":{"input_tokens":3},"finish_reason":"tool_calls","retries_used":0}"#,
+            r#"{"type":"tool_batch_started","batch_id":"b1","step_id":1,"planned_calls":["c1"]}"#,
+            r#"{"type":"tool_dispatch_intent","batch_id":"b1","tool_call_id":"c1","args":{"cmd":"ls"},"module_id":"tools"}"#,
+            r#"{"type":"tool_result","batch_id":"b1","result":{"tool_call_id":"c1","output":{"kind":"text","text":"ok"},"is_error":false},"outcome":"completed"}"#,
+            r#"{"type":"tool_batch_finished","batch_id":"b1"}"#,
+        ];
+        let old = log(&lines);
+        // After the intent, after the batch's last result, after its end.
+        for (end, messages) in [(5, 2), (6, 2), (7, 3)] {
+            let framed = &old[..end];
+            let today = walk_pages(
+                |from, limit| {
+                    broca_core::read_session_page(
+                        &broca_core::StorePageSnapshot::empty(),
+                        framed,
+                        Some(from),
+                        Some(limit),
+                    )
+                    .map_err(|e| e.to_string())
+                },
+                7,
+            )
+            .unwrap();
+            let converted = broca_session_convert::convert(framed, Some("l1")).unwrap();
+            let store = block_on(async {
+                let backend = MemoryBackend::default();
+                let mut session = Session::create(
+                    &backend,
+                    SessionAddr("s".into()),
+                    triple("s"),
+                    &DeploymentKey::new(1, &[0x5a; 32]),
+                    false,
+                )
+                .await
+                .unwrap();
+                for record in &converted.records {
+                    session
+                        .append(std::slice::from_ref(record), false)
+                        .await
+                        .unwrap();
+                }
+                walk_store_pages(&session, 7).await.unwrap()
+            });
+            assert_eq!(
+                today.0.len(),
+                messages,
+                "today's messages after record {end}"
+            );
+            assert_eq!(store, today, "after record {end}");
         }
     }
 }

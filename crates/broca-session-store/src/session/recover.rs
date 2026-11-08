@@ -372,6 +372,7 @@ impl<B: SessionBackend> Session<B> {
                         finished_at_ms: Some(now_ms),
                         detail: None,
                         hooks: None,
+                        call_key: None,
                     }));
                 }
                 if open_turn.contains(id) && !has_reply {
@@ -504,6 +505,9 @@ impl<B: SessionBackend> Session<B> {
             window: OpenLogIndex::default(),
             imported: Default::default(),
             sealed_entries: Default::default(),
+            kept: super::kept::KeptRecords::from_next(intent_seq + 1, false),
+            memory_only: Default::default(),
+            memory_refused: Default::default(),
         };
         let checkpoint_body = Checkpoint {
             covers_through: intent_seq,

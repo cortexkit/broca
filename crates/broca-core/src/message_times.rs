@@ -187,7 +187,7 @@ pub fn fold<'a>(
                     }
                 }
                 PlacementAction::Append { first, count, kind } => {
-                    if kind == AppendKind::Assistant {
+                    if matches!(kind, AppendKind::Assistant | AppendKind::Finalize) {
                         native_assistants.extend(first..first + count);
                     }
                     if let Some(at) = source_time {

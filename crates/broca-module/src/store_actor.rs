@@ -86,9 +86,17 @@ pub struct StoreActor<B: SessionBackend> {
     /// after that it carries what holds only for this actor's life, such as whether the
     /// compaction provider was sent Setup yet.
     compaction_session: Arc<broca_core::compaction_v2::session::Session>,
+    /// `session.apply_view` commands waiting for the compaction state, which a run holds while
+    /// it writes through this actor (see `apply_view`).
+    pending_views: Vec<(
+        crate::store_import::ApplyViewCommand,
+        oneshot::Sender<crate::store_import::StoreOutcome>,
+    )>,
     /// The module's stop, once the actor serves in a module: work a send waits on, such as its
     /// input transforms, gives up when it fires.
     seal: CancellationToken,
+    /// Where finished runs' facts are kept, shared with the module's reads (see `with_settled`).
+    settled: Option<Arc<crate::store_status::SettledRuns>>,
 }
 
 /// How an actor lives in the module's registry. Tests serve an actor without one.
@@ -167,6 +175,9 @@ struct ActiveRun {
     /// The queued send the run started from, when it drained from the queue.
     submission: Option<broca_protocol::SubmissionId>,
     done: JoinHandle<StoreRunEnd>,
+    /// The run's in-flight model step, which the run loop keeps current and `run.status` serves
+    /// for the active run, as today's actor serves its run's.
+    step: broca_core::provider::LiveStepProgress,
 }
 
 /// A run to start: the send's request and what the run's start records about the send.
@@ -254,8 +265,45 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             stopping: false,
             billing: None,
             compaction_session: Arc::default(),
+            pending_views: Vec::new(),
             seal: CancellationToken::new(),
+            settled: None,
         }
+    }
+
+    /// The actor serves finished runs' facts from `settled`, and keeps the ones it reads there,
+    /// as the module's reads of a session no actor holds do.
+    pub fn with_settled(mut self, settled: Arc<crate::store_status::SettledRuns>) -> Self {
+        self.settled = Some(settled);
+        self
+    }
+
+    /// Answers a read of the session from what the actor holds (see `store_reads`): made durable
+    /// first when the last batch was appended without a barrier, then read from memory only.
+    async fn store_read(
+        &mut self,
+        request: &crate::store_reads::StoreReadRequest,
+    ) -> crate::store_reads::StoreReadOutcome {
+        let addr = broca_core::session_addr(&self.key);
+        let live_step = self
+            .run
+            .as_ref()
+            .map(|active| crate::store_reads::LiveStep {
+                run_id: active.run_id.0.clone(),
+                step: active.step.lock().unwrap().clone(),
+            });
+        let context = crate::store_reads::ReadContext {
+            parts: &self.parts,
+            held: true,
+            open: true,
+            settled: self
+                .settled
+                .as_deref()
+                .map(|settled| (settled, addr.as_str())),
+            session_name: &self.key.session,
+            live_step: live_step.as_ref(),
+        };
+        crate::store_reads::answer_in_memory(&mut self.session, &context, request).await
     }
 
     /// The actor writes the spend facts of each run that ends to `billing`.
@@ -399,6 +447,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                     }
                 }
             }
+            self.retry_views().await;
         }
     }
 
@@ -856,10 +905,21 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 false
             }
             LineageCmd::IdleTick => self.run.is_none(),
+            LineageCmd::Store {
+                command: crate::store_import::StoreCommand::ApplyView(command),
+                reply,
+            } => {
+                self.apply_view_or_wait(*command, reply).await;
+                false
+            }
             LineageCmd::Store { command, reply } => {
                 let (outcome, exit) = self.store_command(command).await;
                 let _ = reply.send(outcome);
                 exit
+            }
+            LineageCmd::StoreRead { request, reply } => {
+                let _ = reply.send(self.store_read(&request).await);
+                false
             }
             other => {
                 refuse(other);
@@ -919,8 +979,10 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         req.scope = scope;
         req.session_class = session_class;
         let cancel = CancellationToken::new();
+        let step: broca_core::provider::LiveStepProgress = Arc::default();
         let control = RunControl {
             cancel: Some(cancel.clone()),
+            step_progress: Some(Arc::clone(&step)),
             hook_plane: self.executor.hook_plane(),
             provider_held_lifecycle: self.executor.provider_held_lifecycle(),
             compaction_plane: self.executor.compaction_plane(),
@@ -971,6 +1033,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             started: resume,
             submission: drained.map(|drained| drained.submission),
             done,
+            step,
         });
     }
 
@@ -2185,6 +2248,9 @@ fn reopen(command: LineageCmd) {
         LineageCmd::Store { reply, .. } => {
             let _ = reply.send(crate::store_import::StoreOutcome::Reopen);
         }
+        LineageCmd::StoreRead { reply, .. } => {
+            let _ = reply.send(crate::store_reads::StoreReadOutcome::Reopen);
+        }
         LineageCmd::Cancel { reply, .. } | LineageCmd::CancelFrom { reply, .. } => {
             let _ = reply.send(CancelOutcome::Reopen);
         }
@@ -2249,6 +2315,9 @@ fn refuse(command: LineageCmd) {
         // Served by `handle`; never refused here.
         LineageCmd::Store { reply, .. } => {
             let _ = reply.send(crate::store_import::StoreOutcome::Reopen);
+        }
+        LineageCmd::StoreRead { reply, .. } => {
+            let _ = reply.send(crate::store_reads::StoreReadOutcome::Reopen);
         }
         LineageCmd::ResumeRestart { reply } => {
             let _ = reply.send(Err(unserved("resuming after a restart")));
@@ -2326,6 +2395,7 @@ fn refuse(command: LineageCmd) {
     }
 }
 
+mod apply_view;
 mod import;
 
 #[cfg(test)]
@@ -2336,6 +2406,10 @@ mod differential;
 mod entries_comparison;
 #[cfg(test)]
 mod import_tests;
+#[cfg(test)]
+mod read_cost;
+#[cfg(test)]
+mod reads_tests;
 #[cfg(test)]
 mod status_tests;
 #[cfg(test)]

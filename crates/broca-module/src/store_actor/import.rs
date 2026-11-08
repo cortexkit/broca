@@ -27,6 +27,14 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         match command {
             StoreCommand::Import(command) => self.import(*command).await,
             StoreCommand::InstallView(command) => (self.install_view(*command).await, false),
+            // Served by the command loop, which applies a view while a run runs too.
+            StoreCommand::ApplyView(_) => (
+                StoreOutcome::Refused(ImportRefusal::new(
+                    "internal_error",
+                    "session.apply_view reached the import commands",
+                )),
+                false,
+            ),
         }
     }
 

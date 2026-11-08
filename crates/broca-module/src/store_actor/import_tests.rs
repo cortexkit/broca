@@ -246,19 +246,16 @@ async fn an_import_writes_the_history_and_answers_its_retry_from_the_receipt() {
     let source = Source::new("whole");
     let (commands, served) = serve(create(backend).await.unwrap());
     let reply = imported(ask(&commands, source.import(source.params("imp-1"))).await);
-    let rows: Vec<_> = reply
-        .moves
-        .rows
-        .iter()
-        .map(|row| (row.mid.as_str(), row.entry))
-        .collect();
+    // The results split off `msg_a1` are broca's own message, listed right after it.
+    every_ordinal_once(&reply);
     assert_eq!(
-        rows,
+        moved(&reply.moves),
         [
-            ("msg_u1", Some(1)),
-            ("msg_sys", None),
-            ("msg_a1", Some(2)),
-            ("msg_a2", Some(4))
+            ("msg_u1".to_owned(), Some(1), false),
+            ("msg_sys".to_owned(), None, false),
+            ("msg_a1".to_owned(), Some(2), false),
+            ("added".to_owned(), Some(3), true),
+            ("msg_a2".to_owned(), Some(4), false)
         ]
     );
     assert_eq!(reply.imported_messages, 4);
@@ -552,7 +549,9 @@ async fn a_cut_at_every_write_leaves_no_session_or_the_whole_import() {
                     let (commands, served) = serve(session);
                     let retry =
                         imported(ask(&commands, source.import(source.params("imp-1"))).await);
-                    assert_eq!(retry.moves, reference.moves, "cut {cut}");
+                    // An added row's id is the session's own, so only its place is compared.
+                    assert_eq!(moved(&retry.moves), moved(&reference.moves), "cut {cut}");
+                    assert_eq!(retry.moves.shape, reference.moves.shape);
                     assert_eq!(retry.imported_messages, reference.imported_messages);
                     assert_eq!(retry.history_version, reference.history_version);
                     drop(commands);
@@ -630,6 +629,7 @@ async fn a_later_run_renders_the_imported_history_without_reasoning_payloads() {
         account_reports: None,
         max_same_account_wait: Default::default(),
         auth_selection: None,
+        step_progress: None,
     };
     let mut parts = MemoryParts::default();
     broca_session_loop::run::run(&mut session, &mut parts, admission, &seams)
@@ -1075,6 +1075,7 @@ async fn run_once<W: Writer>(
         account_reports: None,
         max_same_account_wait: Default::default(),
         auth_selection: None,
+        step_progress: None,
     };
     broca_session_loop::run::run(writer, parts, admission, &seams)
         .await
@@ -1655,6 +1656,45 @@ async fn newest_and_floor(
     entries
 }
 
+/// A move list's rows as `(mid, entry, added)`, with an added row's id, which names a seq of
+/// the session that holds it, written `added`.
+fn moved(moves: &broca_wire::head_import::MoveList) -> Vec<(String, Option<u64>, bool)> {
+    moves
+        .rows
+        .iter()
+        .map(|row| {
+            let mid = if row.added { "added" } else { &row.mid };
+            (mid.to_owned(), row.entry, row.added)
+        })
+        .collect()
+}
+
+/// The move list names every ordinal the import placed exactly once, source rows and the
+/// messages broca added alike, in ordinal order; an added row's id is broca's, and every other
+/// row is a source row.
+fn every_ordinal_once(reply: &FileImportReply) {
+    let entries: Vec<u64> = reply
+        .moves
+        .rows
+        .iter()
+        .filter_map(|row| row.entry)
+        .collect();
+    assert_eq!(
+        entries,
+        (1..=reply.imported_messages).collect::<Vec<_>>(),
+        "{:?}",
+        reply.moves.rows
+    );
+    for row in &reply.moves.rows {
+        assert_eq!(
+            row.added,
+            broca_session_store::session::is_broca_id_form(&row.mid),
+            "{row:?}"
+        );
+        assert!(!row.added || row.entry.is_some(), "{row:?}");
+    }
+}
+
 /// OpenCode 2.2.3's real export imports whole: its move list, its newest message, its parts
 /// numbered from `tag_floor`, and every side-file send as reads serve broca's own: the ride's
 /// delivered text on its call, the second turn's client message id and marks, and the note's
@@ -1668,10 +1708,29 @@ async fn thalamus_opencode2_export_imports_into_the_store() {
         "ses_a0ba61c714d844b0af1d9c52d4135091",
     )
     .await;
+    // The tool results split off the two assistant rows that called tools are rows of their
+    // own, broca's, right after the row each was split from.
+    every_ordinal_once(&reply);
+    let added: Vec<(u64, &str)> = reply
+        .moves
+        .rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| row.added)
+        .map(|(at, row)| (row.entry.unwrap(), reply.moves.rows[at - 1].mid.as_str()))
+        .collect();
+    assert_eq!(
+        added,
+        [
+            (3, "msg_1b49586f1001rVgZgzWdeKZmu8"),
+            (12, "msg_1b495957b001zk2Vzqz0lhIKBJ")
+        ]
+    );
     let rows: Vec<_> = reply
         .moves
         .rows
         .iter()
+        .filter(|row| !row.added)
         .map(|row| (row.mid.as_str(), row.entry))
         .collect();
     assert_eq!(
@@ -1785,6 +1844,9 @@ async fn thalamus_pi_export_imports_into_the_store() {
             .map(|(at, id)| (*id, Some(at as u64 + 1))),
     );
     assert_eq!(rows, expected);
+    // Pi closes no call of this session, so broca adds no message.
+    every_ordinal_once(&reply);
+    assert!(reply.moves.rows.iter().all(|row| !row.added));
     assert_eq!(reply.dropped_system_messages, 1);
     let entries = newest_and_floor(&reply, &session, &export).await;
     for (at, id) in ids.iter().enumerate() {
@@ -1828,4 +1890,81 @@ async fn thalamus_pi_export_imports_into_the_store() {
             .as_deref(),
         Some("steer")
     );
+}
+
+/// A Pi call left without a result is closed by the results Pi itself gives it (`No result
+/// provided`), a message broca adds under its own id. The move list lists it right after the
+/// assistant row whose call it closes, so the list names every ordinal once.
+#[tokio::test]
+async fn a_pi_call_left_unanswered_is_listed_after_its_turn() {
+    let message = |id: &str, parent: Option<&str>, message: serde_json::Value| {
+        serde_json::json!({"type": "message", "id": id, "parentId": parent,
+                           "timestamp": "2026-01-01T00:00:01Z", "message": message})
+    };
+    let mut journal = String::from(
+        "{\"type\":\"session\",\"id\":\"s\",\"timestamp\":\"2026-01-01T00:00:00Z\"}\n",
+    );
+    for entry in [
+        message(
+            "u1",
+            None,
+            serde_json::json!({"role": "user", "content": "first"}),
+        ),
+        message(
+            "a1",
+            Some("u1"),
+            serde_json::json!({"role": "assistant", "stopReason": "toolUse",
+                "content": [{"type": "toolCall", "id": "t1", "name": "read", "arguments": {}}]}),
+        ),
+        message(
+            "u2",
+            Some("a1"),
+            serde_json::json!({"role": "user", "content": "second"}),
+        ),
+    ] {
+        journal.push_str(&entry.to_string());
+        journal.push('\n');
+    }
+    let backend: &'static MemoryBackend = Box::leak(Box::default());
+    let source = Source::of("pi-unanswered", journal.into_bytes(), None);
+    let mut params = source.params("imp-pi-unanswered");
+    params.source.harness = ImportHarness::Pi;
+    params.source.session = "s".into();
+    let (commands, served) = serve(create(backend).await.unwrap());
+    let reply = imported(ask(&commands, source.import(params)).await);
+    drop(commands);
+    served.await.unwrap();
+    every_ordinal_once(&reply);
+    let rows: Vec<(&str, Option<u64>, bool)> = reply
+        .moves
+        .rows
+        .iter()
+        .map(|row| {
+            (
+                if row.added { "added" } else { row.mid.as_str() },
+                row.entry,
+                row.added,
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            ("u1", Some(1), false),
+            ("a1", Some(2), false),
+            ("added", Some(3), true),
+            ("u2", Some(4), false),
+        ]
+    );
+    let session = load(backend).await.unwrap();
+    let closing = &session.entries(3, 1).await.unwrap()[0];
+    assert_eq!(
+        closing.state.facts.as_ref().unwrap().mid,
+        reply.moves.rows[2].mid,
+        "the added row names the closing results' own id"
+    );
+    assert!(matches!(
+        &closing.message.content[0],
+        ContentBlock::ToolResult(result) if result.is_error
+    ));
 }
