@@ -26,6 +26,22 @@ use super::super::tests::{self as store, LoopExecutor};
 use super::{display_reads_alike, store_starts, streams, today_restarted, today_riding, Today};
 use crate::actor::{LineageCmd, LineageStatus, SendKey, SendOutcome, SendPlan};
 use crate::executor::RunKind;
+use broca_session_store::keys::Cipher;
+
+cipher_tests!(
+    ordered_admission_refusals_are_answered_alike,
+    a_superseded_send_and_one_outliving_its_run_are_recorded_alike,
+    two_rides_on_one_batch_are_two_notices_alike,
+    an_idle_start_send_starts_a_run_alike,
+    ordered_steers_join_the_running_run_alike,
+    an_expired_send_waits_on_an_idle_session_alike,
+    a_queued_ordered_sends_retry_is_answered_alike,
+    string_sends_from_plan_named_senders_are_admitted_alike,
+    an_interrupt_on_an_idle_session_starts_its_run_alike,
+    an_interrupt_during_a_model_step_cancels_the_run_and_runs_first_alike,
+    an_interrupt_during_a_tool_call_waits_for_it_then_runs_alike,
+    a_crash_between_an_interrupt_and_its_run_is_recovered_alike,
+);
 
 /// The session's owner.
 fn core() -> BindPrincipal {
@@ -136,8 +152,15 @@ struct Pair {
 }
 
 impl Pair {
-    async fn new(script: Vec<Vec<NormalizedEvent>>, gated: bool) -> Self {
-        Self::with_planes(script, gated, Default::default(), Default::default()).await
+    async fn new(script: Vec<Vec<NormalizedEvent>>, gated: bool, cipher: Cipher) -> Self {
+        Self::with_planes(
+            script,
+            gated,
+            Default::default(),
+            Default::default(),
+            cipher,
+        )
+        .await
     }
 
     /// [`Self::new`], with today's executor offering `today_planes` and the store's
@@ -147,6 +170,7 @@ impl Pair {
         gated: bool,
         today_planes: store::Planes,
         store_planes: store::Planes,
+        cipher: Cipher,
     ) -> Self {
         let today_gate = gated.then(|| Arc::new(Notify::new()));
         let store_gate = gated.then(|| Arc::new(Notify::new()));
@@ -159,7 +183,7 @@ impl Pair {
             backend,
             SessionAddr(store::ADDR.into()),
             store::triple(),
-            &store::deployment(),
+            &store::deployment().creating(cipher),
             false,
         )
         .await
@@ -584,9 +608,8 @@ fn hello() -> Vec<Vec<NormalizedEvent>> {
 
 /// Each admission refusal of an ordered send, and a send expired on arrival, are answered
 /// alike, and none of them is queued.
-#[tokio::test]
-async fn ordered_admission_refusals_are_answered_alike() {
-    let pair = Pair::new(hello(), false).await;
+async fn ordered_admission_refusals_are_answered_alike(cipher: Cipher) {
+    let pair = Pair::new(hello(), false, cipher).await;
     pair.first("r1").await;
     pair.idle().await;
     let refused = |outcome: &SendOutcome, field: &str| {
@@ -694,9 +717,8 @@ fn reading_later() -> Vec<Vec<NormalizedEvent>> {
 /// A send under a dedupe key supersedes the same sender's undelivered send while a run runs;
 /// a list without `idle_start` outlives the run's end, queued; the next run's tool batch
 /// carries it. Alike.
-#[tokio::test]
-async fn a_superseded_send_and_one_outliving_its_run_are_recorded_alike() {
-    let pair = Pair::new(reading_later(), true).await;
+async fn a_superseded_send_and_one_outliving_its_run_are_recorded_alike(cipher: Cipher) {
+    let pair = Pair::new(reading_later(), true, cipher).await;
     pair.first("r1").await;
     let order = json!({"modes": ["tool_result"], "dedupe_key": "status"});
     let outcome = pair
@@ -743,9 +765,8 @@ async fn a_superseded_send_and_one_outliving_its_run_are_recorded_alike() {
 
 /// Two senders' notes queued while a run runs both ride on the next run's tool batch: each is
 /// one `notice_delivered` and one notice on the results message carrying it, read alike.
-#[tokio::test]
-async fn two_rides_on_one_batch_are_two_notices_alike() {
-    let pair = Pair::new(reading_later(), true).await;
+async fn two_rides_on_one_batch_are_two_notices_alike(cipher: Cipher) {
+    let pair = Pair::new(reading_later(), true, cipher).await;
     pair.first("r1").await;
     for (run_id, sender, text) in [("q1", AFT, "aft's note"), ("q2", MC, "mc's note")] {
         let outcome = pair
@@ -774,9 +795,8 @@ async fn two_rides_on_one_batch_are_two_notices_alike() {
 
 /// A list naming `idle_start` from a sender granted it starts its run on an idle session, and
 /// the owner's `[steer, idle_start]` does too. Alike, with each run's start naming its send.
-#[tokio::test]
-async fn an_idle_start_send_starts_a_run_alike() {
-    let pair = Pair::new(hello(), false).await;
+async fn an_idle_start_send_starts_a_run_alike(cipher: Cipher) {
+    let pair = Pair::new(hello(), false, cipher).await;
     pair.first("r1").await;
     pair.idle().await;
     let outcome = pair
@@ -810,9 +830,8 @@ fn reading() -> Vec<Vec<NormalizedEvent>> {
 /// An ordered steer joins the running run at its next step, and a templated
 /// `[turn_system, steer]` from a named sender steers on a route without turn-scoped system
 /// messages. Alike.
-#[tokio::test]
-async fn ordered_steers_join_the_running_run_alike() {
-    let pair = Pair::new(reading(), true).await;
+async fn ordered_steers_join_the_running_run_alike(cipher: Cipher) {
+    let pair = Pair::new(reading(), true, cipher).await;
     pair.first("r1").await;
     let outcome = pair
         .alike(
@@ -851,9 +870,8 @@ async fn ordered_steers_join_the_running_run_alike() {
 
 /// A queued ordered send whose expiry passes while the session is idle stays queued, as today's
 /// actor leaves it, until the next run's first boundary ends it. Alike.
-#[tokio::test]
-async fn an_expired_send_waits_on_an_idle_session_alike() {
-    let pair = Pair::new(hello(), true).await;
+async fn an_expired_send_waits_on_an_idle_session_alike(cipher: Cipher) {
+    let pair = Pair::new(hello(), true, cipher).await;
     pair.first("r1").await;
     let expires = broca_core::run::epoch_millis().unwrap() + 400;
     pair.alike(
@@ -881,9 +899,8 @@ async fn an_expired_send_waits_on_an_idle_session_alike() {
 
 /// A keyed ordered send's retry is answered from the queue while it waits; a retry asking for
 /// another list, or none, is refused naming `delivery`. Alike.
-#[tokio::test]
-async fn a_queued_ordered_sends_retry_is_answered_alike() {
-    let pair = Pair::new(hello(), true).await;
+async fn a_queued_ordered_sends_retry_is_answered_alike(cipher: Cipher) {
+    let pair = Pair::new(hello(), true, cipher).await;
     pair.first("r1").await;
     let order = json!({"modes": ["tool_result"]});
     let mut replies = Vec::new();
@@ -916,11 +933,10 @@ async fn a_queued_ordered_sends_retry_is_answered_alike() {
 /// `queue` starts a run on the idle session as `[idle_start]`; a sender without the grant is
 /// refused both, and an `interrupt` it isn't granted; a module the plan doesn't name is left to
 /// the owner check. Alike, records and reads included.
-#[tokio::test]
-async fn string_sends_from_plan_named_senders_are_admitted_alike() {
+async fn string_sends_from_plan_named_senders_are_admitted_alike(cipher: Cipher) {
     let mut script = hello();
     script.push(store::text_step("a4", "last"));
-    let pair = Pair::new(script, true).await;
+    let pair = Pair::new(script, true, cipher).await;
     pair.first("r1").await;
     let refused = |outcome: &SendOutcome| {
         assert!(
@@ -1011,9 +1027,8 @@ fn run_story(ledger: &[Value]) -> Vec<String> {
 
 /// An interrupt on an idle session starts its run at once, from the owner and from a sender the
 /// plan grants one, alike; the plan sender's run continues under the session's principal.
-#[tokio::test]
-async fn an_interrupt_on_an_idle_session_starts_its_run_alike() {
-    let pair = Pair::new(hello(), false).await;
+async fn an_interrupt_on_an_idle_session_starts_its_run_alike(cipher: Cipher) {
+    let pair = Pair::new(hello(), false, cipher).await;
     pair.first("r1").await;
     pair.idle().await;
     for (run_id, sender) in [("i1", core()), ("i2", module(OCCI))] {
@@ -1040,9 +1055,8 @@ async fn an_interrupt_on_an_idle_session_starts_its_run_alike() {
 /// An interrupt during a model step, with a plain send already queued: its message is durable
 /// first and answered `pending`, the running run ends `cancelled` without its step's answer, and
 /// the interrupt runs next, ahead of the plain send, alike.
-#[tokio::test]
-async fn an_interrupt_during_a_model_step_cancels_the_run_and_runs_first_alike() {
-    let pair = Pair::new(hello(), true).await;
+async fn an_interrupt_during_a_model_step_cancels_the_run_and_runs_first_alike(cipher: Cipher) {
+    let pair = Pair::new(hello(), true, cipher).await;
     pair.first("r1").await;
     let plain = pair
         .alike("p1", from(core(), "after that"), None, None)
@@ -1104,11 +1118,17 @@ fn reading_then_done() -> Vec<Vec<NormalizedEvent>> {
 /// An interrupt while a tool call is in flight: the call is answered, not abandoned; then the
 /// run ends `cancelled` at its boundary, with the result kept, and the interrupt runs next,
 /// alike.
-#[tokio::test]
-async fn an_interrupt_during_a_tool_call_waits_for_it_then_runs_alike() {
+async fn an_interrupt_during_a_tool_call_waits_for_it_then_runs_alike(cipher: Cipher) {
     let (today_planes, today_reached, today_release) = tool_gated();
     let (store_planes, store_reached, store_release) = tool_gated();
-    let pair = Pair::with_planes(reading_then_done(), false, today_planes, store_planes).await;
+    let pair = Pair::with_planes(
+        reading_then_done(),
+        false,
+        today_planes,
+        store_planes,
+        cipher,
+    )
+    .await;
     pair.first("r1").await;
     today_reached.notified().await;
     store_reached.notified().await;
@@ -1135,11 +1155,17 @@ async fn an_interrupt_during_a_tool_call_waits_for_it_then_runs_alike() {
 /// A process that dies after an interrupt's message is durable and before the run it stopped
 /// has ended: the next open ends that run `interrupted` as a crash's orphan, never resuming it,
 /// and the interrupt runs first, alike.
-#[tokio::test]
-async fn a_crash_between_an_interrupt_and_its_run_is_recovered_alike() {
+async fn a_crash_between_an_interrupt_and_its_run_is_recovered_alike(cipher: Cipher) {
     let (today_planes, today_reached, _today_release) = tool_gated();
     let (store_planes, store_reached, _store_release) = tool_gated();
-    let pair = Pair::with_planes(reading_then_done(), false, today_planes, store_planes).await;
+    let pair = Pair::with_planes(
+        reading_then_done(),
+        false,
+        today_planes,
+        store_planes,
+        cipher,
+    )
+    .await;
     pair.first("r1").await;
     today_reached.notified().await;
     store_reached.notified().await;

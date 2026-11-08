@@ -6976,26 +6976,10 @@ impl<W: WalStore + 'static> LineageActor<W> {
         {
             return crate::person_media::outcome(error);
         }
-        if has_media
-            && !order.modes.iter().any(|mode| {
-                matches!(
-                    mode,
-                    broca_protocol::DeliveryMode::Steer | broca_protocol::DeliveryMode::IdleStart
-                )
-            })
+        if let Err(error) =
+            crate::person_media::ordered_carrier(&order, &request.input, &media_model)
         {
-            let kind = broca_provider::person_media::references(&request.input)
-                .next()
-                .unwrap()
-                .kind;
-            return crate::person_media::outcome(RunError::MediaUnsupported(
-                broca_provider::person_media::refusal(
-                    &media_model,
-                    kind,
-                    broca_protocol::MediaMarkerReason::Carrier,
-                )
-                .to_string(),
-            ));
+            return crate::person_media::outcome(error);
         }
         let manifest = match self.frozen_input_manifest().await {
             Ok(manifest) => manifest,

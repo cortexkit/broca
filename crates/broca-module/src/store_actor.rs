@@ -480,18 +480,27 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         record: Record,
         staged: &[crate::person_media::StagedMedia],
     ) -> Result<Record, SessionError> {
+        let mut appended = self
+            .append_own_batch_with_media(std::slice::from_ref(&record), staged)
+            .await?;
+        Ok(appended.pop().expect("one record was appended"))
+    }
+
+    /// [`Self::append_own_with_media`] for a batch of records, appended together.
+    async fn append_own_batch_with_media(
+        &mut self,
+        records: &[Record],
+        staged: &[crate::person_media::StagedMedia],
+    ) -> Result<Vec<Record>, SessionError> {
         let mut media = broca_session_loop::HeldInputMedia::default();
         for item in staged {
             media.hold(&item.reference, Arc::clone(&item.bytes));
         }
-        let (seq, mut appended) = media
-            .append(&mut self.durable(), std::slice::from_ref(&record), true)
-            .await?;
-        let record = appended.pop().expect("one record was appended");
+        let (seq, appended) = media.append(&mut self.durable(), records, true).await?;
         if let Some(running) = self.run.as_mut() {
-            running.link.note_own(seq, std::slice::from_ref(&record));
+            running.link.note_own(seq, &appended);
         }
-        Ok(record)
+        Ok(appended)
     }
 
     /// Serves `commands` until the session goes away: when the channel closes, or when it is
@@ -2716,17 +2725,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         // As today's actor steers, the attachments are checked against the media the running
         // run's model takes, as its start froze them.
         let mut start = start;
-        let profile = serde_json::from_value::<broca_provider::wire::FrozenRenderConfig>(
-            frozen.render_config.clone(),
-        )
-        .ok()
-        .and_then(|config| config.media.map(Box::new));
-        let model = format!(
-            "{}/{}",
-            frozen.model.provider_module_id, frozen.model.model_id
-        );
         let staged = match self
-            .stage_media(&mut start.request, Some((profile, model)))
+            .stage_media(&mut start.request, Some(frozen_media(&frozen)))
             .await
         {
             Ok(staged) => staged,
@@ -3066,6 +3066,26 @@ pub fn serves_creating_send(
     unserved_delivery(ordered, delivery, conversation_key).is_none()
         && unserved_request(request, kind, retention).is_none()
         && !carries_media(request)
+}
+
+/// The media a run's model takes, as the run's start froze them, and the model's name, which a
+/// refusal names: what a send joining that run is checked against.
+fn frozen_media(
+    frozen: &broca_session_loop::Admission,
+) -> (
+    Option<Box<broca_provider::media_profile::MediaProfile>>,
+    String,
+) {
+    let profile = serde_json::from_value::<broca_provider::wire::FrozenRenderConfig>(
+        frozen.render_config.clone(),
+    )
+    .ok()
+    .and_then(|config| config.media.map(Box::new));
+    let model = format!(
+        "{}/{}",
+        frozen.model.provider_module_id, frozen.model.model_id
+    );
+    (profile, model)
 }
 
 /// The delivery a send creating a session asks for that keeps the new session out of the new

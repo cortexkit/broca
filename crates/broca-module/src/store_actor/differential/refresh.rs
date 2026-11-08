@@ -21,6 +21,8 @@ use super::Module;
 use crate::actor::{SendOutcome, SendPlan};
 use crate::serve::ServeHandler;
 
+cipher_tests!(a_refreshed_sender_policy_refuses_a_module_it_doesnt_name_alike);
+
 /// A plan whose system text is `text`, offering the tools `tools` from one provider. With
 /// `pinned`, its system text item names the model it was written for, so a run on another
 /// model is refused. With `chooses`, the plan chooses the session's next-run model.
@@ -280,6 +282,42 @@ async fn compare(
         false,
     )
     .await;
+    compared(today, store, first, steps).await
+}
+
+/// [`compare`], with the store module's sessions in mode `cipher`.
+async fn compare_in(
+    cipher: broca_session_store::keys::Cipher,
+    first: &broca_wal::PlanManifest,
+    steps: &[Step],
+) -> (
+    Module,
+    Module,
+    Vec<String>,
+    Vec<(String, Option<String>, String)>,
+) {
+    let (today, store) = super::head::both_in(
+        (0..steps.len())
+            .map(|n| text_step(&format!("a{n}"), "hello"))
+            .collect(),
+        cipher,
+    )
+    .await;
+    compared(today, store, first, steps).await
+}
+
+/// [`compare`] on the modules `today` and `store`.
+async fn compared(
+    today: Module,
+    store: Module,
+    first: &broca_wal::PlanManifest,
+    steps: &[Step],
+) -> (
+    Module,
+    Module,
+    Vec<String>,
+    Vec<(String, Option<String>, String)>,
+) {
     let today_answers = drive(&today, first, steps).await;
     let store_answers = drive(&store, first, steps).await;
     assert_eq!(store_answers, today_answers);
@@ -580,14 +618,16 @@ async fn a_refresh_changes_the_inherited_model_and_the_senders_alike() {
 /// Once a refresh sets the session's sender policy, a module its plan doesn't name is refused
 /// `scope_owner_mismatch`, even with a string `delivery`, alike: here `occipital`, which the
 /// first plan named and the refresh's plan drops, and a module neither plan named.
-#[tokio::test]
-async fn a_refreshed_sender_policy_refuses_a_module_it_doesnt_name_alike() {
+async fn a_refreshed_sender_policy_refuses_a_module_it_doesnt_name_alike(
+    cipher: broca_session_store::keys::Cipher,
+) {
     let without_occipital = {
         let mut plan = plan("you are a worker", &["read"], None, None);
         plan["senders"] = json!([{"module": "magic-context"}]);
         manifest(&plan, "plan-2")
     };
-    let (today, store, answers, _) = compare(
+    let (today, store, answers, _) = compare_in(
+        cipher,
         &first_plan(),
         &[
             send("r1", "plan-1"),

@@ -1785,7 +1785,9 @@ where
                         let seq = first_seq + batch.len() as u64;
                         delivered.extend(input.iter().map(|message| {
                             Record::Input(Input {
-                                media: Vec::new(),
+                                // A delivered copy's media are stored where the send's queued
+                                // record stored them.
+                                media: send.media_of(message),
                                 run_id: run_id.clone(),
                                 placement,
                                 message: message.clone(),
@@ -4578,6 +4580,31 @@ struct OrderedSend {
     /// What a ride's text is shown as having come from: its sender and the plan template it was
     /// rendered from.
     notice: Notice,
+    /// Where the queued record stored the bytes of each medium the send's messages carry, by
+    /// digest: a delivered copy of a message points at the same objects.
+    media: std::collections::HashMap<String, broca_session_store::record::MediaObject>,
+}
+
+impl OrderedSend {
+    /// Where each medium of `message`, a message this send delivers, is stored. Matched by
+    /// digest, since the send's `pre_user` transforms may have rewritten the messages its
+    /// queued record kept.
+    fn media_of(&self, message: &Message) -> Vec<broca_session_store::record::InputMedia> {
+        broca_session_store::session::message_media(message)
+            .into_iter()
+            .filter_map(|(block, part, reference)| {
+                self.media.get(&reference.sha256).map(|object| {
+                    broca_session_store::record::InputMedia {
+                        block,
+                        part,
+                        log: object.log,
+                        generation: object.generation,
+                        seq: object.seq,
+                    }
+                })
+            })
+            .collect()
+    }
 }
 
 /// The module a principal names, else `broca`, as today's ride envelope names a sender.
@@ -4669,6 +4696,9 @@ async fn ordered_sends<W: Writer>(
             .filter(|message| message.role != Role::System)
             .collect();
         let send_id = queued.send_id.clone().unwrap_or_else(|| id.clone());
+        let media = broca_session_store::session::stored_media(&Record::QueuedSend(queued.clone()))
+            .into_iter()
+            .collect();
         sends.insert(
             id,
             OrderedSend {
@@ -4678,6 +4708,7 @@ async fn ordered_sends<W: Writer>(
                 send_id,
                 ride_sender,
                 notice,
+                media,
             },
         );
     }

@@ -446,7 +446,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     ) -> Result<Option<SubmissionId>, SendOutcome> {
         let Start {
             run_id,
-            request,
+            mut request,
             title,
             send_id,
             identity,
@@ -480,6 +480,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             ));
         }
         let expired = order.expired_at(now_ms());
+        let staged = self.stage_ordered_media(&mut request, &order).await?;
         let prepared = self
             .transform_input(
                 request.input.clone(),
@@ -493,6 +494,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         if let Some(provider) = prepared.refused.clone() {
             return Err(SendOutcome::PreUserUnavailable { provider });
         }
+        request.staged_uploads = None;
         // Whose dedupe key this is: the plan-named sender, or the owner sending as itself.
         let sender = ordered_by.clone().or_else(|| request.principal.clone());
         let superseded = self
@@ -562,12 +564,11 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 ended(&submission_id.0, &SendEndReason::Expired).map_err(SendOutcome::Error)?,
             );
         }
-        let seq = Writer::append(&mut self.durable(), &records, true)
+        // The queued record keeps the send's media, stored as the session's own objects before
+        // the batch, as a queued send's are.
+        self.append_own_batch_with_media(&records, &staged)
             .await
             .map_err(|error| SendOutcome::Error(format!("{error:?}")))?;
-        if let Some(active) = self.run.as_mut() {
-            active.link.note_own(seq, &records);
-        }
         if expired {
             return Err(SendOutcome::SendEnded {
                 submission_id,
@@ -580,6 +581,47 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             return Ok(Some(submission_id));
         }
         Err(SendOutcome::Pending { submission_id })
+    }
+}
+
+impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
+    /// Stages the attachments an ordered send's `content` names into its input and checks them,
+    /// as today's actor does for an ordered send (`queue_ordered_submission`): against the
+    /// running run's media, as its start froze them, when the list may steer into that run, else
+    /// against the profile the executor quotes for the send's model. A send holding media whose
+    /// list names neither `steer` nor `idle_start` is refused as media its carrier can't take:
+    /// a tool result carries text only, and turn-scoped system text is a template's text.
+    async fn stage_ordered_media(
+        &self,
+        request: &mut SubmissionRequest,
+        order: &DeliveryOrder,
+    ) -> Result<Vec<crate::person_media::StagedMedia>, SendOutcome> {
+        let running = match self.run.is_some() && order.modes.contains(&DeliveryMode::Steer) {
+            true => self
+                .session
+                .operations
+                .run
+                .as_ref()
+                .and_then(|run| run.start.as_ref()),
+            false => None,
+        };
+        let frozen = running
+            .map(|start| {
+                broca_session_loop::run::admission_of_start(start, &self.parts)
+                    .map(|admission| super::frozen_media(&admission))
+                    .map_err(|error| SendOutcome::Error(format!("{error:?}")))
+            })
+            .transpose()?;
+        let staged = self.stage_media(request, frozen).await?;
+        // Only a list naming no steer is refused, and such a list was checked against the send's
+        // own model, so the refusal names that model.
+        let model = format!(
+            "{}/{}",
+            request.model.provider_module_id, request.model.model_id
+        );
+        crate::person_media::ordered_carrier(order, &request.input, &model)
+            .map_err(crate::person_media::outcome)?;
+        Ok(staged)
     }
 }
 

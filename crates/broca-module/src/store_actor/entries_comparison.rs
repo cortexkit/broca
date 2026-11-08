@@ -234,6 +234,19 @@ async fn side_idling(
     compaction: bool,
     idle: Duration,
 ) -> Side {
+    let deployment = broca_session_store::keys::DeploymentKey::new(1, &[7; 32]);
+    side_in(store, steps, gated, compaction, idle, deployment).await
+}
+
+/// [`side_idling`], whose new storage creates sessions under `deployment`.
+async fn side_in(
+    store: bool,
+    steps: Vec<Vec<NormalizedEvent>>,
+    gated: bool,
+    compaction: bool,
+    idle: Duration,
+    deployment: broca_session_store::keys::DeploymentKey,
+) -> Side {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let dir = broca_test_support::scratch_root().join(format!(
@@ -256,14 +269,10 @@ async fn side_idling(
         store: scripted(),
         compaction: compaction.then(|| Arc::new(ReadyProvider)),
     });
-    let runtime = crate::store_open::StoreRuntime::open(
-        &dir,
-        broca_session_store::keys::DeploymentKey::new(1, &[7; 32]),
-        Arc::clone(&executor),
-        idle,
-    )
-    .await
-    .unwrap();
+    let runtime =
+        crate::store_open::StoreRuntime::open(&dir, deployment, Arc::clone(&executor), idle)
+            .await
+            .unwrap();
     let registry = LineageRegistry::new_with_reader(
         Arc::new(
             crate::opener::DefaultOpener::new(
@@ -1752,8 +1761,27 @@ async fn numbered_part(side: &Side, ordinal: u64) -> (String, String, u64) {
 /// part's message, the next request no longer shows it, and the same send ends
 /// `template_part_gone` alike, before any step applied the view. The store session stays open
 /// throughout, so its numbers come from the compaction state its actor keeps.
-#[tokio::test]
-async fn a_part_tag_template_renders_the_number_the_next_request_shows_alike() {
+mod a_part_tag_template_renders_the_number_the_next_request_shows_alike {
+    use broca_session_store::keys::Cipher;
+
+    #[tokio::test]
+    async fn encrypted() {
+        super::a_part_tag_template_renders_the_number_the_next_request_shows_alike(
+            Cipher::XChaCha20Poly1305,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn plain() {
+        super::a_part_tag_template_renders_the_number_the_next_request_shows_alike(Cipher::None)
+            .await;
+    }
+}
+
+async fn a_part_tag_template_renders_the_number_the_next_request_shows_alike(
+    cipher: broca_session_store::keys::Cipher,
+) {
     use broca_core::compaction_v2::protocol::view::{Edit, EditOp, View};
     let template = pointer();
     let mut manifest = compacting_manifest(true);
@@ -1772,8 +1800,25 @@ async fn a_part_tag_template_renders_the_number_the_next_request_shows_alike() {
         text_step("a3", "§5§ §6§ It says file contents."),
         text_step("a4", "seen"),
     ];
-    let today = side_idling(false, steps.clone(), false, true, Duration::from_secs(60)).await;
-    let store = side_idling(true, steps, false, true, Duration::from_secs(60)).await;
+    let deployment = || broca_session_store::keys::DeploymentKey::new(1, &[7; 32]).creating(cipher);
+    let today = side_in(
+        false,
+        steps.clone(),
+        false,
+        true,
+        Duration::from_secs(60),
+        deployment(),
+    )
+    .await;
+    let store = side_in(
+        true,
+        steps,
+        false,
+        true,
+        Duration::from_secs(60),
+        deployment(),
+    )
+    .await;
     for side in [&today, &store] {
         let first = side
             .send_request(
