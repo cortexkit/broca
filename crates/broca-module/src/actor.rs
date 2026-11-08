@@ -1427,6 +1427,24 @@ fn effective_plan_senders(
     ownership.effective_senders()
 }
 
+/// Whether a keyed send's retry asks for the same delivery order as the send it repeats: the
+/// list, dedupe key and template, by llm-runner's comparison (`same_payload`), which leaves out
+/// the expiry.
+pub(crate) fn same_order(
+    retry: &broca_protocol::DeliveryOrder,
+    earlier: &broca_protocol::DeliveryOrder,
+) -> bool {
+    let role_order = |order: &broca_protocol::DeliveryOrder| {
+        let mut published =
+            cortexkit_role_llm_runner::delivery_order::DeliveryOrder::new(order.modes.clone());
+        published.dedupe_key = order.dedupe_key.clone();
+        published.expires_at_ms = order.expires_at_ms;
+        published.template = order.template.clone();
+        published
+    };
+    role_order(retry).same_payload(&role_order(earlier))
+}
+
 /// The actor's run state.
 enum RunState {
     Idle,
@@ -6405,19 +6423,11 @@ impl<W: WalStore + 'static> LineageActor<W> {
         let submission_id = broca_protocol::SubmissionId(format!("sub-{}", run_id.0));
         let used = self.recorded_send_keys.contains_key(run_id)
             || self.ordered_submissions.contains_key(&submission_id);
-        let role_order = |order: &broca_protocol::DeliveryOrder| {
-            let mut published =
-                cortexkit_role_llm_runner::delivery_order::DeliveryOrder::new(order.modes.clone());
-            published.dedupe_key = order.dedupe_key.clone();
-            published.expires_at_ms = order.expires_at_ms;
-            published.template = order.template.clone();
-            published
-        };
         let same = match (
             self.ordered_submissions.get(&submission_id),
             self.admitting_order.as_ref(),
         ) {
-            (Some(earlier), Some(retry)) => role_order(retry).same_payload(&role_order(earlier)),
+            (Some(earlier), Some(retry)) => same_order(retry, earlier),
             (None, None) => true,
             _ => false,
         };
