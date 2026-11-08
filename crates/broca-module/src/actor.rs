@@ -3999,7 +3999,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 if let Err(error) = self.sync_session_change_from_wal().await {
                     return SendOutcome::Transient(error);
                 }
-                let drift = if self.session_change.accepted_generation > 0 {
+                let refreshed = (self.session_change.accepted_generation > 0).then(|| {
                     let effective = self
                         .session_change
                         .current_manifest
@@ -4010,19 +4010,11 @@ impl<W: WalStore + 'static> LineageActor<W> {
                         .accepted
                         .get(&self.session_change.accepted_generation)
                         .map(|(identity, _)| identity.as_str());
-                    cortexkit_role_llm_runner::session_change::check_send_drift(
-                        effective,
-                        accepted,
-                        &plan.identity,
-                    )
-                    .map_err(|detail| broca_fetch_plan::Refusal::PlanDrift {
-                        frozen: detail.frozen,
-                        sent: detail.sent,
-                    })
-                } else {
-                    broca_fetch_plan::check_later_plan(frozen, &plan.identity)
-                };
-                if let Err(refusal) = drift {
+                    (effective, accepted)
+                });
+                if let Err(refusal) =
+                    crate::plan_change::later_send_plan(frozen, refreshed, &plan.identity)
+                {
                     return SendOutcome::PlanRefused(refusal);
                 }
             }
@@ -5709,22 +5701,14 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     .as_ref()
                     .and_then(|first| first.manifest.clone())
             });
-            if resuming {
-                // A pending refresh cannot change an episode re-driven after a crash.
-                current
-            } else {
-                if let Some(pending) = self.pending_for_model(&resolved_request.model) {
-                    broca_fetch_plan::session_change::check_applying_model(
-                        pending,
-                        &resolved_request.model,
-                        resolved_request.variant.as_deref(),
-                    )
-                    .map_err(StartRunFailure::PlanRefused)?;
-                    Some(pending.manifest.clone())
-                } else {
-                    current
-                }
-            }
+            crate::plan_change::run_manifest(
+                current,
+                self.pending_for_model(&resolved_request.model),
+                resuming,
+                &resolved_request.model,
+                resolved_request.variant.as_deref(),
+            )
+            .map_err(StartRunFailure::PlanRefused)?
         };
         // Every path that starts an episode passes here (a direct send, a drained queue, a
         // queue rebuilt after a crash), so an episode whose plan asks a provider to confine its
@@ -7286,17 +7270,25 @@ impl<W: WalStore + 'static> LineageActor<W> {
         &self,
         model: &broca_protocol::ModelHandle,
     ) -> Option<&broca_fetch_plan::session_change::PendingState> {
-        let model = format!("{}:{}", model.provider_module_id, model.model_id);
-        let switched = self
-            .session_change_last_model
-            .as_ref()
-            .is_some_and(|previous| previous != &model);
-        self.session_change.pending.as_ref().filter(|pending| {
-            pending.policy == "immediately"
-                || self.session_change_flushed
-                || (pending.policy == "on_prefix_rebuild"
-                    && (self.session_change_rebuild || switched))
-        })
+        crate::plan_change::pending_applying(
+            self.session_change.pending.as_ref(),
+            self.session_change_rebuild,
+            self.session_change_flushed,
+            self.session_change_last_model.as_deref(),
+            model,
+        )
+    }
+
+    /// The plan-change facts this actor holds, for a request naming `generation` and `send_id`.
+    fn change_facts(
+        &self,
+        generation: Option<u64>,
+        send_id: Option<&str>,
+    ) -> crate::plan_change::ChangeFacts {
+        let mut facts =
+            crate::plan_change::ChangeFacts::of(&self.session_change, generation, send_id);
+        facts.flushed = self.session_change_flushed;
+        facts
     }
 
     /// Serialize acceptance against episode starts and other changes. The fetched manifest and
@@ -7307,63 +7299,35 @@ impl<W: WalStore + 'static> LineageActor<W> {
         policy: String,
         manifest: Box<broca_wal::PlanManifest>,
     ) -> SessionRefreshOutcome {
-        use crate::serve::SessionChangeError;
-        use cortexkit_role_llm_runner::session_change::{refresh_order, RefreshOrder};
+        use crate::plan_change::RefreshAcceptance;
         if self.wal_store.check_move(&self.key, true).is_err() {
             return SessionRefreshOutcome::Reopen;
         }
         if let Err(error) = self.sync_session_change_from_wal().await {
             return SessionRefreshOutcome::Error(error);
         }
-        match refresh_order(
-            self.session_change.accepted_generation,
+        let (run_in_progress, applies_from_next_run) = match crate::plan_change::accept_refresh(
+            &self.change_facts(Some(generation), None),
             generation,
-            &manifest.plan_identity,
             &policy,
-            self.session_change.earlier(generation),
+            &manifest,
+            matches!(self.state, RunState::Active { .. }),
         ) {
-            RefreshOrder::Repeat => {
-                let (run_in_progress, applies_from_next_run) =
-                    self.session_change.accepted_replies[&generation];
+            RefreshAcceptance::Repeat {
+                run_in_progress,
+                applies_from_next_run,
+            } => {
                 return SessionRefreshOutcome::Accepted {
                     run_in_progress,
                     applies_from_next_run,
-                };
+                }
             }
-            RefreshOrder::Stale => {
-                return SessionRefreshOutcome::Refused(SessionChangeError::GenerationStale {
-                    accepted: self.session_change.accepted_generation,
-                })
-            }
-            RefreshOrder::New => {}
-        }
-        let next_plan =
-            serde_json::from_str(manifest.plan.as_json_text()).expect("admitted plan is JSON");
-        if broca_fetch_plan::session_change::check_compaction_item(
-            self.session_change.current_manifest.as_deref(),
-            &next_plan,
-        )
-        .is_err()
-        {
-            return SessionRefreshOutcome::Refused(SessionChangeError::InvalidParams {
-                field: "plan.compaction_item".into(),
-                message:
-                    "the session's compaction provider, preset and params are fixed for its life"
-                        .into(),
-            });
-        }
-        if let Some(surface) = broca_fetch_plan::session_change::unsupported_surface(
-            self.session_change.current_manifest.as_deref(),
-            &manifest,
-            &policy,
-        ) {
-            return SessionRefreshOutcome::Refused(SessionChangeError::RungUnsupported {
-                surface: surface.into(),
-                rung: policy,
-            });
-        }
-        let run_in_progress = matches!(self.state, RunState::Active { .. });
-        let applies_from_next_run = policy == "immediately" || self.session_change_flushed;
+            RefreshAcceptance::Refused(refusal) => return SessionRefreshOutcome::Refused(refusal),
+            RefreshAcceptance::Accept {
+                run_in_progress,
+                applies_from_next_run,
+            } => (run_in_progress, applies_from_next_run),
+        };
         let writer = self
             .writer
             .as_ref()
@@ -7405,8 +7369,8 @@ impl<W: WalStore + 'static> LineageActor<W> {
         if let Err(error) = self.sync_session_change_from_wal().await {
             return SessionRefreshPolicyOutcome::Error(error);
         }
-        match crate::serve::check_session_policy(
-            &self.session_change,
+        match crate::plan_change::check_policy(
+            &self.change_facts(Some(generation), Some(&send_id)),
             generation,
             &policy,
             &send_id,
@@ -7444,20 +7408,17 @@ impl<W: WalStore + 'static> LineageActor<W> {
         if let Err(error) = self.sync_session_change_from_wal().await {
             return SessionFlushPrefixOutcome::Error(error);
         }
-        if let Some(pending_generation) = self.session_change.flush_send_ids.get(&send_id) {
-            return SessionFlushPrefixOutcome::Flushed {
-                pending_generation: *pending_generation,
+        let pending_generation =
+            match crate::plan_change::flush(&self.change_facts(None, Some(&send_id))) {
+                Err(pending_generation) => {
+                    return SessionFlushPrefixOutcome::Flushed { pending_generation }
+                }
+                Ok(pending_generation) => pending_generation,
             };
-        }
         if let Err(error) = self.wal_store.check_move(&self.key, true) {
             let _ = error;
             return SessionFlushPrefixOutcome::Reopen;
         }
-        let pending_generation = self
-            .session_change
-            .pending
-            .as_ref()
-            .map(|pending| pending.generation);
         let writer = self
             .writer
             .as_ref()

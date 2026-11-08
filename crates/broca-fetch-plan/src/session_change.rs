@@ -105,12 +105,185 @@ pub fn check_applying_model(
 }
 
 /// A pending change: the highest accepted generation not yet applied, with its latest policy and
-/// the manifest it will freeze when it applies.
+/// the manifest it will freeze when it applies, held as `M`. Today's fold holds the manifest
+/// itself. The new storage's fold holds a reference to it instead: the setup parts the manifest
+/// is stored as (its plan, each provider's answer, its tools, its system text and its
+/// declarations) and the rest of its members, as a run start references the manifest it froze.
 #[derive(Debug, Clone, PartialEq)]
-pub struct PendingState {
+pub struct Pending<M> {
     pub generation: u64,
     pub policy: String,
-    pub manifest: Arc<PlanManifest>,
+    pub manifest: M,
+}
+
+/// A pending change as today's fold holds it, with its manifest.
+pub type PendingState = Pending<Arc<PlanManifest>>;
+
+/// A pending change that applies at a run start: its generation, and the runner role's
+/// `applied_by` name for how (`fold` after a prefix rebuild, `append` with the prefix intact).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Applying {
+    pub generation: u64,
+    pub applied_by: &'static str,
+}
+
+/// The key a run's model is compared by when deciding whether the model switched between runs.
+pub fn model_key(model: &broca_protocol::ModelHandle) -> String {
+    format!("{}:{}", model.provider_module_id, model.model_id)
+}
+
+/// Whether a pending change under `policy` applies at a run start on the model keyed `model`, and
+/// if it does, its `applied_by` name. `rebuild` and `flushed` say whether a prefix rebuild and a
+/// flush happened since the change was accepted, and `last_model` is the previous run's model
+/// key: a run on another model is a rebuild too. `immediately` applies at the next run, and
+/// `on_prefix_rebuild` once a rebuild happened; a flush applies the change whatever its policy.
+/// A policy the session doesn't support never applies, so a record carrying one can't change a
+/// run.
+pub fn applies_at_run_start(
+    policy: &str,
+    rebuild: bool,
+    flushed: bool,
+    last_model: Option<&str>,
+    model: &str,
+) -> Option<&'static str> {
+    let rebuild = rebuild || last_model.is_some_and(|previous| previous != model);
+    let applies = flushed
+        || match policy {
+            "immediately" => true,
+            "on_prefix_rebuild" => rebuild,
+            _ => false,
+        };
+    applies.then_some(if rebuild { "fold" } else { "append" })
+}
+
+/// The session-change transitions both folds make, over a manifest held as `M`: today's fold
+/// over a WAL ([`SessionChangeState::fold`]) and the new storage's operational fold. Each method
+/// is one record's effect, so the two folds can't drift apart.
+///
+/// A run start is two steps. [`Self::run_started`] notes the run's model and manifest, and when
+/// the pending change applies at it, [`Self::applied`] applies it after. Whether it applies is
+/// decided before either, by [`Self::applying`]. The new storage records that decision in the
+/// run start's batch; today's fold makes it again on replay.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Transitions<M> {
+    /// The highest change generation accepted. `0` before any.
+    pub accepted_generation: u64,
+    /// The highest change generation applied. `0` before any.
+    pub applied_generation: u64,
+    pub pending: Option<Pending<M>>,
+    /// The latest run's frozen manifest.
+    pub current: Option<M>,
+    /// The manifest of the latest prefix rebuild, or of the first run before any.
+    pub prefix: Option<M>,
+    /// A real prefix rebuild happened since the pending acceptance: a compaction view applied,
+    /// a model switch between runs, or a prefix flush.
+    pub rebuild_since_accept: bool,
+    /// A flush has not yet reached a new run, including a flush before the acceptance.
+    pub flushed_since_accept: bool,
+    /// The latest run's model, by [`model_key`].
+    pub last_model: Option<String>,
+}
+
+impl<M> Default for Transitions<M> {
+    fn default() -> Self {
+        Self {
+            accepted_generation: 0,
+            applied_generation: 0,
+            pending: None,
+            current: None,
+            prefix: None,
+            rebuild_since_accept: false,
+            flushed_since_accept: false,
+            last_model: None,
+        }
+    }
+}
+
+impl<M: Clone> Transitions<M> {
+    /// A refresh accepted under `generation`. The writer checks generation order where it
+    /// writes, so each acceptance supersedes the pending change in log order. A flush before the
+    /// acceptance still counts as a rebuild for it.
+    pub fn accepted(&mut self, generation: u64, policy: &str, manifest: M) {
+        if generation > self.accepted_generation {
+            self.accepted_generation = generation;
+        }
+        self.pending = Some(Pending {
+            generation,
+            policy: policy.to_owned(),
+            manifest,
+        });
+        self.rebuild_since_accept = self.flushed_since_accept;
+    }
+
+    /// The pending change's policy changed, when `generation` is still the pending one.
+    pub fn policy_changed(&mut self, generation: u64, policy: &str) {
+        if let Some(pending) = self.pending.as_mut() {
+            if pending.generation == generation {
+                policy.clone_into(&mut pending.policy);
+            }
+        }
+    }
+
+    /// A prefix flush: a real prefix rebuild for the pending change, which the next run applies
+    /// whatever its policy, as a fold.
+    pub fn flushed(&mut self) {
+        self.rebuild_since_accept = true;
+        self.flushed_since_accept = true;
+    }
+
+    /// A compaction view applied: a real prefix rebuild, whose prefix is the current manifest.
+    pub fn view_applied(&mut self) {
+        self.rebuild_since_accept = true;
+        self.prefix = self.current.clone();
+    }
+
+    /// Whether the pending change applies at a run start on the model keyed `model`, and how
+    /// ([`applies_at_run_start`]). Asked before the run start's own transitions.
+    pub fn applying(&self, model: &str) -> Option<Applying> {
+        let pending = self.pending.as_ref()?;
+        applies_at_run_start(
+            &pending.policy,
+            self.rebuild_since_accept,
+            self.flushed_since_accept,
+            self.last_model.as_deref(),
+            model,
+        )
+        .map(|applied_by| Applying {
+            generation: pending.generation,
+            applied_by,
+        })
+    }
+
+    /// A run started on the model keyed `model`, freezing `manifest`. A run on another model
+    /// than the previous run is a prefix rebuild whose prefix is this run's manifest. A first
+    /// run, or one after a flush, starts a new prefix.
+    pub fn run_started(&mut self, model: String, manifest: Option<M>) {
+        if let Some(previous) = self.last_model.replace(model.clone()) {
+            if previous != model {
+                self.rebuild_since_accept = true;
+                self.prefix = manifest.clone();
+            }
+        }
+        self.current = manifest;
+        if self.prefix.is_none() || self.flushed_since_accept {
+            self.prefix = self.current.clone();
+        }
+        self.flushed_since_accept = false;
+    }
+
+    /// The pending change applied at the run start just folded, as `applying` decided before
+    /// it. Returns the change it applied; `None`, changing nothing, when no change is pending.
+    /// Applied by a rebuild (`fold`), its manifest is the new prefix.
+    pub fn applied(&mut self, applying: Applying) -> Option<Pending<M>> {
+        let pending = self.pending.take()?;
+        self.applied_generation = pending.generation;
+        if applying.applied_by == "fold" {
+            self.prefix = Some(pending.manifest.clone());
+        }
+        self.rebuild_since_accept = false;
+        self.flushed_since_accept = false;
+        Some(pending)
+    }
 }
 
 /// The latest applied change.
@@ -123,6 +296,26 @@ pub struct EffectiveState {
     pub manifest_digest: String,
     pub composition_digest: Option<String>,
     pub absent_items: Vec<cortexkit_role_llm_runner::baseline::AbsentItem>,
+}
+
+impl EffectiveState {
+    /// The facts the baseline reports for the change `applying` applied, which froze `manifest`:
+    /// the whole manifest's digest, its composition digest when it has one, and the plan items
+    /// its fetch left absent.
+    pub fn of(manifest: &PlanManifest, applying: Applying) -> Self {
+        let facts = crate::baseline_facts(manifest);
+        Self {
+            generation: applying.generation,
+            applied_by: applying.applied_by.into(),
+            manifest_digest: crate::plan_identity(
+                &serde_json::to_value(manifest).expect("manifest JSON"),
+            )
+            .expect("canonical manifest"),
+            composition_digest: (!facts.composition_digest.is_empty())
+                .then_some(facts.composition_digest),
+            absent_items: facts.absent_items,
+        }
+    }
 }
 
 /// The session-change facts a WAL folds, for the baseline and for repeat classification.
@@ -169,16 +362,11 @@ impl SessionChangeState {
     /// freezes the pending manifest applies it: `immediately` at the next run, and
     /// `on_prefix_rebuild` only once a compaction view applied, the model switched between
     /// episodes, or a prefix flush arrived after the acceptance. The applying run records the
-    /// change as `fold` when a rebuild applied it and `append` otherwise.
+    /// change as `fold` when a rebuild applied it and `append` otherwise. The transitions are
+    /// [`Transitions`]'s, which the new storage's fold makes too.
     pub fn fold(records: &[FramedRecord]) -> Self {
         let mut state = Self::default();
-        // Whether a real frozen-prefix rebuild happened since the pending acceptance: a
-        // compaction view applied, a model switch between episodes, or a prefix flush.
-        let mut rebuild_since_accept = false;
-        let mut last_model: Option<String> = None;
-        // Whether a flush arrived since the pending acceptance, forcing the next run to apply
-        // whatever its policy.
-        let mut flushed_since_accept = false;
+        let mut change = Transitions::<Arc<PlanManifest>>::default();
         for framed in records {
             match &framed.record {
                 WalRecord::SessionRefreshAccepted {
@@ -195,17 +383,7 @@ impl SessionChangeState {
                     state
                         .accepted
                         .insert(*generation, (identity, policy.clone()));
-                    if *generation > state.accepted_generation {
-                        state.accepted_generation = *generation;
-                    }
-                    // The actor checks generation ordering at the serialized write point. Each
-                    // acceptance therefore supersedes the previous pending change in WAL order.
-                    state.pending = Some(PendingState {
-                        generation: *generation,
-                        policy: policy.clone(),
-                        manifest: Arc::new((**manifest).clone()),
-                    });
-                    rebuild_since_accept = flushed_since_accept;
+                    change.accepted(*generation, policy, Arc::new((**manifest).clone()));
                 }
                 WalRecord::SessionRefreshPolicyChanged {
                     generation,
@@ -215,11 +393,7 @@ impl SessionChangeState {
                     state
                         .policy_send_ids
                         .insert(send_id.clone(), (*generation, policy.clone()));
-                    if let Some(pending) = state.pending.as_mut() {
-                        if pending.generation == *generation {
-                            pending.policy.clone_from(policy);
-                        }
-                    }
+                    change.policy_changed(*generation, policy);
                 }
                 WalRecord::SessionPrefixFlushed {
                     send_id,
@@ -228,83 +402,47 @@ impl SessionChangeState {
                     state
                         .flush_send_ids
                         .insert(send_id.clone(), *pending_generation);
-                    // A flush is a real prefix rebuild for the pending change: the next run
-                    // applies it whatever its policy, and the application counts as a fold.
-                    rebuild_since_accept = true;
-                    flushed_since_accept = true;
+                    change.flushed();
                 }
                 WalRecord::CompactionViewApplied { .. }
-                | WalRecord::CompactionViewAppliedV2 { .. } => {
-                    rebuild_since_accept = true;
-                    state.prefix_manifest = state.current_manifest.clone();
-                }
+                | WalRecord::CompactionViewAppliedV2 { .. } => change.view_applied(),
                 WalRecord::RunStarted {
                     manifest, config, ..
                 } => {
-                    let model = format!(
-                        "{}:{}",
-                        config.model.provider_module_id, config.model.model_id
-                    );
-                    if let Some(previous) = last_model.replace(model.clone()) {
-                        if previous != model {
-                            rebuild_since_accept = true;
-                            state.prefix_manifest = manifest.as_deref().cloned().map(Arc::new);
+                    let model = model_key(&config.model);
+                    let started = manifest.as_deref().cloned().map(Arc::new);
+                    // Replay decides again what the writer decided at this run start: the
+                    // pending change applies when its policy's trigger came and the run froze
+                    // its manifest.
+                    let applying = change.applying(&model).filter(|_| {
+                        started.as_ref().is_some_and(|started| {
+                            change
+                                .pending
+                                .as_ref()
+                                .is_some_and(|pending| pending.manifest == *started)
+                        })
+                    });
+                    change.run_started(model, started);
+                    if let Some(applying) = applying {
+                        if let Some(pending) = change.applied(applying) {
+                            state
+                                .applied
+                                .insert(applying.generation, applying.applied_by.into());
+                            state.effective = Some(EffectiveState::of(&pending.manifest, applying));
                         }
                     }
-                    if let Some(pending) = state.pending.clone() {
-                        let applies = flushed_since_accept
-                            || match pending.policy.as_str() {
-                                "immediately" => true,
-                                "on_prefix_rebuild" => rebuild_since_accept || flushed_since_accept,
-                                // The writer never accepts a rung the session does not support, so
-                                // replay never meets one here. Treat it as waiting, never as applying,
-                                // so a record with an unsupported policy cannot change a running run.
-                                _ => false,
-                            };
-                        let manifest_matches = manifest
-                            .as_ref()
-                            .is_some_and(|started| started.as_ref() == pending.manifest.as_ref());
-                        if applies && manifest_matches {
-                            let applied_by = if rebuild_since_accept {
-                                "fold"
-                            } else {
-                                "append"
-                            };
-                            state.applied_generation = pending.generation;
-                            state.applied.insert(pending.generation, applied_by.into());
-                            let facts = crate::baseline_facts(&pending.manifest);
-                            state.effective = Some(EffectiveState {
-                                generation: pending.generation,
-                                applied_by: applied_by.into(),
-                                manifest_digest: crate::plan_identity(
-                                    &serde_json::to_value(pending.manifest.as_ref())
-                                        .expect("manifest JSON"),
-                                )
-                                .expect("canonical manifest"),
-                                composition_digest: (!facts.composition_digest.is_empty())
-                                    .then_some(facts.composition_digest),
-                                absent_items: facts.absent_items,
-                            });
-                            if applied_by == "fold" {
-                                state.prefix_manifest = Some(pending.manifest.clone());
-                            }
-                            state.pending = None;
-                            rebuild_since_accept = false;
-                            flushed_since_accept = false;
-                        }
-                    }
-                    state.current_manifest = manifest.as_deref().cloned().map(Arc::new);
-                    if state.prefix_manifest.is_none() || flushed_since_accept {
-                        state.prefix_manifest = state.current_manifest.clone();
-                    }
-                    flushed_since_accept = false;
                 }
                 _ => {}
             }
         }
-        state.rebuild_pending = rebuild_since_accept;
-        state.flush_pending = flushed_since_accept;
-        state.last_model = last_model;
+        state.accepted_generation = change.accepted_generation;
+        state.applied_generation = change.applied_generation;
+        state.pending = change.pending;
+        state.current_manifest = change.current;
+        state.prefix_manifest = change.prefix;
+        state.rebuild_pending = change.rebuild_since_accept;
+        state.flush_pending = change.flushed_since_accept;
+        state.last_model = change.last_model;
         state
     }
 
@@ -620,5 +758,215 @@ mod tests {
         ]);
         assert_eq!(state.applied_generation, 1);
         assert_eq!(state.effective.unwrap().applied_by, "fold");
+    }
+
+    /// The fold as it was written before its transitions moved into [`Transitions`], kept
+    /// verbatim so the shared transitions are checked against it.
+    fn fold_before_sharing(records: &[FramedRecord]) -> SessionChangeState {
+        let mut state = SessionChangeState::default();
+        let mut rebuild_since_accept = false;
+        let mut last_model: Option<String> = None;
+        let mut flushed_since_accept = false;
+        for framed in records {
+            match &framed.record {
+                WalRecord::SessionRefreshAccepted {
+                    generation,
+                    policy,
+                    manifest,
+                    run_in_progress,
+                    applies_from_next_run,
+                } => {
+                    state
+                        .accepted_replies
+                        .insert(*generation, (*run_in_progress, *applies_from_next_run));
+                    let identity = manifest.plan_identity.clone();
+                    state
+                        .accepted
+                        .insert(*generation, (identity, policy.clone()));
+                    if *generation > state.accepted_generation {
+                        state.accepted_generation = *generation;
+                    }
+                    state.pending = Some(PendingState {
+                        generation: *generation,
+                        policy: policy.clone(),
+                        manifest: Arc::new((**manifest).clone()),
+                    });
+                    rebuild_since_accept = flushed_since_accept;
+                }
+                WalRecord::SessionRefreshPolicyChanged {
+                    generation,
+                    policy,
+                    send_id,
+                } => {
+                    state
+                        .policy_send_ids
+                        .insert(send_id.clone(), (*generation, policy.clone()));
+                    if let Some(pending) = state.pending.as_mut() {
+                        if pending.generation == *generation {
+                            pending.policy.clone_from(policy);
+                        }
+                    }
+                }
+                WalRecord::SessionPrefixFlushed {
+                    send_id,
+                    pending_generation,
+                } => {
+                    state
+                        .flush_send_ids
+                        .insert(send_id.clone(), *pending_generation);
+                    rebuild_since_accept = true;
+                    flushed_since_accept = true;
+                }
+                WalRecord::CompactionViewApplied { .. }
+                | WalRecord::CompactionViewAppliedV2 { .. } => {
+                    rebuild_since_accept = true;
+                    state.prefix_manifest = state.current_manifest.clone();
+                }
+                WalRecord::RunStarted {
+                    manifest, config, ..
+                } => {
+                    let model = format!(
+                        "{}:{}",
+                        config.model.provider_module_id, config.model.model_id
+                    );
+                    if let Some(previous) = last_model.replace(model.clone()) {
+                        if previous != model {
+                            rebuild_since_accept = true;
+                            state.prefix_manifest = manifest.as_deref().cloned().map(Arc::new);
+                        }
+                    }
+                    if let Some(pending) = state.pending.clone() {
+                        let applies = flushed_since_accept
+                            || match pending.policy.as_str() {
+                                "immediately" => true,
+                                "on_prefix_rebuild" => rebuild_since_accept || flushed_since_accept,
+                                _ => false,
+                            };
+                        let manifest_matches = manifest
+                            .as_ref()
+                            .is_some_and(|started| started.as_ref() == pending.manifest.as_ref());
+                        if applies && manifest_matches {
+                            let applied_by = if rebuild_since_accept {
+                                "fold"
+                            } else {
+                                "append"
+                            };
+                            state.applied_generation = pending.generation;
+                            state.applied.insert(pending.generation, applied_by.into());
+                            let facts = crate::baseline_facts(&pending.manifest);
+                            state.effective = Some(EffectiveState {
+                                generation: pending.generation,
+                                applied_by: applied_by.into(),
+                                manifest_digest: crate::plan_identity(
+                                    &serde_json::to_value(pending.manifest.as_ref())
+                                        .expect("manifest JSON"),
+                                )
+                                .expect("canonical manifest"),
+                                composition_digest: (!facts.composition_digest.is_empty())
+                                    .then_some(facts.composition_digest),
+                                absent_items: facts.absent_items,
+                            });
+                            if applied_by == "fold" {
+                                state.prefix_manifest = Some(pending.manifest.clone());
+                            }
+                            state.pending = None;
+                            rebuild_since_accept = false;
+                            flushed_since_accept = false;
+                        }
+                    }
+                    state.current_manifest = manifest.as_deref().cloned().map(Arc::new);
+                    if state.prefix_manifest.is_none() || flushed_since_accept {
+                        state.prefix_manifest = state.current_manifest.clone();
+                    }
+                    flushed_since_accept = false;
+                }
+                _ => {}
+            }
+        }
+        state.rebuild_pending = rebuild_since_accept;
+        state.flush_pending = flushed_since_accept;
+        state.last_model = last_model;
+        state
+    }
+
+    /// A `RunStarted` like [`run_started`]'s, on the mock provider's model `model_id`.
+    fn run_started_on(identity: Option<&str>, model_id: &str) -> WalRecord {
+        let mut record = run_started(identity);
+        if let WalRecord::RunStarted { config, .. } = &mut record {
+            config.model.model_id = model_id.into();
+        }
+        record
+    }
+
+    /// Every sequence of up to five session-change records, over refreshes of both policies,
+    /// policy changes, flushes, applied views and runs on two models that freeze the latest
+    /// accepted manifest, an older one or none, folds to the same state through the shared
+    /// transitions as through the fold written before them.
+    #[test]
+    fn shared_transitions_fold_every_short_log_as_before() {
+        const SYMBOLS: usize = 9;
+        const LONGEST: u32 = 5;
+        // The record each symbol stands for once `accepted` refreshes were accepted before it.
+        fn record(symbol: usize, accepted: u64) -> WalRecord {
+            let latest = format!("plan-{accepted}");
+            match symbol {
+                0 => accepted_record(accepted + 1, "immediately"),
+                1 => accepted_record(accepted + 1, "on_prefix_rebuild"),
+                2 => WalRecord::SessionRefreshPolicyChanged {
+                    generation: accepted,
+                    policy: "immediately".into(),
+                    send_id: format!("policy-{accepted}"),
+                },
+                3 => WalRecord::SessionPrefixFlushed {
+                    send_id: format!("flush-{accepted}"),
+                    pending_generation: Some(accepted),
+                },
+                4 => WalRecord::CompactionViewAppliedV2 {
+                    step_id: 1,
+                    version: 1,
+                    checksum: "c".into(),
+                },
+                5 => run_started_on(Some(&latest), "mock-model"),
+                6 => run_started_on(Some(&latest), "other-model"),
+                7 => run_started_on(Some("plan-0"), "mock-model"),
+                _ => run_started_on(None, "mock-model"),
+            }
+        }
+        fn accepted_record(generation: u64, policy: &str) -> WalRecord {
+            accepted(generation, policy, &format!("plan-{generation}"))
+        }
+        let table: Vec<Vec<FramedRecord>> = (0..=u64::from(LONGEST))
+            .map(|accepted| {
+                (0..SYMBOLS)
+                    .map(|symbol| framed(record(symbol, accepted)))
+                    .collect()
+            })
+            .collect();
+        let mut compared = 0;
+        for length in 1..=LONGEST {
+            for mut code in 0..SYMBOLS.pow(length) {
+                let mut accepted = 0;
+                let mut records = Vec::new();
+                for _ in 0..length {
+                    let symbol = code % SYMBOLS;
+                    records.push(table[accepted][symbol].clone());
+                    if symbol <= 1 {
+                        accepted += 1;
+                    }
+                    code /= SYMBOLS;
+                }
+                assert_eq!(
+                    SessionChangeState::fold(&records),
+                    fold_before_sharing(&records),
+                    "{:?}",
+                    records.iter().map(|r| &r.record).collect::<Vec<_>>()
+                );
+                compared += 1;
+            }
+        }
+        assert_eq!(
+            compared,
+            (1..=LONGEST).map(|n| SYMBOLS.pow(n)).sum::<usize>()
+        );
     }
 }
