@@ -327,57 +327,69 @@ impl SessionChangeError {
     }
 }
 
-/// Classify policy retries and refusals without side effects. The serve preflight avoids
-/// opening an actor for a refusal; the actor repeats the check at the serialized write point.
-pub(crate) fn check_session_policy(
-    change: &broca_fetch_plan::session_change::SessionChangeState,
-    generation: u64,
-    policy: &str,
-    send_id: &str,
-) -> Result<bool, SessionChangeError> {
-    if let Some((earlier_generation, earlier_policy)) = change.policy_send_ids.get(send_id) {
-        let field = if generation != *earlier_generation {
-            Some("generation")
-        } else if policy != earlier_policy {
-            Some("policy")
-        } else {
-            None
+/// What a plan-change op's preflight reads about the session before it checks the request: who
+/// owns the session, the plan opener of its scoped runs, and its plan-change facts for the
+/// request's generation and `send_id`.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ChangeRead {
+    /// The scope and principal the session's first run froze, which name its owner; `None`
+    /// before the session's first run.
+    pub first_run: Option<(
+        Option<broca_protocol::SessionScope>,
+        Option<broca_protocol::BindPrincipal>,
+    )>,
+    /// The plan opener the latest scoped run that names one names (`scope_plan_opener`).
+    pub opener: Option<String>,
+    pub facts: crate::plan_change::ChangeFacts,
+}
+
+impl ChangeRead {
+    /// What the WAL `records` say, for a request naming `generation` and `send_id`.
+    pub(crate) fn of_wal(
+        records: &[broca_wal::FramedRecord],
+        generation: Option<u64>,
+        send_id: Option<&str>,
+    ) -> Self {
+        let first_run = first_run_started(records).and_then(|start| match start {
+            broca_wal::WalRecord::RunStarted {
+                scope, principal, ..
+            } => Some((scope.clone(), principal.clone())),
+            _ => None,
+        });
+        let opener = records
+            .iter()
+            .rev()
+            .find_map(|record| match &record.record {
+                broca_wal::WalRecord::RunStarted {
+                    scope: Some(scope), ..
+                } => scope_plan_opener(scope),
+                _ => None,
+            });
+        let change = broca_fetch_plan::session_change::SessionChangeState::fold(records);
+        Self {
+            first_run,
+            opener,
+            facts: crate::plan_change::ChangeFacts::of(&change, generation, send_id),
+        }
+    }
+
+    /// The caller's refusal when it isn't the session's owner, or when the session has no run
+    /// yet and so no baseline to change.
+    fn check_owner(
+        &self,
+        principal: Option<&broca_protocol::BindPrincipal>,
+        scope: &broca_protocol::SendScope,
+    ) -> Result<(), SessionChangeError> {
+        let Some((frozen, first)) = &self.first_run else {
+            return Err(SessionChangeError::Transient(
+                "the session has no baseline yet; send its first send first".into(),
+            ));
         };
-        return match field {
-            None => Ok(true),
-            Some(field) => Err(SessionChangeError::SendIdReuse {
-                field: field.into(),
-                message: format!("send_id {send_id} was used with another {field}"),
-            }),
-        };
+        match owner_mismatch(frozen.as_ref(), first.as_ref(), principal, scope) {
+            Some(mismatch) => Err(SessionChangeError::OwnerMismatch(Box::new(mismatch))),
+            None => Ok(()),
+        }
     }
-    if let Some(applied_by) = change.applied.get(&generation) {
-        return Err(SessionChangeError::AlreadyApplied {
-            generation,
-            applied_by: applied_by.clone(),
-        });
-    }
-    let Some(pending) = change
-        .pending
-        .as_ref()
-        .filter(|pending| pending.generation == generation)
-    else {
-        return Err(SessionChangeError::PendingSuperseded {
-            generation,
-            pending: change.accepted_generation,
-        });
-    };
-    if let Some(surface) = broca_fetch_plan::session_change::unsupported_surface(
-        change.current_manifest.as_deref(),
-        &pending.manifest,
-        policy,
-    ) {
-        return Err(SessionChangeError::RungUnsupported {
-            surface: surface.into(),
-            rung: policy.into(),
-        });
-    }
-    Ok(false)
 }
 
 /// A `session.send` response.
@@ -610,6 +622,18 @@ fn baseline_owner_mismatch(
     else {
         return None;
     };
+    owner_mismatch(frozen.as_ref(), first.as_ref(), principal, scope)
+}
+
+/// Why the caller is not the owner a session's first run recorded, if it is not: the owner of
+/// the scope it froze, `frozen`, when the session is scoped, else the principal of its first
+/// send, `first`. A session whose first run recorded neither has no owner to hold a caller to.
+pub(crate) fn owner_mismatch(
+    frozen: Option<&broca_protocol::SessionScope>,
+    first: Option<&broca_protocol::BindPrincipal>,
+    principal: Option<&broca_protocol::BindPrincipal>,
+    scope: &broca_protocol::SendScope,
+) -> Option<broca_core::OwnerMismatch> {
     match (frozen, first) {
         (Some(frozen), _) => {
             (principal != Some(&frozen.owner)).then(|| broca_core::OwnerMismatch::Scoped {
@@ -2320,6 +2344,23 @@ pub trait ServeHandler: Send + Sync {
 }
 
 impl crate::LineageRegistry {
+    /// What a plan-change op's preflight reads about `session`, for a request naming
+    /// `generation` and `send_id`. `wal_error` words a failure to read the session's WAL, as
+    /// each op words it.
+    async fn read_change(
+        &self,
+        session: &LineageKey,
+        generation: Option<u64>,
+        send_id: Option<&str>,
+        wal_error: fn(String) -> String,
+    ) -> Result<ChangeRead, SessionChangeError> {
+        let (records, _) = self
+            .read_durable_wal(session)
+            .await
+            .map_err(|error| SessionChangeError::Transient(wal_error(error.to_string())))?;
+        Ok(ChangeRead::of_wal(&records, generation, send_id))
+    }
+
     /// Fill each message's `tool_calls` with what the WAL recorded about its calls' dispatch.
     /// The facts of a turn in this read's WAL tail come with the page; an older turn's come from
     /// the session's cache (see [`crate::LineageRegistry::tool_turn_dispatches`]).
@@ -4381,32 +4422,21 @@ impl ServeHandler for crate::LineageRegistry {
     ) -> Result<cortexkit_role_llm_runner::session_change::RefreshReply, SessionChangeError> {
         use cortexkit_role_llm_runner::{rungs, session_change};
         let _change_guard = self.lock_session_change(session).await;
-        let (records, _) = self.read_durable_wal(session).await.map_err(|error| {
-            SessionChangeError::Transient(format!("cannot read the session WAL: {error}"))
-        })?;
-        let Some(start) = first_run_started(&records) else {
-            return Err(SessionChangeError::Transient(
-                "the session has no baseline yet; send its first send first".into(),
-            ));
-        };
-        if let Some(mismatch) = baseline_owner_mismatch(start, principal, scope) {
-            return Err(SessionChangeError::OwnerMismatch(Box::new(mismatch)));
-        }
-        let opener = records
-            .iter()
-            .rev()
-            .find_map(|record| match &record.record {
-                broca_wal::WalRecord::RunStarted {
-                    scope: Some(scope), ..
-                } => scope_plan_opener(scope),
-                _ => None,
-            });
+        let read = self
+            .read_change(session, Some(generation), None, |error| {
+                format!("cannot read the session WAL: {error}")
+            })
+            .await?;
+        read.check_owner(principal, scope)?;
         let senders =
             broca_fetch_plan::plan_senders(&plan).map_err(SessionChangeError::FetchRefused)?;
-        cortexkit_role_llm_runner::scope_admission::check_plan_senders(opener.as_deref(), &senders)
-            .map_err(|field| {
-                SessionChangeError::FetchRefused(broca_fetch_plan::Refusal::invalid(field))
-            })?;
+        cortexkit_role_llm_runner::scope_admission::check_plan_senders(
+            read.opener.as_deref(),
+            &senders,
+        )
+        .map_err(|field| {
+            SessionChangeError::FetchRefused(broca_fetch_plan::Refusal::invalid(field))
+        })?;
         if !rungs::ALL.contains(&policy.as_str()) {
             return Err(SessionChangeError::InvalidParams {
                 field: "policy".into(),
@@ -4423,32 +4453,17 @@ impl ServeHandler for crate::LineageRegistry {
                 message: "the plan is not canonical JSON".into(),
             }
         })?;
-        let change = broca_fetch_plan::session_change::SessionChangeState::fold(&records);
-        let earlier = change.earlier(generation);
-        match session_change::refresh_order(
-            change.accepted_generation,
-            generation,
-            &plan_identity,
-            &policy,
-            earlier,
-        ) {
-            session_change::RefreshOrder::Repeat => {
-                let (run_in_progress, applies_from_next_run) = change.accepted_replies[&generation];
-                return Ok(session_change::RefreshReply::new(
-                    cortexkit_role_llm_runner::baseline::PendingChange {
-                        generation,
-                        policy: policy.clone(),
-                    },
-                    run_in_progress,
-                    applies_from_next_run,
-                ));
-            }
-            session_change::RefreshOrder::Stale => {
-                return Err(SessionChangeError::GenerationStale {
-                    accepted: change.accepted_generation,
-                });
-            }
-            session_change::RefreshOrder::New => {}
+        if let Some((run_in_progress, applies_from_next_run)) =
+            crate::plan_change::refresh_order(&read.facts, generation, &plan_identity, &policy)?
+        {
+            return Ok(session_change::RefreshReply::new(
+                cortexkit_role_llm_runner::baseline::PendingChange {
+                    generation,
+                    policy: policy.clone(),
+                },
+                run_in_progress,
+                applies_from_next_run,
+            ));
         }
         self.check_plan_selection(&plan_value)
             .await
@@ -4458,7 +4473,7 @@ impl ServeHandler for crate::LineageRegistry {
                 })
             })?;
         broca_fetch_plan::session_change::check_compaction_item(
-            change.current_manifest.as_deref(),
+            read.facts.current_manifest.as_deref(),
             &plan_value,
         )
         .map_err(SessionChangeError::FetchRefused)?;
@@ -4535,7 +4550,7 @@ impl ServeHandler for crate::LineageRegistry {
             .await
             .map_err(SessionChangeError::FetchRefused)?;
         if let Some(surface) = broca_fetch_plan::session_change::unsupported_surface(
-            change.current_manifest.as_deref(),
+            read.facts.current_manifest.as_deref(),
             &admitted.manifest,
             &policy,
         ) {
@@ -4585,18 +4600,10 @@ impl ServeHandler for crate::LineageRegistry {
     {
         use cortexkit_role_llm_runner::{rungs, session_change};
         let _change_guard = self.lock_session_change(session).await;
-        let (records, _) = self
-            .read_durable_wal(session)
-            .await
-            .map_err(|error| SessionChangeError::Transient(error.to_string()))?;
-        let Some(start) = first_run_started(&records) else {
-            return Err(SessionChangeError::Transient(
-                "the session has no baseline yet; send its first send first".into(),
-            ));
-        };
-        if let Some(mismatch) = baseline_owner_mismatch(start, principal, scope) {
-            return Err(SessionChangeError::OwnerMismatch(Box::new(mismatch)));
-        }
+        let read = self
+            .read_change(session, Some(generation), Some(&send_id), |error| error)
+            .await?;
+        read.check_owner(principal, scope)?;
         if !rungs::ALL.contains(&policy.as_str()) {
             return Err(SessionChangeError::InvalidParams {
                 field: "policy".into(),
@@ -4612,8 +4619,7 @@ impl ServeHandler for crate::LineageRegistry {
                 message: "send_id is required".into(),
             });
         }
-        let change = broca_fetch_plan::session_change::SessionChangeState::fold(&records);
-        if check_session_policy(&change, generation, &policy, &send_id)? {
+        if crate::plan_change::check_policy(&read.facts, generation, &policy, &send_id)? {
             return Ok(session_change::RefreshPolicyReply::new(
                 cortexkit_role_llm_runner::baseline::PendingChange { generation, policy },
             ));
@@ -4650,26 +4656,20 @@ impl ServeHandler for crate::LineageRegistry {
     {
         use cortexkit_role_llm_runner::session_change;
         let _change_guard = self.lock_session_change(session).await;
-        let (records, _) = self.read_durable_wal(session).await.map_err(|error| {
-            SessionChangeError::Transient(format!("cannot read the session WAL: {error}"))
-        })?;
-        let Some(start) = first_run_started(&records) else {
-            return Err(SessionChangeError::Transient(
-                "the session has no baseline yet; send its first send first".into(),
-            ));
-        };
-        if let Some(mismatch) = baseline_owner_mismatch(start, principal, scope) {
-            return Err(SessionChangeError::OwnerMismatch(Box::new(mismatch)));
-        }
+        let read = self
+            .read_change(session, None, Some(&send_id), |error| {
+                format!("cannot read the session WAL: {error}")
+            })
+            .await?;
+        read.check_owner(principal, scope)?;
         if send_id.is_empty() {
             return Err(SessionChangeError::InvalidParams {
                 field: "send_id".into(),
                 message: "send_id is required".into(),
             });
         }
-        let change = broca_fetch_plan::session_change::SessionChangeState::fold(&records);
-        if let Some(pending_generation) = change.flush_send_ids.get(&send_id) {
-            return Ok(session_change::FlushPrefixReply::new(*pending_generation));
+        if let Err(pending_generation) = crate::plan_change::flush(&read.facts) {
+            return Ok(session_change::FlushPrefixReply::new(pending_generation));
         }
         match self.route_session_flush_prefix(session, send_id).await {
             Ok(crate::actor::SessionFlushPrefixOutcome::Flushed { pending_generation }) => {
