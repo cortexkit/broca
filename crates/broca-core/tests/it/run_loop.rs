@@ -671,6 +671,42 @@ impl Wal for CountingWal {
     }
 }
 
+#[tokio::test]
+async fn ordinary_step_adds_no_delivery_boundary_sync() {
+    for with_inbox in [false, true] {
+        let wal = CountingWalStore::default();
+        let request = req("ordinary-boundary", vec![], vec![]);
+        let writer = WalHandle::spawn(wal.open(&request.session).unwrap(), 1).unwrap();
+        let provider = StubProvider::new(vec![text_step("done")]);
+        let plane = StubToolPlane::new();
+        let (tx, _rx) = mpsc::channel(256);
+        let summary = broca_core::run_loop_on_writer(
+            request,
+            &writer,
+            StartMode::FreshOrResume,
+            &provider,
+            &plane,
+            &AllowAll,
+            &wal,
+            None,
+            RunControl {
+                steer: with_inbox.then(broca_core::SteerInbox::new),
+                ..Default::default()
+            },
+            &tx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(summary.reason, RunFinishReason::Completed);
+        assert_eq!(
+            wal.sync_calls(),
+            3,
+            "ordinary run retains its baseline barrier count, with_inbox={with_inbox}"
+        );
+        writer.shutdown().await.unwrap();
+    }
+}
+
 async fn drive_with_wal_store<T, A, W, P: broca_core::Provider>(
     request: RunRequest,
     provider: P,
