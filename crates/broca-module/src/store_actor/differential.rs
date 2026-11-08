@@ -1549,5 +1549,6 @@ mod controls;
 mod head;
 mod media;
 mod photo_sends;
+mod refresh;
 mod streams;
 mod warm;

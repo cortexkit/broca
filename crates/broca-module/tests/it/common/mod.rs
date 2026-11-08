@@ -441,6 +441,7 @@ impl FakeExecutor {
             session: job.req.session.clone(),
             config: Box::new(broca_wal::RunConfig {
                 route_decision_id: job.req.route_decision_id.clone(),
+                account_route: job.req.account_route.clone(),
                 account_limit_pause: false,
                 turn_directives_v1: job.req.directives.clone(),
                 tools: job.req.tools.clone().into(),
@@ -544,6 +545,7 @@ impl RunExecutor for FakeExecutor {
 
 fn min_config() -> broca_wal::RunConfig {
     broca_wal::RunConfig {
+        account_route: None,
         global_system: None,
         route_decision_id: None,
         account_limit_pause: false,
@@ -638,6 +640,7 @@ fn unique() -> u64 {
 pub fn req(key: &BindIdentity, run: &str) -> RunRequest {
     use broca_protocol::content::{ContentBlock, Message, Role};
     RunRequest {
+        account_route: None,
         route_decision_id: None,
         input_written_at_ms: None,
         directives: None,

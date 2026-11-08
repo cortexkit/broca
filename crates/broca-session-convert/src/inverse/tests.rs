@@ -295,3 +295,103 @@ fn a_sends_images_round_trip_and_where_the_store_keeps_them_stays_its_own() {
         assert_eq!(first_difference(a, b, ""), None, "record {i}");
     }
 }
+
+/// A refresh, a policy change and a flush keep records of their own, and the run start that
+/// applied the refresh is followed, after its input, by the application today's fold decides.
+/// Going back, the application is dropped: today's log keeps none, and decides it again on
+/// replay.
+#[test]
+fn plan_changes_round_trip_and_record_their_application() {
+    use broca_session_store::fold::operations::Operations;
+    use broca_session_store::record::{Record, Stream};
+    let manifest = |identity: &str| {
+        serde_json::to_value(broca_wal::PlanManifest {
+            rich_ui: None,
+            plan: broca_wal::OpaqueJson::from_json_text(format!(r#"{{"id":"{identity}"}}"#))
+                .unwrap(),
+            plan_identity: identity.into(),
+            composition_digest: format!("composition-{identity}"),
+            fetches: Vec::new(),
+            tools: std::sync::Arc::new(Vec::new()),
+            system_text: format!("system of {identity}"),
+            system_digest: "s".into(),
+            join_version: 1,
+            role_versions: Default::default(),
+            declarations: Vec::new(),
+        })
+        .unwrap()
+    };
+    let run = |run: &str, identity: &str| {
+        let mut value: serde_json::Value = serde_json::from_str(&RUN.replace("RUN", run)).unwrap();
+        value["manifest"] = manifest(identity);
+        value.to_string()
+    };
+    let refresh = serde_json::json!({
+        "type": "session_refresh_accepted", "generation": 1, "policy": "on_prefix_rebuild",
+        "manifest": manifest("plan-2"), "run_in_progress": false,
+        "applies_from_next_run": false,
+    })
+    .to_string();
+    let old = log(&[
+        &run("r1", "plan-1"),
+        r#"{"type":"run_finished","reason":"completed","usage":{},"retries_used":0}"#,
+        &refresh,
+        r#"{"type":"session_refresh_policy_changed","generation":1,"policy":"immediately","send_id":"policy-1"}"#,
+        r#"{"type":"session_prefix_flushed","send_id":"flush-1","pending_generation":1}"#,
+        &run("r2", "plan-2"),
+    ]);
+    let converted = convert(&old, None).unwrap();
+    let ledger: Vec<_> = converted
+        .records
+        .iter()
+        .filter(|record| record.stream() == Stream::Ledger)
+        .map(|record| record.name())
+        .collect();
+    assert_eq!(
+        ledger,
+        [
+            "RunStart",
+            "RunEnd",
+            "Billed",
+            "SessionRefresh",
+            "RefreshPolicy",
+            "PrefixFlush",
+            "RunStart",
+            "RefreshApplied"
+        ]
+    );
+    let second = converted
+        .records
+        .iter()
+        .rposition(|record| matches!(record, Record::RunStart(_)))
+        .unwrap();
+    assert!(matches!(converted.records[second + 1], Record::Input(_)));
+    let Record::RefreshApplied(applied) = &converted.records[second + 2] else {
+        panic!("{:?}", converted.records[second + 2]);
+    };
+    let today = broca_fetch_plan::session_change::SessionChangeState::fold(&old);
+    let effective = today.effective.unwrap();
+    assert_eq!(
+        (applied.generation, applied.applied_by.as_str()),
+        (1, "fold")
+    );
+    assert_eq!(applied.manifest_digest, effective.manifest_digest);
+    assert_eq!(
+        applied.composition_digest.as_deref(),
+        Some("composition-plan-2")
+    );
+    let mut operations = Operations::default();
+    for record in converted
+        .records
+        .iter()
+        .filter(|record| record.stream() == Stream::Ledger)
+    {
+        operations.apply(record).unwrap();
+    }
+    let plan = operations.plan.unwrap();
+    assert_eq!((plan.accepted_generation, plan.applied_generation), (1, 1));
+    assert_eq!(plan.pending, None);
+    assert!(!plan.flushed_since_accept && !plan.rebuild_since_accept);
+    assert_eq!(plan.effective.unwrap().generation, 1);
+    assert_round_trip(&old);
+}

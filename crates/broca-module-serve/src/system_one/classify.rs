@@ -25,7 +25,7 @@ use cortexkit_role_classifier::{
     reply::Usage,
     request::{
         check_catalog_row, check_request_bytes, parse_request, CatalogRow, ClassifyRequest,
-        CLASSIFIER_KIND,
+        DECISION_KIND, SERVING_KINDS,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -34,10 +34,6 @@ use sha2::{Digest, Sha256};
 
 use super::{internal_refusal, ModelPin, ProviderReply, SystemOne, ToolAdmission};
 use crate::llm_tools::spend::{ItemSpend, MarkedItemError, Spend};
-
-/// The catalog kind fusiform gives a decision model. `classifier/v1` calls the same kind
-/// `classifier`; a row stating either is a classifier.
-pub(crate) const DECISION_KIND: &str = "decision";
 
 /// A bound on the tokens TypeSafe adds to each request around the state and questions (its
 /// prompt template). TypeSafe documents none; the bound only has to be at least the real
@@ -48,17 +44,18 @@ const OVERHEAD_TOKENS: u64 = 512;
 const IMAGE_TOKENS_EACH: u64 = 4_096;
 
 pub(crate) fn is_classifier_row(row: &ModelBatchRow) -> bool {
-    matches!(row.kind.as_deref(), Some(DECISION_KIND | CLASSIFIER_KIND))
+    row.kind
+        .as_deref()
+        .is_some_and(|kind| SERVING_KINDS.contains(&kind))
 }
 
-/// The catalog row as the role's check reads it: fusiform's `decision` is the role's
-/// `classifier`; any other stated kind is passed on as stated, so a refusal names it.
+/// Keep the catalog's stated kind intact so the contract owns serving-kind admission and
+/// a refusal can name the kind the catalog actually supplied.
 pub(super) fn catalog_row(row: Option<&ModelBatchRow>) -> CatalogRow<'_> {
     match row {
         None => CatalogRow::Absent,
         Some(row) => match row.kind.as_deref() {
             None => CatalogRow::Kindless,
-            Some(_) if is_classifier_row(row) => CatalogRow::Kind(CLASSIFIER_KIND),
             Some(kind) => CatalogRow::Kind(kind),
         },
     }
@@ -67,13 +64,13 @@ pub(super) fn catalog_row(row: Option<&ModelBatchRow>) -> CatalogRow<'_> {
 /// The catalog facts a batch is priced by, frozen at its first admission so a re-send after a
 /// catalog change prices the batch as it was admitted.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
-struct FrozenRow {
+pub(super) struct FrozenRow {
     #[serde(default)]
-    input_rate_nanos: Option<i64>,
+    pub(super) input_rate_nanos: Option<i64>,
     #[serde(default)]
-    output_rate_nanos: Option<i64>,
+    pub(super) output_rate_nanos: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    charge_basis: Option<broca_core::ChargeBasis>,
+    pub(super) charge_basis: Option<broca_core::ChargeBasis>,
 }
 
 impl FrozenRow {
@@ -85,21 +82,21 @@ impl FrozenRow {
 /// The parts of the request forwarded to the provider as the caller wrote them: the questions
 /// and each item's state, as their exact text. Decoding through `Value` would respell numbers.
 #[derive(Deserialize)]
-struct RawParams<'a> {
+pub(super) struct RawParams<'a> {
     #[serde(borrow)]
-    questions: &'a RawValue,
+    pub(super) questions: &'a RawValue,
     #[serde(borrow)]
-    items: Vec<RawItem<'a>>,
+    pub(super) items: Vec<RawItem<'a>>,
 }
 
 #[derive(Deserialize)]
-struct RawItem<'a> {
+pub(super) struct RawItem<'a> {
     #[serde(borrow)]
-    state: &'a RawValue,
+    pub(super) state: &'a RawValue,
     /// Forwarded as written to a provider that takes images; validation already bounded them
     /// by the model's `images.max`, which is absent for a text-only model.
     #[serde(borrow, default)]
-    images: Option<&'a RawValue>,
+    pub(super) images: Option<&'a RawValue>,
 }
 
 /// The provider's reply, with its answers kept as the exact text it sent (RULES §12).
@@ -140,6 +137,8 @@ struct ReplyItem<'a> {
 struct Reply<'a> {
     batch_id: &'a str,
     model: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    decision_id: Option<&'a str>,
     items: Vec<ReplyItem<'a>>,
     usage: Usage,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -147,7 +146,7 @@ struct Reply<'a> {
 }
 
 /// Where an item stands as the call goes.
-enum Slot {
+pub(super) enum Slot {
     /// A stored outcome: from an earlier call, or recorded by this one.
     Stored(StoredOutcome),
     /// Not answered and not stored: a code that stopped the call, or one never stored. A
@@ -161,10 +160,11 @@ enum Slot {
 /// that panics or whose future is dropped: it removes the in-process claim and starts the
 /// store release in the background, since nothing is left to wait for it. Either way a
 /// failed store release is logged and the row stays held until the next start releases it.
-struct Hold<'a> {
-    service: &'a Arc<SystemOne>,
-    batch_id: String,
-    stored: bool,
+pub(super) struct Hold<'a> {
+    pub(super) service: &'a Arc<SystemOne>,
+    pub(super) batch_id: String,
+    pub(super) stored: bool,
+    pub(super) local: bool,
 }
 
 /// End this process's store hold on a batch. A failure is only logged: the call is answered
@@ -181,7 +181,7 @@ impl Hold<'_> {
     /// hold). The reply leaves only after this, so once the release succeeds a caller that
     /// re-sends the same batch the moment it is answered finds the batch free, not
     /// `batch_in_progress`.
-    async fn release(mut self) {
+    pub(super) async fn release(mut self) {
         if self.stored {
             // Cleared first so the drop below does not start a second release. If this future
             // is dropped mid-wait, the blocking task still runs to completion.
@@ -233,15 +233,17 @@ impl Drop for Hold<'_> {
                 Err(_) => release(),
             }
         }
-        self.service
-            .claims
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(&self.batch_id);
+        if self.local {
+            self.service
+                .claims
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&self.batch_id);
+        }
     }
 }
 
-async fn blocking<T: Send + 'static>(
+pub(super) async fn blocking<T: Send + 'static>(
     work: impl FnOnce() -> Result<T, broca_store::system_one::SystemOneStoreError> + Send + 'static,
 ) -> Result<T, Refusal> {
     match tokio::task::spawn_blocking(work).await {
@@ -261,14 +263,14 @@ async fn blocking<T: Send + 'static>(
     }
 }
 
-fn sha256_hex(text: &str) -> String {
+pub(super) fn sha256_hex(text: &str) -> String {
     Sha256::digest(text.as_bytes())
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
 }
 
-fn item_error_json(error: &ItemError) -> String {
+pub(super) fn item_error_json(error: &ItemError) -> String {
     serde_json::to_string(error).expect("an item error encodes")
 }
 
@@ -283,7 +285,11 @@ fn stored_error_json(error: &ItemError, spend: Option<ItemSpend>) -> String {
 }
 
 /// One item's estimate, at `rate` (zero for an unpriced input).
-fn estimate(request: &ClassifyRequest, index: usize, rate: i64) -> Result<Estimate, Refusal> {
+pub(super) fn estimate(
+    request: &ClassifyRequest,
+    index: usize,
+    rate: i64,
+) -> Result<Estimate, Refusal> {
     let item = &request.items[index];
     let state = Tokens::bound_of_json(&item.state)
         .map_err(|e| Refusal::invalid_params(format!("items[{index}].state"), e.0))?;
@@ -299,7 +305,7 @@ fn estimate(request: &ClassifyRequest, index: usize, rate: i64) -> Result<Estima
 /// What answering an item cost, for the batch's recorded spend: the reported input at the
 /// frozen rate, or the item's estimate when the provider did not report it, plus reported
 /// output where output is priced.
-fn spend_of(frozen: &FrozenRow, usage: Option<&Usage>, estimate: &Estimate) -> u64 {
+pub(super) fn spend_of(frozen: &FrozenRow, usage: Option<&Usage>, estimate: &Estimate) -> u64 {
     let input = match (frozen.input_rate_nanos, usage.and_then(|u| u.input_tokens)) {
         (Some(rate), Some(tokens)) => cost_nanos(tokens, rate).unwrap_or(u64::MAX),
         (Some(_), None) => estimate.cost_nanos,
@@ -317,7 +323,10 @@ fn spend_of(frozen: &FrozenRow, usage: Option<&Usage>, estimate: &Estimate) -> u
 
 /// The batch's cumulative cost over every answered item: absent when the model is unpriced,
 /// or when an answered item did not report the tokens a priced direction bills (RULES §10).
-fn batch_cost(frozen: &FrozenRow, answered: &[(Option<u64>, Option<u64>)]) -> Option<u64> {
+pub(super) fn batch_cost(
+    frozen: &FrozenRow,
+    answered: &[(Option<u64>, Option<u64>)],
+) -> Option<u64> {
     if !frozen.priced() {
         return None;
     }
@@ -355,7 +364,10 @@ fn first_call_refusal(error: &ItemError, model: &str, pin: &ModelPin) -> Refusal
 
 /// Map one attempt's reply to the item's answer text and usage, or its error (RULES §15,
 /// TypeSafe's errors by status).
-fn map_reply(reply: ProviderReply, pin: &ModelPin) -> Result<(String, Option<Usage>), ItemError> {
+pub(super) fn map_reply(
+    reply: ProviderReply,
+    pin: &ModelPin,
+) -> Result<(String, Option<Usage>), ItemError> {
     match reply {
         ProviderReply::ClassifiedError { error, .. } => Err(error),
         ProviderReply::AttributedAnswer { body, .. } => {
@@ -433,7 +445,7 @@ fn map_reply(reply: ProviderReply, pin: &ModelPin) -> Result<(String, Option<Usa
 /// anything was sent (no credential, no connection) spent nothing. Every other failure may have
 /// reached a billed model: a `provider_error` status (408 or 5xx), a timeout, a connection lost
 /// mid-request, or a 200 whose body did not decode.
-fn reply_spend(reply: &ProviderReply) -> ItemSpend {
+pub(super) fn reply_spend(reply: &ProviderReply) -> ItemSpend {
     let code = match reply {
         ProviderReply::ClassifiedError { may_have_spent, .. } => {
             return if *may_have_spent {
@@ -459,7 +471,10 @@ fn reply_spend(reply: &ProviderReply) -> ItemSpend {
 /// status that names a wait short enough to sit out inside the call. A Workers AI refusal is
 /// retried only when its code maps to a rate limit or a provider error: a 429 for the daily
 /// allocation (3036) names the account, and waiting cannot clear it.
-fn retry_wait(reply: &ProviderReply, service: &SystemOne) -> Option<std::time::Duration> {
+pub(super) fn retry_wait(
+    reply: &ProviderReply,
+    service: &SystemOne,
+) -> Option<std::time::Duration> {
     let wait = match reply {
         ProviderReply::ClassifiedError { error, .. }
             if error.class == errors::ErrorClass::Transient =>
@@ -535,33 +550,35 @@ async fn call_provider(
                 tokio::time::sleep(wait).await;
             }
             _ => {
-                let (auth_selection, account_ref) = match &reply {
-                    ProviderReply::AttributedAnswer {
-                        auth_selection,
-                        account_ref,
-                        ..
-                    } => (auth_selection.clone(), account_ref.clone()),
-                    _ => (pin.provider.credential_id(), None),
-                };
                 let spend = reply_spend(&reply);
-                return map_reply(reply, pin)
-                    .map(|(answers, usage)| PaidAnswer {
-                        answers,
-                        usage,
-                        auth_selection,
-                        account_ref,
-                    })
-                    .map_err(|error| (error, spend));
+                return paid_answer(reply, pin).map_err(|error| (error, spend));
             }
         }
     }
 }
 
-struct PaidAnswer {
-    answers: String,
-    usage: Option<Usage>,
-    auth_selection: Option<String>,
-    account_ref: Option<String>,
+pub(super) struct PaidAnswer {
+    pub(super) answers: String,
+    pub(super) usage: Option<Usage>,
+    pub(super) auth_selection: Option<String>,
+    pub(super) account_ref: Option<String>,
+}
+
+pub(super) fn paid_answer(reply: ProviderReply, pin: &ModelPin) -> Result<PaidAnswer, ItemError> {
+    let (auth_selection, account_ref) = match &reply {
+        ProviderReply::AttributedAnswer {
+            auth_selection,
+            account_ref,
+            ..
+        } => (auth_selection.clone(), account_ref.clone()),
+        _ => (pin.provider.credential_id(), None),
+    };
+    map_reply(reply, pin).map(|(answers, usage)| PaidAnswer {
+        answers,
+        usage,
+        auth_selection,
+        account_ref,
+    })
 }
 
 /// Serve one `classify.run`. `admitted_at_ms`, when given, is when the call was first admitted:
@@ -589,7 +606,16 @@ pub(super) fn admit_tool(
     params: &str,
     stored: Option<&broca_store::system_one::StoredBatch>,
 ) -> Result<ToolAdmission, Refusal> {
-    let request = parse_request(params)?;
+    let request = cortexkit_role_classifier::request::parse_request_for(
+        params,
+        &cortexkit_role_classifier::describe::RoleDescribe::new(
+            cortexkit_role_classifier::describe::Limits::new(
+                service.config.max_items,
+                service.config.max_request_bytes,
+            ),
+            vec![],
+        ),
+    )?;
     let frozen = if let Some(stored) = stored {
         serde_json::from_str::<FrozenRow>(&stored.frozen_row)
             .map_err(|_| internal_refusal("the stored tool price does not decode"))?
@@ -601,12 +627,19 @@ pub(super) fn admit_tool(
                 service.config.max_request_bytes,
             ),
         )?;
-        let row = service.catalog.row(&request.model);
-        check_catalog_row(&request.model, catalog_row(row.as_ref()))?;
+        let row = service
+            .catalog
+            .row(request.model.as_deref().unwrap_or_default());
+        check_catalog_row(
+            request.model.as_deref().unwrap_or_default(),
+            catalog_row(row.as_ref()),
+        )?;
         let row = row.expect("catalog admission checked presence");
         let pin = service
-            .pin(&request.model)
-            .ok_or_else(|| Refusal::model_unavailable(&request.model))?;
+            .pin(request.model.as_deref().unwrap_or_default())
+            .ok_or_else(|| {
+                Refusal::model_unavailable(request.model.as_deref().unwrap_or_default())
+            })?;
         service.check_images_request(&request, &service.model_entry(pin, &row))?;
         use broca_core::ChargeBasisResolver;
         FrozenRow {
@@ -616,7 +649,13 @@ pub(super) fn admit_tool(
                 service
                     .charge_basis
                     .resolve_charge_basis(
-                        request.model.split('/').next().unwrap_or_default(),
+                        request
+                            .model
+                            .as_deref()
+                            .unwrap_or_default()
+                            .split('/')
+                            .next()
+                            .unwrap_or_default(),
                         "apikey",
                     )
                     .0,
@@ -682,7 +721,10 @@ pub(super) async fn run_inner(
     );
     // §8: everything is checked before anything is written or sent.
     check_request_bytes(params.len(), &limits)?;
-    let request = parse_request(params)?;
+    let request = cortexkit_role_classifier::request::parse_request_for(
+        params,
+        &cortexkit_role_classifier::describe::RoleDescribe::new(limits, vec![]),
+    )?;
     let raw: RawParams<'_> = serde_json::from_str(params)
         .map_err(|e| Refusal::invalid_params("params", e.to_string()))?;
     let row = if let Some((_, admission)) = tool {
@@ -698,20 +740,27 @@ pub(super) async fn run_inner(
             output_rate_nanos: frozen.output_rate_nanos,
         })
     } else {
-        service.catalog.row(&request.model)
+        service
+            .catalog
+            .row(request.model.as_deref().unwrap_or_default())
     };
-    check_catalog_row(&request.model, catalog_row(row.as_ref()))?;
+    check_catalog_row(
+        request.model.as_deref().unwrap_or_default(),
+        catalog_row(row.as_ref()),
+    )?;
     let row = row.expect("check_catalog_row refuses an absent row");
     // A classifier row broca has no route to: the catalog knows it, broca cannot serve it.
     let pin = service
-        .pin(&request.model)
-        .ok_or_else(|| Refusal::model_unavailable(&request.model))?
+        .pin(request.model.as_deref().unwrap_or_default())
+        .ok_or_else(|| Refusal::model_unavailable(request.model.as_deref().unwrap_or_default()))?
         .clone();
     // Every usage fact names the provider id and the model id apart. A routed key that does
     // not split into both could not be attributed, so it is refused here, before anything is
     // written or sent, rather than answered and billed without a fact.
-    if super::catalog_key_parts(&request.model).is_none() {
-        return Err(Refusal::model_unavailable(&request.model));
+    if super::catalog_key_parts(request.model.as_deref().unwrap_or_default()).is_none() {
+        return Err(Refusal::model_unavailable(
+            request.model.as_deref().unwrap_or_default(),
+        ));
     }
     let entry = service.model_entry(&pin, &row);
     if tool.is_none() {
@@ -764,6 +813,7 @@ pub(super) async fn run_inner(
         service,
         batch_id: request.batch_id.clone(),
         stored: false,
+        local: true,
     };
     // Everything after the in-process claim runs in `serve_claimed`, so that every way the
     // call can end normally once the store row may exist (a reply, a scope or reuse refusal,
@@ -834,7 +884,7 @@ async fn serve_claimed(
         let (role, batch_id, model, owner) = (
             service.role.clone(),
             request.batch_id.clone(),
-            request.model.clone(),
+            request.model.clone().unwrap_or_default(),
             service.owner.clone(),
         );
         let (identity_json, digest) = (identity_json.to_owned(), digest.to_owned());
@@ -860,6 +910,9 @@ async fn serve_claimed(
         .await?
     };
     let (fresh, frozen, ceiling, mut spent, stored) = match claimed {
+        Claimed::Expired => return Err(super::routed::disabled_unavailable(
+            "batch content has expired; routing cleanup must finish before this id can be reused",
+        )),
         Claimed::ScopeMismatch => {
             return Err(Refusal::new(
                 "batch_scope_mismatch",
@@ -881,13 +934,23 @@ async fn serve_claimed(
             ))
         }
         Claimed::Fresh => (true, live_frozen, sent_ceiling, 0u64, Vec::new()),
-        Claimed::Resumed(record) => (
-            false,
-            serde_json::from_str(&record.frozen_row).unwrap_or_default(),
-            record.ceiling_nanos,
-            record.spent_nanos,
-            record.outcomes,
-        ),
+        Claimed::Resumed(record) => {
+            hold.stored = true;
+            if !service.config.routed_models && service.role == super::STORE_ROLE {
+                if let Some(reply) =
+                    super::routed::replay_when_disabled(service, request, &record).await?
+                {
+                    return Ok(reply);
+                }
+            }
+            (
+                false,
+                serde_json::from_str(&record.frozen_row).unwrap_or_default(),
+                record.ceiling_nanos,
+                record.spent_nanos,
+                record.outcomes,
+            )
+        }
     };
     hold.stored = true;
     let rate = frozen.input_rate_nanos.unwrap_or(0);
@@ -1017,7 +1080,11 @@ async fn serve_claimed(
                         discard_fresh(service, &request.batch_id).await;
                         hold.stored = false;
                     }
-                    let refusal = first_call_refusal(error, &request.model, pin);
+                    let refusal = first_call_refusal(
+                        error,
+                        request.model.as_deref().unwrap_or_default(),
+                        pin,
+                    );
                     // Every batch-level code is an answer the provider does not bill (or a
                     // credential that was never sent), so the call spent nothing.
                     return Err(if is_tool {
@@ -1067,7 +1134,9 @@ async fn serve_claimed(
                 let fact = service
                     .export
                     .as_ref()
-                    .zip(super::catalog_key_parts(&request.model))
+                    .zip(super::catalog_key_parts(
+                        request.model.as_deref().unwrap_or_default(),
+                    ))
                     .map(|(export, (provider, model))| {
                         use broca_core::ChargeBasisResolver;
                         let method = auth_selection
@@ -1157,6 +1226,17 @@ async fn record_paid(
     spend_nanos: u64,
     fact: Option<broca_store::system_one::FactContext>,
 ) -> Result<(), Refusal> {
+    record_paid_routed(service, batch_id, outcome, spend_nanos, fact, None).await
+}
+
+pub(super) async fn record_paid_routed(
+    service: &Arc<SystemOne>,
+    batch_id: &str,
+    outcome: &StoredOutcome,
+    spend_nanos: u64,
+    fact: Option<broca_store::system_one::FactContext>,
+    runs: Option<String>,
+) -> Result<(), Refusal> {
     let store = Arc::clone(&service.store);
     let (role, batch_id, owner) = (
         service.role.clone(),
@@ -1167,7 +1247,7 @@ async fn record_paid(
     let outcome = outcome.clone();
     let now = (service.clock)();
     let held = blocking(move || {
-        store.record_paid(
+        store.record_paid_routed(
             &role,
             &batch_id,
             &owner,
@@ -1177,6 +1257,7 @@ async fn record_paid(
                 now_ms: now,
                 fact: fact.as_ref(),
             },
+            runs.as_deref(),
         )
     })
     .await?;
@@ -1210,11 +1291,21 @@ async fn discard_fresh(service: &Arc<SystemOne>, batch_id: &str) {
 
 /// The batch reply. `tool` keeps each item error's spend mark for a model-tool call; a
 /// `classifier/v1` reply carries none.
-fn reply(
+pub(super) fn reply(
     request: &ClassifyRequest,
     frozen: &FrozenRow,
     slots: Vec<Option<Slot>>,
     tool: bool,
+) -> Result<Box<RawValue>, Refusal> {
+    reply_decision(request, frozen, slots, tool, None)
+}
+
+pub(super) fn reply_decision(
+    request: &ClassifyRequest,
+    frozen: &FrozenRow,
+    slots: Vec<Option<Slot>>,
+    tool: bool,
+    decision_id: Option<&str>,
 ) -> Result<Box<RawValue>, Refusal> {
     let mut answers_raw: Vec<Option<Box<RawValue>>> = Vec::with_capacity(slots.len());
     let mut errors_parsed: Vec<Option<MarkedItemError>> = Vec::with_capacity(slots.len());
@@ -1279,7 +1370,8 @@ fn reply(
         .collect();
     let reply = Reply {
         batch_id: &request.batch_id,
-        model: &request.model,
+        model: request.model.as_deref().unwrap_or_default(),
+        decision_id,
         items,
         usage: total,
         cost_usd: batch_cost(frozen, &answered_tokens).map(nanos_to_usd),

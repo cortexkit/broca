@@ -3,9 +3,62 @@
 use std::path::Path;
 
 use broca_protocol::BindIdentity;
-use rusqlite::{Connection, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
 use crate::{session_refs, SqliteStore};
+
+/// The owner and `ref` of the scope whose stamped `route.bind` reserved a new session address;
+/// admission defines and compares it, and this inventory records it.
+pub use broca_core::scope_admission::ScopeReservation;
+
+/// One row per address a stamped bind reserved. The owner is stored as the principal's JSON,
+/// which decodes back to the same `BindPrincipal`, including a kind this build does not know.
+/// Shared by the legacy run index and the broca-state/2 inventory.
+pub(crate) const SCOPE_RESERVATION_SCHEMA: &str =
+    "CREATE TABLE IF NOT EXISTS session_scope_reservation (
+    address TEXT PRIMARY KEY, owner TEXT NOT NULL, scope_ref TEXT NOT NULL
+) WITHOUT ROWID";
+
+/// Record `reservation` for `address`, inside the caller's reserving transaction. The caller
+/// writes it only when the inventory had no root for the pair, so any row already at the
+/// address belongs to an inventory entry that no longer exists and is replaced.
+pub(crate) fn record_scope_reservation(
+    conn: &Connection,
+    address: &str,
+    reservation: &ScopeReservation,
+) -> Result<(), String> {
+    let owner = serde_json::to_string(&reservation.owner).map_err(|error| error.to_string())?;
+    conn.execute(
+        "INSERT INTO session_scope_reservation VALUES(?1,?2,?3)
+         ON CONFLICT(address) DO UPDATE SET owner=excluded.owner, scope_ref=excluded.scope_ref",
+        rusqlite::params![address, owner, reservation.scope_ref],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+/// The reservation recorded for `address`, if any. An owner that does not decode is an error,
+/// never an absent reservation: admission must not open a reserved session to anyone because
+/// its row could not be read.
+pub(crate) fn read_scope_reservation(
+    conn: &Connection,
+    address: &str,
+) -> Result<Option<ScopeReservation>, String> {
+    let row = conn
+        .query_row(
+            "SELECT owner, scope_ref FROM session_scope_reservation WHERE address=?1",
+            [address],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    row.map(|(owner, scope_ref)| {
+        let owner = serde_json::from_str(&owner)
+            .map_err(|error| format!("scope reservation owner does not decode: {error}"))?;
+        Ok(ScopeReservation { owner, scope_ref })
+    })
+    .transpose()
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum SessionAddressError {
@@ -159,10 +212,14 @@ impl SqliteStore {
     /// Existing pairs use a read snapshot, without competing for SQLite's writer
     /// lock. Only an absent pair takes a writer transaction and rechecks discovery
     /// before reserving its first root across connections and processes.
+    ///
+    /// `reservation` is the stamp of a scoped bind. It is recorded only when this call
+    /// reserves a new pair, in the same transaction; resolving an existing pair writes nothing.
     pub fn resolve_session_address(
         &self,
         bind: &BindIdentity,
         stamped_workdir: Option<&Path>,
+        reservation: Option<&ScopeReservation>,
     ) -> Result<BindIdentity, SessionAddressError> {
         let mut conn = self.conn.lock().map_err(SessionAddressError::store_error)?;
         let root = conn
@@ -192,8 +249,13 @@ impl SqliteStore {
                     .validate_keyable()
                     .map_err(SessionAddressError::Invalid)?;
                 require_no_gap(root.as_deref())?;
-                session_refs::insert(&tx, &broca_core::session_addr(&identity), &identity)
+                let address = broca_core::session_addr(&identity);
+                session_refs::insert(&tx, &address, &identity)
                     .map_err(SessionAddressError::store_error)?;
+                if let Some(reservation) = reservation {
+                    record_scope_reservation(&tx, &address, reservation)
+                        .map_err(SessionAddressError::store_error)?;
+                }
                 identity
             }
         };
@@ -201,6 +263,16 @@ impl SqliteStore {
         tx.commit().map_err(SessionAddressError::store_error)?;
         require_no_gap(root.as_deref())?;
         Ok(resolved)
+    }
+
+    /// The scope reservation recorded for `session`'s address, if a stamped bind reserved it.
+    pub fn scope_reservation(
+        &self,
+        session: &BindIdentity,
+    ) -> Result<Option<ScopeReservation>, SessionAddressError> {
+        let conn = self.conn.lock().map_err(SessionAddressError::store_error)?;
+        read_scope_reservation(&conn, &broca_core::session_addr(session))
+            .map_err(SessionAddressError::store_error)
     }
 }
 

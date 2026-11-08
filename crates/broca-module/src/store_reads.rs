@@ -71,6 +71,15 @@ pub enum StoreReadRequest {
     /// The medium with digest `sha256` that a record of the session names, with its bytes, as
     /// `session.media_read` serves it.
     Media { sha256: String },
+    /// What a plan-change op's preflight reads about the session, for a request naming
+    /// `generation` and `send_id` (see `store_plan_change::change_read`).
+    PlanChange {
+        generation: Option<u64>,
+        send_id: Option<String>,
+    },
+    /// The plan identities a later send's plan is checked against once the session took a
+    /// refresh (see `store_plan_change::identities`).
+    PlanIdentities,
 }
 
 /// What a `session.read` page asks of the session itself.
@@ -132,6 +141,8 @@ pub enum StoreReadReply {
     HistoryHead(Result<crate::store_entries::HistoryHead, ServeError>),
     /// `None` when no record of the session names the digest.
     Media(Result<Option<StoredMedia>, ServeError>),
+    PlanChange(Result<PlanChangeRead, String>),
+    PlanIdentities(Result<RefreshedIdentities, String>),
 }
 
 /// A medium a record of the session names: its reference, and its bytes or why they couldn't be
@@ -141,6 +152,13 @@ pub struct StoredMedia {
     pub reference: broca_protocol::MediaRef,
     pub bytes: Result<Vec<u8>, String>,
 }
+
+/// The plan identities a later send's plan is checked against once the session took a refresh:
+/// the applied plan's and the latest accepted one's; `None` before any refresh.
+pub type RefreshedIdentities = Option<(Option<String>, Option<String>)>;
+
+/// What a plan-change op's preflight read about a session kept in the new storage.
+pub struct PlanChangeRead(pub(crate) crate::serve::ChangeRead);
 
 /// How the session's store actor answered a read.
 pub enum StoreReadOutcome {
@@ -260,11 +278,8 @@ pub async fn execute<B: SessionBackend>(
                 .map_err(crate::store_read::read_failed),
         ),
         StoreReadRequest::Ownership => StoreReadReply::Ownership(
-            broca_session_loop::owner::ownership_with_first_episode(
-                &session.operations.owner,
-                ctx.parts,
-            )
-            .map_err(|error| format!("the session's stored owner can't be read: {error}")),
+            broca_session_loop::owner::ownership_with_plan(&session.operations, ctx.parts)
+                .map_err(|error| format!("the session's stored owner can't be read: {error}")),
         ),
         StoreReadRequest::Compaction {
             key,
@@ -287,6 +302,22 @@ pub async fn execute<B: SessionBackend>(
         ),
         StoreReadRequest::Media { sha256 } => {
             StoreReadReply::Media(stored_media(session, sha256).await)
+        }
+        StoreReadRequest::PlanChange {
+            generation,
+            send_id,
+        } => StoreReadReply::PlanChange(
+            crate::store_plan_change::change_read(
+                session,
+                ctx.parts,
+                *generation,
+                send_id.as_deref(),
+            )
+            .await
+            .map(PlanChangeRead),
+        ),
+        StoreReadRequest::PlanIdentities => {
+            StoreReadReply::PlanIdentities(crate::store_plan_change::identities(session).await)
         }
     }
 }

@@ -13,7 +13,8 @@ use crate::frame::FrameKey;
 use crate::head::SessionTriple;
 use crate::keys::DeploymentKey;
 use crate::record::{
-    Event, Input, Placement, QueuedSend, Record, RunEnd, RunStart, SessionRefresh, Steer,
+    Event, Input, Placement, PrefixFlush, QueuedSend, Record, RefreshApplied, RefreshPolicy,
+    RunEnd, RunStart, SessionRefresh, Steer,
 };
 use crate::session::{Session, GRACE_MS};
 
@@ -151,10 +152,41 @@ fn records_name_their_ids() {
         applies_from_next_run: false,
         setup: Vec::new(),
         manifest: None,
+        selection: None,
     });
     assert_eq!(
         ids(&refresh),
         BTreeSet::from([(IdKind::RefreshGeneration, "7".into())])
+    );
+    // A policy change, a flush and an application each file under a kind of their own, so a
+    // send id shared with a send or with the other op names another key.
+    let policy = Record::RefreshPolicy(RefreshPolicy {
+        generation: 7,
+        policy: "immediately".into(),
+        send_id: "x".into(),
+    });
+    assert_eq!(
+        ids(&policy),
+        BTreeSet::from([(IdKind::RefreshPolicySendId, "x".into())])
+    );
+    let flush = Record::PrefixFlush(PrefixFlush {
+        send_id: "x".into(),
+        pending_generation: None,
+    });
+    assert_eq!(
+        ids(&flush),
+        BTreeSet::from([(IdKind::PrefixFlushSendId, "x".into())])
+    );
+    let applied = Record::RefreshApplied(RefreshApplied {
+        generation: 7,
+        applied_by: "append".into(),
+        manifest_digest: "m".into(),
+        composition_digest: None,
+        absent_items: Vec::new(),
+    });
+    assert_eq!(
+        ids(&applied),
+        BTreeSet::from([(IdKind::AppliedGeneration, "7".into())])
     );
     // A transcript record names nothing the index files, even when it carries an id.
     let input = Record::Input(Input {

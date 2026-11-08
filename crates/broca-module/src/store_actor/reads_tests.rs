@@ -610,6 +610,8 @@ fn shape(reply: StoreReadReply) -> String {
         },
         StoreReadReply::HistoryHead(head) => format!("{head:?}"),
         StoreReadReply::Media(media) => format!("{media:?}"),
+        StoreReadReply::PlanChange(read) => format!("{:?}", read.map(|read| read.0)),
+        StoreReadReply::PlanIdentities(identities) => format!("{identities:?}"),
         StoreReadReply::Entries(entries) => format!("{entries:?}"),
         StoreReadReply::Ownership(ownership) => format!("{ownership:?}"),
         StoreReadReply::RunResult(reply) => match reply {

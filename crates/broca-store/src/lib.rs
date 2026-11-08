@@ -65,11 +65,22 @@ pub use fold_identities::{fold_identities, require_legacy_operator_root, LegacyO
 /// Reserve a logical session's storage address and verify its history through
 /// the format-selected inventory.
 pub trait SessionAddressResolver: Send + Sync {
+    /// Resolve `bind` to the root its pair was first reserved under, reserving it under
+    /// `workdir` (or the unscoped namespace) when the pair is new. A scoped bind passes its
+    /// stamp as `reservation`; it is recorded only when this call reserves a new pair.
     fn resolve_session_address(
         &self,
         bind: &BindIdentity,
         workdir: Option<&Path>,
+        reservation: Option<&session_address::ScopeReservation>,
     ) -> Result<BindIdentity, session_address::SessionAddressError>;
+
+    /// The scope reservation a stamped bind recorded when it reserved `session`'s address.
+    /// `None` for an address reserved without a stamp or before reservations were recorded.
+    fn scope_reservation(
+        &self,
+        session: &BindIdentity,
+    ) -> Result<Option<session_address::ScopeReservation>, session_address::SessionAddressError>;
 
     /// Check history without opening a writer. Evidence failures must remain
     /// errors; an unreadable inventory cannot certify a new or available log.
@@ -93,8 +104,17 @@ impl SessionAddressResolver for SqliteStore {
         &self,
         bind: &BindIdentity,
         workdir: Option<&Path>,
+        reservation: Option<&session_address::ScopeReservation>,
     ) -> Result<BindIdentity, session_address::SessionAddressError> {
-        SqliteStore::resolve_session_address(self, bind, workdir)
+        SqliteStore::resolve_session_address(self, bind, workdir, reservation)
+    }
+
+    fn scope_reservation(
+        &self,
+        session: &BindIdentity,
+    ) -> Result<Option<session_address::ScopeReservation>, session_address::SessionAddressError>
+    {
+        SqliteStore::scope_reservation(self, session)
     }
 }
 
@@ -107,10 +127,25 @@ impl SessionAddressResolver for db::OverhaulDb {
         db::OverhaulDb::session_log_state(self, session, wal)
     }
 
+    fn scope_reservation(
+        &self,
+        session: &BindIdentity,
+    ) -> Result<Option<session_address::ScopeReservation>, session_address::SessionAddressError>
+    {
+        use session_address::SessionAddressError;
+        let address = broca_core::session_addr(session);
+        self.read_snapshot(|tx| {
+            Ok(session_address::read_scope_reservation(tx, &address)
+                .map_err(SessionAddressError::store_error))
+        })
+        .map_err(SessionAddressError::store_error)?
+    }
+
     fn resolve_session_address(
         &self,
         bind: &BindIdentity,
         workdir: Option<&Path>,
+        reservation: Option<&session_address::ScopeReservation>,
     ) -> Result<BindIdentity, session_address::SessionAddressError> {
         use session_address::{InventoryUnavailable, SessionAddressError};
         let known = self
@@ -154,10 +189,11 @@ impl SessionAddressResolver for db::OverhaulDb {
                 if let Err(error) = identity.validate_keyable() {
                     return Ok(Err(SessionAddressError::Invalid(error)));
                 }
+                let address = broca_core::session_addr(&identity);
                 tx.execute(
                     "INSERT INTO session_identity VALUES(?1,?2,?3,?4,?5,?6)",
                     rusqlite::params![
-                        broca_core::session_addr(&identity),
+                        address,
                         identity.project_root.to_string_lossy(),
                         identity.harness,
                         identity.session,
@@ -169,6 +205,10 @@ impl SessionAddressResolver for db::OverhaulDb {
                         broca_core::agent_session_ref(&identity),
                     ],
                 )?;
+                if let Some(reservation) = reservation {
+                    session_address::record_scope_reservation(tx, &address, reservation)
+                        .map_err(db::DbError::Invalid)?;
+                }
                 if session_refs::projection_gap(root)
                     .map_err(|e| db::DbError::Invalid(e.to_string()))?
                 {
@@ -4101,12 +4141,12 @@ mod tests {
         db.reconcile_inventory().unwrap();
         let bind = broca_protocol::BindIdentity::new("/route", "runner", "known");
         let expected = db
-            .resolve_session_address(&bind, Some(std::path::Path::new("/first")))
+            .resolve_session_address(&bind, Some(std::path::Path::new("/first")), None)
             .unwrap();
         let writer = rusqlite::Connection::open(root.join("broca.db")).unwrap();
         writer.execute_batch("BEGIN IMMEDIATE").unwrap();
         assert_eq!(
-            db.resolve_session_address(&bind, Some(std::path::Path::new("/later")))
+            db.resolve_session_address(&bind, Some(std::path::Path::new("/later")), None)
                 .unwrap(),
             expected
         );
@@ -4127,16 +4167,16 @@ mod tests {
         let db = super::db::OverhaulDb::open(&root).unwrap();
         let bind = broca_protocol::BindIdentity::new("/route", "runner", "seat");
         assert!(matches!(
-            db.resolve_session_address(&bind, None),
+            db.resolve_session_address(&bind, None, None),
             Err(super::session_address::SessionAddressError::Unavailable(_))
         ));
         db.reconcile_inventory().unwrap();
         let first = db
-            .resolve_session_address(&bind, Some(std::path::Path::new("/first")))
+            .resolve_session_address(&bind, Some(std::path::Path::new("/first")), None)
             .unwrap();
         assert_eq!(first.project_root, std::path::Path::new("/first"));
         assert_eq!(
-            db.resolve_session_address(&bind, Some(std::path::Path::new("/later")))
+            db.resolve_session_address(&bind, Some(std::path::Path::new("/later")), None)
                 .unwrap(),
             first
         );
@@ -4144,12 +4184,79 @@ mod tests {
         db.record_session(&broca_core::session_addr(&other), &other)
             .unwrap();
         assert!(matches!(
-            db.resolve_session_address(&bind, None),
+            db.resolve_session_address(&bind, None, None),
             Err(super::session_address::SessionAddressError::Ambiguous)
         ));
         for file in ["run-index.db", "run-index.db-wal", "run-index.db-shm"] {
             assert!(!root.join(file).exists());
         }
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// broca-state/2 records a stamped bind's scope owner with the address it reserves, and
+    /// records nothing for an unstamped reservation or for a pair that already exists.
+    #[test]
+    fn overhaul_reservations_record_only_a_stamped_new_pair() {
+        use super::session_address::ScopeReservation;
+        use super::SessionAddressResolver;
+        let root = broca_test_support::scratch_root()
+            .join(format!("overhaul-scope-reservation-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("state-format"), "broca-state/2").unwrap();
+        let db = super::db::OverhaulDb::open(&root).unwrap();
+        db.reconcile_inventory().unwrap();
+        let reservation = |module_id: &str| ScopeReservation {
+            owner: broca_protocol::BindPrincipal::Reserved {
+                module_id: module_id.into(),
+            },
+            scope_ref: format!("{module_id}-head"),
+        };
+        let rows = || -> i64 {
+            rusqlite::Connection::open(root.join("broca.db"))
+                .unwrap()
+                .query_row(
+                    "SELECT count(*) FROM session_scope_reservation",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+
+        let stamped = broca_protocol::BindIdentity::new("/route", "runner", "head");
+        let reserved = db
+            .resolve_session_address(
+                &stamped,
+                Some(std::path::Path::new("/stamped")),
+                Some(&reservation("prefrontal-core")),
+            )
+            .unwrap();
+        assert_eq!(
+            db.scope_reservation(&reserved).unwrap(),
+            Some(reservation("prefrontal-core"))
+        );
+        assert_eq!(rows(), 1);
+        // Resolving the existing pair under another stamp leaves the first reservation alone.
+        assert_eq!(
+            db.resolve_session_address(&stamped, None, Some(&reservation("magic-context")))
+                .unwrap(),
+            reserved
+        );
+        assert_eq!(
+            db.scope_reservation(&reserved).unwrap(),
+            Some(reservation("prefrontal-core"))
+        );
+
+        let unstamped = broca_protocol::BindIdentity::new("/route", "runner", "plain");
+        let plain = db.resolve_session_address(&unstamped, None, None).unwrap();
+        assert_eq!(db.scope_reservation(&plain).unwrap(), None);
+        assert_eq!(
+            db.resolve_session_address(&unstamped, None, Some(&reservation("magic-context")))
+                .unwrap(),
+            plain
+        );
+        assert_eq!(db.scope_reservation(&plain).unwrap(), None);
+        assert_eq!(rows(), 1);
         drop(db);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -6404,6 +6511,7 @@ mod tests {
             session_change_recorded: false,
             sender_admission: None,
             plan_manifest_folded: true,
+            reservation: None,
         };
         let snapshot =
             broca_core::load_prior_wal_snapshot(&wal_store, &session, safe_head, Some(&store))

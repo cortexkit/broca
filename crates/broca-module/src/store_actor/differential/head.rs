@@ -85,7 +85,7 @@ async fn gated_module(
 }
 
 /// Today's module and one whose sessions start in the new storage, over the same script.
-async fn both(
+pub(super) async fn both(
     steps: Vec<Vec<NormalizedEvent>>,
     gated: bool,
 ) -> (Module, Module, Option<Arc<Notify>>, Option<Arc<Notify>>) {
@@ -97,7 +97,7 @@ async fn both(
 }
 
 /// A send through the registry's own route, with the title and plan the serve layer hands over.
-async fn send_titled(
+pub(super) async fn send_titled(
     module: &Module,
     run_id: &str,
     request: SubmissionRequest,
@@ -128,7 +128,10 @@ async fn send_titled(
 
 /// The module's head for `principal`, as JSON with what each storage keeps for itself taken out.
 /// `mode3` isn't on the wire, so it is added under its own name.
-async fn head_json(module: &Module, principal: Option<&BindPrincipal>) -> serde_json::Value {
+pub(super) async fn head_json(
+    module: &Module,
+    principal: Option<&BindPrincipal>,
+) -> serde_json::Value {
     let head = module
         .registry
         .head_for(&module.key, principal, &SendScope::default())
@@ -156,13 +159,13 @@ async fn head_json(module: &Module, principal: Option<&BindPrincipal>) -> serde_
     value
 }
 
-fn core() -> BindPrincipal {
+pub(super) fn core() -> BindPrincipal {
     BindPrincipal::Reserved {
         module_id: "prefrontal-core".into(),
     }
 }
 
-fn occipital() -> BindPrincipal {
+pub(super) fn occipital() -> BindPrincipal {
     BindPrincipal::Reserved {
         module_id: "occipital".into(),
     }

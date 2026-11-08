@@ -14,6 +14,8 @@ path = "src/main.rs"
 
 [dependencies]
 broca-core = { path = "../broca-core" }
+# Today's plan-change fold, which says which run start applied each refresh.
+broca-fetch-plan = { path = "../broca-fetch-plan" }
 # Today's offline request renderer (`wal_render`), which the `render` check compares the new run
 # loop's rebuilt requests with.
 broca-module = { path = "../broca-module" }

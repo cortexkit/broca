@@ -177,6 +177,7 @@ fn retry_attempt_scripts() -> Vec<Vec<NormalizedEvent>> {
 
 pub fn edit_request() -> RunRequest {
     RunRequest {
+        account_route: None,
         route_decision_id: None,
         input_written_at_ms: None,
         directives: None,

@@ -574,7 +574,8 @@ async fn published_classify_request_vectors_use_the_real_serve_path() {
     };
     let route = rig.open(true, false).await;
     let vectors: Value = serde_json::from_str(cortexkit_llm_tools::vectors::CLASSIFY).unwrap();
-    for vector in vectors["valid_requests"].as_array().unwrap() {
+    let valid = vectors["valid_requests"].as_array().unwrap();
+    for vector in valid {
         let mut arguments = vector["value"].clone();
         arguments["model"] = json!(MODEL);
         let bytes = route
@@ -586,7 +587,13 @@ async fn published_classify_request_vectors_use_the_real_serve_path() {
     }
     for vector in vectors["invalid_requests"].as_array().unwrap() {
         let mut arguments = vector["value"].clone();
-        if arguments.get("model").is_some() {
+        // A vector's example model is swapped for the rig's, so only the defect the vector
+        // names is refused. An empty model is itself that defect (`empty-model`), so it stays.
+        if arguments
+            .get("model")
+            .and_then(Value::as_str)
+            .is_some_and(|model| !model.is_empty())
+        {
             arguments["model"] = json!(MODEL);
         }
         refused_without_writes(
@@ -598,7 +605,8 @@ async fn published_classify_request_vectors_use_the_real_serve_path() {
         )
         .await;
     }
-    assert_eq!(rig.calls(), 3);
+    // One provider call per valid vector; no invalid vector reaches the provider.
+    assert_eq!(rig.calls(), valid.len());
 }
 
 /// A batch another process holds is refused as transient and writes nothing; once that owner is
@@ -1808,6 +1816,32 @@ impl Route {
 
 fn args() -> Value {
     json!({"model":MODEL,"questions":{"q":{"type":"noul","instructions":"Is the invented note urgent?"}},"item":{"state":"invented"},"max_cost_usd":0.01})
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn contract03_unpinned_tool_refusal_changes_no_artifact() {
+    let Some(rig) = Rig::start(
+        "contract03-missing-pin",
+        true,
+        true,
+        Some(42_000_000),
+        0,
+        false,
+    )
+    .await
+    else {
+        return;
+    };
+    let route = rig.open(true, false).await;
+    let mut arguments = args();
+    arguments.as_object_mut().unwrap().remove("model");
+    let error =
+        refused_without_writes(&rig, &route, arguments, "missing-model", "invalid_params").await;
+    assert_eq!(error["detail"]["field"], "model");
+    let call = route.call(args(), Some("pinned")).await.unwrap();
+    let result: cortexkit_llm_tools::classify::Result = serde_json::from_slice(&call).unwrap();
+    cortexkit_llm_tools::classify::validate_result(&result).unwrap();
+    assert_eq!(result.model, MODEL);
 }
 
 fn rows(path: &Path, table: &str) -> Vec<String> {

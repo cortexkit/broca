@@ -255,9 +255,17 @@ struct Vault {
     openai_apikey_listed: std::sync::atomic::AtomicBool,
     /// Once set, the listing also carries the OpenRouter API key `apikey:openrouter`.
     openrouter_listed: std::sync::atomic::AtomicBool,
+    /// The value of the new storage's deployment-key record (`opaque:broca-deployment:<id>`).
+    /// `None` answers `not_found`, as a vault without the record or its grant does.
+    deployment_key: Mutex<Option<Vec<u8>>>,
 }
 
+/// The prefix of the new storage's deployment-key records, which the daemon reads at boot.
+const DEPLOYMENT_KEY_RECORD: &str = "opaque:broca-deployment:";
+
 impl Vault {
+    /// The credential ids of the scoped reads runs made, in order. The daemon's reads of the new
+    /// storage's deployment key are not a run's credential read, so they are left out.
     fn scoped_reads(&self) -> Vec<String> {
         self.requests
             .lock()
@@ -270,7 +278,24 @@ impl Vault {
                     .unwrap_or_default()
                     .to_string()
             })
+            .filter(|id| !id.starts_with(DEPLOYMENT_KEY_RECORD))
             .collect()
+    }
+
+    /// How many times the daemon read a deployment-key record.
+    #[cfg(unix)]
+    fn deployment_key_reads(&self) -> usize {
+        self.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(method, params)| {
+                method == "credential.get_scoped"
+                    && params["credential_id"]
+                        .as_str()
+                        .is_some_and(|id| id.starts_with(DEPLOYMENT_KEY_RECORD))
+            })
+            .count()
     }
 
     fn list_calls(&self) -> usize {
@@ -429,7 +454,17 @@ impl subc_client_rs::ModuleHandler for VaultModule {
             }
             "credential.get_scoped" => {
                 let id = params["credential_id"].as_str().unwrap_or_default();
-                if self.not_found.lock().unwrap().contains(id) {
+                if id.starts_with(DEPLOYMENT_KEY_RECORD) {
+                    match self.deployment_key.lock().unwrap().clone() {
+                        Some(value) => json!({
+                            "payload": value,
+                            "expires_at_ms": null,
+                            "record_version": 1,
+                            "credential_id": id,
+                        }),
+                        None => json!({ "error": { "class": "permanent", "code": "not_found" } }),
+                    }
+                } else if self.not_found.lock().unwrap().contains(id) {
                     json!({ "error": { "class": "permanent", "code": "not_found" } })
                 } else if self.needs_reauth.lock().unwrap().contains(id) {
                     json!({ "error": { "class": "auth", "code": "needs_reauth" } })
@@ -1078,6 +1113,7 @@ impl Rig {
             anthropic_apikey_listed: Default::default(),
             openai_apikey_listed: Default::default(),
             openrouter_listed: Default::default(),
+            deployment_key: Mutex::new(None),
         });
         let routing_task = register(
             &connection_file,
@@ -3709,4 +3745,120 @@ async fn grammar_too_large_status_and_memo_through_real_serve() {
     assert!(requests[0].pointer("/output_config/format").is_some());
     assert!(requests[1].pointer("/output_config/format").is_none());
     assert!(requests[2].pointer("/output_config/format").is_none());
+}
+
+/// A SESSION KEPT IN THE NEW STORAGE IS SERVED BY THE REAL DAEMON ONCE THE VAULT HOLDS ITS
+/// DEPLOYMENT KEY.
+///
+/// The real `ck-broca`, supervised by the real `ck-subc`, reads `opaque:broca-deployment:1` from
+/// the `claustrum` stand-in on its own when it starts. While the stand-in answers `not_found`, a
+/// session kept in the new storage is refused `open_failed`, class transient, its reason naming
+/// `key_unavailable`, and nothing of it is served from today's storage; a session on today's
+/// storage is served. Once the record exists, the daemon reads it again without being asked and
+/// serves the held session, with no restart. The missing record is never reported to the vault
+/// as an auth failure. Unix only: the session's address hashes its project root as the module
+/// spells it, which the test matches by creating the session under both spellings it can name,
+/// as given and canonical; on Windows the module's spelling may be neither.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_real_daemon_serves_a_held_session_once_the_vault_holds_its_deployment_key() {
+    let Some(rig) = Rig::start().await else {
+        return;
+    };
+    let key: [u8; 32] = std::array::from_fn(|i| (i as u8).wrapping_mul(29).wrapping_add(3));
+    let name = "held-in-new-storage";
+    let spellings = [
+        rig.session(name),
+        broca_protocol::BindIdentity::new(rig.root.join("project"), "runner", name),
+    ];
+    for held in &spellings {
+        let head =
+            broca_wal::session_storage_head(&rig.state_root, &broca_core::session_addr(held));
+        if head.exists() {
+            continue;
+        }
+        broca_session_store::session::Session::create(
+            broca_session_store::backend::LocalBackend::new(
+                rig.state_root.join(broca_wal::SESSION_STORAGE_DIR),
+            ),
+            broca_session_store::backend::SessionAddr(broca_core::session_addr(held)),
+            broca_session_store::head::SessionTriple {
+                project_root: held.project_root.display().to_string(),
+                harness: held.harness.clone(),
+                session: held.session.clone(),
+            },
+            &broca_session_store::keys::DeploymentKey::new(1, &key),
+            false,
+        )
+        .await
+        .unwrap();
+    }
+    broca_test_support::wait_until("the daemon to read its deployment key", || async {
+        match rig.vault.deployment_key_reads() {
+            0 => Err("no read yet".to_string()),
+            _ => Ok(()),
+        }
+    })
+    .await;
+
+    let refusal = rig
+        .expect_refused(
+            name,
+            "session.head before the deployment key loads",
+            rig.raw_request(name, "session.head", json!({})).await,
+        )
+        .await;
+    assert_eq!(refusal["code"], "open_failed", "{refusal}");
+    assert_eq!(refusal["detail"]["class"], "transient", "{refusal}");
+    assert!(
+        refusal["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("key_unavailable")),
+        "{refusal}"
+    );
+    for held in &spellings {
+        assert!(
+            !rig.state_root
+                .join("wal")
+                .join(format!("{}.wal", broca_core::session_addr(held)))
+                .exists(),
+            "the held session was not served from today's storage"
+        );
+    }
+    let today = rig.raw_request("today", "session.head", json!({})).await;
+    rig.expect_ok("today", "session.head on today's storage", today)
+        .await;
+
+    let hex: String = key.iter().map(|byte| format!("{byte:02x}")).collect();
+    *rig.vault.deployment_key.lock().unwrap() = Some(hex.into_bytes());
+    broca_test_support::wait_until("the held session served once the key loads", || async {
+        match rig.raw_request(name, "session.head", json!({})).await {
+            Ok(head) => Ok(head),
+            Err(refusal)
+                if refusal["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("key_unavailable")) =>
+            {
+                Err(refusal_summary(&refusal))
+            }
+            Err(refusal) => panic!(
+                "the held session was refused for another reason: {}\n{}",
+                refusal_summary(&refusal),
+                rig.diagnostics(name).await
+            ),
+        }
+    })
+    .await;
+    assert!(
+        rig.vault
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(method, _)| method != "credential.report_auth_failure"),
+        "a missing deployment key is never reported as an auth failure"
+    );
+    let root = rig.root.clone();
+    drop(rig);
+    broca_test_support::remove_rig_dir(root);
 }

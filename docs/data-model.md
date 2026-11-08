@@ -257,6 +257,14 @@ absent); `stop_when` (array, absent when empty). `frozen_render_config`,
 `frozen_render_config` can contain a `project_id` key of its own (Google Code Assist's
 GCP project), which is not `run_started.project_id`.
 
+`RunConfig.account_route` is an optional `{provider, model}` object containing the provider
+and model names routing returned for the account route. Both strings are nonempty. It is frozen beside
+`route_decision_id`, reused on resume, and never replaces `RunConfig.model` or the provider's
+render config. `queued.request.account_route` retains the independently queued run's choice.
+The member is absent by default and omitted when unset, preserving existing record bytes.
+Broca 0.3.321's write-ahead log reader accepts and ignores this optional member; it
+introduces no new required feature.
+
 `global_system` is an optional array of native system messages, omitted unless a mode-3 run
 without a fetch plan has global instructions. It requires `compaction-v2/v1`. Global
 instructions are provider configuration, not transcript entries: they consume no ordinal or

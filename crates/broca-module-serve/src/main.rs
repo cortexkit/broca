@@ -153,6 +153,8 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     broca_module_serve::config::warn_obsolete_media_default().map_err(ServeIoError)?;
     let service_tier =
         broca_module_serve::config::ServiceTierConfig::load_default().map_err(ServeIoError)?;
+    let classifier_routing = broca_module_serve::config::ClassifierRoutingConfig::load_default()
+        .map_err(ServeIoError)?;
     broca_protocol::configure_service_tier(service_tier.enabled)
         .map_err(|error| ServeIoError(error.into()))?;
     let archive_config = broca_module_serve::wal_archive::WalArchiveConfig::load_default_path()
@@ -569,6 +571,11 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
     let mut vault_gauge = broca_module_serve::serve::VaultGauge::not_in_use();
+    let mut classifier_router = None;
+    // Where the new session storage's deployment key is read from: the vault, by grant. `None`
+    // when the module reads no vault, so sessions kept in the new storage stay refused.
+    let mut store_key_source: Option<Arc<dyn broca_module_serve::store_key::DeploymentKeySource>> =
+        None;
     // System One's provider credentials. Without a vault (the mock provider path) their
     // requests carry none, as every run's do there.
     let mut system_one_credential: Arc<
@@ -686,6 +693,14 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             &vault_bind,
             VAULT_READY_TIMEOUT,
         ));
+        // Owed reports still describe real runs after routed admission is switched off.
+        classifier_router = Some(broca_module_serve::system_one::Routing {
+            client: routing.clone(),
+            credentials: Arc::new(broca_module_serve::system_one::VaultRoutingCredentials(
+                system_one_vault.clone(),
+            )),
+            module_id: "broca".into(),
+        });
         let system_one_vault_credential = |credential_id: &str| {
             Arc::new(
                 broca_module_serve::system_one::credential::VaultCredential {
@@ -707,6 +722,14 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         openai_decisions_credential = system_one_vault_credential(
             broca_module_serve::system_one::openai_decisions::CREDENTIAL_ID,
         );
+        // The deployment key is read on a route of its own, so its retries while the record is
+        // missing never queue behind a run's credential read.
+        store_key_source = Some(Arc::new(broca_subc::VaultClient::new(
+            Arc::clone(&vault_conn),
+            &vault_module,
+            &vault_bind,
+            VAULT_READY_TIMEOUT,
+        )));
         let client = broca_subc::VaultClient::new(
             vault_conn,
             &vault_module,
@@ -770,10 +793,37 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         broca_subc::SubcCompactionPlane::new(plan_conn.clone()),
     ));
     let executor = Arc::new(executor_impl.with_clock(retention.clock.clone()));
+    // The new session storage. A session kept there is told apart from today's from the first
+    // open, and served once the deployment key has loaded from the vault (see `store_key`).
+    let session_storage =
+        broca_module_serve::config::SessionStorageConfig::load_default().map_err(ServeIoError)?;
+    let store_slot = Arc::new(broca_module::store_open::StoreSlot::awaiting_key(
+        &state_root,
+        session_storage.deployment_key_id,
+    ));
+    broca_module_serve::store_key::publish(Arc::clone(&store_slot));
+    let store_setup = broca_module::store_open::StoreRuntimeSetup {
+        state_root: state_root.clone(),
+        executor: executor.clone(),
+        idle_ttl: idle_ttl.unwrap_or(broca_module::actor::IDLE_TTL),
+        import_roots: broca_module_serve::config::ImportConfig::load_default()
+            .map_err(ServeIoError)?
+            .roots,
+        // A run that ends on a session kept in the new storage is billed into the usage export
+        // today's runs are billed into, under the same charge-basis table. Only a legacy root
+        // keeps that export.
+        billing: run_index
+            .as_ref()
+            .map(|legacy| broca_module::store_billing::StoreBilling {
+                index: legacy.clone(),
+                resolver: charge_basis_table.clone(),
+            }),
+    };
     let move_wal = wal_store.clone();
     let mut opener_builder =
         opener_for_state_root(lease_store, wal_store, executor, state_format, &state_root)?
-            .with_charge_basis_resolver(charge_basis_table.clone());
+            .with_charge_basis_resolver(charge_basis_table.clone())
+            .with_store_slot(Arc::clone(&store_slot));
     if let Some(legacy) = &run_index {
         opener_builder = opener_builder
             .with_run_index(legacy.clone())
@@ -826,6 +876,17 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         registry.set_session_address_inventory(run_index.as_ref().unwrap().clone());
     }
     let registry = Arc::new(registry);
+    // The deployment key is read off the startup path: the module serves today's sessions at
+    // once, and sessions kept in the new storage from when the key loads.
+    let _store_key = tokio::spawn(
+        broca_module_serve::store_key::KeyLoader {
+            source: store_key_source,
+            slot: store_slot,
+            setup: store_setup,
+            backoff: Default::default(),
+        }
+        .run(registry.as_ref().clone()),
+    );
     held_runtime.bind_stopping_signal(registry.stopping_signal());
     registry.set_tool_route_health(Arc::new(move |open| {
         tool_route_health_plane.tool_routes_health(open)
@@ -849,7 +910,10 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             broca_store::SystemOneStore::open(state_root.join("system-one.db"))
                 .map_err(|e| ServeIoError(format!("open System One batch store: {e}")))?,
         );
-        let config = broca_module_serve::system_one::Config::default();
+        let config = broca_module_serve::system_one::Config {
+            routed_models: classifier_routing.enabled,
+            ..Default::default()
+        };
         let openai_decisions =
             broca_module_serve::system_one::openai_decisions::OpenAiDecisions::new(
                 openai_decisions_base_url.as_deref(),
@@ -895,7 +959,13 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             },
             config,
             registry.batches_in_flight_gauge(),
-        );
+        )
+        .with_routing_content_retention(state_format.runs(BackgroundTask::RetentionSweeper));
+        let service = if let Some(routing) = classifier_router {
+            service.with_routing(routing)
+        } else {
+            service
+        };
         let service = if llm_tools_config.image_references {
             service.with_image_resolver(cerebellum.clone())
         } else {
@@ -916,6 +986,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         }
         service
     };
+    let _routing_recovery = system_one.spawn_routing_recovery(registry.stopping_signal());
     // System One's batch sweep deletes batches, so it counts as retention: an overhaul root runs
     // none.
     let _system_one_sweep = state_format.start(BackgroundTask::RetentionSweeper, || {
@@ -4676,6 +4747,7 @@ mod executor {
             broca_module_serve::account_routing::choose_account(
                 routing,
                 broca_module_serve::account_routing::ChoiceInputs {
+                    account_route: req.account_route.as_ref(),
                     decision_id: req.route_decision_id.as_deref(),
                     service_tier,
                     pool: preference.pool,
@@ -5338,6 +5410,34 @@ mod executor {
                 &catalog.priced_modes(&request.model.provider_module_id, &request.model.model_id),
             )
         }
+        fn check_account_route(
+            &self,
+            request: &broca_protocol::request::SubmissionRequest,
+        ) -> Result<(), String> {
+            let (pin, account) =
+                caller_auth_for_episode(request.auth.as_ref(), EpisodeAuthContext::FreshSession)
+                    .map_err(|error| format!("account_route: {error}"))?;
+            let method = self
+                .vault
+                .as_ref()
+                .map_or(pin.unwrap_or(FALLBACK_METHOD), |vault| {
+                    broca_module_serve::auth_routing::resolve_credential_id(
+                        &request.model.provider_module_id,
+                        pin,
+                        account,
+                        &vault.methods,
+                        FALLBACK_METHOD,
+                    )
+                    .method
+                });
+            if !broca_module_serve::account_routing::selects_accounts(method) {
+                return Err(format!(
+                    "account_route is not accepted for sign-in method {}",
+                    method.as_token()
+                ));
+            }
+            Ok(())
+        }
         fn source_warm_enabled(&self) -> bool {
             self.anthropic_fallbacks.refusal_resend.is_enabled()
         }
@@ -5989,6 +6089,7 @@ mod executor {
         include!("step_event_writer_tests.rs");
         include!("auth_hint_writer_tests.rs");
         include!("vault_request_tests.rs");
+        include!("store_key_tests.rs");
         include!("role_plane_tests.rs");
         include!("admission_wal_read_budget_tests.rs");
 
@@ -6189,6 +6290,7 @@ mod executor {
             frozen.prompt_cache_key = Some("frozen-key".into());
             let mut req = drift_request(std::path::Path::new("/inherit-cache"));
             let config = broca_wal::RunConfig {
+                account_route: None,
                 global_system: None,
                 route_decision_id: None,
                 account_limit_pause: false,
@@ -7398,6 +7500,7 @@ mod executor {
                     session: BindIdentity::new("/tmp/project", "harness", "session"),
                     ts_ms: None,
                     config: Box::new(broca_wal::RunConfig {
+                        account_route: None,
                         global_system: None,
                         route_decision_id: None,
                         account_limit_pause: false,

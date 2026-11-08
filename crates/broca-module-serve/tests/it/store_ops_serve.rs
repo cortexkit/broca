@@ -301,7 +301,7 @@ impl Rig {
         let registry = Arc::new(registry);
         // The identity every bind below names, resolved as the serve path resolves it.
         let key = registry
-            .resolve_session_address(&BindIdentity::new("", "runner", "head"), None)
+            .resolve_session_address(&BindIdentity::new("", "runner", "head"), None, None)
             .await
             .unwrap();
         let (client, server) = tokio::io::duplex(256 * 1024);

@@ -25,10 +25,11 @@ use broca_session_store::record::{
     Assistant, Attempt, AuthRefrozen, BatchEnd, BatchStart, Billed, BudgetFire, BudgetFiring,
     CallFacts, CallOutcome, CancelPoint, CancelRequest, CeilingDecided, Compaction, ConfigRefrozen,
     Delivery, DeliveryOrdered, Event, Input, Marker, ModelStepUsage, Notice, OutputCapLowered,
-    PartKind, PartRef, Pause, Placement, QueuedSend, Record, Redo, ResultAppend, Resumed,
-    Retraction, RunEnd, RunStart, SendEnded, SessionRefresh, SetupStub, Steer, StepEnd,
-    StepRefused, StepStart, Stream, StructuredDowngraded, StructuredResult, ToolHeld, ToolIntent,
-    ToolOutcome, ToolReply, TurnFacts, Unanswered, View, ViewApplied, Warmed,
+    PartKind, PartRef, Pause, Placement, PrefixFlush, QueuedSend, Record, Redo, RefreshApplied,
+    RefreshPolicy, ResultAppend, Resumed, Retraction, RunEnd, RunStart, SendEnded, SessionRefresh,
+    SetupStub, Steer, StepEnd, StepRefused, StepStart, Stream, StructuredDowngraded,
+    StructuredResult, ToolHeld, ToolIntent, ToolOutcome, ToolReply, TurnFacts, Unanswered, View,
+    ViewApplied, Warmed,
 };
 use broca_wal::{FramedRecord, WalRecord};
 use serde::de::DeserializeOwned;
@@ -211,6 +212,9 @@ pub fn convert(old: &[FramedRecord], lineage: Option<&str>) -> Result<Converted,
     let mut stamps: HashMap<String, Option<broca_session_store::record::RichUi>> = HashMap::new();
     // The provider serving the run in force, which decides what lifetime its requests ask for.
     let mut provider_id = String::new();
+    // Today's plan-change fold, record by record, so the run start that applied each refresh is
+    // known: the new storage records that application after the run's input.
+    let mut plan_changes = broca_fetch_plan::session_change::SessionChangeFold::default();
     for framed in old {
         match &framed.record {
             WalRecord::RunStarted { config, ts_ms, .. } => {
@@ -300,7 +304,9 @@ pub fn convert(old: &[FramedRecord], lineage: Option<&str>) -> Result<Converted,
             .observe(&framed.record, framed.seq)
             .map(|(_, copy)| copy);
         let before = out.records.len();
+        let applied = plan_changes.record(&framed.record).map(refresh_applied);
         convert_one(&framed.record, &mut state, &mut out)?;
+        out.records.extend(applied.map(Record::RefreshApplied));
         // Today's display facts of each message this record gave a new version, by today's
         // ordinal; a fold today's read refuses leaves them as they were.
         let mut changed = Vec::new();
@@ -457,6 +463,12 @@ pub fn convert(old: &[FramedRecord], lineage: Option<&str>) -> Result<Converted,
         }
     }
     Ok(out)
+}
+
+/// The record of a refresh's application, from the facts today's fold reports for it, as the
+/// store's run loop records it.
+fn refresh_applied(effective: &broca_fetch_plan::session_change::EffectiveState) -> RefreshApplied {
+    broca_session_loop::run::refresh_applied(&effective.applied_change())
 }
 
 /// The facts of the tool turn whose assistant message is at `ordinal`, from today's display
@@ -639,7 +651,20 @@ fn convert_one(
     }
     convert_record(record, state, out)?;
     record_model_shares(record, state, out);
+    record_refresh_selection(record, out);
     Ok(())
+}
+
+/// Records on the refresh just written the model its plan chooses, as the store actor records it
+/// when it accepts one (`broca_session_loop::plan::recorded_selection`).
+fn record_refresh_selection(record: &WalRecord, out: &mut Converted) {
+    if let (
+        WalRecord::SessionRefreshAccepted { manifest, .. },
+        Some(Record::SessionRefresh(refresh)),
+    ) = (record, out.records.last_mut())
+    {
+        refresh.selection = broca_session_loop::plan::recorded_selection(manifest);
+    }
 }
 
 /// Records which model each part of a step's usage counts under, by today's own rule
@@ -985,6 +1010,21 @@ fn convert_record(
                 applies_from_next_run: f.req_bool("applies_from_next_run"),
                 setup,
                 manifest,
+                // Filled in from the record's manifest once converted (`record_refresh_selection`).
+                selection: None,
+            }));
+        }
+        "session_refresh_policy_changed" => {
+            out.records.push(Record::RefreshPolicy(RefreshPolicy {
+                generation: f.req_u64("generation"),
+                policy: f.req_string("policy"),
+                send_id: f.req_string("send_id"),
+            }));
+        }
+        "session_prefix_flushed" => {
+            out.records.push(Record::PrefixFlush(PrefixFlush {
+                send_id: f.req_string("send_id"),
+                pending_generation: f.u64("pending_generation"),
             }));
         }
         "structured_output_result" => {

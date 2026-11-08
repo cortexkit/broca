@@ -1734,6 +1734,7 @@ impl Scenario {
     fn plain_request_for(&self, run_id: &str, input: &[Message]) -> RunRequest {
         RunRequest {
             route_decision_id: None,
+            account_route: None,
             input_written_at_ms: None,
             directives: None,
             session_class: None,
