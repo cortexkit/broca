@@ -297,11 +297,20 @@ where
 {
     refuse_first_protocol_compaction(writer)?;
     refuse_unbuilt(&admission)?;
-    // A session keeps the layout its first run started under; a new run on it freezes the view
-    // library's current plan version, as today's loop does.
+    // A session on the current compaction contract stays on it, and a new run on it freezes the
+    // view library's current plan version, as today's loop does. A session that ran outside it
+    // moves onto it at the first run whose plan names a compaction provider: that run enrolls
+    // it (see `crate::enroll`).
     let mut admission = admission;
     let contract =
         crate::admit::session_contract(writer.operations(), admission.compaction_plan_version);
+    let enrolling =
+        contract && !writer.operations().on_contract() && writer.operations().run.is_some();
+    if enrolling && !crate::enroll::window_whole(writer.conversation()) {
+        return Err(crate::enroll::refused(
+            crate::enroll::Refusal::WindowNotWhole,
+        ));
+    }
     admission.compaction_plan_version = contract.then_some(cortexkit_compaction_view::PLAN_VERSION);
     let mut input = std::mem::take(&mut admission.input);
     if contract {
@@ -321,6 +330,16 @@ where
     // requests show the projection's numbers instead, but today's reads still number the run's
     // messages by these rules, so they are recorded alike.
     let checkpoint = shown_high(&*writer, &*parts).await?;
+    // The enrolling run decides what the session serves about the messages placed before it,
+    // numbered after the highest number any earlier request showed, and stores the decisions
+    // before its start's batch names them.
+    let enrolled = if enrolling {
+        let decided = crate::enroll::decide(&*writer, checkpoint).await?;
+        let overlay = writer.put_enrollment(&decided.entries).await?;
+        Some(decided.record(overlay))
+    } else {
+        None
+    };
     let runner = broca_core::tags::rules_for(
         Some(broca_wal::ComputedTagRules { checkpoint }),
         frozen_render_tags(&admission),
@@ -346,7 +365,7 @@ where
         ),
         inner: writer,
     };
-    let start_seq = admit(&mut placed, parts, &admission, checkpoint).await?;
+    let start_seq = admit(&mut placed, parts, &admission, checkpoint, enrolled).await?;
     if let Some(reports) = &seams.account_reports {
         reports.run_started(&event_id(&placed, start_seq), start_seq);
     }
@@ -1498,8 +1517,17 @@ pub async fn offline_request<W: Writer>(
     let episodes = render_episodes(writer, parts)?;
     let run_rules = run_tag_rules(writer, &episodes).await?;
     let tools = Arc::new(admission.tools.clone());
+    let enrollment = writer.enrollment().await?;
     let opts = call_options(
-        writer, &admission, &tools, &episodes, &run_rules, None, step_id, compacted,
+        writer,
+        &admission,
+        &tools,
+        &episodes,
+        &run_rules,
+        None,
+        step_id,
+        compacted,
+        enrollment.as_ref(),
     )?;
     if !compacted {
         return Ok(opts);
@@ -1775,6 +1803,7 @@ where
             _ => {}
         }
         let run_rules = run_tag_rules(writer, &episodes).await?;
+        let enrollment = writer.enrollment().await?;
         let mut opts = call_options(
             writer,
             admission,
@@ -1784,6 +1813,7 @@ where
             seams.session_address.clone(),
             step_id,
             compaction.is_some(),
+            enrollment.as_ref(),
         )?;
         // The step names the account routing gives the run now, as today's does.
         if let Some(context) = opts.step_context.as_mut() {
@@ -1861,8 +1891,31 @@ where
             }
         }
         // Client-side refusal fallback: the step goes to the run's refusal-fallback model while
-        // the session's schedule says so, or when it is a step already refused and re-sent.
-        let mut route = crate::refusal::Route::decide(writer, seams.provider, step_id)?;
+        // the session's schedule says so, or when it is a step already refused and re-sent. On
+        // the run that moved the session onto the current compaction contract, the newest
+        // step's usage measures the request from before the move, which rebuilt it, so the
+        // prepared request's own estimate decides whether it fits the fallback's window.
+        let own_estimate = match (
+            crate::enroll::is_enrolling_run(writer.operations(), &admission.run_id),
+            seams.provider.refusal_fallback_model(),
+        ) {
+            (true, Some(_)) => {
+                let history = writer
+                    .operations()
+                    .estimate
+                    .as_ref()
+                    .map(crate::compaction::history)
+                    .unwrap_or_default();
+                let bytes = seams
+                    .provider
+                    .try_render_request(&opts)
+                    .map_err(|error| LoopError::Parts(error.message))?;
+                Some(broca_core::compaction::request_estimate(bytes.len(), &history).0)
+            }
+            _ => None,
+        };
+        let mut route =
+            crate::refusal::Route::decide(writer, seams.provider, step_id, own_estimate)?;
         let prepared = opts;
         let mut opts =
             match reserve_for(writer, seams, admission, step_id, &prepared, &route).await? {
@@ -2327,12 +2380,15 @@ fn to_value<T: serde::Serialize>(value: Option<&T>) -> Result<Option<Value>, Loo
 }
 
 /// Writes the run's start. `checkpoint` is the highest part number the session has shown
-/// ([`shown_high`]), which the run's computed numbering continues after.
+/// ([`shown_high`]), which the run's computed numbering continues after. `enrolled` is the
+/// record of the session's move onto the current compaction contract when this run makes it,
+/// which its start's batch carries.
 async fn admit<W: Writer>(
     writer: &mut W,
     parts: &mut dyn Parts,
     admission: &Admission,
     checkpoint: u64,
+    enrolled: Option<broca_session_store::record::CompactionEnrolled>,
 ) -> Result<u64, LoopError> {
     // The session's refusal-fallback schedule carries into the run only under the same model
     // and within a day of its last change, as today's admission decides it.
@@ -2506,6 +2562,11 @@ async fn admit<W: Writer>(
     if let Some(applied) = &admission.applies_refresh {
         records.push(Record::RefreshApplied(refresh_applied(applied)));
     }
+    // So is the session's enrollment, in the same batch as the start that moves it onto the
+    // contract: once the batch commits, the session is enrolled for good.
+    if let Some(enrolled) = enrolled {
+        records.push(Record::CompactionEnrolled(enrolled));
+    }
     // The start's seq is the one the batch took, which a writer shared with the session actor
     // knows only once it is appended.
     let position = records
@@ -2609,6 +2670,8 @@ fn render_episodes<W: Writer>(
 /// The request for step `step_id`: the conversation as the folds hold it, under the run's
 /// frozen settings, with the render inputs today's loop gives a request: each message's
 /// position, its part numbers under the run's tag rules, and the run's place in the prompt.
+/// `enrollment` is what the session's move onto the current compaction contract decided about
+/// the messages placed before it, which a request on the contract renders them by.
 #[allow(clippy::too_many_arguments)]
 fn call_options<W: Writer>(
     writer: &W,
@@ -2619,6 +2682,7 @@ fn call_options<W: Writer>(
     session_address: Option<String>,
     step_id: u64,
     compacted: bool,
+    enrollment: Option<&broca_session_store::session::EnrollmentOverlay>,
 ) -> Result<CallOptions, LoopError> {
     let mut prompt = writer.conversation().messages.clone();
     repetition_guidance(
@@ -2637,6 +2701,14 @@ fn call_options<W: Writer>(
     // one on the established layout numbers each run's messages by that run's frozen rules, in
     // the order they were placed, as today's loop numbers them, and renders them in place.
     let contract = admission.compaction_plan_version.is_some();
+    // The global system messages a session that enrolled carried in its transcript before are
+    // left out, as a session on the contract never holds them: the run's system text takes
+    // their place above the conversation, and the entries leave them out alike.
+    let mut episodes = episodes.to_vec();
+    if let (true, Some(enrollment)) = (contract, enrollment) {
+        crate::enroll::without_suppressed(&mut prompt, enrollment);
+        crate::enroll::translate_episodes(&mut episodes, enrollment);
+    }
     let overflow = |_| LoopError::Unsupported("part numbers past the numbering limit");
     if contract {
         TagNumbering::for_run(
@@ -2673,7 +2745,7 @@ fn call_options<W: Writer>(
     }
     let mut opts = CallOptions::new(prompt);
     opts.marker_order_version = Some(MARKER_ORDER_VERSION);
-    opts.render_episodes = Arc::new(episodes.to_vec().into());
+    opts.render_episodes = Arc::new(episodes.into());
     opts.tools = Arc::clone(tools);
     opts.tool_choice = Arc::new(admission.tool_choice.clone());
     opts.response_format = Arc::new(admission.response_format.clone());
@@ -2703,11 +2775,14 @@ fn call_options<W: Writer>(
     // renders one: text delivered with a tool result is added to the result's copy, and the
     // system text goes above the conversation.
     let conversation = writer.conversation();
-    let entries = broca_session_store::session::window_entries(conversation, 1, usize::MAX)
-        .iter()
-        .map(crate::entries::project)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(LoopError::Parts)?;
+    let entries = broca_session_store::session::EnrollmentOverlay::serve(
+        enrollment,
+        broca_session_store::session::window_entries(conversation, 1, usize::MAX),
+    )
+    .iter()
+    .map(crate::entries::project)
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(LoopError::Parts)?;
     let prompt = broca_core::compaction_v2::render::deliveries_only(&opts.prompt, &entries)
         .map_err(LoopError::Parts)?;
     let opts = broca_core::compaction_v2::render::options(&opts, prompt);

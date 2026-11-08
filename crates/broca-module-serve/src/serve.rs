@@ -5861,6 +5861,14 @@ async fn send_session_change_error(
                 ErrorBody::new(refusal.code(), refusal.message()).with_detail(refusal.detail());
             send_error_body(writer, ver, channel, epoch, corr, body).await
         }
+        SessionChangeError::CompactionNotAddable(refusal) => {
+            let body = ErrorBody::new(
+                cortexkit_role_llm_runner::errors::INVALID_PARAMS,
+                refusal.message(),
+            )
+            .with_detail(broca_module::serve::compaction_not_addable_detail(refusal));
+            send_error_body(writer, ver, channel, epoch, corr, body).await
+        }
         SessionChangeError::Transient(message) => {
             let serve = ServeError::Transient(message);
             send_serve_error(writer, ver, channel, epoch, corr, &serve).await

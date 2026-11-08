@@ -947,6 +947,19 @@ impl Writer for Unsealed<'_> {
         Writer::open_log_records(&*self.0).await
     }
 
+    async fn enrollment(
+        &self,
+    ) -> Result<Option<broca_session_store::session::EnrollmentOverlay>, SessionError> {
+        Writer::enrollment(&*self.0).await
+    }
+
+    async fn put_enrollment(
+        &mut self,
+        entries: &broca_session_store::record::EnrolledEntries,
+    ) -> Result<broca_session_store::record::EnrollmentOverlayRef, SessionError> {
+        Writer::put_enrollment(&mut *self.0, entries).await
+    }
+
     async fn run_start(
         &self,
         run_id: &str,

@@ -624,6 +624,15 @@ pub trait LineageOpener: Send + Sync {
             |_| None,
         )
     }
+    /// The context limit a fresh run of `model` would freeze when its send names none
+    /// (`RunExecutor::compaction_context_limit`, which says why a send's own limit doesn't
+    /// count). An opener that runs nothing answers `Err`.
+    async fn compaction_context_limit(
+        &self,
+        _model: &cortexkit_role_llm_runner::head_selection::PlanModel,
+    ) -> Result<Option<u64>, String> {
+        Err("this runner can't resolve a model's context limit".into())
+    }
     /// Retire routes synchronously when retention deletes a session without an actor.
     fn on_session_deleted(&self, _session: &LineageKey) {}
     fn retire_session_transport(&self, _session: &LineageKey) {}
@@ -2051,6 +2060,15 @@ impl LineageRegistry {
         cortexkit_role_llm_runner::head_selection::PlanModelProblem,
     > {
         self.inner.opener.check_plan_selection(plan).await
+    }
+
+    /// The context limit a fresh run of `model` would freeze when its send names none, from
+    /// the opener (`LineageOpener::compaction_context_limit`).
+    pub(crate) async fn compaction_context_limit(
+        &self,
+        model: &cortexkit_role_llm_runner::head_selection::PlanModel,
+    ) -> Result<Option<u64>, String> {
+        self.inner.opener.compaction_context_limit(model).await
     }
     pub fn active_event_sessions(&self) -> Vec<LineageKey> {
         self.inner

@@ -43,6 +43,34 @@ pub(crate) struct ChangeFacts {
     /// The flush recorded under the request's `send_id`, with the pending generation it
     /// reported.
     pub flush_send: Option<Option<u64>>,
+    /// What the rules for adding a compaction provider read about a session in the new
+    /// storage, which can gain one at its next run (`broca_session_loop::enroll`); `None` on
+    /// today's storage, which refuses a refresh that adds one.
+    pub enrollment: Option<EnrollmentFacts>,
+}
+
+/// What a refresh that adds a compaction provider is checked against on the new storage.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct EnrollmentFacts {
+    /// The window holds every message the session placed (`enroll::window_whole`).
+    pub window_whole: bool,
+    /// The session's earlier runs carried global system messages
+    /// (`enroll::carries_global_system`).
+    pub carries_global_system: bool,
+    /// The model the session's next run takes when a refresh chooses none: the latest refresh
+    /// that chose one, else its first run's plan, else its latest run's model.
+    pub session_model: Option<cortexkit_role_llm_runner::head_selection::PlanModel>,
+}
+
+impl ChangeFacts {
+    /// The latest plan the session accepted: its pending refresh's while one waits to apply,
+    /// else the one its latest run froze. A refresh's compaction item is compared with it.
+    pub fn latest_manifest(&self) -> Option<&PlanManifest> {
+        match &self.pending {
+            Some(pending) => Some(pending.manifest.as_ref()),
+            None => self.current_manifest.as_deref(),
+        }
+    }
 }
 
 impl ChangeFacts {
@@ -67,6 +95,8 @@ impl ChangeFacts {
             applied_by: generation.and_then(|generation| state.applied.get(&generation).cloned()),
             policy_send: send_id.and_then(|send_id| state.policy_send_ids.get(send_id).cloned()),
             flush_send: send_id.and_then(|send_id| state.flush_send_ids.get(send_id).copied()),
+            // Today's storage can't gain a compaction provider.
+            enrollment: None,
         }
     }
 }
@@ -127,7 +157,8 @@ pub(crate) enum RefreshAcceptance {
 
 /// The actor's checks of a refresh of `generation` under `policy`, whose fetched manifest is
 /// `manifest`, made where it writes: generation order against what the session accepted since
-/// the serve layer looked, the compaction item, which stays the session's for its life, and the
+/// the serve layer looked, the compaction item, which stays the session's for its life once it
+/// has one (a session in the new storage may gain one, see [`ChangeFacts::enrollment`]), and the
 /// rungs the changed surfaces support. A new refresh's reply says whether a run is in progress
 /// and whether the change applies from the next run, which it does under `immediately` or after
 /// a flush.
@@ -150,13 +181,33 @@ pub(crate) fn accept_refresh(
     }
     let next_plan =
         serde_json::from_str(manifest.plan.as_json_text()).expect("admitted plan is JSON");
-    if session_change::check_compaction_item(facts.current_manifest.as_deref(), &next_plan).is_err()
-    {
-        return RefreshAcceptance::Refused(SessionChangeError::InvalidParams {
-            field: "plan.compaction_item".into(),
-            message: "the session's compaction provider, preset and params are fixed for its life"
-                .into(),
-        });
+    match (
+        session_change::compaction_item_change(facts.latest_manifest(), &next_plan),
+        &facts.enrollment,
+    ) {
+        (Ok(session_change::CompactionItemChange::Same), _) => {}
+        // Only the new storage moves a session onto the compaction contract, at the run that
+        // applies this refresh; the state that move needs is checked again here, where the
+        // refresh is written, as the serve layer's preflight checked it before the fetch.
+        (Ok(session_change::CompactionItemChange::Added), Some(enrollment)) => {
+            if let Err(refusal) = broca_session_loop::enroll::check(
+                enrollment.window_whole,
+                enrollment.carries_global_system,
+                !manifest.system_text.is_empty(),
+            ) {
+                return RefreshAcceptance::Refused(SessionChangeError::CompactionNotAddable(
+                    refusal,
+                ));
+            }
+        }
+        _ => {
+            return RefreshAcceptance::Refused(SessionChangeError::InvalidParams {
+                field: "plan.compaction_item".into(),
+                message:
+                    "the session's compaction provider, preset and params are fixed for its life"
+                        .into(),
+            });
+        }
     }
     if let Some(surface) =
         session_change::unsupported_surface(facts.current_manifest.as_deref(), manifest, policy)
@@ -531,5 +582,175 @@ mod tests {
         assert!(later_send_plan(Some("a"), Some((Some("b"), Some("c"))), "c").is_ok());
         assert!(later_send_plan(Some("a"), Some((Some("b"), Some("c"))), "b").is_ok());
         assert!(later_send_plan(Some("a"), Some((Some("b"), Some("c"))), "a").is_err());
+    }
+
+    /// [`manifest`] whose plan names `item` as its compaction item, or none.
+    fn with_item(
+        identity: &str,
+        system_text: &str,
+        item: Option<serde_json::Value>,
+    ) -> PlanManifest {
+        let mut manifest = manifest(identity, &[], system_text);
+        let mut plan: serde_json::Value =
+            serde_json::from_str(manifest.plan.as_json_text()).unwrap();
+        plan["compaction_item"] = item.unwrap_or(serde_json::Value::Null);
+        manifest.plan = broca_wal::OpaqueJson::from_json_text(plan.to_string()).unwrap();
+        manifest
+    }
+
+    /// Only a session in the new storage takes a refresh that adds a compaction provider, and
+    /// only while it can enroll; every other change to the item is refused with today's bytes, on
+    /// either storage, against the latest accepted plan: the pending one once there is one.
+    #[test]
+    fn only_the_new_storage_adds_a_compaction_provider_and_only_when_it_can_enroll() {
+        use broca_session_loop::enroll::Refusal;
+        let item = serde_json::json!({"provider": "ck-mc", "preset": "head", "params": {}});
+        let fixed = SessionChangeError::InvalidParams {
+            field: "plan.compaction_item".into(),
+            message: "the session's compaction provider, preset and params are fixed for its life"
+                .into(),
+        };
+        let not_addable =
+            |refusal| RefreshAcceptance::Refused(SessionChangeError::CompactionNotAddable(refusal));
+        let accepted =
+            |acceptance: RefreshAcceptance| matches!(acceptance, RefreshAcceptance::Accept { .. });
+        let adding = with_item("adding", "text", Some(item.clone()));
+        let today = ChangeFacts {
+            current_manifest: Some(Arc::new(with_item("old", "text", None))),
+            ..ChangeFacts::default()
+        };
+        assert_eq!(
+            accept_refresh(&today, 1, "immediately", &adding, false),
+            RefreshAcceptance::Refused(fixed.clone())
+        );
+        let store = ChangeFacts {
+            enrollment: Some(EnrollmentFacts {
+                window_whole: true,
+                carries_global_system: true,
+                session_model: None,
+            }),
+            ..today.clone()
+        };
+        assert!(accepted(accept_refresh(
+            &store,
+            1,
+            "immediately",
+            &adding,
+            false
+        )));
+        let mut cut = store.clone();
+        cut.enrollment.as_mut().unwrap().window_whole = false;
+        assert_eq!(
+            accept_refresh(&cut, 1, "immediately", &adding, false),
+            not_addable(Refusal::WindowNotWhole)
+        );
+        let silent = with_item("silent", "", Some(item.clone()));
+        assert_eq!(
+            accept_refresh(&store, 1, "immediately", &silent, false),
+            not_addable(Refusal::NoSystemText)
+        );
+        let mut quiet = store.clone();
+        quiet.enrollment.as_mut().unwrap().carries_global_system = false;
+        assert!(accepted(accept_refresh(
+            &quiet,
+            1,
+            "immediately",
+            &silent,
+            false
+        )));
+        let pending = ChangeFacts {
+            accepted_generation: 1,
+            pending: Some(PendingState {
+                generation: 1,
+                policy: "immediately".into(),
+                manifest: Arc::new(adding.clone()),
+            }),
+            ..store.clone()
+        };
+        let again = with_item("again", "text", Some(item.clone()));
+        assert!(accepted(accept_refresh(
+            &pending,
+            2,
+            "immediately",
+            &again,
+            false
+        )));
+        let mut other = item.clone();
+        other["preset"] = serde_json::json!("worker");
+        for next in [
+            with_item("removed", "text", None),
+            with_item("changed", "text", Some(other)),
+        ] {
+            assert_eq!(
+                accept_refresh(&pending, 2, "immediately", &next, false),
+                RefreshAcceptance::Refused(fixed.clone())
+            );
+            let today_pending = ChangeFacts {
+                enrollment: None,
+                ..pending.clone()
+            };
+            assert_eq!(
+                accept_refresh(&today_pending, 2, "immediately", &next, false),
+                RefreshAcceptance::Refused(fixed.clone())
+            );
+        }
+    }
+
+    /// The three reasons a session that could gain a compaction provider refuses one, as the
+    /// wire carries them: `invalid_params` on `plan.compaction_item`, with a stable reason.
+    #[test]
+    fn the_refusals_of_an_added_compaction_provider_name_their_reason() {
+        use broca_session_loop::enroll::Refusal;
+        for (refusal, detail, message) in [
+            (
+                Refusal::NoContextLimit,
+                r#"{"field":"plan.compaction_item","reason":"no_context_limit"}"#,
+                "a compaction provider can't be added: no context limit resolves for the plan's model",
+            ),
+            (
+                Refusal::NoSystemText,
+                r#"{"field":"plan.compaction_item","reason":"no_system_text"}"#,
+                "a compaction provider can't be added by a plan without system text: the session's earlier runs carried a system prompt",
+            ),
+            (
+                Refusal::WindowNotWhole,
+                r#"{"field":"plan.compaction_item","reason":"window_not_whole"}"#,
+                "a compaction provider can't be added: the session's history was cut or sealed, or a window change is pending",
+            ),
+        ] {
+            let error = SessionChangeError::CompactionNotAddable(refusal);
+            assert_eq!(error.code(), "invalid_params");
+            assert!(!error.retryable());
+            assert_eq!(
+                serde_json::to_string(&crate::serve::compaction_not_addable_detail(refusal))
+                    .unwrap(),
+                detail
+            );
+            assert_eq!(refusal.message(), message);
+        }
+    }
+
+    /// A resolved limit accepts the add; a resolution that gives none refuses it
+    /// `no_context_limit`; one that couldn't run refuses it transiently with its cause, never as
+    /// `no_context_limit`. Nothing a send names enters: the outcome depends on resolution alone.
+    #[test]
+    fn an_added_compaction_provider_needs_a_resolved_context_limit() {
+        use crate::serve::context_limit_outcome;
+        let model = cortexkit_role_llm_runner::head_selection::PlanModel::new("anthropic", "m");
+        assert_eq!(context_limit_outcome(Ok(Some(200_000)), &model), Ok(()));
+        assert_eq!(
+            context_limit_outcome(Ok(None), &model),
+            Err(SessionChangeError::CompactionNotAddable(
+                broca_session_loop::enroll::Refusal::NoContextLimit
+            ))
+        );
+        let unresolved = context_limit_outcome(Err("no catalog".into()), &model).unwrap_err();
+        assert_eq!(
+            unresolved,
+            SessionChangeError::Transient(
+                "the context limit of anthropic/m couldn't be resolved: no catalog".into()
+            )
+        );
+        assert!(unresolved.retryable());
     }
 }

@@ -981,7 +981,10 @@ message! {
     pub struct EnrollmentOverlayRef {
         1 req log: crate::codec::Id128,
         2 req generation: crate::codec::Id128,
-        /// The seq the first record of the enrolling run's start batch took.
+        /// The seq the session's next record would take when the object was written, which the
+        /// enrolling run's start batch then takes unless another record came first. It keeps the
+        /// object's name apart from every other enrollment object the session could write: a
+        /// later one is written at a later seq, unless no batch named this one.
         3 req seq: u64,
     }
 }

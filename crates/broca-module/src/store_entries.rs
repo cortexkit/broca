@@ -62,16 +62,12 @@ fn transcript_len<B: SessionBackend>(session: &Session<B>) -> u64 {
     crate::store_read::transcript_len(session)
 }
 
-/// Whether the session is on the current compaction contract: its first run froze a compaction
-/// plan version. Today's storage decides it the same way from a log's first run start
-/// (`broca_core::is_mode3_log`). A session with no run yet isn't.
+/// Whether the session is on the current compaction contract (`Operations::on_contract`): its
+/// latest run started under a compaction plan version, as every run of a session created on it
+/// does, and as every run does from the one that moved a session onto it. A session with no run
+/// yet isn't.
 pub fn on_contract<B: SessionBackend>(session: &Session<B>) -> bool {
-    session
-        .operations
-        .owner
-        .first_start
-        .as_ref()
-        .is_some_and(|start| start.compaction_plan_version.is_some())
+    session.operations.on_contract()
 }
 
 /// The compaction provider in force: the one the plan of the session's latest run names, or,
@@ -287,7 +283,7 @@ fn project(stored: &StoredEntry) -> Result<Entry, String> {
 
 /// Every compaction entry of the session, oldest first: what a view is checked against.
 pub async fn all_entries<B: SessionBackend>(session: &Session<B>) -> Result<Vec<Entry>, String> {
-    crate::store_read::served_entries(session, 1, usize::MAX)
+    crate::store_read::served_compaction_entries(session, 1, usize::MAX)
         .await
         .map_err(|error| format!("{error:?}"))?
         .iter()
@@ -318,7 +314,7 @@ pub async fn entries_page<B: SessionBackend>(
         ),
         _ => (1, usize::MAX),
     };
-    let stored = crate::store_read::served_entries(session, from, count)
+    let stored = crate::store_read::served_compaction_entries(session, from, count)
         .await
         .map_err(|error| format!("{error:?}"))?;
     let entries = stored.iter().map(project).collect::<Result<Vec<_>, _>>()?;
@@ -326,7 +322,7 @@ pub async fn entries_page<B: SessionBackend>(
         Some(last) if last.ordinal >= len => Some(cursor(last)),
         _ if len == 0 => None,
         _ => {
-            let last = crate::store_read::served_entries(session, len, 1)
+            let last = crate::store_read::served_compaction_entries(session, len, 1)
                 .await
                 .map_err(|error| format!("{error:?}"))?;
             last.first().map(project).transpose()?.as_ref().map(cursor)

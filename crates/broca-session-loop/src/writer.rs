@@ -73,6 +73,20 @@ pub trait Writer {
         call_key: &str,
     ) -> Result<Option<broca_session_store::record::ToolIntent>, SessionError>;
 
+    /// What the session's enrollment in the current compaction contract decided about the
+    /// messages placed before it, or `None` for a session that never enrolled (see
+    /// `Session::enrollment`). Damage when the session names decisions it can't read.
+    async fn enrollment(
+        &self,
+    ) -> Result<Option<broca_session_store::session::EnrollmentOverlay>, SessionError>;
+
+    /// Stores an enrollment's decisions, durable before this returns, for the batch about to be
+    /// appended to name in its `CompactionEnrolled` record (see `Session::put_enrollment`).
+    async fn put_enrollment(
+        &mut self,
+        entries: &broca_session_store::record::EnrolledEntries,
+    ) -> Result<broca_session_store::record::EnrollmentOverlayRef, SessionError>;
+
     /// Seals the session's history before the entry with ordinal `ordinal`, starting the new
     /// open log with `carry` (see `Session::seal_at_entry`).
     async fn seal_at_entry(
@@ -191,6 +205,19 @@ impl<B: SessionBackend> Writer for Session<B> {
 
     async fn open_log_records(&self) -> Result<Vec<(u64, Record)>, SessionError> {
         Session::open_log_records(self).await
+    }
+
+    async fn enrollment(
+        &self,
+    ) -> Result<Option<broca_session_store::session::EnrollmentOverlay>, SessionError> {
+        Session::enrollment(self).await
+    }
+
+    async fn put_enrollment(
+        &mut self,
+        entries: &broca_session_store::record::EnrolledEntries,
+    ) -> Result<broca_session_store::record::EnrollmentOverlayRef, SessionError> {
+        Session::put_enrollment(self, entries).await
     }
 
     async fn seal_at_entry(

@@ -424,6 +424,17 @@ pub fn invert(records: &[Record], parts: &BTreeMap<Digest, Vec<u8>>) -> Result<V
                 }
                 pending.push(record);
             }
+            // A session moves onto the current compaction contract partway through its life only
+            // on the new storage. Today's storage keeps one layout for a log's whole life, and its
+            // compaction code reads a log only when every run is on the contract, so such a
+            // session has no form there.
+            Record::CompactionEnrolled(_) => {
+                return Err(
+                    "the session enrolled in the current compaction contract on the new \
+                     storage, which today's storage can't hold"
+                        .into(),
+                );
+            }
             Record::Compaction(compaction) => {
                 unclaimed(&pending, "a compaction boundary")?;
                 let mut object = members(Some(&compaction.body))?;

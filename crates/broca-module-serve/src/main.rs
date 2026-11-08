@@ -5232,6 +5232,40 @@ mod executor {
             )
         }
 
+        /// The limit a fresh run's resolution freezes (`broca_catalog::live::episode_context_limit`,
+        /// the function that resolution fills `ProviderResolution::context_limit` from), with the
+        /// run's endpoint and the wire family its auth method implies. The method is read from
+        /// configuration alone, as `check_plan_selection` reads it: a refresh must never choose an
+        /// account, read a credential or retire a connection. A send's own `context_limit` would
+        /// win at the run, but a refresh carries none and no later send has to name one, so a
+        /// refresh is checked against what the run resolves by itself.
+        async fn compaction_context_limit(
+            &self,
+            model: &cortexkit_role_llm_runner::head_selection::PlanModel,
+        ) -> Result<Option<u64>, String> {
+            let method = self
+                .vault
+                .as_ref()
+                .filter(|_| self.provider_base_url.is_none())
+                .map(|vault| {
+                    broca_module_serve::auth_routing::resolve_credential_id(
+                        &model.provider,
+                        None,
+                        None,
+                        &vault.methods,
+                        FALLBACK_METHOD,
+                    )
+                    .method
+                });
+            broca_catalog::live::episode_context_limit(
+                &format!("{}/{}", model.provider, model.model),
+                self.provider_base_url.as_deref(),
+                method.and_then(family_for_method),
+                model.variant.as_deref(),
+            )
+            .map_err(|error| error.to_string())
+        }
+
         async fn check_plan_selection(
             &self,
             plan: &serde_json::Value,

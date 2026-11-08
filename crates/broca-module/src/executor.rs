@@ -147,6 +147,20 @@ pub trait RunExecutor: Send + Sync + 'static {
         )
     }
 
+    /// The context limit a fresh run of `model` would freeze, resolved as the run resolves it
+    /// but without choosing an account, reading a credential or touching a connection: what a
+    /// plan refresh that adds a compaction provider is checked against, since a run on the
+    /// compaction contract can't run without one. A send may name its own `context_limit`, which
+    /// a run prefers, but a refresh carries none and a later send may not, so only the resolved
+    /// limit counts here. `Ok(None)` when resolution gives none (an opaque endpoint); `Err` when
+    /// it couldn't run, with its cause. A runner that can't resolve models answers `Err`.
+    async fn compaction_context_limit(
+        &self,
+        _model: &cortexkit_role_llm_runner::head_selection::PlanModel,
+    ) -> Result<Option<u64>, String> {
+        Err("this runner can't resolve a model's context limit".into())
+    }
+
     /// Validate the abstract level before a send can enter the durable queue.
     fn check_service_tier(
         &self,

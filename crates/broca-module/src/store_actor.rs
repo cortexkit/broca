@@ -1106,9 +1106,11 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             compaction_plane: self.executor.compaction_plane(),
             compaction_session: Some(Arc::clone(&self.compaction_session)),
             display_sent_by: sent_by,
-            // By the rule today's actor applies: a new log whose plan names a compaction
-            // provider starts on the compaction contract; an existing log keeps its own mode.
-            new_log_compaction_plan_version: crate::plan_episode::new_log_compaction_plan_version(
+            // The version the run's plan asks for. The loop decides the session's mode from it
+            // and the session's latest run: a session on the compaction contract stays on it,
+            // and one that ran outside it moves onto it at the first run whose plan names a
+            // compaction provider (`broca_session_loop::admit::session_contract`).
+            new_log_compaction_plan_version: crate::plan_episode::plan_compaction_version(
                 manifest.as_deref(),
             ),
             manifest,

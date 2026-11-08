@@ -5981,7 +5981,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             // compaction keep the established log layout. An existing log keeps the mode its
             // first run recorded: the run loop reads that before looking at this field, so a
             // legacy session is never upgraded here.
-            new_log_compaction_plan_version: crate::plan_episode::new_log_compaction_plan_version(
+            new_log_compaction_plan_version: crate::plan_episode::plan_compaction_version(
                 manifest.as_deref(),
             ),
             emit_display_context: true,

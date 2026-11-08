@@ -2024,6 +2024,19 @@ impl Writer for Recording<'_, '_> {
         self.session.open_log_records().await
     }
 
+    async fn enrollment(
+        &self,
+    ) -> Result<Option<broca_session_store::session::EnrollmentOverlay>, SessionError> {
+        Writer::enrollment(&*self.session).await
+    }
+
+    async fn put_enrollment(
+        &mut self,
+        entries: &broca_session_store::record::EnrolledEntries,
+    ) -> Result<broca_session_store::record::EnrollmentOverlayRef, SessionError> {
+        Writer::put_enrollment(&mut *self.session, entries).await
+    }
+
     async fn run_start(
         &self,
         run_id: &str,
@@ -7172,4 +7185,905 @@ async fn a_refusal_schedule_carries_into_the_next_run() {
         ),
     )
     .await;
+}
+
+// A session that ran outside the current compaction contract gains a compaction provider at
+// the first run whose plan names one: that run enrolls it, on its existing conversation, with
+// its message ids unchanged. These drive the new loop alone, since today's storage can't enroll
+// a session; each request is checked against what today's compaction code renders from the
+// entries the session serves.
+
+/// The context limit a run under a plan naming a compaction provider freezes here.
+const ENROLLED_LIMIT: u64 = 200_000;
+
+/// The system text the enrolling plan renders above the conversation.
+const ENROLLED_SYSTEM: &str = "You compact.";
+
+/// One run of an enrollment scenario: its id, its input, the plan it freezes and what the
+/// provider answers its steps.
+struct EnrollRun {
+    id: &'static str,
+    input: Vec<Message>,
+    manifest: Option<Arc<broca_wal::PlanManifest>>,
+    steps: Vec<Vec<NormalizedEvent>>,
+    /// The context limit a run under a plan naming a compaction provider freezes, when not
+    /// [`ENROLLED_LIMIT`].
+    limit: Option<u64>,
+}
+
+fn enrollment_tools() -> Vec<Tool> {
+    vec![
+        tool("read", ExecutionMode::Parallel),
+        tool("rows", ExecutionMode::Parallel),
+        tool("big", ExecutionMode::Parallel),
+    ]
+}
+
+/// The tool plane: `read` answers text, `rows` answers JSON.
+fn enrollment_plane() -> Spy {
+    Spy::new(
+        StubToolPlane::new()
+            .with_canned_text("read", "file contents")
+            .with_canned_text("rows", r#"{"rows": 2}"#),
+    )
+}
+
+/// A plan naming a compaction provider, with its own system text.
+fn enrolling_manifest() -> Arc<broca_wal::PlanManifest> {
+    let mut manifest = compacted_manifest(&enrollment_tools()).as_ref().clone();
+    manifest.system_text = ENROLLED_SYSTEM.into();
+    manifest.plan_identity = "plan-compacted".into();
+    Arc::new(manifest)
+}
+
+/// A plan with no compaction provider that renders part numbers into the model's view.
+fn tagging_manifest() -> Arc<broca_wal::PlanManifest> {
+    let mut manifest = planned_manifest(&enrollment_tools()).as_ref().clone();
+    manifest.plan = broca_wal::OpaqueJson::from_json_text(
+        json!({"tool_items": [{"provider": "provider"}], "render_tags": true}).to_string(),
+    )
+    .unwrap();
+    Arc::new(manifest)
+}
+
+fn enrollment_addr() -> SessionAddr {
+    SessionAddr("0123456789abcdef".into())
+}
+
+fn enrollment_triple() -> SessionTriple {
+    SessionTriple {
+        project_root: "/project".into(),
+        harness: "differential".into(),
+        session: "s1".into(),
+    }
+}
+
+fn enrollment_key() -> DeploymentKey {
+    DeploymentKey::new(1, &[7; 32])
+}
+
+async fn enrollment_session(backend: &MemoryBackend) -> Session<&MemoryBackend> {
+    Session::create(
+        backend,
+        enrollment_addr(),
+        enrollment_triple(),
+        &enrollment_key(),
+        false,
+    )
+    .await
+    .unwrap()
+}
+
+/// Runs `this` on `session` through the new loop, as the module runs a new run: admitted by the
+/// shared rules from its request and run control, with `plane` as the compaction provider. A run
+/// whose plan names a compaction provider asks for the current plan version and freezes a
+/// context limit, as the store actor gives it. The requests the run sent.
+async fn enroll_run(
+    session: &mut Session<&MemoryBackend>,
+    parts: &mut MemoryParts,
+    plane: &dyn broca_core::CompactionPlane,
+    this: &EnrollRun,
+) -> Result<Vec<CallOptions>, broca_session_loop::LoopError> {
+    let provider = ScriptedProvider::new(this.steps.clone());
+    let finished = enroll_run_with(session, parts, plane, this, &provider).await?;
+    assert!(finished.paused.is_none());
+    Ok(sent_requests(&provider))
+}
+
+async fn enroll_run_with(
+    session: &mut Session<&MemoryBackend>,
+    parts: &mut MemoryParts,
+    plane: &dyn broca_core::CompactionPlane,
+    this: &EnrollRun,
+    provider: &ScriptedProvider,
+) -> Result<broca_session_loop::Finished, broca_session_loop::LoopError> {
+    let compacted = this
+        .manifest
+        .as_deref()
+        .is_some_and(broca_core::compaction::has_compaction);
+    let scenario = Scenario {
+        input: this.input.clone(),
+        tools: enrollment_tools(),
+        stop_when: Vec::new(),
+        manifest: this.manifest.clone(),
+        steps: Vec::new(),
+    };
+    let mut request = scenario.plain_request_for(this.id, &this.input);
+    let control = RunControl {
+        manifest: this.manifest.clone(),
+        new_log_compaction_plan_version: compacted
+            .then_some(cortexkit_compaction_view::PLAN_VERSION),
+        admitted_context_limit: compacted.then_some(this.limit.unwrap_or(ENROLLED_LIMIT)),
+        ..Default::default()
+    };
+    request.context_limit = control.admitted_context_limit;
+    let admission = broca_session_loop::admit::admission(
+        &mut request,
+        &control,
+        provider,
+        &session.operations,
+        Some(1),
+    )
+    .map_err(broca_session_loop::LoopError::Refused)?;
+    let tools = enrollment_plane();
+    let lifecycle = tools.lifecycle();
+    let bind = bind();
+    let now = harness_now;
+    let seams = Seams {
+        provider,
+        tools: &tools,
+        bind: bind.clone(),
+        out: None,
+        cancel: CancellationToken::new(),
+        stop: Default::default(),
+        held: Some(&*lifecycle),
+        approval: &HarnessPolicy,
+        hook_plane: None,
+        now_ms: &now,
+        session_address: Some(broca_core::wal_writer::session_addr(&bind)),
+        compaction_plane: Some(plane),
+        compaction_session: None,
+        compaction_changes: false,
+        keep_warm: None,
+        account_reports: None,
+        max_same_account_wait: Default::default(),
+        auth_selection: None,
+        step_progress: None,
+    };
+    let mut writer = Recording {
+        session,
+        records: Vec::new(),
+        injected: Default::default(),
+        ended: Default::default(),
+        media: Default::default(),
+    };
+    // The run's future is large; kept on the heap, a test thread's stack holds it.
+    Box::pin(async { through!(writer, |w| run(w, parts, admission, &seams).await) }).await
+}
+
+/// Resumes `session`'s latest run through the new loop, with `plane` as its compaction
+/// provider and `steps` as what the provider answers.
+async fn enroll_resume(
+    session: &mut Session<&MemoryBackend>,
+    parts: &MemoryParts,
+    plane: &dyn broca_core::CompactionPlane,
+    steps: Vec<Vec<NormalizedEvent>>,
+) -> broca_session_loop::Finished {
+    let provider = ScriptedProvider::new(steps);
+    let tools = enrollment_plane();
+    let lifecycle = tools.lifecycle();
+    let bind = bind();
+    let now = harness_now;
+    let seams = Seams {
+        provider: &provider,
+        tools: &tools,
+        bind: bind.clone(),
+        out: None,
+        cancel: CancellationToken::new(),
+        stop: Default::default(),
+        held: Some(&*lifecycle),
+        approval: &HarnessPolicy,
+        hook_plane: None,
+        now_ms: &now,
+        session_address: Some(broca_core::wal_writer::session_addr(&bind)),
+        compaction_plane: Some(plane),
+        compaction_session: None,
+        compaction_changes: false,
+        keep_warm: None,
+        account_reports: None,
+        max_same_account_wait: Default::default(),
+        auth_selection: None,
+        step_progress: None,
+    };
+    let mut writer = Recording {
+        session,
+        records: Vec::new(),
+        injected: Default::default(),
+        ended: Default::default(),
+        media: Default::default(),
+    };
+    Box::pin(async { through!(writer, |w| resume(w, parts, &seams).await) })
+        .await
+        .expect("the run resumes")
+}
+
+/// Three runs outside the compaction contract: system text, a tool call answered with text, and
+/// one run that renders part numbers and calls a tool answered with JSON. A later run outside the
+/// contract doesn't repeat the session's system text (`fresh_start::append_system_messages`).
+fn earlier_runs() -> Vec<EnrollRun> {
+    vec![
+        EnrollRun {
+            id: "r1",
+            input: vec![system("You are terse."), user("read a")],
+            manifest: None,
+            steps: vec![
+                answer(
+                    "a1",
+                    vec![call("c1", "read", json!({}))],
+                    FinishReason::ToolCalls,
+                ),
+                text_step("a2", "done with a"),
+            ],
+            limit: None,
+        },
+        EnrollRun {
+            id: "r2",
+            input: vec![user("count the rows")],
+            manifest: Some(tagging_manifest()),
+            steps: vec![
+                answer(
+                    "a3",
+                    vec![call("c2", "rows", json!({}))],
+                    FinishReason::ToolCalls,
+                ),
+                text_step("a4", "two rows"),
+            ],
+            limit: None,
+        },
+        EnrollRun {
+            id: "r3",
+            input: vec![user("summarize")],
+            manifest: None,
+            steps: vec![text_step("a5", "a summary")],
+            limit: None,
+        },
+    ]
+}
+
+/// The enrolling run: its plan names a compaction provider.
+fn enrolling_run(steps: Vec<Vec<NormalizedEvent>>) -> EnrollRun {
+    EnrollRun {
+        id: "r4",
+        input: vec![user("go on")],
+        manifest: Some(enrolling_manifest()),
+        steps,
+        limit: None,
+    }
+}
+
+/// The text of a message's text blocks, joined.
+fn text_of(message: &Message) -> String {
+    message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+/// Every part number the projected entries show, in entry order, each once.
+fn shown_tags(entries: &[cortexkit_role_compaction::read::Entry]) -> Vec<u64> {
+    let mut seen = std::collections::BTreeSet::new();
+    entries
+        .iter()
+        .flat_map(|entry| entry.parts.iter().filter_map(|part| part.tag))
+        .filter(|tag| seen.insert(*tag))
+        .collect()
+}
+
+/// The session's entries as `session.entries` serves them, projected.
+async fn served_entries(
+    session: &Session<&MemoryBackend>,
+) -> Vec<cortexkit_role_compaction::read::Entry> {
+    session
+        .compaction_entries(1, usize::MAX)
+        .await
+        .unwrap()
+        .iter()
+        .map(broca_session_loop::entries::project)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
+
+/// The enrolling run, after three runs outside the contract:
+/// - Setup is sent with no applied view and no earlier request to compare with, carrying the
+///   prompt size the last step before the move reported;
+/// - the entries cover every earlier message but the suppressed global system messages, each
+///   with a time, numbered in the projection's numbering from the highest number an earlier
+///   request showed, contiguous and never repeating, the run's own after the enrollment's last;
+/// - the JSON tool result's run shows that numbering split from the runner's;
+/// - the request carries the plan's system text, not the session's;
+/// - ids and every earlier `session.read` are unchanged, and a pre-enrollment id still reads.
+#[tokio::test]
+async fn an_enrolled_session_serves_and_renders_its_history_on_the_contract() {
+    with_each_writer(|| async {
+        let backend = MemoryBackend::default();
+        let mut session = enrollment_session(&backend).await;
+        let mut parts = MemoryParts::default();
+        let spy = CompactionSpy::new(&CompactionScript {
+            context_limit: ENROLLED_LIMIT,
+            rides: Vec::new(),
+        });
+        for earlier in earlier_runs() {
+            enroll_run(&mut session, &mut parts, &spy, &earlier)
+                .await
+                .expect("an earlier run");
+        }
+        assert!(spy.calls().is_empty(), "no compaction call before the move");
+        assert!(!session.operations.on_contract());
+        let read_before = session.entries(1, usize::MAX).await.unwrap();
+        let through = session.conversation.placed;
+        let requests = enroll_run(
+            &mut session,
+            &mut parts,
+            &spy,
+            &enrolling_run(vec![text_step("a6", "going on")]),
+        )
+        .await
+        .expect("the enrolling run");
+
+        let enrolled = session.operations.enrolled.clone().expect("enrolled");
+        assert!(session.operations.on_contract());
+        assert_eq!(enrolled.run_id, "r4");
+        assert_eq!(enrolled.through_ordinal, through);
+        assert!(enrolled.tag_floor > 0, "the tagging run showed numbers");
+        assert!(enrolled.tag_high > enrolled.tag_floor);
+
+        // Setup first, with nothing applied. The newest request before the move was outside
+        // the contract, so the first ride compares with none: the run would otherwise fail for
+        // want of that request's context.
+        let calls = spy.calls();
+        assert!(calls[0].starts_with("compaction.setup "), "{calls:?}");
+        assert!(!calls[0].contains("applied_view"), "{}", calls[0]);
+        // The step before the move reported a 100-token prompt, which stands for the fill.
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.contains("\"last_prompt_tokens\":100")),
+            "{calls:?}"
+        );
+
+        // The entries: every earlier message but the global system messages, with times.
+        let raw = session.entries(1, usize::MAX).await.unwrap();
+        let globals: Vec<u64> = raw
+            .iter()
+            .filter(|entry| broca_core::compaction_v2::systems::is_global(&entry.message))
+            .map(|entry| entry.ordinal)
+            .collect();
+        assert_eq!(globals, vec![1], "the first run's system text");
+        assert!(globals.iter().all(|ordinal| *ordinal <= through));
+        let served_stored = session.compaction_entries(1, usize::MAX).await.unwrap();
+        let served_ordinals: Vec<u64> = served_stored.iter().map(|entry| entry.ordinal).collect();
+        let expected_ordinals: Vec<u64> = raw
+            .iter()
+            .map(|entry| entry.ordinal)
+            .filter(|ordinal| !globals.contains(ordinal))
+            .collect();
+        assert_eq!(served_ordinals, expected_ordinals);
+        // The projection's numbering, from the floor, a tool-results message taking none.
+        let mut high = enrolled.tag_floor;
+        for entry in served_stored
+            .iter()
+            .filter(|entry| entry.ordinal <= through)
+        {
+            let facts = entry.state.facts.as_ref().unwrap();
+            assert_eq!(facts.tag_base, high, "message {}", entry.ordinal);
+            assert!(facts.written_at_ms.is_some_and(|at| at > 0));
+            high += broca_core::compaction_v2::metadata::numbered_parts(&entry.message);
+        }
+        assert_eq!(high, enrolled.tag_high);
+        let entries = served_entries(&session).await;
+        let earlier: Vec<_> = entries
+            .iter()
+            .filter(|entry| entry.ordinal <= through)
+            .cloned()
+            .collect();
+        let later: Vec<_> = entries
+            .iter()
+            .filter(|entry| entry.ordinal > through)
+            .cloned()
+            .collect();
+        assert_eq!(
+            shown_tags(&earlier),
+            (enrolled.tag_floor + 1..=enrolled.tag_high).collect::<Vec<_>>()
+        );
+        let own = shown_tags(&later);
+        assert!(!own.is_empty());
+        assert_eq!(
+            own,
+            (enrolled.tag_high + 1..=enrolled.tag_high + own.len() as u64).collect::<Vec<_>>()
+        );
+        // The run that rendered numbers numbered its JSON tool result its own way: the runner's
+        // numbering and the projection's split there.
+        let r2: Vec<(u64, u64)> = served_stored
+            .iter()
+            .filter_map(|entry| {
+                let facts = entry.state.facts.as_ref()?;
+                (facts.run_id.as_deref() == Some("r2")).then_some(())?;
+                Some((facts.tag_base, facts.runner_tag_base?))
+            })
+            .collect();
+        let raw_r2: Vec<(u64, u64)> = raw
+            .iter()
+            .filter_map(|entry| {
+                let facts = entry.state.facts.as_ref()?;
+                (facts.run_id.as_deref() == Some("r2")).then_some(())?;
+                Some((facts.tag_base, facts.runner_tag_base?))
+            })
+            .collect();
+        assert!(r2.len() >= 3, "{r2:?}");
+        let gaps: std::collections::BTreeSet<i64> = r2
+            .iter()
+            .map(|(served, runner)| *served as i64 - *runner as i64)
+            .collect();
+        assert!(
+            gaps.len() > 1,
+            "the JSON result splits the numberings: {r2:?}"
+        );
+        assert!(raw_r2.iter().all(|(stored, _)| *stored == 0), "{raw_r2:?}");
+
+        // The request: the plan's system text above the conversation, and no earlier global
+        // system message.
+        let request = &requests[0];
+        assert_eq!(request.prompt[0].role, Role::System);
+        assert_eq!(text_of(&request.prompt[0]), ENROLLED_SYSTEM);
+        assert!(request.prompt[1..]
+            .iter()
+            .all(|message| !broca_core::compaction_v2::systems::is_global(message)));
+        assert!(request
+            .prompt
+            .iter()
+            .all(|message| !text_of(message).contains("You are terse.")));
+        let texts: Vec<String> = request.prompt.iter().map(text_of).collect();
+        for expected in ["read a", "count the rows", "summarize", "go on"] {
+            assert!(
+                texts.iter().any(|text| text.contains(expected)),
+                "{expected} in {texts:?}"
+            );
+        }
+
+        // Ids and reads of the earlier messages are unchanged, and a pre-enrollment id reads.
+        assert_eq!(&raw[..read_before.len()], &read_before[..]);
+        let first_user = &read_before[1];
+        let mid = &first_user.state.facts.as_ref().unwrap().mid;
+        let by_id = session
+            .entry_by_mid(mid)
+            .await
+            .unwrap()
+            .expect("found by id");
+        assert_eq!(by_id.message, first_user.message);
+        let global_mid = &read_before[0].state.facts.as_ref().unwrap().mid;
+        assert_eq!(session.entry_by_mid(global_mid).await.unwrap(), None);
+    })
+    .await;
+}
+
+/// A view the compaction provider hands over on the enrolling run, which cuts through history
+/// before the enrollment point and drops the run's own big call, applies to the enrolled
+/// session's entries, and its cut seals history through the enrollment point. Reloaded, the
+/// session serves the same entries, sealed reads and numbers.
+#[tokio::test]
+async fn a_cut_and_a_view_on_the_enrolling_run_seal_through_the_enrollment_and_reload() {
+    with_each_writer(|| async {
+        let backend = MemoryBackend::default();
+        let mut session = enrollment_session(&backend).await;
+        let mut parts = MemoryParts::default();
+        let quiet = CompactionSpy::new(&CompactionScript {
+            context_limit: ENROLLED_LIMIT,
+            rides: Vec::new(),
+        });
+        for earlier in earlier_runs() {
+            enroll_run(&mut session, &mut parts, &quiet, &earlier)
+                .await
+                .expect("an earlier run");
+        }
+        let read_before = session.entries(1, usize::MAX).await.unwrap();
+        let ordinal_of = |text: &str| {
+            read_before
+                .iter()
+                .find(|entry| text_of(&entry.message) == text)
+                .map(|entry| entry.ordinal)
+                .unwrap()
+        };
+        let cut = ordinal_of("done with a");
+        // The enrolling run's big tool result puts its second request over the window; the
+        // provider answers the ride with a view that cuts through an earlier message and drops
+        // the big call, and the step renders from it.
+        let big_call = session.conversation.placed + 2;
+        let spy = CompactionSpy::new(&CompactionScript {
+            context_limit: 1_200,
+            rides: vec![Ride::CutAndDrop(cut, big_call)],
+        });
+        let mut enrolling = enrolling_run(vec![
+            answer(
+                "a6",
+                vec![call("c3", "big", json!({}))],
+                FinishReason::ToolCalls,
+            ),
+            text_step("a7", "done"),
+        ]);
+        enrolling.limit = Some(1_200);
+        let requests = enroll_run(&mut session, &mut parts, &spy, &enrolling)
+            .await
+            .expect("the enrolling run");
+        let enrolled = session.operations.enrolled.clone().unwrap();
+        assert!(
+            session.conversation.window_start() > 1,
+            "the cut sealed history: {:?}",
+            spy.calls()
+        );
+        assert!(session.conversation.window_start() <= enrolled.through_ordinal);
+        let texts = |request: &CallOptions| request.prompt.iter().map(text_of).collect::<Vec<_>>();
+        assert_eq!(requests.len(), 2, "{:?}", spy.calls());
+        assert!(texts(&requests[0])
+            .iter()
+            .any(|text| text.contains("read a")));
+        assert!(!texts(&requests[1])
+            .iter()
+            .any(|text| text.contains("read a")));
+        assert!(!texts(&requests[1])
+            .iter()
+            .any(|text| text.contains("done with a")));
+        assert!(texts(&requests[1])
+            .iter()
+            .any(|text| text.contains("count the rows")));
+        assert_eq!(text_of(&requests[1].prompt[0]), ENROLLED_SYSTEM);
+
+        let entries = served_entries(&session).await;
+        let sealed_mid = read_before
+            .iter()
+            .find(|entry| entry.ordinal == cut)
+            .and_then(|entry| entry.state.facts.as_ref())
+            .map(|facts| facts.mid.clone())
+            .unwrap();
+        let sealed = session.entry_by_mid(&sealed_mid).await.unwrap().unwrap();
+        let loaded = Session::load(
+            &backend,
+            enrollment_addr(),
+            &enrollment_triple(),
+            &enrollment_key(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(loaded.operations.enrolled, Some(enrolled.clone()));
+        assert_eq!(served_entries(&loaded).await, entries);
+        assert_eq!(
+            loaded.entry_by_mid(&sealed_mid).await.unwrap(),
+            Some(sealed.clone())
+        );
+        // The sealed message keeps the number the enrollment gave it.
+        let cut_tag = entries
+            .iter()
+            .find(|entry| entry.ordinal == cut)
+            .and_then(|entry| entry.parts.iter().find_map(|part| part.tag))
+            .expect("the cut message shows a number");
+        assert_eq!(sealed.state.facts.as_ref().unwrap().tag_base + 1, cut_tag);
+        // Reads of the earlier messages are as they were, sealed or not.
+        assert_eq!(
+            loaded.entries(1, read_before.len()).await.unwrap(),
+            read_before
+        );
+    })
+    .await;
+}
+
+/// A crash at any point of the enrolling run: before its start's batch is durable the session
+/// isn't enrolled and the next send enrolls it; after it, the session is enrolled once and the
+/// resumed run never renumbers.
+#[tokio::test]
+async fn a_crash_at_any_point_of_the_enrolling_run_enrolls_once_and_never_renumbers() {
+    // The run's future is large; kept on the heap, a test thread's stack holds it.
+    Box::pin(crash_at_any_point_of_the_enrolling_run()).await;
+}
+
+async fn crash_at_any_point_of_the_enrolling_run() {
+    let quiet = || {
+        CompactionSpy::new(&CompactionScript {
+            context_limit: ENROLLED_LIMIT,
+            rides: Vec::new(),
+        })
+    };
+    let steps = || {
+        vec![
+            answer(
+                "a6",
+                vec![call("c3", "read", json!({}))],
+                FinishReason::ToolCalls,
+            ),
+            text_step("a7", "done"),
+        ]
+    };
+    let prepared = || async {
+        let backend: &'static MemoryBackend = Box::leak(Box::default());
+        let mut session = enrollment_session(backend).await;
+        let mut parts = MemoryParts::default();
+        for earlier in earlier_runs() {
+            enroll_run(&mut session, &mut parts, &quiet(), &earlier)
+                .await
+                .expect("an earlier run");
+        }
+        (backend, session, parts)
+    };
+    let (_, mut reference, mut parts) = prepared().await;
+    enroll_run(
+        &mut reference,
+        &mut parts,
+        &quiet(),
+        &enrolling_run(steps()),
+    )
+    .await
+    .expect("the enrolling run");
+    let expected = reference.operations.enrolled.clone().unwrap();
+    let expected_entries = served_entries(&reference).await;
+    let earlier_tags = |entries: &[cortexkit_role_compaction::read::Entry]| {
+        entries
+            .iter()
+            .filter(|entry| entry.ordinal <= expected.through_ordinal)
+            .map(|entry| {
+                (
+                    entry.ordinal,
+                    entry.parts.iter().map(|part| part.tag).collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut crashes = 0;
+    for mutations in 0.. {
+        let (backend, mut session, mut parts) = prepared().await;
+        backend.crash_after(Some(mutations));
+        let outcome = enroll_run(&mut session, &mut parts, &quiet(), &enrolling_run(steps())).await;
+        backend.crash_after(None);
+        if outcome.is_ok() {
+            break;
+        }
+        crashes += 1;
+        drop(session);
+        let mut loaded = Session::load(
+            backend,
+            enrollment_addr(),
+            &enrollment_triple(),
+            &enrollment_key(),
+        )
+        .await
+        .unwrap();
+        let started = loaded
+            .operations
+            .run
+            .as_ref()
+            .and_then(|run| run.start.as_ref())
+            .is_some_and(|start| start.run_id == "r4");
+        assert_eq!(
+            started,
+            loaded.operations.enrolled.is_some(),
+            "after {mutations}"
+        );
+        if started {
+            let finished = loaded.operations.run.as_ref().unwrap().finished.is_some();
+            if !finished {
+                enroll_resume(&mut loaded, &parts, &quiet(), vec![text_step("a7", "done")]).await;
+            }
+        } else {
+            assert!(!loaded.operations.on_contract(), "after {mutations}");
+            enroll_run(&mut loaded, &mut parts, &quiet(), &enrolling_run(steps()))
+                .await
+                .expect("the next send enrolls");
+        }
+        let enrolled = loaded.operations.enrolled.clone().expect("enrolled once");
+        assert_eq!(
+            (
+                enrolled.through_ordinal,
+                enrolled.tag_floor,
+                enrolled.tag_high,
+                enrolled.run_id.as_str()
+            ),
+            (
+                expected.through_ordinal,
+                expected.tag_floor,
+                expected.tag_high,
+                "r4"
+            ),
+            "after {mutations}"
+        );
+        assert_eq!(
+            earlier_tags(&served_entries(&loaded).await),
+            earlier_tags(&expected_entries),
+            "after {mutations}"
+        );
+    }
+    assert!(crashes > 3, "the run crashed at several points: {crashes}");
+}
+
+/// A compaction provider whose first Setup fails: the run that asks ends unavailable.
+struct SetupFailsOnce {
+    inner: CompactionSpy,
+    failed: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait]
+impl broca_core::CompactionPlane for SetupFailsOnce {
+    async fn setup(
+        &self,
+        module: &str,
+        bind: &broca_protocol::BindIdentity,
+        scope: Option<&broca_protocol::SessionScope>,
+        request: broca_core::compaction_provider::setup::SetupRequest,
+    ) -> Result<
+        broca_core::compaction_provider::setup::SetupAnswer,
+        broca_core::CompactionUnavailable,
+    > {
+        self.inner.setup(module, bind, scope, request).await
+    }
+
+    async fn call_v2(
+        &self,
+        module: &str,
+        bind: &broca_protocol::BindIdentity,
+        scope: Option<&broca_protocol::SessionScope>,
+        method: &str,
+        params: Value,
+        deadline: u64,
+    ) -> Result<Box<serde_json::value::RawValue>, broca_core::compaction_v2::runtime::CallError>
+    {
+        if method == "compaction.setup"
+            && !self.failed.swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.inner
+                .calls
+                .lock()
+                .unwrap()
+                .push((method.into(), params));
+            return Err(broca_core::compaction_v2::runtime::CallError::Unavailable);
+        }
+        self.inner
+            .call_v2(module, bind, scope, method, params, deadline)
+            .await
+    }
+}
+
+/// A failed Setup on the enrolling run ends it `compaction_unavailable`, never in the old
+/// layout: the session stays enrolled, and the next send asks for Setup again and runs on.
+#[tokio::test]
+async fn a_failed_setup_ends_the_enrolling_run_and_the_next_send_retries_it() {
+    let backend = MemoryBackend::default();
+    let mut session = enrollment_session(&backend).await;
+    let mut parts = MemoryParts::default();
+    let plane = SetupFailsOnce {
+        inner: CompactionSpy::new(&CompactionScript {
+            context_limit: ENROLLED_LIMIT,
+            rides: Vec::new(),
+        }),
+        failed: Default::default(),
+    };
+    for earlier in earlier_runs() {
+        enroll_run(&mut session, &mut parts, &plane.inner, &earlier)
+            .await
+            .expect("an earlier run");
+    }
+    let provider = ScriptedProvider::new(vec![text_step("a6", "never sent")]);
+    let finished = enroll_run_with(
+        &mut session,
+        &mut parts,
+        &plane,
+        &enrolling_run(Vec::new()),
+        &provider,
+    )
+    .await
+    .expect("the run ends");
+    assert_eq!(finished.reason, broca_protocol::RunFinishReason::Error);
+    let ended = session
+        .open_log_records()
+        .await
+        .unwrap()
+        .into_iter()
+        .find_map(|(_, record)| match record {
+            Record::RunEnd(end) if end.run_id == "r4" => end.error,
+            _ => None,
+        })
+        .expect("the enrolling run ended with an error");
+    assert!(
+        ended.to_string().contains("compaction_unavailable"),
+        "{ended}"
+    );
+    assert!(
+        sent_requests(&provider).is_empty(),
+        "no request without Setup"
+    );
+    let enrolled = session.operations.enrolled.clone().expect("still enrolled");
+    let next = EnrollRun {
+        id: "r5",
+        input: vec![user("try again")],
+        manifest: Some(enrolling_manifest()),
+        steps: vec![text_step("a7", "back")],
+        limit: None,
+    };
+    let requests = enroll_run(&mut session, &mut parts, &plane, &next)
+        .await
+        .expect("the next send");
+    assert_eq!(text_of(&requests[0].prompt[0]), ENROLLED_SYSTEM);
+    assert_eq!(session.operations.enrolled, Some(enrolled));
+    let setups = plane
+        .inner
+        .calls()
+        .iter()
+        .filter(|call| call.starts_with("compaction.setup"))
+        .count();
+    assert_eq!(setups, 2, "the next send asked for Setup again");
+}
+
+/// On the enrolling run, a scheduled refusal fallback takes the step only if the prepared
+/// request's own estimate fits the fallback's window; the newest step's usage, from before the
+/// request was rebuilt, doesn't decide. A window that holds it lets the step go there.
+#[tokio::test]
+async fn the_enrolling_run_falls_back_only_when_its_own_request_fits() {
+    for (fallback_limit, expected) in [
+        (150, broca_core::refusal_fallback::StepRoute::Source),
+        (1_000_000, broca_core::refusal_fallback::StepRoute::Fallback),
+    ] {
+        FALLBACK
+            .scope(
+                Some(FallbackScript {
+                    model: ModelHandle::new(provider_id(), "fallback-model"),
+                    context_limit: Some(fallback_limit),
+                }),
+                async {
+                    let backend = MemoryBackend::default();
+                    let mut session = enrollment_session(&backend).await;
+                    let mut parts = MemoryParts::default();
+                    let spy = CompactionSpy::new(&CompactionScript {
+                        context_limit: ENROLLED_LIMIT,
+                        rides: Vec::new(),
+                    });
+                    // The run's own model refuses its first step, which arms the schedule the
+                    // next run carries.
+                    let refused = EnrollRun {
+                        id: "r1",
+                        input: vec![system("You are terse."), user("first task")],
+                        manifest: None,
+                        steps: vec![refusal("a0"), text_step("a1", "ok")],
+                        limit: None,
+                    };
+                    enroll_run(&mut session, &mut parts, &spy, &refused)
+                        .await
+                        .expect("the refused run");
+                    let mut manifest = enrolling_manifest().as_ref().clone();
+                    manifest.system_text = "Compact with care. ".repeat(200);
+                    let provider = ScriptedProvider::new(vec![text_step("a2", "on")]);
+                    enroll_run_with(
+                        &mut session,
+                        &mut parts,
+                        &spy,
+                        &EnrollRun {
+                            id: "r2",
+                            input: vec![user("second task")],
+                            manifest: Some(Arc::new(manifest)),
+                            steps: Vec::new(),
+                            limit: None,
+                        },
+                        &provider,
+                    )
+                    .await
+                    .expect("the enrolling run");
+                    assert!(session.operations.enrolled.is_some());
+                    assert_eq!(
+                        *provider.route.lock().unwrap(),
+                        Some(expected),
+                        "a fallback window of {fallback_limit}"
+                    );
+                },
+            )
+            .await;
+    }
 }

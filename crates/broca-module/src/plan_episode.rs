@@ -89,13 +89,16 @@ pub(crate) fn freeze_manifest(
     Ok(())
 }
 
-/// The compaction plan version a brand-new log starts under when its first run is admitted
-/// under `manifest`: the current one (`compaction_v2::PLAN_VERSION`) when the plan names a
-/// compaction provider, so the session records and renders under the current compaction
-/// contract, and `None` otherwise, which keeps the established log layout. Both run loops read the mode an
-/// existing log's first run recorded before they read this, so a session already written in
-/// the established layout is never moved onto the contract by a later plan.
-pub(crate) fn new_log_compaction_plan_version(manifest: Option<&PlanManifest>) -> Option<u32> {
+/// The compaction plan version a run admitted under `manifest` asks for: the current one
+/// (`compaction_v2::PLAN_VERSION`) when the plan names a compaction provider, so the run records
+/// and renders under the current compaction contract, and `None` otherwise. Each run loop decides
+/// from it with the session's own mode:
+/// - Today's loop reads it only for a brand-new log. An existing log keeps the mode its first
+///   run recorded, and a refresh can't add a compaction provider there.
+/// - The new storage's loop reads it for every run (`broca_session_loop::admit::session_contract`).
+///   A session already on the contract stays on it. A session that ran outside it moves onto it
+///   at the first run whose plan names a compaction provider.
+pub(crate) fn plan_compaction_version(manifest: Option<&PlanManifest>) -> Option<u32> {
     manifest
         .is_some_and(|manifest| matches!(broca_core::compaction::item(manifest), Ok(Some(_))))
         .then_some(broca_core::compaction_v2::PLAN_VERSION)
@@ -110,7 +113,7 @@ mod tests {
     use broca_wal::{OpaqueJson, PlanManifest};
     use serde_json::json;
 
-    use super::{freeze_manifest, new_log_compaction_plan_version, require_confining_scope};
+    use super::{freeze_manifest, plan_compaction_version, require_confining_scope};
 
     fn tool(name: &str) -> Tool {
         serde_json::from_value(json!({
@@ -240,11 +243,11 @@ mod tests {
             "",
         );
         assert_eq!(
-            new_log_compaction_plan_version(Some(&compacted)),
+            plan_compaction_version(Some(&compacted)),
             Some(broca_core::compaction_v2::PLAN_VERSION)
         );
         let uncompacted = manifest(json!({"compaction_item": null}), "");
-        assert_eq!(new_log_compaction_plan_version(Some(&uncompacted)), None);
-        assert_eq!(new_log_compaction_plan_version(None), None);
+        assert_eq!(plan_compaction_version(Some(&uncompacted)), None);
+        assert_eq!(plan_compaction_version(None), None);
     }
 }
