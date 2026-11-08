@@ -2283,6 +2283,9 @@ async fn handle_control_request(
             metrics["scoped_role_route_refusals"] =
                 serde_json::json!(broca_subc::scoped_role_route_refusals());
             metrics["session_readers"] = crate::session_readers::health();
+            // Which deployment key the new session storage is opened with, and whether it has
+            // loaded: while it hasn't, sessions kept there are refused `key_unavailable`.
+            metrics["store"] = crate::store_key::health();
             metrics["usage_observe"] = crate::usage_observe::published_metrics();
             metrics["account_limit_stale_resets"] =
                 serde_json::json!(broca_core::account_limit_stale_resets());
@@ -10381,6 +10384,11 @@ mod tests {
         write_frame(&mut daemon, &ack).await.unwrap();
 
         // A new connection reports both serve-loop counters before this test submits any drops.
+        // Health also names the new storage's deployment key and whether it has loaded.
+        crate::store_key::publish(Arc::new(broca_module::store_open::StoreSlot::awaiting_key(
+            std::path::Path::new("/unused"),
+            7,
+        )));
         let health = Frame::build(
             FrameType::Request,
             control_flags(),
@@ -10397,6 +10405,11 @@ mod tests {
             (FrameType::Response, 0, 2)
         );
         let health: serde_json::Value = serde_json::from_slice(&health.body).unwrap();
+        assert_eq!(
+            health["metrics"]["store"],
+            serde_json::json!({"key_id": 7, "loaded": false}),
+            "health.check reports the deployment key's id and that it hasn't loaded"
+        );
         assert!(
             health["metrics"]["scoped_role_route_refusals"].is_object(),
             "health.check includes scoped role-open refusal counts keyed by daemon code"

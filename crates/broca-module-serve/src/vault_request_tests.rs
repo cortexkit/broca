@@ -16,6 +16,8 @@ struct CapturingVaultDaemon {
     route_opens: Arc<std::sync::atomic::AtomicUsize>,
     route_open_starts: Arc<std::sync::Mutex<Vec<tokio::time::Instant>>>,
     errors: Arc<std::sync::Mutex<Vec<String>>>,
+    /// The records the stand-in serves, shared with its connections.
+    record: Arc<std::sync::Mutex<StandInRecord>>,
     server: tokio::task::JoinHandle<()>,
 }
 
@@ -121,6 +123,7 @@ impl CapturingVaultDaemon {
         let route_open_starts = Arc::new(std::sync::Mutex::new(Vec::new()));
         let errors = Arc::new(std::sync::Mutex::new(Vec::new()));
         let record = Arc::new(std::sync::Mutex::new(StandInRecord::default()));
+        let shared_record = record.clone();
         let server = {
             let requests = requests.clone();
             let route_open_identities = route_open_identities.clone();
@@ -166,8 +169,21 @@ impl CapturingVaultDaemon {
             route_opens,
             route_open_starts,
             errors,
+            record: shared_record,
             server,
         }
+    }
+
+    /// Serves `payload` as the value of the deployment-key record `credential_id`, or answers
+    /// `not_found` for it when `None`, as claustrum does for a missing record or grant.
+    fn serve_deployment_key(&self, credential_id: &str, payload: Option<Vec<u8>>) {
+        let mut record = self.record.lock().unwrap();
+        match payload {
+            Some(payload) => record
+                .deployment_keys
+                .insert(credential_id.to_string(), payload),
+            None => record.deployment_keys.remove(credential_id),
+        };
     }
 
     /// The params of every `credential.get_scoped`, in arrival order.
@@ -257,6 +273,9 @@ struct StandInRecord {
     expires_at_ms: Option<i64>,
     /// How many `credential.get_scoped` reads have arrived.
     scoped_reads: usize,
+    /// The deployment-key records (`opaque:broca-deployment:<id>`) and their values. A
+    /// deployment-key id not listed is answered `not_found`.
+    deployment_keys: std::collections::HashMap<String, Vec<u8>>,
 }
 
 /// The token the stand-in serves at `version`: version 1 is the admission token.
@@ -457,6 +476,22 @@ async fn serve_capturing_vault(
                 }
                 let reply = match method.as_str() {
                     "credential.get" => token(1, None),
+                    "credential.get_scoped"
+                        if request["params"]["credential_id"]
+                            .as_str()
+                            .is_some_and(|id| id.starts_with("opaque:broca-deployment:")) =>
+                    {
+                        let id = request["params"]["credential_id"].as_str().unwrap();
+                        match record.lock().unwrap().deployment_keys.get(id) {
+                            Some(payload) => serde_json::json!({"result": {
+                                "payload": payload,
+                                "expires_at_ms": null,
+                                "record_version": 1,
+                                "credential_id": id
+                            }}),
+                            None => not_found,
+                        }
+                    }
                     "credential.get_scoped" if scoped_not_found => not_found,
                     "credential.get_scoped" => {
                         let mut record = record.lock().unwrap();

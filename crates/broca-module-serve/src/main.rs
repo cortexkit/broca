@@ -572,6 +572,10 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let mut vault_gauge = broca_module_serve::serve::VaultGauge::not_in_use();
     let mut classifier_router = None;
+    // Where the new session storage's deployment key is read from: the vault, by grant. `None`
+    // when the module reads no vault, so sessions kept in the new storage stay refused.
+    let mut store_key_source: Option<Arc<dyn broca_module_serve::store_key::DeploymentKeySource>> =
+        None;
     // System One's provider credentials. Without a vault (the mock provider path) their
     // requests carry none, as every run's do there.
     let mut system_one_credential: Arc<
@@ -718,6 +722,14 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         openai_decisions_credential = system_one_vault_credential(
             broca_module_serve::system_one::openai_decisions::CREDENTIAL_ID,
         );
+        // The deployment key is read on a route of its own, so its retries while the record is
+        // missing never queue behind a run's credential read.
+        store_key_source = Some(Arc::new(broca_subc::VaultClient::new(
+            Arc::clone(&vault_conn),
+            &vault_module,
+            &vault_bind,
+            VAULT_READY_TIMEOUT,
+        )));
         let client = broca_subc::VaultClient::new(
             vault_conn,
             &vault_module,
@@ -781,10 +793,37 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         broca_subc::SubcCompactionPlane::new(plan_conn.clone()),
     ));
     let executor = Arc::new(executor_impl.with_clock(retention.clock.clone()));
+    // The new session storage. A session kept there is told apart from today's from the first
+    // open, and served once the deployment key has loaded from the vault (see `store_key`).
+    let session_storage =
+        broca_module_serve::config::SessionStorageConfig::load_default().map_err(ServeIoError)?;
+    let store_slot = Arc::new(broca_module::store_open::StoreSlot::awaiting_key(
+        &state_root,
+        session_storage.deployment_key_id,
+    ));
+    broca_module_serve::store_key::publish(Arc::clone(&store_slot));
+    let store_setup = broca_module::store_open::StoreRuntimeSetup {
+        state_root: state_root.clone(),
+        executor: executor.clone(),
+        idle_ttl: idle_ttl.unwrap_or(broca_module::actor::IDLE_TTL),
+        import_roots: broca_module_serve::config::ImportConfig::load_default()
+            .map_err(ServeIoError)?
+            .roots,
+        // A run that ends on a session kept in the new storage is billed into the usage export
+        // today's runs are billed into, under the same charge-basis table. Only a legacy root
+        // keeps that export.
+        billing: run_index
+            .as_ref()
+            .map(|legacy| broca_module::store_billing::StoreBilling {
+                index: legacy.clone(),
+                resolver: charge_basis_table.clone(),
+            }),
+    };
     let move_wal = wal_store.clone();
     let mut opener_builder =
         opener_for_state_root(lease_store, wal_store, executor, state_format, &state_root)?
-            .with_charge_basis_resolver(charge_basis_table.clone());
+            .with_charge_basis_resolver(charge_basis_table.clone())
+            .with_store_slot(Arc::clone(&store_slot));
     if let Some(legacy) = &run_index {
         opener_builder = opener_builder
             .with_run_index(legacy.clone())
@@ -837,6 +876,17 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         registry.set_session_address_inventory(run_index.as_ref().unwrap().clone());
     }
     let registry = Arc::new(registry);
+    // The deployment key is read off the startup path: the module serves today's sessions at
+    // once, and sessions kept in the new storage from when the key loads.
+    let _store_key = tokio::spawn(
+        broca_module_serve::store_key::KeyLoader {
+            source: store_key_source,
+            slot: store_slot,
+            setup: store_setup,
+            backoff: Default::default(),
+        }
+        .run(registry.as_ref().clone()),
+    );
     held_runtime.bind_stopping_signal(registry.stopping_signal());
     registry.set_tool_route_health(Arc::new(move |open| {
         tool_route_health_plane.tool_routes_health(open)
@@ -6007,6 +6057,7 @@ mod executor {
         include!("step_event_writer_tests.rs");
         include!("auth_hint_writer_tests.rs");
         include!("vault_request_tests.rs");
+        include!("store_key_tests.rs");
         include!("role_plane_tests.rs");
         include!("admission_wal_read_budget_tests.rs");
 
