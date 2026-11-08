@@ -915,10 +915,14 @@ impl Rig {
     }
 
     fn send(&self, tail: bool) -> Value {
-        json!({"session":"session","send_id":if tail { "tail" } else { "tool-turn" },
+        let mut params = json!({"session":"session","send_id":if tail { "tail" } else { "tool-turn" },
             "prompt":if tail { "continue the history" } else { PROMPT },"system":SYSTEM,"title":TITLE,
             "model":{"provider":"xai","model":"differential-model"},"cache":{"key":"differential-cache"},
-            "tools":[{"name":"work","description":"Return the fixture output.","input_schema":{"type":"object"},"module":TOOLS}]})
+            "tools":[{"name":"work","description":"Return the fixture output.","input_schema":{"type":"object"},"module":TOOLS}]});
+        if tail {
+            params.as_object_mut().unwrap().remove("tools");
+        }
+        params
     }
 }
 

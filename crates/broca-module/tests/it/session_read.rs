@@ -644,6 +644,28 @@ async fn send_with_materialization(
     skip_materialization: bool,
 ) {
     let req = req(key, run, text);
+    let send_id = format!("send-{run}");
+    let mut submission = req.to_submission();
+    // Existing sessions inherit frozen tools even after their WAL moves into an archive.
+    // A retry of the send that created the session repeats its original tool declaration.
+    if rig
+        .wal_store
+        .wal_present_checked(key)
+        .expect("check fixture WAL presence")
+        == Some(true)
+        && rig
+            .wal_store
+            .read_records(key)
+            .expect("read fixture tools identity")
+            .iter()
+            .find_map(|framed| match &framed.record {
+                WalRecord::RunStarted { send_id, .. } => Some(send_id.as_deref()),
+                _ => None,
+            })
+            .is_some_and(|creating_id| creating_id != Some(send_id.as_str()))
+    {
+        submission.tools = None;
+    }
     rig.registry
         .send(broca_module::serve::SendRequest {
             session_class: None,
@@ -654,8 +676,8 @@ async fn send_with_materialization(
             delivery: Default::default(),
             session: key.clone(),
             run_id: req.run_id.clone(),
-            send_id: Some(format!("send-{run}")),
-            request: Box::new(req.to_submission()),
+            send_id: Some(send_id),
+            request: Box::new(submission),
             skip_materialization,
             kind: RunKind::FreshOrResume,
             plan: None,
