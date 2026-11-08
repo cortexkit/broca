@@ -141,6 +141,7 @@ fn tool(name: &str) -> Tool {
 
 fn request(dir: &std::path::Path, run: &str, model: &str, user: Message) -> RunRequest {
     RunRequest {
+        account_route: None,
         route_decision_id: None,
         input_written_at_ms: None,
         directives: None,

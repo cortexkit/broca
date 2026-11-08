@@ -1173,6 +1173,7 @@ async fn import_reply_too_large_session(rig: &mut Rig, channel: u16, final_text:
         .import(broca_module::serve::SessionImportRequest {
             project_id: None,
             principal: None,
+            scope: broca_protocol::SendScope::Internal,
             session,
             run_id: RunId("reply-too-large-import".into()),
             messages,
@@ -2669,11 +2670,18 @@ async fn assert_projected_control_mids_match_read(rig: &mut Rig) {
     );
     // Core projection keeps native positions. The public stream must translate them to
     // exactly the mids a reader already holds, for both boundaries and lifecycle events.
+    // Every caller has exactly one finished run, whose `run_finished` is the replay's last
+    // control frame. Waiting for it before the quiet window starts keeps a slow runner from
+    // closing the window partway through the replay.
     let frames = rig
-        .subscribe_collect(
+        .subscribe_collect_until(
             20,
             serde_json::json!({"from":"start"}),
             Duration::from_millis(100),
+            |frame| {
+                serde_json::from_slice::<serde_json::Value>(&frame.body)
+                    .is_ok_and(|body| body["event"]["type"] == "run_finished")
+            },
         )
         .await;
     let mut public_mids = 0;

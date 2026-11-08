@@ -57,6 +57,7 @@ fn init_schema_measured(
         "CREATE TABLE IF NOT EXISTS agent_data_pending_session (session TEXT PRIMARY KEY) WITHOUT ROWID",
         "CREATE TABLE IF NOT EXISTS agent_data_writer (id INTEGER PRIMARY KEY CHECK(id=1))",
         "CREATE TABLE IF NOT EXISTS agent_data_backfill_cursor (id INTEGER PRIMARY KEY CHECK(id=1), last_run_id TEXT, valid INTEGER NOT NULL)",
+        crate::session_address::SCOPE_RESERVATION_SCHEMA,
         "CREATE TRIGGER IF NOT EXISTS agent_data_run_insert AFTER INSERT ON run_index
          WHEN NOT EXISTS(SELECT 1 FROM agent_data_writer) BEGIN
             INSERT OR IGNORE INTO agent_data_pending_session VALUES(NEW.session);

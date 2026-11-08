@@ -302,6 +302,7 @@ async fn choose(
     choose_account(
         client,
         ChoiceInputs {
+            account_route: None,
             pool: None,
             credential_id: None,
             service_tier: None,
@@ -422,6 +423,7 @@ fn account_for_hold_cap_params_preserve_legacy_members_and_bound_the_previous_ac
             "{name}"
         );
         let mut params = account_for_params(&AccountForRequest {
+            account_route: None,
             pool: None,
             credential_id: None,
             service_tier: None,
@@ -458,6 +460,7 @@ async fn account_for_counts_only_sent_unknown_hold_caps_not_real_zero_or_static_
         choose_account(
             &client,
             ChoiceInputs {
+                account_route: None,
                 pool: None,
                 credential_id: None,
                 service_tier: None,
@@ -594,6 +597,7 @@ async fn a_hung_routing_costs_at_most_the_admission_budget() {
     let (choice, events) = broca_test_support::capture_logs(choose_account(
         &client,
         ChoiceInputs {
+            account_route: None,
             pool: None,
             credential_id: None,
             service_tier: None,
@@ -651,6 +655,7 @@ async fn a_slow_listing_shares_the_admission_budget() {
     let choice = choose_account(
         &client,
         ChoiceInputs {
+            account_route: None,
             pool: None,
             credential_id: None,
             service_tier: None,
@@ -749,6 +754,7 @@ async fn choose_api_key_with_decision(
     choose_account(
         client,
         ChoiceInputs {
+            account_route: None,
             static_credential: &key,
             caller_named_account: pinned,
             pool,
@@ -947,6 +953,7 @@ async fn apikey_legacy_unhinted_and_pinned_keep_the_configured_vault_record() {
         let choice = choose_account(
             &client(&routing),
             ChoiceInputs {
+                account_route: None,
                 static_credential: &key,
                 caller_named_account: account.is_some(),
                 pool: None,
@@ -1077,6 +1084,7 @@ async fn caller_affinity_changes_only_the_conversation_key_in_the_routing_body()
     let choice = choose_account(
         &client,
         ChoiceInputs {
+            account_route: None,
             pool: None,
             credential_id: None,
             service_tier: None,
@@ -1409,6 +1417,7 @@ async fn refusal_log_names_send_and_routing_decision() {
     let (result, events) = broca_test_support::capture_logs(choose_account(
         &client,
         ChoiceInputs {
+            account_route: None,
             pool: None,
             credential_id: None,
             service_tier: None,
@@ -2678,6 +2687,7 @@ async fn a_caller_decision_is_forwarded_even_with_a_pin_and_is_not_runner_report
     let choice = choose_account(
         &client,
         ChoiceInputs {
+            account_route: None,
             pool: None,
             credential_id: None,
             service_tier: None,
@@ -2719,6 +2729,7 @@ async fn an_unknown_caller_decision_never_falls_back_to_a_static_account() {
     let result = choose_account(
         &client,
         ChoiceInputs {
+            account_route: None,
             pool: None,
             credential_id: None,
             service_tier: None,
@@ -2753,6 +2764,7 @@ async fn choose_with_auth_hints(
     choose_account(
         client,
         ChoiceInputs {
+            account_route: None,
             decision_id: None,
             service_tier: None,
             pool: Some("selected-pool"),

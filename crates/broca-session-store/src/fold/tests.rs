@@ -1,6 +1,7 @@
 use super::conversation::Conversation;
 use super::operations::{
-    Budget, ModelTotals, OpenBatch, Operations, Owner, Run, SessionUsage, SetupInForce, UsageTotals,
+    Budget, EffectiveChange, ManifestRef, ModelTotals, OpenBatch, Operations, Owner, PendingChange,
+    Plan, Run, SessionUsage, SetupInForce, UsageTotals,
 };
 use super::{Bound, FieldSpec};
 
@@ -16,6 +17,10 @@ const STATES: &[(&str, &[FieldSpec])] = &[
     ("SessionUsage", SessionUsage::SCHEMA),
     ("UsageTotals", UsageTotals::SCHEMA),
     ("ModelTotals", ModelTotals::SCHEMA),
+    ("Plan", Plan::SCHEMA),
+    ("PendingChange", PendingChange::SCHEMA),
+    ("EffectiveChange", EffectiveChange::SCHEMA),
+    ("ManifestRef", ManifestRef::SCHEMA),
 ];
 
 /// Each field bounded as `Declared`, with the state struct whose own fields carry the bounds.
@@ -24,6 +29,13 @@ const DECLARED: &[(&str, &str, &str)] = &[
     ("Operations", "setup", "SetupInForce"),
     ("Operations", "owner", "Owner"),
     ("Operations", "session_usage", "SessionUsage"),
+    ("Operations", "plan", "Plan"),
+    ("Plan", "pending", "PendingChange"),
+    ("Plan", "effective", "EffectiveChange"),
+    ("Plan", "current", "ManifestRef"),
+    ("Plan", "prefix", "ManifestRef"),
+    ("Plan", "accepted", "ManifestRef"),
+    ("PendingChange", "manifest", "ManifestRef"),
     ("SessionUsage", "totals", "UsageTotals"),
     ("ModelTotals", "totals", "UsageTotals"),
     ("Run", "budget", "Budget"),

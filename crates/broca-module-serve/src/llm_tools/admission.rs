@@ -121,6 +121,10 @@ pub(super) fn admit(
     }
     let request: classify::Request = serde_json::from_str(arguments.get())
         .map_err(|e| Refusal::invalid_params("arguments", e.to_string()))?;
+    let model = request
+        .model
+        .as_deref()
+        .ok_or_else(|| Refusal::invalid_params("model", "model is required for llm.classify"))?;
     (if image_references {
         classify::validate_request_with_image_references(&request)
     } else {
@@ -171,7 +175,7 @@ pub(super) fn admit(
         batch_id,
         args_digest,
         params,
-        provider: request.model.split('/').next().unwrap_or_default().into(),
+        provider: model.split('/').next().unwrap_or_default().into(),
     })
 }
 
@@ -180,4 +184,45 @@ fn basal_scope_required() -> Refusal {
         "flow_scope_required",
         "Basal model tools require a daemon-stamped flow or an authorized ephemeral program run with a linked parent scope",
     )
+}
+
+#[cfg(test)]
+mod contract03_tests {
+    use super::*;
+
+    #[test]
+    fn llm_classify_missing_pin_is_refused_at_admission() {
+        let principal = broca_protocol::BindPrincipal::Reserved {
+            module_id: "owner".into(),
+        };
+        let scope = broca_protocol::SendScope::Stamped(broca_protocol::BindScope {
+            scope: broca_protocol::SessionScope {
+                owner: principal.clone(),
+                agent_id_frozen: false,
+                scope_ref: "run".into(),
+                scope_epoch: 1,
+                flow_id: None,
+                sender: None,
+                agent_id: Some("agent".into()),
+                run_id: Some("run".into()),
+            },
+            owner_authorized: true,
+            kind: broca_protocol::ScopeKind::Head,
+            parent: None,
+            parent_state: None,
+        });
+        let arguments = serde_json::value::to_raw_value(&serde_json::json!({"item":{"state":"invented"},"questions":{"q":{"type":"noul","instructions":"true?"}},"max_cost_usd":1.0})).unwrap();
+        let error = admit(
+            Some(&principal),
+            &scope,
+            &arguments,
+            Some("missing-model"),
+            false,
+        )
+        .err()
+        .expect("unpinned tool call must not be admitted");
+        assert_eq!(error.code, "invalid_params");
+        assert_eq!(error.detail.field.as_deref(), Some("model"));
+        assert_eq!(error.message, "model is required for llm.classify");
+    }
 }

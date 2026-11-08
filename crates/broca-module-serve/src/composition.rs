@@ -1508,6 +1508,7 @@ mod tests {
             ts_ms: None,
             config: Box::new(RunConfig {
                 global_system: None,
+                account_route: None,
                 route_decision_id: None,
                 account_limit_pause: false,
                 turn_directives_v1: None,
@@ -1593,6 +1594,7 @@ mod tests {
 
     fn request(bind: &BindIdentity) -> broca_core::RunRequest {
         broca_core::RunRequest {
+            account_route: None,
             route_decision_id: None,
             input_written_at_ms: None,
             directives: None,

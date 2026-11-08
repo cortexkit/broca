@@ -2283,6 +2283,9 @@ async fn handle_control_request(
             metrics["scoped_role_route_refusals"] =
                 serde_json::json!(broca_subc::scoped_role_route_refusals());
             metrics["session_readers"] = crate::session_readers::health();
+            // Which deployment key the new session storage is opened with, and whether it has
+            // loaded: while it hasn't, sessions kept there are refused `key_unavailable`.
+            metrics["store"] = crate::store_key::health();
             metrics["usage_observe"] = crate::usage_observe::published_metrics();
             metrics["account_limit_stale_resets"] =
                 serde_json::json!(broca_core::account_limit_stale_resets());
@@ -2437,6 +2440,17 @@ async fn authorize_bind(
     mut completed: BindCompletion,
     registry: LineageRegistry,
 ) -> BindCompletion {
+    // A scoped bind that reserves a new session address records its scope's owner and ref with
+    // it, so until the session's first send is admitted only that scope can start it.
+    let reservation = match &completed.bind.scope {
+        broca_protocol::SendScope::Stamped(stamp) => {
+            Some(broca_store::session_address::ScopeReservation {
+                owner: stamp.scope.owner.clone(),
+                scope_ref: stamp.scope.scope_ref.clone(),
+            })
+        }
+        _ => None,
+    };
     match registry
         .resolve_session_address(
             &completed.identity,
@@ -2445,6 +2459,7 @@ async fn authorize_bind(
                 .stamped_project
                 .as_ref()
                 .and_then(|stamp| stamp.workdir.as_deref()),
+            reservation.as_ref(),
         )
         .await
     {
@@ -3787,6 +3802,7 @@ where
             let import_req = SessionImportRequest {
                 project_id: bind.project_id.clone(),
                 principal: bind.principal.clone(),
+                scope: bind.scope.clone(),
                 session: session.clone(),
                 run_id,
                 messages: params.messages,
@@ -5156,6 +5172,8 @@ pub(crate) fn served_on_new_storage(method: &str, params: &serde_json::Value) ->
         OP_STATUS | OP_RUN_RESULT | OP_SEND_STATUS | OP_SESSION_SEND_STATUS => true,
         // The store actor serves sends, cancels and retractions.
         OP_SEND | OP_CANCEL | OP_RETRACT => true,
+        // Plan refreshes, through today's preflight, decided and written by the store actor.
+        OP_REFRESH | OP_REFRESH_POLICY | OP_FLUSH_PREFIX => true,
         // A head import from a file creates the session in the new storage. An import carrying
         // its messages inline is today's import, which writes a WAL.
         OP_IMPORT => params.get("source").is_some(),
@@ -6031,7 +6049,19 @@ fn scope_error_bytes(err: &ServeError) -> Result<Vec<u8>, ServeIoError> {
             serde_json::to_vec(&adoption_refused(refusal))
         }
         ServeError::ScopeRefused(broca_core::ScopeRefusal::OwnerMismatch(mismatch)) => {
-            let mut body = broca_wire::ScopeOwnerMismatch::new(owner_mismatch_detail(mismatch));
+            let mut body = match &**mismatch {
+                // Same code and detail as a first-principal refusal; only the message differs.
+                broca_core::OwnerMismatch::Reserved {
+                    owner,
+                    presented_principal,
+                } => broca_wire::ScopeOwnerMismatch::reserved(
+                    owner.as_owner_string(),
+                    presented_principal
+                        .as_ref()
+                        .map(broca_protocol::BindPrincipal::as_owner_string),
+                ),
+                _ => broca_wire::ScopeOwnerMismatch::new(owner_mismatch_detail(mismatch)),
+            };
             if let broca_core::OwnerMismatch::OwnerOperation { first, mismatch } = &**mismatch {
                 let first = first.as_owner_string();
                 let accepted = match &**mismatch {
@@ -6170,6 +6200,10 @@ fn owner_mismatch_detail(
         },
         broca_core::OwnerMismatch::FirstPrincipal {
             first,
+            presented_principal,
+        }
+        | broca_core::OwnerMismatch::Reserved {
+            owner: first,
             presented_principal,
         } => broca_wire::ScopeOwnerMismatchDetail::FirstPrincipal {
             first: first.as_owner_string(),
@@ -8470,6 +8504,7 @@ mod tests {
             run_id: broca_protocol::RunId("legacy".into()),
             session,
             config: Box::new(broca_wal::RunConfig {
+                account_route: None,
                 global_system: None,
                 route_decision_id: None,
                 account_limit_pause: false,
@@ -9039,6 +9074,7 @@ mod tests {
             let (writer, mut written) =
                 broca_diagnostics::channel::<Frame>(EGRESS_BUFFER, Arc::default());
             let large = serde_json::to_vec(&serde_json::json!({
+                "model":"typesafe/jev-1.13.0",
                 "answers":{"q":{"type":"noul","noul":0.5,"provider_extra":{"text":"x".repeat(broca_wire::SUBC_MAX_FRAME_BYTES as usize)}}},
                 "usage":{"input_tokens":0},"cost_usd":0,
             })).unwrap();
@@ -10374,6 +10410,11 @@ mod tests {
         write_frame(&mut daemon, &ack).await.unwrap();
 
         // A new connection reports both serve-loop counters before this test submits any drops.
+        // Health also names the new storage's deployment key and whether it has loaded.
+        crate::store_key::publish(Arc::new(broca_module::store_open::StoreSlot::awaiting_key(
+            std::path::Path::new("/unused"),
+            7,
+        )));
         let health = Frame::build(
             FrameType::Request,
             control_flags(),
@@ -10390,6 +10431,11 @@ mod tests {
             (FrameType::Response, 0, 2)
         );
         let health: serde_json::Value = serde_json::from_slice(&health.body).unwrap();
+        assert_eq!(
+            health["metrics"]["store"],
+            serde_json::json!({"key_id": 7, "loaded": false}),
+            "health.check reports the deployment key's id and that it hasn't loaded"
+        );
         assert!(
             health["metrics"]["scoped_role_route_refusals"].is_object(),
             "health.check includes scoped role-open refusal counts keyed by daemon code"
