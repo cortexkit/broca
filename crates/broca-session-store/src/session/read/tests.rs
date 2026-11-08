@@ -79,7 +79,7 @@ fn reply(id: &str, text: String) -> Record {
     })
 }
 
-/// The entry facts of the message at `ordinal`. Its tag base is the ordinal, so a read that
+/// The entry facts of the message at `ordinal`. Its tag bases are the ordinal, so a read that
 /// returns another message's facts shows it.
 fn facts(ordinal: u64) -> Record {
     Record::EntryFacts(EntryFacts {
@@ -89,6 +89,8 @@ fn facts(ordinal: u64) -> Record {
         no_display_facts: None,
         reasoning_summaries: Vec::new(),
         rich_ui: None,
+        runner_tag_base: Some(ordinal),
+        legacy_view_seq: None,
         ordinal,
         written_at_ms: Some(ordinal),
         tag_base: ordinal,
@@ -191,6 +193,26 @@ fn every_message_reads_back_by_ordinal_after_two_cuts() {
             assert!(!entry.open);
         }
         assert!(loaded.entries(121, 5).await.unwrap().is_empty());
+
+        // Each part number names the last message whose base is below it, sealed or in the
+        // window: here the base is the ordinal, and tool messages have no facts, so they number
+        // nothing.
+        let expected_holder = |tag: u64| (1..tag.min(121)).rev().find(|ordinal| ordinal % 4 != 3);
+        for tag in 1..=125 {
+            let found = loaded.tagged_entry(tag).await.unwrap();
+            assert_eq!(
+                found.as_ref().map(|entry| entry.ordinal),
+                expected_holder(tag),
+                "tag {tag}"
+            );
+            if let Some(entry) = found {
+                assert_eq!(
+                    &entry.message,
+                    &expected[entry.ordinal as usize - 1],
+                    "tag {tag}"
+                );
+            }
+        }
     });
 }
 

@@ -281,6 +281,147 @@ impl<B: SessionBackend> Session<B> {
         Ok(out)
     }
 
+    /// The entry whose numbered parts take part number `tag` under the runner's own numbering
+    /// (`EntryFacts::runner_tag_base`), if the session's branch holds one: the last entry, in
+    /// ordinal order, whose base is below `tag`, since a message's parts take the numbers after
+    /// its base, in order. Those numbers never repeat in a session and only grow with the
+    /// ordinal, so the entry is found by a search, never a scan: the held assistant message and
+    /// the window from memory, then sealed history a segment at a time. Each probe reads the one
+    /// segment the transcript directory names for an ordinal and rules out every ordinal that
+    /// segment places, so a search reads O(log n) segments of a session with n sealed segments,
+    /// and the directory's pages above each.
+    ///
+    /// Which of the entry's parts are numbered, and so whether its parts reach `tag`, depends on
+    /// the rules its run numbered under, which the caller checks. An entry without a base (one
+    /// no computed numbering placed, or converted from a session that predates the field) is
+    /// taken to number nothing.
+    pub async fn tagged_entry(&self, tag: u64) -> Result<Option<StoredEntry>, SessionError> {
+        let base = |entry: &StoredEntry| {
+            entry
+                .state
+                .facts
+                .as_ref()
+                .and_then(|facts| facts.runner_tag_base)
+        };
+        let below = |entry: &StoredEntry| base(entry).is_some_and(|base| base < tag);
+        if let Some((ordinal, message, state)) = self.conversation.open_entry() {
+            let held = StoredEntry {
+                ordinal,
+                message: message.clone(),
+                next: None,
+                state: state.clone(),
+                open: true,
+            };
+            if below(&held) {
+                return Ok(Some(held));
+            }
+        }
+        let window = self.conversation.window_start();
+        for ordinal in (window..=self.conversation.placed).rev() {
+            let base = self
+                .conversation
+                .window_entry(ordinal)
+                .and_then(|(_, state)| state.facts.as_ref())
+                .and_then(|facts| facts.runner_tag_base);
+            if base.is_some_and(|base| base < tag) {
+                return Ok(window_entries(&self.conversation, ordinal, 1).pop());
+            }
+        }
+        let key = self.key.frame_key();
+        let pages = Pages {
+            backend: &self.backend,
+            addr: &self.addr,
+            session: self.head.session_id,
+            key: &key,
+            fanout: crate::directory::FANOUT,
+        };
+        let (mut low, mut high) = (1, window.saturating_sub(1));
+        // The last entry below `tag` in the sealed segments searched so far, all before `low`.
+        let mut found = None;
+        while low <= high {
+            self.storage_read()?;
+            let middle = low + (high - low) / 2;
+            let damaged =
+                || SessionError::Fold(format!("no sealed segment places message {middle}"));
+            let segment = pages
+                .find_ordinal(self.head.transcript_dir.as_ref(), middle)
+                .await
+                .map_err(SessionError::Directory)?
+                .ok_or_else(damaged)?;
+            let (first, last) = (
+                segment.first_ordinal.unwrap_or(middle),
+                segment.last_ordinal.unwrap_or(middle),
+            );
+            let entries = self.segment_entries(&segment, &key).await?;
+            let numbered: Vec<&StoredEntry> = entries
+                .iter()
+                .filter(|entry| base(entry).is_some())
+                .collect();
+            match (numbered.first(), numbered.last()) {
+                // The segment's first base is already at or past `tag`: look before it.
+                (Some(earliest), _) if !below(earliest) => {
+                    if first <= 1 {
+                        break;
+                    }
+                    high = first - 1;
+                }
+                // Its last base is below `tag`: the entry is its last, or one after it.
+                (_, Some(latest)) if below(latest) => {
+                    found = Some((*latest).clone());
+                    low = last + 1;
+                }
+                // The segment holds the change from below `tag` to past it.
+                (Some(_), Some(_)) => {
+                    return Ok(numbered
+                        .into_iter()
+                        .rev()
+                        .find(|entry| below(entry))
+                        .cloned());
+                }
+                // A segment whose entries have no facts numbers nothing.
+                _ => low = last + 1,
+            }
+        }
+        Ok(found)
+    }
+
+    /// Every entry the sealed transcript segment `segment` places on the session's branch.
+    async fn segment_entries(
+        &self,
+        segment: &crate::directory::DirEntry,
+        key: &crate::frame::FrameKey,
+    ) -> Result<Vec<StoredEntry>, SessionError> {
+        let damaged =
+            || SessionError::Fold(format!("sealed segment {} is missing", segment.object));
+        let bytes = self
+            .backend
+            .get_object(&self.addr, &segment.object)
+            .await?
+            .ok_or_else(damaged)?;
+        let opened =
+            Segment::open(&bytes, key, segment.object.as_bytes()).map_err(SessionError::Segment)?;
+        let mut out = Vec::new();
+        for position in 0..opened.index.blocks.len() {
+            let Some(first) = opened.index.blocks[position].first_ordinal else {
+                continue;
+            };
+            let mut conversation = Conversation::new(self.conversation.appends_in_conversation);
+            conversation.placed = first - 1;
+            for (_, record) in opened
+                .block(position)
+                .map_err(SessionError::Segment)?
+                .into_iter()
+                .filter(|(seq, _)| segment.keeps(*seq))
+            {
+                conversation
+                    .apply(&record)
+                    .map_err(|e| SessionError::Fold(format!("conversation: {e:?}")))?;
+            }
+            out.extend(window_entries(&conversation, first, usize::MAX));
+        }
+        Ok(out)
+    }
+
     /// The ordinal of the message with id `mid`, if it's on the current branch. The id tells
     /// where to look: a new id names the seq of its `EntryFacts` record, a converted one its
     /// position in today's history. Either way, the entry found there must carry exactly that

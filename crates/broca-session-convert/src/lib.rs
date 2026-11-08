@@ -136,6 +136,12 @@ struct State {
     anchors: Vec<Anchor>,
     /// The key the outcome of the terminal record being converted records (see [`anchor`]).
     outcome_key: Option<String>,
+    /// The seq, in the converted session, of the newest first-protocol compaction view event
+    /// (`compaction_view_applied`, kept whole as a ledger event) converted so far.
+    legacy_view: Option<u64>,
+    /// That view as it stood when the newest model step finished: the view in force for the
+    /// request that step sent (`output_refs::view_at_writing_step`).
+    step_legacy_view: Option<u64>,
 }
 
 /// Writes the held copies as transcript entries at the boundary that places them.
@@ -393,6 +399,8 @@ pub fn convert(old: &[FramedRecord], lineage: Option<&str>) -> Result<Converted,
                 // Today's read serves display facts only on a log with a lineage.
                 entry.no_display_facts = lineage.is_none().then_some(true);
                 entry.reasoning_summaries = summaries_of.remove(&ordinal).unwrap_or_default();
+                entry.runner_tag_base = legacy.runner_bases.get(&(ordinal - 1)).copied();
+                entry.legacy_view_seq = state.step_legacy_view;
                 // A run's assistant messages carry its Rich UI stamp, as today's read serves it.
                 if assistant_of.get(&ordinal) == Some(&true) {
                     entry.rich_ui = entry
@@ -683,6 +691,15 @@ fn convert_record(
         _ => return Err(err("record without a type")),
     };
     let mut f = Fields::new(kind.clone(), object);
+    match kind.as_str() {
+        "model_step_finished" => state.step_legacy_view = state.legacy_view,
+        "compaction_view_applied" => {
+            // A converted session's records take seqs from 1 in the order converted, so the
+            // event about to be pushed takes the seq one past the records before it.
+            state.legacy_view = Some(out.records.len() as u64 + 1);
+        }
+        _ => {}
+    }
     match kind.as_str() {
         "run_started" => run_started(&mut f, state, out)?,
         "model_step_finished" => model_step_finished(&mut f, state, out)?,
