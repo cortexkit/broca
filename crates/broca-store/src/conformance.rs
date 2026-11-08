@@ -798,6 +798,7 @@ where
         framed(
             seq,
             WalRecord::Steered {
+                message_marks: None,
                 sent_by: None,
                 written_at_ms: None,
                 tags: None,
@@ -2422,6 +2423,7 @@ pub(crate) fn run_started(
     framed(
         seq,
         WalRecord::RunStarted {
+            message_marks: None,
             compaction_plan_version: None,
             sent_by: None,
             written_at_ms: None,

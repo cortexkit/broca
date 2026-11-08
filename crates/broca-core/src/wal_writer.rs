@@ -829,7 +829,8 @@ impl FileWalStore {
         }
     }
 
-    pub(crate) fn media_store_class(
+    /// Resolve media retention from the session's actual live or archived WAL location.
+    pub fn media_store_class(
         &self,
         address: &str,
     ) -> Result<Option<crate::media_store::MediaStoreClass>, WalError> {

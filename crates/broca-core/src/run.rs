@@ -696,6 +696,7 @@ pub struct RunControl {
     pub new_log_compaction_plan_version: Option<u32>,
     /// Attested input route, kept out of request rendering and admission identity.
     pub display_sent_by: Option<broca_protocol::BindPrincipal>,
+    pub display_message_marks: Option<broca_protocol::MessageMarks>,
     #[cfg(test)]
     pub(crate) held_prompt_probe: Option<Arc<held_prompt::Probe>>,
     #[cfg(test)]
@@ -929,6 +930,7 @@ impl Default for RunControl {
             compaction_changes: None,
             new_log_compaction_plan_version: None,
             display_sent_by: None,
+            display_message_marks: None,
             #[cfg(test)]
             held_prompt_probe: None,
             #[cfg(test)]
@@ -3635,6 +3637,24 @@ async fn seal_size_refusal<W: WalStore>(
     result
 }
 
+/// Apply the live tag projection to a replayed prompt. Defer media-bearing messages
+/// until preparation fixes their part locations, just as the live incremental loop does.
+pub fn render_prompt_tags(
+    prompt: &mut [Message],
+    render_tags: bool,
+    defer_media_tags: bool,
+    frozen_render_config: &serde_json::Value,
+) {
+    render_new_tags(
+        prompt,
+        &mut 0,
+        render_tags,
+        defer_media_tags,
+        frozen_render_config,
+        None,
+    );
+}
+
 /// Render the tags of the messages appended to `prompt` since `rendered_len`: a run that
 /// renders tags shows numbers (by the rules each message was written under); any run shows
 /// the model's text cleaned where an earlier tag-rendering run under the computed rules wrote
@@ -6095,6 +6115,7 @@ where
                 &session.state,
                 &session.runtime,
                 &crate::compaction_v2::journal::WalJournal {
+                    applied_by: None,
                     writer,
                     session: &req.session,
                 },
@@ -6121,6 +6142,7 @@ where
         // first possible mode is `steer` or `turn_system` joins this step after the steered
         // messages, and one that expired ends. Records precede `StepStarted`, exactly where
         // replay places them.
+        let mut delivered_input = false;
         let mut steered = match &control.steer {
             Some(inbox) => match inbox.try_take_at_step_with_system(
                 &resolved_run_id,
@@ -6131,6 +6153,9 @@ where
                     provider.turn_system_possible(preceding, followed_by_user)
                 },
                 |records| {
+                    delivered_input = records.iter().any(|record| {
+                        matches!(record, WalRecord::SendDelivered { input: Some(_), .. })
+                    });
                     let assigned = records
                         .into_iter()
                         .map(|record| writer.record_tagged(record).1)
@@ -6147,6 +6172,11 @@ where
                 Vec::new()
             }
         };
+        if delivered_input {
+            // Live media reads only the durable WAL head. Publish both the delivery's capture
+            // and the StepStarted that places it before any request render can read that head.
+            writer.sync().await?;
+        }
         if control.emit_display_context {
             let _ = send(
                 out,
@@ -6305,7 +6335,26 @@ where
             let raw: Vec<_> = frames.iter().map(|frame| frame.record.clone()).collect();
             // Expiry counts from the last request that reached the cache, by the lifetime that
             // request asked the provider for, which a refresh may have changed since.
-            let last_send = crate::cache_warm::last_cache_send(&raw);
+            // Session conditions stay on the source model, but cache proof follows the route
+            // the upcoming step will serve, including a scheduled refusal fallback.
+            let fallback = provider.refusal_fallback_model();
+            let routing = crate::refusal_fallback::decide_step_route(
+                refusal_schedule.as_ref(),
+                fallback.is_some(),
+                refused_steps.contains(&step_id),
+                provider.refusal_fallback_context_limit(),
+                compaction_history.previous_native_usage,
+            );
+            let fallback =
+                fallback.filter(|_| routing.route == crate::refusal_fallback::StepRoute::Fallback);
+            let serving_model = fallback.as_ref().unwrap_or(&config.model);
+            let serving_variant = if fallback.is_some() {
+                None
+            } else {
+                config.variant.as_deref()
+            };
+            let last_send =
+                crate::cache_warm::last_cache_send_for_model(&raw, serving_model, serving_variant);
             let requested_ttl = |config: &RunConfig| {
                 control
                     .keep_warm
@@ -6338,6 +6387,7 @@ where
                 &session.state,
                 &session.runtime,
                 &crate::compaction_v2::journal::WalJournal {
+                    applied_by: None,
                     writer,
                     session: &req.session,
                 },
@@ -6923,31 +6973,21 @@ where
         // froze a fallback at admission has a `fallback_model`; every other run skips all of
         // this, and its steps, records and bytes are exactly what they were without it.
         let fallback_model = provider.refusal_fallback_model();
-        // A prompt that already fills the fallback model's window would only overflow it.
-        let fallback_fits = match (
-            provider.refusal_fallback_context_limit(),
-            compaction_history
-                .previous_native_usage
-                .and_then(|usage| usage.fill_tokens()),
-        ) {
-            (Some(limit), Some(fill)) => fill < limit,
-            _ => true,
-        };
         // Set once this step has been refused and re-sent, live or before a crash: a step is
         // re-sent at most once, and a refusal on the re-send passes through.
         let mut fallback_resent = refused_steps.contains(&step_id);
-        let mut step_route = crate::refusal_fallback::StepRoute::Source;
-        let mut route_reason = broca_wal::StepRouteReason::Schedule;
+        let routing = crate::refusal_fallback::decide_step_route(
+            refusal_schedule.as_ref(),
+            fallback_model.is_some(),
+            fallback_resent,
+            provider.refusal_fallback_context_limit(),
+            compaction_history.previous_native_usage,
+        );
+        let fallback_fits = routing.fallback_fits;
+        let mut step_route = routing.route;
+        let mut route_reason = routing.reason;
         if let Some(fallback) = &fallback_model {
-            let scheduled = fallback_resent
-                || crate::refusal_fallback::route(refusal_schedule.as_ref(), true)
-                    == crate::refusal_fallback::StepRoute::Fallback;
-            if scheduled && fallback_fits {
-                step_route = crate::refusal_fallback::StepRoute::Fallback;
-                if fallback_resent {
-                    route_reason = broca_wal::StepRouteReason::Refusal;
-                }
-            } else if scheduled {
+            if routing.skipped_for_context {
                 tracing::warn!(
                     target: "broca::refusal_fallback",
                     session = %req.session.session,

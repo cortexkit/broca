@@ -293,6 +293,9 @@ fn send_delivered(delivery: &Delivery, claimed: &[&Record]) -> Result<Value, Str
                 sender: ride.sender.clone(),
                 forms: ride.forms.clone(),
                 form,
+                // The forward conversion counts a ride's message marks as lost, so a stored
+                // ride never had any.
+                speaks_for: None,
             };
             object.insert("ride".into(), json(&ride));
         }

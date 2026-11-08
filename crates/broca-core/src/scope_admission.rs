@@ -91,8 +91,8 @@ pub fn decide_sender_access(
     Ok(())
 }
 
-/// Cancel and retract compare owner principals, not the route's scope or epoch. Cleanup
-/// commonly arrives on an unscoped route after the scope that started the work has ended.
+/// Owner operations accept plain or unscoped owner routes, including cleanup after the
+/// original scope ended. Flow- and run-stamped routes carry senders, never owner authority.
 /// Only an attested consumer on the first episode protects a session; older, direct and
 /// unverified histories retain their unrestricted cancel/retract behavior.
 pub fn decide_owner_access(
@@ -109,7 +109,9 @@ pub fn decide_owner_access(
                 .scope
                 .as_ref()
                 .is_some_and(|scope| principal == Some(&scope.owner)));
-    if is_owner {
+    let sender_route = matches!(send, SendScope::Stamped(bind)
+        if bind.scope.flow_id.is_some() || bind.scope.run_id.is_some());
+    if is_owner && !sender_route {
         return Ok(());
     }
     let mismatch = match &ownership.scope {
@@ -1406,6 +1408,20 @@ mod owner_access_tests {
         for epoch in [1, 7, 9] {
             let mut scope = ownership.scope.clone().unwrap();
             scope.scope_epoch = epoch;
+            // Epoch does not grant a flow route owner authority, even to the scope owner.
+            let flow = SendScope::Stamped(broca_protocol::BindScope {
+                scope: scope.clone(),
+                owner_authorized: true,
+                kind: broca_protocol::ScopeKind::Head,
+                parent: None,
+                parent_state: None,
+            });
+            assert!(matches!(
+                decide_owner_access(&ownership, Some(&owner), &flow),
+                Err(ScopeRefusal::OwnerMismatch(_))
+            ));
+            scope.flow_id = None;
+            scope.sender = None;
             let send = SendScope::Stamped(broca_protocol::BindScope {
                 scope,
                 owner_authorized: true,

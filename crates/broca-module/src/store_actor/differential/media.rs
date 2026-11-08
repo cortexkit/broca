@@ -177,6 +177,8 @@ pub(super) struct Side {
     pub(super) gate: Option<Arc<tokio::sync::Notify>>,
     /// The mode the side's module creates new-storage sessions in.
     pub(super) cipher: Cipher,
+    /// The caller whose sends reach the side's session.
+    pub(super) caller: crate::store_actor::tests::Caller,
 }
 
 impl Drop for Side {
@@ -216,6 +218,7 @@ pub(super) async fn side_gated(
         key,
         gate,
         cipher,
+        caller: Default::default(),
     }
 }
 
@@ -293,7 +296,7 @@ impl Side {
             .await
     }
 
-    /// A send asking to be delivered as `delivery`.
+    /// A send asking to be delivered as `delivery`, as the side's caller sends it.
     pub(super) async fn deliver(
         &self,
         run_id: &str,
@@ -304,7 +307,7 @@ impl Side {
             .route_submission_with_order(
                 &self.key,
                 RunId(run_id.into()),
-                request,
+                self.caller.shape(run_id, &SendKey::Minted, request),
                 RunKind::FreshOrResume,
                 SendKey::Minted,
                 false,

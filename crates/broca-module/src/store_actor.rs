@@ -1869,6 +1869,21 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         )
         .map_err(SendOutcome::ScopeRefused)?;
         let Some(manifest) = start.manifest.clone() else {
+            // Without a plan, a send that leaves its tools out runs on the latest run's, as
+            // today's actor does; the session's first run has none to take, so it runs with none.
+            if tools_were_omitted {
+                let inherited = if first_run {
+                    Vec::new()
+                } else {
+                    self.latest_admission()
+                        .map_err(SendOutcome::Transient)?
+                        .map(|latest| latest.tools)
+                        .unwrap_or_default()
+                };
+                start.request.policy_allowed =
+                    inherited.iter().map(|tool| tool.name.clone()).collect();
+                start.request.tools = Some(inherited);
+            }
             return Ok(());
         };
         crate::plan_episode::freeze_manifest(

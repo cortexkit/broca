@@ -19,6 +19,7 @@ fn user(text: &str) -> Message {
 
 fn run_started(stop_when: Vec<StopCondition>) -> WalRecord {
     WalRecord::RunStarted {
+        message_marks: None,
         compaction_plan_version: None,
         sent_by: None,
         written_at_ms: None,
@@ -75,6 +76,7 @@ fn run_started(stop_when: Vec<StopCondition>) -> WalRecord {
 
 fn steered(text: &str) -> WalRecord {
     WalRecord::Steered {
+        message_marks: None,
         sent_by: None,
         written_at_ms: None,
         tags: None,

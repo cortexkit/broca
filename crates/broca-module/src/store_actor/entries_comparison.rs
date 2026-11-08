@@ -204,6 +204,8 @@ struct Side {
     gate: Option<Arc<Notify>>,
     /// The scripted provider this side's runs call, which keeps the requests they sent.
     provider: broca_core::provider::StubProvider,
+    /// The caller whose sends reach the side's session.
+    caller: super::tests::Caller,
 }
 
 impl Drop for Side {
@@ -298,10 +300,12 @@ async fn side_in(
         key,
         gate,
         provider,
+        caller: Default::default(),
     }
 }
 
 impl Side {
+    /// Sends `request` as the side's caller sends it.
     async fn send_request(
         &self,
         run_id: &str,
@@ -312,7 +316,7 @@ impl Side {
             .route_submission_with_order(
                 &self.key,
                 RunId(run_id.into()),
-                request,
+                self.caller.shape(run_id, &SendKey::Minted, request),
                 RunKind::FreshOrResume,
                 SendKey::Minted,
                 false,
@@ -333,7 +337,8 @@ impl Side {
         self.send_request(run_id, request(text), None).await
     }
 
-    /// Sends `request` on the session's plan with the ordered delivery `order`.
+    /// Sends `request` on the session's plan with the ordered delivery `order`, as the side's
+    /// caller sends it.
     async fn send_ordered(
         &self,
         run_id: &str,
@@ -344,7 +349,7 @@ impl Side {
             .route_submission_with_order(
                 &self.key,
                 RunId(run_id.into()),
-                request,
+                self.caller.shape(run_id, &SendKey::Minted, request),
                 RunKind::FreshOrResume,
                 SendKey::Minted,
                 false,

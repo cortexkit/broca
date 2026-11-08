@@ -1361,6 +1361,20 @@ impl Rig {
                 "input_schema": {"type": "object"}
             }]
         });
+        // New keys inherit the frozen surface; retries of the creating key repeat its
+        // original declaration so the request identity stays identical after a restart too.
+        // Explicit overrides below still exercise forbidden later declarations.
+        let records = self.records();
+        if records
+            .iter()
+            .find_map(|record| match record {
+                WalRecord::RunStarted { send_id, .. } => Some(send_id.as_deref()),
+                _ => None,
+            })
+            .is_some_and(|first| first != Some(send_id))
+        {
+            params.as_object_mut().unwrap().remove("tools");
+        }
         if let Some(delivery) = delivery {
             params["delivery"] = serde_json::json!(delivery);
         }

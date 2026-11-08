@@ -135,6 +135,7 @@ impl Fixture {
         wal.append(
             1,
             &WalRecord::RunStarted {
+                message_marks: None,
                 compaction_plan_version: None,
                 sent_by: None,
                 written_at_ms: None,
@@ -1986,6 +1987,7 @@ fn a_steered_session_folds_and_extracts_with_its_gate() {
         wal.append(
             1,
             &WalRecord::Steered {
+                message_marks: None,
                 sent_by: None,
                 written_at_ms: None,
                 tags: None,

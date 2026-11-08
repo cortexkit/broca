@@ -1646,8 +1646,21 @@ async fn real_basal_sender_guard_protects_other_runs_and_allows_own_flow() {
             .unwrap(),
         )
         .await
-        .unwrap();
-    assert_eq!(response["result"], "ack", "{response}");
+        .unwrap_err();
+    assert!(
+        response.to_string().contains("scope_owner_mismatch"),
+        "{response}"
+    );
+    let cleanup = owner.route_open_management("broca", &own).await.unwrap();
+    let cancelled = owner_op(
+        &owner,
+        &cleanup,
+        "run.cancel",
+        serde_json::json!({"run_id":own_run}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(cancelled["result"], "ack", "{cancelled}");
 }
 
 /// A successful, fixed chat-completion response keeps billing checks independent of a vault
@@ -2294,9 +2307,13 @@ async fn active_status_reports_held_model_step_and_content() {
     }
     let expected = std::fs::read(path).expect("active-step golden generated through serve");
     assert_eq!(usage_compat::legacy_bytes(&bytes, &expected), expected);
+    let cleanup = basal
+        .route_open_management("broca", &session)
+        .await
+        .unwrap();
     let cancelled = scope_request(
         &basal,
-        &route,
+        &cleanup,
         "run.cancel",
         serde_json::json!({"run_id":run_id}),
     )
@@ -2531,6 +2548,20 @@ async fn real_frozen_carrier_and_scope_owner_cleanup_across_epochs() {
         serde_json::json!({"submission_id":second}),
     )
     .await
+    .unwrap_err();
+    let error: serde_json::Value = serde_json::from_slice(&response).unwrap();
+    assert_eq!(error["code"], "scope_owner_mismatch", "{error}");
+    let cleanup = owner
+        .route_open_management("broca", &session)
+        .await
+        .unwrap();
+    let response = owner_op(
+        &owner,
+        &cleanup,
+        "session.retract",
+        serde_json::json!({"submission_id":second}),
+    )
+    .await
     .unwrap();
     assert_eq!(response["result"], "retracted", "{response}");
     let carrier_route = basal
@@ -2545,6 +2576,16 @@ async fn real_frozen_carrier_and_scope_owner_cleanup_across_epochs() {
     let response = owner_op(
         &basal,
         &carrier_route,
+        "run.cancel",
+        serde_json::json!({"run_id":run_id}),
+    )
+    .await
+    .unwrap_err();
+    let error: serde_json::Value = serde_json::from_slice(&response).unwrap();
+    assert_eq!(error["code"], "scope_owner_mismatch", "{error}");
+    let response = owner_op(
+        &owner,
+        &cleanup,
         "run.cancel",
         serde_json::json!({"run_id":run_id}),
     )

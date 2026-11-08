@@ -641,7 +641,7 @@ pub type RecordedSummaries =
 
 /// What `include_display_facts` adds to each message of `response`, the same for both storages:
 /// its creation time; for an assistant message its completion time and reasoning summaries; the
-/// sender, notices and per-call times `facts` holds for it (by zero-based ordinal), and for a
+/// sender, message marks (`speaks_for`, `notice`), notices and per-call times `facts` holds for it (by zero-based ordinal), and for a
 /// user message its send's `client_message_id`. A message that makes tool calls and has no
 /// per-call facts names each call with no times.
 ///
@@ -680,6 +680,10 @@ pub fn apply_display_facts(
             };
         }
         if let Some(facts) = facts.get(&(entry.ordinal - 1)) {
+            if let Some(marks) = &facts.message_marks {
+                entry.speaks_for = marks.speaks_for.clone();
+                entry.notice = marks.notice;
+            }
             entry.sender = facts.sender.clone();
             entry.notices = facts
                 .notices
@@ -764,6 +768,8 @@ pub fn session_read_response(
             .messages
             .into_iter()
             .map(|message| SessionReadMessage {
+                speaks_for: None,
+                notice: false,
                 sender: None,
                 notices: Vec::new(),
                 created_at: None,
@@ -5687,6 +5693,7 @@ mod offset_head_tests {
 
     fn run_started() -> WalRecord {
         WalRecord::RunStarted {
+            message_marks: None,
             compaction_plan_version: None,
             sent_by: None,
             written_at_ms: None,

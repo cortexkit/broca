@@ -93,6 +93,7 @@ async fn gated_module_in(
         registry,
         wal,
         key,
+        caller: Default::default(),
     }
 }
 
@@ -119,7 +120,8 @@ pub(super) async fn both_in(
     (today, store)
 }
 
-/// A send through the registry's own route, with the title and plan the serve layer hands over.
+/// A send through the registry's own route, with the title and plan the serve layer hands over,
+/// as the module's caller sends it.
 pub(super) async fn send_titled(
     module: &Module,
     run_id: &str,
@@ -132,7 +134,7 @@ pub(super) async fn send_titled(
         .route_submission_with_order(
             &module.key,
             RunId(run_id.into()),
-            request,
+            module.caller.shape(run_id, &SendKey::Minted, request),
             RunKind::FreshOrResume,
             SendKey::Minted,
             false,

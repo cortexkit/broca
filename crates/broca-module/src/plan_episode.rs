@@ -7,14 +7,27 @@ use broca_protocol::request::SubmissionRequest;
 use broca_protocol::SessionScope;
 use broca_wal::PlanManifest;
 
-/// The refusal for a send carrying `tools` into a session whose first episode froze a fetch plan:
-/// the plan owns the session's tools for its whole life, so the send is refused before any retry,
-/// queue, steer or interrupt path could ignore the tools or freeze them.
+/// Whether a send that names tools is refused because the session's creating send froze them.
+/// A retry under a recorded key is never refused here:
+/// its original payload meets the retry's identity comparison instead. An internal send (keyed by
+/// run id) carries the session's own frozen tools, so it is refused only on a planned session,
+/// whose tools come from the plan alone.
+pub(crate) fn tools_are_frozen(
+    retry: bool,
+    internal: bool,
+    session_exists: bool,
+    planned: bool,
+) -> bool {
+    !retry && ((!internal && session_exists) || planned)
+}
+
+/// A new send cannot redeclare the tools frozen by the session's creating send,
+/// whether the surface came from a fetch plan or a legacy tool list.
 pub(crate) fn tools_frozen_refusal() -> crate::actor::SendOutcome {
     crate::actor::SendOutcome::DeliveryRefused {
         code: "invalid_params",
         field: "tools",
-        message: "tools are frozen by the session's fetch plan".into(),
+        message: "tools are frozen by the session's creating send".into(),
     }
 }
 

@@ -1,6 +1,6 @@
 //! Checks shared by pushed views, ride answers and step-boundary application.
 
-use cortexkit_compaction_view::{render, rules};
+use cortexkit_compaction_view::render;
 use cortexkit_role_compaction::{
     read::{Cursor, Detail, Entry, Head, ReadPage, ReadRequest, Select},
     rules::ProviderRules,
@@ -46,8 +46,7 @@ pub fn check_boundary(
             });
         }
     }
-    render::plan(entries, &view.edits)?;
-    rules::check(entries, &view.edits, provider_rules).map_err(ViewRefusal::Rule)
+    render::plan_view(entries, view, provider_rules).map(|_| ())
 }
 
 pub fn newest(entries: &[Entry]) -> Option<Cursor> {

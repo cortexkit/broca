@@ -644,6 +644,28 @@ async fn send_with_materialization(
     skip_materialization: bool,
 ) {
     let req = req(key, run, text);
+    let send_id = format!("send-{run}");
+    let mut submission = req.to_submission();
+    // Existing sessions inherit frozen tools even after their WAL moves into an archive.
+    // A retry of the send that created the session repeats its original tool declaration.
+    if rig
+        .wal_store
+        .wal_present_checked(key)
+        .expect("check fixture WAL presence")
+        == Some(true)
+        && rig
+            .wal_store
+            .read_records(key)
+            .expect("read fixture tools identity")
+            .iter()
+            .find_map(|framed| match &framed.record {
+                WalRecord::RunStarted { send_id, .. } => Some(send_id.as_deref()),
+                _ => None,
+            })
+            .is_some_and(|creating_id| creating_id != Some(send_id.as_str()))
+    {
+        submission.tools = None;
+    }
     rig.registry
         .send(broca_module::serve::SendRequest {
             session_class: None,
@@ -654,8 +676,8 @@ async fn send_with_materialization(
             delivery: Default::default(),
             session: key.clone(),
             run_id: req.run_id.clone(),
-            send_id: Some(format!("send-{run}")),
-            request: Box::new(req.to_submission()),
+            send_id: Some(send_id),
+            request: Box::new(submission),
             skip_materialization,
             kind: RunKind::FreshOrResume,
             plan: None,
@@ -1771,6 +1793,7 @@ fn min_config() -> RunConfig {
 
 fn started(key: &BindIdentity, run: &str, text: &str) -> WalRecord {
     WalRecord::RunStarted {
+        message_marks: None,
         compaction_plan_version: None,
         sent_by: None,
         written_at_ms: None,
@@ -3267,6 +3290,7 @@ async fn read_falls_back_when_budget_config_is_only_in_materialized_prefix() {
     let batch_id = BatchId("batch-1".into());
     let records = vec![
         WalRecord::RunStarted {
+            message_marks: None,
             compaction_plan_version: None,
             sent_by: None,
             written_at_ms: None,
@@ -3716,6 +3740,7 @@ async fn read_falls_back_for_a_budget_firing_in_a_later_unprojected_episode() {
         &key,
         &[
             WalRecord::RunStarted {
+                message_marks: None,
                 compaction_plan_version: None,
                 sent_by: None,
                 written_at_ms: None,
@@ -3857,6 +3882,7 @@ async fn torn_import_is_publicly_interrupted_for_read_and_run_status() {
         &rig.wal_store,
         &key,
         &[WalRecord::RunStarted {
+            message_marks: None,
             compaction_plan_version: None,
             sent_by: None,
             written_at_ms: None,
@@ -4517,6 +4543,7 @@ async fn session_read_renders_a_steered_message_at_its_wal_position() {
     let rig = Rig::new("steered-read", Arc::new(NoopExec));
     let key = rig.key("steered");
     let steered = WalRecord::Steered {
+        message_marks: None,
         sent_by: None,
         written_at_ms: None,
         tags: None,

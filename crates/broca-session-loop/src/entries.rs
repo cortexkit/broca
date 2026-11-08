@@ -1767,6 +1767,9 @@ pub fn ride_metadata(delivered: &Delivered) -> Option<broca_wal::record::RideMet
         form: match ride.form {
             RideForm::Append => broca_wal::record::RideForm::Append,
         },
+        // The new storage doesn't keep message marks yet; conversion counts a ride's marks as
+        // lost, so a stored ride never had any.
+        speaks_for: None,
     })
 }
 

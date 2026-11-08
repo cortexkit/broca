@@ -57,6 +57,7 @@ fn a_queued_send_is_the_record_the_converter_makes_of_todays() {
         title: receipt.title,
         delivery: at.delivery,
         hooks: None,
+        message_marks: None,
     };
     let converted = broca_session_convert::convert(
         &[FramedRecord {
@@ -133,6 +134,7 @@ fn a_steer_is_the_record_the_converter_makes_of_todays() {
         delivery: receipt.delivery,
         input: std::sync::Arc::new(input),
         hooks: None,
+        message_marks: None,
     };
     let converted = broca_session_convert::convert(
         &[FramedRecord {

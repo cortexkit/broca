@@ -39,7 +39,7 @@ cipher_tests!(
     a_photo_whose_bytes_cant_be_read_refuses_alike_and_nothing_is_sent,
     a_run_after_a_view_drops_a_photo_renders_alike,
     a_photo_between_numbered_messages_renders_alike,
-    an_ordered_steer_photo_lands_with_its_bytes_where_today_marks_it,
+    an_ordered_steer_photo_lands_with_its_bytes_alike,
     an_idle_start_photo_starts_its_run_and_renders_alike,
     an_ordered_photo_no_mode_can_carry_is_refused_alike,
 );
@@ -555,6 +555,7 @@ impl Rendered {
                 key,
                 gate,
                 cipher,
+                caller: Default::default(),
             },
             sent,
         }
@@ -785,7 +786,8 @@ async fn a_steered_photo_renders_alike(cipher: Cipher) {
     sent_alike(&today, &store, "the step that places the steered photo");
 }
 
-/// Uploads the image `hex` names on `side` and sends it with the ordered delivery list `modes`.
+/// Uploads the image `hex` names on `side` and sends it with the ordered delivery list `modes`,
+/// as the side's caller sends it.
 async fn send_ordered_image(
     side: &Rendered,
     run_id: &str,
@@ -793,14 +795,17 @@ async fn send_ordered_image(
     hex: &str,
 ) -> SendOutcome {
     let upload = side.side.uploaded(&bytes_of(hex)).await;
+    let key = crate::actor::SendKey::Minted;
     side.side
         .registry
         .route_submission_with_order(
             &side.side.key,
             broca_protocol::RunId(run_id.into()),
-            photo("look", &[&upload]),
+            side.side
+                .caller
+                .shape(run_id, &key, photo("look", &[&upload])),
             RunKind::FreshOrResume,
-            crate::actor::SendKey::Minted,
+            key,
             false,
             broca_protocol::Delivery::Queue,
             None,
@@ -821,15 +826,11 @@ async fn send_ordered_image(
 /// storages write that boundary in the same order: the run's start, the send's delivery, then
 /// the step's start.
 ///
-/// Every request before that step is the same on both. That step's request is not, and the
-/// difference is pinned here: today's renders the delivered photo as a `provenance` marker, not
-/// its bytes, while the new storage sends the photo. Today's own media fold, run over today's
-/// records from the first, binds the photo to the delivered message (it holds a delivered send's
-/// input until the step starts, then places it), so the marker comes from today's live renderer
-/// during the run that delivers the send, not from a rule the new storage should follow. The new
-/// storage's delivered copy points at the bytes the queued record stored, and its fold binds the
-/// photo as today's fold does.
-async fn an_ordered_steer_photo_lands_with_its_bytes_where_today_marks_it(cipher: Cipher) {
+/// Every request is the same on both, that step's included: each sends the delivered photo's
+/// bytes, never a `provenance` marker in their place. Today's own media fold, run over today's
+/// records from the first, binds the photo to the delivered message as the new storage's fold
+/// does; the new storage's delivered copy points at the bytes the queued record stored.
+async fn an_ordered_steer_photo_lands_with_its_bytes_alike(cipher: Cipher) {
     let (today, store) = both(three_texts(), true, cipher).await;
     for side in [&today, &store] {
         side.side.release_to_idle().await;
@@ -853,26 +854,12 @@ async fn an_ordered_steer_photo_lands_with_its_bytes_where_today_marks_it(cipher
         today_fold_binds(&today, &wide),
         "today's media fold binds the delivered photo"
     );
-    let (old, new) = (today.sent(), store.sent());
-    assert_eq!(new.len(), old.len(), "how many requests");
-    let (old_last, old_earlier) = old.split_last().expect("a request");
-    let (new_last, new_earlier) = new.split_last().expect("a request");
-    assert_eq!(
-        new_earlier, old_earlier,
-        "every request before the delivering step"
-    );
-    let old_last =
-        String::from_utf8_lossy(old_last.as_ref().expect("today's was sent")).into_owned();
-    let new_last =
-        String::from_utf8_lossy(new_last.as_ref().expect("the store's was sent")).into_owned();
-    let photo = base64(&bytes_of(WIDE));
+    sent_alike(&today, &store, "the step that delivers the ordered photo");
+    let last = store.sent().last().cloned().unwrap().unwrap();
+    let last = String::from_utf8_lossy(&last);
     assert!(
-        old_last.contains("reason=provenance") && !old_last.contains(&photo),
-        "today's live render marks the delivered photo: {old_last}"
-    );
-    assert!(
-        new_last.contains(&photo) && !new_last.contains("reason=provenance"),
-        "the store sends the delivered photo: {new_last}"
+        last.contains(&base64(&bytes_of(WIDE))) && !last.contains("reason=provenance"),
+        "the delivering step sends the delivered photo's bytes: {last}"
     );
 }
 
@@ -1064,21 +1051,22 @@ async fn a_photo_whose_bytes_cant_be_read_refuses_alike_and_nothing_is_sent(ciph
 }
 
 /// Sends `request` on `side` as run `run_id` under the fetch plan `plan`, as a planned
-/// session's sends arrive.
+/// session's sends arrive from the side's caller.
 async fn send_planned(
     side: &Rendered,
     run_id: &str,
     request: SubmissionRequest,
     plan: &Arc<broca_wal::PlanManifest>,
 ) -> SendOutcome {
+    let key = crate::actor::SendKey::Minted;
     side.side
         .registry
         .route_submission_with_order(
             &side.side.key,
             broca_protocol::RunId(run_id.into()),
-            request,
+            side.side.caller.shape(run_id, &key, request),
             RunKind::FreshOrResume,
-            crate::actor::SendKey::Minted,
+            key,
             false,
             broca_protocol::Delivery::Queue,
             Some(crate::actor::SendPlan {

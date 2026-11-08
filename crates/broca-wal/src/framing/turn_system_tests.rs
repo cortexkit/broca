@@ -29,6 +29,7 @@ fn turn_system_writer_serializer_requires_reader_support_and_preserves_legacy_by
         appended_text: None,
     };
     let steered = WalRecord::Steered {
+        message_marks: None,
         sent_by: None,
         written_at_ms: None,
         tags: None,

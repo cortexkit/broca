@@ -11,13 +11,16 @@ pub fn fold(state: &mut State, record: &WalRecord, session: &BindIdentity) -> Re
         WalRecord::RunStarted { .. } => state.begin_run(),
         WalRecord::StepStarted { step_id, .. } => state.start_step(step_id.0),
         WalRecord::CompactionViewV2(view) => {
-            let view = storage::rebuild(
+            let received = storage::rebuild(
                 state.latest_received(),
                 view.version,
                 view.checksum.clone(),
                 &view.edits,
+                view.built_through.clone(),
+                view.new_signed.clone(),
             )?;
-            state.restore_accepted(view)?;
+            state.restore_accepted(received)?;
+            state.restore_accepted_by(view.applied_by.clone());
         }
         WalRecord::CompactionViewAppliedV2 {
             step_id,

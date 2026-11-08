@@ -34,6 +34,8 @@ impl ReceivedView {
         version: u64,
         checksum: String,
         edits: Vec<Box<RawValue>>,
+        built_through: Option<String>,
+        new_signed: Option<String>,
     ) -> Result<Self, String> {
         if version == 0 || version > 9_007_199_254_740_991 {
             return Err(format!(
@@ -48,7 +50,7 @@ impl ReceivedView {
                 })
             })
             .collect::<Result<_, _>>()?;
-        let view = View::seal(version, decoded);
+        let view = View::seal_with_policy(version, decoded, built_through, new_signed);
         if view.checksum != checksum {
             return Err(format!(
                 "compaction view version {version} checksum mismatch"
@@ -114,11 +116,17 @@ impl Serialize for ReceivedView {
             version: u64,
             checksum: &'a str,
             edits: &'a [Box<RawValue>],
+            #[serde(skip_serializing_if = "Option::is_none")]
+            built_through: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            new_signed: Option<&'a str>,
         }
         RawView {
             version: self.view.version,
             checksum: &self.view.checksum,
             edits: &self.edits,
+            built_through: self.view.built_through.as_deref(),
+            new_signed: self.view.new_signed.as_deref(),
         }
         .serialize(serializer)
     }
@@ -131,8 +139,19 @@ impl<'de> Deserialize<'de> for ReceivedView {
             version: u64,
             checksum: String,
             edits: Vec<Box<RawValue>>,
+            #[serde(default)]
+            built_through: Option<String>,
+            #[serde(default)]
+            new_signed: Option<String>,
         }
         let raw = RawView::deserialize(deserializer)?;
-        Self::rebuilt(raw.version, raw.checksum, raw.edits).map_err(serde::de::Error::custom)
+        Self::rebuilt(
+            raw.version,
+            raw.checksum,
+            raw.edits,
+            raw.built_through,
+            raw.new_signed,
+        )
+        .map_err(serde::de::Error::custom)
     }
 }

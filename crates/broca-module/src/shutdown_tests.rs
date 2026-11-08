@@ -25,6 +25,7 @@ impl RunExecutor for DispatchHeld {
         let call = ToolCallId("shutdown-call".into());
         let batch = BatchId("shutdown-batch".into());
         job.writer.record(WalRecord::RunStarted {
+            message_marks: None,
             compaction_plan_version: None,
             sent_by: None,
             written_at_ms: None,
@@ -592,6 +593,8 @@ async fn shutdown_admits_queued_sends_before_stopping_and_stops_cleanly() {
             .await
     });
     let (reply, rx) = oneshot::channel();
+    let mut request = text_req(&f.key, "late-run").to_submission();
+    request.tools = None;
     handle
         .send(LineageCmd::Send {
             session_class: None,
@@ -600,7 +603,7 @@ async fn shutdown_admits_queued_sends_before_stopping_and_stops_cleanly() {
             title: None,
             conversation_key: None,
             run_id: RunId("late-run".into()),
-            request: Box::new(text_req(&f.key, "late-run").to_submission()),
+            request: Box::new(request),
             kind: RunKind::FreshOrResume,
             key: crate::actor::SendKey::Minted,
             skip_materialization: false,
@@ -676,6 +679,8 @@ async fn shutdown_rejects_new_admission() {
     // A scheduler yield does not prove the spawned task has requested stopping.
     signal.cancelled().await;
     let (reply, rx) = oneshot::channel();
+    let mut request = text_req(&f.key, "late-run").to_submission();
+    request.tools = None;
     handle
         .send(LineageCmd::Send {
             session_class: None,
@@ -684,7 +689,7 @@ async fn shutdown_rejects_new_admission() {
             title: None,
             conversation_key: None,
             run_id: RunId("late-run".into()),
-            request: Box::new(text_req(&f.key, "late-run").to_submission()),
+            request: Box::new(request),
             kind: RunKind::FreshOrResume,
             key: crate::actor::SendKey::Minted,
             skip_materialization: false,

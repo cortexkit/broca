@@ -98,6 +98,11 @@ pub fn restore(
                 checksum: view.checksum.clone(),
                 edits: serde_json::from_value(view.edits.clone())
                     .map_err(|error| format!("a stored compaction view's edits: {error}"))?,
+                // The new storage doesn't keep a view's build metadata yet; conversion counts
+                // it as lost, so a stored view never had any.
+                built_through: None,
+                new_signed: None,
+                applied_by: None,
             }),
             Record::ViewApplied(applied) => WalRecord::CompactionViewAppliedV2 {
                 step_id: applied.step_id,

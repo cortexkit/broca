@@ -4024,6 +4024,7 @@ fn steered(call: usize, index: usize, messages: Vec<Message>) -> WalRecord {
         input: Arc::new(messages),
         hooks: None,
         tags: None,
+        message_marks: None,
     }
 }
 

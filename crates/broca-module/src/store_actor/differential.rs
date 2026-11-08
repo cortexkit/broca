@@ -436,6 +436,8 @@ async fn compare(script: Vec<Vec<NormalizedEvent>>, gated: bool, steps: Vec<Step
     ));
     let (commands, served, _) =
         super::tests::actor_with(executor(script, store_gate.clone()), parts.clone()).await;
+    // Both sides get the request one caller shapes.
+    let caller = super::tests::Caller::default();
     for (index, step) in steps.into_iter().enumerate() {
         match step {
             Step::Send {
@@ -447,15 +449,15 @@ async fn compare(script: Vec<Vec<NormalizedEvent>>, gated: bool, steps: Vec<Step
                 delivery,
                 class,
             } => {
-                let mut sent = request(text);
-                sent.route_decision_id = route_decision.map(str::to_owned);
-                if let Some(tweak) = tweak {
-                    tweak(&mut sent);
-                }
                 let send_key = || match key {
                     Some(key) => SendKey::SendId(key.into()),
                     None => SendKey::Minted,
                 };
+                let mut sent = caller.shape(run_id, &send_key(), request(text));
+                sent.route_decision_id = route_decision.map(str::to_owned);
+                if let Some(tweak) = tweak {
+                    tweak(&mut sent);
+                }
                 let old = today
                     .send(run_id, sent.clone(), send_key(), delivery, class)
                     .await;
@@ -1007,12 +1009,12 @@ fn head_scope(owner: broca_protocol::BindPrincipal) -> broca_protocol::SendScope
     })
 }
 
-/// Core, sending under its own head scope. The send declares no tools: on a scoped session
-/// tools come only from a plan, which a store session can't have yet.
+/// Core, sending under its own head scope. The send names no tools: on a scoped session tools
+/// come only from a plan.
 fn scoped_by_core(request: &mut SubmissionRequest) {
     request.principal = Some(core());
     request.scope = head_scope(core());
-    request.tools = Some(Vec::new());
+    request.tools = None;
 }
 
 /// Core under its own head scope, declaring the default request's tools.
@@ -1033,7 +1035,7 @@ fn scoped_by_another(request: &mut SubmissionRequest) {
 fn unstamped_by_core(request: &mut SubmissionRequest) {
     request.principal = Some(core());
     request.scope = broca_protocol::SendScope::Unstamped;
-    request.tools = Some(Vec::new());
+    request.tools = None;
 }
 
 /// A first scoped send freezes its scope, and later sends under it run with it, alike. A send
@@ -1247,6 +1249,8 @@ struct Module {
     registry: LineageRegistry,
     wal: Arc<FileWalStore>,
     key: BindIdentity,
+    /// The caller whose sends reach the module's session.
+    caller: super::tests::Caller,
 }
 
 impl Drop for Module {
@@ -1312,6 +1316,7 @@ async fn module(on: bool, steps: Vec<Vec<NormalizedEvent>>) -> Module {
         registry,
         wal,
         key,
+        caller: Default::default(),
     }
 }
 
@@ -1321,7 +1326,7 @@ impl Module {
             .route_submission_with_order(
                 &self.key,
                 RunId(run_id.into()),
-                request(text),
+                self.caller.shape(run_id, &SendKey::Minted, request(text)),
                 RunKind::FreshOrResume,
                 SendKey::Minted,
                 false,
