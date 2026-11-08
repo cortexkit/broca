@@ -1429,9 +1429,15 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 })
             })
             .transpose()?;
+        let rebuild = plan.rebuild_since_accept
+            || crate::plan_change::adds_compaction(
+                self.session.operations().on_contract(),
+                current.as_deref(),
+                pending.as_ref(),
+            );
         let applying = crate::plan_change::pending_applying(
             pending.as_ref(),
-            plan.rebuild_since_accept,
+            rebuild,
             plan.flushed_since_accept,
             plan.last_model.as_deref(),
             model,
@@ -1441,7 +1447,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         let applies = applying.map(|pending| {
             let applied_by = applies_at_run_start(
                 &pending.policy,
-                plan.rebuild_since_accept,
+                rebuild,
                 plan.flushed_since_accept,
                 plan.last_model.as_deref(),
                 &model_key(model),

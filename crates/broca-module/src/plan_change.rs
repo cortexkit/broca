@@ -288,6 +288,27 @@ pub(crate) fn flush(facts: &ChangeFacts) -> Result<Option<u64>, Option<u64>> {
     }
 }
 
+/// Whether the pending refresh adds a compaction provider to a session that isn't on the
+/// current compaction contract (`on_contract`), against `current`, the latest run's manifest.
+/// Adding one rebuilds the request's prefix: the system text moves above the conversation and
+/// part numbers show. So such a refresh applies at the next run whatever its policy, and its
+/// `RefreshApplied` record says `applied_by: "fold"`, as one applied after a prefix rebuild does.
+/// Only a session in the session store takes such a refresh; one kept in the write-ahead log
+/// refuses it.
+pub(crate) fn adds_compaction(
+    on_contract: bool,
+    current: Option<&PlanManifest>,
+    pending: Option<&PendingState>,
+) -> bool {
+    !on_contract
+        && pending.is_some_and(|pending| {
+            serde_json::from_str::<serde_json::Value>(pending.manifest.plan.as_json_text())
+                .ok()
+                .and_then(|next| session_change::compaction_item_change(current, &next).ok())
+                == Some(session_change::CompactionItemChange::Added)
+        })
+}
+
 /// The pending change, when it applies at a run start on `model`: `rebuild` and `flushed` say
 /// whether a prefix rebuild and a flush happened since it was accepted, and `last_model` is the
 /// previous run's model key.
@@ -582,6 +603,40 @@ mod tests {
         assert!(later_send_plan(Some("a"), Some((Some("b"), Some("c"))), "c").is_ok());
         assert!(later_send_plan(Some("a"), Some((Some("b"), Some("c"))), "b").is_ok());
         assert!(later_send_plan(Some("a"), Some((Some("b"), Some("c"))), "a").is_err());
+    }
+
+    /// A refresh adding a compaction provider rebuilds the request's prefix, so it applies at
+    /// the next run even under `on_prefix_rebuild`, with `applied_by: "fold"`. One that
+    /// keeps the item, or a session already on the contract, waits for a real rebuild.
+    #[test]
+    fn adding_a_compaction_provider_applies_at_the_next_run_as_a_prefix_rebuild() {
+        let item = serde_json::json!({"provider": "ck-mc", "preset": "head", "params": {}});
+        let current = with_item("old", "text", None);
+        let pending = |manifest: PlanManifest| PendingState {
+            generation: 1,
+            policy: "on_prefix_rebuild".into(),
+            manifest: Arc::new(manifest),
+        };
+        let adding = pending(with_item("adding", "text", Some(item)));
+        let keeping = pending(with_item("keeping", "other text", None));
+        let model = broca_protocol::ModelHandle::new("stub", "m");
+        // The same model as the session's last run: no model switch rebuilds the prefix.
+        let key = session_change::model_key(&model);
+        let applies = |pending: &PendingState, on_contract: bool| {
+            let rebuild = adds_compaction(on_contract, Some(&current), Some(pending));
+            pending_applying(Some(pending), rebuild, false, Some(&key), &model).and_then(|_| {
+                session_change::applies_at_run_start(
+                    &pending.policy,
+                    rebuild,
+                    false,
+                    Some(&key),
+                    &key,
+                )
+            })
+        };
+        assert_eq!(applies(&adding, false), Some("fold"));
+        assert_eq!(applies(&keeping, false), None);
+        assert_eq!(applies(&adding, true), None);
     }
 
     /// [`manifest`] whose plan names `item` as its compaction item, or none.
