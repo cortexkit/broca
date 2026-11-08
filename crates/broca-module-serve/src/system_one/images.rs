@@ -114,7 +114,12 @@ impl SystemOne {
         };
         let model = request.model.as_deref().unwrap_or_default();
         let entry = if self.config.routed_models && self.role == super::STORE_ROLE {
-            super::routed::validation_entry(self)
+            if stored.is_none() {
+                super::routed::pinned_entry(self, &request)?
+                    .unwrap_or_else(|| super::routed::validation_entry(self))
+            } else {
+                super::routed::validation_entry(self)
+            }
         } else {
             let row = self.catalog.row(model);
             cortexkit_role_classifier::request::check_catalog_row(
