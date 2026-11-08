@@ -189,76 +189,108 @@ impl SessionChangeState {
     /// change as `fold` when a rebuild applied it and `append` otherwise. The transitions are
     /// [`Transitions`]'s, which the new storage's fold makes too.
     pub fn fold(records: &[FramedRecord]) -> Self {
-        let mut state = Self::default();
-        let mut change = Transitions::<Arc<PlanManifest>>::default();
+        let mut fold = SessionChangeFold::default();
         for framed in records {
-            match &framed.record {
-                WalRecord::SessionRefreshAccepted {
-                    generation,
-                    policy,
-                    manifest,
-                    run_in_progress,
-                    applies_from_next_run,
-                } => {
-                    state
-                        .accepted_replies
-                        .insert(*generation, (*run_in_progress, *applies_from_next_run));
-                    let identity = manifest.plan_identity.clone();
-                    state
-                        .accepted
-                        .insert(*generation, (identity, policy.clone()));
-                    change.accepted(*generation, policy, Arc::new((**manifest).clone()));
-                }
-                WalRecord::SessionRefreshPolicyChanged {
-                    generation,
-                    policy,
-                    send_id,
-                } => {
-                    state
-                        .policy_send_ids
-                        .insert(send_id.clone(), (*generation, policy.clone()));
-                    change.policy_changed(*generation, policy);
-                }
-                WalRecord::SessionPrefixFlushed {
-                    send_id,
-                    pending_generation,
-                } => {
-                    state
-                        .flush_send_ids
-                        .insert(send_id.clone(), *pending_generation);
-                    change.flushed();
-                }
-                WalRecord::CompactionViewApplied { .. }
-                | WalRecord::CompactionViewAppliedV2 { .. } => change.view_applied(),
-                WalRecord::RunStarted {
-                    manifest, config, ..
-                } => {
-                    let model = model_key(&config.model);
-                    let started = manifest.as_deref().cloned().map(Arc::new);
-                    // Replay decides again what the writer decided at this run start: the
-                    // pending change applies when its policy's trigger came and the run froze
-                    // its manifest.
-                    let applying = change.applying(&model).filter(|_| {
-                        started.as_ref().is_some_and(|started| {
-                            change
-                                .pending
-                                .as_ref()
-                                .is_some_and(|pending| pending.manifest == *started)
-                        })
-                    });
-                    change.run_started(model, started);
-                    if let Some(applying) = applying {
-                        if let Some(pending) = change.applied(applying) {
-                            state
-                                .applied
-                                .insert(applying.generation, applying.applied_by.into());
-                            state.effective = Some(EffectiveState::of(&pending.manifest, applying));
-                        }
+            fold.record(&framed.record);
+        }
+        fold.finish()
+    }
+
+    /// The plan identity and policy accepted under `generation`, if any, for
+    /// `session_change::refresh_order`'s repeat check.
+    pub fn earlier(&self, generation: u64) -> Option<(&str, &str)> {
+        self.accepted
+            .get(&generation)
+            .map(|(plan, policy)| (plan.as_str(), policy.as_str()))
+    }
+}
+
+/// [`SessionChangeState::fold`] one record at a time, for a reader that needs to know which run
+/// start applied a change: the session's converter, which records that application.
+#[derive(Debug, Clone, Default)]
+pub struct SessionChangeFold {
+    state: SessionChangeState,
+    change: Transitions<Arc<PlanManifest>>,
+}
+
+impl SessionChangeFold {
+    /// Folds `record`, the session's next durable record. Returns the change it applied, when it
+    /// is a run start that applied the pending change.
+    pub fn record(&mut self, record: &WalRecord) -> Option<&EffectiveState> {
+        let Self { state, change } = self;
+        match record {
+            WalRecord::SessionRefreshAccepted {
+                generation,
+                policy,
+                manifest,
+                run_in_progress,
+                applies_from_next_run,
+            } => {
+                state
+                    .accepted_replies
+                    .insert(*generation, (*run_in_progress, *applies_from_next_run));
+                let identity = manifest.plan_identity.clone();
+                state
+                    .accepted
+                    .insert(*generation, (identity, policy.clone()));
+                change.accepted(*generation, policy, Arc::new((**manifest).clone()));
+            }
+            WalRecord::SessionRefreshPolicyChanged {
+                generation,
+                policy,
+                send_id,
+            } => {
+                state
+                    .policy_send_ids
+                    .insert(send_id.clone(), (*generation, policy.clone()));
+                change.policy_changed(*generation, policy);
+            }
+            WalRecord::SessionPrefixFlushed {
+                send_id,
+                pending_generation,
+            } => {
+                state
+                    .flush_send_ids
+                    .insert(send_id.clone(), *pending_generation);
+                change.flushed();
+            }
+            WalRecord::CompactionViewApplied { .. } | WalRecord::CompactionViewAppliedV2 { .. } => {
+                change.view_applied()
+            }
+            WalRecord::RunStarted {
+                manifest, config, ..
+            } => {
+                let model = model_key(&config.model);
+                let started = manifest.as_deref().cloned().map(Arc::new);
+                // Replay decides again what the writer decided at this run start: the pending
+                // change applies when its policy's trigger came and the run froze its manifest.
+                let applying = change.applying(&model).filter(|_| {
+                    started.as_ref().is_some_and(|started| {
+                        change
+                            .pending
+                            .as_ref()
+                            .is_some_and(|pending| pending.manifest == *started)
+                    })
+                });
+                change.run_started(model, started);
+                if let Some(applying) = applying {
+                    if let Some(pending) = change.applied(applying) {
+                        state
+                            .applied
+                            .insert(applying.generation, applying.applied_by.into());
+                        state.effective = Some(EffectiveState::of(&pending.manifest, applying));
+                        return state.effective.as_ref();
                     }
                 }
-                _ => {}
             }
+            _ => {}
         }
+        None
+    }
+
+    /// The state the records folded so far leave.
+    pub fn finish(self) -> SessionChangeState {
+        let Self { mut state, change } = self;
         state.accepted_generation = change.accepted_generation;
         state.applied_generation = change.applied_generation;
         state.pending = change.pending;
@@ -268,14 +300,6 @@ impl SessionChangeState {
         state.flush_pending = change.flushed_since_accept;
         state.last_model = change.last_model;
         state
-    }
-
-    /// The plan identity and policy accepted under `generation`, if any, for
-    /// `session_change::refresh_order`'s repeat check.
-    pub fn earlier(&self, generation: u64) -> Option<(&str, &str)> {
-        self.accepted
-            .get(&generation)
-            .map(|(plan, policy)| (plan.as_str(), policy.as_str()))
     }
 }
 
@@ -785,6 +809,22 @@ mod tests {
                     "{:?}",
                     records.iter().map(|r| &r.record).collect::<Vec<_>>()
                 );
+                // Folded one record at a time, each run start that applied a change reports
+                // it: together they are every application the whole fold records, and the last
+                // is the effective change.
+                let mut fold = SessionChangeFold::default();
+                let mut reported = BTreeMap::new();
+                let mut last = None;
+                for framed in &records {
+                    if let Some(effective) = fold.record(&framed.record) {
+                        assert!(matches!(framed.record, WalRecord::RunStarted { .. }));
+                        reported.insert(effective.generation, effective.applied_by.clone());
+                        last = Some(effective.clone());
+                    }
+                }
+                let state = fold.finish();
+                assert_eq!(reported, state.applied);
+                assert_eq!(last, state.effective);
                 compared += 1;
             }
         }
