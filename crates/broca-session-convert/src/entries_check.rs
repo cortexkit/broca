@@ -23,7 +23,6 @@ use std::collections::BTreeMap;
 
 use broca_core::compaction_v2::protocol::read::{Detail, Head, ReadRequest, Select};
 use broca_session_store::backend::{MemoryBackend, SessionAddr};
-use broca_session_store::keys::DeploymentKey;
 use broca_session_store::session::Session;
 use futures::executor::block_on;
 use serde::Serialize;
@@ -143,7 +142,7 @@ where
 
 pub(crate) fn run(args: &Args) {
     let mut report = EntriesCheckReport::default();
-    let deployment = DeploymentKey::new(1, &[0x5a; 32]);
+    let deployment = crate::deployment();
     let limit = std::env::var("PAGES_LIMIT")
         .ok()
         .and_then(|limit| limit.parse().ok())

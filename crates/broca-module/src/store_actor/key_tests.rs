@@ -9,7 +9,7 @@ use broca_core::{FileLeaseStore, FileWalStore};
 use broca_protocol::{BindIdentity, RunId};
 use broca_session_store::backend::{LocalBackend, SessionAddr};
 use broca_session_store::head::SessionTriple;
-use broca_session_store::keys::DeploymentKey;
+use broca_session_store::keys::{Cipher, DeploymentKey};
 use broca_session_store::session::Session;
 use sha2::Digest;
 
@@ -53,6 +53,12 @@ fn triple(key: &BindIdentity) -> SessionTriple {
 }
 
 async fn module(name: &str, billing: Option<StoreBilling>) -> Module {
+    module_with(name, billing, Cipher::XChaCha20Poly1305).await
+}
+
+/// [`module`] whose new storage creates sessions in mode `new_sessions` and takes every new
+/// session a creating send opens.
+async fn module_with(name: &str, billing: Option<StoreBilling>, new_sessions: Cipher) -> Module {
     let dir =
         broca_test_support::scratch_root().join(format!("store-key-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -70,7 +76,7 @@ async fn module(name: &str, billing: Option<StoreBilling>) -> Module {
     .unwrap();
     let wal = Arc::new(FileWalStore::new(dir.join("wal")));
     let executor: Arc<dyn RunExecutor> = Arc::new(executor(vec![text_step("a1", "hello")], None));
-    let slot = Arc::new(StoreSlot::awaiting_key(&dir, 1));
+    let slot = Arc::new(StoreSlot::awaiting_key(&dir, 1).creating(new_sessions));
     let registry = LineageRegistry::new_with_reader(
         Arc::new(
             DefaultOpener::new(
@@ -83,7 +89,8 @@ async fn module(name: &str, billing: Option<StoreBilling>) -> Module {
         ),
         wal,
         None,
-    );
+    )
+    .with_store_new_sessions();
     let setup = StoreRuntimeSetup {
         state_root: dir.clone(),
         executor,
@@ -193,6 +200,163 @@ async fn a_key_with_another_id_is_not_installed() {
         .is_err());
     assert!(!module.slot.key_loaded());
     assert_key_unavailable(module.registry.actor_for(&module.held).await.err().unwrap());
+}
+
+impl Module {
+    /// Creates the session `name` beside the held one, in mode `cipher`, as a module creating
+    /// sessions in that mode would have.
+    async fn create(&self, name: &str, cipher: Cipher) -> BindIdentity {
+        let session = BindIdentity::new(self.dir.join("project"), "store-actor", name);
+        let deployment = DeploymentKey::new(1, &KEY).creating(cipher);
+        Session::create(
+            LocalBackend::new(self.dir.join(broca_wal::SESSION_STORAGE_DIR)),
+            SessionAddr(broca_core::session_addr(&session)),
+            triple(&session),
+            &deployment,
+            false,
+        )
+        .await
+        .unwrap()
+        .close()
+        .await
+        .unwrap();
+        session
+    }
+
+    /// The mode the stored head of `session` names.
+    fn stored_mode(&self, session: &BindIdentity) -> Cipher {
+        let (stored, _) = LocalBackend::new(self.dir.join(broca_wal::SESSION_STORAGE_DIR))
+            .read_stored_head(&SessionAddr(broca_core::session_addr(session)))
+            .unwrap()
+            .unwrap();
+        broca_session_store::head::stored_cipher(&stored).unwrap()
+    }
+
+    /// Rewrites the head of `session` to name mode `cipher` (`None` names none, which reads as
+    /// encrypted), keeping the rest of its bytes: the change no writer makes.
+    async fn flip_mode(&self, session: &BindIdentity, cipher: Option<Cipher>) {
+        use broca_session_store::backend::SessionBackend;
+        use broca_session_store::codec::Message;
+        let backend = LocalBackend::new(self.dir.join(broca_wal::SESSION_STORAGE_DIR));
+        let addr = SessionAddr(broca_core::session_addr(session));
+        let (stored, version) = backend.read_stored_head(&addr).unwrap().unwrap();
+        // The head's body follows its 40-byte tag or check.
+        let (prefix, body) = stored.split_at(40);
+        let mut head = broca_session_store::head::Head::decode(body).unwrap();
+        head.cipher = cipher;
+        let mut flipped = prefix.to_vec();
+        flipped.extend(head.encode());
+        backend
+            .write_head(&addr, &flipped, Some(version), version + 1)
+            .await
+            .unwrap();
+    }
+}
+
+/// Whether `error` is the open refusing a head as damage: it failed its check in the mode it
+/// names.
+fn refused_as_damage(error: &OpenError) -> bool {
+    matches!(error, OpenError::Open(reason) if reason.contains("Head(Authentication)"))
+}
+
+/// A plain session is served while the deployment key hasn't loaded, by the runtime the module
+/// opened at its start without the key, and an encrypted session at the same root is refused
+/// `key_unavailable` until the key loads.
+#[tokio::test]
+async fn a_plain_session_is_served_before_the_key_loads_and_an_encrypted_one_is_refused() {
+    let module = module("plain", None).await;
+    let plain = module.create("plain", Cipher::None).await;
+    module
+        .slot
+        .open_without_key(&module.setup)
+        .await
+        .expect("the runtime opens without the key");
+    assert!(!module.slot.key_loaded());
+    module
+        .registry
+        .actor_for(&plain)
+        .await
+        .expect("the plain session is served without the key");
+    assert!(module.registry.store_holding(&plain).unwrap().is_some());
+    assert_key_unavailable(
+        module
+            .registry
+            .actor_for(&module.held)
+            .await
+            .err()
+            .expect("the encrypted session is refused"),
+    );
+    assert_eq!(module.slot.take_refused(), vec![module.held.clone()]);
+    module.load_key().await;
+    module
+        .registry
+        .actor_for(&module.held)
+        .await
+        .expect("the encrypted session is served once the key has loaded");
+}
+
+/// A head whose mode was flipped is never served. An encrypted head that names plain mode is
+/// routed as plain before the key loads, and its open refuses it as damage: its bytes fail the
+/// plain check. A plain head that names no mode reads as encrypted: refused `key_unavailable`
+/// before the key loads, and as damage after, since it wraps no key.
+#[tokio::test]
+async fn a_flipped_head_mode_is_refused_as_damage_both_ways() {
+    let module = module("flipped", None).await;
+    let plain = module.create("was-plain", Cipher::None).await;
+    module.flip_mode(&module.held, Some(Cipher::None)).await;
+    module.flip_mode(&plain, None).await;
+    assert_eq!(module.stored_mode(&module.held), Cipher::None);
+    assert_eq!(module.stored_mode(&plain), Cipher::XChaCha20Poly1305);
+    module.slot.open_without_key(&module.setup).await.unwrap();
+
+    let error = module.registry.actor_for(&module.held).await.err().unwrap();
+    assert!(refused_as_damage(&error), "{error:?}");
+    assert_key_unavailable(module.registry.actor_for(&plain).await.err().unwrap());
+
+    module.load_key().await;
+    for session in [&module.held, &plain] {
+        let error = module.registry.actor_for(session).await.err().unwrap();
+        assert!(refused_as_damage(&error), "{}: {error:?}", session.session);
+    }
+}
+
+/// With new sessions plain, a send that creates a session creates it plain, before the key has
+/// loaded, and the encrypted session created before keeps its mode once served.
+#[tokio::test]
+async fn a_module_creating_plain_sessions_creates_the_next_one_plain() {
+    let module = module_with("creates-plain", None, Cipher::None).await;
+    module.slot.open_without_key(&module.setup).await.unwrap();
+    let fresh = BindIdentity::new(module.dir.join("project"), "store-actor", "fresh");
+    let outcome = module
+        .registry
+        .route_submission_with_order(
+            &fresh,
+            RunId("r1".into()),
+            request("hi"),
+            RunKind::FreshOrResume,
+            SendKey::Minted,
+            false,
+            broca_protocol::Delivery::Queue,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .await
+        .expect("a plain session is created without the key");
+    assert!(matches!(outcome, SendOutcome::Active { .. }));
+    assert!(!module.slot.key_loaded());
+    assert_eq!(module.stored_mode(&fresh), Cipher::None);
+    assert!(
+        !module.wal_file(&fresh).exists(),
+        "the session was created in the new storage, not today's"
+    );
+    module.load_key().await;
+    module.registry.actor_for(&module.held).await.unwrap();
+    assert_eq!(module.stored_mode(&module.held), Cipher::XChaCha20Poly1305);
 }
 
 /// The fact id today's runs are exported under: SHA-256 over the source instance, the bind

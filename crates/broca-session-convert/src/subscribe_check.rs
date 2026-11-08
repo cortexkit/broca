@@ -244,7 +244,7 @@ pub(super) fn cost(args: &Args) {
             session: "cost".into(),
         };
         // Measurements encrypt with a fixed throwaway key: only the cost matters.
-        let deployment = broca_session_store::keys::DeploymentKey::new(1, &[0x5a; 32]);
+        let deployment = crate::deployment();
         let wal: Vec<broca_wal::WalRecord> = old.iter().map(|f| f.record.clone()).collect();
         let appends_in_conversation = !broca_core::is_mode3_log(&wal);
         let timed = futures::executor::block_on(async {

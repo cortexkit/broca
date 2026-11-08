@@ -144,7 +144,7 @@ pub async fn compaction_runner(
                 unreachable!("built above");
             };
             serve_compaction::<broca_session_store::backend::LocalBackend>(
-                store.parts(),
+                store.parts_for(store.new_sessions()),
                 None,
                 key,
                 caller.as_deref(),

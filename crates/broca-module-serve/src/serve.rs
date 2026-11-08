@@ -10407,8 +10407,9 @@ mod tests {
         let health: serde_json::Value = serde_json::from_slice(&health.body).unwrap();
         assert_eq!(
             health["metrics"]["store"],
-            serde_json::json!({"key_id": 7, "loaded": false}),
-            "health.check reports the deployment key's id and that it hasn't loaded"
+            serde_json::json!({"key_id": 7, "loaded": false, "new_sessions": "encrypted"}),
+            "health.check reports the deployment key's id, that it hasn't loaded, and the mode \
+             new sessions take"
         );
         assert!(
             health["metrics"]["scoped_role_route_refusals"].is_object(),

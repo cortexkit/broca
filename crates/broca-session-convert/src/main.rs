@@ -37,6 +37,11 @@
 //!
 //! Point it only at a copy of a state root (an APFS clone, `cp -c`), never at live files: it opens
 //! each log read-only, but a measurement run should never share a disk path with the daemon.
+//!
+//! `--plain`, with any command, stores everything the converter writes or measures in the plain
+//! mode (see `broca_session_store::keys::Cipher`): sessions are created plain, and frames and
+//! segments carry the unkeyed check instead of encryption. Without it they are encrypted under a
+//! fixed throwaway key, as before. `read-cost` stays encrypted either way.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -49,8 +54,8 @@ use broca_session_convert::{convert, Tally};
 use broca_session_store::backend::{MemoryBackend, SessionAddr};
 use broca_session_store::codec::Digest;
 use broca_session_store::fold::conversation::Conversation;
-use broca_session_store::frame::{FrameKey, FRAME_OVERHEAD};
-use broca_session_store::keys::DeploymentKey;
+use broca_session_store::frame::FrameKey;
+use broca_session_store::keys::{Cipher, DeploymentKey};
 use broca_session_store::record::{CancelPoint, Record, Stream};
 use broca_session_store::session::Session;
 use broca_wal::FramedRecord;
@@ -64,9 +69,37 @@ mod pages;
 mod serve_check;
 mod subscribe_check;
 
-/// Measurements encrypt with a fixed throwaway key: only the cost matters, not secrecy.
+/// Set from `--plain` when the arguments are read: the mode everything the converter stores
+/// takes.
+static PLAIN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// The mode `--plain` chose: plain with it, encrypted without.
+fn cipher() -> Cipher {
+    if PLAIN.get().copied().unwrap_or(false) {
+        Cipher::None
+    } else {
+        Cipher::XChaCha20Poly1305
+    }
+}
+
+/// The deployment key every converted session is created and opened with: a fixed throwaway
+/// key, since only cost and correctness are measured, creating sessions in the mode `--plain`
+/// chose.
+fn deployment() -> DeploymentKey {
+    DeploymentKey::new(1, &[0x5a; 32]).creating(cipher())
+}
+
+/// A frame key in the mode `--plain` chose: encrypted under fixed throwaway `bytes`, or plain.
+fn frame_key(bytes: &[u8; 32]) -> FrameKey {
+    match cipher() {
+        Cipher::XChaCha20Poly1305 => FrameKey::new(1, bytes),
+        Cipher::None => FrameKey::plain(),
+    }
+}
+
+/// Measurements use a fixed throwaway key: only the cost matters, not secrecy.
 fn measurement_key() -> FrameKey {
-    FrameKey::new(1, &[7; 32])
+    frame_key(&[7; 32])
 }
 
 #[derive(Default, Serialize)]
@@ -91,9 +124,9 @@ struct Report {
     old_by_type: BTreeMap<String, Tally>,
     new_records: u64,
     new_body_bytes: u64,
-    /// The logs framed and encrypted: bodies plus `FRAME_OVERHEAD` bytes per record.
+    /// The logs framed, encrypted or plain: bodies plus the key's frame overhead per record.
     new_framed_bytes: u64,
-    /// History sealed: zstd in 16 KiB blocks, encrypted, both streams.
+    /// History sealed: zstd in 16 KiB blocks, encrypted or plain, transcript and ledger alike.
     sealed_bytes: u64,
     /// The same with opaque reasoning, signatures and provider text state pruned from runs that
     /// ended.
@@ -170,7 +203,8 @@ fn usage() -> ! {
          session-convert entries [--dir SCRATCH] [--out FILE] [--limit N] PATH...\n       \
          session-convert billing [--dir SCRATCH] [--out FILE] [--limit N] PATH...\n       \
          session-convert subscribe [--dir SCRATCH] [--out FILE] [--limit N] PATH...\n       \
-         session-convert subscribe-cost --dir SCRATCH [--out FILE] PATH..."
+         session-convert subscribe-cost --dir SCRATCH [--out FILE] PATH...\n\
+         Any command takes --plain: store in the plain mode instead of encrypted."
     );
     std::process::exit(64);
 }
@@ -226,6 +260,9 @@ fn parse_args() -> Args {
             "--every" => parsed.every = number().max(1),
             "--only" => parsed.only = Some(args.next().unwrap_or_else(|| usage())),
             "--dir" => parsed.dir = Some(PathBuf::from(args.next().unwrap_or_else(|| usage()))),
+            "--plain" => {
+                let _ = PLAIN.set(true);
+            }
             _ => paths.push(PathBuf::from(arg)),
         }
     }
@@ -327,7 +364,7 @@ struct RenderReport {
 fn run_render(args: &Args) {
     use broca_wal::WalRecord;
     let mut report = RenderReport::default();
-    let deployment = DeploymentKey::new(1, &[0x5a; 32]);
+    let deployment = deployment();
     let sha = |bytes: &[u8]| {
         use sha2::Digest as _;
         broca_session_store::codec::hex(&sha2::Sha256::digest(bytes))
@@ -760,7 +797,7 @@ struct EntriesReport {
 /// Every entry must be equal, digests included.
 fn run_entries(args: &Args) {
     let mut report = EntriesReport::default();
-    let deployment = DeploymentKey::new(1, &[0x5a; 32]);
+    let deployment = deployment();
     each_log(args, |item| {
         let Item::Log {
             name, old: Ok(old), ..
@@ -953,7 +990,7 @@ struct BillingReport {
 fn run_billing(args: &Args) {
     use broca_session_convert::billing::{bind_of, compare, log_session, triple, warms_at};
     let mut report = BillingReport::default();
-    let deployment = DeploymentKey::new(1, &[0x5a; 32]);
+    let deployment = deployment();
     each_log(args, |item| {
         let Item::Log { name, old, .. } = item else {
             return;
@@ -2208,7 +2245,7 @@ impl Measuring {
         let report = &mut self.report;
         debug_assert_eq!(
             report.new_framed_bytes,
-            report.new_body_bytes + report.new_records * FRAME_OVERHEAD as u64
+            report.new_body_bytes + report.new_records * self.key.frame_overhead() as u64
         );
         report.parts_distinct = self.parts.len() as u64;
         report.parts_distinct_bytes = self.parts.values().sum();
@@ -2483,9 +2520,11 @@ fn run_append(args: &Args) {
     chosen.extend(by_size.iter().rev().take(5).map(|(_, f)| *f));
     chosen.dedup();
 
-    // Measurements encrypt with a fixed throwaway key: only the cost matters, not secrecy.
-    let deployment = DeploymentKey::new(1, &[0x5a; 32]);
-    let setup_key = deployment.setup_key();
+    // Measurements use a fixed throwaway key: only the cost matters, not secrecy.
+    let deployment = deployment();
+    let setup_key = deployment
+        .setup_key_for(deployment.new_sessions())
+        .expect("the measurement key is loaded");
     // One setup store for the whole run, as a deployment has: later sessions reuse parts that
     // earlier ones stored.
     let setup_root = dir.join("append-setup");
@@ -2559,10 +2598,13 @@ fn run_append(args: &Args) {
     report.id_lookup_us = percentiles(id_lookups);
     report.setup_parts_written = setup_puts.len() as u64;
     report.setup_put_us = percentiles(setup_puts);
-    if let Ok(entries) = std::fs::read_dir(setup_root.join("setup")) {
-        for entry in entries.flatten() {
-            report.setup_parts_stored += 1;
-            report.setup_bytes_stored += entry.metadata().map(|m| m.len()).unwrap_or(0);
+    // Encrypted parts sit in `setup`, plain ones in `setup-plain`.
+    for folder in ["setup", "setup-plain"] {
+        if let Ok(entries) = std::fs::read_dir(setup_root.join(folder)) {
+            for entry in entries.flatten() {
+                report.setup_parts_stored += 1;
+                report.setup_bytes_stored += entry.metadata().map(|m| m.len()).unwrap_or(0);
+            }
         }
     }
     let _ = std::fs::remove_dir_all(&setup_root);
@@ -2648,7 +2690,7 @@ struct SealReport {
 /// It also seals each transcript again with finished runs' opaque reasoning pruned (a run is
 /// finished when the log holds its end), which is what a real seal writes.
 fn run_seal(args: &Args) {
-    let key = broca_session_store::frame::FrameKey::new(1, &[0x5a; 32]);
+    let key = frame_key(&[0x5a; 32]);
     let mut report = SealReport::default();
     let mut builds = Vec::new();
     let mut expands = Vec::new();

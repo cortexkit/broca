@@ -20,7 +20,6 @@
 use std::collections::BTreeMap;
 
 use broca_session_store::backend::{MemoryBackend, SessionAddr};
-use broca_session_store::keys::DeploymentKey;
 use broca_session_store::session::Session;
 use futures::executor::block_on;
 use serde::Serialize;
@@ -232,7 +231,7 @@ fn cuts(old: &[broca_wal::FramedRecord], max: usize) -> Vec<(usize, Option<Strin
 
 pub(crate) fn run(args: &Args) {
     let mut report = CallsCheckReport::default();
-    let deployment = DeploymentKey::new(1, &[0x5a; 32]);
+    let deployment = crate::deployment();
     let limit = std::env::var("PAGES_LIMIT")
         .ok()
         .and_then(|limit| limit.parse().ok())
@@ -460,7 +459,7 @@ mod tests {
                 &backend,
                 SessionAddr("s".into()),
                 triple("s"),
-                &DeploymentKey::new(1, &[0x5a; 32]),
+                &crate::deployment(),
                 false,
             )
             .await
@@ -662,7 +661,7 @@ mod tests {
                     &backend,
                     SessionAddr("s".into()),
                     triple("s"),
-                    &DeploymentKey::new(1, &[0x5a; 32]),
+                    &crate::deployment(),
                     false,
                 )
                 .await

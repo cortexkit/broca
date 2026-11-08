@@ -29,7 +29,6 @@ use broca_module::serve::{SessionReadRequest, SessionReadResponse};
 use broca_module::store_read::todays::Todays;
 use broca_session_loop::parts::MemoryParts;
 use broca_session_store::backend::{MemoryBackend, SessionAddr, SessionBackend};
-use broca_session_store::keys::DeploymentKey;
 use broca_session_store::session::Session;
 use futures::executor::block_on;
 use serde::Serialize;
@@ -416,7 +415,7 @@ fn count_members(report: &mut ModeReport, pages: &[SessionReadResponse]) {
 
 pub(super) fn run(args: &Args) {
     let mut report = PagesReport::default();
-    let deployment = DeploymentKey::new(1, &[0x5a; 32]);
+    let deployment = crate::deployment();
     let limit = std::env::var("PAGES_LIMIT")
         .ok()
         .and_then(|limit| limit.parse().ok())
