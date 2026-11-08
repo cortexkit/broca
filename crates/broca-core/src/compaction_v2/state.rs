@@ -22,12 +22,17 @@ pub struct State {
     step_id: Option<u64>,
     #[serde(default)]
     step_view: Option<View>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    latest_applied_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    applied_by: Option<String>,
 }
 
 /// Each method returns only after its record has crossed the durability barrier.
 /// The WAL adapter owns record encoding, including deduplication of stored edits.
 #[async_trait]
 pub trait Journal: Send + Sync {
+    fn view_refused(&self, _publication: &super::diagnostics::Publication, _code: &str) {}
     async fn accepted(
         &self,
         previous: Option<&ReceivedView>,
@@ -58,6 +63,14 @@ impl State {
     }
     pub fn applied_identity(&self) -> Option<AppliedView> {
         self.applied().map(View::applied)
+    }
+
+    pub fn applied_by(&self) -> Option<&str> {
+        self.applied_by.as_deref()
+    }
+
+    pub fn restore_accepted_by(&mut self, module: Option<String>) {
+        self.latest_applied_by = module;
     }
 
     pub fn restore_marker(&mut self, version: u64) {
@@ -124,10 +137,19 @@ impl State {
             ));
         }
         self.latest = Some(received);
+        self.latest_applied_by = None;
         Ok(())
     }
 
     pub fn restore_applied(&mut self, identity: &AppliedView) -> Result<(), String> {
+        let applied_by = if self
+            .latest()
+            .is_some_and(|view| view.applied() == *identity)
+        {
+            self.latest_applied_by.clone()
+        } else {
+            self.applied_by.clone()
+        };
         let view = self
             .latest_received()
             .filter(|view| view.view().applied() == *identity)
@@ -143,6 +165,7 @@ impl State {
                 )
             })?;
         self.applied = Some(view.clone());
+        self.applied_by = applied_by;
         Ok(())
     }
 
@@ -162,6 +185,7 @@ impl State {
         }
         journal.accepted(self.latest.as_ref(), &received).await?;
         self.latest = Some(received);
+        self.latest_applied_by = None;
         Ok(Ok(()))
     }
 
@@ -188,13 +212,26 @@ impl State {
                 boundary.rules,
                 boundary.accepts_images,
             ) {
+                journal.view_refused(
+                    &super::diagnostics::Publication::from_view(view),
+                    &super::diagnostics::refusal_code(&refusal),
+                );
                 return Ok(vec![Event::ViewRefused {
                     version: view.version,
                     refusal,
                 }]);
             }
-            journal.applied(boundary.step, view).await?;
+            journal
+                .applied(boundary.step, view)
+                .await
+                .inspect_err(|_| {
+                    journal.view_refused(
+                        &super::diagnostics::Publication::from_view(view),
+                        "internal_error",
+                    );
+                })?;
             self.applied = Some(received.clone());
+            self.applied_by = self.latest_applied_by.clone();
             if self.step_id == Some(boundary.step) {
                 self.step_view = self.applied().cloned();
             }

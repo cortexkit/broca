@@ -29,6 +29,7 @@ pub enum CallError {
 /// Transport identity is supplied by the session-bound adapter, never in bodies.
 #[async_trait]
 pub trait Plane: Send + Sync {
+    fn view_refused(&self, _view: &RawValue, _code: &str) {}
     async fn call(
         &self,
         method: &str,
@@ -45,6 +46,9 @@ pub struct BoundPlane<'a> {
 
 #[async_trait]
 impl Plane for BoundPlane<'_> {
+    fn view_refused(&self, view: &RawValue, code: &str) {
+        super::diagnostics::Publication::from_raw(view).warn(self.bind, code);
+    }
     async fn call(
         &self,
         method: &str,
@@ -351,7 +355,13 @@ impl Runtime {
             Ok(RawRideAnswer {
                 answer,
                 view: Some(view),
-            }) if answer == "view" => ReceivedView::parse(&view).ok(),
+            }) if answer == "view" => match ReceivedView::parse(&view) {
+                Ok(received) => Some(received),
+                Err(_) => {
+                    plane.view_refused(&view, "invalid_params");
+                    None
+                }
+            },
             Err(CallError::Refused(ref refusal)) if refusal.code == "unknown_session" => {
                 lane.ready = false;
                 lane.setup_due = true;

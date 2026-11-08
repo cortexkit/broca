@@ -28,16 +28,27 @@ impl WalJournal<'_> {
 
 #[async_trait]
 impl Journal for WalJournal<'_> {
+    fn view_refused(&self, publication: &super::diagnostics::Publication, code: &str) {
+        publication.warn(self.session, code);
+    }
     async fn accepted(
         &self,
         previous: Option<&ReceivedView>,
         received: &ReceivedView,
     ) -> Result<(), String> {
         let view = received.view();
+        if view.built_through.is_some() || view.new_signed.is_some() {
+            return Err(
+                "writing compaction-view-meta/v1 requires the metadata writer release".into(),
+            );
+        }
         self.commit(WalRecord::CompactionViewV2(CompactionViewV2 {
             version: view.version,
             checksum: view.checksum.clone(),
             edits: storage::encode(previous, received),
+            built_through: None,
+            new_signed: None,
+            applied_by: None,
         }))
         .await
     }

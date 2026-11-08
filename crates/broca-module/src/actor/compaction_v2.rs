@@ -110,6 +110,40 @@ impl<W: WalStore + 'static> super::LineageActor<W> {
         method: &str,
         params: &RawValue,
     ) -> Result<Box<RawValue>, Refusal> {
+        let answer = self.compaction_v2_call_inner(caller, method, params).await;
+        if method == "session.apply_view" {
+            let code = match &answer {
+                Err(refusal) => Some(refusal.code.clone()),
+                Ok(raw) => {
+                    let reply: serde_json::Value =
+                        serde_json::from_str(raw.get()).expect("compaction reply is JSON");
+                    reply
+                        .get("refusal")
+                        .and_then(|refusal| refusal.get("code"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                }
+            };
+            if let Some(code) = code {
+                #[derive(serde::Deserialize)]
+                struct Publication {
+                    view: Box<RawValue>,
+                }
+                if let Ok(publication) = serde_json::from_str::<Publication>(params.get()) {
+                    v2::diagnostics::Publication::from_raw(&publication.view)
+                        .warn(&self.key, &code);
+                }
+            }
+        }
+        answer
+    }
+
+    async fn compaction_v2_call_inner(
+        &mut self,
+        caller: Option<&str>,
+        method: &str,
+        params: &RawValue,
+    ) -> Result<Box<RawValue>, Refusal> {
         let checkpoint = self.load_checkpoint_at_head().await.map_err(internal)?;
         let mode3 = match checkpoint.head.as_ref().and_then(|head| head.mode3) {
             Some(mode3) => mode3,
@@ -208,7 +242,13 @@ impl<W: WalStore + 'static> super::LineageActor<W> {
                     .map_err(|error| Refusal::invalid_params("", error.to_string()))?;
                 let state = self.compaction_session.state.lock().await;
                 let answer = match state.applied_received() {
-                    Some(view) => serde_json::json!({"view":view}),
+                    Some(view) => {
+                        let mut answer = serde_json::json!({"view":view});
+                        if let Some(module) = state.applied_by() {
+                            answer["applied_by"] = serde_json::json!(module);
+                        }
+                        answer
+                    }
                     None => serde_json::json!({}),
                 };
                 to_raw_value(&answer).map_err(|error| internal(error.to_string()))

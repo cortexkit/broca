@@ -471,8 +471,9 @@ fn compaction_v2_render_drops_both_halves_of_a_tool_and_preserves_correct_reply_
         result(ToolOutput::Text {
             text: "done".into(),
         }),
+        text(Role::User, "next question"),
     ];
-    let entries = project(&messages, &facts(3), &Deliveries::new(), true);
+    let entries = project(&messages, &facts(4), &Deliveries::new(), true);
     let edits = vec![Edit::new(
         1,
         EditOp::Drop {
@@ -481,9 +482,96 @@ fn compaction_v2_render_drops_both_halves_of_a_tool_and_preserves_correct_reply_
         },
     )];
     let rendered = render::prompt(&messages, &entries, &edits, |_| panic!("no image")).unwrap();
-    assert_eq!(rendered.len(), 2);
+    assert_eq!(rendered.len(), 3);
     assert_eq!(rendered[0].content, messages[0].content);
     assert_eq!(rendered[1].content, vec![messages[1].content[0].clone()]);
+    assert_eq!(rendered[2].role, Role::User);
+}
+
+#[test]
+fn compaction_v2_strip_newest_signed_thinking_keeps_final_tool() {
+    let mut messages = vec![
+        text(Role::User, "old question"),
+        call(),
+        result(ToolOutput::Text {
+            text: "done".into(),
+        }),
+    ];
+    if let ContentBlock::ToolCall(call) = &mut messages[1].content[1] {
+        call.thought_signature = None;
+    }
+    let entries = project(&messages, &facts(3), &Deliveries::new(), true);
+    let edits = vec![Edit::new(
+        1,
+        EditOp::Replace {
+            mid: entries[0].mid.clone(),
+            part: "0".into(),
+            field: "text".into(),
+            value: json!("summary"),
+            expect: entries[0].parts[0].digest.clone(),
+        },
+    )];
+    let provider_rules = rules::defaults("claude-opus-5-5");
+    let strict = View::seal_with_policy(1, edits.clone(), Some(entries[0].mid.clone()), None);
+    assert!(matches!(
+        views::check(&entries, None, &strict, &provider_rules, true),
+        Err(ViewRefusal::Rule(
+            cortexkit_role_compaction::rules::RuleBreak::SignedPartInvalid { .. }
+        ))
+    ));
+    let strip =
+        View::seal_with_policy(1, edits, Some(entries[0].mid.clone()), Some("strip".into()));
+    assert!(views::check(&entries, None, &strip, &provider_rules, true).is_ok());
+    let render = |view: &View| {
+        render::prompt_view_with_rides(
+            &messages,
+            &entries,
+            &Default::default(),
+            Some(view),
+            &provider_rules,
+            |_| panic!("no image"),
+        )
+        .unwrap()
+    };
+    let rendered = render(&strip);
+    assert_eq!(rendered[1].content, vec![messages[1].content[1].clone()]);
+    assert_eq!(rendered[2].role, Role::Tool);
+    assert_eq!(
+        strip.edits.len(),
+        1,
+        "stripping never mutates the stored view"
+    );
+
+    let stored = broca_wal::WalRecord::CompactionViewV2(broca_wal::CompactionViewV2 {
+        version: strip.version,
+        checksum: strip.checksum.clone(),
+        edits: super::storage::encode(None, &strip.clone().into()),
+        built_through: strip.built_through.clone(),
+        new_signed: strip.new_signed.clone(),
+        applied_by: Some("ck-mc".into()),
+    });
+    let stored: broca_wal::WalRecord =
+        serde_json::from_slice(&serde_json::to_vec(&stored).unwrap()).unwrap();
+    let mut restored = super::state::State::default();
+    let session = broca_protocol::BindIdentity::new("/project", "test", "s");
+    super::fold::fold(&mut restored, &stored, &session).unwrap();
+    super::fold::fold(
+        &mut restored,
+        &broca_wal::WalRecord::CompactionViewAppliedV2 {
+            step_id: 1,
+            version: strip.version,
+            checksum: strip.checksum.clone(),
+        },
+        &session,
+    )
+    .unwrap();
+    let checkpoint = serde_json::to_vec(&restored).unwrap();
+    let restored: super::state::State = serde_json::from_slice(&checkpoint).unwrap();
+    let applied = restored.applied().unwrap();
+    assert!(applied.verify());
+    assert_eq!(applied, &strip);
+    assert_eq!(restored.applied_by(), Some("ck-mc"));
+    assert_eq!(render(applied), rendered);
 }
 
 fn setup() -> cortexkit_role_compaction::setup::SetupRequest {
@@ -624,6 +712,12 @@ struct MemoryJournal {
 
 #[async_trait::async_trait]
 impl state::Journal for MemoryJournal {
+    fn view_refused(&self, publication: &super::diagnostics::Publication, code: &str) {
+        publication.warn(
+            &broca_protocol::BindIdentity::new("/project", "test", "s"),
+            code,
+        );
+    }
     async fn accepted(
         &self,
         _: Option<&super::received::ReceivedView>,
@@ -981,14 +1075,20 @@ fn compaction_v2_received_edits_keep_unknown_members_and_exact_bytes() {
         view.version,
         view.checksum.clone(),
         received.edits().to_vec(),
+        None,
+        None,
     )
     .unwrap();
     assert_eq!(rebuilt.edits()[0].get(), raw.get());
-    assert!(
-        ReceivedView::rebuilt(view.version, "wrong".into(), received.edits().to_vec())
-            .unwrap_err()
-            .contains("checksum mismatch")
-    );
+    assert!(ReceivedView::rebuilt(
+        view.version,
+        "wrong".into(),
+        received.edits().to_vec(),
+        None,
+        None
+    )
+    .unwrap_err()
+    .contains("checksum mismatch"));
 }
 
 #[test]
@@ -1338,20 +1438,29 @@ fn compaction_v2_storage_references_only_byte_identical_previous_edits() {
     .unwrap();
     let edit: Edit = serde_json::from_str(raw.get()).unwrap();
     let first = View::seal(1, vec![edit.clone()]);
-    let previous = ReceivedView::rebuilt(1, first.checksum, vec![raw.clone()]).unwrap();
+    let previous = ReceivedView::rebuilt(1, first.checksum, vec![raw.clone()], None, None).unwrap();
     let next = View::seal(2, vec![edit.clone()]);
-    let identical = ReceivedView::rebuilt(2, next.checksum.clone(), vec![raw]).unwrap();
+    let identical = ReceivedView::rebuilt(2, next.checksum.clone(), vec![raw], None, None).unwrap();
     let encoded = storage::encode(Some(&previous), &identical);
     assert!(matches!(
         encoded.as_slice(),
         [StoredViewEdit::Previous { index: 0 }]
     ));
     assert_eq!(
-        storage::rebuild(Some(&previous), 2, next.checksum.clone(), &encoded).unwrap(),
+        storage::rebuild(
+            Some(&previous),
+            2,
+            next.checksum.clone(),
+            &encoded,
+            None,
+            None
+        )
+        .unwrap(),
         identical
     );
     let normalized = serde_json::value::to_raw_value(&edit).unwrap();
-    let different_bytes = ReceivedView::rebuilt(2, next.checksum, vec![normalized]).unwrap();
+    let different_bytes =
+        ReceivedView::rebuilt(2, next.checksum, vec![normalized], None, None).unwrap();
     assert!(matches!(
         storage::encode(Some(&previous), &different_bytes).as_slice(),
         [StoredViewEdit::Full { .. }]
@@ -1372,11 +1481,13 @@ fn compaction_v2_storage_bad_reference_and_checksum_refuse_by_name() {
         2,
         "unused".into(),
         &[StoredViewEdit::Previous { index: 8 }],
+        None,
+        None,
     )
     .unwrap_err();
     assert!(error.contains("compaction view version 2"));
     assert!(error.contains("previous edit index 8"));
-    assert!(storage::rebuild(None, 2, "wrong".into(), &[])
+    assert!(storage::rebuild(None, 2, "wrong".into(), &[], None, None)
         .unwrap_err()
         .contains("checksum mismatch"));
 }
@@ -1739,6 +1850,48 @@ async fn compaction_v2_request_over_limit_rides_reestimates_then_refuses() {
     );
     assert_eq!(calls[2].1["causes"], json!(["over_limit"]));
     assert!(calls[2].1["request_tokens"].as_u64().unwrap() > 900);
+}
+
+#[tokio::test]
+async fn compaction_v2_refused_ride_warns_once_without_changing_the_view() {
+    let messages = vec![text(Role::User, &"x".repeat(1000))];
+    let entries = project(&messages, &facts(1), &Deliveries::new(), true);
+    let mut view = View::seal(7, vec![]);
+    view.checksum = "bad-checksum".into();
+    let plane = RecordingPlane::default();
+    plane.answers.lock().unwrap().extend([
+        json!({"answer":"ready"}),
+        json!({"answer":"received"}),
+        json!({"answer":"view","view":view}),
+        json!({"answer":"received"}),
+    ]);
+    let state = tokio::sync::Mutex::new(state::State::default());
+    let journal = MemoryJournal::default();
+    let runtime = runtime::Runtime::default();
+    let conditions = conditions();
+    let current = send_context();
+    let (result, logs) = broca_test_support::capture_logs(super::request::prepare(
+        &state,
+        &runtime,
+        &journal,
+        &plane,
+        request_at(&messages, &entries, &conditions, &current),
+        |_| panic!("no image"),
+        text_estimate,
+    ))
+    .await;
+    assert!(result.is_ok());
+    assert!(state.lock().await.latest().is_none());
+    let warnings: Vec<_> = logs
+        .iter()
+        .filter(|event| event.message() == "compaction published view refused")
+        .collect();
+    assert_eq!(warnings.len(), 1, "{logs:?}");
+    assert_eq!(warnings[0].level, tracing::Level::WARN);
+    assert_eq!(warnings[0].fields["refusal_code"], "bad_checksum");
+    assert_eq!(warnings[0].fields["view_version"], "7");
+    assert_eq!(warnings[0].fields["built_through"], "false");
+    assert_eq!(warnings[0].fields["new_signed"], "false");
 }
 
 #[tokio::test]

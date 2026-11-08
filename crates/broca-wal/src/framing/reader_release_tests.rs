@@ -115,6 +115,39 @@ fn a_reader_without_compaction_v2_refuses_all_four_shapes_by_name() {
 }
 
 #[test]
+fn compaction_view_metadata_requires_its_reader_by_name() {
+    let older: Vec<_> = KNOWN_FEATURES
+        .iter()
+        .copied()
+        .filter(|name| *name != COMPACTION_VIEW_META_FEATURE)
+        .collect();
+    for metadata in [
+        serde_json::json!({"built_through":"m1"}),
+        serde_json::json!({"new_signed":"strip"}),
+        serde_json::json!({"applied_by":"ck-mc"}),
+    ] {
+        let mut value = serde_json::json!({"type":"compaction_view_v2","version":1,"checksum":"checksum","edits":[]});
+        value
+            .as_object_mut()
+            .unwrap()
+            .extend(metadata.as_object().unwrap().clone());
+        let record: WalRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            record.required_features(),
+            [COMPACTION_V2_FEATURE, COMPACTION_VIEW_META_FEATURE]
+        );
+        let bytes = encode(1, 1, &record).unwrap();
+        assert!(
+            matches!(decode_next(&bytes), DecodeStep::Record { framed, .. } if framed.record == record)
+        );
+        assert!(
+            matches!(decode_next_with(&bytes, &older), DecodeStep::NewerWriter { missing, .. }
+            if missing == ["compaction-view-meta/v1"])
+        );
+    }
+}
+
+#[test]
 fn compaction_plan_version_unions_with_other_record_requirements_even_when_zero() {
     let mut record: WalRecord = serde_json::from_str(PINNED_SCHEMA_PIN_RUN_STARTED).unwrap();
     let mut expected = record.required_features().to_vec();

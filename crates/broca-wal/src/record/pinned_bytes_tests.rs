@@ -13,6 +13,20 @@
 use super::*;
 
 #[test]
+fn compaction_view_before_metadata_keeps_exact_bytes() {
+    let pinned = r#"{"type":"compaction_view_v2","version":1,"checksum":"provider-checksum","edits":[{"kind":"full","edit":{"since":1,"op":"drop","mid":"m1","part":"0"}}]}"#;
+    let record: WalRecord = serde_json::from_str(pinned).unwrap();
+    assert_eq!(serde_json::to_string(&record).unwrap(), pinned);
+    assert_eq!(record.required_features(), ["compaction-v2/v1"]);
+    let frame = crate::framing::encode(7, 3, &record).unwrap();
+    assert_eq!(frame[4], crate::framing::GATED_FRAMING_VERSION);
+    assert_eq!(
+        &frame[crate::framing::HEADER_LEN..],
+        format!(r#"{{"requires":["compaction-v2/v1"],"record":{pinned}}}"#).as_bytes()
+    );
+}
+
+#[test]
 fn run_started_before_compaction_plan_version_keeps_exact_bytes() {
     let pinned = r#"{"type":"run_started","run_id":"r","session":{"project_root":"/project","harness":"runner","session":"s"},"config":{"model":{"provider_module_id":"p","model_id":"m"},"tools":[],"tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},"context_epoch":0,"renderer_version":1},"input":[],"origin":{"kind":"fresh"}}"#;
     let record: WalRecord = serde_json::from_str(pinned).unwrap();

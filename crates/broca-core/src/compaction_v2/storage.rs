@@ -29,17 +29,25 @@ pub fn rebuild(
     version: u64,
     checksum: String,
     edits: &[StoredViewEdit],
+    built_through: Option<String>,
+    new_signed: Option<String>,
 ) -> Result<ReceivedView, String> {
     #[derive(serde::Serialize)]
     struct Envelope<'a> {
         version: u64,
         checksum: &'a str,
         edits: &'a [Box<serde_json::value::RawValue>],
+        #[serde(skip_serializing_if = "Option::is_none")]
+        built_through: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        new_signed: Option<&'a str>,
     }
     let mut bytes = broca_protocol::serialized_json_bytes(&Envelope {
         version,
         checksum: &checksum,
         edits: &[],
+        built_through: built_through.as_deref(),
+        new_signed: new_signed.as_deref(),
     });
     let mut rebuilt = Vec::new();
     for edit in edits {
@@ -59,5 +67,11 @@ pub fn rebuild(
         }
         rebuilt.push(raw);
     }
-    ReceivedView::rebuilt(version, checksum, rebuilt.into_iter().cloned().collect())
+    ReceivedView::rebuilt(
+        version,
+        checksum,
+        rebuilt.into_iter().cloned().collect(),
+        built_through,
+        new_signed,
+    )
 }

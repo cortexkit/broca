@@ -560,6 +560,13 @@ pub struct CompactionViewV2 {
     pub version: u64,
     pub checksum: String,
     pub edits: Vec<StoredViewEdit>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub built_through: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_signed: Option<String>,
+    /// The applying module attested for the provider's route, never request data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_by: Option<String>,
 }
 
 /// One edit in rebuilt view order. A previous index names the latest earlier accepted view,
@@ -2218,6 +2225,14 @@ impl WalRecord {
     /// on its own, so no caller can write a must-understand value into a frame an older build
     /// would read without checking.
     pub fn required_features(&self) -> &'static [&'static str] {
+        if matches!(self, Self::CompactionViewV2(view)
+            if view.built_through.is_some() || view.new_signed.is_some() || view.applied_by.is_some())
+        {
+            return &[
+                crate::framing::COMPACTION_V2_FEATURE,
+                crate::framing::COMPACTION_VIEW_META_FEATURE,
+            ];
+        }
         if matches!(
             self,
             Self::RecoveryCut { .. } | Self::RecoveryCallClosed { .. }
