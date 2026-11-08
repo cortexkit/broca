@@ -45,6 +45,7 @@ async fn a_steer_and_a_cancel_are_answered_while_the_media_fold_builds() {
     .with_readers(Arc::new(move || backend))
     .with_media_build_gate(Arc::clone(&build));
     let (commands, receiver) = mpsc::unbounded_channel();
+    let commands = super::tests::Commands::over(commands, backend);
     let served = tokio::spawn(actor.serve(receiver));
 
     // The run's start is durable while the fold builds: the send is answered.

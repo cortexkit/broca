@@ -20,7 +20,7 @@ use broca_wire::head_import::{
 use sha2::Digest as _;
 use tokio::sync::{mpsc, oneshot};
 
-use super::tests::{executor, request, send_as, text_step};
+use super::tests::{executor, request, send_exactly, text_step};
 use super::StoreActor;
 use crate::actor::{LineageCmd, SendKey, SendOutcome};
 use crate::store_import::{
@@ -281,12 +281,13 @@ async fn an_import_writes_the_history_and_answers_its_retry_from_the_receipt() {
         refused(ask(&commands, source.import(source.params("imp-2"))).await),
         "session_exists"
     );
-    let outcome = send_as(
+    let outcome = send_exactly(
         &commands,
         "r1",
         request("next"),
         SendKey::Minted,
         broca_protocol::Delivery::Queue,
+        None,
     )
     .await;
     assert!(

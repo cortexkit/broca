@@ -141,7 +141,7 @@ fn templated(
 /// One session on today's storage and one in the new storage, over the same script.
 struct Pair {
     today: Today,
-    commands: mpsc::UnboundedSender<LineageCmd>,
+    commands: store::Commands,
     served: tokio::task::JoinHandle<Session<&'static MemoryBackend>>,
     store: Arc<LoopExecutor>,
     /// The store actor's setup parts, kept so its session's reads can name its runs' tools.
@@ -200,7 +200,7 @@ impl Pair {
         let served = tokio::spawn(actor.serve(receiver));
         Self {
             today,
-            commands,
+            commands: store::Commands::over(commands, backend),
             served,
             store: executor,
             parts,
@@ -1191,3 +1191,5 @@ async fn a_crash_between_an_interrupt_and_its_run_is_recovered_alike(cipher: Cip
         ]
     );
 }
+
+mod frozen_tools;
