@@ -14,7 +14,8 @@ use cortexkit_compaction_view::{
 use cortexkit_role_compaction::{
     part::{PartBody, ToolPart, ToolStatus},
     read::{Entry, Role},
-    view::{Edit, EditOp, InsertAt, InsertedImage},
+    rules::ProviderRules,
+    view::{Edit, EditOp, InsertAt, InsertedImage, View},
 };
 
 /// Rebuild a request offline for a log whose first run froze a compaction plan version.
@@ -29,11 +30,12 @@ pub fn request_options(
     let transcript = super::transcript::project(records, lineage)?;
     let (config, manifest) = super::host::frozen(records)?;
     let prompt = if manifest.is_some_and(crate::compaction::has_compaction) {
-        prompt_with_rides(
+        prompt_view_with_rides(
             &boundary.prompt,
             &transcript.entries,
             &transcript.rides,
-            applied.map_or(&[], |view| view.edits.as_slice()),
+            applied,
+            &super::host::conditions(&config, &transcript.entries, false, None)?.rules,
             super::host::image_reference,
         )?
     } else {
@@ -75,14 +77,53 @@ pub fn prompt_with_rides(
     entries: &[Entry],
     rides: &super::entries::RideEnvelopes,
     edits: &[Edit],
+    image: impl FnMut(&InsertedImage) -> Result<MediaRef, String>,
+) -> Result<Vec<Message>, String> {
+    let edits = render::edits_for_transcript(entries, edits);
+    let plan = render::plan(entries, &edits)
+        .map_err(|error| format!("compaction render plan refused: {error:?}"))?;
+    render_planned(stored, entries, rides, &edits, plan, image)
+}
+
+/// Plan the complete applied view, including permission to strip newer signatures.
+/// Reverts filter obsolete edit targets, but preserve `built_through`: it marks the
+/// last message the provider had read when it authorized stripping newer signatures.
+pub fn prompt_view_with_rides(
+    stored: &[Message],
+    entries: &[Entry],
+    rides: &super::entries::RideEnvelopes,
+    view: Option<&View>,
+    rules: &ProviderRules,
+    image: impl FnMut(&InsertedImage) -> Result<MediaRef, String>,
+) -> Result<Vec<Message>, String> {
+    let Some(view) = view else {
+        return prompt_with_rides(stored, entries, rides, &[], image);
+    };
+    if !view.verify() {
+        return Err("compaction render plan refused: BadChecksum".into());
+    }
+    let filtered = View::seal_with_policy(
+        view.version,
+        render::edits_for_transcript(entries, &view.edits),
+        view.built_through.clone(),
+        view.new_signed.clone(),
+    );
+    let plan = render::plan_view(entries, &filtered, rules)
+        .map_err(|error| format!("compaction render plan refused: {error:?}"))?;
+    render_planned(stored, entries, rides, &filtered.edits, plan, image)
+}
+
+fn render_planned(
+    stored: &[Message],
+    entries: &[Entry],
+    rides: &super::entries::RideEnvelopes,
+    edits: &[Edit],
+    plan: render::RenderPlan,
     mut image: impl FnMut(&InsertedImage) -> Result<MediaRef, String>,
 ) -> Result<Vec<Message>, String> {
     if stored.len() != entries.len() {
         return Err("compaction transcript projection does not match native message count".into());
     }
-    let edits = render::edits_for_transcript(entries, edits);
-    let plan = render::plan(entries, &edits)
-        .map_err(|error| format!("compaction render plan refused: {error:?}"))?;
     let positions: HashMap<_, _> = entries
         .iter()
         .enumerate()

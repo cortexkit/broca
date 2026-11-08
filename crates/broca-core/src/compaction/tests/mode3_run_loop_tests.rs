@@ -958,6 +958,9 @@ async fn compaction_v2_next_request_numbers_follow_the_view_the_next_request_ren
         version: 2,
         checksum: newer.checksum.clone(),
         edits: v2::storage::encode(None, &newer.into()),
+        built_through: None,
+        new_signed: None,
+        applied_by: None,
     }));
     let (pending, _) = numbers_of(&records);
     assert_eq!(
@@ -1186,6 +1189,9 @@ async fn compaction_v2_crash_mid_step_does_not_adopt_a_newer_accepted_view() {
         version: 2,
         checksum: newer.checksum.clone(),
         edits: v2::storage::encode(None, &newer.into()),
+        built_through: None,
+        new_signed: None,
+        applied_by: None,
     }));
     let frames: Vec<_> = prefix
         .iter()
@@ -1643,6 +1649,9 @@ async fn compaction_v2_recorded_request_rebuild_uses_the_applied_view_not_a_late
             version: 2,
             checksum: newer.checksum.clone(),
             edits: v2::storage::encode(None, &newer.into()),
+            built_through: None,
+            new_signed: None,
+            applied_by: None,
         }),
     );
     records.insert(attempt_at + 1, serde_json::from_value(json!({"type":"model_attempt_finished","step_id":1,"attempt":0,"request_body_len":1,"request_body_sha256":"recorded-digest","response_body_len":0,"response_body_sha256":"response","outcome":"complete","http_status":200,"ts_ms":10})).unwrap());

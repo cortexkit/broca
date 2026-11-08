@@ -257,6 +257,7 @@ pub const KNOWN_FEATURES: &[&str] = &[
     CLIENT_MESSAGE_ID_FEATURE,
     COMPACTION_RIDE_WAIT_FEATURE,
     COMPACTION_V2_FEATURE,
+    COMPACTION_VIEW_META_FEATURE,
     COMPACTION_VIEW_NEGOTIATION_FEATURE,
     COMPACTION_VIEW_FEATURE,
     COMPACTION_WAIT_FEATURE,
@@ -307,6 +308,10 @@ pub const ACCOUNT_LIMIT_PAUSE_FEATURE: &str = "account-limit-pause/v1";
 
 /// Mode-3 accepted views, applied-view selections, cut markers and the frozen plan version.
 pub const COMPACTION_V2_FEATURE: &str = "compaction-v2/v1";
+
+/// Checksummed view policy and attested applying-module provenance. Older readers
+/// cannot reconstruct the policy's checksum or safely omit its rendering effect.
+pub const COMPACTION_VIEW_META_FEATURE: &str = "compaction-view-meta/v1";
 
 /// Whether this build runs `compaction-v2/v1` sessions. A reader-only build sets it false: it
 /// decodes those frames but marks the log read-only, so a rollback never runs a mode-3 session.
@@ -1729,6 +1734,7 @@ mod tests {
                 CLIENT_MESSAGE_ID_FEATURE,
                 COMPACTION_RIDE_WAIT_FEATURE,
                 COMPACTION_V2_FEATURE,
+                COMPACTION_VIEW_META_FEATURE,
                 COMPACTION_VIEW_NEGOTIATION_FEATURE,
                 COMPACTION_VIEW_FEATURE,
                 COMPACTION_WAIT_FEATURE,

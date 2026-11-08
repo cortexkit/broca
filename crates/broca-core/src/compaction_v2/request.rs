@@ -101,8 +101,14 @@ pub async fn prepare(
     let frozen = frozen && view.is_some();
     // Claimed only where the accepted Setup listed it.
     let cache_expired = at.cache_expired && runtime.detects_cache_expired().await;
-    let mut prompt =
-        render::prompt_with_rides(at.stored, at.entries, at.rides, edits(&view), &mut image)?;
+    let mut prompt = render::prompt_view_with_rides(
+        at.stored,
+        at.entries,
+        at.rides,
+        view.as_ref(),
+        &at.conditions.rules,
+        &mut image,
+    )?;
     let mut tokens = estimate(&prompt)?;
     let causes = if frozen {
         Vec::new()
@@ -130,8 +136,14 @@ pub async fn prepare(
         )
         .await?;
         view = state.lock().await.view_for_step(at.step).cloned();
-        prompt =
-            render::prompt_with_rides(at.stored, at.entries, at.rides, edits(&view), &mut image)?;
+        prompt = render::prompt_view_with_rides(
+            at.stored,
+            at.entries,
+            at.rides,
+            view.as_ref(),
+            &at.conditions.rules,
+            &mut image,
+        )?;
         tokens = estimate(&prompt)?;
     }
     // A cache-rewrite ride can return a larger view. It still owes an over-limit
@@ -149,8 +161,14 @@ pub async fn prepare(
         .await?;
         rode_over_limit = true;
         view = state.lock().await.view_for_step(at.step).cloned();
-        prompt =
-            render::prompt_with_rides(at.stored, at.entries, at.rides, edits(&view), &mut image)?;
+        prompt = render::prompt_view_with_rides(
+            at.stored,
+            at.entries,
+            at.rides,
+            view.as_ref(),
+            &at.conditions.rules,
+            &mut image,
+        )?;
         tokens = estimate(&prompt)?;
     }
     runtime
@@ -173,10 +191,6 @@ pub async fn prepare(
         applied: view.as_ref().map(View::applied),
         request_tokens: tokens,
     })
-}
-
-fn edits(view: &Option<View>) -> &[cortexkit_role_compaction::view::Edit] {
-    view.as_ref().map_or(&[], |view| view.edits.as_slice())
 }
 
 async fn ride(

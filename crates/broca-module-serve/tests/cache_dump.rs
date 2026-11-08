@@ -612,6 +612,9 @@ async fn mode3_offline_rebuild_matches_every_received_step_after_a_ride() {
             version: 2,
             checksum: newer.checksum.clone(),
             edits: broca_core::compaction_v2::storage::encode(None, &newer.into()),
+            built_through: None,
+            new_signed: None,
+            applied_by: None,
         }),
     );
     let (run_id, config) = records
