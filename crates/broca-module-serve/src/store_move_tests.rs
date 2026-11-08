@@ -663,3 +663,17 @@ async fn a_fenced_session_takes_no_delivery_and_no_second_move() {
         .await
         .unwrap();
 }
+
+/// What precondition 1 still refuses: every required operation the new storage doesn't serve
+/// yet, read from the serve layer's allowlist and the compaction-runner route. When one of these
+/// is served, it leaves this list.
+#[test]
+fn precondition_one_names_what_the_new_storage_still_does_not_serve() {
+    let served = served_by_serve_layer();
+    let unserved: Vec<&str> = REQUIRED_OPERATIONS
+        .iter()
+        .copied()
+        .filter(|op| !served(op))
+        .collect();
+    assert_eq!(unserved, ["run.tool_calls"]);
+}

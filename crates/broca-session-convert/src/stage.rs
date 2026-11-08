@@ -83,11 +83,13 @@ pub fn triple(session: &BindIdentity) -> SessionTriple {
     }
 }
 
-/// Whether the session at `records` holds media its move can't carry yet. Today's media lives
-/// outside the WAL, in a media store keyed by digest, and the new storage keeps each medium as
-/// an object of its own session, written before the record that names it. The new storage has
-/// no writer for an input message's media yet, so until it does every session that names any
-/// medium is refused, by this function alone.
+/// Whether the session at `records` holds media its move can't carry yet. The new storage can
+/// store them (`Session::append_media` for a tool result's, `Session::append_input_media` for a
+/// message's), but its run loop has no request renderer that reads a session's own media
+/// objects: its executor refuses a run whose provider renders images while the session holds
+/// media. A moved session's next request then couldn't be the one today's renderer builds, so
+/// every session that names any medium is refused, by this function alone, until that renderer
+/// exists.
 pub fn media_refusal(records: &[FramedRecord]) -> Option<&'static str> {
     (!media_digests(records).is_empty()).then_some("media")
 }

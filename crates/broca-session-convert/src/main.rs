@@ -35,10 +35,11 @@
 //! `subscribe_check`). `session-convert subscribe-cost --dir <scratch> <path>...` times a
 //! subscriber's catch-up on the largest log given.
 //!
-//! `session-convert move-check --dir <scratch> [--all-steps] [--out FILE] <path>...`: for every
-//! session log, what moving its session into the new storage would do: the WAL's preconditions,
-//! then the move's staging writer and verifier, writing only under `--dir` (see `move_check`).
-//! `--all-steps` adds the verifier's offline check of every recorded model request.
+//! `session-convert move-check --dir <scratch> [--all-steps] [--every N] [--out FILE] <path>...`:
+//! for every session log, what moving its session into the new storage would do: the WAL's
+//! preconditions, then the move's staging writer and verifier, writing only under `--dir` (see
+//! `move_check`). `--all-steps` adds the verifier's offline check of every recorded model
+//! request, and `--every N` checks one log in N.
 //!
 //! Point it only at a copy of a state root (an APFS clone, `cp -c`), never at live files: it opens
 //! each log read-only, but a measurement run should never share a disk path with the daemon.
@@ -179,7 +180,7 @@ fn usage() -> ! {
          session-convert billing [--dir SCRATCH] [--out FILE] [--limit N] PATH...\n       \
          session-convert subscribe [--dir SCRATCH] [--out FILE] [--limit N] PATH...\n       \
          session-convert subscribe-cost --dir SCRATCH [--out FILE] PATH...\n       \
-         session-convert move-check --dir SCRATCH [--all-steps] [--out FILE] PATH..."
+         session-convert move-check --dir SCRATCH [--all-steps] [--every N] [--out FILE] PATH..."
     );
     std::process::exit(64);
 }

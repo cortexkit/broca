@@ -87,9 +87,24 @@ pub type RunRows = Arc<dyn Fn(&BindIdentity) -> Result<Vec<RunIndexRow>, String>
 /// Drops a session's materialized rows (its projected messages, tags, episodes and pages).
 pub type ForgetProjection = Arc<dyn Fn(&BindIdentity) -> Result<(), String> + Send + Sync>;
 
-/// The serve layer's own allowlist, as precondition 1 reads it.
+/// The operations of the `compaction-runner/v1` route. That route is dispatched by its role
+/// before the serve layer's allowlist is consulted, and the registry sends a store session's
+/// calls on it to the new storage (`LineageRegistry::route_compaction_v2`), so the new storage
+/// serves them though the allowlist doesn't name them.
+const COMPACTION_RUNNER_OPERATIONS: [&str; 3] = [
+    "session.entries",
+    "session.applied_view",
+    "session.apply_view",
+];
+
+/// What the new storage serves, as precondition 1 reads it: the serve layer's own allowlist
+/// (`served_on_new_storage`) for the session's route, and the compaction-runner route's
+/// operations.
 pub fn served_by_serve_layer() -> Served {
-    Arc::new(|op: &str| crate::serve::served_on_new_storage(op, &json!({})))
+    Arc::new(|op: &str| {
+        COMPACTION_RUNNER_OPERATIONS.contains(&op)
+            || crate::serve::served_on_new_storage(op, &json!({}))
+    })
 }
 
 /// What a move needs beyond the registry: where it writes, what it reads its preconditions

@@ -65,6 +65,7 @@ pub const RUN_RESULT: &str = "run_result";
 pub const SEND_STATUS: &str = "send_status";
 pub const READ: &str = "read";
 pub const HISTORY_RAW: &str = "history_raw";
+pub const HISTORY_DISPLAY: &str = "history_display";
 pub const ENTRIES: &str = "entries";
 pub const HEAD: &str = "head";
 pub const BILLING: &str = "billing";
@@ -149,6 +150,8 @@ pub async fn verify(verify: Verify<'_>) -> Result<Verified, Mismatch> {
     checks.push(READ);
     history(verify.records, staged, &parts).await?;
     checks.push(HISTORY_RAW);
+    history_walks(&verify, lineage.as_deref(), staged, &parts).await?;
+    checks.push(HISTORY_DISPLAY);
     entries(&verify, lineage.as_deref(), staged, &parts).await?;
     checks.push(ENTRIES);
     head(verify.records, staged, &parts).await?;
@@ -1145,4 +1148,86 @@ async fn next_request(
     .await;
     let _ = std::fs::remove_dir_all(&scratch);
     result
+}
+
+/// The walks `session.history` is read by: each form, from the newest page by `older` cursors
+/// and from the first message by `newer` cursors.
+const HISTORY_WALKS: [(&str, bool); 4] = [
+    ("raw", true),
+    ("raw", false),
+    ("display", true),
+    ("display", false),
+];
+
+/// Every page of one walk of `session.history` over `handler`, as `broca_module::history::read`
+/// serves them, ending at a refusal if one comes.
+async fn history_pages(
+    handler: &dyn broca_module::ServeHandler,
+    session: &BindIdentity,
+    form: &str,
+    newest: bool,
+) -> Vec<Value> {
+    let mut params = json!({ "form": form, "limit": PAGE });
+    if !newest {
+        params["from_ordinal"] = json!(1);
+    }
+    let follow = if newest { "older" } else { "newer" };
+    let mut pages = Vec::new();
+    loop {
+        let page = match serde_json::from_value(params.clone()) {
+            Ok(request) => broca_module::history::read(handler, session, &request)
+                .await
+                .map_err(|error| format!("{error:?}")),
+            Err(error) => Err(error.to_string()),
+        };
+        let page = match page {
+            Ok(page) => page,
+            Err(error) => {
+                pages.push(json!({ "refused": error }));
+                return pages;
+            }
+        };
+        let next = page.get(follow).and_then(Value::as_str).map(str::to_owned);
+        pages.push(page);
+        match next {
+            Some(cursor) => params = json!({ "form": form, "limit": PAGE, "cursor": cursor }),
+            None => return pages,
+        }
+    }
+}
+
+/// `session.history` in both forms, every page of every walk, compared whole. Today's side is
+/// given the staged session's incarnation and history version, which each storage keeps for
+/// itself, so cursors compare as the positions they hold.
+async fn history_walks(
+    verify: &Verify<'_>,
+    lineage: Option<&str>,
+    view: &Session<LocalBackend>,
+    parts: &MemoryParts,
+) -> Result<(), Mismatch> {
+    let head = view.head();
+    let today = broca_module::store_read::history_sides::TodaysHistory::new(
+        verify.records,
+        lineage,
+        broca_session_store::codec::hex(&head.incarnation.0),
+        head.history_version,
+    )
+    .map_err(|error| mismatch(HISTORY_DISPLAY, format!("today's history: {error:?}")))?;
+    let staged = crate::stored_history::StoredHistory {
+        session: view,
+        parts,
+    };
+    for (form, newest) in HISTORY_WALKS {
+        let walk = format!(
+            "{form} from the {}",
+            if newest { "newest" } else { "first" }
+        );
+        same(
+            HISTORY_DISPLAY,
+            &walk,
+            &Value::Array(history_pages(&staged, verify.session, form, newest).await),
+            &Value::Array(history_pages(&today, verify.session, form, newest).await),
+        )?;
+    }
+    Ok(())
 }

@@ -198,6 +198,7 @@ fn a_staged_session_agrees_with_its_wal_on_every_check() {
             "send_status",
             "read",
             "history_raw",
+            "history_display",
             "entries",
             "head",
             "billing",

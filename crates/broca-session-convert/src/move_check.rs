@@ -92,7 +92,15 @@ pub(super) fn run(args: &Args) {
         Mode::Move
     };
     let mut report = MoveCheckReport::default();
+    let mut index = 0usize;
     each_log(args, |item| {
+        // `--every N` checks one log in N, in the order the logs are visited.
+        if matches!(item, Item::Log { .. }) {
+            index += 1;
+            if !(index - 1).is_multiple_of(args.every) {
+                return;
+            }
+        }
         let (name, old) = match item {
             Item::Log {
                 name, old: Ok(old), ..
