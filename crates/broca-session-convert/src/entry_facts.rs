@@ -363,5 +363,7 @@ pub fn record(
                 .and_then(|mode| mode.as_str().map(str::to_owned))
         }),
         delivery_tool_call_id: delivery.and_then(|delivery| delivery.tool_call_id.clone()),
+        // A ride's notice is added where the ride lands, by restating these facts after it.
+        notices: Vec::new(),
     }
 }

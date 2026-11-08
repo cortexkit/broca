@@ -21,8 +21,9 @@ use broca_protocol::ToolCallId;
 use broca_session_store::fold::conversation::{Conversation, Delivered};
 use broca_session_store::fold::operations::{CallState, Operations};
 use broca_session_store::record::{
-    CallFacts, CallOutcome, EntryFacts, Notice, Placement, ReasoningSummary, Record, RichUi,
-    RideForm, StepUsage, ToolIntent, ToolOutcome, ToolReply, TurnFacts, Unanswered, ViewRef,
+    CallFacts, CallOutcome, EntryFacts, Notice, Placement, ReasoningSummary, Record, ResultAppend,
+    RichUi, RideForm, RideNotice, StepUsage, ToolIntent, ToolOutcome, ToolReply, TurnFacts,
+    Unanswered, ViewRef,
 };
 use broca_session_store::session::{SessionError, StoredEntry};
 use cortexkit_role_compaction::read::Entry;
@@ -584,6 +585,11 @@ pub fn with_facts(batch: Vec<Record>, at: &Placing<'_>) -> Result<Vec<Record>, S
     let mut reply: Option<ToolReply> = None;
     // A run's end restating its last turn's facts after itself, as it places no message.
     let mut restated: Option<TurnFacts> = None;
+    // The ids of the calls of the tool turn this batch placed, once it has: a ride's notice
+    // names its result by its call's place among them.
+    let mut turn_calls: Option<Vec<ToolCallId>> = None;
+    // The results message's facts restated after a ride, with the ride's notice.
+    let mut ride_facts: Option<EntryFacts> = None;
     while let Some(mut record) = records.next() {
         // The seq the record takes.
         let seq = at.first_seq + out.len() as u64;
@@ -601,7 +607,9 @@ pub fn with_facts(batch: Vec<Record>, at: &Placing<'_>) -> Result<Vec<Record>, S
                 results_mid = None;
             }
             // A ride names its carrier by the call's key, which only now is known for a call
-            // answered in this batch: the intent's key, else the outcome's.
+            // answered in this batch: the intent's key, else the outcome's. Its notice is served
+            // with the results message that carries it, which is the newest message placed, so
+            // that message's facts are restated right after the ride with the notice added.
             Record::ResultAppend(append) => {
                 if let Some(ride) = append.ride.as_mut().filter(|ride| ride.call_key.is_empty()) {
                     ride.call_key = key_of.get(&append.tool_call_id).cloned().ok_or_else(|| {
@@ -611,6 +619,13 @@ pub fn with_facts(batch: Vec<Record>, at: &Placing<'_>) -> Result<Vec<Record>, S
                         )
                     })?;
                 }
+                ride_facts = restate_for_ride(
+                    append,
+                    counts.placed,
+                    &out,
+                    turn_calls.as_deref(),
+                    at.conversation,
+                )?;
             }
             // A step or batch start announces the id of the message it will write, minted from
             // the writer generation and the seq this record takes.
@@ -713,6 +728,7 @@ pub fn with_facts(batch: Vec<Record>, at: &Placing<'_>) -> Result<Vec<Record>, S
             {
                 // The reply completed the turn, which placed the assistant message and then its
                 // results' message.
+                turn_calls = Some(call_ids(&assistant));
                 placed_turn = Some((counts.placed - 1, assistant));
             }
             let now_known = known_of(&counts);
@@ -782,6 +798,7 @@ pub fn with_facts(batch: Vec<Record>, at: &Placing<'_>) -> Result<Vec<Record>, S
                     created_at_ms: facts.created_at_ms,
                     delivery_mode,
                     delivery_tool_call_id,
+                    notices: Vec::new(),
                 });
                 high = high
                     .checked_add(if entries {
@@ -817,6 +834,10 @@ pub fn with_facts(batch: Vec<Record>, at: &Placing<'_>) -> Result<Vec<Record>, S
         out.push(record);
         if let Some(turn) = restated.take() {
             out.push(Record::TurnFacts(turn));
+        }
+        if let Some(facts) = ride_facts.take() {
+            out.push(Record::EntryFacts(facts));
+            inserted = true;
         }
         if !continues && !pending.is_empty() {
             flush(&mut out, &mut pending, at);
@@ -1103,21 +1124,36 @@ fn run_send_facts(
 }
 
 /// The send facts of a steer or delivered send's message placed by `input`, from the pending
-/// input it was accepted as (`receipt_seq`).
+/// input it was accepted as (`receipt_seq`). A send delivered in the batch placing its messages
+/// isn't pending yet when the batch is built, so its facts come from its queued send, which the
+/// delivery takes them from (`Operations::apply_at`).
 fn held_send_facts(input: &broca_session_store::record::Input, at: &Placing<'_>) -> SendFacts {
-    let Some(pending) = at.operations.run.as_ref().and_then(|run| {
+    let pending = at.operations.run.as_ref().and_then(|run| {
         run.pending_steers
             .iter()
             .find(|pending| pending.seq.is_some() && pending.seq == input.receipt_seq)
-    }) else {
-        return SendFacts::default();
+    });
+    let (sender, digest) = match pending {
+        Some(pending) => (
+            pending.sender.clone(),
+            pending.request_identity_digest.as_deref(),
+        ),
+        None => match at
+            .operations
+            .queue
+            .iter()
+            .find(|queued| Some(&queued.submission_id) == input.submission_id.as_ref())
+        {
+            Some(queued) => (
+                queued.sender.clone(),
+                queued.request_identity_digest.as_deref(),
+            ),
+            None => return SendFacts::default(),
+        },
     };
     SendFacts {
-        sender: pending.sender.clone(),
-        client_message_id: pending
-            .request_identity_digest
-            .as_deref()
-            .and_then(broca_core::digest_client_message_id),
+        sender,
+        client_message_id: digest.and_then(broca_core::digest_client_message_id),
     }
 }
 
@@ -1140,6 +1176,92 @@ fn accepted_at(input: &broca_session_store::record::Input, at: &Placing<'_>) -> 
             .and_then(|pending| pending.written_at_ms)
             .or(input.written_at_ms),
     }
+}
+
+/// The ids of the tool calls `message` makes, in content order.
+pub fn call_ids(message: &Message) -> Vec<ToolCallId> {
+    message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::ToolCall(call) => Some(call.tool_call_id.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The notice `session.read` serves for the send `append` delivered riding on a result of a tool
+/// results message, whose assistant message made the calls `calls`, as today's display facts
+/// name it (`broca_core::display_facts`): the result's place is its call's last place among
+/// `calls`. Only a ride delivered with its envelope has one, and only text set apart from the
+/// result by a blank line, which belongs to rendering and isn't part of the notice.
+pub fn ride_notice(append: &ResultAppend, calls: &[ToolCallId]) -> Option<RideNotice> {
+    let ride = append.ride.as_ref()?;
+    let text = append.text.strip_prefix("\n\n")?;
+    let part = calls.iter().rposition(|id| *id == append.tool_call_id)?;
+    Some(RideNotice {
+        part: u32::try_from(part).ok()?,
+        send_id: append.send_id.clone()?,
+        sender: ride.sender.clone(),
+        call_key: ride.call_key.clone(),
+        text: text.to_owned(),
+    })
+}
+
+/// `facts`, the facts of the tool results message the ride `append` landed on, restated with the
+/// ride's `notice` added, naming the message as delivered as a tool result on the ride's call,
+/// as today's reads name the message a ride took. The converter and the run loop both write one
+/// right after each ride, so a session reads the same whichever wrote it.
+pub fn with_ride(facts: &EntryFacts, append: &ResultAppend, notice: RideNotice) -> EntryFacts {
+    let mut facts = facts.clone();
+    facts.notices.push(notice);
+    facts.delivery_mode = Some("tool_result".into());
+    facts.delivery_tool_call_id = Some(append.tool_call_id.0.clone());
+    facts
+}
+
+/// The facts of the tool results message at `ordinal` that `append` rides on, restated with the
+/// ride's notice ([`with_ride`]), or `None` for text without a notice: the latest facts this
+/// batch wrote for the message (`written`; a message's facts are always written by the time a
+/// later record of the batch is), else those the session holds.
+/// `calls` are the ids of the calls of the turn this batch placed, when it placed one; else
+/// they are read from the assistant message before the results.
+fn restate_for_ride(
+    append: &ResultAppend,
+    ordinal: u64,
+    written: &[Record],
+    calls: Option<&[ToolCallId]>,
+    conversation: &Conversation,
+) -> Result<Option<EntryFacts>, String> {
+    if append.ride.is_none() {
+        return Ok(None);
+    }
+    let calls = match calls {
+        Some(calls) => calls.to_vec(),
+        None => conversation
+            .window_message(ordinal.saturating_sub(1))
+            .map(call_ids)
+            .unwrap_or_default(),
+    };
+    let Some(notice) = ride_notice(append, &calls) else {
+        return Ok(None);
+    };
+    let facts = written
+        .iter()
+        .rev()
+        .find_map(|record| match record {
+            Record::EntryFacts(facts) if facts.ordinal == ordinal => Some(facts),
+            _ => None,
+        })
+        .or_else(|| {
+            conversation
+                .window_entry(ordinal)
+                .and_then(|(_, state)| state.facts.as_ref())
+        })
+        .ok_or_else(|| {
+            format!("entry facts: the results message {ordinal} a send rides on has no facts")
+        })?;
+    Ok(Some(with_ride(facts, append, notice)))
 }
 
 /// The id a message converted from today's storage takes at `position` (its ordinal less one),

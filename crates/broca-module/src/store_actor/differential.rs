@@ -105,6 +105,22 @@ fn today_with(
     gate: Option<Arc<Notify>>,
     planes: super::tests::Planes,
 ) -> Today {
+    today_opened(steps, gate, planes, false)
+}
+
+/// [`today`] whose WAL writer records each ride with its envelope (its call's key, sender and
+/// forms), as the writer does once rides are enabled, where a ride is a notice and its text
+/// isn't joined into the result. The new storage always records rides that way.
+fn today_riding(steps: Vec<Vec<NormalizedEvent>>, gate: Option<Arc<Notify>>) -> Today {
+    today_opened(steps, gate, super::tests::Planes::default(), true)
+}
+
+fn today_opened(
+    steps: Vec<Vec<NormalizedEvent>>,
+    gate: Option<Arc<Notify>>,
+    planes: super::tests::Planes,
+    rides: bool,
+) -> Today {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let dir = broca_test_support::scratch_root().join(format!(
@@ -122,19 +138,17 @@ fn today_with(
         wal: Arc::clone(&wal),
         planes,
     });
-    // A reader over the WAL alone: `session.read` serves from the log when no store is given.
-    let registry = LineageRegistry::new_with_reader(
-        Arc::new(
-            crate::opener::DefaultOpener::new(
-                Arc::new(FileLeaseStore::new(dir.join("leases"))),
-                wal.clone(),
-                executor.clone(),
-            )
-            .with_idle_ttl(Duration::from_secs(60)),
-        ),
+    let mut opener = crate::opener::DefaultOpener::new(
+        Arc::new(FileLeaseStore::new(dir.join("leases"))),
         wal.clone(),
-        None,
-    );
+        executor.clone(),
+    )
+    .with_idle_ttl(Duration::from_secs(60));
+    if rides {
+        opener = opener.with_ride_writer_for_test();
+    }
+    // A reader over the WAL alone: `session.read` serves from the log when no store is given.
+    let registry = LineageRegistry::new_with_reader(Arc::new(opener), wal.clone(), None);
     let key = BindIdentity::new(dir.join("project"), "store-actor", "s1");
     Today {
         dir,

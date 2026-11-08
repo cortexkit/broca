@@ -442,6 +442,47 @@ pub fn convert(old: &[FramedRecord], lineage: Option<&str>) -> Result<Converted,
                     last_turn = Some(turn);
                 }
             }
+            // A send that rode on a result here is served with the results message carrying
+            // it, the newest message placed: that message's facts are restated right after the
+            // ride with its notice added, as the run loop writes them.
+            let mut at = before;
+            while at < out.records.len() {
+                if let Record::ResultAppend(append) = &out.records[at] {
+                    let calls = out.records[..at]
+                        .iter()
+                        .rev()
+                        .find_map(|record| match record {
+                            Record::Assistant(assistant) => {
+                                Some(broca_session_loop::entries::call_ids(&assistant.message))
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or_default();
+                    if let Some(notice) = broca_session_loop::entries::ride_notice(append, &calls) {
+                        let ordinal = counts.placed;
+                        let placed = out.records[..at]
+                            .iter()
+                            .rev()
+                            .find_map(|record| match record {
+                                Record::EntryFacts(facts) if facts.ordinal == ordinal => {
+                                    Some(facts)
+                                }
+                                _ => None,
+                            })
+                            .ok_or_else(|| {
+                                err(format!(
+                                    "entry facts: the results message {ordinal} a send rode on \
+                                     has no facts"
+                                ))
+                            })?;
+                        let restated =
+                            broca_session_loop::entries::with_ride(placed, append, notice);
+                        out.records.insert(at + 1, Record::EntryFacts(restated));
+                        at += 1;
+                    }
+                }
+                at += 1;
+            }
         }
     }
     if let Some((legacy, _, emitted)) = &facts {

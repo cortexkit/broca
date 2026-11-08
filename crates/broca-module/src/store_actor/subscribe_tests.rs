@@ -373,15 +373,15 @@ async fn a_subscribe_from_a_reads_head_misses_and_repeats_nothing() {
 }
 
 /// A session whose first run's tool result carries two notes, as a run that delivered sends
-/// with that result records them: one from the module `occi` under the send id `ride-1`, and
-/// one recorded without its send, as a log converted from today's WAL storage holds one (a WAL
-/// ride written without its envelope names no send id). Built from the records a store actor
-/// wrote for [`script`]'s two runs, the notes put after the tool batch's end, written to a
-/// session of its own. Returns that session's backend, the seq of the note with its send (the
-/// other follows it), and the session.
+/// with that result records them: a ride from the module `occi` under the send id `ride-1`, with
+/// its envelope, and text delivered before envelopes existed, as a log converted from today's
+/// WAL storage holds it (no envelope, no send id). Built from the records a store actor wrote
+/// for [`script`]'s two runs, the notes put after the tool batch's end, written to a session of
+/// its own. Returns that session's backend, the seq of the ride (the other note follows it), and
+/// the session.
 async fn ridden_session() -> (&'static MemoryBackend, u64, Session<&'static MemoryBackend>) {
     use super::tests::{deployment, triple, ADDR};
-    use broca_session_store::record::{Notice, ResultAppend};
+    use broca_session_store::record::{Notice, ResultAppend, RideEnvelope, RideForm};
     let (commands, served, _backend, _parts, _live) = two_runs().await;
     drop(commands);
     let ran = served.await.unwrap();
@@ -420,39 +420,36 @@ async fn ridden_session() -> (&'static MemoryBackend, u64, Session<&'static Memo
             run_id: "r1".into(),
             tool_call_id: call.clone(),
             text: format!("\n\n{text}"),
+            // The notice record names whoever its order says sent it; a ride's envelope names
+            // the sender a notice is delivered under.
             notice: Some(Notice {
-                sender: "occi".into(),
+                sender: "ordered-by".into(),
                 template: None,
             }),
             written_at_ms: Some(1),
             send_id: send_id.map(str::to_owned),
-            ride: None,
+            ride: send_id.map(|_| RideEnvelope {
+                call_key: "key-1".into(),
+                sender: "occi".into(),
+                forms: vec!["tool_result".into()],
+                form: RideForm::Append,
+            }),
         })
     };
-    records.insert(batch_end + 1, note("unsent", None));
-    records.insert(batch_end + 1, note("sent", Some("ride-1")));
+    records.insert(batch_end + 1, note("joined", None));
+    records.insert(batch_end + 1, note("ridden", Some("ride-1")));
     let first = session.append(&records, true).await.unwrap();
     (backend, first + batch_end as u64 + 1, session)
 }
 
-/// A note riding a tool result is a notice naming the send it came with and its sender; a note
-/// recorded without its send is left out of the stream, yet a cursor naming its unit still
-/// resumes, since a resume checks a cursor against every unit its record yields before notice
-/// visibility filters any. Every delivered unit resumes.
+/// A ride is one notice, under the send id, sender and call key its envelope recorded. Text
+/// delivered before envelopes existed is no notice: its record yields no unit at all, as
+/// today's stream yields none for it. Every delivered unit resumes.
 #[tokio::test]
-async fn a_ride_is_a_notice_and_one_without_its_send_still_resumes() {
+async fn a_ride_is_one_notice_and_text_without_an_envelope_is_none() {
     use cortexkit_role_llm_runner::live::LiveEvent;
-    let (backend, sent_seq, session) = ridden_session().await;
-    let unsent_seq = sent_seq + 1;
-    let identity = crate::store_fanout::CursorIdentity::of(&session);
-    let records = session.open_log_records().await.unwrap();
-    let unsent = &records
-        .iter()
-        .find(|(seq, _)| *seq == unsent_seq)
-        .expect("the session holds the unsent note")
-        .1;
-    let unsent_cursor = Cursor::new(unsent_seq, 0)
-        .with_store_identity(identity.incarnation, identity.key.digest(unsent));
+    let (backend, ride_seq, session) = ridden_session().await;
+    let joined_seq = ride_seq + 1;
     let actor = super::StoreActor::new(
         super::tests::bind(),
         session,
@@ -465,12 +462,13 @@ async fn a_ride_is_a_notice_and_one_without_its_send_still_resumes() {
 
     let mut from_start = subscribe(&commands, FromCursor::Start, false).await;
     let stream = units(quiet(&mut from_start).await);
-    let notices: Vec<(String, String, u64)> = stream
+    let notices: Vec<(String, String, String, u64)> = stream
         .iter()
         .filter_map(|event| match &event.2 {
             LiveEvent::NoticeDelivered(notice) => Some((
                 notice.send_id.clone(),
                 notice.sender.clone(),
+                notice.call_key.clone(),
                 event.0.wal_seq,
             )),
             _ => None,
@@ -478,22 +476,20 @@ async fn a_ride_is_a_notice_and_one_without_its_send_still_resumes() {
         .collect();
     assert_eq!(
         notices,
-        [("ride-1".to_owned(), "occi".to_owned(), sent_seq)],
+        [(
+            "ride-1".to_owned(),
+            "occi".to_owned(),
+            "key-1".to_owned(),
+            ride_seq
+        )],
         "{:#?}",
         wires(&stream)
     );
-    resumes_at_every_unit(&commands, &stream).await;
-    let mut resumed = subscribe(&commands, resume(unsent_cursor), false).await;
-    let after: Vec<_> = stream
-        .iter()
-        .filter(|event| event.0.wal_seq > unsent_seq)
-        .cloned()
-        .collect();
-    assert_eq!(
-        wires(&units(quiet(&mut resumed).await)),
-        wires(&after),
-        "a resume at the note recorded without its send"
+    assert!(
+        stream.iter().all(|event| event.0.wal_seq != joined_seq),
+        "text without an envelope yields no unit"
     );
+    resumes_at_every_unit(&commands, &stream).await;
 }
 
 /// Asks the actor to read `request` from what it holds.

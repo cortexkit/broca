@@ -3,13 +3,16 @@
 //! sender and principal, each ending, each delivery and each run's start. Admission's refusals,
 //! a send expired on arrival, a dedupe key superseding an undelivered send, an `idle_start`
 //! send starting a run, and a send that outlives a run's end and rides on a later one are each
-//! answered and recorded alike.
+//! answered and recorded alike. Each scenario's sessions then read alike: `session.read` in every
+//! opt-in mode on a few pages (a ride's notice among the carrying message's display facts, each
+//! delivered entry's `delivered_as`), and the control stream from the start, where a ride is one
+//! `notice_delivered`.
 
 use std::sync::Arc;
 
 use broca_protocol::content::ContentBlock;
 use broca_protocol::{BindPrincipal, Delivery, NormalizedEvent, RunId, SubmissionRequest};
-use broca_session_loop::parts::MemoryParts;
+use broca_session_loop::parts::{MemoryParts, SharedParts};
 use broca_session_store::backend::{MemoryBackend, SessionAddr};
 use broca_session_store::record::Record;
 use broca_session_store::session::Session;
@@ -18,7 +21,7 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot, Notify};
 
 use super::super::tests::{self as store, LoopExecutor};
-use super::{store_starts, today_with, Today};
+use super::{display_reads_alike, store_starts, streams, today_riding, Today};
 use crate::actor::{LineageCmd, SendKey, SendOutcome, SendPlan};
 use crate::executor::RunKind;
 
@@ -120,6 +123,8 @@ struct Pair {
     commands: mpsc::UnboundedSender<LineageCmd>,
     served: tokio::task::JoinHandle<Session<&'static MemoryBackend>>,
     store: Arc<LoopExecutor>,
+    /// The store actor's setup parts, kept so its session's reads can name its runs' tools.
+    parts: SharedParts,
     gates: Vec<Arc<Notify>>,
 }
 
@@ -127,7 +132,7 @@ impl Pair {
     async fn new(script: Vec<Vec<NormalizedEvent>>, gated: bool) -> Self {
         let today_gate = gated.then(|| Arc::new(Notify::new()));
         let store_gate = gated.then(|| Arc::new(Notify::new()));
-        let today = today_with(script.clone(), today_gate.clone(), store::Planes::default());
+        let today = today_riding(script.clone(), today_gate.clone());
         let executor = Arc::new(store::executor(script, store_gate.clone()));
         let backend: &'static MemoryBackend = Box::leak(Box::default());
         let session = Session::create(
@@ -139,12 +144,14 @@ impl Pair {
         )
         .await
         .unwrap();
+        let parts = SharedParts::new(Box::new(MemoryParts::default()));
         let actor = super::super::StoreActor::new(
             store::bind(),
             session,
             executor.clone(),
-            Box::new(MemoryParts::default()),
-        );
+            Box::new(parts.clone()),
+        )
+        .with_readers(Arc::new(move || backend));
         let (commands, receiver) = mpsc::unbounded_channel();
         let served = tokio::spawn(actor.serve(receiver));
         Self {
@@ -152,6 +159,7 @@ impl Pair {
             commands,
             served,
             store: executor,
+            parts,
             gates: today_gate.into_iter().chain(store_gate).collect(),
         }
     }
@@ -259,11 +267,34 @@ impl Pair {
 
     /// Ends the store session's actor, and checks the two sessions recorded their sends alike:
     /// the same conversation, the same send ledger, the same sends still queued, the same runs'
-    /// starts, and every model call sent the same messages and results. Returns the ledger and
-    /// the queue.
-    async fn assert_alike(self) -> (Vec<Value>, Vec<String>) {
+    /// starts, and every model call sent the same messages and results; and that they read
+    /// alike: the same control stream from the start, and the same `session.read` replies in
+    /// every opt-in mode. Returns the ledger, the queue, and how many notices the session holds:
+    /// `notice_delivered` events in its stream, and notices its `session.read` serves.
+    async fn assert_alike(self) -> (Vec<Value>, Vec<String>, (usize, usize)) {
+        let stream = streams::store(&self.commands).await;
+        streams::assert_alike(
+            &stream,
+            &streams::routed(&self.today.registry, &self.today.key).await,
+        );
+        let notices = stream
+            .iter()
+            .filter(|unit| unit["event"]["type"] == "notice_delivered")
+            .count();
         drop(self.commands);
         let session = self.served.await.unwrap();
+        display_reads_alike(&self.today, &session, &self.parts).await;
+        let mut whole =
+            crate::serve::SessionReadRequest::new(self.today.key.clone(), None, Some(500));
+        whole.include_display_facts = true;
+        let read = crate::store_read::serve_view(&session, &self.parts, &whole)
+            .await
+            .expect("the store's session reads");
+        let served: usize = read
+            .messages
+            .iter()
+            .map(|message| message.notices.len())
+            .sum();
         let records: Vec<Record> = session
             .open_log_records()
             .await
@@ -308,7 +339,7 @@ impl Pair {
             "the model calls were sent different messages"
         );
         assert!(self.today.registry.stop_and_seal().await);
-        (ledger, queue)
+        (ledger, queue, (notices, served))
     }
 }
 
@@ -530,7 +561,7 @@ async fn ordered_admission_refusals_are_answered_alike() {
         new,
         SendOutcome::Error(super::super::unserved("a template with a part_tag slot"))
     );
-    let (_, queue) = pair.assert_alike().await;
+    let (_, queue, _) = pair.assert_alike().await;
     assert!(queue.is_empty(), "nothing refused is queued: {queue:?}");
 }
 
@@ -572,8 +603,10 @@ async fn a_superseded_send_and_one_outliving_its_run_are_recorded_alike() {
     pair.release();
     pair.release();
     pair.idle().await;
-    let (ledger, queue) = pair.assert_alike().await;
+    let (ledger, queue, notices) = pair.assert_alike().await;
     assert!(queue.is_empty(), "the send rode: {queue:?}");
+    // The one ride is one `notice_delivered` and one notice on the message carrying it.
+    assert_eq!(notices, (1, 1), "the ride's notices");
     // The older send ended superseded, and the newer one waited out the first run to ride on
     // the second run's tool batch.
     let at = |entry: &Value| ledger.iter().position(|recorded| recorded == entry);
@@ -589,6 +622,37 @@ async fn a_superseded_send_and_one_outliving_its_run_are_recorded_alike() {
         superseded.is_some() && second_run.is_some() && rode > second_run,
         "{ledger:#?}"
     );
+}
+
+/// Two senders' notes queued while a run runs both ride on the next run's tool batch: each is
+/// one `notice_delivered` and one notice on the results message carrying it, read alike.
+#[tokio::test]
+async fn two_rides_on_one_batch_are_two_notices_alike() {
+    let pair = Pair::new(reading_later(), true).await;
+    pair.first("r1").await;
+    for (run_id, sender, text) in [("q1", AFT, "aft's note"), ("q2", MC, "mc's note")] {
+        let outcome = pair
+            .alike(
+                run_id,
+                from(module(sender), text),
+                Some(json!({"modes": ["tool_result"]})),
+                None,
+            )
+            .await;
+        assert!(
+            matches!(outcome, SendOutcome::Pending { .. }),
+            "{outcome:?}"
+        );
+    }
+    pair.release();
+    pair.idle().await;
+    pair.alike("r2", from(core(), "read a"), None, None).await;
+    pair.release();
+    pair.release();
+    pair.idle().await;
+    let (_, queue, notices) = pair.assert_alike().await;
+    assert!(queue.is_empty(), "both sends rode: {queue:?}");
+    assert_eq!(notices, (2, 2), "the rides' notices");
 }
 
 /// A list naming `idle_start` from a sender granted it starts its run on an idle session, and
@@ -656,7 +720,7 @@ async fn ordered_steers_join_the_running_run_alike() {
     pair.release();
     pair.release();
     pair.idle().await;
-    let (ledger, queue) = pair.assert_alike().await;
+    let (ledger, queue, _) = pair.assert_alike().await;
     assert!(queue.is_empty(), "both sends were delivered: {queue:?}");
     for id in ["sub-q1", "sub-q2"] {
         assert!(
@@ -688,7 +752,7 @@ async fn an_expired_send_waits_on_an_idle_session_alike() {
     pair.alike("r2", from(core(), "next"), None, None).await;
     pair.release();
     pair.idle().await;
-    let (ledger, queue) = pair.assert_alike().await;
+    let (ledger, queue, _) = pair.assert_alike().await;
     assert!(queue.is_empty(), "the expired send ended: {queue:?}");
     // Nothing ended it while the session sat idle: it ended after the next run started.
     let ended = ledger
@@ -726,6 +790,6 @@ async fn a_queued_ordered_sends_retry_is_answered_alike() {
     assert_eq!(replies, [pending.clone(), pending, reuse.clone(), reuse]);
     pair.release();
     pair.idle().await;
-    let (_, queue) = pair.assert_alike().await;
+    let (_, queue, _) = pair.assert_alike().await;
     assert_eq!(queue, vec!["sub-r-k1".to_owned()], "the keyed send waits");
 }

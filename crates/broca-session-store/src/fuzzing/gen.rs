@@ -625,6 +625,14 @@ mod records {
         no_display_facts,
         reasoning_summaries,
         rich_ui,
+        notices,
+    });
+    crate::fuzzing::gen::fields!(RideNotice {
+        part,
+        send_id,
+        sender,
+        call_key,
+        text
     });
     crate::fuzzing::gen::fields!(ReasoningSummary { part, text });
     crate::fuzzing::gen::fields!(RichUi {

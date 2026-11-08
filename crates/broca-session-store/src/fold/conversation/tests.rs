@@ -277,6 +277,7 @@ fn facts(ordinal: u64, tag_base: u64) -> Record {
         created_at_ms: None,
         delivery_mode: None,
         delivery_tool_call_id: None,
+        notices: Vec::new(),
     })
 }
 

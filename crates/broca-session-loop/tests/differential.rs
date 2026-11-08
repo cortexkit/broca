@@ -880,6 +880,78 @@ fn cache() -> bool {
 }
 
 tokio::task_local! {
+    /// Whether the comparison also reads both sessions' compaction entries (`session.entries`)
+    /// on the compaction contract and compares them: set for the sends delivered into a run.
+    static ENTRIES: bool;
+}
+
+fn entries_compared() -> bool {
+    ENTRIES.try_with(|set| *set).unwrap_or(false)
+}
+
+/// Runs `comparison` with both sessions' compaction entries compared at its end.
+async fn reading_entries(comparison: impl std::future::Future<Output = ()>) {
+    ENTRIES.scope(true, comparison).await;
+}
+
+/// On the compaction contract, every compaction entry the new session serves equals the one
+/// today's storage serves for the same history (`compaction_v2::transcript::project`): a
+/// carrying tool result with its own output and each ride beside it, and each delivered
+/// message as it was placed. Message ids, call keys and other ids each storage mints its own
+/// way are compared by order of first appearance; times by whether they are there.
+async fn entries_alike(today: &LogImage, session: &Session<&MemoryBackend>) {
+    // Only a log on the compaction contract serves compaction entries.
+    if LAYOUT.try_with(|layout| layout.is_none()).unwrap_or(true) {
+        return;
+    }
+    let framed = today.framed();
+    assert!(
+        broca_core::is_mode3_log(framed.iter().map(|frame| &frame.record)),
+        "today's log is on the compaction contract"
+    );
+    let lineage = lineage(today).expect("today's log on the contract has a lineage");
+    let old = broca_core::compaction_v2::transcript::project(&framed, &lineage)
+        .expect("today's entries project")
+        .entries;
+    let new: Vec<_> = session
+        .entries(1, usize::MAX)
+        .await
+        .expect("the new session's entries read")
+        .iter()
+        .map(|entry| broca_session_loop::entries::project(entry).expect("an entry projects"))
+        .collect();
+    fn masked(entries: &[cortexkit_role_compaction::read::Entry]) -> Value {
+        fn rename(value: &mut Value, names: &mut std::collections::HashMap<String, usize>) {
+            match value {
+                Value::Object(members) => {
+                    for (key, member) in members.iter_mut() {
+                        match (key.as_str(), member.as_str()) {
+                            ("mid" | "call_key" | "id", Some(text)) => {
+                                let next = names.len();
+                                let name = *names.entry(text.to_owned()).or_insert(next);
+                                *member = json!(format!("{key}#{name}"));
+                            }
+                            _ if member.is_number()
+                                && (key.ends_with("_at") || key.ends_with("_at_ms")) =>
+                            {
+                                *member = json!("<time>");
+                            }
+                            _ => rename(member, names),
+                        }
+                    }
+                }
+                Value::Array(items) => items.iter_mut().for_each(|item| rename(item, names)),
+                _ => {}
+            }
+        }
+        let mut value = serde_json::to_value(entries).unwrap();
+        rename(&mut value, &mut Default::default());
+        value
+    }
+    assert_eq!(masked(&new), masked(&old), "the compaction entries differ");
+}
+
+tokio::task_local! {
     /// The route both loops' providers judge turn-scoped system messages by, for a comparison of
     /// sends delivered that way. `None` judges by the stub route, which takes none.
     static TURN_SYSTEM: Option<broca_provider::wire::FrozenRenderConfig>;
@@ -4017,7 +4089,7 @@ async fn compare_actions_in_once(
 ) {
     // Today's run is boxed: its future is large enough to overflow a test thread's stack where
     // it is built.
-    let (today, summaries, _, _) = Box::pin(today_with_actions(
+    let (today, summaries, full, _) = Box::pin(today_with_actions(
         &scenario,
         None,
         scenario.steps.clone(),
@@ -4132,6 +4204,9 @@ async fn compare_actions_in_once(
             .collect(),
     };
     assert_same(&today, &new);
+    if entries_compared() {
+        entries_alike(&full, writer.session).await;
+    }
     rides_name_their_carrier(&writer.records);
     // Reloading the session from a checkpoint at any record gives the state folding every
     // record does, rides kept beside their calls included.
@@ -4261,7 +4336,23 @@ async fn compare_actions_every_cut_once(
             let new = resumed_as_today(new, today);
             assert_eq!(&new, today, "{context}: request {index}");
         }
-        for (index, (new, today)) in new.records.iter().zip(today_appended).enumerate() {
+        // Where today's resumed loop loses a ride's envelope it has no notice for the ride, so
+        // nothing restates the carrying message's facts after it: the new loop's restatement
+        // right after each ride is set aside.
+        let new_records: Vec<Value> = new
+            .records
+            .iter()
+            .enumerate()
+            .filter(|(index, record)| {
+                !(envelope_lost
+                    && record["EntryFacts"].is_object()
+                    && index.checked_sub(1).is_some_and(|before| {
+                        new.records[before]["ResultAppend"]["ride"].is_object()
+                    }))
+            })
+            .map(|(_, record)| record.clone())
+            .collect();
+        for (index, (new, today)) in new_records.iter().zip(today_appended).enumerate() {
             if envelope_lost && today["ResultAppend"]["ride"].is_null() {
                 let without = |record: &Value| {
                     let mut record = record.clone();
@@ -4277,7 +4368,7 @@ async fn compare_actions_every_cut_once(
             assert_eq!(new, today, "{context}: record {index}");
         }
         assert_eq!(
-            new.records.len(),
+            new_records.len(),
             today_appended.len(),
             "{context}: record count"
         );
@@ -5114,7 +5205,7 @@ fn a_note(id: &str) -> (usize, Action) {
 /// ride's envelope names the carrying call's key.
 #[tokio::test]
 async fn a_ride_on_a_text_result() {
-    compare_steered(calling("read", 0), vec![a_note("q1")]).await;
+    reading_entries(compare_steered(calling("read", 0), vec![a_note("q1")])).await;
 }
 
 #[tokio::test]
@@ -5125,7 +5216,7 @@ async fn every_cut_of_a_ride_on_a_text_result_resumes_alike() {
 /// An error result carries a ride as a text result does.
 #[tokio::test]
 async fn a_ride_on_an_error_result() {
-    compare_steered(calling("broken", 0), vec![a_note("q1")]).await;
+    reading_entries(compare_steered(calling("broken", 0), vec![a_note("q1")])).await;
 }
 
 #[tokio::test]
@@ -5136,7 +5227,11 @@ async fn every_cut_of_a_ride_on_an_error_result_resumes_alike() {
 /// Several sends ride on one batch's carrier, in queue order.
 #[tokio::test]
 async fn several_rides_in_one_batch() {
-    compare_steered(calling("read", 1), vec![a_note("q1"), a_note("q2")]).await;
+    reading_entries(compare_steered(
+        calling("read", 1),
+        vec![a_note("q1"), a_note("q2")],
+    ))
+    .await;
 }
 
 #[tokio::test]
@@ -5148,7 +5243,7 @@ async fn every_cut_of_several_rides_in_one_batch_resumes_alike() {
 /// compaction contract every result carries one, so there it rides.
 #[tokio::test]
 async fn a_batch_without_a_carrier_leaves_the_send_queued() {
-    compare_steered(calling("json", 0), vec![a_note("q1")]).await;
+    reading_entries(compare_steered(calling("json", 0), vec![a_note("q1")])).await;
 }
 
 #[tokio::test]
@@ -5169,7 +5264,7 @@ async fn a_system_or_steer_send_on_a_route_with_system_text() {
     TURN_SYSTEM
         .scope(
             Some(anthropic_route(true)),
-            compare_steered(calling("read", 0), vec![system_note("q1")]),
+            reading_entries(compare_steered(calling("read", 0), vec![system_note("q1")])),
         )
         .await;
 }
@@ -5179,7 +5274,7 @@ async fn a_system_or_steer_send_on_a_route_without_system_text() {
     TURN_SYSTEM
         .scope(
             Some(anthropic_route(false)),
-            compare_steered(calling("read", 0), vec![system_note("q1")]),
+            reading_entries(compare_steered(calling("read", 0), vec![system_note("q1")])),
         )
         .await;
 }
