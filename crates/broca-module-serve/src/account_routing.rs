@@ -1408,11 +1408,11 @@ where
         .or(inputs.inherited_conversation_key)
         .unwrap_or(&derived);
     let decision = |path: &str, admission_id, decision_id| {
-        // The caller owns reports for an explicit decision; only runner allocations have
-        // an admission id that enables broca's normal and sealed-run reporters.
+        // Only a runner-owned account_for allocation grants an admission to report. Static
+        // fallbacks and login refusals reserve nothing; explicit decisions belong to the caller.
         let mut result = decision(
             path,
-            if inputs.decision_id.is_some() {
+            if inputs.decision_id.is_some() || path != broca_wal::ACCOUNT_DECISION_ROUTED {
                 None
             } else {
                 admission_id
@@ -1839,7 +1839,34 @@ pub struct RunReporter {
     tx: tokio::sync::mpsc::UnboundedSender<ReportEvent>,
 }
 
+fn held_admission_id(decision: &AccountDecision) -> Option<&str> {
+    if decision.path == broca_wal::ACCOUNT_DECISION_ROUTED {
+        decision.admission_id.as_deref()
+    } else {
+        None
+    }
+}
+
 impl RunReporter {
+    /// Report only an allocation routing granted to this runner. Older static decisions can
+    /// contain fabricated admission ids; their presence must not enable live or recovery reports.
+    pub fn start_for_decision(
+        client: Arc<RoutingClient>,
+        decision: &AccountDecision,
+        run_id: String,
+        view_digest: Option<String>,
+        durable_head: Arc<AtomicU64>,
+    ) -> Option<Arc<Self>> {
+        let admission_id = held_admission_id(decision)?.to_owned();
+        Some(Self::start(
+            client,
+            admission_id,
+            run_id,
+            view_digest,
+            durable_head,
+        ))
+    }
+
     /// Start reporting run `run_id`, known to routing as `admission_id`. `durable_head` is the
     /// run's WAL writer's durable-sequence gauge. `view_digest` is the listing digest the
     /// run's credential was chosen from, when this process chose it.
@@ -2107,7 +2134,7 @@ pub fn report_sealed(client: Arc<RoutingClient>, sealed: &broca_module::SealedRu
         .auth_selection
         .as_ref()
         .and_then(|selection| selection.account_decision.as_ref())
-        .and_then(|decision| decision.admission_id.clone())
+        .and_then(held_admission_id)
     else {
         return;
     };
@@ -2116,7 +2143,7 @@ pub fn report_sealed(client: Arc<RoutingClient>, sealed: &broca_module::SealedRu
     };
     let body = run_finished_body(
         &id,
-        &admission_id,
+        admission_id,
         &sealed.run_id.0,
         RunFinishReason::Interrupted,
         None,

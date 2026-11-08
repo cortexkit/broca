@@ -514,7 +514,7 @@ async fn account_selection_disabled_keeps_the_static_credential() {
         panic!("selection off must retain the static credential")
     };
     assert_eq!(decision.path, broca_wal::ACCOUNT_DECISION_DISABLED);
-    assert_eq!(decision.admission_id.as_deref(), Some("run-1"));
+    assert_eq!(decision.admission_id, None);
     assert_eq!(decision.decision_id.as_deref(), Some("acd-disabled"));
     assert_eq!(routing.methods(), vec![ACCOUNT_FOR_OP]);
     assert_eq!(client.counters.get("disabled"), 1);
@@ -691,8 +691,8 @@ async fn a_caller_pin_is_kept_and_routing_is_not_asked() {
     assert_eq!(path_of(&choice), "pinned");
     assert_eq!(
         choice.decision().unwrap().admission_id.as_deref(),
-        Some("run-1"),
-        "a pinned run is still reported"
+        None,
+        "a static pin reserved no routing admission"
     );
     assert!(routing.methods().is_empty());
 }
@@ -1429,7 +1429,7 @@ async fn auth_required_admits_for_a_fresh_login() {
             conversation_key: Some(conversation_key(&session())),
             conversation_key_source: Some(broca_wal::ConversationKeySource::Session),
             path: "auth_required".into(),
-            admission_id: Some("run-1".into()),
+            admission_id: None,
             decision_id: Some("acd-9".into()),
         })
     );
@@ -1928,6 +1928,141 @@ fn admission_started_matches_routings_pinned_body() {
         admission_started_body("lineage:4", "adm-finish", "run-finish"),
         routing_pin
     );
+}
+
+fn report_key_limit(client: Arc<RoutingClient>, decision: &AccountDecision) -> bool {
+    let Some(reporter) = RunReporter::start_for_decision(
+        client,
+        decision,
+        "run-1".into(),
+        None,
+        Arc::new(AtomicU64::new(3)),
+    ) else {
+        return false;
+    };
+    let lineage = lineage();
+    broca_core::AccountReporter::run_started(reporter.as_ref(), Some(lineage), 1);
+    let observed = attempt(
+        Some(429),
+        AttemptAccountObservation {
+            limit: Some(AttemptAccountLimit {
+                disposition: broca_protocol::provider::AccountLimitDisposition::ACCOUNT,
+                observed_at_ms: 12_000,
+                resets_at_ms: Some(42_000),
+                resets_at_source: Some("retry_after".into()),
+                limit_window: None,
+            }),
+            ..Default::default()
+        },
+    );
+    broca_core::AccountReporter::attempt_recorded(reporter.as_ref(), Some(lineage), 2, &observed);
+    reporter.finish(Some(lineage), 3, RunFinishReason::Error);
+    true
+}
+
+async fn wait_for_reporter_release(routing: &Arc<FakeRouting>) {
+    broca_test_support::wait_until("admission reporters release routing", || async {
+        if Arc::strong_count(routing) == 1 {
+            Ok(())
+        } else {
+            Err("a routing client or reporter is still active".into())
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn static_key_limits_send_nothing_but_routed_limits_name_the_issued_admission() {
+    for routed in [false, true] {
+        let routing = FakeRouting::answering(Ok(Ok(serde_json::to_vec(&json!({"result":{
+            "admission":{"id":"run-1","state":"reserved"},
+            "account":{"account_id":"key-b","credential_id":"key-b","method":"apikey"}
+        }}))
+        .unwrap())));
+        let client = Arc::new(client(&routing));
+        let choice = choose_api_key(
+            &client,
+            routed.then_some("key-pool"),
+            None,
+            !routed,
+            Some(api_keys()),
+        )
+        .await
+        .unwrap();
+        let decision = choice.decision().unwrap();
+        let started = report_key_limit(Arc::clone(&client), decision);
+        drop(client);
+        wait_for_reporter_release(&routing).await;
+        let reports = routing.observed();
+        if routed {
+            assert!(started);
+            assert_eq!(decision.admission_id.as_deref(), Some("run-1"));
+            assert_eq!(reports.len(), 3);
+            assert_eq!(reports[0]["kind"], "admission_started");
+            assert_eq!(reports[1]["kind"], "account_limit_exhausted");
+            assert_eq!(reports[1]["admission_id"], "run-1");
+            assert_eq!(reports[1]["observed_at_ms"], 12_000);
+            assert_eq!(reports[2]["kind"], "run_finished");
+            let requests = routing.requests.lock().unwrap();
+            let admission = requests
+                .iter()
+                .find(|request| request["method"] == ACCOUNT_FOR_OP)
+                .unwrap();
+            assert_eq!(admission["params"]["admission_id"], "run-1");
+        } else {
+            assert!(reports.is_empty(), "static-key reports: {reports:?}");
+            assert!(!started);
+            assert_eq!(decision.admission_id, None);
+            assert!(routing.methods().is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn legacy_unheld_admissions_never_start_reporters_or_report_sealed_runs() {
+    for path in [
+        "pinned",
+        "single_candidate",
+        "candidates_unknown",
+        "disabled",
+        "legacy_static",
+        "auth_required",
+        "future_static",
+    ] {
+        let routing = Arc::new(FakeRouting::default());
+        let client = Arc::new(client(&routing));
+        let decision = AccountDecision {
+            conversation_key: None,
+            conversation_key_source: None,
+            path: path.into(),
+            admission_id: Some("fabricated-by-an-older-runner".into()),
+            decision_id: None,
+        };
+        let started = report_key_limit(Arc::clone(&client), &decision);
+        report_sealed(
+            Arc::clone(&client),
+            &broca_module::SealedRun {
+                session: session(),
+                run_id: broca_protocol::RunId("run-1".into()),
+                auth_selection: Some(broca_core::AuthSelection {
+                    billing_vault_facts: None,
+                    auth_method: Some("apikey".into()),
+                    credential_id: "key-b".into(),
+                    account_ref: None,
+                    resolved_credential_id: None,
+                    vault_request: None,
+                    account_decision: Some(decision),
+                }),
+                lineage: Some(lineage()),
+                terminal_seq: 4,
+            },
+        );
+        drop(client);
+        wait_for_reporter_release(&routing).await;
+        let reports = routing.observed();
+        assert!(!started, "{path} created a reporter: {reports:?}");
+        assert!(reports.is_empty(), "{path} emitted reports: {reports:?}");
+    }
 }
 
 #[test]
@@ -2814,7 +2949,7 @@ async fn a_sealed_run_reports_its_interrupted_terminal_once() {
         &sealed(Some(selection(Some(AccountDecision {
             conversation_key: None,
             conversation_key_source: None,
-            path: "disabled".into(),
+            path: "routed".into(),
             admission_id: Some("run-1".into()),
             decision_id: None,
         })))),

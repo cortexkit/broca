@@ -4081,29 +4081,27 @@ mod executor {
             };
             control.pre_model_error = routing_decision_error.or(control.pre_model_error);
             control.auth_selection = resolution.selection.clone();
-            // Report this run's account evidence to routing when it has an admission id there:
-            // every decision path except the `legacy_static` one older builds wrote (the removed
-            // operator switch that bypassed routing), fresh or resumed alike.
+            // Report only an allocation routing granted to this runner. A static choice never
+            // holds an admission, even when an older frozen decision carries an invented id.
             let account_reporter = match (
                 self.routing.as_ref(),
                 resolution
                     .selection
                     .as_ref()
-                    .and_then(|selection| selection.account_decision.as_ref())
-                    .and_then(|decision| decision.admission_id.clone()),
+                    .and_then(|selection| selection.account_decision.as_ref()),
             ) {
-                (Some(routing), Some(admission_id)) => {
+                (Some(routing), Some(decision)) => {
                     let view_digest = match &account_choice {
                         AccountChoice::Routed { view_digest, .. } => Some(view_digest.clone()),
                         _ => None,
                     };
-                    Some(broca_module_serve::account_routing::RunReporter::start(
+                    broca_module_serve::account_routing::RunReporter::start_for_decision(
                         Arc::clone(routing),
-                        admission_id,
+                        decision,
                         run_id.0.clone(),
                         view_digest,
                         durable_head,
-                    ))
+                    )
                 }
                 _ => None,
             };
