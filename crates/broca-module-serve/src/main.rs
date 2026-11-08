@@ -398,35 +398,34 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .map_err(|e| ServeIoError(format!("open late-results store: {e}")))?;
     held_runtime.publish_for_health();
+    // What drops a moved session's materialized rows, in either state format.
+    let forget_projection: broca_module_serve::store_move::ForgetProjection =
+        match (&stores.legacy, &stores.overhaul) {
+            (Some(legacy), _) => {
+                let legacy = legacy.clone();
+                Arc::new(move |session: &broca_protocol::BindIdentity| {
+                    legacy.drop_session_projection(session)
+                })
+            }
+            (None, Some(overhaul)) => {
+                let db = overhaul.db.clone();
+                Arc::new(move |session: &broca_protocol::BindIdentity| {
+                    db.forget_session(session)
+                        .map_err(|error| error.to_string())
+                })
+            }
+            (None, None) => Arc::new(|_: &broca_protocol::BindIdentity| Ok(())),
+        };
     // A finished move's journal stays until the session's materialized rows and late-results
     // registrations are gone, which needs the stores just opened, and no actor yet.
-    {
-        let forget: broca_module_serve::store_move::ForgetProjection =
-            match (&stores.legacy, &stores.overhaul) {
-                (Some(legacy), _) => {
-                    let legacy = legacy.clone();
-                    Arc::new(move |session: &broca_protocol::BindIdentity| {
-                        legacy.drop_session_projection(session)
-                    })
-                }
-                (None, Some(overhaul)) => {
-                    let db = overhaul.db.clone();
-                    Arc::new(move |session: &broca_protocol::BindIdentity| {
-                        db.forget_session(session)
-                            .map_err(|error| error.to_string())
-                    })
-                }
-                (None, None) => Arc::new(|_: &broca_protocol::BindIdentity| Ok(())),
-            };
-        unsettled_moves.extend(
-            broca_module_serve::store_move::finish_at_startup(
-                &state_root,
-                Some(&forget),
-                Some(&held_runtime.store),
-            )
-            .refused,
-        );
-    }
+    unsettled_moves.extend(
+        broca_module_serve::store_move::finish_at_startup(
+            &state_root,
+            Some(&forget_projection),
+            Some(&held_runtime.store),
+        )
+        .refused,
+    );
     let plane =
         plane.with_provider_held_support(held_runtime.store.clone(), held_runtime.slots.clone());
     let plane = Arc::new(plane);
@@ -853,6 +852,8 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             }),
     };
     let move_wal = wal_store.clone();
+    let store_move_wal = wal_store.clone();
+    let store_move_leases: Arc<dyn broca_core::LeaseStore> = lease_store.clone();
     let mut opener_builder =
         opener_for_state_root(lease_store, wal_store, executor, state_format, &state_root)?
             .with_charge_basis_resolver(charge_basis_table.clone())
@@ -913,6 +914,29 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     unsettled_moves.dedup();
     registry.refuse_unsettled_moves(unsettled_moves);
     let registry = Arc::new(registry);
+    // `session.move_to_store` moves a session into the new storage once the deployment key has
+    // loaded (`key_unavailable` until then).
+    {
+        let mut mover = broca_module_serve::store_move::StoreMove::new(
+            registry.as_ref().clone(),
+            &state_root,
+            Arc::clone(&store_slot),
+            store_move_wal,
+            store_move_leases,
+            broca_module_serve::store_move::served_by_serve_layer(),
+        )
+        .with_forget_projection(forget_projection)
+        .with_late_results(held_runtime.store.clone(), held_runtime.slots.clone());
+        // Only a legacy root keeps the run index whose rows the move checks are settled. On an
+        // overhaul root the move refuses `reconcile_owed`.
+        if let Some(legacy) = &run_index {
+            let legacy = legacy.clone();
+            mover = mover.with_run_rows(Arc::new(move |session: &broca_protocol::BindIdentity| {
+                legacy.session_runs(session)
+            }));
+        }
+        registry.set_store_mover(Arc::new(mover));
+    }
     // The deployment key is read off the startup path: the module serves today's sessions at
     // once, and sessions kept in the new storage from when the key loads.
     let _store_key = tokio::spawn(

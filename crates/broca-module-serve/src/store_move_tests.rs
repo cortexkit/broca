@@ -129,7 +129,10 @@ impl Rig {
         let forgotten = self.forgotten.clone();
         StoreMove::new(
             self.registry.clone(),
-            self.runtime.clone(),
+            &self.dir,
+            Arc::new(broca_module::store_open::StoreSlot::loaded(
+                self.runtime.clone(),
+            )),
             self.wal_store.clone(),
             Arc::new(FileLeaseStore::new(self.dir.join("leases"))),
             Arc::new(|_: &str| true),
@@ -407,6 +410,26 @@ async fn each_precondition_refuses_by_name_and_writes_nothing() {
     assert_refused(&rig, rig.mover(), &bytes, "unsupported_feature").await;
     drop(rig);
 
+    // A compaction view the session accepted, which a seal of the new storage can't carry
+    // yet.
+    let rig = Rig::start("refuse-views").await;
+    let mut records = session_records(&rig.wal());
+    let first_run_end = records
+        .iter()
+        .position(|record| matches!(record, WalRecord::RunFinished { .. }))
+        .unwrap();
+    records.insert(
+        first_run_end + 1,
+        record(
+            json!({"type": "compaction_view_v2", "version": 1, "checksum": "c1",
+            "edits": []}),
+        ),
+    );
+    rig.write(&records);
+    let bytes = std::fs::read(rig.wal()).unwrap();
+    assert_refused(&rig, rig.mover(), &bytes, "compaction_views").await;
+    drop(rig);
+
     // A run-index row still owed reconciliation.
     let rig = Rig::start("refuse-index").await;
     let bytes = rig.write_session();
@@ -462,6 +485,21 @@ async fn a_module_without_a_mover_refuses_store_unavailable() {
     let bytes = rig.write_session();
     let refused = rig.registry.move_to_store(&key()).await.unwrap_err();
     assert_eq!(refused.code, "store_unavailable");
+    assert_today(&rig, &bytes);
+}
+
+/// Until the deployment key has loaded, a move refuses as store sessions are refused then:
+/// `key_unavailable`, transient, with nothing written.
+#[tokio::test]
+async fn a_move_before_the_key_loads_refuses_key_unavailable() {
+    let rig = Rig::start("awaiting-key").await;
+    let bytes = rig.write_session();
+    let mut mover = rig.mover();
+    mover.slot = Arc::new(broca_module::store_open::StoreSlot::awaiting_key(
+        &rig.dir, 1,
+    ));
+    let refused = mover.move_to_store(&key()).await.unwrap_err();
+    assert_eq!(refused.code, "key_unavailable", "{refused:?}");
     assert_today(&rig, &bytes);
 }
 

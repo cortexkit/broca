@@ -96,7 +96,9 @@ pub fn served_by_serve_layer() -> Served {
 /// from, and what it seals.
 pub struct StoreMove {
     pub(crate) registry: LineageRegistry,
-    pub(crate) runtime: Arc<broca_module::store_open::StoreRuntime>,
+    pub(crate) state_root: PathBuf,
+    /// The new storage, whose runtime serves once the deployment key has loaded.
+    pub(crate) slot: Arc<broca_module::store_open::StoreSlot>,
     pub(crate) wal_store: Arc<broca_core::FileWalStore>,
     pub(crate) leases: Arc<dyn broca_core::LeaseStore>,
     pub(crate) served: Served,
@@ -141,14 +143,16 @@ fn io_failed(what: &'static str) -> impl Fn(std::io::Error) -> MoveRefusal {
 impl StoreMove {
     pub fn new(
         registry: LineageRegistry,
-        runtime: Arc<broca_module::store_open::StoreRuntime>,
+        state_root: &Path,
+        slot: Arc<broca_module::store_open::StoreSlot>,
         wal_store: Arc<broca_core::FileWalStore>,
         leases: Arc<dyn broca_core::LeaseStore>,
         served: Served,
     ) -> Self {
         Self {
             registry,
-            runtime,
+            state_root: state_root.to_path_buf(),
+            slot,
             wal_store,
             leases,
             served,
@@ -182,7 +186,18 @@ impl StoreMove {
     }
 
     fn state_root(&self) -> &Path {
-        self.runtime.state_root()
+        &self.state_root
+    }
+
+    /// The runtime serving the new storage, or the transient `key_unavailable` refusal store
+    /// sessions get while the deployment key hasn't loaded.
+    fn runtime(&self) -> Result<Arc<broca_module::store_open::StoreRuntime>, MoveRefusal> {
+        self.slot.runtime().ok_or_else(|| {
+            MoveRefusal::new(
+                "key_unavailable",
+                broca_module::store_open::key_unavailable(self.slot.key_id()).to_string(),
+            )
+        })
     }
 
     /// A point where the move does a file operation or finishes a step. A test can crash the
@@ -207,6 +222,16 @@ impl StoreMover for StoreMove {
             Err(Stop::Crashed) => Err(MoveRefusal::new("crashed", "a test crashed the move")),
         }
     }
+}
+
+/// What the moved session is sealed with: the cipher the runtime serving the new storage opens
+/// its sessions with, today its deployment key. This is the one place a move chooses it, for
+/// the staged session's writer and for the verifier that reads it back, so a cipher the
+/// deployment configures reaches the move by changing only this function.
+fn new_session_cipher(
+    runtime: &broca_module::store_open::StoreRuntime,
+) -> &broca_session_store::keys::DeploymentKey {
+    runtime.deployment()
 }
 
 /// A new move id: `store-move:` and a random UUID (version 4).
@@ -319,6 +344,7 @@ impl StoreMove {
                 .into())
             }
         }
+        let runtime = self.runtime()?;
         // Precondition 1: every operation the session's callers use is served there.
         if let Some(op) = REQUIRED_OPERATIONS.iter().find(|op| !(self.served)(op)) {
             return Err(not_movable(op).into());
@@ -363,7 +389,7 @@ impl StoreMove {
             .map_err(io_failed("the move's journal couldn't be written"))?;
         self.step("journal")?;
         let mut fence = None;
-        match self.fenced(key, journal, &mut fence).await {
+        match self.fenced(key, &runtime, journal, &mut fence).await {
             Ok(reply) => Ok(reply),
             Err(Abort::Before(journal, stop)) => match stop {
                 Stop::Refused(refusal) => {
@@ -466,6 +492,7 @@ impl StoreMove {
     async fn fenced(
         &self,
         key: &BindIdentity,
+        runtime: &broca_module::store_open::StoreRuntime,
         mut journal: MoveJournal,
         fence: &mut Option<StoreMoveFence>,
     ) -> Result<serde_json::Value, Abort> {
@@ -563,7 +590,7 @@ impl StoreMove {
             records: &records,
             lineage: lineage_text.as_deref(),
             session: key,
-            deployment: self.runtime.deployment(),
+            deployment: new_session_cipher(runtime),
             store_root: &store,
             staging: &paths.staging,
         };
@@ -578,7 +605,7 @@ impl StoreMove {
             records: &records,
             lineage,
             session: key,
-            deployment: self.runtime.deployment(),
+            deployment: new_session_cipher(runtime),
             store_root: &store,
             staging: &paths.staging,
             converted: &staged.converted,
@@ -595,7 +622,7 @@ impl StoreMove {
         before!(self.step("verify"));
         // The runtime serving the session reads its setup parts from memory: hold the staged
         // ones there, already stored.
-        before!(self.hold_parts(&staged.converted));
+        before!(self.hold_parts(runtime, &staged.converted));
         // Feature floor.
         before!(broca_wal::raise_floor(
             &state_root.join(broca_wal::FEATURE_FLOOR_FILENAME),
@@ -638,8 +665,12 @@ impl StoreMove {
 
     /// Holds the staged session's setup parts in the runtime's parts, marked stored: they are
     /// in the setup store already.
-    fn hold_parts(&self, converted: &broca_session_convert::Converted) -> Result<(), MoveRefusal> {
-        let mut parts = self.runtime.parts().clone();
+    fn hold_parts(
+        &self,
+        runtime: &broca_module::store_open::StoreRuntime,
+        converted: &broca_session_convert::Converted,
+    ) -> Result<(), MoveRefusal> {
+        let mut parts = runtime.parts().clone();
         for part in converted
             .records
             .iter()

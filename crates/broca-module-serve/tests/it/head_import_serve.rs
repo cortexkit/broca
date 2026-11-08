@@ -129,7 +129,8 @@ impl Rig {
             // operation the move requires, read from the serve layer's own allowlist.
             let mover = broca_module_serve::store_move::StoreMove::new(
                 registry.clone(),
-                runtime,
+                &dir,
+                Arc::new(broca_module::store_open::StoreSlot::loaded(runtime)),
                 wal,
                 Arc::new(FileLeaseStore::new(dir.join("leases"))),
                 broca_module_serve::store_move::served_by_serve_layer(),
