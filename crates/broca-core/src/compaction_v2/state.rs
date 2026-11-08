@@ -32,6 +32,7 @@ pub struct State {
 /// The WAL adapter owns record encoding, including deduplication of stored edits.
 #[async_trait]
 pub trait Journal: Send + Sync {
+    fn view_refused(&self, _publication: &super::diagnostics::Publication, _code: &str) {}
     async fn accepted(
         &self,
         previous: Option<&ReceivedView>,
@@ -211,12 +212,24 @@ impl State {
                 boundary.rules,
                 boundary.accepts_images,
             ) {
+                journal.view_refused(
+                    &super::diagnostics::Publication::from_view(view),
+                    &super::diagnostics::refusal_code(&refusal),
+                );
                 return Ok(vec![Event::ViewRefused {
                     version: view.version,
                     refusal,
                 }]);
             }
-            journal.applied(boundary.step, view).await?;
+            journal
+                .applied(boundary.step, view)
+                .await
+                .inspect_err(|_| {
+                    journal.view_refused(
+                        &super::diagnostics::Publication::from_view(view),
+                        "internal_error",
+                    );
+                })?;
             self.applied = Some(received.clone());
             self.applied_by = self.latest_applied_by.clone();
             if self.step_id == Some(boundary.step) {

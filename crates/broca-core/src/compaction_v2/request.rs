@@ -218,6 +218,7 @@ async fn ride(
     };
     let version = received.view().version;
     let identity = received.view().applied();
+    let publication = super::diagnostics::Publication::from_view(received.view());
     let mut state = state.lock().await;
     let answer = state
         .accept(
@@ -227,7 +228,8 @@ async fn ride(
             &at.conditions.rules,
             at.conditions.accepts_images == Some(true),
         )
-        .await?;
+        .await
+        .inspect_err(|_| journal.view_refused(&publication, "internal_error"))?;
     // A crash can leave a ride's view accepted but not applied. Resumed, the step rides again,
     // and the provider re-offers that same view: it is still this step's answer, so it applies
     // now instead of being refused as not newer.
@@ -238,7 +240,10 @@ async fn ride(
     match answer {
         Ok(()) => apply_ride_answer(&mut state, runtime, journal, setup, at).await?,
         Err(_) if reoffered => apply_ride_answer(&mut state, runtime, journal, setup, at).await?,
-        Err(refusal) => runtime.event(Event::ViewRefused { version, refusal }),
+        Err(refusal) => {
+            journal.view_refused(&publication, &super::diagnostics::refusal_code(&refusal));
+            runtime.event(Event::ViewRefused { version, refusal });
+        }
     }
     Ok(())
 }

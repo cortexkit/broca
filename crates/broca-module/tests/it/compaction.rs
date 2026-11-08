@@ -407,6 +407,142 @@ fn seed_mode3(rig: &Rig) {
 }
 
 #[tokio::test]
+async fn compaction_v2_metadata_requires_writer_support() {
+    use broca_core::compaction_v2::protocol::{
+        read::{Detail, ReadPage, ReadRequest, Select},
+        view::View,
+    };
+    let rig = Rig::new(0);
+    seed_mode3(&rig);
+    let request = ReadRequest::new(
+        Select::After {
+            after_ordinal: None,
+            limit: Some(1),
+        },
+        Detail::Full,
+    );
+    let page = rig
+        .registry
+        .route_compaction_v2(
+            &rig.key,
+            Some("provider".into()),
+            "session.entries".into(),
+            serde_json::value::to_raw_value(&request).unwrap(),
+        )
+        .await
+        .unwrap();
+    let page: ReadPage = serde_json::from_str(page.get()).unwrap();
+    let session_ref = broca_core::agent_session_ref(&rig.key);
+    let capture = broca_test_support::LogCapture::observe(move |event| {
+        event.message() == "compaction published view refused"
+            && event.fields.get("session_ref") == Some(&session_ref)
+    });
+    let before = rig.wal.read_records(&rig.key).unwrap().len();
+    for (version, new_signed) in [(1, None), (2, Some("strip".into()))] {
+        let view = View::seal_with_policy(
+            version,
+            vec![],
+            Some(page.entries[0].mid.clone()),
+            new_signed,
+        );
+        assert!(view.verify());
+        let refusal = rig
+            .registry
+            .route_compaction_v2(
+                &rig.key,
+                Some("provider".into()),
+                "session.apply_view".into(),
+                serde_json::value::to_raw_value(&json!({"view":view})).unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(refusal.code, "internal_error");
+        assert!(refusal
+            .message
+            .contains("requires the metadata writer release"));
+    }
+    let events = capture.events();
+    assert_eq!(events.len(), 2, "{events:?}");
+    for (event, (version, new_signed)) in events.iter().zip([("1", "false"), ("2", "true")]) {
+        assert_eq!(event.level, tracing::Level::WARN);
+        assert_eq!(event.fields["view_version"], version);
+        assert_eq!(event.fields["refusal_code"], "internal_error");
+        assert_eq!(event.fields["built_through"], "true");
+        assert_eq!(event.fields["new_signed"], new_signed);
+    }
+    assert_eq!(rig.wal.read_records(&rig.key).unwrap().len(), before);
+    rig.close().await;
+}
+
+#[tokio::test]
+async fn compaction_v2_refused_publication_warns_once_with_policy_presence() {
+    use broca_core::compaction_v2::protocol::view::View;
+    let rig = Rig::new(0);
+    seed_mode3(&rig);
+    let session_ref = broca_core::agent_session_ref(&rig.key);
+    let expected_session = session_ref.clone();
+    let capture = broca_test_support::LogCapture::observe(move |event| {
+        event.message() == "compaction published view refused"
+            && event.fields.get("session_ref") == Some(&expected_session)
+    });
+    let mut view = serde_json::to_value(View::seal(7, vec![])).unwrap();
+    view["checksum"] = json!("bad-checksum");
+    view["built_through"] = json!("m12345678.0");
+    view["new_signed"] = json!("strip");
+    let before = rig.wal.read_records(&rig.key).unwrap().len();
+    let answer = rig
+        .registry
+        .route_compaction_v2(
+            &rig.key,
+            Some("provider".into()),
+            "session.apply_view".into(),
+            serde_json::value::to_raw_value(&json!({"view":view})).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(answer.get()).unwrap(),
+        json!({"answer":"refused","refusal":{"code":"bad_checksum"}})
+    );
+    let logs = capture.events();
+    assert_eq!(logs.len(), 1, "{logs:?}");
+    let event = &logs[0];
+    assert_eq!(event.level, tracing::Level::WARN);
+    assert_eq!(event.target, "compaction");
+    for (field, expected) in [
+        ("session_ref", session_ref.as_str()),
+        ("view_version", "7"),
+        ("refusal_code", "bad_checksum"),
+        ("built_through", "true"),
+        ("new_signed", "true"),
+    ] {
+        assert_eq!(event.fields.get(field).map(String::as_str), Some(expected));
+    }
+    let malformed = rig
+        .registry
+        .route_compaction_v2(
+            &rig.key,
+            Some("provider".into()),
+            "session.apply_view".into(),
+            serde_json::value::to_raw_value(
+                &json!({"view":{"version":"not-a-number","edits":[],"checksum":""}}),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(malformed.code, "invalid_params");
+    let events = capture.events();
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert_eq!(events[1].fields["view_version"], "unknown");
+    assert_eq!(events[1].fields["refusal_code"], "invalid_params");
+    assert_eq!(events[1].fields["built_through"], "false");
+    assert_eq!(events[1].fields["new_signed"], "false");
+    assert_eq!(rig.wal.read_records(&rig.key).unwrap().len(), before);
+    rig.close().await;
+}
+
+#[tokio::test]
 async fn compaction_v2_bound_ops_check_provider_and_store_before_accepted_without_applying_mid_run()
 {
     use broca_core::compaction_v2::protocol::{

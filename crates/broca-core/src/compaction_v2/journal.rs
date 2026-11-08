@@ -28,6 +28,9 @@ impl WalJournal<'_> {
 
 #[async_trait]
 impl Journal for WalJournal<'_> {
+    fn view_refused(&self, publication: &super::diagnostics::Publication, code: &str) {
+        publication.warn(self.session, code);
+    }
     async fn accepted(
         &self,
         previous: Option<&ReceivedView>,

@@ -711,6 +711,12 @@ struct MemoryJournal {
 
 #[async_trait::async_trait]
 impl state::Journal for MemoryJournal {
+    fn view_refused(&self, publication: &super::diagnostics::Publication, code: &str) {
+        publication.warn(
+            &broca_protocol::BindIdentity::new("/project", "test", "s"),
+            code,
+        );
+    }
     async fn accepted(
         &self,
         _: Option<&super::received::ReceivedView>,
@@ -1843,6 +1849,48 @@ async fn compaction_v2_request_over_limit_rides_reestimates_then_refuses() {
     );
     assert_eq!(calls[2].1["causes"], json!(["over_limit"]));
     assert!(calls[2].1["request_tokens"].as_u64().unwrap() > 900);
+}
+
+#[tokio::test]
+async fn compaction_v2_refused_ride_warns_once_without_changing_the_view() {
+    let messages = vec![text(Role::User, &"x".repeat(1000))];
+    let entries = project(&messages, &facts(1), &Deliveries::new(), true);
+    let mut view = View::seal(7, vec![]);
+    view.checksum = "bad-checksum".into();
+    let plane = RecordingPlane::default();
+    plane.answers.lock().unwrap().extend([
+        json!({"answer":"ready"}),
+        json!({"answer":"received"}),
+        json!({"answer":"view","view":view}),
+        json!({"answer":"received"}),
+    ]);
+    let state = tokio::sync::Mutex::new(state::State::default());
+    let journal = MemoryJournal::default();
+    let runtime = runtime::Runtime::default();
+    let conditions = conditions();
+    let current = send_context();
+    let (result, logs) = broca_test_support::capture_logs(super::request::prepare(
+        &state,
+        &runtime,
+        &journal,
+        &plane,
+        request_at(&messages, &entries, &conditions, &current),
+        |_| panic!("no image"),
+        text_estimate,
+    ))
+    .await;
+    assert!(result.is_ok());
+    assert!(state.lock().await.latest().is_none());
+    let warnings: Vec<_> = logs
+        .iter()
+        .filter(|event| event.message() == "compaction published view refused")
+        .collect();
+    assert_eq!(warnings.len(), 1, "{logs:?}");
+    assert_eq!(warnings[0].level, tracing::Level::WARN);
+    assert_eq!(warnings[0].fields["refusal_code"], "bad_checksum");
+    assert_eq!(warnings[0].fields["view_version"], "7");
+    assert_eq!(warnings[0].fields["built_through"], "false");
+    assert_eq!(warnings[0].fields["new_signed"], "false");
 }
 
 #[tokio::test]

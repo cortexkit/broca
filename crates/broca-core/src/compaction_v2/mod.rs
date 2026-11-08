@@ -8,6 +8,7 @@ pub use cortexkit_role_compaction as protocol;
 pub mod admission;
 pub mod authority;
 pub mod conditions;
+pub mod diagnostics;
 pub mod entries;
 pub mod fold;
 pub mod host;
