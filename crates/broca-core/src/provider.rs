@@ -129,7 +129,10 @@ pub trait Provider: Send + Sync {
     /// The loop calls this even if a caller retains the provider for a later run.
     fn close_run_transport(&self) {}
 
-    /// Release transport after a durably completed run. Abnormal exits still close it.
+    /// Release transport after durable completion or a provider-held tool pause.
+    /// A backend retaining response-continuation state must verify that the next request
+    /// extends its last completed response with matching request properties before reuse.
+    /// Other exits still close the transport.
     fn complete_run_transport(&self) {
         self.close_run_transport();
     }
