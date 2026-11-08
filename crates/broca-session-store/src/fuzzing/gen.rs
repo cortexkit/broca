@@ -1304,7 +1304,12 @@ mod stored {
         id_index,
         cold_since_ms,
         appends_in_conversation,
+        cipher,
     });
+    variants!(
+        crate::keys::Cipher: crate::keys::Cipher::XChaCha20Poly1305,
+        crate::keys::Cipher::None,
+    );
     crate::fuzzing::gen::fields!(DirEntry {
         object,
         first_seq,

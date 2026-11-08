@@ -16,6 +16,7 @@ use broca_core::{
     OutputEvent, RunError, RunSummary, StartMode, StubToolPlane, WalStore,
 };
 use broca_protocol::{BindIdentity, BindPrincipal, NormalizedEvent, RunId, SubmissionRequest};
+use broca_session_store::keys::Cipher;
 use serde_json::{json, Value};
 use sha2::Digest as _;
 use tokio::sync::mpsc;
@@ -25,6 +26,11 @@ use crate::actor::{LineageStatus, SendKey, SendOutcome};
 use crate::executor::{RunExecutor, RunJob, RunKind, StoreRunEnd, StoreRunJob};
 use crate::registry::LineageRegistry;
 use crate::serve::ServeHandler;
+
+cipher_tests!(
+    uploads_and_media_reads_answer_alike,
+    a_store_sessions_media_survives_a_restart_and_stays_its_own,
+);
 
 /// A one-pixel PNG: the image both sessions hold.
 pub(super) const PNG: &str = "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de0000000c49444154789c63f8cfc0000003010100c9fe92ef0000000049454e44ae426082";
@@ -50,6 +56,16 @@ fn stranger() -> BindPrincipal {
     BindPrincipal::Reserved {
         module_id: "magic-context".into(),
     }
+}
+
+/// The mode the stored head of the session `key` under the state root `dir` names.
+pub(super) fn stored_mode(dir: &std::path::Path, key: &BindIdentity) -> Cipher {
+    use broca_session_store::backend::{LocalBackend, SessionAddr};
+    let (stored, _) = LocalBackend::new(dir.join(broca_wal::SESSION_STORAGE_DIR))
+        .read_stored_head(&SessionAddr(broca_core::session_addr(key)))
+        .unwrap()
+        .expect("the session is kept in the new storage");
+    broca_session_store::head::stored_cipher(&stored).unwrap()
 }
 
 /// The media profile of a model that takes images.
@@ -159,6 +175,8 @@ pub(super) struct Side {
     pub(super) key: BindIdentity,
     /// What each model step waits for, when the side's steps are gated.
     pub(super) gate: Option<Arc<tokio::sync::Notify>>,
+    /// The mode the side's module creates new-storage sessions in.
+    pub(super) cipher: Cipher,
 }
 
 impl Drop for Side {
@@ -168,13 +186,18 @@ impl Drop for Side {
 }
 
 /// A module whose sessions start in the new storage when `store`, else on today's storage, over
-/// the scripted model `steps`.
-pub(super) async fn side(store: bool, steps: Vec<Vec<NormalizedEvent>>) -> Side {
-    side_gated(store, steps, false).await
+/// the scripted model `steps`. Its new storage creates sessions in mode `cipher`.
+pub(super) async fn side(store: bool, steps: Vec<Vec<NormalizedEvent>>, cipher: Cipher) -> Side {
+    side_gated(store, steps, false, cipher).await
 }
 
 /// [`side`], with every model step waiting for the side's gate when `gated`.
-pub(super) async fn side_gated(store: bool, steps: Vec<Vec<NormalizedEvent>>, gated: bool) -> Side {
+pub(super) async fn side_gated(
+    store: bool,
+    steps: Vec<Vec<NormalizedEvent>>,
+    gated: bool,
+    cipher: Cipher,
+) -> Side {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let dir = broca_test_support::scratch_root().join(format!(
@@ -185,24 +208,27 @@ pub(super) async fn side_gated(store: bool, steps: Vec<Vec<NormalizedEvent>>, ga
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let gate = gated.then(|| Arc::new(tokio::sync::Notify::new()));
-    let registry = registry_gated(&dir, store, steps, gate.clone()).await;
+    let registry = registry_gated(&dir, store, steps, gate.clone(), cipher).await;
     let key = BindIdentity::new(dir.join("project"), "store-actor", "s1");
     Side {
         dir,
         registry,
         key,
         gate,
+        cipher,
     }
 }
 
 /// A module over the state root `dir`, as a process starting there opens it: its sessions
-/// start in the new storage when `store`, its runs scripted by `steps`.
+/// start in the new storage when `store`, its runs scripted by `steps`, and its new storage
+/// creates sessions in mode `cipher`.
 pub(super) async fn registry_at(
     dir: &std::path::Path,
     store: bool,
     steps: Vec<Vec<NormalizedEvent>>,
+    cipher: Cipher,
 ) -> LineageRegistry {
-    registry_gated(dir, store, steps, None).await
+    registry_gated(dir, store, steps, None, cipher).await
 }
 
 /// [`registry_at`], with every model step waiting for `gate` when there is one.
@@ -211,6 +237,7 @@ async fn registry_gated(
     store: bool,
     steps: Vec<Vec<NormalizedEvent>>,
     gate: Option<Arc<tokio::sync::Notify>>,
+    cipher: Cipher,
 ) -> LineageRegistry {
     broca_core::media_store::create_media_directories(dir).unwrap();
     let wal = Arc::new(FileWalStore::new(dir.join("wal")));
@@ -228,7 +255,7 @@ async fn registry_gated(
     });
     let runtime = crate::store_open::StoreRuntime::open(
         dir,
-        broca_session_store::keys::DeploymentKey::new(1, &[7; 32]),
+        broca_session_store::keys::DeploymentKey::new(1, &[7; 32]).creating(cipher),
         Arc::clone(&executor),
         super::IDLE,
     )
@@ -255,6 +282,12 @@ async fn registry_gated(
 }
 
 impl Side {
+    /// The mode the stored head of the side's session names, which a session in the new storage
+    /// keeps for its life.
+    pub(super) fn stored_mode(&self) -> Cipher {
+        stored_mode(&self.dir, &self.key)
+    }
+
     pub(super) async fn send(&self, run_id: &str, request: SubmissionRequest) -> SendOutcome {
         self.deliver(run_id, request, broca_protocol::Delivery::Queue)
             .await
@@ -472,16 +505,15 @@ pub(super) fn reads_of(sha256: &str, size: u64) -> Vec<Value> {
 /// every step and its refusals, the image each session holds read whole, by byte range and as a
 /// metadata probe, and the refusals of a digest the session doesn't hold. An upload no send named
 /// is not readable, and neither is a digest of another session, nor one malformed.
-#[tokio::test]
-async fn uploads_and_media_reads_answer_alike() {
+async fn uploads_and_media_reads_answer_alike(cipher: Cipher) {
     let steps = || {
         vec![
             super::super::tests::text_step("a1", "hello"),
             super::super::tests::text_step("a2", "seen"),
         ]
     };
-    let today = side(false, steps()).await;
-    let store = side(true, steps()).await;
+    let today = side(false, steps(), cipher).await;
+    let store = side(true, steps(), cipher).await;
     let image = bytes_of(PNG);
     let unsent = bytes_of(WIDE);
 
@@ -511,6 +543,7 @@ async fn uploads_and_media_reads_answer_alike() {
     today.idle().await;
     // The session in the new storage: a head whose first message carries the same image.
     import_with(&store, &image).await;
+    assert_eq!(store.stored_mode(), cipher);
 
     // Every step of an upload, and its refusals, answer alike.
     let (old, new) = (
@@ -626,11 +659,11 @@ async fn uploads_and_media_reads_answer_alike() {
 /// A store session's image survives a restart: a module started anew on the same state root
 /// reads it back byte-equal, whole and by byte range. Another session of the module, whose
 /// records don't name the image, can't read it, though the image's bytes are stored beside it.
-#[tokio::test]
-async fn a_store_sessions_media_survives_a_restart_and_stays_its_own() {
-    let store = side(true, Vec::new()).await;
+async fn a_store_sessions_media_survives_a_restart_and_stays_its_own(cipher: Cipher) {
+    let store = side(true, Vec::new(), cipher).await;
     let (image, other_image) = (bytes_of(PNG), bytes_of(WIDE));
     import_with(&store, &image).await;
+    assert_eq!(store.stored_mode(), cipher);
     let other = BindIdentity::new(store.dir.join("project"), "store-actor", "s2");
     import_into(&store.registry, &store.dir, &other, &other_image).await;
     let read = json!({"sha256": digest(&image), "offset": 0, "length": image.len()});
@@ -640,7 +673,7 @@ async fn a_store_sessions_media_survives_a_restart_and_stays_its_own() {
     );
     assert!(store.registry.stop_and_seal().await);
 
-    let restarted = registry_at(&store.dir, true, Vec::new()).await;
+    let restarted = registry_at(&store.dir, true, Vec::new(), cipher).await;
     let reply = ServeHandler::media_read(&restarted, &store.key, read.clone())
         .await
         .unwrap();

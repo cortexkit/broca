@@ -177,7 +177,15 @@ pub async fn write(stage: &Stage<'_>, prepared: Prepared) -> Result<Staged, Stag
         }
     };
     let setup_backend = LocalBackend::new(stage.store_root);
-    let setup_key = stage.deployment.setup_key();
+    // The setup parts go to the name space of the mode the session is created in.
+    let setup_key = stage
+        .deployment
+        .setup_key_for(stage.deployment.new_sessions())
+        .ok_or_else(|| {
+            StageError::Failed(
+                "an encrypted session can't be staged before the deployment key has loaded".into(),
+            )
+        })?;
     let setup = SetupStore::new(&setup_backend, &setup_key);
     let mut session = Session::create(
         LocalBackend::new(stage.staging),

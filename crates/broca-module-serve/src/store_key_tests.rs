@@ -247,7 +247,7 @@ async fn a_vault_serving_the_deployment_key_loads_it_and_a_held_session_opens() 
     daemon.serve_deployment_key(DEPLOYMENT_KEY_RECORD, Some(deployment_key_hex().into_bytes()));
     assert_eq!(
         broca_module_serve::store_key::health_of(&rig.slot),
-        serde_json::json!({"key_id": 1, "loaded": false})
+        serde_json::json!({"key_id": 1, "loaded": false, "new_sessions": "encrypted"})
     );
     let loading = tokio::spawn(rig.loader(&daemon).await.run(rig.registry.clone()));
     broca_test_support::wait_until("the deployment key loaded", || async {
@@ -264,7 +264,7 @@ async fn a_vault_serving_the_deployment_key_loads_it_and_a_held_session_opens() 
         .expect("the held session opens under the vault's key");
     assert_eq!(
         broca_module_serve::store_key::health_of(&rig.slot),
-        serde_json::json!({"key_id": 1, "loaded": true})
+        serde_json::json!({"key_id": 1, "loaded": true, "new_sessions": "encrypted"})
     );
     assert_eq!(
         daemon.requests(),

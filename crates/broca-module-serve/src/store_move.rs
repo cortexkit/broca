@@ -112,7 +112,7 @@ pub fn served_by_serve_layer() -> Served {
 pub struct StoreMove {
     pub(crate) registry: LineageRegistry,
     pub(crate) state_root: PathBuf,
-    /// The new storage, whose runtime serves once the deployment key has loaded.
+    /// The new storage: its runtime creates the moved session (see `runtime`).
     pub(crate) slot: Arc<broca_module::store_open::StoreSlot>,
     pub(crate) wal_store: Arc<broca_core::FileWalStore>,
     pub(crate) leases: Arc<dyn broca_core::LeaseStore>,
@@ -204,10 +204,12 @@ impl StoreMove {
         &self.state_root
     }
 
-    /// The runtime serving the new storage, or the transient `key_unavailable` refusal store
-    /// sessions get while the deployment key hasn't loaded.
+    /// The runtime that creates the moved session, or the transient `key_unavailable` refusal
+    /// store sessions get while the deployment key hasn't loaded. A move creates the session in
+    /// the mode new sessions are created in (`session_storage.encryption`): a plain one as soon
+    /// as the runtime is open, an encrypted one once the key has loaded.
     fn runtime(&self) -> Result<Arc<broca_module::store_open::StoreRuntime>, MoveRefusal> {
-        self.slot.runtime().ok_or_else(|| {
+        self.slot.creating_runtime().ok_or_else(|| {
             MoveRefusal::new(
                 "key_unavailable",
                 broca_module::store_open::key_unavailable(self.slot.key_id()).to_string(),
@@ -239,10 +241,11 @@ impl StoreMover for StoreMove {
     }
 }
 
-/// What the moved session is sealed with: the cipher the runtime serving the new storage opens
-/// its sessions with, today its deployment key. This is the one place a move chooses it, for
-/// the staged session's writer and for the verifier that reads it back, so a cipher the
-/// deployment configures reaches the move by changing only this function.
+/// What the moved session is created and read back with: the runtime's deployment key, which
+/// creates sessions in the mode `session_storage.encryption` configures (plain, or encrypted
+/// under that key). This is the one place a move chooses the new session's mode, for the
+/// staged session's writer, for the verifier that reads it back, and for the setup parts the
+/// runtime holds for it.
 fn new_session_cipher(
     runtime: &broca_module::store_open::StoreRuntime,
 ) -> &broca_session_store::keys::DeploymentKey {
@@ -685,7 +688,9 @@ impl StoreMove {
         runtime: &broca_module::store_open::StoreRuntime,
         converted: &broca_session_convert::Converted,
     ) -> Result<(), MoveRefusal> {
-        let mut parts = runtime.parts().clone();
+        let mut parts = runtime
+            .parts_for(new_session_cipher(runtime).new_sessions())
+            .clone();
         for part in converted
             .records
             .iter()

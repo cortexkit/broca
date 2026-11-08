@@ -826,13 +826,18 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     ));
     let executor = Arc::new(executor_impl.with_clock(retention.clock.clone()));
     // The new session storage. A session kept there is told apart from today's from the first
-    // open, and served once the deployment key has loaded from the vault (see `store_key`).
+    // open. Its runtime opens here, without the deployment key, and serves plain sessions from
+    // the start; encrypted sessions are served once the key has loaded from the vault (see
+    // `store_key`). `session_storage.encryption` chooses the mode of the sessions it creates.
     let session_storage =
         broca_module_serve::config::SessionStorageConfig::load_default().map_err(ServeIoError)?;
-    let store_slot = Arc::new(broca_module::store_open::StoreSlot::awaiting_key(
-        &state_root,
-        session_storage.deployment_key_id,
-    ));
+    let store_slot = Arc::new(
+        broca_module::store_open::StoreSlot::awaiting_key(
+            &state_root,
+            session_storage.deployment_key_id,
+        )
+        .creating(session_storage.new_sessions()),
+    );
     broca_module_serve::store_key::publish(Arc::clone(&store_slot));
     let store_setup = broca_module::store_open::StoreRuntimeSetup {
         state_root: state_root.clone(),
@@ -851,6 +856,13 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
                 resolver: charge_basis_table.clone(),
             }),
     };
+    if let Err(error) = store_slot.open_without_key(&store_setup).await {
+        // Plain sessions stay unserved until the key loads, which opens the runtime again.
+        tracing::warn!(
+            target: "session_storage",
+            "the new storage could not be opened without its deployment key: {error}"
+        );
+    }
     let move_wal = wal_store.clone();
     let store_move_wal = wal_store.clone();
     let store_move_leases: Arc<dyn broca_core::LeaseStore> = lease_store.clone();
@@ -914,8 +926,9 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     unsettled_moves.dedup();
     registry.refuse_unsettled_moves(unsettled_moves);
     let registry = Arc::new(registry);
-    // `session.move_to_store` moves a session into the new storage once the deployment key has
-    // loaded (`key_unavailable` until then).
+    // `session.move_to_store` moves a session into the new storage, creating it in the mode
+    // `session_storage.encryption` chose: a plain session once the runtime is open, an
+    // encrypted one once the deployment key has loaded (`key_unavailable` until then).
     {
         let mut mover = broca_module_serve::store_move::StoreMove::new(
             registry.as_ref().clone(),

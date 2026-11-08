@@ -22,7 +22,6 @@ use std::collections::BTreeMap;
 use broca_core::head::HeadProjection;
 use broca_protocol::{BindPrincipal, SendScope};
 use broca_session_store::backend::{MemoryBackend, SessionAddr};
-use broca_session_store::keys::DeploymentKey;
 use broca_session_store::record::Record;
 use broca_session_store::session::Session;
 use broca_wal::{FramedRecord, WalRecord};
@@ -337,7 +336,7 @@ fn carried_views(
 
 pub(super) fn run(args: &Args) {
     let mut report = HeadsReport::default();
-    let deployment = DeploymentKey::new(1, &[0x5a; 32]);
+    let deployment = crate::deployment();
     each_log(args, |item| {
         let (name, old) = match item {
             Item::Log {

@@ -25,7 +25,6 @@ use broca_module::serve::SessionReadRequest;
 use broca_module::store_read::todays::Todays;
 use broca_protocol::content::{ContentBlock, Message, Role};
 use broca_session_store::backend::{MemoryBackend, SessionAddr};
-use broca_session_store::keys::DeploymentKey;
 use broca_session_store::session::Session;
 use futures::executor::block_on;
 use serde::Serialize;
@@ -126,7 +125,7 @@ fn failed(report: &mut NumberingReport, what: String) {
 
 pub(super) fn run(args: &Args) {
     let mut report = NumberingReport::default();
-    let deployment = DeploymentKey::new(1, &[0x5a; 32]);
+    let deployment = crate::deployment();
     each_log(args, |item| {
         let Item::Log {
             name, old: Ok(old), ..

@@ -13,6 +13,7 @@ use broca_module::executor::{RunExecutor, RunJob};
 use broca_module::opener::DefaultOpener;
 use broca_module::LineageRegistry;
 use broca_protocol::BindIdentity;
+use broca_session_store::keys::Cipher;
 use broca_wal::{FramedRecord, Wal as _, WalRecord};
 use serde_json::json;
 use tokio::sync::mpsc;
@@ -84,10 +85,19 @@ impl Drop for Rig {
 }
 
 async fn runtime(dir: &Path) -> Arc<broca_module::store_open::StoreRuntime> {
+    runtime_creating(dir, Cipher::XChaCha20Poly1305).await
+}
+
+/// A runtime with its deployment key loaded that creates sessions in mode `cipher`, as
+/// `session_storage.encryption` configures it.
+async fn runtime_creating(
+    dir: &Path,
+    cipher: Cipher,
+) -> Arc<broca_module::store_open::StoreRuntime> {
     Arc::new(
         broca_module::store_open::StoreRuntime::open(
             dir,
-            deployment(),
+            deployment().creating(cipher),
             Arc::new(NoRuns),
             Duration::from_millis(100),
         )
@@ -98,12 +108,17 @@ async fn runtime(dir: &Path) -> Arc<broca_module::store_open::StoreRuntime> {
 
 impl Rig {
     async fn start(tag: &str) -> Self {
+        Self::start_creating(tag, Cipher::XChaCha20Poly1305).await
+    }
+
+    /// A rig whose new storage creates sessions in mode `cipher`.
+    async fn start_creating(tag: &str, cipher: Cipher) -> Self {
         let dir = broca_test_support::scratch_root()
             .join(format!("broca-store-move-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let wal_store = Arc::new(FileWalStore::new(dir.join("wal")));
-        let runtime = runtime(&dir).await;
+        let runtime = runtime_creating(&dir, cipher).await;
         let opener = DefaultOpener::new(
             Arc::new(FileLeaseStore::new(dir.join("leases"))),
             wal_store.clone(),
@@ -488,8 +503,9 @@ async fn a_module_without_a_mover_refuses_store_unavailable() {
     assert_today(&rig, &bytes);
 }
 
-/// Until the deployment key has loaded, a move refuses as store sessions are refused then:
-/// `key_unavailable`, transient, with nothing written.
+/// Until the deployment key has loaded, a move that would create an encrypted session refuses
+/// as store sessions are refused then: `key_unavailable`, transient, with nothing written. Both
+/// before the runtime opens and once it serves plain sessions without the key.
 #[tokio::test]
 async fn a_move_before_the_key_loads_refuses_key_unavailable() {
     let rig = Rig::start("awaiting-key").await;
@@ -501,6 +517,66 @@ async fn a_move_before_the_key_loads_refuses_key_unavailable() {
     let refused = mover.move_to_store(&key()).await.unwrap_err();
     assert_eq!(refused.code, "key_unavailable", "{refused:?}");
     assert_today(&rig, &bytes);
+
+    let slot = Arc::new(broca_module::store_open::StoreSlot::awaiting_key(
+        &rig.dir, 1,
+    ));
+    slot.open_without_key(&setup(&rig.dir)).await.unwrap();
+    assert!(slot.runtime().is_some(), "plain sessions are served");
+    let mut mover = rig.mover();
+    mover.slot = slot;
+    let refused = mover.move_to_store(&key()).await.unwrap_err();
+    assert_eq!(refused.code, "key_unavailable", "{refused:?}");
+    assert_today(&rig, &bytes);
+}
+
+/// What the slot opens its runtime with, besides the deployment key.
+fn setup(dir: &Path) -> broca_module::store_open::StoreRuntimeSetup {
+    broca_module::store_open::StoreRuntimeSetup {
+        state_root: dir.to_path_buf(),
+        executor: Arc::new(NoRuns),
+        idle_ttl: Duration::from_millis(100),
+        import_roots: None,
+        billing: None,
+    }
+}
+
+/// A move creates the session in the mode new sessions are created in
+/// (`session_storage.encryption`). Plain or encrypted, the moved session verifies, and after a
+/// restart it reloads in that mode and reads. A plain move needs no deployment key.
+#[tokio::test]
+async fn a_move_creates_the_session_in_the_configured_mode() {
+    for cipher in Cipher::ALL {
+        let rig = Rig::start_creating(&format!("mode-{}", cipher.label()), cipher).await;
+        rig.write_session();
+        let reply = rig.mover().move_to_store(&key()).await.unwrap();
+        assert_eq!(reply["moved"], true, "{}", cipher.label());
+        assert_moved(&rig).await;
+        let restarted = runtime_creating(&rig.dir, cipher).await;
+        let view = restarted.current_view(&key()).await.unwrap().unwrap();
+        assert_eq!(view.head().cipher(), cipher);
+    }
+
+    // Plain, before the key has loaded: the runtime the slot opened without it moves the
+    // session.
+    let rig = Rig::start_creating("mode-plain-no-key", Cipher::None).await;
+    rig.write_session();
+    let slot = Arc::new(
+        broca_module::store_open::StoreSlot::awaiting_key(&rig.dir, 1).creating(Cipher::None),
+    );
+    slot.open_without_key(&setup(&rig.dir)).await.unwrap();
+    assert!(!slot.key_loaded());
+    let mut mover = rig.mover();
+    mover.slot = slot;
+    mover.move_to_store(&key()).await.unwrap();
+    assert_moved(&rig).await;
+    let view = runtime(&rig.dir)
+        .await
+        .current_view(&key())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(view.head().cipher(), Cipher::None);
 }
 
 /// A difference planted in what the staged session is checked against aborts the move, naming

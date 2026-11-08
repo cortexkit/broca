@@ -12,7 +12,6 @@ use std::collections::BTreeMap;
 
 use broca_session_convert::stage::{Stage, StageError};
 use broca_session_convert::verify::{Mode, Verify};
-use broca_session_store::keys::DeploymentKey;
 use broca_wal::WalRecord;
 use futures::executor::block_on;
 use serde::Serialize;
@@ -85,7 +84,9 @@ pub(super) fn run(args: &Args) {
         .join("move-check");
     let store_root = scratch.join("session-store");
     let staging = store_root.join("staging").join("store-move-check");
-    let deployment = DeploymentKey::new(1, &[0x5a; 32]);
+    // `--plain` chooses the mode the staged sessions are created in, as
+    // `session_storage.encryption` does for a daemon's move.
+    let deployment = crate::deployment();
     let mode = if args.all_steps {
         Mode::Offline
     } else {

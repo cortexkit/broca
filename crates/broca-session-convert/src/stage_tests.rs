@@ -135,12 +135,22 @@ fn written(root: &Path) -> (Vec<FramedRecord>, Option<WalLineageId>) {
 }
 
 fn staged(root: &Path, records: &[FramedRecord], lineage: Option<WalLineageId>) -> Staged {
+    staged_in(root, records, lineage, &deployment())
+}
+
+/// Stages the session with `deployment`, which creates it in its mode.
+fn staged_in(
+    root: &Path,
+    records: &[FramedRecord],
+    lineage: Option<WalLineageId>,
+    deployment: &DeploymentKey,
+) -> Staged {
     let lineage = lineage.map(|id| id.to_string());
     block_on(stage(Stage {
         records,
         lineage: lineage.as_deref(),
         session: &session(),
-        deployment: &deployment(),
+        deployment,
         store_root: &root.join("session-store"),
         staging: &root.join("session-store/staging/store-move-test"),
     }))
@@ -154,16 +164,87 @@ fn verified(
     converted: &crate::Converted,
     mode: Mode,
 ) -> Result<Verified, crate::verify::Mismatch> {
+    verified_in(root, records, lineage, converted, mode, &deployment())
+}
+
+/// Verifies the staged session with `deployment`, whose mode the session must be stored in.
+fn verified_in(
+    root: &Path,
+    records: &[FramedRecord],
+    lineage: Option<WalLineageId>,
+    converted: &crate::Converted,
+    mode: Mode,
+    deployment: &DeploymentKey,
+) -> Result<Verified, crate::verify::Mismatch> {
     block_on(verify(Verify {
         records,
         lineage,
         session: &session(),
-        deployment: &deployment(),
+        deployment,
         store_root: &root.join("session-store"),
         staging: &root.join("session-store/staging/store-move-test"),
         converted,
         mode,
     }))
+}
+
+/// A session is staged in the mode its deployment key creates sessions in, its setup parts in
+/// that mode's setup store, and it reloads and verifies in that mode, plain and encrypted alike.
+/// Read back expecting the other mode, it fails the staged-session check by name.
+#[test]
+fn a_session_is_staged_and_verified_in_the_mode_new_sessions_take() {
+    use broca_session_store::keys::Cipher;
+    for cipher in Cipher::ALL {
+        let root = scratch(&format!("mode-{}", cipher.label()));
+        let (records, lineage) = written(&root);
+        let creating = deployment().creating(cipher);
+        let staged = staged_in(&root, &records, lineage, &creating);
+        let staging = root.join("session-store/staging/store-move-test");
+        let view = block_on(Session::view(
+            LocalBackend::new(&staging),
+            SessionAddr(broca_core::session_addr(&session())),
+            &crate::stage::triple(&session()),
+            &creating,
+        ))
+        .unwrap();
+        assert_eq!(view.head().cipher(), cipher);
+        drop(view);
+        let setup = match cipher {
+            Cipher::XChaCha20Poly1305 => "setup",
+            Cipher::None => "setup-plain",
+        };
+        assert!(
+            root.join("session-store").join(setup).exists(),
+            "{} parts in {setup}",
+            cipher.label()
+        );
+        let verified = verified_in(
+            &root,
+            &records,
+            lineage,
+            &staged.converted,
+            Mode::Move,
+            &creating,
+        )
+        .unwrap();
+        assert_eq!((verified.runs, verified.messages), (2, 4));
+        assert!(verified.checks.contains(&"next_request"));
+        let other = match cipher {
+            Cipher::XChaCha20Poly1305 => Cipher::None,
+            Cipher::None => Cipher::XChaCha20Poly1305,
+        };
+        let failed = verified_in(
+            &root,
+            &records,
+            lineage,
+            &staged.converted,
+            Mode::Move,
+            &deployment().creating(other),
+        )
+        .unwrap_err();
+        assert_eq!(failed.check, "staged", "{failed}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
 
 /// A staged session is a normal session of the new storage at the session's own address, its

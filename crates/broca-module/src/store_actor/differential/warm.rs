@@ -18,6 +18,7 @@ use broca_provider::families::{anthropic_frozen_config, AnthropicMessages};
 use broca_provider::wire::{
     AuthHandle, CacheClass, CachePolicy, CacheTtl, FrozenRenderConfig, MarkerSyntax,
 };
+use broca_session_store::keys::Cipher;
 use serde_json::json;
 use tokio::sync::mpsc;
 
@@ -26,6 +27,11 @@ use crate::actor::{LineageStatus, SendKey, SendOutcome, WarmOutcome};
 use crate::cache::{CacheDeclaration, CacheDeclarer};
 use crate::executor::{RunExecutor, RunJob, RunKind, StoreRunEnd, StoreRunJob, WarmError, WarmJob};
 use crate::registry::LineageRegistry;
+
+cipher_tests!(
+    warm_refusals_answer_alike,
+    a_warm_resends_the_next_request_and_dates_the_cache,
+);
 
 /// A first-party Anthropic config frozen with one-hour markers and adaptive thinking, which a
 /// warm may refresh.
@@ -180,6 +186,7 @@ fn scratch() -> std::path::PathBuf {
     dir
 }
 
+/// The module over the state root `dir`; its new storage creates sessions in mode `cipher`.
 async fn registry_at(
     dir: &std::path::Path,
     store: bool,
@@ -187,6 +194,7 @@ async fn registry_at(
     config: Option<&FrozenRenderConfig>,
     steps: Vec<Vec<NormalizedEvent>>,
     sent: &Arc<Mutex<Vec<Vec<u8>>>>,
+    cipher: Cipher,
 ) -> LineageRegistry {
     let wal = Arc::new(FileWalStore::new(dir.join("wal")));
     let render_config = config.map(|config| serde_json::to_value(config).unwrap());
@@ -207,7 +215,7 @@ async fn registry_at(
     });
     let runtime = crate::store_open::StoreRuntime::open(
         dir,
-        broca_session_store::keys::DeploymentKey::new(1, &[7; 32]),
+        broca_session_store::keys::DeploymentKey::new(1, &[7; 32]).creating(cipher),
         Arc::clone(&executor),
         IDLE,
     )
@@ -236,16 +244,17 @@ async fn registry_at(
     }
 }
 
-/// A side whose session ran one send to its end.
+/// A side whose session ran one send to its end. A store side's session is in mode `cipher`.
 async fn side(
     store: bool,
     declares: bool,
     config: Option<&FrozenRenderConfig>,
     steps: Vec<Vec<NormalizedEvent>>,
+    cipher: Cipher,
 ) -> Side {
     let dir = scratch();
     let sent = Arc::default();
-    let registry = registry_at(&dir, store, declares, config, steps, &sent).await;
+    let registry = registry_at(&dir, store, declares, config, steps, &sent, cipher).await;
     let key = BindIdentity::new(dir.join("project"), "store-actor", "s1");
     let side = Side {
         dir,
@@ -283,6 +292,9 @@ async fn side(
         }
     })
     .await;
+    if store {
+        assert_eq!(super::media::stored_mode(&side.dir, &side.key), cipher);
+    }
     side
 }
 
@@ -319,8 +331,7 @@ fn attempted_step(id: &str, text: &str, sent_at_ms: u64) -> Vec<NormalizedEvent>
 /// The refusals decided before anything is sent answer alike: a warm naming a lineage, a module
 /// that can't read the session's cache policy, a session whose policy allows no warm, and a cache
 /// whose lifetime is unknown because no request of the session reached it.
-#[tokio::test]
-async fn warm_refusals_answer_alike() {
+async fn warm_refusals_answer_alike(cipher: Cipher) {
     let steps = || vec![crate::store_actor::tests::text_step("a1", "hi")];
     let config = warmable();
     let unknown_clock = |detail: &broca_wire::WarmRefusalDetail| {
@@ -352,8 +363,8 @@ async fn warm_refusals_answer_alike() {
             &unsupported,
         ),
     ] {
-        let today = side(false, declares, config, steps()).await;
-        let store = side(true, declares, config, steps()).await;
+        let today = side(false, declares, config, steps(), cipher).await;
+        let store = side(true, declares, config, steps(), cipher).await;
         let (old, new) = (today.warm(None).await, store.warm(None).await);
         let WarmOutcome::Refused(refusal) = &old else {
             panic!("{what}: {old:?}");
@@ -365,8 +376,8 @@ async fn warm_refusals_answer_alike() {
             "{what}: nothing sent"
         );
     }
-    let today = side(false, true, Some(&config), steps()).await;
-    let store = side(true, true, Some(&config), steps()).await;
+    let today = side(false, true, Some(&config), steps(), cipher).await;
+    let store = side(true, true, Some(&config), steps(), cipher).await;
     let named = |outcome: WarmOutcome| match outcome {
         WarmOutcome::Refused(refusal) => refusal.detail,
         other => panic!("refused: {other:?}"),
@@ -388,8 +399,7 @@ async fn warm_refusals_answer_alike() {
 /// actor computed. It answers with the policy's lifetime counted from the warm's own send, and
 /// its record dates the cache: a module restarted on the same state root warms the session again
 /// from that clock, as today's module dates the cache from its log.
-#[tokio::test]
-async fn a_warm_resends_the_next_request_and_dates_the_cache() {
+async fn a_warm_resends_the_next_request_and_dates_the_cache(cipher: Cipher) {
     let now = crate::actor::epoch_ms();
     let config = warmable();
     let store = side(
@@ -397,6 +407,7 @@ async fn a_warm_resends_the_next_request_and_dates_the_cache() {
         true,
         Some(&config),
         vec![attempted_step("a1", "hi", now - 60_000)],
+        cipher,
     )
     .await;
     let outcome = store.warm(None).await;
@@ -427,7 +438,7 @@ async fn a_warm_resends_the_next_request_and_dates_the_cache() {
     // not the request a minute before it.
     let runtime = crate::store_open::StoreRuntime::open(
         &store.dir,
-        broca_session_store::keys::DeploymentKey::new(1, &[7; 32]),
+        broca_session_store::keys::DeploymentKey::new(1, &[7; 32]).creating(cipher),
         Arc::new(super::super::tests::executor(Vec::new(), None)),
         IDLE,
     )
@@ -448,6 +459,7 @@ async fn a_warm_resends_the_next_request_and_dates_the_cache() {
         Some(&config),
         Vec::new(),
         &store.sent,
+        cipher,
     )
     .await;
     let again = restarted.route_warm(&store.key, None).await.unwrap();

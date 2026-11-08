@@ -488,10 +488,10 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> DefaultOpener<L, W> {
         }
         if let Some(slot) = &self.store {
             // Decided under the lease, so no other open of this session decides beside it. A
-            // session in the new storage is served from there, and refused while its key hasn't
-            // loaded; one that exists in neither storage starts there when the registry marked
-            // its creating send and the key has loaded. The actor keeps the lease until its
-            // session is closed.
+            // session in the new storage is served from there, and refused while it is encrypted
+            // and its key hasn't loaded; one that exists in neither storage starts there when the
+            // registry marked its creating send and the runtime can create it in the mode new
+            // sessions take. The actor keeps the lease until its session is closed.
             let held = slot.holding(key)?;
             let create = held.is_none()
                 && !status
@@ -499,7 +499,7 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> DefaultOpener<L, W> {
                 && self.wal_store.wal_present(key) == Some(false);
             let store = match held {
                 Some(store) => Some(store),
-                None if create => slot.runtime(),
+                None if create => slot.creating_runtime(),
                 None => None,
             };
             if let Some(store) = store {

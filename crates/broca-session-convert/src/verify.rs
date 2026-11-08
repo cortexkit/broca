@@ -128,7 +128,6 @@ fn reply<T: Serialize, E: std::fmt::Debug>(reply: Result<T, E>) -> Value {
 pub async fn verify(verify: Verify<'_>) -> Result<Verified, Mismatch> {
     let addr = SessionAddr(broca_core::session_addr(verify.session));
     let triple = crate::stage::triple(verify.session);
-    let parts = setup_parts(&verify).await?;
     let view = Session::view(
         LocalBackend::new(verify.staging),
         addr.clone(),
@@ -143,6 +142,20 @@ pub async fn verify(verify: Verify<'_>) -> Result<Verified, Mismatch> {
         )
     })?;
     let staged: &Session<LocalBackend> = &view;
+    // The session must be stored in the mode the deployment creates sessions in, which is the
+    // mode its setup parts are read back in.
+    let cipher = staged.head().cipher();
+    if cipher != verify.deployment.new_sessions() {
+        return Err(mismatch(
+            STAGED,
+            format!(
+                "the staged session is {}, and new sessions are {}",
+                cipher.label(),
+                verify.deployment.new_sessions().label()
+            ),
+        ));
+    }
+    let parts = setup_parts(&verify, cipher).await?;
     let lineage = verify.lineage.map(|id| id.to_string());
     let mut checks = Vec::new();
     runs(&verify, staged, &parts, &mut checks).await?;
@@ -197,10 +210,19 @@ pub async fn verify(verify: Verify<'_>) -> Result<Verified, Mismatch> {
 }
 
 /// The setup parts the staged session's records name, read back from the new storage's setup
-/// store, where the staging writer stored them, as a module serving the session reads them.
-async fn setup_parts(verify: &Verify<'_>) -> Result<MemoryParts, Mismatch> {
+/// store in the name space of `cipher`, the staged session's mode, where the staging writer
+/// stored them, as a module serving the session reads them.
+async fn setup_parts(
+    verify: &Verify<'_>,
+    cipher: broca_session_store::keys::Cipher,
+) -> Result<MemoryParts, Mismatch> {
     let backend = LocalBackend::new(verify.store_root);
-    let key = verify.deployment.setup_key();
+    let key = verify.deployment.setup_key_for(cipher).ok_or_else(|| {
+        mismatch(
+            STAGED,
+            "an encrypted session's setup parts can't be read before the deployment key has loaded",
+        )
+    })?;
     let store = SetupStore::new(&backend, &key);
     let mut parts = BTreeMap::new();
     for part in verify

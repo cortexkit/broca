@@ -9,9 +9,18 @@ use futures::executor::block_on;
 use crate::backend::{MemoryBackend, SessionAddr, SessionBackend};
 use crate::head::SessionTriple;
 use crate::idindex::IdKind;
-use crate::keys::DeploymentKey;
+use crate::keys::{Cipher, DeploymentKey};
 use crate::record::{Event, Input, Placement, Record, RunEnd, RunStart};
 use crate::session::{Session, SessionError};
+
+cipher_tests!(
+    a_writer_keeps_its_latest_runs_records,
+    a_view_keeps_every_record_it_read,
+    a_seal_drops_the_kept_records_and_memory_only_refuses_sealed_history,
+    a_sync_makes_an_unsynced_tail_durable_once,
+    a_failed_sync_leaves_the_tail_unsynced,
+    a_view_at_a_position_reads_only_that_far,
+);
 
 fn triple() -> SessionTriple {
     SessionTriple {
@@ -21,8 +30,9 @@ fn triple() -> SessionTriple {
     }
 }
 
-fn deployment() -> DeploymentKey {
-    DeploymentKey::new(1, &[5; 32])
+/// The test deployment key, creating sessions in mode `cipher`.
+fn deployment(cipher: Cipher) -> DeploymentKey {
+    DeploymentKey::new(1, &[5; 32]).creating(cipher)
 }
 
 fn addr() -> SessionAddr {
@@ -102,8 +112,8 @@ fn event(name: &str) -> Record {
 
 /// Two finished runs, then a third still running. Returns the session and the seq of each run's
 /// start; the last run's input, where a cut can fall, follows its start.
-async fn history<B: SessionBackend>(backend: &B) -> (Session<&B>, Vec<u64>) {
-    let mut session = Session::create(backend, addr(), triple(), &deployment(), false)
+async fn history<B: SessionBackend>(backend: &B, cipher: Cipher) -> (Session<&B>, Vec<u64>) {
+    let mut session = Session::create(backend, addr(), triple(), &deployment(cipher), false)
         .await
         .unwrap();
     let mut starts = Vec::new();
@@ -120,8 +130,8 @@ async fn history<B: SessionBackend>(backend: &B) -> (Session<&B>, Vec<u64>) {
     (session, starts)
 }
 
-async fn view<B: SessionBackend>(backend: B) -> crate::session::SessionView<B> {
-    Session::view(backend, addr(), &triple(), &deployment())
+async fn view<B: SessionBackend>(backend: B, cipher: Cipher) -> crate::session::SessionView<B> {
+    Session::view(backend, addr(), &triple(), &deployment(cipher))
         .await
         .unwrap()
 }
@@ -129,14 +139,13 @@ async fn view<B: SessionBackend>(backend: B) -> crate::session::SessionView<B> {
 /// A writer keeps the records of its latest run, from the run's start on: reading them from
 /// memory only gives exactly what a fresh view reads from storage, and a run before it reads
 /// from storage, which memory only refuses.
-#[test]
-fn a_writer_keeps_its_latest_runs_records() {
+fn a_writer_keeps_its_latest_runs_records(cipher: Cipher) {
     let backend = MemoryBackend::default();
     block_on(async {
-        let (session, starts) = history(&backend).await;
+        let (session, starts) = history(&backend, cipher).await;
         assert_eq!(session.kept_run_start("c"), Some(starts[2]));
         assert_eq!(session.kept_run_start("b"), None);
-        let fresh = view(&backend).await;
+        let fresh = view(&backend, cipher).await;
         let from_storage = fresh.records_from(starts[2]).await.unwrap();
         let in_memory = {
             let _memory = session.in_memory();
@@ -167,12 +176,11 @@ fn a_writer_keeps_its_latest_runs_records() {
 
 /// A view keeps every record it read, so even reading from memory only it serves any run's
 /// records, and never reads the log again.
-#[test]
-fn a_view_keeps_every_record_it_read() {
+fn a_view_keeps_every_record_it_read(cipher: Cipher) {
     let backend = MemoryBackend::default();
     block_on(async {
-        let (session, starts) = history(&backend).await;
-        let fresh = view(&backend).await;
+        let (session, starts) = history(&backend, cipher).await;
+        let fresh = view(&backend, cipher).await;
         assert_eq!(fresh.kept_run_start("c"), Some(starts[2]));
         let expected = fresh.records_from(1).await.unwrap();
         // A record appended after the view was loaded is not part of it.
@@ -187,11 +195,10 @@ fn a_view_keeps_every_record_it_read() {
 /// After a seal the sealed history is read from storage: reading from memory only refuses it, and
 /// the records kept before the seal are dropped, since the new log was copied, not appended. A run
 /// started after the seal is kept again.
-#[test]
-fn a_seal_drops_the_kept_records_and_memory_only_refuses_sealed_history() {
+fn a_seal_drops_the_kept_records_and_memory_only_refuses_sealed_history(cipher: Cipher) {
     let backend = MemoryBackend::default();
     block_on(async {
-        let (mut session, starts) = history(&backend).await;
+        let (mut session, starts) = history(&backend, cipher).await;
         session.seal(Some(starts[2] + 1), 1_000).await.unwrap();
         assert_eq!(session.kept_records(), 0);
         assert_eq!(session.kept_run_start("c"), None);
@@ -222,7 +229,7 @@ fn a_seal_drops_the_kept_records_and_memory_only_refuses_sealed_history() {
         };
         assert_eq!(
             in_memory,
-            view(&backend).await.records_from(d).await.unwrap()
+            view(&backend, cipher).await.records_from(d).await.unwrap()
         );
         assert_eq!(in_memory.len(), 2);
     });
@@ -230,11 +237,10 @@ fn a_seal_drops_the_kept_records_and_memory_only_refuses_sealed_history() {
 
 /// A batch appended without a barrier leaves the log unsynced until a sync writes a claim frame
 /// with one; a second sync with nothing new writes nothing.
-#[test]
-fn a_sync_makes_an_unsynced_tail_durable_once() {
+fn a_sync_makes_an_unsynced_tail_durable_once(cipher: Cipher) {
     let backend = MemoryBackend::default();
     block_on(async {
-        let (mut session, _) = history(&backend).await;
+        let (mut session, _) = history(&backend, cipher).await;
         assert!(!session.unsynced());
         session.append(&[event("unsynced")], false).await.unwrap();
         assert!(session.unsynced());
@@ -248,7 +254,7 @@ fn a_sync_makes_an_unsynced_tail_durable_once() {
             "nothing to sync, nothing written"
         );
         // The log still loads, with the record the sync made durable.
-        let loaded = view(&backend).await;
+        let loaded = view(&backend, cipher).await;
         assert!(loaded
             .open_log_records()
             .await
@@ -260,11 +266,10 @@ fn a_sync_makes_an_unsynced_tail_durable_once() {
 
 /// A sync that fails leaves the tail unsynced and the writer poisoned: nothing is answered from
 /// the session as though it were durable.
-#[test]
-fn a_failed_sync_leaves_the_tail_unsynced() {
+fn a_failed_sync_leaves_the_tail_unsynced(cipher: Cipher) {
     let backend = MemoryBackend::default();
     block_on(async {
-        let (mut session, _) = history(&backend).await;
+        let (mut session, _) = history(&backend, cipher).await;
         session.append(&[event("unsynced")], false).await.unwrap();
         backend.fail_once(0);
         assert!(session.sync().await.is_err());
@@ -275,22 +280,21 @@ fn a_failed_sync_leaves_the_tail_unsynced() {
 
 /// A view loaded at a position reads the log only as far as the position: what was appended since
 /// isn't in it. Once the head moves, as a seal moves it, the position refuses.
-#[test]
-fn a_view_at_a_position_reads_only_that_far() {
+fn a_view_at_a_position_reads_only_that_far(cipher: Cipher) {
     let backend = MemoryBackend::default();
     block_on(async {
-        let (mut session, starts) = history(&backend).await;
-        let position = Session::stored_position(&&backend, &addr(), &deployment())
+        let (mut session, starts) = history(&backend, cipher).await;
+        let position = Session::stored_position(&&backend, &addr(), &deployment(cipher))
             .await
             .unwrap()
             .unwrap();
-        let before = view(&backend).await.records_from(1).await.unwrap();
+        let before = view(&backend, cipher).await.records_from(1).await.unwrap();
         session.append(&[event("after")], true).await.unwrap();
-        let at = Session::view_at(&backend, addr(), &triple(), &deployment(), &position)
+        let at = Session::view_at(&backend, addr(), &triple(), &deployment(cipher), &position)
             .await
             .unwrap();
         assert_eq!(at.records_from(1).await.unwrap(), before);
-        let now = Session::stored_position(&&backend, &addr(), &deployment())
+        let now = Session::stored_position(&&backend, &addr(), &deployment(cipher))
             .await
             .unwrap()
             .unwrap();
@@ -299,7 +303,7 @@ fn a_view_at_a_position_reads_only_that_far() {
 
         session.seal(Some(starts[2] + 1), 1_000).await.unwrap();
         assert!(matches!(
-            Session::view_at(&backend, addr(), &triple(), &deployment(), &now).await,
+            Session::view_at(&backend, addr(), &triple(), &deployment(cipher), &now).await,
             Err(SessionError::Moved)
         ));
     });
