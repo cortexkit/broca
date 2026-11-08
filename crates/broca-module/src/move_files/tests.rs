@@ -926,6 +926,29 @@ async fn source_unfinished_run_is_busy_before_any_freeze() {
     assert!(!rig.store.path(CUT).exists());
 }
 
+/// A session the new session storage holds isn't today's to hand over: Prepare refuses the
+/// whole set before freezing anything or writing the cut's state.
+#[tokio::test]
+async fn prepare_refuses_a_session_the_new_storage_holds_before_any_freeze() {
+    let rig = Rig::new("store-held", true);
+    let head = broca_wal::session_storage_head(
+        &rig.root,
+        &broca_core::session_addr(&rig.driver.plans[0].session),
+    );
+    std::fs::create_dir_all(head.parent().unwrap()).unwrap();
+    std::fs::write(&head, b"head").unwrap();
+    let error = rig.op(Op::Prepare).await.unwrap_err();
+    assert_eq!(error.code.as_str(), "not_exportable");
+    for plan in &rig.driver.plans {
+        assert!(!rig
+            .wal
+            .wal_path(&plan.session)
+            .with_extension("moving")
+            .exists());
+    }
+    assert!(!rig.store.path(CUT).exists());
+}
+
 #[tokio::test]
 async fn receiver_open_actor_refuses_the_entire_set_before_any_staging() {
     let mut rig = Rig::new("receiver-busy", false);

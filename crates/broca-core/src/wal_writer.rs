@@ -96,6 +96,13 @@ pub trait WalStore: Send + Sync {
     fn check_move(&self, _session: &BindIdentity, _write: bool) -> Result<(), WalError> {
         Ok(())
     }
+    /// How a reader that doesn't go through [`Self::check_move`] refuses `session` when the new
+    /// session storage owns it, or a move into it is in flight (see
+    /// [`FileWalStore::store_owner_refusal`]). `None` when today's storage owns the session,
+    /// which is always so for a store with no state root.
+    fn store_owner_refusal(&self, _session: &BindIdentity) -> Result<Option<WalError>, WalError> {
+        Ok(None)
+    }
     /// The frame format the logs this store opens write, decided once at boot. Each log the
     /// store opens reports the same value through [`Wal::wal_config`], which is what a writer
     /// handle reads at spawn. The default, for stores with no state root, is legacy.
@@ -786,17 +793,50 @@ impl FileWalStore {
     /// answers for it from an absent WAL or creates one, which would fork the session in two.
     /// A head that can't be checked refuses too, rather than reading as absent.
     fn check_session_storage(&self, session: &BindIdentity) -> Result<(), WalError> {
-        let state_root = self.root.parent().unwrap_or_else(|| Path::new(""));
-        let head = broca_wal::session_storage_head(state_root, &session_addr(session));
+        let head = broca_wal::session_storage_head(self.state_root(), &session_addr(session));
         match std::fs::symlink_metadata(head) {
-            Ok(_) => Err(WalError::NewerWriter {
-                offset: 0,
-                ver: 0,
-                missing: vec![broca_wal::SESSION_STORAGE_FEATURE.to_owned()],
-            }),
+            Ok(_) => Err(session_storage_refusal()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(WalError::Io(error)),
         }
+    }
+
+    /// The state root this store's WAL folder lives in.
+    fn state_root(&self) -> &Path {
+        self.root.parent().unwrap_or_else(|| Path::new(""))
+    }
+
+    /// Whether the new session storage owns `session`, or a move into it is in flight
+    /// (`broca_wal::owned_by_store`). A reader of this store that doesn't go through
+    /// [`Self::check_move`] asks this first, and skips or refuses such a session.
+    pub fn owned_by_store(&self, session: &BindIdentity) -> Result<bool, WalError> {
+        self.address_owned_by_store(&session_addr(session))
+    }
+
+    /// [`Self::owned_by_store`] for a session known only by its address.
+    pub fn address_owned_by_store(&self, address: &str) -> Result<bool, WalError> {
+        broca_wal::owned_by_store(self.state_root(), address).map_err(WalError::Io)
+    }
+
+    /// How a reader of this store refuses `session` when the new session storage owns it: as
+    /// [`Self::check_move`] refuses a session whose head exists, or `SessionMoving` under the
+    /// move's id while a move is in flight, which a caller may retry. `None` when today's
+    /// storage owns the session.
+    pub fn store_owner_refusal(
+        &self,
+        session: &BindIdentity,
+    ) -> Result<Option<WalError>, WalError> {
+        Ok(
+            match broca_wal::store_ownership(self.state_root(), &session_addr(session))
+                .map_err(WalError::Io)?
+            {
+                broca_wal::StoreOwnership::Today => None,
+                broca_wal::StoreOwnership::Held => Some(session_storage_refusal()),
+                broca_wal::StoreOwnership::Moving { move_id } => {
+                    Some(WalError::SessionMoving { cut_id: move_id })
+                }
+            },
+        )
     }
 
     fn check_authorization_move(&self, session: &BindIdentity) -> Result<(), WalError> {
@@ -2285,6 +2325,24 @@ pub fn session_addr(session: &BindIdentity) -> String {
     format!("{hash:016x}")
 }
 
+/// The refusal today's storage gives a session kept in the new session storage: it has no WAL
+/// here, and a build that serves the new storage reads it from there. The feature list names the
+/// new storage, so a caller can tell this refusal from a WAL frame this build can't read.
+pub fn session_storage_refusal() -> WalError {
+    WalError::NewerWriter {
+        offset: 0,
+        ver: 0,
+        missing: vec![broca_wal::SESSION_STORAGE_FEATURE.to_owned()],
+    }
+}
+
+/// Whether `error` is [`session_storage_refusal`]: today's storage refused a session because the
+/// new session storage holds it.
+pub fn is_session_storage_refusal(error: &WalError) -> bool {
+    matches!(error, WalError::NewerWriter { missing, .. }
+        if missing.iter().any(|name| name == broca_wal::SESSION_STORAGE_FEATURE))
+}
+
 impl WalStore for FileWalStore {
     fn served_history(&self) -> Option<Arc<dyn crate::ServedHistory>> {
         self.served_history.lock().unwrap().clone()
@@ -2436,6 +2494,9 @@ impl WalStore for FileWalStore {
     }
     fn check_move(&self, session: &BindIdentity, write: bool) -> Result<(), WalError> {
         FileWalStore::check_move(self, session, write)
+    }
+    fn store_owner_refusal(&self, session: &BindIdentity) -> Result<Option<WalError>, WalError> {
+        FileWalStore::store_owner_refusal(self, session)
     }
     fn open(&self, session: &BindIdentity) -> Result<Box<dyn Wal + Send>, WalError> {
         self.open_with_retention(session, None)

@@ -292,6 +292,14 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> LineageOpener for DefaultOp
             None => Ok(false),
         }
     }
+    fn store_owner_refusal(&self, key: &LineageKey) -> Result<Option<OpenError>, OpenError> {
+        let wal = |error: broca_wal::WalError| OpenError::from_wal_read(error.to_string(), &error);
+        Ok(self
+            .wal_store
+            .store_owner_refusal(key)
+            .map_err(wal)?
+            .map(wal))
+    }
     async fn backfill_attribution(
         &self,
         key: &LineageKey,

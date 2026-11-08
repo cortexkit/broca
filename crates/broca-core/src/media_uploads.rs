@@ -138,8 +138,19 @@ impl Uploads {
     ) -> io::Result<crate::media_store::MediaStore> {
         let state = self.root.parent().expect("uploads have a state root");
         let wal = crate::FileWalStore::new(state.join("wal"));
+        let address = crate::wal_writer::session_addr(identity);
+        // The new session storage keeps its own media; today's stores hold nothing new for a
+        // session it owns, or that a move is taking there.
+        if wal
+            .address_owned_by_store(&address)
+            .map_err(io::Error::other)?
+        {
+            return Err(io::Error::other(
+                "session is owned by the new session storage, which keeps its media",
+            ));
+        }
         let class = wal
-            .media_store_class(&crate::wal_writer::session_addr(identity))
+            .media_store_class(&address)
             .map_err(io::Error::other)?
             .ok_or_else(|| io::Error::other("session WAL has no media store class"))?;
         self.media_store(class)

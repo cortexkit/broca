@@ -440,10 +440,12 @@ fn eligible_with(
     }
 }
 
+/// Whether the session's WAL must stay where it is: a move fence protects it, or the new session
+/// storage owns the session (or a move is taking it there), which has no use for an archived
+/// copy of a WAL it holds or is copying.
 fn move_protected(root: &Path, session: &BindIdentity) -> bool {
-    crate::FileWalStore::new(root.join("wal"))
-        .check_move(session, true)
-        .is_err()
+    let wal = crate::FileWalStore::new(root.join("wal"));
+    wal.check_move(session, true).is_err() || !matches!(wal.owned_by_store(session), Ok(false))
 }
 
 // Store rows are hints until their triple reproduces the filename. A stale embedded
