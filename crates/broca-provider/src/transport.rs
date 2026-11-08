@@ -5222,25 +5222,43 @@ fn classify_http_error_in_family(
 /// So it's classed transient, which the vault-report path never reports: the transport retries
 /// it, since the same request seconds later succeeds, and a run that exhausts retries ends as an
 /// error rather than parking for a re-login nobody needs. The match needs the ChatGPT family AND
-/// the shared ChatGPT policy's verdict: a 401 whose message starts by naming an `sk-` key. A 401
-/// that names nothing, or names a token, keeps its class.
+/// the captured status, type, code and complete message. Only its single masked key token may
+/// vary. A different 401 keeps its ordinary classification rather than borrowing this exception.
 fn classify_chatgpt_upstream_key_rejection(
     family: crate::spec::WireFamilyId,
     status: u16,
     body: &str,
     error: ProviderError,
 ) -> ProviderError {
-    if family != crate::spec::WireFamilyId::OpenAiResponsesChatgpt {
+    if family != crate::spec::WireFamilyId::OpenAiResponsesChatgpt || status != 401 {
         return error;
     }
-    // The observation time only dates a usage-limit reset, which a 401 never carries.
-    if cortexkit_chatgpt_policy::classify_response_with_retry_after(
-        status,
-        body,
-        UNIX_EPOCH,
-        error.retry_after_secs,
-    ) != cortexkit_chatgpt_policy::Classification::UpstreamKeyRejection
+    let Some(detail) = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|body| body.get("error").cloned())
+    else {
+        return error;
+    };
+    if detail.get("type").and_then(Value::as_str) != Some("invalid_request_error")
+        || detail.get("code").and_then(Value::as_str) != Some("invalid_api_key")
     {
+        return error;
+    }
+    let key = detail
+        .get("message")
+        .and_then(Value::as_str)
+        .and_then(|message| message.strip_prefix("Incorrect API key provided: sk-"))
+        .and_then(|tail| {
+            tail.strip_suffix(
+                ". You can find your API key at https://platform.openai.com/account/api-keys.",
+            )
+        });
+    if !key.is_some_and(|key| {
+        !key.is_empty()
+            && key
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'*'))
+    }) {
         return error;
     }
     ProviderError { provider_details: None, provider_subcode: None,
@@ -5347,8 +5365,13 @@ fn classify_account_limit_exhausted_with_auth(
             return exhausted;
         }
     }
-    if family == crate::spec::WireFamilyId::OpenAiChat && status == 403 {
-        return kimi_weekly_usage_limit_reached(body, error);
+    if status == 403
+        && matches!(
+            family,
+            crate::spec::WireFamilyId::OpenAiChat | crate::spec::WireFamilyId::AnthropicMessages
+        )
+    {
+        return kimi_usage_limit_reached(family, body, error);
     }
     if status != 429 {
         return error;
@@ -5408,7 +5431,7 @@ fn classify_account_limit_exhausted_with_auth(
         crate::spec::WireFamilyId::OpenAiResponses => {
             meta_subscription_quota_exhausted(status, body, error)
         }
-        crate::spec::WireFamilyId::OpenAiChat => kimi_weekly_usage_limit_reached(body, error),
+        crate::spec::WireFamilyId::OpenAiChat => error,
         // Code Assist wraps the Gemini request but answers errors in the same Google RPC shape,
         // so both families share one decoder.
         crate::spec::WireFamilyId::Gemini | crate::spec::WireFamilyId::GoogleCodeAssist => {
@@ -5550,8 +5573,8 @@ fn log_opencode_go_refusal(
 
 /// Meta's Muse subscription quota refusal is an account wall, not a short rate limit: its HTTP
 /// 429 carries a structured `rate_limit_error`, an absolute `resets_at`, and a subscription
-/// exhaustion message. The reset is required so a per-minute Responses-family throttle stays
-/// retryable even if its prose happens to mention a subscription.
+/// exhaustion message. The complete captured sentence and matching textual/numeric reset are
+/// required so a per-minute throttle cannot become an account wall through a prose substring.
 fn meta_subscription_quota_exhausted(
     status: u16,
     body: &str,
@@ -5567,18 +5590,36 @@ fn meta_subscription_quota_exhausted(
         return error;
     };
     if detail.get("type").and_then(Value::as_str) != Some("rate_limit_error")
-        || !detail
-            .get("message")
-            .and_then(Value::as_str)
-            .is_some_and(|message| message.contains("Subscription quota exhausted"))
+        || detail.get("code").and_then(Value::as_str) != Some("rate_limit_exceeded")
     {
         return error;
     }
-    let Some(resets_at_ms) = detail
-        .get("resets_at")
-        .and_then(Value::as_u64)
-        .and_then(|seconds| seconds.checked_mul(1_000))
+    let Some(stamp) = detail
+        .get("message")
+        .and_then(Value::as_str)
+        .and_then(|message| {
+            message.strip_prefix("Subscription quota exhausted. Your usage window resets at ")
+        })
+        .and_then(|tail| tail.strip_suffix('.'))
+        .filter(|stamp| stamp.len() == 20)
     else {
+        return error;
+    };
+    let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(stamp) else {
+        return error;
+    };
+    if parsed.timestamp_subsec_nanos() != 0
+        || parsed.format("%Y-%m-%dT%H:%M:%SZ").to_string() != stamp
+    {
+        return error;
+    }
+    let Ok(seconds) = u64::try_from(parsed.timestamp()) else {
+        return error;
+    };
+    if detail.get("resets_at").and_then(Value::as_u64) != Some(seconds) {
+        return error;
+    }
+    let Some(resets_at_ms) = seconds.checked_mul(1_000) else {
         return error;
     };
     ProviderError {
@@ -5797,20 +5838,42 @@ fn inception_payment_required(
     }
 }
 
-/// Kimi's weekly allowance refusal has no reset timestamp, so preserve the unknown reset rather
-/// than inventing a retry time from the wording of its message.
-fn kimi_weekly_usage_limit_reached(body: &str, error: ProviderError) -> ProviderError {
+/// Captured Kimi usage walls have no absolute reset. Match only their complete messages under
+/// the observed wire discriminator; a window name does not supply a reset timestamp.
+fn kimi_usage_limit_reached(
+    family: crate::spec::WireFamilyId,
+    body: &str,
+    error: ProviderError,
+) -> ProviderError {
     let Some(detail) = serde_json::from_str::<Value>(body)
         .ok()
         .and_then(|body| body.get("error").cloned())
     else {
         return error;
     };
-    let matches = detail.get("type").and_then(Value::as_str) == Some("access_terminated_error")
-        && detail
-            .get("message")
-            .and_then(Value::as_str)
-            .is_some_and(|message| message.to_ascii_lowercase().contains("usage limit"));
+    if detail.get("code").is_some() {
+        return error;
+    }
+    let matches = matches!(
+        (
+            family,
+            detail.get("type").and_then(Value::as_str),
+            detail.get("message").and_then(Value::as_str),
+        ),
+        (
+            crate::spec::WireFamilyId::OpenAiChat,
+            Some("access_terminated_error"),
+            Some(KIMI_WEEKLY_MESSAGE | KIMI_FIVE_HOUR_MESSAGE),
+        ) | (
+            crate::spec::WireFamilyId::AnthropicMessages,
+            Some("permission_error"),
+            Some(
+                KIMI_FIVE_HOUR_MESSAGE
+                    | KIMI_BILLING_PRICING_MESSAGE
+                    | KIMI_BILLING_MEMBERSHIP_MESSAGE
+            ),
+        )
+    );
     if !matches {
         return error;
     }
@@ -6087,10 +6150,15 @@ const GOOGLE_RPC_RETRY_INFO_TYPE: &str = "type.googleapis.com/google.rpc.RetryIn
 const GOOGLE_QUOTA_EXHAUSTED_REASON: &str = "QUOTA_EXHAUSTED";
 
 use cortexkit_anthropic_policy::{
-    anthropic_credit_balance_too_low,
     UNIFIED_REPRESENTATIVE_CLAIM as ANTHROPIC_UNIFIED_REPRESENTATIVE_CLAIM,
     UNIFIED_RESET as ANTHROPIC_UNIFIED_RESET, UNIFIED_STATUS as ANTHROPIC_UNIFIED_STATUS,
 };
+
+const ANTHROPIC_CREDIT_BALANCE_MESSAGE: &str = "Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.";
+const KIMI_WEEKLY_MESSAGE: &str = "You've reached your weekly (7-day) usage limit. Your quota will reset when the current 7-day window ends. To continue now, purchase extra usage or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota";
+const KIMI_FIVE_HOUR_MESSAGE: &str = "You've reached your 5-hour usage limit. Your quota will reset when the current 5-hour window ends. To continue now, purchase extra usage or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota";
+const KIMI_BILLING_PRICING_MESSAGE: &str = "You've reached your usage limit for this billing cycle. Your quota will be refreshed in the next cycle. To continue now, purchase extra usage or upgrade your plan: https://www.kimi.com/code/#pricing";
+const KIMI_BILLING_MEMBERSHIP_MESSAGE: &str = "You've reached your usage limit for this billing cycle. Your quota will be refreshed in the next cycle. To continue now, purchase extra usage or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota";
 
 /// The provider code for [`classify_chatgpt_upstream_key_rejection`].
 pub const CHATGPT_UPSTREAM_KEY_REJECTED: &str = "chatgpt_upstream_key_rejected";
@@ -6145,8 +6213,14 @@ fn http_error_in_family(
             Some(BILLING_EXHAUSTED.to_string())
         }
         Some("invalid_request_error")
-            if family == Some(WireFamilyId::AnthropicMessages)
-                && anthropic_credit_balance_too_low(message) =>
+            if code == 400
+                && family == Some(WireFamilyId::AnthropicMessages)
+                && body.as_ref().is_some_and(|body| {
+                    body.pointer("/error/type").and_then(Value::as_str)
+                        == Some("invalid_request_error")
+                        && body.pointer("/error/code").is_none()
+                })
+                && message == ANTHROPIC_CREDIT_BALANCE_MESSAGE =>
         {
             Some(BILLING_EXHAUSTED.to_string())
         }
@@ -6233,6 +6307,10 @@ fn truncate_error_body(text: &str) -> &str {
     }
     &text[..end]
 }
+
+#[cfg(test)]
+#[path = "transport_classifier_captures.rs"]
+mod classifier_captures;
 
 #[cfg(test)]
 mod tests {
@@ -11285,35 +11363,30 @@ mod tests {
         }
     }
 
-    /// Anthropic's out-of-credit refusal, from its public error shape: assumed, not captured.
-    /// Replace with the first real refusal once one is recorded.
+    /// Matches six captured Anthropic credit refusals from 2026-10-16 through 2026-10-27.
+    /// The fixed type and complete message are preserved; varying request ids are omitted.
     const ANTHROPIC_CREDIT_BALANCE_BODY: &str = r#"{"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits."}}"#;
 
     #[test]
     fn anthropic_credit_balance_400_is_billing_exhausted() {
-        let shouted = ANTHROPIC_CREDIT_BALANCE_BODY
-            .replace("credit balance is too low", "CREDIT BALANCE IS TOO LOW");
-        for body in [ANTHROPIC_CREDIT_BALANCE_BODY, shouted.as_str()] {
-            // Both classifiers relabel the refusal: `classify_http_error_in_family`, the live
-            // path, which is told the wire family, and `classify_http_error`, the public entry
-            // point, which infers the family from the Anthropic body shape.
-            for error in [
-                super::classify_http_error_in_family(
-                    400,
-                    body,
-                    None,
-                    None,
-                    Some(WireFamilyId::AnthropicMessages),
-                    None,
-                ),
-                classify_http_error(400, body, None, None),
-            ] {
-                assert_eq!(error.class, ErrorClass::Permanent);
-                assert!(error.is_billing_exhausted());
-                assert_eq!(error.provider_code.as_deref(), Some(BILLING_EXHAUSTED));
-                assert_eq!(error.status, Some(400));
-                assert_eq!(error.resets_at_ms, None);
-            }
+        // The family-aware call explicitly selects AnthropicMessages; the public entry point
+        // infers that family from the envelope. Both recognize the exact captured message.
+        for error in [
+            super::classify_http_error_in_family(
+                400,
+                ANTHROPIC_CREDIT_BALANCE_BODY,
+                None,
+                None,
+                Some(WireFamilyId::AnthropicMessages),
+                None,
+            ),
+            classify_http_error(400, ANTHROPIC_CREDIT_BALANCE_BODY, None, None),
+        ] {
+            assert_eq!(error.class, ErrorClass::Permanent);
+            assert!(error.is_billing_exhausted());
+            assert_eq!(error.provider_code.as_deref(), Some(BILLING_EXHAUSTED));
+            assert_eq!(error.status, Some(400));
+            assert_eq!(error.resets_at_ms, None);
         }
     }
 
@@ -13377,7 +13450,8 @@ mod tests {
         use super::{classify_chatgpt_upstream_key_rejection, CHATGPT_UPSTREAM_KEY_REJECTED};
         let marker = "PRIVATE_BODY_TAIL";
         let body = serde_json::json!({"error": {
-            "message": format!("Incorrect API key provided: sk-private-key. {}{marker}", "x".repeat(600)),
+            "message": format!("Incorrect API key provided: sk-private-{}{marker}. You can find your API key at https://platform.openai.com/account/api-keys.", "x".repeat(600)),
+            "type": "invalid_request_error",
             "code": "invalid_api_key"
         }}).to_string();
         assert!(body.find(marker).unwrap() > 512);
