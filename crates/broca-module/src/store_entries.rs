@@ -24,14 +24,15 @@
 //!   store actor doesn't take one yet, so it is refused by name (`not_served_on_new_storage`).
 //!
 //! `session.history` on a store session (`crate::history::read`) takes its head facts from
-//! [`history_head`] and its pages from `session.read`, which a store session serves from the
-//! store. Message ids name the store's own ids, which only the store resolves. The raw form is
-//! served whole. The display form needs per-call times and statuses, the Rich UI dialect and
-//! catalog digest each run froze at its start (`rich_ui`), and output references, which the
-//! store doesn't serve yet, so it is refused by name.
+//! [`history_head`] and its pages from `session.read` with display facts, which a store session
+//! serves from the store, so the raw form carries each message's sender as today's does. Message
+//! ids name the store's own ids, which only the store resolves. The display form's output
+//! references find a named part and the compaction view its writing request rendered under from
+//! facts recorded beside each message (`crate::store_output_refs`).
 //!
 //! A read cleans tag notation out of a reply wherever the run that wrote it cleans, as today's
-//! read does: [`mark_reply_cleaning`] marks each message from the tag rules its run froze.
+//! read does: [`attach_part_tags`] numbers each message, and marks it for cleaning, by the tag
+//! rules its run froze.
 
 use broca_core::compaction_v2::protocol::{
     read::{Cursor, Entry, Head, ReadPage, ReadRequest, Select},
@@ -363,22 +364,6 @@ pub fn raw_history_entries(page: broca_core::SessionReadPage) -> Vec<Option<serd
         .collect()
 }
 
-/// The refusal of a part-number lookup (`ServeHandler::tag_location`) on a session kept in the
-/// new storage. The lookup isn't compaction-facing: output references (`session.output_refs`,
-/// `session.output_ref_read` and the display form of `session.history`) use it to find the part
-/// a reply's part number named, then check it against the compaction view the writing step
-/// rendered with, which they read from today's WAL. Until output references are served from the
-/// store, the lookup is refused by name, permanently, rather than answered as "no such part".
-pub fn tag_location_unserved() -> crate::serve::ServeError {
-    crate::serve::ServeError::Open(
-        format!(
-            "{NOT_SERVED_ON_NEW_STORAGE}: output references are not served yet for a session kept \
-             in the new storage"
-        ),
-        Some(broca_protocol::ErrorClass::Permanent),
-    )
-}
-
 /// What `session.history` reads about a session kept in the new storage besides its pages,
 /// which today's storage answers from `session.head` and from the WAL form of a message id.
 #[derive(Debug, Clone, PartialEq)]
@@ -420,7 +405,7 @@ pub async fn history_head(
 }
 
 /// The [`HistoryHead`] of a loaded `session`, resolving `mid` when the read names a message.
-pub(crate) async fn history_head_of<B: SessionBackend>(
+pub async fn history_head_of<B: SessionBackend>(
     session: &Session<B>,
     mid: Option<&str>,
 ) -> Result<HistoryHead, crate::serve::ServeError> {
@@ -441,44 +426,50 @@ pub(crate) async fn history_head_of<B: SessionBackend>(
     })
 }
 
-/// Marks each model-written message of a read page whose run cleans its replies, as today's
-/// read marks it, so every exposure (`broca_protocol::tags::exposed_message`) cleans tag notation
-/// out of the reply text exactly where today's does. Today's read decides it from the computed
-/// tag rules the run froze (`broca_core::tags::computed_rules` over its run config), so this reads
-/// each run's config back from its start and the setup parts it names, once per run on the page.
-/// The mark carries only what exposure reads (whether the run cleans); a read that serves no
-/// display facts reads nothing else from it. A message no run wrote (an import) isn't cleaned,
-/// as today's isn't.
-pub async fn mark_reply_cleaning<B: SessionBackend>(
+/// Attaches to each message of a read page the part numbers today's read attaches, from the
+/// computed tag rules each run froze (`broca_core::tags::computed_rules` over its run config),
+/// read back from the run's start and the setup parts it names, once per run on the page.
+///
+/// A message in `numbering` (by zero-based ordinal: the run that numbered it and the number
+/// before its first part, `EntryFacts::runner_tag_base`) is numbered from that base under its
+/// run's rules, as today's replay numbers it, so output references find the parts a request
+/// showed by the numbers it showed them with. Every other model-written message is marked only
+/// for reply cleaning, where its run cleans, so every exposure
+/// (`broca_protocol::tags::exposed_message`) cleans tag notation out of the reply text exactly
+/// where today's does. A message no run wrote (an import) is neither numbered nor cleaned, as
+/// today's isn't.
+pub async fn attach_part_tags<B: SessionBackend>(
     session: &Session<B>,
     parts: &dyn Parts,
     messages: &mut [broca_core::SessionReadMessage],
+    numbering: &std::collections::BTreeMap<u64, (String, u64)>,
 ) -> Result<(), String> {
-    use broca_protocol::tags::{ComputedTags, PartTags};
-    use broca_session_loop::writer::Writer;
-    let mut cleans: std::collections::HashMap<String, Option<bool>> = Default::default();
+    use broca_protocol::tags::{ComputedRules, ComputedTags, PartTags};
+    let mut runs: std::collections::HashMap<String, Option<ComputedRules>> = Default::default();
     for message in messages {
-        if message.message.role != broca_protocol::content::Role::Assistant {
-            continue;
+        // A page's messages are numbered from 0 until the reply is built.
+        let numbered = numbering.get(&message.ordinal);
+        let run_id = match (numbered, &message.run) {
+            (Some((run_id, _)), _) => run_id,
+            (None, Some(run))
+                if message.message.role == broca_protocol::content::Role::Assistant =>
+            {
+                &run.run_id
+            }
+            _ => continue,
+        };
+        if !runs.contains_key(run_id) {
+            let rules = crate::store_output_refs::run_rules(session, parts, run_id).await?;
+            runs.insert(run_id.clone(), rules);
         }
-        let Some(run) = &message.run else {
+        let Some(rules) = runs[run_id] else {
             continue;
         };
-        if !cleans.contains_key(&run.run_id) {
-            let start = Writer::run_start(session, &run.run_id)
-                .await
-                .map_err(|error| format!("run {}'s start: {error:?}", run.run_id))?;
-            let rules = match start {
-                Some(start) => {
-                    let config = broca_session_loop::run::run_config_of_start(&start, parts)
-                        .map_err(|error| format!("run {}'s config: {error:?}", run.run_id))?;
-                    broca_core::tags::computed_rules(&config).map(|rules| rules.clean)
-                }
-                None => None,
-            };
-            cleans.insert(run.run_id.clone(), rules);
-        }
-        if cleans[&run.run_id] == Some(true) {
+        if let Some((_, base)) = numbered {
+            let mut high = *base;
+            broca_protocol::tags::number_message(&mut message.message, rules, &mut high)
+                .map_err(|_| format!("message {}'s part numbers overflow", message.ordinal))?;
+        } else if rules.clean {
             message.message.set_tags(Some(std::sync::Arc::new(PartTags {
                 parts: vec![None; message.message.content.len()],
                 computed: Some(ComputedTags {

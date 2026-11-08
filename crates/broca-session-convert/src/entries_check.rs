@@ -5,8 +5,8 @@
 //!
 //! - **`session.history`, raw form:** every page of the transcript, 50 messages at a time (or
 //!   `PAGES_LIMIT`), today's from `broca_core::read_session_page` over the log, the store's from
-//!   `broca_module::store_read::read_page` with the reply-cleaning marks
-//!   (`store_entries::mark_reply_cleaning`), each turned into raw entries by
+//!   `broca_module::store_read::read_page` with the part numbers and reply-cleaning marks
+//!   (`store_entries::attach_part_tags`), each turned into raw entries by
 //!   `store_entries::raw_history_entries`. Message ids are each storage's own and are left out.
 //! - **The `compaction-runner/v1` bind:** today's admission (`check_bind` over the log's mode and
 //!   the compaction provider its ownership summary keeps) against the store's
@@ -233,15 +233,16 @@ pub(crate) fn run(args: &Args) {
         let store = walk(
             |from, limit| {
                 block_on(async {
-                    let mut page =
+                    let read =
                         broca_module::store_read::read_page(&session, Some(from), Some(limit))
                             .await
-                            .map_err(|e| format!("{e:?}"))?
-                            .page;
-                    broca_module::store_entries::mark_reply_cleaning(
+                            .map_err(|e| format!("{e:?}"))?;
+                    let mut page = read.page;
+                    broca_module::store_entries::attach_part_tags(
                         &session,
                         &parts,
                         &mut page.messages,
+                        &read.numbering,
                     )
                     .await?;
                     Ok(page)

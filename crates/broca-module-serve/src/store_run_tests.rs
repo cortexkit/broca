@@ -43,6 +43,7 @@ async fn serve_store_run(
                 writer: &mut *session,
                 parts: &mut own_parts,
                 store: None,
+                media: None,
             };
             link.serve(&mut writer, request).await;
         }

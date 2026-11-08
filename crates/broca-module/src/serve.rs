@@ -2562,6 +2562,20 @@ pub trait ServeHandler: Send + Sync {
         Ok(None)
     }
 
+    /// For a session kept in the new storage, the compaction view the request of the model step
+    /// that wrote message `ordinal` (counting from 0) was rendered under, which output references
+    /// check a named part against: `Some(None)` when no view applied. `None` for a session kept
+    /// on today's storage, whose views output references read from its log instead
+    /// ([`crate::output_refs::view_at_writing_step`]).
+    async fn store_writing_view(
+        &self,
+        _session: &LineageKey,
+        _ordinal: u64,
+    ) -> Result<Option<Option<broca_core::compaction_provider::view::CompactionView>>, ServeError>
+    {
+        Ok(None)
+    }
+
     /// `session.output_refs` (llm-runner §9.13): one page of an output-reference set, derived
     /// from the session log on every read (see [`crate::output_refs`]).
     async fn output_refs(
@@ -3028,12 +3042,46 @@ impl ServeHandler for crate::LineageRegistry {
         session: &LineageKey,
         tag: u64,
     ) -> Result<Option<broca_core::TagLocation>, ServeError> {
-        if self.store_holding(session)?.is_some() {
-            return Err(crate::store_entries::tag_location_unserved());
+        if let Some(store) = self.store_holding(session)? {
+            use crate::store_reads::{StoreReadReply, StoreReadRequest};
+            return match store
+                .read(self, session, StoreReadRequest::TagLocation(tag))
+                .await?
+            {
+                Some(StoreReadReply::TagLocation(location)) => location.map(Some),
+                Some(_) => Err(crate::store_reads::mismatched()),
+                // A session whose creation never committed holds no part.
+                None => Ok(Some(broca_core::TagLocation {
+                    found: None,
+                    indexed_through: u64::MAX,
+                })),
+            };
         }
         self.route_tag_location(session, tag)
             .await
             .map_err(ServeError::from)
+    }
+
+    async fn store_writing_view(
+        &self,
+        session: &LineageKey,
+        ordinal: u64,
+    ) -> Result<Option<Option<broca_core::compaction_provider::view::CompactionView>>, ServeError>
+    {
+        use crate::store_reads::{StoreReadReply, StoreReadRequest};
+        match self.store_holding(session)? {
+            Some(store) => {
+                match store
+                    .read(self, session, StoreReadRequest::WritingView { ordinal })
+                    .await?
+                {
+                    Some(StoreReadReply::WritingView(view)) => view.map(Some),
+                    Some(_) => Err(crate::store_reads::mismatched()),
+                    None => Ok(Some(None)),
+                }
+            }
+            None => Ok(None),
+        }
     }
 
     async fn frozen_manifest(

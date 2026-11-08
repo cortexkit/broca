@@ -142,6 +142,8 @@ fn facts(ordinal: u64, mid: &str) -> Record {
         no_display_facts: None,
         reasoning_summaries: Vec::new(),
         rich_ui: None,
+        runner_tag_base: None,
+        legacy_view_seq: None,
     })
 }
 
@@ -195,6 +197,7 @@ fn import_batch(a: &[u8]) -> (Vec<Record>, Vec<NewInputMedia>, Vec<(String, u64)
     ];
     let media = vec![NewInputMedia {
         record: 1,
+        message: 0,
         block: 1,
         part: None,
         bytes: a.to_vec(),

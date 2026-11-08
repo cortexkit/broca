@@ -3611,6 +3611,7 @@ impl SteerSink for NewSink {
             .lock()
             .unwrap()
             .push(Record::Steer(broca_session_store::record::Steer {
+                media: Vec::new(),
                 input,
                 written_at_ms,
                 tags_v1,

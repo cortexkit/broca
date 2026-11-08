@@ -244,6 +244,22 @@ fn numbered_flags(message: &Message) -> Vec<bool> {
         .collect()
 }
 
+/// The part number each block of `message` shows under the compaction projection, when its
+/// numbering continues after `tag_base`: what [`attach_native_tags`] attaches, and what a
+/// request rendered on the compaction contract shows the model.
+pub fn compaction_part_numbers(message: &Message, tag_base: u64) -> Vec<Option<u64>> {
+    let mut high = tag_base;
+    numbered_flags(message)
+        .into_iter()
+        .map(|numbered| {
+            numbered.then(|| {
+                high += 1;
+                high
+            })
+        })
+        .collect()
+}
+
 pub fn attach_native_tags(message: &mut Message, metadata: &Metadata) -> Result<(), String> {
     check_number_range(metadata)?;
     let flags = numbered_flags(message);

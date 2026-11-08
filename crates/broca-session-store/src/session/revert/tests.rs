@@ -128,6 +128,8 @@ fn facts(ordinal: u64, mid: String) -> Record {
         no_display_facts: None,
         reasoning_summaries: Vec::new(),
         rich_ui: None,
+        runner_tag_base: None,
+        legacy_view_seq: None,
         ordinal,
         written_at_ms: Some(ordinal),
         tag_base: 0,
@@ -453,6 +455,7 @@ fn a_revert_refuses_open_work_and_wrong_targets(cipher: Cipher) {
         session
             .append(
                 &[Record::QueuedSend(QueuedSend {
+                    media: Vec::new(),
                     submission_id: "sub".into(),
                     send_id: Some("queued".into()),
                     input: Vec::new(),

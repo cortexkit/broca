@@ -26,6 +26,29 @@ use crate::actor::{LineageStatus, SendKey, SendOutcome};
 use crate::executor::{RunExecutor, RunJob, RunKind};
 use crate::registry::LineageRegistry;
 
+/// Turns async test functions that take a `Cipher` into tests run once in each mode, as the
+/// session store's own tests are: each named function `f` becomes the tests `f::encrypted` and
+/// `f::plain`, whose module creates new-storage sessions in that mode. A test function left out
+/// of the list is never called, which the build refuses as dead code, so no test is silently
+/// dropped.
+macro_rules! cipher_tests {
+    ($($name:ident),+ $(,)?) => {
+        $(
+            mod $name {
+                #[tokio::test]
+                async fn encrypted() {
+                    super::$name(broca_session_store::keys::Cipher::XChaCha20Poly1305).await;
+                }
+
+                #[tokio::test]
+                async fn plain() {
+                    super::$name(broca_session_store::keys::Cipher::None).await;
+                }
+            }
+        )+
+    };
+}
+
 /// Today's executor in this harness: today's loop over the scripted provider, on the writer the
 /// actor hands it.
 pub(super) struct TodayLoop {
@@ -116,6 +139,7 @@ fn today_with(
     let wal = Arc::new(FileWalStore::new(dir.join("wal")));
     let executor = Arc::new(TodayLoop {
         provider: Gated {
+            render_config: None,
             inner: broca_core::provider::StubProvider::new(steps),
             gate,
         },
@@ -1227,6 +1251,7 @@ async fn module(on: bool, steps: Vec<Vec<NormalizedEvent>>) -> Module {
     let executor: Arc<dyn RunExecutor> = Arc::new(BothLoops {
         today: TodayLoop {
             provider: Gated {
+                render_config: None,
                 inner: broca_core::provider::StubProvider::new(steps.clone()),
                 gate: None,
             },
@@ -1545,5 +1570,8 @@ async fn a_store_session_reads_as_the_same_history_on_todays_storage() {
 
 mod controls;
 mod head;
+mod media;
+mod photo_sends;
 mod refresh;
 mod streams;
+mod warm;
