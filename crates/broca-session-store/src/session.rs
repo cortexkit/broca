@@ -882,7 +882,7 @@ mod kept;
 pub use kept::InMemory;
 mod media;
 use media::OpenLogIndex;
-pub use media::{MediaError, NewMedia};
+pub use media::{MediaError, NamedMedium, NewMedia};
 mod import;
 pub use import::{is_broca_id_form, NewInputMedia};
 

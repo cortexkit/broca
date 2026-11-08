@@ -123,6 +123,84 @@ pub(super) fn input_medium(
     }
 }
 
+/// A medium a record of the session names, found by its digest ([`Session::named_media`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamedMedium {
+    pub reference: MediaRef,
+    /// Where a record stored the medium's bytes: the open log, the writer generation and the
+    /// seq of the record that wrote its object. `None` when the record naming it stored none.
+    stored: Option<(crate::codec::Id128, crate::codec::Id128, u64)>,
+}
+
+impl NamedMedium {
+    /// Whether a record stored the medium's bytes.
+    pub fn stored(&self) -> bool {
+        self.stored.is_some()
+    }
+}
+
+/// The media parts of a tool result, with their positions in its parts.
+fn media_parts(result: &ToolResult) -> impl Iterator<Item = (u32, &MediaRef)> {
+    let parts: &[ToolOutputPart] = match &result.output {
+        ToolOutput::Parts { parts } => parts,
+        _ => &[],
+    };
+    parts
+        .iter()
+        .enumerate()
+        .filter_map(|(part, block)| match block {
+            ToolOutputPart::Media { media } => Some((part as u32, media)),
+            _ => None,
+        })
+}
+
+/// Every place `record` names the medium with digest `sha256`, each with where the record stored
+/// its bytes, if it did.
+fn named_in(record: &Record, sha256: &str) -> Vec<NamedMedium> {
+    use broca_protocol::content::ContentBlock;
+    let mut named = Vec::new();
+    match record {
+        Record::Input(input) => {
+            for (block, content) in input.message.content.iter().enumerate() {
+                let block = block as u32;
+                let found: Vec<(Option<u32>, &MediaRef)> = match content {
+                    ContentBlock::Media(media) => vec![(None, media)],
+                    ContentBlock::ToolResult(result) => media_parts(result)
+                        .map(|(part, media)| (Some(part), media))
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                for (part, media) in found.into_iter().filter(|(_, m)| m.sha256 == sha256) {
+                    let stored = input
+                        .media
+                        .iter()
+                        .find(|object| object.block == block && object.part == part)
+                        .map(|object| (object.log, object.generation, object.seq));
+                    named.push(NamedMedium {
+                        reference: media.clone(),
+                        stored,
+                    });
+                }
+            }
+        }
+        Record::ToolReply(reply) => {
+            for (part, media) in media_parts(&reply.result).filter(|(_, m)| m.sha256 == sha256) {
+                let stored = reply
+                    .media
+                    .iter()
+                    .find(|object| object.part == part)
+                    .map(|object| (object.log, object.generation, object.seq));
+                named.push(NamedMedium {
+                    reference: media.clone(),
+                    stored,
+                });
+            }
+        }
+        _ => {}
+    }
+    named
+}
+
 fn matches(media: &MediaRef, bytes: &[u8]) -> bool {
     media.byte_size == bytes.len() as u64 && media.sha256 == hex(&Sha256::digest(bytes))
 }
@@ -297,6 +375,37 @@ impl<B: SessionBackend> Session<B> {
             &reference.sha256,
         );
         self.read_named_media(name, reference).await
+    }
+
+    /// The medium with digest `sha256` that a record of the session names: a media block of an
+    /// input message, a media part of a tool result inside one, or a media part of a tool
+    /// result. Every record is looked at, sealed or in the open log. A record that stored the
+    /// medium's bytes is preferred; when none did, the first record naming the digest is
+    /// returned, with no bytes to read. `None` when no record names the digest.
+    pub async fn named_media(&self, sha256: &str) -> Result<Option<NamedMedium>, SessionError> {
+        let mut unstored = None;
+        for (_, record) in self.records_from(0).await? {
+            for medium in named_in(&record, sha256) {
+                if medium.stored.is_some() {
+                    return Ok(Some(medium));
+                }
+                unstored.get_or_insert(medium);
+            }
+        }
+        Ok(unstored)
+    }
+
+    /// The bytes of `medium`, checked against its reference: `Missing` when no record stored
+    /// them. Reading them touches storage, so a session answering from memory only refuses.
+    pub async fn named_media_bytes(&self, medium: &NamedMedium) -> Result<Vec<u8>, SessionError> {
+        let Some((log, generation, seq)) = &medium.stored else {
+            return Err(SessionError::Media(MediaError::Missing(
+                medium.reference.sha256.clone(),
+            )));
+        };
+        self.storage_read()?;
+        let name = self.media_name_at(log, generation, *seq, &medium.reference.sha256);
+        self.read_named_media(name, &medium.reference).await
     }
 
     async fn read_named_media(

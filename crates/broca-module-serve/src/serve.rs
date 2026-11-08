@@ -5141,6 +5141,14 @@ fn served_on_new_storage(method: &str, params: &serde_json::Value) -> bool {
         OP_INSTALL_VIEW => true,
         // Describes the module, not the session.
         OP_ROLE_DESCRIBE => true,
+        // Media the store's own records name, read from the objects they stored
+        // (`uploads::media_read`). Uploads are staged beside the session, whichever storage
+        // keeps it; only the owner check reads the session, from the store.
+        cortexkit_role_llm_runner::ops::SESSION_MEDIA_READ => true,
+        "session.upload_begin"
+        | "session.upload_append"
+        | "session.upload_commit"
+        | "session.upload_status" => true,
         // The raw form pages through the store's `session.read` (`crate::history`). The display
         // form needs per-call facts the store doesn't serve yet, so it is refused here.
         cortexkit_role_llm_runner::ops::SESSION_HISTORY => {

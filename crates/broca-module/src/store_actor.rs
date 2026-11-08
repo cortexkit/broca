@@ -2293,10 +2293,13 @@ fn refuse_unbuilt_request(request: &SubmissionRequest) -> Option<&'static str> {
         Some("keep-warm")
     } else if request.service_tier_level.is_some() {
         Some("a service tier level")
-    } else if broca_provider::person_media::references(&request.input)
-        .next()
-        .is_some()
+    } else if !request.content.is_empty()
+        || broca_provider::person_media::references(&request.input)
+            .next()
+            .is_some()
     {
+        // A send's attachments arrive as upload references (`content`), which today's actor
+        // stages into its input; a store session would otherwise run the send without them.
         Some("a send with media")
     } else {
         None

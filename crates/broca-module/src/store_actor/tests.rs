@@ -581,6 +581,26 @@ async fn an_unserved_send_is_refused_by_name() {
     assert!(served.await.unwrap().operations().run.is_none());
 }
 
+/// A send attaching an upload is refused by name before anything is written, never run with
+/// its attachment dropped.
+#[tokio::test]
+async fn a_send_attaching_an_upload_is_refused_by_name() {
+    let (commands, served, _) = actor(executor(vec![text_step("a1", "never sent")], None)).await;
+    let mut attaching = request("look");
+    attaching.content =
+        serde_json::from_value(serde_json::json!([{"type": "upload", "upload_id": "u1"}])).unwrap();
+    assert_eq!(
+        send_with(&commands, "r1", attaching, SendKey::Minted).await,
+        SendOutcome::Error(
+            "a send with media is not served yet for a session kept in the new storage".into()
+        )
+    );
+    drop(commands);
+    let session = served.await.unwrap();
+    assert!(session.operations().run.is_none(), "nothing was written");
+    assert!(session.conversation().messages.is_empty());
+}
+
 /// A cancel at the step boundary is durable before its reply. The run, whose first model call is
 /// in flight, finishes that step and its tool call, and then ends cancelled at the boundary
 /// instead of sending its next step.

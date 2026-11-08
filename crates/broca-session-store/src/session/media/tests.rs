@@ -451,3 +451,80 @@ fn a_revert_forgets_the_abandoned_branchs_media() {
         assert_eq!(session.window_media(&image(b)).await.unwrap(), b);
     });
 }
+
+/// A medium is found by its digest wherever a record of the session names it, sealed history
+/// included, and its bytes read back from the object the record stored. A record naming a digest
+/// without storing its bytes is found with nothing to read, and a digest no record names isn't
+/// found. Reading the bytes touches storage, so a session answering from memory only refuses.
+#[test]
+fn a_named_medium_is_found_by_digest_in_sealed_history_and_the_open_log() {
+    let backend = MemoryBackend::default();
+    let (a, b, c) = (
+        b"image a".as_slice(),
+        b"image b".as_slice(),
+        b"image c".as_slice(),
+    );
+    block_on(async {
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(), false)
+            .await
+            .unwrap();
+        photo_run(&mut session, "r0", 1, &[a]).await;
+        let cut = session.next_seq() + 1;
+        photo_run(&mut session, "r1", 5, &[b]).await;
+        session.seal(Some(cut), 0).await.unwrap();
+        // An input naming `c` in its content, whose record stored no bytes for it.
+        let Record::Input(mut unstored) = input("r2", "look") else {
+            unreachable!()
+        };
+        unstored.message.content.push(ContentBlock::Media(image(c)));
+        let mid = session.message_id(2);
+        session
+            .append(
+                &[
+                    start("r2", "send-r2"),
+                    Record::Input(unstored),
+                    facts(9, mid),
+                ],
+                true,
+            )
+            .await
+            .unwrap();
+        for (bytes, place) in [(a, "sealed history"), (b, "the open log")] {
+            let found = session
+                .named_media(&image(bytes).sha256)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("found in {place}"));
+            assert_eq!(found.reference, image(bytes), "{place}");
+            assert!(found.stored(), "{place}");
+            assert_eq!(
+                session.named_media_bytes(&found).await.unwrap(),
+                bytes,
+                "{place}"
+            );
+            let memory = session.in_memory();
+            assert!(matches!(
+                session.named_media_bytes(&found).await,
+                Err(SessionError::NotInMemory)
+            ));
+            drop(memory);
+        }
+        let named_only = session
+            .named_media(&image(c).sha256)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!named_only.stored());
+        assert!(matches!(
+            session.named_media_bytes(&named_only).await,
+            Err(SessionError::Media(MediaError::Missing(_)))
+        ));
+        assert_eq!(
+            session
+                .named_media(&image(b"never named").sha256)
+                .await
+                .unwrap(),
+            None
+        );
+    });
+}

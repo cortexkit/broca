@@ -266,6 +266,7 @@ impl Rig {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        broca_core::media_store::create_media_directories(&dir).unwrap();
         let wal = Arc::new(FileWalStore::new(dir.join("wal")));
         let executor: Arc<dyn RunExecutor> = Arc::new(StoreLoop {
             provider: broca_core::provider::StubProvider::new(steps),
@@ -379,6 +380,63 @@ impl Rig {
             "{outcome:?}"
         );
         self.settled(run_id).await;
+    }
+
+    /// Creates the session in the new storage by importing, through the registry the connection
+    /// serves, a head whose first message carries `image`, owned by core under its head scope.
+    async fn import_with_image(&self, image: &[u8]) {
+        use broca_module::store_import::{ImportCommand, ImportRoots, StoreCommand, StoreOutcome};
+        let folder = self.dir.join("imports");
+        std::fs::create_dir_all(&folder).unwrap();
+        let export = serde_json::to_vec(&json!({
+            "info": {"id": "ses_head"},
+            "messages": [
+                {"id": "msg_u1", "type": "user", "time": {"created": 1000}, "text": "Look.",
+                 "files": [{"mime": "image/png", "data": base64(image)}]},
+                {"id": "msg_a1", "type": "assistant", "time": {"created": 2000, "completed": 3000},
+                 "content": [{"type": "text", "text": "Seen."}]}
+            ]
+        }))
+        .unwrap();
+        let path = folder.join("head.json");
+        std::fs::write(&path, &export).unwrap();
+        let params = serde_json::from_value(json!({
+            "import_id": "imp-1",
+            "source": {
+                "harness": "opencode2",
+                "path": path.display().to_string(),
+                "session": "ses_head",
+                "sha256": digest(&export),
+            },
+            "origin": {"kind": "import", "source_ref": "thalamus:ses_head"},
+        }))
+        .unwrap();
+        let core = broca_protocol::BindPrincipal::Reserved {
+            module_id: "prefrontal-core".into(),
+        };
+        let command = StoreCommand::Import(Box::new(ImportCommand {
+            params,
+            principal: core.clone(),
+            // An import arrives on a route scoped to its owner's head.
+            scope: Some(broca_protocol::SessionScope {
+                owner: core,
+                scope_ref: "head-1".into(),
+                scope_epoch: 1,
+                flow_id: None,
+                sender: None,
+                agent_id: None,
+                run_id: None,
+                agent_id_frozen: false,
+            }),
+            roots: Arc::new(ImportRoots::new(vec![folder.clone()], Some(folder))),
+            now_ms: 9_000,
+        }));
+        let outcome = self
+            .registry
+            .route_store_command(&self.key, command)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, StoreOutcome::Imported(_)), "{outcome:?}");
     }
 
     async fn settled(&self, run_id: &str) {
@@ -620,4 +678,93 @@ async fn compaction_entries_reach_the_store_through_serve() {
         "a page from ordinal 3 holds one entry: {page}"
     );
     assert_eq!(page["entries"][0]["ordinal"], 3, "{page}");
+}
+
+/// A one-pixel PNG.
+const PNG: &str = "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de0000000c49444154789c63f8cfc0000003010100c9fe92ef0000000049454e44ae426082";
+/// A three-by-two PNG.
+const WIDE: &str = "89504e470d0a1a0a0000000d49484452000000030000000208020000001216f14d0000001049444154789c63f8cfc000410c70160041d205fb87f0b9480000000049454e44ae426082";
+
+fn bytes_of(hex: &str) -> Vec<u8> {
+    (0..hex.len())
+        .step_by(2)
+        .map(|at| u8::from_str_radix(&hex[at..at + 2], 16).unwrap())
+        .collect()
+}
+
+fn digest(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    format!("{:x}", sha2::Sha256::digest(bytes))
+}
+
+fn base64(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// `session.media_read` and the upload operations reach the store through the serve path. A
+/// head imported into the new storage carries an image, which reads back byte-equal, whole and
+/// by byte range. An image uploaded to the session is staged and committed, and reading it is
+/// refused while no record of the session names it.
+#[tokio::test]
+async fn media_read_and_uploads_reach_the_store_through_serve() {
+    let mut rig = Rig::start("media", Vec::new()).await;
+    let (image, unsent) = (bytes_of(PNG), bytes_of(WIDE));
+    rig.import_with_image(&image).await;
+    rig.assert_store_only();
+    rig.bind_session(1, core()).await;
+    let whole = rig
+        .result(
+            1,
+            "session.media_read",
+            json!({"sha256": digest(&image), "offset": 0, "length": image.len()}),
+        )
+        .await;
+    assert_eq!(whole["data"], json!(base64(&image)), "{whole}");
+    assert_eq!(whole["size"], json!(image.len()), "{whole}");
+    assert_eq!(whole["mime"], "image/png", "{whole}");
+    let range = rig
+        .result(
+            1,
+            "session.media_read",
+            json!({"sha256": digest(&image), "offset": 3, "length": 8}),
+        )
+        .await;
+    assert_eq!(range["data"], json!(base64(&image[3..11])), "{range}");
+
+    let begin = rig
+        .result(
+            1,
+            "session.upload_begin",
+            json!({"mime": "image/png", "bytes": unsent.len(), "sha256": digest(&unsent)}),
+        )
+        .await;
+    let id = begin["upload_id"].as_str().unwrap().to_owned();
+    let appended = rig
+        .result(
+            1,
+            "session.upload_append",
+            json!({"upload_id": id, "offset": 0, "data": base64(&unsent)}),
+        )
+        .await;
+    assert_eq!(appended["received"], json!(unsent.len()), "{appended}");
+    let committed = rig
+        .result(1, "session.upload_commit", json!({"upload_id": id}))
+        .await;
+    assert_eq!(committed["state"], "committed", "{committed}");
+    assert_eq!(committed["sha256"], json!(digest(&unsent)), "{committed}");
+    let status = rig
+        .result(1, "session.upload_status", json!({"upload_id": id}))
+        .await;
+    assert_eq!(status["state"], "committed", "{status}");
+    assert_eq!(
+        rig.refused(
+            1,
+            "session.media_read",
+            json!({"sha256": digest(&unsent), "offset": 0, "length": 10}),
+        )
+        .await,
+        "unknown_media",
+        "an upload no record names is not readable"
+    );
 }

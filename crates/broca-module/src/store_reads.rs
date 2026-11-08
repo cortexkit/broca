@@ -68,6 +68,9 @@ pub enum StoreReadRequest {
     /// What `session.history` reads about the session besides its pages, resolving the message
     /// `mid` names when it names one (see `store_entries::HistoryHead`).
     HistoryHead { mid: Option<String> },
+    /// The medium with digest `sha256` that a record of the session names, with its bytes, as
+    /// `session.media_read` serves it.
+    Media { sha256: String },
 }
 
 /// What a `session.read` page asks of the session itself.
@@ -127,6 +130,16 @@ pub enum StoreReadReply {
         >,
     ),
     HistoryHead(Result<crate::store_entries::HistoryHead, ServeError>),
+    /// `None` when no record of the session names the digest.
+    Media(Result<Option<StoredMedia>, ServeError>),
+}
+
+/// A medium a record of the session names: its reference, and its bytes or why they couldn't be
+/// read.
+#[derive(Debug)]
+pub struct StoredMedia {
+    pub reference: broca_protocol::MediaRef,
+    pub bytes: Result<Vec<u8>, String>,
 }
 
 /// How the session's store actor answered a read.
@@ -272,7 +285,32 @@ pub async fn execute<B: SessionBackend>(
         StoreReadRequest::HistoryHead { mid } => StoreReadReply::HistoryHead(
             crate::store_entries::history_head_of(session, mid.as_deref()).await,
         ),
+        StoreReadRequest::Media { sha256 } => {
+            StoreReadReply::Media(stored_media(session, sha256).await)
+        }
     }
+}
+
+/// The medium with digest `sha256` that a record of `session` names, with its bytes.
+async fn stored_media<B: SessionBackend>(
+    session: &Session<B>,
+    sha256: &str,
+) -> Result<Option<StoredMedia>, ServeError> {
+    let Some(medium) = session
+        .named_media(sha256)
+        .await
+        .map_err(crate::store_read::read_failed)?
+    else {
+        return Ok(None);
+    };
+    let bytes = session
+        .named_media_bytes(&medium)
+        .await
+        .map_err(|error| format!("{error:?}"));
+    Ok(Some(StoredMedia {
+        reference: medium.reference,
+        bytes,
+    }))
 }
 
 /// Makes `session`'s latest records durable before a read reports them: the read's refusal when
