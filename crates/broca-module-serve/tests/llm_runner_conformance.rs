@@ -3046,7 +3046,9 @@ impl LlmRunnerSubject for BrocaSubject {
                 json!({"model":{"provider":"xai","model":format!("conformance-media-{accepts}")}});
             if !self.shared.plan_sessions.lock().unwrap().contains(session) {
                 fields["system"] = json!(format!("{SESSION_MARKER}{session}"));
-                fields["tools"] = json!([{"name":SCRIPTED_TOOL,"description":"Answers each call with its scripted result.","input_schema":{"type":"object"},"module":TOOL_MODULE}]);
+                if first {
+                    fields["tools"] = json!([{"name":SCRIPTED_TOOL,"description":"Answers each call with its scripted result.","input_schema":{"type":"object"},"module":TOOL_MODULE}]);
+                }
             }
             return fields.as_object().unwrap().clone();
         }
@@ -3091,6 +3093,9 @@ impl LlmRunnerSubject for BrocaSubject {
                 "module": TOOL_MODULE,
             }],
         });
+        if !first {
+            fields.as_object_mut().unwrap().remove("tools");
+        }
         // Native durability, reader-identity and retention fixtures depend on this original
         // system marker, including error sessions that never install a model script.
         if !markerless {
@@ -3445,7 +3450,7 @@ impl LlmRunnerSubject for BrocaSubject {
                     "composition":composition,
                 }),
             );
-        } else {
+        } else if first {
             fields.insert(
                 "tools".into(),
                 Value::Array(
@@ -4356,6 +4361,100 @@ fn check_0814_undeclared_cases(
     Ok(())
 }
 
+fn expected_0821_cases() -> Vec<(&'static str, CaseOutcome)> {
+    include_str!("golden/llm_runner_0821.applicability.txt")
+        .lines()
+        .map(|line| {
+            let (status, row) = line.split_once(' ').unwrap();
+            let (name, reason) = row.split_once(": ").unwrap_or((row, ""));
+            let outcome = match status {
+                "N/A" => CaseOutcome::Inapplicable {
+                    reason: reason.into(),
+                },
+                // cortexkit-role-llm-runner-conformance 0.17.25 skips missing fork_answer
+                // in runner::gate. Preserve that decision; an upstream fix must update the pin.
+                "SKIP" => {
+                    assert_eq!(reason, "fork_answer");
+                    CaseOutcome::Skipped {
+                        missing: vec![Capability::ForkAnswer],
+                    }
+                }
+                "PASS" => {
+                    assert!(reason.is_empty());
+                    CaseOutcome::Passed
+                }
+                _ => panic!("unknown applicability status {status}"),
+            };
+            (name, outcome)
+        })
+        .collect()
+}
+
+fn check_0821_cases(
+    cases: &[cortexkit_role_llm_runner_conformance::CaseReport],
+) -> Result<(), String> {
+    for (name, expected) in expected_0821_cases() {
+        let case = cases
+            .iter()
+            .find(|case| case.case == name)
+            .ok_or_else(|| format!("the suite has no case {name}"))?;
+        if case.outcome != expected {
+            return Err(format!("{name}: {:?}, expected {expected:?}", case.outcome));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn runner_0821_cases_pin_exact_native_outcomes() {
+    use cortexkit_role_llm_runner_conformance::{CaseReport, CASES};
+    let cases: Vec<_> = expected_0821_cases()
+        .into_iter()
+        .map(|(name, outcome)| {
+            let spec = CASES.iter().find(|spec| spec.name == name).unwrap();
+            CaseReport {
+                case: spec.name,
+                requires: spec.requires.to_vec(),
+                outcome,
+            }
+        })
+        .collect();
+    assert_eq!(cases.len(), 59);
+    check_0821_cases(&cases).unwrap();
+    for index in 0..cases.len() {
+        for outcome in [
+            CaseOutcome::Passed,
+            CaseOutcome::Failed {
+                reason: "failed".into(),
+            },
+            CaseOutcome::Skipped { missing: vec![] },
+            CaseOutcome::Skipped {
+                missing: vec![Capability::ForkAnswer],
+            },
+            CaseOutcome::Inapplicable {
+                reason: "fixture unavailable".into(),
+            },
+            CaseOutcome::Inapplicable {
+                reason: "missing groups: fork_answer".into(),
+            },
+        ] {
+            if outcome == cases[index].outcome {
+                continue;
+            }
+            let mut changed = cases.clone();
+            changed[index].outcome = outcome;
+            assert!(
+                check_0821_cases(&changed).is_err(),
+                "{}",
+                changed[index].case
+            );
+        }
+        let mut missing = cases.clone();
+        missing.remove(index);
+        assert!(check_0821_cases(&missing).is_err());
+    }
+}
+
 #[test]
 fn account_route_undeclared_groups_report_exact_reasons_never_skips() {
     use cortexkit_role_llm_runner_conformance::{CaseReport, CASES};
@@ -4855,6 +4954,7 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
     );
     check_0811_cases(&report.cases).unwrap();
     check_0814_undeclared_cases(&report.cases).unwrap();
+    check_0821_cases(&report.cases).unwrap();
     let attachment_gaps = attachment_contract_gaps(&report);
     assert!(
         attachment_gaps.is_empty(),
@@ -5124,8 +5224,8 @@ async fn a_step_cut_before_its_intent_is_sealed_without_sending_the_call() {
         .await
         .unwrap();
     let owner = subject.owner_stamp();
-    let send = |prompt: &str, send_id: &str| {
-        let mut params = subject.send_fields(session, true);
+    let send = |prompt: &str, send_id: &str, first: bool| {
+        let mut params = subject.send_fields(session, first);
         params.insert("prompt".into(), json!(prompt));
         params.insert("send_id".into(), json!(send_id));
         Value::Object(params)
@@ -5140,7 +5240,7 @@ async fn a_step_cut_before_its_intent_is_sealed_without_sending_the_call() {
 
     let live = subject.spawn(&root).await.unwrap();
     let route = subject.session_route(&live, session, &owner).await.unwrap();
-    let first = send("first", "send-1");
+    let first = send("first", "send-1", true);
     let trigger: Trigger<'_> = Box::pin(async {
         let _ = route.request("session.send", first.clone()).await;
         sleep(Duration::from_secs(60)).await;
@@ -5229,7 +5329,7 @@ async fn a_step_cut_before_its_intent_is_sealed_without_sending_the_call() {
     // The next send renders the kept step with its result right after it.
     let next = response(
         route
-            .request("session.send", send("next", "send-2"))
+            .request("session.send", send("next", "send-2", false))
             .await
             .unwrap(),
     );
@@ -7085,6 +7185,23 @@ async fn conformance_subject_always_declares_attachments() {
     assert!(subject.capabilities().contains(&Capability::Attachments));
     assert!(subject.capabilities().contains(&Capability::MediaOnlySend));
     assert!(subject.image_tool_result("old-image-rule").is_some());
+}
+
+#[tokio::test]
+async fn conformance_later_send_fields_inherit_the_frozen_tools() {
+    let root = broca_test_support::scratch_root().join("subject-frozen-tool-fields");
+    let subject = BrocaSubject::new(&root).await;
+    for session in ["ordinary", "cf-attachments-1"] {
+        let first = subject.send_fields(session, true);
+        assert!(first["tools"].is_array());
+        let later = subject.send_fields(session, false);
+        assert!(!later.contains_key("tools"), "{session}: {later:?}");
+        assert_eq!(first["model"], later["model"]);
+        let explicit = subject
+            .send_fields_with_tools(session, false, &[SCRIPTED_TOOL])
+            .unwrap();
+        assert!(!explicit.contains_key("tools"), "{explicit:?}");
+    }
 }
 
 fn attachment_contract_gaps(

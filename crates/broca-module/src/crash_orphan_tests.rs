@@ -124,6 +124,7 @@ impl RunExecutor for Recording {
     ) -> Result<RunSummary, broca_core::RunError> {
         self.executed.lock().unwrap().push(job.req.run_id.0.clone());
         job.writer.record(WalRecord::RunStarted {
+            message_marks: None,
             compaction_plan_version: None,
             sent_by: None,
             written_at_ms: None,
@@ -429,6 +430,7 @@ impl Drop for Fixture {
 
 fn run_started(key: &BindIdentity) -> WalRecord {
     WalRecord::RunStarted {
+        message_marks: None,
         compaction_plan_version: None,
         sent_by: None,
         written_at_ms: None,

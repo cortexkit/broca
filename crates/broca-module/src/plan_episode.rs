@@ -7,14 +7,13 @@ use broca_protocol::request::SubmissionRequest;
 use broca_protocol::SessionScope;
 use broca_wal::PlanManifest;
 
-/// The refusal for a send carrying `tools` into a session whose first episode froze a fetch plan:
-/// the plan owns the session's tools for its whole life, so the send is refused before any retry,
-/// queue, steer or interrupt path could ignore the tools or freeze them.
+/// A new send cannot redeclare the tools frozen by the session's creating send,
+/// whether the surface came from a fetch plan or a legacy tool list.
 pub(crate) fn tools_frozen_refusal() -> crate::actor::SendOutcome {
     crate::actor::SendOutcome::DeliveryRefused {
         code: "invalid_params",
         field: "tools",
-        message: "tools are frozen by the session's fetch plan".into(),
+        message: "tools are frozen by the session's creating send".into(),
     }
 }
 

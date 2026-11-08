@@ -28,6 +28,7 @@ fn config(model: &str, effort: &str, admitted: bool) -> FrozenRenderConfig {
 fn start(model: &str, effort: &str, admitted: bool, role: Option<Role>) -> WalRecord {
     let frozen = config(model, effort, admitted);
     WalRecord::RunStarted {
+        message_marks: None,
         compaction_plan_version: None,
         sent_by: None,
         written_at_ms: None,

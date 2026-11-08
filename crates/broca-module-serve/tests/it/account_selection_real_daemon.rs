@@ -1123,7 +1123,7 @@ impl Rig {
             )
             .await
             .unwrap();
-        let mut params = json!({"prompt": "hello", "model": {"provider": "anthropic", "model": MODEL}, "tools": [], "send_id": send_id});
+        let mut params = json!({"prompt": "hello", "model": {"provider": "anthropic", "model": MODEL}, "send_id": send_id});
         params
             .as_object_mut()
             .unwrap()
@@ -1575,7 +1575,7 @@ fn spec<'a>(send_id: &'a str, auth: Option<broca_wire::AuthParams>) -> SendSpec<
         model: MODEL,
         variant: None,
         service_tier: None,
-        tools: Some(Vec::new()),
+        tools: None,
         send_id: Some(send_id),
         max_output_tokens: None,
         cache: None,

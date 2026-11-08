@@ -331,6 +331,7 @@ impl Fixture {
             wal.append(
                 1,
                 &WalRecord::RunStarted {
+                    message_marks: None,
                     compaction_plan_version: None,
                     sent_by: None,
                     written_at_ms: None,
@@ -769,6 +770,7 @@ async fn restart_admission(actor: &mut LineageActor<ProbeWal>) -> Result<RunId, 
             RunKind::FreshOrResume,
             None,
             SendIdentity {
+                message_marks: None,
                 display_sent_by: None,
                 title: None,
                 conversation_key: None,

@@ -244,6 +244,7 @@ impl RunExecutor for FakeExec {
         }
         self.started.fetch_add(1, Ordering::SeqCst);
         job.writer.record(broca_wal::WalRecord::RunStarted {
+            message_marks: None,
             compaction_plan_version: None,
             sent_by: None,
             written_at_ms: None,
@@ -371,6 +372,7 @@ impl RunExecutor for ReauthCoreExec {
             config.budget = job.req.budget.clone();
             config.stop_when = job.req.stop_when.clone();
             job.writer.record(WalRecord::RunStarted {
+                message_marks: None,
                 compaction_plan_version: None,
                 sent_by: None,
                 written_at_ms: None,
@@ -434,6 +436,7 @@ impl RunExecutor for ReauthCoreExec {
                 account_decision: None,
             });
             job.writer.record(WalRecord::RunStarted {
+                message_marks: None,
                 compaction_plan_version: None,
                 sent_by: None,
                 written_at_ms: None,
@@ -688,7 +691,7 @@ fn chatgpt_send(session: BindIdentity, run_id: &str, prompt: &str) -> SendReques
                     text: prompt.into(),
                 }],
             )],
-            tools: Some(vec![]),
+            tools: None,
             policy_allowed: Default::default(),
             tool_choice: Default::default(),
             generation: Default::default(),
@@ -5621,6 +5624,17 @@ impl PreparedWalRoute {
         first_principal: Option<broca_protocol::BindPrincipal>,
         principal: Option<subc_protocol::Principal>,
     ) -> Self {
+        Self::start_prepared_on_route(tag, prepare, reader, first_principal, principal, true).await
+    }
+
+    async fn start_prepared_on_route(
+        tag: &str,
+        prepare: impl FnOnce(&Path, &BindIdentity),
+        reader: Option<Arc<dyn broca_core::WalStore>>,
+        first_principal: Option<broca_protocol::BindPrincipal>,
+        principal: Option<subc_protocol::Principal>,
+        flow_route: bool,
+    ) -> Self {
         let dir = tmpdir(tag);
         let (mut reg, wal) = registry_and_wal(&dir);
         if let Some(reader) = reader {
@@ -5669,6 +5683,7 @@ impl PreparedWalRoute {
                 file.append(
                     1,
                     &WalRecord::RunStarted {
+                        message_marks: None,
                         compaction_plan_version: None,
                         sent_by: None,
                         written_at_ms: None,
@@ -5759,7 +5774,7 @@ impl PreparedWalRoute {
         .unwrap();
         write_frame(&mut writer, &ack).await.unwrap();
 
-        let bind_scope = principal.as_ref().map(|_| {
+        let bind_scope = principal.as_ref().filter(|_| flow_route).map(|_| {
             let mut stamp = subc_protocol::scope::ScopeStamp::new(
                 prefrontal_core(),
                 "flow-1",
@@ -5855,6 +5870,7 @@ async fn run_status_frozen_auth_selection_matches_served_golden() {
             wal.append(
                 1,
                 &WalRecord::RunStarted {
+                    message_marks: None,
                     compaction_plan_version: None,
                     sent_by: None,
                     written_at_ms: None,
@@ -6645,6 +6661,7 @@ async fn history_unreachable_refusal_golden_from_real_serve() {
         wal.append(
             1,
             &WalRecord::RunStarted {
+                message_marks: None,
                 compaction_plan_version: None,
                 sent_by: None,
                 written_at_ms: None,
@@ -7193,7 +7210,7 @@ async fn authorization_precedes_migration_and_validation_for_moved_sessions() {
 #[tokio::test]
 async fn authorized_moved_sessions_keep_operation_specific_fences() {
     for pending_release in [false, true] {
-        let mut route = protected_moved_route("basal", pending_release).await;
+        let mut route = protected_moved_route_with_scope("basal", pending_release, false).await;
         let before = std::fs::read(&route.wal_path).unwrap();
         for (i, method) in [
             "session.send",
@@ -7298,16 +7315,30 @@ async fn overlapping_protected_moved_routes_keep_separate_scratch_state() {
 }
 
 async fn protected_moved_route(first: &str, pending_release: bool) -> PreparedWalRoute {
-    let route = PreparedWalRoute::start_with_authorization(
+    protected_moved_route_with_scope(first, pending_release, true).await
+}
+
+async fn protected_moved_route_with_scope(
+    first: &str,
+    pending_release: bool,
+    flow_route: bool,
+) -> PreparedWalRoute {
+    let route = PreparedWalRoute::start_prepared_on_route(
         "protected-moved-wire",
-        |_| {},
+        |_, _| {},
         None,
         Some(broca_protocol::BindPrincipal::Reserved {
             module_id: first.into(),
         }),
         Some(subc_protocol::Principal::Reserved {
-            module_id: "basal".into(),
+            module_id: if flow_route {
+                "basal"
+            } else {
+                "prefrontal-core"
+            }
+            .into(),
         }),
+        flow_route,
     )
     .await;
     if pending_release {

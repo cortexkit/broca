@@ -562,6 +562,7 @@ mod tests {
             framed(
                 1,
                 broca_wal::WalRecord::RunStarted {
+                    message_marks: None,
                     sent_by: None,
                     written_at_ms: None,
                     tags: None,

@@ -1568,6 +1568,7 @@ async fn compaction_v2_every_result_kind_carries_delivery_without_changing_store
                     for record in &mut resumed {
                         if let WalRecord::SendDelivered { ride, .. } = record {
                             *ride = Some(broca_wal::record::RideMetadata {
+                                speaks_for: None,
                                 call_key: "recorded-carrying-key".into(),
                                 send_id: "reminder".into(),
                                 sender: "broca".into(),

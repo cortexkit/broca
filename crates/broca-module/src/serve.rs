@@ -486,6 +486,8 @@ fn session_read_response(
             .messages
             .into_iter()
             .map(|message| SessionReadMessage {
+                speaks_for: None,
+                notice: false,
                 sender: None,
                 notices: Vec::new(),
                 created_at: None,
@@ -3479,6 +3481,10 @@ impl ServeHandler for crate::LineageRegistry {
                         .collect();
                 }
                 if let Some(facts) = facts.get(&(entry.ordinal - 1)) {
+                    if let Some(marks) = &facts.message_marks {
+                        entry.speaks_for = marks.speaks_for.clone();
+                        entry.notice = marks.notice;
+                    }
                     entry.sender = facts.sender.clone();
                     entry.notices = facts
                         .notices
@@ -5254,6 +5260,7 @@ mod offset_head_tests {
 
     fn run_started() -> WalRecord {
         WalRecord::RunStarted {
+            message_marks: None,
             compaction_plan_version: None,
             sent_by: None,
             written_at_ms: None,

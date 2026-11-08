@@ -280,6 +280,7 @@ fn registry(state_root: &Path) -> LineageRegistry {
 fn owner_send() -> SendRequest {
     let adopt = adopt_request();
     let mut request = adopt.to_submission();
+    request.tools = None;
     request.scope = stamped();
     SendRequest {
         session_class: None,
