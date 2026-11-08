@@ -3,6 +3,13 @@ use futures::executor::block_on;
 use crate::backend::{MemoryBackend, SessionAddr, SessionBackend};
 use crate::codec::Id128;
 use crate::frame::FrameKey;
+use crate::keys::Cipher;
+
+cipher_tests!(
+    appends_build_a_tree_whose_lookups_find_every_entry,
+    an_out_of_order_entry_refuses,
+    ordinal_lookups_walk_a_deep_tree,
+);
 
 use super::{DirEntry, DirectoryError, Pages};
 
@@ -21,16 +28,15 @@ fn entry(n: u64) -> DirEntry {
 /// Appending many entries through a small fanout builds a tree several levels deep. Every entry
 /// is found by any seq inside it, the root names them all, and each append replaces only pages
 /// on the old rightmost path, never one the new root still names.
-#[test]
-fn appends_build_a_tree_whose_lookups_find_every_entry() {
-    block_on(appends_build_a_tree())
+fn appends_build_a_tree_whose_lookups_find_every_entry(cipher: Cipher) {
+    block_on(appends_build_a_tree(cipher))
 }
 
-async fn appends_build_a_tree() {
+async fn appends_build_a_tree(cipher: Cipher) {
     let backend = MemoryBackend::default();
     let addr = SessionAddr("a".into());
     backend.write_head(&addr, b"h", None, 1).await.unwrap();
-    let key = FrameKey::new(1, &[7; 32]);
+    let key = FrameKey::for_tests(cipher, 1, &[7; 32]);
     let pages = Pages {
         backend: &backend,
         addr: &addr,
@@ -73,16 +79,15 @@ async fn appends_build_a_tree() {
     assert!(last.is_none());
 }
 
-#[test]
-fn an_out_of_order_entry_refuses() {
-    block_on(out_of_order())
+fn an_out_of_order_entry_refuses(cipher: Cipher) {
+    block_on(out_of_order(cipher))
 }
 
-async fn out_of_order() {
+async fn out_of_order(cipher: Cipher) {
     let backend = MemoryBackend::default();
     let addr = SessionAddr("a".into());
     backend.write_head(&addr, b"h", None, 1).await.unwrap();
-    let key = FrameKey::new(1, &[7; 32]);
+    let key = FrameKey::for_tests(cipher, 1, &[7; 32]);
     let pages = Pages {
         backend: &backend,
         addr: &addr,
@@ -100,13 +105,12 @@ async fn out_of_order() {
 /// Lookups by ordinal walk a tree several levels deep too. Each entry places four messages,
 /// every third places none (ordinals absent), and pages carry the ordinal range of what they
 /// hold, so the walk takes the one child that holds the ordinal.
-#[test]
-fn ordinal_lookups_walk_a_deep_tree() {
+fn ordinal_lookups_walk_a_deep_tree(cipher: Cipher) {
     block_on(async {
         let backend = MemoryBackend::default();
         let addr = SessionAddr("a".into());
         backend.write_head(&addr, b"h", None, 1).await.unwrap();
-        let key = FrameKey::new(1, &[7; 32]);
+        let key = FrameKey::for_tests(cipher, 1, &[7; 32]);
         let pages = Pages {
             backend: &backend,
             addr: &addr,
