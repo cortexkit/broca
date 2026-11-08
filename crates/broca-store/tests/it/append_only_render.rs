@@ -86,6 +86,7 @@ fn text_step(id: &str, text: &str) -> Vec<NormalizedEvent> {
 
 fn request(run: &str, dir: &std::path::Path, text: &str) -> RunRequest {
     RunRequest {
+        account_route: None,
         route_decision_id: None,
         input_written_at_ms: None,
         directives: None,

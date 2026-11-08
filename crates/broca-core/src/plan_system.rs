@@ -16,7 +16,10 @@ pub(crate) fn frozen_text(
     }
 }
 
-pub(crate) fn view(opts: &CallOptions, durable: &[Message], text: &str) -> Option<CallOptions> {
+/// The system text a run's provider view carries in place of the session's original system
+/// message, when the run is to show its plan's: a view of the request only, never a rewrite of
+/// the transcript. Both run loops apply it once a refresh applied.
+pub fn view(opts: &CallOptions, durable: &[Message], text: &str) -> Option<CallOptions> {
     let original = durable
         .first()
         .filter(|message| message.role == Role::System);

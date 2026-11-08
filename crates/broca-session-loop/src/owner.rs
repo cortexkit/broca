@@ -39,9 +39,9 @@ pub fn ownership(owner: &Owner) -> Result<SessionOwnershipV1, String> {
 
 /// [`ownership`] plus the first run's tools and fetch-plan manifest (`first_episode`), read
 /// back from the setup parts the first run's start names, as `SessionOwnershipV1` carries them
-/// for `route.bind` and the plan checks. The store takes no plan refresh yet, so the first
-/// manifest is also the latest and `latest_manifest` stays absent, as today's summary leaves it
-/// for an unrefreshed session.
+/// for `route.bind` and the plan checks. `latest_manifest` stays absent: before a refresh every
+/// run freezes the first run's manifest, and after one [`ownership_with_plan`] carries the
+/// refreshed senders.
 pub fn ownership_with_first_episode(
     owner: &Owner,
     parts: &dyn crate::parts::Parts,
@@ -58,6 +58,24 @@ pub fn ownership_with_first_episode(
                 .map(|tool| tool.name.clone())
                 .collect(),
             manifest: admission.manifest,
+        });
+    }
+    Ok(summary)
+}
+
+/// [`ownership_with_first_episode`] plus the sender policy the session's latest accepted refresh
+/// set (`sender_admission`), as today's summary carries it from the refresh's acceptance: the
+/// senders every sender check reads ([`crate::plan::senders`]).
+pub fn ownership_with_plan(
+    operations: &broca_session_store::fold::operations::Operations,
+    parts: &dyn crate::parts::Parts,
+) -> Result<SessionOwnershipV1, String> {
+    let mut summary = ownership_with_first_episode(&operations.owner, parts)?;
+    if crate::plan::refreshed(operations) {
+        summary.session_change_recorded = true;
+        summary.sender_admission = Some(broca_core::admission::SenderAdmissionV1 {
+            version: 1,
+            accepted_senders: Some(crate::plan::senders(operations, parts)?),
         });
     }
     Ok(summary)

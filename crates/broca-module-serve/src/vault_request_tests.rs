@@ -1660,7 +1660,7 @@ async fn routed_chatgpt_choice() -> AccountChoice {
         credentials: candidates, grants: 1, grant_tuples: Vec::new(), view: "chatgpt-view".into(),
     });
     let credential = broca_module_serve::CredentialId::parse("chatgpt:openai").unwrap();
-    let choice = choose_account(&client, ChoiceInputs { decision_id: None, service_tier: None, pool: None, credential_id: None,
+    let choice = choose_account(&client, ChoiceInputs { decision_id: None, account_route: None, service_tier: None, pool: None, credential_id: None,
     hold_cap: Default::default(),
     conversation_key: None, inherited_conversation_key: None,
     static_credential: &credential, caller_named_account: false,
@@ -1942,7 +1942,7 @@ async fn chatgpt_refresh_run_rejecting(
     // not socket negotiation, while retaining its original send-count assertions.
     broca_core::Provider::set_chatgpt_https_policy(&resolved.provider, Arc::new(|| true));
     let session = BindIdentity::new(&root, "chatgpt-refresh", label);
-    let req = broca_core::RunRequest { route_decision_id: None,
+    let req = broca_core::RunRequest { route_decision_id: None, account_route: None,
     input_written_at_ms: None, directives: None, session_class: None, retention: None,
     title: None,
     on_restart: None,
