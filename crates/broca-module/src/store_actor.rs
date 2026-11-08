@@ -3092,3 +3092,5 @@ mod status_tests;
 mod subscribe_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tool_calls_tests;

@@ -1186,7 +1186,7 @@ pub(crate) fn wake_directives(
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
-struct RunToolCallsAnchor {
+pub(crate) struct RunToolCallsAnchor {
     file_id: u64,
     seq: u64,
     byte_end: u64,
@@ -1213,17 +1213,19 @@ impl From<RunToolCallsAnchor> for broca_wal::WalByteAnchor {
 }
 
 /// A continuation resumes at the next call's assistant record, not at the session's WAL head.
+/// For a session kept in the new storage the seqs are the store's own, `lineage_id` names the
+/// session's log incarnation, and no byte anchors are kept.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct RunToolCallsCursor {
+pub(crate) struct RunToolCallsCursor {
     version: u8,
     run_id: String,
-    lineage_id: Option<String>,
-    run_start_seq: u64,
-    run_end_seq: u64,
-    step_seq: u64,
+    pub(crate) lineage_id: Option<String>,
+    pub(crate) run_start_seq: u64,
+    pub(crate) run_end_seq: u64,
+    pub(crate) step_seq: u64,
     call_index: usize,
-    batch_end_seq: u64,
+    pub(crate) batch_end_seq: u64,
     ordinal: u64,
     anchor_before: Option<RunToolCallsAnchor>,
     after_batch: Vec<RunToolCallsPosition>,
@@ -1232,7 +1234,7 @@ struct RunToolCallsCursor {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-struct RunToolCallsPosition {
+pub(crate) struct RunToolCallsPosition {
     step_seq: u64,
     call_index: usize,
     batch_end_seq: u64,
@@ -1241,25 +1243,31 @@ struct RunToolCallsPosition {
 }
 
 #[derive(Clone, Debug)]
-struct IndexedRunToolCall {
-    call: cortexkit_role_llm_runner::tool_calls::RunToolCall,
-    step_seq: u64,
-    call_index: usize,
-    batch_end_seq: u64,
-    ordinal: u64,
-    after_batch: Vec<RunToolCallsPosition>,
+pub(crate) struct IndexedRunToolCall {
+    pub(crate) call: cortexkit_role_llm_runner::tool_calls::RunToolCall,
+    /// The seq of the record holding the assistant message that made the call.
+    pub(crate) step_seq: u64,
+    /// The call's position among the calls its step's batch lists.
+    pub(crate) call_index: usize,
+    /// The seq of the record that ended the call's batch, or of the run's last record while the
+    /// batch is open.
+    pub(crate) batch_end_seq: u64,
+    pub(crate) ordinal: u64,
+    pub(crate) after_batch: Vec<RunToolCallsPosition>,
 }
 
 #[derive(Clone, Copy)]
-struct RunToolCallsPageContext<'a> {
-    run_id: &'a str,
-    lineage_id: Option<&'a str>,
-    run_start_seq: u64,
-    run_end_seq: u64,
-    range: &'a broca_wal::WalRangeRead,
-    range_start_seq: u64,
-    fallback: Option<RunToolCallsAnchor>,
-    seed: Option<&'a RunToolCallsCursor>,
+pub(crate) struct RunToolCallsPageContext<'a> {
+    pub(crate) run_id: &'a str,
+    pub(crate) lineage_id: Option<&'a str>,
+    pub(crate) run_start_seq: u64,
+    pub(crate) run_end_seq: u64,
+    /// The WAL range the calls were read from, whose byte anchors a cursor keeps; `None` for a
+    /// session kept in the new storage, whose cursors keep none.
+    pub(crate) range: Option<&'a broca_wal::WalRangeRead>,
+    pub(crate) range_start_seq: u64,
+    pub(crate) fallback: Option<RunToolCallsAnchor>,
+    pub(crate) seed: Option<&'a RunToolCallsCursor>,
 }
 
 struct RunToolCallBuilder {
@@ -1323,7 +1331,7 @@ fn run_tool_call_bounds(records: &[broca_wal::FramedRecord], run_id: &str) -> Op
     Some((start_seq, end_seq))
 }
 
-fn run_tool_call_outcome(
+pub(crate) fn run_tool_call_outcome(
     outcome: broca_wal::record::DispatchOutcome,
     has_intent: bool,
     reason: Option<&str>,
@@ -1589,7 +1597,7 @@ fn indexed_run_tool_calls(
     Ok(entries)
 }
 
-fn invalid_tool_call_cursor(message: &str) -> ServeError {
+pub(crate) fn invalid_tool_call_cursor(message: &str) -> ServeError {
     ServeError::InvalidParams {
         field: cortexkit_role_llm_runner::tool_calls::AFTER_FIELD.into(),
         message: message.into(),
@@ -1654,18 +1662,20 @@ fn run_tool_calls_cursor_is_authentic(cursor: &RunToolCallsCursor) -> Result<boo
 
 fn indexed_run_tool_call_position(
     entry: &IndexedRunToolCall,
-    range: &broca_wal::WalRangeRead,
+    range: Option<&broca_wal::WalRangeRead>,
     range_start_seq: u64,
     fallback: Option<RunToolCallsAnchor>,
 ) -> RunToolCallsPosition {
     let anchor_before = if entry.step_seq == range_start_seq {
         fallback
     } else {
-        entry
-            .step_seq
-            .checked_sub(1)
-            .and_then(|seq| range.anchor_at(seq))
-            .map(Into::into)
+        range.and_then(|range| {
+            entry
+                .step_seq
+                .checked_sub(1)
+                .and_then(|seq| range.anchor_at(seq))
+                .map(Into::into)
+        })
     };
     RunToolCallsPosition {
         step_seq: entry.step_seq,
@@ -1740,6 +1750,142 @@ fn next_run_tool_calls_cursor(
         context.run_end_seq,
     )
     .map(Some)
+}
+
+/// The most calls a `run.tool_calls` page of `request` holds.
+pub(crate) fn tool_calls_limit(
+    request: &cortexkit_role_llm_runner::tool_calls::ToolCallsRequest,
+) -> usize {
+    request
+        .limit
+        .unwrap_or(broca_core::SESSION_READ_DEFAULT_LIMIT)
+        .min(broca_core::SESSION_READ_MAX_LIMIT) as usize
+}
+
+/// The cursor `token` names, refused unless it is one this process returned for the run
+/// `run_id`.
+pub(crate) fn checked_tool_calls_cursor(
+    token: &str,
+    run_id: &str,
+) -> Result<RunToolCallsCursor, ServeError> {
+    let cursor: RunToolCallsCursor = serde_json::from_str(token).map_err(|_| {
+        invalid_tool_call_cursor("run.tool_calls.after is not a cursor returned for this run")
+    })?;
+    if cursor.version != 1
+        || cursor.run_id != run_id
+        || cursor.run_start_seq == 0
+        || cursor.run_end_seq < cursor.step_seq
+        || cursor.batch_end_seq < cursor.step_seq
+        || cursor.batch_end_seq > cursor.run_end_seq
+        || cursor.step_seq <= cursor.run_start_seq
+        || cursor
+            .anchor_before
+            .is_some_and(|anchor| anchor.seq != cursor.step_seq - 1)
+    {
+        return Err(invalid_tool_call_cursor(
+            "run.tool_calls.after is not a cursor returned for this run",
+        ));
+    }
+    if !run_tool_calls_cursor_is_authentic(&cursor)? {
+        return Err(invalid_tool_call_cursor(
+            "run.tool_calls.after was not returned for this run",
+        ));
+    }
+    Ok(cursor)
+}
+
+/// The `run.tool_calls` page of the run's calls `entries`: from the call the context's cursor
+/// names when it has one, else from the run's first call, at most `limit` calls and the page
+/// byte target, with the cursor of the next call when more follow.
+pub(crate) fn run_tool_calls_answer(
+    mut entries: Vec<IndexedRunToolCall>,
+    limit: usize,
+    context: &RunToolCallsPageContext<'_>,
+) -> Result<cortexkit_role_llm_runner::tool_calls::ToolCallsPage, ServeError> {
+    use cortexkit_role_llm_runner::tool_calls::ToolCallsPage;
+
+    if let Some(cursor) = context.seed {
+        let Some(index) = entries.iter().position(|entry| {
+            entry.step_seq == cursor.step_seq && entry.call_index == cursor.call_index
+        }) else {
+            return Err(invalid_tool_call_cursor(
+                "run.tool_calls.after does not name a call in this run",
+            ));
+        };
+        entries.drain(..index);
+        for entry in &mut entries {
+            entry.after_batch = cursor.after_batch.clone();
+        }
+    } else {
+        let mut future_batches = Vec::new();
+        for entry in &entries {
+            if future_batches
+                .last()
+                .is_none_or(|position: &RunToolCallsPosition| position.step_seq != entry.step_seq)
+            {
+                future_batches.push(indexed_run_tool_call_position(
+                    entry,
+                    context.range,
+                    context.range_start_seq,
+                    context.fallback,
+                ));
+            }
+        }
+        for entry in &mut entries {
+            entry.after_batch = future_batches
+                .iter()
+                .filter(|position| position.step_seq > entry.step_seq)
+                .cloned()
+                .collect();
+        }
+    }
+
+    let run_id = context.run_id.to_owned();
+    let max_bytes = broca_wire::role::READ_DEFAULT_MAX_BYTES;
+    let mut page_calls = Vec::new();
+    let mut consumed = 0usize;
+    while consumed < entries.len() && page_calls.len() < limit {
+        let entry = &entries[consumed];
+        let mut candidate_calls = page_calls.clone();
+        candidate_calls.push(entry.call.clone());
+        let mut candidate = ToolCallsPage::new(run_id.clone(), candidate_calls);
+        if let Some(next) = next_run_tool_calls_cursor(&entries, consumed + 1, context)? {
+            candidate = candidate.with_next(next);
+        }
+        let encoded_bytes = serde_json::to_vec(&candidate)
+            .map_err(|error| ServeError::Open(error.to_string(), None))?
+            .len() as u64;
+        if !page_calls.is_empty() && encoded_bytes > max_bytes {
+            break;
+        }
+        page_calls.push(entry.call.clone());
+        consumed += 1;
+        if encoded_bytes > max_bytes {
+            break;
+        }
+    }
+    let mut page = ToolCallsPage::new(run_id.clone(), page_calls);
+    if let Some(next) = next_run_tool_calls_cursor(&entries, consumed, context)? {
+        page = page.with_next(next);
+    }
+
+    let frame_bytes = broca_wire::serialized_result_frame_bytes(&page);
+    if frame_bytes > broca_wire::SUBC_MAX_FRAME_BYTES {
+        let call = page
+            .calls
+            .first()
+            .expect("a too-large run.tool_calls page contains a call");
+        return Err(ServeError::ReplyTooLarge(ReplyTooLargeDetail::new(
+            frame_bytes,
+            broca_wire::SUBC_MAX_FRAME_BYTES,
+            ReplyTooLargeSubject::ToolCall {
+                run_id,
+                tool_call_id: call.tool_call_id.clone(),
+                call_key: call.call_key.clone(),
+            },
+        )));
+    }
+    Ok(page)
 }
 
 pub(crate) fn frozen_auth_selection(state: &broca_core::ReconciledRunState) -> Option<String> {
@@ -4473,252 +4619,174 @@ impl ServeHandler for crate::LineageRegistry {
         session: &LineageKey,
         request: cortexkit_role_llm_runner::tool_calls::ToolCallsRequest,
     ) -> Result<cortexkit_role_llm_runner::tool_calls::ToolCallsPage, ServeError> {
-        use cortexkit_role_llm_runner::tool_calls::ToolCallsPage;
-
         if let Err(field) = request.check() {
             return Err(ServeError::InvalidParams {
                 field: field.into(),
                 message: "run.tool_calls.limit must be greater than zero".into(),
             });
         }
-        let run_id = request.run_id.clone();
-        let row_read = self
-            .read_run_row(session, &broca_protocol::RunId(run_id.clone()))
-            .await?;
-        let limit = request
-            .limit
-            .unwrap_or(broca_core::SESSION_READ_DEFAULT_LIMIT)
-            .min(broca_core::SESSION_READ_MAX_LIMIT) as usize;
-        let (range, run_start_seq, run_end_seq, lineage_id, seed, range_start_seq, fallback) =
-            match request.after.as_deref() {
-                None => {
-                    let range = match &row_read {
-                        Some(read) => {
-                            let mut range =
-                                broca_wal::WalRangeRead::without_anchors(read.records.clone());
-                            range.lineage_id = read.lineage_id;
-                            range
-                        }
-                        None => {
-                            self.read_run_tool_calls_range(session, &run_id, 0, None, None)
+        if let Some(store) = self.store_holding(session)? {
+            return crate::store_status::StoreRead::new(&store, session, self)
+                .run_tool_calls(request)
+                .await;
+        }
+        // As `read`: a head published meanwhile serves the answer once more, from there.
+        let again = request.clone();
+        let today: Result<cortexkit_role_llm_runner::tool_calls::ToolCallsPage, ServeError> =
+            async move {
+                let run_id = request.run_id.clone();
+                let row_read = self
+                    .read_run_row(session, &broca_protocol::RunId(run_id.clone()))
+                    .await?;
+                let limit = tool_calls_limit(&request);
+                let (
+                    range,
+                    run_start_seq,
+                    run_end_seq,
+                    lineage_id,
+                    seed,
+                    range_start_seq,
+                    fallback,
+                ) = match request.after.as_deref() {
+                    None => {
+                        let range = match &row_read {
+                            Some(read) => {
+                                let mut range =
+                                    broca_wal::WalRangeRead::without_anchors(read.records.clone());
+                                range.lineage_id = read.lineage_id;
+                                range
+                            }
+                            None => {
+                                self.read_run_tool_calls_range(session, &run_id, 0, None, None)
+                                    .await?
+                            }
+                        };
+                        let records = match &row_read {
+                            Some(read) => read.records.as_slice(),
+                            None => run_tool_call_records(&range)?,
+                        };
+                        let Some((start, end)) = run_tool_call_bounds(records, &run_id) else {
+                            return Err(ServeError::UnknownRun(run_id));
+                        };
+                        let lineage_id =
+                            range.lineage_id.as_ref().map(|lineage| lineage.to_string());
+                        (range, start, end, lineage_id, None, 0, None)
+                    }
+                    Some(token) => {
+                        let cursor = checked_tool_calls_cursor(token, &run_id)?;
+                        let lineage_id = cursor.lineage_id.clone();
+                        let range = match &row_read {
+                            Some(read) => {
+                                let records = read
+                                    .records
+                                    .iter()
+                                    .filter(|f| {
+                                        f.seq >= cursor.step_seq && f.seq <= cursor.batch_end_seq
+                                    })
+                                    .cloned()
+                                    .collect();
+                                let mut range = broca_wal::WalRangeRead::without_anchors(records);
+                                range.lineage_id = read.lineage_id;
+                                range
+                            }
+                            None => {
+                                self.read_run_tool_calls_range(
+                                    session,
+                                    &run_id,
+                                    cursor.step_seq - 1,
+                                    cursor.anchor_before.map(Into::into),
+                                    Some(cursor.batch_end_seq),
+                                )
                                 .await?
+                            }
+                        };
+                        let observed_lineage =
+                            range.lineage_id.as_ref().map(|lineage| lineage.to_string());
+                        if observed_lineage
+                            .as_ref()
+                            .is_some_and(|observed| lineage_id.as_ref() != Some(observed))
+                        {
+                            return Err(invalid_tool_call_cursor(
+                                "run.tool_calls.after belongs to a different WAL lineage",
+                            ));
                         }
-                    };
-                    let records = match &row_read {
-                        Some(read) => read.records.as_slice(),
-                        None => run_tool_call_records(&range)?,
-                    };
-                    let Some((start, end)) = run_tool_call_bounds(records, &run_id) else {
-                        return Err(ServeError::UnknownRun(run_id));
-                    };
-                    let lineage_id = range.lineage_id.as_ref().map(|lineage| lineage.to_string());
-                    (range, start, end, lineage_id, None, 0, None)
-                }
-                Some(token) => {
-                    let cursor: RunToolCallsCursor = serde_json::from_str(token).map_err(|_| {
-                        invalid_tool_call_cursor(
-                            "run.tool_calls.after is not a cursor returned for this run",
+                        (
+                            range,
+                            cursor.run_start_seq,
+                            cursor.run_end_seq,
+                            lineage_id,
+                            Some(cursor.clone()),
+                            cursor.step_seq,
+                            cursor.anchor_before,
                         )
-                    })?;
-                    if cursor.version != 1
-                        || cursor.run_id != run_id
-                        || cursor.run_start_seq == 0
-                        || cursor.run_end_seq < cursor.step_seq
-                        || cursor.batch_end_seq < cursor.step_seq
-                        || cursor.batch_end_seq > cursor.run_end_seq
-                        || cursor.step_seq <= cursor.run_start_seq
-                        || cursor
-                            .anchor_before
-                            .is_some_and(|anchor| anchor.seq != cursor.step_seq - 1)
-                    {
-                        return Err(invalid_tool_call_cursor(
-                            "run.tool_calls.after is not a cursor returned for this run",
-                        ));
                     }
-                    if !run_tool_calls_cursor_is_authentic(&cursor)? {
-                        return Err(invalid_tool_call_cursor(
-                            "run.tool_calls.after was not returned for this run",
-                        ));
+                };
+                let row_records = row_read.as_ref().map(|read| {
+                    read.records
+                        .iter()
+                        .filter(|f| {
+                            seed.as_ref().is_none_or(|cursor| {
+                                f.seq >= cursor.step_seq && f.seq <= cursor.batch_end_seq
+                            })
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>()
+                });
+                let records = match &row_records {
+                    Some(records) => records.as_slice(),
+                    None => run_tool_call_records(&range)?,
+                };
+                let step_ordinals = if seed.is_none() {
+                    match &row_read {
+                        Some(read) => read
+                            .replayed
+                            .committed_tool_turns
+                            .iter()
+                            .filter_map(|(index, record_index)| {
+                                let message = read.replayed.prompt.get(*index)?;
+                                let seq = read.records.get(*record_index)?.seq;
+                                Some((seq, message.ordinal.unwrap_or(*index as u64)))
+                            })
+                            .collect(),
+                        None => committed_tool_step_ordinals(records),
                     }
-                    let lineage_id = cursor.lineage_id.clone();
-                    let range = match &row_read {
-                        Some(read) => {
-                            let records = read
-                                .records
-                                .iter()
-                                .filter(|f| {
-                                    f.seq >= cursor.step_seq && f.seq <= cursor.batch_end_seq
-                                })
-                                .cloned()
-                                .collect();
-                            let mut range = broca_wal::WalRangeRead::without_anchors(records);
-                            range.lineage_id = read.lineage_id;
-                            range
-                        }
-                        None => {
-                            self.read_run_tool_calls_range(
-                                session,
-                                &run_id,
-                                cursor.step_seq - 1,
-                                cursor.anchor_before.map(Into::into),
-                                Some(cursor.batch_end_seq),
-                            )
-                            .await?
-                        }
-                    };
-                    let observed_lineage =
-                        range.lineage_id.as_ref().map(|lineage| lineage.to_string());
-                    if observed_lineage
-                        .as_ref()
-                        .is_some_and(|observed| lineage_id.as_ref() != Some(observed))
-                    {
-                        return Err(invalid_tool_call_cursor(
-                            "run.tool_calls.after belongs to a different WAL lineage",
-                        ));
-                    }
-                    (
-                        range,
-                        cursor.run_start_seq,
-                        cursor.run_end_seq,
-                        lineage_id,
-                        Some(cursor.clone()),
-                        cursor.step_seq,
-                        cursor.anchor_before,
-                    )
-                }
-            };
-        let row_records = row_read.as_ref().map(|read| {
-            read.records
-                .iter()
-                .filter(|f| {
-                    seed.as_ref().is_none_or(|cursor| {
-                        f.seq >= cursor.step_seq && f.seq <= cursor.batch_end_seq
-                    })
-                })
-                .cloned()
-                .collect::<Vec<_>>()
-        });
-        let records = match &row_records {
-            Some(records) => records.as_slice(),
-            None => run_tool_call_records(&range)?,
-        };
-        let step_ordinals = if seed.is_none() {
-            match &row_read {
-                Some(read) => read
-                    .replayed
-                    .committed_tool_turns
-                    .iter()
-                    .filter_map(|(index, record_index)| {
-                        let message = read.replayed.prompt.get(*index)?;
-                        let seq = read.records.get(*record_index)?.seq;
-                        Some((seq, message.ordinal.unwrap_or(*index as u64)))
-                    })
-                    .collect(),
-                None => committed_tool_step_ordinals(records),
-            }
-        } else {
-            std::collections::HashMap::new()
-        };
-        let mut entries = indexed_run_tool_calls(
-            records,
-            &run_id,
-            lineage_id.as_deref(),
-            seed.as_ref(),
-            &step_ordinals,
-        )?;
-        if let Some(cursor) = &seed {
-            let Some(index) = entries.iter().position(|entry| {
-                entry.step_seq == cursor.step_seq && entry.call_index == cursor.call_index
-            }) else {
-                return Err(invalid_tool_call_cursor(
-                    "run.tool_calls.after does not name a call in this run",
-                ));
-            };
-            entries.drain(..index);
-            for entry in &mut entries {
-                entry.after_batch = cursor.after_batch.clone();
-            }
-        } else {
-            let mut future_batches = Vec::new();
-            for entry in &entries {
-                if future_batches
-                    .last()
-                    .is_none_or(|position: &RunToolCallsPosition| {
-                        position.step_seq != entry.step_seq
-                    })
-                {
-                    future_batches.push(indexed_run_tool_call_position(
-                        entry,
-                        &range,
+                } else {
+                    std::collections::HashMap::new()
+                };
+                let entries = indexed_run_tool_calls(
+                    records,
+                    &run_id,
+                    lineage_id.as_deref(),
+                    seed.as_ref(),
+                    &step_ordinals,
+                )?;
+                run_tool_calls_answer(
+                    entries,
+                    limit,
+                    &RunToolCallsPageContext {
+                        run_id: &run_id,
+                        lineage_id: lineage_id.as_deref(),
+                        run_start_seq,
+                        run_end_seq,
+                        range: Some(&range),
                         range_start_seq,
                         fallback,
-                    ));
+                        seed: seed.as_ref(),
+                    },
+                )
+            }
+            .await;
+        match today {
+            Err(error) => match self.store_after_refusal(session, &error)? {
+                Some(store) => {
+                    crate::store_status::StoreRead::new(&store, session, self)
+                        .run_tool_calls(again)
+                        .await
                 }
-            }
-            for entry in &mut entries {
-                entry.after_batch = future_batches
-                    .iter()
-                    .filter(|position| position.step_seq > entry.step_seq)
-                    .cloned()
-                    .collect();
-            }
+                None => Err(error),
+            },
+            served => served,
         }
-
-        let page_context = RunToolCallsPageContext {
-            run_id: &run_id,
-            lineage_id: lineage_id.as_deref(),
-            run_start_seq,
-            run_end_seq,
-            range: &range,
-            range_start_seq,
-            fallback,
-            seed: seed.as_ref(),
-        };
-        let max_bytes = broca_wire::role::READ_DEFAULT_MAX_BYTES;
-        let mut page_calls = Vec::new();
-        let mut consumed = 0usize;
-        while consumed < entries.len() && page_calls.len() < limit {
-            let entry = &entries[consumed];
-            let mut candidate_calls = page_calls.clone();
-            candidate_calls.push(entry.call.clone());
-            let mut candidate = ToolCallsPage::new(run_id.clone(), candidate_calls);
-            if let Some(next) = next_run_tool_calls_cursor(&entries, consumed + 1, &page_context)? {
-                candidate = candidate.with_next(next);
-            }
-            let encoded_bytes = serde_json::to_vec(&candidate)
-                .map_err(|error| ServeError::Open(error.to_string(), None))?
-                .len() as u64;
-            if !page_calls.is_empty() && encoded_bytes > max_bytes {
-                break;
-            }
-            page_calls.push(entry.call.clone());
-            consumed += 1;
-            if encoded_bytes > max_bytes {
-                break;
-            }
-        }
-        let mut page = ToolCallsPage::new(run_id.clone(), page_calls);
-        if let Some(next) = next_run_tool_calls_cursor(&entries, consumed, &page_context)? {
-            page = page.with_next(next);
-        }
-
-        let frame_bytes = broca_wire::serialized_result_frame_bytes(&page);
-        if frame_bytes > broca_wire::SUBC_MAX_FRAME_BYTES {
-            let call = page
-                .calls
-                .first()
-                .expect("a too-large run.tool_calls page contains a call");
-            return Err(ServeError::ReplyTooLarge(ReplyTooLargeDetail::new(
-                frame_bytes,
-                broca_wire::SUBC_MAX_FRAME_BYTES,
-                ReplyTooLargeSubject::ToolCall {
-                    run_id,
-                    tool_call_id: call.tool_call_id.clone(),
-                    call_key: call.call_key.clone(),
-                },
-            )));
-        }
-        Ok(page)
     }
 
     async fn baseline(

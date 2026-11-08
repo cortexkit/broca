@@ -165,11 +165,67 @@ impl broca_core::capability::ApprovalPolicy for GatedApproval {
 }
 
 /// The hook and compaction planes a test executor offers, standing in for the ones the module's
-/// executor reaches over the daemon; none by default.
+/// executor reaches over the daemon; none by default. With `tool_gate`, each tool dispatch waits
+/// for one release of the gate after its intent is durable, so a test can read a batch in flight.
 #[derive(Clone, Default)]
 pub(super) struct Planes {
     pub(super) hooks: Option<Arc<dyn broca_core::HookPlane>>,
     pub(super) compaction: Option<Arc<dyn broca_core::CompactionPlane>>,
+    pub(super) tool_gate: Option<Arc<Notify>>,
+}
+
+/// The test tool plane both sides' executors dispatch through: `read` answers `text`, after
+/// `gate` lets the dispatch through when one is given.
+pub(super) struct GatedTools {
+    inner: StubToolPlane,
+    gate: Option<Arc<Notify>>,
+}
+
+impl GatedTools {
+    pub(super) fn new(text: &str, gate: Option<Arc<Notify>>) -> Self {
+        Self {
+            inner: StubToolPlane::new().with_canned_text("read", text),
+            gate,
+        }
+    }
+}
+
+#[async_trait]
+impl broca_core::tool_plane::ToolPlane for GatedTools {
+    async fn batch_started(
+        &self,
+        ctx: &broca_core::tool_plane::BatchCtx,
+        calls: &[broca_protocol::ToolCall],
+        manifest: &broca_core::capability::ToolManifest,
+    ) -> Result<(), broca_core::tool_plane::ToolPlaneError> {
+        self.inner.batch_started(ctx, calls, manifest).await
+    }
+
+    fn dispatch_target(
+        &self,
+        ctx: &broca_core::tool_plane::BatchCtx,
+        tool_call_id: &broca_protocol::ToolCallId,
+    ) -> Option<String> {
+        self.inner.dispatch_target(ctx, tool_call_id)
+    }
+
+    async fn dispatch(
+        &self,
+        ctx: &broca_core::tool_plane::BatchCtx,
+        call: &broca_protocol::ToolCall,
+    ) -> broca_core::tool_plane::DispatchResult {
+        if let Some(gate) = &self.gate {
+            gate.notified().await;
+        }
+        self.inner.dispatch(ctx, call).await
+    }
+
+    async fn batch_finished(
+        &self,
+        ctx: &broca_core::tool_plane::BatchCtx,
+    ) -> Result<(), broca_core::tool_plane::ToolPlaneError> {
+        self.inner.batch_finished(ctx).await
+    }
 }
 
 pub(super) fn executor(
@@ -248,7 +304,7 @@ impl RunExecutor for LoopExecutor {
                     .map_err(StoreRunError::Admission)?,
                 )
             };
-            let tools = StubToolPlane::new().with_canned_text("read", &self.tool_text);
+            let tools = GatedTools::new(&self.tool_text, self.planes.tool_gate.clone());
             let now = || 1;
             let approval = GatedApproval(self.approval_gate.clone());
             let seams = Seams {

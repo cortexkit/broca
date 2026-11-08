@@ -5173,8 +5173,10 @@ pub(crate) fn served_on_new_storage(method: &str, params: &serde_json::Value) ->
         OP_READ | OP_HEAD => true,
         // The store actor's subscriptions (`store_fanout`).
         OP_SUBSCRIBE => true,
-        // Run and send facts built from the store's own records (`store_status`).
+        // Run and send facts built from the store's own records (`store_status`), and a run's
+        // calls (`store_tool_calls`).
         OP_STATUS | OP_RUN_RESULT | OP_SEND_STATUS | OP_SESSION_SEND_STATUS => true,
+        OP_RUN_TOOL_CALLS => true,
         // The store actor serves sends, cancels and retractions.
         OP_SEND | OP_CANCEL | OP_RETRACT => true,
         // Plan refreshes, through today's preflight, decided and written by the store actor.

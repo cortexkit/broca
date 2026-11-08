@@ -47,6 +47,7 @@ mod store_plan_change;
 pub mod store_read;
 pub mod store_reads;
 pub mod store_status;
+pub mod store_tool_calls;
 mod uploads;
 pub mod wal_render;
 

@@ -790,8 +790,9 @@ async fn a_fenced_session_takes_no_delivery_and_no_second_move() {
 }
 
 /// What precondition 1 still refuses: every required operation the new storage doesn't serve
-/// yet, read from the serve layer's allowlist and the compaction-runner route. When one of these
-/// is served, it leaves this list.
+/// yet, read from the serve layer's allowlist and the compaction-runner route. The new storage
+/// serves every one of them now, so a real move passes it; an operation added to the required
+/// list before it is served there shows up here.
 #[test]
 fn precondition_one_names_what_the_new_storage_still_does_not_serve() {
     let served = served_by_serve_layer();
@@ -800,5 +801,5 @@ fn precondition_one_names_what_the_new_storage_still_does_not_serve() {
         .copied()
         .filter(|op| !served(op))
         .collect();
-    assert_eq!(unserved, ["run.tool_calls"]);
+    assert_eq!(unserved, Vec::<&str>::new());
 }

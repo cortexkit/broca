@@ -620,6 +620,10 @@ fn shape(reply: StoreReadReply) -> String {
             Ok(reply) => serde_json::to_value(reply).unwrap().to_string(),
             Err(error) => format!("{error:?}"),
         },
+        StoreReadReply::RunToolCalls(reply) => match reply {
+            Ok(reply) => serde_json::to_value(reply).unwrap().to_string(),
+            Err(error) => format!("{error:?}"),
+        },
         StoreReadReply::SendStatus(reply) => match reply {
             Ok(reply) => serde_json::to_value(reply).unwrap().to_string(),
             Err(error) => format!("{error:?}"),

@@ -431,7 +431,8 @@ async fn a_module_without_the_new_storage_refuses_file_imports_by_name() {
 
 /// On a session kept in the new storage, an op with no store implementation yet is refused by
 /// name before authorization reads anything, never with today's storage's advice to run a newer
-/// build. `role.describe` still answers on the session's route. Cancels are authorized from the
+/// build. `run.tool_calls` is served from the store: a run the session never started is unknown.
+/// `role.describe` still answers on the session's route. Cancels are authorized from the
 /// stored owner: a stranger is refused as not the owner, and the owner's cancel is answered.
 #[tokio::test]
 async fn a_store_session_refuses_unbuilt_ops_by_name_and_checks_owners_from_the_store() {
@@ -440,14 +441,16 @@ async fn a_store_session_refuses_unbuilt_ops_by_name_and_checks_owners_from_the_
     let params = rig.import_params("imp-1");
     rig.result(1, "session.import", params).await;
 
-    for method in ["run.tool_calls", "session.baseline"] {
-        assert_eq!(
-            rig.refused(1, method, serde_json::json!({"run_id": "r1"}))
-                .await,
-            "not_served_on_new_storage",
-            "{method}"
-        );
-    }
+    assert_eq!(
+        rig.refused(1, "session.baseline", serde_json::json!({"run_id": "r1"}))
+            .await,
+        "not_served_on_new_storage"
+    );
+    assert_eq!(
+        rig.refused(1, "run.tool_calls", serde_json::json!({"run_id": "r1"}))
+            .await,
+        broca_wire::UNKNOWN_RUN
+    );
     // Run status is served from the store. With no run named it is the session's status, idle
     // once the import's own run has ended.
     let idle = rig.result(1, "run.status", serde_json::json!({})).await;

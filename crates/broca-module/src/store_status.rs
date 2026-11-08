@@ -1135,6 +1135,21 @@ impl StoreRead<'_> {
         }
     }
 
+    /// `run.tool_calls` (see `store_tool_calls::run_tool_calls`).
+    pub async fn run_tool_calls(
+        &self,
+        request: cortexkit_role_llm_runner::tool_calls::ToolCallsRequest,
+    ) -> Result<cortexkit_role_llm_runner::tool_calls::ToolCallsPage, crate::serve::ServeError>
+    {
+        use crate::store_reads::{StoreReadReply, StoreReadRequest};
+        let run_id = request.run_id.clone();
+        match self.read(StoreReadRequest::RunToolCalls(request)).await? {
+            None => Err(crate::serve::ServeError::UnknownRun(run_id)),
+            Some(StoreReadReply::RunToolCalls(reply)) => reply,
+            Some(_) => Err(crate::store_reads::mismatched()),
+        }
+    }
+
     /// `send.status` and `session.send_status` (see [`Reader::send_status`]).
     pub async fn send_status(
         &self,

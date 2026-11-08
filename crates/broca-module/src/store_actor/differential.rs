@@ -13,7 +13,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use broca_core::{
     run_loop_on_writer_admitted_with_prior_snapshot, AllowAll, FileLeaseStore, FileWalStore,
-    OutputEvent, RunError, RunSummary, StartMode, StubToolPlane, WalStore,
+    OutputEvent, RunError, RunSummary, StartMode, WalStore,
 };
 use broca_protocol::content::ContentBlock;
 use broca_protocol::{BindIdentity, NormalizedEvent, RunId, SubmissionRequest};
@@ -83,7 +83,7 @@ impl RunExecutor for TodayLoop {
             RunKind::FreshOrResume | RunKind::ResumeAfterAuth => StartMode::ResumeAfterAuth,
             RunKind::AppendEpisode => StartMode::AppendEpisode,
         };
-        let tools = StubToolPlane::new().with_canned_text("read", "file contents");
+        let tools = super::tests::GatedTools::new("file contents", self.planes.tool_gate.clone());
         Box::pin(run_loop_on_writer_admitted_with_prior_snapshot(
             job.req,
             &job.writer,
