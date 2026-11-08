@@ -291,10 +291,23 @@ pub struct SendParams {
 /// Check the shared run parameters before broca's legacy parameter decoder can lose a
 /// nested field name. Legacy stop-condition lists remain accepted beside the role object.
 pub fn check_run_parameters(params: &serde_json::Value) -> Result<(), String> {
-    for field in ["speaks_for", "notice"] {
+    // Undeclared notice permissions must not fall through the permissive send decoder:
+    // silently dropping even a false member would accept a request broca cannot honour.
+    for field in ["keep", "yield"] {
         if params.get(field).is_some() {
             return Err(field.into());
         }
+    }
+    if let Some(index) = params
+        .pointer("/plan/senders")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|senders| {
+            senders
+                .iter()
+                .position(|sender| sender.get("yields").is_some())
+        })
+    {
+        return Err(format!("plan.senders[{index}].yields"));
     }
     if let Some(route) = params.get("account_route") {
         serde_json::from_value::<cortexkit_role_llm_runner::send::AccountRoute>(route.clone())
@@ -1087,8 +1100,8 @@ pub struct ReadParams {
     /// so no message carries any.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub include_originals: bool,
-    /// `inline` (the default), `blocks` (stored media references), or `descriptors`, which
-    /// serves large payloads as refs in place and every entry's content identities. Any other
+    /// `inline` (the default), `blocks` (stored media), `media_refs` (only media replaced by
+    /// references), or `descriptors` (large payload references and content identities). Any other
     /// value is refused naming `media`; a model-view read refuses `descriptors`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media: Option<cortexkit_role_llm_runner::read::MediaMode>,
@@ -1385,6 +1398,44 @@ impl SessionReadMessage {
             self.identify_content(&inline);
             self.described = Some(inline);
         }
+    }
+
+    /// Replace top-level media only. Tool-result text keeps its inline bytes and markers:
+    /// the tool-output contract has no parts form for serving structured media references.
+    pub fn show_media_refs(&mut self) {
+        if !self
+            .message
+            .content
+            .iter()
+            .any(|part| matches!(part, broca_protocol::ContentBlock::Media(_)))
+        {
+            return;
+        }
+        let stored = broca_protocol::caller_message::message_content_identity(&self.message).inline;
+        let mut served = serde_json::to_value(CallerMessage(&self.message, false))
+            .expect("a stored message serializes");
+        let stored_parts = stored["content"]
+            .as_array()
+            .expect("message content is an array");
+        let served_parts = served["content"]
+            .as_array_mut()
+            .expect("message content is an array");
+        // Tool-result media refs have no defined wire position. Keep their inline text
+        // and markers instead of introducing a multi-part tool-output shape.
+        for (index, part) in stored_parts.iter().enumerate() {
+            if part.get("type").and_then(serde_json::Value::as_str) == Some("media") {
+                served_parts[index] = serde_json::to_value(media_reference(
+                    part,
+                    Some(broca_protocol::tags::part_key(
+                        self.ordinal.saturating_sub(1),
+                        index,
+                    )),
+                ))
+                .expect("a stored media reference serializes");
+            }
+        }
+        self.identify_content(&stored);
+        self.described = Some(served);
     }
 
     fn identify_content(&mut self, inline: &serde_json::Value) {
@@ -6248,6 +6299,102 @@ mod caller_message_tests {
             digest: None,
             part_digests: None,
         }
+    }
+
+    #[test]
+    fn media_refs_keep_large_payloads_and_flattened_tool_results() {
+        use broca_protocol::{
+            MediaKind, MediaRef, ToolCall, ToolCallId, ToolOutput, ToolOutputPart, ToolResult,
+        };
+        let media = MediaRef {
+            kind: MediaKind::Image,
+            mime: "image/png".into(),
+            byte_size: 69,
+            sha256: "b1ff9c8ea3a780bad09b346c423d2d0e46815926879b18e841d928376a946640".into(),
+            width: Some(1),
+            height: Some(1),
+        };
+        let payload = "x".repeat(300_000);
+        let original = read_message(vec![
+            ContentBlock::Text {
+                text: payload.clone(),
+            },
+            ContentBlock::Media(media.clone()),
+            ContentBlock::ToolCall(ToolCall {
+                tool_call_id: ToolCallId("call".into()),
+                tool_name: "work".into(),
+                input: json!({"large":payload}),
+                thought_signature: None,
+            }),
+            ContentBlock::ToolResult(ToolResult {
+                tool_call_id: ToolCallId("call".into()),
+                is_error: false,
+                output: ToolOutput::Parts {
+                    parts: vec![
+                        ToolOutputPart::Text {
+                            text: payload.clone(),
+                        },
+                        ToolOutputPart::Media { media },
+                    ],
+                },
+            }),
+            ContentBlock::ToolResult(ToolResult {
+                tool_call_id: ToolCallId("text-only".into()),
+                is_error: false,
+                output: ToolOutput::Parts {
+                    parts: vec![
+                        ToolOutputPart::Text {
+                            text: payload.clone(),
+                        },
+                        ToolOutputPart::Text {
+                            text: "tail".into(),
+                        },
+                    ],
+                },
+            }),
+            ContentBlock::Reasoning {
+                text: payload.clone(),
+                signature: Some("signature".into()),
+            },
+        ]);
+        let inline = serde_json::to_value(&original).unwrap();
+        let mut blocks = original.clone();
+        blocks.show_media_blocks_with_identity();
+        let blocks = serde_json::to_value(blocks).unwrap();
+        let mut refs = original.clone();
+        refs.show_media_refs();
+        assert_eq!(refs.message, original.message);
+        let refs = serde_json::to_value(refs).unwrap();
+        let mut expected = inline["message"].clone();
+        expected["content"][1] = json!({"type":"media_ref","part":"m3#1","kind":"image","mime":"image/png","byte_size":69,"sha256":"b1ff9c8ea3a780bad09b346c423d2d0e46815926879b18e841d928376a946640","width":1,"height":1});
+        assert_eq!(refs["message"], expected);
+        assert_eq!(refs["message"]["content"][0]["text"], payload);
+        assert_eq!(refs["digest"], blocks["digest"]);
+        assert_eq!(refs["part_digests"], blocks["part_digests"]);
+        for index in [0, 2, 3, 4, 5] {
+            assert_eq!(
+                refs["message"]["content"][index],
+                inline["message"]["content"][index]
+            );
+        }
+        let mut text_only = read_message(vec![original.message.content[4].clone()]);
+        let default_bytes = serde_json::to_vec(&text_only).unwrap();
+        text_only.show_media_refs();
+        assert_eq!(serde_json::to_vec(&text_only).unwrap(), default_bytes);
+        let mut media_tool_result = read_message(vec![original.message.content[3].clone()]);
+        let inline_bytes = serde_json::to_vec(&media_tool_result).unwrap();
+        media_tool_result.show_media_refs();
+        assert_eq!(
+            serde_json::to_vec(&media_tool_result).unwrap(),
+            inline_bytes
+        );
+        let mut descriptors = original;
+        descriptors.describe().unwrap();
+        let descriptors = serde_json::to_value(descriptors).unwrap();
+        assert_eq!(
+            refs["message"]["content"][1],
+            descriptors["message"]["content"][1]
+        );
     }
 
     #[test]

@@ -83,13 +83,13 @@ cortexkit-role-harness = "=0.1.0"
 cortexkit-role-tool-provider = "=0.15.1"
 cortexkit-llm-tools = "=0.3.0"
 cortexkit-role-tool-provider-conformance = "=0.15.1"
-cortexkit-role-llm-runner = "=0.8.21"
+cortexkit-role-llm-runner = "=0.8.28"
 # Recorded v1 requests must keep the exact tag-rendering bytes of their original contract.
 cortexkit-role-llm-runner-v1 = { package = "cortexkit-role-llm-runner", version = "=0.7.48" }
 cortexkit-bus-naming = "=0.2.7"
 cortexkit-bus-trait = "=0.3.0"
 cortexkit-bus-nats = "=0.3.1"
-cortexkit-role-llm-runner-conformance = "=0.17.25"
+cortexkit-role-llm-runner-conformance = "=0.17.33"
 # Draft 2020-12 validation of structured-output values. Default features are off so the
 # validator has no HTTP or file retriever: a schema can never make broca fetch anything.
 jsonschema = { version = "=0.58.6", default-features = false }
@@ -117,7 +117,7 @@ tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev 
 
 [patch.crates-io]
 # Fix the kit's media-only first-send bookkeeping; drop with conformance kit 0.17.34.
-cortexkit-role-llm-runner-conformance = { git = "https://github.com/cortexkit/commons", rev = "20d2091fe69d1928ac9de29db8e09c3891a68e80" }
+cortexkit-role-llm-runner-conformance = { git = "https://github.com/cortexkit/commons", rev = "f01b58afab9311f2254ea912c0bd31a9c096bbd8" }
 # JetStream's retry dependency must not enable Tokio's production test clock.
 # See commons third_party/tryhard/CORTEXKIT.md; remove once upstream drops test-util.
 tryhard = { git = "https://github.com/cortexkit/commons", rev = "fe59258998db48975f43cb892b71a9952db4eb86" }

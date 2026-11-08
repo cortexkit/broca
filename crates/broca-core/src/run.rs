@@ -199,6 +199,7 @@ impl RunRequest {
     /// [`from_submission`]: RunRequest::from_submission
     pub fn to_submission(&self) -> SubmissionRequest {
         SubmissionRequest {
+            message_marks: Default::default(),
             route_decision_id: self.route_decision_id.clone(),
             account_route: self.account_route.clone(),
             service_tier_level: None,

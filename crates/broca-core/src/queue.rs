@@ -382,6 +382,7 @@ mod tests {
             send_id: None,
             submission_id: SubmissionId(id.into()),
             request: Box::new(SubmissionRequest {
+                message_marks: Default::default(),
                 account_route: None,
                 route_decision_id: None,
                 service_tier_level: None,

@@ -3501,6 +3501,14 @@ where
                 Err(error) => unreachable!("send parameter validation returned {error}"),
             };
             send_req.request.project_id = bind.project_id.clone();
+            send_req.request.message_marks = ["speaks_for", "notice"]
+                .into_iter()
+                .filter_map(|field| {
+                    req.params
+                        .get(field)
+                        .map(|value| (field.into(), value.clone()))
+                })
+                .collect();
             send_req.request.inherit_frozen = inherit_frozen;
             if broca_protocol::service_tier_enabled() {
                 send_req.request.service_tier_level = service_tier_level;
@@ -3838,6 +3846,18 @@ where
             }
         }
         OP_READ => {
+            if req.params.get("tag").is_some() {
+                return send_invalid_params(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    Some("tag".into()),
+                    "broca does not declare tag_read",
+                )
+                .await;
+            }
             let params: broca_wire::ReadParams = match decode_params(&req.params) {
                 Ok(p) => p,
                 Err((field, message)) => {

@@ -673,6 +673,7 @@ fn chatgpt_send(session: BindIdentity, run_id: &str, prompt: &str) -> SendReques
         run_id: RunId(run_id.into()),
         send_id: Some(format!("send-{run_id}")),
         request: Box::new(SubmissionRequest {
+            message_marks: Default::default(),
             account_route: None,
             route_decision_id: None,
             service_tier_level: None,

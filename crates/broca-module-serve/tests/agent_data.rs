@@ -2162,6 +2162,7 @@ async fn closed_session_with_a_queued_send_is_busy_before_prepare() {
         request_identity_digest: None,
         principal: None,
         request: Box::new(broca_protocol::request::SubmissionRequest {
+            message_marks: Default::default(),
             account_route: None,
             route_decision_id: None,
             service_tier_level: None,

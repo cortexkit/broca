@@ -2405,7 +2405,7 @@ impl WalRecord {
             } => ride.speaks_for.is_some(),
             _ => false,
         };
-        let base = if has_marks {
+        let base = if has_marks || identity_digest.is_some_and(digest_carries_message_marks) {
             with_feature(base, crate::framing::MESSAGE_MARKS_FEATURE)
         } else {
             base
@@ -5614,6 +5614,7 @@ mod schema_tests {
                 delivery: None,
                 submission_id: SubmissionId("sub2".into()),
                 request: Box::new(SubmissionRequest {
+                    message_marks: Default::default(),
                     account_route: None,
                     route_decision_id: None,
                     service_tier_level: None,
@@ -7395,4 +7396,36 @@ pub struct RideMetadata {
 #[serde(rename_all = "snake_case")]
 pub enum RideForm {
     Append,
+}
+
+// Resume records can retain retry metadata without carrying a new marked entry.
+fn digest_carries_message_marks(digest: &str) -> bool {
+    #[derive(serde::Deserialize)]
+    struct Probe {
+        #[serde(default)]
+        message_marks: Option<serde::de::IgnoredAny>,
+    }
+    serde_json::from_str::<Probe>(digest).is_ok_and(|probe| probe.message_marks.is_some())
+}
+
+#[cfg(test)]
+mod message_mark_identity_feature_tests {
+    use super::*;
+
+    #[test]
+    fn identity_marks_require_the_reader_feature_without_a_new_marked_entry() {
+        for bytes in [
+            include_str!("../tests/golden/pre_step_transforms/run_started.json"),
+            include_str!("../tests/golden/pre_step_transforms/queued.json"),
+            include_str!("../tests/golden/pre_step_transforms/steered.json"),
+        ] {
+            let mut value: serde_json::Value = serde_json::from_str(bytes).unwrap();
+            value["request_identity_digest"] =
+                serde_json::json!(r#"{"version":1,"message_marks":{"notice":true}}"#);
+            let record: WalRecord = serde_json::from_value(value).unwrap();
+            assert!(record
+                .required_features()
+                .contains(&crate::framing::MESSAGE_MARKS_FEATURE));
+        }
+    }
 }

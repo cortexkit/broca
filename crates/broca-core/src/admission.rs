@@ -71,6 +71,7 @@ pub fn submission_difference(
     requested: &SubmissionRequest,
 ) -> Option<&'static str> {
     let SubmissionRequest {
+        message_marks: _,
         route_decision_id: existing_route_decision_id,
         account_route: existing_account_route,
         staged_uploads: _,
@@ -104,6 +105,7 @@ pub fn submission_difference(
         client_message_id: _,
     } = existing;
     let SubmissionRequest {
+        message_marks: _,
         route_decision_id: requested_route_decision_id,
         account_route: requested_account_route,
         staged_uploads: _,
@@ -210,6 +212,9 @@ fn inherited_difference(
 
 #[derive(Serialize, Deserialize)]
 struct SubmissionIdentityDigestV1 {
+    /// Normalized display metadata is compared directly, never hashed with message content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    message_marks: Option<broca_protocol::MessageMarks>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     route_decision_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -321,6 +326,7 @@ fn identity_digest_v1(
     conversation_key: Option<&str>,
 ) -> SubmissionIdentityDigestV1 {
     let SubmissionRequest {
+        message_marks: _,
         route_decision_id,
         account_route,
         staged_uploads: _,
@@ -354,6 +360,7 @@ fn identity_digest_v1(
     let mut policy_allowed: Vec<&str> = policy_allowed.iter().map(String::as_str).collect();
     policy_allowed.sort_unstable();
     SubmissionIdentityDigestV1 {
+        message_marks: normalized_message_marks(request),
         route_decision_id: route_decision_id.clone(),
         account_route: account_route
             .as_ref()
@@ -399,6 +406,12 @@ fn identity_digest_v1(
     }
 }
 
+fn normalized_message_marks(request: &SubmissionRequest) -> Option<broca_protocol::MessageMarks> {
+    let marks: broca_protocol::MessageMarks =
+        serde_json::from_value(serde_json::Value::Object(request.message_marks.clone())).ok()?;
+    (marks.speaks_for.is_some() || marks.notice).then_some(marks)
+}
+
 /// Identify the first field whose digest differs from a previously persisted identity. A
 /// malformed/unknown digest returns the generic identity label and therefore fails closed.
 pub fn submission_identity_difference(
@@ -408,8 +421,7 @@ pub fn submission_identity_difference(
     send_identity_difference(stored, requested, broca_protocol::Delivery::Queue)
 }
 
-/// [`submission_identity_difference`] for a send with an explicit delivery mode. A different
-/// mode is named first: it is the difference the caller most needs to see.
+/// [`submission_identity_difference`] for a send with an explicit delivery mode.
 pub fn send_identity_difference(
     stored: &str,
     requested: &SubmissionRequest,
@@ -433,6 +445,28 @@ pub fn send_identity_difference_with_conversation_key(
     }
     let requested = identity_digest_v1(requested, delivery, conversation_key);
     [
+        (
+            stored
+                .message_marks
+                .as_ref()
+                .and_then(|marks| marks.speaks_for.as_ref())
+                != requested
+                    .message_marks
+                    .as_ref()
+                    .and_then(|marks| marks.speaks_for.as_ref()),
+            "speaks_for",
+        ),
+        (
+            stored
+                .message_marks
+                .as_ref()
+                .is_some_and(|marks| marks.notice)
+                != requested
+                    .message_marks
+                    .as_ref()
+                    .is_some_and(|marks| marks.notice),
+            "notice",
+        ),
         (
             stored.route_decision_id != requested.route_decision_id,
             "route_decision_id",
@@ -3413,6 +3447,7 @@ mod tests {
 
     fn request(text: &str) -> SubmissionRequest {
         SubmissionRequest {
+            message_marks: Default::default(),
             account_route: None,
             route_decision_id: None,
             service_tier_level: None,
@@ -6969,5 +7004,40 @@ mod credential_evidence_tests {
                     && sent.plan_tier_source.is_none()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod message_mark_identity_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn marks_are_raw_retry_metadata_and_leave_every_existing_hash_unchanged() {
+        let plain: SubmissionRequest = serde_json::from_value(json!({
+            "model":broca_protocol::ModelHandle::new("fake", "fake"),"input":[]
+        }))
+        .unwrap();
+        let old_bytes = submission_identity_digest(&plain);
+        let mut marked = plain.clone();
+        marked.message_marks = json!({"speaks_for":{"agent_id":"Ada"}})
+            .as_object()
+            .unwrap()
+            .clone();
+        let mut identity: serde_json::Value =
+            serde_json::from_str(&submission_identity_digest(&marked)).unwrap();
+        assert_eq!(
+            identity.as_object_mut().unwrap().remove("message_marks"),
+            Some(json!({"speaks_for":{"agent_id":"Ada"}}))
+        );
+        assert_eq!(
+            identity,
+            serde_json::from_str::<serde_json::Value>(&old_bytes).unwrap()
+        );
+        let mut explicit_false = plain;
+        explicit_false
+            .message_marks
+            .insert("notice".into(), json!(false));
+        assert_eq!(submission_identity_digest(&explicit_false), old_bytes);
     }
 }

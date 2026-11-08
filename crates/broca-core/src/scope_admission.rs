@@ -136,6 +136,30 @@ pub fn decide_owner_access(
     )))
 }
 
+/// Validate display attribution against the frozen owner before any session write.
+pub fn admit_message_marks(
+    params: &serde_json::Map<String, serde_json::Value>,
+    ownership: &SessionOwnershipV1,
+    principal: Option<&BindPrincipal>,
+    send: &SendScope,
+) -> Result<Option<broca_protocol::MessageMarks>, &'static str> {
+    let automated = matches!(send, SendScope::Stamped(bind)
+        if bind.scope.flow_id.is_some() || bind.scope.run_id.is_some());
+    let scope = ownership.scope.as_ref().or(match send {
+        SendScope::Stamped(bind) if ownership.episodes == 0 => Some(&bind.scope),
+        _ => None,
+    });
+    let owner = scope
+        .filter(|_| !automated)
+        .map(|scope| scope.owner.as_owner_string());
+    let sender = principal
+        .map(BindPrincipal::as_owner_string)
+        .unwrap_or_default();
+    let marks =
+        cortexkit_role_llm_runner::message_marks::check(params, true, owner.as_deref(), &sender)?;
+    Ok((marks.speaks_for.is_some() || marks.notice).then_some(marks))
+}
+
 /// The scope a stamped `route.bind` carried when it reserved a new session address: its owner
 /// and `ref`, without its epoch.
 ///

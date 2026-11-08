@@ -506,6 +506,9 @@ pub enum KeepWarm {
 /// as the identical request sent when idle).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SubmissionRequest {
+    /// Untrusted display marks, validated before admission and excluded from request bytes.
+    #[serde(skip)]
+    pub message_marks: serde_json::Map<String, serde_json::Value>,
     /// Caller-owned routing decision, distinct from routing's allocated account decision.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route_decision_id: Option<String>,
@@ -857,6 +860,7 @@ mod tests {
     #[test]
     fn submission_request_tool_module_round_trips_when_present() {
         let request = SubmissionRequest {
+            message_marks: Default::default(),
             account_route: None,
             route_decision_id: None,
             service_tier_level: None,
@@ -952,6 +956,7 @@ mod budget_compat_tests {
     #[test]
     fn absent_submission_budget_is_omitted_and_defaults_to_none() {
         let request = SubmissionRequest {
+            message_marks: Default::default(),
             account_route: None,
             route_decision_id: None,
             service_tier_level: None,

@@ -1834,6 +1834,31 @@ rows and fold the bounded WAL suffix since that continuation. No boot-time sweep
 historical sessions. Retention expiry removes the cache and prevents a racing reader
 from repopulating an expired lineage.
 
+**Message marks.** Broca declares `message_marks`. A scoped session's attested owner can
+send `speaks_for: {agent_id}`; any admitted sender can send `notice: true` for its own
+automatic message. The two marks cannot be combined. Invalid marks refuse before opening
+a writer. Flow- and run-stamped routes are senders, never owners. Marks are durable
+metadata beside the entry: opted-in reads, raw history and display rows expose them;
+default message bodies, content digests and `history_version` do not change. A send delivered
+alongside a tool result is represented by `notices` facts and `notice_delivered` events;
+these carry `speaks_for`, never a redundant `notice` flag.
+An identical `send_id` retry compares normalized marks as well as the request: changed
+marks refuse `send_id_reuse` with `detail.field` naming `speaks_for` or `notice`, while
+absent and `notice: false` compare equal and retain the original answer. The WAL's
+`message-marks/v1` reader shipped before the writer. After marked sends have been written,
+rolling back the daemon requires a build retaining that reader; older builds refuse the
+must-understand WAL feature rather than silently lose the attribution.
+
+**Media-only references.** Broca declares `media_refs`. `media: "media_refs"` on
+`session.read` or raw `session.history` replaces byte-backed media outside tool results with exactly
+the `media_ref` metadata served by descriptors, including decoded-byte SHA-256, MIME and
+byte size. Large text, reasoning and tool arguments remain inline, without the descriptors
+threshold. Existing `blocks`, `descriptors` and default reads keep their previous bytes.
+All tool results, including media-bearing ones, keep inline's flattened text byte-for-byte,
+including media markers and text above the descriptors threshold. Tool output has no
+multi-part read form under the contract; placement of tool-result media references remains
+undefined and is not invented by this renderer.
+
 **Rich UI teaching stamp.** Broca declares `rich_ui_stamp`. A teaching provider's fetched
 `system_text.rich_ui` value (`{dialect, catalog_digest}`) is frozen at admission, never read
 from caller-supplied metadata or fetched again for later runs. Conflicting stamps refuse

@@ -221,6 +221,7 @@ impl SendParamsExt for SendParams {
             })
             .transpose()?;
         let submission = SubmissionRequest {
+            message_marks: Default::default(),
             route_decision_id,
             account_route,
             service_tier_level: None,

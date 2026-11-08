@@ -1,6 +1,3 @@
-N/A message_marks_served: message_marks is not declared
-N/A message_marks_both_refused: message_marks is not declared
-N/A message_marks_speaks_for_owner_only: message_marks is not declared
 N/A adopt_open_opens_unknown_session: missing groups: adopt_open
 N/A adopt_open_repeat_replays: missing groups: adopt_open
 N/A adopt_open_existing_session_unchanged: missing groups: adopt_open

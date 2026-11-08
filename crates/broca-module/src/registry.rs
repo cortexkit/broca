@@ -3929,6 +3929,28 @@ impl LineageRegistry {
         }
         crate::retention::validate_retention(retention, None, false)
             .map_err(OpenError::RetentionInvalid)?;
+        if !request.message_marks.is_empty() {
+            // Refuse invalid marks before opening a writer, including its new-WAL header.
+            let ownership = match self.bind_ownership(key).await {
+                BindOwnership::Known(ownership) => ownership,
+                BindOwnership::NoHistorySource => {
+                    return Ok(SendOutcome::Error(
+                        "message marks require an ownership history reader".into(),
+                    ));
+                }
+                BindOwnership::Unreadable(error) => return Ok(SendOutcome::Error(error)),
+            };
+            if let Err(field) = broca_core::scope_admission::admit_message_marks(
+                &request.message_marks,
+                &ownership,
+                request.principal.as_ref(),
+                &request.scope,
+            ) {
+                return Ok(SendOutcome::StructuredOutputInvalid {
+                    field: field.into(),
+                });
+            }
+        }
         loop {
             let handle = self
                 .actor_for_mode(key, retention, session_class.clone(), false)

@@ -399,6 +399,7 @@ pub fn broca_role_describe_with_writers(
         cortexkit_role_llm_runner::capabilities::HISTORY_DISPLAY,
         cortexkit_role_llm_runner::capabilities::RICH_UI_STAMP,
         cortexkit_role_llm_runner::capabilities::READ_DISPLAY_FACTS,
+        cortexkit_role_llm_runner::capabilities::MESSAGE_MARKS,
         cortexkit_role_llm_runner::capabilities::CALL_IDENTITY,
         cortexkit_role_llm_runner::capabilities::OUTPUT_REFS,
         "run_ops",
@@ -411,6 +412,7 @@ pub fn broca_role_describe_with_writers(
         cortexkit_role_llm_runner::capabilities::HEAD_SELECTION,
         cortexkit_role_llm_runner::capabilities::ROUTED_ACCOUNTS,
         cortexkit_role_llm_runner::capabilities::ACCOUNT_ROUTE,
+        cortexkit_role_llm_runner::capabilities::ADMISSION_REPORTS,
         cortexkit_role_llm_runner::capabilities::RUN_CANCEL,
         cortexkit_role_llm_runner::capabilities::RUN_CANCEL_BY_INTERRUPT,
         cortexkit_role_llm_runner::capabilities::RETRACT,
@@ -525,6 +527,10 @@ pub fn broca_role_describe_with_writers(
         .role
         .capabilities
         .push(cortexkit_role_llm_runner::capabilities::MEDIA_ONLY_SEND.into());
+    response
+        .role
+        .capabilities
+        .push(cortexkit_role_llm_runner::capabilities::MEDIA_REFS.into());
     response.role.majors[0].ops.extend([
         "session.upload_begin".into(),
         "session.upload_append".into(),
@@ -1215,6 +1221,34 @@ mod pinned_reply_bytes {
     }
 
     #[test]
+    fn adopted_runner_groups_leave_other_optional_groups_undeclared() {
+        use cortexkit_role_llm_runner::capabilities::{
+            ADMISSION_REPORTS, MEDIA_REFS, MESSAGE_MARKS,
+        };
+        for writer in [false, true] {
+            let actual = broca_role_describe_with_writers("test", writer, writer, writer);
+            let encoded = serde_json::to_value(&actual).unwrap();
+            let checked = cortexkit_role_llm_runner::describe::check_describe(&encoded).unwrap();
+            for group in [MESSAGE_MARKS, MEDIA_REFS, ADMISSION_REPORTS] {
+                assert!(checked.declares(group), "{group}");
+            }
+            for group in [
+                "adopt_open",
+                "fork_answer",
+                "call_yield",
+                "stop_all",
+                "cache_policy",
+                "send_ids",
+                "history_intake",
+                "plan_notes",
+                "restart_survival",
+            ] {
+                assert!(!checked.declares(group), "{group}");
+            }
+        }
+    }
+
+    #[test]
     fn role_describe_bytes_are_pinned() {
         assert_golden(
             broca_role_describe_with_writers("0.0.0-writer-golden", true, true, true),
@@ -1265,7 +1299,7 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "691b0dd4715193a2d22103784a7e1926ee10e8b288d9f8cf4718ba8d48f396cc",
+            "c68b5381e86ff0fc50f96eb7495bdb4c7c3ff26e0a5ce70b165c1dc20aa71663",
         );
     }
 
@@ -1460,7 +1494,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "13db65e5f96519035ec6ac03a282e1b8d22d694c437d3e5e394df9660c4aacad";
+        "2e93ec6ea38b4b603eafe08add76a383badc90552f84302c4ad2003f6c87773a";
     const RUN_TOOL_CALLS_PAGE_SHA256: &str =
         "6978763bd48c30edffbf61a4b4a0966d7efdfc146b94023f4a36cca4bda0881d";
     const DELIVERED_STEP_SHA256: &str =

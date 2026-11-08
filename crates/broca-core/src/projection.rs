@@ -1256,6 +1256,7 @@ fn project_control_record<S: ControlProjectionSink>(
                             .with_text(text);
                             notice.speaks_for =
                                 ride.as_ref().and_then(|ride| ride.speaks_for.clone());
+                            notice.delivered_as = Some("tool_result".into());
                             LiveEvent::NoticeDelivered(notice)
                         })
                         .unwrap_or(LiveEvent::DisplayReset)
