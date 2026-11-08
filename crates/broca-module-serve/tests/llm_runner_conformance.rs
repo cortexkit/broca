@@ -4356,6 +4356,100 @@ fn check_0814_undeclared_cases(
     Ok(())
 }
 
+fn expected_0821_cases() -> Vec<(&'static str, CaseOutcome)> {
+    include_str!("golden/llm_runner_0821.applicability.txt")
+        .lines()
+        .map(|line| {
+            let (status, row) = line.split_once(' ').unwrap();
+            let (name, reason) = row.split_once(": ").unwrap_or((row, ""));
+            let outcome = match status {
+                "N/A" => CaseOutcome::Inapplicable {
+                    reason: reason.into(),
+                },
+                // cortexkit-role-llm-runner-conformance 0.17.25 skips missing fork_answer
+                // in runner::gate. Preserve that decision; an upstream fix must update the pin.
+                "SKIP" => {
+                    assert_eq!(reason, "fork_answer");
+                    CaseOutcome::Skipped {
+                        missing: vec![Capability::ForkAnswer],
+                    }
+                }
+                "PASS" => {
+                    assert!(reason.is_empty());
+                    CaseOutcome::Passed
+                }
+                _ => panic!("unknown applicability status {status}"),
+            };
+            (name, outcome)
+        })
+        .collect()
+}
+
+fn check_0821_cases(
+    cases: &[cortexkit_role_llm_runner_conformance::CaseReport],
+) -> Result<(), String> {
+    for (name, expected) in expected_0821_cases() {
+        let case = cases
+            .iter()
+            .find(|case| case.case == name)
+            .ok_or_else(|| format!("the suite has no case {name}"))?;
+        if case.outcome != expected {
+            return Err(format!("{name}: {:?}, expected {expected:?}", case.outcome));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn runner_0821_cases_pin_exact_native_outcomes() {
+    use cortexkit_role_llm_runner_conformance::{CaseReport, CASES};
+    let cases: Vec<_> = expected_0821_cases()
+        .into_iter()
+        .map(|(name, outcome)| {
+            let spec = CASES.iter().find(|spec| spec.name == name).unwrap();
+            CaseReport {
+                case: spec.name,
+                requires: spec.requires.to_vec(),
+                outcome,
+            }
+        })
+        .collect();
+    assert_eq!(cases.len(), 59);
+    check_0821_cases(&cases).unwrap();
+    for index in 0..cases.len() {
+        for outcome in [
+            CaseOutcome::Passed,
+            CaseOutcome::Failed {
+                reason: "failed".into(),
+            },
+            CaseOutcome::Skipped { missing: vec![] },
+            CaseOutcome::Skipped {
+                missing: vec![Capability::ForkAnswer],
+            },
+            CaseOutcome::Inapplicable {
+                reason: "fixture unavailable".into(),
+            },
+            CaseOutcome::Inapplicable {
+                reason: "missing groups: fork_answer".into(),
+            },
+        ] {
+            if outcome == cases[index].outcome {
+                continue;
+            }
+            let mut changed = cases.clone();
+            changed[index].outcome = outcome;
+            assert!(
+                check_0821_cases(&changed).is_err(),
+                "{}",
+                changed[index].case
+            );
+        }
+        let mut missing = cases.clone();
+        missing.remove(index);
+        assert!(check_0821_cases(&missing).is_err());
+    }
+}
+
 #[test]
 fn account_route_undeclared_groups_report_exact_reasons_never_skips() {
     use cortexkit_role_llm_runner_conformance::{CaseReport, CASES};
@@ -4855,6 +4949,7 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
     );
     check_0811_cases(&report.cases).unwrap();
     check_0814_undeclared_cases(&report.cases).unwrap();
+    check_0821_cases(&report.cases).unwrap();
     let attachment_gaps = attachment_contract_gaps(&report);
     assert!(
         attachment_gaps.is_empty(),

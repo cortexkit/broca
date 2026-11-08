@@ -724,6 +724,9 @@ pub enum WalRecord {
     /// into the immutable conversation prefix and opens a new one. It is
     /// run_id-authoritative.
     RunStarted {
+        /// Display-only marks, absent on older sends and outside their stored bodies.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_marks: Option<broca_protocol::MessageMarks>,
         /// Attested route sender for display only, independent of the execution principal.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sent_by: Option<BindPrincipal>,
@@ -1450,6 +1453,9 @@ pub enum WalRecord {
     /// dropping path. Consume/retract is unambiguous across a crash: the pending set is
     /// `Queued − Retracted − consumed-by-a-RunStarted`.
     Queued {
+        /// Display-only marks retained while the admitted send waits for delivery.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_marks: Option<broca_protocol::MessageMarks>,
         /// Attested route sender for display only; never grants queue ownership.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sent_by: Option<BindPrincipal>,
@@ -1530,6 +1536,9 @@ pub enum WalRecord {
     /// gated frame requiring [`crate::framing::STEER_QUEUE_FEATURE`] (see
     /// [`WalRecord::required_features`]), which such a build refuses as a newer writer.
     Steered {
+        /// Display-only marks of the send, not part of its rendered input.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_marks: Option<broca_protocol::MessageMarks>,
         /// Attested route sender for display only; never used to authorize a retry.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sent_by: Option<BindPrincipal>,
@@ -2369,6 +2378,20 @@ impl WalRecord {
         };
         let base = if identity_digest.is_some_and(digest_carries_client_message_id) {
             with_feature(base, crate::framing::CLIENT_MESSAGE_ID_FEATURE)
+        } else {
+            base
+        };
+        let has_marks = match self {
+            Self::RunStarted { message_marks, .. }
+            | Self::Queued { message_marks, .. }
+            | Self::Steered { message_marks, .. } => message_marks.is_some(),
+            Self::SendDelivered {
+                ride: Some(ride), ..
+            } => ride.speaks_for.is_some(),
+            _ => false,
+        };
+        let base = if has_marks {
+            with_feature(base, crate::framing::MESSAGE_MARKS_FEATURE)
         } else {
             base
         };
@@ -4723,6 +4746,7 @@ mod schema_tests {
             account_decision: None,
         });
         let record = WalRecord::RunStarted {
+            message_marks: None,
             compaction_plan_version: None,
             sent_by: None,
             written_at_ms: None,
@@ -4782,6 +4806,7 @@ mod schema_tests {
             account_decision: None,
         });
         let record = WalRecord::RunStarted {
+            message_marks: None,
             compaction_plan_version: None,
             sent_by: None,
             written_at_ms: None,
@@ -4962,6 +4987,7 @@ mod schema_tests {
     #[test]
     fn pre_fix_run_started_omits_ts_ms_and_decodes_as_none() {
         let record = WalRecord::RunStarted {
+            message_marks: None,
             compaction_plan_version: None,
             sent_by: None,
             written_at_ms: None,
@@ -5018,6 +5044,7 @@ mod schema_tests {
     #[test]
     fn pre_work_class_run_started_bytes_are_pinned() {
         let record = WalRecord::RunStarted {
+            message_marks: None,
             compaction_plan_version: None,
             sent_by: None,
             written_at_ms: None,
@@ -5058,6 +5085,7 @@ mod schema_tests {
     #[test]
     fn pre_context_management_run_started_bytes_are_pinned() {
         let record = |config: Box<RunConfig>| WalRecord::RunStarted {
+            message_marks: None,
             compaction_plan_version: None,
             sent_by: None,
             written_at_ms: None,
@@ -5115,6 +5143,7 @@ mod schema_tests {
     #[test]
     fn pre_variant_run_started_bytes_are_pinned() {
         let record = |config: Box<RunConfig>| WalRecord::RunStarted {
+            message_marks: None,
             compaction_plan_version: None,
             sent_by: None,
             written_at_ms: None,
@@ -5176,6 +5205,7 @@ mod schema_tests {
     #[test]
     fn pre_service_tier_run_started_bytes_are_pinned() {
         let record = |config: Box<RunConfig>| WalRecord::RunStarted {
+            message_marks: None,
             compaction_plan_version: None,
             sent_by: None,
             written_at_ms: None,
@@ -5291,6 +5321,7 @@ mod schema_tests {
             let mut config = min_config();
             config.frozen_render_config = frozen_render_config;
             WalRecord::RunStarted {
+                message_marks: None,
                 compaction_plan_version: None,
                 sent_by: None,
                 written_at_ms: None,
@@ -5457,6 +5488,7 @@ mod schema_tests {
         };
         let records = vec![
             WalRecord::RunStarted {
+                message_marks: None,
                 compaction_plan_version: None,
                 sent_by: None,
                 written_at_ms: None,
@@ -5554,6 +5586,7 @@ mod schema_tests {
                 caller_text: Some("nudge text".into()),
             },
             WalRecord::Queued {
+                message_marks: None,
                 sent_by: None,
                 written_at_ms: None,
                 retention: None,
@@ -7336,6 +7369,9 @@ pub struct RideMetadata {
     pub call_key: String,
     pub send_id: String,
     pub sender: String,
+    /// Agent attribution travels with the ride so bounded reads need no earlier queue record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speaks_for: Option<broca_protocol::SpeaksFor>,
     pub forms: Vec<String>,
     pub form: RideForm,
 }

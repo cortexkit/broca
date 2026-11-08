@@ -1361,6 +1361,15 @@ impl Rig {
                 "input_schema": {"type": "object"}
             }]
         });
+        // A continuation inherits the creating send's tool declaration. Explicit test overrides
+        // below can still exercise a forbidden later tools declaration.
+        if self
+            .records()
+            .iter()
+            .any(|record| matches!(record, WalRecord::RunStarted { .. }))
+        {
+            params.as_object_mut().unwrap().remove("tools");
+        }
         if let Some(delivery) = delivery {
             params["delivery"] = serde_json::json!(delivery);
         }

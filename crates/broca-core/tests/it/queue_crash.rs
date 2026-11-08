@@ -30,6 +30,7 @@ fn msg(text: &str) -> Message {
 
 fn queued(id: &str) -> WalRecord {
     WalRecord::Queued {
+        message_marks: None,
         sent_by: None,
         written_at_ms: None,
         retention: None,
@@ -86,6 +87,7 @@ fn retracted(id: &str) -> WalRecord {
 
 fn consume(run: &str, sub: &str) -> WalRecord {
     WalRecord::RunStarted {
+        message_marks: None,
         compaction_plan_version: None,
         sent_by: None,
         written_at_ms: None,
