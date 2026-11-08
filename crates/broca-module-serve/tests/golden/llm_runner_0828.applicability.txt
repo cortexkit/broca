@@ -1,3 +1,4 @@
+PASS role_describe_groups_complete
 N/A cache_policy_plan_key_accepted: missing groups: cache_policy
 N/A cache_policy_send_key_accepted: missing groups: cache_policy
 N/A cache_policy_plan_key_empty_refused: missing groups: cache_policy

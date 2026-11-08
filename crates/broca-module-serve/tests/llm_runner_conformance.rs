@@ -2832,6 +2832,7 @@ impl LlmRunnerSubject for BrocaSubject {
             Capability::HeadSelection,
             Capability::RoutedAccounts,
             Capability::AccountRoute,
+            Capability::AdmissionReports,
             Capability::RunCancel,
             Capability::Retract,
             Capability::DispatchAttribution,
@@ -4578,7 +4579,7 @@ fn runner_0821_cases_pin_exact_native_outcomes() {
             }
         })
         .collect();
-    assert_eq!(cases.len(), 94);
+    assert_eq!(cases.len(), 95);
     check_0821_cases(&cases).unwrap();
     for index in 0..cases.len() {
         for outcome in [
@@ -7537,6 +7538,22 @@ async fn assertion_wal_reader_uses_the_inventory_address_for_a_folderless_sessio
         }
     ));
     assert!(!store.wal_path(&claim).exists());
+}
+
+#[tokio::test]
+async fn conformance_subject_declares_the_served_admission_reports_group() {
+    let scratch = broca_test_support::scratch_root().join("admission-reports-declaration");
+    let subject = BrocaSubject::new(&scratch).await;
+    for writer in [false, true] {
+        let describe = broca_wire::broca_role_describe_with_writers("test", writer, writer, writer);
+        assert!(describe
+            .capabilities
+            .iter()
+            .any(|group| group == cortexkit_role_llm_runner::capabilities::ADMISSION_REPORTS));
+        assert!(subject
+            .capabilities()
+            .contains(&Capability::AdmissionReports));
+    }
 }
 
 #[tokio::test]
