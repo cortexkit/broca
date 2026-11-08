@@ -1441,7 +1441,7 @@ mod account_route_resume_tests {
 }
 
 /// How a send with a legacy string `delivery` is admitted ([`LineageActor::string_sender`]).
-enum StringSender {
+pub(crate) enum StringSender {
     /// The session's owner, or a caller the plan does not name: admitted as before.
     Owner,
     /// A plan-named sender's `queue` or `steer`, admitted and delivered as the list it stands
@@ -1456,6 +1456,24 @@ fn effective_plan_senders(
     ownership: &broca_core::SessionOwnershipV1,
 ) -> Vec<cortexkit_role_llm_runner::delivery_order::PlanSender> {
     ownership.effective_senders()
+}
+
+/// Whether a keyed send's retry asks for the same delivery order as the send it repeats: the
+/// list, dedupe key and template, by llm-runner's comparison (`same_payload`), which leaves out
+/// the expiry.
+pub(crate) fn same_order(
+    retry: &broca_protocol::DeliveryOrder,
+    earlier: &broca_protocol::DeliveryOrder,
+) -> bool {
+    let role_order = |order: &broca_protocol::DeliveryOrder| {
+        let mut published =
+            cortexkit_role_llm_runner::delivery_order::DeliveryOrder::new(order.modes.clone());
+        published.dedupe_key = order.dedupe_key.clone();
+        published.expires_at_ms = order.expires_at_ms;
+        published.template = order.template.clone();
+        published
+    };
+    role_order(retry).same_payload(&role_order(earlier))
 }
 
 /// The actor's run state.
@@ -6574,19 +6592,11 @@ impl<W: WalStore + 'static> LineageActor<W> {
         let submission_id = broca_protocol::SubmissionId(format!("sub-{}", run_id.0));
         let used = self.recorded_send_keys.contains_key(run_id)
             || self.ordered_submissions.contains_key(&submission_id);
-        let role_order = |order: &broca_protocol::DeliveryOrder| {
-            let mut published =
-                cortexkit_role_llm_runner::delivery_order::DeliveryOrder::new(order.modes.clone());
-            published.dedupe_key = order.dedupe_key.clone();
-            published.expires_at_ms = order.expires_at_ms;
-            published.template = order.template.clone();
-            published
-        };
         let same = match (
             self.ordered_submissions.get(&submission_id),
             self.admitting_order.as_ref(),
         ) {
-            (Some(earlier), Some(retry)) => role_order(retry).same_payload(&role_order(earlier)),
+            (Some(earlier), Some(retry)) => same_order(retry, earlier),
             (None, None) => true,
             _ => false,
         };
@@ -6966,26 +6976,10 @@ impl<W: WalStore + 'static> LineageActor<W> {
         {
             return crate::person_media::outcome(error);
         }
-        if has_media
-            && !order.modes.iter().any(|mode| {
-                matches!(
-                    mode,
-                    broca_protocol::DeliveryMode::Steer | broca_protocol::DeliveryMode::IdleStart
-                )
-            })
+        if let Err(error) =
+            crate::person_media::ordered_carrier(&order, &request.input, &media_model)
         {
-            let kind = broca_provider::person_media::references(&request.input)
-                .next()
-                .unwrap()
-                .kind;
-            return crate::person_media::outcome(RunError::MediaUnsupported(
-                broca_provider::person_media::refusal(
-                    &media_model,
-                    kind,
-                    broca_protocol::MediaMarkerReason::Carrier,
-                )
-                .to_string(),
-            ));
+            return crate::person_media::outcome(error);
         }
         let manifest = match self.frozen_input_manifest().await {
             Ok(manifest) => manifest,

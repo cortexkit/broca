@@ -758,6 +758,10 @@ pub struct DisplayFacts {
     /// For an assistant message whose tool turn has facts: one per tool call it made, in call
     /// order, as reads serve them (see [`turn_times`]). Empty otherwise.
     pub tool_times: Vec<cortexkit_role_llm_runner::read::ToolTime>,
+    /// For a tool results message: each send that rode on one of its results with its envelope,
+    /// in the order delivered, as its facts recorded it when the ride landed
+    /// (`EntryFacts::notices`). These are the notices `session.read` serves.
+    pub ride_notices: Vec<cortexkit_role_llm_runner::read::NoticeFact>,
 }
 
 /// A tool call's identity, as reads serve it.
@@ -839,6 +843,19 @@ pub fn display_facts(entry: &StoredEntry) -> DisplayFacts {
             .as_ref()
             .map(|turn| turn_times(&entry.message, turn))
             .unwrap_or_default(),
+        ride_notices: facts
+            .iter()
+            .flat_map(|facts| &facts.notices)
+            .map(|notice| {
+                cortexkit_role_llm_runner::read::NoticeFact::new(
+                    notice.part,
+                    &notice.send_id,
+                    &notice.sender,
+                    &notice.text,
+                )
+                .with_call_key(&notice.call_key)
+            })
+            .collect(),
     }
 }
 
@@ -896,17 +913,22 @@ pub fn facts_by_call<'t>(
 impl DisplayFacts {
     /// What an `include_display_facts` read serves from these facts, in the form today's read
     /// builds for a page message (`crate::serve::apply_display_facts`): the sender, for a user
-    /// message the send's `client_message_id`, and each tool call's facts.
-    ///
-    /// Notices are left out: today's read serves one only for a send that rode on a tool result
-    /// with its notice envelope, which the new storage doesn't record yet. A converted session
-    /// holds none (the conversion refuses such a log) and the run loop refuses such a send, so
-    /// no session here has one to serve.
+    /// message the send's `client_message_id`, each tool call's facts, and for a tool results
+    /// message the notices of the sends that rode on its results.
     pub fn served(&self) -> broca_core::display_facts::DisplayFacts {
         broca_core::display_facts::DisplayFacts {
             sender: self.sender.clone(),
             client_message_id: self.client_message_id.clone(),
             tool_times: self.tool_times.clone(),
+            notices: self
+                .ride_notices
+                .iter()
+                .map(|fact| broca_core::projection::ProjectedNotice {
+                    fact: fact.clone(),
+                    // A served notice names its send by the send's id alone.
+                    submission_id: String::new(),
+                })
+                .collect(),
             ..Default::default()
         }
     }

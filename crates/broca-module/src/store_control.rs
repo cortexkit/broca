@@ -563,19 +563,23 @@ impl StoreControl {
                     units.plain(unit);
                 }
             }
+            // A ride delivered with its envelope is a notice, once per ride, under the key, send
+            // id and sender its envelope recorded, as today's control stream names it. Text
+            // delivered before envelopes existed is no notice, and yields nothing.
             Record::ResultAppend(append) => {
                 let carrier = self.carriers.get(&append.tool_call_id).cloned();
-                if let (Some((mid, part, key)), Some(notice)) = (carrier, &append.notice) {
-                    let visible = append.send_id.is_some();
+                if let (Some((mid, part, _)), Some(ride), Some(send_id)) =
+                    (carrier, &append.ride, &append.send_id)
+                {
                     if let Some(event) = notice_delivered_event(
                         mid.clone(),
                         part,
-                        key,
-                        append.send_id.clone().unwrap_or_default(),
-                        notice.sender.clone(),
+                        Some(ride.call_key.clone()),
+                        send_id.clone(),
+                        ride.sender.clone(),
                         &append.text,
                     ) {
-                        units.push_visible(boundary_unit(mid), event, visible);
+                        units.boundary(&mid, event);
                     }
                 }
             }

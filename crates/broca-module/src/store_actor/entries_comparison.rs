@@ -234,6 +234,19 @@ async fn side_idling(
     compaction: bool,
     idle: Duration,
 ) -> Side {
+    let deployment = broca_session_store::keys::DeploymentKey::new(1, &[7; 32]);
+    side_in(store, steps, gated, compaction, idle, deployment).await
+}
+
+/// [`side_idling`], whose new storage creates sessions under `deployment`.
+async fn side_in(
+    store: bool,
+    steps: Vec<Vec<NormalizedEvent>>,
+    gated: bool,
+    compaction: bool,
+    idle: Duration,
+    deployment: broca_session_store::keys::DeploymentKey,
+) -> Side {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let dir = broca_test_support::scratch_root().join(format!(
@@ -256,14 +269,10 @@ async fn side_idling(
         store: scripted(),
         compaction: compaction.then(|| Arc::new(ReadyProvider)),
     });
-    let runtime = crate::store_open::StoreRuntime::open(
-        &dir,
-        broca_session_store::keys::DeploymentKey::new(1, &[7; 32]),
-        Arc::clone(&executor),
-        idle,
-    )
-    .await
-    .unwrap();
+    let runtime =
+        crate::store_open::StoreRuntime::open(&dir, deployment, Arc::clone(&executor), idle)
+            .await
+            .unwrap();
     let registry = LineageRegistry::new_with_reader(
         Arc::new(
             crate::opener::DefaultOpener::new(
@@ -322,6 +331,34 @@ impl Side {
 
     async fn send(&self, run_id: &str, text: &str) -> SendOutcome {
         self.send_request(run_id, request(text), None).await
+    }
+
+    /// Sends `request` on the session's plan with the ordered delivery `order`.
+    async fn send_ordered(
+        &self,
+        run_id: &str,
+        request: SubmissionRequest,
+        order: Value,
+    ) -> SendOutcome {
+        self.registry
+            .route_submission_with_order(
+                &self.key,
+                RunId(run_id.into()),
+                request,
+                RunKind::FreshOrResume,
+                SendKey::Minted,
+                false,
+                broca_protocol::Delivery::Queue,
+                Some(planned("plan-1", None)),
+                None,
+                None,
+                None,
+                None,
+                false,
+                Some(serde_json::from_value(order).expect("an order decodes")),
+            )
+            .await
+            .expect("the session opens")
     }
 
     /// Waits until `run_id` is the session's latest run and it no longer runs, letting every
@@ -1665,4 +1702,212 @@ async fn an_idle_apply_view_reaches_the_next_runs_first_step_as_today() {
         })
         .collect();
     assert_eq!(applied, [1], "r3's first step applied the view");
+}
+
+/// The template the plan gives the session's owner: a pointer at one part of the session.
+fn pointer() -> cortexkit_role_llm_runner::delivery_order::Template {
+    serde_json::from_value(json!({
+        "id": "pointer",
+        "text": "see {part}",
+        "slots": {"part": {"type": "part_tag"}},
+    }))
+    .unwrap()
+}
+
+/// A send from the session's owner, which the plan names as a sender with [`pointer`].
+fn owned(text: &str) -> SubmissionRequest {
+    let mut request = untooled(text);
+    request.principal = Some(broca_protocol::BindPrincipal::Reserved {
+        module_id: "prefrontal-core".into(),
+    });
+    request
+}
+
+/// The first part of the entry at `ordinal` that shows a number, as `session.entries` serves
+/// it: the entry's message id, the part's id and its number.
+async fn numbered_part(side: &Side, ordinal: u64) -> (String, String, u64) {
+    let page = side
+        .compaction(
+            Some("ck-mc"),
+            "session.entries",
+            json!({"select": {"by": "after"}, "detail": "full"}),
+        )
+        .await
+        .unwrap();
+    let entry = page["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["ordinal"] == ordinal)
+        .unwrap_or_else(|| panic!("no entry {ordinal}: {page}"))
+        .clone();
+    let part = entry["parts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|part| part["tag"].is_u64())
+        .unwrap_or_else(|| panic!("entry {ordinal} shows no number: {entry}"));
+    (
+        entry["mid"].as_str().unwrap().to_owned(),
+        part["id"].as_str().unwrap().to_owned(),
+        part["tag"].as_u64().unwrap(),
+    )
+}
+
+/// A template send whose `part_tag` slot names a part of the session renders the number the
+/// session's next request shows for it, on a session whose plan names a compaction provider and
+/// renders part numbers: the same number, the same run input and request on either storage,
+/// each naming the part by its own id. Once the provider's newest accepted view drops that
+/// part's message, the next request no longer shows it, and the same send ends
+/// `template_part_gone` alike, before any step applied the view. The store session stays open
+/// throughout, so its numbers come from the compaction state its actor keeps.
+mod a_part_tag_template_renders_the_number_the_next_request_shows_alike {
+    use broca_session_store::keys::Cipher;
+
+    #[tokio::test]
+    async fn encrypted() {
+        super::a_part_tag_template_renders_the_number_the_next_request_shows_alike(
+            Cipher::XChaCha20Poly1305,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn plain() {
+        super::a_part_tag_template_renders_the_number_the_next_request_shows_alike(Cipher::None)
+            .await;
+    }
+}
+
+async fn a_part_tag_template_renders_the_number_the_next_request_shows_alike(
+    cipher: broca_session_store::keys::Cipher,
+) {
+    use broca_core::compaction_v2::protocol::view::{Edit, EditOp, View};
+    let template = pointer();
+    let mut manifest = compacting_manifest(true);
+    manifest.plan = broca_wal::OpaqueJson::from_json_text(
+        json!({
+            "compaction_item": {"provider": "ck-mc", "preset": "default"},
+            "render_tags": true,
+            "senders": [{"module": "prefrontal-core", "templates": [template]}],
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let steps = vec![
+        text_step("a1", "§2§ Done."),
+        tool_step("a2"),
+        text_step("a3", "§5§ §6§ It says file contents."),
+        text_step("a4", "seen"),
+    ];
+    let deployment = || broca_session_store::keys::DeploymentKey::new(1, &[7; 32]).creating(cipher);
+    let today = side_in(
+        false,
+        steps.clone(),
+        false,
+        true,
+        Duration::from_secs(60),
+        deployment(),
+    )
+    .await;
+    let store = side_in(
+        true,
+        steps,
+        false,
+        true,
+        Duration::from_secs(60),
+        deployment(),
+    )
+    .await;
+    for side in [&today, &store] {
+        let first = side
+            .send_request(
+                "r1",
+                owned("first"),
+                Some(planned("plan-1", Some(manifest.clone()))),
+            )
+            .await;
+        assert!(matches!(first, SendOutcome::Active { .. }), "{first:?}");
+        side.settled("r1").await;
+        side.assert_completed("r1").await;
+        let second = side
+            .send_request("r2", owned("read a"), Some(planned("plan-1", None)))
+            .await;
+        assert!(
+            matches!(
+                second,
+                SendOutcome::Active { .. } | SendOutcome::Pending { .. }
+            ),
+            "{second:?}"
+        );
+        side.settled("r2").await;
+        side.assert_completed("r2").await;
+    }
+    let digest = cortexkit_role_llm_runner::delivery_order::template_digest(&template);
+    let order = |mid: &str, part: &str| {
+        json!({
+            "modes": ["idle_start"],
+            "template": {"id": "pointer", "digest": digest, "slots": {"part": {"mid": mid, "part": part}}},
+        })
+    };
+    let mut named = Vec::new();
+    for side in [&today, &store] {
+        // The first run's reply, entry 2.
+        let (mid, part, number) = numbered_part(side, 2).await;
+        let mut request = owned("");
+        request.input = Vec::new();
+        let outcome = side.send_ordered("t1", request, order(&mid, &part)).await;
+        assert!(matches!(outcome, SendOutcome::Active { .. }), "{outcome:?}");
+        side.settled("t1").await;
+        side.assert_completed("t1").await;
+        named.push((mid, part, number));
+    }
+    assert_eq!(
+        named[1].2, named[0].2,
+        "both storages number the part alike"
+    );
+    // t1's first step is the provider's fourth request; its input is the rendered template.
+    let prompt = |side: &Side| serde_json::to_value(&side.provider.calls()[3].prompt).unwrap();
+    assert_eq!(prompt(&store), prompt(&today));
+    let input = prompt(&store)
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "user")
+        .cloned()
+        .unwrap();
+    assert!(
+        input.to_string().contains(&format!("see {}", named[0].2))
+            || input.to_string().contains(&format!("§{}§", named[0].2)),
+        "the run's input names part {}: {input}",
+        named[0].2
+    );
+    let mut gone = Vec::new();
+    for (side, (mid, part, _)) in [&today, &store].into_iter().zip(&named) {
+        let view = View::seal(
+            1,
+            vec![Edit::new(
+                1,
+                EditOp::Drop {
+                    mid: mid.clone(),
+                    part: None,
+                },
+            )],
+        );
+        let applied = side
+            .compaction(Some("ck-mc"), "session.apply_view", json!({ "view": view }))
+            .await;
+        assert_eq!(applied, Ok(json!({"answer": "accepted"})));
+        let mut request = owned("");
+        request.input = Vec::new();
+        gone.push(side.send_ordered("t2", request, order(mid, part)).await);
+    }
+    assert_eq!(gone[1], gone[0], "the store answers as today's");
+    assert_eq!(
+        gone[0],
+        SendOutcome::TemplatePartGone {
+            slot: "part".into()
+        }
+    );
 }

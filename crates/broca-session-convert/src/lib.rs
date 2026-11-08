@@ -463,6 +463,46 @@ pub fn convert(old: &[FramedRecord], lineage: Option<&str>) -> Result<Converted,
                     last_turn = Some(turn);
                 }
             }
+            // A send that rode on a result here is served with the results message carrying
+            // it, the newest message placed: that message's facts are restated right after the
+            // ride with its notice added, as the run loop writes them.
+            let mut at = before;
+            while at < out.records.len() {
+                if let Record::ResultAppend(append) = &out.records[at] {
+                    let calls = out.records[..at]
+                        .iter()
+                        .rev()
+                        .find_map(|record| match record {
+                            Record::Assistant(assistant) => {
+                                Some(broca_session_loop::entries::call_ids(&assistant.message))
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or_default();
+                    if let Some(notice) = broca_session_loop::entries::ride_notice(append, &calls) {
+                        let ordinal = counts.placed;
+                        let placed = out.records[..at]
+                            .iter()
+                            .rev()
+                            .find_map(|record| match record {
+                                Record::EntryFacts(facts) if facts.ordinal == ordinal => {
+                                    Some(facts)
+                                }
+                                _ => None,
+                            })
+                            .ok_or_else(|| {
+                                err(format!(
+                                    "entry facts: the results message {ordinal} a send rode on \
+                                     has no facts"
+                                ))
+                            })?;
+                        let restated = broca_session_loop::entries::with_ride(placed, notice);
+                        out.records.insert(at + 1, Record::EntryFacts(restated));
+                        at += 1;
+                    }
+                }
+                at += 1;
+            }
         }
     }
     if let Some((legacy, _, emitted)) = &facts {
@@ -1723,6 +1763,9 @@ fn send_delivered(
     out: &mut Converted,
 ) -> Result<(), ConvertError> {
     let input: Option<Vec<Message>> = f.parse("input")?;
+    // The envelope today's writer adds to a ride (llm-runner 0.8.11). A delivery recorded
+    // before envelopes existed has none, and keeps rendering its joined bytes as before.
+    let ride: Option<broca_wal::record::RideMetadata> = f.parse("ride")?;
     let delivery = Delivery {
         submission_id: f.req_string("submission_id"),
         run_id: f.req_string("run_id"),
@@ -1750,13 +1793,21 @@ fn send_delivered(
     };
     if let (Some(call), Some(text)) = (&delivery.tool_call_id, &delivery.appended_text) {
         out.records.push(Record::ResultAppend(ResultAppend {
-            send_id: None,
+            send_id: ride.as_ref().map(|ride| ride.send_id.clone()),
             run_id: state.run_id.clone(),
             tool_call_id: call.clone(),
             text: text.clone(),
             notice: state.delivery_notices.get(&state.seq).cloned(),
             written_at_ms: delivery.written_at_ms,
+            ride: ride.as_ref().map(ride_envelope),
         }));
+    } else if let Some(ride) = &ride {
+        // Only text delivered with a tool result carries an envelope; one anywhere else has
+        // no record to go on.
+        f.lose(
+            "ride (no tool result text)".into(),
+            json_len(&serde_json::to_value(ride).unwrap_or(Value::Null)),
+        );
     }
     let copies = copies_of(
         &delivery.input,
@@ -1768,6 +1819,21 @@ fn send_delivered(
     hold(copies, state, out);
     out.records.push(Record::Delivery(delivery));
     Ok(())
+}
+
+/// A ride's envelope as the new format keeps it: everything today's `ride` member holds but its
+/// send id, which `ResultAppend` keeps in its own field.
+fn ride_envelope(
+    ride: &broca_wal::record::RideMetadata,
+) -> broca_session_store::record::RideEnvelope {
+    broca_session_store::record::RideEnvelope {
+        call_key: ride.call_key.clone(),
+        sender: ride.sender.clone(),
+        forms: ride.forms.clone(),
+        form: match ride.form {
+            broca_wal::record::RideForm::Append => broca_session_store::record::RideForm::Append,
+        },
+    }
 }
 
 #[cfg(test)]

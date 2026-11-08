@@ -77,6 +77,12 @@ fn one_of_each() -> Vec<Record> {
             text: "reminder".into(),
             notice: None,
             written_at_ms: None,
+            ride: Some(RideEnvelope {
+                call_key: "lineage:4".into(),
+                sender: "reminders".into(),
+                forms: vec!["tool_result".into(), "turn_system".into()],
+                form: RideForm::Append,
+            }),
         }),
         Record::SetupStub(SetupStub {
             parts: vec![part.clone()],

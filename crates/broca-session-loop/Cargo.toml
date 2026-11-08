@@ -31,6 +31,8 @@ tokio.workspace = true
 tokio-util.workspace = true
 
 [dev-dependencies]
+# Today's loop writes a ride's envelope in the comparisons only through its test seam.
+broca-core = { path = "../broca-core", features = ["test-clock"] }
 broca-crash-harness = { path = "../broca-crash-harness" }
 broca-session-convert = { path = "../broca-session-convert" }
 broca-test-support = { path = "../broca-test-support" }
