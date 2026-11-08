@@ -250,7 +250,7 @@ async fn head_selection_account_decision_tier_cannot_step_down() {
 fn row(id: &str, account_id: Option<&str>, provider: &str, method: &str) -> ScopedCredential {
     ScopedCredential {
         id: id.into(),
-        categories: vec![format!("{provider}-native")],
+        categories: vec!["llm-provider".into()],
         credential_type: method.into(),
         serves: vec![provider.into()],
         refresh_adapter: Some(provider.into()),
@@ -1301,6 +1301,58 @@ async fn an_unmapped_credential_is_never_offered_warned_once_and_counted() {
     fixed.credentials[2].provider_ids = vec!["anthropic".into()];
     cache.store(fixed);
     assert_eq!(cache.unmapped().count(), 1);
+}
+
+/// A non-model record that broca's exact grant lists, such as the new session storage's
+/// deployment key, has no category, no auth_method and no provider ids. It is not a model
+/// credential, so it is neither warned about nor counted as unmapped, and never offered.
+#[tokio::test]
+async fn an_uncategorized_exact_grant_record_is_not_judged_for_routing_metadata() {
+    let mut deployment_key = anthropic("opaque:broca-deployment:1", "unused");
+    deployment_key.categories.clear();
+    deployment_key.credential_type = "unknown".into();
+    deployment_key.serves.clear();
+    deployment_key.refresh_adapter = None;
+    deployment_key.account_id = None;
+    deployment_key.provider_ids.clear();
+    deployment_key.auth_method = None;
+    let mut model_without_method = anthropic("oauth:anthropic:acct-d", "acct-d");
+    model_without_method.auth_method = None;
+    let rows = listing(vec![
+        anthropic("oauth:anthropic", "acct-a"),
+        deployment_key,
+        model_without_method,
+    ]);
+    let cache = ListingCache::default();
+    let (_, events) = broca_test_support::capture_logs(async {
+        cache.store((*rows).clone());
+    })
+    .await;
+    let unmapped: Vec<_> = cache.unmapped().snapshot().into_keys().collect();
+    assert_eq!(
+        unmapped,
+        ["oauth:anthropic:acct-d"],
+        "only the model credential is judged"
+    );
+    let warnings: Vec<String> = events
+        .iter()
+        .filter(|event| event.level == tracing::Level::WARN)
+        .map(|event| event.message().to_owned())
+        .collect();
+    assert!(
+        warnings
+            .iter()
+            .all(|w| !w.contains("opaque:broca-deployment:1")),
+        "{warnings:?}"
+    );
+    assert_eq!(
+        Candidates::from_listing(&rows, AuthMethod::Oauth, "anthropic").accounts,
+        [Candidate {
+            account_id: "acct-a".into(),
+            credential_id: "oauth:anthropic".into()
+        }]
+    );
+    assert!(Candidates::api_keys(&rows, "anthropic").accounts.is_empty());
 }
 
 /// `health.check` reports the unmapped count inside the account-selection block.

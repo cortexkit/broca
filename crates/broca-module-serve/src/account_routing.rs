@@ -731,10 +731,19 @@ pub fn unmapped_field(row: &ScopedCredential) -> Option<&'static str> {
 // for authentication. Unknown or absent adapters remain in scope.
 const NON_MODEL_REFRESH_ADAPTERS: &[&str] = &["cursor"];
 
+/// The vault category every model credential carries. broca's model grant is a category grant
+/// on it; every other row broca lists reached it through an exact grant.
+const MODEL_CATEGORY: &str = "llm-provider";
+
 pub fn metadata_in_chooser_scope(row: &ScopedCredential) -> bool {
+    // Only model credentials are judged for routing metadata. broca's grants also list
+    // non-model records, such as the new session storage's deployment key, which have no
+    // category and no auth_method. The row's `type` can't tell them apart: the vault derives it
+    // from the id's prefix and reports "unknown" for such records.
+    row.categories.iter().any(|category| category == MODEL_CATEGORY)
     // API-key pool candidates can lack provider ids, so this subscription metadata check
     // must not mark a loadable, provider-unmapped key as ineligible for routing.
-    row.auth_method
+        && row.auth_method
         .as_deref()
         .and_then(AuthMethod::from_token)
         .map(|method| matches!(method, AuthMethod::Oauth | AuthMethod::Chatgpt))
