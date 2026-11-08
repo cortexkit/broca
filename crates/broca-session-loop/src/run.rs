@@ -2950,10 +2950,15 @@ async fn model_step<W: Writer, P: Provider, T>(
         first_attempt: 0,
         attempt_hook: None,
     };
-    let mut events = seams
-        .provider
-        .step_with_runtime(StepId(step_id), Arc::new(opts), runtime)
-        .await;
+    // A cancel drops the call while it hasn't returned its stream yet, as today's loop drops its
+    // step future, so a call slow to answer never holds the run's end back.
+    let mut events = tokio::select! {
+        biased;
+        _ = seams.cancel.cancelled() => return Ok(Err(StepFailure::Cancelled)),
+        events = seams
+            .provider
+            .step_with_runtime(StepId(step_id), Arc::new(opts), runtime) => events,
+    };
     let mut message = None;
     // The provider's `StepFinished` usage wins; its final `Finished` fills it only when the
     // step reported none, as today's loop takes them.

@@ -3595,6 +3595,9 @@ enum Action {
     Steer(Vec<Message>),
     /// Cancels the run at its next step boundary.
     CancelAtBoundary,
+    /// Cancels the run now, as the actor does for an interrupting send, while the provider's
+    /// call hasn't returned its stream: the provider returns it only a second later.
+    CancelNow,
     /// Asks the run to stop, as the runner does when it shuts down.
     Stop,
     /// Queues a send with a delivery order, as the actor does for a running run: its
@@ -3676,6 +3679,9 @@ trait SteerSink: Send + Sync {
     async fn steer(&self, record: WalRecord);
     /// Records the caller's cancel at the run's next step boundary, as the actor would.
     async fn cancel_at_boundary(&self);
+    /// Cancels the run now, as the actor does for an interrupting send: no record, only the
+    /// run's cancel token.
+    fn cancel_now(&self);
     /// Asks the run to stop, as the runner does when it shuts down.
     fn stop(&self);
     /// Queues an ordered send into the running run, as the actor does.
@@ -3687,6 +3693,7 @@ struct TodaySink {
     inbox: Arc<SteerInbox>,
     writer: Arc<WalHandle>,
     stop: CancellationToken,
+    cancel: CancellationToken,
 }
 
 #[async_trait]
@@ -3709,6 +3716,10 @@ impl SteerSink for TodaySink {
             .request_boundary_cancel(&self.writer, &RunId("r1".into()))
             .await
             .expect("the cancel is durable");
+    }
+
+    fn cancel_now(&self) {
+        self.cancel.cancel();
     }
 
     fn stop(&self) {
@@ -3750,6 +3761,7 @@ impl SteerSink for TodaySink {
 struct NewSink {
     injected: Arc<Mutex<Vec<Record>>>,
     stop: CancellationToken,
+    cancel: CancellationToken,
 }
 
 #[async_trait]
@@ -3780,6 +3792,10 @@ impl SteerSink for NewSink {
                 at: broca_session_store::record::CancelPoint::StepBoundary,
             },
         ));
+    }
+
+    fn cancel_now(&self) {
+        self.cancel.cancel();
     }
 
     fn stop(&self) {
@@ -3828,13 +3844,23 @@ impl Provider for SteeringProvider {
             *steers = rest;
             due.into_iter().map(|(_, action)| action).collect()
         };
+        let mut slow = false;
         for (index, action) in due.into_iter().enumerate() {
             match action {
                 Action::Steer(messages) => self.sink.steer(steered(call, index, messages)).await,
                 Action::CancelAtBoundary => self.sink.cancel_at_boundary().await,
+                Action::CancelNow => {
+                    self.sink.cancel_now();
+                    slow = true;
+                }
                 Action::Stop => self.sink.stop(),
                 Action::Ordered { send, records } => self.sink.ordered(*send, records).await,
             }
+        }
+        if slow {
+            // Not a wait for anything: the call this cancel meets answers late, so a loop that
+            // waits for it instead of dropping it is caught recording the step's answer.
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
         self.inner.step(step_id, opts).await
     }
@@ -3963,6 +3989,7 @@ async fn today_with_actions(
         );
     }
     let stop = CancellationToken::new();
+    let cancel = CancellationToken::new();
     let scripted = ScriptedProvider::new(steps);
     if start.is_some() {
         scripted.resuming();
@@ -3975,12 +4002,12 @@ async fn today_with_actions(
             inbox: Arc::clone(&inbox),
             writer: Arc::clone(&writer),
             stop: stop.clone(),
+            cancel: cancel.clone(),
         }),
     };
     let plane = scenario.plane();
     let (tx, mut rx) = mpsc::channel(512);
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
-    let cancel = CancellationToken::new();
     plane.cancel_on_hold(cancel.clone());
     let wal_dir = dir.join("wal");
     *plane.held.ended.lock().unwrap() = Some(Arc::new(move || {
@@ -4117,6 +4144,7 @@ async fn compare_actions_in_once(
     .unwrap();
     let injected: Arc<Mutex<Vec<Record>>> = Default::default();
     let stop = CancellationToken::new();
+    let cancel = CancellationToken::new();
     let provider = SteeringProvider {
         inner: ScriptedProvider::new(scenario.steps.clone()),
         calls: Default::default(),
@@ -4124,6 +4152,7 @@ async fn compare_actions_in_once(
         sink: Arc::new(NewSink {
             injected: Arc::clone(&injected),
             stop: stop.clone(),
+            cancel: cancel.clone(),
         }),
     };
     let plane = scenario.plane();
@@ -4142,7 +4171,7 @@ async fn compare_actions_in_once(
         tools: &plane,
         bind: bind.clone(),
         out: None,
-        cancel: Default::default(),
+        cancel: cancel.clone(),
         stop: stop.clone(),
         held: None,
         approval: &HarnessPolicy,
@@ -4167,7 +4196,6 @@ async fn compare_actions_in_once(
     *plane.held.ended.lock().unwrap() = Some(Arc::new(move || {
         ended.load(std::sync::atomic::Ordering::SeqCst)
     }));
-    let cancel = CancellationToken::new();
     plane.cancel_on_hold(cancel.clone());
     let seams = Seams {
         held: Some(&*lifecycle),
@@ -4586,6 +4614,22 @@ async fn a_steer_during_a_step_that_hits_the_step_limit_ends_with_the_run() {
         vec![(1, Action::Steer(vec![user("never mind")]))],
     )
     .await;
+}
+
+/// A cancel that meets a model call which hasn't returned its stream yet, as an interrupting
+/// send's cancel can: both loops drop the call and end the run `cancelled`, with no answer and no
+/// attempt recorded for it. Every record each loop writes is compared: the first call's step
+/// start, and the run's end with its usage.
+#[tokio::test]
+async fn a_cancel_before_the_first_call_returns_its_stream_drops_the_call() {
+    compare_steered(calling("read", 0), vec![(1, Action::CancelNow)]).await;
+}
+
+/// The same after a tool batch: the second call is dropped, the batch's results stay, and the
+/// run's usage is the first step's.
+#[tokio::test]
+async fn a_cancel_before_a_later_call_returns_its_stream_drops_the_call() {
+    compare_steered(calling("read", 0), vec![(2, Action::CancelNow)]).await;
 }
 
 #[tokio::test]
