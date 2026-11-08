@@ -3295,6 +3295,11 @@ where
                 &mut trace,
             ) => AttemptStop::Ended(Box::new(result)),
         };
+        // Date the failure before cache finalization and billing settlement can await.
+        // ModelAttempt::ts_ms is assigned later, when the terminal record is constructed.
+        if matches!(&stop, AttemptStop::Ended(result) if result.is_err()) {
+            trace.account_observation.failure_received_at_ms = Some(clock.now_ms());
+        }
         // Sample the network retry budget before joining diagnostics for the terminal record.
         let attempt_elapsed = retry_clock.attempt_elapsed(attempt_started);
         trace.cache_evidence = trace
@@ -7051,6 +7056,47 @@ mod tests {
         );
         let ids: std::collections::BTreeSet<_> = sends.iter().map(|(id, _)| id).collect();
         assert_eq!(ids.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn failed_attempt_receipt_precedes_billing_and_is_not_serialized() {
+        let server = ScriptedServer::start(vec![ScriptResponse::Http {
+            status: 400,
+            headers: vec![],
+            body: b"bad request",
+        }])
+        .await;
+        let provider = retry_test_provider(&server, 0);
+        let hook = Arc::new(TestAttemptHook::new(server.order.clone()));
+        let mut stream = broca_core::Provider::step_with_runtime(
+            &provider,
+            StepId(1),
+            Arc::new(CallOptions::new(vec![])),
+            broca_core::provider::StepRuntime {
+                cancel: CancellationToken::new(),
+                deadline: None,
+                seal: None,
+                progress: None,
+                first_attempt: 0,
+                attempt_hook: Some(hook.clone()),
+            },
+        )
+        .await;
+        while stream.recv().await.is_some() {}
+        let settled = hook.finished.lock().unwrap();
+        assert_eq!(settled.len(), 1);
+        let attempt = &settled[0].1;
+        assert_eq!(attempt.outcome, AttemptOutcome::HttpError);
+        assert!(
+            attempt.account_observation.failure_received_at_ms.is_some(),
+            "billing settlement must already receive the original failure timestamp"
+        );
+        let bytes = serde_json::to_vec(attempt).unwrap();
+        let mut without_receipt = attempt.clone();
+        without_receipt.account_observation.failure_received_at_ms = None;
+        assert_eq!(bytes, serde_json::to_vec(&without_receipt).unwrap());
+        let decoded: ModelAttempt = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(*decoded.account_observation, Default::default());
     }
 
     #[tokio::test]

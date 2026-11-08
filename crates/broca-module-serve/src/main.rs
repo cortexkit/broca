@@ -7393,7 +7393,7 @@ mod executor {
             );
             for (seq, receipt) in [(2, 1_000), (3, 42_000)] {
                 let status = if seq == 2 { Some(503) } else { attempt_status };
-                let attempt: broca_protocol::ModelAttempt =
+                let mut attempt: broca_protocol::ModelAttempt =
                     serde_json::from_value(serde_json::json!({
                         "attempt":seq - 2,"request_body_len":10,"request_body_sha256":"aa",
                         "http_status":status,"response_body_len":0,
@@ -7405,6 +7405,7 @@ mod executor {
                         }
                     }))
                     .unwrap();
+                attempt.account_observation.failure_received_at_ms = Some(receipt);
                 broca_core::AccountReporter::attempt_recorded(
                     reporter.as_ref(),
                     Some(lineage),

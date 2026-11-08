@@ -1880,7 +1880,8 @@ fn the_removed_break_glass_and_any_unknown_key_are_refused() {
 
 // ---- report bodies --------------------------------------------------------------------------
 
-fn attempt(http_status: Option<u16>, observation: AttemptAccountObservation) -> ModelAttempt {
+fn attempt(http_status: Option<u16>, mut observation: AttemptAccountObservation) -> ModelAttempt {
+    observation.failure_received_at_ms = Some(NOW as u64);
     ModelAttempt {
         content_progress: Default::default(),
         attempt: 0,
@@ -1948,6 +1949,7 @@ fn attempt_with_headers_matches_routings_pinned_body() {
     let observed = attempt(
         Some(200),
         AttemptAccountObservation {
+            failure_received_at_ms: None,
             ratelimit_headers: headers(&[
                 ("anthropic-ratelimit-unified-5h-utilization", "0.995"),
                 (
@@ -1983,6 +1985,29 @@ fn attempt_without_a_status_line_matches_routings_pinned_body() {
 }
 
 #[test]
+fn account_limit_exhausted_uses_receipt_time_not_attempt_end() {
+    let mut observed = attempt(
+        Some(429),
+        AttemptAccountObservation {
+            failure_received_at_ms: None,
+            ratelimit_headers: BTreeMap::new(),
+            limit: Some(AttemptAccountLimit {
+                disposition: broca_protocol::provider::AccountLimitDisposition::ACCOUNT,
+                observed_at_ms: 12_000,
+                resets_at_ms: Some(42_000),
+                resets_at_source: Some("retry_after".into()),
+                limit_window: None,
+            }),
+        },
+    );
+    observed.ts_ms = 19_000;
+    let report = attempt_body("receipt-event", "admitted-run", &observed, None);
+    assert_eq!(report["kind"], "account_limit_exhausted");
+    assert_eq!(report["admission_id"], "admitted-run");
+    assert_eq!(report["observed_at_ms"], 12_000);
+}
+
+#[test]
 fn account_limit_exhausted_matches_routings_pinned_body() {
     let routing_pin = json!({
         "event_id": "e-2",
@@ -2004,6 +2029,7 @@ fn account_limit_exhausted_matches_routings_pinned_body() {
     let mut observed = attempt(
         Some(429),
         AttemptAccountObservation {
+            failure_received_at_ms: None,
             ratelimit_headers: BTreeMap::new(),
             limit: Some(limit.clone()),
         },
@@ -2086,6 +2112,7 @@ fn headers_pass_through_unknown_names_and_odd_values_verbatim() {
     let observed = attempt(
         Some(200),
         AttemptAccountObservation {
+            failure_received_at_ms: None,
             ratelimit_headers: odd.clone(),
             limit: None,
         },
@@ -2242,6 +2269,67 @@ async fn terminal_transient_backoff_is_gated_and_precedes_release() {
 }
 
 #[tokio::test]
+async fn terminal_transient_backoff_uses_receipt_time_not_settlement_time() {
+    for (receipt, retry_seconds, expected) in [
+        (Some(12_000), None, Some(17_000)),
+        (Some(12_000), Some(1.25), Some(13_250)),
+        (None, None, None),
+    ] {
+        let routing = Arc::new(FakeRouting {
+            backoff: true,
+            ..FakeRouting::default()
+        });
+        let reporter = RunReporter::start(
+            Arc::new(client(&routing)),
+            "adm-receipt".into(),
+            "run-receipt".into(),
+            None,
+            Arc::new(AtomicU64::new(4)),
+        );
+        let lineage = lineage();
+        let mut observed = attempt(Some(503), AttemptAccountObservation::default());
+        observed.account_observation.failure_received_at_ms = receipt;
+        observed.ts_ms = 19_000;
+        broca_core::AccountReporter::attempt_recorded(
+            reporter.as_ref(),
+            Some(lineage),
+            2,
+            &observed,
+        );
+        let error = serde_json::from_value(json!({
+            "class":"transient", "message":"unavailable", "status":503,
+            "retry_after_secs":retry_seconds,
+        }))
+        .unwrap();
+        reporter.terminal_transient(Some(lineage), 4, &error);
+        reporter.finish(Some(lineage), 4, RunFinishReason::Error);
+        drop(reporter);
+        broca_test_support::wait_until("receipt reports drained", || async {
+            if Arc::strong_count(&routing) == 1 {
+                Ok(())
+            } else {
+                Err("reporter still owns routing".into())
+            }
+        })
+        .await;
+        let reports = routing.observed();
+        let backoff: Vec<_> = reports
+            .iter()
+            .filter(|report| report["kind"] == "transient_backoff")
+            .collect();
+        if let Some(expected) = expected {
+            assert_eq!(backoff.len(), 1);
+            assert_eq!(backoff[0]["retry_at_ms"], expected);
+        } else {
+            assert!(
+                backoff.is_empty(),
+                "missing receipt must never use attempt end"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn terminal_transient_backoff_requires_a_failed_final_attempt_outcome() {
     for (outcome, status, backoff) in [
         (AttemptOutcome::Complete, Some(503), false),
@@ -2267,6 +2355,7 @@ async fn terminal_transient_backoff_requires_a_failed_final_attempt_outcome() {
         let lineage = lineage();
         let mut observed = attempt(Some(503), AttemptAccountObservation::default());
         observed.ts_ms = 1_000;
+        observed.account_observation.failure_received_at_ms = Some(1_000);
         broca_core::AccountReporter::attempt_recorded(
             reporter.as_ref(),
             Some(lineage),
@@ -2277,6 +2366,7 @@ async fn terminal_transient_backoff_requires_a_failed_final_attempt_outcome() {
         observed.http_status = status;
         observed.outcome = outcome.clone();
         observed.ts_ms = 42_000;
+        observed.account_observation.failure_received_at_ms = Some(42_000);
         broca_core::AccountReporter::attempt_recorded(
             reporter.as_ref(),
             Some(lineage),
@@ -2380,6 +2470,7 @@ async fn terminal_credential_reports(
     let lineage = lineage();
     broca_core::AccountReporter::run_started(reporter.as_ref(), Some(lineage), 1);
     let observation = AttemptAccountObservation {
+        failure_received_at_ms: None,
         limit: error
             .is_account_limit_exhausted()
             .then(|| AttemptAccountLimit {
@@ -2639,6 +2730,7 @@ async fn an_attempt_is_reported_only_once_its_record_is_durable_and_in_order() {
     let first = attempt(
         Some(200),
         AttemptAccountObservation {
+            failure_received_at_ms: None,
             ratelimit_headers: headers(&[("anthropic-ratelimit-unified-5h-utilization", "0.25")]),
             limit: None,
         },

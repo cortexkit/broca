@@ -1729,7 +1729,7 @@ pub fn attempt_body(
         if let Some(source) = &limit.resets_at_source {
             body.insert("resets_at_source".into(), json!(source));
         }
-        body.insert("observed_at_ms".into(), json!(attempt.ts_ms));
+        body.insert("observed_at_ms".into(), json!(limit.observed_at_ms));
         if !headers.is_empty() {
             body.insert("upstream_origin".into(), json!("upstream"));
             body.insert("headers".into(), json!(headers));
@@ -1934,6 +1934,9 @@ impl RunReporter {
                         // an unrelated internal error after a final failed attempt can still
                         // cause a five-second false block. This bounded cost is accepted instead
                         // of adding a separate core signal identifying the error that ended the run.
+                        // Only the observing process holds receipt evidence. After a restart,
+                        // the abandoned run finishes as Interrupted, with no reconstructed
+                        // transient report. Never substitute record or report time for a receipt.
                         last_failed_attempt_at_ms = matches!(
                             &attempt.outcome,
                             AttemptOutcome::EofBeforeCompletion
@@ -1949,7 +1952,8 @@ impl RunReporter {
                                 | AttemptOutcome::HeaderTimeout
                                 | AttemptOutcome::NoStatus
                         )
-                        .then_some(attempt.ts_ms);
+                        .then_some(attempt.account_observation.failure_received_at_ms)
+                        .flatten();
                         client
                             .observe(attempt_body(
                                 &id,
