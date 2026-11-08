@@ -117,6 +117,7 @@ async fn refused_live_steer_is_queued_for_next_turn() {
     )];
     let mut request = text_req(&key, "next").to_submission();
     request.input = late.clone();
+    request.tools = None;
     let outcome = registry
         .route_submission_with_delivery(
             &key,

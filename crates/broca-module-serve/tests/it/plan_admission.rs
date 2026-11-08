@@ -598,7 +598,8 @@ async fn later_scoped_planless_tool_declarations_refuse_without_writing() {
             json!({"delivery": delivery, "tools": legacy_tools()}),
         )
         .await;
-        assert_eq!(error_body(&reply)["code"], "scoped_tools_require_plan");
+        assert_eq!(error_body(&reply)["code"], "invalid_params");
+        assert_eq!(error_body(&reply)["detail"]["field"], "tools");
         assert_eq!(rig.wal_bytes(), before);
     }
     let plan = vector("plans/broca-head-no-compaction.json");
@@ -2273,6 +2274,71 @@ async fn later_plan_tools_are_refused_in_every_delivery_without_writes() {
         json!({"tools": []}),
     )
     .await;
+    assert_eq!(error_body(&reply)["code"], "invalid_params");
+    assert_eq!(error_body(&reply)["detail"]["field"], "tools");
+    assert_eq!(rig.wal_bytes(), before);
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn creating_planless_send_accepts_tools() {
+    let (mut rig, admitter) = plan_rig("creating-planless-tools").await;
+    let mut tools = legacy_tools();
+    tools[0]["execution_mode"] = json!("parallel");
+    result(&send_plan(&mut rig, 7, "first", "hi", None, json!({"tools": tools})).await);
+    let records = rig.wait_for_finished(1).await;
+    let WalRecord::RunStarted { config, .. } = run_started(&records)[0] else {
+        unreachable!()
+    };
+    assert_eq!(serde_json::to_value(config.tools.as_ref()).unwrap(), tools);
+    assert!(admitter.calls().is_empty());
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn later_planless_tools_are_refused_in_every_delivery_without_writes() {
+    let (mut rig, _) = plan_rig("later-planless-tools").await;
+    rig.script.hold_model(true);
+    result(
+        &send_plan(
+            &mut rig,
+            7,
+            "first",
+            "hi",
+            None,
+            json!({"tools": legacy_tools()}),
+        )
+        .await,
+    );
+    rig.wait_entered().await;
+    for tools in [json!([]), legacy_tools()] {
+        for delivery in ["queue", "steer", "interrupt"] {
+            let before = rig.wal_bytes();
+            let reply = send_plan(
+                &mut rig,
+                7,
+                &format!("{delivery}-{tools}"),
+                "next",
+                None,
+                json!({"tools": tools, "delivery": delivery}),
+            )
+            .await;
+            if std::env::var_os("BROCA_CAPTURE_SAMPLES").is_some() {
+                println!(
+                    "BROCA_SAMPLE later-tools.json {}",
+                    String::from_utf8_lossy(&reply.body)
+                );
+            }
+            assert_eq!(error_body(&reply)["code"], "invalid_params");
+            assert_eq!(error_body(&reply)["detail"]["field"], "tools");
+            assert_eq!(rig.wal_bytes(), before);
+        }
+    }
+    rig.script.hold_model(false);
+    rig.wait_for_finished(1).await;
+    rig.wait_idle().await;
+    let before = rig.wal_bytes();
+    let reply = send_plan(&mut rig, 7, "idle", "next", None, json!({"tools": []})).await;
     assert_eq!(error_body(&reply)["code"], "invalid_params");
     assert_eq!(error_body(&reply)["detail"]["field"], "tools");
     assert_eq!(rig.wal_bytes(), before);

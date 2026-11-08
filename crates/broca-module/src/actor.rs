@@ -3895,31 +3895,40 @@ impl<W: WalStore + 'static> LineageActor<W> {
             }
         }
 
-        // A plan owns the tool surface for the entire lineage. Reject an explicit later
+        // The creating send freezes tools even without a plan. Reject an explicit later
         // surface before any retry, queue, steer or interrupt path can ignore or freeze it.
+        // Internal RunId sends carry the session's own concrete frozen surface, never a
+        // caller's; the tools-frozen refusal still applies to internal planned-session sends.
         if request.tools.is_some() {
-            let planned = match self
+            let (exists, planned) = match self
                 .prior_snapshot
                 .as_ref()
                 .and_then(|snapshot| snapshot.checkpoint_at_head.ownership.as_ref())
             {
-                Some(ownership) => ownership
-                    .first_episode
-                    .as_ref()
-                    .is_some_and(|first| first.manifest.is_some()),
-                None => match self.load_ownership().await {
-                    Ok(ownership) => ownership
+                Some(ownership) => (
+                    ownership.episodes > 0,
+                    ownership
                         .first_episode
                         .as_ref()
                         .is_some_and(|first| first.manifest.is_some()),
+                ),
+                None => match self.load_ownership().await {
+                    Ok(ownership) => (
+                        ownership.episodes > 0,
+                        ownership
+                            .first_episode
+                            .as_ref()
+                            .is_some_and(|first| first.manifest.is_some()),
+                    ),
                     Err(error) => return SendOutcome::Transient(error),
                 },
             };
-            if self
-                .first_episode
-                .get()
-                .is_some_and(|first| first.manifest.is_some())
+            if (!matches!(key, SendKey::RunId) && (self.first_episode.get().is_some() || exists))
                 || planned
+                || self
+                    .first_episode
+                    .get()
+                    .is_some_and(|first| first.manifest.is_some())
             {
                 return crate::plan_episode::tools_frozen_refusal();
             }
@@ -15004,6 +15013,12 @@ mod tests {
         }
     }
 
+    fn text_submission(key: &BindIdentity, run: &str) -> SubmissionRequest {
+        let mut request = text_req(key, run).to_submission();
+        request.tools = None;
+        request
+    }
+
     /// Start a send keyed by a caller `send_id` on a run that holds after its durable terminal,
     /// and return once the actor is still active for it but its `RunFinished` is synced.
     async fn start_held_durable_finish(
@@ -15041,7 +15056,7 @@ mod tests {
             .route_submission_with_materialization(
                 &key,
                 run_id.clone(),
-                text_req(&key, &run_id.0).to_submission(),
+                text_submission(&key, &run_id.0),
                 RunKind::FreshOrResume,
                 SendKey::SendId(format!("send-{name}")),
                 false,
@@ -15069,7 +15084,7 @@ mod tests {
             registry.route_submission_with_materialization(
                 &key,
                 run_id.clone(),
-                text_req(&key, &run_id.0).to_submission(),
+                text_submission(&key, &run_id.0),
                 RunKind::FreshOrResume,
                 SendKey::SendId("send-resend-durable-finish".into()),
                 false,
@@ -15134,7 +15149,7 @@ mod tests {
             .route_submission_with_materialization(
                 &key,
                 run_id.clone(),
-                text_req(&key, &run_id.0).to_submission(),
+                text_submission(&key, &run_id.0),
                 RunKind::FreshOrResume,
                 SendKey::SendId(format!("send-{name}")),
                 false,
@@ -15150,7 +15165,7 @@ mod tests {
             registry.route_submission_with_delivery(
                 &key,
                 steer_run.clone(),
-                text_req(&key, &steer_run.0).to_submission(),
+                text_submission(&key, &steer_run.0),
                 RunKind::FreshOrResume,
                 SendKey::SendId(format!("steer-{name}")),
                 false,

@@ -281,7 +281,8 @@ impl Fixture {
             tail_limit: AtomicUsize::new(0),
             after_read: Default::default(),
         });
-        let request = submission_from_config(min_config(), text_req(&key, "old").input);
+        let mut request = submission_from_config(min_config(), text_req(&key, "old").input);
+        request.tools = None;
         let digest = send_identity_digest(&request, broca_protocol::Delivery::Queue, None);
         let mut wal = wal_store
             .inner
