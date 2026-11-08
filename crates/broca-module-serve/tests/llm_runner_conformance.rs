@@ -59,9 +59,14 @@ const FLOW_SCOPE_REF: &str = "conformance-flow";
 const FIRST_SCOPE_SYNC_CORR: u64 = 1_000_001;
 
 fn scope_fixture_records() -> Value {
+    // The plain-scope plan fetches the scripted catalog through broca's attested route.
+    // Grant that exact provider target; the tool-free flow fixture needs no extra carrier.
     json!([
         {"ref":PLAIN_SCOPE_REF,"scope_epoch":1,"kind":"head","attributes":{},
-         "carriers":[{"principal":{"kind":"reserved","module_id":SENDER_MODULE},"targets":["broca"]}]},
+         "carriers":[
+             {"principal":{"kind":"reserved","module_id":SENDER_MODULE},"targets":["broca"]},
+             {"principal":{"kind":"reserved","module_id":"broca"},"targets":[TOOL_MODULE]}
+         ]},
         {"ref":FLOW_SCOPE_REF,"scope_epoch":1,"kind":"head",
          "attributes":{"flow_id":"conformance-flow","agent_id":"conformance-agent"},
          "carriers":[{"principal":{"kind":"reserved","module_id":SENDER_MODULE},"targets":["broca"]}]}
@@ -7351,6 +7356,33 @@ async fn conformance_subject_always_declares_attachments() {
     assert!(subject.image_tool_result("old-image-rule").is_some());
     assert!(subject.capabilities().contains(&Capability::MessageMarks));
     assert!(subject.capabilities().contains(&Capability::MediaRefs));
+}
+
+#[test]
+fn message_marks_fixture_grants_only_the_required_plan_fetch_target() {
+    let scopes = scope_fixture_records();
+    let scopes = scopes.as_array().unwrap();
+    let plain = scopes
+        .iter()
+        .find(|scope| scope["ref"] == PLAIN_SCOPE_REF)
+        .unwrap();
+    let flow = scopes
+        .iter()
+        .find(|scope| scope["ref"] == FLOW_SCOPE_REF)
+        .unwrap();
+    assert_eq!(
+        plain["carriers"],
+        json!([
+            {"principal":{"kind":"reserved","module_id":SENDER_MODULE},"targets":["broca"]},
+            {"principal":{"kind":"reserved","module_id":"broca"},"targets":[TOOL_MODULE]}
+        ])
+    );
+    assert_eq!(
+        flow["carriers"],
+        json!([
+            {"principal":{"kind":"reserved","module_id":SENDER_MODULE},"targets":["broca"]}
+        ])
+    );
 }
 
 #[tokio::test]
