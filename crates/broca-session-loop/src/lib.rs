@@ -35,6 +35,7 @@ pub mod budget;
 pub mod compaction;
 pub mod durable;
 pub mod entries;
+pub mod inverse;
 pub mod media;
 pub mod output;
 pub mod owner;
@@ -47,7 +48,7 @@ pub mod shared;
 pub mod today;
 pub mod writer;
 
-pub use media::PendingMedia;
+pub use media::{HeldInputMedia, PendingMedia};
 pub use parts::{MemoryParts, Parts};
 pub use run::{resume, run, seal, AccountReports, Admission, Finished, LoopError, Seams};
 pub use writer::Writer;

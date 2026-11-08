@@ -67,7 +67,7 @@ impl Noter {
 /// message at its next ride. It keeps each call it is sent: its method, and for a notice its
 /// sequence number and the ordinals of the entries it carries.
 #[derive(Default)]
-struct Compactor {
+pub(super) struct Compactor {
     methods: Mutex<Vec<String>>,
     calls: Mutex<Vec<Value>>,
     /// The id of each entry the notices carried, by its ordinal. Each storage mints its own ids,
@@ -83,11 +83,11 @@ struct Compactor {
 
 impl Compactor {
     /// Answers the next ride with a view dropping the message at `ordinal`.
-    fn drop_at_next_ride(&self, ordinal: u64) {
+    pub(super) fn drop_at_next_ride(&self, ordinal: u64) {
         *self.drop_at_ride.lock().unwrap() = Some(ordinal);
     }
 
-    fn views(&self) -> usize {
+    pub(super) fn views(&self) -> usize {
         self.views.lock().unwrap().len()
     }
 
@@ -188,7 +188,7 @@ impl broca_core::CompactionPlane for Compactor {
 
 /// A fetch plan's manifest: `plan` as the caller sent it, the `read` tool both sides' tool
 /// planes answer, a system text, and what each subscribed provider declared.
-fn manifest(plan: Value, declarations: Vec<FrozenDeclaration>) -> Arc<PlanManifest> {
+pub(super) fn manifest(plan: Value, declarations: Vec<FrozenDeclaration>) -> Arc<PlanManifest> {
     Arc::new(PlanManifest {
         rich_ui: None,
         plan: OpaqueJson::from_json_text(plan.to_string()).unwrap(),
@@ -236,7 +236,7 @@ fn noting_plan(on_unavailable: &str) -> Arc<PlanManifest> {
 }
 
 /// A plan naming a compaction provider.
-fn compacting_plan() -> Arc<PlanManifest> {
+pub(super) fn compacting_plan() -> Arc<PlanManifest> {
     manifest(
         json!({"compaction_item": {"provider": "compactor", "preset": "default"}}),
         vec![],
@@ -841,7 +841,7 @@ fn compacting(compactor: &Arc<Compactor>) -> Planes {
 
 /// A send with no tools of its own and a context window, which a run on the compaction
 /// contract needs.
-fn limited(text: &str) -> SubmissionRequest {
+pub(super) fn limited(text: &str) -> SubmissionRequest {
     let mut request = untooled(text);
     request.context_limit = Some(200_000);
     request

@@ -343,6 +343,9 @@ pub struct StoreRunJob {
     /// handed back in [`StoreRunEnd`].
     pub parts: Box<dyn broca_session_loop::parts::Parts>,
     pub mode: StoreRunMode,
+    /// What the run renders media from, as today's runs render it (see `store_media`), sent
+    /// once the session's media fold is ready. `None` for a seal, which calls no model.
+    pub media: Option<crate::store_media::StoreRunMediaWait>,
 }
 
 /// What a store run does: admit a new run, or carry on or end the session's unfinished one.

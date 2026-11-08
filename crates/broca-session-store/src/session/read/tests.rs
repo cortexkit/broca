@@ -4,9 +4,18 @@ use futures::executor::block_on;
 
 use crate::backend::MemoryBackend;
 use crate::head::SessionTriple;
-use crate::keys::DeploymentKey;
+use crate::keys::{Cipher, DeploymentKey};
 use crate::record::{Assistant, EntryFacts, Input, Placement, Record, StepStart, ToolReply};
 use crate::session::Session;
+
+cipher_tests!(
+    every_message_reads_back_by_ordinal_after_two_cuts,
+    message_ids_resolve_in_the_window_and_sealed_history,
+    an_id_a_steps_start_announced_resolves_in_the_window_and_sealed_history,
+    a_held_assistant_message_reads_last_at_its_reserved_ordinal,
+    records_from_a_seq_read_both_streams_sealed_and_open,
+    a_ledger_record_reads_back_by_its_seq_from_the_open_log_and_sealed_history,
+);
 
 fn triple() -> SessionTriple {
     SessionTriple {
@@ -16,8 +25,9 @@ fn triple() -> SessionTriple {
     }
 }
 
-fn deployment() -> DeploymentKey {
-    DeploymentKey::new(1, &[5; 32])
+/// The test deployment key, creating sessions in mode `cipher`.
+fn deployment(cipher: Cipher) -> DeploymentKey {
+    DeploymentKey::new(1, &[5; 32]).creating(cipher)
 }
 
 fn addr() -> crate::backend::SessionAddr {
@@ -79,7 +89,7 @@ fn reply(id: &str, text: String) -> Record {
     })
 }
 
-/// The entry facts of the message at `ordinal`. Its tag base is the ordinal, so a read that
+/// The entry facts of the message at `ordinal`. Its tag bases are the ordinal, so a read that
 /// returns another message's facts shows it.
 fn facts(ordinal: u64) -> Record {
     Record::EntryFacts(EntryFacts {
@@ -89,6 +99,8 @@ fn facts(ordinal: u64) -> Record {
         no_display_facts: None,
         reasoning_summaries: Vec::new(),
         rich_ui: None,
+        runner_tag_base: Some(ordinal),
+        legacy_view_seq: None,
         ordinal,
         written_at_ms: Some(ordinal),
         tag_base: ordinal,
@@ -129,11 +141,10 @@ fn round(n: usize) -> Vec<Vec<Record>> {
 /// Every message reads back by its ordinal from wherever it lives: the window, or a sealed
 /// segment found through the directory, its index and one block. Two cuts make two segments,
 /// each of several blocks. Ordinals outside the conversation read as `None`.
-#[test]
-fn every_message_reads_back_by_ordinal_after_two_cuts() {
+fn every_message_reads_back_by_ordinal_after_two_cuts(cipher: Cipher) {
     let backend = MemoryBackend::default();
     block_on(async {
-        let mut session = Session::create(&backend, addr(), triple(), &deployment(), false)
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(cipher), false)
             .await
             .unwrap();
         let mut cuts = Vec::new();
@@ -154,7 +165,7 @@ fn every_message_reads_back_by_ordinal_after_two_cuts() {
         assert_eq!(session.conversation.window_start(), 97);
         session.close().await.unwrap();
 
-        let loaded = Session::load(&backend, addr(), &triple(), &deployment())
+        let loaded = Session::load(&backend, addr(), &triple(), &deployment(cipher))
             .await
             .unwrap();
         assert_eq!(loaded.conversation.messages.len(), 24);
@@ -192,6 +203,101 @@ fn every_message_reads_back_by_ordinal_after_two_cuts() {
             assert!(!entry.open);
         }
         assert!(loaded.entries(121, 5).await.unwrap().is_empty());
+
+        // Each part number names the last message whose base is below it, sealed or in the
+        // window: here the base is the ordinal, and tool messages have no facts, so they number
+        // nothing.
+        let expected_holder = |tag: u64| (1..tag.min(121)).rev().find(|ordinal| ordinal % 4 != 3);
+        for tag in 1..=125 {
+            let found = loaded.tagged_entry(tag).await.unwrap();
+            assert_eq!(
+                found.as_ref().map(|entry| entry.ordinal),
+                expected_holder(tag),
+                "tag {tag}"
+            );
+            if let Some(entry) = found {
+                assert_eq!(
+                    &entry.message,
+                    &expected[entry.ordinal as usize - 1],
+                    "tag {tag}"
+                );
+            }
+        }
+    });
+}
+
+/// A ledger record reads back by its seq, from the open log and after seals have moved it into
+/// sealed history, by a lookup: the ledger directory names the one segment that holds it, and no
+/// other sealed segment is read, so an unreadable later segment doesn't matter. A transcript
+/// record's seq, or one no record has, reads as `None`.
+fn a_ledger_record_reads_back_by_its_seq_from_the_open_log_and_sealed_history(cipher: Cipher) {
+    let backend = MemoryBackend::default();
+    block_on(async {
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(cipher), false)
+            .await
+            .unwrap();
+        let event = Record::Event(crate::record::Event {
+            name: "compaction_view_applied".into(),
+            run_id: Some("r".into()),
+            body: Some(serde_json::json!({"view": "{}"})),
+        });
+        let mut cuts = Vec::new();
+        let mut at = None;
+        let mut transcript = None;
+        for n in 0..30 {
+            for (part, batch) in round(n).into_iter().enumerate() {
+                let seq = session.append(&batch, true).await.unwrap();
+                if part == 0 && (n == 12 || n == 24) {
+                    cuts.push(seq);
+                }
+                if n == 5 && part == 0 {
+                    transcript = Some(seq);
+                    at = Some(
+                        session
+                            .append(std::slice::from_ref(&event), true)
+                            .await
+                            .unwrap(),
+                    );
+                }
+            }
+        }
+        let (at, transcript) = (at.unwrap(), transcript.unwrap());
+        assert_eq!(
+            session.ledger_record(at).await.unwrap().as_ref(),
+            Some(&event)
+        );
+        let segments = |backend: &MemoryBackend| -> Vec<String> {
+            backend
+                .object_names(&addr())
+                .into_iter()
+                .filter(|name| name.ends_with("/l"))
+                .collect()
+        };
+        session.seal(Some(cuts[0]), 0).await.unwrap();
+        let first = segments(&backend);
+        assert_eq!(first.len(), 1);
+        session.seal(Some(cuts[1]), 0).await.unwrap();
+        session.close().await.unwrap();
+        let later: Vec<String> = segments(&backend)
+            .into_iter()
+            .filter(|name| !first.contains(name))
+            .collect();
+        assert_eq!(later.len(), 1);
+        for name in &later {
+            backend.set_object(&addr(), name, b"unreadable".to_vec());
+        }
+        let loaded = Session::view(&backend, addr(), &triple(), &deployment(cipher))
+            .await
+            .unwrap();
+        assert_eq!(
+            loaded.ledger_record(at).await.unwrap().as_ref(),
+            Some(&event)
+        );
+        assert_eq!(loaded.ledger_record(transcript).await.unwrap(), None);
+        assert_eq!(loaded.ledger_record(u64::MAX).await.unwrap(), None);
+        // The segment the directory names is the one read.
+        backend.set_object(&addr(), &first[0], b"unreadable".to_vec());
+        assert!(loaded.ledger_record(at).await.is_err());
     });
 }
 
@@ -200,11 +306,10 @@ fn every_message_reads_back_by_ordinal_after_two_cuts() {
 /// their facts record, and any id whose entry doesn't carry exactly that id resolves to nothing:
 /// another prefix, a seq that isn't a facts record, a non-canonical number, an ordinal past
 /// the end.
-#[test]
-fn message_ids_resolve_in_the_window_and_sealed_history() {
+fn message_ids_resolve_in_the_window_and_sealed_history(cipher: Cipher) {
     let backend = MemoryBackend::default();
     block_on(async {
-        let mut session = Session::create(&backend, addr(), triple(), &deployment(), false)
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(cipher), false)
             .await
             .unwrap();
         let mut cut = 0;
@@ -275,7 +380,7 @@ fn message_ids_resolve_in_the_window_and_sealed_history() {
         assert!(session.conversation.window_start() > 20);
         check(&session, &minted).await;
         session.close().await.unwrap();
-        let loaded = Session::load(&backend, addr(), &triple(), &deployment())
+        let loaded = Session::load(&backend, addr(), &triple(), &deployment(cipher))
             .await
             .unwrap();
         check(&loaded, &minted).await;
@@ -285,11 +390,10 @@ fn message_ids_resolve_in_the_window_and_sealed_history() {
 /// An answer whose id its step's start announced (`StepStart::mid`, minted from that record's
 /// seq) resolves by that id in the window, once sealed and after a reload. A step's start whose
 /// step wrote no message announces an id that resolves to nothing.
-#[test]
-fn an_id_a_steps_start_announced_resolves_in_the_window_and_sealed_history() {
+fn an_id_a_steps_start_announced_resolves_in_the_window_and_sealed_history(cipher: Cipher) {
     let backend = MemoryBackend::default();
     block_on(async {
-        let mut session = Session::create(&backend, addr(), triple(), &deployment(), false)
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(cipher), false)
             .await
             .unwrap();
         // Two rounds, then a third whose final answer comes from a step that announced its id.
@@ -353,7 +457,7 @@ fn an_id_a_steps_start_announced_resolves_in_the_window_and_sealed_history() {
         assert!(session.conversation.window_start() > ordinal);
         check(&session, &announced, ordinal, &unused).await;
         session.close().await.unwrap();
-        let loaded = Session::load(&backend, addr(), &triple(), &deployment())
+        let loaded = Session::load(&backend, addr(), &triple(), &deployment(cipher))
             .await
             .unwrap();
         check(&loaded, &announced, ordinal, &unused).await;
@@ -362,11 +466,10 @@ fn an_id_a_steps_start_announced_resolves_in_the_window_and_sealed_history() {
 
 /// An assistant message waiting for its tool results is read last, at its reserved ordinal,
 /// with its facts and no next message.
-#[test]
-fn a_held_assistant_message_reads_last_at_its_reserved_ordinal() {
+fn a_held_assistant_message_reads_last_at_its_reserved_ordinal(cipher: Cipher) {
     let backend = MemoryBackend::default();
     block_on(async {
-        let mut session = Session::create(&backend, addr(), triple(), &deployment(), false)
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(cipher), false)
             .await
             .unwrap();
         session
@@ -390,11 +493,10 @@ fn a_held_assistant_message_reads_last_at_its_reserved_ordinal() {
 /// Every record of both streams from a seq on reads back once, in seq order, wherever two cuts
 /// left it: sealed ledger and transcript segments, a segment the read starts inside, and the
 /// open log, which keeps the transcript after the last cut.
-#[test]
-fn records_from_a_seq_read_both_streams_sealed_and_open() {
+fn records_from_a_seq_read_both_streams_sealed_and_open(cipher: Cipher) {
     let backend = MemoryBackend::default();
     block_on(async {
-        let mut session = Session::create(&backend, addr(), triple(), &deployment(), false)
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(cipher), false)
             .await
             .unwrap();
         let mut appended = Vec::new();
@@ -422,7 +524,7 @@ fn records_from_a_seq_read_both_streams_sealed_and_open() {
             session.seal(Some(*cut), 0).await.unwrap();
         }
         session.close().await.unwrap();
-        let loaded = Session::load(&backend, addr(), &triple(), &deployment())
+        let loaded = Session::load(&backend, addr(), &triple(), &deployment(cipher))
             .await
             .unwrap();
         for first in [

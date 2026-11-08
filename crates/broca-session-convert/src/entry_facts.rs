@@ -46,6 +46,9 @@ pub struct Legacy {
     /// By position: what today's `include_display_facts` read names about the send that placed
     /// the message (`broca_core::display_facts`), for the messages it names anything about.
     pub display: BTreeMap<u64, SendDisplay>,
+    /// By position: the base today's read numbers the message's parts after, for a message a
+    /// run with computed tag rules numbered (its `ComputedTags::base`).
+    pub runner_bases: BTreeMap<u64, u64>,
 }
 
 /// Who sent the send that placed a message, and the `client_message_id` it carried, as today's
@@ -91,7 +94,29 @@ pub fn legacy(old: &[FramedRecord], lineage: Option<&str>) -> Result<Option<Lega
         page_only(&raw, lineage)?
     };
     legacy.display = send_display(old, lineage);
+    legacy.runner_bases = runner_bases(&raw)?;
     Ok(Some(legacy))
+}
+
+/// The base each message's computed part numbers continue after, by position, as today's read
+/// numbers the messages it serves: the replay's own numbering (`broca_core::replay`), and for an
+/// assistant message still waiting for its tool results, at the position after the stored ones,
+/// the numbers the replay gives it ahead of its batch's commit.
+fn runner_bases(raw: &[WalRecord]) -> Result<BTreeMap<u64, u64>, String> {
+    let replayed = broca_core::replay(raw).map_err(|error| error.to_string())?;
+    let base =
+        |message: &broca_protocol::Message| Some(message.part_tags()?.computed.as_ref()?.base);
+    let held = replayed
+        .open_tool_turn
+        .as_ref()
+        .and_then(|(message, _)| Some((replayed.prompt.len() as u64, base(message)?)));
+    Ok(replayed
+        .prompt
+        .iter()
+        .enumerate()
+        .filter_map(|(position, message)| Some((position as u64, base(message)?)))
+        .chain(held)
+        .collect())
 }
 
 /// Today's facts for a log on the current compaction contract.
@@ -338,6 +363,8 @@ pub fn record(
         no_display_facts: None,
         reasoning_summaries: Vec::new(),
         rich_ui: None,
+        runner_tag_base: None,
+        legacy_view_seq: None,
         ordinal,
         written_at_ms,
         tag_base: metadata.tag_base,

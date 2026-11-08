@@ -230,6 +230,18 @@ pub struct Seams<'a, P, T> {
     /// today's loop does (`RunControl::step_progress`): the session's owner serves it as an
     /// active run's `step`. It is cleared when the step's call ends. Never a durability input.
     pub step_progress: Option<broca_core::provider::LiveStepProgress>,
+    /// What each model call waits for before the provider is asked to render and send it, such
+    /// as the media its requests are rendered with while they are still being prepared. A cancel
+    /// during the wait ends the step cancelled, as a cancel during the call does.
+    pub model_call_ready: Option<Arc<dyn ModelCallReady>>,
+}
+
+/// Something a run's model calls wait for (see [`Seams::model_call_ready`]).
+#[async_trait::async_trait]
+pub trait ModelCallReady: Send + Sync {
+    /// Returns once a model call may be rendered, or why none can be: the step then fails with
+    /// that error, never sending a request.
+    async fn ready(&self) -> Result<(), ProviderError>;
 }
 
 /// The run loop's account reports, as today's `broca_core::AccountReporter` receives them. Each
@@ -316,8 +328,24 @@ where
         .map_err(LoopError::Refused)?;
     }
     admission.input = input;
+    // The run numbers its messages' parts by its own computed rules, after the highest number
+    // the session has shown, as its start freezes them. On the compaction contract its
+    // requests show the projection's numbers instead, but today's reads still number the run's
+    // messages by these rules, so they are recorded alike.
+    let checkpoint = shown_high(&*writer, &*parts).await?;
+    let runner = broca_core::tags::rules_for(
+        Some(broca_wal::ComputedTagRules { checkpoint }),
+        frozen_render_tags(&admission),
+        &admission.render_config,
+    )
+    .map(|rules| crate::entries::RunnerTags {
+        run_id: admission.run_id.clone(),
+        rules,
+        checkpoint,
+    });
     let mut placed = Placed {
         calls: Default::default(),
+        runner,
         rich_ui: admission
             .manifest
             .as_ref()
@@ -330,7 +358,7 @@ where
         ),
         inner: writer,
     };
-    let start_seq = admit(&mut placed, parts, &admission).await?;
+    let start_seq = admit(&mut placed, parts, &admission, checkpoint).await?;
     if let Some(reports) = &seams.account_reports {
         reports.run_started(&event_id(&placed, start_seq), start_seq);
     }
@@ -551,8 +579,10 @@ where
         }
     }
     let drift = drift.filter(|_| !matches!(resolution, Resolution::Paused(_)));
+    let runner = runner_of_start(writer, parts, &admission.run_id).await?;
     let mut placed = Placed {
         calls: Default::default(),
+        runner,
         rich_ui: admission
             .manifest
             .as_ref()
@@ -787,10 +817,12 @@ where
         return Err(LoopError::Unsupported("sealing a run that wasn't running"));
     }
     let admission = frozen_admission(run, parts)?;
+    let runner = runner_of_start(writer, parts, &run_id).await?;
     // The closing results message is placed with the facts its run's frozen rules give it, as a
     // resume places it.
     let mut placed = Placed {
         calls: Default::default(),
+        runner,
         rich_ui: admission
             .manifest
             .as_ref()
@@ -1421,6 +1453,26 @@ async fn run_tag_rules<W: Writer>(
 /// Whether the run froze part numbers into the model's view: a run read back from its start
 /// carries the frozen choice, and a new run takes it from its plan, as its start record freezes
 /// it.
+/// The open run `run_id`'s own part numbering, as its start froze it.
+async fn runner_of_start<W: Writer>(
+    writer: &W,
+    parts: &dyn Parts,
+    run_id: &str,
+) -> Result<Option<crate::entries::RunnerTags>, LoopError> {
+    let Some(start) = writer.run_start(run_id).await? else {
+        return Ok(None);
+    };
+    let config = run_config_of_start(&start, parts)?;
+    Ok(config
+        .computed_tags
+        .zip(broca_core::tags::computed_rules(&config))
+        .map(|(tags, rules)| crate::entries::RunnerTags {
+            run_id: run_id.to_owned(),
+            rules,
+            checkpoint: tags.checkpoint,
+        }))
+}
+
 fn frozen_render_tags(admission: &Admission) -> bool {
     admission.render_tags
         || admission
@@ -1459,7 +1511,7 @@ pub async fn offline_request<W: Writer>(
     let run_rules = run_tag_rules(writer, &episodes).await?;
     let tools = Arc::new(admission.tools.clone());
     let opts = call_options(
-        writer, &admission, &tools, &episodes, &run_rules, None, step_id, compacted,
+        writer, &admission, &tools, &episodes, &run_rules, None, step_id, compacted, false,
     )?;
     if !compacted {
         return Ok(opts);
@@ -1489,6 +1541,12 @@ where
     let episodes = render_episodes(writer, parts)?;
     let tools = Arc::new(admission.tools.clone());
     let manifest = ToolManifest::from_tools(admission.tools.clone());
+    // As today's loop asks once per run: a provider whose media renderer tags its own copy of
+    // each request takes the run's tag choice here, and the loop leaves media-holding messages
+    // untagged, since preparing their media needs the parts where the model put them.
+    let defer_media_tags = seams
+        .provider
+        .defer_media_tags(frozen_render_tags(admission));
     let mut structured = structured_of(admission);
     let hook_plan = hook_plan(admission, seams)?;
     let hooks = hook_plan
@@ -1786,6 +1844,7 @@ where
             seams.session_address.clone(),
             step_id,
             compaction.is_some(),
+            defer_media_tags,
         )?;
         // The step names the account routing gives the run now, as today's does.
         if let Some(context) = opts.step_context.as_mut() {
@@ -2329,10 +2388,13 @@ fn to_value<T: serde::Serialize>(value: Option<&T>) -> Result<Option<Value>, Loo
         .map_err(|e| LoopError::Parts(e.to_string()))
 }
 
+/// Writes the run's start. `checkpoint` is the highest part number the session has shown
+/// ([`shown_high`]), which the run's computed numbering continues after.
 async fn admit<W: Writer>(
     writer: &mut W,
     parts: &mut dyn Parts,
     admission: &Admission,
+    checkpoint: u64,
 ) -> Result<u64, LoopError> {
     // The session's refusal-fallback schedule carries into the run only under the same model
     // and within a day of its last change, as today's admission decides it.
@@ -2391,7 +2453,6 @@ async fn admit<W: Writer>(
         config.insert("render_tags".into(), json!(true));
     }
     // Today's computed tag rules, starting after the highest number the session has shown.
-    let checkpoint = shown_high(writer, parts).await?;
     config.insert("computed_tags".into(), json!({ "checkpoint": checkpoint }));
     config.insert("context_epoch".into(), json!(0));
     if !admission.stop_when.is_empty() {
@@ -2620,6 +2681,7 @@ fn call_options<W: Writer>(
     session_address: Option<String>,
     step_id: u64,
     compacted: bool,
+    defer_media_tags: bool,
 ) -> Result<CallOptions, LoopError> {
     let mut prompt = writer.conversation().messages.clone();
     let contract = admission.compaction_plan_version.is_some();
@@ -2668,7 +2730,24 @@ fn call_options<W: Writer>(
                 .map_err(overflow)?;
         }
     }
-    if !contract && frozen_render_tags(admission) {
+    if !contract && defer_media_tags {
+        // The provider's media renderer tags a message holding media itself, on its own copy of
+        // the request, after preparing that message's media (see `defer_media_tags` above).
+        let render = frozen_render_tags(admission);
+        for message in prompt.iter_mut() {
+            if !broca_session_store::session::message_media(message).is_empty() {
+                continue;
+            }
+            if render {
+                render_tags_into(
+                    std::slice::from_mut(message),
+                    TagRendering::for_render_config(&admission.render_config),
+                );
+            } else {
+                clean_computed_into(std::slice::from_mut(message));
+            }
+        }
+    } else if !contract && frozen_render_tags(admission) {
         // A run frozen with part numbers in the model's view sends user and tool-result text with
         // its numbers in front, as today's loop renders it.
         render_tags_into(
@@ -2941,6 +3020,16 @@ async fn model_step<W: Writer, P: Provider, T>(
             max_content_gap_ms: None,
             max_content_gap_ended_at_ms: None,
         });
+    }
+    if let Some(ready) = &seams.model_call_ready {
+        tokio::select! {
+            ready = ready.ready() => {
+                if let Err(error) = ready {
+                    return Ok(Err(StepFailure::Error(Box::new(error), 0, None)));
+                }
+            }
+            _ = seams.cancel.cancelled() => return Ok(Err(StepFailure::Cancelled)),
+        }
     }
     let runtime = StepRuntime {
         cancel: seams.cancel.clone(),
@@ -5530,7 +5619,8 @@ fn placed_copies(operations: &Operations, run_id: &str) -> Vec<Record> {
                 .enumerate()
                 .map(move |(index, message)| {
                     Record::Input(Input {
-                        media: Vec::new(),
+                        // The copy's media are stored where the accepting record stored them.
+                        media: pending.media_at(index),
                         run_id: run_id.to_string(),
                         placement: pending.placement,
                         message: message.clone(),

@@ -3,10 +3,20 @@ use broca_protocol::content::{ContentBlock, Message, Role};
 use super::{build, groups, Segment, SegmentError, SegmentMeta};
 use crate::codec::Id128;
 use crate::frame::FrameKey;
+use crate::keys::Cipher;
 use crate::record::{Event, Input, Placement, Record};
 
-fn key() -> FrameKey {
-    FrameKey::new(1, &[7; 32])
+cipher_tests!(
+    every_record_reads_back_from_its_block,
+    a_group_never_splits_across_blocks,
+    a_segment_read_under_another_name_or_key_refuses,
+    a_changed_or_moved_block_refuses,
+    records_of_both_streams_or_out_of_order_refuse,
+);
+
+/// The test key in mode `cipher`.
+fn key(cipher: Cipher) -> FrameKey {
+    FrameKey::for_tests(cipher, 1, &[7; 32])
 }
 
 fn meta() -> SegmentMeta {
@@ -43,11 +53,10 @@ fn transcript(count: u64, size: usize) -> Vec<(u64, Record)> {
         .collect()
 }
 
-#[test]
-fn every_record_reads_back_from_its_block() {
+fn every_record_reads_back_from_its_block(cipher: Cipher) {
     let records = transcript(200, 400);
-    let bytes = build(&key(), b"objects/s/c/seg-1", &records, meta()).unwrap();
-    let key = key();
+    let bytes = build(&key(cipher), b"objects/s/c/seg-1", &records, meta()).unwrap();
+    let key = key(cipher);
     let segment = Segment::open(&bytes, &key, b"objects/s/c/seg-1").unwrap();
     assert!(
         segment.index.blocks.len() > 3,
@@ -67,8 +76,7 @@ fn every_record_reads_back_from_its_block() {
     assert_eq!(all, records);
 }
 
-#[test]
-fn a_group_never_splits_across_blocks() {
+fn a_group_never_splits_across_blocks(cipher: Cipher) {
     // A user input, then records that join its group: none starts a block.
     let mut records = vec![(1, input("start"))];
     for seq in 2..40 {
@@ -87,8 +95,8 @@ fn a_group_never_splits_across_blocks() {
     }
     records.push((40, input("next")));
     assert_eq!(groups(&records), vec![0..39, 39..40]);
-    let bytes = build(&key(), b"n", &records, meta()).unwrap();
-    let key = key();
+    let bytes = build(&key(cipher), b"n", &records, meta()).unwrap();
+    let key = key(cipher);
     let segment = Segment::open(&bytes, &key, b"n").unwrap();
     // The 39-record group is larger than a block, so it is a block of its own.
     assert_eq!(segment.index.blocks.len(), 2);
@@ -104,6 +112,8 @@ fn facts(ordinal: u64) -> Record {
         no_display_facts: None,
         reasoning_summaries: Vec::new(),
         rich_ui: None,
+        runner_tag_base: None,
+        legacy_view_seq: None,
         ordinal,
         written_at_ms: None,
         tag_base: 0,
@@ -138,27 +148,39 @@ fn messages_placed_together_share_a_group_with_their_facts() {
     assert_eq!(groups(&records), vec![0..4, 4..6]);
 }
 
-#[test]
-fn a_segment_read_under_another_name_or_key_refuses() {
+fn a_segment_read_under_another_name_or_key_refuses(cipher: Cipher) {
     let records = transcript(50, 400);
-    let bytes = build(&key(), b"name-a", &records, meta()).unwrap();
-    let key = key();
+    let bytes = build(&key(cipher), b"name-a", &records, meta()).unwrap();
+    let key = key(cipher);
     assert!(matches!(
         Segment::open(&bytes, &key, b"name-b"),
         Err(SegmentError::Authentication)
     ));
-    let other = FrameKey::new(1, &[8; 32]);
-    assert!(matches!(
-        Segment::open(&bytes, &other, b"name-a"),
-        Err(SegmentError::Authentication)
-    ));
+    // Another key: other key bytes for an encrypted segment, another key id for a plain one,
+    // which has no key bytes, and a key of the other mode for either. Each fails the units'
+    // check, and nothing reads a unit in a mode other than its key's.
+    let others = match cipher {
+        Cipher::XChaCha20Poly1305 => [
+            FrameKey::new(1, &[8; 32]),
+            FrameKey::for_tests(Cipher::None, 1, &[7; 32]),
+        ],
+        Cipher::None => [
+            FrameKey::for_tests(Cipher::None, 2, &[7; 32]),
+            FrameKey::new(1, &[7; 32]),
+        ],
+    };
+    for other in &others {
+        assert!(matches!(
+            Segment::open(&bytes, other, b"name-a"),
+            Err(SegmentError::Authentication)
+        ));
+    }
 }
 
-#[test]
-fn a_changed_or_moved_block_refuses() {
+fn a_changed_or_moved_block_refuses(cipher: Cipher) {
     let records = transcript(200, 400);
-    let bytes = build(&key(), b"n", &records, meta()).unwrap();
-    let key = key();
+    let bytes = build(&key(cipher), b"n", &records, meta()).unwrap();
+    let key = key(cipher);
     let segment = Segment::open(&bytes, &key, b"n").unwrap();
     let first = segment.index.blocks[0].clone();
     let second = segment.index.blocks[1].clone();
@@ -191,19 +213,23 @@ fn a_changed_or_moved_block_refuses() {
     assert!(Segment::open(&header, &key, b"n").is_err());
 }
 
-#[test]
-fn records_of_both_streams_or_out_of_order_refuse() {
+fn records_of_both_streams_or_out_of_order_refuse(cipher: Cipher) {
     let ledger = Record::Event(Event {
         name: "e".into(),
         run_id: None,
         body: None,
     });
     assert!(matches!(
-        build(&key(), b"n", &[(1, input("a")), (2, ledger)], meta()),
+        build(&key(cipher), b"n", &[(1, input("a")), (2, ledger)], meta()),
         Err(SegmentError::BadRecords(_))
     ));
     assert!(matches!(
-        build(&key(), b"n", &[(2, input("a")), (1, input("b"))], meta()),
+        build(
+            &key(cipher),
+            b"n",
+            &[(2, input("a")), (1, input("b"))],
+            meta()
+        ),
         Err(SegmentError::BadRecords(_))
     ));
 }

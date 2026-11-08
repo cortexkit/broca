@@ -157,6 +157,25 @@ message! {
 }
 
 message! {
+    /// The stored bytes of one medium of a message accepted before it is placed: a queued send's
+    /// or a steer's. The object is written under the accepting record, as an input message's is
+    /// (see [`InputMedia`]), and the message's copy in the transcript points at the same object.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    pub struct SendMedia {
+        /// The message's position in the record's messages.
+        1 req message: u32,
+        /// The message's content block holding the medium.
+        2 req block: u32,
+        /// For a medium inside a tool result block: its position in the result's parts.
+        3 opt part: u32,
+        /// The open log the object was written under.
+        4 req log: crate::codec::Id128,
+        5 req generation: crate::codec::Id128,
+        6 req seq: u64,
+    }
+}
+
+message! {
     /// One model step's assistant message: text, reasoning and tool calls, with the model that
     /// produced it as the message's origin.
     #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -378,11 +397,25 @@ message! {
         /// `session.read` serves on it with `include_rich_ui`. Recorded here so a read finds it
         /// without looking up the run's start. Absent when the run's plan has none.
         20 opt rich_ui: RichUi,
+        /// The highest part number the runner's own numbering (llm-runner's tags: stamped on a
+        /// v1 run's records, computed by `broca_protocol::tags::number_message` from each later
+        /// run's checkpoint) shows before this message. The message's numbered parts take the
+        /// numbers after it, under its run's rules. It is the numbering today's read attaches to
+        /// each message and output references resolve a reply's `$$tc(N)` against; on the
+        /// compaction contract the model is shown `tag_base`'s numbering instead. Absent on
+        /// sessions written before it was recorded.
+        21 opt runner_tag_base: u64,
+        /// On a session converted from a log whose compaction provider spoke the first
+        /// compaction protocol only: the seq of that log's view event (`compaction_view_applied`,
+        /// kept whole as a ledger event) in force when the model step that wrote this message
+        /// sent its request, which output references check a named part against. Absent when no
+        /// such view had applied; the run loop never writes first-protocol views.
+        22 opt legacy_view_seq: u64,
         /// For a tool results message: each send that rode on one of its results, in the order
         /// delivered, as `session.read` serves it in the message's `notices` display fact. Only
         /// a ride delivered with its envelope has one; text delivered before envelopes existed
         /// stays joined into its result and has none.
-        21 rep notices: RideNotice,
+        23 rep notices: RideNotice,
     }
 }
 
@@ -932,6 +965,11 @@ message! {
         /// How the send asked to be delivered, as the caller named it (`interrupt` drains ahead
         /// of every plain send). Absent for a plain queued send.
         9 opt delivery: String,
+        /// Where the bytes of each medium the send's messages carry are stored. The run or
+        /// boundary that places the messages points their transcript copies at the same objects.
+        /// A reader that places or renders the messages needs them, so a record carrying any is
+        /// refused by a reader that doesn't know the field.
+        10 rep [must] media: SendMedia,
     }
 }
 
@@ -1135,6 +1173,10 @@ message! {
         3 opt tags_v1: serde_json::Value,
         /// The receipt: sender, send id, delivery, retention, title and hooks.
         4 opt receipt: serde_json::Value,
+        /// Where the bytes of each medium the steer's messages carry are stored, which the
+        /// messages' transcript copies point at. A record carrying any is refused by a reader
+        /// that doesn't know the field.
+        5 rep [must] media: SendMedia,
     }
 }
 

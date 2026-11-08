@@ -14,6 +14,10 @@
 //! fuzzer makes up, since it can't forge a tag. So each entry point's first byte selects a mode:
 //! the raw bytes as stored, or bytes the entry point seals under fixed test keys first, so the
 //! fuzzer reaches the decoder past the tag.
+//!
+//! The entry points above run in the encrypted mode. [`plain`] runs the same families with the
+//! plain mode's units and heads (see `keys::Cipher`), whose unkeyed check the fuzzer could forge
+//! but mostly won't, so they too are sealed first.
 
 use std::future::Future;
 use std::pin::pin;
@@ -32,7 +36,7 @@ use crate::fold::operations::Operations;
 use crate::frame::FrameKey;
 use crate::head::{self, Head};
 use crate::idindex::{self, IndexPages, IndexRoot};
-use crate::keys::{DataKey, DeploymentKey};
+use crate::keys::{Cipher, DataKey, DeploymentKey};
 use crate::log::ChainBase;
 use crate::record::{Event, Marker, Record, StepStart};
 use crate::segment::{self, BlockBody, BlockEntry, SegmentHeader, SegmentIndex, StoredRecord};
@@ -58,8 +62,9 @@ const DEPLOYMENT_ID: u16 = 3;
 const DEPLOYMENT: [u8; 32] = [0x24; 32];
 const DATA_KEY: [u8; 32] = [0x66; 32];
 
-pub fn frame_key() -> FrameKey {
-    FrameKey::new(KEY_ID, &KEY)
+/// The frame key every entry point seals and opens under, in mode `cipher`.
+pub fn frame_key(cipher: Cipher) -> FrameKey {
+    FrameKey::for_tests(cipher, KEY_ID, &KEY)
 }
 
 /// Bytes a decoder may hold per input byte. The largest structural blow-up is an empty nested
@@ -287,27 +292,47 @@ pub fn record(data: &[u8]) {
 /// batches the input chooses, changes it as the input says, and checks every verdict the reader
 /// and the damage analysis give against what was written (see [`check_log`]).
 pub fn frame_log(data: &[u8]) {
+    frame_log_in(data, Cipher::XChaCha20Poly1305);
+}
+
+/// The plain mode's units, through the same families as the encrypted entry points: the first
+/// byte picks frames and the open log, segments, heads and checkpoints, or directory and id-index
+/// pages, and the rest is that family's input, read in the plain mode.
+pub fn plain(data: &[u8]) {
+    let mut input = Input::new(data);
+    let family = input.byte() % 4;
+    let rest = input.rest();
+    match family {
+        0 => frame_log_in(rest, Cipher::None),
+        1 => segment_in(rest, Cipher::None),
+        2 => head_checkpoint_in(rest, Cipher::None),
+        _ => directory_idindex_in(rest, Cipher::None),
+    }
+}
+
+fn frame_log_in(data: &[u8], cipher: Cipher) {
     let mut input = Input::new(data);
     match input.byte() % 3 {
         0 => {
             let bytes = input.rest();
-            read_any_log(bytes, 0);
+            read_any_log(bytes, 0, cipher);
         }
         1 => {
             let created_len = input.number();
-            let bytes = log::sealed_frames(&mut input);
-            read_any_log(&bytes, created_len);
+            let bytes = log::sealed_frames(&mut input, cipher);
+            read_any_log(&bytes, created_len, cipher);
         }
         _ => {
-            let (written, mutation) = log::from_input(&mut input);
+            let (written, mutation) = log::from_input(&mut input, cipher);
             check_log(&written, &mutation);
         }
     }
 }
 
-/// Reads `bytes` as a log every way the crate does and checks what holds of any log.
-pub fn read_any_log(bytes: &[u8], created_len: u64) {
-    let key = frame_key();
+/// Reads `bytes` as a log every way the crate does, under the test key in mode `cipher`, and
+/// checks what holds of any log.
+pub fn read_any_log(bytes: &[u8], created_len: u64, cipher: Cipher) {
+    let key = frame_key(cipher);
     let _ = bounded(bytes.len(), 0, || {
         crate::frame::open(bytes, |id| (id == KEY_ID).then_some(&key), BIND)
     });
@@ -326,6 +351,10 @@ pub fn read_any_log(bytes: &[u8], created_len: u64) {
 /// under the test key; mode 2 builds a valid segment of records the input chooses, changes it
 /// as the input says, and reads it back.
 pub fn segment(data: &[u8]) {
+    segment_in(data, Cipher::XChaCha20Poly1305);
+}
+
+fn segment_in(data: &[u8], cipher: Cipher) {
     let mut input = Input::new(data);
     match input.byte() % 3 {
         0 => {
@@ -333,11 +362,11 @@ pub fn segment(data: &[u8]) {
             message::<SegmentHeader>(bytes);
             message::<SegmentIndex>(bytes);
             message::<BlockBody>(bytes);
-            read_segment(bytes);
+            read_segment(bytes, cipher);
         }
         1 => {
-            let bytes = sealed_segment(&mut input);
-            read_segment(&bytes);
+            let bytes = sealed_segment(&mut input, cipher);
+            read_segment(&bytes, cipher);
         }
         _ => {
             // Records of one stream, in increasing seq order, as a segment holds them.
@@ -359,7 +388,7 @@ pub fn segment(data: &[u8]) {
                 log_start: None,
                 placed_before: Vec::new(),
             };
-            let key = frame_key();
+            let key = frame_key(cipher);
             let Ok(mut bytes) = segment::build(&key, SEGMENT_NAME, &records, meta) else {
                 return;
             };
@@ -376,22 +405,22 @@ pub fn segment(data: &[u8]) {
                 1 => {
                     let at = usize::from(input.u16()) % bytes.len();
                     bytes.truncate(at);
-                    read_segment(&bytes);
+                    read_segment(&bytes, cipher);
                 }
                 _ => {
                     let at = usize::from(input.u16()) % bytes.len();
                     bytes[at] ^= input.byte().max(1);
-                    read_segment(&bytes);
+                    read_segment(&bytes, cipher);
                 }
             }
         }
     }
 }
 
-/// Opens `bytes` as a segment and, when it opens, reads every block it lists and looks records
-/// up in it.
-fn read_segment(bytes: &[u8]) {
-    let key = frame_key();
+/// Opens `bytes` as a segment under the test key in mode `cipher` and, when it opens, reads every
+/// block it lists and looks records up in it.
+fn read_segment(bytes: &[u8], cipher: Cipher) {
+    let key = frame_key(cipher);
     let Ok(opened) = bounded(bytes.len(), 0, || {
         segment::Segment::open(bytes, &key, SEGMENT_NAME)
     }) else {
@@ -448,8 +477,8 @@ fn segment_header_bytes(bytes: &[u8]) -> Option<&[u8]> {
 
 /// A segment whose header, blocks and index the input chooses, each either a valid encoding
 /// with input-chosen fields or bytes as given, sealed where a segment's units are.
-fn sealed_segment(input: &mut Input<'_>) -> Vec<u8> {
-    let key = frame_key();
+fn sealed_segment(input: &mut Input<'_>, cipher: Cipher) -> Vec<u8> {
+    let key = frame_key(cipher);
     let header = if input.byte() & 1 == 0 {
         input.chunk().to_vec()
     } else {
@@ -544,10 +573,17 @@ fn sealed_segment(input: &mut Input<'_>) -> Vec<u8> {
 /// message they nest, and opens them as a stored head; mode 1 takes a head the bytes decode to,
 /// gives it a data key wrapped under the test deployment key, seals it and opens it again.
 pub fn head_checkpoint(data: &[u8]) {
+    head_checkpoint_in(data, Cipher::XChaCha20Poly1305);
+}
+
+/// [`head_checkpoint`] with heads of mode `cipher`. A plain head is sealed with no data key, and
+/// opens with the test deployment key and without one alike.
+fn head_checkpoint_in(data: &[u8], cipher: Cipher) {
     let mut input = Input::new(data);
     let mode = input.byte() % 2;
     let bytes = input.rest();
     let deployment = DeploymentKey::new(DEPLOYMENT_ID, &DEPLOYMENT);
+    let unloaded = DeploymentKey::unloaded(DEPLOYMENT_ID);
     let head = message::<Head>(bytes);
     message::<Checkpoint>(bytes);
     message::<Conversation>(bytes);
@@ -556,19 +592,40 @@ pub fn head_checkpoint(data: &[u8]) {
     message::<head::PendingDeletion>(bytes);
     message::<head::Residence>(bytes);
     let _ = chain_base(bytes);
+    let _ = bounded(bytes.len(), 0, || head::stored_cipher(bytes));
     let _ = bounded(bytes.len(), 0, || head::open(bytes, &deployment));
+    let _ = bounded(bytes.len(), 0, || head::open(bytes, &unloaded));
     if mode == 1 {
         if let Some(mut head) = head {
-            let key = DataKey::from_bytes(1, DATA_KEY);
             head.format = head::HEAD_FORMAT;
-            head.keys = vec![head::WrappedKey {
-                id: 1,
-                deployment: DEPLOYMENT_ID,
-                wrapped: ByteBuf(crate::keys::wrap(&deployment, &head.session_id, &key)),
-            }];
+            let key = match cipher {
+                Cipher::XChaCha20Poly1305 => {
+                    let key = DataKey::from_bytes(1, DATA_KEY);
+                    head.cipher = None;
+                    head.keys = vec![head::WrappedKey {
+                        id: 1,
+                        deployment: DEPLOYMENT_ID,
+                        wrapped: ByteBuf(
+                            crate::keys::wrap(&deployment, &head.session_id, &key)
+                                .expect("the test deployment key is loaded"),
+                        ),
+                    }];
+                    key
+                }
+                Cipher::None => {
+                    head.cipher = Some(Cipher::None);
+                    head.keys = Vec::new();
+                    DataKey::plain()
+                }
+            };
             let sealed = head::seal(&head, &key);
             let (opened, _) = head::open(&sealed, &deployment).expect("a sealed head opens");
             assert_eq!(opened, head);
+            if cipher == Cipher::None {
+                let (opened, _) =
+                    head::open(&sealed, &unloaded).expect("a plain head opens without the key");
+                assert_eq!(opened, head);
+            }
         }
     }
 }
@@ -577,6 +634,10 @@ pub fn head_checkpoint(data: &[u8]) {
 /// message; mode 1 stores directory pages the input chooses, sealed under the test key, and
 /// walks them every way a directory is walked; mode 2 does the same for an id index.
 pub fn directory_idindex(data: &[u8]) {
+    directory_idindex_in(data, Cipher::XChaCha20Poly1305);
+}
+
+fn directory_idindex_in(data: &[u8], cipher: Cipher) {
     let mut input = Input::new(data);
     match input.byte() % 3 {
         0 => {
@@ -592,8 +653,8 @@ pub fn directory_idindex(data: &[u8]) {
             message::<crate::record::ImportedIdMap>(bytes);
             message::<crate::record::ImportReceipt>(bytes);
         }
-        1 => walk_directory(&mut input),
-        _ => walk_idindex(&mut input),
+        1 => walk_directory(&mut input, cipher),
+        _ => walk_idindex(&mut input, cipher),
     }
 }
 
@@ -636,9 +697,9 @@ fn memory_backend() -> (MemoryBackend, SessionAddr) {
     (backend, addr)
 }
 
-fn walk_directory(input: &mut Input<'_>) {
+fn walk_directory(input: &mut Input<'_>, cipher: Cipher) {
     let (backend, addr) = memory_backend();
-    let key = frame_key();
+    let key = frame_key(cipher);
     for n in 0..input.byte() % (OBJECTS + 1) {
         let name = format!("p{n}");
         let plain = if input.byte() & 1 == 0 {
@@ -689,9 +750,9 @@ fn id128(input: &mut Input<'_>) -> Id128 {
     }
 }
 
-fn walk_idindex(input: &mut Input<'_>) {
+fn walk_idindex(input: &mut Input<'_>, cipher: Cipher) {
     let (backend, addr) = memory_backend();
-    let key = frame_key();
+    let key = frame_key(cipher);
     let pages = IndexPages {
         backend: &backend,
         addr: &addr,

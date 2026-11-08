@@ -9,11 +9,21 @@ use crate::backend::{MemoryBackend, SessionAddr, SessionBackend};
 use crate::codec::Message as _;
 use crate::head::SessionTriple;
 use crate::idindex::IdKind;
-use crate::keys::DeploymentKey;
+use crate::keys::{Cipher, DeploymentKey};
 use crate::record::{
     Assistant, EntryFacts, Input, Placement, QueuedSend, Record, RunEnd, RunStart,
 };
 use crate::session::{Session, SessionError, GRACE_MS};
+
+cipher_tests!(
+    a_revert_drops_what_the_session_kept_of_its_sealed_history,
+    entries_by_mid_reads_named_entries_in_order,
+    a_revert_in_the_open_log_keeps_the_messages_before_it,
+    a_revert_into_sealed_history_cuts_the_directory_and_leaves_no_window,
+    a_revert_refuses_open_work_and_wrong_targets,
+    a_revert_that_fails_before_its_commit_undoes_itself,
+    a_crash_at_any_point_of_a_revert_loads_to_before_or_after_it,
+);
 
 fn triple() -> SessionTriple {
     SessionTriple {
@@ -23,8 +33,9 @@ fn triple() -> SessionTriple {
     }
 }
 
-fn deployment() -> DeploymentKey {
-    DeploymentKey::new(1, &[5; 32])
+/// The test deployment key, creating sessions in mode `cipher`.
+fn deployment(cipher: Cipher) -> DeploymentKey {
+    DeploymentKey::new(1, &[5; 32]).creating(cipher)
 }
 
 fn addr() -> SessionAddr {
@@ -117,6 +128,8 @@ fn facts(ordinal: u64, mid: String) -> Record {
         no_display_facts: None,
         reasoning_summaries: Vec::new(),
         rich_ui: None,
+        runner_tag_base: None,
+        legacy_view_seq: None,
         ordinal,
         written_at_ms: Some(ordinal),
         tag_base: 0,
@@ -198,11 +211,10 @@ async fn runs<B: SessionBackend>(
 /// after a revert into sealed history, a sealed entry the revert cut away is read fresh and not
 /// found, instead of being answered from what was kept, and a value derived from sealed history
 /// is gone. Both are kept again under the new version.
-#[test]
-fn a_revert_drops_what_the_session_kept_of_its_sealed_history() {
+fn a_revert_drops_what_the_session_kept_of_its_sealed_history(cipher: Cipher) {
     let backend = MemoryBackend::default();
     block_on(async {
-        let mut session = Session::create(&backend, addr(), triple(), &deployment(), false)
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(cipher), false)
             .await
             .unwrap();
         let (mids, inputs) = runs(&mut session, 0, 4).await;
@@ -236,11 +248,10 @@ fn a_revert_drops_what_the_session_kept_of_its_sealed_history() {
 
 /// Entries read by message id come back once each, in ordinal order, from sealed history and
 /// the window alike; an id no entry has is left out.
-#[test]
-fn entries_by_mid_reads_named_entries_in_order() {
+fn entries_by_mid_reads_named_entries_in_order(cipher: Cipher) {
     let backend = MemoryBackend::default();
     block_on(async {
-        let mut session = Session::create(&backend, addr(), triple(), &deployment(), false)
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(cipher), false)
             .await
             .unwrap();
         let (mids, inputs) = runs(&mut session, 0, 4).await;
@@ -264,11 +275,10 @@ fn entries_by_mid_reads_named_entries_in_order() {
 /// resend's resolves to the ordinal, and the ledger keeps every abandoned run. The fold owes a
 /// `transcript_changed` from the ordinal and moves the history version, the head too, and a
 /// reload rebuilds the same state. A retry is answered from the resend's send id.
-#[test]
-fn a_revert_in_the_open_log_keeps_the_messages_before_it() {
+fn a_revert_in_the_open_log_keeps_the_messages_before_it(cipher: Cipher) {
     let backend = MemoryBackend::default();
     block_on(async {
-        let mut session = Session::create(&backend, addr(), triple(), &deployment(), false)
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(cipher), false)
             .await
             .unwrap();
         let (mids, _) = runs(&mut session, 0, 4).await;
@@ -319,7 +329,7 @@ fn a_revert_in_the_open_log_keeps_the_messages_before_it() {
             Ok(Reverted::Already { .. })
         ));
         session.close().await.unwrap();
-        let loaded = Session::load(&backend, addr(), &triple(), &deployment())
+        let loaded = Session::load(&backend, addr(), &triple(), &deployment(cipher))
             .await
             .unwrap();
         check(&loaded, &mids, &mid).await;
@@ -330,11 +340,10 @@ fn a_revert_in_the_open_log_keeps_the_messages_before_it() {
 /// window-pending: the messages before it are read from sealed segments, the resend is the whole
 /// window. After the grace period, the abandoned segments and pages are deleted, and reads, a
 /// reload and a later seal all still work.
-#[test]
-fn a_revert_into_sealed_history_cuts_the_directory_and_leaves_no_window() {
+fn a_revert_into_sealed_history_cuts_the_directory_and_leaves_no_window(cipher: Cipher) {
     let backend = MemoryBackend::default();
     block_on(async {
-        let mut session = Session::create(&backend, addr(), triple(), &deployment(), false)
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(cipher), false)
             .await
             .unwrap();
         let (mut mids, inputs) = runs(&mut session, 0, 4).await;
@@ -389,7 +398,7 @@ fn a_revert_into_sealed_history_cuts_the_directory_and_leaves_no_window() {
         );
         check(&session, &mids, &mid).await;
         session.close().await.unwrap();
-        let mut loaded = Session::load(&backend, addr(), &triple(), &deployment())
+        let mut loaded = Session::load(&backend, addr(), &triple(), &deployment(cipher))
             .await
             .unwrap();
         assert!(loaded.conversation.window_pending);
@@ -403,11 +412,10 @@ fn a_revert_into_sealed_history_cuts_the_directory_and_leaves_no_window() {
 /// A revert refuses, writing nothing, while a run is open, while a send waits in the queue, for
 /// an id no message on the branch has, for a message that isn't a run's own input, and for a
 /// resend of the wrong shape.
-#[test]
-fn a_revert_refuses_open_work_and_wrong_targets() {
+fn a_revert_refuses_open_work_and_wrong_targets(cipher: Cipher) {
     let backend = MemoryBackend::default();
     block_on(async {
-        let mut session = Session::create(&backend, addr(), triple(), &deployment(), false)
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(cipher), false)
             .await
             .unwrap();
         let (mids, _) = runs(&mut session, 0, 3).await;
@@ -448,6 +456,7 @@ fn a_revert_refuses_open_work_and_wrong_targets() {
         session
             .append(
                 &[Record::QueuedSend(QueuedSend {
+                    media: Vec::new(),
                     submission_id: "sub".into(),
                     send_id: Some("queued".into()),
                     input: Vec::new(),
@@ -471,7 +480,7 @@ fn a_revert_refuses_open_work_and_wrong_targets() {
             &backend,
             SessionAddr("1111222233334444".into()),
             triple(),
-            &deployment(),
+            &deployment(cipher),
             false,
         )
         .await
@@ -491,15 +500,15 @@ fn a_revert_refuses_open_work_and_wrong_targets() {
 /// A revert that fails before its commit undoes itself: nothing it created is left, the state
 /// is unchanged, and the log accepts records again. A failed commit poisons the writer instead,
 /// since it can't tell whether the head moved, and the next load undoes the revert.
-#[test]
-fn a_revert_that_fails_before_its_commit_undoes_itself() {
+fn a_revert_that_fails_before_its_commit_undoes_itself(cipher: Cipher) {
     let (mut undone, mut at_commit) = (0, 0);
     for failing in 1..20 {
         let backend = MemoryBackend::default();
         block_on(async {
-            let mut session = Session::create(&backend, addr(), triple(), &deployment(), false)
-                .await
-                .unwrap();
+            let mut session =
+                Session::create(&backend, addr(), triple(), &deployment(cipher), false)
+                    .await
+                    .unwrap();
             let (mids, _) = runs(&mut session, 0, 3).await;
             let before = (session.conversation.encode(), session.operations.encode());
             let logs = backend.log_names(&addr());
@@ -516,7 +525,7 @@ fn a_revert_that_fails_before_its_commit_undoes_itself() {
                 Err(SessionError::Poisoned)
             ) {
                 at_commit += 1;
-                let loaded = Session::load(&backend, addr(), &triple(), &deployment())
+                let loaded = Session::load(&backend, addr(), &triple(), &deployment(cipher))
                     .await
                     .unwrap();
                 assert_eq!(
@@ -546,15 +555,15 @@ fn a_revert_that_fails_before_its_commit_undoes_itself() {
 }
 
 /// A crash at any point of a revert loads to the session before it or after it.
-#[test]
-fn a_crash_at_any_point_of_a_revert_loads_to_before_or_after_it() {
+fn a_crash_at_any_point_of_a_revert_loads_to_before_or_after_it(cipher: Cipher) {
     let mut committed = 0;
     for crash in 0..20 {
         let backend = MemoryBackend::default();
         let (before, mids) = block_on(async {
-            let mut session = Session::create(&backend, addr(), triple(), &deployment(), false)
-                .await
-                .unwrap();
+            let mut session =
+                Session::create(&backend, addr(), triple(), &deployment(cipher), false)
+                    .await
+                    .unwrap();
             let (mids, _) = runs(&mut session, 0, 3).await;
             let before = texts(&session.conversation.messages);
             backend.crash_after(Some(crash));
@@ -565,7 +574,7 @@ fn a_crash_at_any_point_of_a_revert_loads_to_before_or_after_it() {
         });
         backend.crash_after(None);
         block_on(async {
-            let loaded = Session::load(&backend, addr(), &triple(), &deployment())
+            let loaded = Session::load(&backend, addr(), &triple(), &deployment(cipher))
                 .await
                 .unwrap();
             let window = texts(&loaded.conversation.messages);

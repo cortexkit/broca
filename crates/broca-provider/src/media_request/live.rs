@@ -1,7 +1,7 @@
 //! Session-owned bridge from durable captures to the request transport.
 use std::sync::Mutex;
 
-use broca_core::{media_request::SessionMedia, media_store::MediaStore};
+use broca_core::{media_request::SessionMedia, media_store::MediaBytes};
 use broca_protocol::{CallOptions, ErrorClass, ProviderError};
 use broca_wal::{FramedRecord, WalRecord};
 
@@ -32,7 +32,7 @@ impl LiveMedia {
         self.state.lock().unwrap().aging.clone()
     }
 
-    pub fn new(store: MediaStore, read_tail: Box<ReadTail>) -> Self {
+    pub fn new(store: impl MediaBytes + 'static, read_tail: Box<ReadTail>) -> Self {
         Self {
             state: Mutex::new(State {
                 session: SessionMedia::new(store),
@@ -46,7 +46,7 @@ impl LiveMedia {
     }
 
     pub fn from_checkpoint(
-        store: MediaStore,
+        store: impl MediaBytes + 'static,
         checkpoint: broca_core::media_request::MediaCheckpoint,
         budget: Option<broca_protocol::request::BudgetConfig>,
         profile: Option<MediaProfile>,

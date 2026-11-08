@@ -8,12 +8,24 @@ use super::{Recovery, REMOVED_KEEP_MS};
 use crate::backend::{MemoryBackend, SessionAddr, SessionBackend};
 use crate::codec::{Digest, Message as _};
 use crate::head::SessionTriple;
-use crate::keys::DeploymentKey;
+use crate::keys::{Cipher, DeploymentKey};
 use crate::record::{
     Assistant, BatchStart, CallOutcome, Input, Placement, Record, RunEnd, RunStart, StepStart,
     ToolIntent, ToolOutcome, ToolReply,
 };
 use crate::session::{Session, SessionError};
+
+cipher_tests!(
+    a_lost_tool_result_closes_open_work_and_warns_the_model,
+    a_kept_outcome_says_the_call_finished,
+    only_outcomes_lost_with_the_log_are_derived,
+    seqs_after_a_recovery_are_above_everything_the_damage_removed,
+    transcript_records_after_a_possible_loss_are_dropped,
+    damage_to_acknowledged_bytes_refuses_and_changes_nothing,
+    a_crash_at_any_point_of_a_recovery_recovers_again,
+    a_damaged_checkpoint_is_rebuilt_and_loses_nothing,
+    a_damaged_checkpoint_without_its_copy_refuses,
+);
 
 fn triple() -> SessionTriple {
     SessionTriple {
@@ -23,8 +35,9 @@ fn triple() -> SessionTriple {
     }
 }
 
-fn deployment() -> DeploymentKey {
-    DeploymentKey::new(1, &[5; 32])
+/// The test deployment key, creating sessions in mode `cipher`.
+fn deployment(cipher: Cipher) -> DeploymentKey {
+    DeploymentKey::new(1, &[5; 32]).creating(cipher)
 }
 
 fn addr() -> SessionAddr {
@@ -207,8 +220,8 @@ fn texts(messages: &[Message]) -> Vec<String> {
 /// A finished run, then a run whose call was dispatched (all synced). Then, unsynced: the call's
 /// result and outcome, and the next step's start. Returns the session and the offsets where the
 /// unsynced result batch starts and ends.
-async fn history<B: SessionBackend>(backend: &B) -> (Session<&B>, u64, u64) {
-    let mut session = Session::create(backend, addr(), triple(), &deployment(), false)
+async fn history<B: SessionBackend>(backend: &B, cipher: Cipher) -> (Session<&B>, u64, u64) {
+    let mut session = Session::create(backend, addr(), triple(), &deployment(cipher), false)
         .await
         .unwrap();
     session.append(&[start("a")], true).await.unwrap();
@@ -243,10 +256,10 @@ async fn history<B: SessionBackend>(backend: &B) -> (Session<&B>, u64, u64) {
     (session, from, to)
 }
 
-fn damage(backend: &MemoryBackend, at: u64) {
+fn damage(backend: &MemoryBackend, at: u64, cipher: Cipher) {
     let (log, end) = block_on(async {
         let (stored, _) = backend.read_head(&addr()).await.unwrap().unwrap();
-        let (head, _) = crate::head::open(&stored, &deployment()).unwrap();
+        let (head, _) = crate::head::open(&stored, &deployment(cipher)).unwrap();
         let log = head.open_log.unwrap().change;
         (log, backend.log_end(&addr(), &log).await.unwrap())
     });
@@ -255,34 +268,41 @@ fn damage(backend: &MemoryBackend, at: u64) {
     backend.set_log(&addr(), &log, bytes);
 }
 
-fn recover(backend: &MemoryBackend, now: u64) -> Result<Recovery, SessionError> {
+fn recover(backend: &MemoryBackend, now: u64, cipher: Cipher) -> Result<Recovery, SessionError> {
     block_on(Session::recover(
         backend,
         addr(),
         &triple(),
-        &deployment(),
+        &deployment(cipher),
         now,
     ))
 }
 
-fn load(backend: &MemoryBackend) -> Result<Session<&MemoryBackend>, SessionError> {
-    block_on(Session::load(backend, addr(), &triple(), &deployment()))
+fn load(backend: &MemoryBackend, cipher: Cipher) -> Result<Session<&MemoryBackend>, SessionError> {
+    block_on(Session::load(
+        backend,
+        addr(),
+        &triple(),
+        &deployment(cipher),
+    ))
 }
 
 /// A lost tool result and outcome: the call may have run, so its run ends interrupted, the call
 /// gets `outcome_unknown` in both streams, the model is warned, and the transcript change is owed to
 /// the compaction provider. The session then loads, takes appends, and reloads the same.
-#[test]
-fn a_lost_tool_result_closes_open_work_and_warns_the_model() {
+fn a_lost_tool_result_closes_open_work_and_warns_the_model(cipher: Cipher) {
     let backend = MemoryBackend::default();
-    let (session, from, to) = block_on(history(&backend));
+    let (session, from, to) = block_on(history(&backend, cipher));
     drop(session);
     // Both frames of the batch: the transcript result and the ledger outcome.
-    damage(&backend, from + 60);
-    damage(&backend, to - 20);
-    assert!(matches!(load(&backend), Err(SessionError::NeedsRecovery)));
+    damage(&backend, from + 60, cipher);
+    damage(&backend, to - 20, cipher);
+    assert!(matches!(
+        load(&backend, cipher),
+        Err(SessionError::NeedsRecovery)
+    ));
 
-    let Recovery::Recovered(recovered) = recover(&backend, 1_000).unwrap() else {
+    let Recovery::Recovered(recovered) = recover(&backend, 1_000, cipher).unwrap() else {
         panic!("nothing recovered");
     };
     assert!(recovered.loss_aware);
@@ -290,7 +310,7 @@ fn a_lost_tool_result_closes_open_work_and_warns_the_model() {
     assert_eq!(recovered.unknown_calls, [ToolCallId("c1".into())]);
     assert_eq!(recovered.history_version, Some(1));
 
-    let mut session = load(&backend).unwrap();
+    let mut session = load(&backend, cipher).unwrap();
     assert!(session.head().next_seq > recovered.removed_through);
     let window = texts(&session.conversation.messages);
     assert_eq!(&window[..3], ["ask a", "answer a", "ask b"]);
@@ -320,7 +340,7 @@ fn a_lost_tool_result_closes_open_work_and_warns_the_model() {
         .unwrap();
     let state = (session.conversation.encode(), session.operations.encode());
     block_on(session.close()).unwrap();
-    let reloaded = load(&backend).unwrap();
+    let reloaded = load(&backend, cipher).unwrap();
     assert_eq!(
         (reloaded.conversation.encode(), reloaded.operations.encode()),
         state
@@ -336,18 +356,17 @@ fn a_lost_tool_result_closes_open_work_and_warns_the_model() {
 
 /// When only the transcript result was lost, the kept ledger outcome says the call finished:
 /// its closing result says so, and it isn't `outcome_unknown`.
-#[test]
-fn a_kept_outcome_says_the_call_finished() {
+fn a_kept_outcome_says_the_call_finished(cipher: Cipher) {
     let backend = MemoryBackend::default();
-    let (session, from, _) = block_on(history(&backend));
+    let (session, from, _) = block_on(history(&backend, cipher));
     drop(session);
-    damage(&backend, from + 60);
-    let Recovery::Recovered(recovered) = recover(&backend, 1_000).unwrap() else {
+    damage(&backend, from + 60, cipher);
+    let Recovery::Recovered(recovered) = recover(&backend, 1_000, cipher).unwrap() else {
         panic!("nothing recovered");
     };
     assert!(recovered.unknown_calls.is_empty());
     assert_eq!(recovered.interrupted_runs, ["b"]);
-    let session = load(&backend).unwrap();
+    let session = load(&backend, cipher).unwrap();
     let window = texts(&session.conversation.messages);
     assert!(
         window[3].contains("finished, but storage damage removed its output"),
@@ -358,14 +377,13 @@ fn a_kept_outcome_says_the_call_finished() {
 /// A kept transcript result whose ledger outcome was lost gets its outcome from the result. A
 /// call answered before a ledger seal is settled: its outcome is sealed, not lost, even though
 /// the open log still holds its message and result.
-#[test]
-fn only_outcomes_lost_with_the_log_are_derived() {
+fn only_outcomes_lost_with_the_log_are_derived(cipher: Cipher) {
     let backend = MemoryBackend::default();
     let mut session = block_on(Session::create(
         &backend,
         addr(),
         triple(),
-        &deployment(),
+        &deployment(cipher),
         false,
     ))
     .unwrap();
@@ -406,8 +424,8 @@ fn only_outcomes_lost_with_the_log_are_derived() {
     block_on(session.append(&[step("b", 2)], false)).unwrap();
     drop(session);
     // Only the ledger outcome's frame.
-    damage(&backend, to - 20);
-    let Recovery::Recovered(recovered) = recover(&backend, 1_000).unwrap() else {
+    damage(&backend, to - 20, cipher);
+    let Recovery::Recovered(recovered) = recover(&backend, 1_000, cipher).unwrap() else {
         panic!("nothing recovered");
     };
     let _ = from;
@@ -417,14 +435,13 @@ fn only_outcomes_lost_with_the_log_are_derived() {
 
 /// Damage to the last batch loses the highest seqs the log held. The recovery's own records,
 /// and every later append, take seqs above all of them.
-#[test]
-fn seqs_after_a_recovery_are_above_everything_the_damage_removed() {
+fn seqs_after_a_recovery_are_above_everything_the_damage_removed(cipher: Cipher) {
     let backend = MemoryBackend::default();
-    let (session, _, to) = block_on(history(&backend));
+    let (session, _, to) = block_on(history(&backend, cipher));
     let written_through = session.encoder.next_seq() - 1;
     drop(session);
-    damage(&backend, to + 60);
-    let Recovery::Recovered(recovered) = recover(&backend, 1_000).unwrap() else {
+    damage(&backend, to + 60, cipher);
+    let Recovery::Recovered(recovered) = recover(&backend, 1_000, cipher).unwrap() else {
         panic!("nothing recovered");
     };
     assert!(
@@ -432,25 +449,24 @@ fn seqs_after_a_recovery_are_above_everything_the_damage_removed() {
         "{} < {written_through}",
         recovered.removed_through
     );
-    let mut session = load(&backend).unwrap();
+    let mut session = load(&backend, cipher).unwrap();
     let first = block_on(session.append(&[start("c")], true)).unwrap();
     assert!(first > recovered.removed_through);
 }
 
 /// Transcript records after the first one that may be missing are dropped, even though they
 /// authenticate: a conversation never skips a message.
-#[test]
-fn transcript_records_after_a_possible_loss_are_dropped() {
+fn transcript_records_after_a_possible_loss_are_dropped(cipher: Cipher) {
     let backend = MemoryBackend::default();
-    let (mut session, from, _) = block_on(history(&backend));
+    let (mut session, from, _) = block_on(history(&backend, cipher));
     block_on(session.append(&[input("b", "after the loss")], false)).unwrap();
     drop(session);
-    damage(&backend, from + 60);
-    let Recovery::Recovered(recovered) = recover(&backend, 1_000).unwrap() else {
+    damage(&backend, from + 60, cipher);
+    let Recovery::Recovered(recovered) = recover(&backend, 1_000, cipher).unwrap() else {
         panic!("nothing recovered");
     };
     assert_eq!(recovered.transcript_dropped, 1);
-    let loaded = load(&backend).unwrap();
+    let loaded = load(&backend, cipher).unwrap();
     assert!(!texts(&loaded.conversation.messages)
         .iter()
         .any(|text| text == "after the loss"));
@@ -458,16 +474,18 @@ fn transcript_records_after_a_possible_loss_are_dropped() {
 
 /// Damage in bytes a barrier acknowledged is corruption: loading and recovery refuse, and
 /// nothing changes.
-#[test]
-fn damage_to_acknowledged_bytes_refuses_and_changes_nothing() {
+fn damage_to_acknowledged_bytes_refuses_and_changes_nothing(cipher: Cipher) {
     let backend = MemoryBackend::default();
-    let (session, from, _) = block_on(history(&backend));
+    let (session, from, _) = block_on(history(&backend, cipher));
     drop(session);
-    damage(&backend, from - 20);
+    damage(&backend, from - 20, cipher);
     let logs = backend.log_names(&addr());
-    assert!(matches!(load(&backend), Err(SessionError::Corrupt { .. })));
     assert!(matches!(
-        recover(&backend, 1_000),
+        load(&backend, cipher),
+        Err(SessionError::Corrupt { .. })
+    ));
+    assert!(matches!(
+        recover(&backend, 1_000, cipher),
         Err(SessionError::Corrupt { .. })
     ));
     assert_eq!(backend.log_names(&addr()), logs);
@@ -477,15 +495,14 @@ fn damage_to_acknowledged_bytes_refuses_and_changes_nothing() {
 /// A crash at any point of a recovery leaves the session needing recovery, or recovered. Either
 /// way, recovering again and loading gives the same conversation and run state as a recovery
 /// that never crashed, with nothing left of the crashed attempt.
-#[test]
-fn a_crash_at_any_point_of_a_recovery_recovers_again() {
+fn a_crash_at_any_point_of_a_recovery_recovers_again(cipher: Cipher) {
     let expected = {
         let backend = MemoryBackend::default();
-        let (session, from, _) = block_on(history(&backend));
+        let (session, from, _) = block_on(history(&backend, cipher));
         drop(session);
-        damage(&backend, from + 60);
-        recover(&backend, 1_000).unwrap();
-        let session = load(&backend).unwrap();
+        damage(&backend, from + 60, cipher);
+        recover(&backend, 1_000, cipher).unwrap();
+        let session = load(&backend, cipher).unwrap();
         (
             texts(&session.conversation.messages),
             session.operations.run.as_ref().unwrap().finished,
@@ -494,16 +511,16 @@ fn a_crash_at_any_point_of_a_recovery_recovers_again() {
     let mut crashed = 0;
     for crash in 0..30 {
         let backend = MemoryBackend::default();
-        let (session, from, _) = block_on(history(&backend));
+        let (session, from, _) = block_on(history(&backend, cipher));
         drop(session);
-        damage(&backend, from + 60);
+        damage(&backend, from + 60, cipher);
         backend.crash_after(Some(crash));
-        if recover(&backend, 1_000).is_err() {
+        if recover(&backend, 1_000, cipher).is_err() {
             crashed += 1;
         }
         backend.crash_after(None);
-        recover(&backend, 1_000).unwrap();
-        let session = load(&backend).unwrap();
+        recover(&backend, 1_000, cipher).unwrap();
+        let session = load(&backend, cipher).unwrap();
         let got = (
             texts(&session.conversation.messages),
             session.operations.run.as_ref().unwrap().finished,
@@ -534,9 +551,13 @@ impl<F: std::future::Future> Blocking for F {}
 
 /// Two finished runs, all synced. `seal` adds a ledger seal after the first, so the open log is
 /// one a change created rather than the session's first.
-fn finished_runs(backend: &MemoryBackend, seal: bool) -> (Vec<String>, Option<RunFinishReason>) {
+fn finished_runs(
+    backend: &MemoryBackend,
+    seal: bool,
+    cipher: Cipher,
+) -> (Vec<String>, Option<RunFinishReason>) {
     block_on(async {
-        let mut session = Session::create(backend, addr(), triple(), &deployment(), false)
+        let mut session = Session::create(backend, addr(), triple(), &deployment(cipher), false)
             .await
             .unwrap();
         session.append(&[start("a")], true).await.unwrap();
@@ -576,23 +597,22 @@ fn finished_runs(backend: &MemoryBackend, seal: bool) -> (Vec<String>, Option<Ru
 /// A damaged checkpoint is rebuilt, never cut: from empty state for the session's first log, and
 /// from the copy the creating change sealed for a later log. Nothing else was damaged, so the
 /// recovery closes nothing and the session loads with the conversation and run state it had.
-#[test]
-fn a_damaged_checkpoint_is_rebuilt_and_loses_nothing() {
+fn a_damaged_checkpoint_is_rebuilt_and_loses_nothing(cipher: Cipher) {
     for seal in [false, true] {
         let backend = MemoryBackend::default();
-        let expected = finished_runs(&backend, seal);
-        damage(&backend, 60);
+        let expected = finished_runs(&backend, seal, cipher);
+        damage(&backend, 60, cipher);
         assert!(
-            matches!(load(&backend), Err(SessionError::NeedsRecovery)),
+            matches!(load(&backend, cipher), Err(SessionError::NeedsRecovery)),
             "seal {seal}"
         );
-        let Recovery::Recovered(recovered) = recover(&backend, 1_000).unwrap() else {
+        let Recovery::Recovered(recovered) = recover(&backend, 1_000, cipher).unwrap() else {
             panic!("seal {seal}: nothing recovered");
         };
         assert!(!recovered.loss_aware, "seal {seal}");
         assert!(recovered.interrupted_runs.is_empty(), "seal {seal}");
         assert_eq!(recovered.history_version, None, "seal {seal}");
-        let session = load(&backend).unwrap();
+        let session = load(&backend, cipher).unwrap();
         let got = (
             texts(&session.conversation.messages),
             session.operations.run.as_ref().unwrap().finished,
@@ -604,23 +624,22 @@ fn a_damaged_checkpoint_is_rebuilt_and_loses_nothing() {
 
 /// A ledger segment whose copy names another log can't stand in for this log's checkpoint:
 /// recovery refuses and writes nothing.
-#[test]
-fn a_damaged_checkpoint_without_its_copy_refuses() {
+fn a_damaged_checkpoint_without_its_copy_refuses(cipher: Cipher) {
     let backend = MemoryBackend::default();
-    finished_runs(&backend, true);
+    finished_runs(&backend, true, cipher);
     // Seal again: the newest ledger segment now belongs to the change that created the current
     // log. Then point the head back at the log the first seal created.
     let (first_log, logs) = block_on(async {
         let (stored, _) = backend.read_head(&addr()).await.unwrap().unwrap();
-        let (head, _) = crate::head::open(&stored, &deployment()).unwrap();
+        let (head, _) = crate::head::open(&stored, &deployment(cipher)).unwrap();
         (head.open_log.unwrap().change, backend.log_names(&addr()))
     });
-    let mut session = load(&backend).unwrap();
+    let mut session = load(&backend, cipher).unwrap();
     block_on(session.seal(None, 2_000)).unwrap();
     drop(session);
     block_on(async {
         let (stored, version) = backend.read_head(&addr()).await.unwrap().unwrap();
-        let (mut head, key) = crate::head::open(&stored, &deployment()).unwrap();
+        let (mut head, key) = crate::head::open(&stored, &deployment(cipher)).unwrap();
         let mut open = head.open_log.clone().unwrap();
         open.change = first_log;
         let len = backend.log_end(&addr(), &first_log).await.unwrap();
@@ -637,10 +656,10 @@ fn a_damaged_checkpoint_without_its_copy_refuses() {
             .unwrap();
     });
     assert!(logs.contains(&first_log));
-    damage(&backend, 60);
+    damage(&backend, 60, cipher);
     let objects = backend.object_names(&addr());
     assert!(matches!(
-        recover(&backend, 3_000),
+        recover(&backend, 3_000, cipher),
         Err(SessionError::CheckpointLost)
     ));
     assert_eq!(backend.object_names(&addr()), objects);

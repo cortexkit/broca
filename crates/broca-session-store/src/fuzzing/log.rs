@@ -21,6 +21,7 @@ use crate::damage::{self, Lost, Verdict};
 use crate::fold::conversation::Conversation;
 use crate::fold::operations::Operations;
 use crate::frame::{self, FrameHeader, FrameStream, FLAG_CLAIM_ONLY};
+use crate::keys::Cipher;
 use crate::log::{self, ChainBase, LogEncoder, LogEnd, ReadLog};
 use crate::record::{Record, Stream};
 
@@ -77,13 +78,15 @@ pub struct WrittenBatch {
     pub records: Vec<(u64, Record)>,
 }
 
-/// A log as written: its bytes, each frame and batch in it, and the length synced at creation.
+/// A log as written: its bytes, each frame and batch in it, the length synced at creation, and
+/// the mode its frames are sealed in.
 #[derive(Debug, Clone)]
 pub struct WrittenLog {
     pub bytes: Vec<u8>,
     pub created_len: u64,
     pub frames: Vec<WrittenFrame>,
     pub batches: Vec<WrittenBatch>,
+    pub cipher: Cipher,
 }
 
 impl WrittenLog {
@@ -144,9 +147,9 @@ impl WrittenLog {
 }
 
 /// Writes a log whose records start at `next_seq` after the records `base` names, then runs
-/// `ops`, as `LogWriter` and `session` write logs.
-pub fn write_log(next_seq: u64, base: ChainBase, ops: &[LogOp]) -> WrittenLog {
-    let mut encoder = LogEncoder::new(frame_key(), BIND.to_vec(), next_seq, base);
+/// `ops`, as `LogWriter` and `session` write logs, its frames sealed in mode `cipher`.
+pub fn write_log(cipher: Cipher, next_seq: u64, base: ChainBase, ops: &[LogOp]) -> WrittenLog {
+    let mut encoder = LogEncoder::new(frame_key(cipher), BIND.to_vec(), next_seq, base);
     let checkpoint = Checkpoint {
         covers_through: 0,
         next_seq,
@@ -161,6 +164,7 @@ pub fn write_log(next_seq: u64, base: ChainBase, ops: &[LogOp]) -> WrittenLog {
         created_len: 0,
         frames: Vec::new(),
         batches: Vec::new(),
+        cipher,
     };
     let encoded = encoder
         .checkpoint(&checkpoint)
@@ -205,8 +209,8 @@ pub fn write_log(next_seq: u64, base: ChainBase, ops: &[LogOp]) -> WrittenLog {
     log
 }
 
-/// A log and one change to it, chosen by the input.
-pub fn from_input(input: &mut Input<'_>) -> (WrittenLog, Mutation) {
+/// A log in mode `cipher` and one change to it, chosen by the input.
+pub fn from_input(input: &mut Input<'_>, cipher: Cipher) -> (WrittenLog, Mutation) {
     let next_seq = 1 + input.number() % 1000;
     let base = ChainBase {
         transcript: (input.byte() & 1 == 1).then(|| input.number() % next_seq),
@@ -224,7 +228,7 @@ pub fn from_input(input: &mut Input<'_>) -> (WrittenLog, Mutation) {
             _ => LogOp::Claim,
         });
     }
-    let log = write_log(next_seq, base, &ops);
+    let log = write_log(cipher, next_seq, base, &ops);
     let len = log.bytes.len();
     let at = usize::from(input.u16()) % len;
     let mutation = match input.byte() % 4 {
@@ -309,9 +313,10 @@ pub fn check_read_shape(len: u64, created_len: u64, read: &ReadLog) {
     assert!(read.durable_bound >= created_len);
 }
 
-/// Reads `log` changed by `mutation` and checks every verdict against what was written.
+/// Reads `log` changed by `mutation`, in the mode it was written in, and checks every verdict
+/// against what was written.
 pub fn check_log(log: &WrittenLog, mutation: &Mutation) {
-    let key = frame_key();
+    let key = frame_key(log.cipher);
     assert_eq!(key.id(), KEY_ID);
     let (bytes, changed) = apply(log, *mutation);
     let len = bytes.len();
@@ -468,10 +473,11 @@ fn describe(verdict: &Verdict) -> String {
     }
 }
 
-/// Frames whose headers and bodies the input chooses, sealed under the test key, possibly cut
-/// or changed after: what an authenticated but inconsistent log looks like to the reader.
-pub fn sealed_frames(input: &mut Input<'_>) -> Vec<u8> {
-    let key = frame_key();
+/// Frames whose headers and bodies the input chooses, sealed under the test key in mode
+/// `cipher`, possibly cut or changed after: what an authenticated but inconsistent log looks like
+/// to the reader.
+pub fn sealed_frames(input: &mut Input<'_>, cipher: Cipher) -> Vec<u8> {
+    let key = frame_key(cipher);
     let mut out = Vec::new();
     let mut seq = input.number();
     let mut index = 0u32;

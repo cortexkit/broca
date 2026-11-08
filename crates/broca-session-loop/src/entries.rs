@@ -43,6 +43,33 @@ pub struct Placed<'w, W> {
     pub calls: OpenCalls,
     /// The Rich UI stamp the run's plan froze, which the run's assistant messages record.
     pub rich_ui: Option<RichUi>,
+    /// The run's own part numbering, which each message's `runner_tag_base` records.
+    pub runner: Option<RunnerTags>,
+}
+
+/// A run's own part numbering (llm-runner's computed tags, `broca_core::tags::computed_rules`):
+/// the rules its config froze, and its checkpoint, the highest number the session had shown
+/// when the run started, which the numbering of its messages continues after, in order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunnerTags {
+    pub run_id: String,
+    pub rules: broca_protocol::tags::ComputedRules,
+    pub checkpoint: u64,
+}
+
+/// The highest part number the runner's numbering shows once `message` is numbered after
+/// `high` under `rules`.
+fn runner_high_after(
+    message: &Message,
+    rules: broca_protocol::tags::ComputedRules,
+    high: u64,
+) -> u64 {
+    let mut numbered = message.clone();
+    let mut high = high;
+    // Numbering past the protocol's range is refused when a request is numbered; the base
+    // recorded here then stays where it was.
+    let _ = broca_protocol::tags::number_message(&mut numbered, rules, &mut high);
+    high
 }
 
 /// What a tool turn's facts name about its calls that the operational fold doesn't keep, as far
@@ -278,6 +305,7 @@ impl<W: Writer> Writer for Placed<'_, W> {
         let mut first = 0;
         let calls = &self.calls;
         let rich_ui = self.rich_ui.as_ref();
+        let runner = self.runner.as_ref();
         let records = self
             .inner
             .append_with(
@@ -294,6 +322,7 @@ impl<W: Writer> Writer for Placed<'_, W> {
                         operations,
                         calls,
                         rich_ui,
+                        runner,
                     };
                     match with_facts(batch, &placing) {
                         Ok(batch) => batch,
@@ -473,6 +502,8 @@ pub struct Placing<'a> {
     pub calls: &'a OpenCalls,
     /// The run's Rich UI stamp (`Placed::rich_ui`).
     pub rich_ui: Option<&'a RichUi>,
+    /// The run's own part numbering (`Placed::runner`).
+    pub runner: Option<&'a RunnerTags>,
 }
 
 /// `batch` with an `EntryFacts` record after the records that place or reserve each message:
@@ -492,6 +523,11 @@ pub fn with_facts(batch: Vec<Record>, at: &Placing<'_>) -> Result<Vec<Record>, S
         0
     };
     let mut time = last_time(at.conversation);
+    // The run's own numbering continues from the newest message it placed, or from its
+    // checkpoint when it has placed none (a run's start in this batch resets it there).
+    let mut runner_high = at
+        .runner
+        .map(|runner| runner_high_water(at.conversation, runner));
     let mut out = Vec::with_capacity(batch.len() + 2);
     let mut pending: Vec<EntryFacts> = Vec::new();
     // The ids the current step and batch announced for the messages they write, which those
@@ -604,6 +640,7 @@ pub fn with_facts(batch: Vec<Record>, at: &Placing<'_>) -> Result<Vec<Record>, S
                         .iter()
                         .any(|pending| pending.ordered && &pending.submission_id == id)
                 });
+                runner_high = at.runner.map(|runner| runner.checkpoint);
                 step_mid = None;
                 results_mid = None;
             }
@@ -784,6 +821,8 @@ pub fn with_facts(batch: Vec<Record>, at: &Placing<'_>) -> Result<Vec<Record>, S
                     no_display_facts: None,
                     reasoning_summaries: message.map(reasoning_summaries).unwrap_or_default(),
                     rich_ui: stamped,
+                    runner_tag_base: runner_high,
+                    legacy_view_seq: None,
                     ordinal,
                     written_at_ms,
                     tag_base: high,
@@ -810,6 +849,10 @@ pub fn with_facts(batch: Vec<Record>, at: &Placing<'_>) -> Result<Vec<Record>, S
                     })
                     .filter(|high| *high <= 9_007_199_254_740_991)
                     .ok_or("compaction tag numbers exceed the protocol integer range")?;
+                if let (Some(runner), Some(base), Some(message)) = (at.runner, runner_high, message)
+                {
+                    runner_high = Some(runner_high_after(message, runner.rules, base));
+                }
             }
             known = now_known;
         }
@@ -1498,6 +1541,54 @@ fn describe<'r>(
 /// assistant message still waiting for its tool results.
 fn known_of(conversation: &Conversation) -> u64 {
     conversation.placed + u64::from(conversation.open_tool_turn().is_some())
+}
+
+/// Where the run `runner`'s numbering stands before the next message it places: numbered on
+/// from the newest of the run's messages that records its base, through every message after
+/// it, or, when none does, from the run's checkpoint through the run's messages. A message
+/// that names no run (one held for its tool results, which reads don't attribute until its
+/// calls are under way) counts as the run's once a message of the run precedes it.
+fn runner_high_water(conversation: &Conversation, runner: &RunnerTags) -> u64 {
+    use broca_session_store::fold::conversation::EntryState;
+    let held = conversation
+        .open_entry
+        .as_ref()
+        .zip(conversation.open_tool_turn())
+        .map(|(entry, message)| (message, entry));
+    let all: Vec<(&Message, &EntryState)> = conversation
+        .messages
+        .iter()
+        .zip(conversation.entries.iter())
+        .chain(held)
+        .collect();
+    fn facts(entry: &EntryState) -> Option<&EntryFacts> {
+        entry.facts.as_ref()
+    }
+    let ours = |entry: &EntryState| {
+        facts(entry).and_then(|facts| facts.run_id.as_deref()) == Some(runner.run_id.as_str())
+    };
+    let anchor = all.iter().rposition(|(_, entry)| {
+        ours(entry)
+            && facts(entry)
+                .and_then(|facts| facts.runner_tag_base)
+                .is_some()
+    });
+    let (mut high, rest) = match anchor {
+        Some(at) => (
+            facts(all[at].1)
+                .and_then(|facts| facts.runner_tag_base)
+                .unwrap_or(runner.checkpoint),
+            &all[at..],
+        ),
+        None => match all.iter().position(|(_, entry)| ours(entry)) {
+            Some(first) => (runner.checkpoint, &all[first..]),
+            None => (runner.checkpoint, &all[all.len()..]),
+        },
+    };
+    for (message, _) in rest {
+        high = runner_high_after(message, runner.rules, high);
+    }
+    high
 }
 
 /// The highest part number so far: the newest message's base plus its own numbered parts, or

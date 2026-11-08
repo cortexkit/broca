@@ -221,6 +221,7 @@ fn one_of_each() -> Vec<Record> {
             call_key: None,
         }),
         Record::QueuedSend(QueuedSend {
+            media: Vec::new(),
             submission_id: "sub".into(),
             send_id: Some("s2".into()),
             input: vec![Message::new(

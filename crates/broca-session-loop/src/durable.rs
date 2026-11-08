@@ -10,9 +10,10 @@ use broca_session_store::backend::{BackendError, SessionBackend};
 use broca_session_store::fold::conversation::Conversation;
 use broca_session_store::fold::operations::Operations;
 use broca_session_store::record::{PartRef, Record};
-use broca_session_store::session::{Carry, SessionError, StoredEntry};
+use broca_session_store::session::{Carry, NewInputMedia, SessionError, StoredEntry};
 use broca_session_store::setup::{SetupError, SetupKey, SetupStore};
 
+use crate::media::HeldInputMedia;
 use crate::parts::{Parts, SharedParts};
 use crate::writer::Writer;
 
@@ -81,17 +82,36 @@ pub async fn store_unstored<S: PartStore>(
 
 /// A session's writer that stores the setup parts not yet durable before each append, so no
 /// appended record names a part only memory holds. A failure to store one refuses the append
-/// with nothing written. Every other method is the inner writer's.
+/// with nothing written. With `media`, an append also stores or points at each held medium its
+/// records' messages name, so a send's media are durable before the records that place it.
+/// Every other method is the inner writer's.
 pub struct Durable<'a, W, S> {
     pub writer: &'a mut W,
     pub parts: &'a mut SharedParts,
     pub store: Option<&'a S>,
+    /// The media of sends the writer's owner staged and no record stores yet.
+    pub media: Option<&'a mut HeldInputMedia>,
 }
 
 impl<W: Writer, S: PartStore> Writer for Durable<'_, W, S> {
     async fn append(&mut self, records: &[Record], barrier: bool) -> Result<u64, SessionError> {
         store_unstored(self.parts, self.store).await?;
-        self.writer.append(records, barrier).await
+        match self.media.as_deref_mut() {
+            Some(held) => Ok(held.append(self.writer, records, barrier).await?.0),
+            None => self.writer.append(records, barrier).await,
+        }
+    }
+
+    async fn append_input_media(
+        &mut self,
+        records: &[Record],
+        media: Vec<NewInputMedia>,
+        barrier: bool,
+    ) -> Result<(u64, Vec<Record>), SessionError> {
+        store_unstored(self.parts, self.store).await?;
+        self.writer
+            .append_input_media(records, media, barrier)
+            .await
     }
 
     async fn send_records(&mut self, submission_id: &str) -> Result<Vec<Record>, SessionError> {

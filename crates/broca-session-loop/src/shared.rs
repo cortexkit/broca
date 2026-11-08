@@ -703,6 +703,7 @@ mod tests {
                 facts: crate::entries::Tags::default(),
                 calls: Default::default(),
                 rich_ui: None,
+                runner: None,
             };
             placed.append(&[input("placed")], true).await.unwrap();
         };

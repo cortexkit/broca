@@ -27,7 +27,7 @@ use crate::fold::conversation::Conversation;
 use crate::fold::operations::Operations;
 use crate::head::{self, Head, HeadError, OpenLog, Residence, SessionTriple, WrappedKey};
 use crate::idindex::OpenIds;
-use crate::keys::{self, random_id, DataKey, DeploymentKey};
+use crate::keys::{self, random_id, Cipher, DataKey, DeploymentKey};
 use crate::log::{ChainBase, LogEncoder, LogEnd, LogError, ReadLog};
 use crate::record::{ChangeAborted, Record, Stream, WriterOpened};
 
@@ -63,7 +63,7 @@ pub enum SessionError {
     Index(crate::idindex::IndexError),
     /// A revert was refused; nothing was written.
     RevertRefused(revert::RevertRefusal),
-    /// A tool result's media couldn't be stored or read back.
+    /// A medium's bytes couldn't be stored or read back.
     Media(media::MediaError),
     /// The open log holds debris, or a recovery a crash interrupted: run
     /// [`Session::recover`], then load again.
@@ -282,9 +282,11 @@ pub enum Appended<'a> {
 pub type AppendObserver = Box<dyn FnMut(Appended<'_>) + Send + Sync>;
 
 impl<B: SessionBackend> Session<B> {
-    /// Creates a session at `addr`. `appends_in_conversation` is the conversation fold's
-    /// setting: `false` for sessions on the current compaction contract, which keep text
-    /// delivered with a tool result apart from the result.
+    /// Creates a session at `addr`, in the cipher mode `deployment` creates sessions in (see
+    /// [`DeploymentKey::creating`]): the mode is recorded in the head and never changes.
+    /// `appends_in_conversation` is the conversation fold's setting: `false` for sessions on the
+    /// current compaction contract, which keep text delivered with a tool result apart from the
+    /// result.
     pub async fn create(
         backend: B,
         addr: SessionAddr,
@@ -293,7 +295,21 @@ impl<B: SessionBackend> Session<B> {
         appends_in_conversation: bool,
     ) -> Result<Self, SessionError> {
         let session_id = random_id();
-        let key = DataKey::generate(DATA_KEY_ID);
+        let (key, wrapped, cipher) = match deployment.new_sessions() {
+            Cipher::XChaCha20Poly1305 => {
+                let key = DataKey::generate(DATA_KEY_ID);
+                let wrapped = keys::wrap(deployment, &session_id, &key)
+                    .ok_or(SessionError::Head(HeadError::NotLoaded))?;
+                let wrapped = vec![WrappedKey {
+                    id: key.id,
+                    deployment: deployment.id(),
+                    wrapped: ByteBuf(wrapped),
+                }];
+                // An encrypted head leaves the field out, as every head did before plain mode.
+                (key, wrapped, None)
+            }
+            Cipher::None => (DataKey::plain(), Vec::new(), Some(Cipher::None)),
+        };
         let log = random_id();
         let head = Head {
             format: head::HEAD_FORMAT,
@@ -303,11 +319,7 @@ impl<B: SessionBackend> Session<B> {
             history_version: 0,
             residence: Residence::Creating(log),
             features: Vec::new(),
-            keys: vec![WrappedKey {
-                id: key.id,
-                deployment: deployment.id(),
-                wrapped: ByteBuf(keys::wrap(deployment, &session_id, &key)),
-            }],
+            keys: wrapped,
             generation: random_id(),
             next_seq: 1,
             open_log: None,
@@ -318,6 +330,7 @@ impl<B: SessionBackend> Session<B> {
             id_index: None,
             cold_since_ms: None,
             appends_in_conversation: appends_in_conversation.then_some(true),
+            cipher,
         };
         let version = backend
             .write_head(&addr, &head::seal(&head, &key), None, 1)
@@ -882,7 +895,10 @@ mod kept;
 pub use kept::InMemory;
 mod media;
 use media::OpenLogIndex;
-pub use media::{MediaError, NewMedia};
+pub use media::{
+    message_media, record_objects, sent_messages, stored_media, MediaError, MediaObjects,
+    NamedMedium, NewMedia,
+};
 mod import;
 pub use import::{is_broca_id_form, NewInputMedia};
 
