@@ -2134,7 +2134,7 @@ async fn run_finished_is_sent_once_for_every_terminal_reason() {
 }
 
 #[tokio::test]
-async fn terminal_apikey_backoff_is_gated_and_precedes_release() {
+async fn terminal_transient_backoff_is_gated_and_precedes_release() {
     for supported in [false, true] {
         let routing = Arc::new(FakeRouting {
             backoff: supported,
@@ -2161,7 +2161,7 @@ async fn terminal_apikey_backoff_is_gated_and_precedes_release() {
             "retry_after_secs":1.125,"provider_code":"rate_limited"}),
         )
         .unwrap();
-        reporter.terminal_rate_limit(Some(lineage), 3, &error);
+        reporter.terminal_transient(Some(lineage), 3, &error);
         reporter.finish(Some(lineage), 3, RunFinishReason::Error);
         broca_test_support::wait_until("API-key release report", || async {
             let observed = routing.observed();
@@ -2190,12 +2190,12 @@ async fn terminal_apikey_backoff_is_gated_and_precedes_release() {
 }
 
 #[tokio::test]
-async fn terminal_apikey_backoff_requires_a_timed_rate_limit() {
+async fn terminal_transient_backoff_excludes_account_limits_and_invalid_delays() {
     for extra in [
-        json!({"provider_code":"rate_limited"}),
-        json!({"status":503,"retry_after_secs":1.0}),
         json!({"provider_code":"account_limit_exhausted","status":429,"retry_after_secs":1.0}),
         json!({"provider_code":"rate_limited","retry_after_secs":-1.0}),
+        json!({"class":"auth_required","status":401,"retry_after_secs":1.0}),
+        json!({"class":"permanent","provider_code":"billing_exhausted","retry_after_secs":1.0}),
     ] {
         let routing = Arc::new(FakeRouting {
             backoff: true,
@@ -2220,7 +2220,7 @@ async fn terminal_apikey_backoff_requires_a_timed_rate_limit() {
             .as_object_mut()
             .unwrap()
             .extend(extra.as_object().unwrap().clone());
-        reporter.terminal_rate_limit(Some(lineage), 3, &serde_json::from_value(error).unwrap());
+        reporter.terminal_transient(Some(lineage), 3, &serde_json::from_value(error).unwrap());
         reporter.finish(Some(lineage), 3, RunFinishReason::Error);
         let reports = broca_test_support::wait_until("untimed API-key release report", || async {
             let observed = routing.observed();
@@ -2276,9 +2276,7 @@ async fn terminal_credential_reports(
         &attempt(error.status, observation),
     );
     reporter.terminal_credential_refused(Some(lineage), 3, &error, Some(method), credential_id);
-    if method == "apikey" {
-        reporter.terminal_rate_limit(Some(lineage), 3, &error);
-    }
+    reporter.terminal_transient(Some(lineage), 3, &error);
     reporter.finish(Some(lineage), 3, RunFinishReason::Error);
     broca_test_support::wait_until("credential refusal release report", || async {
         let reports = routing.observed();

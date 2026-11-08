@@ -2615,7 +2615,7 @@ mod executor {
     /// Share the durable terminal's error between routing and vault reporting. API-key auth
     /// pauses block the rejected key without ending the paused run or releasing its admission.
     /// `terminal_error` reads the error from the session's storage and is awaited only when the
-    /// outcome can carry a refusal worth reporting.
+    /// outcome can carry a terminal transient or refusal worth reporting.
     async fn report_routed_terminal_error(
         reporter: &broca_module_serve::account_routing::RunReporter,
         selection: Option<&broca_core::AuthSelection>,
@@ -2644,8 +2644,8 @@ mod executor {
                 selection.auth_method.as_deref(),
                 Some(&selection.credential_id),
             );
-            if apikey && finished_error {
-                reporter.terminal_rate_limit(terminal.0, terminal.1, error);
+            if finished_error {
+                reporter.terminal_transient(terminal.0, terminal.1, error);
             }
         }
         Some(error)
@@ -7332,6 +7332,245 @@ mod executor {
                 let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
                 self.reports.lock().unwrap().push(body["params"].clone());
                 Ok(Ok(br#"{"result":{}}"#.to_vec()))
+            }
+        }
+
+        async fn terminal_backoff_reports(
+            method: &str,
+            path: &str,
+            outcome: Result<RunSummary, RunError>,
+            error: ProviderError,
+        ) -> Vec<serde_json::Value> {
+            use broca_module_serve::account_routing::{RoutingClient, RunReporter};
+            use broca_wal::Wal;
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let mut wal =
+                broca_wal::FileWal::open(broca_test_support::scratch_root().join(format!(
+                    "terminal-backoff-{}-{}.wal",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                )))
+                .unwrap();
+            wal.append(4, &run_finished(4, Some(error.clone())).record, true)
+                .unwrap();
+            let lineage = wal.lineage_id().unwrap();
+            let routing = Arc::new(TerminalRouting {
+                reports: Default::default(),
+                supported: true,
+            });
+            let reporter = RunReporter::start(
+                Arc::new(RoutingClient::new(routing.clone(), Default::default())),
+                "adm-transient".into(),
+                "run-transient".into(),
+                None,
+                Arc::new(std::sync::atomic::AtomicU64::new(4)),
+            );
+            for (seq, receipt) in [(2, 1_000), (3, 42_000)] {
+                let attempt: broca_protocol::ModelAttempt =
+                    serde_json::from_value(serde_json::json!({
+                        "attempt":seq - 2,"request_body_len":10,"request_body_sha256":"aa",
+                        "http_status":error.status,"response_body_len":0,
+                        "response_body_sha256":"bb","ts_ms":receipt,
+                        "outcome":if error.status.is_some() { "complete" } else { "connect_failed" }
+                    }))
+                    .unwrap();
+                broca_core::AccountReporter::attempt_recorded(
+                    reporter.as_ref(),
+                    Some(lineage),
+                    seq,
+                    &attempt,
+                );
+            }
+            let selection: broca_core::AuthSelection = serde_json::from_value(serde_json::json!({
+                "auth_method":method,"credential_id":"vault-key",
+                "account_decision":{"path":path,"admission_id":"adm-transient"}
+            }))
+            .unwrap();
+            report_routed_terminal_error(
+                &reporter,
+                Some(&selection),
+                &outcome,
+                async { Some(error) },
+                (Some(lineage), 4),
+            )
+            .await;
+            if let Ok(summary) = outcome {
+                if summary.paused.is_none() {
+                    reporter.finish(Some(lineage), 4, summary.reason);
+                }
+            }
+            drop(reporter);
+            broca_test_support::wait_until("terminal backoff reports drained", || async {
+                if Arc::strong_count(&routing) == 1 {
+                    Ok(())
+                } else {
+                    Err("report task still owns routing".into())
+                }
+            })
+            .await;
+            let reports = routing.reports.lock().unwrap().clone();
+            reports
+        }
+
+        #[tokio::test]
+        async fn routed_chatgpt_terminal_overload_reports_default_backoff() {
+            let mut error = err_with_status(Some(503));
+            error.class = ErrorClass::Transient;
+            error.provider_code = Some("server_is_overloaded".into());
+            let reports = terminal_backoff_reports(
+                "chatgpt",
+                "routed",
+                run_outcome(RunFinishReason::Error, None),
+                error,
+            )
+            .await;
+            assert_eq!(
+                reports
+                    .iter()
+                    .map(|body| body["kind"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                ["attempt", "attempt", "transient_backoff", "run_finished"]
+            );
+            assert_eq!(reports[2]["retry_at_ms"], 47_000);
+            assert_eq!(reports[2]["admission_id"], "adm-transient");
+            assert_eq!(
+                reports[2]["event_id"],
+                format!("{}:backoff", reports[3]["event_id"].as_str().unwrap())
+            );
+        }
+
+        #[tokio::test]
+        async fn routed_terminal_transients_report_structured_or_default_backoff_for_every_method()
+        {
+            for method in ["oauth", "chatgpt", "apikey"] {
+                for (status, code, retry, expected, class) in [
+                    (
+                        Some(429),
+                        Some("rate_limited"),
+                        Some(1.125),
+                        43_125,
+                        ErrorClass::Transient,
+                    ),
+                    (
+                        Some(503),
+                        Some("server_is_overloaded"),
+                        Some(2.25),
+                        44_250,
+                        ErrorClass::Transient,
+                    ),
+                    (
+                        Some(503),
+                        Some("server_is_overloaded"),
+                        None,
+                        47_000,
+                        ErrorClass::Transient,
+                    ),
+                    (None, None, None, 47_000, ErrorClass::Transient),
+                    (None, None, None, 47_000, ErrorClass::ProviderUnavailable),
+                ] {
+                    let mut error = err_with_status(status);
+                    error.class = class;
+                    error.provider_code = code.map(str::to_owned);
+                    error.retry_after_secs = retry;
+                    error.message = "retry after 999 seconds".into();
+                    let reports = terminal_backoff_reports(
+                        method,
+                        "routed",
+                        run_outcome(RunFinishReason::Error, None),
+                        error,
+                    )
+                    .await;
+                    assert_eq!(reports.len(), 4, "{method}: {status:?}");
+                    assert_eq!(reports[2]["kind"], "transient_backoff");
+                    assert_eq!(reports[2]["retry_at_ms"], expected, "{method}: {status:?}");
+                    assert_eq!(reports[2]["admission_id"], "adm-transient");
+                    assert_eq!(reports[3]["kind"], "run_finished");
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn routed_recovery_account_pause_and_credential_refusal_do_not_queue_backoff() {
+            for method in ["oauth", "chatgpt", "apikey"] {
+                for (reason, pause, class, code, status) in [
+                    (
+                        RunFinishReason::Completed,
+                        None,
+                        ErrorClass::Transient,
+                        "server_is_overloaded",
+                        503,
+                    ),
+                    (
+                        RunFinishReason::Interrupted,
+                        Some(PauseReason::AccountLimit),
+                        ErrorClass::Transient,
+                        "account_limit_exhausted",
+                        429,
+                    ),
+                    (
+                        RunFinishReason::Error,
+                        None,
+                        ErrorClass::Transient,
+                        "account_limit_exhausted",
+                        429,
+                    ),
+                    (
+                        RunFinishReason::Error,
+                        None,
+                        ErrorClass::Permanent,
+                        "billing_exhausted",
+                        402,
+                    ),
+                    (
+                        RunFinishReason::Interrupted,
+                        Some(PauseReason::AuthRequired),
+                        ErrorClass::Auth,
+                        "invalid_api_key",
+                        401,
+                    ),
+                ] {
+                    let mut error = err_with_status(Some(status));
+                    error.class = class;
+                    error.provider_code = Some(code.into());
+                    error.retry_after_secs = Some(1.0);
+                    let reports = terminal_backoff_reports(
+                        method,
+                        "routed",
+                        run_outcome(reason, pause),
+                        error,
+                    )
+                    .await;
+                    assert!(
+                        reports
+                            .iter()
+                            .all(|body| body["kind"] != "transient_backoff"),
+                        "{method}: {code}: {reason:?}"
+                    );
+                    if pause.is_some() {
+                        assert!(reports.iter().all(|body| body["kind"] != "run_finished"));
+                    }
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn unrouted_terminal_transients_do_not_queue_backoff() {
+            for method in ["oauth", "chatgpt", "apikey"] {
+                for path in ["legacy_static", "caller"] {
+                    let mut error = err_with_status(Some(503));
+                    error.class = ErrorClass::Transient;
+                    let reports = terminal_backoff_reports(
+                        method,
+                        path,
+                        run_outcome(RunFinishReason::Error, None),
+                        error,
+                    )
+                    .await;
+                    assert_eq!(reports.len(), 3, "{method}: {path}");
+                    assert!(reports
+                        .iter()
+                        .all(|body| body["kind"] != "transient_backoff"));
+                }
             }
         }
 

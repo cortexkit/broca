@@ -650,11 +650,14 @@ answer outside the offered account/credential pairs. A key's account id is the v
 hinted admissions rather than bypassing
 routing. `run_finished` with the admission id releases the routed key, just as for subscriptions.
 
-For an API-key run admitted by routing, a terminal transient rate limit with `retry_after_secs`
-also reports `transient_backoff` before `run_finished`. Its own stable event id is distinct from
-the release, and `retry_at_ms` is the final attempt's receipt time plus the retry delay in Unix
-milliseconds. Broca uses the provider's existing rate-limit classification; a refusal recovered
-by the provider's retries is not reported as backoff. The new observation is sent only when the
+For a run admitted by routing under any method (`oauth`, `chatgpt` or `apikey`), a terminal error
+classified at its source as `transient` reports one `transient_backoff` before `run_finished`.
+Its stable event id is `<id>:backoff`, distinct from the release, and `retry_at_ms` is always
+present: the final attempt's receipt time plus the structured provider retry delay
+(`retry_after_secs`), or plus 5,000 ms when no delay is supplied. Broca never infers timing from
+message text. A transient recovered by broca's own retries is not reported as backoff;
+`account_limit_exhausted` and `credential_refused` keep their own paths and method rules.
+The observation is sent only when the
 router's `role.describe` declares `observe_backoff`. Discovery uses the management route's
 capability cache, also used for `service_tier`, and refreshes when that route is reopened.
 Renewal (`mode: "renew"` with `expected_pin`) is not currently implemented for any routed method.

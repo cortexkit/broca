@@ -1961,23 +1961,24 @@ impl RunReporter {
         });
     }
 
-    /// Report a terminal rate limit using the final attempt's receipt time. A rate limit
-    /// cleared by the provider's own retries never reaches this hook and is not reported.
-    /// The executor calls this only for an API-key run admitted by routing.
-    pub fn terminal_rate_limit(
+    /// Report an uncleared transient using the final attempt's receipt time. Account limits
+    /// have their own reports; other transients use the structured retry delay or five seconds.
+    /// Exhausted transport failures use their shared transient classification.
+    /// The executor calls this only for an error finish on a run admitted by routing.
+    pub fn terminal_transient(
         &self,
         lineage: Option<WalLineageId>,
         wal_seq: u64,
         error: &broca_protocol::ProviderError,
     ) {
-        if error.is_rate_limited() {
-            if let Some(retry_after_secs) = error.retry_after_secs {
-                let _ = self.tx.send(ReportEvent::Backoff {
-                    lineage,
-                    wal_seq,
-                    retry_after_secs,
-                });
-            }
+        if error.class.shared_class() == ErrorClass::Transient
+            && !error.is_account_limit_exhausted()
+        {
+            let _ = self.tx.send(ReportEvent::Backoff {
+                lineage,
+                wal_seq,
+                retry_after_secs: error.retry_after_secs.unwrap_or(5.0),
+            });
         }
     }
 

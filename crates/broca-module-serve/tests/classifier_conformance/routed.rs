@@ -341,6 +341,18 @@ impl State {
                 } else {
                     false
                 };
+                if params["kind"] == "transient_backoff" && !duplicate {
+                    let admission = inner
+                        .admissions
+                        .get(params["admission_id"].as_str().unwrap())
+                        .expect("backoff must name an admitted run");
+                    assert!(
+                        !admission.finished,
+                        "transient_backoff must precede run_finished"
+                    );
+                    assert!(id.ends_with(":backoff"));
+                    assert!(params["retry_at_ms"].as_u64().is_some());
+                }
                 let bound = if let Some(admission) = inner
                     .admissions
                     .get_mut(params["admission_id"].as_str().unwrap())
@@ -622,6 +634,49 @@ mod tests {
             decision_id: "scripted".into(),
         })]);
         state
+    }
+
+    #[test]
+    fn routed_fixture_transient_backoff_is_bound_before_release_and_replays_after() {
+        let state = scripted_state();
+        admit(&state);
+        let backoff = json!({"event_id":"lineage:3:backoff","kind":"transient_backoff",
+            "admission_id":"first","caller":{"runner":"broca"},"retry_at_ms":47_000});
+        let observed = call(&state, "route.account_observe", backoff.clone());
+        assert_eq!(observed["observation"]["bound"], true);
+        assert_eq!(observed["observation"]["duplicate"], false);
+        assert!(!state.0.lock().unwrap().admissions["first"].finished);
+        call(
+            &state,
+            "route.account_observe",
+            json!({"event_id":"lineage:3","kind":"run_finished","admission_id":"first",
+                "caller":{"runner":"broca"},"run_id":"run-1","terminal_reason":"error",
+                "upstream_origin":"upstream"}),
+        );
+        assert!(state.0.lock().unwrap().admissions["first"].finished);
+        let replay = call(&state, "route.account_observe", backoff);
+        assert_eq!(replay["observation"]["duplicate"], true);
+        assert_eq!(state.0.lock().unwrap().events.len(), 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "transient_backoff must precede run_finished")]
+    fn routed_fixture_transient_backoff_rejects_a_new_observation_after_release() {
+        let state = scripted_state();
+        admit(&state);
+        call(
+            &state,
+            "route.account_observe",
+            json!({"event_id":"lineage:3","kind":"run_finished","admission_id":"first",
+                "caller":{"runner":"broca"},"run_id":"run-1","terminal_reason":"error",
+                "upstream_origin":"upstream"}),
+        );
+        call(
+            &state,
+            "route.account_observe",
+            json!({"event_id":"lineage:3:backoff","kind":"transient_backoff",
+                "admission_id":"first","caller":{"runner":"broca"},"retry_at_ms":47_000}),
+        );
     }
 
     #[test]
