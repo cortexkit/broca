@@ -49,6 +49,7 @@ fn step_start() -> Record {
     Record::StepStart(StepStart {
         run_id: "r".into(),
         step_id: 1,
+        mid: None,
     })
 }
 
@@ -78,6 +79,7 @@ fn batch(ids: &[&str]) -> Record {
         batch_id: "b".into(),
         step_id: 1,
         planned: ids.iter().map(|id| ToolCallId((*id).into())).collect(),
+        mid: None,
     })
 }
 

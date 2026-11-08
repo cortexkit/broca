@@ -129,10 +129,17 @@ struct State {
     /// In a mode-3 log: who delivered each tool-result delivery's text, by the delivering
     /// record's seq (see `entry_facts`).
     delivery_notices: HashMap<u64, Notice>,
-    /// The current step's calls that a record already anchored, as today's call keys read them:
-    /// `None` for a dispatch intent, which holds the call's key, or the seq of the deferral that
-    /// prepared a call for an approval.
-    anchored: HashMap<String, Option<u64>>,
+    /// The copies of the current step's calls and the records that anchored them, as today's
+    /// readers key them (`broca_core::call_identity`).
+    anchors: broca_core::call_identity::CallAnchors,
+    /// The copy the record being converted is about, if it is about one.
+    call: Option<broca_core::call_identity::CallAnchor>,
+    /// Whether today's message ids carry the log's lineage (`broca_core::message_mid`).
+    mode3: bool,
+    /// For the step or batch start being converted: today's id of the message it announces,
+    /// the step's assistant message or the batch's tool-results message, at the position
+    /// today's placement gives it.
+    announced_mid: Option<String>,
 }
 
 /// Writes the held copies as transcript entries at the boundary that places them.
@@ -168,6 +175,7 @@ pub fn convert(old: &[FramedRecord], lineage: Option<&str>) -> Result<Converted,
         .map_err(err)?
         .map(|legacy| {
             state.delivery_notices = legacy.delivery_notices.clone();
+            state.mode3 = !legacy.page_only;
             (legacy, Conversation::new(false), 0u64)
         });
     // Today's placement and budget rules decide what older records left implicit: the firing a
@@ -218,6 +226,17 @@ pub fn convert(old: &[FramedRecord], lineage: Option<&str>) -> Result<Converted,
         // A record today's placement refuses is one today's replay refuses too; the conversion
         // still carries it, and the conversation check reports the log.
         let actions = placement.observe(&framed.record).unwrap_or_default();
+        // A step announces its assistant message at the position placement now gives the next
+        // message, after any steers the step's start placed; a batch announces the tool-results
+        // message that follows the assistant message it holds.
+        let announced = match &framed.record {
+            WalRecord::StepStarted { .. } => Some(placement.next_ordinal()),
+            WalRecord::ToolBatchStarted { .. } => placement.held_tool_result_ordinal(),
+            _ => None,
+        };
+        state.announced_mid = announced.and_then(|position| {
+            broca_core::message_mid(state.mode3, state.lineage.as_deref(), position).ok()
+        });
         // A step taken after the budget's finalize firing enters today's conversation at once,
         // calls and all.
         state.finalize_step = actions.iter().any(|action| {
@@ -240,23 +259,11 @@ pub fn convert(old: &[FramedRecord], lineage: Option<&str>) -> Result<Converted,
                 broca_core::run::limiting_stop_satisfied(&stop_when, steps, assistant_message);
         }
         state.seq = framed.seq;
-        // Today's call keys come from the record that first anchors each call of a step.
-        match &framed.record {
-            WalRecord::RunStarted { .. }
-            | WalRecord::ModelStepFinished { .. }
-            | WalRecord::TurnFinished { .. }
-            | WalRecord::RunFinished { .. } => state.anchored.clear(),
-            WalRecord::ToolDispatchIntent { tool_call_id, .. } => {
-                state.anchored.insert(tool_call_id.0.clone(), None);
-            }
-            WalRecord::ToolCallDeferred { call_id, .. } => {
-                state
-                    .anchored
-                    .entry(call_id.0.clone())
-                    .or_insert(Some(framed.seq));
-            }
-            _ => {}
-        }
+        // Today's call keys come from the record that first anchors each copy of a step's calls.
+        state.call = state
+            .anchors
+            .observe(&framed.record, framed.seq)
+            .map(|(_, copy)| copy);
         let before = out.records.len();
         convert_one(&framed.record, &mut state, &mut out)?;
         if let Some((legacy, counts, emitted)) = &mut facts {
@@ -542,6 +549,7 @@ fn convert_record(
             out.records.push(Record::StepStart(StepStart {
                 run_id: state.run_id.clone(),
                 step_id: f.req_u64("step_id"),
+                mid: state.announced_mid.take(),
             }));
         }
         "tool_batch_started" => {
@@ -551,6 +559,7 @@ fn convert_record(
                 batch_id: f.req_string("batch_id"),
                 step_id: f.req_u64("step_id"),
                 planned,
+                mid: state.announced_mid.take(),
             }));
         }
         "tool_batch_finished" => out.records.push(Record::BatchEnd(BatchEnd {
@@ -1380,14 +1389,17 @@ fn reply_and_outcome(terminal: Terminal, state: &State, out: &mut Converted) {
     let result_digest = sha256(&result.encode());
     let tool_call_id = result.tool_call_id.clone();
     let is_error = result.is_error;
-    // A call no dispatch intent anchored keeps the key today's projection gives it: the log's
-    // lineage and the seq of the record that first anchored it, its deferral or this terminal.
-    let call_key = match state.anchored.get(&tool_call_id.0) {
-        Some(None) => None,
-        Some(Some(deferred)) => {
-            broca_core::context::tool_call_key(state.lineage.as_deref(), *deferred, None)
-        }
-        None => broca_core::context::tool_call_key(state.lineage.as_deref(), state.seq, None),
+    // A copy no dispatch intent anchored keeps the key today's projection gives it: the log's
+    // lineage and the seq of the record that first anchored that copy, its deferral or this
+    // terminal. So a repeated id's refused copy has a key of its own, apart from the dispatched
+    // copy's. A terminal for a call the step didn't make is keyed by its own seq.
+    let call_key = match &state.call {
+        Some(copy) if copy.id == tool_call_id => copy
+            .intent_seq
+            .is_none()
+            .then(|| copy.key(state.lineage.as_deref()))
+            .flatten(),
+        _ => broca_core::context::tool_call_key(state.lineage.as_deref(), state.seq, None),
     };
     out.records.push(Record::ToolReply(ToolReply {
         run_id: state.run_id.clone(),

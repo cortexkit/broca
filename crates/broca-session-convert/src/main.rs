@@ -30,6 +30,11 @@
 //! possible cut. Every fact must be equal field for field, fact id included. The report names
 //! counts, run ids and field names only.
 //!
+//! `session-convert subscribe <path>...`: for every session log, today's `session.subscribe`
+//! control stream against the new storage's, from the converted records (see
+//! `subscribe_check`). `session-convert subscribe-cost --dir <scratch> <path>...` times a
+//! subscriber's catch-up on the largest log given.
+//!
 //! Point it only at a copy of a state root (an APFS clone, `cp -c`), never at live files: it opens
 //! each log read-only, but a measurement run should never share a disk path with the daemon.
 
@@ -54,6 +59,7 @@ use serde::Serialize;
 
 mod heads;
 mod serve_check;
+mod subscribe_check;
 
 /// Measurements encrypt with a fixed throwaway key: only the cost matters, not secrecy.
 fn measurement_key() -> FrameKey {
@@ -159,7 +165,9 @@ fn usage() -> ! {
          session-convert append --dir SCRATCH [--sample N] [--out FILE] PATH...\n       \
          session-convert split [--dir SCRATCH] [--out FILE] [--limit N] PATH...\n       \
          session-convert entries [--dir SCRATCH] [--out FILE] [--limit N] PATH...\n       \
-         session-convert billing [--dir SCRATCH] [--out FILE] [--limit N] PATH..."
+         session-convert billing [--dir SCRATCH] [--out FILE] [--limit N] PATH...\n       \
+         session-convert subscribe [--dir SCRATCH] [--out FILE] [--limit N] PATH...\n       \
+         session-convert subscribe-cost --dir SCRATCH [--out FILE] PATH..."
     );
     std::process::exit(64);
 }
@@ -263,6 +271,8 @@ fn main() {
         "episodes" => run_episodes(&args),
         "render" => run_render(&args),
         "serve-check" => serve_check::run(&args),
+        "subscribe" => subscribe_check::run(&args),
+        "subscribe-cost" => subscribe_check::cost(&args),
         _ => usage(),
     }
 }

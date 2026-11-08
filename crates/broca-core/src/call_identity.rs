@@ -2,13 +2,18 @@
 use broca_protocol::ToolCallId;
 use broca_wal::WalRecord;
 
+/// The calls of the current step, one slot per copy in the assistant message's order, each
+/// anchored by the records that answer it. A record matches the first fitting copy of its
+/// call id, so a repeated id's copies keep distinct anchors.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct CallAnchors {
+pub struct CallAnchors {
     slots: Vec<CallAnchor>,
 }
 
+/// One copy of a tool call and what anchored it: the seq of the first record that did (its
+/// dispatch intent, deferral or terminal), and the facts its intent recorded.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct CallAnchor {
+pub struct CallAnchor {
     pub id: ToolCallId,
     pub seq: Option<u64>,
     pub intent_seq: Option<u64>,
@@ -21,6 +26,7 @@ pub(crate) struct CallAnchor {
 }
 
 impl CallAnchor {
+    /// The call's key: the one a record names, else the log's lineage and the anchoring seq.
     pub fn key(&self, lineage: Option<&str>) -> Option<String> {
         self.recorded_key
             .clone()
@@ -29,10 +35,14 @@ impl CallAnchor {
 }
 
 impl CallAnchors {
+    /// The step's call copies, in the assistant message's order.
     pub fn slots(&self) -> &[CallAnchor] {
         &self.slots
     }
 
+    /// Takes in the record at `seq`: a run, step or turn boundary resets the copies, and a
+    /// record about a call anchors the copy it answers. Returns that copy's index and its
+    /// state after the record, or `None` for a record about no copy.
     pub fn observe(&mut self, record: &WalRecord, seq: u64) -> Option<(usize, CallAnchor)> {
         match record {
             WalRecord::RunStarted { .. }

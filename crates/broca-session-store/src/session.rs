@@ -130,6 +130,57 @@ pub fn apply(
     }
 }
 
+/// Refuses entry facts that give a message another id than the one its step or batch announced
+/// (`StepStart::mid`, `BatchStart::mid`): a live subscriber already saw the message under the
+/// announced id, so two ids for one message mean the session's records disagree. The facts
+/// checked are a model-written message's, for the newest message: the step's assistant
+/// message, placed or held for its tool results, or the tool-results message the batch's last
+/// reply placed. Facts written before announcements were recorded have nothing to match.
+///
+/// A writer checks facts as it appends them, against the folds just before them. A log read
+/// back isn't checked again: a seal or a revert copies earlier messages' facts into the new log
+/// with their first ids, while the folds they're replayed against already moved on to later
+/// steps.
+pub fn check_announced_mid(
+    conversation: &Conversation,
+    operations: &Operations,
+    record: &Record,
+) -> Result<(), String> {
+    use broca_protocol::content::Role;
+    let Record::EntryFacts(facts) = record else {
+        return Ok(());
+    };
+    let Some(run) = operations.run.as_ref() else {
+        return Ok(());
+    };
+    if !facts.native {
+        return Ok(());
+    }
+    let held = conversation
+        .open_entry()
+        .filter(|(ordinal, ..)| *ordinal == facts.ordinal)
+        .map(|(_, message, _)| message.role);
+    let newest = (facts.ordinal == conversation.placed)
+        .then(|| conversation.window_message(facts.ordinal))
+        .flatten()
+        .map(|message| message.role);
+    let announced = match held.or(newest) {
+        Some(Role::Assistant) => run.step_mid.as_ref(),
+        Some(Role::Tool) => run
+            .open_batch
+            .as_ref()
+            .and_then(|batch| batch.results_mid.as_ref()),
+        _ => None,
+    };
+    match announced {
+        Some(announced) if *announced != facts.mid => Err(format!(
+            "message_id_mismatch: message {} has id {} but its start announced {announced}",
+            facts.ordinal, facts.mid
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// What [`Session::read`] found: a creation that never committed, or a log read and folded.
 enum Loaded<B: SessionBackend> {
     Creating {
@@ -183,7 +234,22 @@ pub struct Session<B: SessionBackend> {
     /// What the session keeps of its sealed history while it's open (see `entry_by_mid` and
     /// `keep_sealed_derived`).
     sealed_entries: read::SealedEntries,
+    /// Told of every batch this writer appends (see [`Session::observe_appends`]).
+    observer: Option<AppendObserver>,
 }
+
+/// What a session's writer tells the observer of its appends (see [`Session::observe_appends`]).
+pub enum Appended<'a> {
+    /// Records the writer appended, the first at seq `first`, told once their append returned.
+    Records { first: u64, records: &'a [Record] },
+    /// A revert replaced the session's history after a cut: records told before may be gone
+    /// from the branch the session now holds.
+    Replaced,
+}
+
+/// The observer of a session's appends: it runs on the writer's task, right after each append
+/// returns, so it sees the records in seq order and only once they're written.
+pub type AppendObserver = Box<dyn FnMut(Appended<'_>) + Send + Sync>;
 
 impl<B: SessionBackend> Session<B> {
     /// Creates a session at `addr`. `appends_in_conversation` is the conversation fold's
@@ -298,6 +364,7 @@ impl<B: SessionBackend> Session<B> {
             window: OpenLogIndex::default(),
             imported: Default::default(),
             sealed_entries: Default::default(),
+            observer: None,
         })
     }
 
@@ -448,6 +515,7 @@ impl<B: SessionBackend> Session<B> {
             window,
             imported: Default::default(),
             sealed_entries: Default::default(),
+            observer: None,
         };
         Ok(Loaded::Open {
             session: Box::new(session),
@@ -462,28 +530,17 @@ impl<B: SessionBackend> Session<B> {
     /// records their edits). The writer appended every one of them, so a log that no longer reads
     /// clean means something else wrote it, and the read refuses.
     pub async fn open_log_records(&self) -> Result<Vec<(u64, Record)>, SessionError> {
-        let open =
-            self.head
-                .open_log
-                .clone()
-                .ok_or(SessionError::Backend(BackendError::Corrupt(
-                    "local head without a log",
-                )))?;
-        let end = self.backend.log_end(&self.addr, &self.log).await?;
-        let bytes = self.backend.read_log(&self.addr, &self.log, 0..end).await?;
-        let bind = log_bind(&self.head.session_id, &self.log);
-        match crate::damage::analyse(
-            &bytes,
-            &self.key.frame_key(),
-            &bind,
-            open.synced_len,
-            chain_base,
-            None,
-        )? {
-            crate::damage::Verdict::Opens(read) => Ok(read.records),
-            _ => Err(SessionError::Fold(
-                "the open log no longer reads clean under its writer".into(),
-            )),
+        Ok(self.place().open_log().await?.records)
+    }
+
+    /// Where this session's records are stored now.
+    fn place(&self) -> stored::Place<'_, B> {
+        stored::Place {
+            backend: &self.backend,
+            addr: &self.addr,
+            head: &self.head,
+            key: &self.key,
+            log: &self.log,
         }
     }
 
@@ -574,6 +631,8 @@ impl<B: SessionBackend> Session<B> {
         let first = encoded.first_seq.expect("a batch holds records");
         self.poisoned = true;
         for (position, record) in records.iter().enumerate() {
+            check_announced_mid(&self.conversation, &self.operations, record)
+                .map_err(SessionError::Fold)?;
             apply(
                 &mut self.conversation,
                 &mut self.operations,
@@ -603,7 +662,28 @@ impl<B: SessionBackend> Session<B> {
             self.window.note(first + position as u64, record);
         }
         self.poisoned = false;
+        self.observed(Appended::Records { first, records });
         Ok(first)
+    }
+
+    /// Tells `observer` of every batch this writer appends from now on, right after its append
+    /// returns: the session's own appends, a seal's change records and the records it carries
+    /// into the new log, and a revert's replacing the history. One observer at a time; a new one
+    /// replaces the last.
+    pub fn observe_appends(&mut self, observer: AppendObserver) {
+        self.observer = Some(observer);
+    }
+
+    fn observed(&mut self, appended: Appended<'_>) {
+        if let Some(observer) = self.observer.as_mut() {
+            observer(appended);
+        }
+    }
+
+    /// The log holding `seq`, from its start through `last` (see
+    /// [`StoredRecords::from_log_holding`]), read over this session's own backend.
+    pub async fn from_log_holding(&self, seq: u64, last: u64) -> Result<LogFrom, SessionError> {
+        stored::from_log_holding(&self.place(), seq, last).await
     }
 
     /// Appends a claim-only frame, so the log's last barrier counts toward its durable bound.
@@ -634,6 +714,11 @@ impl<B: SessionBackend> Session<B> {
 
     pub fn head(&self) -> &Head {
         &self.head
+    }
+
+    /// The key this session's subscribe cursors are digested under.
+    pub fn cursor_key(&self) -> crate::keys::CursorKey {
+        self.key.cursor_key()
     }
 
     /// The seq the next appended record will take.
@@ -681,6 +766,8 @@ pub use import::{is_broca_id_form, NewInputMedia};
 
 mod read;
 pub use read::{served_window, window_entries, StoredEntry};
+mod stored;
+pub use stored::{LogFrom, StoredRecords};
 mod cold;
 pub use cold::Cold;
 mod recover;

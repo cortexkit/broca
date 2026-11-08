@@ -199,6 +199,8 @@ impl StoreRuntime {
             Box::new(self.parts.clone()),
         )
         .with_storage(storage);
+        let readers_root = store_root(&self.state_root);
+        actor = actor.with_readers(Arc::new(move || LocalBackend::new(readers_root.clone())));
         if let Some(billing) = &self.billing {
             actor = actor.with_billing(billing.clone());
         }

@@ -325,3 +325,30 @@ fn the_open_logs_newest_activity_is_kept_and_read_back() {
         assert_eq!(view.open_log_activity_ms(), Some(9));
     });
 }
+
+/// The observer of a session's appends hears of a batch only once its append returned, under
+/// the seqs its records took: a batch the backend refuses is never told.
+#[test]
+fn an_append_is_observed_only_once_it_returned() {
+    use std::sync::{Arc, Mutex};
+    let backend = MemoryBackend::default();
+    block_on(async {
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(), false)
+            .await
+            .unwrap();
+        let told = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&told);
+        session.observe_appends(Box::new(move |appended| {
+            if let super::Appended::Records { first, records } = appended {
+                seen.lock().unwrap().push((first, records.len()));
+            }
+        }));
+        let first = session
+            .append(&[input("one"), event("a")], true)
+            .await
+            .unwrap();
+        backend.fail_once(0);
+        assert!(session.append(&[input("two")], true).await.is_err());
+        assert_eq!(*told.lock().unwrap(), [(first, 2)]);
+    });
+}

@@ -126,6 +126,7 @@ fn step(run: &str, step_id: u64) -> Record {
     Record::StepStart(StepStart {
         run_id: run.into(),
         step_id,
+        mid: None,
     })
 }
 
@@ -136,6 +137,7 @@ fn dispatched(run: &str, id: &str) -> [Record; 2] {
             batch_id: "b".into(),
             step_id: 1,
             planned: vec![ToolCallId(id.into())],
+            mid: None,
         }),
         Record::ToolIntent(ToolIntent {
             run_id: run.into(),

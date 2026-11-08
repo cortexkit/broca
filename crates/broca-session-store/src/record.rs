@@ -527,6 +527,13 @@ message! {
     pub struct StepStart {
         1 req run_id: String,
         2 req step_id: u64,
+        /// The id of the assistant message this step writes, decided here so a live subscriber
+        /// can name the message from the step's start. The new loop mints it from its writer
+        /// generation and this record's seq; a step converted from a WAL log keeps the id the
+        /// WAL projection gives the message at that position. The message's `EntryFacts`
+        /// carries the same id, and a fold refuses one that doesn't. A step that writes no
+        /// message leaves it unused. Absent on steps written before it was recorded.
+        3 opt mid: String,
     }
 }
 
@@ -623,6 +630,9 @@ message! {
         2 req batch_id: String,
         3 req step_id: u64,
         4 rep planned: ToolCallId,
+        /// The id of the tool-results message this batch's replies make, decided here as
+        /// `StepStart::mid` is for the step's assistant message, with the same rules.
+        5 opt mid: String,
     }
 }
 

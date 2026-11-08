@@ -168,6 +168,17 @@ pub async fn serve_read(
     let mut response = crate::serve::session_read_response(page, None);
     response.history_version = head.history_version;
     response.incarnation = broca_session_store::codec::hex(&head.incarnation.0);
+    // The cursor at the read's durable end, which a subscribe resumes from with nothing missed
+    // or repeated.
+    response.head = crate::store_fanout::last_cursor(&session)
+        .await
+        .map_err(|error| {
+            crate::serve::ServeError::Open(
+                format!("the session's control stream can't be projected: {error}"),
+                Some(broca_protocol::ErrorClass::Permanent),
+            )
+        })?
+        .map(broca_wire::CursorWire::from);
     for (entry, mid) in response.messages.iter_mut().zip(mids) {
         entry.mid = mid;
     }

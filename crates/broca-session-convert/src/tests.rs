@@ -190,6 +190,33 @@ fn a_call_answered_without_an_intent_keeps_todays_key_on_its_outcome() {
     );
 }
 
+/// A refused duplicate copy of a call keeps a key of its own, as today's readers give it: the
+/// first copy of the repeated id is dispatched and keyed by its intent, the second is answered
+/// with the synthetic duplicate error and keyed by that result's seq.
+#[test]
+fn a_refused_duplicate_copy_keeps_its_own_key_apart_from_the_dispatched_copy() {
+    let old = log(&[
+        &RUN.replace("RUN", "r"),
+        r#"{"type":"step_started","step_id":1}"#,
+        r#"{"type":"model_step_finished","step_id":1,"assistant_message":{"message_id":"m1","content":[{"type":"tool_call","tool_call_id":"c1","tool_name":"bash","input":{"n":1}},{"type":"tool_call","tool_call_id":"c1","tool_name":"bash","input":{"n":2}}]},"usage":{},"retries_used":0}"#,
+        r#"{"type":"tool_batch_started","batch_id":"b1","step_id":1,"planned_calls":["c1","c1"]}"#,
+        r#"{"type":"tool_dispatch_intent","batch_id":"b1","tool_call_id":"c1","args":{"n":1}}"#,
+        r#"{"type":"tool_result","batch_id":"b1","result":{"tool_call_id":"c1","output":{"kind":"text","text":"ok"},"is_error":false},"outcome":"completed"}"#,
+        r#"{"type":"tool_result","batch_id":"b1","result":{"tool_call_id":"c1","output":{"kind":"error","message":"duplicate tool_call_id from provider"},"is_error":true},"outcome":"completed"}"#,
+    ]);
+    let converted = convert(&old, Some("lineage")).unwrap();
+    let keys: Vec<Option<String>> = converted
+        .records
+        .iter()
+        .filter_map(|record| match record {
+            Record::ToolOutcome(outcome) => Some(outcome.call_key.clone()),
+            _ => None,
+        })
+        .collect();
+    // The duplicate's synthetic result is the log's seventh record.
+    assert_eq!(keys, [None, Some("lineage:7".to_owned())]);
+}
+
 /// A refusal-fallback schedule carries to the next run under the same model and is dropped
 /// under another: the run start records what today's admission decided.
 #[test]

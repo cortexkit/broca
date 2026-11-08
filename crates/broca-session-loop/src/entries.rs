@@ -271,40 +271,107 @@ pub fn with_facts(batch: Vec<Record>, at: &Placing<'_>) -> Result<Vec<Record>, S
     let mut time = last_time(at.conversation);
     let mut out = Vec::with_capacity(batch.len() + 2);
     let mut pending: Vec<EntryFacts> = Vec::new();
+    // The ids the current step and batch announced for the messages they write, which those
+    // messages' facts carry: from earlier batches, then from this batch's own starts.
+    let run = at.operations.run.as_ref();
+    let mut step_mid = run.and_then(|run| run.step_mid.clone());
+    // Whether this batch placed or held the message `step_mid` names.
+    let mut step_placed = false;
+    let mut results_mid = run
+        .and_then(|run| run.open_batch.as_ref())
+        .and_then(|batch| batch.results_mid.clone());
     // Who sent the input of a run started in this batch, read from its start as today's entry
     // metadata reads it from the run's start.
     let mut run_sender = None;
-    // The calls a dispatch intent anchored, before this batch and in it: their key is the
-    // intent's.
-    let mut dispatched: Vec<broca_protocol::ToolCallId> = at
+    // The copies of the open batch's calls, in the assistant message's order, each with whether
+    // a dispatch intent anchored it and whether it was answered, from earlier batches and then
+    // this one. Only a call's first copy is ever dispatched: a later copy of the same id is
+    // refused as a duplicate. An answer goes to the first unanswered copy of its id, as today's
+    // readers match them, so a refused copy keys apart from the dispatched one.
+    let mut copies: Vec<(broca_protocol::ToolCallId, bool, bool)> = Vec::new();
+    if let Some(batch) = at
         .operations
         .run
         .as_ref()
         .and_then(|run| run.open_batch.as_ref())
-        .map(|batch| {
-            batch
-                .calls
-                .iter()
-                .filter(|call| call.intent)
-                .map(|call| call.id.clone())
-                .collect()
-        })
-        .unwrap_or_default();
+    {
+        for call in &batch.calls {
+            let first = !copies.iter().any(|(id, ..)| *id == call.id);
+            copies.push((
+                call.id.clone(),
+                call.intent && first,
+                call.terminal.is_some(),
+            ));
+        }
+    }
     let mut records = batch.into_iter().peekable();
     while let Some(mut record) = records.next() {
         if let Record::RunStart(start) = &record {
             run_sender = input_sender(start);
+            step_mid = None;
+            results_mid = None;
+        }
+        // A step or batch start announces the id of the message it will write, minted from the
+        // writer generation and the seq this record takes.
+        let minted = format!("{}.{}", at.prefix, at.first_seq + out.len() as u64);
+        match &mut record {
+            Record::StepStart(start) => {
+                // A step started again after an attempt that wrote no message (a pause, a
+                // refusal) writes the message that attempt announced. On today's WAL storage a
+                // message's id is its position, which the earlier attempt never took, so the
+                // retried step's message keeps the same id there; this keeps it here too.
+                let retried = step_mid
+                    .take()
+                    .filter(|mid| !step_placed && !newest_assistant_is(at.conversation, mid));
+                step_mid = Some(
+                    start
+                        .mid
+                        .get_or_insert_with(|| retried.unwrap_or(minted))
+                        .clone(),
+                );
+                step_placed = false;
+                results_mid = None;
+            }
+            Record::Assistant(_) => step_placed = true,
+            Record::BatchStart(batch) => {
+                results_mid = Some(batch.mid.get_or_insert(minted).clone());
+            }
+            _ => {}
         }
         match &mut record {
-            Record::BatchStart(_) => dispatched.clear(),
-            Record::ToolIntent(intent) => dispatched.push(intent.tool_call_id.clone()),
-            // A call answered without a dispatch intent takes a key minted from the writer
-            // generation and the seq its outcome takes, in the form of the store's ids.
-            Record::ToolOutcome(outcome)
-                if outcome.call_key.is_none() && !dispatched.contains(&outcome.tool_call_id) =>
-            {
-                outcome.call_key =
-                    Some(format!("{}.{}", at.prefix, at.first_seq + out.len() as u64));
+            Record::BatchStart(batch) => {
+                copies = batch
+                    .planned
+                    .iter()
+                    .map(|id| (id.clone(), false, false))
+                    .collect();
+            }
+            Record::ToolIntent(intent) => {
+                if let Some(copy) = copies.iter_mut().find(|(id, anchored, answered)| {
+                    *id == intent.tool_call_id && !anchored && !answered
+                }) {
+                    copy.1 = true;
+                }
+            }
+            Record::ToolOutcome(outcome) => {
+                let anchored = match copies
+                    .iter_mut()
+                    .find(|(id, _, answered)| *id == outcome.tool_call_id && !answered)
+                {
+                    Some(copy) => {
+                        copy.2 = true;
+                        copy.1
+                    }
+                    None => copies
+                        .iter()
+                        .any(|(id, anchored, _)| *id == outcome.tool_call_id && *anchored),
+                };
+                // A copy answered without a dispatch intent takes a key minted from the writer
+                // generation and the seq its outcome takes, in the form of the store's ids.
+                if outcome.call_key.is_none() && !anchored {
+                    outcome.call_key =
+                        Some(format!("{}.{}", at.prefix, at.first_seq + out.len() as u64));
+                }
             }
             _ => {}
         }
@@ -316,6 +383,13 @@ pub fn with_facts(batch: Vec<Record>, at: &Placing<'_>) -> Result<Vec<Record>, S
             let now_known = known_of(&counts);
             for ordinal in known + 1..=now_known {
                 let (message, facts) = describe(&record, at, run_sender.as_ref())?;
+                // The message a step or batch announced takes the id it announced: a step's
+                // assistant message, and the tool-results message a batch's last reply places.
+                let announced = match &record {
+                    Record::Assistant(_) => step_mid.clone(),
+                    Record::ToolReply(_) if ordinal == now_known => results_mid.clone(),
+                    _ => None,
+                };
                 let own = facts.written_at_ms;
                 // On the contract a message without its own time takes the newest earlier
                 // entry's, as `session.entries` serves it. Off it, only its own, as
@@ -341,7 +415,9 @@ pub fn with_facts(batch: Vec<Record>, at: &Placing<'_>) -> Result<Vec<Record>, S
                     native: facts.native,
                     render_tags: at.tags.render,
                     clean_reply: facts.clean_reply,
-                    mid: String::new(),
+                    // Empty until `flush` mints one: only a message nothing announced takes an
+                    // id from the seq of its own facts.
+                    mid: announced.unwrap_or_default(),
                     run_id: facts.run_id,
                     created_at_ms: facts.created_at_ms,
                     delivery_mode: facts.delivery_mode.map(str::to_owned),
@@ -409,9 +485,25 @@ fn accepted_at(input: &broca_session_store::record::Input, at: &Placing<'_>) -> 
     }
 }
 
+/// Whether the newest assistant message `conversation` holds, held for its tool results or
+/// placed, has the id `mid`.
+fn newest_assistant_is(conversation: &Conversation, mid: &str) -> bool {
+    let named = |facts: Option<&EntryFacts>| facts.is_some_and(|facts| facts.mid == mid);
+    if let Some((_, _, state)) = conversation.open_entry() {
+        return named(state.facts.as_ref());
+    }
+    (conversation.window_start()..=conversation.placed)
+        .rev()
+        .filter_map(|ordinal| conversation.window_entry(ordinal))
+        .find(|(message, _)| message.role == Role::Assistant)
+        .is_some_and(|(_, state)| named(state.facts.as_ref()))
+}
+
 fn flush(out: &mut Vec<Record>, pending: &mut Vec<EntryFacts>, at: &Placing<'_>) {
     for mut facts in pending.drain(..) {
-        facts.mid = format!("{}.{}", at.prefix, at.first_seq + out.len() as u64);
+        if facts.mid.is_empty() {
+            facts.mid = format!("{}.{}", at.prefix, at.first_seq + out.len() as u64);
+        }
         out.push(Record::EntryFacts(facts));
     }
 }

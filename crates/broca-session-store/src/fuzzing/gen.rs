@@ -653,7 +653,11 @@ mod records {
         interrupt_reason,
         error,
     });
-    crate::fuzzing::gen::fields!(StepStart { run_id, step_id });
+    crate::fuzzing::gen::fields!(StepStart {
+        run_id,
+        step_id,
+        mid
+    });
     crate::fuzzing::gen::fields!(StepEnd {
         run_id,
         step_id,
@@ -703,7 +707,8 @@ mod records {
         run_id,
         batch_id,
         step_id,
-        planned
+        planned,
+        mid
     });
     crate::fuzzing::gen::fields!(BatchEnd { run_id, batch_id });
     crate::fuzzing::gen::fields!(ToolIntent {
@@ -1004,7 +1009,8 @@ mod operations {
     crate::fuzzing::gen::fields!(OpenBatch {
         batch_id,
         step_id,
-        calls
+        calls,
+        results_mid
     });
     crate::fuzzing::gen::fields!(PendingInput {
         seq,
@@ -1053,7 +1059,8 @@ mod operations {
         step_request,
         step_attempt,
         end_error,
-        end_usage
+        end_usage,
+        step_mid
     });
     crate::fuzzing::gen::fields!(StepAttempt { step_id, ts_ms });
     crate::fuzzing::gen::fields!(StepRequest {

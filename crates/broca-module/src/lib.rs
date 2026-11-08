@@ -32,6 +32,8 @@ pub mod serve;
 pub mod session_class;
 pub mod store_actor;
 pub mod store_billing;
+pub mod store_control;
+pub mod store_fanout;
 pub mod store_head;
 pub mod store_import;
 pub mod store_open;

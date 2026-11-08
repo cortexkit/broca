@@ -267,6 +267,15 @@ async fn a_cancelled_run_heads_alike() {
     run_out(&store, &store_gate).await;
     let head = heads_alike(&today, &store, "cancelled").await;
     assert_eq!(head["last_run_state"]["state"], "cancelled");
+    streams_alike(&today, &store).await;
+}
+
+/// A subscriber from the start of each module's session gets the same control stream.
+async fn streams_alike(today: &Module, store: &Module) {
+    super::streams::assert_alike(
+        &super::streams::routed(&store.registry, &store.key).await,
+        &super::streams::routed(&today.registry, &today.key).await,
+    );
 }
 
 /// A send queued behind a running run: while the run runs, the head names it active and the
@@ -294,6 +303,7 @@ async fn a_queued_send_behind_a_running_run_heads_alike() {
     let ended = heads_alike(&today, &store, "after both runs").await;
     assert_eq!(ended["last_run_state"]["run_id"], "r2");
     assert_eq!(ended["last_run_state"]["state"], "completed");
+    streams_alike(&today, &store).await;
 }
 
 /// A run paused for sign-in: the head names the pause and the input profile the run froze,

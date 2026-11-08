@@ -93,6 +93,9 @@ state! {
             reset: "batch_start",
             bound: Bound::OpenWork("one step's tool calls"),
         },
+        /// The id the batch's `BatchStart` decided for the tool-results message its replies
+        /// make (`BatchStart::mid`).
+        4 opt pub results_mid: String => { owner: "run loop", reset: "batch_start", bound: Bound::Fixed },
     }
 }
 
@@ -434,6 +437,14 @@ state! {
             reset: "run_start",
             bound: Bound::Fixed,
         },
+        /// The id the current step's `StepStart` decided for the assistant message it writes
+        /// (`StepStart::mid`), kept until the next step starts so the message's `EntryFacts` can
+        /// be checked against it.
+        34 opt pub step_mid: String => {
+            owner: "run loop",
+            reset: "step_start",
+            bound: Bound::Fixed,
+        },
     }
 }
 
@@ -536,6 +547,7 @@ impl Run {
             step_attempt: None,
             end_error: None,
             end_usage: None,
+            step_mid: None,
             warms: Vec::new(),
             keep_warm: start.keep_warm.clone(),
             on_restart: start.on_restart.clone(),
@@ -1440,9 +1452,10 @@ impl Operations {
             _ => {}
         }
         match record {
-            Record::StepStart(_) => {
+            Record::StepStart(start) => {
                 run.step_request = None;
                 run.step_attempt = None;
+                run.step_mid = start.mid.clone();
                 run.warms.clear();
                 run.provider_call_started = true;
                 run.account_limit_pause = None;
@@ -1495,6 +1508,7 @@ impl Operations {
                 run.open_batch = Some(OpenBatch {
                     batch_id: batch.batch_id.clone(),
                     step_id: batch.step_id,
+                    results_mid: batch.mid.clone(),
                     calls: batch
                         .planned
                         .iter()

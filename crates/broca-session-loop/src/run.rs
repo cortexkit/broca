@@ -837,6 +837,7 @@ fn never_dispatched_close_out<W: Writer>(writer: &W, run_id: &str, now: u64) -> 
                 batch_id: batch_id.clone(),
                 step_id: run.completed_steps,
                 planned: planned.clone(),
+                mid: None,
             }));
             batch_id
         }
@@ -1663,6 +1664,8 @@ where
                     batch.push(Record::StepStart(StepStart {
                         run_id: run_id.clone(),
                         step_id,
+                        // Minted by the entry-facts writer once the batch's seqs are known.
+                        mid: None,
                     }));
                     batch
                 },
@@ -2016,6 +2019,7 @@ where
                 batch_id: batch_id.clone(),
                 step_id,
                 planned: calls.iter().map(|call| call.tool_call_id.clone()).collect(),
+                mid: None,
             }));
             for garbage in &step.cuts {
                 terminal_with_reason(
@@ -3061,6 +3065,7 @@ where
                             .iter()
                             .map(|call| call.tool_call_id.clone())
                             .collect(),
+                        mid: None,
                     }));
                 }
                 for ((call, plan), intent) in calls.iter().zip(&plans).zip(&prepared) {
@@ -4032,6 +4037,7 @@ async fn submitted<W: Writer, P, T>(
             batch_id: batch_id.clone(),
             step_id,
             planned: calls.iter().map(|call| call.tool_call_id.clone()).collect(),
+            mid: None,
         }));
     }
     for call in calls {
@@ -4101,6 +4107,7 @@ async fn hard_stop<W: Writer, P, T>(
         batch_id: batch_id.clone(),
         step_id,
         planned: calls.iter().map(|call| call.tool_call_id.clone()).collect(),
+        mid: None,
     })];
     let now = (seams.now_ms)();
     for call in calls {
@@ -4158,6 +4165,7 @@ async fn stopped_batch<W: Writer, P, T>(
         batch_id: batch_id.clone(),
         step_id,
         planned: calls.iter().map(|call| call.tool_call_id.clone()).collect(),
+        mid: None,
     })];
     let mut seen = std::collections::HashSet::new();
     for call in calls {

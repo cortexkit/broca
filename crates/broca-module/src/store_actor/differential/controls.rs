@@ -63,16 +63,34 @@ impl Noter {
     }
 }
 
-/// A compaction provider that is always ready and never has a view to offer. It keeps each
-/// call it is sent: its method, and for a notice its sequence number and the ordinals of the
-/// entries it carries.
+/// A compaction provider that is always ready and has a view to offer only once told to drop a
+/// message at its next ride. It keeps each call it is sent: its method, and for a notice its
+/// sequence number and the ordinals of the entries it carries.
 #[derive(Default)]
 struct Compactor {
     methods: Mutex<Vec<String>>,
     calls: Mutex<Vec<Value>>,
+    /// The id of each entry the notices carried, by its ordinal. Each storage mints its own ids,
+    /// so a view names the messages each session told its provider of.
+    mids: Mutex<std::collections::BTreeMap<u64, String>>,
+    /// The ordinal of the message the next ride's view drops.
+    drop_at_ride: Mutex<Option<u64>>,
+    /// The views rides were answered with.
+    views: Mutex<Vec<broca_core::compaction_v2::protocol::view::View>>,
+    /// The events the notices told of, such as a view's refusal.
+    events: Mutex<Vec<Value>>,
 }
 
 impl Compactor {
+    /// Answers the next ride with a view dropping the message at `ordinal`.
+    fn drop_at_next_ride(&self, ordinal: u64) {
+        *self.drop_at_ride.lock().unwrap() = Some(ordinal);
+    }
+
+    fn views(&self) -> usize {
+        self.views.lock().unwrap().len()
+    }
+
     fn setups(&self) -> usize {
         self.methods
             .lock()
@@ -119,13 +137,23 @@ impl broca_core::CompactionPlane for Compactor {
     ) -> Result<Box<serde_json::value::RawValue>, broca_core::compaction_v2::runtime::CallError>
     {
         self.methods.lock().unwrap().push(method.to_owned());
-        let ordinals: Vec<Value> = params
-            .get("entries")
-            .and_then(Value::as_array)
+        if let Some(events) = params.get("events").and_then(Value::as_array) {
+            self.events.lock().unwrap().extend(events.iter().cloned());
+        }
+        let entries = params.get("entries").and_then(Value::as_array);
+        let ordinals: Vec<Value> = entries
             .into_iter()
             .flatten()
             .filter_map(|entry| entry.get("ordinal").cloned())
             .collect();
+        for entry in entries.into_iter().flatten() {
+            if let (Some(ordinal), Some(mid)) = (
+                entry.get("ordinal").and_then(Value::as_u64),
+                entry.get("mid").and_then(Value::as_str),
+            ) {
+                self.mids.lock().unwrap().insert(ordinal, mid.to_owned());
+            }
+        }
         self.calls.lock().unwrap().push(json!({
             "method": method,
             "seq": params.get("seq"),
@@ -134,7 +162,24 @@ impl broca_core::CompactionPlane for Compactor {
         let answer = match method {
             "compaction.setup" => json!({"answer": "ready"}),
             "compaction.notice" => json!({"answer": "received"}),
-            "compaction.ride" => json!({"answer": "nothing"}),
+            "compaction.ride" => match self.drop_at_ride.lock().unwrap().take() {
+                None => json!({"answer": "nothing"}),
+                Some(ordinal) => {
+                    use broca_core::compaction_v2::protocol::view::{Edit, EditOp, View};
+                    // An ordinal no notice named gives an id no message has, which the session
+                    // refuses; the scenario then finds its view unapplied.
+                    let mid = self
+                        .mids
+                        .lock()
+                        .unwrap()
+                        .get(&ordinal)
+                        .cloned()
+                        .unwrap_or_default();
+                    let view = View::seal(1, vec![Edit::new(1, EditOp::Drop { mid, part: None })]);
+                    self.views.lock().unwrap().push(view.clone());
+                    json!({"answer": "view", "view": view})
+                }
+            },
             _ => return Err(broca_core::compaction_v2::runtime::CallError::Unavailable),
         };
         Ok(serde_json::value::to_raw_value(&answer).unwrap())
@@ -261,7 +306,8 @@ impl Pair {
             session,
             executor.clone(),
             Box::new(MemoryParts::default()),
-        );
+        )
+        .with_readers(Arc::new(move || backend));
         let (commands, receiver) = mpsc::unbounded_channel();
         let served = tokio::spawn(actor.serve(receiver));
         Self {
@@ -344,8 +390,13 @@ impl Pair {
         store::idle(&self.commands).await;
     }
 
-    /// Ends the store session's actor.
+    /// Ends the store session's actor, once both sessions' control streams from their start
+    /// were found the same.
     async fn end(self) -> Ended {
+        super::streams::assert_alike(
+            &super::streams::store(&self.commands).await,
+            &super::streams::routed(&self.today.registry, &self.today.key).await,
+        );
         drop(self.commands);
         Ended {
             session: self.served.await.unwrap(),
@@ -864,5 +915,137 @@ async fn a_tool_batchs_results_are_told_once_durable_alike() {
     assert_eq!(new.calls(), old.calls());
     let ended = pair.end().await;
     ended.assert_alike().await;
+    ended.stop().await;
+}
+
+/// A view the compaction provider hands over at a ride, here the one a run on another model
+/// starts with, is accepted and applied at that step's boundary, alike: both sessions record
+/// the view and its application, the model is sent the same messages with the dropped message
+/// left out, and a subscriber from each session's start gets the same control stream.
+#[tokio::test]
+async fn a_view_handed_over_at_a_ride_is_applied_alike() {
+    let (pair, old, new) = compacting_pair(
+        vec![
+            store::text_step("a1", "hello"),
+            store::text_step("a2", "again"),
+        ],
+        false,
+    )
+    .await;
+    let plan = compacting_plan();
+    let (today, store) = pair
+        .send("r1", limited("first"), Some(&plan), Delivery::Queue)
+        .await;
+    assert!(matches!(today, SendOutcome::Active { .. }), "{today:?}");
+    assert_eq!(store, today);
+    pair.idle().await;
+    // The view drops the first run's answer, the session's second message.
+    old.drop_at_next_ride(2);
+    new.drop_at_next_ride(2);
+    let mut second = limited("second");
+    second.model = broca_protocol::request::ModelHandle::new("stub", "another");
+    let (today, store) = pair.send("r2", second, None, Delivery::Queue).await;
+    assert!(matches!(today, SendOutcome::Active { .. }), "{today:?}");
+    assert_eq!(store, today);
+    pair.idle().await;
+    assert_eq!(
+        (old.views(), new.views()),
+        (1, 1),
+        "a ride handed a view over"
+    );
+    assert_eq!(new.calls(), old.calls());
+    super::super::subscribe_tests::every_unit_resumes(&pair.commands).await;
+    let ended = pair.end().await;
+    ended.assert_alike().await;
+    let (prompts, _) = ended.prompts();
+    let last = prompts.last().unwrap();
+    let has = |text: &str| last.iter().any(|said| said.ends_with(text));
+    assert!(
+        has("second") && !has("hello"),
+        "the second run's model call leaves the dropped answer out: {last:?}; the view {:?}, \
+         the ids notices named {:?}, the events they told {:?}",
+        old.views.lock().unwrap(),
+        old.mids.lock().unwrap(),
+        old.events.lock().unwrap(),
+    );
+    let today_applied = ended
+        .today_records()
+        .iter()
+        .filter(|record| matches!(record, WalRecord::CompactionViewAppliedV2 { .. }))
+        .count();
+    let store_applied = ended
+        .store_records()
+        .await
+        .iter()
+        .filter(|record| matches!(record, Record::ViewApplied(_)))
+        .count();
+    assert_eq!((today_applied, store_applied), (1, 1));
+    ended.stop().await;
+}
+
+/// A step whose two tool calls share an id: the first copy is dispatched and the second is
+/// answered with the duplicate error, alike. On the control lane the call starts once, and each
+/// copy's finish carries its own key, today's as the store's: the dispatched copy's from its
+/// intent, the refused copy's from its answer.
+#[tokio::test]
+async fn a_repeated_call_ids_copies_finish_with_keys_of_their_own_alike() {
+    use broca_protocol::content::{AssistantMessage, ContentBlock, FinishReason, ToolCall};
+    use broca_protocol::{MessageId, ProviderControl, ToolCallId, Usage};
+    let call = |n: u64| {
+        ContentBlock::ToolCall(ToolCall {
+            thought_signature: None,
+            tool_call_id: ToolCallId("c1".into()),
+            tool_name: "read".into(),
+            input: json!({ "n": n }),
+        })
+    };
+    let repeated = vec![
+        NormalizedEvent::Control(ProviderControl::AssistantMessage {
+            message: AssistantMessage {
+                message_id: MessageId("a1".into()),
+                content: vec![call(1), call(2)],
+            },
+        }),
+        NormalizedEvent::Control(ProviderControl::Finished {
+            usage: Usage {
+                input_tokens: Some(100),
+                output_tokens: Some(20),
+                ..Usage::default()
+            },
+            finish_reason: FinishReason::ToolCalls,
+            retries_used: 0,
+        }),
+    ];
+    let pair = Pair::new(
+        vec![repeated, store::text_step("a2", "done")],
+        false,
+        Planes::default(),
+        Planes::default(),
+    )
+    .await;
+    let (today, store) = pair
+        .send("r1", store::request("first"), None, Delivery::Queue)
+        .await;
+    assert!(matches!(today, SendOutcome::Active { .. }), "{today:?}");
+    assert_eq!(store, today);
+    pair.idle().await;
+    // Today's control lane: one start, and two finishes under two distinct keys, the first
+    // the start's.
+    let stream = super::streams::routed(&pair.today.registry, &pair.today.key).await;
+    let keys = |kind: &str| -> Vec<Value> {
+        stream
+            .iter()
+            .filter(|unit| unit["event"]["type"] == kind && unit["event"]["tool_call_id"] == "c1")
+            .map(|unit| unit["event"]["call_key"].clone())
+            .collect()
+    };
+    let (started, finished) = (keys("tool_started"), keys("tool_finished"));
+    assert_eq!(started.len(), 1, "{stream:#?}");
+    assert_eq!(finished.len(), 2, "{stream:#?}");
+    assert!(finished.iter().all(Value::is_string), "{finished:?}");
+    assert_eq!(finished[0], started[0]);
+    assert_ne!(finished[0], finished[1]);
+    // And the store's stream is the same, unit for unit.
+    let ended = pair.end().await;
     ended.stop().await;
 }
