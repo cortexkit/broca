@@ -650,8 +650,10 @@ answer outside the offered account/credential pairs. A key's account id is the v
 hinted admissions rather than bypassing
 routing. `run_finished` with the admission id releases the routed key, just as for subscriptions.
 
-For a run admitted by routing under any method (`oauth`, `chatgpt` or `apikey`), a terminal error
-classified at its source as `transient` reports one `transient_backoff` before `run_finished`.
+For a run admitted by routing under any method (`oauth`, `chatgpt` or `apikey`), an uncleared
+provider error classified at its source as `transient` reports one `transient_backoff` before
+`run_finished`. The final model attempt's recorded outcome must be a failure, not a successful
+or cancelled attempt.
 Its stable event id is `<id>:backoff`, distinct from the release, and `retry_at_ms` is always
 present: the final attempt's receipt time plus the structured provider retry delay
 (`retry_after_secs`), or plus 5,000 ms when no delay is supplied. Broca never infers timing from

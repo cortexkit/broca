@@ -1839,10 +1839,10 @@ fn attempt(http_status: Option<u16>, observation: AttemptAccountObservation) -> 
         response_body_len: 0,
         response_body_sha256: "bb".into(),
         response_body_cap: None,
-        outcome: if http_status.is_some() {
-            AttemptOutcome::Complete
-        } else {
-            AttemptOutcome::ConnectFailed
+        outcome: match http_status {
+            Some(200..=299) => AttemptOutcome::Complete,
+            Some(_) => AttemptOutcome::HttpError,
+            None => AttemptOutcome::ConnectFailed,
         },
         ts_ms: NOW as u64,
         sent_at_ms: None,
@@ -2186,6 +2186,76 @@ async fn terminal_transient_backoff_is_gated_and_precedes_release() {
             assert_ne!(reports[1]["event_id"], reports[2]["event_id"]);
         }
         assert_eq!(reports.last().unwrap()["admission_id"], "adm-key");
+    }
+}
+
+#[tokio::test]
+async fn terminal_transient_backoff_requires_a_failed_final_attempt_outcome() {
+    for (outcome, status, backoff) in [
+        (AttemptOutcome::Complete, Some(503), false),
+        (AttemptOutcome::ToolArgsTrailingGarbage, Some(200), false),
+        (AttemptOutcome::Cancelled, None, false),
+        (AttemptOutcome::SealedInFlight, None, false),
+        (AttemptOutcome::Unknown("future".into()), None, false),
+        (AttemptOutcome::ProviderError, Some(200), true),
+        (AttemptOutcome::ConnectFailed, None, true),
+        (AttemptOutcome::HttpError, Some(503), true),
+    ] {
+        let routing = Arc::new(FakeRouting {
+            backoff: true,
+            ..FakeRouting::default()
+        });
+        let reporter = RunReporter::start(
+            Arc::new(client(&routing)),
+            "adm-final-attempt".into(),
+            "run-final-attempt".into(),
+            None,
+            Arc::new(AtomicU64::new(4)),
+        );
+        let lineage = lineage();
+        let mut observed = attempt(Some(503), AttemptAccountObservation::default());
+        observed.ts_ms = 1_000;
+        broca_core::AccountReporter::attempt_recorded(
+            reporter.as_ref(),
+            Some(lineage),
+            2,
+            &observed,
+        );
+        // The recorded outcome, not the status, decides whether the final attempt failed.
+        observed.http_status = status;
+        observed.outcome = outcome.clone();
+        observed.ts_ms = 42_000;
+        broca_core::AccountReporter::attempt_recorded(
+            reporter.as_ref(),
+            Some(lineage),
+            3,
+            &observed,
+        );
+        let error =
+            serde_json::from_value(json!({"class":"transient","message":"failed"})).unwrap();
+        reporter.terminal_transient(Some(lineage), 4, &error);
+        reporter.finish(Some(lineage), 4, RunFinishReason::Error);
+        let reports = broca_test_support::wait_until("final attempt release report", || async {
+            let reports = routing.observed();
+            if reports
+                .last()
+                .is_some_and(|body| body["kind"] == "run_finished")
+            {
+                Ok(reports)
+            } else {
+                Err(format!("reports: {reports:?}"))
+            }
+        })
+        .await;
+        assert_eq!(reports.len(), if backoff { 4 } else { 3 }, "{outcome:?}");
+        if backoff {
+            assert_eq!(reports[2]["kind"], "transient_backoff");
+            assert_eq!(reports[2]["retry_at_ms"], 47_000);
+        } else {
+            assert!(reports
+                .iter()
+                .all(|body| body["kind"] != "transient_backoff"));
+        }
     }
 }
 

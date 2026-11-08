@@ -7341,6 +7341,31 @@ mod executor {
             outcome: Result<RunSummary, RunError>,
             error: ProviderError,
         ) -> Vec<serde_json::Value> {
+            let attempt_status = if outcome
+                .as_ref()
+                .is_ok_and(|summary| summary.reason == RunFinishReason::Completed)
+            {
+                Some(200)
+            } else {
+                error.status
+            };
+            terminal_backoff_reports_with_attempt_status(
+                method,
+                path,
+                outcome,
+                error,
+                attempt_status,
+            )
+            .await
+        }
+
+        async fn terminal_backoff_reports_with_attempt_status(
+            method: &str,
+            path: &str,
+            outcome: Result<RunSummary, RunError>,
+            error: ProviderError,
+            attempt_status: Option<u16>,
+        ) -> Vec<serde_json::Value> {
             use broca_module_serve::account_routing::{RoutingClient, RunReporter};
             use broca_wal::Wal;
             static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -7366,12 +7391,17 @@ mod executor {
                 Arc::new(std::sync::atomic::AtomicU64::new(4)),
             );
             for (seq, receipt) in [(2, 1_000), (3, 42_000)] {
+                let status = if seq == 2 { Some(503) } else { attempt_status };
                 let attempt: broca_protocol::ModelAttempt =
                     serde_json::from_value(serde_json::json!({
                         "attempt":seq - 2,"request_body_len":10,"request_body_sha256":"aa",
-                        "http_status":error.status,"response_body_len":0,
+                        "http_status":status,"response_body_len":0,
                         "response_body_sha256":"bb","ts_ms":receipt,
-                        "outcome":if error.status.is_some() { "complete" } else { "connect_failed" }
+                        "outcome":match status {
+                            Some(200..=299) => "complete",
+                            Some(_) => "http_error",
+                            None => "connect_failed",
+                        }
                     }))
                     .unwrap();
                 broca_core::AccountReporter::attempt_recorded(
@@ -7437,6 +7467,23 @@ mod executor {
                 reports[2]["event_id"],
                 format!("{}:backoff", reports[3]["event_id"].as_str().unwrap())
             );
+        }
+
+        #[tokio::test]
+        async fn routed_internal_transient_after_successful_attempt_does_not_queue_backoff() {
+            let mut error = err_with_status(None);
+            error.class = ErrorClass::Transient;
+            let reports = terminal_backoff_reports_with_attempt_status(
+                "chatgpt",
+                "routed",
+                run_outcome(RunFinishReason::Error, None),
+                error,
+                Some(200),
+            )
+            .await;
+            assert!(reports
+                .iter()
+                .all(|body| body["kind"] != "transient_backoff"));
         }
 
         #[tokio::test]
