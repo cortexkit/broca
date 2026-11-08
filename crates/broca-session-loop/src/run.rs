@@ -2965,10 +2965,13 @@ async fn model_step<W: Writer, P: Provider, T>(
     let mut step_usage = Usage::default();
     let mut served = Served::default();
     let mut cuts = Vec::new();
-    loop {
+    let outcome = loop {
+        // Biased: the cancel is checked before each event, as broca-core's run loop checks it
+        // before its step.
         let event = tokio::select! {
+            biased;
+            _ = seams.cancel.cancelled() => break Err(StepFailure::Cancelled),
             event = events.recv() => event,
-            _ = seams.cancel.cancelled() => return Ok(Err(StepFailure::Cancelled)),
         };
         match event {
             Some(NormalizedEvent::Display(display)) => {
@@ -3011,85 +3014,138 @@ async fn model_step<W: Writer, P: Provider, T>(
                     step_usage
                 };
                 let Some(message) = message.take() else {
-                    return Ok(Err(StepFailure::Error(
+                    break Err(StepFailure::Error(
                         Box::new(incomplete_stream()),
                         retries_used,
                         limited,
-                    )));
+                    ));
                 };
-                return Ok(Ok(Step {
+                break Ok(Step {
                     message,
                     usage,
                     finish_reason,
                     retries_used,
                     served,
                     cuts,
-                }));
+                });
             }
             Some(NormalizedEvent::Control(ProviderControl::Error {
                 error,
                 retries_used,
-            })) => {
-                return Ok(Err(StepFailure::Error(
-                    Box::new(error),
-                    retries_used,
-                    limited,
-                )))
-            }
-            // Each attempt's record, around the same hooks today's loop calls: keep-warm learns
-            // its send time and rate-limit headers, its input transformations are reported, and
-            // the provider adds its cache evidence before the record is written and learns which
-            // record holds it after. A failed attempt is durable at once (it may have been billed
-            // and no step's end will follow it); a completed one rides the step's end.
-            Some(NormalizedEvent::Control(ProviderControl::AttemptFinished { mut attempt })) => {
-                if let Some(warm) = &seams.keep_warm {
-                    warm.note_attempt(&attempt);
-                }
-                broca_core::run::report_input_transformations(
-                    &seams.bind,
-                    &broca_protocol::RunId(run_id.into()),
-                    StepId(step_id),
-                    &attempt,
-                );
-                seams.provider.annotate_cache_evidence(&mut attempt);
-                let durable = attempt.outcome != broca_protocol::AttemptOutcome::Complete;
-                // The seq the record took, which a writer shared with the session actor knows
-                // only once it is appended.
-                let seq = writer
-                    .append(
-                        &[attempt_record(
-                            run_id,
-                            step_id,
-                            attempt.clone(),
-                            requested_ttl_ms,
-                            account_limit_pause,
-                        )?],
-                        durable,
-                    )
-                    .await?;
-                limited = attempt.account_observation.limit.is_some().then(|| {
-                    Box::new(FailedAccountLimitAttempt {
-                        seq,
-                        attempt: attempt.clone(),
-                    })
-                });
-                seams
-                    .provider
-                    .cache_attempt_recorded(Some(event_id(writer, seq)));
-                if let Some(reports) = &seams.account_reports {
-                    reports.attempt_recorded(&event_id(writer, seq), seq, &attempt);
-                }
+            })) => break Err(StepFailure::Error(Box::new(error), retries_used, limited)),
+            Some(NormalizedEvent::Control(ProviderControl::AttemptFinished { attempt })) => {
+                limited = record_attempt(
+                    writer,
+                    seams,
+                    run_id,
+                    step_id,
+                    attempt,
+                    requested_ttl_ms,
+                    account_limit_pause,
+                )
+                .await?;
             }
             None => {
-                return Ok(Err(StepFailure::Error(
+                break Err(StepFailure::Error(
                     Box::new(incomplete_stream()),
                     0,
                     limited,
-                )))
+                ))
             }
             Some(NormalizedEvent::Control(_)) => {}
         }
+    };
+    // A step that failed while the run's cancel was tripped is a cancellation, as broca-core's
+    // run loop attributes it (`attribute_step_failure_to_cancel`): the provider may see the
+    // cancel and close its stream before this loop looks at the token again.
+    let outcome = match outcome {
+        Err(StepFailure::Error(..)) if seams.cancel.is_cancelled() => Err(StepFailure::Cancelled),
+        outcome => outcome,
+    };
+    // A cancel stops the step cooperatively: a provider that reports attempt evidence records
+    // its attempt in flight and then closes the stream. Its record is read until then, for at
+    // most `CANCELLED_STEP_ATTEMPT_DRAIN`, so the attempt is recorded and reported before the
+    // run ends, as broca-core's run loop does. Only attempt records are taken: nothing else of
+    // a step that no longer counts is.
+    if matches!(outcome, Err(StepFailure::Cancelled)) && seams.provider.reports_attempt_evidence() {
+        let drained = tokio::time::timeout(broca_core::run::CANCELLED_STEP_ATTEMPT_DRAIN, async {
+            while let Some(event) = events.recv().await {
+                if let NormalizedEvent::Control(ProviderControl::AttemptFinished { attempt }) =
+                    event
+                {
+                    record_attempt(
+                        writer,
+                        seams,
+                        run_id,
+                        step_id,
+                        attempt,
+                        requested_ttl_ms,
+                        account_limit_pause,
+                    )
+                    .await?;
+                }
+            }
+            Ok::<(), LoopError>(())
+        })
+        .await;
+        if let Ok(result) = drained {
+            result?;
+        }
     }
+    Ok(outcome)
+}
+
+/// Records one attempt's evidence, around the hooks broca-core's run loop calls: keep-warm
+/// learns its send time and rate-limit headers, its input transformations are reported, and the
+/// provider adds its cache evidence before the record is written and learns which record holds
+/// it after. A failed attempt is durable at once (it may have been billed and no step's end will
+/// follow it); a completed one rides the step's end. Returns the attempt, with its record's seq,
+/// when the provider refused it for the account's limit.
+async fn record_attempt<W: Writer, P: Provider, T>(
+    writer: &mut W,
+    seams: &Seams<'_, P, T>,
+    run_id: &str,
+    step_id: u64,
+    mut attempt: broca_protocol::ModelAttempt,
+    requested_ttl_ms: Option<u64>,
+    account_limit_pause: bool,
+) -> Result<Option<Box<FailedAccountLimitAttempt>>, LoopError> {
+    if let Some(warm) = &seams.keep_warm {
+        warm.note_attempt(&attempt);
+    }
+    broca_core::run::report_input_transformations(
+        &seams.bind,
+        &broca_protocol::RunId(run_id.into()),
+        StepId(step_id),
+        &attempt,
+    );
+    seams.provider.annotate_cache_evidence(&mut attempt);
+    let durable = attempt.outcome != broca_protocol::AttemptOutcome::Complete;
+    // The seq the record took, which a writer shared with the session actor knows only once it
+    // is appended.
+    let seq = writer
+        .append(
+            &[attempt_record(
+                run_id,
+                step_id,
+                attempt.clone(),
+                requested_ttl_ms,
+                account_limit_pause,
+            )?],
+            durable,
+        )
+        .await?;
+    seams
+        .provider
+        .cache_attempt_recorded(Some(event_id(writer, seq)));
+    if let Some(reports) = &seams.account_reports {
+        reports.attempt_recorded(&event_id(writer, seq), seq, &attempt);
+    }
+    Ok(attempt
+        .account_observation
+        .limit
+        .is_some()
+        .then(|| Box::new(FailedAccountLimitAttempt { seq, attempt })))
 }
 
 /// A call of a batch that already has an intent, from before the run paused or crashed: it is

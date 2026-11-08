@@ -880,6 +880,89 @@ fn cache() -> bool {
 }
 
 tokio::task_local! {
+    /// Whether the comparison also compares each run's spend facts, as the usage export would
+    /// hold them.
+    static SPEND: bool;
+}
+
+fn spend_compared() -> bool {
+    SPEND.try_with(|set| *set).unwrap_or(false)
+}
+
+/// Runs `comparison` with each run's spend facts compared at its end.
+async fn compare_spent<F: std::future::Future<Output = ()>>(comparison: F) {
+    SPEND.scope(true, comparison).await;
+}
+
+/// Each run of today's log `today` gets the same spend facts from today's builder
+/// (`compute_segments_for_run`) as the same run of `session` does, its records rebuilt in
+/// today's form as the store actor's billing rebuilds them. The times each loop took from its
+/// own clock, and the fact ids made from them, are set aside.
+async fn spend_alike(today: &LogImage, session: &Session<&MemoryBackend>, parts: &MemoryParts) {
+    struct UnknownCharge;
+    impl broca_core::ChargeBasisResolver for UnknownCharge {
+        fn resolve_charge_basis(&self, _: &str, _: &str) -> (broca_core::ChargeBasis, u32) {
+            (broca_core::ChargeBasis::Unknown, 1)
+        }
+        fn charge_basis_overrides(&self) -> String {
+            broca_core::NO_CHARGE_BASIS_OVERRIDES.into()
+        }
+    }
+    fn timeless(facts: Vec<broca_core::billing::SpendSegment>) -> Vec<Value> {
+        facts
+            .iter()
+            .map(|fact| {
+                let mut value = serde_json::to_value(fact).unwrap();
+                for field in ["fact_id", "occurred_at_ms", "pricing_at_ms"] {
+                    if value.get(field).is_some() {
+                        value[field] = json!("<normalized>");
+                    }
+                }
+                value
+            })
+            .collect()
+    }
+    let framed = today.framed();
+    let mut runs: Vec<(RunId, broca_protocol::BindIdentity)> = Vec::new();
+    for frame in &framed {
+        if let WalRecord::RunStarted {
+            run_id, session, ..
+        } = &frame.record
+        {
+            if !runs.iter().any(|(known, _)| known == run_id) {
+                runs.push((run_id.clone(), session.clone()));
+            }
+        }
+    }
+    assert!(!runs.is_empty(), "today's log started no run");
+    let records = session.open_log_records().await.unwrap();
+    for (run_id, identity) in runs {
+        let old = broca_core::billing::compute_segments_for_run(
+            &framed,
+            &run_id,
+            "differential",
+            &UnknownCharge,
+        );
+        let rebuilt =
+            broca_session_loop::billing::today_records(&records, &run_id.0, &identity, parts)
+                .expect("the run's records rebuild");
+        let new = broca_core::billing::compute_segments_for_run(
+            &rebuilt,
+            &run_id,
+            "differential",
+            &UnknownCharge,
+        );
+        assert!(!old.is_empty(), "today bills run {}", run_id.0);
+        assert_eq!(
+            timeless(new),
+            timeless(old),
+            "run {}'s spend facts",
+            run_id.0
+        );
+    }
+}
+
+tokio::task_local! {
     /// Whether the comparison also reads both sessions' compaction entries (`session.entries`)
     /// on the compaction contract and compares them: set for the sends delivered into a run.
     static ENTRIES: bool;
@@ -1350,6 +1433,13 @@ fn reported_attempt(attempt: &broca_protocol::ModelAttempt) -> String {
 }
 
 struct TodayReports(Arc<Mutex<Vec<String>>>);
+
+/// Today's loop's account reporter, when the comparison has one.
+fn today_reporter() -> Option<Arc<dyn broca_core::AccountReporter>> {
+    reports().map(|reports| {
+        Arc::new(TodayReports(Arc::clone(&reports.today))) as Arc<dyn broca_core::AccountReporter>
+    })
+}
 
 impl broca_core::AccountReporter for TodayReports {
     fn run_started(&self, _: Option<broca_wal::WalLineageId>, _: u64) {
@@ -3598,6 +3688,10 @@ enum Action {
     /// Cancels the run now, as the actor does for an interrupting send, while the provider's
     /// call hasn't returned its stream: the provider returns it only a second later.
     CancelNow,
+    /// Cancels the run while the provider's call streams, from a provider that reports attempt
+    /// evidence: as a transport does once it sees the cancel, the provider then sends the
+    /// call's scripted events (its attempt in flight) a moment later and closes the stream.
+    CancelMidStream,
     /// Asks the run to stop, as the runner does when it shuts down.
     Stop,
     /// Queues a send with a delivery order, as the actor does for a running run: its
@@ -3828,12 +3922,28 @@ struct SteeringProvider {
     /// `(call, action)`: during the provider's `call`th request (from 1), the actor does this.
     steers: Mutex<Vec<(usize, Action)>>,
     sink: Arc<dyn SteerSink>,
+    /// Whether it reports attempt evidence, as a transport does: when one of its calls is
+    /// cancelled mid-stream.
+    reports_attempts: bool,
+}
+
+/// Whether `steers` cancel a call mid-stream.
+fn cancels_mid_stream(steers: &[(usize, Action)]) -> bool {
+    steers
+        .iter()
+        .any(|(_, action)| matches!(action, Action::CancelMidStream))
 }
 
 #[async_trait]
 impl Provider for SteeringProvider {
     fn turn_system_possible(&self, preceding: Option<&Message>, followed_by_user: bool) -> bool {
         self.inner.turn_system_possible(preceding, followed_by_user)
+    }
+
+    /// A provider whose calls are cancelled mid-stream reports its attempts as a transport
+    /// does, so both loops read a cancelled call's stream for its attempt in flight.
+    fn reports_attempt_evidence(&self) -> bool {
+        self.reports_attempts
     }
 
     async fn step(&self, step_id: StepId, opts: &CallOptions) -> mpsc::Receiver<NormalizedEvent> {
@@ -3845,6 +3955,7 @@ impl Provider for SteeringProvider {
             due.into_iter().map(|(_, action)| action).collect()
         };
         let mut slow = false;
+        let mut mid_stream = false;
         for (index, action) in due.into_iter().enumerate() {
             match action {
                 Action::Steer(messages) => self.sink.steer(steered(call, index, messages)).await,
@@ -3853,6 +3964,7 @@ impl Provider for SteeringProvider {
                     self.sink.cancel_now();
                     slow = true;
                 }
+                Action::CancelMidStream => mid_stream = true,
                 Action::Stop => self.sink.stop(),
                 Action::Ordered { send, records } => self.sink.ordered(*send, records).await,
             }
@@ -3862,7 +3974,24 @@ impl Provider for SteeringProvider {
             // waits for it instead of dropping it is caught recording the step's answer.
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
-        self.inner.step(step_id, opts).await
+        let mut events = self.inner.step(step_id, opts).await;
+        if !mid_stream {
+            return events;
+        }
+        let sink = Arc::clone(&self.sink);
+        let (tx, rx) = mpsc::channel(64);
+        tokio::spawn(async move {
+            sink.cancel_now();
+            // Not a wait for anything: the attempt comes after the cancel, as a transport's
+            // does, so a loop that stops reading at the cancel is caught missing it.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            while let Some(event) = events.recv().await {
+                if tx.send(event).await.is_err() {
+                    break;
+                }
+            }
+        });
+        rx
     }
 }
 
@@ -3997,6 +4126,7 @@ async fn today_with_actions(
     let provider = SteeringProvider {
         inner: scripted,
         calls: Default::default(),
+        reports_attempts: cancels_mid_stream(&steers),
         steers: Mutex::new(steers.clone()),
         sink: Arc::new(TodaySink {
             inbox: Arc::clone(&inbox),
@@ -4030,6 +4160,7 @@ async fn today_with_actions(
         provider_held_lifecycle: Some(plane.lifecycle()),
         cancel: Some(cancel),
         new_log_compaction_plan_version: layout(),
+        account_reporter: today_reporter(),
         ..admission_control(scenario)
     };
     let first = run_loop_on_writer(
@@ -4069,6 +4200,7 @@ async fn today_with_actions(
                     .map_or_else(Default::default, |script| script.wait),
                 provider_held_lifecycle: Some(plane.lifecycle()),
                 new_log_compaction_plan_version: layout(),
+                account_reporter: today_reporter(),
                 ..admission_control(scenario)
             },
             &tx,
@@ -4148,6 +4280,7 @@ async fn compare_actions_in_once(
     let provider = SteeringProvider {
         inner: ScriptedProvider::new(scenario.steps.clone()),
         calls: Default::default(),
+        reports_attempts: cancels_mid_stream(&steers),
         steers: Mutex::new(steers),
         sink: Arc::new(NewSink {
             injected: Arc::clone(&injected),
@@ -4235,6 +4368,9 @@ async fn compare_actions_in_once(
     assert_same(&today, &new);
     if entries_compared() {
         entries_alike(&full, writer.session).await;
+    }
+    if spend_compared() {
+        spend_alike(&full, writer.session, &parts).await;
     }
     rides_name_their_carrier(&writer.records);
     // Reloading the session from a checkpoint at any record gives the state folding every
@@ -4623,6 +4759,27 @@ async fn a_steer_during_a_step_that_hits_the_step_limit_ends_with_the_run() {
 #[tokio::test]
 async fn a_cancel_before_the_first_call_returns_its_stream_drops_the_call() {
     compare_steered(calling("read", 0), vec![(1, Action::CancelNow)]).await;
+}
+
+/// A cancel while a model call streams, from a provider that reports attempt evidence: the
+/// provider sends its attempt in flight after the cancel and closes the stream. Both loops read
+/// the stream for it before the run ends `cancelled`, so the attempt is recorded with its
+/// billing evidence and reported to the account router. The records (the attempt's included)
+/// and both loops' account reports are compared: a run start and the cancelled attempt for each
+/// of the four runs. So are the run's spend facts, though today's builder reads no attempt
+/// record: the cancelled run is billed alike.
+#[tokio::test]
+async fn a_cancel_mid_stream_records_the_attempt_in_flight() {
+    let mut scenario = calling("read", 0);
+    scenario.steps[0] = vec![attempt(1, 200, "cancelled")];
+    compare_reported(
+        8,
+        compare_spent(compare_steered(
+            scenario,
+            vec![(1, Action::CancelMidStream)],
+        )),
+    )
+    .await;
 }
 
 /// The same after a tool batch: the second call is dropped, the batch's results stay, and the
