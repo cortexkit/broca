@@ -40,8 +40,11 @@ pub mod counting;
 pub mod entry_facts;
 pub mod inverse;
 pub mod measure;
+pub mod preconditions;
 pub mod read_cost;
 pub mod split;
+pub mod stage;
+pub mod verify;
 
 /// A count of old records, fields or values, and their stored JSON size.
 #[derive(Debug, Default, Clone, Copy, serde::Serialize)]
@@ -1706,6 +1709,8 @@ fn send_delivered(
 
 #[cfg(test)]
 mod read_cost_tests;
+#[cfg(test)]
+mod stage_tests;
 #[cfg(test)]
 mod summaries_tests;
 #[cfg(test)]

@@ -16,6 +16,8 @@ broca-wire = { path = "../broca-wire" }
 broca-core = { path = "../broca-core" }
 broca-provider = { path = "../broca-provider" }
 broca-wal = { path = "../broca-wal" }
+# Owner-only files for the Claude Code persona's identity (`claude_code_identity`).
+broca-owner-only.workspace = true
 broca-store = { path = "../broca-store" }
 # Sessions kept in the new storage: their store and the run loop that runs on it.
 broca-session-store = { path = "../broca-session-store" }

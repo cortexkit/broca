@@ -260,8 +260,8 @@ pub struct AppendMeasure {
     pub open_after_cold: u64,
 }
 
-/// The setup parts `record` names.
-fn named_parts(record: &Record) -> &[PartRef] {
+/// The setup parts `record` names, which must be stored before it is.
+pub fn named_parts(record: &Record) -> &[PartRef] {
     match record {
         Record::RunStart(start) => &start.setup,
         Record::SetupStub(stub) => &stub.parts,

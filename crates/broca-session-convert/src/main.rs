@@ -35,6 +35,11 @@
 //! `subscribe_check`). `session-convert subscribe-cost --dir <scratch> <path>...` times a
 //! subscriber's catch-up on the largest log given.
 //!
+//! `session-convert move-check --dir <scratch> [--all-steps] [--out FILE] <path>...`: for every
+//! session log, what moving its session into the new storage would do: the WAL's preconditions,
+//! then the move's staging writer and verifier, writing only under `--dir` (see `move_check`).
+//! `--all-steps` adds the verifier's offline check of every recorded model request.
+//!
 //! Point it only at a copy of a state root (an APFS clone, `cp -c`), never at live files: it opens
 //! each log read-only, but a measurement run should never share a disk path with the daemon.
 
@@ -60,6 +65,7 @@ use serde::Serialize;
 mod calls_check;
 mod entries_check;
 mod heads;
+mod move_check;
 mod pages;
 mod serve_check;
 mod subscribe_check;
@@ -170,7 +176,8 @@ fn usage() -> ! {
          session-convert entries [--dir SCRATCH] [--out FILE] [--limit N] PATH...\n       \
          session-convert billing [--dir SCRATCH] [--out FILE] [--limit N] PATH...\n       \
          session-convert subscribe [--dir SCRATCH] [--out FILE] [--limit N] PATH...\n       \
-         session-convert subscribe-cost --dir SCRATCH [--out FILE] PATH..."
+         session-convert subscribe-cost --dir SCRATCH [--out FILE] PATH...\n       \
+         session-convert move-check --dir SCRATCH [--all-steps] [--out FILE] PATH..."
     );
     std::process::exit(64);
 }
@@ -189,6 +196,8 @@ struct Args {
     max_records: Option<usize>,
     /// Visit only every Nth log.
     every: usize,
+    /// `move-check`: verify in the offline mode, which rebuilds every recorded model request.
+    all_steps: bool,
     dir: Option<PathBuf>,
     files: Vec<PathBuf>,
 }
@@ -205,6 +214,7 @@ fn parse_args() -> Args {
         prefixes: false,
         max_records: None,
         every: 1,
+        all_steps: false,
         dir: None,
         files: Vec::new(),
     };
@@ -222,6 +232,7 @@ fn parse_args() -> Args {
             "--limit" => parsed.limit = number(),
             "--sample" => parsed.sample = number(),
             "--prefixes" => parsed.prefixes = true,
+            "--all-steps" => parsed.all_steps = true,
             "--max-records" => parsed.max_records = Some(number()),
             "--every" => parsed.every = number().max(1),
             "--only" => parsed.only = Some(args.next().unwrap_or_else(|| usage())),
@@ -279,6 +290,7 @@ fn main() {
         "subscribe-cost" => subscribe_check::cost(&args),
         "entries-check" => entries_check::run(&args),
         "calls-check" => calls_check::run(&args),
+        "move-check" => move_check::run(&args),
         _ => usage(),
     }
 }
@@ -431,7 +443,7 @@ fn run_render(args: &Args) {
             } else {
                 cap
             };
-            let today = broca_module_serve::wal_render::render_step_with_lineage(
+            let today = broca_module::wal_render::render_step_with_lineage(
                 old.lineage.as_deref(),
                 prefix,
                 config,
@@ -1263,7 +1275,7 @@ fn run_prompt(args: &Args) {
             return;
         }
         report.messages += today.len() as u64;
-        let counted = broca_module_serve::claude_code_identity::human_prompt_ordinal(&records, &[]);
+        let counted = broca_module::claude_code_identity::human_prompt_ordinal(&records, &[]);
         if counted > 0 {
             report.prompt_count_nonzero += 1;
         }

@@ -26,7 +26,9 @@ pub mod cache_routing;
 pub mod cache_warm;
 pub mod catalog_refresh;
 pub mod chatgpt_identity;
-pub mod claude_code_identity;
+// Moved into broca-module so the session converter, which the daemon now depends on, can use it
+// without depending on this crate. Kept at this path for every existing caller.
+pub use broca_module::claude_code_identity;
 pub mod client;
 pub mod codeassist_identity;
 pub mod compaction_bus;
@@ -62,7 +64,8 @@ pub mod usage_observe;
 pub mod vault_audit;
 pub mod vault_config;
 pub mod wal_archive;
-pub mod wal_render;
+// Moved into broca-module with `claude_code_identity`, for the same reason.
+pub use broca_module::wal_render;
 pub mod wire;
 
 pub use auth_routing::{family_for_method, AuthMethod, CredentialId, MethodConfig};
