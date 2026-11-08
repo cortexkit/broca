@@ -749,6 +749,7 @@ mod media;
 pub(crate) mod media_head;
 #[path = "run_rows.rs"]
 mod run_rows;
+pub mod store_move;
 pub use run_rows::OverhaulRunSource;
 
 /// A failed durability boundary. Historical events survive successful session recovery.
@@ -957,6 +958,11 @@ impl ReadOnlyLineage {
 }
 
 struct Inner {
+    /// The sessions a move into the new storage holds (see `store_move`), by address, and the
+    /// lease-free WAL reads in flight per address, which such a move waits out.
+    store_moves: store_move::MoveFences,
+    /// What runs `session.move_to_store`, installed by the daemon with its stores.
+    store_mover: std::sync::OnceLock<Arc<dyn store_move::StoreMover>>,
     run_event_reader: std::sync::OnceLock<Arc<RunEventLookup>>,
     session_address_inventory: std::sync::OnceLock<Arc<dyn broca_store::SessionAddressResolver>>,
     episode_source: std::sync::OnceLock<Arc<EpisodeReadSource>>,
@@ -2259,6 +2265,12 @@ impl LineageRegistry {
         if self.inner.opener.serves_from_store(key)? {
             return Ok(());
         }
+        // A move into the new storage holding the session in this process, or one startup
+        // couldn't settle, keeps today's storage from serving it. Both are known in memory, so
+        // this check reads nothing.
+        if let Some(refusal) = self.inner.store_moves.refusal(key) {
+            return Err(refusal);
+        }
         self.inner.opener.check_move(key, write)?;
         if let Some(reader) = &self.inner.reader {
             reader
@@ -2363,6 +2375,8 @@ impl LineageRegistry {
                     SESSION_CACHE_SESSIONS,
                 )),
                 retention: std::sync::OnceLock::new(),
+                store_moves: Default::default(),
+                store_mover: std::sync::OnceLock::new(),
                 #[cfg(test)]
                 close_started: tokio::sync::watch::channel(0).0,
                 #[cfg(test)]
@@ -4661,6 +4675,9 @@ impl LineageRegistry {
         key: &LineageKey,
         request: ReadRangeRequest,
     ) -> Result<broca_wal::WalRangeRead, OpenError> {
+        // Counted before anything is read, so a move into the new storage that has already
+        // named this session waits for this read to end.
+        let _in_flight = self.inner.store_moves.read(key);
         let ReadRangeRequest {
             after_seq,
             anchor,
@@ -6462,6 +6479,11 @@ impl LineageRegistry {
     /// calls: open the session if it is closed (its open-time recovery runs first), then ask its
     /// actor to resume a run paused on held calls. A live run needs nothing more.
     pub async fn resume_held_run(&self, session: &LineageKey) -> Result<(), String> {
+        // A move into the new storage holds this session: the delivery is retried on a later
+        // pull, which finds the session where the move left it.
+        if self.inner.store_moves.fenced(session) {
+            return Err("session_moving: a move into the new storage holds this session".into());
+        }
         for _ in 0..3 {
             let handle = self
                 .actor_for(session)
@@ -8765,12 +8787,12 @@ impl LineageRegistry {
         key: &LineageKey,
         run: Option<&str>,
     ) -> Result<(), OpenError> {
-        self.check_move(key, false)?;
         // Today's retention doesn't decide a session the new storage owns, or a move is
         // taking there: its WAL is the copy being moved or the retired one left behind.
         if self.store_owner_refusal(key)?.is_some() {
             return Ok(());
         }
+        self.check_move(key, false)?;
         let Some(service) = self.inner.retention.get().cloned() else {
             return Ok(());
         };

@@ -68,6 +68,7 @@ pub(crate) fn plant_journal(root: &std::path::Path, key: &BindIdentity) {
         harness: key.harness.clone(),
         session: key.session.clone(),
         lineage_id: None,
+        wal: "wal/x.wal".into(),
         staging: format!("staging/{MOVE_ID}"),
         frozen: None,
         appends_in_conversation: None,

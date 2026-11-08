@@ -57,6 +57,7 @@ pub mod stall;
 pub mod state_root;
 pub mod state_root_lock;
 pub mod step_events;
+pub mod store_move;
 pub mod system_one;
 pub mod trajectory;
 pub mod transport_config;

@@ -107,20 +107,34 @@ impl Rig {
             wal.clone(),
             executor.clone(),
         );
+        let mut runtime = None;
         if store {
-            let runtime = broca_module::store_open::StoreRuntime::open(
-                &dir,
-                broca_session_store::keys::DeploymentKey::new(1, &[7; 32]),
-                executor,
-                Duration::from_millis(100),
-            )
-            .await
-            .unwrap();
-            opener = opener.with_store_runtime(Arc::new(runtime));
+            let opened = Arc::new(
+                broca_module::store_open::StoreRuntime::open(
+                    &dir,
+                    broca_session_store::keys::DeploymentKey::new(1, &[7; 32]),
+                    executor,
+                    Duration::from_millis(100),
+                )
+                .await
+                .unwrap(),
+            );
+            opener = opener.with_store_runtime(opened.clone());
+            runtime = Some(opened);
         }
-        let mut registry = LineageRegistry::new_with_reader(Arc::new(opener), wal, None);
-        if store {
+        let mut registry = LineageRegistry::new_with_reader(Arc::new(opener), wal.clone(), None);
+        if let Some(runtime) = runtime {
             registry = registry.with_store_new_sessions();
+            // Moves are refused by precondition 1 until the new storage serves every
+            // operation the move requires, read from the serve layer's own allowlist.
+            let mover = broca_module_serve::store_move::StoreMove::new(
+                registry.clone(),
+                runtime,
+                wal,
+                Arc::new(FileLeaseStore::new(dir.join("leases"))),
+                broca_module_serve::store_move::served_by_serve_layer(),
+            );
+            registry.set_store_mover(Arc::new(mover));
         }
         // A bind resolves the session's address through the deployment's inventory, which
         // today's store keeps.
@@ -491,5 +505,48 @@ async fn a_store_session_refuses_unbuilt_ops_by_name_and_checks_owners_from_the_
     assert!(
         !body.contains("wal_newer_writer") && !body.contains("not_served_on_new_storage"),
         "the owner's cancel reaches the store actor: {body}"
+    );
+}
+
+/// `session.move_to_store` through real dispatch. Only the operator's own connection may call
+/// it. Until the new storage serves every operation the move requires, the move refuses
+/// `not_movable` naming the first operation it doesn't serve, and writes nothing.
+#[tokio::test]
+async fn a_move_to_the_new_storage_is_refused_until_every_operation_is_served() {
+    let mut rig = Rig::start("move-to-store", true).await;
+    rig.bind(1, core(), None).await;
+    assert_eq!(
+        rig.refused(1, "session.move_to_store", serde_json::json!({}))
+            .await,
+        "operator_required"
+    );
+    rig.bind(2, Principal::Direct, None).await;
+    let reply = rig
+        .request(
+            2,
+            serde_json::json!({"method": "session.move_to_store", "params": {}}),
+        )
+        .await;
+    assert_eq!(reply.header.ty, FrameType::Error);
+    let body: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+    let served = broca_module_serve::store_move::served_by_serve_layer();
+    let unserved = broca_module_serve::store_move::REQUIRED_OPERATIONS
+        .iter()
+        .find(|op| !served(op));
+    let Some(op) = unserved else {
+        panic!(
+            "the new storage serves every operation a move requires: extend this test to the \
+             full move (a session with a tool-result note and a live subscriber, then a send, \
+             reads, an old cursor refused cursor_expired, and a restart)"
+        );
+    };
+    assert_eq!(body["code"], "not_movable", "{body}");
+    assert_eq!(body["detail"]["reason"], *op, "{body}");
+    assert!(
+        !rig.dir
+            .join(broca_wal::SESSION_STORAGE_DIR)
+            .join(broca_wal::MOVE_JOURNAL_DIR)
+            .exists(),
+        "a refused move writes no journal"
     );
 }

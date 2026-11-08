@@ -838,6 +838,39 @@ impl SqliteStore {
         self
     }
 
+    /// Every run-index row of `session`, in run-id order. The index keeps a row's session as
+    /// its bind identity's JSON, so rows are matched on its three members.
+    pub fn session_runs(&self, session: &BindIdentity) -> Result<Vec<RunIndexRow>, String> {
+        let run_ids = {
+            let conn = self.conn.lock().map_err(|e| e.to_string())?;
+            let mut statement = conn
+                .prepare(
+                    "SELECT run_id FROM run_index \
+                      WHERE json_extract(session, '$.project_root') = ?1 \
+                        AND json_extract(session, '$.harness') = ?2 \
+                        AND json_extract(session, '$.session') = ?3 \
+                      ORDER BY run_id",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = statement
+                .query_map(
+                    rusqlite::params![
+                        session.project_root.to_string_lossy(),
+                        session.harness,
+                        session.session
+                    ],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(|e| e.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?
+        };
+        run_ids
+            .iter()
+            .filter_map(|run_id| RunIndex::lookup_run(self, run_id).transpose())
+            .collect()
+    }
+
     /// Discard one session's derived transcript and its last projected WAL sequence
     /// atomically so an installed move is rebuilt from its new WAL. Billing facts and the durable
     /// imported-run IDs that prevent billing another Mac's work again are

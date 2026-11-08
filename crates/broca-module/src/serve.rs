@@ -2455,6 +2455,18 @@ pub trait ServeHandler: Send + Sync {
         Ok(false)
     }
 
+    /// `session.move_to_store`: moves the session from today's storage into the new storage
+    /// (see `registry::store_move`). A handler without the new storage refuses by name.
+    async fn move_to_store(
+        &self,
+        _session: &LineageKey,
+    ) -> Result<serde_json::Value, crate::registry::store_move::MoveRefusal> {
+        Err(crate::registry::store_move::MoveRefusal::new(
+            "store_unavailable",
+            "this module keeps no sessions in the new storage",
+        ))
+    }
+
     /// Where a file-source import may read from. `None` without the new storage.
     fn import_roots(&self) -> Option<std::sync::Arc<crate::store_import::ImportRoots>> {
         None
@@ -3449,6 +3461,13 @@ impl ServeHandler for crate::LineageRegistry {
 
     fn kept_in_new_storage(&self, session: &LineageKey) -> Result<bool, ServeError> {
         Ok(self.store_holding(session)?.is_some())
+    }
+
+    async fn move_to_store(
+        &self,
+        session: &LineageKey,
+    ) -> Result<serde_json::Value, crate::registry::store_move::MoveRefusal> {
+        crate::LineageRegistry::move_to_store(self, session).await
     }
 
     async fn import(&self, req: SessionImportRequest) -> Result<SessionImportResponse, ServeError> {

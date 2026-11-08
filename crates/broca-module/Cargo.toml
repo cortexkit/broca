@@ -36,7 +36,9 @@ cortexkit-compaction-view.workspace = true
 # The `llm-runner/v1` role's steer delivery receipt, which a retried steer's answer carries.
 cortexkit-role-llm-runner = { workspace = true }
 # Continuation tokens are authenticated, so only a cursor broca issued can resume a page.
-getrandom = "0.3"
+# `std` gives `getrandom::Error` its `std::error::Error` impl, which `claude_code_identity` maps
+# into an `io::Error`; building this crate alone must not rely on another crate enabling it.
+getrandom = { version = "0.3", features = ["std"] }
 sha2.workspace = true
 serde.workspace = true
 serde_json.workspace = true

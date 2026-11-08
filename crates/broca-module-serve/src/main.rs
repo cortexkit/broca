@@ -333,6 +333,10 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     // Create the state root up front so the SQLite run index can open its file (the file
     // stores create their own subdirs lazily, but SqliteStore::open needs the dir to exist).
     create_state_directories(&state_root)?;
+    // A move of a session into the new storage that a crash interrupted is undone or
+    // finished from its journal before anything sweeps the state root or opens a session.
+    let mut unsettled_moves =
+        broca_module_serve::store_move::recover_at_startup(&state_root).refused;
     if state_format == state_format::StateFormat::Legacy {
         start_media_sweep(&state_root);
     }
@@ -392,6 +396,35 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .map_err(|e| ServeIoError(format!("open late-results store: {e}")))?;
     held_runtime.publish_for_health();
+    // A finished move's journal stays until the session's materialized rows and late-results
+    // registrations are gone, which needs the stores just opened, and no actor yet.
+    {
+        let forget: broca_module_serve::store_move::ForgetProjection =
+            match (&stores.legacy, &stores.overhaul) {
+                (Some(legacy), _) => {
+                    let legacy = legacy.clone();
+                    Arc::new(move |session: &broca_protocol::BindIdentity| {
+                        legacy.drop_session_projection(session)
+                    })
+                }
+                (None, Some(overhaul)) => {
+                    let db = overhaul.db.clone();
+                    Arc::new(move |session: &broca_protocol::BindIdentity| {
+                        db.forget_session(session)
+                            .map_err(|error| error.to_string())
+                    })
+                }
+                (None, None) => Arc::new(|_: &broca_protocol::BindIdentity| Ok(())),
+            };
+        unsettled_moves.extend(
+            broca_module_serve::store_move::finish_at_startup(
+                &state_root,
+                Some(&forget),
+                Some(&held_runtime.store),
+            )
+            .refused,
+        );
+    }
     let plane =
         plane.with_provider_held_support(held_runtime.store.clone(), held_runtime.slots.clone());
     let plane = Arc::new(plane);
@@ -825,6 +858,10 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         registry.set_session_address_inventory(run_index.as_ref().unwrap().clone());
     }
+    // A session whose move startup couldn't settle isn't served from today's storage.
+    unsettled_moves.sort();
+    unsettled_moves.dedup();
+    registry.refuse_unsettled_moves(unsettled_moves);
     let registry = Arc::new(registry);
     held_runtime.bind_stopping_signal(registry.stopping_signal());
     registry.set_tool_route_health(Arc::new(move |open| {

@@ -111,6 +111,16 @@ impl StoreRuntime {
         &self.settled
     }
 
+    /// The deployment key the new storage's sessions and setup parts are sealed with.
+    pub fn deployment(&self) -> &DeploymentKey {
+        &self.deployment
+    }
+
+    /// The state root whose new storage this runtime serves.
+    pub fn state_root(&self) -> &Path {
+        &self.state_root
+    }
+
     /// The views kept of sessions no actor holds.
     pub fn views(&self) -> &crate::store_reads::ViewCache {
         &self.views

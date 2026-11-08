@@ -42,6 +42,9 @@ pub struct MoveJournal {
     pub session: String,
     /// The lineage of the WAL being moved, as its first frame records it.
     pub lineage_id: Option<String>,
+    /// The WAL being moved, relative to the state root, so startup can find its freeze without
+    /// resolving the session.
+    pub wal: String,
     /// The private folder the move writes the session into before publishing it, relative to
     /// the new storage's root.
     pub staging: String,
@@ -57,8 +60,6 @@ pub struct MoveJournal {
 /// `sha256`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FrozenPrefix {
-    /// The frozen WAL's path, relative to the state root.
-    pub wal: String,
     pub end_offset: u64,
     /// Lowercase hex.
     pub sha256: String,
@@ -139,6 +140,7 @@ mod tests {
             harness: "h".into(),
             session: "s".into(),
             lineage_id: None,
+            wal: "wal/x.wal".into(),
             staging: "staging/x".into(),
             frozen: None,
             appends_in_conversation: None,
