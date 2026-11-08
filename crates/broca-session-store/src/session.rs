@@ -58,6 +58,9 @@ pub enum SessionError {
     /// A seal would move the records of a compaction view the session still names out of the
     /// open log without carrying a copy of it: see [`Carry::records`].
     ViewNotCarried,
+    /// A change's new log would start from a state that no longer names the session's
+    /// enrollment in the current compaction contract. Nothing was committed.
+    EnrollmentNotCarried,
     Directory(crate::directory::DirectoryError),
     Segment(crate::segment::SegmentError),
     Index(crate::idindex::IndexError),
@@ -82,6 +85,10 @@ pub enum SessionError {
     /// The session names an import's id map that is missing or doesn't read: damage, never an
     /// id the session doesn't hold.
     ImportedIdsDamaged(String),
+    /// The session enrolled in the current compaction contract, and the object holding what its
+    /// enrollment decided about the earlier messages is missing, doesn't read, or doesn't cover
+    /// them (see `enrollment`): damage, never an empty overlay.
+    EnrollmentDamaged(String),
     /// A read made while reads come from memory only (see [`Session::in_memory`]) needs history
     /// kept in storage. Nothing was read.
     NotInMemory,
@@ -119,7 +126,11 @@ fn log_bind(session: &Id128, log: &Id128) -> Vec<u8> {
 }
 
 /// Folds one record, at `seq`, into whichever fold its stream belongs to. Appending uses it, and
-/// so does a copy of the folds that must stay equal to a session's own.
+/// so does a copy of the folds that must stay equal to a session's own. The conversation is told
+/// of the session's enrollment in the current compaction contract, which the operational fold
+/// keeps, before every transcript record it folds: where stored results stop carrying the text
+/// delivered with them (`Conversation::enrolled`) depends on it, and a window folded again from
+/// an older checkpoint must fold alike.
 pub fn apply(
     conversation: &mut Conversation,
     operations: &mut Operations,
@@ -127,12 +138,19 @@ pub fn apply(
     record: &Record,
 ) -> Result<(), String> {
     match record.stream() {
-        Stream::Transcript => conversation
-            .apply(record)
-            .map_err(|e| format!("conversation: {e:?}")),
-        Stream::Ledger => operations
-            .apply_at(Some(seq), record)
-            .map_err(|e| format!("operations: {e:?}")),
+        Stream::Transcript => {
+            conversation.enrolled(operations.enrolled_through());
+            conversation
+                .apply(record)
+                .map_err(|e| format!("conversation: {e:?}"))
+        }
+        Stream::Ledger => {
+            operations
+                .apply_at(Some(seq), record)
+                .map_err(|e| format!("operations: {e:?}"))?;
+            conversation.enrolled(operations.enrolled_through());
+            Ok(())
+        }
     }
 }
 
@@ -237,6 +255,8 @@ pub struct Session<B: SessionBackend> {
     window: OpenLogIndex,
     /// The import's id map, once read (see `import`).
     imported: import::IdMapCache,
+    /// The enrollment's decisions, once read or written (see `enrollment`).
+    enrollment: enrollment::OverlayCache,
     /// What the session keeps of its sealed history while it's open (see `entry_by_mid` and
     /// `keep_sealed_derived`).
     sealed_entries: read::SealedEntries,
@@ -394,6 +414,7 @@ impl<B: SessionBackend> Session<B> {
             open_ids: OpenIds::default(),
             window: OpenLogIndex::default(),
             imported: Default::default(),
+            enrollment: Default::default(),
             sealed_entries: Default::default(),
             observer: None,
             kept: kept::KeptRecords::from_next(head_next_seq, true),
@@ -615,6 +636,7 @@ impl<B: SessionBackend> Session<B> {
             open_ids,
             window,
             imported: Default::default(),
+            enrollment: Default::default(),
             sealed_entries: Default::default(),
             observer: None,
             // Set by whoever takes the loaded session: a view keeps every record, a writer its
@@ -885,6 +907,8 @@ use media::OpenLogIndex;
 pub use media::{MediaError, NewMedia};
 mod import;
 pub use import::{is_broca_id_form, NewInputMedia};
+mod enrollment;
+pub use enrollment::EnrollmentOverlay;
 
 mod read;
 pub use read::{served_window, window_entries, StoredEntry};

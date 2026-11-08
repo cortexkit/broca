@@ -212,6 +212,22 @@ impl<B: SessionBackend> Session<B> {
         }
     }
 
+    /// A change's new log starts from a checkpoint whose operational state must still name the
+    /// session's enrollment in the current compaction contract, as it names a view the session
+    /// holds (see [`Session::check_views_carried`]): the enrollment record moves out of the open
+    /// log with the rest of the ledger, and only the fold says the session enrolled. A change
+    /// that would lose it refuses before it commits.
+    pub(super) fn check_enrollment_carried(
+        &self,
+        created: Created,
+    ) -> Result<Created, SessionError> {
+        if created.operations.enrolled == self.operations.enrolled {
+            Ok(created)
+        } else {
+            Err(SessionError::EnrollmentNotCarried)
+        }
+    }
+
     /// Runs a seal over an open log already read. `prune_window` also prunes finished runs'
     /// opaque reasoning from the transcript records it copies into the new log; the caller
     /// passes it only when no run is unfinished.
@@ -244,7 +260,7 @@ impl<B: SessionBackend> Session<B> {
                 now_ms,
             )
             .await;
-        let mut created = match created {
+        let mut created = match created.and_then(|created| self.check_enrollment_carried(created)) {
             Ok(created) => created,
             Err(error) => {
                 self.abort(change).await;
@@ -382,6 +398,9 @@ impl<B: SessionBackend> Session<B> {
             }
             None => checkpoint.conversation.clone(),
         };
+        // The window's records are folded again below, as the session folded them.
+        let mut at_cut = at_cut;
+        at_cut.enrolled(self.operations.enrolled_through());
         // The commit settles the intent, so state carried past it has no open change.
         let mut settled = self.operations.clone();
         settled.open_change = None;

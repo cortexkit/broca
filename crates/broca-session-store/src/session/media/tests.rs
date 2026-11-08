@@ -428,7 +428,10 @@ fn a_revert_forgets_the_abandoned_branchs_media() {
             input("r9", "take one photo"),
             facts(0, String::new()),
         ];
-        let reverted = session.revert(&abandoned, resend, 1_000).await.unwrap();
+        let reverted = session
+            .revert(&abandoned, resend, None, 1_000)
+            .await
+            .unwrap();
         assert!(
             matches!(reverted, Reverted::Applied { ordinal: 5, .. }),
             "{reverted:?}"

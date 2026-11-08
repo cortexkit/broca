@@ -220,6 +220,16 @@ state! {
             reset: "never",
             bound: Bound::Fixed,
         },
+        /// On a session that joins delivered text into its tool results
+        /// (`appends_in_conversation`) and then enrolled in the current compaction contract: the
+        /// last ordinal placed before the enrollment. Results up to it keep the text joined into
+        /// them, as they were stored; text delivered with a later result stays apart from it, as
+        /// on the contract. Absent on every other session.
+        16 opt pub joined_through: u64 => {
+            owner: "admission",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
     }
 }
 
@@ -244,7 +254,36 @@ impl Conversation {
             window_repetition: None,
             first_protocol_compaction: false,
             human_prompts: 0,
+            joined_through: None,
         }
+    }
+
+    /// The session enrolled in the current compaction contract after placing message
+    /// `through_ordinal`: a session that joined delivered text into its results keeps the text
+    /// joined into results up to it, and keeps text delivered with a later result apart from it,
+    /// as the contract does. Which results join depends only on their ordinals, so a fold that
+    /// learns of the enrollment before it folds the records placing them (a session's window,
+    /// folded again from a checkpoint older than the enrollment) folds them the same.
+    pub fn enrolled(&mut self, through_ordinal: Option<u64>) {
+        if let (true, Some(through)) = (self.appends_in_conversation, through_ordinal) {
+            self.joined_through = Some(through);
+        }
+    }
+
+    /// Whether text delivered with a result of the newest tool message is joined into it: on a
+    /// session that joins delivered text, unless that message was placed after the session
+    /// enrolled in the current compaction contract.
+    fn joins_delivered_text(&self) -> bool {
+        if !self.appends_in_conversation {
+            return false;
+        }
+        let Some(through) = self.joined_through else {
+            return true;
+        };
+        self.messages
+            .iter()
+            .rposition(|message| message.role == Role::Tool)
+            .is_some_and(|at| self.window_start() + at as u64 <= through)
     }
 
     /// A copy without the window: the count of placed messages, the held tool turn and its
@@ -267,6 +306,7 @@ impl Conversation {
             window_repetition: self.window_repetition.clone(),
             first_protocol_compaction: self.first_protocol_compaction,
             human_prompts: self.human_prompts,
+            joined_through: self.joined_through,
         }
     }
 
@@ -489,7 +529,7 @@ impl Conversation {
                 }
             }
             Record::ResultAppend(append) => {
-                if self.appends_in_conversation {
+                if self.joins_delivered_text() {
                     append_to_newest_result(&mut self.messages, &append.tool_call_id, &append.text);
                 } else {
                     self.attach_delivery(append);
