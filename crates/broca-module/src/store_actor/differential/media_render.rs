@@ -27,6 +27,19 @@ use super::media::{base64, bytes_of, image_profile, image_render_config, photo, 
 use crate::actor::SendOutcome;
 use crate::executor::{RunExecutor, RunJob, RunKind, StoreRunEnd, StoreRunError, StoreRunJob};
 use crate::registry::LineageRegistry;
+use broca_session_store::keys::Cipher;
+
+cipher_tests!(
+    a_photo_in_the_input_renders_alike,
+    a_photo_in_a_tool_result_renders_alike,
+    a_queued_photo_renders_alike,
+    a_steered_photo_renders_alike,
+    a_run_after_a_restart_renders_an_earlier_photo_alike,
+    a_tool_image_renders_alike_after_a_restart,
+    a_photo_whose_bytes_cant_be_read_refuses_alike_and_nothing_is_sent,
+    a_run_after_a_view_drops_a_photo_renders_alike,
+    a_photo_between_numbered_messages_renders_alike,
+);
 
 /// What a side's model was asked to send, in order: each request's body, or the code of the
 /// refusal that kept it from being sent.
@@ -453,6 +466,7 @@ async fn registry(
     gate: Option<Arc<tokio::sync::Notify>>,
     sent: &Sent,
     compactor: Option<Arc<super::controls::Compactor>>,
+    cipher: Cipher,
 ) -> LineageRegistry {
     broca_core::media_store::create_media_directories(dir).unwrap();
     let wal = Arc::new(FileWalStore::new(dir.join("wal")));
@@ -468,7 +482,7 @@ async fn registry(
     });
     let runtime = crate::store_open::StoreRuntime::open(
         dir,
-        broca_session_store::keys::DeploymentKey::new(1, &[7; 32]),
+        broca_session_store::keys::DeploymentKey::new(1, &[7; 32]).creating(cipher),
         Arc::clone(&executor),
         super::IDLE,
     )
@@ -501,8 +515,13 @@ struct Rendered {
 }
 
 impl Rendered {
-    async fn new(store: bool, steps: Vec<Vec<NormalizedEvent>>, gated: bool) -> Self {
-        Self::with_compactor(store, steps, gated, None).await
+    async fn new(
+        store: bool,
+        steps: Vec<Vec<NormalizedEvent>>,
+        gated: bool,
+        cipher: Cipher,
+    ) -> Self {
+        Self::with_compactor(store, steps, gated, None, cipher).await
     }
 
     /// [`Rendered::new`], its runs offered `compactor` as their compaction provider.
@@ -511,6 +530,7 @@ impl Rendered {
         steps: Vec<Vec<NormalizedEvent>>,
         gated: bool,
         compactor: Option<Arc<super::controls::Compactor>>,
+        cipher: Cipher,
     ) -> Self {
         use std::sync::atomic::AtomicU64;
         static N: AtomicU64 = AtomicU64::new(0);
@@ -523,7 +543,7 @@ impl Rendered {
         std::fs::create_dir_all(&dir).unwrap();
         let gate = gated.then(|| Arc::new(tokio::sync::Notify::new()));
         let sent = Sent::default();
-        let registry = registry(&dir, store, steps, gate.clone(), &sent, compactor).await;
+        let registry = registry(&dir, store, steps, gate.clone(), &sent, compactor, cipher).await;
         let key = BindIdentity::new(dir.join("project"), "store-actor", "s1");
         Self {
             side: Side {
@@ -531,6 +551,7 @@ impl Rendered {
                 registry,
                 key,
                 gate,
+                cipher,
             },
             sent,
         }
@@ -540,7 +561,9 @@ impl Rendered {
     /// `steps`.
     async fn restarted(mut self, store: bool, steps: Vec<Vec<NormalizedEvent>>) -> Self {
         assert!(self.side.registry.stop_and_seal().await);
-        self.side.registry = registry(&self.side.dir, store, steps, None, &self.sent, None).await;
+        let cipher = self.side.cipher;
+        self.side.registry =
+            registry(&self.side.dir, store, steps, None, &self.sent, None, cipher).await;
         self
     }
 
@@ -605,9 +628,13 @@ fn with_photo_tool(text: &str) -> SubmissionRequest {
 }
 
 /// Both sides, each started by the same text send, its run finished, or still in its first model
-/// step when `gated`.
-async fn both(steps: Vec<Vec<NormalizedEvent>>, gated: bool) -> (Rendered, Rendered) {
-    both_from(steps, gated, text("first")).await
+/// step when `gated`. The store side's session is in mode `cipher`.
+async fn both(
+    steps: Vec<Vec<NormalizedEvent>>,
+    gated: bool,
+    cipher: Cipher,
+) -> (Rendered, Rendered) {
+    both_from(steps, gated, text("first"), cipher).await
 }
 
 /// [`both`], each side started by the send `first`.
@@ -615,12 +642,16 @@ async fn both_from(
     steps: Vec<Vec<NormalizedEvent>>,
     gated: bool,
     first: SubmissionRequest,
+    cipher: Cipher,
 ) -> (Rendered, Rendered) {
     let mut sides = Vec::new();
     for store in [false, true] {
-        let side = Rendered::new(store, steps.clone(), gated).await;
+        let side = Rendered::new(store, steps.clone(), gated, cipher).await;
         let sent = side.side.send("r1", first.clone()).await;
         assert!(matches!(sent, SendOutcome::Active { .. }), "{sent:?}");
+        if store {
+            assert_eq!(side.side.stored_mode(), cipher);
+        }
         if !gated {
             side.side.idle().await;
         }
@@ -690,9 +721,8 @@ fn three_texts() -> Vec<Vec<NormalizedEvent>> {
 
 /// A photo in the user's input renders alike, and so does the next run's request, whose history
 /// holds it.
-#[tokio::test]
-async fn a_photo_in_the_input_renders_alike() {
-    let (today, store) = both(three_texts(), false).await;
+async fn a_photo_in_the_input_renders_alike(cipher: Cipher) {
+    let (today, store) = both(three_texts(), false, cipher).await;
     for side in [&today, &store] {
         let sent = send_photo(side, "r2", broca_protocol::Delivery::Queue).await;
         assert!(matches!(sent, SendOutcome::Active { .. }), "{sent:?}");
@@ -707,14 +737,13 @@ async fn a_photo_in_the_input_renders_alike() {
 }
 
 /// A photo a tool returned renders alike in the request after its result.
-#[tokio::test]
-async fn a_photo_in_a_tool_result_renders_alike() {
+async fn a_photo_in_a_tool_result_renders_alike(cipher: Cipher) {
     let steps = vec![
         text_step("a1", "hello"),
         photo_step("a2"),
         text_step("a3", "I see it"),
     ];
-    let (today, store) = both_from(steps, false, with_photo_tool("first")).await;
+    let (today, store) = both_from(steps, false, with_photo_tool("first"), cipher).await;
     for side in [&today, &store] {
         side.side.send("r2", with_photo_tool("show me")).await;
         side.side.idle().await;
@@ -723,9 +752,8 @@ async fn a_photo_in_a_tool_result_renders_alike() {
 }
 
 /// A queued photo renders alike when its run starts.
-#[tokio::test]
-async fn a_queued_photo_renders_alike() {
-    let (today, store) = both(three_texts(), true).await;
+async fn a_queued_photo_renders_alike(cipher: Cipher) {
+    let (today, store) = both(three_texts(), true, cipher).await;
     for side in [&today, &store] {
         let sent = send_photo(side, "r2", broca_protocol::Delivery::Queue).await;
         assert!(matches!(sent, SendOutcome::Pending { .. }), "{sent:?}");
@@ -736,9 +764,8 @@ async fn a_queued_photo_renders_alike() {
 
 /// A photo steered into a running run renders alike at the step that places it. The run steered
 /// into started from a photo send, so both sides render its requests with their media renderer.
-#[tokio::test]
-async fn a_steered_photo_renders_alike() {
-    let (today, store) = both(three_texts(), true).await;
+async fn a_steered_photo_renders_alike(cipher: Cipher) {
+    let (today, store) = both(three_texts(), true, cipher).await;
     for side in [&today, &store] {
         side.side.release_to_idle().await;
         let sent = send_photo(side, "r2", broca_protocol::Delivery::Queue).await;
@@ -757,9 +784,8 @@ async fn a_steered_photo_renders_alike() {
 
 /// After a restart, a run's request still carries the photo an earlier run's input held: the
 /// new storage's fold is rebuilt from the session's first record, and must hold its capture.
-#[tokio::test]
-async fn a_run_after_a_restart_renders_an_earlier_photo_alike() {
-    let (today, store) = both(three_texts(), false).await;
+async fn a_run_after_a_restart_renders_an_earlier_photo_alike(cipher: Cipher) {
+    let (today, store) = both(three_texts(), false, cipher).await;
     for side in [&today, &store] {
         send_photo(side, "r2", broca_protocol::Delivery::Queue).await;
         side.side.idle().await;
@@ -780,14 +806,13 @@ async fn a_run_after_a_restart_renders_an_earlier_photo_alike() {
 
 /// A tool's image survives a restart: the next run's request carries its bytes, read from the
 /// object stored with the tool's result.
-#[tokio::test]
-async fn a_tool_image_renders_alike_after_a_restart() {
+async fn a_tool_image_renders_alike_after_a_restart(cipher: Cipher) {
     let steps = vec![
         text_step("a1", "hello"),
         photo_step("a2"),
         text_step("a3", "I see it"),
     ];
-    let (today, store) = both_from(steps, false, with_photo_tool("first")).await;
+    let (today, store) = both_from(steps, false, with_photo_tool("first"), cipher).await;
     for side in [&today, &store] {
         side.side.send("r2", with_photo_tool("show me")).await;
         side.side.idle().await;
@@ -827,9 +852,8 @@ fn media_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
 /// session's own object, so removing that object is what refuses it, even with the same bytes
 /// waiting where today's media store keeps them: a run of a session in the new storage never
 /// reads those.
-#[tokio::test]
-async fn a_photo_whose_bytes_cant_be_read_refuses_alike_and_nothing_is_sent() {
-    let (today, store) = both(three_texts(), false).await;
+async fn a_photo_whose_bytes_cant_be_read_refuses_alike_and_nothing_is_sent(cipher: Cipher) {
+    let (today, store) = both(three_texts(), false, cipher).await;
     for side in [&today, &store] {
         send_photo(side, "r2", broca_protocol::Delivery::Queue).await;
         side.side.idle().await;
@@ -910,20 +934,27 @@ fn planned(mut request: SubmissionRequest) -> SubmissionRequest {
 /// A run after a compaction view that drops an earlier photo renders alike: the view is applied
 /// at the run's first step on both storages, and the photo, no longer in the model's view, is
 /// left out of the request the same way.
-#[tokio::test]
-async fn a_run_after_a_view_drops_a_photo_renders_alike() {
+async fn a_run_after_a_view_drops_a_photo_renders_alike(cipher: Cipher) {
     let plan = super::controls::compacting_plan();
     let steps = three_texts();
     let mut sides = Vec::new();
     let mut compactors = Vec::new();
     for store in [false, true] {
         let compactor = Arc::new(super::controls::Compactor::default());
-        let side =
-            Rendered::with_compactor(store, steps.clone(), false, Some(Arc::clone(&compactor)))
-                .await;
+        let side = Rendered::with_compactor(
+            store,
+            steps.clone(),
+            false,
+            Some(Arc::clone(&compactor)),
+            cipher,
+        )
+        .await;
         let sent = send_planned(&side, "r1", planned(text("first")), &plan).await;
         assert!(matches!(sent, SendOutcome::Active { .. }), "{sent:?}");
         side.side.idle().await;
+        if store {
+            assert_eq!(side.side.stored_mode(), cipher);
+        }
         let upload = side.side.uploaded(&bytes_of(PNG)).await;
         let sent = send_planned(&side, "r2", planned(photo("look", &[&upload])), &plan).await;
         assert!(matches!(sent, SendOutcome::Active { .. }), "{sent:?}");
@@ -974,15 +1005,17 @@ async fn a_run_after_a_view_drops_a_photo_renders_alike() {
 /// On a session whose plan shows part numbers, a request whose photo message sits between
 /// numbered messages renders alike: the loop leaves the photo's message for the media renderer
 /// to number, as today's loop does, and numbers the others itself.
-#[tokio::test]
-async fn a_photo_between_numbered_messages_renders_alike() {
+async fn a_photo_between_numbered_messages_renders_alike(cipher: Cipher) {
     let plan = super::controls::manifest(json!({"render_tags": true}), vec![]);
     let mut sides = Vec::new();
     for store in [false, true] {
-        let side = Rendered::new(store, three_texts(), false).await;
+        let side = Rendered::new(store, three_texts(), false, cipher).await;
         let sent = send_planned(&side, "r1", planned(text("first")), &plan).await;
         assert!(matches!(sent, SendOutcome::Active { .. }), "{sent:?}");
         side.side.idle().await;
+        if store {
+            assert_eq!(side.side.stored_mode(), cipher);
+        }
         let upload = side.side.uploaded(&bytes_of(PNG)).await;
         let sent = send_planned(&side, "r2", planned(photo("look", &[&upload])), &plan).await;
         assert!(matches!(sent, SendOutcome::Active { .. }), "{sent:?}");

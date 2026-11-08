@@ -9,6 +9,7 @@
 //! storage, the image's bytes are the session's own object: stored once, under the record that
 //! first named them, and read back byte-equal after a restart.
 
+use broca_session_store::keys::Cipher;
 use serde_json::json;
 
 use super::media::{
@@ -17,6 +18,13 @@ use super::media::{
 use super::{request, scoped_by_core};
 use crate::actor::SendOutcome;
 use crate::serve::ServeHandler;
+
+cipher_tests!(
+    a_photo_send_starting_a_run_answers_alike,
+    a_queued_photo_send_answers_alike_and_its_run_points_at_its_bytes,
+    a_steered_photo_answers_alike_and_its_copy_points_at_its_bytes,
+    a_retracted_photo_send_answers_alike_and_its_bytes_stay_readable,
+);
 
 fn steps() -> Vec<Vec<broca_protocol::NormalizedEvent>> {
     vec![
@@ -27,9 +35,9 @@ fn steps() -> Vec<Vec<broca_protocol::NormalizedEvent>> {
 }
 
 /// A side whose session exists: core's first text send ran, and, when `gated`, is still in its
-/// first model step.
-async fn started(store: bool, gated: bool) -> Side {
-    let side = side_gated(store, steps(), gated).await;
+/// first model step. A store side's session is in mode `cipher`.
+async fn started(store: bool, gated: bool, cipher: Cipher) -> Side {
+    let side = side_gated(store, steps(), gated, cipher).await;
     let mut first = request("first");
     scoped_by_core(&mut first);
     let sent = side.send("r1", first).await;
@@ -37,12 +45,18 @@ async fn started(store: bool, gated: bool) -> Side {
     if !gated {
         side.idle().await;
     }
+    if store {
+        assert_eq!(side.stored_mode(), cipher);
+    }
     side
 }
 
-/// Today's side and the store's, each started alike.
-async fn both(gated: bool) -> (Side, Side) {
-    (started(false, gated).await, started(true, gated).await)
+/// Today's side and the store's, each started alike, the store's session in mode `cipher`.
+async fn both(gated: bool, cipher: Cipher) -> (Side, Side) {
+    (
+        started(false, gated, cipher).await,
+        started(true, gated, cipher).await,
+    )
 }
 
 /// The role and the digests of the media each message of the side's history holds, in order, as
@@ -117,7 +131,7 @@ fn media_objects(store: &Side) -> usize {
 /// byte range.
 async fn survives_a_restart(store: &Side, image: &[u8]) {
     assert!(store.registry.stop_and_seal().await);
-    let restarted = registry_at(&store.dir, true, Vec::new()).await;
+    let restarted = registry_at(&store.dir, true, Vec::new(), store.cipher).await;
     let whole = ServeHandler::media_read(
         &restarted,
         &store.key,
@@ -163,9 +177,8 @@ async fn photo_send(
 /// A photo send that starts a run answers alike, and so does one naming an upload that doesn't
 /// exist. The image reads back alike, sits in the same message of the history, and survives a
 /// restart of the store side byte-equal.
-#[tokio::test]
-async fn a_photo_send_starting_a_run_answers_alike() {
-    let (today, store) = both(false).await;
+async fn a_photo_send_starting_a_run_answers_alike(cipher: Cipher) {
+    let (today, store) = both(false, cipher).await;
     let image = bytes_of(PNG);
     let unknown = photo("look", &["no-such-upload"]);
     assert_eq!(
@@ -195,9 +208,8 @@ async fn a_photo_send_starting_a_run_answers_alike() {
 /// A photo send while a run runs is queued alike, and its image reads alike while it waits. When
 /// it drains, its run's message points at the bytes its queued record stored, so the store keeps
 /// one object for them, read back byte-equal after a restart.
-#[tokio::test]
-async fn a_queued_photo_send_answers_alike_and_its_run_points_at_its_bytes() {
-    let (today, store) = both(true).await;
+async fn a_queued_photo_send_answers_alike_and_its_run_points_at_its_bytes(cipher: Cipher) {
+    let (today, store) = both(true, cipher).await;
     let image = bytes_of(PNG);
     let (old, new) = photo_send(
         &today,
@@ -226,9 +238,8 @@ async fn a_queued_photo_send_answers_alike_and_its_run_points_at_its_bytes() {
 
 /// A photo steered into a running run is taken alike, and its image reads alike before and after
 /// the boundary that places it. The placed copy points at the bytes the steer stored.
-#[tokio::test]
-async fn a_steered_photo_answers_alike_and_its_copy_points_at_its_bytes() {
-    let (today, store) = both(true).await;
+async fn a_steered_photo_answers_alike_and_its_copy_points_at_its_bytes(cipher: Cipher) {
+    let (today, store) = both(true, cipher).await;
     let image = bytes_of(PNG);
     let (old, new) = photo_send(
         &today,
@@ -261,9 +272,8 @@ async fn a_steered_photo_answers_alike_and_its_copy_points_at_its_bytes() {
 /// A queued photo send retracted before it runs answers alike. Its image stays readable alike,
 /// as today's session keeps every medium a record captured: on the new storage its bytes stay the
 /// session's object, named by the queued record the retraction leaves in the history.
-#[tokio::test]
-async fn a_retracted_photo_send_answers_alike_and_its_bytes_stay_readable() {
-    let (today, store) = both(true).await;
+async fn a_retracted_photo_send_answers_alike_and_its_bytes_stay_readable(cipher: Cipher) {
+    let (today, store) = both(true, cipher).await;
     let image = bytes_of(PNG);
     let (old, new) = photo_send(
         &today,

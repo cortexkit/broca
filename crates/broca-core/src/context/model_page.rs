@@ -1010,6 +1010,7 @@ mod episode_page_tests {
             session: BindIdentity::new("/tmp/project", "runner", "session"),
             config: Box::new(RunConfig {
                 global_system: None,
+                account_route: None,
                 route_decision_id: None,
                 account_limit_pause: false,
                 turn_directives_v1: None,

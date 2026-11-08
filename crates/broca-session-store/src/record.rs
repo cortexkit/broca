@@ -345,6 +345,20 @@ message! {
         /// `session.read` serves on it with `include_rich_ui`. Recorded here so a read finds it
         /// without looking up the run's start. Absent when the run's plan has none.
         20 opt rich_ui: RichUi,
+        /// The highest part number the runner's own numbering (llm-runner's tags: stamped on a
+        /// v1 run's records, computed by `broca_protocol::tags::number_message` from each later
+        /// run's checkpoint) shows before this message. The message's numbered parts take the
+        /// numbers after it, under its run's rules. It is the numbering today's read attaches to
+        /// each message and output references resolve a reply's `$$tc(N)` against; on the
+        /// compaction contract the model is shown `tag_base`'s numbering instead. Absent on
+        /// sessions written before it was recorded.
+        21 opt runner_tag_base: u64,
+        /// On a session converted from a log whose compaction provider spoke the first
+        /// compaction protocol only: the seq of that log's view event (`compaction_view_applied`,
+        /// kept whole as a ledger event) in force when the model step that wrote this message
+        /// sent its request, which output references check a named part against. Absent when no
+        /// such view had applied; the run loop never writes first-protocol views.
+        22 opt legacy_view_seq: u64,
     }
 }
 
@@ -913,6 +927,52 @@ message! {
         5 rep setup: PartRef,
         /// The rest of the refreshed manifest, owned by the fetch-plan code.
         6 opt manifest: serde_json::Value,
+        /// The model the refreshed plan chooses for the session's next runs (its `model`), as
+        /// admission read it from the plan; absent when the plan chooses none. A send that
+        /// leaves its model to the session, and `session.head`, follow the latest refresh that
+        /// chooses one.
+        7 opt selection: serde_json::Value,
+    }
+}
+
+message! {
+    /// The pending refresh's policy changed (`session.refresh_policy`), durable before the
+    /// caller is answered. `send_id` is the change's idempotency key: a repeat is answered from
+    /// this record.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct RefreshPolicy {
+        1 req generation: u64,
+        2 req policy: String,
+        3 req send_id: String,
+    }
+}
+
+message! {
+    /// The session's frozen prefix was flushed (`session.flush_prefix`): the next run applies any
+    /// pending refresh, whatever its policy. `pending_generation` is the refresh pending when the
+    /// flush was accepted, which a repeat under the same `send_id` is answered with.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct PrefixFlush {
+        1 req send_id: String,
+        2 opt pending_generation: u64,
+    }
+}
+
+message! {
+    /// The run whose start shares this record's batch applied the pending refresh `generation`:
+    /// `applied_by` is `fold` when a prefix rebuild applied it and `append` when the run applied
+    /// it with the prefix intact. It carries the facts the session's baseline reports for the
+    /// applied change, decided with it: the whole manifest's digest, its composition digest when
+    /// it has one, and the plan items its fetch left absent. Written after the run's input
+    /// records, so the run's start is still followed directly by its input.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct RefreshApplied {
+        1 req generation: u64,
+        2 req applied_by: String,
+        3 req manifest_digest: String,
+        4 opt composition_digest: String,
+        /// Owned by the fetch-plan code: each absent item as the baseline reports it.
+        5 rep absent_items: serde_json::Value,
     }
 }
 
@@ -1544,6 +1604,9 @@ records! {
         99 AuthRefrozen,
         100 StepRefused,
         101 Billed,
+        102 RefreshPolicy,
+        103 PrefixFlush,
+        104 RefreshApplied,
     }
 }
 

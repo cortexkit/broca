@@ -449,6 +449,8 @@ pub fn seed(history: HeadHistory, at: &SeedFacts<'_>) -> Result<Seed, ImportRefu
             no_display_facts: None,
             reasoning_summaries: broca_session_loop::entries::reasoning_summaries(&message.message),
             rich_ui: None,
+            runner_tag_base: None,
+            legacy_view_seq: None,
         }));
         high = high
             .checked_add(broca_core::compaction_v2::metadata::numbered_parts(

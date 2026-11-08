@@ -145,6 +145,10 @@ pub struct Admission {
     /// then ends with this error before any step, as today's loop ends it. Unlike every other
     /// field it isn't frozen into the start, and a run read back from its start has none.
     pub pre_model_error: Option<ProviderError>,
+    /// The pending plan change this run applies by freezing its manifest, recorded after the
+    /// run's input in the batch of its start. Like `pre_model_error`, a run read back from its
+    /// start has none: the record that followed the start keeps it.
+    pub applies_refresh: Option<broca_protocol::session_change::AppliedChange>,
 }
 
 /// What the send that started a run recorded about itself, as today's run start records it.
@@ -324,8 +328,24 @@ where
         .map_err(LoopError::Refused)?;
     }
     admission.input = input;
+    // The run numbers its messages' parts by its own computed rules, after the highest number
+    // the session has shown, as its start freezes them. On the compaction contract its
+    // requests show the projection's numbers instead, but today's reads still number the run's
+    // messages by these rules, so they are recorded alike.
+    let checkpoint = shown_high(&*writer, &*parts).await?;
+    let runner = broca_core::tags::rules_for(
+        Some(broca_wal::ComputedTagRules { checkpoint }),
+        frozen_render_tags(&admission),
+        &admission.render_config,
+    )
+    .map(|rules| crate::entries::RunnerTags {
+        run_id: admission.run_id.clone(),
+        rules,
+        checkpoint,
+    });
     let mut placed = Placed {
         calls: Default::default(),
+        runner,
         rich_ui: admission
             .manifest
             .as_ref()
@@ -338,7 +358,7 @@ where
         ),
         inner: writer,
     };
-    let start_seq = admit(&mut placed, parts, &admission).await?;
+    let start_seq = admit(&mut placed, parts, &admission, checkpoint).await?;
     if let Some(reports) = &seams.account_reports {
         reports.run_started(&event_id(&placed, start_seq), start_seq);
     }
@@ -559,8 +579,10 @@ where
         }
     }
     let drift = drift.filter(|_| !matches!(resolution, Resolution::Paused(_)));
+    let runner = runner_of_start(writer, parts, &admission.run_id).await?;
     let mut placed = Placed {
         calls: Default::default(),
+        runner,
         rich_ui: admission
             .manifest
             .as_ref()
@@ -795,10 +817,12 @@ where
         return Err(LoopError::Unsupported("sealing a run that wasn't running"));
     }
     let admission = frozen_admission(run, parts)?;
+    let runner = runner_of_start(writer, parts, &run_id).await?;
     // The closing results message is placed with the facts its run's frozen rules give it, as a
     // resume places it.
     let mut placed = Placed {
         calls: Default::default(),
+        runner,
         rich_ui: admission
             .manifest
             .as_ref()
@@ -1049,7 +1073,7 @@ fn decode<T: serde::de::DeserializeOwned>(value: Option<Value>) -> Result<Option
 /// Stores a plan manifest's shared members as setup parts, in a fixed order: the plan, each
 /// provider's answer, the manifest's tools, its system text and its hook declarations. Returns
 /// what remains of the manifest, or `None` when nothing does.
-fn manifest_parts(
+pub fn manifest_parts(
     manifest: &broca_wal::PlanManifest,
     parts: &mut dyn Parts,
     setup: &mut Vec<broca_session_store::record::PartRef>,
@@ -1089,23 +1113,23 @@ pub fn frozen_manifest(
     start: &broca_session_store::record::RunStart,
     parts: &dyn Parts,
 ) -> Result<Option<std::sync::Arc<broca_wal::PlanManifest>>, LoopError> {
-    let Some(first) = start
-        .setup
-        .iter()
-        .position(|part| part.kind == PartKind::Plan)
-    else {
-        return Ok(None);
-    };
-    let mut members = match start
-        .run_choices
-        .as_ref()
-        .and_then(|choices| choices.get("manifest"))
-    {
+    broca_session_store::fold::operations::ManifestRef::of_start(start)
+        .map(|manifest| stored_manifest(&manifest, parts))
+        .transpose()
+}
+
+/// The plan manifest `manifest` references, rebuilt from its setup parts and the rest of its
+/// members.
+pub fn stored_manifest(
+    manifest: &broca_session_store::fold::operations::ManifestRef,
+    parts: &dyn Parts,
+) -> Result<std::sync::Arc<broca_wal::PlanManifest>, LoopError> {
+    let mut members = match &manifest.rest {
         Some(Value::Object(rest)) => rest.clone(),
         _ => serde_json::Map::new(),
     };
     let mut fetches = Vec::new();
-    for part in &start.setup[first..] {
+    for part in &manifest.parts {
         let value = parts.get(part).map_err(LoopError::Parts)?;
         match part.kind {
             PartKind::Plan => {
@@ -1126,7 +1150,7 @@ pub fn frozen_manifest(
     }
     members.insert("fetches".into(), Value::Array(fetches));
     serde_json::from_value(Value::Object(members))
-        .map(|manifest| Some(std::sync::Arc::new(manifest)))
+        .map(std::sync::Arc::new)
         .map_err(|e| LoopError::Parts(format!("the frozen manifest: {e}")))
 }
 
@@ -1338,7 +1362,22 @@ pub fn admission_of_start(
             hooks: decode(start.hooks.clone())?,
         },
         pre_model_error: None,
+        applies_refresh: None,
     })
+}
+
+/// A run start's application of a pending plan change, as the record that follows the run's
+/// input in the start's batch keeps it.
+pub fn refresh_applied(
+    applied: &broca_protocol::session_change::AppliedChange,
+) -> broca_session_store::record::RefreshApplied {
+    broca_session_store::record::RefreshApplied {
+        generation: applied.generation,
+        applied_by: applied.applied_by.clone(),
+        manifest_digest: applied.manifest_digest.clone(),
+        composition_digest: applied.composition_digest.clone(),
+        absent_items: applied.absent_items.clone(),
+    }
 }
 
 /// A session compacted under the first compaction protocol keeps rendering under that protocol's
@@ -1414,6 +1453,26 @@ async fn run_tag_rules<W: Writer>(
 /// Whether the run froze part numbers into the model's view: a run read back from its start
 /// carries the frozen choice, and a new run takes it from its plan, as its start record freezes
 /// it.
+/// The open run `run_id`'s own part numbering, as its start froze it.
+async fn runner_of_start<W: Writer>(
+    writer: &W,
+    parts: &dyn Parts,
+    run_id: &str,
+) -> Result<Option<crate::entries::RunnerTags>, LoopError> {
+    let Some(start) = writer.run_start(run_id).await? else {
+        return Ok(None);
+    };
+    let config = run_config_of_start(&start, parts)?;
+    Ok(config
+        .computed_tags
+        .zip(broca_core::tags::computed_rules(&config))
+        .map(|(tags, rules)| crate::entries::RunnerTags {
+            run_id: run_id.to_owned(),
+            rules,
+            checkpoint: tags.checkpoint,
+        }))
+}
+
 fn frozen_render_tags(admission: &Admission) -> bool {
     admission.render_tags
         || admission
@@ -1758,6 +1817,9 @@ where
         if finalizing {
             opts.tool_choice = Arc::new(ToolChoice::None);
         }
+        // The session's original system message, which a plan's system text takes the place of
+        // in the provider view below.
+        let durable_system: Vec<Message> = opts.prompt.first().cloned().into_iter().collect();
         if let Some(ctx) = compaction {
             let marked = writer.conversation().marker.clone();
             match crate::compaction::prepare(writer, admission, seams, ctx, step_id, opts).await? {
@@ -1796,6 +1858,25 @@ where
             {
                 crate::compaction::seal_at_cut(writer, seams, ctx, marker.first_kept_ordinal)
                     .await?;
+            }
+        }
+        // Once a refresh applied, the model sees the system text of the plan the run froze in
+        // place of the session's original system message, as a view of the request only, as
+        // today's loop shows it. A session on the current compaction contract renders its
+        // system text from its entries instead.
+        if admission.compaction_plan_version.is_none()
+            && writer
+                .operations()
+                .plan
+                .as_ref()
+                .is_some_and(|plan| plan.applied_generation > 0)
+        {
+            if let Some(manifest) = &admission.manifest {
+                if let Some(view) =
+                    broca_core::plan_system::view(&opts, &durable_system, &manifest.system_text)
+                {
+                    opts = view;
+                }
             }
         }
         // Client-side refusal fallback: the step goes to the run's refusal-fallback model while
@@ -2264,10 +2345,13 @@ fn to_value<T: serde::Serialize>(value: Option<&T>) -> Result<Option<Value>, Loo
         .map_err(|e| LoopError::Parts(e.to_string()))
 }
 
+/// Writes the run's start. `checkpoint` is the highest part number the session has shown
+/// ([`shown_high`]), which the run's computed numbering continues after.
 async fn admit<W: Writer>(
     writer: &mut W,
     parts: &mut dyn Parts,
     admission: &Admission,
+    checkpoint: u64,
 ) -> Result<u64, LoopError> {
     // The session's refusal-fallback schedule carries into the run only under the same model
     // and within a day of its last change, as today's admission decides it.
@@ -2326,7 +2410,6 @@ async fn admit<W: Writer>(
         config.insert("render_tags".into(), json!(true));
     }
     // Today's computed tag rules, starting after the highest number the session has shown.
-    let checkpoint = shown_high(writer, parts).await?;
     config.insert("computed_tags".into(), json!({ "checkpoint": checkpoint }));
     config.insert("context_epoch".into(), json!(0));
     if !admission.stop_when.is_empty() {
@@ -2436,6 +2519,11 @@ async fn admit<W: Writer>(
             receipt_seq: None,
             pruned: Vec::new(),
         }));
+    }
+    // The pending plan change this run applies is recorded after its input, so the start is
+    // still followed directly by its input.
+    if let Some(applied) = &admission.applies_refresh {
+        records.push(Record::RefreshApplied(refresh_applied(applied)));
     }
     // The start's seq is the one the batch took, which a writer shared with the session actor
     // knows only once it is appended.

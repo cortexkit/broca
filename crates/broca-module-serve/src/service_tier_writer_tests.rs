@@ -105,7 +105,7 @@ impl TierServeRig {
         // The address this rig's route actually reaches: the same resolution a served bind
         // performs, so a session recorded under another address before 0.34 is still found.
         let session = registry
-            .resolve_session_address(&BindIdentity::new("", "tier-test", "session"), None)
+            .resolve_session_address(&BindIdentity::new("", "tier-test", "session"), None, None)
             .await
             .expect("the session address resolves from the inventory, as a served bind does");
         let mut rig = Self {
@@ -296,6 +296,12 @@ impl RunExecutor for TierFixtureExecutor {
         request: &broca_protocol::SubmissionRequest,
     ) -> Result<(), String> {
         self.live.check_service_tier(request)
+    }
+    fn check_account_route(
+        &self,
+        request: &broca_protocol::request::SubmissionRequest,
+    ) -> Result<(), String> {
+        self.live.check_account_route(request)
     }
 
     fn compaction_plane(&self) -> Option<Arc<dyn broca_core::CompactionPlane>> {

@@ -527,6 +527,7 @@ impl RunExecutor for ReauthCoreExec {
 
 fn min_config() -> broca_wal::RunConfig {
     broca_wal::RunConfig {
+        account_route: None,
         global_system: None,
         route_decision_id: None,
         account_limit_pause: false,
@@ -669,6 +670,7 @@ fn chatgpt_send(session: BindIdentity, run_id: &str, prompt: &str) -> SendReques
         run_id: RunId(run_id.into()),
         send_id: Some(format!("send-{run_id}")),
         request: Box::new(SubmissionRequest {
+            account_route: None,
             route_decision_id: None,
             service_tier_level: None,
             staged_uploads: None,
@@ -7557,4 +7559,157 @@ fn walk_files(path: &Path) -> Vec<std::path::PathBuf> {
     } else {
         vec![path.to_path_buf()]
     }
+}
+
+async fn account_route_send(
+    rig: &mut PrincipalRig,
+    params: serde_json::Value,
+) -> (FrameType, serde_json::Value) {
+    let corr = rig.next_corr();
+    write_req(
+        &mut rig.writer,
+        7,
+        corr,
+        serde_json::json!({"method":"session.send","params":params}),
+    )
+    .await;
+    let reply = read_one(&mut rig.reader).await;
+    (
+        reply.header.ty,
+        serde_json::from_slice(&reply.body).unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn account_route_wire_refusals_write_nothing() {
+    let mut rig = PrincipalRig::start("account-route-refusals").await;
+    rig.bind(7, None).await;
+    for bad in [
+        serde_json::Value::Null,
+        serde_json::json!("route"),
+        serde_json::json!({}),
+        serde_json::json!({"provider":"p"}),
+        serde_json::json!({"provider":"","model":"m"}),
+        serde_json::json!({"provider":"p","model":""}),
+        serde_json::json!({"provider":5,"model":"m"}),
+        serde_json::json!({"provider":"p","model":"m","extra":true}),
+    ] {
+        let reply = account_route_send(
+            &mut rig,
+            serde_json::json!({
+                "send_id":"bad-route","prompt":"hello","model":{"provider":"fake","model":"fake"},
+                "auth":{"method":"oauth"},"account_route":bad
+            }),
+        )
+        .await;
+        assert_eq!(reply.0, FrameType::Error, "{reply:?}");
+        assert_eq!(reply.1["code"], "invalid_params", "{reply:?}");
+        assert_eq!(reply.1["detail"]["field"], "account_route", "{reply:?}");
+        assert!(
+            !rig.wal_path.exists(),
+            "invalid account_route created a WAL"
+        );
+    }
+    for method in ["antigravity", "unknown"] {
+        let reply = account_route_send(
+            &mut rig,
+            serde_json::json!({
+                "prompt":"hello","model":{"provider":"fake","model":"fake"},
+                "auth":{"method":method},"account_route":{"provider":"p","model":"m"}
+            }),
+        )
+        .await;
+        assert_eq!(reply.0, FrameType::Error);
+        assert_eq!(reply.1["code"], "invalid_params");
+        assert_eq!(reply.1["detail"]["field"], "account_route");
+        assert!(!rig.wal_path.exists());
+    }
+    for field in ["speaks_for", "notice"] {
+        let mut params =
+            serde_json::json!({"prompt":"hello","model":{"provider":"fake","model":"fake"}});
+        params[field] = serde_json::json!(true);
+        let reply = account_route_send(&mut rig, params).await;
+        assert_eq!(reply.0, FrameType::Error);
+        assert_eq!(reply.1["code"], "invalid_params");
+        assert_eq!(reply.1["detail"]["field"], field);
+        assert!(!rig.wal_path.exists());
+    }
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn account_route_wire_joins_inherit_and_queue_freezes_its_own_route() {
+    let mut rig = PrincipalRig::start("account-route-joining").await;
+    rig.bind(7, None).await;
+    let route = serde_json::json!({"provider":"routing-provider","model":"routing-model"});
+    let base = serde_json::json!({"prompt":"hello","model":{"provider":"fake","model":"fake"}});
+    let mut first = base.clone();
+    first["send_id"] = "first-route".into();
+    first["account_route"] = route.clone();
+    let reply = account_route_send(&mut rig, first).await;
+    assert_eq!(reply.0, FrameType::Response, "{reply:?}");
+    let before = rig.records();
+    assert!(before.iter().any(|record| matches!(record, WalRecord::RunStarted {config, ..} if serde_json::to_value(&config.account_route).unwrap() == route)));
+    for different in [
+        serde_json::json!({"provider":"different","model":"routing-model"}),
+        serde_json::json!({"provider":"routing-provider","model":"different"}),
+    ] {
+        let mut joining = base.clone();
+        joining["send_id"] = "different-route".into();
+        joining["delivery"] = "steer".into();
+        joining["account_route"] = different;
+        let reply = account_route_send(&mut rig, joining).await;
+        assert_eq!(reply.0, FrameType::Error, "{reply:?}");
+        assert_eq!(reply.1["code"], "invalid_params");
+        assert_eq!(reply.1["detail"]["field"], "account_route");
+        assert_eq!(rig.records(), before);
+    }
+    for (send_id, explicit) in [("equal-route", true), ("absent-route", false)] {
+        let mut joining = base.clone();
+        joining["send_id"] = send_id.into();
+        joining["delivery"] = "steer".into();
+        if explicit {
+            joining["account_route"] = route.clone();
+        }
+        let reply = account_route_send(&mut rig, joining).await;
+        assert_eq!(reply.0, FrameType::Response, "{reply:?}");
+        assert_eq!(reply.1["result"]["state"], "active");
+    }
+    let own_route = serde_json::json!({"provider":"queued-provider","model":"queued-model"});
+    let mut queued = base;
+    queued["send_id"] = "queued-route".into();
+    queued["account_route"] = own_route.clone();
+    let reply = account_route_send(&mut rig, queued).await;
+    assert_eq!(reply.0, FrameType::Response, "{reply:?}");
+    assert_eq!(reply.1["result"]["state"], "pending");
+    // Steering adds a follow-up model call; the queued run then makes its own call.
+    for steps in [2, 3] {
+        rig.gate.notify_one();
+        broca_test_support::wait_until("account-route next model gate", || {
+            let actual = rig
+                .records()
+                .iter()
+                .filter(|record| matches!(record, WalRecord::StepStarted { .. }))
+                .count();
+            std::future::ready(if actual >= steps {
+                Ok(())
+            } else {
+                Err(format!("step starts={actual}, wanted={steps}"))
+            })
+        })
+        .await;
+    }
+    rig.gate.notify_one();
+    let records = rig.wait_for_finished(2).await;
+    let routes: Vec<_> = records
+        .iter()
+        .filter_map(|record| match record {
+            WalRecord::RunStarted { config, .. } => {
+                Some(serde_json::to_value(&config.account_route).unwrap())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(routes, vec![route, own_route]);
+    rig.finish().await;
 }

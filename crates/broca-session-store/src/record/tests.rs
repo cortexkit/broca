@@ -238,6 +238,23 @@ fn one_of_each() -> Vec<Record> {
             applies_from_next_run: true,
             setup: vec![],
             manifest: None,
+            selection: Some(serde_json::json!({"provider": "p", "model": "m"})),
+        }),
+        Record::RefreshPolicy(RefreshPolicy {
+            generation: 2,
+            policy: "on_prefix_rebuild".into(),
+            send_id: "policy-1".into(),
+        }),
+        Record::PrefixFlush(PrefixFlush {
+            send_id: "flush-1".into(),
+            pending_generation: Some(2),
+        }),
+        Record::RefreshApplied(RefreshApplied {
+            generation: 2,
+            applied_by: "fold".into(),
+            manifest_digest: "m".into(),
+            composition_digest: Some("c".into()),
+            absent_items: vec![serde_json::json!({"provider": "p", "kind": "tool"})],
         }),
         Record::StructuredResult(StructuredResult {
             run_id: "run-1".into(),

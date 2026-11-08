@@ -8,12 +8,18 @@ use super::{is_broca_id_form, NewInputMedia};
 use crate::backend::{MemoryBackend, SessionAddr, SessionBackend as _};
 use crate::codec::{hex, DecodeErrorKind, Message as _};
 use crate::head::SessionTriple;
-use crate::keys::DeploymentKey;
+use crate::keys::{Cipher, DeploymentKey};
 use crate::record::{
     CallFacts, EntryFacts, ImportReceipt, ImportedIds, ImportedMove, Input, InputMedia, Placement,
     Record, RunEnd, RunStart, TurnFacts,
 };
 use crate::session::{Session, SessionError};
+
+cipher_tests!(
+    an_import_stores_its_media_and_resolves_its_ids_before_and_after_a_seal,
+    a_damaged_id_map_reads_as_damage,
+    turn_facts_attach_to_their_message,
+);
 
 fn triple() -> SessionTriple {
     SessionTriple {
@@ -23,8 +29,9 @@ fn triple() -> SessionTriple {
     }
 }
 
-fn deployment() -> DeploymentKey {
-    DeploymentKey::new(1, &[5; 32])
+/// The test deployment key, creating sessions in mode `cipher`.
+fn deployment(cipher: Cipher) -> DeploymentKey {
+    DeploymentKey::new(1, &[5; 32]).creating(cipher)
 }
 
 fn addr() -> SessionAddr {
@@ -135,6 +142,8 @@ fn facts(ordinal: u64, mid: &str) -> Record {
         no_display_facts: None,
         reasoning_summaries: Vec::new(),
         rich_ui: None,
+        runner_tag_base: None,
+        legacy_view_seq: None,
     })
 }
 
@@ -204,12 +213,11 @@ fn import_batch(a: &[u8]) -> (Vec<Record>, Vec<NewInputMedia>, Vec<(String, u64)
 /// An import's media is stored before its batch and reads back from the stored record, and its
 /// source ids resolve to their ordinals through the id map: in the open log, after a seal at a
 /// cut through the imported history, and after a reload that reads the map again.
-#[test]
-fn an_import_stores_its_media_and_resolves_its_ids_before_and_after_a_seal() {
+fn an_import_stores_its_media_and_resolves_its_ids_before_and_after_a_seal(cipher: Cipher) {
     let backend = MemoryBackend::default();
     let a = b"an imported image".as_slice();
     block_on(async {
-        let mut session = Session::create(&backend, addr(), triple(), &deployment(), true)
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(cipher), true)
             .await
             .unwrap();
         let (records, media, ids) = import_batch(a);
@@ -265,7 +273,7 @@ fn an_import_stores_its_media_and_resolves_its_ids_before_and_after_a_seal() {
         assert_eq!(session.input_media(with_image, 1, None).await.unwrap(), a);
         session.close().await.unwrap();
 
-        let loaded = Session::load(&backend, addr(), &triple(), &deployment())
+        let loaded = Session::load(&backend, addr(), &triple(), &deployment(cipher))
             .await
             .unwrap();
         assert_eq!(loaded.find_message("msg_u1").await.unwrap(), Some(1));
@@ -276,11 +284,10 @@ fn an_import_stores_its_media_and_resolves_its_ids_before_and_after_a_seal() {
 }
 
 /// A map the session names but can't read is damage, never an id it doesn't hold.
-#[test]
-fn a_damaged_id_map_reads_as_damage() {
+fn a_damaged_id_map_reads_as_damage(cipher: Cipher) {
     let backend = MemoryBackend::default();
     block_on(async {
-        let mut session = Session::create(&backend, addr(), triple(), &deployment(), true)
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(cipher), true)
             .await
             .unwrap();
         let (records, media, ids) = import_batch(b"image");
@@ -298,7 +305,7 @@ fn a_damaged_id_map_reads_as_damage() {
         let last = sealed.len() - 1;
         sealed[last] ^= 1;
         backend.set_object(&addr(), &name, sealed);
-        let loaded = Session::load(&backend, addr(), &triple(), &deployment())
+        let loaded = Session::load(&backend, addr(), &triple(), &deployment(cipher))
             .await
             .unwrap();
         assert!(matches!(
@@ -381,11 +388,10 @@ fn an_older_reader_refuses_input_media_and_an_id_map() {
 
 /// A turn's call facts attach to the assistant message they name, in the window and through a
 /// reload, beside its entry facts.
-#[test]
-fn turn_facts_attach_to_their_message() {
+fn turn_facts_attach_to_their_message(cipher: Cipher) {
     let backend = MemoryBackend::default();
     block_on(async {
-        let mut session = Session::create(&backend, addr(), triple(), &deployment(), true)
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(cipher), true)
             .await
             .unwrap();
         let call: ContentBlock = serde_json::from_value(serde_json::json!({
@@ -418,7 +424,7 @@ fn turn_facts_attach_to_their_message() {
             .unwrap();
         assert_eq!(session.conversation.entries[0].turn, Some(turn.clone()));
         session.close().await.unwrap();
-        let loaded = Session::load(&backend, addr(), &triple(), &deployment())
+        let loaded = Session::load(&backend, addr(), &triple(), &deployment(cipher))
             .await
             .unwrap();
         let entry = loaded.entries(1, 1).await.unwrap().remove(0);

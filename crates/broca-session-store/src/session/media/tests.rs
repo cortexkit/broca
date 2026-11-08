@@ -9,12 +9,26 @@ use super::{MediaError, NewMedia};
 use crate::backend::{MemoryBackend, SessionAddr, SessionBackend};
 use crate::codec::hex;
 use crate::head::SessionTriple;
-use crate::keys::DeploymentKey;
+use crate::keys::{Cipher, DeploymentKey};
 use crate::record::{
     Assistant, EntryFacts, Input, MediaObject, Placement, QueuedSend, Record, RunEnd, RunStart,
     Steer, ToolReply,
 };
 use crate::session::{NewInputMedia, Reverted, Session, SessionError};
+
+cipher_tests!(
+    a_results_media_is_stored_once_and_reads_back_after_reload,
+    media_that_doesnt_match_its_part_is_refused_before_anything_is_written,
+    a_changed_or_moved_media_object_reads_as_corrupt,
+    a_seal_keeps_the_windows_media_and_forgets_media_it_moved_out,
+    a_revert_forgets_the_abandoned_branchs_media,
+    a_named_medium_is_found_by_digest_in_sealed_history_and_the_open_log,
+    a_sends_media_are_stored_under_its_record_and_its_copies_point_at_them,
+    a_sends_media_that_dont_match_are_refused_before_anything_is_written,
+    a_crash_while_storing_a_sends_media_never_leaves_a_record_without_its_bytes,
+    a_changed_or_moved_input_medium_reads_as_corrupt,
+    a_media_object_moved_onto_another_name_for_the_same_bytes_reads_as_corrupt,
+);
 
 fn triple() -> SessionTriple {
     SessionTriple {
@@ -24,8 +38,9 @@ fn triple() -> SessionTriple {
     }
 }
 
-fn deployment() -> DeploymentKey {
-    DeploymentKey::new(1, &[5; 32])
+/// The test deployment key, creating sessions in mode `cipher`.
+fn deployment(cipher: Cipher) -> DeploymentKey {
+    DeploymentKey::new(1, &[5; 32]).creating(cipher)
 }
 
 fn addr() -> SessionAddr {
@@ -138,6 +153,8 @@ fn facts(ordinal: u64, mid: String) -> Record {
         no_display_facts: None,
         reasoning_summaries: Vec::new(),
         rich_ui: None,
+        runner_tag_base: None,
+        legacy_view_seq: None,
         ordinal,
         written_at_ms: Some(ordinal),
         tag_base: 0,
@@ -265,12 +282,11 @@ fn objects_of(record: &Record) -> Vec<(u32, u64)> {
 /// Each image is stored once, under the record that first names it: a later result naming the
 /// same bytes points at that object. The bytes read back by reference after a reload, and the
 /// stored record says where each part's bytes are.
-#[test]
-fn a_results_media_is_stored_once_and_reads_back_after_reload() {
+fn a_results_media_is_stored_once_and_reads_back_after_reload(cipher: Cipher) {
     let backend = MemoryBackend::default();
     let (a, b) = (b"image a".as_slice(), b"image b".as_slice());
     block_on(async {
-        let mut session = Session::create(&backend, addr(), triple(), &deployment(), false)
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(cipher), false)
             .await
             .unwrap();
         let (_, first) = photo_run(&mut session, "r0", 1, &[a]).await;
@@ -283,7 +299,7 @@ fn a_results_media_is_stored_once_and_reads_back_after_reload() {
         assert_ne!(second_objects[1].1, first_seq);
         session.close().await.unwrap();
 
-        let loaded = Session::load(&backend, addr(), &triple(), &deployment())
+        let loaded = Session::load(&backend, addr(), &triple(), &deployment(cipher))
             .await
             .unwrap();
         assert_eq!(loaded.window_media(&image(a)).await.unwrap(), a);
@@ -302,11 +318,10 @@ fn a_results_media_is_stored_once_and_reads_back_after_reload() {
 
 /// Bytes that don't match their part's reference, and a part that isn't media, are refused
 /// before anything is written: no object, no record.
-#[test]
-fn media_that_doesnt_match_its_part_is_refused_before_anything_is_written() {
+fn media_that_doesnt_match_its_part_is_refused_before_anything_is_written(cipher: Cipher) {
     let backend = MemoryBackend::default();
     block_on(async {
-        let mut session = Session::create(&backend, addr(), triple(), &deployment(), false)
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(cipher), false)
             .await
             .unwrap();
         let before = session.next_seq();
@@ -345,12 +360,11 @@ fn media_that_doesnt_match_its_part_is_refused_before_anything_is_written() {
 /// An object whose bytes were changed, or that holds another object's bytes, reads as corrupt,
 /// never as other bytes: a read decrypts the object and checks the bytes against the part's
 /// reference.
-#[test]
-fn a_changed_or_moved_media_object_reads_as_corrupt() {
+fn a_changed_or_moved_media_object_reads_as_corrupt(cipher: Cipher) {
     let backend = MemoryBackend::default();
     let (a, b) = (b"image a".as_slice(), b"image b".as_slice());
     block_on(async {
-        let mut session = Session::create(&backend, addr(), triple(), &deployment(), false)
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(cipher), false)
             .await
             .unwrap();
         photo_run(&mut session, "r0", 1, &[a, b]).await;
@@ -376,12 +390,11 @@ fn a_changed_or_moved_media_object_reads_as_corrupt() {
 /// A seal keeps the window's media where it is, and forgets media it moved out of the open
 /// log: a result naming those bytes again writes them again. The sealed record still reads its
 /// own media.
-#[test]
-fn a_seal_keeps_the_windows_media_and_forgets_media_it_moved_out() {
+fn a_seal_keeps_the_windows_media_and_forgets_media_it_moved_out(cipher: Cipher) {
     let backend = MemoryBackend::default();
     let (a, b) = (b"image a".as_slice(), b"image b".as_slice());
     block_on(async {
-        let mut session = Session::create(&backend, addr(), triple(), &deployment(), false)
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(cipher), false)
             .await
             .unwrap();
         let (_, sealed_away) = photo_run(&mut session, "r0", 1, &[a]).await;
@@ -404,7 +417,7 @@ fn a_seal_keeps_the_windows_media_and_forgets_media_it_moved_out() {
         // a was written again; b is still the window's.
         assert_eq!(media_objects(&backend).len(), objects + 1);
         session.close().await.unwrap();
-        let loaded = Session::load(&backend, addr(), &triple(), &deployment())
+        let loaded = Session::load(&backend, addr(), &triple(), &deployment(cipher))
             .await
             .unwrap();
         assert_eq!(loaded.window_media(&image(a)).await.unwrap(), a);
@@ -414,12 +427,11 @@ fn a_seal_keeps_the_windows_media_and_forgets_media_it_moved_out() {
 
 /// After a revert in the open log, the kept messages' media is still the window's, and the
 /// abandoned branch's isn't: a result on the new branch naming those bytes writes them again.
-#[test]
-fn a_revert_forgets_the_abandoned_branchs_media() {
+fn a_revert_forgets_the_abandoned_branchs_media(cipher: Cipher) {
     let backend = MemoryBackend::default();
     let (a, b) = (b"image a".as_slice(), b"image b".as_slice());
     block_on(async {
-        let mut session = Session::create(&backend, addr(), triple(), &deployment(), false)
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(cipher), false)
             .await
             .unwrap();
         photo_run(&mut session, "r0", 1, &[a]).await;
@@ -459,8 +471,7 @@ fn a_revert_forgets_the_abandoned_branchs_media() {
 /// included, and its bytes read back from the object the record stored. A record naming a digest
 /// without storing its bytes is found with nothing to read, and a digest no record names isn't
 /// found. Reading the bytes touches storage, so a session answering from memory only refuses.
-#[test]
-fn a_named_medium_is_found_by_digest_in_sealed_history_and_the_open_log() {
+fn a_named_medium_is_found_by_digest_in_sealed_history_and_the_open_log(cipher: Cipher) {
     let backend = MemoryBackend::default();
     let (a, b, c) = (
         b"image a".as_slice(),
@@ -468,7 +479,7 @@ fn a_named_medium_is_found_by_digest_in_sealed_history_and_the_open_log() {
         b"image c".as_slice(),
     );
     block_on(async {
-        let mut session = Session::create(&backend, addr(), triple(), &deployment(), false)
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(cipher), false)
             .await
             .unwrap();
         photo_run(&mut session, "r0", 1, &[a]).await;
@@ -575,12 +586,11 @@ fn blocks(record: usize, message: u32, images: &[&[u8]]) -> Vec<NewInputMedia> {
 /// places a queued send does, points at that object instead of writing another; a steer's
 /// pointers reach the run state its boundary places copies from. Every medium reads back by
 /// digest after a reload, and `stored_media` lists where each record keeps its bytes.
-#[test]
-fn a_sends_media_are_stored_under_its_record_and_its_copies_point_at_them() {
+fn a_sends_media_are_stored_under_its_record_and_its_copies_point_at_them(cipher: Cipher) {
     let backend = MemoryBackend::default();
     let (a, b) = (b"image a".as_slice(), b"image b".as_slice());
     block_on(async {
-        let mut session = Session::create(&backend, addr(), triple(), &deployment(), false)
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(cipher), false)
             .await
             .unwrap();
         let mid = session.message_id(2);
@@ -656,7 +666,7 @@ fn a_sends_media_are_stored_under_its_record_and_its_copies_point_at_them() {
         );
         session.close().await.unwrap();
 
-        let loaded = Session::load(&backend, addr(), &triple(), &deployment())
+        let loaded = Session::load(&backend, addr(), &triple(), &deployment(cipher))
             .await
             .unwrap();
         for bytes in [a, b] {
@@ -674,11 +684,10 @@ fn a_sends_media_are_stored_under_its_record_and_its_copies_point_at_them() {
 
 /// Bytes that don't match the medium their message names, and a block that isn't a medium, are
 /// refused before anything is written: no object, no record.
-#[test]
-fn a_sends_media_that_dont_match_are_refused_before_anything_is_written() {
+fn a_sends_media_that_dont_match_are_refused_before_anything_is_written(cipher: Cipher) {
     let backend = MemoryBackend::default();
     block_on(async {
-        let mut session = Session::create(&backend, addr(), triple(), &deployment(), false)
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(cipher), false)
             .await
             .unwrap();
         let before = session.next_seq();
@@ -710,16 +719,16 @@ fn a_sends_media_that_dont_match_are_refused_before_anything_is_written() {
 
 /// A crash at any point of storing a send's media and appending its record leaves a session
 /// whose every stored medium reads back: the record never lands before its bytes are durable.
-#[test]
-fn a_crash_while_storing_a_sends_media_never_leaves_a_record_without_its_bytes() {
+fn a_crash_while_storing_a_sends_media_never_leaves_a_record_without_its_bytes(cipher: Cipher) {
     let image_a = b"image a".as_slice();
     let mut landed = 0;
     for crash in 0..6 {
         let backend = MemoryBackend::default();
         block_on(async {
-            let mut session = Session::create(&backend, addr(), triple(), &deployment(), false)
-                .await
-                .unwrap();
+            let mut session =
+                Session::create(&backend, addr(), triple(), &deployment(cipher), false)
+                    .await
+                    .unwrap();
             backend.crash_after(Some(crash));
             let _ = session
                 .append_input_media(
@@ -731,7 +740,7 @@ fn a_crash_while_storing_a_sends_media_never_leaves_a_record_without_its_bytes()
         });
         backend.crash_after(None);
         block_on(async {
-            let loaded = Session::load(&backend, addr(), &triple(), &deployment())
+            let loaded = Session::load(&backend, addr(), &triple(), &deployment(cipher))
                 .await
                 .unwrap();
             if let Some(found) = loaded.named_media(&image(image_a).sha256).await.unwrap() {
@@ -746,4 +755,98 @@ fn a_crash_while_storing_a_sends_media_never_leaves_a_record_without_its_bytes()
         });
     }
     assert!((1..6).contains(&landed), "{landed}");
+}
+
+/// Whether `object` holds `bytes` as they are, which only a plain session's objects do: an
+/// encrypted session's hold them encrypted.
+fn holds_verbatim(object: &[u8], bytes: &[u8]) -> bool {
+    object.windows(bytes.len()).any(|window| window == bytes)
+}
+
+/// A send's media object whose bytes were changed, or that holds another object's bytes, reads
+/// as corrupt, never as other bytes, as a tool result's does. A plain session keeps the bytes as
+/// they are, under a check over the object's name; an encrypted one keeps them encrypted.
+fn a_changed_or_moved_input_medium_reads_as_corrupt(cipher: Cipher) {
+    let backend = MemoryBackend::default();
+    let (a, b) = (b"image a".as_slice(), b"image b".as_slice());
+    block_on(async {
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(cipher), false)
+            .await
+            .unwrap();
+        for (submission, bytes) in [("sub-1", a), ("sub-2", b)] {
+            session
+                .append_input_media(
+                    &[queued(submission, &[bytes])],
+                    blocks(0, 0, &[bytes]),
+                    true,
+                )
+                .await
+                .unwrap();
+        }
+        let found_a = session
+            .named_media(&image(a).sha256)
+            .await
+            .unwrap()
+            .unwrap();
+        let found_b = session
+            .named_media(&image(b).sha256)
+            .await
+            .unwrap()
+            .unwrap();
+        let name_a = session.media_object_name(&image(a)).unwrap();
+        let name_b = session.media_object_name(&image(b)).unwrap();
+        let stored_b = backend.get_object(&addr(), &name_b).await.unwrap().unwrap();
+        assert_eq!(
+            holds_verbatim(&stored_b, b),
+            cipher == Cipher::None,
+            "{cipher:?}"
+        );
+
+        backend.set_object(&addr(), &name_a, stored_b.clone());
+        assert!(matches!(
+            session.named_media_bytes(&found_a).await,
+            Err(SessionError::Media(MediaError::Corrupt(_)))
+        ));
+        let mut changed = stored_b;
+        changed[0] ^= 1;
+        backend.set_object(&addr(), &name_b, changed);
+        assert!(matches!(
+            session.named_media_bytes(&found_b).await,
+            Err(SessionError::Media(MediaError::Corrupt(_)))
+        ));
+    });
+}
+
+/// An object moved onto the name of another object of the same bytes reads as corrupt: its check
+/// covers the name it was written under, so a copy is refused even where the bytes would match
+/// the reference. The bytes are written twice because a seal forgets the first object, which the
+/// sealed record still names.
+fn a_media_object_moved_onto_another_name_for_the_same_bytes_reads_as_corrupt(cipher: Cipher) {
+    let backend = MemoryBackend::default();
+    let a = b"image a".as_slice();
+    block_on(async {
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(cipher), false)
+            .await
+            .unwrap();
+        let (_, sealed_away) = photo_run(&mut session, "r0", 1, &[a]).await;
+        let cut = session.next_seq() + 1;
+        photo_run(&mut session, "r1", 5, &[b"image b".as_slice()]).await;
+        session.seal(Some(cut), 0).await.unwrap();
+        photo_run(&mut session, "r2", 9, &[a]).await;
+        let Record::ToolReply(sealed_away) = &sealed_away else {
+            unreachable!()
+        };
+        let first = session.media_name(&sealed_away.media[0], &image(a).sha256);
+        let second = session.media_object_name(&image(a)).unwrap();
+        assert_ne!(first, second, "the bytes were written twice");
+        assert_eq!(session.window_media(&image(a)).await.unwrap(), a);
+
+        let moved = backend.get_object(&addr(), &first).await.unwrap().unwrap();
+        backend.set_object(&addr(), &second, moved);
+        assert!(matches!(
+            session.window_media(&image(a)).await,
+            Err(SessionError::Media(MediaError::Corrupt(_)))
+        ));
+        assert_eq!(session.record_media(sealed_away, 1).await.unwrap(), a);
+    });
 }

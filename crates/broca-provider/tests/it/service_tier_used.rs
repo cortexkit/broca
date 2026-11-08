@@ -491,6 +491,7 @@ mod end_to_end {
         broca_core::Provider::set_chatgpt_https_policy(&provider, Arc::new(|| true));
         let session = BindIdentity::new(dir.join("proj"), "service-tier", tag);
         let request = RunRequest {
+            account_route: None,
             route_decision_id: None,
             input_written_at_ms: None,
             directives: None,

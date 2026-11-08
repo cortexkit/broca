@@ -25,10 +25,11 @@ use broca_session_store::record::{
     Assistant, Attempt, AuthRefrozen, BatchEnd, BatchStart, Billed, BudgetFire, BudgetFiring,
     CallFacts, CallOutcome, CancelPoint, CancelRequest, CeilingDecided, Compaction, ConfigRefrozen,
     Delivery, DeliveryOrdered, Event, Input, Marker, ModelStepUsage, Notice, OutputCapLowered,
-    PartKind, PartRef, Pause, Placement, QueuedSend, Record, Redo, ResultAppend, Resumed,
-    Retraction, RunEnd, RunStart, SendEnded, SessionRefresh, SetupStub, Steer, StepEnd,
-    StepRefused, StepStart, Stream, StructuredDowngraded, StructuredResult, ToolHeld, ToolIntent,
-    ToolOutcome, ToolReply, TurnFacts, Unanswered, View, ViewApplied, Warmed,
+    PartKind, PartRef, Pause, Placement, PrefixFlush, QueuedSend, Record, Redo, RefreshApplied,
+    RefreshPolicy, ResultAppend, Resumed, Retraction, RunEnd, RunStart, SendEnded, SessionRefresh,
+    SetupStub, Steer, StepEnd, StepRefused, StepStart, Stream, StructuredDowngraded,
+    StructuredResult, ToolHeld, ToolIntent, ToolOutcome, ToolReply, TurnFacts, Unanswered, View,
+    ViewApplied, Warmed,
 };
 use broca_wal::{FramedRecord, WalRecord};
 use serde::de::DeserializeOwned;
@@ -43,6 +44,7 @@ pub use broca_session_loop::inverse;
 pub mod measure;
 pub mod read_cost;
 pub mod split;
+pub mod stored_history;
 
 /// A count of old records, fields or values, and their stored JSON size.
 #[derive(Debug, Default, Clone, Copy, serde::Serialize)]
@@ -143,6 +145,12 @@ struct State {
     /// the step's assistant message or the batch's tool-results message, at the position
     /// today's placement gives it.
     announced_mid: Option<String>,
+    /// The seq, in the converted session, of the newest first-protocol compaction view event
+    /// (`compaction_view_applied`, kept whole as a ledger event) converted so far.
+    legacy_view: Option<u64>,
+    /// That view as it stood when the newest model step finished: the view in force for the
+    /// request that step sent (`output_refs::view_at_writing_step`).
+    step_legacy_view: Option<u64>,
 }
 
 /// Writes the held copies as transcript entries at the boundary that places them.
@@ -162,6 +170,11 @@ fn hold(inputs: Vec<Input>, state: &mut State, out: &Converted) {
         ..input
     }));
 }
+
+/// The seq a converted session's first record takes, which a converted record that names another
+/// by its seq counts from: creating a session opens its writer, which writes `WriterOpened` at
+/// seq 1, and the converted records are appended right after it, in order, by that writer.
+pub const FIRST_SEQ: u64 = 2;
 
 /// Converts one log. `lineage` is the log's lineage id: a log on the current compaction
 /// contract needs it, because today's message ids carry it and a converted message keeps its id.
@@ -212,6 +225,9 @@ pub fn convert(old: &[FramedRecord], lineage: Option<&str>) -> Result<Converted,
     let mut stamps: HashMap<String, Option<broca_session_store::record::RichUi>> = HashMap::new();
     // The provider serving the run in force, which decides what lifetime its requests ask for.
     let mut provider_id = String::new();
+    // Today's plan-change fold, record by record, so the run start that applied each refresh is
+    // known: the new storage records that application after the run's input.
+    let mut plan_changes = broca_fetch_plan::session_change::SessionChangeFold::default();
     for framed in old {
         match &framed.record {
             WalRecord::RunStarted { config, ts_ms, .. } => {
@@ -301,7 +317,9 @@ pub fn convert(old: &[FramedRecord], lineage: Option<&str>) -> Result<Converted,
             .observe(&framed.record, framed.seq)
             .map(|(_, copy)| copy);
         let before = out.records.len();
+        let applied = plan_changes.record(&framed.record).map(refresh_applied);
         convert_one(&framed.record, &mut state, &mut out)?;
+        out.records.extend(applied.map(Record::RefreshApplied));
         // Today's display facts of each message this record gave a new version, by today's
         // ordinal; a fold today's read refuses leaves them as they were.
         let mut changed = Vec::new();
@@ -409,6 +427,8 @@ pub fn convert(old: &[FramedRecord], lineage: Option<&str>) -> Result<Converted,
                 // Today's read serves display facts only on a log with a lineage.
                 entry.no_display_facts = lineage.is_none().then_some(true);
                 entry.reasoning_summaries = summaries_of.remove(&ordinal).unwrap_or_default();
+                entry.runner_tag_base = legacy.runner_bases.get(&(ordinal - 1)).copied();
+                entry.legacy_view_seq = state.step_legacy_view;
                 // A run's assistant messages carry its Rich UI stamp, as today's read serves it.
                 if assistant_of.get(&ordinal) == Some(&true) {
                     entry.rich_ui = entry
@@ -458,6 +478,12 @@ pub fn convert(old: &[FramedRecord], lineage: Option<&str>) -> Result<Converted,
         }
     }
     Ok(out)
+}
+
+/// The record of a refresh's application, from the facts today's fold reports for it, as the
+/// store's run loop records it.
+fn refresh_applied(effective: &broca_fetch_plan::session_change::EffectiveState) -> RefreshApplied {
+    broca_session_loop::run::refresh_applied(&effective.applied_change())
 }
 
 /// The facts of the tool turn whose assistant message is at `ordinal`, from today's display
@@ -640,7 +666,20 @@ fn convert_one(
     }
     convert_record(record, state, out)?;
     record_model_shares(record, state, out);
+    record_refresh_selection(record, out);
     Ok(())
+}
+
+/// Records on the refresh just written the model its plan chooses, as the store actor records it
+/// when it accepts one (`broca_session_loop::plan::recorded_selection`).
+fn record_refresh_selection(record: &WalRecord, out: &mut Converted) {
+    if let (
+        WalRecord::SessionRefreshAccepted { manifest, .. },
+        Some(Record::SessionRefresh(refresh)),
+    ) = (record, out.records.last_mut())
+    {
+        refresh.selection = broca_session_loop::plan::recorded_selection(manifest);
+    }
 }
 
 /// Records which model each part of a step's usage counts under, by today's own rule
@@ -699,6 +738,15 @@ fn convert_record(
         _ => return Err(err("record without a type")),
     };
     let mut f = Fields::new(kind.clone(), object);
+    match kind.as_str() {
+        "model_step_finished" => state.step_legacy_view = state.legacy_view,
+        "compaction_view_applied" => {
+            // The event about to be pushed takes the seq after the records before it, counting
+            // from the seq a converted session's first record takes.
+            state.legacy_view = Some(out.records.len() as u64 + FIRST_SEQ);
+        }
+        _ => {}
+    }
     match kind.as_str() {
         "run_started" => run_started(&mut f, state, out)?,
         "model_step_finished" => model_step_finished(&mut f, state, out)?,
@@ -986,6 +1034,21 @@ fn convert_record(
                 applies_from_next_run: f.req_bool("applies_from_next_run"),
                 setup,
                 manifest,
+                // Filled in from the record's manifest once converted (`record_refresh_selection`).
+                selection: None,
+            }));
+        }
+        "session_refresh_policy_changed" => {
+            out.records.push(Record::RefreshPolicy(RefreshPolicy {
+                generation: f.req_u64("generation"),
+                policy: f.req_string("policy"),
+                send_id: f.req_string("send_id"),
+            }));
+        }
+        "session_prefix_flushed" => {
+            out.records.push(Record::PrefixFlush(PrefixFlush {
+                send_id: f.req_string("send_id"),
+                pending_generation: f.u64("pending_generation"),
             }));
         }
         "structured_output_result" => {

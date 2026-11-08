@@ -194,6 +194,11 @@ pub struct SessionImportRequest {
     pub project_id: Option<String>,
     /// The principal the daemon stamped on the importing bind; recorded on the RunStarted.
     pub principal: Option<broca_protocol::BindPrincipal>,
+    /// What the importing route says about scopes. An import seeds a session's first episode,
+    /// so a session whose address an owner's scoped bind reserved accepts it only over a route
+    /// stamped with that owner's reserving scope ref. `Internal` (a caller inside broca) takes no
+    /// such check.
+    pub scope: broca_protocol::SendScope,
     pub session: LineageKey,
     pub run_id: broca_protocol::RunId,
     pub messages: Vec<broca_protocol::Message>,
@@ -322,57 +327,69 @@ impl SessionChangeError {
     }
 }
 
-/// Classify policy retries and refusals without side effects. The serve preflight avoids
-/// opening an actor for a refusal; the actor repeats the check at the serialized write point.
-pub(crate) fn check_session_policy(
-    change: &broca_fetch_plan::session_change::SessionChangeState,
-    generation: u64,
-    policy: &str,
-    send_id: &str,
-) -> Result<bool, SessionChangeError> {
-    if let Some((earlier_generation, earlier_policy)) = change.policy_send_ids.get(send_id) {
-        let field = if generation != *earlier_generation {
-            Some("generation")
-        } else if policy != earlier_policy {
-            Some("policy")
-        } else {
-            None
+/// What a plan-change op's preflight reads about the session before it checks the request: who
+/// owns the session, the plan opener of its scoped runs, and its plan-change facts for the
+/// request's generation and `send_id`.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ChangeRead {
+    /// The scope and principal the session's first run froze, which name its owner; `None`
+    /// before the session's first run.
+    pub first_run: Option<(
+        Option<broca_protocol::SessionScope>,
+        Option<broca_protocol::BindPrincipal>,
+    )>,
+    /// The plan opener the latest scoped run that names one names (`scope_plan_opener`).
+    pub opener: Option<String>,
+    pub facts: crate::plan_change::ChangeFacts,
+}
+
+impl ChangeRead {
+    /// What the WAL `records` say, for a request naming `generation` and `send_id`.
+    pub(crate) fn of_wal(
+        records: &[broca_wal::FramedRecord],
+        generation: Option<u64>,
+        send_id: Option<&str>,
+    ) -> Self {
+        let first_run = first_run_started(records).and_then(|start| match start {
+            broca_wal::WalRecord::RunStarted {
+                scope, principal, ..
+            } => Some((scope.clone(), principal.clone())),
+            _ => None,
+        });
+        let opener = records
+            .iter()
+            .rev()
+            .find_map(|record| match &record.record {
+                broca_wal::WalRecord::RunStarted {
+                    scope: Some(scope), ..
+                } => scope_plan_opener(scope),
+                _ => None,
+            });
+        let change = broca_fetch_plan::session_change::SessionChangeState::fold(records);
+        Self {
+            first_run,
+            opener,
+            facts: crate::plan_change::ChangeFacts::of(&change, generation, send_id),
+        }
+    }
+
+    /// The caller's refusal when it isn't the session's owner, or when the session has no run
+    /// yet and so no baseline to change.
+    fn check_owner(
+        &self,
+        principal: Option<&broca_protocol::BindPrincipal>,
+        scope: &broca_protocol::SendScope,
+    ) -> Result<(), SessionChangeError> {
+        let Some((frozen, first)) = &self.first_run else {
+            return Err(SessionChangeError::Transient(
+                "the session has no baseline yet; send its first send first".into(),
+            ));
         };
-        return match field {
-            None => Ok(true),
-            Some(field) => Err(SessionChangeError::SendIdReuse {
-                field: field.into(),
-                message: format!("send_id {send_id} was used with another {field}"),
-            }),
-        };
+        match owner_mismatch(frozen.as_ref(), first.as_ref(), principal, scope) {
+            Some(mismatch) => Err(SessionChangeError::OwnerMismatch(Box::new(mismatch))),
+            None => Ok(()),
+        }
     }
-    if let Some(applied_by) = change.applied.get(&generation) {
-        return Err(SessionChangeError::AlreadyApplied {
-            generation,
-            applied_by: applied_by.clone(),
-        });
-    }
-    let Some(pending) = change
-        .pending
-        .as_ref()
-        .filter(|pending| pending.generation == generation)
-    else {
-        return Err(SessionChangeError::PendingSuperseded {
-            generation,
-            pending: change.accepted_generation,
-        });
-    };
-    if let Some(surface) = broca_fetch_plan::session_change::unsupported_surface(
-        change.current_manifest.as_deref(),
-        &pending.manifest,
-        policy,
-    ) {
-        return Err(SessionChangeError::RungUnsupported {
-            surface: surface.into(),
-            rung: policy.into(),
-        });
-    }
-    Ok(false)
 }
 
 /// A `session.send` response.
@@ -971,6 +988,18 @@ fn baseline_owner_mismatch(
     else {
         return None;
     };
+    owner_mismatch(frozen.as_ref(), first.as_ref(), principal, scope)
+}
+
+/// Why the caller is not the owner a session's first run recorded, if it is not: the owner of
+/// the scope it froze, `frozen`, when the session is scoped, else the principal of its first
+/// send, `first`. A session whose first run recorded neither has no owner to hold a caller to.
+pub(crate) fn owner_mismatch(
+    frozen: Option<&broca_protocol::SessionScope>,
+    first: Option<&broca_protocol::BindPrincipal>,
+    principal: Option<&broca_protocol::BindPrincipal>,
+    scope: &broca_protocol::SendScope,
+) -> Option<broca_core::OwnerMismatch> {
     match (frozen, first) {
         (Some(frozen), _) => {
             (principal != Some(&frozen.owner)).then(|| broca_core::OwnerMismatch::Scoped {
@@ -1005,12 +1034,35 @@ pub fn scope_plan_opener(scope: &broca_protocol::SessionScope) -> Option<String>
     })
 }
 
+/// Whether `run.result` cleans the final reply of the run `run_id` of tag notation, when the run
+/// started on the current compaction contract: its frozen config and manifest decide it. `None`
+/// for any other run, whose reply's own tag flags decide.
+pub(crate) fn clean_reply_of(
+    records: &[broca_wal::FramedRecord],
+    run_id: &broca_protocol::RunId,
+) -> Option<bool> {
+    records.iter().find_map(|frame| match &frame.record {
+        broca_wal::WalRecord::RunStarted {
+            run_id: id,
+            config,
+            manifest,
+            compaction_plan_version: Some(_),
+            ..
+        } if id == run_id => Some(broca_core::compaction_v2::metadata::clean_replies_for_run(
+            config,
+            manifest.as_deref(),
+        )),
+        _ => None,
+    })
+}
+
 /// The final assistant message of the completed run `run_id`: the last assistant message of the
 /// transcript as it stood when that run's episode ended. Its text parts are joined in order with
 /// nothing inserted, and its reasoning parts are left out.
 pub(crate) fn final_message_of(
     records: &[broca_wal::FramedRecord],
     run_id: &broca_protocol::RunId,
+    clean_reply: Option<bool>,
 ) -> Result<broca_wire::FinalMessage, ServeError> {
     // Missing records and replay failures do not expose a retryable I/O cause.
     let started = |framed: &broca_wal::FramedRecord| matches!(&framed.record, broca_wal::WalRecord::RunStarted { run_id: id, .. } if id == run_id);
@@ -1026,12 +1078,13 @@ pub(crate) fn final_message_of(
         .map_or(records.len(), |offset| start + 1 + offset);
     let transcript = broca_core::replay_transcript(&records[..end])
         .map_err(|error| ServeError::Open(format!("replay failed: {error}"), None))?;
-    final_message_from_prompt(&transcript, run_id)
+    final_message_from_prompt(&transcript, run_id, clean_reply)
 }
 
 fn final_message_from_prompt(
     transcript: &[broca_protocol::Message],
     run_id: &broca_protocol::RunId,
+    clean_reply: Option<bool>,
 ) -> Result<broca_wire::FinalMessage, ServeError> {
     let (ordinal, message) = transcript
         .iter()
@@ -1045,23 +1098,20 @@ fn final_message_from_prompt(
             )
         })?;
     let ordinal = message.ordinal.unwrap_or(ordinal as u64);
+    // The reconstructed message's tag flags also drive provider requests. Caller text follows
+    // the run's frozen exposure policy, including compaction views that show numbers without
+    // legacy tags.
+    let clean = clean_reply.unwrap_or_else(|| broca_protocol::tags::cleans_model_text(message));
     Ok(broca_wire::FinalMessage {
         ordinal: ordinal + 1,
         mid: format!("m{ordinal}"),
-        text: final_text(message),
+        text: joined_text(message, clean),
     })
 }
 
 /// A run's final message's text, as `run.result` serves it: its text parts joined in order with
-/// nothing inserted, its reasoning parts left out.
-pub(crate) fn final_text(message: &broca_protocol::Message) -> String {
-    // The text as every exposure shows it: cleaned when a tag-rendering run under the computed
-    // rules wrote it, raw for any other run and for a structured-output run's final text.
-    joined_text(message, broca_protocol::tags::cleans_model_text(message))
-}
-
-/// [`final_text`] for a message whose tag rules are known apart from it: `clean` says whether
-/// the run that wrote it cleans the model's text of tag notation on every exposure.
+/// nothing inserted, its reasoning parts left out. `clean` says whether the run that wrote it
+/// cleans the model's text of tag notation on every exposure.
 pub(crate) fn joined_text(message: &broca_protocol::Message, clean: bool) -> String {
     message
         .content
@@ -2413,10 +2463,13 @@ pub trait ServeHandler: Send + Sync {
 
     /// The adoption check a stamped `route.bind` gets before it is acknowledged: `Ok(Some)` when
     /// the bound session was recorded without a scope and its history refuses the stamp. Only
-    /// adoption is decided here; every other scope rule is decided on each send, since an
-    /// episode can be written between the bind and the send. `Err` when the history cannot be
-    /// read, so whether it refuses the stamp is unknown: the bind is refused rather than
-    /// accepted. The default implementation has no history source and returns no refusal.
+    /// adoption is decided here, plus the reservation of a session with no episode yet: a stamp
+    /// whose owner or ref differs from the scope that reserved the session's address is
+    /// `Err(ServeError::ScopeRefused)`, the refusal its first send would get. Every other scope
+    /// rule is decided on each send, since an episode can be written between the bind and the
+    /// send. `Err` also when the history cannot be read, so whether it refuses the stamp is
+    /// unknown: the bind is refused rather than accepted. The default implementation has no
+    /// history source and returns no refusal.
     async fn bind_adoption_refusal(
         &self,
         _session: &LineageKey,
@@ -2506,6 +2559,20 @@ pub trait ServeHandler: Send + Sync {
         _session: &LineageKey,
         _run_id: &str,
     ) -> Result<Option<Vec<broca_wal::WalRecord>>, ServeError> {
+        Ok(None)
+    }
+
+    /// For a session kept in the new storage, the compaction view the request of the model step
+    /// that wrote message `ordinal` (counting from 0) was rendered under, which output references
+    /// check a named part against: `Some(None)` when no view applied. `None` for a session kept
+    /// on today's storage, whose views output references read from its log instead
+    /// ([`crate::output_refs::view_at_writing_step`]).
+    async fn store_writing_view(
+        &self,
+        _session: &LineageKey,
+        _ordinal: u64,
+    ) -> Result<Option<Option<broca_core::compaction_provider::view::CompactionView>>, ServeError>
+    {
         Ok(None)
     }
 
@@ -2813,6 +2880,48 @@ pub trait ServeHandler: Send + Sync {
 }
 
 impl crate::LineageRegistry {
+    /// What a plan-change op's preflight reads about `session`, for a request naming
+    /// `generation` and `send_id`. `wal_error` words a failure to read the session's WAL, as
+    /// each op words it.
+    async fn read_change(
+        &self,
+        session: &LineageKey,
+        generation: Option<u64>,
+        send_id: Option<&str>,
+        wal_error: fn(String) -> String,
+    ) -> Result<ChangeRead, SessionChangeError> {
+        use crate::store_reads::{StoreReadReply, StoreReadRequest};
+        // A session kept in the new storage is read from its fold and its id index.
+        if let Some(store) = self
+            .store_holding(session)
+            .map_err(|error| SessionChangeError::Transient(wal_error(format!("{error:?}"))))?
+        {
+            let request = StoreReadRequest::PlanChange {
+                generation,
+                send_id: send_id.map(str::to_owned),
+            };
+            return match store.read(self, session, request).await {
+                Ok(Some(StoreReadReply::PlanChange(Ok(read)))) => Ok(read.0),
+                Ok(Some(StoreReadReply::PlanChange(Err(error)))) => {
+                    Err(SessionChangeError::Transient(wal_error(error)))
+                }
+                // The session's creation never committed, so it has no run to change.
+                Ok(None) => Ok(ChangeRead::default()),
+                Ok(Some(_)) => Err(SessionChangeError::Transient(
+                    "a store read was answered with another read's reply".into(),
+                )),
+                Err(error) => Err(SessionChangeError::Transient(wal_error(format!(
+                    "{error:?}"
+                )))),
+            };
+        }
+        let (records, _) = self
+            .read_durable_wal(session)
+            .await
+            .map_err(|error| SessionChangeError::Transient(wal_error(error.to_string())))?;
+        Ok(ChangeRead::of_wal(&records, generation, send_id))
+    }
+
     /// Fill each message's `tool_calls` with what the WAL recorded about its calls' dispatch.
     /// The facts of a turn in this read's WAL tail come with the page; an older turn's come from
     /// the session's cache (see [`crate::LineageRegistry::tool_turn_dispatches`]).
@@ -2933,14 +3042,46 @@ impl ServeHandler for crate::LineageRegistry {
         session: &LineageKey,
         tag: u64,
     ) -> Result<Option<broca_core::TagLocation>, ServeError> {
-        if let Some(store) = self.store_runtime() {
-            if store.holds(session)? {
-                return Err(crate::store_entries::tag_location_unserved());
-            }
+        if let Some(store) = self.store_holding(session)? {
+            use crate::store_reads::{StoreReadReply, StoreReadRequest};
+            return match store
+                .read(self, session, StoreReadRequest::TagLocation(tag))
+                .await?
+            {
+                Some(StoreReadReply::TagLocation(location)) => location.map(Some),
+                Some(_) => Err(crate::store_reads::mismatched()),
+                // A session whose creation never committed holds no part.
+                None => Ok(Some(broca_core::TagLocation {
+                    found: None,
+                    indexed_through: u64::MAX,
+                })),
+            };
         }
         self.route_tag_location(session, tag)
             .await
             .map_err(ServeError::from)
+    }
+
+    async fn store_writing_view(
+        &self,
+        session: &LineageKey,
+        ordinal: u64,
+    ) -> Result<Option<Option<broca_core::compaction_provider::view::CompactionView>>, ServeError>
+    {
+        use crate::store_reads::{StoreReadReply, StoreReadRequest};
+        match self.store_holding(session)? {
+            Some(store) => {
+                match store
+                    .read(self, session, StoreReadRequest::WritingView { ordinal })
+                    .await?
+                {
+                    Some(StoreReadReply::WritingView(view)) => view.map(Some),
+                    Some(_) => Err(crate::store_reads::mismatched()),
+                    None => Ok(Some(None)),
+                }
+            }
+            None => Ok(None),
+        }
     }
 
     async fn frozen_manifest(
@@ -3079,6 +3220,30 @@ impl ServeHandler for crate::LineageRegistry {
 
     async fn send(&self, mut req: SendRequest) -> Result<SendResponse, ServeError> {
         use crate::actor::SendOutcome;
+        // A session with no WAL yet has no episode, and an owner's scoped bind may have reserved
+        // its address. Refuse anyone else's first send here, before staging media or opening the
+        // session's actor, which writes the WAL's first frame. The actor makes the same decision
+        // for a session whose WAL already exists.
+        if req.request.scope != broca_protocol::SendScope::Internal
+            && self.wal_written(&req.session) == Some(false)
+        {
+            // A reservation that cannot be read refuses the send as transient, never as "not
+            // reserved", which would let anyone start the session.
+            let reservation = self
+                .scope_reservation(&req.session)
+                .await
+                .map_err(ServeError::Transient)?;
+            let ownership = broca_core::SessionOwnershipV1 {
+                reservation,
+                ..Default::default()
+            };
+            broca_core::scope_admission::check_scope_reservation(
+                &ownership,
+                req.request.principal.as_ref(),
+                &req.request.scope,
+            )
+            .map_err(ServeError::ScopeRefused)?;
+        }
         if !req.request.content.is_empty() && !self.session_written(&req.session)? {
             let mut request = (*req.request).clone();
             crate::person_media::stage(self.upload_store().as_ref(), &req.session, &mut request)
@@ -3260,6 +3425,10 @@ impl ServeHandler for crate::LineageRegistry {
                 field: "route_decision_id".into(),
                 message: "route_decision_id is fixed for the active run".into(),
             }),
+            SendOutcome::AccountRouteFixed => Err(ServeError::InvalidParams {
+                field: "account_route".into(),
+                message: "account_route is fixed for the active run".into(),
+            }),
             SendOutcome::ServiceTierInvalid { reason, message } => {
                 Err(ServeError::ServiceTierInvalid { reason, message })
             }
@@ -3410,11 +3579,12 @@ impl ServeHandler for crate::LineageRegistry {
             // existing unreadable-history refusals keep their code and cause.
             self.check_session_log(session).await?;
         }
-        match broca_core::decide_scope(
-            &ownership,
-            principal,
-            &broca_protocol::SendScope::Stamped(scope.clone()),
-        ) {
+        // A stamp of another scope meets the refusal its first send would get, so the route is
+        // never acknowledged for a session whose address another scope's bind reserved.
+        let stamped = broca_protocol::SendScope::Stamped(scope.clone());
+        broca_core::scope_admission::check_scope_reservation(&ownership, principal, &stamped)
+            .map_err(ServeError::ScopeRefused)?;
+        match broca_core::decide_scope(&ownership, principal, &stamped) {
             Err(broca_core::ScopeRefusal::AdoptionRefused(refusal)) => Ok(Some(refusal)),
             _ => Ok(None),
         }
@@ -3442,6 +3612,28 @@ impl ServeHandler for crate::LineageRegistry {
         // writes nothing: a person names media only through upload references.
         if let Err((field, message)) = broca_wire::check_supplied_media(&req.messages) {
             return Err(ServeError::InvalidParams { field, message });
+        }
+        // An import writes the session's first episode and records its principal, so on a
+        // session with no episode it meets the scope reservation exactly as a first send does,
+        // before the session is opened.
+        if req.scope != broca_protocol::SendScope::Internal {
+            match self.bind_ownership(&req.session).await {
+                crate::registry::BindOwnership::Known(ownership) => {
+                    broca_core::scope_admission::check_scope_reservation(
+                        &ownership,
+                        req.principal.as_ref(),
+                        &req.scope,
+                    )
+                    .map_err(ServeError::ScopeRefused)?;
+                }
+                crate::registry::BindOwnership::NoHistorySource => {}
+                crate::registry::BindOwnership::Unreadable(reason) => {
+                    return Err(ServeError::Open(
+                        format!("session.import owner check: session history unreadable: {reason}"),
+                        Some(broca_protocol::ErrorClass::Transient),
+                    ));
+                }
+            }
         }
         let request = broca_core::ImportRequest {
             project_id: req.project_id,
@@ -3555,10 +3747,8 @@ impl ServeHandler for crate::LineageRegistry {
     }
 
     async fn read(&self, req: SessionReadRequest) -> Result<SessionReadResponse, ServeError> {
-        if let Some(store) = self.store_runtime() {
-            if store.holds(&req.session)? {
-                return crate::store_read::serve_read(self, &store, req).await;
-            }
+        if let Some(store) = self.store_holding(&req.session)? {
+            return crate::store_read::serve_read(self, &store, req).await;
         }
         let before_history = self.history_read_version(&req.session).await?;
         let late_only = req.late_after.is_some();
@@ -3704,8 +3894,9 @@ impl ServeHandler for crate::LineageRegistry {
         } else {
             Default::default()
         };
-        // The cache holds exact native outputs, not an inverse of the model renderer.
-        // Overlay only response copies; joined materialized rows still feed model resume.
+        // The display-facts cache holds each tool result's output exactly as the tool returned
+        // it, before any notice was joined to it for the model. Only this response's copies take
+        // those outputs: the stored rows keep the joined text, because a resumed run renders it.
         for entry in &mut response.messages {
             if let Some(outputs) = native_tool_outputs
                 .as_ref()
@@ -3791,13 +3982,11 @@ impl ServeHandler for crate::LineageRegistry {
         session: &LineageKey,
         mid: Option<&str>,
     ) -> Result<Option<crate::store_entries::HistoryHead>, ServeError> {
-        match self.store_runtime() {
-            Some(store) if store.holds(session)? => {
-                crate::store_entries::history_head(self, &store, session, mid)
-                    .await
-                    .map(Some)
-            }
-            _ => Ok(None),
+        match self.store_holding(session)? {
+            Some(store) => crate::store_entries::history_head(self, &store, session, mid)
+                .await
+                .map(Some),
+            None => Ok(None),
         }
     }
 
@@ -3829,11 +4018,8 @@ impl ServeHandler for crate::LineageRegistry {
         principal: Option<&broca_protocol::BindPrincipal>,
         scope: &broca_protocol::SendScope,
     ) -> Result<broca_wire::HeadResponse, ServeError> {
-        if let Some(store) = self.store_runtime() {
-            if store.holds(session)? {
-                return crate::store_head::serve_head(self, &store, session, principal, scope)
-                    .await;
-            }
+        if let Some(store) = self.store_holding(session)? {
+            return crate::store_head::serve_head(self, &store, session, principal, scope).await;
         }
         let before_history = self.history_read_version(session).await?;
         // The newest page of one message: the store's last row and the WAL past its watermark,
@@ -4119,9 +4305,12 @@ impl ServeHandler for crate::LineageRegistry {
                 Some(records) => records,
                 None => self.read_durable_wal(session).await?.0,
             };
+            let clean_reply = clean_reply_of(&records, &run_id);
             let mut message = match &row_read {
-                Some(read) => final_message_from_prompt(&read.replayed.prompt, &run_id)?,
-                None => final_message_of(&records, &run_id)?,
+                Some(read) => {
+                    final_message_from_prompt(&read.replayed.prompt, &run_id, clean_reply)?
+                }
+                None => final_message_of(&records, &run_id, clean_reply)?,
             };
             // A complete legacy snapshot already proves its original m<position> vocabulary.
             // Re-reading head would read the log again even though this snapshot already proves it.
@@ -4546,6 +4735,17 @@ impl ServeHandler for crate::LineageRegistry {
         &self,
         session: &LineageKey,
     ) -> Option<(Option<String>, Option<String>)> {
+        use crate::store_reads::{StoreReadReply, StoreReadRequest};
+        if let Some(store) = self.store_holding(session).ok()? {
+            return match store
+                .read(self, session, StoreReadRequest::PlanIdentities)
+                .await
+                .ok()??
+            {
+                StoreReadReply::PlanIdentities(identities) => identities.ok()?,
+                _ => None,
+            };
+        }
         let (records, _) = self.read_durable_wal(session).await.ok()?;
         let change = broca_fetch_plan::session_change::SessionChangeState::fold(&records);
         if change.accepted_generation == 0 {
@@ -4584,32 +4784,21 @@ impl ServeHandler for crate::LineageRegistry {
     ) -> Result<cortexkit_role_llm_runner::session_change::RefreshReply, SessionChangeError> {
         use cortexkit_role_llm_runner::{rungs, session_change};
         let _change_guard = self.lock_session_change(session).await;
-        let (records, _) = self.read_durable_wal(session).await.map_err(|error| {
-            SessionChangeError::Transient(format!("cannot read the session WAL: {error}"))
-        })?;
-        let Some(start) = first_run_started(&records) else {
-            return Err(SessionChangeError::Transient(
-                "the session has no baseline yet; send its first send first".into(),
-            ));
-        };
-        if let Some(mismatch) = baseline_owner_mismatch(start, principal, scope) {
-            return Err(SessionChangeError::OwnerMismatch(Box::new(mismatch)));
-        }
-        let opener = records
-            .iter()
-            .rev()
-            .find_map(|record| match &record.record {
-                broca_wal::WalRecord::RunStarted {
-                    scope: Some(scope), ..
-                } => scope_plan_opener(scope),
-                _ => None,
-            });
+        let read = self
+            .read_change(session, Some(generation), None, |error| {
+                format!("cannot read the session WAL: {error}")
+            })
+            .await?;
+        read.check_owner(principal, scope)?;
         let senders =
             broca_fetch_plan::plan_senders(&plan).map_err(SessionChangeError::FetchRefused)?;
-        cortexkit_role_llm_runner::scope_admission::check_plan_senders(opener.as_deref(), &senders)
-            .map_err(|field| {
-                SessionChangeError::FetchRefused(broca_fetch_plan::Refusal::invalid(field))
-            })?;
+        cortexkit_role_llm_runner::scope_admission::check_plan_senders(
+            read.opener.as_deref(),
+            &senders,
+        )
+        .map_err(|field| {
+            SessionChangeError::FetchRefused(broca_fetch_plan::Refusal::invalid(field))
+        })?;
         if !rungs::ALL.contains(&policy.as_str()) {
             return Err(SessionChangeError::InvalidParams {
                 field: "policy".into(),
@@ -4626,32 +4815,17 @@ impl ServeHandler for crate::LineageRegistry {
                 message: "the plan is not canonical JSON".into(),
             }
         })?;
-        let change = broca_fetch_plan::session_change::SessionChangeState::fold(&records);
-        let earlier = change.earlier(generation);
-        match session_change::refresh_order(
-            change.accepted_generation,
-            generation,
-            &plan_identity,
-            &policy,
-            earlier,
-        ) {
-            session_change::RefreshOrder::Repeat => {
-                let (run_in_progress, applies_from_next_run) = change.accepted_replies[&generation];
-                return Ok(session_change::RefreshReply::new(
-                    cortexkit_role_llm_runner::baseline::PendingChange {
-                        generation,
-                        policy: policy.clone(),
-                    },
-                    run_in_progress,
-                    applies_from_next_run,
-                ));
-            }
-            session_change::RefreshOrder::Stale => {
-                return Err(SessionChangeError::GenerationStale {
-                    accepted: change.accepted_generation,
-                });
-            }
-            session_change::RefreshOrder::New => {}
+        if let Some((run_in_progress, applies_from_next_run)) =
+            crate::plan_change::refresh_order(&read.facts, generation, &plan_identity, &policy)?
+        {
+            return Ok(session_change::RefreshReply::new(
+                cortexkit_role_llm_runner::baseline::PendingChange {
+                    generation,
+                    policy: policy.clone(),
+                },
+                run_in_progress,
+                applies_from_next_run,
+            ));
         }
         self.check_plan_selection(&plan_value)
             .await
@@ -4661,7 +4835,7 @@ impl ServeHandler for crate::LineageRegistry {
                 })
             })?;
         broca_fetch_plan::session_change::check_compaction_item(
-            change.current_manifest.as_deref(),
+            read.facts.current_manifest.as_deref(),
             &plan_value,
         )
         .map_err(SessionChangeError::FetchRefused)?;
@@ -4738,7 +4912,7 @@ impl ServeHandler for crate::LineageRegistry {
             .await
             .map_err(SessionChangeError::FetchRefused)?;
         if let Some(surface) = broca_fetch_plan::session_change::unsupported_surface(
-            change.current_manifest.as_deref(),
+            read.facts.current_manifest.as_deref(),
             &admitted.manifest,
             &policy,
         ) {
@@ -4788,18 +4962,10 @@ impl ServeHandler for crate::LineageRegistry {
     {
         use cortexkit_role_llm_runner::{rungs, session_change};
         let _change_guard = self.lock_session_change(session).await;
-        let (records, _) = self
-            .read_durable_wal(session)
-            .await
-            .map_err(|error| SessionChangeError::Transient(error.to_string()))?;
-        let Some(start) = first_run_started(&records) else {
-            return Err(SessionChangeError::Transient(
-                "the session has no baseline yet; send its first send first".into(),
-            ));
-        };
-        if let Some(mismatch) = baseline_owner_mismatch(start, principal, scope) {
-            return Err(SessionChangeError::OwnerMismatch(Box::new(mismatch)));
-        }
+        let read = self
+            .read_change(session, Some(generation), Some(&send_id), |error| error)
+            .await?;
+        read.check_owner(principal, scope)?;
         if !rungs::ALL.contains(&policy.as_str()) {
             return Err(SessionChangeError::InvalidParams {
                 field: "policy".into(),
@@ -4815,8 +4981,7 @@ impl ServeHandler for crate::LineageRegistry {
                 message: "send_id is required".into(),
             });
         }
-        let change = broca_fetch_plan::session_change::SessionChangeState::fold(&records);
-        if check_session_policy(&change, generation, &policy, &send_id)? {
+        if crate::plan_change::check_policy(&read.facts, generation, &policy, &send_id)? {
             return Ok(session_change::RefreshPolicyReply::new(
                 cortexkit_role_llm_runner::baseline::PendingChange { generation, policy },
             ));
@@ -4853,26 +5018,20 @@ impl ServeHandler for crate::LineageRegistry {
     {
         use cortexkit_role_llm_runner::session_change;
         let _change_guard = self.lock_session_change(session).await;
-        let (records, _) = self.read_durable_wal(session).await.map_err(|error| {
-            SessionChangeError::Transient(format!("cannot read the session WAL: {error}"))
-        })?;
-        let Some(start) = first_run_started(&records) else {
-            return Err(SessionChangeError::Transient(
-                "the session has no baseline yet; send its first send first".into(),
-            ));
-        };
-        if let Some(mismatch) = baseline_owner_mismatch(start, principal, scope) {
-            return Err(SessionChangeError::OwnerMismatch(Box::new(mismatch)));
-        }
+        let read = self
+            .read_change(session, None, Some(&send_id), |error| {
+                format!("cannot read the session WAL: {error}")
+            })
+            .await?;
+        read.check_owner(principal, scope)?;
         if send_id.is_empty() {
             return Err(SessionChangeError::InvalidParams {
                 field: "send_id".into(),
                 message: "send_id is required".into(),
             });
         }
-        let change = broca_fetch_plan::session_change::SessionChangeState::fold(&records);
-        if let Some(pending_generation) = change.flush_send_ids.get(&send_id) {
-            return Ok(session_change::FlushPrefixReply::new(*pending_generation));
+        if let Err(pending_generation) = crate::plan_change::flush(&read.facts) {
+            return Ok(session_change::FlushPrefixReply::new(pending_generation));
         }
         match self.route_session_flush_prefix(session, send_id).await {
             Ok(crate::actor::SessionFlushPrefixOutcome::Flushed { pending_generation }) => {
@@ -5035,8 +5194,8 @@ impl ServeHandler for crate::LineageRegistry {
                 if wake_directive_requested(records, &run_id) =>
             {
                 *directives = match &row_read {
-                    Some(read) => final_message_from_prompt(&read.replayed.prompt, &run_id),
-                    None => final_message_of(records, &run_id),
+                    Some(read) => final_message_from_prompt(&read.replayed.prompt, &run_id, None),
+                    None => final_message_of(records, &run_id, None),
                 }
                 .ok()
                 .and_then(|message| completed_directives(records, &run_id, &message.text));
@@ -5480,6 +5639,7 @@ mod offset_head_tests {
             session: BindIdentity::new("/tmp/project", "runner", "session"),
             config: Box::new(RunConfig {
                 global_system: None,
+                account_route: None,
                 route_decision_id: None,
                 account_limit_pause: false,
                 turn_directives_v1: None,

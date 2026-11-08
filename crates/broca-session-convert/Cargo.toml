@@ -14,6 +14,8 @@ path = "src/main.rs"
 
 [dependencies]
 broca-core = { path = "../broca-core" }
+# Today's plan-change fold, which says which run start applied each refresh.
+broca-fetch-plan = { path = "../broca-fetch-plan" }
 # Today's offline request renderer (`wal_render`), which the `render` check compares the new run
 # loop's rebuilt requests with.
 broca-module = { path = "../broca-module" }
@@ -27,6 +29,10 @@ cortexkit-role-compaction.workspace = true
 # The runner contract's session usage: the `ops` check compares the new fold's usage with the
 # usage the WAL path's `HeadProjection` serves on `session.head`.
 cortexkit-role-llm-runner.workspace = true
+# The history check's store side is a serve handler (`history_check::StoredHistory`), whose
+# subscribe method names tokio's channel.
+async-trait.workspace = true
+tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_jcs.workspace = true
@@ -35,5 +41,4 @@ zstd = "0.14"
 futures = { workspace = true, features = ["executor"] }
 
 [dev-dependencies]
-async-trait.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

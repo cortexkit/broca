@@ -141,7 +141,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         let config = broca_session_loop::run::run_config_of_start(start, &self.parts)
             .map_err(|error| format!("{error:?}"))?;
         let entries = crate::store_entries::all_entries(&self.session).await?;
-        let conditions = v2::host::conditions(&config, &entries, false)?;
+        let conditions = v2::host::conditions(&config, &entries, false, None)?;
         let journal = ActorJournal {
             session: tokio::sync::Mutex::new(&mut self.session),
             appended: Default::default(),

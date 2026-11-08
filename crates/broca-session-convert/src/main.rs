@@ -37,6 +37,11 @@
 //!
 //! Point it only at a copy of a state root (an APFS clone, `cp -c`), never at live files: it opens
 //! each log read-only, but a measurement run should never share a disk path with the daemon.
+//!
+//! `--plain`, with any command, stores everything the converter writes or measures in the plain
+//! mode (see `broca_session_store::keys::Cipher`): sessions are created plain, and frames and
+//! segments carry the unkeyed check instead of encryption. Without it they are encrypted under a
+//! fixed throwaway key, as before. `read-cost` stays encrypted either way.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -49,8 +54,8 @@ use broca_session_convert::{convert, Tally};
 use broca_session_store::backend::{MemoryBackend, SessionAddr};
 use broca_session_store::codec::Digest;
 use broca_session_store::fold::conversation::Conversation;
-use broca_session_store::frame::{FrameKey, FRAME_OVERHEAD};
-use broca_session_store::keys::DeploymentKey;
+use broca_session_store::frame::FrameKey;
+use broca_session_store::keys::{Cipher, DeploymentKey};
 use broca_session_store::record::{CancelPoint, Record, Stream};
 use broca_session_store::session::Session;
 use broca_wal::FramedRecord;
@@ -60,13 +65,43 @@ use serde::Serialize;
 mod calls_check;
 mod entries_check;
 mod heads;
+mod history_check;
+mod numbering;
 mod pages;
 mod serve_check;
 mod subscribe_check;
 
-/// Measurements encrypt with a fixed throwaway key: only the cost matters, not secrecy.
+/// Set from `--plain` when the arguments are read: the mode everything the converter stores
+/// takes.
+static PLAIN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// The mode `--plain` chose: plain with it, encrypted without.
+fn cipher() -> Cipher {
+    if PLAIN.get().copied().unwrap_or(false) {
+        Cipher::None
+    } else {
+        Cipher::XChaCha20Poly1305
+    }
+}
+
+/// The deployment key every converted session is created and opened with: a fixed throwaway
+/// key, since only cost and correctness are measured, creating sessions in the mode `--plain`
+/// chose.
+fn deployment() -> DeploymentKey {
+    DeploymentKey::new(1, &[0x5a; 32]).creating(cipher())
+}
+
+/// A frame key in the mode `--plain` chose: encrypted under fixed throwaway `bytes`, or plain.
+fn frame_key(bytes: &[u8; 32]) -> FrameKey {
+    match cipher() {
+        Cipher::XChaCha20Poly1305 => FrameKey::new(1, bytes),
+        Cipher::None => FrameKey::plain(),
+    }
+}
+
+/// Measurements use a fixed throwaway key: only the cost matters, not secrecy.
 fn measurement_key() -> FrameKey {
-    FrameKey::new(1, &[7; 32])
+    frame_key(&[7; 32])
 }
 
 #[derive(Default, Serialize)]
@@ -91,9 +126,9 @@ struct Report {
     old_by_type: BTreeMap<String, Tally>,
     new_records: u64,
     new_body_bytes: u64,
-    /// The logs framed and encrypted: bodies plus `FRAME_OVERHEAD` bytes per record.
+    /// The logs framed, encrypted or plain: bodies plus the key's frame overhead per record.
     new_framed_bytes: u64,
-    /// History sealed: zstd in 16 KiB blocks, encrypted, both streams.
+    /// History sealed: zstd in 16 KiB blocks, encrypted or plain, transcript and ledger alike.
     sealed_bytes: u64,
     /// The same with opaque reasoning, signatures and provider text state pruned from runs that
     /// ended.
@@ -170,7 +205,8 @@ fn usage() -> ! {
          session-convert entries [--dir SCRATCH] [--out FILE] [--limit N] PATH...\n       \
          session-convert billing [--dir SCRATCH] [--out FILE] [--limit N] PATH...\n       \
          session-convert subscribe [--dir SCRATCH] [--out FILE] [--limit N] PATH...\n       \
-         session-convert subscribe-cost --dir SCRATCH [--out FILE] PATH..."
+         session-convert subscribe-cost --dir SCRATCH [--out FILE] PATH...\n\
+         Any command takes --plain: store in the plain mode instead of encrypted."
     );
     std::process::exit(64);
 }
@@ -226,6 +262,9 @@ fn parse_args() -> Args {
             "--every" => parsed.every = number().max(1),
             "--only" => parsed.only = Some(args.next().unwrap_or_else(|| usage())),
             "--dir" => parsed.dir = Some(PathBuf::from(args.next().unwrap_or_else(|| usage()))),
+            "--plain" => {
+                let _ = PLAIN.set(true);
+            }
             _ => paths.push(PathBuf::from(arg)),
         }
     }
@@ -269,6 +308,8 @@ fn main() {
         "seal" => run_seal(&args),
         "entries" => run_entries(&args),
         "pages" => pages::run(&args),
+        "history" => history_check::run(&args),
+        "numbering" => numbering::run(&args),
         "read-cost" => pages::run_read_cost(&args),
         "heads" => heads::run(&args),
         "billing" => run_billing(&args),
@@ -327,7 +368,7 @@ struct RenderReport {
 fn run_render(args: &Args) {
     use broca_wal::WalRecord;
     let mut report = RenderReport::default();
-    let deployment = DeploymentKey::new(1, &[0x5a; 32]);
+    let deployment = deployment();
     let sha = |bytes: &[u8]| {
         use sha2::Digest as _;
         broca_session_store::codec::hex(&sha2::Sha256::digest(bytes))
@@ -760,7 +801,7 @@ struct EntriesReport {
 /// Every entry must be equal, digests included.
 fn run_entries(args: &Args) {
     let mut report = EntriesReport::default();
-    let deployment = DeploymentKey::new(1, &[0x5a; 32]);
+    let deployment = deployment();
     each_log(args, |item| {
         let Item::Log {
             name, old: Ok(old), ..
@@ -953,7 +994,7 @@ struct BillingReport {
 fn run_billing(args: &Args) {
     use broca_session_convert::billing::{bind_of, compare, log_session, triple, warms_at};
     let mut report = BillingReport::default();
-    let deployment = DeploymentKey::new(1, &[0x5a; 32]);
+    let deployment = deployment();
     each_log(args, |item| {
         let Item::Log { name, old, .. } = item else {
             return;
@@ -1377,6 +1418,9 @@ struct OpsReport {
     /// For each compared field that is usually empty, how many compared states had a value on
     /// today's side. A field that is never set anywhere compares nothing.
     set_on_today: BTreeMap<&'static str, u64>,
+    /// Visited logs with a refresh, refresh-policy or prefix-flush record: the logs whose plan
+    /// changes the comparison exercises beyond the manifests runs froze.
+    plan_change_logs: u64,
 }
 
 /// Serializing values of different types through one closure.
@@ -1461,7 +1505,9 @@ fn compare_ops(old: &[FramedRecord], lineage: Option<&str>) -> OpsOutcome {
     };
     let owner_differs = owner_difference(old, &operations)
         .or_else(|| first_episode_difference(old, &operations, &parts))
-        .or_else(|| session_usage_difference(&records, &operations));
+        .or_else(|| session_usage_difference(&records, &operations))
+        .or_else(|| plan_difference(old, &converted.records, &operations, &parts))
+        .or_else(|| head_plan_difference(&records, &operations, &parts));
     let Some(run) = operations.run else {
         // Nothing to compare only when today's replay has no run either.
         return if today.run_id.is_none() && owner_differs.is_none() {
@@ -1709,6 +1755,205 @@ fn session_usage_difference(
     (json(&today.usage) != json(&folded)).then(|| "session_usage".to_owned())
 }
 
+/// Whether the fold's plan changes differ from today's `SessionChangeState` folded from the same
+/// log, naming the first field that does: what was accepted and applied, the pending change, the
+/// latest applied change's baseline facts, the manifests of the latest run and the latest prefix
+/// rebuild, the rebuild and flush marks and the latest run's model. Today's per-generation and
+/// per-`send_id` answers are compared with the newest of the converted `records` the session's id
+/// index names under the same key (`record_ids`), which is where the store reads them.
+fn plan_difference(
+    old: &[FramedRecord],
+    records: &[broca_session_store::record::Record],
+    operations: &broca_session_store::fold::operations::Operations,
+    parts: &broca_session_loop::parts::MemoryParts,
+) -> Option<String> {
+    use broca_session_store::fold::operations::{ManifestRef, Plan};
+    use broca_session_store::idindex::IdKind;
+    use broca_session_store::record::Record;
+    let today = broca_fetch_plan::session_change::SessionChangeState::fold(old);
+    let default = Plan::default();
+    let plan = operations.plan.as_ref().unwrap_or(&default);
+    // The newest ledger record under each id the index keeps for plan changes.
+    let mut indexed: BTreeMap<(u8, String), &Record> = BTreeMap::new();
+    for record in records {
+        if record.stream() != Stream::Ledger {
+            continue;
+        }
+        for (kind, id) in broca_session_store::idindex::record_ids(record) {
+            let code = match kind {
+                IdKind::RefreshGeneration => 5,
+                IdKind::RefreshPolicySendId => 6,
+                IdKind::PrefixFlushSendId => 7,
+                IdKind::AppliedGeneration => 8,
+                _ => continue,
+            };
+            indexed.insert((code, id), record);
+        }
+    }
+    let index_of = |code: u8| {
+        indexed
+            .iter()
+            .filter(move |((indexed, _), _)| *indexed == code)
+            .map(|((_, id), record)| (id.clone(), *record))
+    };
+    let accepted: BTreeMap<String, (String, String, bool, bool)> = index_of(5)
+        .filter_map(|(id, record)| match record {
+            Record::SessionRefresh(refresh) => Some((
+                id,
+                (
+                    ManifestRef::of_refresh(refresh)
+                        .plan_identity()
+                        .unwrap_or_default()
+                        .to_owned(),
+                    refresh.policy.clone(),
+                    refresh.run_in_progress,
+                    refresh.applies_from_next_run,
+                ),
+            )),
+            _ => None,
+        })
+        .collect();
+    let today_accepted: BTreeMap<String, (String, String, bool, bool)> = today
+        .accepted
+        .iter()
+        .map(|(generation, (identity, policy))| {
+            let (run_in_progress, applies) = today.accepted_replies[generation];
+            (
+                generation.to_string(),
+                (identity.clone(), policy.clone(), run_in_progress, applies),
+            )
+        })
+        .collect();
+    let policy_sends: BTreeMap<String, (u64, String)> = index_of(6)
+        .filter_map(|(id, record)| match record {
+            Record::RefreshPolicy(policy) => Some((id, (policy.generation, policy.policy.clone()))),
+            _ => None,
+        })
+        .collect();
+    let flush_sends: BTreeMap<String, Option<u64>> = index_of(7)
+        .filter_map(|(id, record)| match record {
+            Record::PrefixFlush(flush) => Some((id, flush.pending_generation)),
+            _ => None,
+        })
+        .collect();
+    let applied: BTreeMap<String, String> = index_of(8)
+        .filter_map(|(id, record)| match record {
+            Record::RefreshApplied(applied) => Some((id, applied.applied_by.clone())),
+            _ => None,
+        })
+        .collect();
+    let today_applied: BTreeMap<String, String> = today
+        .applied
+        .iter()
+        .map(|(generation, applied_by)| (generation.to_string(), applied_by.clone()))
+        .collect();
+    let manifest = |manifest: Option<&ManifestRef>| {
+        manifest
+            .map(|manifest| broca_session_loop::run::stored_manifest(manifest, parts))
+            .transpose()
+    };
+    let (pending, current, prefix) = match (
+        manifest(plan.pending.as_ref().map(|pending| &pending.manifest)),
+        manifest(plan.current.as_ref()),
+        manifest(plan.prefix.as_ref()),
+    ) {
+        (Ok(pending), Ok(current), Ok(prefix)) => (pending, current, prefix),
+        _ => return Some("plan (a manifest is unreadable)".into()),
+    };
+    let today_effective = today.effective.as_ref().map(|effective| {
+        (
+            effective.generation,
+            effective.applied_by.clone(),
+            effective.manifest_digest.clone(),
+            effective.composition_digest.clone(),
+            serde_json::to_value(&effective.absent_items).unwrap_or_default(),
+        )
+    });
+    let folded_effective = plan.effective.as_ref().map(|effective| {
+        (
+            effective.generation,
+            effective.applied_by.clone(),
+            effective.manifest_digest.clone(),
+            effective.composition_digest.clone(),
+            serde_json::Value::Array(effective.absent_items.clone()),
+        )
+    });
+    [
+        (
+            "plan.accepted_generation",
+            today.accepted_generation == plan.accepted_generation,
+        ),
+        (
+            "plan.applied_generation",
+            today.applied_generation == plan.applied_generation,
+        ),
+        (
+            "plan.pending",
+            today
+                .pending
+                .as_ref()
+                .map(|pending| (pending.generation, &pending.policy, &pending.manifest))
+                == plan
+                    .pending
+                    .as_ref()
+                    .zip(pending.as_ref())
+                    .map(|(folded, manifest)| (folded.generation, &folded.policy, manifest)),
+        ),
+        ("plan.effective", today_effective == folded_effective),
+        ("plan.current", today.current_manifest == current),
+        ("plan.prefix", today.prefix_manifest == prefix),
+        (
+            "plan.rebuild_since_accept",
+            today.rebuild_pending == plan.rebuild_since_accept,
+        ),
+        (
+            "plan.flushed_since_accept",
+            today.flush_pending == plan.flushed_since_accept,
+        ),
+        ("plan.last_model", today.last_model == plan.last_model),
+        ("index refresh:<generation>", today_accepted == accepted),
+        (
+            "index refresh-policy:<send_id>",
+            today.policy_send_ids == policy_sends,
+        ),
+        ("index flush:<send_id>", today.flush_send_ids == flush_sends),
+        ("index applied:<generation>", today_applied == applied),
+    ]
+    .into_iter()
+    .find(|(_, equal)| !equal)
+    .map(|(field, _)| field.to_owned())
+}
+
+/// Whether the model a send leaving its model to the session runs on (`plan.model`) and the
+/// senders the session admits, as the new storage reads them (`broca_session_loop::plan`), differ
+/// from what today's head folds from the same records (`HeadProjection::selection` and its
+/// senders).
+fn head_plan_difference(
+    records: &[broca_wal::WalRecord],
+    operations: &broca_session_store::fold::operations::Operations,
+    parts: &broca_session_loop::parts::MemoryParts,
+) -> Option<String> {
+    let mut today = broca_core::head::HeadProjection::default();
+    for record in records {
+        today.observe(record);
+    }
+    let selection = match broca_session_loop::plan::selection(operations, parts) {
+        Ok(selection) => selection,
+        Err(error) => return Some(format!("plan selection (unreadable: {error})")),
+    };
+    if today.selection != selection {
+        return Some("plan selection".into());
+    }
+    let senders = match broca_session_loop::plan::sender_manifest(operations, parts) {
+        Ok(manifest) => manifest
+            .as_deref()
+            .map(broca_core::head::head_senders)
+            .unwrap_or_default(),
+        Err(error) => return Some(format!("plan senders (unreadable: {error})")),
+    };
+    (today.senders() != senders.as_slice()).then(|| "plan senders".to_owned())
+}
+
 /// Whether the folded owner summary differs from the one today's admission folds from the same
 /// log (`SessionOwnershipV1::fold_owner_records`), naming the first field that does. The fold
 /// keeps only the first two distinct principals, so those are compared with today's first two.
@@ -1839,6 +2084,16 @@ fn run_ops(args: &Args) {
         if args.prefixes && args.max_records.is_some_and(|max| old.len() > max) {
             report.not_visited += 1;
             return;
+        }
+        if old.iter().any(|framed| {
+            matches!(
+                framed.record,
+                broca_wal::WalRecord::SessionRefreshAccepted { .. }
+                    | broca_wal::WalRecord::SessionRefreshPolicyChanged { .. }
+                    | broca_wal::WalRecord::SessionPrefixFlushed { .. }
+            )
+        }) {
+            report.plan_change_logs += 1;
         }
         let ends: Vec<usize> = if args.prefixes {
             (1..=old.len()).collect()
@@ -1994,7 +2249,7 @@ impl Measuring {
         let report = &mut self.report;
         debug_assert_eq!(
             report.new_framed_bytes,
-            report.new_body_bytes + report.new_records * FRAME_OVERHEAD as u64
+            report.new_body_bytes + report.new_records * self.key.frame_overhead() as u64
         );
         report.parts_distinct = self.parts.len() as u64;
         report.parts_distinct_bytes = self.parts.values().sum();
@@ -2269,9 +2524,11 @@ fn run_append(args: &Args) {
     chosen.extend(by_size.iter().rev().take(5).map(|(_, f)| *f));
     chosen.dedup();
 
-    // Measurements encrypt with a fixed throwaway key: only the cost matters, not secrecy.
-    let deployment = DeploymentKey::new(1, &[0x5a; 32]);
-    let setup_key = deployment.setup_key();
+    // Measurements use a fixed throwaway key: only the cost matters, not secrecy.
+    let deployment = deployment();
+    let setup_key = deployment
+        .setup_key_for(deployment.new_sessions())
+        .expect("the measurement key is loaded");
     // One setup store for the whole run, as a deployment has: later sessions reuse parts that
     // earlier ones stored.
     let setup_root = dir.join("append-setup");
@@ -2345,10 +2602,13 @@ fn run_append(args: &Args) {
     report.id_lookup_us = percentiles(id_lookups);
     report.setup_parts_written = setup_puts.len() as u64;
     report.setup_put_us = percentiles(setup_puts);
-    if let Ok(entries) = std::fs::read_dir(setup_root.join("setup")) {
-        for entry in entries.flatten() {
-            report.setup_parts_stored += 1;
-            report.setup_bytes_stored += entry.metadata().map(|m| m.len()).unwrap_or(0);
+    // Encrypted parts sit in `setup`, plain ones in `setup-plain`.
+    for folder in ["setup", "setup-plain"] {
+        if let Ok(entries) = std::fs::read_dir(setup_root.join(folder)) {
+            for entry in entries.flatten() {
+                report.setup_parts_stored += 1;
+                report.setup_bytes_stored += entry.metadata().map(|m| m.len()).unwrap_or(0);
+            }
         }
     }
     let _ = std::fs::remove_dir_all(&setup_root);
@@ -2434,7 +2694,7 @@ struct SealReport {
 /// It also seals each transcript again with finished runs' opaque reasoning pruned (a run is
 /// finished when the log holds its end), which is what a real seal writes.
 fn run_seal(args: &Args) {
-    let key = broca_session_store::frame::FrameKey::new(1, &[0x5a; 32]);
+    let key = frame_key(&[0x5a; 32]);
     let mut report = SealReport::default();
     let mut builds = Vec::new();
     let mut expands = Vec::new();

@@ -11,11 +11,18 @@ use crate::backend::{MemoryBackend, SessionAddr, SessionBackend};
 use crate::codec::Id128;
 use crate::frame::FrameKey;
 use crate::head::SessionTriple;
-use crate::keys::DeploymentKey;
+use crate::keys::{Cipher, DeploymentKey};
 use crate::record::{
-    Event, Input, Placement, QueuedSend, Record, RunEnd, RunStart, SessionRefresh, Steer,
+    Event, Input, Placement, PrefixFlush, QueuedSend, Record, RefreshApplied, RefreshPolicy,
+    RunEnd, RunStart, SessionRefresh, Steer,
 };
 use crate::session::{Session, GRACE_MS};
+
+cipher_tests!(
+    merges_in_steps_keep_every_id_findable,
+    the_production_share_keeps_up_without_forcing,
+    a_session_finds_ids_open_sealed_and_merged,
+);
 
 /// A deterministic generator, so a failure replays.
 struct Lcg(u64);
@@ -151,10 +158,41 @@ fn records_name_their_ids() {
         applies_from_next_run: false,
         setup: Vec::new(),
         manifest: None,
+        selection: None,
     });
     assert_eq!(
         ids(&refresh),
         BTreeSet::from([(IdKind::RefreshGeneration, "7".into())])
+    );
+    // A policy change, a flush and an application each file under a kind of their own, so a
+    // send id shared with a send or with the other op names another key.
+    let policy = Record::RefreshPolicy(RefreshPolicy {
+        generation: 7,
+        policy: "immediately".into(),
+        send_id: "x".into(),
+    });
+    assert_eq!(
+        ids(&policy),
+        BTreeSet::from([(IdKind::RefreshPolicySendId, "x".into())])
+    );
+    let flush = Record::PrefixFlush(PrefixFlush {
+        send_id: "x".into(),
+        pending_generation: None,
+    });
+    assert_eq!(
+        ids(&flush),
+        BTreeSet::from([(IdKind::PrefixFlushSendId, "x".into())])
+    );
+    let applied = Record::RefreshApplied(RefreshApplied {
+        generation: 7,
+        applied_by: "append".into(),
+        manifest_digest: "m".into(),
+        composition_digest: None,
+        absent_items: Vec::new(),
+    });
+    assert_eq!(
+        ids(&applied),
+        BTreeSet::from([(IdKind::AppliedGeneration, "7".into())])
     );
     // A transcript record names nothing the index files, even when it carries an id.
     let input = Record::Input(Input {
@@ -177,16 +215,15 @@ fn records_name_their_ids() {
 /// than `2 * FANIN` runs; every tenth change, every id ever filed answers with exactly its seqs
 /// and ids never filed answer with none. Retired runs, once deleted, leave the backend holding
 /// exactly the objects the root names.
-#[test]
-fn merges_in_steps_keep_every_id_findable() {
-    block_on(merges_in_steps())
+fn merges_in_steps_keep_every_id_findable(cipher: Cipher) {
+    block_on(merges_in_steps(cipher))
 }
 
-async fn merges_in_steps() {
+async fn merges_in_steps(cipher: Cipher) {
     let backend = MemoryBackend::default();
     let addr = SessionAddr("a".into());
     backend.write_head(&addr, b"h", None, 1).await.unwrap();
-    let key = FrameKey::new(1, &[7; 32]);
+    let key = FrameKey::for_tests(cipher, 1, &[7; 32]);
     let pages = IndexPages {
         backend: &backend,
         addr: &addr,
@@ -277,16 +314,15 @@ async fn merges_in_steps() {
 
 /// With the production share, seals of steady size never fill a level, so no merge is forced
 /// to finish within one change.
-#[test]
-fn the_production_share_keeps_up_without_forcing() {
-    block_on(production_share())
+fn the_production_share_keeps_up_without_forcing(cipher: Cipher) {
+    block_on(production_share(cipher))
 }
 
-async fn production_share() {
+async fn production_share(cipher: Cipher) {
     let backend = MemoryBackend::default();
     let addr = SessionAddr("a".into());
     backend.write_head(&addr, b"h", None, 1).await.unwrap();
-    let key = FrameKey::new(1, &[7; 32]);
+    let key = FrameKey::for_tests(cipher, 1, &[7; 32]);
     let pages = IndexPages {
         backend: &backend,
         addr: &addr,
@@ -328,15 +364,14 @@ fn triple() -> SessionTriple {
 /// Through a real session: runs whose start and end name a run id, and whose start names a send
 /// id, sealed every few runs, so the index merges. Every id is found, whether its records are in
 /// the open log or sealed and merged, after deleting what merges retired, and after a reload.
-#[test]
-fn a_session_finds_ids_open_sealed_and_merged() {
-    block_on(session_finds_ids())
+fn a_session_finds_ids_open_sealed_and_merged(cipher: Cipher) {
+    block_on(session_finds_ids(cipher))
 }
 
-async fn session_finds_ids() {
+async fn session_finds_ids(cipher: Cipher) {
     let backend = MemoryBackend::default();
     let addr = SessionAddr("0123456789abcdef".into());
-    let deployment = DeploymentKey::new(1, &[5; 32]);
+    let deployment = DeploymentKey::new(1, &[5; 32]).creating(cipher);
     let mut session = Session::create(&backend, addr.clone(), triple(), &deployment, false)
         .await
         .unwrap();

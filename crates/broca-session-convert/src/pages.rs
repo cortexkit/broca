@@ -179,7 +179,7 @@ fn page_members(page: &SessionReadResponse) -> Value {
 
 /// Today's message with the payloads the store's sealed copy holds pruned set aside, and how
 /// many were. A payload counts as pruned only where the store's message holds it empty.
-fn set_aside(got: &Value, expected: &Value) -> (Value, u64) {
+pub(super) fn set_aside(got: &Value, expected: &Value) -> (Value, u64) {
     let mut expected = expected.clone();
     let mut pruned = 0;
     let blocks = got["message"]["content"]
@@ -414,9 +414,71 @@ fn count_members(report: &mut ModeReport, pages: &[SessionReadResponse]) {
     }
 }
 
+/// The converted session of the log `old`, built in `backend` at `addr` by appending the
+/// converted records one at a time, with the seqs of its runs' inputs (where a seal can cut)
+/// and its setup parts.
+pub(super) fn built_session<B: SessionBackend>(
+    old: &super::OldLog,
+    name: &str,
+    backend: B,
+    addr: &SessionAddr,
+    deployment: &DeploymentKey,
+) -> Result<(Session<B>, Vec<u64>, MemoryParts), String> {
+    let converted = convert_log(old).map_err(|e| format!("convert: {}", e.0))?;
+    let parts = MemoryParts {
+        parts: converted.parts.clone(),
+    };
+    block_on(async {
+        let mut session = Session::create(backend, addr.clone(), triple(name), deployment, false)
+            .await
+            .map_err(|e| format!("create: {e:?}"))?;
+        let mut run_inputs = Vec::new();
+        for (index, record) in converted.records.iter().enumerate() {
+            let seq = session
+                .append(std::slice::from_ref(record), false)
+                .await
+                .map_err(|e| format!("append {}: {e:?}", record.name()))?;
+            // A converted record that names another by seq counts on this.
+            if seq != index as u64 + broca_session_convert::FIRST_SEQ {
+                return Err(format!("converted record {index} took seq {seq}"));
+            }
+            if matches!(record, broca_session_store::record::Record::Input(input) if input.placement == broca_session_store::record::Placement::RunInput)
+            {
+                run_inputs.push(seq);
+            }
+        }
+        Ok((session, run_inputs, parts))
+    })
+}
+
+/// Seals `session` at the newest of its runs' inputs `run_inputs` a seal can cut at, and closes
+/// it. False when no cut can be sealed: none is a clean cut, or the session names compaction
+/// views, which only a caller that carries them can seal, as this check doesn't.
+pub(super) fn seal_at_newest_input<B: SessionBackend>(
+    mut session: Session<B>,
+    run_inputs: &[u64],
+) -> Result<bool, String> {
+    block_on(async {
+        let mut sealed = false;
+        for cut in run_inputs.iter().rev() {
+            match session.seal(Some(*cut), 0).await {
+                Ok(_) => {
+                    sealed = true;
+                    break;
+                }
+                Err(broca_session_store::session::SessionError::BadCut(_)) => continue,
+                Err(broca_session_store::session::SessionError::ViewNotCarried) => break,
+                Err(e) => return Err(format!("seal: {e:?}")),
+            }
+        }
+        session.close().await.map_err(|e| format!("close: {e:?}"))?;
+        Ok(sealed)
+    })
+}
+
 pub(super) fn run(args: &Args) {
     let mut report = PagesReport::default();
-    let deployment = DeploymentKey::new(1, &[0x5a; 32]);
+    let deployment = crate::deployment();
     let limit = std::env::var("PAGES_LIMIT")
         .ok()
         .and_then(|limit| limit.parse().ok())
@@ -452,62 +514,20 @@ pub(super) fn run(args: &Args) {
                 Err(e) => return report.fail(&format!("today's {} pages", mode.0), e, &name),
             }
         }
-        let converted = match convert_log(&old) {
-            Ok(converted) => converted,
-            Err(e) => return report.fail("convert", e.0, &name),
-        };
-        let parts = MemoryParts {
-            parts: converted.parts.clone(),
-        };
         let backend = MemoryBackend::default();
         let addr = SessionAddr(name.clone());
-        let built = block_on(async {
-            let mut session =
-                Session::create(&backend, addr.clone(), triple(&name), &deployment, false)
-                    .await
-                    .map_err(|e| format!("create: {e:?}"))?;
-            let mut run_inputs = Vec::new();
-            for record in &converted.records {
-                let seq = session
-                    .append(std::slice::from_ref(record), false)
-                    .await
-                    .map_err(|e| format!("append {}: {e:?}", record.name()))?;
-                if matches!(record, broca_session_store::record::Record::Input(input) if input.placement == broca_session_store::record::Placement::RunInput)
-                {
-                    run_inputs.push(seq);
-                }
-            }
-            Ok::<_, String>((session, run_inputs))
-        });
-        let (mut session, run_inputs) = match built {
-            Ok(built) => built,
-            Err(e) => return report.fail("session", e, &name),
-        };
+        let (session, run_inputs, parts) =
+            match built_session(&old, &name, &backend, &addr, &deployment) {
+                Ok(built) => built,
+                Err(e) => return report.fail("session", e, &name),
+            };
         for (mode, today) in MODES.iter().zip(&today) {
             match store_pages(&session, &parts, &name, limit, *mode, &mut report) {
                 Ok(open) => compare(&mut report, &name, mode.0, false, &open, today),
                 Err(e) => return report.fail(&format!("the store's {} pages", mode.0), e, &name),
             }
         }
-        let sealed = block_on(async {
-            let mut sealed = false;
-            for cut in run_inputs.iter().rev() {
-                match session.seal(Some(*cut), 0).await {
-                    Ok(_) => {
-                        sealed = true;
-                        break;
-                    }
-                    Err(broca_session_store::session::SessionError::BadCut(_)) => continue,
-                    // A session that names compaction views can only be sealed by a caller that
-                    // carries them, which this check doesn't: its pages are read open only.
-                    Err(broca_session_store::session::SessionError::ViewNotCarried) => break,
-                    Err(e) => return Err(format!("seal: {e:?}")),
-                }
-            }
-            session.close().await.map_err(|e| format!("close: {e:?}"))?;
-            Ok(sealed)
-        });
-        let sealed = match sealed {
+        let sealed = match seal_at_newest_input(session, &run_inputs) {
             Ok(sealed) => sealed,
             Err(e) => return report.fail("session", e, &name),
         };
