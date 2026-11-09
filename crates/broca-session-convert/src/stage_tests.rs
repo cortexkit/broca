@@ -138,6 +138,162 @@ fn staged(root: &Path, records: &[FramedRecord], lineage: Option<WalLineageId>) 
     staged_in(root, records, lineage, &deployment())
 }
 
+/// The last update today's head serves for the session whose WAL is `records`, read with no
+/// file behind it.
+fn todays_updated_at(records: &[FramedRecord]) -> u64 {
+    broca_module::head_time::updated_at_of_wal(records, None)
+}
+
+/// A run of a log written before its records carried times: none of them says when.
+fn timeless_run(run: &str) -> Vec<WalRecord> {
+    let mut start = run_started(run, 0, "Hello.");
+    if let WalRecord::RunStarted { ts_ms, .. } = &mut start {
+        *ts_ms = None;
+    }
+    let mut records = vec![start];
+    records.extend(
+        [
+            json!({"type": "step_started", "step_id": 1}),
+            json!({"type": "model_step_finished", "step_id": 1,
+                "assistant_message": {"message_id": "m1",
+                    "content": [{"type": "text", "text": "One."}]},
+                "usage": {"input_tokens": 3, "output_tokens": 1},
+                "finish_reason": "stop", "retries_used": 0}),
+            json!({"type": "run_finished", "reason": "completed",
+                "usage": {"input_tokens": 3, "output_tokens": 1}, "retries_used": 0}),
+        ]
+        .into_iter()
+        .map(record),
+    );
+    records
+}
+
+fn framed(records: Vec<WalRecord>) -> Vec<FramedRecord> {
+    (1u64..)
+        .zip(records)
+        .map(|(seq, record)| FramedRecord {
+            seq,
+            fence: 1,
+            record,
+        })
+        .collect()
+}
+
+/// The last update the head of the session `staging` holds serves, read as the module reads
+/// it, or why it can't say.
+fn staged_updated_at(
+    staging: &Path,
+    converted: &crate::Converted,
+) -> Result<u64, broca_module::store_head::StoreHeadError> {
+    let view = block_on(Session::view(
+        LocalBackend::new(staging),
+        SessionAddr(broca_core::session_addr(&session())),
+        &crate::stage::triple(&session()),
+        &deployment(),
+    ))
+    .unwrap();
+    let parts = broca_session_loop::parts::MemoryParts {
+        parts: converted.parts.clone(),
+    };
+    block_on(broca_module::store_head::build(&view, &parts, false))
+        .map(|head| head.reply.updated_at.expect("a built head has a time"))
+}
+
+/// A moved session's head goes on serving the last update today's head served for it, which
+/// its `Moved` record carries: for a log none of whose records carries a time too, which the
+/// new storage could otherwise only refuse (`session_time_unknown`). A record time later than
+/// that is served instead, and records written after the move advance it.
+#[test]
+fn a_moved_sessions_head_keeps_todays_last_update() {
+    use broca_session_store::record::{Moved, Record};
+    let root = scratch("moved-time");
+    let staging = root.join("session-store/staging/store-move-test");
+    // Today's head serves the live WAL file's write time for a log whose records say nothing.
+    let timeless = framed(timeless_run("r1"));
+    let today = broca_module::head_time::updated_at_of_wal(&timeless, Some(1_234_000));
+    assert_eq!(today, 1_234_000);
+    let moved = Moved {
+        move_id: "store-move:test".into(),
+        source_activity_ms: today,
+    };
+    let stage_with_moved = |records: &[FramedRecord], moved: &Moved| {
+        let _ = std::fs::remove_dir_all(&root);
+        block_on(stage(Stage {
+            records,
+            lineage: None,
+            session: &session(),
+            deployment: &deployment(),
+            store_root: &root.join("session-store"),
+            staging: &staging,
+            media: None,
+            moved,
+        }))
+        .unwrap()
+    };
+    let staged = stage_with_moved(&timeless, &moved);
+    assert_eq!(
+        staged_updated_at(&staging, &staged.converted).unwrap(),
+        today
+    );
+
+    // A log whose records carry a time later than the WAL file's write time: the newest
+    // record time.
+    let (timed, lineage) = written(&root.join("timed"));
+    let newest = broca_module::head_time::newest_record_ms(&timed).unwrap();
+    let earlier = Moved {
+        move_id: "store-move:test".into(),
+        source_activity_ms: newest - 1,
+    };
+    let _ = lineage;
+    let staged = stage_with_moved(&timed, &earlier);
+    assert_eq!(
+        staged_updated_at(&staging, &staged.converted).unwrap(),
+        newest
+    );
+
+    // A later run on the new storage advances it past the move's time.
+    let mut both = timeless_run("r1");
+    let mut later = run_started("r2", 2_000_000, "Again.");
+    if let WalRecord::RunStarted { written_at_ms, .. } = &mut later {
+        *written_at_ms = Some(2_000_000);
+    }
+    both.push(later);
+    let both = framed(both);
+    let converted = crate::convert(&both, None).unwrap();
+    let split = converted
+        .records
+        .iter()
+        .rposition(|record| matches!(record, Record::RunStart(_)))
+        .unwrap();
+    let mut records = converted.records[..split].to_vec();
+    records.push(Record::Moved(moved.clone()));
+    records.extend_from_slice(&converted.records[split..]);
+    let backend = broca_session_store::backend::MemoryBackend::default();
+    let mut store = block_on(Session::create(
+        &backend,
+        SessionAddr(broca_core::session_addr(&session())),
+        crate::stage::triple(&session()),
+        &deployment(),
+        true,
+    ))
+    .unwrap();
+    block_on(store.append(&records, false)).unwrap();
+    let parts = broca_session_loop::parts::MemoryParts {
+        parts: converted.parts.clone(),
+    };
+    let head = block_on(broca_module::store_head::build(&store, &parts, false)).unwrap();
+    assert_eq!(head.reply.updated_at, Some(2_000_000));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The record a move of the session whose WAL is `records` writes.
+fn moved(records: &[FramedRecord]) -> broca_session_store::record::Moved {
+    broca_session_store::record::Moved {
+        move_id: "store-move:test".into(),
+        source_activity_ms: todays_updated_at(records),
+    }
+}
+
 /// Stages the session with `deployment`, which creates it in its mode.
 fn staged_in(
     root: &Path,
@@ -154,6 +310,7 @@ fn staged_in(
         store_root: &root.join("session-store"),
         staging: &root.join("session-store/staging/store-move-test"),
         media: None,
+        moved: &moved(records),
     }))
     .unwrap()
 }
@@ -188,6 +345,7 @@ fn verified_in(
         mode,
         media: None,
         media_root: None,
+        todays_updated_at: todays_updated_at(records),
     }))
 }
 
@@ -429,6 +587,7 @@ fn stage_with(
         store_root: &root.join("session-store"),
         staging: &root.join("session-store/staging/store-move-test"),
         media: Some(media),
+        moved: &moved(records),
     }))
 }
 
@@ -517,6 +676,7 @@ fn a_session_holding_media_is_staged_with_its_bytes() {
             mode: Mode::Move,
             media: Some(media),
             media_root: None,
+            todays_updated_at: todays_updated_at(&records),
         }))
         .unwrap_err()
     };
@@ -606,6 +766,7 @@ fn a_tool_results_image_is_staged_with_its_bytes() {
         mode: Mode::Move,
         media: Some(&media),
         media_root: None,
+        todays_updated_at: todays_updated_at(&records),
     }))
     .unwrap_err();
     assert_eq!(failed.check, crate::verify::NEXT_REQUEST, "{failed}");

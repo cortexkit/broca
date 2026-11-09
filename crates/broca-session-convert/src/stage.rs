@@ -15,7 +15,7 @@ use broca_protocol::{BindIdentity, MediaRef, ToolOutput, ToolOutputPart};
 use broca_session_store::backend::{LocalBackend, SessionAddr, SessionBackend};
 use broca_session_store::head::SessionTriple;
 use broca_session_store::keys::DeploymentKey;
-use broca_session_store::record::Record;
+use broca_session_store::record::{Moved, Record};
 use broca_session_store::session::{NewInputMedia, NewMedia, Session};
 use broca_session_store::setup::SetupStore;
 use broca_wal::FramedRecord;
@@ -39,6 +39,10 @@ pub struct Stage<'a> {
     /// Today's media store for the session, which the bytes of every medium it names are read
     /// from; `None` where there is none, which refuses a session naming any medium.
     pub media: Option<&'a dyn MediaBytes>,
+    /// The record of the move, written in the batch that holds the last converted record: its
+    /// id, and the last update today's `session.head` serves for the session
+    /// (`broca_module::head_time`), which the moved session's head goes on serving.
+    pub moved: &'a Moved,
 }
 
 /// A session written into its staging folder.
@@ -422,13 +426,17 @@ pub async fn write(stage: &Stage<'_>, prepared: Prepared) -> Result<Staged, Stag
     .await
     .map_err(failed("create the staged session"))?;
     // The records are appended as the run loop appends them: each group up to a barrier as one
-    // synced batch, after the setup parts it names are stored.
+    // synced batch, after the setup parts it names are stored. The move's own record goes in
+    // the last batch.
     let records = &converted.records;
+    let moved = Record::Moved(stage.moved.clone());
+    if records.is_empty() {
+        append_batch(&mut session, std::slice::from_ref(&moved), &media).await?;
+    }
     let mut start = 0;
     for (index, record) in records.iter().enumerate() {
-        if !(crate::measure::barrier_after(record, records.get(index + 1))
-            || index + 1 == records.len())
-        {
+        let last = index + 1 == records.len();
+        if !(crate::measure::barrier_after(record, records.get(index + 1)) || last) {
             continue;
         }
         for part in records[start..=index]
@@ -448,7 +456,13 @@ pub async fn write(stage: &Stage<'_>, prepared: Prepared) -> Result<Staged, Stag
                 ));
             }
         }
-        append_batch(&mut session, &records[start..=index], &media).await?;
+        if last {
+            let mut batch = records[start..=index].to_vec();
+            batch.push(moved.clone());
+            append_batch(&mut session, &batch, &media).await?;
+        } else {
+            append_batch(&mut session, &records[start..=index], &media).await?;
+        }
         start = index + 1;
     }
     let messages = broca_module::store_read::transcript_len(&session);

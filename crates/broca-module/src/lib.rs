@@ -15,6 +15,7 @@ mod compaction_watch;
 pub mod diagnostics;
 pub mod executor;
 pub mod fanout;
+pub mod head_time;
 pub mod held_slots;
 pub mod held_withdrawals;
 pub mod history;

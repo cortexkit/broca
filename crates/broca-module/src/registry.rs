@@ -5161,10 +5161,7 @@ impl LineageRegistry {
     pub fn live_wal_written_ms(&self, key: &LineageKey) -> Option<u64> {
         let reader = self.inner.reader.as_ref()?;
         let written = reader.wal_store.live_wal_last_write(key).ok()??;
-        written
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()
-            .map(|since| u64::try_from(since.as_millis()).unwrap_or(u64::MAX))
+        crate::head_time::epoch_ms(written)
     }
 
     /// Copy the cache reference under the slots lock, then acquire its facts separately.
@@ -5838,10 +5835,9 @@ impl LineageRegistry {
         let newest_record_ms = match tail.records() {
             broca_wal::WalRangeRecords::Complete(records)
             | broca_wal::WalRangeRecords::Partial(records)
-            | broca_wal::WalRangeRecords::Unknown(records) => records
-                .iter()
-                .rev()
-                .find_map(|framed| broca_core::record_time_ms(&framed.record)),
+            | broca_wal::WalRangeRecords::Unknown(records) => {
+                crate::head_time::newest_record_ms(records)
+            }
             broca_wal::WalRangeRecords::Absent => None,
         };
         let retention_activity_ms = match tail.records() {

@@ -494,3 +494,21 @@ fn an_enrolled_session_does_not_convert_back() {
     );
     invert(&converted.records, &converted.parts).expect("the same log without it converts back");
 }
+
+/// A moved session's `Moved` record has no record of today's: the session converts back to the
+/// log it was moved from, record for record.
+#[test]
+fn a_moved_session_converts_back_to_its_log() {
+    let converted = convert(&log(&[RUN]), None).unwrap();
+    let mut records = converted.records.clone();
+    records.push(broca_session_store::record::Record::Moved(
+        broca_session_store::record::Moved {
+            move_id: "store-move:test".into(),
+            source_activity_ms: 5,
+        },
+    ));
+    assert_eq!(
+        invert(&records, &converted.parts).unwrap(),
+        invert(&converted.records, &converted.parts).unwrap()
+    );
+}

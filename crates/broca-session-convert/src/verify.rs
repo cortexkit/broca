@@ -50,6 +50,9 @@ pub struct Verify<'a> {
     /// Where that store lives, which today's offline render reads a request's media from; `None`
     /// where there is none, which refuses a request holding media.
     pub media_root: Option<MediaRoot<'a>>,
+    /// The last update today's `session.head` serves for the session
+    /// (`broca_module::head_time`), which the staged session's `Moved` record carries.
+    pub todays_updated_at: u64,
 }
 
 /// Where today's media store for a session lives: the state root, and the class of store the
@@ -181,7 +184,7 @@ pub async fn verify(verify: Verify<'_>) -> Result<Verified, Mismatch> {
     checks.push(HISTORY_DISPLAY);
     entries(&verify, lineage.as_deref(), staged, &parts).await?;
     checks.push(ENTRIES);
-    head(verify.records, staged, &parts).await?;
+    head(verify.records, verify.todays_updated_at, staged, &parts).await?;
     checks.push(HEAD);
     if !staged.operations.billing_owed.is_empty() {
         return Err(mismatch(
@@ -814,10 +817,11 @@ fn frozen_media(records: &[FramedRecord]) -> Option<Value> {
 }
 
 /// `session.head`: the reply, the input profile, and the sender grant each principal is told.
-/// Today's head is built from the WAL as the module's head builds it, its time the newest any
-/// record carries.
+/// Today's head is built from the WAL as the module's head builds it, its last update
+/// `updated_at`, the one today's head serves (`broca_module::head_time`).
 async fn head<B: SessionBackend>(
     records: &[FramedRecord],
+    updated_at: u64,
     view: &Session<B>,
     parts: &MemoryParts,
 ) -> Result<(), Mismatch> {
@@ -861,10 +865,7 @@ async fn head<B: SessionBackend>(
             .find_map(|frame| frame.record.title())
             .map(str::to_owned),
         mode3,
-        updated_at: records
-            .iter()
-            .rev()
-            .find_map(|frame| broca_core::record_time_ms(&frame.record)),
+        updated_at: Some(updated_at),
     });
     let built = broca_module::store_head::build(view, parts, true)
         .await

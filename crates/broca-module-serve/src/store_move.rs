@@ -660,9 +660,17 @@ impl StoreMove {
         before!(write_journal(&state_root, &journal)
             .map_err(io_failed("the move's journal couldn't be written")));
         before!(self.step("journal_layout"));
-        // Stage.
+        // Stage. The moved session goes on serving the last update today's head serves for it.
         let lineage_text = lineage.map(|id| id.to_string());
         let store = store_root(&state_root);
+        let todays_updated_at = broca_module::head_time::updated_at_of_wal(
+            &records,
+            broca_module::head_time::file_written_ms(&paths.wal),
+        );
+        let moved = broca_session_store::record::Moved {
+            move_id: journal.move_id.clone(),
+            source_activity_ms: todays_updated_at,
+        };
         let stage = Stage {
             records: &records,
             lineage: lineage_text.as_deref(),
@@ -671,6 +679,7 @@ impl StoreMove {
             store_root: &store,
             staging: &paths.staging,
             media: media_bytes(&media),
+            moved: &moved,
         };
         let staged = before!(broca_session_convert::stage::write(&stage, prepared)
             .await
@@ -693,6 +702,7 @@ impl StoreMove {
                 state_root: &state_root,
                 class: media.class,
             }),
+            todays_updated_at,
         })
         .await
         .map_err(|mismatch| {

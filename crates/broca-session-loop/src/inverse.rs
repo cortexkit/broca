@@ -517,6 +517,9 @@ impl Inverse {
                 // session takes it in silently; turning the whole log back refuses it
                 // ([`invert`]).
                 Record::CompactionEnrolled(_) => {}
+                // The session's move here from today's storage, which only the new storage
+                // records: today's log was the session until then, and has no record of it.
+                Record::Moved(_) => {}
                 // The new storage's own bookkeeping: a writer opening the log, and a change to
                 // where records are stored. Records keep their seqs and bytes through a change,
                 // so no message comes or goes with one.

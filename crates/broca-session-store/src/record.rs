@@ -1034,6 +1034,20 @@ message! {
 }
 
 message! {
+    /// The session moved here from today's storage (`session.move_to_store`), written in the
+    /// batch that holds the last of its converted records. Nothing happened in the session: the
+    /// record's time is the one today's `session.head` served as the session's last update before
+    /// the move, so the head reads the same after it, and later records advance it.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    pub struct Moved {
+        /// The move that wrote it, `store-move:<uuid>`.
+        1 req move_id: String,
+        /// When the session last changed, as today's `session.head` served it (`updated_at`).
+        2 req source_activity_ms: u64,
+    }
+}
+
+message! {
     /// A session that ran outside the current compaction contract moved onto it: the run whose
     /// start shares this record's batch is its first run on the contract. The messages already
     /// placed, ordinals 1 through `through_ordinal`, keep their records and their facts; what
@@ -1677,6 +1691,7 @@ impl Record {
             Record::Pause(r) => r.ts_ms,
             Record::Steer(r) => r.written_at_ms,
             Record::Delivery(r) => r.written_at_ms,
+            Record::Moved(r) => Some(r.source_activity_ms),
             _ => None,
         }
     }
@@ -1738,6 +1753,7 @@ records! {
         103 PrefixFlush,
         104 RefreshApplied,
         105 CompactionEnrolled,
+        106 Moved,
     }
 }
 

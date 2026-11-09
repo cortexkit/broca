@@ -268,6 +268,51 @@ fn session_records(path: &Path) -> Vec<WalRecord> {
     written
 }
 
+/// A session whose log's records carry no time (one written before they did) moves, and its
+/// head serves the same last update after the move as today's head served before it: the live
+/// WAL file's write time, which the move records in the session (`Record::Moved`). Without it
+/// the new storage could only refuse the head (`session_time_unknown`).
+#[tokio::test]
+async fn a_session_whose_records_carry_no_time_keeps_its_heads_last_update() {
+    use broca_module::serve::ServeHandler as _;
+    let rig = Rig::start("timeless").await;
+    let mut records = Vec::new();
+    for (index, run) in RUNS.iter().enumerate() {
+        let step = index as u64 + 1;
+        let mut start = run_started(run, 0);
+        if let WalRecord::RunStarted { ts_ms, .. } = &mut start {
+            *ts_ms = None;
+        }
+        records.push(start);
+        records.push(record(json!({"type": "step_started", "step_id": step})));
+        records.push(record(json!({
+            "type": "model_step_finished", "step_id": step,
+            "assistant_message": {"message_id": format!("m{step}"),
+                "content": [{"type": "text", "text": format!("Answer {step}.")}]},
+            "usage": {"input_tokens": 3, "output_tokens": 1},
+            "finish_reason": "stop", "retries_used": 0,
+        })));
+        records.push(record(json!({
+            "type": "run_finished", "reason": "completed",
+            "usage": {"input_tokens": 3, "output_tokens": 1}, "retries_used": 0,
+        })));
+    }
+    assert!(records
+        .iter()
+        .all(|record| broca_core::record_time_ms(record).is_none()));
+    rig.write(&records);
+    let today = rig.registry.head(&key()).await.unwrap().updated_at;
+    assert!(today.is_some_and(|at| at > 0), "{today:?}");
+    let moved = rig.mover().move_to_store(&key()).await.unwrap();
+    assert_eq!(moved["moved"], true, "{moved}");
+    let after = rig.registry.head(&key()).await.unwrap();
+    assert!(
+        after.incarnation != "unwritten",
+        "served from the new storage"
+    );
+    assert_eq!(after.updated_at, today);
+}
+
 /// Every name under `path`, relative to it, for comparing what a folder holds.
 fn tree(path: &Path) -> Vec<String> {
     fn walk(root: &Path, path: &Path, out: &mut Vec<String>) {

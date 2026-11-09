@@ -4344,19 +4344,17 @@ impl ServeHandler for crate::LineageRegistry {
             // Otherwise use the live WAL file's own write time, a stat; else
             // (its WAL was folded into an archive) the newest timestamped record of the read's
             // tail. Only a folded session whose tail holds no timestamped record pays for a pass
-            // over its whole WAL.
-            let updated_at = match retention_activity_ms
-                .or_else(|| self.live_wal_written_ms(session).or(newest_record_ms))
-            {
+            // over its whole WAL (`head_time`, which a move records this time by).
+            let updated_at = match crate::head_time::known_updated_at(
+                retention_activity_ms,
+                self.live_wal_written_ms(session),
+                newest_record_ms,
+            ) {
                 Some(at) => at,
-                None => self
-                    .read_durable_wal(session)
-                    .await?
-                    .0
-                    .iter()
-                    .rev()
-                    .find_map(|framed| broca_core::record_time_ms(&framed.record))
-                    .unwrap_or(0),
+                None => {
+                    crate::head_time::newest_record_ms(&self.read_durable_wal(session).await?.0)
+                        .unwrap_or(0)
+                }
             };
             let selected_model = head_facts.selected_model();
             let service_tier = head_facts.selection.as_ref().and_then(|selection| {

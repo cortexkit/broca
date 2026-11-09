@@ -2310,6 +2310,9 @@ struct OldLog {
     lineage: Option<String>,
     /// The same lineage id, for today's code that takes it typed.
     lineage_id: Option<broca_wal::WalLineageId>,
+    /// When the log's file was last written, which today's `session.head` serves as the
+    /// session's last update when nothing else says it.
+    written_ms: Option<u64>,
 }
 
 impl OldLog {
@@ -2319,6 +2322,7 @@ impl OldLog {
             records,
             lineage: lineage_id.map(|id| id.to_string()),
             lineage_id,
+            written_ms: broca_module::head_time::file_written_ms(path),
         }
     }
 }

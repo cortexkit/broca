@@ -149,6 +149,13 @@ pub(super) fn run(args: &Args) {
                 Err(error) => return refused(&mut report, &name, error),
             };
         let _ = std::fs::remove_dir_all(&staging);
+        // As a move records it: the last update today's head serves for the session.
+        let todays_updated_at =
+            broca_module::head_time::updated_at_of_wal(&old.records, old.written_ms);
+        let moved = broca_session_store::record::Moved {
+            move_id: "store-move:move-check".into(),
+            source_activity_ms: todays_updated_at,
+        };
         let stage = Stage {
             records: &old.records,
             lineage: old.lineage.as_deref(),
@@ -157,6 +164,7 @@ pub(super) fn run(args: &Args) {
             store_root: &store_root,
             staging: &staging,
             media: None,
+            moved: &moved,
         };
         let staged = match block_on(broca_session_convert::stage::write(&stage, prepared)) {
             Ok(staged) => staged,
@@ -176,6 +184,7 @@ pub(super) fn run(args: &Args) {
             mode,
             media: None,
             media_root: None,
+            todays_updated_at,
         }));
         match verified {
             Ok(verified) => {
