@@ -38,8 +38,8 @@
 //! through `route.account_observe`: `admission_started` once `RunStarted` is durable, one report
 //! per provider attempt once its record is durable, and `run_finished` once the terminal is.
 //! Reports are sent once, in order, from a task of their own: they never block a run and are
-//! never retried. `run_finished` also ends the run's lease in routing, so broca never sends
-//! `route.account_release`.
+//! never resent after possible delivery. `run_finished` also ends the run's lease in routing,
+//! so broca never sends `route.account_release`.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -314,14 +314,17 @@ enum RouteSlot {
 
 /// The routing module's management route over the shared subc connection. The route is opened
 /// once, in a task of its own, so a caller that stops waiting (its admission budget ran out)
-/// does not abandon the open: the next caller finds the route ready. A request that fails on
-/// the connection forgets the route, and the next request opens a fresh one.
+/// does not abandon the open: the next caller finds the route ready. Connection errors forget
+/// the route. Only a stale handle, which proves the request was not sent, reopens and retries
+/// once within the caller's existing budget; other failures wait for the next request.
 pub struct SubcRoutingTransport {
     conn: Arc<broca_subc::SubcConnection>,
     module_id: String,
     identity: BindIdentity,
     route: Arc<Mutex<RouteSlot>>,
     capabilities: tokio::sync::Mutex<Option<(broca_subc::RouteHandle, Vec<String>)>>,
+    #[cfg(test)]
+    stale_opens_for_test: std::sync::atomic::AtomicUsize,
 }
 
 impl SubcRoutingTransport {
@@ -336,6 +339,8 @@ impl SubcRoutingTransport {
             identity,
             route: Arc::new(Mutex::new(RouteSlot::Empty)),
             capabilities: tokio::sync::Mutex::new(None),
+            #[cfg(test)]
+            stale_opens_for_test: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -369,11 +374,29 @@ impl SubcRoutingTransport {
                 }
             }
         };
-        let opened = opening
-            .wait_for(Option::is_some)
-            .await
-            .map_err(|_| "the routing route open was abandoned".to_string())?;
-        opened.clone().expect("waited for a result")
+        let handle = {
+            let opened = opening
+                .wait_for(Option::is_some)
+                .await
+                .map_err(|_| "the routing route open was abandoned".to_string())?;
+            opened.clone().expect("waited for a result")?
+        };
+        #[cfg(test)]
+        if self
+            .stale_opens_for_test
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok()
+        {
+            // Close before returning so tests can force a stale reopened handle without
+            // racing the connection reader's processing of a daemon Goodbye.
+            self.conn
+                .route_close(&handle)
+                .await
+                .expect("close test route");
+        }
+        Ok(handle)
     }
 
     fn forget(&self, failed: broca_subc::RouteHandle) {
@@ -382,6 +405,37 @@ impl SubcRoutingTransport {
             *slot = RouteSlot::Empty;
         }
     }
+
+    async fn request_on_cached_route(
+        &self,
+        body: Vec<u8>,
+        request_error: impl Fn(broca_subc::ConnError) -> String,
+    ) -> Result<(broca_subc::RouteHandle, Result<Vec<u8>, Vec<u8>>), String> {
+        let route = self.route().await?;
+        match self.conn.route_request_terminal(&route, body.clone()).await {
+            Ok(reply) => return Ok((route, reply)),
+            Err(error) => {
+                self.forget(route);
+                if !matches!(error, broca_subc::ConnError::StaleRouteHandle(_)) {
+                    return Err(request_error(error));
+                }
+            }
+        }
+
+        // A stale handle fails before the request frame is built or queued to subc's writer.
+        // Reopen only for that proof of non-delivery, never for a failed or missing reply.
+        let route = self.route().await?;
+        let reply = self
+            .conn
+            .route_request_terminal(&route, body)
+            .await
+            .map_err(|error| {
+                self.forget(route);
+                request_error(error)
+            })?;
+        Ok((route, reply))
+    }
+
     async fn supports(&self, capability: &str) -> Result<bool, String> {
         let route = self.route().await?;
         let mut cached = self.capabilities.lock().await;
@@ -390,18 +444,13 @@ impl SubcRoutingTransport {
                 return Ok(capabilities.iter().any(|name| name == capability));
             }
         }
-        let response = self
-            .conn
-            .route_request_terminal(
-                &route,
+        let (route, response) = self
+            .request_on_cached_route(
                 serde_json::to_vec(&json!({"method":"role.describe","params":{}}))
                     .expect("describe JSON"),
+                |error| error.to_string(),
             )
-            .await
-            .map_err(|error| {
-                self.forget(route);
-                error.to_string()
-            })?;
+            .await?;
         let capabilities = match response {
             Ok(body) => serde_json::from_slice::<Value>(&body)
                 .ok()
@@ -430,14 +479,11 @@ impl RoutingTransport for SubcRoutingTransport {
         self.supports("observe_credential_refused").await
     }
     async fn request(&self, body: Vec<u8>) -> RoutingReply {
-        let route = self.route().await?;
-        match self.conn.route_request_terminal(&route, body).await {
-            Ok(reply) => Ok(reply),
-            Err(error) => {
-                self.forget(route);
-                Err(format!("routing module '{}': {error}", self.module_id))
-            }
-        }
+        self.request_on_cached_route(body, |error| {
+            format!("routing module '{}': {error}", self.module_id)
+        })
+        .await
+        .map(|(_, reply)| reply)
     }
 }
 
@@ -1213,8 +1259,8 @@ impl RoutingClient {
     }
 
     /// Send one report and wait at most [`OBSERVE_BUDGET`] for routing to take it. Never
-    /// retried: a lost report only costs routing that one observation, and routing expires on
-    /// its own the lease of a run whose `run_finished` never arrived.
+    /// resent after possible delivery: a lost report only costs routing that one observation,
+    /// and routing expires on its own the lease of a run whose `run_finished` never arrived.
     pub async fn observe(&self, params: Value) {
         let deadline = tokio::time::Instant::now() + OBSERVE_BUDGET;
         if params["kind"] == "transient_backoff" || params["kind"] == "credential_refused" {

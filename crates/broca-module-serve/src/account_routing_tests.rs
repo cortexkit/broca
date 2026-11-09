@@ -9,6 +9,9 @@ use broca_protocol::{AttemptAccountLimit, AttemptAccountObservation, AttemptOutc
 use broca_subc::vault::ScopedCredential;
 use std::sync::atomic::AtomicUsize;
 
+#[path = "account_routing_transport_tests.rs"]
+mod transport_tests;
+
 #[test]
 fn routed_accounts_discovery_lists_only_self_routed_sign_in_methods() {
     for describe in [
