@@ -268,6 +268,15 @@ fn message_marks_kit_session(session: &str) -> bool {
         })
 }
 
+/// A session the kit's media_refs_* and media_descriptors_* cases open: `cf-media-<counter>`.
+fn media_fixture_session(session: &str) -> bool {
+    session.strip_prefix("cf-media-").is_some_and(|counter| {
+        counter
+            .parse::<u64>()
+            .is_ok_and(|number| number > 0 && number.to_string() == counter)
+    })
+}
+
 fn message_marks_route_stamp(session: &str, stamp: &RouteStamp) -> RouteStamp {
     if message_marks_kit_session(session)
         && stamp.scope.is_none()
@@ -307,6 +316,11 @@ const HARNESS: &str = "conformance";
 /// provider answers with as they are, instead of the result's JSON as one text block.
 const OWN_CONTENT: &str = "$broca_content";
 const OWN_STRUCTURED: &str = "$broca_structured";
+/// The model the kit's media fixture sessions use. It is scripted through the Messages
+/// stream, like the output-refs fixture, and its catalog row differs from that fixture's only
+/// in a context window large enough to send the frame-budget case's two 2.2 MB tool-call
+/// arguments back to the model.
+const MEDIA_FIXTURE_MODEL: &str = "conformance-media-blocks";
 #[cfg(feature = "test-clock")]
 #[path = "llm_runner_conformance/bus.rs"]
 mod bus;
@@ -625,6 +639,12 @@ fn seed_structured_output_catalog(state_root: &Path) -> std::io::Result<()> {
     models.insert(
         format!("{}/{}", output_refs::PROVIDER, output_refs::MODEL),
         output_refs::catalog_row(),
+    );
+    let mut media = output_refs::catalog_row();
+    media["limit.context"] = json!(16_000_000);
+    models.insert(
+        format!("{}/{MEDIA_FIXTURE_MODEL}", output_refs::PROVIDER),
+        media,
     );
     let lkg = json!({
         "catalog_version": 1,
@@ -1010,8 +1030,9 @@ async fn serve_model_request(
             .lock()
             .unwrap()
             .contains_key(&session);
-    if model.ends_with(output_refs::MODEL) || native_messages {
-        let body = if native_messages {
+    let media_fixture = model.ends_with(MEDIA_FIXTURE_MODEL);
+    if model.ends_with(output_refs::MODEL) || native_messages || media_fixture {
+        let body = if native_messages || media_fixture {
             output_refs::stream_for_model(&id, model, &turn)
         } else {
             output_refs::stream(&id, &turn)
@@ -3126,8 +3147,18 @@ impl LlmRunnerSubject for BrocaSubject {
             .lock()
             .unwrap()
             .contains(session);
+        // The kit's media fixtures script an answer as several text parts and check how reads
+        // describe each part. Chat-completions text deltas concatenate into one part, so those
+        // sessions use the Messages stream, whose content blocks keep each scripted part.
+        let model = if media_fixture_session(session) {
+            json!({"provider": output_refs::PROVIDER, "model": MEDIA_FIXTURE_MODEL})
+        } else if markerless {
+            json!({"provider": "mock", "model": format!("{PLAN_MODEL_PREFIX}{session}")})
+        } else {
+            json!({"provider": "mock", "model": "mock-model"})
+        };
         let mut fields = json!({
-            "model": {"provider": "mock", "model": if markerless { format!("{PLAN_MODEL_PREFIX}{session}") } else { "mock-model".into() }},
+            "model": model,
             "tools": [{
                 "name": SCRIPTED_TOOL,
                 "description": "Answers each call with its scripted result.",
@@ -3766,6 +3797,27 @@ impl LlmRunnerSubject for BrocaSubject {
             "type": "image",
             "mimeType": format!("image/png; name={marker}"),
             "data": "aGk=",
+        }]}))
+    }
+
+    /// The media fixture cases' byte-backed image: the scripted tool answers with exactly
+    /// these PNG bytes as its own image block, which broca stores inside that call's
+    /// tool_result. broca keeps a tool's image only inside its result, never as a bare image
+    /// block, so it cannot supply the un-nested form media_descriptors_image_bytes asks for,
+    /// and the kit reports that case inapplicable.
+    fn media_tool_result(&self, bytes: &[u8], nested: bool, _scenario: &str) -> Option<Value> {
+        use base64::Engine;
+        if !nested {
+            return None;
+        }
+        let image = broca_core::media_validation::validate_media(bytes, "image/png")
+            .expect("the kit's media fixture is a valid PNG");
+        Some(json!({OWN_CONTENT:[{
+            "type": "image",
+            "mimeType": "image/png",
+            "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+            "width": image.width,
+            "height": image.height,
         }]}))
     }
 
@@ -4584,7 +4636,7 @@ fn runner_0821_cases_pin_exact_native_outcomes() {
             }
         })
         .collect();
-    assert_eq!(cases.len(), 95);
+    assert_eq!(cases.len(), 105);
     check_0821_cases(&cases).unwrap();
     for index in 0..cases.len() {
         for outcome in [

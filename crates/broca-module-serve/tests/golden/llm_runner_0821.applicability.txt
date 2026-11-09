@@ -54,6 +54,16 @@ N/A plan_notes_system_note_not_full_text: plan_notes is not declared
 PASS media_refs_media_are_refs
 PASS media_refs_large_payloads_inline
 PASS media_refs_descriptor_digests
+N/A media_descriptors_image_bytes: the adapter cannot supply a byte-backed image result
+PASS media_descriptors_nested_media
+PASS media_descriptors_frame_budget
+PASS media_descriptors_utf8_head
+PASS media_descriptors_inline_unchanged
+PASS media_descriptors_full_content_digests
+PASS media_descriptors_pairing
+PASS media_descriptors_part_keys
+PASS media_descriptors_provider_rows
+PASS media_descriptors_stable_across_pages
 N/A read_display_facts_send_id: missing groups: send_ids
 PASS_WITH_INAPPLICABLE_RULE read_display_facts_send_id_when_present: read_display_facts_send_id_unkeyed: runner returned no submission_id; verified absence instead
 N/A call_identity_imported_call_carrier: adapter hook seed_imported_tool_call is unavailable
