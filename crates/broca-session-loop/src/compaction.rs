@@ -98,11 +98,9 @@ pub fn restore(
                 checksum: view.checksum.clone(),
                 edits: serde_json::from_value(view.edits.clone())
                     .map_err(|error| format!("a stored compaction view's edits: {error}"))?,
-                // The new storage doesn't keep a view's build metadata yet; conversion counts
-                // it as lost, so a stored view never had any.
-                built_through: None,
-                new_signed: None,
-                applied_by: None,
+                built_through: view.built_through.clone(),
+                new_signed: view.new_signed.clone(),
+                applied_by: view.applied_by.clone(),
             }),
             Record::ViewApplied(applied) => WalRecord::CompactionViewAppliedV2 {
                 step_id: applied.step_id,
@@ -177,20 +175,14 @@ impl<'w, W: Writer> StoreJournal<'w, W> {
 }
 
 impl<W: Writer> Journal for StoreJournal<'_, W> {
+    /// A view a run's step accepted, which no provider handed over through
+    /// `session.apply_view`, so it names none, as today's loop journal records none.
     async fn accepted(
         &self,
         previous: Option<&ReceivedView>,
         received: &ReceivedView,
     ) -> Result<(), String> {
-        let view = received.view();
-        let edits = serde_json::to_value(v2::storage::encode(previous, received))
-            .map_err(|error| error.to_string())?;
-        self.commit(Record::View(View {
-            version: view.version,
-            checksum: view.checksum.clone(),
-            edits,
-        }))
-        .await
+        self.commit(view_record(previous, received, None)?).await
     }
 
     async fn applied(
@@ -624,24 +616,17 @@ pub async fn seal_ledger<W: Writer>(
 
 /// Whole copies of the views a seal must carry into the new log: the applied view and a
 /// `ViewApplied` naming it for the step that applied it, then the accepted view when it's a
-/// newer one, stored as its change against the applied view carried just before it. Empty when
-/// the session names no view.
+/// newer one, stored as its change against the applied view carried just before it. Each copy
+/// names the provider the state holds for it, so the new log restores who handed each view
+/// over. Empty when the session names no view.
 pub fn carried_views(state: &State, operations: &Operations) -> Result<Vec<Record>, LoopError> {
-    let record = |previous: Option<&ReceivedView>, view: &ReceivedView| {
-        serde_json::to_value(v2::storage::encode(previous, view))
-            .map(|edits| {
-                Record::View(View {
-                    version: view.view().version,
-                    checksum: view.view().checksum.clone(),
-                    edits,
-                })
-            })
-            .map_err(|error| LoopError::Parts(error.to_string()))
+    let record = |previous: Option<&ReceivedView>, view: &ReceivedView, by: Option<&str>| {
+        view_record(previous, view, by).map_err(LoopError::Parts)
     };
     let mut carry = Vec::new();
     let applied = match (state.applied_received(), &operations.view_applied) {
         (Some(applied), Some(slot)) => {
-            carry.push(record(None, applied)?);
+            carry.push(record(None, applied, state.applied_by())?);
             carry.push(Record::ViewApplied(ViewApplied {
                 step_id: slot.step_id,
                 version: applied.view().version,
@@ -659,9 +644,31 @@ pub fn carried_views(state: &State, operations: &Operations) -> Result<Vec<Recor
     if let Some(latest) = state.latest_received().filter(|latest| {
         applied.is_none_or(|applied| latest.view().version != applied.view().version)
     }) {
-        carry.push(record(applied, latest)?);
+        carry.push(record(applied, latest, state.accepted_by())?);
     }
     Ok(carry)
+}
+
+/// The `View` record of `view`, accepted after `previous`: its edits stored as their change
+/// against `previous`, its build metadata as the provider sealed it, and `applied_by`, the
+/// provider that handed it over through `session.apply_view` (`None` for a view a run's step
+/// accepted). Today's journal writes the same fields on its accepted-view record.
+pub fn view_record(
+    previous: Option<&ReceivedView>,
+    view: &ReceivedView,
+    applied_by: Option<&str>,
+) -> Result<Record, String> {
+    let edits = serde_json::to_value(v2::storage::encode(previous, view))
+        .map_err(|error| error.to_string())?;
+    let sealed = view.view();
+    Ok(Record::View(View {
+        version: sealed.version,
+        checksum: sealed.checksum.clone(),
+        edits,
+        built_through: sealed.built_through.clone(),
+        new_signed: sealed.new_signed.clone(),
+        applied_by: applied_by.map(str::to_owned),
+    }))
 }
 
 /// The repetition counters a cut before ordinal `first_kept` must keep: when the cut splits a
@@ -1072,3 +1079,6 @@ pub fn history(estimate: &Estimate) -> CompactionHistory {
     history.previous_model = native.map(|(model, _)| model);
     history
 }
+
+#[cfg(test)]
+mod tests;

@@ -50,6 +50,7 @@ fn model() -> ModelHandle {
 fn start(run: &str, send: Option<&str>) -> Record {
     Record::RunStart(Box::new(RunStart {
         imported_ids: None,
+        message_marks: None,
         run_id: run.into(),
         model: model(),
         setup: Vec::new(),
@@ -115,6 +116,7 @@ fn records_name_their_ids() {
         written_at_ms: None,
         tags_v1: None,
         receipt: Some(json!({"send_id": "steer-1", "delivery": "steer"})),
+        message_marks: None,
     });
     assert_eq!(
         ids(&steer),
@@ -143,6 +145,7 @@ fn records_name_their_ids() {
         request: None,
         receipt: None,
         delivery: None,
+        message_marks: None,
     });
     assert_eq!(
         ids(&queued),

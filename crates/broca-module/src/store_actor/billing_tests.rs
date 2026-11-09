@@ -15,10 +15,11 @@ use broca_store::SqliteStore;
 use tokio::sync::mpsc;
 
 use super::tests::{
-    actor_with, bind, deployment, executor, idle, send, text_step, triple, LoopExecutor, ADDR,
+    actor_with, bind, deployment, executor, idle, send, text_step, triple, Commands, LoopExecutor,
+    ADDR,
 };
 use super::StoreActor;
-use crate::actor::{LineageCmd, SendOutcome};
+use crate::actor::SendOutcome;
 use crate::store_billing::StoreBilling;
 
 /// What an insert into [`Export`] does.
@@ -140,7 +141,7 @@ async fn open_billed(
     parts: &SharedParts,
     export: &Arc<Export>,
     create: bool,
-) -> (mpsc::UnboundedSender<LineageCmd>, Served) {
+) -> (Commands, Served) {
     let addr = SessionAddr(ADDR.into());
     let session = if create {
         Session::create(backend, addr, triple(), &deployment(), false).await
@@ -151,7 +152,10 @@ async fn open_billed(
     let actor = StoreActor::new(bind(), session, Arc::new(executor), Box::new(parts.clone()))
         .with_billing(billing(export));
     let (commands, receiver) = mpsc::unbounded_channel();
-    (commands, tokio::spawn(actor.serve(receiver)))
+    (
+        Commands::over(commands, backend),
+        tokio::spawn(actor.serve(receiver)),
+    )
 }
 
 fn parts() -> SharedParts {
@@ -183,7 +187,7 @@ async fn billed(session: &Session<&'static MemoryBackend>) -> Vec<String> {
         .collect()
 }
 
-async fn ran(commands: &mpsc::UnboundedSender<LineageCmd>, run_id: &str, text: &str) {
+async fn ran(commands: &Commands, run_id: &str, text: &str) {
     assert!(matches!(
         send(commands, run_id, text).await,
         SendOutcome::Active { .. }
@@ -445,6 +449,8 @@ async fn an_imported_session_owes_nothing_and_a_later_run_is_billed_once() {
         false,
     )
     .await;
+    // The session's creating send was the import's, not this caller's.
+    commands.caller().joins_existing();
     idle(&commands).await;
     assert!(export.facts().is_empty(), "open billed an imported run");
     ran(&commands, "r1", "first").await;

@@ -150,6 +150,7 @@ fn queued(
     set(&mut object, "written_at_ms", send.written_at_ms);
     set(&mut object, "ts_ms", send.ts_ms);
     set(&mut object, "delivery", send.delivery.as_ref());
+    set(&mut object, "message_marks", send.message_marks.as_ref());
     let mut request = members(send.request.as_ref())?;
     request.insert("input".into(), json(&send.input));
     for part in &send.setup {
@@ -241,6 +242,7 @@ fn steered(steer: &Steer, claimed: &[&Record]) -> Result<Value, String> {
     object.insert("input".into(), json(&steer.input));
     set(&mut object, "written_at_ms", steer.written_at_ms);
     set(&mut object, "tags", steer.tags_v1.as_ref());
+    set(&mut object, "message_marks", steer.message_marks.as_ref());
     Ok(Value::Object(object))
 }
 
@@ -293,9 +295,12 @@ fn send_delivered(delivery: &Delivery, claimed: &[&Record]) -> Result<Value, Str
                 sender: ride.sender.clone(),
                 forms: ride.forms.clone(),
                 form,
-                // The forward conversion counts a ride's message marks as lost, so a stored
-                // ride never had any.
-                speaks_for: None,
+                speaks_for: ride
+                    .speaks_for
+                    .as_ref()
+                    .map(|stored| serde_json::from_value(stored.clone()))
+                    .transpose()
+                    .map_err(|error| format!("send_delivered: a ride's speaks_for: {error}"))?,
             };
             object.insert("ride".into(), json(&ride));
         }
@@ -747,12 +752,17 @@ impl Inverse {
                 object.insert("sequential".into(), json(held.sequential));
                 Value::Object(object)
             }
-            Record::View(view) => serde_json::json!({
-                "type": "compaction_view_v2",
-                "version": view.version,
-                "checksum": view.checksum,
-                "edits": view.edits,
-            }),
+            Record::View(view) => {
+                let mut object = Map::new();
+                object.insert("type".into(), json("compaction_view_v2"));
+                object.insert("version".into(), json(view.version));
+                object.insert("checksum".into(), json(&view.checksum));
+                object.insert("edits".into(), view.edits.clone());
+                set(&mut object, "built_through", view.built_through.as_ref());
+                set(&mut object, "new_signed", view.new_signed.as_ref());
+                set(&mut object, "applied_by", view.applied_by.as_ref());
+                Value::Object(object)
+            }
             Record::ViewApplied(applied) => serde_json::json!({
                 "type": "compaction_view_applied_v2",
                 "step_id": applied.step_id,

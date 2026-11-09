@@ -1566,12 +1566,13 @@ struct CompactionScript {
 enum Ride {
     /// A view that drops the whole entry at this ordinal.
     Drop(u64),
+    /// A view that shortens a tool output without removing the request's final turn.
+    Trim(u64),
     /// A view that cuts through the entry at this ordinal: it and everything before it no
     /// longer render.
     Cut(u64),
-    /// A view that cuts through the entry at the first ordinal and drops the whole entry at the
-    /// second.
-    CutAndDrop(u64, u64),
+    /// A view that cuts through the first ordinal and shortens the tool output at the second.
+    CutAndTrim(u64, u64),
 }
 
 /// A compaction provider that answers from a script and records every call, so both loops must
@@ -1580,6 +1581,7 @@ enum Ride {
 struct CompactionSpy {
     rides: Mutex<VecDeque<Ride>>,
     mids: Mutex<std::collections::BTreeMap<u64, String>>,
+    tool_parts: Mutex<std::collections::BTreeMap<u64, (String, String)>>,
     version: std::sync::atomic::AtomicU64,
     calls: Mutex<Vec<(String, Value)>>,
     /// The one answer that says the provider lost its Setup, if the comparison scripts one.
@@ -1608,6 +1610,7 @@ impl CompactionSpy {
         Self {
             rides: Mutex::new(script.rides.iter().copied().collect()),
             mids: Mutex::default(),
+            tool_parts: Mutex::default(),
             version: Default::default(),
             calls: Mutex::default(),
             lost: Mutex::new(LOST.try_with(|lost| *lost).ok()),
@@ -1681,19 +1684,39 @@ fn rename(value: &mut Value, names: &mut std::collections::HashMap<String, usize
     }
 }
 
-/// Every `(ordinal, mid)` pair an entry in `value` names.
-fn entry_mids(value: &Value, out: &mut std::collections::BTreeMap<u64, String>) {
+/// Remember entry ids and the latest tool-part digests from notices, so a replacement names
+/// the completed output it was built from rather than the earlier running call.
+fn remember_entries(
+    value: &Value,
+    mids: &mut std::collections::BTreeMap<u64, String>,
+    tool_parts: &mut std::collections::BTreeMap<u64, (String, String)>,
+) {
     match value {
         Value::Object(members) => {
             if let (Some(ordinal), Some(mid)) = (
                 members.get("ordinal").and_then(Value::as_u64),
                 members.get("mid").and_then(Value::as_str),
             ) {
-                out.insert(ordinal, mid.to_owned());
+                mids.insert(ordinal, mid.to_owned());
+                if let Some(parts) = members.get("parts").and_then(Value::as_array) {
+                    if let Some(tool) = parts.iter().find(|part| part["kind"] == "tool") {
+                        tool_parts.insert(
+                            ordinal,
+                            (
+                                tool["id"].as_str().unwrap().to_owned(),
+                                tool["digest"].as_str().unwrap().to_owned(),
+                            ),
+                        );
+                    }
+                }
             }
-            members.values().for_each(|member| entry_mids(member, out));
+            members
+                .values()
+                .for_each(|member| remember_entries(member, mids, tool_parts));
         }
-        Value::Array(items) => items.iter().for_each(|item| entry_mids(item, out)),
+        Value::Array(items) => items
+            .iter()
+            .for_each(|item| remember_entries(item, mids, tool_parts)),
         _ => {}
     }
 }
@@ -1723,7 +1746,11 @@ impl broca_core::CompactionPlane for CompactionSpy {
         _: u64,
     ) -> Result<Box<serde_json::value::RawValue>, broca_core::compaction_v2::runtime::CallError>
     {
-        entry_mids(&params, &mut self.mids.lock().unwrap());
+        remember_entries(
+            &params,
+            &mut self.mids.lock().unwrap(),
+            &mut self.tool_parts.lock().unwrap(),
+        );
         // The scope the call is routed under is part of what both loops must do alike.
         let routed = match scope {
             Some(scope) => format!("{method} scope={}", scope.scope_ref),
@@ -1749,6 +1776,16 @@ impl broca_core::CompactionPlane for CompactionSpy {
                 Some(ride) => {
                     use cortexkit_role_compaction::view::{Edit, EditOp, View};
                     let mid = |ordinal: u64| self.mids.lock().unwrap()[&ordinal].clone();
+                    let trim = |ordinal| {
+                        let (part, expect) = self.tool_parts.lock().unwrap()[&ordinal].clone();
+                        EditOp::Replace {
+                            mid: mid(ordinal),
+                            part,
+                            field: "output".into(),
+                            value: json!("compacted tool output"),
+                            expect,
+                        }
+                    };
                     let version = 1 + self
                         .version
                         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1757,16 +1794,13 @@ impl broca_core::CompactionPlane for CompactionSpy {
                             mid: mid(ordinal),
                             part: None,
                         }],
+                        Ride::Trim(ordinal) => vec![trim(ordinal)],
                         Ride::Cut(ordinal) => vec![EditOp::Cut {
                             through: mid(ordinal),
                         }],
-                        Ride::CutAndDrop(cut, drop) => vec![
-                            EditOp::Cut { through: mid(cut) },
-                            EditOp::Drop {
-                                mid: mid(drop),
-                                part: None,
-                            },
-                        ],
+                        Ride::CutAndTrim(cut, tool) => {
+                            vec![EditOp::Cut { through: mid(cut) }, trim(tool)]
+                        }
                     };
                     let view = View::seal(
                         version,
@@ -2416,6 +2450,14 @@ async fn new_from(
     outcome_keys_name_their_place(&writer);
     if !resuming {
         media_reads_back(writer.session).await;
+        if writer.operations().view_applied.is_none() {
+            assert!(writer.conversation().marker.is_none());
+            assert_eq!(
+                writer.conversation().window_start(),
+                1,
+                "without an applied view the run must not seal history"
+            );
+        }
     }
     let all: Vec<Record> = held.iter().chain(&records).cloned().collect();
     Outcome {
@@ -3567,7 +3609,7 @@ async fn compare_runs_in_once(scenario: Scenario, runs: &[(&str, Vec<Message>)])
         script
             .rides
             .iter()
-            .any(|ride| matches!(ride, Ride::Cut(_) | Ride::CutAndDrop(..)))
+            .any(|ride| matches!(ride, Ride::Cut(_) | Ride::CutAndTrim(..)))
     }) {
         sealed_at_the_cut(writer.session, &triple, &bind).await;
     }
@@ -3892,6 +3934,7 @@ impl SteerSink for NewSink {
                 written_at_ms,
                 tags_v1,
                 receipt,
+                message_marks: None,
             }));
     }
 
@@ -6584,7 +6627,7 @@ async fn a_provider_that_lost_its_setup_mid_run_gets_setup_before_the_next_step(
     ] {
         let script = || CompactionScript {
             context_limit,
-            rides: vec![Ride::Drop(2)],
+            rides: vec![Ride::Trim(2)],
         };
         let scenario = compacted_scenario(steps);
         LOST.scope(lost, compare_compacted(scenario.clone(), script()))
@@ -6656,7 +6699,7 @@ async fn a_compacted_tool_call_then_an_answer() {
 }
 
 /// A tool result pushes the next request over the window; the step rides, the provider answers
-/// with a view that drops the call's entry, and the step renders from that view.
+/// with a view that shortens the output but keeps the final tool turn, and the step renders it.
 #[tokio::test]
 async fn an_over_limit_step_rides_and_renders_from_the_view_it_gets() {
     compare_compacted(
@@ -6670,7 +6713,7 @@ async fn an_over_limit_step_rides_and_renders_from_the_view_it_gets() {
         ]),
         CompactionScript {
             context_limit: 1_200,
-            rides: vec![Ride::Drop(2)],
+            rides: vec![Ride::Trim(2)],
         },
     )
     .await;
@@ -6689,7 +6732,7 @@ async fn every_cut_of_an_over_limit_ride_resumes_alike() {
         ]),
         CompactionScript {
             context_limit: 1_200,
-            rides: vec![Ride::Drop(2)],
+            rides: vec![Ride::Trim(2)],
         },
     )
     .await;
@@ -6713,7 +6756,7 @@ async fn a_compacted_run_with_every_send_fact_calls_compaction_alike() {
                 ]),
                 CompactionScript {
                     context_limit: 1_200,
-                    rides: vec![Ride::Drop(2)],
+                    rides: vec![Ride::Trim(2)],
                 },
             )
             .await;
@@ -6831,9 +6874,9 @@ async fn a_cut_past_two_runs_keeps_only_the_runs_that_shape_requests() {
 }
 
 /// A run whose repeated failing call spans a cut: two failures, then a big result pushes the next
-/// request over the window, and the provider cuts through the first failure and drops the big
-/// call. The new loop seals that history mid-run, so the third failure's warning must still count
-/// the sealed first one, from the counters the seal kept.
+/// request over the window, and the provider cuts through the first failure and trims the big
+/// output. Sealing that history mid-run must keep the repetition counters, so the third failure's
+/// warning still counts the sealed first failure.
 fn repetition_across_a_cut_scenario() -> Scenario {
     let tools = vec![
         tool("grep", ExecutionMode::Parallel),
@@ -6875,7 +6918,7 @@ fn repetition_cut() -> CompactionScript {
         context_limit: 1_200,
         // Entries: the input (1), each call with its result, then its empty results entry
         // (2-3 and 4-5 the failures, 6-7 the big call).
-        rides: vec![Ride::CutAndDrop(3, 6)],
+        rides: vec![Ride::CutAndTrim(3, 6)],
     }
 }
 
@@ -6912,8 +6955,8 @@ async fn a_run_after_a_cut_through_an_earlier_run_continues_alike() {
                     // The first run's answer adds to the token estimate per request byte, so the
                     // window is a little larger than the single-run scenario's.
                     context_limit: 1_600,
-                    // The first run's entries are 1-2, so the cut and drop move up by two.
-                    rides: vec![Ride::CutAndDrop(5, 8)],
+                    // The first run's entries are 1-2, so the cut and trimmed tool move up by two.
+                    rides: vec![Ride::CutAndTrim(5, 8)],
                 })),
                 Box::pin(compare_runs_in(
                     scenario,
@@ -6946,7 +6989,7 @@ async fn a_ledger_seal_between_runs_keeps_the_compaction_views() {
                 COMPACTION.scope(
                     Some(Arc::new(CompactionScript {
                         context_limit: 1_200,
-                        rides: vec![Ride::Drop(2)],
+                        rides: vec![Ride::Trim(2)],
                     })),
                     Box::pin(compare_runs_in(
                         compacted_scenario(vec![
@@ -6961,6 +7004,65 @@ async fn a_ledger_seal_between_runs_keeps_the_compaction_views() {
                         &[("r1", vec![user("read a")]), ("r2", vec![user("more")])],
                     )),
                 ),
+            ),
+        )
+        .await;
+}
+
+/// Removing the final tool turn is refused, not accepted as a smaller request. Both loops
+/// report the same rule and leave no view or cut to apply or seal.
+#[tokio::test]
+async fn a_view_dropping_the_final_tool_turn_is_refused_alike() {
+    LAYOUT
+        .scope(
+            Some(cortexkit_compaction_view::PLAN_VERSION),
+            COMPACTION.scope(
+                Some(Arc::new(CompactionScript {
+                    context_limit: 1_200,
+                    rides: vec![Ride::Drop(2)],
+                })),
+                with_each_writer(|| async {
+                    let scenario = compacted_scenario(vec![
+                        answer(
+                            "a1",
+                            vec![call("c1", "big", json!({}))],
+                            FinishReason::ToolCalls,
+                        ),
+                        text_step("a2", "done"),
+                    ]);
+                    let today = Box::pin(today(&scenario)).await;
+                    let new = Box::pin(new_loop(&scenario)).await;
+                    assert_same(&today, &new);
+                    for outcome in [&today, &new] {
+                        let events: Vec<Value> = outcome
+                            .calls
+                            .iter()
+                            .filter_map(|call| call.strip_prefix("compaction.notice "))
+                            .map(|params| serde_json::from_str::<Value>(params).unwrap())
+                            .flat_map(|params| {
+                                params["events"].as_array().cloned().unwrap_or_default()
+                            })
+                            .collect();
+                        assert_eq!(
+                            events,
+                            vec![json!({
+                                "event": "view_refused",
+                                "version": 1,
+                                "refusal": {
+                                    "code": "rule",
+                                    "rule": "final_turn_removed",
+                                    "index": 0,
+                                },
+                            })]
+                        );
+                        for record in &outcome.records {
+                            for kind in ["View", "ViewApplied", "Marker"] {
+                                assert!(record.get(kind).is_none(), "unexpected {record}");
+                            }
+                        }
+                        assert_eq!(outcome.requests.len(), 1, "no over-window request sent");
+                    }
+                }),
             ),
         )
         .await;
@@ -8826,7 +8928,7 @@ async fn an_enrolled_session_serves_and_renders_its_history_on_the_contract() {
 }
 
 /// A view the compaction provider hands over on the enrolling run, which cuts through history
-/// before the enrollment point and drops the run's own big call, applies to the enrolled
+/// before the enrollment point and trims the run's own big output, applies to the enrolled
 /// session's entries, and its cut seals history through the enrollment point. Reloaded, the
 /// session serves the same entries, sealed reads and numbers.
 #[tokio::test]
@@ -8855,12 +8957,12 @@ async fn a_cut_and_a_view_on_the_enrolling_run_seal_through_the_enrollment_and_r
             };
             let cut = ordinal_of("done with a");
             // The enrolling run's big tool result puts its second request over the window; the
-            // provider answers the ride with a view that cuts through an earlier message and drops
-            // the big call, and the step renders from it.
+            // provider answers the ride with a view that cuts through an earlier message and trims
+            // the big output without removing the final tool turn, and the step renders it.
             let big_call = session.conversation.placed + 2;
             let spy = CompactionSpy::new(&CompactionScript {
                 context_limit: 1_200,
-                rides: vec![Ride::CutAndDrop(cut, big_call)],
+                rides: vec![Ride::CutAndTrim(cut, big_call)],
             });
             let mut enrolling = enrolling_run(vec![
                 answer(
@@ -8875,6 +8977,7 @@ async fn a_cut_and_a_view_on_the_enrolling_run_seal_through_the_enrollment_and_r
                 .await
                 .expect("the enrolling run");
             let enrolled = session.operations.enrolled.clone().unwrap();
+            assert!(session.operations.view_applied.is_some());
             assert!(
                 session.conversation.window_start() > 1,
                 "the cut sealed history: {:?}",
@@ -8897,6 +9000,19 @@ async fn a_cut_and_a_view_on_the_enrolling_run_seal_through_the_enrollment_and_r
                 .iter()
                 .any(|text| text.contains("count the rows")));
             assert_eq!(text_of(&requests[1].prompt[0]), ENROLLED_SYSTEM);
+            let blocks: Vec<_> = requests[1]
+                .prompt
+                .iter()
+                .flat_map(|message| &message.content)
+                .collect();
+            assert!(blocks.iter().any(|block| {
+                matches!(block, ContentBlock::ToolCall(call) if call.tool_call_id.0 == "c3")
+            }));
+            assert!(blocks.iter().any(|block| {
+                matches!(block, ContentBlock::ToolResult(result)
+                    if result.tool_call_id.0 == "c3"
+                        && result.output == ToolOutput::Text { text: "compacted tool output".into() })
+            }));
 
             let entries = served_entries(&session).await;
             let sealed_mid = read_before

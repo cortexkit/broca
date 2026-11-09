@@ -2,7 +2,7 @@
 //! installing the compaction provider's first view of the imported history.
 
 use broca_session_store::backend::SessionBackend;
-use broca_session_store::record::{Record, View, ViewApplied};
+use broca_session_store::record::{Record, ViewApplied};
 use broca_wire::head_import::InstallViewReply;
 
 use super::StoreActor;
@@ -282,18 +282,14 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 )
             };
         }
-        let edits =
-            match serde_json::to_value(broca_core::compaction_v2::storage::encode(None, &received))
-            {
-                Ok(edits) => edits,
-                Err(error) => return refuse("invalid_params", &error.to_string()),
-            };
+        // An installed view names no provider that handed it over: no `session.apply_view`
+        // accepted it.
+        let view_record = match broca_session_loop::compaction::view_record(None, &received, None) {
+            Ok(record) => record,
+            Err(error) => return refuse("invalid_params", &error),
+        };
         let records = [
-            Record::View(View {
-                version: reply.version,
-                checksum: reply.checksum.clone(),
-                edits,
-            }),
+            view_record,
             // No step has run: the view is the one the session's first step applies.
             Record::ViewApplied(ViewApplied {
                 step_id: 0,

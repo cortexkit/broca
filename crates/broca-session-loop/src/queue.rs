@@ -94,6 +94,8 @@ pub fn queued_send(
         request: (!rest.is_empty()).then_some(Value::Object(rest)),
         receipt,
         delivery,
+        // Today's actor admits no display marks on a send yet, so its queued record has none.
+        message_marks: None,
     })
 }
 
@@ -160,6 +162,8 @@ pub fn steer(
         written_at_ms,
         tags_v1: None,
         receipt,
+        // Today's actor admits no display marks on a steer yet, so its record has none.
+        message_marks: None,
     })
 }
 

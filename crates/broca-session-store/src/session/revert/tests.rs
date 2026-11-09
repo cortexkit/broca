@@ -49,6 +49,7 @@ fn model() -> ModelHandle {
 fn start(run: &str, send: &str) -> Record {
     Record::RunStart(Box::new(RunStart {
         imported_ids: None,
+        message_marks: None,
         run_id: run.into(),
         model: model(),
         setup: Vec::new(),
@@ -470,6 +471,7 @@ fn a_revert_refuses_open_work_and_wrong_targets(cipher: Cipher) {
                     request: None,
                     receipt: None,
                     delivery: None,
+                    message_marks: None,
                 })],
                 true,
             )

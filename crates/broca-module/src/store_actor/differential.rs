@@ -461,7 +461,7 @@ async fn compare(script: Vec<Vec<NormalizedEvent>>, gated: bool, steps: Vec<Step
                 let old = today
                     .send(run_id, sent.clone(), send_key(), delivery, class)
                     .await;
-                let new = super::tests::send_labelled(
+                let new = super::tests::send_exactly(
                     &commands,
                     run_id,
                     sent,

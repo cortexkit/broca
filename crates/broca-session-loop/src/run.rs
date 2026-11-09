@@ -180,6 +180,8 @@ pub struct SendFacts {
     /// What the input hooks did to the run's input, as evidence: the input itself is already
     /// the hooks' final value.
     pub hooks: Option<broca_wal::Hooks>,
+    /// The send's display marks, which the run's start records for its input.
+    pub message_marks: Option<broca_protocol::MessageMarks>,
 }
 
 /// The seams a run calls. None of them is owned by the run.
@@ -1398,6 +1400,7 @@ pub fn admission_of_start(
             )?,
             scope: decode(start.scope.clone())?,
             hooks: decode(start.hooks.clone())?,
+            message_marks: decode(start.message_marks.clone())?,
         },
         pre_model_error: None,
         applies_refresh: None,
@@ -2618,6 +2621,7 @@ async fn admit<W: Writer>(
     }
     records.push(Record::RunStart(Box::new(RunStart {
         imported_ids: None,
+        message_marks: to_value(admission.send.message_marks.as_ref())?,
         run_id: admission.run_id.clone(),
         model: admission.model.clone(),
         setup,
@@ -4953,6 +4957,13 @@ fn tool_batch_deliveries(
                     })
                     .collect(),
                 form: RideForm::Append,
+                // The agent the queued send's marks say its module spoke for, as today's
+                // envelope takes it from the queued record.
+                speaks_for: pending
+                    .message_marks
+                    .as_ref()
+                    .and_then(|marks| marks.get("speaks_for"))
+                    .cloned(),
             }),
         }));
         records.push(Record::Delivery(Delivery {

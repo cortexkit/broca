@@ -51,12 +51,15 @@ pub struct Legacy {
     pub runner_bases: BTreeMap<u64, u64>,
 }
 
-/// Who sent the send that placed a message, and the `client_message_id` it carried, as today's
-/// display facts name them: on every message of a run's input or of a steer or delivered send.
+/// Who sent the send that placed a message, the `client_message_id` it carried, and its display
+/// marks, as today's display facts name them: on every message of a run's input or of a steer
+/// or delivered send.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SendDisplay {
     pub sender: Option<String>,
     pub client_message_id: Option<String>,
+    /// llm-runner's `MessageMarks` JSON.
+    pub marks: Option<serde_json::Value>,
 }
 
 /// Today's send display facts for `old`, by position, from the fold today's read runs over the
@@ -74,6 +77,10 @@ fn send_display(old: &[FramedRecord], lineage: Option<&str>) -> BTreeMap<u64, Se
         let row = SendDisplay {
             sender: version.facts.sender,
             client_message_id: version.facts.client_message_id,
+            marks: version
+                .facts
+                .message_marks
+                .map(|marks| serde_json::to_value(marks).expect("marks encode")),
         };
         if row == SendDisplay::default() {
             display.remove(&version.ordinal);
@@ -359,7 +366,7 @@ pub fn record(
     EntryFacts {
         client_message_id: display.and_then(|display| display.client_message_id.clone()),
         sender: display.and_then(|display| display.sender.clone()),
-        marks: None,
+        marks: display.and_then(|display| display.marks.clone()),
         no_display_facts: None,
         reasoning_summaries: Vec::new(),
         rich_ui: None,

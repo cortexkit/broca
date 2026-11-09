@@ -194,6 +194,9 @@ pub struct InstallViewCommand {
 #[derive(Clone)]
 pub struct ApplyViewCommand {
     pub view: Box<serde_json::value::RawValue>,
+    /// The caller the route admitted as the session's compaction provider, which the accepted
+    /// view records as the module that applied it.
+    pub caller: Option<String>,
 }
 
 /// How the store actor answered a [`StoreCommand`].
@@ -620,6 +623,7 @@ fn seed_start(
         seeded: Some(true),
         refusal_schedule: None,
         imported_ids: None,
+        message_marks: None,
     })
 }
 

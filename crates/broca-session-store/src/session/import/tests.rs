@@ -86,6 +86,7 @@ fn start(run: &str, seeded: bool) -> Record {
         seeded: seeded.then_some(true),
         refusal_schedule: None,
         imported_ids: None,
+        message_marks: None,
     }))
 }
 

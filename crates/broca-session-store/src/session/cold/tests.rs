@@ -49,6 +49,7 @@ fn model() -> ModelHandle {
 fn start(run: &str, at: u64) -> Record {
     Record::RunStart(Box::new(RunStart {
         imported_ids: None,
+        message_marks: None,
         run_id: run.into(),
         model: model(),
         setup: Vec::new(),

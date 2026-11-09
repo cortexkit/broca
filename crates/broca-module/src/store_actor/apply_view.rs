@@ -21,7 +21,7 @@ use broca_core::compaction_v2::{
     state::{Journal, State},
 };
 use broca_session_store::backend::SessionBackend;
-use broca_session_store::record::{Record, View};
+use broca_session_store::record::Record;
 use broca_session_store::session::Session;
 use tokio::sync::oneshot;
 
@@ -29,9 +29,11 @@ use super::StoreActor;
 use crate::store_import::{ApplyViewCommand, ImportRefusal, StoreOutcome};
 
 /// Writes an accepted view through the actor's own session, keeping what it appended so a
-/// running run's copy of the session catches up with it.
+/// running run's copy of the session catches up with it. The view records the provider that
+/// handed it over, as today's journal records `session.apply_view`'s admitted caller.
 struct ActorJournal<'s, B: SessionBackend> {
     session: tokio::sync::Mutex<&'s mut Session<B>>,
+    applied_by: Option<&'s str>,
     appended: std::sync::Mutex<Vec<(u64, Record)>>,
 }
 
@@ -41,14 +43,8 @@ impl<B: SessionBackend> Journal for ActorJournal<'_, B> {
         previous: Option<&ReceivedView>,
         received: &ReceivedView,
     ) -> Result<(), String> {
-        let view = received.view();
-        let edits = serde_json::to_value(v2::storage::encode(previous, received))
-            .map_err(|error| error.to_string())?;
-        let record = Record::View(View {
-            version: view.version,
-            checksum: view.checksum.clone(),
-            edits,
-        });
+        let record =
+            broca_session_loop::compaction::view_record(previous, received, self.applied_by)?;
         let seq = self
             .session
             .lock()
@@ -144,6 +140,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         let conditions = v2::host::conditions(&config, &entries, false, None)?;
         let journal = ActorJournal {
             session: tokio::sync::Mutex::new(&mut self.session),
+            applied_by: command.caller.as_deref(),
             appended: Default::default(),
         };
         let answer = match state
@@ -156,7 +153,12 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             )
             .await?
         {
-            Ok(()) => ApplyViewAnswer::Accepted,
+            Ok(()) => {
+                // The state names the provider too, as today's actor sets it, so the step that
+                // applies the view, and a seal carrying it, keep who handed it over.
+                state.restore_accepted_by(command.caller.clone());
+                ApplyViewAnswer::Accepted
+            }
             Err(refusal) => ApplyViewAnswer::Refused { refusal },
         };
         let appended = journal

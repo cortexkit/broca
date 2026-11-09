@@ -49,6 +49,7 @@ fn model() -> ModelHandle {
 fn start(run: &str) -> Record {
     Record::RunStart(Box::new(RunStart {
         imported_ids: None,
+        message_marks: None,
         run_id: run.into(),
         model: model(),
         setup: Vec::new(),
@@ -460,6 +461,9 @@ fn a_seal_carries_ledger_records_into_the_new_log(cipher: Cipher) {
             version: 3,
             checksum: "c3".into(),
             edits: serde_json::json!([]),
+            built_through: None,
+            new_signed: None,
+            applied_by: None,
         });
         loaded
             .seal_carrying(

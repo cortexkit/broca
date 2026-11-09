@@ -13,13 +13,14 @@ use broca_session_store::record::Record;
 use broca_session_store::session::{Carry, Session};
 use tokio::sync::{mpsc, oneshot};
 
-use super::tests::{actor_with, executor, idle, read_step, reopen, send, text_step};
+use super::tests::{actor_with, executor, idle, read_step, reopen, send, text_step, Commands};
 use crate::actor::{LineageCmd, SubscribeOutcome};
 use crate::fanout::{ControlEvent, Delivery, FromCursor, ResumeCursorProof};
 
-type Commands = mpsc::UnboundedSender<LineageCmd>;
+/// A store actor's command channel, as the subscribe and read helpers use it.
+type Sender = mpsc::UnboundedSender<LineageCmd>;
 
-async fn subscribe(commands: &Commands, from: FromCursor, live: bool) -> mpsc::Receiver<Delivery> {
+async fn subscribe(commands: &Sender, from: FromCursor, live: bool) -> mpsc::Receiver<Delivery> {
     let (sink, deliveries) = mpsc::channel(4096);
     let (reply, answer) = oneshot::channel();
     commands
@@ -128,7 +129,7 @@ async fn two_runs() -> (
 }
 
 /// Every resume cursor in `stream` resumes with exactly the units after it.
-async fn resumes_at_every_unit(commands: &Commands, stream: &[Arc<ControlEvent>]) {
+async fn resumes_at_every_unit(commands: &Sender, stream: &[Arc<ControlEvent>]) {
     for (at, event) in stream.iter().enumerate() {
         let mut resumed = subscribe(commands, resume(event.0), false).await;
         assert_eq!(
@@ -141,7 +142,7 @@ async fn resumes_at_every_unit(commands: &Commands, stream: &[Arc<ControlEvent>]
 
 /// Every unit a subscriber from the session's start gets resumes with exactly the units after
 /// it, for the other scenarios that drive a store actor.
-pub(super) async fn every_unit_resumes(commands: &Commands) {
+pub(super) async fn every_unit_resumes(commands: &Sender) {
     let mut from_start = subscribe(commands, FromCursor::Start, false).await;
     let stream = units(quiet(&mut from_start).await);
     assert!(!stream.is_empty(), "the session's stream has units");
@@ -184,7 +185,7 @@ async fn a_position_only_cursor_resumes_after_its_position() {
     );
 }
 
-async fn expired(commands: &Commands, from: FromCursor) -> Vec<Delivery> {
+async fn expired(commands: &Sender, from: FromCursor) -> Vec<Delivery> {
     let mut deliveries = subscribe(commands, from, false).await;
     quiet(&mut deliveries).await
 }
@@ -434,6 +435,7 @@ async fn ridden_session() -> (&'static MemoryBackend, u64, Session<&'static Memo
                 sender: "occi".into(),
                 forms: vec!["tool_result".into()],
                 form: RideForm::Append,
+                speaks_for: None,
             }),
         })
     };
@@ -459,6 +461,7 @@ async fn a_ride_is_one_notice_and_text_without_an_envelope_is_none() {
     )
     .with_readers(Arc::new(move || backend));
     let (commands, receiver) = mpsc::unbounded_channel();
+    let commands = Commands::over(commands, backend);
     let _served = tokio::spawn(actor.serve(receiver));
 
     let mut from_start = subscribe(&commands, FromCursor::Start, false).await;
@@ -495,7 +498,7 @@ async fn a_ride_is_one_notice_and_text_without_an_envelope_is_none() {
 
 /// Asks the actor to read `request` from what it holds.
 async fn read(
-    commands: &Commands,
+    commands: &Sender,
     request: crate::store_reads::StoreReadRequest,
 ) -> crate::store_reads::StoreReadOutcome {
     let (reply, answer) = oneshot::channel();
@@ -538,6 +541,7 @@ async fn an_actor_served_reads_head_is_the_head_a_fresh_view_computes() {
     )
     .with_readers_held(Arc::new(move || backend), Arc::clone(&gate));
     let (commands, receiver) = mpsc::unbounded_channel();
+    let commands = Commands::over(commands, backend);
     let _served = tokio::spawn(actor.serve(receiver));
     send(&commands, "r1", "one").await;
     idle(&commands).await;

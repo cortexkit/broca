@@ -131,6 +131,7 @@ pub fn run_started(
     set(&mut object, "hooks", start.hooks.as_ref());
     set(&mut object, "keep_warm", start.keep_warm.as_ref());
     set(&mut object, "on_restart", start.on_restart.as_ref());
+    set(&mut object, "message_marks", start.message_marks.as_ref());
 
     // The config's members and setup parts are read as the serve executor reads them.
     let (config, manifest_parts) = crate::run::run_config_members(start, part, || {

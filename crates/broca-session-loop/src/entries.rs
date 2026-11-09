@@ -837,7 +837,7 @@ pub fn with_facts(batch: Vec<Record>, at: &Placing<'_>) -> Result<Vec<Record>, S
                 pending.push(EntryFacts {
                     client_message_id: facts.send.client_message_id,
                     sender: facts.send.sender,
-                    marks: None,
+                    marks: facts.send.marks,
                     no_display_facts: None,
                     reasoning_summaries: message.map(reasoning_summaries).unwrap_or_default(),
                     rich_ui: stamped,
@@ -1125,19 +1125,22 @@ fn cancelled(mut turn: TurnFacts) -> Option<TurnFacts> {
     changed.then_some(turn)
 }
 
-/// Who sent the send that placed a message, and the `client_message_id` it carried, as today's
-/// display facts name them for every message of a run's input or of a steer or delivered send.
+/// Who sent the send that placed a message, the `client_message_id` it carried, and its display
+/// marks, as today's display facts name them for every message of a run's input or of a steer
+/// or delivered send.
 #[derive(Debug, Clone, Default)]
 struct SendFacts {
     sender: Option<String>,
     client_message_id: Option<String>,
+    /// llm-runner's `MessageMarks` JSON.
+    marks: Option<serde_json::Value>,
 }
 
 /// The send facts of the input of the run `start` starts, by today's rules: for a fresh run, the
 /// queued send it consumes names them (`operations` holds it in its queue until the run starts),
 /// else the run's own start: its sender's module (whoever sent on the owner's behalf, else the
-/// run's principal), and the `client_message_id` its request identity carries. A run that isn't
-/// fresh has none.
+/// run's principal), and the `client_message_id` its request identity carries. The marks are the
+/// run's start's own, else the queued send's. A run that isn't fresh has none.
 fn run_send_facts(
     start: &broca_session_store::record::RunStart,
     operations: &Operations,
@@ -1185,6 +1188,10 @@ fn run_send_facts(
                     .as_deref()
                     .and_then(broca_core::digest_client_message_id)
             }),
+        marks: start
+            .message_marks
+            .clone()
+            .or_else(|| queued.and_then(|send| send.message_marks.clone())),
     }
 }
 
@@ -1198,10 +1205,11 @@ fn held_send_facts(input: &broca_session_store::record::Input, at: &Placing<'_>)
             .iter()
             .find(|pending| pending.seq.is_some() && pending.seq == input.receipt_seq)
     });
-    let (sender, digest) = match pending {
+    let (sender, digest, marks) = match pending {
         Some(pending) => (
             pending.sender.clone(),
             pending.request_identity_digest.as_deref(),
+            pending.message_marks.clone(),
         ),
         None => match at
             .operations
@@ -1212,6 +1220,7 @@ fn held_send_facts(input: &broca_session_store::record::Input, at: &Placing<'_>)
             Some(queued) => (
                 queued.sender.clone(),
                 queued.request_identity_digest.as_deref(),
+                queued.message_marks.clone(),
             ),
             None => return SendFacts::default(),
         },
@@ -1219,6 +1228,7 @@ fn held_send_facts(input: &broca_session_store::record::Input, at: &Placing<'_>)
     SendFacts {
         sender,
         client_message_id: digest.and_then(broca_core::digest_client_message_id),
+        marks,
     }
 }
 
@@ -1270,6 +1280,7 @@ pub fn ride_notice(append: &ResultAppend, calls: &[ToolCallId]) -> Option<RideNo
         sender: ride.sender.clone(),
         call_key: ride.call_key.clone(),
         text: text.to_owned(),
+        speaks_for: ride.speaks_for.clone(),
     })
 }
 
@@ -1767,9 +1778,11 @@ pub fn ride_metadata(delivered: &Delivered) -> Option<broca_wal::record::RideMet
         form: match ride.form {
             RideForm::Append => broca_wal::record::RideForm::Append,
         },
-        // The new storage doesn't keep message marks yet; conversion counts a ride's marks as
-        // lost, so a stored ride never had any.
-        speaks_for: None,
+        // The envelope keeps the agent the sending module spoke for, as today's does.
+        speaks_for: ride
+            .speaks_for
+            .as_ref()
+            .and_then(|stored| serde_json::from_value(stored.clone()).ok()),
     })
 }
 

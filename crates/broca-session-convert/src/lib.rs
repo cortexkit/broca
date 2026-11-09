@@ -847,13 +847,15 @@ fn convert_record(
                 state,
                 out,
             );
-            // The record keeps everything it accepted: the messages, and the receipt (send id,
-            // delivery, retention, sender) the queue reads.
+            // The record keeps everything it accepted: the messages, their display marks, and
+            // the receipt (send id, delivery, retention, sender) the queue reads.
+            let message_marks = f.take("message_marks");
             out.records.push(Record::Steer(Steer {
                 media: Vec::new(),
                 input,
                 written_at_ms: written,
                 tags_v1: tags,
+                message_marks,
                 receipt: f.rest(),
             }));
         }
@@ -1120,6 +1122,9 @@ fn convert_record(
                 version,
                 checksum,
                 edits,
+                built_through: f.string("built_through"),
+                new_signed: f.string("new_signed"),
+                applied_by: f.string("applied_by"),
             }));
         }
         "compaction_view_applied_v2" => out.records.push(Record::ViewApplied(ViewApplied {
@@ -1295,8 +1300,10 @@ fn queued(f: &mut Fields, out: &mut Converted) -> Result<(), ConvertError> {
     }
     let request_rest = request.rest();
     request.finish(out);
+    let message_marks = f.take("message_marks");
     out.records.push(Record::QueuedSend(QueuedSend {
         media: Vec::new(),
+        message_marks,
         submission_id,
         send_id: f.string("send_id"),
         input,
@@ -1377,6 +1384,7 @@ fn run_started(f: &mut Fields, state: &mut State, out: &mut Converted) -> Result
 
     let mut start = RunStart {
         imported_ids: None,
+        message_marks: f.take("message_marks"),
         run_id: run_id.clone(),
         model: model.clone(),
         setup: parts,
@@ -1769,14 +1777,6 @@ fn send_delivered(
     // The envelope today's writer adds to a ride (llm-runner 0.8.11). A delivery recorded
     // before envelopes existed has none, and keeps rendering its joined bytes as before.
     let ride: Option<broca_wal::record::RideMetadata> = f.parse("ride")?;
-    // The new storage doesn't keep message marks yet, so a ride carrying `speaks_for` is
-    // counted as lost, never dropped silently, and the session doesn't convert exactly.
-    if let Some(speaks_for) = ride.as_ref().and_then(|ride| ride.speaks_for.as_ref()) {
-        f.lose(
-            "ride.speaks_for (message marks)".into(),
-            json_len(&serde_json::to_value(speaks_for).unwrap_or(Value::Null)),
-        );
-    }
     let delivery = Delivery {
         submission_id: f.req_string("submission_id"),
         run_id: f.req_string("run_id"),
@@ -1844,11 +1844,17 @@ fn ride_envelope(
         form: match ride.form {
             broca_wal::record::RideForm::Append => broca_session_store::record::RideForm::Append,
         },
+        speaks_for: ride
+            .speaks_for
+            .as_ref()
+            .map(|speaks_for| serde_json::to_value(speaks_for).expect("a speaks_for encodes")),
     }
 }
 
 #[cfg(test)]
 mod inverse_tests;
+#[cfg(test)]
+mod marks_tests;
 #[cfg(test)]
 mod read_cost_tests;
 #[cfg(test)]

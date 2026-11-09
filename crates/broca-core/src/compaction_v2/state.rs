@@ -74,6 +74,12 @@ impl State {
         self.applied_by.as_deref()
     }
 
+    /// The module that handed the newest accepted view over, which becomes `applied_by` once a
+    /// step applies that view. `None` for a view a run's step accepted.
+    pub fn accepted_by(&self) -> Option<&str> {
+        self.latest_applied_by.as_deref()
+    }
+
     pub fn restore_accepted_by(&mut self, module: Option<String>) {
         self.latest_applied_by = module;
     }

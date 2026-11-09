@@ -221,6 +221,7 @@ fn a_ride_is_kept_beside_its_call_in_both_layouts() {
         sender: "reminders".into(),
         forms: vec!["tool_result".into()],
         form: crate::record::RideForm::Append,
+        speaks_for: None,
     };
     let append = Record::ResultAppend(ResultAppend {
         send_id: Some("q".into()),

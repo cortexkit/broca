@@ -184,7 +184,7 @@ impl SessionBackend for Recording {
 /// the batch's intents make it durable. Returns the actor's commands, the backend, and the
 /// approval's `reached` and `release`.
 async fn stopped_in_the_gap() -> (
-    mpsc::UnboundedSender<LineageCmd>,
+    super::tests::Commands,
     tokio::task::JoinHandle<Session<&'static Recording>>,
     &'static Recording,
     Arc<Notify>,
@@ -205,6 +205,7 @@ async fn stopped_in_the_gap() -> (
     let parts = SharedParts::new(Box::new(MemoryParts::default()));
     let actor = StoreActor::new(bind(), session, Arc::new(executor), Box::new(parts));
     let (commands, receiver) = mpsc::unbounded_channel();
+    let commands = super::tests::Commands::over(commands, backend);
     let served = tokio::spawn(actor.serve(receiver));
     assert!(matches!(
         send(&commands, "r1", "first").await,
@@ -317,6 +318,8 @@ struct Module {
     registry: LineageRegistry,
     key: BindIdentity,
     gate: Arc<Notify>,
+    /// The caller whose sends reach the module's session.
+    caller: super::tests::Caller,
 }
 
 impl Drop for Module {
@@ -365,6 +368,7 @@ async fn module(steps: Vec<Vec<NormalizedEvent>>) -> Module {
         registry,
         key,
         gate,
+        caller: Default::default(),
     }
 }
 
@@ -389,12 +393,13 @@ impl Module {
         }
     }
 
+    /// Sends `text` as the module's caller sends it.
     async fn send(&self, run_id: &str, text: &str) -> SendOutcome {
         self.registry
             .route_submission_with_order(
                 &self.key,
                 RunId(run_id.into()),
-                request(text),
+                self.caller.shape(run_id, &SendKey::Minted, request(text)),
                 RunKind::FreshOrResume,
                 SendKey::Minted,
                 false,

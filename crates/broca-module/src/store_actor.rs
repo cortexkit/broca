@@ -271,6 +271,9 @@ struct Drained {
     hooks: Option<Box<broca_wal::Hooks>>,
     /// Where the queued record stored the send's media, which the run's input points at.
     media: broca_session_loop::HeldInputMedia,
+    /// The send's display marks, as its record kept them, which the run's start records, as
+    /// today's drain records the queued send's.
+    message_marks: Option<broca_protocol::MessageMarks>,
 }
 
 /// How a keyed send is answered.
@@ -892,11 +895,13 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                         return false;
                     }
                 };
-                // As in today's actor, the session's fetch plan comes next. It owns the session's
-                // tools for its whole life, so a send naming tools is refused before any retry,
-                // queue or steer path could ignore them; and a send's own plan meets the frozen
-                // one before its key is looked at, so a retry under the same key with another plan
-                // is refused by name. The first send freezes the plan its send fetched.
+                // As in today's actor, the session's tools come next. The session's creating send
+                // froze them, so a later send naming tools is refused before any retry, queue or
+                // steer path could ignore them, by the rule today's actor applies. A send retrying
+                // one the session recorded under the same `send_id` is not refused here: its
+                // payload meets the retry's identity comparison instead. An internal send keyed by
+                // run id carries the session's own tools, so it is refused only when the
+                // session's fetch plan owns them.
                 let frozen = match self.frozen_manifest() {
                     Ok(frozen) => frozen,
                     Err(error) => {
@@ -904,10 +909,30 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                         return false;
                     }
                 };
-                if request.tools.is_some() && frozen.is_some() {
-                    let _ = reply.send(crate::plan_episode::tools_frozen_refusal());
-                    return false;
+                if request.tools.is_some() {
+                    let retry = match key.send_id() {
+                        Some(send_id) => match self.recorded_send(&run_id, send_id).await {
+                            Ok(recorded) => recorded,
+                            Err(error) => {
+                                let _ = reply.send(SendOutcome::Error(error));
+                                return false;
+                            }
+                        },
+                        None => false,
+                    };
+                    if crate::plan_episode::tools_are_frozen(
+                        retry,
+                        matches!(key, crate::actor::SendKey::RunId),
+                        self.session.operations().owner.episodes > 0,
+                        frozen.is_some(),
+                    ) {
+                        let _ = reply.send(crate::plan_episode::tools_frozen_refusal());
+                        return false;
+                    }
                 }
+                // The session's fetch plan is next: a send's own plan meets the frozen one before
+                // its key is looked at, so a retry under the same key with another plan is refused
+                // by name. The first send freezes the plan its send fetched.
                 let mut manifest = frozen.clone();
                 let model_check = plan.as_ref().and_then(|plan| plan.model_check.clone());
                 if let Some(plan) = plan {
@@ -1395,6 +1420,11 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             compaction_plane: self.executor.compaction_plane(),
             compaction_session: Some(Arc::clone(&self.compaction_session)),
             display_sent_by: sent_by,
+            // A drained send's marks, as its queued record kept them; a send that starts its run
+            // directly carries none, as today's actor's doesn't.
+            display_message_marks: drained
+                .as_ref()
+                .and_then(|drained| drained.message_marks.clone()),
             // The version the run's plan asks for. The loop decides the session's mode from it
             // and the session's latest run: a session on the compaction contract stays on it,
             // and one that ran outside it moves onto it at the first run whose plan names a
@@ -2048,6 +2078,33 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         (run.finished.is_none() && (self.run.is_some() || run.paused.is_some())).then_some(run)
     }
 
+    /// Whether the session recorded a send that a send keyed by the caller's `send_id`, as the run
+    /// `run_id`, retries. Today's actor reads it from its records: a run started as `run_id`, a
+    /// send queued as it (since retracted or ended, too), or a steer sent under `send_id`.
+    async fn recorded_send(&self, run_id: &RunId, send_id: &str) -> Result<bool, String> {
+        let holds = |kind, id: String, wanted: fn(&Record) -> bool| async move {
+            self.session
+                .find_id(kind, &id)
+                .await
+                .map(|found| found.iter().any(|(_, record)| wanted(record)))
+                .map_err(|error| format!("{error:?}"))
+        };
+        Ok(holds(IdKind::RunId, run_id.0.clone(), |record| {
+            matches!(record, Record::RunStart(_))
+        })
+        .await?
+            || holds(
+                IdKind::SubmissionId,
+                format!("sub-{}", run_id.0),
+                |record| matches!(record, Record::QueuedSend(_)),
+            )
+            .await?
+            || holds(IdKind::SendId, send_id.to_owned(), |record| {
+                matches!(record, Record::Steer(_))
+            })
+            .await?)
+    }
+
     /// A keyed send, looked up by the run id its key names, as today's actor looks it up: a run
     /// started under the key answers the retry from that run's records when the payload is the
     /// same, and is refused naming what differs when it is not. A key no run used starts a run.
@@ -2473,6 +2530,12 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             .transpose()
             .map_err(|error| format!("the queued send's hooks: {error}"))?;
         let written_at_ms = send.written_at_ms;
+        let message_marks = send
+            .message_marks
+            .as_ref()
+            .map(|marks| serde_json::from_value(marks.clone()))
+            .transpose()
+            .map_err(|error| format!("the queued send's marks: {error}"))?;
         let mut media = broca_session_loop::HeldInputMedia::default();
         media.hold_stored(&Record::QueuedSend(send));
         Ok((
@@ -2482,6 +2545,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 written_at_ms,
                 hooks,
                 media,
+                message_marks,
             },
         ))
     }

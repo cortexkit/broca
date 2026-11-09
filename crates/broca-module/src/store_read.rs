@@ -869,13 +869,17 @@ pub fn display_facts(entry: &StoredEntry) -> DisplayFacts {
             .iter()
             .flat_map(|facts| &facts.notices)
             .map(|notice| {
-                cortexkit_role_llm_runner::read::NoticeFact::new(
+                let fact = cortexkit_role_llm_runner::read::NoticeFact::new(
                     notice.part,
                     &notice.send_id,
                     &notice.sender,
                     &notice.text,
                 )
-                .with_call_key(&notice.call_key)
+                .with_call_key(&notice.call_key);
+                match speaks_for(notice.speaks_for.as_ref()) {
+                    Some(speaks_for) => fact.with_speaks_for(speaks_for),
+                    None => fact,
+                }
             })
             .collect(),
     }
@@ -934,11 +938,12 @@ pub fn facts_by_call<'t>(
 
 impl DisplayFacts {
     /// What an `include_display_facts` read serves from these facts, in the form today's read
-    /// builds for a page message (`crate::serve::apply_display_facts`): the sender, for a user
-    /// message the send's `client_message_id`, each tool call's facts, and for a tool results
-    /// message the notices of the sends that rode on its results.
+    /// builds for a page message (`crate::serve::apply_display_facts`): the sender and the send's
+    /// marks, for a user message the send's `client_message_id`, each tool call's facts, and for a
+    /// tool results message the notices of the sends that rode on its results.
     pub fn served(&self) -> broca_core::display_facts::DisplayFacts {
         broca_core::display_facts::DisplayFacts {
+            message_marks: self.message_marks(),
             sender: self.sender.clone(),
             client_message_id: self.client_message_id.clone(),
             tool_times: self.tool_times.clone(),
@@ -954,4 +959,23 @@ impl DisplayFacts {
             ..Default::default()
         }
     }
+
+    /// The send's marks as today's display facts hold them: absent when the send carried
+    /// neither a `speaks_for` nor a true `notice`.
+    fn message_marks(&self) -> Option<broca_protocol::MessageMarks> {
+        let speaks_for = speaks_for(self.speaks_for.as_ref());
+        if speaks_for.is_none() && !self.notice {
+            return None;
+        }
+        let mut marks = broca_protocol::MessageMarks::default();
+        marks.speaks_for = speaks_for;
+        marks.notice = self.notice;
+        Some(marks)
+    }
+}
+
+/// A stored `speaks_for` mark (llm-runner's `SpeaksFor` JSON) as reads serve it, or `None` when
+/// there is none or it doesn't decode.
+fn speaks_for(stored: Option<&serde_json::Value>) -> Option<broca_protocol::SpeaksFor> {
+    stored.and_then(|value| serde_json::from_value(value.clone()).ok())
 }

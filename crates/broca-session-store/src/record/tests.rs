@@ -82,6 +82,7 @@ fn one_of_each() -> Vec<Record> {
                 sender: "reminders".into(),
                 forms: vec!["tool_result".into(), "turn_system".into()],
                 form: RideForm::Append,
+                speaks_for: None,
             }),
         }),
         Record::SetupStub(SetupStub {
@@ -96,6 +97,7 @@ fn one_of_each() -> Vec<Record> {
         }),
         Record::RunStart(Box::new(RunStart {
             imported_ids: None,
+            message_marks: None,
             run_id: "run-1".into(),
             model: model(),
             setup: vec![part],
@@ -236,6 +238,7 @@ fn one_of_each() -> Vec<Record> {
             request: Some(serde_json::json!({"model": {}})),
             receipt: None,
             delivery: Some("interrupt".into()),
+            message_marks: None,
         }),
         Record::SessionRefresh(SessionRefresh {
             generation: 2,

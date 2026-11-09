@@ -349,7 +349,7 @@ impl RunExecutor for LoopExecutor {
 pub(super) async fn actor(
     executor: LoopExecutor,
 ) -> (
-    mpsc::UnboundedSender<LineageCmd>,
+    Commands,
     tokio::task::JoinHandle<Session<&'static MemoryBackend>>,
     &'static MemoryBackend,
 ) {
@@ -361,7 +361,7 @@ pub(super) async fn actor_with(
     executor: LoopExecutor,
     parts: SharedParts,
 ) -> (
-    mpsc::UnboundedSender<LineageCmd>,
+    Commands,
     tokio::task::JoinHandle<Session<&'static MemoryBackend>>,
     &'static MemoryBackend,
 ) {
@@ -379,7 +379,7 @@ pub(super) async fn actor_with(
         .with_readers(Arc::new(move || backend));
     let (commands, receiver) = mpsc::unbounded_channel();
     let served = tokio::spawn(actor.serve(receiver));
-    (commands, served, backend)
+    (Commands::over(commands, backend), served, backend)
 }
 
 pub(super) const ADDR: &str = "0123456789abcdef";
@@ -403,7 +403,7 @@ pub(super) async fn reopen(
     executor: Arc<LoopExecutor>,
     parts: &SharedParts,
 ) -> (
-    mpsc::UnboundedSender<LineageCmd>,
+    Commands,
     tokio::task::JoinHandle<Session<&'static MemoryBackend>>,
 ) {
     let session = Session::load(backend, SessionAddr(ADDR.into()), &triple(), &deployment())
@@ -412,7 +412,10 @@ pub(super) async fn reopen(
     let actor = StoreActor::new(bind(), session, executor, Box::new(parts.clone()))
         .with_readers(Arc::new(move || backend));
     let (commands, receiver) = mpsc::unbounded_channel();
-    (commands, tokio::spawn(actor.serve(receiver)))
+    (
+        Commands::over(commands, backend),
+        tokio::spawn(actor.serve(receiver)),
+    )
 }
 
 pub(super) fn request(text: &str) -> SubmissionRequest {
@@ -434,12 +437,20 @@ pub(super) fn request(text: &str) -> SubmissionRequest {
 /// creating send names its tools: the session freezes them, and a later send that names tools is
 /// refused. A later new send leaves them out and runs on the latest run's tools. A retry, under
 /// the run id or send id of an earlier send, names tools exactly when that earlier send did, so
-/// it repeats the earlier request. Each side of a comparison keeps its own caller and gets the
-/// same sends, so both sides send the same requests.
+/// it repeats the earlier request. Each session a test drives keeps its own caller, so the two
+/// sides of a comparison, given the same sends, send the same requests.
 #[derive(Debug, Default)]
 pub(super) struct Caller {
-    /// Every send so far: its run id, its send id, and whether it named tools.
-    sends: std::sync::Mutex<Vec<(String, Option<String>, bool)>>,
+    sends: std::sync::Mutex<Sends>,
+}
+
+/// What a [`Caller`] has sent.
+#[derive(Debug, Default)]
+struct Sends {
+    /// Whether the session exists: its creating send was sent, by this caller or elsewhere.
+    created: bool,
+    /// Every send this caller made: its run id, its send id, and whether it named tools.
+    earlier: Vec<(String, Option<String>, bool)>,
 }
 
 impl Caller {
@@ -452,28 +463,74 @@ impl Caller {
     ) -> SubmissionRequest {
         let mut sends = self.sends.lock().unwrap();
         let send_id = key.send_id();
-        let earlier = sends
+        let names_tools = sends
+            .earlier
             .iter()
-            .find(|(run, id, _)| run == run_id || (send_id.is_some() && id.as_deref() == send_id));
-        let names_tools = earlier.map_or(sends.is_empty(), |(_, _, named)| *named);
+            .find(|(run, id, _)| run == run_id || (send_id.is_some() && id.as_deref() == send_id))
+            .map_or(!sends.created, |(_, _, named)| *named);
         if !names_tools {
             request.tools = None;
         }
-        sends.push((run_id.to_owned(), send_id.map(str::to_owned), names_tools));
+        sends.created = true;
+        sends
+            .earlier
+            .push((run_id.to_owned(), send_id.map(str::to_owned), names_tools));
         request
+    }
+
+    /// Notes that the session already exists, created elsewhere (by an import, or by records a
+    /// test wrote itself): every new send this caller makes is a later send.
+    pub(super) fn joins_existing(&self) {
+        self.sends.lock().unwrap().created = true;
     }
 }
 
-pub(super) async fn send(
-    commands: &mpsc::UnboundedSender<LineageCmd>,
-    run_id: &str,
-    text: &str,
-) -> SendOutcome {
+/// The command channel of a store actor in these tests, with the caller whose sends reach its
+/// session. Every actor over one backend shares one caller, so the sends to an actor reopened
+/// over a session come from the caller that created it.
+#[derive(Debug, Clone)]
+pub(super) struct Commands {
+    sender: mpsc::UnboundedSender<LineageCmd>,
+    caller: Arc<Caller>,
+}
+
+impl Commands {
+    /// The channel `sender` to an actor over the session `backend` holds.
+    pub(super) fn over<B>(sender: mpsc::UnboundedSender<LineageCmd>, backend: &'static B) -> Self {
+        // Keyed by the backend's address: every backend here is leaked, so no address is reused.
+        static CALLERS: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<usize, Arc<Caller>>>,
+        > = std::sync::OnceLock::new();
+        let caller = CALLERS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .entry(std::ptr::from_ref(backend) as usize)
+            .or_default()
+            .clone();
+        Self { sender, caller }
+    }
+
+    /// The caller whose sends reach the actor's session.
+    pub(super) fn caller(&self) -> &Caller {
+        &self.caller
+    }
+}
+
+impl std::ops::Deref for Commands {
+    type Target = mpsc::UnboundedSender<LineageCmd>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.sender
+    }
+}
+
+pub(super) async fn send(commands: &Commands, run_id: &str, text: &str) -> SendOutcome {
     send_with(commands, run_id, request(text), SendKey::Minted).await
 }
 
 pub(super) async fn send_with(
-    commands: &mpsc::UnboundedSender<LineageCmd>,
+    commands: &Commands,
     run_id: &str,
     request: SubmissionRequest,
     key: SendKey,
@@ -490,7 +547,7 @@ pub(super) async fn send_with(
 
 /// A send with the delivery mode `delivery`.
 pub(super) async fn send_as(
-    commands: &mpsc::UnboundedSender<LineageCmd>,
+    commands: &Commands,
     run_id: &str,
     request: SubmissionRequest,
     key: SendKey,
@@ -499,8 +556,23 @@ pub(super) async fn send_as(
     send_labelled(commands, run_id, request, key, delivery, None).await
 }
 
-/// A send with the delivery mode `delivery`, naming the session label `session_class`.
+/// A send with the delivery mode `delivery`, naming the session label `session_class`, as the
+/// session's caller sends it.
 pub(super) async fn send_labelled(
+    commands: &Commands,
+    run_id: &str,
+    request: SubmissionRequest,
+    key: SendKey,
+    delivery: broca_protocol::Delivery,
+    session_class: Option<&str>,
+) -> SendOutcome {
+    let request = commands.caller.shape(run_id, &key, request);
+    send_exactly(commands, run_id, request, key, delivery, session_class).await
+}
+
+/// [`send_labelled`], sending `request` exactly as given, whatever the session's caller would
+/// send.
+pub(super) async fn send_exactly(
     commands: &mpsc::UnboundedSender<LineageCmd>,
     run_id: &str,
     request: SubmissionRequest,
@@ -531,7 +603,7 @@ pub(super) async fn send_labelled(
 }
 
 /// A send keyed by the caller's `send_id` `k`, whose run id is `r-k`.
-async fn keyed(commands: &mpsc::UnboundedSender<LineageCmd>, k: &str, text: &str) -> SendOutcome {
+async fn keyed(commands: &Commands, k: &str, text: &str) -> SendOutcome {
     send_with(
         commands,
         &format!("r-{k}"),
@@ -1545,14 +1617,15 @@ fn plan_manifest(identity: &str, plan: serde_json::Value) -> broca_wal::PlanMani
 }
 
 /// A send carrying a plan, as the serve layer hands it over: its identity, and the manifest it
-/// fetched when the session had no run.
+/// fetched when the session had no run. The session's caller sends it.
 async fn send_planned(
-    commands: &mpsc::UnboundedSender<LineageCmd>,
+    commands: &Commands,
     run_id: &str,
     request: SubmissionRequest,
     identity: &str,
     manifest: Option<broca_wal::PlanManifest>,
 ) -> SendOutcome {
+    let request = commands.caller.shape(run_id, &SendKey::Minted, request);
     let (reply, answer) = oneshot::channel();
     commands
         .send(LineageCmd::Send {
@@ -1609,6 +1682,7 @@ async fn a_planned_session_runs_on_the_manifests_tools_and_system_text() {
     .unwrap();
     let actor = StoreActor::new(bind(), session, executor.clone(), Box::new(parts.clone()));
     let (commands, receiver) = mpsc::unbounded_channel();
+    let commands = Commands::over(commands, backend);
     let served = tokio::spawn(actor.serve(receiver));
     let manifest = plan_manifest("plan-1", serde_json::json!({}));
     assert!(matches!(
@@ -1623,8 +1697,17 @@ async fn a_planned_session_runs_on_the_manifests_tools_and_system_text() {
         SendOutcome::Active { .. }
     ));
     idle(&commands).await;
+    // A later send naming tools of its own, which the plan's tools leave no room for.
     assert!(matches!(
-        send(&commands, "r2", "second").await,
+        send_exactly(
+            &commands,
+            "r2",
+            request("second"),
+            SendKey::Minted,
+            broca_protocol::Delivery::Queue,
+            None
+        )
+        .await,
         SendOutcome::DeliveryRefused { field: "tools", .. }
     ));
     assert!(matches!(
@@ -1792,6 +1875,7 @@ async fn a_queued_send_drains_under_the_sessions_plan() {
     .unwrap();
     let actor = StoreActor::new(bind(), session, executor.clone(), Box::new(parts.clone()));
     let (commands, receiver) = mpsc::unbounded_channel();
+    let commands = Commands::over(commands, backend);
     let served = tokio::spawn(actor.serve(receiver));
     let manifest = plan_manifest("plan-1", serde_json::json!({}));
     assert!(matches!(
@@ -1888,6 +1972,7 @@ async fn setup_parts_are_stored_before_the_records_naming_them() {
     let actor = StoreActor::new(bind(), session, executor.clone(), Box::new(parts))
         .with_storage(setup_storage(backend));
     let (commands, receiver) = mpsc::unbounded_channel();
+    let commands = Commands::over(commands, backend);
     let served = tokio::spawn(actor.serve(receiver));
     let manifest = plan_manifest("plan-1", serde_json::json!({}));
     assert!(matches!(
@@ -1957,6 +2042,7 @@ async fn setup_parts_are_stored_before_the_records_naming_them() {
     let actor = StoreActor::new(bind(), session, executor.clone(), Box::new(parts))
         .with_storage(setup_storage(backend));
     let (commands, receiver) = mpsc::unbounded_channel();
+    let commands = Commands::over(commands, backend);
     let served = tokio::spawn(actor.serve(receiver));
     gate.notify_one();
     assert!(matches!(
