@@ -191,6 +191,58 @@ fn the_same_holds_on_local_files(cipher: Cipher) {
     assert_eq!(loaded, written);
 }
 
+#[cfg(unix)]
+#[test]
+fn a_session_with_legacy_unix_permissions_still_loads() {
+    use std::os::unix::fs::PermissionsExt;
+
+    fn legacy_modes(path: &std::path::Path, modes: &mut Vec<(std::path::PathBuf, u32)>) {
+        let mode = if path.is_dir() { 0o755 } else { 0o644 };
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        modes.push((path.to_owned(), mode));
+        if path.is_dir() {
+            for entry in std::fs::read_dir(path).unwrap() {
+                legacy_modes(&entry.unwrap().path(), modes);
+            }
+        }
+    }
+
+    for cipher in Cipher::ALL {
+        let root = std::env::temp_dir().join(format!(
+            "broca-session-legacy-{}",
+            crate::codec::hex(&crate::keys::random_id().0)
+        ));
+        let written = create_and_write(&LocalBackend::new(&root), cipher);
+        // The byte format is unchanged; only the creation modes differ from older writers.
+        let mut modes = Vec::new();
+        legacy_modes(&root, &mut modes);
+        let reopened = LocalBackend::new(&root);
+        let loaded = block_on(async {
+            let session = Session::load(&reopened, addr(), &triple(), &deployment(cipher))
+                .await
+                .unwrap();
+            state(&session)
+        });
+        assert_eq!(loaded, written);
+        for (path, mode) in modes {
+            // Loading as a writer replaces the head to claim it. Other existing objects are
+            // opened in place, so their legacy permissions must not be silently repaired.
+            let expected = if path == root.join("heads").join(&addr().0).join("head") {
+                0o600
+            } else {
+                mode
+            };
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                expected,
+                "unexpected mode for {}",
+                path.display()
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
 /// A writer whose head was replaced by another writer's can't append: the backend refuses it.
 fn a_replaced_writer_is_fenced(cipher: Cipher) {
     let backend = MemoryBackend::default();
