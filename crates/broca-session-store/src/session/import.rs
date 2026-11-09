@@ -54,25 +54,35 @@ pub fn is_broca_id_form(mid: &str) -> bool {
 /// A session's loaded id map, kept once read: it never changes after the import wrote it.
 pub(crate) type IdMapCache = std::sync::Mutex<Option<Arc<ImportedIdMap>>>;
 
+/// The name of the id map object `ids` points at.
+pub(crate) fn id_map_name(ids: &ImportedIds) -> String {
+    format!(
+        "{}/a/{}.{}-imported-ids",
+        hex(&ids.log.0),
+        &hex(&ids.generation.0)[..16],
+        ids.seq,
+    )
+}
+
+/// The name of the receipt object beside the id map `ids` points at.
+pub(crate) fn receipt_name(ids: &ImportedIds) -> String {
+    format!(
+        "{}/a/{}.{}-import-receipt",
+        hex(&ids.log.0),
+        &hex(&ids.generation.0)[..16],
+        ids.seq,
+    )
+}
+
 impl<B: SessionBackend> Session<B> {
     /// The name of the id map object `ids` points at.
     fn id_map_name(&self, ids: &ImportedIds) -> String {
-        format!(
-            "{}/a/{}.{}-imported-ids",
-            hex(&ids.log.0),
-            &hex(&ids.generation.0)[..16],
-            ids.seq,
-        )
+        id_map_name(ids)
     }
 
     /// The name of the receipt object beside the id map `ids` points at.
     fn receipt_name(&self, ids: &ImportedIds) -> String {
-        format!(
-            "{}/a/{}.{}-import-receipt",
-            hex(&ids.log.0),
-            &hex(&ids.generation.0)[..16],
-            ids.seq,
-        )
+        receipt_name(ids)
     }
 
     /// Appends an import's seeded batch, synced, after storing what it names: each medium

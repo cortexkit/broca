@@ -325,7 +325,7 @@ fn named_in(record: &Record, sha256: &str) -> Vec<NamedMedium> {
     named
 }
 
-fn matches(media: &MediaRef, bytes: &[u8]) -> bool {
+pub(crate) fn matches(media: &MediaRef, bytes: &[u8]) -> bool {
     media.byte_size == bytes.len() as u64 && media.sha256 == hex(&Sha256::digest(bytes))
 }
 
@@ -333,7 +333,7 @@ fn matches(media: &MediaRef, bytes: &[u8]) -> bool {
 /// at `seq`, for bytes whose digest is `sha256`. The digest is hashed with a key derived from the
 /// session key, so a name says nothing about the content outside the session, and the same bytes
 /// always get the same name.
-fn object_name(
+pub(crate) fn object_name(
     key: &crate::keys::DataKey,
     log: &crate::codec::Id128,
     generation: &crate::codec::Id128,

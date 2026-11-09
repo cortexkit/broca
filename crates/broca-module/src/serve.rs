@@ -2699,6 +2699,20 @@ pub trait ServeHandler: Send + Sync {
         Ok(false)
     }
 
+    /// `session.restore_from_backup`: restores the session, or with `all` every session kept in
+    /// the new storage, from the files the store holds after a backup came back (see
+    /// `registry::store_restore`). A handler without the new storage refuses by name.
+    async fn restore_from_backup(
+        &self,
+        _session: &LineageKey,
+        _all: bool,
+    ) -> Result<serde_json::Value, crate::registry::store_move::MoveRefusal> {
+        Err(crate::registry::store_move::MoveRefusal::new(
+            "store_unavailable",
+            "this module keeps no sessions in the new storage",
+        ))
+    }
+
     /// `session.move_to_store`: moves the session from today's storage into the new storage
     /// (see `registry::store_move`), into the root of `class` when the operator asked for one. A
     /// handler without the new storage refuses by name.
@@ -3878,6 +3892,14 @@ impl ServeHandler for crate::LineageRegistry {
         class: Option<broca_wal::StorageClass>,
     ) -> Result<serde_json::Value, crate::registry::store_move::MoveRefusal> {
         crate::LineageRegistry::move_to_store(self, session, class).await
+    }
+
+    async fn restore_from_backup(
+        &self,
+        session: &LineageKey,
+        all: bool,
+    ) -> Result<serde_json::Value, crate::registry::store_move::MoveRefusal> {
+        crate::LineageRegistry::restore_from_backup(self, session, all).await
     }
 
     async fn import(&self, req: SessionImportRequest) -> Result<SessionImportResponse, ServeError> {

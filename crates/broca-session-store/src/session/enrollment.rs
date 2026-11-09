@@ -97,15 +97,20 @@ impl EnrollmentOverlay {
     }
 }
 
+/// The name of the enrollment object `overlay` points at.
+pub(crate) fn enrollment_name(overlay: &EnrollmentOverlayRef) -> String {
+    format!(
+        "{}/a/{}.{}-compaction-enrollment",
+        hex(&overlay.log.0),
+        &hex(&overlay.generation.0)[..16],
+        overlay.seq,
+    )
+}
+
 impl<B: SessionBackend> Session<B> {
     /// The name of the enrollment object `overlay` points at.
     fn enrollment_name(&self, overlay: &EnrollmentOverlayRef) -> String {
-        format!(
-            "{}/a/{}.{}-compaction-enrollment",
-            hex(&overlay.log.0),
-            &hex(&overlay.generation.0)[..16],
-            overlay.seq,
-        )
+        enrollment_name(overlay)
     }
 
     /// Stores an enrollment's decisions, `entries`, as a session object under the open log,

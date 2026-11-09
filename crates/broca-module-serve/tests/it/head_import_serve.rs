@@ -127,6 +127,14 @@ impl Rig {
             registry = registry.with_store_new_sessions();
             // Moves are refused by precondition 1 until the new storage serves every
             // operation the move requires, read from the serve layer's own allowlist.
+            registry.set_store_restorer(Arc::new(
+                broca_module_serve::store_restore::StoreRestore::new(
+                    registry.clone(),
+                    &dir,
+                    Arc::new(broca_module::store_open::StoreSlot::loaded(runtime.clone())),
+                    Arc::new(FileLeaseStore::new(dir.join("leases"))),
+                ),
+            ));
             let mover = broca_module_serve::store_move::StoreMove::new(
                 registry.clone(),
                 &dir,
@@ -576,4 +584,132 @@ async fn a_move_is_operator_only_and_refuses_a_session_with_no_wal() {
         let body: serde_json::Value = serde_json::from_slice(&refused.body).unwrap();
         assert_eq!(body["code"], "invalid_params", "{class}: {body}");
     }
+}
+
+/// Every file under `dir` whose name ends with `suffix`.
+fn files_ending(dir: &std::path::Path, suffix: &str) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.to_string_lossy().ends_with(suffix) {
+                found.push(path);
+            }
+        }
+    }
+    found
+}
+
+/// `session.restore_from_backup` through real dispatch. Only the operator's own connection may
+/// call it, with `all` a boolean when given. A session whose files are all there is reported kept
+/// and left alone, alone or among every session. Once the import's id map is gone, as from a
+/// backup that listed the store before the import, restore holds the session (once its idle
+/// actor has closed), cuts its open log back to where the batch holding the first record that
+/// names the map starts, keeps the cut bytes beside the log, and the session reads again,
+/// without the imported messages.
+#[tokio::test]
+async fn a_restore_is_operator_only_keeps_a_whole_session_and_cuts_one_lacking_a_file() {
+    let mut rig = Rig::start("restore", true).await;
+    rig.bind(1, core(), Some(stamp(core()))).await;
+    let params = rig.import_params("imp-1");
+    rig.result(1, "session.import", params).await;
+    assert_eq!(
+        rig.refused(1, "session.restore_from_backup", serde_json::json!({}))
+            .await,
+        "operator_required"
+    );
+    rig.bind(2, Principal::Direct, None).await;
+    assert_eq!(
+        rig.refused(
+            2,
+            "session.restore_from_backup",
+            serde_json::json!({"all": "yes"})
+        )
+        .await,
+        "invalid_params"
+    );
+    let stored = |dir: &std::path::Path| {
+        files_ending(dir, "")
+            .into_iter()
+            .map(|path| {
+                let bytes = std::fs::read(&path).unwrap();
+                (path, bytes)
+            })
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    let store = rig.dir.join(broca_wal::SESSION_STORAGE_DURABLE_DIR);
+    let before = stored(&store);
+    let kept = rig
+        .result(2, "session.restore_from_backup", serde_json::json!({}))
+        .await;
+    assert_eq!(kept["sessions"][0]["outcome"], "kept", "{kept}");
+    assert_eq!(kept["sessions"][0]["class"], "durable", "{kept}");
+    let all = rig
+        .result(
+            2,
+            "session.restore_from_backup",
+            serde_json::json!({"all": true}),
+        )
+        .await;
+    assert_eq!(all["sessions"].as_array().unwrap().len(), 1, "{all}");
+    assert_eq!(all["sessions"][0]["outcome"], "kept", "{all}");
+    assert_eq!(stored(&store), before, "a kept session is never written");
+
+    let maps = files_ending(&store, "-imported-ids");
+    assert_eq!(maps.len(), 1, "the import stored one id map: {maps:?}");
+    std::fs::remove_file(&maps[0]).unwrap();
+    // The session's actor serves it until it has been idle a while; until then restore reports
+    // it busy and changes nothing.
+    let rig = Arc::new(tokio::sync::Mutex::new(rig));
+    let session = broca_test_support::wait_until("restore to hold the session", || {
+        let rig = rig.clone();
+        async move {
+            let reply = rig
+                .lock()
+                .await
+                .result(2, "session.restore_from_backup", serde_json::json!({}))
+                .await;
+            let session = reply["sessions"][0].clone();
+            match session["outcome"].as_str() {
+                Some("busy") => Err(session.to_string()),
+                _ => Ok(session),
+            }
+        }
+    })
+    .await;
+    assert_eq!(session["outcome"], "log_cut", "{session}");
+    assert!(
+        session["cut"]["lacking"]
+            .as_str()
+            .unwrap()
+            .starts_with("import id map "),
+        "{session}"
+    );
+    let sidecar = session["cut"]["sidecar"].as_str().unwrap();
+    assert!(std::path::Path::new(sidecar).is_file(), "{session}");
+    // The sidecar is named by the wall clock, not by how long the daemon has run, so a restore
+    // in a later run never names the same file.
+    let stamp: u64 = sidecar
+        .rsplit("restore-cut-")
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    assert!(
+        now - stamp < 60_000,
+        "{sidecar} names {stamp}, now is {now}"
+    );
+    let page = rig
+        .lock()
+        .await
+        .result(1, "session.read", serde_json::json!({}))
+        .await;
+    assert_eq!(page["messages"].as_array().unwrap().len(), 0, "{page}");
 }
