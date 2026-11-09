@@ -7656,14 +7656,26 @@ async fn account_route_wire_refusals_write_nothing() {
         assert_eq!(reply.1["detail"]["field"], "account_route");
         assert!(!rig.wal_path.exists());
     }
-    for field in ["speaks_for", "notice"] {
+    // broca declares message_marks, so speaks_for and notice are admitted when valid. Each of
+    // these is a value the contract refuses, naming the field it names: speaks_for that is not
+    // an object has no valid agent id, this unscoped session has no owner to speak for, and
+    // notice must be a boolean.
+    for (field, value, refused) in [
+        ("speaks_for", serde_json::json!(true), "speaks_for.agent_id"),
+        (
+            "speaks_for",
+            serde_json::json!({"agent_id":"Ada"}),
+            "speaks_for",
+        ),
+        ("notice", serde_json::json!("true"), "notice"),
+    ] {
         let mut params =
             serde_json::json!({"prompt":"hello","model":{"provider":"fake","model":"fake"}});
-        params[field] = serde_json::json!(true);
+        params[field] = value;
         let reply = account_route_send(&mut rig, params).await;
-        assert_eq!(reply.0, FrameType::Error);
-        assert_eq!(reply.1["code"], "invalid_params");
-        assert_eq!(reply.1["detail"]["field"], field);
+        assert_eq!(reply.0, FrameType::Error, "{reply:?}");
+        assert_eq!(reply.1["code"], "invalid_params", "{reply:?}");
+        assert_eq!(reply.1["detail"]["field"], refused, "{reply:?}");
         assert!(!rig.wal_path.exists());
     }
     rig.finish().await;
