@@ -1,0 +1,252 @@
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use broca_core::provider::StubProvider;
+use broca_core::stub_plane::StubToolPlane;
+use broca_protocol::content::{AssistantMessage, ContentBlock, FinishReason, ToolCall};
+use broca_protocol::{
+    BindIdentity, MessageId, NormalizedEvent, ProviderControl, RunId, SubmissionRequest,
+    ToolCallId, Usage,
+};
+use broca_session_store::backend::{MemoryBackend, SessionAddr};
+use broca_session_store::head::SessionTriple;
+use broca_session_store::keys::DeploymentKey;
+use broca_session_store::session::Session;
+use serde_json::{json, Value};
+
+use super::PROJECTED;
+use crate::parts::MemoryParts;
+use crate::run::Seams;
+use crate::writer::Writer;
+
+fn bind() -> BindIdentity {
+    BindIdentity::new("/project", "window", "s1")
+}
+
+/// A compaction provider that answers Setup ready, takes every notice and never hands over a
+/// view.
+struct Quiet;
+
+#[async_trait]
+impl broca_core::CompactionPlane for Quiet {
+    async fn setup(
+        &self,
+        _: &str,
+        _: &BindIdentity,
+        _: Option<&broca_protocol::SessionScope>,
+        _: broca_core::compaction_provider::setup::SetupRequest,
+    ) -> Result<
+        broca_core::compaction_provider::setup::SetupAnswer,
+        broca_core::CompactionUnavailable,
+    > {
+        panic!("a session on the current compaction contract never calls the first protocol")
+    }
+
+    async fn call_v2(
+        &self,
+        _: &str,
+        _: &BindIdentity,
+        _: Option<&broca_protocol::SessionScope>,
+        method: &str,
+        _: Value,
+        _: u64,
+    ) -> Result<Box<serde_json::value::RawValue>, broca_core::compaction_v2::runtime::CallError>
+    {
+        let answer = match method {
+            "compaction.setup" => json!({"answer": "ready"}),
+            "compaction.notice" => json!({"answer": "received"}),
+            "compaction.ride" => json!({"answer": "nothing"}),
+            other => panic!("unexpected compaction method {other}"),
+        };
+        Ok(serde_json::value::to_raw_value(&answer).unwrap())
+    }
+}
+
+fn manifest() -> Arc<broca_wal::PlanManifest> {
+    Arc::new(broca_wal::PlanManifest {
+        rich_ui: None,
+        plan: broca_wal::OpaqueJson::from_json_text(
+            json!({"compaction_item": {"provider": "compactor", "preset": "head", "params": {}}})
+                .to_string(),
+        )
+        .unwrap(),
+        plan_identity: "plan-1".into(),
+        composition_digest: "composition".into(),
+        tools: Arc::new(vec![serde_json::from_value(json!({
+            "name": "read",
+            "description": "Reads a file.",
+            "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}},
+        }))
+        .unwrap()]),
+        system_text: "You are a careful agent.".into(),
+        system_digest: "system".into(),
+        join_version: 1,
+        role_versions: Default::default(),
+        fetches: vec![],
+        declarations: vec![],
+    })
+}
+
+fn tool_step(call: &str) -> Vec<NormalizedEvent> {
+    vec![
+        NormalizedEvent::Control(ProviderControl::AssistantMessage {
+            message: AssistantMessage {
+                message_id: MessageId(format!("m-{call}")),
+                content: vec![ContentBlock::ToolCall(ToolCall {
+                    thought_signature: None,
+                    tool_call_id: ToolCallId(call.into()),
+                    tool_name: "read".into(),
+                    input: json!({"path": format!("src/{call}.rs")}),
+                })],
+            },
+        }),
+        NormalizedEvent::Control(ProviderControl::Finished {
+            usage: Usage {
+                input_tokens: Some(1_000),
+                output_tokens: Some(20),
+                ..Usage::default()
+            },
+            finish_reason: FinishReason::ToolCalls,
+            retries_used: 0,
+        }),
+    ]
+}
+
+fn answer_step(id: &str) -> Vec<NormalizedEvent> {
+    vec![
+        NormalizedEvent::Control(ProviderControl::AssistantMessage {
+            message: AssistantMessage {
+                message_id: MessageId(id.into()),
+                content: vec![ContentBlock::Text {
+                    text: "Done.".into(),
+                }],
+            },
+        }),
+        NormalizedEvent::Control(ProviderControl::Finished {
+            usage: Usage {
+                input_tokens: Some(1_000),
+                output_tokens: Some(10),
+                ..Usage::default()
+            },
+            finish_reason: FinishReason::Stop,
+            retries_used: 0,
+        }),
+    ]
+}
+
+/// Runs `run_id` on `session` under a plan naming a compaction provider, the model answering
+/// `steps` in turn.
+async fn compacted_run(
+    session: &mut Session<&MemoryBackend>,
+    parts: &mut MemoryParts,
+    run_id: &str,
+    steps: Vec<Vec<NormalizedEvent>>,
+) {
+    let provider = StubProvider::new(steps);
+    let request: SubmissionRequest = serde_json::from_value(json!({
+        "model": {"provider_module_id": "stub", "model_id": "m"},
+        "input": [{"role": "user", "content": [{"type": "text", "text": format!("task {run_id}")}]}],
+        "stop_when": [{"type": "step_count", "n": 50}],
+        "context_limit": 1_000_000,
+    }))
+    .unwrap();
+    let mut request = broca_core::RunRequest::from_submission(
+        request,
+        RunId(run_id.into()),
+        bind(),
+        broca_protocol::SubmissionId(String::new()),
+    );
+    let control = broca_core::RunControl {
+        cancel: Some(Default::default()),
+        manifest: Some(manifest()),
+        admitted_context_limit: Some(1_000_000),
+        new_log_compaction_plan_version: Some(broca_core::compaction_v2::PLAN_VERSION),
+        ..Default::default()
+    };
+    let now = || 1_000;
+    let admission = crate::admit::admission(
+        &mut request,
+        &control,
+        &provider,
+        Writer::operations(&*session),
+        Some(now()),
+    )
+    .unwrap();
+    let tools = StubToolPlane::new().with_canned_text("read", "fn main() {}");
+    let seams = Seams {
+        provider: &provider,
+        tools: &tools,
+        bind: bind(),
+        out: None,
+        cancel: Default::default(),
+        stop: Default::default(),
+        held: None,
+        approval: &broca_core::capability::AllowAll,
+        hook_plane: None,
+        now_ms: &now,
+        session_address: None,
+        compaction_plane: Some(&Quiet),
+        compaction_session: None,
+        compaction_changes: true,
+        keep_warm: None,
+        account_reports: None,
+        max_same_account_wait: Default::default(),
+        auth_selection: None,
+        step_progress: None,
+        model_call_ready: None,
+    };
+    crate::run::run(session, parts, admission, &seams)
+        .await
+        .unwrap();
+}
+
+/// How many window entries a run of `tool_steps` tool steps and an answer projects, on a session
+/// holding six answered runs.
+async fn projected_by_a_run(tool_steps: usize) -> usize {
+    let backend = MemoryBackend::default();
+    let mut session = Session::create(
+        &backend,
+        SessionAddr("0123456789abcdef".into()),
+        SessionTriple {
+            project_root: "/project".into(),
+            harness: "window".into(),
+            session: "s1".into(),
+        },
+        &DeploymentKey::new(1, &[7; 32]),
+        false,
+    )
+    .await
+    .unwrap();
+    let mut parts = MemoryParts::default();
+    for index in 0..6 {
+        compacted_run(
+            &mut session,
+            &mut parts,
+            &format!("h{index}"),
+            vec![answer_step(&format!("a{index}"))],
+        )
+        .await;
+    }
+    let mut steps: Vec<_> = (0..tool_steps)
+        .map(|n| tool_step(&format!("c{n}")))
+        .collect();
+    steps.push(answer_step("last"));
+    let before = PROJECTED.with(std::cell::Cell::get);
+    compacted_run(&mut session, &mut parts, "measured", steps).await;
+    PROJECTED.with(std::cell::Cell::get) - before
+}
+
+/// A run's transcript reads project each window entry once, then only what each step adds: the
+/// assistant message and its results, and the held assistant message while its calls run. A
+/// step that projected the whole window at each of its four reads would cost the window's size
+/// four times over.
+#[tokio::test]
+async fn a_step_projects_only_the_entries_it_added() {
+    let short = projected_by_a_run(1).await;
+    let long = projected_by_a_run(9).await;
+    let per_step = (long - short) as f64 / 8.0;
+    assert!(
+        per_step <= 6.0,
+        "each more step projected {per_step} entries ({short} for 2 steps, {long} for 10)"
+    );
+}

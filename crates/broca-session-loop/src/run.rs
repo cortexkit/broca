@@ -406,7 +406,9 @@ where
     // Every end a run writes is followed by a notice of the session's changes, as today's
     // loop follows each of its ends; a pause isn't an end.
     if finished.paused.is_none() {
-        if let Some(changes) = crate::compaction::Changes::of(&admission, seams) {
+        if let Some(changes) = crate::compaction::Changes::of(&admission, seams)
+            .map(|changes| changes.sharing(compaction.as_ref()))
+        {
             changes.tell(&placed, seams).await;
         }
     }
@@ -1671,7 +1673,9 @@ where
     T: ToolPlane,
 {
     let warming = Warming::of(admission, seams);
-    let changes = crate::compaction::Changes::of(admission, seams);
+    // The changes a batch tells the compaction provider read the transcript the run's steps keep.
+    let changes =
+        crate::compaction::Changes::of(admission, seams).map(|changes| changes.sharing(compaction));
     // The pause a timed same-account wait left, which the step it resumes must match.
     let mut account_limit_replay = account_limit_of(writer)?;
     // Each window run's place in the prompt and render config. A run adds no episode once
@@ -5685,6 +5689,7 @@ async fn compaction_ctx<W: Writer, P, T>(
         session,
         provider,
         preset,
+        window: Default::default(),
     }))
 }
 
