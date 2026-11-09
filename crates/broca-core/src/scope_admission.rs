@@ -198,17 +198,28 @@ pub fn check_scope_reservation(
     principal: Option<&BindPrincipal>,
     send: &SendScope,
 ) -> Result<(), ScopeRefusal> {
+    let stamp = match send {
+        SendScope::Internal => return Ok(()),
+        SendScope::DaemonWithoutScopes | SendScope::Unstamped => None,
+        SendScope::Stamped(bind) => Some(&bind.scope),
+    };
+    check_reserved_scope(ownership, principal, stamp)
+}
+
+/// [`check_scope_reservation`] for a caller's request that arrived over a route stamped with
+/// `stamp`, or over an unstamped route when `None`. A file-source `session.import`, which keeps
+/// only its route's scope, meets the reservation through this.
+pub fn check_reserved_scope(
+    ownership: &SessionOwnershipV1,
+    principal: Option<&BindPrincipal>,
+    stamp: Option<&SessionScope>,
+) -> Result<(), ScopeRefusal> {
     let Some(reserved) = ownership
         .reservation
         .as_ref()
         .filter(|_| ownership.episodes == 0)
     else {
         return Ok(());
-    };
-    let stamp = match send {
-        SendScope::Internal => return Ok(()),
-        SendScope::DaemonWithoutScopes | SendScope::Unstamped => None,
-        SendScope::Stamped(bind) => Some(&bind.scope),
     };
     if stamp
         .is_some_and(|stamp| stamp.owner == reserved.owner && stamp.scope_ref == reserved.scope_ref)

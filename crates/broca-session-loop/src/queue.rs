@@ -48,14 +48,15 @@ pub struct Queued {
     pub delivery: Option<broca_protocol::Delivery>,
 }
 
-/// The record for `request`, queued as `submission_id`. Its tool list, when it carries one, is
-/// stored in `parts` first.
+/// The record for `request`, queued as `submission_id`, with the display marks its admission
+/// kept (`message_marks`). Its tool list, when it carries one, is stored in `parts` first.
 pub fn queued_send(
     submission_id: &str,
     send_id: Option<&str>,
     request: &SubmissionRequest,
     receipt: &Receipt,
     at: Queued,
+    message_marks: Option<&broca_protocol::MessageMarks>,
     parts: &mut dyn Parts,
 ) -> Result<QueuedSend, String> {
     let json = |error: serde_json::Error| format!("a queued send: {error}");
@@ -81,6 +82,12 @@ pub fn queued_send(
         },
         None => None,
     };
+    // Stored as today's `Queued` record stores them, so the drained run's start, a ride's notice
+    // and the reads serve them alike.
+    let message_marks = message_marks
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(json)?;
     Ok(QueuedSend {
         // Filled as the record is appended, by the append that stores the media's bytes
         // (`Session::append_input_media`).
@@ -94,9 +101,8 @@ pub fn queued_send(
         request: (!rest.is_empty()).then_some(Value::Object(rest)),
         receipt,
         delivery,
-        // Today's actor admits no display marks on a send yet, so its queued record has none.
-        message_marks: None,
-        named_speaker: None,
+        named_speaker: broca_session_store::record::marks_name_speaker(message_marks.as_ref()),
+        message_marks,
     })
 }
 
@@ -145,17 +151,24 @@ pub struct SteerReceipt {
     pub hooks: Option<Box<broca_wal::Hooks>>,
 }
 
-/// The record of a steer into a running run: its messages, accepted at `written_at_ms`. The run
-/// places them at its next step boundary, so the record carries no part numbers yet.
+/// The record of a steer into a running run: its messages, accepted at `written_at_ms`, with the
+/// display marks its admission kept (`message_marks`). The run places them at its next step
+/// boundary, so the record carries no part numbers yet.
 pub fn steer(
     input: Vec<broca_protocol::Message>,
     written_at_ms: Option<u64>,
     receipt: &SteerReceipt,
+    message_marks: Option<&broca_protocol::MessageMarks>,
 ) -> Result<Steer, String> {
     let receipt = match serde_json::to_value(receipt).map_err(|e| format!("a steer: {e}"))? {
         Value::Object(receipt) if receipt.is_empty() => None,
         receipt => Some(receipt),
     };
+    // Stored as today's `Steered` record stores them.
+    let message_marks = message_marks
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(|e| format!("a steer's marks: {e}"))?;
     Ok(Steer {
         // Filled as the record is appended, by the append that stores the media's bytes.
         media: Vec::new(),
@@ -163,9 +176,8 @@ pub fn steer(
         written_at_ms,
         tags_v1: None,
         receipt,
-        // Today's actor admits no display marks on a steer yet, so its record has none.
-        message_marks: None,
-        named_speaker: None,
+        named_speaker: broca_session_store::record::marks_name_speaker(message_marks.as_ref()),
+        message_marks,
     })
 }
 

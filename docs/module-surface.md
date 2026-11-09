@@ -2430,6 +2430,67 @@ A `v0.3.205` reader refuses those records by feature name; unclassed records ret
 their old bytes and remain readable. The reader, writer and capability ship
 together, with no writer switch or second rollout release.
 
+### Restoring the new storage from a backup
+
+Engram copies `session-store-durable/` by walking its live files, without a snapshot. It
+lists every file first, then reads them, and may read a file again later. So a restored
+session can hold a head newer than the logs and objects beside it, for example one a seal
+wrote after the listing, and an open log holding records that name a medium, a setup part,
+an import's id map or an enrollment's overlay written after the listing. A log read while a
+batch was being appended is stored cut in the middle of that batch, which loading treats as a
+torn tail. Normal loading never falls back: a session whose head names a file the store
+lacks is refused by name.
+
+To make such a session whole again, every head version is also kept as its own file,
+`heads/<addr>/v/<version>`, beside `heads/<addr>/head`, which is the only head loading
+reads. A version is deleted once the version after it has existed for 24 hours, and the
+newest two are always kept. After restoring the files and starting broca, the operator runs
+`session.restore_from_backup` (operator only):
+
+```sh
+broca-session --subc <connection file> --project-root <root> --harness <harness> \
+  --session <session> restore-from-backup          # that session
+broca-session --subc <connection file> --project-root <root> --harness <harness> \
+  --session <session> restore-from-backup --all    # every session in the new storage
+```
+
+With `--all`, the session named only attaches the command to the daemon. The restore runs
+inside the daemon, since checking an encrypted session needs the deployment key. For each
+session it:
+
+- keeps a session whose head and every file it names (open log and checkpoint, directory
+  pages, sealed segments, id index pages, and the media, setup parts, import objects and
+  enrollment overlay that records name) are there and pass their checks. Nothing is written,
+  and the session isn't held;
+- otherwise holds the session as a move does, takes the newest head version, `head` first,
+  then `v/*` newest first, whose change files are all there, and writes it as a new version
+  above every kept one. That rolls back the changes the backup didn't hold whole: a seal
+  moving records out of the open log into sealed segments, a revert, or a recovery;
+- cuts that version's open log back to where the batch holding the first record that names a
+  file the backup lacks starts. Everything the remaining records name was written before
+  them, so what is kept is complete. The cut bytes are kept beside the log, as
+  `logs/<addr>/<log>.restore-cut-<ms>`.
+
+Restore deletes nothing, and refuses a session that fails to load for any other reason: a
+head or open log that fails its checks, or a recovery in progress. A session an actor still
+serves is reported busy and left alone; run the command again once it has been idle. The next
+load treats a restored session as after a crash: a seal the restored version hadn't
+committed, whose intent record ends its log, is undone, a torn tail is cut, and an unfinished run ends interrupted, with calls whose results are
+missing left indeterminate and never sent again. A message id is never reused, since each
+load starts a new writer generation, and a subscriber's cursor past the restored end, or on a
+record that is now another, is refused `cursor_expired`.
+
+The command prints one line per session (`--json-events`: one JSON object, the line in its
+`report` field) and exits 0 when every session was kept or restored, 1 otherwise:
+
+- `kept`: the head version, and that everything it names is there;
+- `rolled_back`: the version it had, the version restored, and the version that was written;
+- `log_cut`: the log, the first record cut, the record naming the file the backup lacks and
+  that file, and the sidecar keeping the cut bytes (a rollback can cut too);
+- `unrecoverable`: what each kept version lacks, for example a sealed segment no kept version
+  can do without; nothing changed;
+- `refused`, `busy`, `key_unavailable` or `failed`: why it wasn't restored; nothing changed.
+
 ## External session and call identities
 
 New external session references use the llm-runner v2 derivation over

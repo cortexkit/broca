@@ -31,6 +31,10 @@ pub const OP_RETRACT: &str = "session.retract";
 /// Move a live, idle session from today's storage into the new storage. Only the operator calls
 /// it, through `broca-session move-to-store`.
 pub const OP_MOVE_TO_STORE: &str = "session.move_to_store";
+/// Restore a session kept in the new storage, or every such session, from the files its store
+/// holds after a backup came back. Only the operator calls it, through `broca-session
+/// restore-from-backup`.
+pub const OP_RESTORE_FROM_BACKUP: &str = "session.restore_from_backup";
 pub const OP_CANCEL: &str = "run.cancel";
 pub const OP_STATUS: &str = "run.status";
 pub const OP_RUN_EVENT_GET: &str = "run.event.get";
@@ -212,6 +216,14 @@ pub(crate) fn management_operations() -> Vec<ManagementOperation> {
             kind: ManagementOperationKind::Mutate,
             description: Some(
                 "Move a live, idle session from today's storage into the new storage; operator only."
+                    .to_string(),
+            ),
+        },
+        ManagementOperation {
+            name: OP_RESTORE_FROM_BACKUP.to_string(),
+            kind: ManagementOperationKind::Mutate,
+            description: Some(
+                "Restore a session kept in the new storage, or every such session, after its files came back from a backup; operator only."
                     .to_string(),
             ),
         },

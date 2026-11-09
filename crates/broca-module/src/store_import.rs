@@ -208,6 +208,12 @@ pub enum StoreOutcome {
     /// with the provider rules' refusal.
     ViewApplied(String),
     Refused(ImportRefusal),
+    /// An import refused by the scope reservation of the session it would create: a scope other
+    /// than the one whose stamped bind reserved the session's address. Answered with the bytes
+    /// today's owner check answers a send with.
+    ScopeRefused(broca_core::ScopeRefusal),
+    /// A dependency the command needs couldn't be read; retrying may succeed.
+    Transient(String),
     /// The session closed under the command: route it again.
     Reopen,
 }

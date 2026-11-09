@@ -144,6 +144,11 @@ pub trait SessionBackend {
         change: &Id128,
         at: Version,
     ) -> Result<(), BackendError>;
+    /// Deletes the session `s` whole, if the stored head is still at `at`: its head first, so
+    /// from then on the session reads as one that never existed, then its logs and objects.
+    /// Durable on return. A crash part way leaves the session absent, with at most some of its
+    /// logs and objects behind, which nothing reads.
+    async fn delete_session(&self, s: &SessionAddr, at: Version) -> Result<(), BackendError>;
     /// Stores setup part `name`, unless a part of that name is already stored: names are derived
     /// from content, so the stored part already holds these bytes. Durable on return, name
     /// included.
@@ -259,6 +264,9 @@ impl<T: SessionBackend + ?Sized> SessionBackend for &T {
     ) -> Result<(), BackendError> {
         (**self).delete_change(s, change, at).await
     }
+    async fn delete_session(&self, s: &SessionAddr, at: Version) -> Result<(), BackendError> {
+        (**self).delete_session(s, at).await
+    }
     async fn put_setup(&self, name: &str, bytes: &[u8]) -> Result<(), BackendError> {
         (**self).put_setup(name, bytes).await
     }
@@ -284,6 +292,10 @@ pub struct MemoryBackend {
     crash_after: Mutex<Option<usize>>,
     /// Mutations left before exactly one of them fails. Tests only.
     fail_at: Mutex<Option<usize>>,
+    /// How many objects were fetched (`get_object`), found or not. Tests only.
+    object_reads: std::sync::atomic::AtomicUsize,
+    /// How many log reads (`read_log`) were served. Tests only.
+    log_reads: std::sync::atomic::AtomicUsize,
 }
 
 #[derive(Default)]
@@ -335,6 +347,16 @@ impl MemoryBackend {
             }
             None => Ok(()),
         }
+    }
+
+    /// How many objects have been fetched from this backend so far, found or not. Tests only.
+    pub fn object_reads(&self) -> usize {
+        self.object_reads.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// How many log reads this backend has served so far. Tests only.
+    pub fn log_reads(&self) -> usize {
+        self.log_reads.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Every object name stored for `s`. Tests only.
@@ -430,6 +452,8 @@ impl SessionBackend for MemoryBackend {
         log: &Id128,
         range: Range<u64>,
     ) -> Result<Vec<u8>, BackendError> {
+        self.log_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let sessions = self.sessions.lock().unwrap();
         let bytes = sessions
             .get(s)
@@ -534,6 +558,8 @@ impl SessionBackend for MemoryBackend {
         s: &SessionAddr,
         name: &str,
     ) -> Result<Option<Vec<u8>>, BackendError> {
+        self.object_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let sessions = self.sessions.lock().unwrap();
         Ok(sessions
             .get(s)
@@ -569,6 +595,14 @@ impl SessionBackend for MemoryBackend {
         Ok(())
     }
 
+    async fn delete_session(&self, s: &SessionAddr, at: Version) -> Result<(), BackendError> {
+        self.mutate()?;
+        let mut sessions = self.sessions.lock().unwrap();
+        sessions.get_mut(s).ok_or(BackendError::Fenced)?.fence(at)?;
+        sessions.remove(s);
+        Ok(())
+    }
+
     async fn put_setup(&self, name: &str, bytes: &[u8]) -> Result<(), BackendError> {
         self.mutate()?;
         self.setup
@@ -592,6 +626,13 @@ impl SessionBackend for MemoryBackend {
 /// - `<root>/heads/<addr>/head`: the head, as its version (8 bytes, little-endian) then its
 ///   bytes. Replaced by writing a temporary file, syncing it, renaming it into place and syncing
 ///   the folder.
+/// - `<root>/heads/<addr>/v/<version>`: every head version, also kept as its own immutable file
+///   in the same layout, written and renamed into place before `head` is replaced. Nothing
+///   loading a session reads them. They exist so a backup that walks live files, and captures a
+///   `head` newer than the logs and objects beside it, still holds an older head that is complete
+///   next to them, which the operator's restore (see `restore`) can choose. A version is deleted
+///   once the version after it has existed for [`HEAD_VERSION_KEEP_MS`], and the newest two are
+///   always kept.
 /// - `<root>/logs/<addr>/<change id>`: one append-only file per log. A barrier syncs it with
 ///   `sync_all`, which issues `F_FULLFSYNC` on macOS and survives power loss.
 /// - `<root>/objects/<addr>/<change id>/<name>`: immutable objects, one folder per change, so
@@ -612,6 +653,15 @@ pub struct LocalBackend {
 }
 
 const VERSION_LEN: usize = 8;
+
+/// The folder of a session's head folder that keeps every head version.
+const VERSIONS_DIR: &str = "v";
+
+/// How long a head version is kept after the version after it was written: far longer than any
+/// backup's walk of the store, so the version that was current when a walk began is still there
+/// for the walk to copy. A kept version whose files were deleted meanwhile is harmless: the
+/// restore checks that every file a version names exists before choosing it.
+pub const HEAD_VERSION_KEEP_MS: u64 = 24 * 60 * 60 * 1000;
 
 /// The folder plain sessions' setup parts live in, beside the encrypted parts' `setup`.
 const PLAIN_SETUP_DIR: &str = "setup-plain";
@@ -684,17 +734,94 @@ impl LocalBackend {
     }
 
     fn read_head_file(&self, s: &SessionAddr) -> Result<Option<(Vec<u8>, Version)>, BackendError> {
-        let mut bytes = Vec::new();
-        match File::open(self.head_dir(s).join("head")) {
-            Ok(mut file) => file.read_to_end(&mut bytes)?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        read_head_at(&self.head_dir(s).join("head"))
+    }
+
+    /// The head versions kept for `s` (see [`HEAD_VERSION_KEEP_MS`]), oldest first.
+    pub fn head_versions(&self, s: &SessionAddr) -> Result<Vec<Version>, BackendError> {
+        Ok(kept_versions(&self.head_dir(s).join(VERSIONS_DIR))?)
+    }
+
+    /// The head kept as `version` of `s`, or `None` when that version isn't kept. A file whose
+    /// version isn't the one its name says is refused as damage.
+    pub fn read_head_version(
+        &self,
+        s: &SessionAddr,
+        version: Version,
+    ) -> Result<Option<Vec<u8>>, BackendError> {
+        let path = self
+            .head_dir(s)
+            .join(VERSIONS_DIR)
+            .join(version.to_string());
+        match read_head_at(&path)? {
+            Some((bytes, stored)) if stored == version => Ok(Some(bytes)),
+            Some(_) => Err(BackendError::Corrupt(
+                "a kept head version holds another version",
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// Every session this store holds a head for. A session folder without a head, such as one a
+    /// creation or a move left before its head was written, holds no session.
+    pub fn stored_sessions(&self) -> Result<Vec<SessionAddr>, BackendError> {
+        let entries = match std::fs::read_dir(self.root.join("heads")) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => return Err(error.into()),
         };
-        if bytes.len() < VERSION_LEN {
-            return Err(BackendError::Corrupt("head file shorter than its version"));
+        let mut sessions = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if entry.path().join("head").is_file() {
+                sessions.push(SessionAddr(name));
+            }
         }
-        let version = u64::from_le_bytes(bytes[..VERSION_LEN].try_into().unwrap());
-        Ok(Some((bytes.split_off(VERSION_LEN), version)))
+        sessions.sort();
+        Ok(sessions)
+    }
+
+    /// Cuts `log` of `s` back to `to` bytes, after keeping the bytes past `to` in a file beside
+    /// it, `<log>.restore-cut-<stamp_ms>`, synced first, so nothing cut is lost. Returns that
+    /// file's path. Only restore does this, holding the session.
+    pub fn cut_log(
+        &self,
+        s: &SessionAddr,
+        log: &Id128,
+        to: u64,
+        stamp_ms: u64,
+    ) -> Result<PathBuf, BackendError> {
+        self.open_logs.lock().unwrap().remove(&(s.clone(), *log));
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(self.log_path(s, log))
+            .map_err(|error| match error.kind() {
+                io::ErrorKind::NotFound => BackendError::NoSuchLog,
+                _ => BackendError::Io(error),
+            })?;
+        if to > file.metadata()?.len() {
+            return Err(BackendError::Corrupt("a cut past the log's end"));
+        }
+        let mut tail = Vec::new();
+        file.seek(SeekFrom::Start(to))?;
+        file.read_to_end(&mut tail)?;
+        let dir = self.log_dir(s);
+        let sidecar = dir.join(format!("{}.restore-cut-{stamp_ms}", hex(&log.0)));
+        // A new file, never one already there: an earlier cut's bytes are never overwritten.
+        let mut kept = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&sidecar)?;
+        kept.write_all(&tail)?;
+        kept.sync_all()?;
+        sync_dir(&dir)?;
+        file.set_len(to)?;
+        file.sync_all()?;
+        Ok(sidecar)
     }
 
     fn fence(&self, s: &SessionAddr, at: Version) -> Result<(), BackendError> {
@@ -740,6 +867,21 @@ impl LocalBackend {
     }
 }
 
+/// A head file's version and bytes, or `None` when there is no such file.
+fn read_head_at(path: &Path) -> Result<Option<(Vec<u8>, Version)>, BackendError> {
+    let mut bytes = Vec::new();
+    match File::open(path) {
+        Ok(mut file) => file.read_to_end(&mut bytes)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if bytes.len() < VERSION_LEN {
+        return Err(BackendError::Corrupt("head file shorter than its version"));
+    }
+    let version = u64::from_le_bytes(bytes[..VERSION_LEN].try_into().unwrap());
+    Ok(Some((bytes.split_off(VERSION_LEN), version)))
+}
+
 /// Makes a folder's entries durable. Windows has no folder sync; durability of renames there is
 /// unproven and is tested before the Windows backend is relied on.
 fn sync_dir(path: &Path) -> io::Result<()> {
@@ -748,6 +890,69 @@ fn sync_dir(path: &Path) -> io::Result<()> {
     #[cfg(not(unix))]
     let _ = path;
     Ok(())
+}
+
+/// Writes a head file, its version then its bytes, as `name` in `dir`: to the temporary file
+/// `temp` first, synced, then renamed into place, and the folder synced.
+fn write_head_file(
+    dir: &Path,
+    temp: &str,
+    name: &str,
+    version: Version,
+    head: &[u8],
+) -> io::Result<()> {
+    let temp = dir.join(temp);
+    let mut file = File::create(&temp)?;
+    file.write_all(&version.to_le_bytes())?;
+    file.write_all(head)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&temp, dir.join(name))?;
+    sync_dir(dir)
+}
+
+/// The head versions kept in `versions`, oldest first. A file whose name isn't a version, such as
+/// a version still being written, isn't one.
+fn kept_versions(versions: &Path) -> io::Result<Vec<Version>> {
+    let entries = match std::fs::read_dir(versions) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut kept = Vec::new();
+    for entry in entries {
+        let name = entry?.file_name();
+        if let Some(version) = name
+            .to_str()
+            .filter(|name| name.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|name| name.parse::<Version>().ok())
+        {
+            kept.push(version);
+        }
+    }
+    kept.sort_unstable();
+    Ok(kept)
+}
+
+/// Deletes every head version in `versions` whose next version was written at least
+/// [`HEAD_VERSION_KEEP_MS`] before `now`, keeping the newest two. Returns how many it deleted.
+fn prune_versions(versions: &Path, now: std::time::SystemTime) -> io::Result<usize> {
+    let kept = kept_versions(versions)?;
+    let keep = std::time::Duration::from_millis(HEAD_VERSION_KEEP_MS);
+    let mut deleted = 0;
+    // A version's age is how long the next one has existed. Its mtime is when it was written:
+    // version files are never changed after their rename.
+    for pair in kept.windows(2).take(kept.len().saturating_sub(2)) {
+        let next = std::fs::metadata(versions.join(pair[1].to_string()))?.modified()?;
+        if now.duration_since(next).is_ok_and(|age| age >= keep) {
+            std::fs::remove_file(versions.join(pair[0].to_string()))?;
+            deleted += 1;
+        }
+    }
+    if deleted > 0 {
+        sync_dir(versions)?;
+    }
+    Ok(deleted)
 }
 
 impl SessionBackend for LocalBackend {
@@ -771,16 +976,21 @@ impl SessionBackend for LocalBackend {
             return Err(BackendError::Fenced);
         }
         let dir = self.head_dir(s);
-        std::fs::create_dir_all(&dir)?;
-        let temp = dir.join("head.tmp");
-        let mut file = File::create(&temp)?;
-        file.write_all(&next.to_le_bytes())?;
-        file.write_all(head)?;
-        file.sync_all()?;
-        drop(file);
-        std::fs::rename(&temp, dir.join("head"))?;
-        sync_dir(&dir)?;
+        let versions = dir.join(VERSIONS_DIR);
+        std::fs::create_dir_all(&versions)?;
+        // The version's own file first, so `head` never names a version that isn't kept.
+        write_head_file(
+            &versions,
+            &format!(".{next}.tmp"),
+            &next.to_string(),
+            next,
+            head,
+        )?;
+        write_head_file(&dir, "head.tmp", "head", next, head)?;
         self.fences.lock().unwrap().insert(s.clone(), next);
+        // The head is committed, so a failure to delete old versions mustn't read as a failed
+        // write: the versions stay, and the next write deletes them.
+        let _ = prune_versions(&versions, std::time::SystemTime::now());
         Ok(next)
     }
 
@@ -965,6 +1175,35 @@ impl SessionBackend for LocalBackend {
         Ok(())
     }
 
+    async fn delete_session(&self, s: &SessionAddr, at: Version) -> Result<(), BackendError> {
+        self.fence(s, at)?;
+        // The head goes first and alone decides whether the session exists, so whatever a crash
+        // leaves of the rest belongs to no session.
+        let heads = self.head_dir(s);
+        match std::fs::remove_file(heads.join("head")) {
+            Ok(()) => sync_dir(&heads)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        self.fences.lock().unwrap().remove(s);
+        self.open_logs
+            .lock()
+            .unwrap()
+            .retain(|(addr, _), _| addr != s);
+        for dir in [self.log_dir(s), self.object_dir(s), heads] {
+            match std::fs::remove_dir_all(&dir) {
+                Ok(()) => {
+                    if let Some(parent) = dir.parent() {
+                        sync_dir(parent)?;
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+
     async fn put_setup(&self, name: &str, bytes: &[u8]) -> Result<(), BackendError> {
         let path = self.setup_path(name)?;
         if path.exists() {
@@ -1022,3 +1261,6 @@ impl SessionBackend for LocalBackend {
         Ok(names)
     }
 }
+
+#[cfg(test)]
+mod tests;

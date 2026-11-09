@@ -1216,6 +1216,124 @@ async fn a_steer_naming_structured_output_the_run_did_not_freeze_is_refused_alik
     .await;
 }
 
+/// Four turns, each answering with text.
+fn four_turns() -> Vec<Vec<NormalizedEvent>> {
+    vec![
+        super::tests::text_step("a1", "hello"),
+        super::tests::text_step("a2", "again"),
+        super::tests::text_step("a3", "more"),
+        super::tests::text_step("a4", "done"),
+    ]
+}
+
+/// Core under its own head scope, marking its message a notice.
+fn noticed(request: &mut SubmissionRequest) {
+    scoped_by_core(request);
+    request.message_marks = [("notice".to_owned(), serde_json::json!(true))]
+        .into_iter()
+        .collect();
+}
+
+/// Core under its own head scope, saying its message speaks for the head's agent, which only
+/// the scope's owner may say.
+fn speaking_for(request: &mut SubmissionRequest) {
+    scoped_by_core(request);
+    request.message_marks = [(
+        "speaks_for".to_owned(),
+        serde_json::json!({"agent_id": "agent-1"}),
+    )]
+    .into_iter()
+    .collect();
+}
+
+/// Another module under core's head scope, saying it speaks for the head's agent.
+fn speaking_for_by_another(request: &mut SubmissionRequest) {
+    speaking_for(request);
+    request.principal = Some(broca_protocol::BindPrincipal::Reserved {
+        module_id: "magic-context".into(),
+    });
+}
+
+/// Core with no scope stamp, saying it speaks for an agent, which a send owning no scope can't.
+fn speaking_for_unscoped(request: &mut SubmissionRequest) {
+    speaking_for(request);
+    request.scope = broca_protocol::SendScope::Unstamped;
+}
+
+/// Core under its own head scope, carrying both marks, which a send may not.
+fn noticed_and_speaking_for(request: &mut SubmissionRequest) {
+    speaking_for(request);
+    request
+        .message_marks
+        .insert("notice".to_owned(), serde_json::json!(true));
+}
+
+/// A send's display marks, a notice and the agent the scope's owner speaks for, are kept for a
+/// run the send starts and for a run drained from the queue, and `session.read` serves them on
+/// each run's message, alike.
+#[tokio::test]
+async fn a_sends_marks_are_kept_for_its_run_alike() {
+    compare(
+        four_turns(),
+        true,
+        vec![
+            tweaked(send("r1", "first"), noticed),
+            tweaked(send("r2", "queued"), speaking_for),
+            Step::Release,
+            Step::Release,
+            Step::Idle,
+            tweaked(send("r3", "third"), speaking_for),
+            tweaked(send("r4", "queued too"), noticed),
+            Step::Release,
+            Step::Release,
+            Step::Idle,
+        ],
+    )
+    .await;
+}
+
+/// A steer's display marks are kept with the steer, and `session.read` serves them on the
+/// message the running run places, alike.
+#[tokio::test]
+async fn a_steers_marks_are_kept_alike() {
+    compare(
+        four_turns(),
+        true,
+        vec![
+            tweaked(send("r1", "first"), scoped_by_core),
+            tweaked(steered(send("s1", "steered")), noticed),
+            Step::Release,
+            Step::Release,
+            Step::Idle,
+            tweaked(send("r2", "second"), scoped_by_core),
+            tweaked(steered(send("s2", "steered again")), speaking_for),
+            Step::Release,
+            Step::Release,
+            Step::Idle,
+        ],
+    )
+    .await;
+}
+
+/// Marks a send may not carry are refused naming the member, before the send's owner is
+/// checked, alike: another module speaking for the scope owner's agent, a send with no scope
+/// speaking for one, and both marks at once. A send whose marks are admitted then runs.
+#[tokio::test]
+async fn marks_a_send_may_not_carry_are_refused_alike() {
+    compare(
+        hello(),
+        false,
+        vec![
+            tweaked(send("r1", "another's"), speaking_for_by_another),
+            tweaked(send("r2", "unscoped"), speaking_for_unscoped),
+            tweaked(send("r3", "both"), noticed_and_speaking_for),
+            tweaked(send("r4", "first"), noticed),
+            Step::Idle,
+        ],
+    )
+    .await;
+}
+
 /// Both loops behind one executor, as the module's executor will be: a session on today's
 /// storage runs through today's loop, a session in the new storage through the new one.
 pub(super) struct BothLoops {

@@ -2298,6 +2298,12 @@ pub enum ServeError {
         code: &'static str,
         message: String,
     },
+    /// A send creating a head asked for `feature`, which the new storage doesn't serve on a
+    /// creating send yet, and a head starts nowhere else. Refused
+    /// [`crate::store_entries::NOT_SERVED_ON_NEW_STORAGE`], permanent, with nothing written.
+    NotServedOnNewStorage {
+        feature: &'static str,
+    },
     /// A template send whose `part_tag` slot names a part the transcript does not show, refused
     /// `template_part_gone` with the slot named in its detail.
     TemplatePartGone {
@@ -2412,6 +2418,9 @@ impl From<OpenError> for ServeError {
             OpenError::NewerWriter { missing, reason } => {
                 ServeError::WalNewerWriter { missing, reason }
             }
+            OpenError::NotServedOnNewStorage { feature } => {
+                ServeError::NotServedOnNewStorage { feature }
+            }
         }
     }
 }
@@ -2449,6 +2458,9 @@ impl std::fmt::Display for ServeError {
                 outcome,
             } => write!(f, "submission '{submission_id}' ended {outcome}"),
             ServeError::DeliveryRefused { message, .. } => f.write_str(message),
+            ServeError::NotServedOnNewStorage { feature } => {
+                f.write_str(&crate::store_actor::unserved_on_creation(feature))
+            }
             ServeError::TemplatePartGone { slot } => write!(
                 f,
                 "the template's {slot} slot names a part the transcript does not show"
@@ -2697,6 +2709,20 @@ pub trait ServeHandler: Send + Sync {
     /// storage when this handler has no runtime for it, before dispatch can consult today's WAL.
     fn kept_in_new_storage(&self, _session: &LineageKey) -> Result<bool, ServeError> {
         Ok(false)
+    }
+
+    /// `session.restore_from_backup`: restores the session, or with `all` every session kept in
+    /// the new storage, from the files the store holds after a backup came back (see
+    /// `registry::store_restore`). A handler without the new storage refuses by name.
+    async fn restore_from_backup(
+        &self,
+        _session: &LineageKey,
+        _all: bool,
+    ) -> Result<serde_json::Value, crate::registry::store_move::MoveRefusal> {
+        Err(crate::registry::store_move::MoveRefusal::new(
+            "store_unavailable",
+            "this module keeps no sessions in the new storage",
+        ))
     }
 
     /// `session.move_to_store`: moves the session from today's storage into the new storage
@@ -3878,6 +3904,14 @@ impl ServeHandler for crate::LineageRegistry {
         class: Option<broca_wal::StorageClass>,
     ) -> Result<serde_json::Value, crate::registry::store_move::MoveRefusal> {
         crate::LineageRegistry::move_to_store(self, session, class).await
+    }
+
+    async fn restore_from_backup(
+        &self,
+        session: &LineageKey,
+        all: bool,
+    ) -> Result<serde_json::Value, crate::registry::store_move::MoveRefusal> {
+        crate::LineageRegistry::restore_from_backup(self, session, all).await
     }
 
     async fn import(&self, req: SessionImportRequest) -> Result<SessionImportResponse, ServeError> {

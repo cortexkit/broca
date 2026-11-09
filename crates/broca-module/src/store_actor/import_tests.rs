@@ -755,6 +755,114 @@ async fn the_registry_creates_an_imported_session_in_the_new_storage() {
     };
 }
 
+/// An import makes its route's principal the session's first owner, so it meets the session's
+/// scope reservation as a first send does. Into a session another module's scope reserved, core's
+/// import is refused as today's owner check refuses a send, naming the reserving owner, before its
+/// source is read; the session created to admit it is gone once its actor closes. A reservation
+/// whose row no longer decodes refuses the import as transient. Into a session core's own scope
+/// reserved, the import is admitted.
+#[tokio::test]
+async fn an_import_meets_the_scope_reservation_of_the_session_it_creates() {
+    use broca_core::scope_admission::OwnerMismatch;
+    use broca_core::{FileLeaseStore, FileWalStore, ScopeRefusal, WalStore};
+    use broca_store::session_address::ScopeReservation;
+    const IDLE: std::time::Duration = std::time::Duration::from_millis(100);
+    let source = Source::new("reserved");
+    let dir = source.dir.join("state");
+    std::fs::create_dir_all(&dir).unwrap();
+    let wal = Arc::new(FileWalStore::new(dir.join("wal")));
+    let executor: Arc<dyn crate::executor::RunExecutor> = Arc::new(executor(Vec::new(), None));
+    let runtime = Arc::new(
+        crate::store_open::StoreRuntime::open(&dir, deployment(), Arc::clone(&executor), IDLE)
+            .await
+            .unwrap(),
+    );
+    let registry = crate::registry::LineageRegistry::new_with_reader(
+        Arc::new(
+            crate::opener::DefaultOpener::new(
+                Arc::new(FileLeaseStore::new(dir.join("leases"))),
+                wal.clone(),
+                executor,
+            )
+            .with_idle_ttl(IDLE)
+            .with_store_runtime(Arc::clone(&runtime)),
+        ),
+        wal.clone(),
+        None,
+    )
+    .with_store_new_sessions();
+    let inventory = super::tests::Inventory::open(&dir, &dir);
+    registry.set_session_address_inventory(Arc::clone(&inventory.store));
+    let another = BindPrincipal::Reserved {
+        module_id: "magic-context".into(),
+    };
+    let session = |name: &str| {
+        broca_protocol::BindIdentity::new(dir.join("project"), "broca", format!("alfonso:{name}"))
+    };
+    let (theirs, damaged, ours) = (session("theirs"), session("damaged"), session("ours"));
+    for (key, owner) in [
+        (&theirs, another.clone()),
+        (&damaged, core()),
+        (&ours, core()),
+    ] {
+        inventory.reserve(
+            key,
+            Some(&ScopeReservation {
+                owner,
+                scope_ref: scope().scope_ref,
+            }),
+        );
+    }
+    inventory.damage(&damaged);
+
+    match registry
+        .route_store_command(&theirs, source.import(source.params("imp-1")))
+        .await
+        .unwrap()
+    {
+        StoreOutcome::ScopeRefused(ScopeRefusal::OwnerMismatch(mismatch)) => assert!(
+            matches!(
+                &*mismatch,
+                OwnerMismatch::Reserved { owner, presented_principal }
+                    if *owner == another && *presented_principal == Some(core())
+            ),
+            "{mismatch:?}"
+        ),
+        other => panic!("expected the reservation's refusal, got {other:?}"),
+    }
+    for _ in 0..1000 {
+        if registry.slot_state(&theirs).is_none() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(
+        !runtime.holds(&theirs).unwrap(),
+        "the session created to admit the refused import is gone"
+    );
+    assert_eq!(wal.wal_present(&theirs), Some(false));
+
+    match registry
+        .route_store_command(&damaged, source.import(source.params("imp-1")))
+        .await
+        .unwrap()
+    {
+        StoreOutcome::Transient(reason) => assert!(
+            reason.starts_with("cannot read the session's scope reservation:"),
+            "{reason}"
+        ),
+        other => panic!("expected a transient refusal, got {other:?}"),
+    }
+
+    let reply = imported(
+        registry
+            .route_store_command(&ours, source.import(source.params("imp-1")))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(reply.imported_messages, 4);
+}
+
 /// An import only ever brings a long-lived agent head onto broca, so the session it creates is
 /// placed durable without any label, in the root backups capture, even when no backup classes
 /// are configured. It reopens from there after a restart, and nothing of it is in the other
@@ -1647,6 +1755,7 @@ async fn a_view_naming_800_sealed_messages_reads_them_once() {
         provider: "compactor".into(),
         preset: "head".into(),
         earlier: None,
+        window: Default::default(),
     };
     let started = std::time::Instant::now();
     let first = broca_session_loop::compaction::transcript(&session, &ctx)

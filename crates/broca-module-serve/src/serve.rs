@@ -58,9 +58,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::manifest::{
     OP_BASELINE, OP_CANCEL, OP_FLUSH_PREFIX, OP_HEAD, OP_IMPORT, OP_INSTALL_VIEW, OP_MOVE_TO_STORE,
-    OP_READ, OP_REFRESH, OP_REFRESH_POLICY, OP_RETRACT, OP_ROLE_DESCRIBE, OP_RUN_EVENT_GET,
-    OP_RUN_RESULT, OP_RUN_TOOL_CALLS, OP_SEND, OP_SEND_STATUS, OP_SESSION_SEND_STATUS, OP_STATUS,
-    OP_SUBSCRIBE, OP_VAULT_AUDIT, OP_WARM,
+    OP_READ, OP_REFRESH, OP_REFRESH_POLICY, OP_RESTORE_FROM_BACKUP, OP_RETRACT, OP_ROLE_DESCRIBE,
+    OP_RUN_EVENT_GET, OP_RUN_RESULT, OP_RUN_TOOL_CALLS, OP_SEND, OP_SEND_STATUS,
+    OP_SESSION_SEND_STATUS, OP_STATUS, OP_SUBSCRIBE, OP_VAULT_AUDIT, OP_WARM,
 };
 use crate::wire::{
     CancelParams, FromWireExt, ImportParams, ImportResult, RetractParams, RouteRequest, SendParams,
@@ -3702,6 +3702,47 @@ where
             )
             .await
         }
+        OP_RESTORE_FROM_BACKUP => {
+            // Only the operator's own connection restores: restore rewrites a session's head and
+            // cuts its log.
+            if !matches!(bind.principal, Some(broca_protocol::BindPrincipal::Direct)) {
+                return send_error(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    "operator_required",
+                    "session.restore_from_backup is for the operator only",
+                )
+                .await;
+            }
+            let all = match restore_all(&req.params) {
+                Ok(all) => all,
+                Err(message) => {
+                    return send_error(
+                        writer,
+                        ver,
+                        channel,
+                        epoch,
+                        corr,
+                        "invalid_params",
+                        &message,
+                    )
+                    .await
+                }
+            };
+            match handler.restore_from_backup(session, all).await {
+                Ok(reply) => send_json_response(writer, ver, channel, epoch, corr, &reply).await,
+                Err(refusal) => {
+                    let mut body = ErrorBody::new(refusal.code, refusal.message);
+                    if let Some(detail) = refusal.detail {
+                        body = body.with_detail(detail);
+                    }
+                    send_error_body(writer, ver, channel, epoch, corr, body).await
+                }
+            }
+        }
         OP_MOVE_TO_STORE => {
             // Only the operator's own connection moves a session: the move changes which
             // storage serves it, and it can't be undone.
@@ -5105,6 +5146,7 @@ fn refused_send_code(error: &ServeError) -> String {
         ServeError::SendRetracted { .. } => "send_retracted".into(),
         ServeError::SendEnded { .. } => "send_ended".into(),
         ServeError::DeliveryRefused { code, .. } => (*code).into(),
+        ServeError::NotServedOnNewStorage { .. } => NOT_SERVED_ON_NEW_STORAGE.into(),
         ServeError::MediaTooLarge(_) => cortexkit_role_llm_runner::errors::MEDIA_TOO_LARGE.into(),
         ServeError::TemplatePartGone { .. } => {
             cortexkit_role_llm_runner::errors::TEMPLATE_PART_GONE.into()
@@ -5205,6 +5247,17 @@ fn move_to_store_class(
     }
 }
 
+/// Whether `session.restore_from_backup`'s params ask for every session kept in the new
+/// storage (`all: true`) or only the route's own (none, or `all: false`). Anything else is
+/// refused, by message.
+fn restore_all(params: &serde_json::Value) -> Result<bool, String> {
+    match params.get("all") {
+        None | Some(serde_json::Value::Null) => Ok(false),
+        Some(serde_json::Value::Bool(all)) => Ok(*all),
+        Some(other) => Err(format!("all must be true or false when given, not {other}")),
+    }
+}
+
 /// The refusal of an op that has no implementation yet for a session kept in the new storage.
 const NOT_SERVED_ON_NEW_STORAGE: &str = "not_served_on_new_storage";
 
@@ -5234,6 +5287,8 @@ pub(crate) fn served_on_new_storage(method: &str, params: &serde_json::Value) ->
         // its messages inline is today's import, which writes a WAL.
         OP_IMPORT => params.get("source").is_some(),
         OP_INSTALL_VIEW => true,
+        // Restore repairs the new storage's own files (`store_restore`).
+        OP_RESTORE_FROM_BACKUP => true,
         // The store actor warms the request its loop would send next, dated by the store's own
         // cache clock (`store_actor::warm`).
         OP_WARM => true,
@@ -5286,6 +5341,14 @@ async fn send_store_outcome<H: ServeHandler + ?Sized>(
                 &refusal.message,
             )
             .await
+        }
+        Ok(StoreOutcome::ScopeRefused(refusal)) => {
+            let error = ServeError::ScopeRefused(refusal);
+            send_serve_error(writer, ver, channel, epoch, corr, &error).await
+        }
+        Ok(StoreOutcome::Transient(message)) => {
+            let error = ServeError::Transient(message);
+            send_serve_error(writer, ver, channel, epoch, corr, &error).await
         }
         // The registry routes a command again when its session closes under it, so it never
         // hands this back.
@@ -5343,6 +5406,7 @@ async fn send_serve_error(
         | ServeError::VariantUnsupported(_)
         | ServeError::ToolAliasInvalid(_)
         | ServeError::DeliveryRefused { .. }
+        | ServeError::NotServedOnNewStorage { .. }
         | ServeError::MediaTooLarge(_)
         | ServeError::SendIdReuse { .. }
         | ServeError::Transient(_)

@@ -653,16 +653,20 @@ impl Rig {
     }
 
     fn write_compaction_config(config_home: &Path) -> PathBuf {
+        Self::write_broca_config(config_home, &Self::compaction_config())
+    }
+
+    /// The `broca.jsonc` that lets broca call compaction providers: only with bus events
+    /// enabled does admission ask a provider about a compaction item instead of refusing it.
+    fn compaction_config() -> serde_json::Value {
+        serde_json::json!({"bus_run_events_enabled": true})
+    }
+
+    /// Writes `config` as broca's `broca.jsonc` under `config_home`, and returns its path.
+    fn write_broca_config(config_home: &Path, config: &serde_json::Value) -> PathBuf {
         let path = config_home.join("cortexkit/broca.jsonc");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &path,
-            serde_json::to_vec(&serde_json::json!({
-                "bus_run_events_enabled": true
-            }))
-            .unwrap(),
-        )
-        .unwrap();
+        std::fs::write(&path, serde_json::to_vec(config).unwrap()).unwrap();
         path
     }
 
@@ -679,6 +683,19 @@ impl Rig {
         state: Option<&Path>,
         model_url: Option<&str>,
         compaction_writer: bool,
+    ) -> Option<Self> {
+        let broca_config = compaction_writer.then(Self::compaction_config);
+        Self::start_with_broca_config(binary, state, model_url, broca_config).await
+    }
+
+    /// A rig whose broca runs `binary` (else this build's) over the state root `state` (else a
+    /// fresh one under the rig), calls the model at `model_url`, and reads `broca_config`, when
+    /// given, as its `broca.jsonc`.
+    async fn start_with_broca_config(
+        binary: Option<&Path>,
+        state: Option<&Path>,
+        model_url: Option<&str>,
+        broca_config: Option<serde_json::Value>,
     ) -> Option<Self> {
         let subc_core = sibling_bin("ck-subc", "SUBC_CORE_BIN");
         let stub = sibling_bin("fake-aft-stub", "FAKE_AFT_STUB_BIN");
@@ -816,11 +833,9 @@ impl Rig {
                 })),
             }
         });
-        if compaction_writer {
-            // Broca calls compaction providers only when bus events are enabled. Without that
-            // startup switch, admission refuses every compaction item before asking its provider.
+        if let Some(broca_config) = &broca_config {
             config["modules"]["broca"]["env"]["BROCA_CONFIG_PATH"] =
-                serde_json::json!(Self::write_compaction_config(&config_home));
+                serde_json::json!(Self::write_broca_config(&config_home, broca_config));
         }
         std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
 
@@ -2142,6 +2157,134 @@ async fn released_reader_reads_agent_run_writer_session_and_refuses_advancement(
         page,
         "reader still serves after refusing advancement"
     );
+}
+
+/// A head's creating send, over a route the daemon stamped with its owner's scope, starts the
+/// head in the durable root of the new storage, not on today's storage: the real `ck-broca`,
+/// supervised by the real `ck-subc`, creating plain sessions. Its first turn completes there.
+/// After the daemon and broca restart over the same state, the owner's next send runs as the
+/// head's second turn, and the head's history reads both turns back, with no log of the head
+/// on today's storage at any point.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_head_runs_two_turns_across_a_restart_in_the_new_storage() {
+    let model = ScopeModel::start().await;
+    // Plain sessions are served without the deployment key, so the rig needs no vault.
+    let storage = serde_json::json!({"session_storage": {"encryption": "off"}});
+    let Some(mut first) =
+        Rig::start_with_broca_config(None, None, Some(&model.url), Some(storage.clone())).await
+    else {
+        return;
+    };
+    let session = first.session("alfonso:head:agent_0123456789abcdef");
+    // Where the head is kept: the new storage's root holding its head file, if any, and how
+    // many logs today's storage holds for it.
+    let kept = |rig: &Rig| {
+        let wal = broca_core::FileWalStore::new(rig.state_root.join("wal"));
+        (
+            broca_wal::session_storage_class(&rig.state_root, &broca_core::session_addr(&session))
+                .unwrap(),
+            broca_wal::StorageClass::ALL
+                .into_iter()
+                .filter(|class| wal.class_wal_path(*class, &session).is_file())
+                .count(),
+        )
+    };
+    let in_the_new_storage = (Some(broca_wal::StorageClass::Durable), 0);
+    let turn = |prompt: &str, send_id: &str, class: Option<&str>| {
+        let mut params = serde_json::json!({
+            "prompt": prompt,
+            "send_id": send_id,
+            "model": {"provider": "mock", "model": "mock-model"},
+        });
+        if let Some(class) = class {
+            params["session_class"] = class.into();
+        }
+        params
+    };
+
+    first.sync_scope().await;
+    let owner = first.connect_as(OWNER, &first.owner_nonce).await;
+    let route = open_scoped(&owner, &session).await.unwrap();
+    let reply = scope_request(
+        &owner,
+        &route,
+        "session.send",
+        turn("Start the head.", "head-first", Some("head")),
+    )
+    .await
+    .unwrap();
+    assert_eq!(reply["result"]["state"], "active", "{reply}");
+    let run = reply["result"]["run_id"].as_str().unwrap().to_owned();
+    completed_run(&owner, &route, &run).await;
+    assert_eq!(kept(&first), in_the_new_storage, "after the first turn");
+    drop(owner);
+
+    // The daemon stops, draining broca, and a new daemon starts broca over the same state.
+    if let Some(pid) = first.child.id() {
+        subc_os::Process::open(pid)
+            .unwrap()
+            .unwrap()
+            .signal(subc_os::Signal::Terminate)
+            .unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(30), first.child.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    let second = Rig::start_with_broca_config(
+        None,
+        Some(&first.state_root),
+        Some(&model.url),
+        Some(storage),
+    )
+    .await
+    .unwrap();
+    second.sync_scope().await;
+    let owner = second.connect_as(OWNER, &second.owner_nonce).await;
+    let route = open_scoped(&owner, &session).await.unwrap();
+    let reply = scope_request(
+        &owner,
+        &route,
+        "session.send",
+        turn("Carry on.", "head-second", None),
+    )
+    .await
+    .unwrap();
+    assert_eq!(reply["result"]["state"], "active", "{reply}");
+    let run = reply["result"]["run_id"].as_str().unwrap().to_owned();
+    completed_run(&owner, &route, &run).await;
+    let history = scope_request(&owner, &route, "session.history", serde_json::json!({}))
+        .await
+        .unwrap();
+    let texts: Vec<(String, String)> = history["result"]["messages"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a history page: {history}"))
+        .iter()
+        .map(|message| {
+            (
+                message["message"]["role"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+                message["message"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+            )
+        })
+        .collect();
+    let said = |role: &str, text: &str| (role.to_owned(), text.to_owned());
+    assert_eq!(
+        texts,
+        [
+            said("user", "Start the head."),
+            said("assistant", "scope answer"),
+            said("user", "Carry on."),
+            said("assistant", "scope answer"),
+        ],
+        "{history}"
+    );
+    assert_eq!(kept(&second), in_the_new_storage, "after the restart");
 }
 
 /// Hold real HTTP requests without a response so authorization checks cannot race provider

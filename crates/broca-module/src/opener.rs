@@ -18,7 +18,9 @@ use broca_core::{
 
 use crate::actor::{LineageActor, IDLE_TTL};
 use crate::executor::RunExecutor;
-use crate::registry::{ActorHandle, LineageKey, LineageOpener, OpenError, RegistryHandle};
+use crate::registry::{
+    ActorHandle, LineageKey, LineageOpener, OpenError, RegistryHandle, StoreCreation,
+};
 
 /// Opens a lineage with a real lease + session WAL writer + the configured executor.
 pub struct DefaultOpener<L: LeaseStore, W: WalStore> {
@@ -421,6 +423,25 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> DefaultOpener<L, W> {
         fences.insert(key.clone(), Arc::downgrade(&fence));
         fence
     }
+
+    /// `creation`, which a send or import marked, when it creates the session `key` in the new
+    /// storage: when today's storage holds no log of it either. `None` leaves the session to
+    /// today's storage, which holds it or can't tell. A head's mark is never left there because
+    /// today's storage couldn't be checked: that refuses the head instead.
+    fn creates_in_store(
+        &self,
+        key: &LineageKey,
+        creation: StoreCreation,
+    ) -> Result<Option<StoreCreation>, OpenError> {
+        match self.wal_store.wal_present_checked(key) {
+            Ok(Some(false)) => Ok(Some(creation)),
+            Ok(_) => Ok(None),
+            Err(error) if matches!(creation, StoreCreation::Head { .. }) => {
+                Err(OpenError::from_wal_read(error.to_string(), &error))
+            }
+            Err(_) => Ok(None),
+        }
+    }
     async fn open_mode(
         &self,
         key: &LineageKey,
@@ -499,29 +520,47 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> DefaultOpener<L, W> {
             // registry marked its creating send or import and the runtime can create it in the
             // mode new sessions take. It starts in the root of the class the rule today's
             // storage places a WAL by gives it: a send's label selects it for backup, and an
-            // import, which only brings an agent head onto broca, always is. The actor keeps the
-            // lease until its session is closed.
+            // import, which only brings an agent head onto broca, always is. A head starts
+            // nowhere else: one the new storage can't start now is refused here, before anything
+            // is created in either storage. The actor keeps the lease until its session is
+            // closed.
             let held = slot.holding(key)?;
-            let creating = if held.is_none() && !status {
-                registry
-                    .take_store_eligible(key)
-                    .filter(|_| self.wal_store.wal_present(key) == Some(false))
+            let mark = if held.is_none() && !status {
+                registry.take_store_eligible(key)
             } else {
                 None
             };
-            let store = match held {
-                Some(store) => Some(store),
-                None if creating.is_some() => slot.creating_runtime(),
+            let creating = match mark {
+                Some(creation) => self.creates_in_store(key, creation)?,
                 None => None,
+            };
+            if let Some(StoreCreation::Head {
+                unserved: Some(feature),
+            }) = creating
+            {
+                return Err(OpenError::NotServedOnNewStorage { feature });
+            }
+            let store = match (held, creating) {
+                (Some(store), _) => Some(store),
+                (None, Some(creation)) => match slot.creating_runtime() {
+                    Some(runtime) => Some(runtime),
+                    None if matches!(creation, StoreCreation::Head { .. }) => {
+                        return Err(crate::store_open::key_unavailable(slot.key_id()));
+                    }
+                    None => None,
+                },
+                (None, None) => None,
             };
             if let Some(store) = store {
                 let class = creating.map(|creation| {
                     let durable = match creation {
-                        crate::registry::StoreCreation::Send => broca_wal::selected_for_backup(
-                            session_class.as_deref(),
-                            &self.wal_store.backup_classes(),
-                        ),
-                        crate::registry::StoreCreation::Import => true,
+                        StoreCreation::Send | StoreCreation::Head { .. } => {
+                            broca_wal::selected_for_backup(
+                                session_class.as_deref(),
+                                &self.wal_store.backup_classes(),
+                            )
+                        }
+                        StoreCreation::Import => true,
                     };
                     broca_wal::placement(retention.is_some(), durable)
                 });

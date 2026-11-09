@@ -60,6 +60,7 @@ pub mod step_events;
 pub mod store_key;
 pub mod store_layout;
 pub mod store_move;
+pub mod store_restore;
 pub mod system_one;
 pub mod trajectory;
 pub mod transport_config;

@@ -195,6 +195,44 @@ impl MediaFold {
         self.take(&unread, parts);
     }
 
+    /// Takes in `records`, which the session's writer just appended from seq `first` on, and
+    /// before them whatever the actor appended since the fold last took anything (a steer, a
+    /// queued send). Those come from the records the writer keeps in memory from its latest run's
+    /// start on, so taking an append never reads the open log. A fold behind what the writer
+    /// keeps would have missed records outside the run; it never should be, and stops, naming
+    /// the gap, rather than read the log.
+    pub fn take_appended<B: SessionBackend>(
+        &mut self,
+        session: &Session<B>,
+        first: u64,
+        records: &[Record],
+        parts: &dyn Parts,
+    ) {
+        if self.broken().is_some() {
+            return;
+        }
+        let next = self.next_seq();
+        if next < first {
+            match session.kept_from(next) {
+                Some(kept) => {
+                    let before: Vec<(u64, Record)> = kept
+                        .into_iter()
+                        .take_while(|(seq, _)| *seq < first)
+                        .collect();
+                    self.take(&before, parts);
+                }
+                None => {
+                    self.stop(format!(
+                        "the session's media fold expected record {next}, which its writer no                          longer keeps, before the records appended from {first}"
+                    ));
+                    return;
+                }
+            }
+        }
+        let appended: Vec<(u64, Record)> = (first..).zip(records.iter().cloned()).collect();
+        self.take(&appended, parts);
+    }
+
     /// What a run starting now renders its media from: the seed through the session's records
     /// taken so far, and from here on the records the fold takes in. `bytes` reads the session's
     /// media objects, when the actor can read them apart from its writer.
@@ -448,11 +486,25 @@ pub struct RunAppends<'a, B: SessionBackend> {
 }
 
 impl<B: SessionBackend> RunAppends<'_, B> {
+    /// After a seal moved the ledger out of the open log: the fold reads the records it hasn't
+    /// taken in yet, which include those the seal wrote to start the new log.
     async fn caught_up<T>(&mut self, result: Result<T, SessionError>) -> Result<T, SessionError> {
         if result.is_ok() {
             if let Some(fold) = self.fold.as_deref_mut() {
                 fold.catch_up(&*self.session, self.parts).await;
             }
+        }
+        result
+    }
+
+    /// After an append: the fold takes the records as appended (see
+    /// [`MediaFold::take_appended`]).
+    fn took(
+        &mut self,
+        result: Result<(u64, Vec<Record>), SessionError>,
+    ) -> Result<(u64, Vec<Record>), SessionError> {
+        if let (Ok((first, records)), Some(fold)) = (&result, self.fold.as_deref_mut()) {
+            fold.take_appended(&*self.session, *first, records, self.parts);
         }
         result
     }
@@ -462,9 +514,9 @@ impl<B: SessionBackend> broca_session_loop::Writer for RunAppends<'_, B> {
     async fn append(&mut self, records: &[Record], barrier: bool) -> Result<u64, SessionError> {
         let appended = self
             .tool_media
-            .append(&mut *self.session, records, barrier)
+            .append_records(&mut *self.session, records, barrier)
             .await;
-        self.caught_up(appended).await
+        self.took(appended).map(|(first, _)| first)
     }
 
     async fn append_input_media(
@@ -477,7 +529,7 @@ impl<B: SessionBackend> broca_session_loop::Writer for RunAppends<'_, B> {
             .session
             .append_input_media(records, media, barrier)
             .await;
-        self.caught_up(appended).await
+        self.took(appended)
     }
 
     async fn send_records(&mut self, submission_id: &str) -> Result<Vec<Record>, SessionError> {
