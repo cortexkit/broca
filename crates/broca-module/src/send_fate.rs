@@ -64,7 +64,10 @@ fn run_sender(records: &[WalRecord], run: &RunId) -> Option<Option<BindPrincipal
     })
 }
 
-fn qualified_sender_run_id(base: &RunId, sender: &BindPrincipal) -> Result<RunId, String> {
+pub(crate) fn qualified_sender_run_id(
+    base: &RunId,
+    sender: &BindPrincipal,
+) -> Result<RunId, String> {
     use sha2::Digest;
     let module_id = match sender {
         BindPrincipal::Reserved { module_id } => module_id,
@@ -235,20 +238,21 @@ pub(crate) fn recorded_send_outcome(
         QueuedSendFate::Retracted => Some(SendOutcome::Retracted { submission_id }),
         QueuedSendFate::Delivered { run_id, mode } => {
             let mut delivered = Delivered::new(delivered_as::STEP).with_ref(run_id.0.clone());
-            if let Some(key) = records.iter().find_map(|record| match record {
+            let ride_key = records.iter().find_map(|record| match record {
                 WalRecord::SendDelivered {
                     submission_id: id,
                     ride: Some(ride),
                     ..
-                } if id == &submission_id => Some(&ride.call_key),
+                } if id == &submission_id => Some(ride.call_key.as_str()),
                 _ => None,
-            }) {
+            });
+            let key = match delivered_call_key(ride_key, mode) {
+                DeliveredCallKey::Ride(key) => Some(key),
+                DeliveredCallKey::Carrier => legacy_carrier_key(records, &submission_id, lineage),
+                DeliveredCallKey::Nothing => None,
+            };
+            if let Some(key) = key {
                 delivered = delivered.with_call_key(key);
-            }
-            if mode == broca_protocol::DeliveryMode::ToolResult && delivered.call_key.is_none() {
-                if let Some(key) = legacy_carrier_key(records, &submission_id, lineage) {
-                    delivered = delivered.with_call_key(key);
-                }
             }
             Some(run_outcome(records, &run_id, Some(delivered), true))
         }
@@ -297,6 +301,32 @@ fn run_outcome(
 
 /// Older deliveries lack an envelope. Their carrying call still has its own durable anchor
 /// in that tool turn; never join a repeated model call ID across different steps.
+/// Where the call key a delivered send's `delivered` names comes from, in either storage.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DeliveredCallKey {
+    /// The key the delivery's ride envelope recorded.
+    Ride(String),
+    /// A send delivered with a tool result before envelopes existed: the key of the call whose
+    /// result carried it.
+    Carrier,
+    /// The send names no call.
+    Nothing,
+}
+
+/// The rule both storages read a delivered send's call key by: the ride envelope's key when
+/// the delivery has one (`ride_key`), else, only for a send delivered with a tool result, the
+/// carrier call's key.
+pub(crate) fn delivered_call_key(
+    ride_key: Option<&str>,
+    mode: broca_protocol::DeliveryMode,
+) -> DeliveredCallKey {
+    match ride_key {
+        Some(key) => DeliveredCallKey::Ride(key.to_owned()),
+        None if mode == broca_protocol::DeliveryMode::ToolResult => DeliveredCallKey::Carrier,
+        None => DeliveredCallKey::Nothing,
+    }
+}
+
 fn legacy_carrier_key(
     records: &[WalRecord],
     submission: &SubmissionId,

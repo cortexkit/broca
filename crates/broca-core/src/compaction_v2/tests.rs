@@ -709,8 +709,6 @@ struct MemoryJournal {
     facts: std::sync::Mutex<Vec<String>>,
     fail: std::sync::atomic::AtomicBool,
 }
-
-#[async_trait::async_trait]
 impl state::Journal for MemoryJournal {
     fn view_refused(&self, publication: &super::diagnostics::Publication, code: &str) {
         publication.warn(

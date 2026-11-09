@@ -24,8 +24,30 @@
 //! from the converted records, from the open log and again after sealing at the newest possible
 //! cut. Every entry must be equal, digests included.
 //!
+//! `session-convert billing <path>...`: for every run of every session log, today's spend facts
+//! (`compute_segments_for_run` over the log) against the facts the new storage's billing path
+//! makes from the converted session, from the open log and again after sealing at the newest
+//! possible cut. Every fact must be equal field for field, fact id included. The report names
+//! counts, run ids and field names only.
+//!
+//! `session-convert subscribe <path>...`: for every session log, today's `session.subscribe`
+//! control stream against the new storage's, from the converted records (see
+//! `subscribe_check`). `session-convert subscribe-cost --dir <scratch> <path>...` times a
+//! subscriber's catch-up on the largest log given.
+//!
+//! `session-convert move-check --dir <scratch> [--all-steps] [--every N] [--out FILE] <path>...`:
+//! for every session log, what moving its session into the new storage would do: the WAL's
+//! preconditions, then the move's staging writer and verifier, writing only under `--dir` (see
+//! `move_check`). `--all-steps` adds the verifier's offline check of every recorded model
+//! request, and `--every N` checks one log in N.
+//!
 //! Point it only at a copy of a state root (an APFS clone, `cp -c`), never at live files: it opens
 //! each log read-only, but a measurement run should never share a disk path with the daemon.
+//!
+//! `--plain`, with any command, stores everything the converter writes or measures in the plain
+//! mode (see `broca_session_store::keys::Cipher`): sessions are created plain, and frames and
+//! segments carry the unkeyed check instead of encryption. Without it they are encrypted under a
+//! fixed throwaway key, as before. `read-cost` stays encrypted either way.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -38,17 +60,55 @@ use broca_session_convert::{convert, Tally};
 use broca_session_store::backend::{MemoryBackend, SessionAddr};
 use broca_session_store::codec::Digest;
 use broca_session_store::fold::conversation::Conversation;
-use broca_session_store::frame::{FrameKey, FRAME_OVERHEAD};
-use broca_session_store::keys::DeploymentKey;
+use broca_session_store::frame::FrameKey;
+use broca_session_store::keys::{Cipher, DeploymentKey};
 use broca_session_store::record::{CancelPoint, Record, Stream};
 use broca_session_store::session::Session;
 use broca_wal::FramedRecord;
 use futures::executor::block_on;
 use serde::Serialize;
 
-/// Measurements encrypt with a fixed throwaway key: only the cost matters, not secrecy.
+mod calls_check;
+mod entries_check;
+mod heads;
+mod history_check;
+mod move_check;
+mod numbering;
+mod pages;
+mod serve_check;
+mod subscribe_check;
+
+/// Set from `--plain` when the arguments are read: the mode everything the converter stores
+/// takes.
+static PLAIN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// The mode `--plain` chose: plain with it, encrypted without.
+fn cipher() -> Cipher {
+    if PLAIN.get().copied().unwrap_or(false) {
+        Cipher::None
+    } else {
+        Cipher::XChaCha20Poly1305
+    }
+}
+
+/// The deployment key every converted session is created and opened with: a fixed throwaway
+/// key, since only cost and correctness are measured, creating sessions in the mode `--plain`
+/// chose.
+fn deployment() -> DeploymentKey {
+    DeploymentKey::new(1, &[0x5a; 32]).creating(cipher())
+}
+
+/// A frame key in the mode `--plain` chose: encrypted under fixed throwaway `bytes`, or plain.
+fn frame_key(bytes: &[u8; 32]) -> FrameKey {
+    match cipher() {
+        Cipher::XChaCha20Poly1305 => FrameKey::new(1, bytes),
+        Cipher::None => FrameKey::plain(),
+    }
+}
+
+/// Measurements use a fixed throwaway key: only the cost matters, not secrecy.
 fn measurement_key() -> FrameKey {
-    FrameKey::new(1, &[7; 32])
+    frame_key(&[7; 32])
 }
 
 #[derive(Default, Serialize)]
@@ -73,9 +133,9 @@ struct Report {
     old_by_type: BTreeMap<String, Tally>,
     new_records: u64,
     new_body_bytes: u64,
-    /// The logs framed and encrypted: bodies plus `FRAME_OVERHEAD` bytes per record.
+    /// The logs framed, encrypted or plain: bodies plus the key's frame overhead per record.
     new_framed_bytes: u64,
-    /// History sealed: zstd in 16 KiB blocks, encrypted, both streams.
+    /// History sealed: zstd in 16 KiB blocks, encrypted or plain, transcript and ledger alike.
     sealed_bytes: u64,
     /// The same with opaque reasoning, signatures and provider text state pruned from runs that
     /// ended.
@@ -149,7 +209,12 @@ fn usage() -> ! {
          session-convert check [--dir SCRATCH] [--out FILE] [--limit N] PATH...\n       \
          session-convert append --dir SCRATCH [--sample N] [--out FILE] PATH...\n       \
          session-convert split [--dir SCRATCH] [--out FILE] [--limit N] PATH...\n       \
-         session-convert entries [--dir SCRATCH] [--out FILE] [--limit N] PATH..."
+         session-convert entries [--dir SCRATCH] [--out FILE] [--limit N] PATH...\n       \
+         session-convert billing [--dir SCRATCH] [--out FILE] [--limit N] PATH...\n       \
+         session-convert subscribe [--dir SCRATCH] [--out FILE] [--limit N] PATH...\n       \
+         session-convert subscribe-cost --dir SCRATCH [--out FILE] PATH...\n       \
+         session-convert move-check --dir SCRATCH [--all-steps] [--every N] [--out FILE] PATH...\n\
+         Any command takes --plain: store in the plain mode instead of encrypted."
     );
     std::process::exit(64);
 }
@@ -168,6 +233,8 @@ struct Args {
     max_records: Option<usize>,
     /// Visit only every Nth log.
     every: usize,
+    /// `move-check`: verify in the offline mode, which rebuilds every recorded model request.
+    all_steps: bool,
     dir: Option<PathBuf>,
     files: Vec<PathBuf>,
 }
@@ -184,6 +251,7 @@ fn parse_args() -> Args {
         prefixes: false,
         max_records: None,
         every: 1,
+        all_steps: false,
         dir: None,
         files: Vec::new(),
     };
@@ -201,10 +269,14 @@ fn parse_args() -> Args {
             "--limit" => parsed.limit = number(),
             "--sample" => parsed.sample = number(),
             "--prefixes" => parsed.prefixes = true,
+            "--all-steps" => parsed.all_steps = true,
             "--max-records" => parsed.max_records = Some(number()),
             "--every" => parsed.every = number().max(1),
             "--only" => parsed.only = Some(args.next().unwrap_or_else(|| usage())),
             "--dir" => parsed.dir = Some(PathBuf::from(args.next().unwrap_or_else(|| usage()))),
+            "--plain" => {
+                let _ = PLAIN.set(true);
+            }
             _ => paths.push(PathBuf::from(arg)),
         }
     }
@@ -247,8 +319,467 @@ fn main() {
         "split" => run_split(&args),
         "seal" => run_seal(&args),
         "entries" => run_entries(&args),
+        "pages" => pages::run(&args),
+        "history" => history_check::run(&args),
+        "numbering" => numbering::run(&args),
+        "read-cost" => pages::run_read_cost(&args),
+        "heads" => heads::run(&args),
+        "billing" => run_billing(&args),
+        "episodes" => run_episodes(&args),
+        "render" => run_render(&args),
+        "serve-check" => serve_check::run(&args),
+        "subscribe" => subscribe_check::run(&args),
+        "subscribe-cost" => subscribe_check::cost(&args),
+        "entries-check" => entries_check::run(&args),
+        "calls-check" => calls_check::run(&args),
+        "move-check" => move_check::run(&args),
         _ => usage(),
     }
+}
+
+/// Requests rebuilt from stored sessions against the bytes broca sent. For each sampled model step
+/// of a log, today's offline renderer (`wal_render`) rebuilds the step's request from today's
+/// records, and the new run loop rebuilds it from the converted records written into a session.
+/// Each is rendered by the run's own wire family and hashed, then compared with the request
+/// digest the step's first attempt recorded when it was sent. Where today's rebuild matches and
+/// the new loop's doesn't, the report names the first request member that differs.
+#[derive(Default, Serialize)]
+struct RenderReport {
+    logs: u64,
+    /// Logs on the current compaction contract layout, whose requests render from the compaction
+    /// view each step recorded as applied.
+    contract_logs: u64,
+    /// Sampled steps of those logs, and how many the new loop rebuilds exactly.
+    contract_steps: u64,
+    contract_new_matches: u64,
+    /// Logs not checked, by reason.
+    skipped: BTreeMap<String, u64>,
+    steps: u64,
+    /// Steps whose rebuilt request from today's records equals the bytes sent.
+    today_matches: u64,
+    /// Steps whose rebuilt request from the new loop equals the bytes sent.
+    new_matches: u64,
+    /// Today's rebuild matches the bytes sent and the new loop's doesn't: by the first request
+    /// member that differs between the two rebuilds.
+    new_differs: BTreeMap<String, u64>,
+    /// The new loop's rebuild matches and today's doesn't.
+    today_only_differs: u64,
+    /// Neither rebuild matches the bytes sent (today's offline renderer can't rebuild these, so
+    /// they say nothing about the new loop).
+    neither: u64,
+    /// Steps where the new loop couldn't build a request, by its error.
+    new_errors: BTreeMap<String, u64>,
+    /// Steps where today's offline renderer couldn't, by its error.
+    today_errors: BTreeMap<String, u64>,
+    /// Steps sent with a lowered output cap. The new loop doesn't lower caps yet, so both
+    /// rebuilds take the recorded cap.
+    output_capped: u64,
+    /// One log per difference class, to look at.
+    examples: BTreeMap<String, String>,
+}
+
+fn run_render(args: &Args) {
+    use broca_wal::WalRecord;
+    let mut report = RenderReport::default();
+    let deployment = deployment();
+    let sha = |bytes: &[u8]| {
+        use sha2::Digest as _;
+        broca_session_store::codec::hex(&sha2::Sha256::digest(bytes))
+    };
+    each_log(args, |item| {
+        let Item::Log {
+            name, old: Ok(old), ..
+        } = item
+        else {
+            return;
+        };
+        report.logs += 1;
+        let records: Vec<WalRecord> = old.records.iter().map(|f| f.record.clone()).collect();
+        let contract = broca_core::is_mode3_log(&records);
+        if contract {
+            report.contract_logs += 1;
+        }
+        // A session on the current compaction contract checks its compaction marker against the
+        // session that wrote it, so the rebuild binds as that session did.
+        let Some(bind) = records.iter().find_map(|record| match record {
+            WalRecord::RunStarted { session, .. } => Some(session.clone()),
+            _ => None,
+        }) else {
+            *report.skipped.entry("no run".into()).or_default() += 1;
+            return;
+        };
+        // Every step with a recorded request: where its start is, its run and config, and the
+        // digest of its first attempt.
+        let mut steps = Vec::new();
+        let mut active: Option<(String, broca_wal::RunConfig)> = None;
+        for (index, record) in records.iter().enumerate() {
+            match record {
+                WalRecord::RunStarted { run_id, config, .. } => {
+                    active = Some((run_id.0.clone(), (**config).clone()))
+                }
+                WalRecord::StepStarted { step_id } => {
+                    let Some((run, config)) = &active else {
+                        continue;
+                    };
+                    let digest = records[index + 1..]
+                        .iter()
+                        .take_while(|record| {
+                            !matches!(
+                                record,
+                                WalRecord::StepStarted { .. } | WalRecord::RunStarted { .. }
+                            )
+                        })
+                        .find_map(|record| match record {
+                            WalRecord::ModelAttemptFinished {
+                                step_id: attempted,
+                                request_body_sha256,
+                                ..
+                            } if attempted == step_id => Some(request_body_sha256.clone()),
+                            _ => None,
+                        });
+                    if let Some(digest) = digest {
+                        steps.push((index, run.clone(), step_id.0, config.clone(), digest));
+                    }
+                }
+                _ => {}
+            }
+        }
+        if steps.is_empty() {
+            *report
+                .skipped
+                .entry("no recorded request".into())
+                .or_default() += 1;
+            return;
+        }
+        // At most `--sample` steps, spread over the log, always the first and the last.
+        let take = args.sample.max(2).min(steps.len());
+        let picked: Vec<usize> = (0..take)
+            .map(|k| k * (steps.len() - 1) / (take - 1).max(1))
+            .collect();
+        for &at in &picked {
+            let (index, run, step, config, digest) = &steps[at];
+            // The step's own lowered output cap, if it recorded one, follows its start.
+            let end = match records.get(index + 1) {
+                Some(WalRecord::OutputReservationClamped { .. }) => index + 1,
+                _ => *index,
+            };
+            let prefix = &records[..=end];
+            report.steps += 1;
+            let cap =
+                broca_core::output_reservation::recorded_cap(prefix, broca_protocol::StepId(*step));
+            report.output_capped += u64::from(cap.is_some());
+            report.contract_steps += u64::from(contract);
+            // A step on the current contract renders from the views recorded up to its request.
+            let view_end = records[end + 1..]
+                .iter()
+                .position(|record| matches!(record, WalRecord::ModelAttemptFinished { .. }))
+                .map_or(records.len(), |offset| end + 1 + offset);
+            let prefix = if contract {
+                &records[..view_end]
+            } else {
+                prefix
+            };
+            let end = if contract { view_end - 1 } else { end };
+            let cap = if contract {
+                broca_core::output_reservation::recorded_cap(prefix, broca_protocol::StepId(*step))
+            } else {
+                cap
+            };
+            let today = broca_module::wal_render::render_step_with_lineage(
+                old.lineage.as_deref(),
+                prefix,
+                config,
+                run,
+                *step,
+                cap,
+                None,
+            );
+            let (frozen, today_opts, today_body) = match today {
+                Ok(today) => today,
+                Err(e) => {
+                    *report
+                        .today_errors
+                        .entry(e.chars().take(100).collect())
+                        .or_default() += 1;
+                    continue;
+                }
+            };
+            let new = (|| -> Result<(broca_protocol::CallOptions, Vec<u8>), String> {
+                let converted = convert(&old.records[..=end], old.lineage.as_deref())
+                    .map_err(|e| format!("convert: {}", e.0))?;
+                let parts = broca_session_loop::parts::MemoryParts {
+                    parts: converted.parts.clone(),
+                };
+                let mut opts = block_on(async {
+                    let backend = MemoryBackend::default();
+                    let mut session = Session::create(
+                        &backend,
+                        SessionAddr(name.clone()),
+                        triple(&name),
+                        &deployment,
+                        false,
+                    )
+                    .await
+                    .map_err(|e| format!("create: {e:?}"))?;
+                    for record in &converted.records {
+                        session
+                            .append(std::slice::from_ref(record), false)
+                            .await
+                            .map_err(|e| format!("append {}: {e:?}", record.name()))?;
+                    }
+                    broca_session_loop::run::offline_request(&session, &parts, &bind, *step)
+                        .await
+                        .map_err(|e| format!("{e:?}"))
+                })?;
+                if let Some(context) = opts.step_context.as_mut() {
+                    context.max_output_tokens = cap;
+                }
+                let family = broca_provider::registry::wire_family(frozen.family_id)
+                    .ok_or("no wire family for the frozen family id")?;
+                let body = family.render_with_provenance(&frozen.for_step(&opts), &opts, None);
+                Ok((opts, body))
+            })();
+            let (new_opts, new_body) = match new {
+                Ok(new) => new,
+                Err(e) => {
+                    let key: String = e.chars().take(100).collect();
+                    report
+                        .examples
+                        .entry(format!("error: {key}"))
+                        .or_insert_with(|| name.clone());
+                    *report.new_errors.entry(key).or_default() += 1;
+                    continue;
+                }
+            };
+            let today_ok = sha(&today_body) == *digest;
+            let new_ok = sha(&new_body) == *digest;
+            report.today_matches += u64::from(today_ok);
+            report.new_matches += u64::from(new_ok);
+            report.contract_new_matches += u64::from(contract && new_ok);
+            match (today_ok, new_ok) {
+                (true, false) => {
+                    let key = options_difference(&today_opts, &new_opts);
+                    // With RENDER_DIFF set, print the first differing prompt message of each
+                    // mismatch, both ways, to see what the new loop builds differently.
+                    if std::env::var_os("RENDER_DIFF").is_some() {
+                        if let Some((at, (a, b))) = today_opts
+                            .prompt
+                            .iter()
+                            .zip(&new_opts.prompt)
+                            .enumerate()
+                            .find(|(_, (a, b))| a != b)
+                        {
+                            // Each part's type and size, then the start of the message.
+                            let show = |m: &broca_protocol::content::Message| {
+                                let value = serde_json::to_value(m).unwrap_or_default();
+                                let parts: Vec<String> = value["content"]
+                                    .as_array()
+                                    .into_iter()
+                                    .flatten()
+                                    .map(|part| {
+                                        format!(
+                                            "{}:{}",
+                                            part["type"].as_str().unwrap_or("?"),
+                                            part.to_string().len()
+                                        )
+                                    })
+                                    .collect();
+                                format!(
+                                    "{parts:?} {}",
+                                    value.to_string().chars().take(300).collect::<String>()
+                                )
+                            };
+                            eprintln!(
+                                "{name} step {step} message {at}\n  today {}\n  new   {}",
+                                show(a),
+                                show(b)
+                            );
+                            if let Ok(replayed) = broca_core::replay::replay(prefix) {
+                                if let Some(m) = replayed.prompt.get(at) {
+                                    eprintln!("  replay {}", show(m));
+                                }
+                                let mut cleaned = replayed.prompt.clone();
+                                broca_protocol::tags::clean_computed_into(&mut cleaned);
+                                eprintln!(
+                                    "  render_tags {} compaction {} cleaned {}",
+                                    config.render_tags,
+                                    replayed.compaction.state().is_some(),
+                                    cleaned.get(at).map(show).unwrap_or_default()
+                                );
+                            }
+                        }
+                    }
+                    report
+                        .examples
+                        .entry(key.clone())
+                        .or_insert_with(|| name.clone());
+                    *report.new_differs.entry(key).or_default() += 1;
+                }
+                (false, true) => report.today_only_differs += 1,
+                (false, false) => report.neither += 1,
+                (true, true) => {}
+            }
+        }
+    });
+    write_report(&report, args.out_file.as_deref());
+}
+
+/// The first member that differs between two rebuilt requests, with array indexes left out so
+/// differences group by member: the serialized request first, then the render-only members the
+/// serialization skips.
+fn options_difference(
+    today: &broca_protocol::CallOptions,
+    new: &broca_protocol::CallOptions,
+) -> String {
+    let a = serde_json::to_value(today).expect("call options serialize");
+    let b = serde_json::to_value(new).expect("call options serialize");
+    if let Some(path) = broca_session_convert::inverse::first_difference(&b, &a, "") {
+        return path
+            .split('/')
+            .filter(|segment| segment.parse::<usize>().is_err())
+            .collect::<Vec<_>>()
+            .join("/");
+    }
+    if today.marker_order_version != new.marker_order_version {
+        return format!(
+            "marker_order_version (today {:?}, new {:?})",
+            today.marker_order_version, new.marker_order_version
+        );
+    }
+    if today.render_episodes != new.render_episodes {
+        return "render_episodes".into();
+    }
+    if today.declared_markers != new.declared_markers {
+        return "declared_markers".into();
+    }
+    "no member differs (the render differs)".into()
+}
+
+/// How many times sessions change their runs' render settings: a run whose render config differs
+/// from the run before it is a change point. The fold keeps the first run and every change point
+/// once they leave the window, so this sets that list's cap.
+#[derive(Default, Serialize)]
+struct EpisodesReport {
+    logs: u64,
+    runs: u64,
+    /// Sessions by their number of change points.
+    change_points: BTreeMap<u64, u64>,
+    max_change_points: u64,
+    max_change_points_log: String,
+    /// The same counted on only what renderers read across runs (family, wire model, reasoning
+    /// effort and whether effort updates are on), the key the fold would keep change points of.
+    key_change_points: BTreeMap<u64, u64>,
+    max_key_change_points: u64,
+    max_key_change_points_log: String,
+    failures: BTreeMap<String, u64>,
+}
+
+/// What request renderers read from a run's render config when that run's messages aren't the
+/// ones being rendered: the ChatGPT effort plan's inputs.
+fn render_key(config: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!([
+        config["family_id"],
+        config["wire_model_id"],
+        config["reasoning_effort"],
+        config["reasoning"]["effort"],
+        config["chatgpt_effort_updates"],
+    ])
+}
+
+fn run_episodes(args: &Args) {
+    let mut report = EpisodesReport::default();
+    each_log(args, |item| {
+        let Item::Log {
+            name, old: Ok(old), ..
+        } = item
+        else {
+            return;
+        };
+        let converted = match convert_log(&old) {
+            Ok(converted) => converted,
+            Err(e) => {
+                *report
+                    .failures
+                    .entry(e.0.chars().take(100).collect())
+                    .or_default() += 1;
+                return;
+            }
+        };
+        report.logs += 1;
+        let mut previous = None;
+        let mut changes = 0u64;
+        let mut previous_key: Option<serde_json::Value> = None;
+        let mut key_changes = 0u64;
+        for record in &converted.records {
+            let Record::RunStart(start) = record else {
+                continue;
+            };
+            report.runs += 1;
+            let config = start
+                .setup
+                .iter()
+                .find(|part| part.kind == broca_session_store::record::PartKind::RenderConfig)
+                .map(|part| part.digest);
+            if let Some(Some(previous)) = previous.filter(|previous| *previous != config) {
+                changes += 1;
+                // With EPISODES_DIFF set, print which members of the render config changed.
+                if std::env::var_os("EPISODES_DIFF").is_some() {
+                    let value = |digest: &broca_session_store::codec::Digest| {
+                        converted
+                            .parts
+                            .get(digest)
+                            .and_then(|bytes| {
+                                serde_json::from_slice::<serde_json::Value>(bytes).ok()
+                            })
+                            .unwrap_or_default()
+                    };
+                    let (before, after) = (
+                        value(&previous),
+                        config.as_ref().map(value).unwrap_or_default(),
+                    );
+                    let keys: std::collections::BTreeSet<&String> = before
+                        .as_object()
+                        .into_iter()
+                        .chain(after.as_object())
+                        .flat_map(|object| object.keys())
+                        .collect();
+                    let changed: Vec<&String> = keys
+                        .into_iter()
+                        .filter(|key| before.get(key.as_str()) != after.get(key.as_str()))
+                        .collect();
+                    eprintln!("{name}: {changed:?}");
+                }
+            } else if previous.is_some_and(|previous| previous != config) {
+                changes += 1;
+            }
+            let key = render_key(
+                &config
+                    .as_ref()
+                    .and_then(|digest| converted.parts.get(digest))
+                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
+                    .unwrap_or_default(),
+            );
+            if previous_key
+                .as_ref()
+                .is_some_and(|previous| *previous != key)
+            {
+                key_changes += 1;
+            }
+            previous_key = Some(key);
+            previous = Some(config);
+        }
+        *report.key_change_points.entry(key_changes).or_default() += 1;
+        if key_changes > report.max_key_change_points {
+            report.max_key_change_points = key_changes;
+            report.max_key_change_points_log = name.clone();
+        }
+        *report.change_points.entry(changes).or_default() += 1;
+        if changes > report.max_change_points {
+            report.max_change_points = changes;
+            report.max_change_points_log = name.clone();
+        }
+    });
+    println!("{}", serde_json::to_string_pretty(&report).unwrap());
 }
 
 #[derive(Default, Serialize)]
@@ -282,9 +813,8 @@ struct EntriesReport {
 /// format serves from the converted records, first from the open log, then after sealing.
 /// Every entry must be equal, digests included.
 fn run_entries(args: &Args) {
-    use broca_session_convert::entry_facts;
     let mut report = EntriesReport::default();
-    let deployment = DeploymentKey::new(1, &[0x5a; 32]);
+    let deployment = deployment();
     each_log(args, |item| {
         let Item::Log {
             name, old: Ok(old), ..
@@ -346,7 +876,7 @@ fn run_entries(args: &Args) {
             }
             let mut equal = 0;
             for (stored, expected) in served.iter().zip(&today) {
-                let got = match entry_facts::project(stored) {
+                let got = match broca_session_loop::entries::project(stored) {
                     Ok(entry) => serde_json::to_value(entry).expect("entries serialize"),
                     Err(e) => {
                         *mismatches.entry(format!("project: {e}")).or_default() += 1;
@@ -447,6 +977,174 @@ fn triple(name: &str) -> broca_session_store::head::SessionTriple {
 }
 
 #[derive(Default, Serialize)]
+struct BillingReport {
+    logs: u64,
+    /// Logs with at least one run start, whose runs are compared.
+    logs_with_runs: u64,
+    /// Converted logs whose owed set is empty, as every converted log's must be: today's
+    /// storage already billed their runs.
+    converted_owe_nothing: u64,
+    /// Converted logs that owe billing, which a store actor would bill again.
+    converted_owing: Vec<String>,
+    /// The comparison over the open log.
+    open: broca_session_convert::billing::Comparison,
+    /// Logs sealed at their newest cut (the latest run input that can start a log), and logs
+    /// sealed with no cut because none could start a log; both move every ledger record out.
+    sealed_at_cut: u64,
+    sealed_without_cut: u64,
+    /// The comparison after sealing.
+    sealed: broca_session_convert::billing::Comparison,
+    /// Logs that couldn't be read, converted, written or sealed, by reason.
+    failures: BTreeMap<String, u64>,
+    /// Differing runs, as `log#run`, by comparison.
+    differing_open: Vec<String>,
+    differing_sealed: Vec<String>,
+}
+
+/// For every run of every log: today's spend facts against the facts the new storage's billing
+/// path makes from the converted session, open and after sealing (see
+/// `broca_session_convert::billing`).
+fn run_billing(args: &Args) {
+    use broca_session_convert::billing::{bind_of, compare, log_session, triple, warms_at};
+    let mut report = BillingReport::default();
+    let deployment = deployment();
+    each_log(args, |item| {
+        let Item::Log { name, old, .. } = item else {
+            return;
+        };
+        report.logs += 1;
+        let mut fail = |what: &str| *report.failures.entry(what.to_owned()).or_default() += 1;
+        let old = match old {
+            Ok(old) => old,
+            Err(_) => return fail("read"),
+        };
+        let Some(bind) = log_session(&old) else {
+            return;
+        };
+        report.logs_with_runs += 1;
+        let converted = match convert_log(&old) {
+            Ok(converted) => converted,
+            Err(_) => return fail("convert"),
+        };
+        let compared = block_on(async {
+            let backend = MemoryBackend::default();
+            let addr = SessionAddr(name.clone());
+            let triple = triple(&bind);
+            let bind = bind_of(&triple);
+            let mut session =
+                Session::create(&backend, addr.clone(), triple.clone(), &deployment, false)
+                    .await
+                    .map_err(|_| "create")?;
+            let mut run_inputs = Vec::new();
+            let mut warm_seqs = Vec::new();
+            for record in &converted.records {
+                let seq = session
+                    .append(std::slice::from_ref(record), false)
+                    .await
+                    .map_err(|_| "append")?;
+                match record {
+                    Record::Input(input)
+                        if input.placement == broca_session_store::record::Placement::RunInput =>
+                    {
+                        run_inputs.push(seq);
+                    }
+                    Record::Warmed(_) => warm_seqs.push(seq),
+                    _ => {}
+                }
+            }
+            let owes = !session.operations.billing_owed.is_empty();
+            let today = warms_at(&old, &warm_seqs).map_err(|_| "warms")?;
+            let parts = broca_session_loop::parts::MemoryParts {
+                parts: converted.parts.clone(),
+            };
+            let open = compare(&old, &today, &session, &bind, &parts).await;
+            // A seal moves the views the session names out of the open log, so it carries a copy
+            // of each, as the run loop does; billing reads none of them.
+            let operations = session.operations.clone();
+            let carried: Vec<Record> = converted
+                .records
+                .iter()
+                .filter(|record| match record {
+                    Record::View(view) => [
+                        operations.view_accepted.as_ref(),
+                        operations
+                            .view_applied
+                            .as_ref()
+                            .map(|applied| &applied.view),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .any(|slot| slot.version == view.version && slot.checksum == view.checksum),
+                    Record::ViewApplied(applied) => {
+                        operations.view_applied.as_ref().is_some_and(|slot| {
+                            slot.view.version == applied.version
+                                && slot.view.checksum == applied.checksum
+                        })
+                    }
+                    _ => false,
+                })
+                .cloned()
+                .collect();
+            let carry = broca_session_store::session::Carry {
+                records: &carried,
+                window_repetition: None,
+            };
+            let mut at_cut = false;
+            for cut in run_inputs.iter().rev() {
+                match session.seal_carrying(Some(*cut), &carry, 0).await {
+                    Ok(_) => {
+                        at_cut = true;
+                        break;
+                    }
+                    Err(broca_session_store::session::SessionError::BadCut(_)) => continue,
+                    Err(_) => return Err("seal"),
+                }
+            }
+            if !at_cut {
+                session
+                    .seal_carrying(None, &carry, 0)
+                    .await
+                    .map_err(|_| "seal")?;
+            }
+            session.close().await.map_err(|_| "close")?;
+            let view = Session::view(&backend, addr, &triple, &deployment)
+                .await
+                .map_err(|_| "view")?;
+            let sealed = compare(&old, &today, &*view, &bind, &parts).await;
+            Ok::<_, &str>((owes, open, at_cut, sealed))
+        });
+        let (owes, open, at_cut, sealed) = match compared {
+            Ok(compared) => compared,
+            Err(what) => return fail(what),
+        };
+        if owes {
+            report.converted_owing.push(name.clone());
+        } else {
+            report.converted_owe_nothing += 1;
+        }
+        report.open.add(&open);
+        report.differing_open.extend(
+            open.differing_runs
+                .iter()
+                .map(|run| format!("{name}#{run}")),
+        );
+        if at_cut {
+            report.sealed_at_cut += 1;
+        } else {
+            report.sealed_without_cut += 1;
+        }
+        report.sealed.add(&sealed);
+        report.differing_sealed.extend(
+            sealed
+                .differing_runs
+                .iter()
+                .map(|run| format!("{name}#{run}")),
+        );
+    });
+    write_report(&report, args.out_file.as_deref());
+}
+
+#[derive(Default, Serialize)]
 struct CheckReport {
     logs: u64,
     /// Logs whose every record rebuilds exactly from the new records.
@@ -525,6 +1223,12 @@ struct PromptReport {
     mismatches: BTreeMap<String, u64>,
     /// A few mismatching logs per category, by name, to look at by hand.
     examples: BTreeMap<String, Vec<String>>,
+    /// Logs whose folded human-prompt count equals today's count over the log's run inputs
+    /// (`claude_code_identity::human_prompt_ordinal`), and the logs where it doesn't.
+    prompt_count_equal: u64,
+    prompt_count_mismatches: BTreeMap<String, u64>,
+    /// Logs with at least one human prompt, so a count can tell the two rules apart.
+    prompt_count_nonzero: u64,
 }
 
 /// Where two prompts first differ, named by position, field and role only.
@@ -613,6 +1317,30 @@ fn run_prompt(args: &Args) {
             return;
         }
         report.messages += today.len() as u64;
+        let counted = broca_module::claude_code_identity::human_prompt_ordinal(&records, &[]);
+        if counted > 0 {
+            report.prompt_count_nonzero += 1;
+        }
+        if conversation.human_prompts == counted {
+            report.prompt_count_equal += 1;
+        } else {
+            let key = if conversation.human_prompts > counted {
+                "folded more"
+            } else {
+                "folded fewer"
+            };
+            *report
+                .prompt_count_mismatches
+                .entry(key.into())
+                .or_default() += 1;
+            let examples = report
+                .examples
+                .entry(format!("prompts: {key}"))
+                .or_default();
+            if examples.len() < 5 {
+                examples.push(name.clone());
+            }
+        }
         match prompt_difference(&today, &conversation.messages) {
             None => report.equal += 1,
             Some(category) => {
@@ -639,12 +1367,23 @@ fn run_trace(args: &Args) {
             return;
         };
         println!("== {name}");
+        // `TRACE_SEQ=<a>-<b>` prints those records whole, as JSON.
+        let whole = std::env::var("TRACE_SEQ").ok().and_then(|range| {
+            let (a, b) = range.split_once('-')?;
+            Some((a.parse::<u64>().ok()?, b.parse::<u64>().ok()?))
+        });
         for framed in old.iter() {
-            let kind = serde_json::to_value(&framed.record)
-                .ok()
+            let value = serde_json::to_value(&framed.record).ok();
+            let kind = value
+                .as_ref()
                 .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_owned))
                 .unwrap_or_default();
             println!("  {:>5} {kind}", framed.seq);
+            if let (Some((a, b)), Some(value)) = (whole, &value) {
+                if (a..=b).contains(&framed.seq) {
+                    println!("{value}");
+                }
+            }
         }
         let records: Vec<broca_wal::WalRecord> = old.iter().map(|f| f.record.clone()).collect();
         let today = broca_core::replay::replay(&records)
@@ -692,6 +1431,9 @@ struct OpsReport {
     /// For each compared field that is usually empty, how many compared states had a value on
     /// today's side. A field that is never set anywhere compares nothing.
     set_on_today: BTreeMap<&'static str, u64>,
+    /// Visited logs with a refresh, refresh-policy or prefix-flush record: the logs whose plan
+    /// changes the comparison exercises beyond the manifests runs froze.
+    plan_change_logs: u64,
 }
 
 /// Serializing values of different types through one closure.
@@ -759,6 +1501,7 @@ fn compare_ops(old: &[FramedRecord], lineage: Option<&str>) -> OpsOutcome {
         return OpsOutcome::FoldRefused(format!("{e:?}"));
     }
     let refusal_schedule = operations.refusal_schedule.clone();
+    let sends = send_differences(&records, &operations);
     let folded_queue: Vec<String> = operations
         .queue
         .iter()
@@ -768,19 +1511,38 @@ fn compare_ops(old: &[FramedRecord], lineage: Option<&str>) -> OpsOutcome {
         .into_iter()
         .map(|pending| pending.submission_id.0)
         .collect();
+    let output_reservation = broca_session_loop::output::history(&operations);
+    // Session-wide facts the head serves, compared whether or not the session has a run.
+    let parts = broca_session_loop::parts::MemoryParts {
+        parts: converted.parts.clone(),
+    };
+    let owner_differs = owner_difference(old, &operations)
+        .or_else(|| first_episode_difference(old, &operations, &parts))
+        .or_else(|| session_usage_difference(&records, &operations))
+        .or_else(|| plan_difference(old, &converted.records, &operations, &parts))
+        .or_else(|| head_plan_difference(&records, &operations, &parts));
     let Some(run) = operations.run else {
         // Nothing to compare only when today's replay has no run either.
-        return if today.run_id.is_none() {
+        return if today.run_id.is_none() && owner_differs.is_none() {
             OpsOutcome::NoRun
         } else {
             OpsOutcome::Compared(
-                vec!["run (missing from the fold)".into()],
+                [
+                    today
+                        .run_id
+                        .is_some()
+                        .then(|| "run (missing from the fold)".to_owned()),
+                    owner_differs,
+                ]
+                .into_iter()
+                .flatten()
+                .collect(),
                 Vec::new(),
                 Vec::new(),
             )
         };
     };
-    let mut differs = Vec::new();
+    let mut differs: Vec<String> = owner_differs.into_iter().collect();
     let mut folded_resolution = run.resolution();
     if let Resolution::Interrupted(ids) | Resolution::ProviderHeld(ids) = &mut folded_resolution {
         ids.sort_by(|a, b| a.0.cmp(&b.0));
@@ -806,6 +1568,10 @@ fn compare_ops(old: &[FramedRecord], lineage: Option<&str>) -> OpsOutcome {
         }
     };
     check(
+        "output_reservation",
+        today.output_reservation == output_reservation,
+    );
+    check(
         "run_id",
         today.run_id.as_ref().map(|id| id.0.as_str()) == Some(run.run_id.as_str()),
     );
@@ -825,7 +1591,7 @@ fn compare_ops(old: &[FramedRecord], lineage: Option<&str>) -> OpsOutcome {
     );
     check(
         "pending_steers",
-        today.pending_steers.len() == run.pending_steers,
+        today.pending_steers.len() == run.pending_messages(),
     );
     let mut nudges: Vec<u64> = today
         .budget_nudges_fired
@@ -889,14 +1655,36 @@ fn compare_ops(old: &[FramedRecord], lineage: Option<&str>) -> OpsOutcome {
         "refusal_schedule",
         json_of(&today.refusal_fallback) == refusal_schedule,
     );
+    // Today keeps every refused step of the episode; only the step in progress can still be
+    // re-sent, so that is the one the fold keeps.
+    check(
+        "refused_step",
+        run.refused_step.is_some()
+            == today
+                .refused_steps
+                .contains(&broca_protocol::StepId(run.completed_steps + 1))
+            && run
+                .refused_step
+                .is_none_or(|step| step == run.completed_steps + 1),
+    );
     let today_cancel = today.cancel_at.map(|at| match at {
         broca_wal::record::RunCancelAt::Now => CancelPoint::Now,
         broca_wal::record::RunCancelAt::StepBoundary => CancelPoint::StepBoundary,
     });
     check("cancel", today_cancel == run.cancel);
+    // The ceiling detail `run.status` reports comes from today's reconciled run state, which
+    // the replay above doesn't carry.
+    let today_ceiling = broca_core::replay::reconcile_run_state(&records, &run.run_id)
+        .and_then(|state| state.context_ceiling);
+    check(
+        "context_ceiling",
+        json_of(&today_ceiling) == run.context_ceiling,
+    );
     check("queue", today_queue == folded_queue);
+    differs.extend(sends);
     let mut set = Vec::new();
     for (field, value) in [
+        ("context_ceiling", json_of(&today_ceiling)),
         ("account_limit_pause", json_of(&today.account_limit_pause)),
         ("keep_warm", json_of(&today.keep_warm)),
         ("on_restart", json_of(&today.on_restart)),
@@ -922,9 +1710,371 @@ fn compare_ops(old: &[FramedRecord], lineage: Option<&str>) -> OpsOutcome {
             "run.budget.nudges_fired",
             run.budget.nudges_fired.len() as u64,
         ),
-        ("run.pending_steers", run.pending_steers as u64),
+        ("run.pending_steers", run.pending_messages() as u64),
     ];
     OpsOutcome::Compared(differs, sizes, set)
+}
+
+/// Where the fold's latest send facts differ from what today's compaction code folds from the
+/// same records: the request-size estimate (`CompactionHistory`), the run of the newest accepted
+/// request (what `host::previous` reads) and the newest cache send (`last_cache_send_at_ms`).
+/// Two kinds of cache-send difference are expected and named apart: a cache warm, which the
+/// fold doesn't read yet, and an attempt without a send time, which today dates from a lower
+/// bound.
+/// Whether the first run's tools and plan, as the stored session gives them to `route.bind` and
+/// the plan checks (`ownership_with_first_episode`), differ from what today's bind ownership
+/// reads from the log's first `RunStarted`: its run id, its tools' names in order and its plan
+/// manifest.
+fn first_episode_difference(
+    old: &[FramedRecord],
+    operations: &broca_session_store::fold::operations::Operations,
+    parts: &broca_session_loop::parts::MemoryParts,
+) -> Option<String> {
+    let today = old.iter().find_map(|frame| match &frame.record {
+        broca_wal::WalRecord::RunStarted {
+            run_id,
+            config,
+            manifest,
+            ..
+        } => Some(broca_core::admission::FirstEpisodeV1 {
+            run_id: run_id.clone(),
+            tool_names: config.tools.iter().map(|tool| tool.name.clone()).collect(),
+            manifest: manifest.as_deref().cloned().map(std::sync::Arc::new),
+        }),
+        _ => None,
+    });
+    let folded =
+        match broca_session_loop::owner::ownership_with_first_episode(&operations.owner, parts) {
+            Ok(folded) => folded.first_episode,
+            Err(error) => return Some(format!("owner.first_episode (unreadable: {error})")),
+        };
+    (today != folded).then(|| "owner.first_episode".to_owned())
+}
+
+/// Whether the session's usage by model, summed from each step's recorded model shares,
+/// differs from the usage today's head folds from the same records (`HeadProjection`).
+fn session_usage_difference(
+    records: &[broca_wal::WalRecord],
+    operations: &broca_session_store::fold::operations::Operations,
+) -> Option<String> {
+    let mut today = broca_core::head::HeadProjection::default();
+    for record in records {
+        today.observe(record);
+    }
+    let folded = broca_module::store_read::session_usage(operations.session_usage.as_ref());
+    let json = |usage: &Option<cortexkit_role_llm_runner::usage::SessionUsage>| {
+        serde_json::to_value(usage).unwrap_or_default()
+    };
+    (json(&today.usage) != json(&folded)).then(|| "session_usage".to_owned())
+}
+
+/// Whether the fold's plan changes differ from today's `SessionChangeState` folded from the same
+/// log, naming the first field that does: what was accepted and applied, the pending change, the
+/// latest applied change's baseline facts, the manifests of the latest run and the latest prefix
+/// rebuild, the rebuild and flush marks and the latest run's model. Today's per-generation and
+/// per-`send_id` answers are compared with the newest of the converted `records` the session's id
+/// index names under the same key (`record_ids`), which is where the store reads them.
+fn plan_difference(
+    old: &[FramedRecord],
+    records: &[broca_session_store::record::Record],
+    operations: &broca_session_store::fold::operations::Operations,
+    parts: &broca_session_loop::parts::MemoryParts,
+) -> Option<String> {
+    use broca_session_store::fold::operations::{ManifestRef, Plan};
+    use broca_session_store::idindex::IdKind;
+    use broca_session_store::record::Record;
+    let today = broca_fetch_plan::session_change::SessionChangeState::fold(old);
+    let default = Plan::default();
+    let plan = operations.plan.as_ref().unwrap_or(&default);
+    // The newest ledger record under each id the index keeps for plan changes.
+    let mut indexed: BTreeMap<(u8, String), &Record> = BTreeMap::new();
+    for record in records {
+        if record.stream() != Stream::Ledger {
+            continue;
+        }
+        for (kind, id) in broca_session_store::idindex::record_ids(record) {
+            let code = match kind {
+                IdKind::RefreshGeneration => 5,
+                IdKind::RefreshPolicySendId => 6,
+                IdKind::PrefixFlushSendId => 7,
+                IdKind::AppliedGeneration => 8,
+                _ => continue,
+            };
+            indexed.insert((code, id), record);
+        }
+    }
+    let index_of = |code: u8| {
+        indexed
+            .iter()
+            .filter(move |((indexed, _), _)| *indexed == code)
+            .map(|((_, id), record)| (id.clone(), *record))
+    };
+    let accepted: BTreeMap<String, (String, String, bool, bool)> = index_of(5)
+        .filter_map(|(id, record)| match record {
+            Record::SessionRefresh(refresh) => Some((
+                id,
+                (
+                    ManifestRef::of_refresh(refresh)
+                        .plan_identity()
+                        .unwrap_or_default()
+                        .to_owned(),
+                    refresh.policy.clone(),
+                    refresh.run_in_progress,
+                    refresh.applies_from_next_run,
+                ),
+            )),
+            _ => None,
+        })
+        .collect();
+    let today_accepted: BTreeMap<String, (String, String, bool, bool)> = today
+        .accepted
+        .iter()
+        .map(|(generation, (identity, policy))| {
+            let (run_in_progress, applies) = today.accepted_replies[generation];
+            (
+                generation.to_string(),
+                (identity.clone(), policy.clone(), run_in_progress, applies),
+            )
+        })
+        .collect();
+    let policy_sends: BTreeMap<String, (u64, String)> = index_of(6)
+        .filter_map(|(id, record)| match record {
+            Record::RefreshPolicy(policy) => Some((id, (policy.generation, policy.policy.clone()))),
+            _ => None,
+        })
+        .collect();
+    let flush_sends: BTreeMap<String, Option<u64>> = index_of(7)
+        .filter_map(|(id, record)| match record {
+            Record::PrefixFlush(flush) => Some((id, flush.pending_generation)),
+            _ => None,
+        })
+        .collect();
+    let applied: BTreeMap<String, String> = index_of(8)
+        .filter_map(|(id, record)| match record {
+            Record::RefreshApplied(applied) => Some((id, applied.applied_by.clone())),
+            _ => None,
+        })
+        .collect();
+    let today_applied: BTreeMap<String, String> = today
+        .applied
+        .iter()
+        .map(|(generation, applied_by)| (generation.to_string(), applied_by.clone()))
+        .collect();
+    let manifest = |manifest: Option<&ManifestRef>| {
+        manifest
+            .map(|manifest| broca_session_loop::run::stored_manifest(manifest, parts))
+            .transpose()
+    };
+    let (pending, current, prefix) = match (
+        manifest(plan.pending.as_ref().map(|pending| &pending.manifest)),
+        manifest(plan.current.as_ref()),
+        manifest(plan.prefix.as_ref()),
+    ) {
+        (Ok(pending), Ok(current), Ok(prefix)) => (pending, current, prefix),
+        _ => return Some("plan (a manifest is unreadable)".into()),
+    };
+    let today_effective = today.effective.as_ref().map(|effective| {
+        (
+            effective.generation,
+            effective.applied_by.clone(),
+            effective.manifest_digest.clone(),
+            effective.composition_digest.clone(),
+            serde_json::to_value(&effective.absent_items).unwrap_or_default(),
+        )
+    });
+    let folded_effective = plan.effective.as_ref().map(|effective| {
+        (
+            effective.generation,
+            effective.applied_by.clone(),
+            effective.manifest_digest.clone(),
+            effective.composition_digest.clone(),
+            serde_json::Value::Array(effective.absent_items.clone()),
+        )
+    });
+    [
+        (
+            "plan.accepted_generation",
+            today.accepted_generation == plan.accepted_generation,
+        ),
+        (
+            "plan.applied_generation",
+            today.applied_generation == plan.applied_generation,
+        ),
+        (
+            "plan.pending",
+            today
+                .pending
+                .as_ref()
+                .map(|pending| (pending.generation, &pending.policy, &pending.manifest))
+                == plan
+                    .pending
+                    .as_ref()
+                    .zip(pending.as_ref())
+                    .map(|(folded, manifest)| (folded.generation, &folded.policy, manifest)),
+        ),
+        ("plan.effective", today_effective == folded_effective),
+        ("plan.current", today.current_manifest == current),
+        ("plan.prefix", today.prefix_manifest == prefix),
+        (
+            "plan.rebuild_since_accept",
+            today.rebuild_pending == plan.rebuild_since_accept,
+        ),
+        (
+            "plan.flushed_since_accept",
+            today.flush_pending == plan.flushed_since_accept,
+        ),
+        ("plan.last_model", today.last_model == plan.last_model),
+        ("index refresh:<generation>", today_accepted == accepted),
+        (
+            "index refresh-policy:<send_id>",
+            today.policy_send_ids == policy_sends,
+        ),
+        ("index flush:<send_id>", today.flush_send_ids == flush_sends),
+        ("index applied:<generation>", today_applied == applied),
+    ]
+    .into_iter()
+    .find(|(_, equal)| !equal)
+    .map(|(field, _)| field.to_owned())
+}
+
+/// Whether the model a send leaving its model to the session runs on (`plan.model`) and the
+/// senders the session admits, as the new storage reads them (`broca_session_loop::plan`), differ
+/// from what today's head folds from the same records (`HeadProjection::selection` and its
+/// senders).
+fn head_plan_difference(
+    records: &[broca_wal::WalRecord],
+    operations: &broca_session_store::fold::operations::Operations,
+    parts: &broca_session_loop::parts::MemoryParts,
+) -> Option<String> {
+    let mut today = broca_core::head::HeadProjection::default();
+    for record in records {
+        today.observe(record);
+    }
+    let selection = match broca_session_loop::plan::selection(operations, parts) {
+        Ok(selection) => selection,
+        Err(error) => return Some(format!("plan selection (unreadable: {error})")),
+    };
+    if today.selection != selection {
+        return Some("plan selection".into());
+    }
+    let senders = match broca_session_loop::plan::sender_manifest(operations, parts) {
+        Ok(manifest) => manifest
+            .as_deref()
+            .map(broca_core::head::head_senders)
+            .unwrap_or_default(),
+        Err(error) => return Some(format!("plan senders (unreadable: {error})")),
+    };
+    (today.senders() != senders.as_slice()).then(|| "plan senders".to_owned())
+}
+
+/// Whether the folded owner summary differs from the one today's admission folds from the same
+/// log (`SessionOwnershipV1::fold_owner_records`), naming the first field that does. The fold
+/// keeps only the first two distinct principals, so those are compared with today's first two.
+fn owner_difference(
+    old: &[FramedRecord],
+    operations: &broca_session_store::fold::operations::Operations,
+) -> Option<String> {
+    let mut today = broca_core::admission::SessionOwnershipV1::default();
+    today.fold_owner_records(old);
+    let today = today.for_owner_access();
+    let folded = match broca_session_loop::owner::ownership(&operations.owner) {
+        Ok(folded) => folded,
+        Err(error) => return Some(format!("owner (unreadable: {error})")),
+    };
+    let first_two: Vec<_> = today.recorded_principals.iter().take(2).cloned().collect();
+    [
+        ("owner.episodes", today.episodes == folded.episodes),
+        (
+            "owner.first_principal",
+            today.first_principal == folded.first_principal,
+        ),
+        (
+            "owner.any_unrecorded_principal",
+            today.any_unrecorded_principal == folded.any_unrecorded_principal,
+        ),
+        (
+            "owner.recorded_principals",
+            first_two == folded.recorded_principals,
+        ),
+        ("owner.scope", today.scope == folded.scope),
+    ]
+    .into_iter()
+    .find(|(_, equal)| !equal)
+    .map(|(field, _)| field.to_owned())
+}
+
+fn send_differences(
+    records: &[broca_wal::WalRecord],
+    operations: &broca_session_store::fold::operations::Operations,
+) -> Vec<String> {
+    use broca_wal::WalRecord;
+    let mut differs = Vec::new();
+    let mut today = broca_core::compaction::CompactionHistory::default();
+    let mut current_run = None;
+    let mut today_run = None;
+    let mut warmed = false;
+    let mut undated = false;
+    for record in records {
+        today.fold(record);
+        match record {
+            WalRecord::RunStarted { run_id, .. } => current_run = Some(run_id.0.clone()),
+            WalRecord::ModelStepFinished { .. } => today_run = current_run.clone(),
+            WalRecord::ModelAttemptFinished {
+                http_status,
+                outcome,
+                sent_at_ms,
+                ..
+            } if broca_core::cache_warm::attempt_reached_the_cache(*http_status, outcome) => {
+                today_run = current_run.clone();
+                undated |= sent_at_ms.is_none();
+            }
+            WalRecord::CacheWarmed { .. } => warmed = true,
+            _ => {}
+        }
+    }
+    let folded = operations
+        .estimate
+        .as_ref()
+        .map(broca_session_loop::compaction::history)
+        .unwrap_or_default();
+    if today.usage() != folded.usage()
+        || today.previous_model != folded.previous_model
+        || today.current_request_bytes != folded.current_request_bytes
+        || today.previous_request_bytes != folded.previous_request_bytes
+    {
+        differs.push("estimate".into());
+    }
+    if today_run != operations.last_send_run {
+        differs.push("last_send_run".into());
+    }
+    let today_cache = broca_core::cache_warm::last_cache_send_at_ms(records);
+    let folded_cache = operations
+        .last_cache_send
+        .as_ref()
+        .map(|send| send.sent_at_ms);
+    if today_cache != folded_cache {
+        differs.push(match (warmed, undated) {
+            (true, _) => "last_cache_send (a cache warm)".into(),
+            (false, true) => "last_cache_send (an attempt without a send time)".into(),
+            (false, false) => "last_cache_send".into(),
+        });
+    } else {
+        // The lifetime that send asked for, by today's rule: the config it was sent under.
+        let today_ttl = broca_core::cache_warm::last_cache_send(records).and_then(|(_, config)| {
+            broca_session_convert::requested_cache_ttl(
+                &config.model.provider_module_id,
+                &config.frozen_render_config,
+            )
+        });
+        let folded_ttl = operations
+            .last_cache_send
+            .as_ref()
+            .and_then(|send| send.requested_ttl_ms);
+        if today_ttl != folded_ttl {
+            differs.push("last_cache_send.requested_ttl_ms".into());
+        }
+    }
+    differs
 }
 
 /// Runs the operational comparison on each log, or with `--prefixes` on every prefix of it
@@ -947,6 +2097,16 @@ fn run_ops(args: &Args) {
         if args.prefixes && args.max_records.is_some_and(|max| old.len() > max) {
             report.not_visited += 1;
             return;
+        }
+        if old.iter().any(|framed| {
+            matches!(
+                framed.record,
+                broca_wal::WalRecord::SessionRefreshAccepted { .. }
+                    | broca_wal::WalRecord::SessionRefreshPolicyChanged { .. }
+                    | broca_wal::WalRecord::SessionPrefixFlushed { .. }
+            )
+        }) {
+            report.plan_change_logs += 1;
         }
         let ends: Vec<usize> = if args.prefixes {
             (1..=old.len()).collect()
@@ -1102,7 +2262,7 @@ impl Measuring {
         let report = &mut self.report;
         debug_assert_eq!(
             report.new_framed_bytes,
-            report.new_body_bytes + report.new_records * FRAME_OVERHEAD as u64
+            report.new_body_bytes + report.new_records * self.key.frame_overhead() as u64
         );
         report.parts_distinct = self.parts.len() as u64;
         report.parts_distinct_bytes = self.parts.values().sum();
@@ -1148,6 +2308,23 @@ enum Item {
 struct OldLog {
     records: Vec<FramedRecord>,
     lineage: Option<String>,
+    /// The same lineage id, for today's code that takes it typed.
+    lineage_id: Option<broca_wal::WalLineageId>,
+    /// When the log's file was last written, which today's `session.head` serves as the
+    /// session's last update when nothing else says it.
+    written_ms: Option<u64>,
+}
+
+impl OldLog {
+    fn new(records: Vec<FramedRecord>, path: &Path) -> Self {
+        let lineage_id = read_lineage(path);
+        Self {
+            records,
+            lineage: lineage_id.map(|id| id.to_string()),
+            lineage_id,
+            written_ms: broca_module::head_time::file_written_ms(path),
+        }
+    }
 }
 
 impl std::ops::Deref for OldLog {
@@ -1165,14 +2342,12 @@ fn convert_log(
 }
 
 /// The lineage id a log's lineage frames name, or `None` for a log written before they existed.
-fn read_lineage(path: &Path) -> Option<String> {
+fn read_lineage(path: &Path) -> Option<broca_wal::WalLineageId> {
     let bytes = std::fs::read(path).ok()?;
     let mut rest = bytes.as_slice();
     while !rest.is_empty() {
         rest = match broca_wal::framing::decode_next(rest) {
-            broca_wal::framing::DecodeStep::Lineage { lineage_id, .. } => {
-                return Some(lineage_id.to_string())
-            }
+            broca_wal::framing::DecodeStep::Lineage { lineage_id, .. } => return Some(lineage_id),
             broca_wal::framing::DecodeStep::Record { consumed, .. } => &rest[consumed..],
             _ => return None,
         };
@@ -1193,10 +2368,7 @@ fn each_log(args: &Args, mut visit: impl FnMut(Item)) {
     let read = |path: &Path| {
         let started = Instant::now();
         let old = broca_wal::replay_file(path, u64::MAX)
-            .map(|records| OldLog {
-                records,
-                lineage: read_lineage(path),
-            })
+            .map(|records| OldLog::new(records, path))
             .map_err(|e| format!("read: {e}"));
         (old, started.elapsed().as_millis())
     };
@@ -1369,9 +2541,11 @@ fn run_append(args: &Args) {
     chosen.extend(by_size.iter().rev().take(5).map(|(_, f)| *f));
     chosen.dedup();
 
-    // Measurements encrypt with a fixed throwaway key: only the cost matters, not secrecy.
-    let deployment = DeploymentKey::new(1, &[0x5a; 32]);
-    let setup_key = deployment.setup_key();
+    // Measurements use a fixed throwaway key: only the cost matters, not secrecy.
+    let deployment = deployment();
+    let setup_key = deployment
+        .setup_key_for(deployment.new_sessions())
+        .expect("the measurement key is loaded");
     // One setup store for the whole run, as a deployment has: later sessions reuse parts that
     // earlier ones stored.
     let setup_root = dir.join("append-setup");
@@ -1386,10 +2560,7 @@ fn run_append(args: &Args) {
     let mut id_lookups = Vec::new();
     for (index, file) in chosen.iter().enumerate() {
         let old = match broca_wal::replay_file(file, u64::MAX) {
-            Ok(records) => OldLog {
-                records,
-                lineage: read_lineage(file),
-            },
+            Ok(records) => OldLog::new(records, file),
             Err(e) => {
                 eprintln!("{}: {e}", file.display());
                 continue;
@@ -1448,10 +2619,13 @@ fn run_append(args: &Args) {
     report.id_lookup_us = percentiles(id_lookups);
     report.setup_parts_written = setup_puts.len() as u64;
     report.setup_put_us = percentiles(setup_puts);
-    if let Ok(entries) = std::fs::read_dir(setup_root.join("setup")) {
-        for entry in entries.flatten() {
-            report.setup_parts_stored += 1;
-            report.setup_bytes_stored += entry.metadata().map(|m| m.len()).unwrap_or(0);
+    // Encrypted parts sit in `setup`, plain ones in `setup-plain`.
+    for folder in ["setup", "setup-plain"] {
+        if let Ok(entries) = std::fs::read_dir(setup_root.join(folder)) {
+            for entry in entries.flatten() {
+                report.setup_parts_stored += 1;
+                report.setup_bytes_stored += entry.metadata().map(|m| m.len()).unwrap_or(0);
+            }
         }
     }
     let _ = std::fs::remove_dir_all(&setup_root);
@@ -1537,7 +2711,7 @@ struct SealReport {
 /// It also seals each transcript again with finished runs' opaque reasoning pruned (a run is
 /// finished when the log holds its end), which is what a real seal writes.
 fn run_seal(args: &Args) {
-    let key = broca_session_store::frame::FrameKey::new(1, &[0x5a; 32]);
+    let key = frame_key(&[0x5a; 32]);
     let mut report = SealReport::default();
     let mut builds = Vec::new();
     let mut expands = Vec::new();
@@ -1571,6 +2745,7 @@ fn run_seal(args: &Args) {
             prefixes: Vec::new(),
             leading: None,
             trailer: None,
+            log_start: None,
             placed_before: Vec::new(),
         };
         report.logs += 1;

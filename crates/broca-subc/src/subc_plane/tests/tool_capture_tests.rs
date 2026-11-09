@@ -33,10 +33,10 @@ fn capture_ctx(batch: &str) -> (PathBuf, BatchCtx, MediaStore) {
     let mut ctx = batch_ctx(batch);
     let wal = broca_core::FileWalStore::new(root.join("wal"));
     drop(wal.open(&ctx.bind).unwrap());
-    ctx.media_capture = Some(ToolMediaCapture::new(
+    ctx.media_capture = Some(std::sync::Arc::new(ToolMediaCapture::new(
         wal.uploads().unwrap(),
         ctx.bind.clone(),
-    ));
+    )));
     let store = MediaStore::open(&root, MediaStoreClass::NonDurable).unwrap();
     (root, ctx, store)
 }

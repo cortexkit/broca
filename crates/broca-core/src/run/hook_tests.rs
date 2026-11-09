@@ -188,14 +188,12 @@ fn runtime<'a>(
     plan: &'a HookPlan,
     plane: &'a Arc<dyn HookPlane>,
     bind: &'a BindIdentity,
-    writer: &'a WalHandle,
 ) -> HookRuntime<'a> {
     HookRuntime {
         scope: None,
         plan,
         plane,
         bind,
-        writer,
         cancel: None,
         stop: None,
         seal: None,
@@ -253,7 +251,7 @@ async fn mutated_input_is_revalidated_before_validate_and_terminal_is_not_rehook
     });
     let (writer, records) = writer();
     let bind = BindIdentity::new("/project", "caller", "s");
-    let runtime = runtime(&plan, &hooks, &bind, &writer);
+    let runtime = runtime(&plan, &hooks, &bind);
     let plane = crate::StubToolPlane::new().with_canned_text("edit", "ok");
     let output = batch(
         vec![call("c")],
@@ -359,7 +357,7 @@ async fn validate_sees_approved_narrowed_args_and_denial_is_one_intentless_barri
     });
     let (writer, records) = writer();
     let bind = BindIdentity::new("/project", "caller", "s");
-    let runtime = runtime(&plan, &hooks, &bind, &writer);
+    let runtime = runtime(&plan, &hooks, &bind);
     let dispatched_records = records.clone();
     let plane=crate::StubToolPlane::new().with_tool("edit",move |call| {
         assert_eq!(call.input,json!({"f":"narrowed"}));
@@ -410,7 +408,7 @@ async fn mutated_input_cannot_bypass_approval_deny() {
     });
     let (writer, records) = writer();
     let bind = BindIdentity::new("/project", "caller", "s");
-    let runtime = runtime(&plan, &hooks, &bind, &writer);
+    let runtime = runtime(&plan, &hooks, &bind);
     let plane = crate::StubToolPlane::new();
     batch(
         vec![call("c")],
@@ -439,7 +437,7 @@ async fn pre_tool_unavailable_refuse_is_a_single_completed_intentless_result() {
     let (hooks, _) = scripted(|_, _| Reply::Unavailable);
     let (writer, records) = writer();
     let bind = BindIdentity::new("/project", "caller", "s");
-    let runtime = runtime(&plan, &hooks, &bind, &writer);
+    let runtime = runtime(&plan, &hooks, &bind);
     batch(
         vec![call("c")],
         &crate::StubToolPlane::new(),
@@ -479,7 +477,7 @@ async fn pre_tool_unknown_answer_is_unavailable_under_the_subscription_policy() 
         let (hooks, _) = scripted(move |_, _| Reply::Answer(unknown.clone()));
         let (writer, records) = writer();
         let bind = BindIdentity::new("/project", "caller", "s");
-        let runtime = runtime(&plan, &hooks, &bind, &writer);
+        let runtime = runtime(&plan, &hooks, &bind);
         let plane = crate::StubToolPlane::new();
         batch(
             vec![call("c")],
@@ -522,7 +520,7 @@ async fn pre_tool_cancel_stops_every_planned_dispatch_and_finishes_announced_bat
     });
     let (writer, records) = writer();
     let bind = BindIdentity::new("/project", "caller", "s");
-    let mut runtime = runtime(&plan, &hooks, &bind, &writer);
+    let mut runtime = runtime(&plan, &hooks, &bind);
     runtime.cancel = Some(&cancel);
     let plane = crate::StubToolPlane::new();
     let result = batch(
@@ -555,7 +553,7 @@ async fn mapped_json_stays_structured_with_zero_post_tool_calls() {
     let (hooks, seen) = scripted(|_, _| Reply::Answer(append("!")));
     let (writer, _) = writer();
     let bind = BindIdentity::new("/project", "caller", "s");
-    let runtime = runtime(&plan, &hooks, &bind, &writer);
+    let runtime = runtime(&plan, &hooks, &bind);
     let value = json!({"data":"x".repeat(1_040_384)});
     let expected = value.clone();
     let plane = crate::StubToolPlane::new().with_tool("edit", move |_| {
@@ -591,7 +589,7 @@ async fn post_tool_does_not_truncate_already_mapped_output() {
     });
     let (writer, records) = writer();
     let bind = BindIdentity::new("/project", "caller", "s");
-    let runtime = runtime(&plan, &hooks, &bind, &writer);
+    let runtime = runtime(&plan, &hooks, &bind);
     let plane = crate::StubToolPlane::new().with_canned_text("edit", &"x".repeat(1_048_577));
     let result = batch(
         vec![call("c")],
@@ -626,7 +624,7 @@ async fn post_answer(
     let (hooks, _) = scripted(move |_, _| Reply::Answer(answer.clone()));
     let (writer, records) = writer();
     let bind = BindIdentity::new("/project", "caller", "s");
-    let runtime = runtime(&plan, &hooks, &bind, &writer);
+    let runtime = runtime(&plan, &hooks, &bind);
     let result = batch(
         vec![call("c")],
         &crate::StubToolPlane::new().with_canned_text("edit", "original"),
@@ -699,7 +697,7 @@ async fn post_tool_cancel_applies_remaining_refuse_policy_without_calling_later_
     let (hooks, seen) = scripted(move |_, _| Reply::Cancel(token.clone()));
     let (writer, records) = writer();
     let bind = BindIdentity::new("/project", "caller", "s");
-    let mut runtime = runtime(&plan, &hooks, &bind, &writer);
+    let mut runtime = runtime(&plan, &hooks, &bind);
     runtime.cancel = Some(&cancel);
     let output = batch(
         vec![call("c")],
@@ -730,7 +728,7 @@ async fn end_to_end_budget_is_capped_even_when_plan_budget_is_larger() {
     let (hooks, seen) = scripted(|_, _| Reply::Never);
     let (writer, _) = writer();
     let bind = BindIdentity::new("/project", "caller", "s");
-    let runtime = runtime(&plan, &hooks, &bind, &writer);
+    let runtime = runtime(&plan, &hooks, &bind);
     let start = tokio::time::Instant::now();
     let mut chain = Box::pin(runtime.chain(
         Subject::PostAssistant {
@@ -759,7 +757,7 @@ async fn tool_call_only_ops_are_unavailable_and_all_non_text_parts_stay_byte_ide
     let (hooks, seen) = scripted(|_, _| Reply::Answer(append("!")));
     let (writer, _) = writer();
     let bind = BindIdentity::new("/project", "caller", "s");
-    let runtime = runtime(&plan, &hooks, &bind, &writer);
+    let runtime = runtime(&plan, &hooks, &bind);
     let content = vec![
         ContentBlock::Reasoning {
             text: "thinking".into(),
@@ -1147,7 +1145,7 @@ async fn post_assistant_cancel_keeps_accepted_ops_and_marks_entire_remaining_cha
     });
     let (writer, _) = writer();
     let bind = BindIdentity::new("/project", "caller", "s");
-    let mut runtime = runtime(&plan, &hooks, &bind, &writer);
+    let mut runtime = runtime(&plan, &hooks, &bind);
     runtime.cancel = Some(&cancel);
     let output = runtime
         .chain(
@@ -1190,7 +1188,7 @@ async fn sequential_post_tool_finishes_before_next_dispatch() {
     });
     let (writer, _) = writer();
     let bind = BindIdentity::new("/project", "caller", "s");
-    let runtime = runtime(&plan, &hooks, &bind, &writer);
+    let runtime = runtime(&plan, &hooks, &bind);
     batch(
         vec![call("first"), call("second")],
         &plane,
@@ -1218,7 +1216,7 @@ async fn excluded_case(kind: &str) {
     let (hooks, seen) = scripted(|_, _| Reply::Answer(HookAnswer::Pass));
     let (writer, _) = writer();
     let bind = BindIdentity::new("/project", "caller", "s");
-    let runtime = runtime(&plan, &hooks, &bind, &writer);
+    let runtime = runtime(&plan, &hooks, &bind);
     let plane = crate::StubToolPlane::new().with_tool("edit", move |call| {
         if call.tool_call_id.0 == "c" {
             crate::StubReply::PlaneUnavailable("offline".into())
@@ -1302,7 +1300,7 @@ async fn excluded_unknown(interrupted: bool) {
     let (hooks, seen) = scripted(|_, _| Reply::Answer(HookAnswer::Pass));
     let (writer, _) = writer();
     let bind = BindIdentity::new("/project", "caller", "s");
-    let runtime = runtime(&plan, &hooks, &bind, &writer);
+    let runtime = runtime(&plan, &hooks, &bind);
     let plane = crate::StubToolPlane::new()
         .with_tool("edit", |_| crate::StubReply::OutcomeUnknown("lost".into()));
     let result = batch(
@@ -1448,7 +1446,7 @@ async fn answers_are_checked_against_frozen_declaration_without_redeclaration() 
     let (hooks, seen) = scripted(|_, _| Reply::Answer(append("!")));
     let (writer, _) = writer();
     let bind = BindIdentity::new("/project", "caller", "s");
-    let runtime = runtime(&plan, &hooks, &bind, &writer);
+    let runtime = runtime(&plan, &hooks, &bind);
     let output = batch(
         vec![call("c")],
         &crate::StubToolPlane::new().with_canned_text("edit", "original"),
@@ -1472,7 +1470,7 @@ async fn post_assistant_replace_without_reduction_owner_is_unavailable() {
     let (hooks, _) = scripted(|_, _| Reply::Answer(replaced()));
     let (writer, _) = writer();
     let bind = BindIdentity::new("/project", "caller", "s");
-    let runtime = runtime(&plan, &hooks, &bind, &writer);
+    let runtime = runtime(&plan, &hooks, &bind);
     let output = runtime
         .chain(
             Subject::PostAssistant {
@@ -1582,7 +1580,7 @@ async fn sealed_post_tool(
     let seal = crate::ShutdownSeal::new();
     let (writer, records) = writer();
     let bind = BindIdentity::new("/project", "caller", "s");
-    let mut runtime = runtime(&plan, &hooks, &bind, &writer);
+    let mut runtime = runtime(&plan, &hooks, &bind);
     runtime.seal = Some(&seal);
     let plane = crate::StubToolPlane::new().with_canned_text("edit", "original");
     let mut tool = tool();
@@ -1717,7 +1715,7 @@ async fn pre_user_identity_stays_on_the_route_before_and_after_recording() {
     let plan = HookPlan::from_manifest(&manifest).unwrap();
     let (hooks, seen) = scripted(|_, _| Reply::Answer(HookAnswer::Pass));
     let bind = BindIdentity::new(scratch.as_path(), "caller", "s");
-    let runtime = runtime(&plan, &hooks, &bind, &writer);
+    let runtime = runtime(&plan, &hooks, &bind);
     let subject = Subject::PreUser {
         blocks: vec!["user".into()],
         mark: None,
@@ -1862,7 +1860,7 @@ async fn matching_tool_coverage_and_phase_call_only_the_selected_subscription() 
     let (hooks, seen) = scripted(|_, _| Reply::Answer(HookAnswer::Pass));
     let (writer, _) = writer();
     let bind = BindIdentity::new("/project", "caller", "s");
-    let runtime = runtime(&plan, &hooks, &bind, &writer);
+    let runtime = runtime(&plan, &hooks, &bind);
     batch(
         vec![call("c")],
         &crate::StubToolPlane::new().with_canned_text("edit", "ok"),
@@ -1902,7 +1900,7 @@ async fn answers_must_obey_the_subscription_operation_and_subject_kind() {
         let (hooks, _) = scripted(move |_, _| Reply::Answer(answer.clone()));
         let (writer, _) = writer();
         let bind = BindIdentity::new("/project", "caller", "s");
-        let runtime = runtime(&plan, &hooks, &bind, &writer);
+        let runtime = runtime(&plan, &hooks, &bind);
         let output = runtime
             .chain(
                 Subject::PostAssistant {
@@ -1930,7 +1928,7 @@ async fn pre_user_seal_cancellation_returns_discardable_output_instead_of_parkin
     let bind = BindIdentity::new("/project", "caller", "s");
     let seal = crate::ShutdownSeal::new();
     seal.seal_and_collect(std::time::Duration::ZERO).await;
-    let mut runtime = runtime(&plan, &hooks, &bind, &writer);
+    let mut runtime = runtime(&plan, &hooks, &bind);
     runtime.seal = Some(&seal);
     let mut chain = Box::pin(runtime.chain(
         Subject::PreUser {
@@ -1966,7 +1964,7 @@ async fn input_hook_cancel_is_not_unavailability_and_never_applies_refuse_policy
     let (hooks, _) = scripted(move |_, _| Reply::Cancel(token.clone()));
     let (writer, _) = writer();
     let bind = BindIdentity::new("/project", "caller", "s");
-    let mut runtime = runtime(&plan, &hooks, &bind, &writer);
+    let mut runtime = runtime(&plan, &hooks, &bind);
     runtime.cancel = Some(&cancel);
     let output = runtime
         .chain(
@@ -2018,7 +2016,7 @@ async fn seal_cancels_pending_hook_immediately_and_parks_without_an_input_slot()
     let (writer, records) = writer();
     let bind = BindIdentity::new("/project", "caller", "s");
     let seal = crate::ShutdownSeal::new();
-    let mut runtime = runtime(&plan, &hooks, &bind, &writer);
+    let mut runtime = runtime(&plan, &hooks, &bind);
     runtime.seal = Some(&seal);
     let mut chain = Box::pin(runtime.chain(
         pre_tool_subject(StepId(1), &call("c"), Phase::Mutate),
@@ -2048,7 +2046,7 @@ async fn pre_tool_stop_during_hook_writes_no_intent_and_finishes_batch() {
     let (hooks, _) = scripted(move |_, _| Reply::Cancel(token.clone()));
     let (writer, records) = writer();
     let bind = BindIdentity::new("/project", "caller", "s");
-    let mut runtime = runtime(&plan, &hooks, &bind, &writer);
+    let mut runtime = runtime(&plan, &hooks, &bind);
     runtime.stop = Some(&stop);
     let plane = crate::StubToolPlane::new();
     let result = batch(
@@ -2080,7 +2078,7 @@ async fn post_tool_subscriber_is_not_called_for_other_subjects() {
     let (hooks, seen) = scripted(|_, _| Reply::Answer(append("wrong hook")));
     let (writer, _) = writer();
     let bind = BindIdentity::new("/project", "caller", "s");
-    let runtime = runtime(&plan, &hooks, &bind, &writer);
+    let runtime = runtime(&plan, &hooks, &bind);
     for subject in [
         Subject::PreUser {
             blocks: vec!["user".into()],
@@ -2137,7 +2135,7 @@ async fn providers_apply_in_frozen_order_not_lexical_order() {
     let (hooks, seen) = scripted(|provider, _| Reply::Answer(append(provider)));
     let (writer, _) = writer();
     let bind = BindIdentity::new("/project", "caller", "s");
-    let runtime = runtime(&plan, &hooks, &bind, &writer);
+    let runtime = runtime(&plan, &hooks, &bind);
     let output = runtime
         .chain(
             Subject::PostAssistant {
@@ -2177,7 +2175,7 @@ async fn catalog_permissions_are_scoped_to_the_selected_tool_owner() {
     let (hooks, _) = scripted(|_, _| Reply::Answer(append("!")));
     let (writer, _) = writer();
     let bind = BindIdentity::new("/project", "caller", "s");
-    let runtime = runtime(&plan, &hooks, &bind, &writer);
+    let runtime = runtime(&plan, &hooks, &bind);
     let result = batch(
         vec![call("c")],
         &crate::StubToolPlane::new().with_canned_text("edit", "original"),
@@ -2945,7 +2943,7 @@ async fn tool_reference_provenance_is_enforced_before_hook_payloads_are_stored()
         assert_eq!(text.matches("reason=provenance]").count(), 2);
         Reply::Answer(append("!"))
     });
-    let runtime = runtime(&plan, &hooks, &bind, &writer);
+    let runtime = runtime(&plan, &hooks, &bind);
     batch(
         vec![call("c")],
         &plane,

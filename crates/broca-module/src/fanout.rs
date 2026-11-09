@@ -155,6 +155,10 @@ pub enum Delivery {
     /// The subscriber could not replay the durable prefix; the serve adapter emits a typed
     /// stream Error frame instead of misreporting a clean empty stream.
     Error(String),
+    /// The subscriber's read access ended with a change the session accepted: a refresh that
+    /// dropped it, or an adoption that changed the owner. The stream ends with the refusal a new
+    /// subscribe would get, and no event recorded after the change is sent.
+    AccessEnded(Box<broca_core::ScopeRefusal>),
     Detached,
 }
 
@@ -194,8 +198,16 @@ impl ResumeCursorProof {
         })
     }
 
-    fn matches(self, cursor: Cursor) -> bool {
+    pub(crate) fn matches(self, cursor: Cursor) -> bool {
         use sha2::{Digest, Sha256};
+        if let Some((incarnation, digest)) = cursor.store_identity() {
+            let text: String = incarnation
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            let incarnation: [u8; 32] = Sha256::digest(text.as_bytes()).into();
+            return incarnation == self.incarnation && digest == self.digest;
+        }
         let Some((lineage, identity)) = cursor.frame_identity() else {
             return false;
         };
@@ -208,14 +220,14 @@ impl ResumeCursorProof {
 
 impl FromCursor {
     /// Should an event at `cursor` be delivered for this attach point?
-    fn includes(&self, cursor: Cursor) -> bool {
+    pub(crate) fn includes(&self, cursor: Cursor) -> bool {
         match self {
             FromCursor::Start => true,
             FromCursor::After(c) | FromCursor::Resume { cursor: c, .. } => cursor > *c,
         }
     }
 
-    fn position(self) -> Option<Cursor> {
+    pub(crate) fn position(self) -> Option<Cursor> {
         match self {
             Self::Start => None,
             Self::After(cursor) | Self::Resume { cursor, .. } => Some(cursor),
@@ -313,20 +325,65 @@ fn project_attach_with_identities(
     project_attach_with_index(durable_prefix, state, from, identities, None)
 }
 
-fn in_flight_step_start(records: &[broca_wal::FramedRecord]) -> Option<usize> {
-    let mut start = None;
-    for (index, frame) in records.iter().enumerate() {
-        match frame.record {
-            broca_wal::WalRecord::StepStarted { .. } => start = Some(index),
-            broca_wal::WalRecord::RunStarted { .. }
-            | broca_wal::WalRecord::ToolBatchFinished { .. }
-            | broca_wal::WalRecord::TurnFinished { .. }
-            | broca_wal::WalRecord::RunFinished { .. }
-            | broca_wal::WalRecord::RunPaused { .. } => start = None,
+/// A record's step boundary in either storage. Model completion alone leaves a tool step open.
+pub(crate) enum StepRecord<'a> {
+    Wal(&'a broca_wal::WalRecord),
+    Store(&'a broca_session_store::record::Record),
+}
+
+/// Retains only the open step's replay state, shared by both subscribe implementations.
+pub(crate) struct StepReplay<T> {
+    current: Option<Vec<T>>,
+}
+
+impl<T> Default for StepReplay<T> {
+    fn default() -> Self {
+        Self { current: None }
+    }
+}
+
+impl<T> StepReplay<T> {
+    pub(crate) fn observe(&mut self, record: StepRecord<'_>) {
+        use broca_session_store::record::Record as S;
+        use broca_wal::WalRecord as W;
+        match record {
+            StepRecord::Wal(W::StepStarted { .. }) | StepRecord::Store(S::StepStart(_)) => {
+                self.current = Some(Vec::new());
+            }
+            StepRecord::Wal(
+                W::RunStarted { .. }
+                | W::ToolBatchFinished { .. }
+                | W::TurnFinished { .. }
+                | W::RunFinished { .. }
+                | W::RunPaused { .. },
+            )
+            | StepRecord::Store(S::RunStart(_) | S::BatchEnd(_) | S::RunEnd(_) | S::Pause(_)) => {
+                self.current = None;
+            }
             _ => {}
         }
     }
-    start
+
+    pub(crate) fn push(&mut self, value: T) {
+        if let Some(current) = &mut self.current {
+            current.push(value);
+        }
+    }
+
+    pub(crate) fn units(&self) -> &[T] {
+        self.current.as_deref().unwrap_or_default()
+    }
+}
+
+fn in_flight_step_start(records: &[broca_wal::FramedRecord]) -> Option<usize> {
+    let mut step = StepReplay::default();
+    for (index, frame) in records.iter().enumerate() {
+        step.observe(StepRecord::Wal(&frame.record));
+        if step.units().is_empty() {
+            step.push(index);
+        }
+    }
+    step.units().first().copied()
 }
 
 fn project_attach_with_index(
@@ -737,12 +794,12 @@ fn replay_for_database_attach_with_lookup(
 /// ring-published after the subscriber registered would be delivered twice. Pure so the
 /// dedup is unit-testable in isolation (the integration stress proves it fires under real
 /// concurrency; this proves the decision itself is correct).
-fn deliver_from_ring(cursor: Cursor, h: u64, from: FromCursor) -> bool {
+pub(crate) fn deliver_from_ring(cursor: Cursor, h: u64, from: FromCursor) -> bool {
     cursor.wal_seq > h && from.includes(cursor)
 }
 
 /// How many live control events the ring buffers before a slow subscriber lags + detaches.
-const RING_CAPACITY: usize = 1024;
+pub(crate) const RING_CAPACITY: usize = 1024;
 /// The writer-to-projector queue is bounded independently from the subscriber ring. If the
 /// projector falls behind, its receiver reports lag and detaches subscribers so they recover
 /// through the existing WAL replay path.
@@ -752,7 +809,7 @@ const OBSERVER_RING_CAPACITY: usize = 1024;
 /// slow display subscriber drops frames (a `DisplayGap` marks the gap), it never detaches
 /// or backpressures the run. Smaller than the control ring: display is a render
 /// convenience, not durable.
-const DISPLAY_RING_CAPACITY: usize = 256;
+pub(crate) const DISPLAY_RING_CAPACITY: usize = 256;
 
 /// A broadcast ring that allocates its slot buffer when the first receiver subscribes.
 ///
@@ -2026,7 +2083,7 @@ pub fn display_gaps() -> u64 {
 
 /// Deliver one item to the sink, honoring cancellation. Returns `Break` if the subscriber
 /// should stop (the sink closed = the client went away, or cancelled = close teardown).
-async fn deliver(
+pub(crate) async fn deliver(
     sink: &mpsc::Sender<Delivery>,
     cancel: &CancellationToken,
     item: Delivery,
@@ -3559,6 +3616,7 @@ mod tests {
                 }
                 Delivery::Control(_) | Delivery::Display(_) => {}
                 Delivery::Error(error) => panic!("replay failed: {error}"),
+                Delivery::AccessEnded(refusal) => panic!("read access ended: {refusal:?}"),
                 Delivery::Expired { .. } => panic!("forever subscriber expired"),
                 Delivery::Detached => panic!("subscriber B detached during replay"),
                 Delivery::CursorExpired => panic!("subscriber B cursor expired during replay"),
@@ -3595,6 +3653,7 @@ mod tests {
                 }
                 Delivery::Display(_) => {}
                 Delivery::Error(error) => panic!("live delivery failed: {error}"),
+                Delivery::AccessEnded(refusal) => panic!("read access ended: {refusal:?}"),
                 Delivery::Expired { .. } => panic!("forever subscriber expired"),
                 Delivery::Detached => panic!("subscriber B detached before terminal"),
                 Delivery::CursorExpired => panic!("subscriber B cursor expired before terminal"),

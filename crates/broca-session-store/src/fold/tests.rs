@@ -1,5 +1,8 @@
 use super::conversation::Conversation;
-use super::operations::{Budget, OpenBatch, Operations, Run};
+use super::operations::{
+    Budget, EffectiveChange, Enrollment, ManifestRef, ModelTotals, OpenBatch, Operations, Owner,
+    PendingChange, Plan, Run, SessionUsage, SetupInForce, UsageTotals,
+};
 use super::{Bound, FieldSpec};
 
 /// Every fold state, by name.
@@ -9,11 +12,36 @@ const STATES: &[(&str, &[FieldSpec])] = &[
     ("Run", Run::SCHEMA),
     ("Budget", Budget::SCHEMA),
     ("OpenBatch", OpenBatch::SCHEMA),
+    ("SetupInForce", SetupInForce::SCHEMA),
+    ("Owner", Owner::SCHEMA),
+    ("SessionUsage", SessionUsage::SCHEMA),
+    ("UsageTotals", UsageTotals::SCHEMA),
+    ("ModelTotals", ModelTotals::SCHEMA),
+    ("Plan", Plan::SCHEMA),
+    ("PendingChange", PendingChange::SCHEMA),
+    ("EffectiveChange", EffectiveChange::SCHEMA),
+    ("ManifestRef", ManifestRef::SCHEMA),
+    ("Enrollment", Enrollment::SCHEMA),
 ];
 
 /// Each field bounded as `Declared`, with the state struct whose own fields carry the bounds.
-const DECLARED: &[(&str, &str, &str)] =
-    &[("Operations", "run", "Run"), ("Run", "budget", "Budget")];
+const DECLARED: &[(&str, &str, &str)] = &[
+    ("Operations", "run", "Run"),
+    ("Operations", "setup", "SetupInForce"),
+    ("Operations", "owner", "Owner"),
+    ("Operations", "session_usage", "SessionUsage"),
+    ("Operations", "plan", "Plan"),
+    ("Operations", "enrolled", "Enrollment"),
+    ("Plan", "pending", "PendingChange"),
+    ("Plan", "effective", "EffectiveChange"),
+    ("Plan", "current", "ManifestRef"),
+    ("Plan", "prefix", "ManifestRef"),
+    ("Plan", "accepted", "ManifestRef"),
+    ("PendingChange", "manifest", "ManifestRef"),
+    ("SessionUsage", "totals", "UsageTotals"),
+    ("ModelTotals", "totals", "UsageTotals"),
+    ("Run", "budget", "Budget"),
+];
 
 #[test]
 fn every_state_field_is_declared_once_with_an_owner_and_a_reset_rule() {

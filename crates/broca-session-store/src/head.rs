@@ -6,17 +6,29 @@
 //! change to a session commits by one compare-and-swap of the head, so the head is what decides
 //! which log is the session's.
 //!
-//! The head is stored readable, so a reader can find the session's objects, but authenticated
-//! with the session's data key: a head changed by anyone without the key fails to open.
+//! The head is stored readable, so a reader can find the session's objects. An encrypted
+//! session's head is authenticated with its data key: a head changed by anyone without the key
+//! fails to open. A plain session's head carries the unkeyed check its units carry instead (see
+//! `frame::FrameKey::seal_unit`), which catches damage but not a deliberate edit.
+//!
+//! The head's mode is its `cipher` field, absent for an encrypted head. Its catalog fields are
+//! readable without a key, so the opener reads the mode first and then checks the head in that
+//! mode only: a head failing its check in the mode it names is damage, never read in the other
+//! mode.
 
 use crate::codec::{ByteBuf, DecodeError, Id128, Message as _};
-use crate::keys::{self, DataKey, DeploymentKey, UnwrapError};
+use crate::keys::{self, Cipher, DataKey, DeploymentKey, UnwrapError};
 
 /// The head format this build writes and reads. A head of any other format refuses by name.
 pub const HEAD_FORMAT: u32 = 1;
 
 const HEAD_CONTEXT: &[u8] = b"broca-session-head-v1";
+/// The bytes before the head's body: an encrypted head's nonce and tag, or a plain head's
+/// [`PLAIN_PAD`] zero bytes and its check. Both modes keep one length, so the body is found
+/// before the mode is known.
 const TAG_LEN: usize = 24 + 16;
+/// The zero bytes a plain head's prefix starts with, where an encrypted head has its nonce.
+const PLAIN_PAD: usize = TAG_LEN - crate::frame::CHECK_LEN;
 
 crate::message! {
     /// The (project root, harness, session) a session was created under. The head keeps it, so
@@ -128,6 +140,20 @@ crate::message! {
         /// Set by the cold step (see `session::cold`) and cleared when a writer opens the session
         /// again, so a catalog rebuilt from heads knows which sessions are cold.
         17 opt cold_since_ms: u64,
+        /// The setting the session's first log was created with (see `Conversation::new`).
+        /// Absent means false. A damaged checkpoint of that first log is rebuilt from it.
+        18 opt appends_in_conversation: bool,
+        /// The session's cipher mode, set when it was created and never changed. Absent means
+        /// encrypted: only a plain head writes it, so an encrypted head's bytes are as before
+        /// plain mode existed, and a build that doesn't know plain mode refuses a plain head.
+        19 opt [must] cipher: Cipher,
+    }
+}
+
+impl Head {
+    /// The session's cipher mode, as its head names it.
+    pub fn cipher(&self) -> Cipher {
+        self.cipher.unwrap_or(Cipher::XChaCha20Poly1305)
     }
 }
 
@@ -140,20 +166,46 @@ pub enum HeadError {
     Format(u32),
     /// The head names no data key wrapped under the deployment key given.
     NoKey,
+    /// The head is encrypted and the deployment key hasn't loaded.
+    NotLoaded,
     Unwrap(UnwrapError),
-    /// The head's tag doesn't match: it was changed by someone without the key.
+    /// The head fails its check in the mode it names: an encrypted head's tag doesn't match its
+    /// data key, or a plain head's check doesn't match its bytes, or a head is shaped unlike
+    /// any its mode writes. Damage, or a change by someone without the key.
     Authentication,
 }
 
-/// The stored form of `head`: its tag under the data key, then its encoded body.
+/// The stored form of `head`: the bytes that authenticate it in its mode, then its encoded body.
+/// `key` must be in the mode the head names.
 pub fn seal(head: &Head, key: &DataKey) -> Vec<u8> {
+    debug_assert_eq!(
+        head.cipher(),
+        key.cipher(),
+        "a head is sealed in its own mode"
+    );
     let body = head.encode();
-    let mut out = keys::authenticate(key, HEAD_CONTEXT, &body);
+    let mut out = match key.cipher() {
+        Cipher::XChaCha20Poly1305 => keys::authenticate(key, HEAD_CONTEXT, &body),
+        Cipher::None => {
+            let mut prefix = vec![0u8; PLAIN_PAD];
+            prefix.extend_from_slice(&crate::frame::plain_check(HEAD_CONTEXT, &body));
+            prefix
+        }
+    };
     out.extend_from_slice(&body);
     out
 }
 
-/// Opens a stored head: decodes it, unwraps its data key under `deployment`, and checks its tag.
+/// The cipher mode a stored head names, read without checking it. Only for choosing how to open
+/// the session: [`open`] then checks the head in that mode, and refuses it when it fails.
+pub fn stored_cipher(bytes: &[u8]) -> Result<Cipher, HeadError> {
+    let body = bytes.get(TAG_LEN..).ok_or(HeadError::Malformed)?;
+    Ok(Head::decode(body).map_err(HeadError::Decode)?.cipher())
+}
+
+/// Opens a stored head: decodes it, then checks it in the mode it names. An encrypted head's data
+/// key is unwrapped under `deployment` and checks its tag; a plain head checks its unkeyed check
+/// and needs no deployment key.
 pub fn open(bytes: &[u8], deployment: &DeploymentKey) -> Result<(Head, DataKey), HeadError> {
     if bytes.len() < TAG_LEN {
         return Err(HeadError::Malformed);
@@ -163,17 +215,38 @@ pub fn open(bytes: &[u8], deployment: &DeploymentKey) -> Result<(Head, DataKey),
     if head.format != HEAD_FORMAT {
         return Err(HeadError::Format(head.format));
     }
-    let wrapped = head
-        .keys
-        .iter()
-        .find(|key| key.deployment == deployment.id())
-        .ok_or(HeadError::NoKey)?;
-    let key = keys::unwrap(deployment, &head.session_id, wrapped.id, &wrapped.wrapped.0)
-        .map_err(HeadError::Unwrap)?;
-    if !keys::verify(&key, HEAD_CONTEXT, body, tag) {
-        return Err(HeadError::Authentication);
+    match head.cipher() {
+        Cipher::None => {
+            let (pad, check) = tag.split_at(PLAIN_PAD);
+            let checks = pad.iter().all(|byte| *byte == 0)
+                && check == crate::frame::plain_check(HEAD_CONTEXT, body);
+            // A plain session has no data key, so its head wraps none.
+            if !checks || !head.keys.is_empty() {
+                return Err(HeadError::Authentication);
+            }
+            Ok((head, DataKey::plain()))
+        }
+        Cipher::XChaCha20Poly1305 => {
+            // Every encrypted head wraps its data key; one that wraps none was never written so.
+            if head.keys.is_empty() {
+                return Err(HeadError::Authentication);
+            }
+            if !deployment.is_loaded() {
+                return Err(HeadError::NotLoaded);
+            }
+            let wrapped = head
+                .keys
+                .iter()
+                .find(|key| key.deployment == deployment.id())
+                .ok_or(HeadError::NoKey)?;
+            let key = keys::unwrap(deployment, &head.session_id, wrapped.id, &wrapped.wrapped.0)
+                .map_err(HeadError::Unwrap)?;
+            if !keys::verify(&key, HEAD_CONTEXT, body, tag) {
+                return Err(HeadError::Authentication);
+            }
+            Ok((head, key))
+        }
     }
-    Ok((head, key))
 }
 
 #[cfg(test)]

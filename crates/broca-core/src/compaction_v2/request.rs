@@ -55,7 +55,7 @@ pub enum Prepared {
 pub async fn apply_boundary(
     state: &tokio::sync::Mutex<State>,
     runtime: &Runtime,
-    journal: &dyn Journal,
+    journal: &impl Journal,
     boundary: Boundary<'_>,
 ) -> Result<(), String> {
     let mut state = state.lock().await;
@@ -74,7 +74,7 @@ pub async fn apply_boundary(
 pub async fn prepare(
     state: &tokio::sync::Mutex<State>,
     runtime: &Runtime,
-    journal: &dyn Journal,
+    journal: &impl Journal,
     plane: &dyn Plane,
     at: At<'_>,
     mut image: impl FnMut(&InsertedImage) -> Result<MediaRef, String>,
@@ -196,7 +196,7 @@ pub async fn prepare(
 async fn ride(
     state: &tokio::sync::Mutex<State>,
     runtime: &Runtime,
-    journal: &dyn Journal,
+    journal: &impl Journal,
     plane: &dyn Plane,
     setup: &mut cortexkit_role_compaction::setup::SetupRequest,
     at: &At<'_>,
@@ -252,7 +252,7 @@ async fn ride(
 async fn apply_ride_answer(
     state: &mut State,
     runtime: &Runtime,
-    journal: &dyn Journal,
+    journal: &impl Journal,
     setup: &mut cortexkit_role_compaction::setup::SetupRequest,
     at: &At<'_>,
 ) -> Result<(), String> {

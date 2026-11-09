@@ -156,7 +156,9 @@ pub struct SessionReadTools {
 /// The last `RunStarted` in `records`, which opens the latest episode among them. A resumed
 /// run continues its episode without writing a new `RunStarted`, so the last one is the
 /// current episode's.
-fn latest_run_started_tools(records: &[broca_wal::FramedRecord]) -> Option<SessionReadTools> {
+pub(crate) fn latest_run_started_tools(
+    records: &[broca_wal::FramedRecord],
+) -> Option<SessionReadTools> {
     records
         .iter()
         .rev()
@@ -622,6 +624,15 @@ pub trait LineageOpener: Send + Sync {
             |_| None,
         )
     }
+    /// The context limit a fresh run of `model` would freeze when its send names none
+    /// (`RunExecutor::compaction_context_limit`, which says why a send's own limit doesn't
+    /// count). An opener that runs nothing answers `Err`.
+    async fn compaction_context_limit(
+        &self,
+        _model: &cortexkit_role_llm_runner::head_selection::PlanModel,
+    ) -> Result<Option<u64>, String> {
+        Err("this runner can't resolve a model's context limit".into())
+    }
     /// Retire routes synchronously when retention deletes a session without an actor.
     fn on_session_deleted(&self, _session: &LineageKey) {}
     fn retire_session_transport(&self, _session: &LineageKey) {}
@@ -636,11 +647,37 @@ pub trait LineageOpener: Send + Sync {
         Ok(None)
     }
     /// Read-only access to the derived run index, without acquiring a session writer.
+    /// The runtime serving sessions kept in the new storage, when this opener has one.
+    fn store_runtime(&self) -> Option<Arc<crate::store_open::StoreRuntime>> {
+        None
+    }
+    /// The runtime when the new storage keeps the session `key`, which then has no WAL; `None`
+    /// for a session on today's storage, or an opener without the new storage. A session the new
+    /// storage keeps is refused `key_unavailable` while its deployment key hasn't loaded, never
+    /// read as one of today's. A head that can't be checked is an error, never `None`.
+    fn store_holding(
+        &self,
+        _key: &LineageKey,
+    ) -> Result<Option<Arc<crate::store_open::StoreRuntime>>, OpenError> {
+        Ok(None)
+    }
     fn run_index_reader(&self) -> Option<Arc<dyn broca_core::RunIndex>> {
         None
     }
     fn check_move(&self, _key: &LineageKey, _write: bool) -> Result<(), OpenError> {
         Ok(())
+    }
+    /// Whether this opener serves `key` from the new storage: the session's head exists and the
+    /// opener has a store runtime. Today's storage refuses such a session by name, so its WAL
+    /// checks are skipped for it. A head that can't be checked is an error, never `false`.
+    fn serves_from_store(&self, _key: &LineageKey) -> Result<bool, OpenError> {
+        Ok(false)
+    }
+    /// How a reader of today's storage that doesn't go through [`Self::check_move`] refuses
+    /// `key` when the new session storage owns it, or a move into it is in flight
+    /// (`broca_core::WalStore::store_owner_refusal`). `None` when today's storage owns it.
+    fn store_owner_refusal(&self, _key: &LineageKey) -> Result<Option<OpenError>, OpenError> {
+        Ok(None)
     }
     /// Best-effort repair through the session's writer fence. The range is already durable;
     /// implementations must not open or modify a WAL while materializing it.
@@ -731,6 +768,7 @@ mod media;
 pub(crate) mod media_head;
 #[path = "run_rows.rs"]
 mod run_rows;
+pub mod store_move;
 pub use run_rows::OverhaulRunSource;
 
 /// A failed durability boundary. Historical events survive successful session recovery.
@@ -805,7 +843,7 @@ pub struct MoveSessionGuard {
 /// One actor generation a mutating cut retired; see [`MoveSessionGuard`].
 struct RetiredActor {
     key: LineageKey,
-    tenure: Option<broca_core::wal_writer::ClosedWriterTenure>,
+    tenure: Option<crate::actor::CutTenure>,
     close: CloseToken,
 }
 
@@ -847,6 +885,11 @@ pub enum CutLockMode {
     /// lease to the guard; the guard commits its slot closed when released. Other actors
     /// pause as for `Inspect`; a busy actor refuses without changing its writer.
     Mutate,
+    /// The move takes the session out of today's storage (`session.move_to_store`): any idle
+    /// actor closes, tearing down its subscribers and joining its writer, and hands its
+    /// session lease to the guard, whether its writer or the actor itself held it. A busy
+    /// actor refuses without changing its writer.
+    Retire,
 }
 
 type ToolRouteHealth = dyn Fn(&[LineageKey]) -> serde_json::Value + Send + Sync;
@@ -939,6 +982,11 @@ impl ReadOnlyLineage {
 }
 
 struct Inner {
+    /// The sessions a move into the new storage holds (see `store_move`), by address, and the
+    /// lease-free WAL reads in flight per address, which such a move waits out.
+    store_moves: store_move::MoveFences,
+    /// What runs `session.move_to_store`, installed by the daemon with its stores.
+    store_mover: std::sync::OnceLock<Arc<dyn store_move::StoreMover>>,
     run_event_reader: std::sync::OnceLock<Arc<RunEventLookup>>,
     session_address_inventory: std::sync::OnceLock<Arc<dyn broca_store::SessionAddressResolver>>,
     episode_source: std::sync::OnceLock<Arc<EpisodeReadSource>>,
@@ -959,6 +1007,10 @@ struct Inner {
     close_started: tokio::sync::watch::Sender<u64>,
     #[cfg(test)]
     expiry_read_probe: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Runs once, the next time a reader asks who owns a session: a test publishes a head
+    /// there to land between a read's store check and its read of today's storage.
+    #[cfg(test)]
+    store_owner_probe: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(all(test, feature = "test-clock"))]
     status_open_probe: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     repairs: crate::retention::Repairs,
@@ -967,6 +1019,12 @@ struct Inner {
     plan_admitter: std::sync::OnceLock<Arc<dyn broca_fetch_plan::PlanAdmitter>>,
     slots: Mutex<HashMap<LineageKey, Entry>>,
     next_gen: AtomicU64,
+    /// Whether a session that exists in neither storage may start in the new storage, when the
+    /// send creating it asks only for what the store actor serves. Off unless a builder sets it.
+    store_new_sessions: std::sync::atomic::AtomicBool,
+    /// Sessions whose creating send the store actor serves, marked by the send and taken by the
+    /// opener, which starts such a session in the new storage when it exists nowhere yet.
+    store_eligible: Mutex<std::collections::HashSet<LineageKey>>,
     opener: Arc<dyn LineageOpener>,
     reader: Option<ReadSources>,
     run_rows: Option<Arc<OverhaulRunSource>>,
@@ -1708,6 +1766,10 @@ impl LineageRegistry {
             .unwrap_or_default();
         let mut recovered = 0;
         for session in sessions {
+            // A session the new storage owns has no WAL writer here to finish a rewrite.
+            if self.store_owner_refusal(&session)?.is_some() {
+                continue;
+            }
             let actor = self.actor_for(&session).await?;
             let (reply, response) = tokio::sync::oneshot::channel();
             actor
@@ -2024,6 +2086,15 @@ impl LineageRegistry {
     > {
         self.inner.opener.check_plan_selection(plan).await
     }
+
+    /// The context limit a fresh run of `model` would freeze when its send names none, from
+    /// the opener (`LineageOpener::compaction_context_limit`).
+    pub(crate) async fn compaction_context_limit(
+        &self,
+        model: &cortexkit_role_llm_runner::head_selection::PlanModel,
+    ) -> Result<Option<u64>, String> {
+        self.inner.opener.compaction_context_limit(model).await
+    }
     pub fn active_event_sessions(&self) -> Vec<LineageKey> {
         self.inner
             .slots
@@ -2250,7 +2321,7 @@ impl LineageRegistry {
                 guard.actors.push(release);
                 if let Some(crate::actor::RetiredForCut { tenure, close }) = retired {
                     // Only a mutating cut may retire an actor or take its session lease.
-                    debug_assert_eq!(mode, CutLockMode::Mutate);
+                    debug_assert_ne!(mode, CutLockMode::Inspect);
                     guard.retired.push(RetiredActor {
                         key: key.clone(),
                         tenure,
@@ -2263,6 +2334,17 @@ impl LineageRegistry {
         Ok(guard)
     }
     pub fn check_move(&self, key: &LineageKey, write: bool) -> Result<(), OpenError> {
+        // A session in the new storage has no WAL, so no WAL move fence applies to it, and
+        // today's store would refuse it by name. Moving such a session isn't built.
+        if self.inner.opener.serves_from_store(key)? {
+            return Ok(());
+        }
+        // A move into the new storage holding the session in this process, or one startup
+        // couldn't settle, keeps today's storage from serving it. Both are known in memory, so
+        // this check reads nothing.
+        if let Some(refusal) = self.inner.store_moves.refusal(key) {
+            return Err(refusal);
+        }
         self.inner.opener.check_move(key, write)?;
         if let Some(reader) = &self.inner.reader {
             reader
@@ -2272,6 +2354,31 @@ impl LineageRegistry {
         }
         Ok(())
     }
+
+    /// How a reader of today's storage that doesn't go through [`Self::check_move`] refuses
+    /// `key` when the new session storage owns it (its head exists), or a move into it is in
+    /// flight (a move journal names it): the feature refusal `check_move` gives a session
+    /// whose head exists, or `SessionMoving` under the move's id. `None` when today's storage
+    /// owns the session.
+    pub(crate) fn store_owner_refusal(
+        &self,
+        key: &LineageKey,
+    ) -> Result<Option<OpenError>, OpenError> {
+        #[cfg(test)]
+        if let Some(probe) = self.inner.store_owner_probe.lock().unwrap().take() {
+            probe();
+        }
+        self.inner.opener.store_owner_refusal(key)
+    }
+
+    /// Refuses `key` as [`Self::store_owner_refusal`] says, or passes it when today's storage
+    /// owns it.
+    pub(crate) fn refuse_store_owned(&self, key: &LineageKey) -> Result<(), OpenError> {
+        match self.store_owner_refusal(key)? {
+            Some(refusal) => Err(refusal),
+            None => Ok(()),
+        }
+    }
     #[cfg(test)]
     pub(crate) fn actor_panic_count(&self) -> u64 {
         self.inner.actor_panics.load(Ordering::SeqCst)
@@ -2280,8 +2387,22 @@ impl LineageRegistry {
     pub fn compaction_supported(&self) -> bool {
         self.inner.opener.compaction_supported()
     }
+
+    /// The runtime serving sessions kept in the new storage, for reads that take no lease.
+    pub(crate) fn store_runtime(&self) -> Option<Arc<crate::store_open::StoreRuntime>> {
+        self.inner.opener.store_runtime()
+    }
     pub fn backup_classes(&self) -> Vec<String> {
         self.inner.opener.backup_classes()
+    }
+
+    /// Lets a session that exists in neither storage start in the new storage when the send
+    /// creating it asks only for what the store actor serves. The opener must have a store
+    /// runtime (`DefaultOpener::with_store_runtime`); without one every session stays on today's
+    /// storage. Off by default, and in production.
+    pub fn with_store_new_sessions(self) -> Self {
+        self.inner.store_new_sessions.store(true, Ordering::SeqCst);
+        self
     }
 
     pub fn new(opener: Arc<dyn LineageOpener>) -> Self {
@@ -2328,10 +2449,14 @@ impl LineageRegistry {
                     SESSION_CACHE_SESSIONS,
                 )),
                 retention: std::sync::OnceLock::new(),
+                store_moves: Default::default(),
+                store_mover: std::sync::OnceLock::new(),
                 #[cfg(test)]
                 close_started: tokio::sync::watch::channel(0).0,
                 #[cfg(test)]
                 expiry_read_probe: Mutex::new(None),
+                #[cfg(test)]
+                store_owner_probe: Mutex::new(None),
                 #[cfg(all(test, feature = "test-clock"))]
                 status_open_probe: Mutex::new(None),
                 repairs: Default::default(),
@@ -2340,6 +2465,8 @@ impl LineageRegistry {
                 cut_gates: Mutex::new(HashMap::new()),
                 change_gates: Mutex::new(HashMap::new()),
                 next_gen: AtomicU64::new(1),
+                store_new_sessions: std::sync::atomic::AtomicBool::new(false),
+                store_eligible: Mutex::new(std::collections::HashSet::new()),
                 opener,
                 reader: wal_store.map(|wal_store| ReadSources { wal_store, store }),
                 run_rows,
@@ -2561,6 +2688,18 @@ impl LineageRegistry {
     {
         use broca_core::compaction_v2::protocol::wire::Refusal;
         let internal = |message: String| Refusal::new("internal_error", message, None);
+        if let Some(store) = self
+            .store_holding(key)
+            .map_err(|error| internal(error.to_string()))?
+        {
+            if method == "session.apply_view" {
+                return crate::store_entries::apply_view(self, &store, key, caller, params).await;
+            }
+            return crate::store_entries::compaction_runner(
+                self, &store, key, caller, method, params,
+            )
+            .await;
+        }
         self.check_move(key, true)
             .map_err(|error| internal(error.to_string()))?;
         self.check_expired(key, None)
@@ -2666,6 +2805,10 @@ impl LineageRegistry {
         if let Some(sender) = self.inner.frozen_senders.lock().unwrap().get(key).cloned() {
             return Ok(Some(sender));
         }
+        if let Some(store) = self.store_holding(key)? {
+            let ownership = store_session_ownership(self, &store, key).await?;
+            return Ok((ownership.episodes > 0).then_some(ownership.first_principal));
+        }
         let reader = self.inner.reader.clone().ok_or_else(|| {
             OpenError::Open("sender authorization reader is not configured".into())
         })?;
@@ -2769,6 +2912,26 @@ impl LineageRegistry {
         key: &LineageKey,
         submission_id: &str,
     ) -> Result<Option<broca_protocol::BindPrincipal>, OpenError> {
+        if let Some(store) = self.store_holding(key)? {
+            use crate::store_reads::{StoreReadReply, StoreReadRequest};
+            return match store
+                .read(
+                    self,
+                    key,
+                    StoreReadRequest::AuthorizationSubmissionSender(submission_id.into()),
+                )
+                .await
+                .map_err(crate::store_reads::open_error)?
+            {
+                None => Ok(None),
+                Some(StoreReadReply::AuthorizationSubmissionSender(sender)) => {
+                    sender.map_err(crate::store_reads::open_error)
+                }
+                Some(_) => Err(crate::store_reads::open_error(
+                    crate::store_reads::mismatched(),
+                )),
+            };
+        }
         let (records, _) = self
             .read_durable_wal_for(key, ReadPurpose::Authorization)
             .await?;
@@ -2899,6 +3062,9 @@ impl LineageRegistry {
         &self,
         key: &LineageKey,
     ) -> Result<broca_core::SessionOwnershipV1, OpenError> {
+        if let Some(store) = self.store_holding(key)? {
+            return store_session_ownership(self, &store, key).await;
+        }
         let reader = self.inner.reader.as_ref().ok_or_else(|| {
             OpenError::Open("sender authorization reader is not configured".into())
         })?;
@@ -3103,6 +3269,9 @@ impl LineageRegistry {
             }
             Err(error) => return Err(error.into()),
             Ok(()) => {}
+        }
+        if let Some(store) = self.store_holding(key)? {
+            return Ok(store_session_ownership(self, &store, key).await?);
         }
         let (live, live_first) = {
             let slots = self.inner.slots.lock().unwrap();
@@ -3496,6 +3665,14 @@ impl LineageRegistry {
         ) {
             return BindOwnership::Known(broca_core::SessionOwnershipV1::default());
         }
+        // A session kept in the new storage has no WAL to read. Its ownership comes from the
+        // owner summary the stored session keeps (`Operations::owner`), which records the same
+        // facts `durable_session_ownership` gathers from a WAL.
+        match self.store_holding(key) {
+            Ok(Some(store)) => return store_bind_ownership(self, &store, key).await,
+            Ok(None) => {}
+            Err(error) => return BindOwnership::Unreadable(error.to_string()),
+        }
         let Some(reader) = self.inner.reader.clone() else {
             return BindOwnership::NoHistorySource;
         };
@@ -3518,7 +3695,48 @@ impl LineageRegistry {
             inner: self.inner.clone(),
         }
     }
+}
 
+/// The ownership of a session kept in the new storage, from a read-only view of it. A session
+/// whose creation never committed holds no run, so it has no owner yet.
+async fn store_bind_ownership(
+    registry: &LineageRegistry,
+    store: &crate::store_open::StoreRuntime,
+    key: &LineageKey,
+) -> BindOwnership {
+    match store_session_ownership(registry, store, key).await {
+        Ok(ownership) => BindOwnership::Known(ownership),
+        Err(error) => BindOwnership::Unreadable(error.to_string()),
+    }
+}
+
+/// The ownership of a session kept in the new storage, as every authorization path reads it:
+/// the owner summary the stored session keeps (`Operations::owner`), with the first run's tools
+/// and plan read back from the deployment's setup parts. It records the same facts
+/// `durable_session_ownership` gathers from a WAL. A session whose creation never committed
+/// holds no run, so it has no owner yet.
+async fn store_session_ownership(
+    registry: &LineageRegistry,
+    store: &crate::store_open::StoreRuntime,
+    key: &LineageKey,
+) -> Result<broca_core::SessionOwnershipV1, OpenError> {
+    use crate::store_reads::{StoreReadReply, StoreReadRequest};
+    match store
+        .read(registry, key, StoreReadRequest::AuthorizationOwnership)
+        .await
+        .map_err(crate::store_reads::open_error)?
+    {
+        None => Ok(broca_core::SessionOwnershipV1::default()),
+        Some(StoreReadReply::AuthorizationOwnership(ownership)) => {
+            ownership.map_err(OpenError::Open)
+        }
+        Some(_) => Err(crate::store_reads::open_error(
+            crate::store_reads::mismatched(),
+        )),
+    }
+}
+
+impl LineageRegistry {
     /// Resolve `key` to a live actor handle, opening (or awaiting an in-flight open, or
     /// awaiting a close then re-opening) as needed. Exactly one actor per session.
     pub async fn actor_for(&self, key: &LineageKey) -> Result<ActorHandle, OpenError> {
@@ -3929,9 +4147,20 @@ impl LineageRegistry {
         }
         crate::retention::validate_retention(retention, None, false)
             .map_err(OpenError::RetentionInvalid)?;
+        let store_eligible = self.inner.store_new_sessions.load(Ordering::SeqCst)
+            && crate::store_actor::serves_creating_send(
+                &request,
+                kind,
+                delivery,
+                conversation_key.is_some(),
+                retention.is_some(),
+                order.is_some(),
+            );
         if !request.message_marks.is_empty() {
             // Refuse invalid marks before opening a writer, including its new-WAL header.
-            let ownership = match self.bind_ownership(key).await {
+            // Ownership replay is large; carrying it inline multiplies the send future's stack
+            // footprint at every await site, overflowing unoptimized lifecycle tests.
+            let ownership = match Box::pin(self.bind_ownership(key)).await {
                 BindOwnership::Known(ownership) => ownership,
                 BindOwnership::NoHistorySource => {
                     return Ok(SendOutcome::Error(
@@ -3952,9 +4181,20 @@ impl LineageRegistry {
             }
         }
         loop {
+            if store_eligible {
+                self.inner
+                    .store_eligible
+                    .lock()
+                    .unwrap()
+                    .insert(key.clone());
+            }
             let handle = self
                 .actor_for_mode(key, retention, session_class.clone(), false)
-                .await?;
+                .await;
+            // A mark the open didn't take, because the session was already open, must not
+            // decide a later open.
+            self.inner.store_eligible.lock().unwrap().remove(key);
+            let handle = handle?;
             let (reply, rx) = tokio::sync::oneshot::channel();
             let cmd = LineageCmd::Send {
                 session_class: session_class.clone(),
@@ -4004,6 +4244,51 @@ impl LineageRegistry {
                 Ok(ImportOutcome::Reopen) => continue,
                 Ok(other) => return Ok(other),
                 Err(_) => continue,
+            }
+        }
+    }
+
+    /// Route a command only the new storage serves to the session's store actor. An import may
+    /// create its session there; nothing else creates one. Refused by name unless the registry
+    /// creates sessions in the new storage (`with_store_new_sessions`).
+    pub async fn route_store_command(
+        &self,
+        key: &LineageKey,
+        command: crate::store_import::StoreCommand,
+    ) -> Result<crate::store_import::StoreOutcome, OpenError> {
+        use crate::actor::LineageCmd;
+        use crate::store_import::{ImportRefusal, StoreCommand, StoreOutcome};
+        if !self.inner.store_new_sessions.load(Ordering::SeqCst) {
+            return Ok(StoreOutcome::Refused(ImportRefusal::new(
+                "new_storage_unavailable",
+                "this module doesn't create sessions in the new storage",
+            )));
+        }
+        let creates = matches!(command, StoreCommand::Import(_));
+        loop {
+            if creates {
+                self.inner
+                    .store_eligible
+                    .lock()
+                    .unwrap()
+                    .insert(key.clone());
+            }
+            let handle = self.actor_for_mode(key, None, None, false).await;
+            // A mark the open didn't take, because the session was already open, must not
+            // decide a later open.
+            self.inner.store_eligible.lock().unwrap().remove(key);
+            let handle = handle?;
+            let (reply, rx) = tokio::sync::oneshot::channel();
+            let cmd = LineageCmd::Store {
+                command: command.clone(),
+                reply,
+            };
+            if handle.send(cmd).await.is_err() {
+                continue;
+            }
+            match rx.await {
+                Ok(StoreOutcome::Reopen) | Err(_) => continue,
+                Ok(other) => return Ok(other),
             }
         }
     }
@@ -4314,6 +4599,9 @@ impl LineageRegistry {
         OpenError,
     > {
         self.check_expired(key, Some(&run_id.0)).await?;
+        // Today's run state, and the orphan recovery below, read and write today's copy, which
+        // the new storage owns, or is about to.
+        self.refuse_store_owned(key)?;
         if matches!(
             self.check_move(key, true),
             Err(OpenError::SessionMoving { .. })
@@ -4503,6 +4791,9 @@ impl LineageRegistry {
         key: &LineageKey,
         request: ReadRangeRequest,
     ) -> Result<broca_wal::WalRangeRead, OpenError> {
+        // Counted before anything is read, so a move into the new storage that has already
+        // named this session waits for this read to end.
+        let _in_flight = self.inner.store_moves.read(key);
         let ReadRangeRequest {
             after_seq,
             anchor,
@@ -4859,6 +5150,37 @@ impl LineageRegistry {
         }
     }
 
+    /// The new storage's runtime when it keeps the session `key`, which then has no WAL; `None`
+    /// for a session on today's storage, or a module without the new storage. A session it keeps
+    /// is refused `key_unavailable` while the deployment key hasn't loaded.
+    pub(crate) fn store_holding(
+        &self,
+        key: &LineageKey,
+    ) -> Result<Option<Arc<crate::store_open::StoreRuntime>>, OpenError> {
+        self.inner.opener.store_holding(key)
+    }
+
+    /// The new storage's runtime for a session today's storage has just refused as kept there:
+    /// a read that takes no lease found no head, and then met the head a move published
+    /// meanwhile. The read is then served once more, from the new storage. `None` for any other
+    /// failure, or when the head is absent.
+    pub(crate) fn store_after_refusal(
+        &self,
+        key: &LineageKey,
+        error: &crate::serve::ServeError,
+    ) -> Result<Option<Arc<crate::store_open::StoreRuntime>>, OpenError> {
+        match error {
+            crate::serve::ServeError::WalNewerWriter { missing, .. }
+                if missing
+                    .iter()
+                    .any(|name| name == broca_wal::SESSION_STORAGE_FEATURE) =>
+            {
+                self.store_holding(key)
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// Whether the session has a WAL, live or archived: a stat, and an archive index lookup
     /// only when there is no live file. `None` means the store cannot tell, not that a WAL exists.
     pub fn wal_written(&self, key: &LineageKey) -> Option<bool> {
@@ -4873,10 +5195,7 @@ impl LineageRegistry {
     pub fn live_wal_written_ms(&self, key: &LineageKey) -> Option<u64> {
         let reader = self.inner.reader.as_ref()?;
         let written = reader.wal_store.live_wal_last_write(key).ok()??;
-        written
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()
-            .map(|since| u64::try_from(since.as_millis()).unwrap_or(u64::MAX))
+        crate::head_time::epoch_ms(written)
     }
 
     /// Copy the cache reference under the slots lock, then acquire its facts separately.
@@ -5098,6 +5417,9 @@ impl LineageRegistry {
         tag: u64,
     ) -> Result<Option<broca_core::TagLocation>, OpenError> {
         self.check_expired(key, None).await?;
+        // The materialized tag index and transcript describe today's copy, which the new
+        // storage owns, or is about to.
+        self.refuse_store_owned(key)?;
         if let Some(bundle) = self.inner.raw_pages.get() {
             let bundle = bundle.clone();
             let key = key.clone();
@@ -5237,6 +5559,9 @@ impl LineageRegistry {
         model: Option<&broca_core::ModelPageRequest>,
     ) -> Result<RoutedPage, OpenError> {
         self.check_history_expired(key).await?;
+        // Every page source below (the materialized pages, episodes and today's WAL) reads
+        // today's copy, which the new storage owns, or is about to.
+        self.refuse_store_owned(key)?;
         // Keep the evidence before a format-selected reader can rebuild rows,
         // but let that reader's established errors win over a new refusal.
         let empty_history_check = self.check_session_log(key).await;
@@ -5544,10 +5869,9 @@ impl LineageRegistry {
         let newest_record_ms = match tail.records() {
             broca_wal::WalRangeRecords::Complete(records)
             | broca_wal::WalRangeRecords::Partial(records)
-            | broca_wal::WalRangeRecords::Unknown(records) => records
-                .iter()
-                .rev()
-                .find_map(|framed| broca_core::record_time_ms(&framed.record)),
+            | broca_wal::WalRangeRecords::Unknown(records) => {
+                crate::head_time::newest_record_ms(records)
+            }
             broca_wal::WalRangeRecords::Absent => None,
         };
         let retention_activity_ms = match tail.records() {
@@ -5890,6 +6214,15 @@ impl LineageRegistry {
                 if let Some(probe) = self.inner.status_open_probe.lock().unwrap().take() {
                     probe();
                 }
+                if let Some(store) = self.store_holding(key)? {
+                    // A session kept in the new storage has no WAL to read: its actor answers,
+                    // opened first when the session needs recovering.
+                    if crate::store_status::status_needs_actor(&store, key).await? {
+                        self.actor_for_mode(key, None, None, true).await?;
+                        continue;
+                    }
+                    return Ok(LineageStatus::Idle);
+                }
                 if self.status_needs_actor(key).await? {
                     if self.crash_orphan_pending(key) {
                         return Err(OpenError::Classified {
@@ -6209,6 +6542,14 @@ impl LineageRegistry {
     }
 
     /// Test/inspection: the current slot state name for a key (None = absent/closed).
+    /// The actor of `key` when the registry holds it open, without opening one.
+    pub(crate) fn open_handle(&self, key: &LineageKey) -> Option<ActorHandle> {
+        match self.inner.slots.lock().unwrap().get(key) {
+            Some(Entry::Open { handle, .. }) => Some(handle.clone()),
+            _ => None,
+        }
+    }
+
     pub fn slot_state(&self, key: &LineageKey) -> Option<&'static str> {
         let slots = self.inner.slots.lock().unwrap();
         slots.get(key).map(|e| match e {
@@ -6248,6 +6589,11 @@ impl LineageRegistry {
     /// calls: open the session if it is closed (its open-time recovery runs first), then ask its
     /// actor to resume a run paused on held calls. A live run needs nothing more.
     pub async fn resume_held_run(&self, session: &LineageKey) -> Result<(), String> {
+        // A move into the new storage holds this session: the delivery is retried on a later
+        // pull, which finds the session where the move left it.
+        if self.inner.store_moves.fenced(session) {
+            return Err("session_moving: a move into the new storage holds this session".into());
+        }
         for _ in 0..3 {
             let handle = self
                 .actor_for(session)
@@ -6449,7 +6795,10 @@ impl LineageRegistry {
         }
         let mut marks = self.inner.crash_orphan_marks.lock().unwrap();
         for (key, run_ids) in by_session {
-            if wal_store.check_move(&key, true).is_err() {
+            // A session the new storage owns has no run here to seal: its runs live there.
+            if wal_store.check_move(&key, true).is_err()
+                || !matches!(wal_store.store_owner_refusal(&key), Ok(None))
+            {
                 sweep.not_live += 1;
                 continue;
             }
@@ -6501,6 +6850,13 @@ impl LineageRegistry {
             {
                 continue;
             }
+            // A session that moved into the new storage after it was marked has no run here
+            // to seal, and opening it would open the new storage's actor instead.
+            if !matches!(self.store_owner_refusal(&key), Ok(None)) {
+                self.inner.crash_orphan_marks.lock().unwrap().remove(&key);
+                sweep.not_live += 1;
+                continue;
+            }
             let opened = async {
                 self.actor_for(&key).await?;
                 self.route_status(&key).await
@@ -6546,6 +6902,11 @@ impl LineageRegistry {
 }
 
 impl RegistryHandle {
+    /// Takes the mark that the send opening `key` is one the store actor serves.
+    pub(crate) fn take_store_eligible(&self, key: &LineageKey) -> bool {
+        self.inner.store_eligible.lock().unwrap().remove(key)
+    }
+
     pub(crate) async fn check_session_log(&self, key: &LineageKey) -> Result<(), OpenError> {
         LineageRegistry {
             inner: self.inner.clone(),
@@ -8549,6 +8910,11 @@ impl LineageRegistry {
         key: &LineageKey,
         run: Option<&str>,
     ) -> Result<(), OpenError> {
+        // Today's retention doesn't decide a session the new storage owns, or a move is
+        // taking there: its WAL is the copy being moved or the retired one left behind.
+        if self.store_owner_refusal(key)?.is_some() {
+            return Ok(());
+        }
         self.check_move(key, false)?;
         let Some(service) = self.inner.retention.get().cloned() else {
             return Ok(());
@@ -8610,6 +8976,10 @@ impl LineageRegistry {
     /// `session.status` may still recover an existing log's torn tail or append an
     /// orphan's terminal; it must never mint a replacement for missing history.
     pub(crate) async fn check_session_log(&self, key: &LineageKey) -> Result<(), OpenError> {
+        // A session kept in the new storage has its head as its log, and no WAL to miss.
+        if self.store_holding(key)?.is_some() {
+            return Ok(());
+        }
         let (Some(inventory), Some(reader)) = (
             self.inner.session_address_inventory.get().cloned(),
             self.inner.reader.as_ref(),
@@ -8720,6 +9090,10 @@ impl RegistryHandle {
 #[cfg(test)]
 #[path = "registry_owner_tests.rs"]
 mod owner_tests;
+
+#[cfg(test)]
+#[path = "registry_store_owner_tests.rs"]
+pub(crate) mod store_owner_tests;
 
 /// Offset page assembly: pages and head from WAL offsets, with bounded decodes.
 ///

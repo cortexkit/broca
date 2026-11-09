@@ -48,12 +48,9 @@ impl RideEnvelopes {
         self.0.get(&(mid.into(), part.into()))?.get(index)?.as_ref()
     }
 
-    pub(crate) fn push(
-        &mut self,
-        mid: &str,
-        part: &str,
-        ride: Option<broca_wal::record::RideMetadata>,
-    ) {
+    /// Adds the envelope of the next text delivered with the part `part` of message `mid`:
+    /// `None` for text delivered without one. Calls follow the part's delivered order.
+    pub fn push(&mut self, mid: &str, part: &str, ride: Option<broca_wal::record::RideMetadata>) {
         self.0
             .entry((mid.into(), part.into()))
             .or_default()
@@ -61,7 +58,9 @@ impl RideEnvelopes {
     }
 }
 
-pub(crate) fn attach_ride_envelope(
+/// Copies a ride's envelope onto the delivered text a compaction part carries, as the ride's
+/// own record names it. Text without an envelope keeps what it has.
+pub fn attach_ride_envelope(
     delivered: &mut Delivered,
     ride: Option<&broca_wal::record::RideMetadata>,
 ) {
@@ -98,6 +97,21 @@ pub fn delivery_sender(
         _ if mode == broca_protocol::DeliveryMode::ToolResult => Some("broca".into()),
         _ => None,
     }
+}
+
+/// Recorded agent speech is not a module notice unless `notice: true` was also recorded.
+/// An unmarked module send keeps its original origin, preserving existing entry digests.
+pub fn recorded_notice_origin(
+    sender: Option<&str>,
+    template: Option<&str>,
+    marks: Option<&broca_protocol::MessageMarks>,
+) -> Option<NoticeOrigin> {
+    if marks.is_some_and(|marks| marks.speaks_for.is_some() && !marks.notice) {
+        return None;
+    }
+    let mut notice = NoticeOrigin::new(sender?);
+    notice.template = template.map(str::to_owned);
+    Some(notice)
 }
 
 /// Recover attribution from admission records, not the current plan or the run

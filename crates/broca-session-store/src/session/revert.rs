@@ -26,7 +26,7 @@
 //! - **Deletion.** The old log, and the objects the cut branch stopped naming, are deleted after
 //!   the grace period. Ledger-named objects are never among them.
 
-use std::collections::BTreeMap;
+use super::media::OpenLogIndex;
 
 use crate::backend::SessionBackend;
 use crate::checkpoint::Checkpoint;
@@ -56,6 +56,13 @@ pub enum RevertRefusal {
     NotRunInput,
     /// The resend isn't a run start with a send id, the run's input, and its entry facts.
     BadResend(&'static str),
+    /// The message was placed before the session enrolled in the current compaction contract.
+    /// Its ordinal would be taken again by a message numbered on the contract, while what
+    /// `session.entries` serves at that ordinal was decided at enrollment.
+    BeforeEnrollment,
+    /// The highest part number before the revert (`TranscriptReverted::tag_high`) was given for
+    /// a session off the current compaction contract, or not given for one on it.
+    TagHigh,
 }
 
 /// What a revert did.
@@ -141,14 +148,18 @@ fn check_resend(resend: &[Record]) -> Result<String, SessionError> {
         .ok_or_else(|| bad("the run start has a send id"))
 }
 
-impl<'b, B: SessionBackend> Session<'b, B> {
+impl<B: SessionBackend> Session<B> {
     /// Ends the branch before the message `target` names, and starts the run `resend` describes
     /// there: its run start (with a send id), its input, and the input's entry facts, whose
-    /// ordinal and id the revert fills in.
+    /// ordinal and id the revert fills in. On a session on the current compaction contract,
+    /// `tag_high` is the highest part number any message took before the revert, which the
+    /// caller counts (the store can't count a message's numbered parts) and the revert records;
+    /// off the contract it is `None`.
     pub async fn revert(
         &mut self,
         target: &str,
         mut resend: Vec<Record>,
+        tag_high: Option<u64>,
         now_ms: u64,
     ) -> Result<Reverted, SessionError> {
         if self.poisoned {
@@ -179,9 +190,20 @@ impl<'b, B: SessionBackend> Session<'b, B> {
         if !self.operations.queue.is_empty() {
             return refuse(RevertRefusal::QueueNotEmpty);
         }
+        if self.operations.on_contract() != tag_high.is_some() {
+            return refuse(RevertRefusal::TagHigh);
+        }
         let Some(ordinal) = self.find_message(target).await? else {
             return refuse(RevertRefusal::UnknownMessage);
         };
+        if self
+            .operations
+            .enrolled
+            .as_ref()
+            .is_some_and(|enrolled| ordinal <= enrolled.through_ordinal)
+        {
+            return refuse(RevertRefusal::BeforeEnrollment);
+        }
         let (records, batches, checkpoint) = self.read_open_log().await?;
         let located = if ordinal >= self.conversation.window_start() {
             locate(
@@ -225,10 +247,11 @@ impl<'b, B: SessionBackend> Session<'b, B> {
                 &batches,
                 &checkpoint,
                 &mut resend,
+                tag_high,
                 now_ms,
             )
             .await;
-        let created = match created {
+        let created = match created.and_then(|created| self.check_enrollment_carried(created)) {
             Ok(created) => created,
             Err(error) => {
                 self.abort(change).await;
@@ -242,6 +265,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
         };
         let mid = facts.mid.clone();
         self.commit(change, intent_seq, created, now_ms).await?;
+        self.observed(super::Appended::Replaced);
         Ok(Reverted::Applied {
             change,
             ordinal,
@@ -255,7 +279,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
     async fn locate_sealed(&self, ordinal: u64) -> Result<Option<Located>, SessionError> {
         let key = self.key.frame_key();
         let pages = Pages {
-            backend: self.backend,
+            backend: &self.backend,
             addr: &self.addr,
             session: self.head.session_id,
             key: &key,
@@ -314,6 +338,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
         batches: &[std::ops::Range<usize>],
         checkpoint: &Checkpoint,
         resend: &mut [Record],
+        tag_high: Option<u64>,
         now_ms: u64,
     ) -> Result<Created, SessionError> {
         let name = hex(&change.0);
@@ -326,6 +351,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
             through_seq: through,
             ordinal,
             history_version,
+            tag_high,
         });
         let mut ledger: Vec<(u64, Record)> = records
             .iter()
@@ -338,13 +364,10 @@ impl<'b, B: SessionBackend> Session<'b, B> {
         settled
             .apply(&reverted)
             .map_err(|e| SessionError::Fold(format!("operations: {e:?}")))?;
-        let ledger_sealed = self.seal_ledger(&name, &ledger, &settled, now_ms).await?;
-        let replaced = ledger_sealed.replaced;
-
         // The transcript: cut the directory at the message if it's sealed; otherwise keep the
         // open log's records before it.
         let pages = Pages {
-            backend: self.backend,
+            backend: &self.backend,
             addr: &self.addr,
             session: self.head.session_id,
             key: &key,
@@ -371,7 +394,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
             let mut refs = gone.segments;
             refs.extend(gone.pages);
             IndexPages {
-                backend: self.backend,
+                backend: &self.backend,
                 addr: &self.addr,
                 session: self.head.session_id,
                 key: &key,
@@ -391,6 +414,20 @@ impl<'b, B: SessionBackend> Session<'b, B> {
                 checkpoint.transcript_base,
             )
         };
+        let checkpoint_body = Checkpoint {
+            covers_through: reverted_seq,
+            next_seq: reverted_seq + 1,
+            conversation: conversation.clone(),
+            operational: settled.clone(),
+            transcript_base: base,
+            ledger_base: Some(reverted_seq),
+            activity_ms: None,
+        }
+        .encode();
+        let ledger_sealed = self
+            .seal_ledger(&name, &ledger, &settled, &checkpoint_body, now_ms)
+            .await?;
+        let replaced = ledger_sealed.replaced;
 
         let mut encoder = LogEncoder::new(
             key.clone(),
@@ -405,19 +442,9 @@ impl<'b, B: SessionBackend> Session<'b, B> {
             .create_log(&self.addr, &change, self.version)
             .await?;
         let mut bytes = encoder
-            .checkpoint(
-                &Checkpoint {
-                    covers_through: reverted_seq,
-                    next_seq: reverted_seq + 1,
-                    conversation: conversation.clone(),
-                    operational: settled.clone(),
-                    transcript_base: base,
-                    ledger_base: Some(reverted_seq),
-                }
-                .encode(),
-            )?
+            .checkpoint(&checkpoint_body)?
             .into_written(&mut encoder);
-        let mut window_facts = BTreeMap::new();
+        let mut window = OpenLogIndex::default();
         let mut kept_records = 0;
         if !located.sealed {
             for batch in batches {
@@ -435,9 +462,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
                     conversation
                         .apply(record)
                         .map_err(|e| SessionError::Fold(format!("conversation: {e:?}")))?;
-                    if let Record::EntryFacts(facts) = record {
-                        window_facts.insert(*seq, facts.ordinal);
-                    }
+                    window.note(*seq, record);
                 }
                 kept_records += kept.len();
                 bytes.extend(encoder.copy_batch(&kept)?.into_written(&mut encoder));
@@ -456,13 +481,11 @@ impl<'b, B: SessionBackend> Session<'b, B> {
         let mut open_ids = OpenIds::default();
         for (offset, record) in resend.iter().enumerate() {
             let seq = first + offset as u64;
-            apply(&mut conversation, &mut operations, record).map_err(SessionError::Fold)?;
+            apply(&mut conversation, &mut operations, seq, record).map_err(SessionError::Fold)?;
             if record.stream() == Stream::Ledger {
                 open_ids.add(seq, record);
             }
-            if let Record::EntryFacts(facts) = record {
-                window_facts.insert(seq, facts.ordinal);
-            }
+            window.note(seq, record);
         }
         if conversation.placed != ordinal {
             return Err(SessionError::Fold(format!(
@@ -493,7 +516,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
             encoder,
             conversation,
             operations,
-            window_facts,
+            window,
             open_ids,
             transcript_dir,
             ledger_dir: ledger_sealed.ledger_dir,

@@ -51,6 +51,7 @@ pub mod provider;
 pub mod render_provenance;
 pub mod request;
 pub mod session;
+pub mod session_change;
 pub mod structured_output;
 pub mod tags;
 pub mod usage;

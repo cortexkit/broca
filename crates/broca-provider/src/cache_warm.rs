@@ -52,7 +52,7 @@ pub struct CacheDeclaration {
 }
 
 /// See [`CacheDeclaration::requested_ttl_ms`].
-fn requested_ttl_ms(provider_id: &str, frozen: &FrozenRenderConfig) -> Option<u64> {
+pub fn requested_ttl_ms(provider_id: &str, frozen: &FrozenRenderConfig) -> Option<u64> {
     match (&frozen.cache.as_ref()?.class, frozen.family_id) {
         (
             CacheClass::Markers {

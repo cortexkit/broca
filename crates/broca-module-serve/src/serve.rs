@@ -57,10 +57,10 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::manifest::{
-    OP_BASELINE, OP_CANCEL, OP_FLUSH_PREFIX, OP_HEAD, OP_IMPORT, OP_READ, OP_REFRESH,
-    OP_REFRESH_POLICY, OP_RETRACT, OP_ROLE_DESCRIBE, OP_RUN_EVENT_GET, OP_RUN_RESULT,
-    OP_RUN_TOOL_CALLS, OP_SEND, OP_SEND_STATUS, OP_SESSION_SEND_STATUS, OP_STATUS, OP_SUBSCRIBE,
-    OP_VAULT_AUDIT, OP_WARM,
+    OP_BASELINE, OP_CANCEL, OP_FLUSH_PREFIX, OP_HEAD, OP_IMPORT, OP_INSTALL_VIEW, OP_MOVE_TO_STORE,
+    OP_READ, OP_REFRESH, OP_REFRESH_POLICY, OP_RETRACT, OP_ROLE_DESCRIBE, OP_RUN_EVENT_GET,
+    OP_RUN_RESULT, OP_RUN_TOOL_CALLS, OP_SEND, OP_SEND_STATUS, OP_SESSION_SEND_STATUS, OP_STATUS,
+    OP_SUBSCRIBE, OP_VAULT_AUDIT, OP_WARM,
 };
 use crate::wire::{
     CancelParams, FromWireExt, ImportParams, ImportResult, RetractParams, RouteRequest, SendParams,
@@ -2283,6 +2283,9 @@ async fn handle_control_request(
             metrics["scoped_role_route_refusals"] =
                 serde_json::json!(broca_subc::scoped_role_route_refusals());
             metrics["session_readers"] = crate::session_readers::health();
+            // Which deployment key the new session storage is opened with, and whether it has
+            // loaded: while it hasn't, sessions kept there are refused `key_unavailable`.
+            metrics["store"] = crate::store_key::health();
             metrics["usage_observe"] = crate::usage_observe::published_metrics();
             metrics["account_limit_stale_resets"] =
                 serde_json::json!(broca_core::account_limit_stale_resets());
@@ -2800,12 +2803,31 @@ where
             PreparedRouteRequest::Request(req) => &req.params,
             PreparedRouteRequest::Subscribe { params, .. } => params,
         };
+        // Establish storage ownership before authorization or dispatch can answer from today's
+        // WAL. Without a store runtime the rollback guard refuses every op; with one, only ops
+        // implemented for the new storage may proceed.
+        match handler.kept_in_new_storage(&session) {
+            Ok(true) if !served_on_new_storage(method, params) => {
+                return send_error(
+                    &writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    NOT_SERVED_ON_NEW_STORAGE,
+                    &format!("{method} isn't served yet for a session kept in the new storage"),
+                )
+                .await;
+            }
+            Ok(_) => {}
+            Err(error) => return send_serve_error(&writer, ver, channel, epoch, corr, &error).await,
+        }
         if let Err(error) = authorize_route_request(handler.as_ref(), &session, &bind, method, params).await {
             return send_serve_error(&writer, ver, channel, epoch, corr, &error).await;
         }
         let write = matches!(
             method,
-            OP_SEND | OP_WARM | OP_IMPORT | OP_CANCEL | OP_RETRACT | OP_REFRESH | OP_REFRESH_POLICY | OP_FLUSH_PREFIX
+            OP_SEND | OP_WARM | OP_IMPORT | OP_INSTALL_VIEW | OP_CANCEL | OP_RETRACT | OP_REFRESH | OP_REFRESH_POLICY | OP_FLUSH_PREFIX
         );
         let write = write || matches!(method, "session.upload_begin" | "session.upload_append" | "session.upload_commit");
         let session_read = matches!(method, OP_READ | OP_HEAD | OP_RUN_RESULT | OP_RUN_TOOL_CALLS | OP_RUN_EVENT_GET | OP_STATUS | OP_SUBSCRIBE | OP_BASELINE | "session.upload_status" | cortexkit_role_llm_runner::ops::SESSION_HISTORY | cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REFS | cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REF_READ)
@@ -3613,6 +3635,146 @@ where
                 }
             }
         }
+        OP_IMPORT if req.params.get("source").is_some() => {
+            // A head's history read from a file another host exported, into a session the new
+            // storage creates. An import carrying its messages inline is today's import, below.
+            let params: broca_wire::head_import::FileImportParams =
+                match serde_json::from_value(req.params) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        return send_error(
+                            writer,
+                            ver,
+                            channel,
+                            epoch,
+                            corr,
+                            "invalid_params",
+                            &error.to_string(),
+                        )
+                        .await
+                    }
+                };
+            let Some(principal) = bind.principal.clone() else {
+                return send_error(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    "principal_required",
+                    "an import needs the daemon's attested principal on its route",
+                )
+                .await;
+            };
+            let Some(roots) = handler.import_roots() else {
+                return send_error(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    "new_storage_unavailable",
+                    "this module doesn't create sessions in the new storage",
+                )
+                .await;
+            };
+            let command = broca_module::store_import::StoreCommand::Import(Box::new(
+                broca_module::store_import::ImportCommand {
+                    params,
+                    principal,
+                    scope: match &bind.scope {
+                        broca_protocol::SendScope::Stamped(stamped) => Some(stamped.scope.clone()),
+                        _ => None,
+                    },
+                    roots,
+                    now_ms: broca_diagnostics::now_ms(),
+                },
+            ));
+            send_store_outcome(
+                handler.as_ref(),
+                session,
+                command,
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+            )
+            .await
+        }
+        OP_MOVE_TO_STORE => {
+            // Only the operator's own connection moves a session: the move changes which
+            // storage serves it, and it can't be undone.
+            if !matches!(bind.principal, Some(broca_protocol::BindPrincipal::Direct)) {
+                return send_error(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    "operator_required",
+                    "session.move_to_store is for the operator only",
+                )
+                .await;
+            }
+            match handler.move_to_store(session).await {
+                Ok(reply) => send_json_response(writer, ver, channel, epoch, corr, &reply).await,
+                Err(refusal) => {
+                    let mut body = ErrorBody::new(refusal.code, refusal.message);
+                    if let Some(detail) = refusal.detail {
+                        body = body.with_detail(detail);
+                    }
+                    send_error_body(writer, ver, channel, epoch, corr, body).await
+                }
+            }
+        }
+        OP_INSTALL_VIEW => {
+            let params: broca_wire::head_import::InstallViewParams =
+                match serde_json::from_value(req.params) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        return send_error(
+                            writer,
+                            ver,
+                            channel,
+                            epoch,
+                            corr,
+                            "invalid_params",
+                            &error.to_string(),
+                        )
+                        .await
+                    }
+                };
+            let Some(principal) = bind.principal.clone() else {
+                return send_error(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    "principal_required",
+                    "installing a view needs the daemon's attested principal on its route",
+                )
+                .await;
+            };
+            let command = broca_module::store_import::StoreCommand::InstallView(Box::new(
+                broca_module::store_import::InstallViewCommand {
+                    view: params.view,
+                    principal,
+                },
+            ));
+            send_store_outcome(
+                handler.as_ref(),
+                session,
+                command,
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+            )
+            .await
+        }
         OP_IMPORT => {
             let params: ImportParams = match serde_json::from_value(req.params) {
                 Ok(params) => params,
@@ -4377,6 +4539,19 @@ where
                         .await;
                         return;
                     }
+                    if let Delivery::AccessEnded(refusal) = &delivery {
+                        // Read access ended with a change the session accepted: the stream ends
+                        // with the refusal a new subscribe would get now.
+                        let error = ServeError::ScopeRefused((**refusal).clone());
+                        let _ = send_subscribe_scope_error(
+                            &writer,
+                            (ver, channel, epoch, corr),
+                            next_seq,
+                            &error,
+                        )
+                        .await;
+                        return;
+                    }
                     if let Delivery::Error(message) = &delivery {
                         // A replay failure is a typed stream terminal, not an empty successful stream.
                         // `Error` is already terminal in the existing subc vocabulary, so do not append
@@ -4666,6 +4841,7 @@ fn encode_delivery(delivery: &Delivery, seq: u64) -> EncodedDelivery {
         Delivery::CursorExpired
         | Delivery::Expired { .. }
         | Delivery::Error(_)
+        | Delivery::AccessEnded(_)
         | Delivery::Detached => return EncodedDelivery::Detached,
     };
     match encoded {
@@ -4995,6 +5171,100 @@ fn log_refused_send(
 fn upload_error_body(error: &broca_core::media_uploads::UploadError, for_send: bool) -> ErrorBody {
     let body = broca_module::serve::admission_refusal::upload_refusal(error, for_send);
     ErrorBody::new(body.code, body.message).with_detail(body.detail.expect("upload detail"))
+}
+
+/// The refusal of an op that has no implementation yet for a session kept in the new storage.
+const NOT_SERVED_ON_NEW_STORAGE: &str = "not_served_on_new_storage";
+
+/// Whether `method` is served for a session kept in the new storage. Every other op is refused
+/// `not_served_on_new_storage` for such a session, so none can fall through to today's WAL
+/// reads. An op joins this list in the change that gives it a store implementation.
+///
+/// The list covers the session's own route. A `compaction-runner/v1` route (`bind`,
+/// `session.entries`, `session.applied_view`, `session.apply_view`) is dispatched by its role
+/// before this check, and the registry sends a store session's calls on it to the store
+/// (`LineageRegistry::route_compaction_v2`).
+pub(crate) fn served_on_new_storage(method: &str, params: &serde_json::Value) -> bool {
+    match method {
+        // Reads served from the store (`store_read`, `store_head`).
+        OP_READ | OP_HEAD => true,
+        // The store actor's subscriptions (`store_fanout`).
+        OP_SUBSCRIBE => true,
+        // Run and send facts built from the store's own records (`store_status`), and a run's
+        // calls (`store_tool_calls`).
+        OP_STATUS | OP_RUN_RESULT | OP_SEND_STATUS | OP_SESSION_SEND_STATUS => true,
+        OP_RUN_TOOL_CALLS => true,
+        // The store actor serves sends, cancels and retractions.
+        OP_SEND | OP_CANCEL | OP_RETRACT => true,
+        // Plan refreshes, through today's preflight, decided and written by the store actor.
+        OP_REFRESH | OP_REFRESH_POLICY | OP_FLUSH_PREFIX => true,
+        // A head import from a file creates the session in the new storage. An import carrying
+        // its messages inline is today's import, which writes a WAL.
+        OP_IMPORT => params.get("source").is_some(),
+        OP_INSTALL_VIEW => true,
+        // The store actor warms the request its loop would send next, dated by the store's own
+        // cache clock (`store_actor::warm`).
+        OP_WARM => true,
+        // Describes the module, not the session.
+        OP_ROLE_DESCRIBE => true,
+        // Media the store's own records name, read from the objects they stored
+        // (`uploads::media_read`). Uploads are staged beside the session, whichever storage
+        // keeps it; only the owner check reads the session, from the store.
+        cortexkit_role_llm_runner::ops::SESSION_MEDIA_READ => true,
+        "session.upload_begin"
+        | "session.upload_append"
+        | "session.upload_commit"
+        | "session.upload_status" => true,
+        // Both forms page through the store (`crate::history`): the raw form through its
+        // `session.read`, the display form with the per-call facts the store records.
+        cortexkit_role_llm_runner::ops::SESSION_HISTORY => true,
+        _ => false,
+    }
+}
+
+/// Routes a command only the new storage serves, and sends its answer: the reply, or its
+/// refusal under the refusal's own code.
+#[allow(clippy::too_many_arguments)]
+async fn send_store_outcome<H: ServeHandler + ?Sized>(
+    handler: &H,
+    session: &BrocaBindIdentity,
+    command: broca_module::store_import::StoreCommand,
+    writer: &EgressSender<Frame>,
+    ver: u8,
+    channel: u16,
+    epoch: u32,
+    corr: u64,
+) -> Result<(), ServeIoError> {
+    use broca_module::store_import::StoreOutcome;
+    match handler.store_command(session, command).await {
+        Ok(StoreOutcome::Imported(reply)) => {
+            send_json_response(writer, ver, channel, epoch, corr, &reply).await
+        }
+        Ok(StoreOutcome::ViewInstalled(reply)) => {
+            send_json_response(writer, ver, channel, epoch, corr, &reply).await
+        }
+        Ok(StoreOutcome::Refused(refusal)) => {
+            send_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                refusal.code,
+                &refusal.message,
+            )
+            .await
+        }
+        // The registry routes a command again when its session closes under it, so it never
+        // hands this back.
+        Ok(StoreOutcome::Reopen) => unreachable!("route_store_command reopens the session itself"),
+        // Only `session.apply_view` is answered so, and it travels on the compaction-runner
+        // route, whose answers that route sends.
+        Ok(StoreOutcome::ViewApplied(_)) => {
+            unreachable!("session.apply_view isn't routed as a store command here")
+        }
+        Err(error) => send_serve_error(writer, ver, channel, epoch, corr, &error).await,
+    }
 }
 
 async fn send_serve_error(
@@ -5655,6 +5925,14 @@ async fn send_session_change_error(
                 ErrorBody::new(refusal.code(), refusal.message()).with_detail(refusal.detail());
             send_error_body(writer, ver, channel, epoch, corr, body).await
         }
+        SessionChangeError::CompactionNotAddable(refusal) => {
+            let body = ErrorBody::new(
+                cortexkit_role_llm_runner::errors::INVALID_PARAMS,
+                refusal.message(),
+            )
+            .with_detail(broca_module::serve::compaction_not_addable_detail(refusal));
+            send_error_body(writer, ver, channel, epoch, corr, body).await
+        }
         SessionChangeError::Transient(message) => {
             let serve = ServeError::Transient(message);
             send_serve_error(writer, ver, channel, epoch, corr, &serve).await
@@ -5771,6 +6049,30 @@ async fn send_error_body(
     body: ErrorBody,
 ) -> Result<(), ServeIoError> {
     let body = serde_json::to_vec(&body).map_err(|e| ServeIoError(e.to_string()))?;
+    send_error_bytes(writer, ver, channel, epoch, corr, body).await
+}
+
+/// Ends a subscribe stream with a scope refusal's wire body, carrying the stream's next seq and
+/// a display reset as every subscribe stream error does.
+async fn send_subscribe_scope_error(
+    writer: &EgressSender<Frame>,
+    (ver, channel, epoch, corr): (u8, u16, u32, u64),
+    seq: u64,
+    error: &ServeError,
+) -> Result<(), ServeIoError> {
+    let mut body: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_slice(&scope_error_bytes(error)?)
+            .map_err(|error| ServeIoError(error.to_string()))?;
+    if let Some(code) = body.get("code").and_then(serde_json::Value::as_str) {
+        record_request_outcome(code);
+    }
+    body.insert("seq".into(), seq.into());
+    body.insert(
+        "event".into(),
+        serde_json::to_value(cortexkit_role_llm_runner::live::LiveEvent::DisplayReset)
+            .map_err(|error| ServeIoError(error.to_string()))?,
+    );
+    let body = serde_json::to_vec(&body).map_err(|error| ServeIoError(error.to_string()))?;
     send_error_bytes(writer, ver, channel, epoch, corr, body).await
 }
 
@@ -6023,6 +6325,7 @@ fn method_code(method: &str) -> u8 {
         OP_RUN_RESULT => 16,
         OP_WARM => 17,
         OP_RUN_TOOL_CALLS => 19,
+        OP_INSTALL_VIEW => 20,
         _ => 255,
     }
 }
@@ -10158,6 +10461,11 @@ mod tests {
         write_frame(&mut daemon, &ack).await.unwrap();
 
         // A new connection reports both serve-loop counters before this test submits any drops.
+        // Health also names the new storage's deployment key and whether it has loaded.
+        crate::store_key::publish(Arc::new(broca_module::store_open::StoreSlot::awaiting_key(
+            std::path::Path::new("/unused"),
+            7,
+        )));
         let health = Frame::build(
             FrameType::Request,
             control_flags(),
@@ -10174,6 +10482,12 @@ mod tests {
             (FrameType::Response, 0, 2)
         );
         let health: serde_json::Value = serde_json::from_slice(&health.body).unwrap();
+        assert_eq!(
+            health["metrics"]["store"],
+            serde_json::json!({"key_id": 7, "loaded": false, "new_sessions": "encrypted"}),
+            "health.check reports the deployment key's id, that it hasn't loaded, and the mode \
+             new sessions take"
+        );
         assert!(
             health["metrics"]["scoped_role_route_refusals"].is_object(),
             "health.check includes scoped role-open refusal counts keyed by daemon code"

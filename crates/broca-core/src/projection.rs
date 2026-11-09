@@ -46,10 +46,21 @@ use broca_wal::{FramedRecord, WalRecord};
 pub struct Cursor {
     pub wal_seq: u64,
     pub sub_index: u32,
-    frame: Option<(
+    frame: Option<FrameProof>,
+}
+
+/// What a cursor names besides its position, so a resume can tell the unit it names is still
+/// the one the log holds at that position.
+#[derive(Debug, Clone, Copy)]
+enum FrameProof {
+    /// A WAL frame: the log's lineage id and the frame's identity.
+    Wal(
         broca_wal::WalLineageId,
         broca_wal::framing::CursorFrameIdentity,
-    )>,
+    ),
+    /// A record of a session kept in the new storage: its head's incarnation and the record's
+    /// keyed digest, both minted by that storage.
+    Store { incarnation: [u8; 16], digest: u64 },
 }
 
 impl Cursor {
@@ -66,7 +77,17 @@ impl Cursor {
         lineage: broca_wal::WalLineageId,
         identity: broca_wal::framing::CursorFrameIdentity,
     ) -> Self {
-        self.frame = (identity.seq == self.wal_seq).then_some((lineage, identity));
+        self.frame = (identity.seq == self.wal_seq).then_some(FrameProof::Wal(lineage, identity));
+        self
+    }
+
+    /// Binds the cursor to a record of a session kept in the new storage: the session head's
+    /// `incarnation` and the record's keyed `digest`.
+    pub fn with_store_identity(mut self, incarnation: [u8; 16], digest: u64) -> Self {
+        self.frame = Some(FrameProof::Store {
+            incarnation,
+            digest,
+        });
         self
     }
 
@@ -76,7 +97,43 @@ impl Cursor {
         broca_wal::WalLineageId,
         broca_wal::framing::CursorFrameIdentity,
     )> {
-        self.frame
+        match self.frame {
+            Some(FrameProof::Wal(lineage, identity)) => Some((lineage, identity)),
+            _ => None,
+        }
+    }
+
+    /// The new storage's identity this cursor carries: the head's incarnation and the record's
+    /// digest.
+    pub fn store_identity(self) -> Option<([u8; 16], u64)> {
+        match self.frame {
+            Some(FrameProof::Store {
+                incarnation,
+                digest,
+            }) => Some((incarnation, digest)),
+            _ => None,
+        }
+    }
+
+    /// The cursor's `incarnation` and `digest` as the wire spells them: a WAL lineage id in its
+    /// dashed form, or the new storage's incarnation in lowercase hex as `session.read` serves
+    /// it, and the digest as 16 lowercase hex digits.
+    pub fn wire_identity(self) -> Option<(String, String)> {
+        match self.frame? {
+            FrameProof::Wal(lineage, identity) => {
+                Some((lineage.to_string(), identity.digest_hex()))
+            }
+            FrameProof::Store {
+                incarnation,
+                digest,
+            } => Some((
+                incarnation
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect(),
+                format!("{digest:016x}"),
+            )),
+        }
     }
 }
 
@@ -177,34 +234,31 @@ pub fn project_control(records: &[FramedRecord]) -> Vec<(Cursor, ControlUnit)> {
 
 /// Episode-local tracking shared by control projection and run-status reconciliation. A dispatch
 /// intent remains unresolved until a definite terminal arrives; an indeterminate terminal stays in
-/// the reported set because the tool may already have applied its side effect.
+/// the reported set because the tool may already have applied its side effect. A session kept in
+/// the new storage reports a run's indeterminate calls through the same tracking.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub(crate) struct IndeterminateToolCalls {
+pub struct IndeterminateToolCalls {
     unresolved_dispatches: Vec<ToolCallId>,
     indeterminate_outcomes: Vec<ToolCallId>,
 }
 
 impl IndeterminateToolCalls {
-    pub(crate) fn reset_episode(&mut self) {
+    pub fn reset_episode(&mut self) {
         self.unresolved_dispatches.clear();
         self.indeterminate_outcomes.clear();
     }
 
-    pub(crate) fn reset_batch(&mut self) {
+    pub fn reset_batch(&mut self) {
         self.unresolved_dispatches.clear();
     }
 
-    pub(crate) fn record_dispatch_intent(&mut self, tool_call_id: &ToolCallId) {
+    pub fn record_dispatch_intent(&mut self, tool_call_id: &ToolCallId) {
         if !self.unresolved_dispatches.contains(tool_call_id) {
             self.unresolved_dispatches.push(tool_call_id.clone());
         }
     }
 
-    pub(crate) fn record_dispatch_terminal(
-        &mut self,
-        tool_call_id: &ToolCallId,
-        indeterminate: bool,
-    ) {
+    pub fn record_dispatch_terminal(&mut self, tool_call_id: &ToolCallId, indeterminate: bool) {
         self.unresolved_dispatches
             .retain(|pending| pending != tool_call_id);
         if indeterminate && !self.indeterminate_outcomes.contains(tool_call_id) {
@@ -212,7 +266,7 @@ impl IndeterminateToolCalls {
         }
     }
 
-    pub(crate) fn snapshot(&self) -> Vec<ToolCallId> {
+    pub fn snapshot(&self) -> Vec<ToolCallId> {
         let mut calls = self.indeterminate_outcomes.clone();
         for tool_call_id in &self.unresolved_dispatches {
             if !calls.contains(tool_call_id) {
@@ -770,19 +824,14 @@ fn project_control_record<S: ControlProjectionSink>(
             // Remember it for the TERMINAL, which carries no run in its WAL record and
             // could not otherwise name one.
             state.run_id = Some(run_id.clone());
-            push!(
-                ControlUnit::RunStarted {
-                    run_id: run_id.clone(),
-                    submission_id: submission_id.clone(),
-                },
-                LiveEvent::RunStarted({
-                    let mut started = live::RunStarted::new(run_id.0.clone());
-                    started.rich_ui = manifest
-                        .as_ref()
-                        .and_then(|manifest| manifest.rich_ui.clone());
-                    started
-                })
+            let (unit, event) = run_started_unit(
+                run_id,
+                submission_id.clone(),
+                manifest
+                    .as_ref()
+                    .and_then(|manifest| manifest.rich_ui.clone()),
             );
+            record_sink.push_with_event(|| unit, || event);
         }
         WalRecord::StepStarted { step_id } => {
             state.assistant_ordinal = Some(state.placement.next_ordinal());
@@ -940,11 +989,7 @@ fn project_control_record<S: ControlProjectionSink>(
             });
             let owner = state.assistant_ordinal.filter(|_| call.is_some());
             let first_start = call.is_some() && state.started_tools.insert(tool_call_id.clone());
-            let outcome_name = match reason {
-                broca_wal::NoDispatchReason::Denied { .. }
-                | broca_wal::NoDispatchReason::PolicyBlocked { .. } => "denied",
-                _ => "error",
-            };
+            let outcome_name = no_dispatch_outcome(reason);
             state
                 .indeterminate_tool_calls
                 .record_dispatch_terminal(tool_call_id, false);
@@ -994,23 +1039,16 @@ fn project_control_record<S: ControlProjectionSink>(
                     error: error.clone().into(),
                 });
             }
-            push!(
-                ControlUnit::RunFinished {
-                    run_id: state.run_id.clone(),
-                    reason: *reason,
-                    usage: state.has_completed_step.then_some(*usage),
-                    final_step_finish_reason: state.final_step_finish_reason,
-                    indeterminate_tool_calls: (*reason == RunFinishReason::Interrupted)
-                        .then(|| state.indeterminate_tool_calls.snapshot()),
-                    retries_used: *retries_used,
-                },
-                state
-                    .run_id
-                    .as_ref()
-                    .map_or(LiveEvent::DisplayReset, |run_id| LiveEvent::RunFinished(
-                        live::RunEnded::new(run_id.0.clone(), reason.as_str())
-                    ))
-            );
+            let (unit, event) = run_finished_unit(RunEndFacts {
+                run_id: state.run_id.as_ref(),
+                reason: *reason,
+                usage: *usage,
+                has_completed_step: state.has_completed_step,
+                final_step_finish_reason: state.final_step_finish_reason,
+                indeterminate: &state.indeterminate_tool_calls,
+                retries_used: *retries_used,
+            });
+            record_sink.push_with_event(|| unit, || event);
             state.assistant_ordinal = None;
             state.tool_result_ordinal = None;
             state.assistant_message = None;
@@ -1026,17 +1064,15 @@ fn project_control_record<S: ControlProjectionSink>(
             account_limit,
             ..
         } if *reason != broca_protocol::PauseReason::ToolHeld => {
-            push!(
-                ControlUnit::Paused {
-                    run_id: run_id.clone(),
-                    reason: *reason,
-                    resume_not_before_ms: account_limit
-                        .as_ref()
-                        .map(|pause| pause.resume_not_before_ms),
-                    error: error.clone().map(SharedProviderError::from),
-                },
-                LiveEvent::RunPaused(live::RunEnded::new(run_id.0.clone(), reason.as_str()))
+            let (unit, event) = paused_unit(
+                run_id,
+                *reason,
+                account_limit
+                    .as_ref()
+                    .map(|pause| pause.resume_not_before_ms),
+                error.clone(),
             );
+            record_sink.push_with_event(|| unit, || event);
         }
         WalRecord::Retracted {
             submission_id,
@@ -1498,16 +1534,30 @@ fn project_control_record<S: ControlProjectionSink>(
     }
 }
 
+/// A message's id as today's WAL projection names it: `m` and its 0-based stored position. For
+/// a log whose ids carry its lineage (`broca_core::is_mode3_log`), the serve layer rewrites it
+/// into that log's public form with `broca_core::message_mid`.
+fn native_mid(ordinal: u64) -> String {
+    format!("m{ordinal}")
+}
+
 fn message_event(
     ordinal: Option<u64>,
     finished: bool,
 ) -> cortexkit_role_llm_runner::live::LiveEvent {
+    message_lifecycle_event(ordinal.map(native_mid), finished)
+}
+
+/// The lifecycle event of message `mid`: started, or finished. With no message, a reset.
+/// Shared by today's projection and the projection of a session kept in the new storage.
+pub fn message_lifecycle_event(
+    mid: Option<String>,
+    finished: bool,
+) -> cortexkit_role_llm_runner::live::LiveEvent {
     use cortexkit_role_llm_runner::live::{LiveEvent, MessageEvent};
-    match ordinal {
-        Some(ordinal) if finished => {
-            LiveEvent::MessageFinished(MessageEvent::new(format!("m{ordinal}")))
-        }
-        Some(ordinal) => LiveEvent::MessageStarted(MessageEvent::new(format!("m{ordinal}"))),
+    match mid {
+        Some(mid) if finished => LiveEvent::MessageFinished(MessageEvent::new(mid)),
+        Some(mid) => LiveEvent::MessageStarted(MessageEvent::new(mid)),
         None => LiveEvent::DisplayReset,
     }
 }
@@ -1519,9 +1569,21 @@ fn tool_started_event(
     arguments: Option<&serde_json::Value>,
     observed_at: Option<u64>,
 ) -> cortexkit_role_llm_runner::live::LiveEvent {
+    tool_started_event_at(native_mid(ordinal), call, name, arguments, observed_at)
+}
+
+/// A call's start, in the message `mid` that made it: the dispatched name and arguments when
+/// they differ from the call's, and when it was observed.
+pub fn tool_started_event_at(
+    mid: String,
+    call: &broca_protocol::ToolCall,
+    name: Option<&str>,
+    arguments: Option<&serde_json::Value>,
+    observed_at: Option<u64>,
+) -> cortexkit_role_llm_runner::live::LiveEvent {
     use cortexkit_role_llm_runner::live::{LiveEvent, ToolStarted};
     LiveEvent::ToolStarted(ToolStarted::new(
-        format!("m{ordinal}"),
+        mid,
         call.tool_call_id.0.clone(),
         name.unwrap_or(&call.tool_name),
         arguments.unwrap_or(&call.input),
@@ -1530,8 +1592,42 @@ fn tool_started_event(
     ))
 }
 
+/// A call prepared for an approval before it was dispatched: its start, with the arguments as
+/// prepared (canonical JSON) rather than as the model wrote them.
+pub fn deferred_tool_started_event(
+    mid: String,
+    call: &broca_protocol::ToolCall,
+    tool: &str,
+    args_jcs: &str,
+    deferred_at_ms: Option<u64>,
+) -> cortexkit_role_llm_runner::live::LiveEvent {
+    use cortexkit_role_llm_runner::live::{self, LiveEvent};
+    let mut event = live::ToolStarted::new(
+        mid,
+        call.tool_call_id.0.clone(),
+        tool,
+        &serde_json::Value::Null,
+        None,
+        deferred_at_ms,
+    );
+    event.arguments = args_jcs.to_owned();
+    LiveEvent::ToolStarted(event)
+}
+
 fn tool_finished_event(
     ordinal: u64,
+    call_id: &ToolCallId,
+    outcome: &str,
+    result: &broca_protocol::ToolResult,
+    observed_at: Option<u64>,
+) -> cortexkit_role_llm_runner::live::LiveEvent {
+    tool_finished_event_at(native_mid(ordinal), call_id, outcome, result, observed_at)
+}
+
+/// A call's end, in the message `mid` that made it: its outcome name and the size of what it
+/// returned.
+pub fn tool_finished_event_at(
+    mid: String,
     call_id: &ToolCallId,
     outcome: &str,
     result: &broca_protocol::ToolResult,
@@ -1557,7 +1653,7 @@ fn tool_finished_event(
         ToolOutput::Error { message, .. } => message.len(),
     };
     LiveEvent::ToolFinished(ToolFinished::new(
-        format!("m{ordinal}"),
+        mid,
         call_id.0.clone(),
         outcome,
         bytes as u64,
@@ -1565,7 +1661,9 @@ fn tool_finished_event(
     ))
 }
 
-fn tool_outcome(
+/// The outcome name a call's end carries, from its recorded terminal and result. An interrupted
+/// call reads `cancelled` when its run was cancelled.
+pub fn tool_outcome(
     outcome: broca_wal::DispatchOutcome,
     result: &broca_protocol::ToolResult,
     cancelled: bool,
@@ -1585,6 +1683,76 @@ fn tool_outcome(
     }
 }
 
+/// The outcome name of a call that was never dispatched, from why it wasn't.
+pub fn no_dispatch_outcome(reason: &broca_wal::NoDispatchReason) -> &'static str {
+    match reason {
+        broca_wal::NoDispatchReason::Denied { .. }
+        | broca_wal::NoDispatchReason::PolicyBlocked { .. } => "denied",
+        _ => "error",
+    }
+}
+
+/// One unit an input message adds to the stream, at the message (or, for a tool result, at the
+/// message whose call it answers) named by position `P`.
+pub enum InputUnit<'a, P> {
+    Started(P),
+    Call(P, &'a broca_protocol::ToolCall),
+    Result(P, &'a broca_protocol::ToolResult),
+    Finished(P),
+}
+
+/// The units an input message placed at `at` adds, in order: its start, each call it makes,
+/// each result that answers a call an earlier message of the same placement made, and its end.
+/// `owners` carries the calls across the placement's messages.
+pub fn input_units<'a, P: Clone>(
+    owners: &mut std::collections::HashMap<ToolCallId, P>,
+    at: P,
+    message: &'a broca_protocol::Message,
+) -> Vec<InputUnit<'a, P>> {
+    let mut units = vec![InputUnit::Started(at.clone())];
+    for block in &message.content {
+        match block {
+            broca_protocol::ContentBlock::ToolCall(call) => {
+                owners.insert(call.tool_call_id.clone(), at.clone());
+                units.push(InputUnit::Call(at.clone(), call));
+            }
+            broca_protocol::ContentBlock::ToolResult(result) => {
+                if let Some(owner) = owners.remove(&result.tool_call_id) {
+                    units.push(InputUnit::Result(owner, result));
+                }
+            }
+            _ => {}
+        }
+    }
+    units.push(InputUnit::Finished(at));
+    units
+}
+
+impl<P> InputUnit<'_, P> {
+    /// The message the unit's boundary names.
+    pub fn position(&self) -> &P {
+        match self {
+            Self::Started(at) | Self::Call(at, _) | Self::Result(at, _) | Self::Finished(at) => at,
+        }
+    }
+
+    /// The unit's lifecycle event, naming each message by `mid`.
+    pub fn event(&self, mid: impl Fn(&P) -> String) -> cortexkit_role_llm_runner::live::LiveEvent {
+        match self {
+            Self::Started(at) => message_lifecycle_event(Some(mid(at)), false),
+            Self::Call(at, call) => tool_started_event_at(mid(at), call, None, None, None),
+            Self::Result(owner, result) => tool_finished_event_at(
+                mid(owner),
+                &result.tool_call_id,
+                tool_outcome(broca_wal::DispatchOutcome::Completed, result, false),
+                result,
+                None,
+            ),
+            Self::Finished(at) => message_lifecycle_event(Some(mid(at)), true),
+        }
+    }
+}
+
 fn input_lifecycles<'a, S: ControlProjectionSink>(
     sink: &mut RecordSink<'_, S>,
     first: u64,
@@ -1593,39 +1761,122 @@ fn input_lifecycles<'a, S: ControlProjectionSink>(
     let mut owners = std::collections::HashMap::new();
     for (index, message) in messages.enumerate() {
         let ordinal = first.saturating_add(index as u64);
-        sink.boundary(ordinal, || message_event(Some(ordinal), false));
-        for block in &message.content {
-            match block {
-                broca_protocol::ContentBlock::ToolCall(call) => {
-                    owners.insert(call.tool_call_id.clone(), (ordinal, call));
-                    sink.boundary(ordinal, || {
-                        tool_started_event(ordinal, call, None, None, None)
-                    });
-                }
-                broca_protocol::ContentBlock::ToolResult(result) => {
-                    if let Some((owner, _)) = owners.remove(&result.tool_call_id) {
-                        sink.boundary(owner, || {
-                            tool_finished_event(
-                                owner,
-                                &result.tool_call_id,
-                                tool_outcome(broca_wal::DispatchOutcome::Completed, result, false),
-                                result,
-                                None,
-                            )
-                        });
-                    }
-                }
-                _ => {}
-            }
+        for unit in input_units(&mut owners, ordinal, message) {
+            let at = *unit.position();
+            sink.boundary(at, || unit.event(|ordinal| native_mid(*ordinal)));
         }
-        sink.boundary(ordinal, || message_event(Some(ordinal), true));
     }
+}
+
+/// The unit a message boundary takes: the message's id, which its event names too.
+pub fn boundary_unit(mid: String) -> ControlUnit {
+    ControlUnit::MessageBoundary { mid }
+}
+
+/// A run's start, as a unit and its lifecycle event, which names the run's rich UI.
+pub fn run_started_unit(
+    run_id: &RunId,
+    submission_id: Option<broca_protocol::SubmissionId>,
+    rich_ui: Option<broca_protocol::RichUiStamp>,
+) -> (ControlUnit, cortexkit_role_llm_runner::live::LiveEvent) {
+    use cortexkit_role_llm_runner::live::{self, LiveEvent};
+    let mut started = live::RunStarted::new(run_id.0.clone());
+    started.rich_ui = rich_ui;
+    (
+        ControlUnit::RunStarted {
+            run_id: run_id.clone(),
+            submission_id,
+        },
+        LiveEvent::RunStarted(started),
+    )
+}
+
+/// What a run's end tells about it besides its reason: what the run did before it ended.
+pub struct RunEndFacts<'a> {
+    /// The run, which today's end record doesn't name.
+    pub run_id: Option<&'a RunId>,
+    pub reason: RunFinishReason,
+    pub usage: broca_protocol::Usage,
+    /// Whether any step of the run completed: only then does the end report usage.
+    pub has_completed_step: bool,
+    pub final_step_finish_reason: Option<FinishReason>,
+    /// The calls that may have run without a recorded result, reported on an interrupted run.
+    pub indeterminate: &'a IndeterminateToolCalls,
+    pub retries_used: u32,
+}
+
+/// A run's end, as a unit and its lifecycle event.
+pub fn run_finished_unit(
+    end: RunEndFacts<'_>,
+) -> (ControlUnit, cortexkit_role_llm_runner::live::LiveEvent) {
+    use cortexkit_role_llm_runner::live::{self, LiveEvent};
+    (
+        ControlUnit::RunFinished {
+            run_id: end.run_id.cloned(),
+            reason: end.reason,
+            usage: end.has_completed_step.then_some(end.usage),
+            final_step_finish_reason: end.final_step_finish_reason,
+            indeterminate_tool_calls: (end.reason == RunFinishReason::Interrupted)
+                .then(|| end.indeterminate.snapshot()),
+            retries_used: end.retries_used,
+        },
+        end.run_id.map_or(LiveEvent::DisplayReset, |run_id| {
+            LiveEvent::RunFinished(live::RunEnded::new(run_id.0.clone(), end.reason.as_str()))
+        }),
+    )
+}
+
+/// A run's pause (never a held-call park), as a unit and its lifecycle event.
+pub fn paused_unit(
+    run_id: &RunId,
+    reason: broca_protocol::PauseReason,
+    resume_not_before_ms: Option<u64>,
+    error: Option<broca_protocol::ProviderError>,
+) -> (ControlUnit, cortexkit_role_llm_runner::live::LiveEvent) {
+    use cortexkit_role_llm_runner::live::{self, LiveEvent};
+    (
+        ControlUnit::Paused {
+            run_id: run_id.clone(),
+            reason,
+            resume_not_before_ms,
+            error: error.map(SharedProviderError::from),
+        },
+        LiveEvent::RunPaused(live::RunEnded::new(run_id.0.clone(), reason.as_str())),
+    )
+}
+
+/// The notice for text a send delivered with call `part` of message `mid`, under the call's
+/// key and the send's id and sender. Only text separated from the result by a blank line is a
+/// notice; the separator belongs to rendering.
+pub fn notice_delivered_event(
+    mid: String,
+    part: u32,
+    key: Option<String>,
+    send_id: String,
+    sender: String,
+    text: &str,
+) -> Option<cortexkit_role_llm_runner::live::LiveEvent> {
+    use cortexkit_role_llm_runner::live::{self, LiveEvent};
+    let text = text.strip_prefix("\n\n")?;
+    Some(key.map_or(LiveEvent::DisplayReset, |key| {
+        LiveEvent::NoticeDelivered(
+            live::NoticeDelivered::new(mid, part, key, send_id, sender).with_text(text),
+        )
+    }))
+}
+
+/// The schema pin a call's start and end carry: the pin it was dispatched under, encoded with
+/// the name it was dispatched as.
+pub fn schema_pin_text(tool_name: &str, pin: &broca_wal::DispatchSchemaPin) -> Option<String> {
+    cortexkit_role_tool_provider::call::SchemaPin::new(tool_name, &pin.schema_digest, pin.semantics)
+        .encode()
+        .ok()
 }
 
 /// The finish reason implied by an assistant message's SHAPE, used only when the record
 /// has no recorded provider finish_reason (older-shaped record). A message with tool
 /// calls implies `ToolCalls`; otherwise `Stop`.
-fn message_shape_finish_reason(
+pub fn message_shape_finish_reason(
     msg: &broca_protocol::content::AssistantMessage,
 ) -> broca_protocol::content::FinishReason {
     use broca_protocol::content::FinishReason;

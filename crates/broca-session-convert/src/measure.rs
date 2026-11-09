@@ -27,8 +27,9 @@ use crate::Converted;
 
 /// Sealed blocks are cut at record boundaries once they reach this size (design 7.3).
 pub const BLOCK_TARGET: usize = 16 * 1024;
-/// What a sealed block adds around its compressed bytes: nonce, tag and a small header.
-const BLOCK_OVERHEAD: usize = 24 + 16 + 16;
+/// What a sealed block adds around its compressed bytes besides its sealed unit's overhead (an
+/// encrypted unit's nonce and tag, or a plain unit's check): a small header.
+const BLOCK_HEADER: usize = 16;
 /// What a pruned opaque item leaves behind: provider format, model, size and hash.
 const PRUNED_STUB: usize = 48;
 
@@ -135,13 +136,14 @@ fn prune(record: &Record, ended: &HashSet<String>) -> (Record, u64) {
     (Record::Assistant(assistant), removed)
 }
 
-fn sealed_size(bodies: impl Iterator<Item = Vec<u8>>) -> u64 {
+fn sealed_size(key: &FrameKey, bodies: impl Iterator<Item = Vec<u8>>) -> u64 {
+    let overhead = key.unit_overhead() + BLOCK_HEADER;
     let mut total = 0u64;
     let mut block: Vec<u8> = Vec::with_capacity(BLOCK_TARGET * 2);
     let flush = |block: &mut Vec<u8>, total: &mut u64| {
         if !block.is_empty() {
             let compressed = zstd::bulk::compress(block, 3).expect("zstd compresses");
-            *total += (compressed.len() + BLOCK_OVERHEAD) as u64;
+            *total += (compressed.len() + overhead) as u64;
             block.clear();
         }
     };
@@ -183,7 +185,7 @@ pub fn measure(converted: &Converted, key: &FrameKey, bind: &[u8]) -> Result<Log
                 .iter()
                 .filter(move |r| r.stream() == stream)
         };
-        sealed += sealed_size(of_stream().map(Record::encode_body));
+        sealed += sealed_size(key, of_stream().map(Record::encode_body));
         let mut pruned = Vec::new();
         let mut pruned_records = 0u64;
         for record in of_stream() {
@@ -195,7 +197,7 @@ pub fn measure(converted: &Converted, key: &FrameKey, bind: &[u8]) -> Result<Log
             pruned.push(record);
         }
         // Each pruned record keeps a small stub per pruned item; one per record is a floor.
-        sealed_pruned += sealed_size(pruned.iter().map(Record::encode_body))
+        sealed_pruned += sealed_size(key, pruned.iter().map(Record::encode_body))
             + pruned_records * PRUNED_STUB as u64;
     }
 
@@ -260,8 +262,8 @@ pub struct AppendMeasure {
     pub open_after_cold: u64,
 }
 
-/// The setup parts `record` names.
-fn named_parts(record: &Record) -> &[PartRef] {
+/// The setup parts `record` names, which must be stored before it is.
+pub fn named_parts(record: &Record) -> &[PartRef] {
     match record {
         Record::RunStart(start) => &start.setup,
         Record::SetupStub(stub) => &stub.parts,
@@ -386,6 +388,11 @@ pub fn append_log(
             .map_err(|e| format!("load to seal: {e:?}"))?;
         let whole = session.conversation.messages.clone();
         let before: Vec<Vec<u8>> = whole.iter().map(|message| message.encode()).collect();
+        // A seal must carry whole copies of the session's compaction views, which only the run
+        // loop's compaction code can build, so this measurement leaves such sessions out.
+        if session.operations.view_accepted.is_some() || session.operations.view_applied.is_some() {
+            return Err("compaction views: a seal needs the run loop's copies of them".into());
+        }
         for cut in run_inputs.iter().rev() {
             let started = Instant::now();
             match session.seal(Some(*cut), 0).await {
@@ -416,7 +423,11 @@ pub fn append_log(
         measure.open_before_cold = session.open_log().1;
         let far_future = u64::MAX / 2;
         match session
-            .cold(far_future, 7 * 24 * 60 * 60 * 1000)
+            .cold(
+                far_future,
+                7 * 24 * 60 * 60 * 1000,
+                &broca_session_store::session::Carry::default(),
+            )
             .await
             .map_err(|e| format!("cold: {e:?}"))?
         {

@@ -416,8 +416,11 @@ impl ProviderHeldCall {
 
 /// One ordered held-call fold for status reads and durable subscribe status events.
 /// Keys include the batch because a model may reuse a call id in a later step.
+///
+/// Today's projection drives it with [`Self::observe`]; the projection of a session kept in the
+/// new storage calls the same steps one by one from its own records.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub(crate) struct HeldCallsProjection {
+pub struct HeldCallsProjection {
     recoveries: Vec<broca_wal::recovery::RecoveryRun>,
     tool_names: HashMap<ToolCallId, String>,
     calls: Vec<(
@@ -429,48 +432,123 @@ pub(crate) struct HeldCallsProjection {
 }
 
 impl HeldCallsProjection {
+    /// A run started: nothing is held.
+    pub fn run_started(&mut self) {
+        *self = Self::default();
+    }
+
+    /// A step started: the run is active again.
+    pub fn step_started(&mut self) {
+        self.state = None;
+    }
+
+    /// The run paused for `reason`; a pause for a held call itself changes nothing.
+    pub fn paused(&mut self, reason: PauseReason) {
+        if reason != PauseReason::ToolHeld && !self.calls.is_empty() {
+            self.state = Some("paused".into());
+        }
+    }
+
+    /// The run ended: every held call goes, which is a change when any was held.
+    pub fn run_finished(
+        &mut self,
+        reason: broca_protocol::caller::RunFinishReason,
+    ) -> Option<cortexkit_role_llm_runner::run::RunStatus> {
+        self.state = Some(reason.as_str().into());
+        let changed = !self.calls.is_empty();
+        self.calls.clear();
+        let status = changed.then(|| self.status());
+        *self = Self::default();
+        status
+    }
+
+    /// A tool batch finished: its call names are no longer needed.
+    pub fn batch_finished(&mut self) {
+        self.tool_names.clear();
+    }
+
+    /// A model step finished with `calls`: their names, which a held call is listed under.
+    pub fn step_finished<'a>(&mut self, calls: impl Iterator<Item = &'a broca_protocol::ToolCall>) {
+        self.tool_names.clear();
+        for call in calls {
+            self.tool_names
+                .insert(call.tool_call_id.clone(), call.tool_name.clone());
+        }
+    }
+
+    /// A call was dispatched under `tool_name`, when the intent names one.
+    pub fn intent(&mut self, tool_call_id: &ToolCallId, tool_name: Option<&str>) {
+        if let Some(tool) = tool_name {
+            self.tool_names
+                .entry(tool_call_id.clone())
+                .or_insert_with(|| tool.to_owned());
+        }
+    }
+
+    /// A provider took call `tool_call_id` of `batch_id` to answer later.
+    pub fn held(
+        &mut self,
+        batch_id: &BatchId,
+        tool_call_id: &ToolCallId,
+        call_key: &str,
+        module: &str,
+        reason: &str,
+        held_at_ms: u64,
+    ) -> Option<cortexkit_role_llm_runner::run::RunStatus> {
+        let held = cortexkit_role_llm_runner::run::HeldCall::new(
+            call_key.to_owned(),
+            self.tool_names
+                .get(tool_call_id)
+                .cloned()
+                .unwrap_or_default(),
+            module.to_owned(),
+            reason.to_owned(),
+            held_at_ms,
+        );
+        if let Some((_, _, previous)) = self
+            .calls
+            .iter_mut()
+            .find(|(batch, call, _)| batch == batch_id && call == tool_call_id)
+        {
+            if previous == &held {
+                return None;
+            }
+            *previous = held;
+        } else {
+            self.calls
+                .push((batch_id.clone(), tool_call_id.clone(), held));
+        }
+        Some(self.status())
+    }
+
+    /// Call `tool_call_id` of `batch_id` reached its terminal: it is no longer held.
+    pub fn terminal(
+        &mut self,
+        batch_id: &BatchId,
+        tool_call_id: &ToolCallId,
+    ) -> Option<cortexkit_role_llm_runner::run::RunStatus> {
+        self.remove(batch_id, tool_call_id)
+    }
+
     /// Only list changes return a snapshot, including the change to an empty list.
     pub(crate) fn observe(
         &mut self,
         record: &WalRecord,
     ) -> Option<cortexkit_role_llm_runner::run::RunStatus> {
         match record {
-            WalRecord::RunStarted { .. } => *self = Self::default(),
-            WalRecord::StepStarted { .. } => self.state = None,
-            WalRecord::RunPaused { reason, .. }
-                if *reason != PauseReason::ToolHeld && !self.calls.is_empty() =>
-            {
-                self.state = Some("paused".into());
-            }
-            WalRecord::RunFinished { reason, .. } => {
-                self.state = Some(reason.as_str().into());
-                let changed = !self.calls.is_empty();
-                self.calls.clear();
-                let status = changed.then(|| self.status());
-                *self = Self::default();
-                return status;
-            }
-            WalRecord::ToolBatchFinished { .. } => {
-                self.tool_names.clear();
-            }
+            WalRecord::RunStarted { .. } => self.run_started(),
+            WalRecord::StepStarted { .. } => self.step_started(),
+            WalRecord::RunPaused { reason, .. } => self.paused(*reason),
+            WalRecord::RunFinished { reason, .. } => return self.run_finished(*reason),
+            WalRecord::ToolBatchFinished { .. } => self.batch_finished(),
             WalRecord::ModelStepFinished {
                 assistant_message, ..
-            } => {
-                self.tool_names.clear();
-                for call in assistant_message.tool_calls() {
-                    self.tool_names
-                        .insert(call.tool_call_id.clone(), call.tool_name.clone());
-                }
-            }
+            } => self.step_finished(assistant_message.tool_calls()),
             WalRecord::ToolDispatchIntent {
                 tool_call_id,
-                tool_name: Some(tool),
+                tool_name,
                 ..
-            } => {
-                self.tool_names
-                    .entry(tool_call_id.clone())
-                    .or_insert_with(|| tool.clone());
-            }
+            } => self.intent(tool_call_id, tool_name.as_deref()),
             WalRecord::ToolCallProviderHeld {
                 batch_id,
                 tool_call_id,
@@ -480,30 +558,14 @@ impl HeldCallsProjection {
                 held_at_ms,
                 ..
             } => {
-                let held = cortexkit_role_llm_runner::run::HeldCall::new(
-                    call_key.clone(),
-                    self.tool_names
-                        .get(tool_call_id)
-                        .cloned()
-                        .unwrap_or_default(),
-                    module.clone(),
-                    reason.clone(),
+                return self.held(
+                    batch_id,
+                    tool_call_id,
+                    call_key,
+                    module,
+                    reason,
                     *held_at_ms,
-                );
-                if let Some((_, _, previous)) = self
-                    .calls
-                    .iter_mut()
-                    .find(|(batch, call, _)| batch == batch_id && call == tool_call_id)
-                {
-                    if previous == &held {
-                        return None;
-                    }
-                    *previous = held;
-                } else {
-                    self.calls
-                        .push((batch_id.clone(), tool_call_id.clone(), held));
-                }
-                return Some(self.status());
+                )
             }
             WalRecord::ToolResult {
                 batch_id, result, ..
@@ -513,9 +575,7 @@ impl HeldCallsProjection {
                 tool_call_id,
                 ..
             } => return self.remove(batch_id, tool_call_id),
-            WalRecord::RecoveryCut { recovery } => {
-                self.recoveries.extend(recovery.runs.iter().cloned())
-            }
+            WalRecord::RecoveryCut { recovery } => self.recovery_cut(&recovery.runs),
             WalRecord::RecoveryCallClosed {
                 run_id,
                 call_key,
@@ -524,34 +584,58 @@ impl HeldCallsProjection {
                 step_id,
                 ..
             } => {
-                let mut terminal = broca_wal::recovery::RecoveryCall {
-                    tool_call_id: tool_call_id.clone(),
-                    batch_id: batch_id.clone(),
-                    step_id: *step_id,
-                    call_keys: call_key.iter().cloned().collect(),
-                };
-                for run in self.recoveries.iter().filter(|run| &run.run_id == run_id) {
-                    for call in &run.calls {
-                        if call.terminal_matches(&terminal) {
-                            terminal.call_keys.extend(call.call_keys.iter().cloned());
-                        }
-                    }
-                }
-                let previous = self.calls.len();
-                self.calls.retain(|(batch, id, held)| {
-                    let identity = broca_wal::recovery::RecoveryCall {
-                        tool_call_id: id.clone(),
-                        batch_id: Some(batch.clone()),
-                        step_id: None,
-                        call_keys: vec![held.call_key.clone()],
-                    };
-                    !identity.terminal_matches(&terminal)
-                });
-                return (previous != self.calls.len()).then(|| self.status());
+                return self.recovery_call_closed(
+                    run_id,
+                    call_key.as_ref(),
+                    tool_call_id,
+                    batch_id.clone(),
+                    *step_id,
+                )
             }
             _ => {}
         }
         None
+    }
+
+    /// A recovery found `runs` with calls whose outcome is unknown.
+    pub fn recovery_cut(&mut self, runs: &[broca_wal::recovery::RecoveryRun]) {
+        self.recoveries.extend(runs.iter().cloned());
+    }
+
+    /// A recovery closed call `tool_call_id` of `run_id`: any held call it names is no longer
+    /// held.
+    pub fn recovery_call_closed(
+        &mut self,
+        run_id: &broca_protocol::RunId,
+        call_key: Option<&String>,
+        tool_call_id: &ToolCallId,
+        batch_id: Option<BatchId>,
+        step_id: Option<broca_protocol::StepId>,
+    ) -> Option<cortexkit_role_llm_runner::run::RunStatus> {
+        let mut terminal = broca_wal::recovery::RecoveryCall {
+            tool_call_id: tool_call_id.clone(),
+            batch_id,
+            step_id,
+            call_keys: call_key.into_iter().cloned().collect(),
+        };
+        for run in self.recoveries.iter().filter(|run| &run.run_id == run_id) {
+            for call in &run.calls {
+                if call.terminal_matches(&terminal) {
+                    terminal.call_keys.extend(call.call_keys.iter().cloned());
+                }
+            }
+        }
+        let previous = self.calls.len();
+        self.calls.retain(|(batch, id, held)| {
+            let identity = broca_wal::recovery::RecoveryCall {
+                tool_call_id: id.clone(),
+                batch_id: Some(batch.clone()),
+                step_id: None,
+                call_keys: vec![held.call_key.clone()],
+            };
+            !identity.terminal_matches(&terminal)
+        });
+        (previous != self.calls.len()).then(|| self.status())
     }
 
     fn remove(
@@ -4543,10 +4627,7 @@ pub struct RunUsageProjection {
     run_id: RunId,
     active: bool,
     model: Option<(broca_protocol::request::ModelHandle, Option<String>)>,
-    final_attempt: Option<generation::AttemptTiming>,
-    tier_usage: cortexkit_role_llm_runner::service_tier::RunServiceTierUsage,
-    tier_reported: bool,
-    final_tier_report: Option<String>,
+    steps: RunUsageSteps,
     pub usage: broca_protocol::usage::RunUsage,
 }
 
@@ -4556,10 +4637,7 @@ impl RunUsageProjection {
             run_id,
             active: false,
             model: None,
-            final_attempt: None,
-            tier_usage: Default::default(),
-            tier_reported: false,
-            final_tier_report: None,
+            steps: RunUsageSteps::default(),
             usage: Default::default(),
         }
     }
@@ -4574,33 +4652,12 @@ impl RunUsageProjection {
                 self.active = run_id == &self.run_id;
                 if self.active {
                     self.model = Some((config.model.clone(), config.variant.clone()));
-                    if broca_protocol::service_tier_enabled() {
-                        let level =
-                            broca_protocol::frozen_service_tier(&config.frozen_render_config);
-                        self.usage.service_tier_applied =
-                            (level != "standard").then(|| level.to_owned());
-                        self.tier_reported = matches!(
-                            config
-                                .frozen_render_config
-                                .get("family_id")
-                                .and_then(serde_json::Value::as_str),
-                            Some(
-                                "openai_chat"
-                                    | "openai_responses"
-                                    | "openai_responses_chatgpt"
-                                    | "anthropic_messages"
-                                    | "gemini"
-                            )
-                        );
-                    }
+                    self.steps
+                        .run_started(&mut self.usage, &config.frozen_render_config);
                 }
-                self.final_attempt = None;
-                self.final_tier_report = None;
+                self.steps.boundary();
             }
-            WalRecord::StepStarted { .. } if self.active => {
-                self.final_attempt = None;
-                self.final_tier_report = None;
-            }
+            WalRecord::StepStarted { .. } if self.active => self.steps.boundary(),
             WalRecord::ModelAttemptFinished {
                 step_id,
                 sent_at_ms,
@@ -4608,81 +4665,156 @@ impl RunUsageProjection {
                 envelope,
                 ..
             } if self.active => {
-                // Replace even an unmeasured attempt: a retry's timing never belongs to
-                // the output produced by the step's final attempt.
-                self.final_attempt = Some(generation::AttemptTiming {
-                    step_id: *step_id,
-                    sent: *sent_at_ms,
-                    first: content_progress.first_content_at_ms,
-                    last: content_progress.last_content_at_ms,
+                let served = envelope.as_ref().and_then(|envelope| {
+                    envelope
+                        .speed_used
+                        .as_deref()
+                        .or(envelope.service_tier_used.as_deref())
                 });
-                self.final_tier_report =
-                    if broca_protocol::service_tier_enabled() && self.tier_reported {
-                        envelope
-                            .as_ref()
-                            .and_then(|envelope| {
-                                envelope
-                                    .speed_used
-                                    .as_deref()
-                                    .or(envelope.service_tier_used.as_deref())
-                            })
-                            .map(abstract_served_tier)
-                    } else {
-                        None
-                    };
+                self.steps.attempt(
+                    *step_id,
+                    *sent_at_ms,
+                    content_progress.first_content_at_ms,
+                    content_progress.last_content_at_ms,
+                    served,
+                );
             }
             WalRecord::ModelStepFinished { .. } | WalRecord::ModelStepRefused { .. }
                 if self.active =>
             {
-                if broca_protocol::service_tier_enabled() {
-                    let mut step =
-                        cortexkit_role_llm_runner::service_tier::ServiceTierUsage::default();
-                    step.service_tier_applied
-                        .clone_from(&self.usage.service_tier_applied);
-                    if self.tier_reported {
-                        if let WalRecord::ModelStepFinished {
-                            service_tier_used,
-                            speed_used,
-                            ..
-                        } = record
-                        {
-                            step.service_tier_served = speed_used
-                                .as_deref()
-                                .or(service_tier_used.as_deref())
-                                .map(abstract_served_tier);
-                        } else if matches!(record, WalRecord::ModelStepRefused { .. }) {
-                            // Refused source calls are billed too; only a recorded envelope can
-                            // supply their report because legacy refusal records have no tier.
-                            step.service_tier_served = self.final_tier_report.take();
-                        }
-                    }
-                    self.tier_usage
-                        .record_step(&step)
-                        .expect("applied tier is a known non-standard level or absent");
-                    self.usage.service_tier_served = self.tier_usage.usage().service_tier_served;
-                }
-                self.final_tier_report = None;
-                // A refused call was billed, so it counts as a call of the model that refused.
-                if let Some((model, variant)) = &self.model {
+                let by_model = self.model.as_ref().map(|(model, variant)| {
                     let variant = variant.as_deref().filter(|value| !value.is_empty());
-                    let by_model = crate::refusal_fallback::usage_by_model(model, variant, record);
-                    generation::record(
-                        &mut self.usage.generation,
-                        self.final_attempt.take(),
-                        record,
-                        &by_model,
-                    );
-                    for (provider, model, variant, usage) in by_model {
-                        self.usage.record_step(
-                            provider,
-                            model,
-                            variant,
-                            reported_step_usage(&usage),
-                        );
-                    }
-                }
+                    crate::refusal_fallback::usage_by_model(model, variant, record)
+                });
+                self.steps.step_ended(
+                    &mut self.usage,
+                    generation::StepServed::of(record),
+                    by_model.as_deref(),
+                );
             }
             _ => {}
+        }
+    }
+}
+
+pub use generation::StepServed;
+
+/// One model's share of a step's usage, as `refusal_fallback::usage_by_model` splits it: the
+/// provider, the model, its variant, and the usage counted under it.
+pub type ModelShare<'a> = (&'a str, &'a str, Option<&'a str>, Usage);
+
+/// The usage arithmetic of one run's completed steps, apart from how its records are read: what
+/// `run.status` and `run.result` serve as the run's `usage`. [`RunUsageProjection`] feeds it from
+/// today's records, and a session kept in the new storage feeds it from its own, so both count a
+/// run's steps, service tiers and generation timing by the same rules.
+#[derive(Debug, Clone, Default)]
+pub struct RunUsageSteps {
+    final_attempt: Option<generation::AttemptTiming>,
+    tier_usage: cortexkit_role_llm_runner::service_tier::RunServiceTierUsage,
+    tier_reported: bool,
+    final_tier_report: Option<String>,
+}
+
+impl RunUsageSteps {
+    /// The run's own start, with the render config it froze.
+    pub fn run_started(
+        &mut self,
+        usage: &mut broca_protocol::usage::RunUsage,
+        frozen_render_config: &serde_json::Value,
+    ) {
+        if broca_protocol::service_tier_enabled() {
+            let level = broca_protocol::frozen_service_tier(frozen_render_config);
+            usage.service_tier_applied = (level != "standard").then(|| level.to_owned());
+            self.tier_reported = matches!(
+                frozen_render_config
+                    .get("family_id")
+                    .and_then(serde_json::Value::as_str),
+                Some(
+                    "openai_chat"
+                        | "openai_responses"
+                        | "openai_responses_chatgpt"
+                        | "anthropic_messages"
+                        | "gemini"
+                )
+            );
+        }
+    }
+
+    /// A boundary no attempt is carried across: any run's start, and each of this run's steps'
+    /// starts.
+    pub fn boundary(&mut self) {
+        self.final_attempt = None;
+        self.final_tier_report = None;
+    }
+
+    /// One of the run's HTTP attempts finished: its step, its send and content stamps, and the
+    /// service tier or speed the provider reported serving it at, as the attempt's record keeps
+    /// it.
+    pub fn attempt(
+        &mut self,
+        step_id: broca_protocol::StepId,
+        sent_at_ms: Option<u64>,
+        first_content_at_ms: Option<u64>,
+        last_content_at_ms: Option<u64>,
+        served_tier: Option<&str>,
+    ) {
+        // Replace even an unmeasured attempt: a retry's timing never belongs to
+        // the output produced by the step's final attempt.
+        self.final_attempt = Some(generation::AttemptTiming {
+            step_id,
+            sent: sent_at_ms,
+            first: first_content_at_ms,
+            last: last_content_at_ms,
+        });
+        self.final_tier_report = if broca_protocol::service_tier_enabled() && self.tier_reported {
+            served_tier.map(abstract_served_tier)
+        } else {
+            None
+        };
+    }
+
+    /// One of the run's steps ended: finished (`served`) or refused (`None`). `by_model` is its
+    /// usage split by the model each part counts under; `None` when the run's model isn't known,
+    /// which counts nothing.
+    pub fn step_ended(
+        &mut self,
+        usage: &mut broca_protocol::usage::RunUsage,
+        served: Option<StepServed<'_>>,
+        by_model: Option<&[ModelShare<'_>]>,
+    ) {
+        if broca_protocol::service_tier_enabled() {
+            let mut step = cortexkit_role_llm_runner::service_tier::ServiceTierUsage::default();
+            step.service_tier_applied
+                .clone_from(&usage.service_tier_applied);
+            if self.tier_reported {
+                if let Some(served) = served {
+                    step.service_tier_served = served
+                        .speed_used
+                        .or(served.service_tier_used)
+                        .map(abstract_served_tier);
+                } else {
+                    // Refused source calls are billed too; only a recorded envelope can
+                    // supply their report because legacy refusal records have no tier.
+                    step.service_tier_served = self.final_tier_report.take();
+                }
+            }
+            self.tier_usage
+                .record_step(&step)
+                .expect("applied tier is a known non-standard level or absent");
+            usage.service_tier_served = self.tier_usage.usage().service_tier_served;
+        }
+        self.final_tier_report = None;
+        // A refused call was billed, so it counts as a call of the model that refused.
+        if let Some(by_model) = by_model {
+            generation::record(
+                &mut usage.generation,
+                self.final_attempt.take(),
+                served,
+                by_model,
+            );
+            for (provider, model, variant, step) in by_model {
+                usage.record_step(provider, model, *variant, reported_step_usage(step));
+            }
         }
     }
 }
@@ -4700,7 +4832,7 @@ fn abstract_served_tier(tier: &str) -> String {
 mod generation;
 pub use generation::content_timing_intervals;
 
-pub(crate) fn reported_step_usage(usage: &Usage) -> cortexkit_role_llm_runner::usage::StepUsage {
+pub fn reported_step_usage(usage: &Usage) -> cortexkit_role_llm_runner::usage::StepUsage {
     let mut step = cortexkit_role_llm_runner::usage::StepUsage::unreported();
     step.input_tokens = usage.input_tokens;
     step.cached_input_tokens = usage.cached_input_tokens;
@@ -4708,6 +4840,57 @@ pub(crate) fn reported_step_usage(usage: &Usage) -> cortexkit_role_llm_runner::u
     step.output_tokens = usage.output_tokens;
     step.reasoning_tokens = usage.reasoning_tokens;
     step
+}
+
+/// A finished step's normalized finish, as `run.status` and `run.result` serve it: the
+/// provider's own terminal token (`raw_finish_reason`) read by the shared finish source of the
+/// family that rendered the step. That family is the run's frozen render config's, or, for a step
+/// routed to the refusal-fallback model (`refusal_fallback`), the fallback config frozen inside
+/// it. `made_calls` is whether the step's message asked for tools. `None` when the config names
+/// no family with a shared finish source.
+pub fn step_finish(
+    frozen_render_config: &serde_json::Value,
+    refusal_fallback: bool,
+    raw_finish_reason: Option<&str>,
+    made_calls: bool,
+) -> Option<cortexkit_role_llm_runner::finish::Finish> {
+    let config = if refusal_fallback {
+        frozen_render_config.pointer("/refusal_fallback/frozen")
+    } else {
+        Some(frozen_render_config)
+    };
+    config
+        .and_then(|config| config.get("family_id"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(|family| match family {
+            "anthropic_messages" => Some("anthropic.messages"),
+            "openai_chat" => Some("openai.chat_completions"),
+            "openai_responses" => Some("openai.responses"),
+            "openai_responses_chatgpt" => Some("openai.chatgpt_responses"),
+            "gemini" => Some("google.generate_content"),
+            "google_codeassist" => Some("google.code_assist"),
+            "bedrock_converse" => Some("aws.bedrock_converse"),
+            _ => None,
+        })
+        .and_then(|source| {
+            cortexkit_role_llm_runner::finish::normalize(source, raw_finish_reason, made_calls)
+                .expect("every frozen family has a shared finish source")
+        })
+}
+
+/// What an ended run admitted with structured output produced, as `run.status` and `run.result`
+/// serve it. A completed run recorded its result in the commit that ended it (`recorded`). Any
+/// other end produced no value, which the frozen settings report as absent. `None` for a run
+/// admitted without structured output.
+pub fn ended_structured_output(
+    recorded: Option<broca_protocol::structured_output::StructuredOutputResult>,
+    frozen: Option<&broca_protocol::structured_output::FrozenStructuredOutput>,
+) -> Option<broca_protocol::structured_output::StructuredOutputResult> {
+    recorded.or_else(|| {
+        frozen.map(|frozen| {
+            broca_protocol::structured_output::result(frozen, false, None, None, Vec::new())
+        })
+    })
 }
 
 /// A run state reconciled from the WAL, including terminal metadata absent from the index.
@@ -4927,32 +5110,12 @@ pub fn reconcile_run_state<'a>(
                 // A step that finished no longer waits for its ride.
                 if active_run.as_deref() == Some(run_id) {
                     if let Some(state) = &mut found {
-                        let config = if fallback.refusal_fallback.is_some() {
-                            frozen_finish_config.pointer("/refusal_fallback/frozen")
-                        } else {
-                            Some(&frozen_finish_config)
-                        };
-                        state.finish = config
-                            .and_then(|config| config.get("family_id"))
-                            .and_then(serde_json::Value::as_str)
-                            .and_then(|family| match family {
-                                "anthropic_messages" => Some("anthropic.messages"),
-                                "openai_chat" => Some("openai.chat_completions"),
-                                "openai_responses" => Some("openai.responses"),
-                                "openai_responses_chatgpt" => Some("openai.chatgpt_responses"),
-                                "gemini" => Some("google.generate_content"),
-                                "google_codeassist" => Some("google.code_assist"),
-                                "bedrock_converse" => Some("aws.bedrock_converse"),
-                                _ => None,
-                            })
-                            .and_then(|source| {
-                                cortexkit_role_llm_runner::finish::normalize(
-                                    source,
-                                    raw_finish_reason.as_deref(),
-                                    assistant_message.tool_calls().next().is_some(),
-                                )
-                                .expect("every frozen family has a shared finish source")
-                            });
+                        state.finish = step_finish(
+                            &frozen_finish_config,
+                            fallback.refusal_fallback.is_some(),
+                            raw_finish_reason.as_deref(),
+                            assistant_message.tool_calls().next().is_some(),
+                        );
                         state.ride_wait_deadline_ms = None;
                     }
                 }
@@ -5048,19 +5211,10 @@ pub fn reconcile_run_state<'a>(
                             RunIndexState::TransformUnavailable
                         }
                     };
-                    // A completed run recorded its result in the commit that ended it. Any
-                    // other end produced no value, which the frozen settings report as absent.
-                    let structured_output = structured_output_result.clone().or_else(|| {
-                        frozen_structured_output.as_ref().map(|frozen| {
-                            broca_protocol::structured_output::result(
-                                frozen,
-                                false,
-                                None,
-                                None,
-                                Vec::new(),
-                            )
-                        })
-                    });
+                    let structured_output = ended_structured_output(
+                        structured_output_result.clone(),
+                        frozen_structured_output.as_ref(),
+                    );
                     found = Some(ReconciledRunState {
                         account_limit_pause: None,
                         budget_detail: budget_detail.clone(),

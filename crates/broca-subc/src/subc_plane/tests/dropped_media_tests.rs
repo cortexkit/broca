@@ -55,7 +55,7 @@ async fn record_reply_with_capture(
         WalHandle::open_and_spawn_observed(store.clone(), ctx.bind.clone(), lease, None)
             .await
             .unwrap();
-    ctx.media_capture = writer.media_capture().filter(|_| capture);
+    ctx.media_capture = writer.tool_media_capture().filter(|_| capture);
     assert_eq!(ctx.media_capture.is_some(), capture);
 
     let rig = Rig::new(true, true, negotiated, false);

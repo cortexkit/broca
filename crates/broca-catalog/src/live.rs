@@ -848,6 +848,86 @@ fn catalog_override_base_url(base_url: &str, family: WireFamilyId) -> String {
     }
 }
 
+/// The context window a fresh episode of `model` freezes when its send names none, as
+/// [`resolve_catalog_episode_with_client`] and the other fresh resolutions put it in
+/// [`ProviderResolution::context_limit`], read without resolving a provider: no credential,
+/// account or connection is touched. `base_url` is the run's explicit endpoint: for a model the
+/// catalog lists it only overrides the catalog's endpoint, as
+/// [`resolve_catalog_episode_at_base_url`] decides, and for any other model it is opaque
+/// (`Ok(None)`). `family_override` is the wire family the run's auth method implies, and
+/// `variant` the run's model variant, which a Code Assist route reads. An error is what
+/// resolving the run would refuse with first on the way to its limit: a model id that isn't a
+/// catalog id, no catalog, a withdrawn model, or one the catalog doesn't serve.
+pub fn episode_context_limit(
+    model: &str,
+    base_url: Option<&str>,
+    family_override: Option<WireFamilyId>,
+    variant: Option<&str>,
+) -> Result<Option<u64>, ResolutionError> {
+    let listed = model
+        .split_once('/')
+        .is_some_and(|(provider_id, model_id)| {
+            crate::catalog()
+                .ok()
+                .is_some_and(|catalog| catalog.contains_model(provider_id, model_id))
+        });
+    if base_url.is_some_and(|url| !url.is_empty()) && !listed {
+        return Ok(None);
+    }
+    let (provider_id, model_id) = model.split_once('/').ok_or_else(|| {
+        format!("model '{model}' is not a catalog id: expected '<provider>/<model>'")
+    })?;
+    let catalog = crate::catalog().map_err(|error| error.to_string())?;
+    if catalog.is_withdrawn(provider_id, model_id) {
+        return Err(
+            format!("catalog model '{provider_id}/{model_id}' was withdrawn upstream").into(),
+        );
+    }
+    if family_override.is_none() && catalog.model_for_serving(provider_id, model_id).is_none() {
+        return Err(format!("catalog has no served model '{provider_id}/{model_id}'").into());
+    }
+    Ok(catalog_context_limit(
+        &catalog,
+        provider_id,
+        model_id,
+        family_override,
+        variant,
+        None,
+    ))
+}
+
+/// The context window the catalog gives a fresh episode of `provider_id`/`model_id`. Under a
+/// wire-family override (an auth method's own family), the endpoint is the family's, but the
+/// window is the model's, so the catalog's row answers it, for a Code Assist route by the
+/// route's canonical id. Otherwise the served model's own limit answers, served under
+/// `recorded_family` when a resume of an OpenCode Go run names the family it recorded. Both
+/// [`episode_context_limit`] and every fresh resolution read the window here.
+fn catalog_context_limit(
+    catalog: &crate::runtime::CatalogSnapshot,
+    provider_id: &str,
+    model_id: &str,
+    family_override: Option<WireFamilyId>,
+    variant: Option<&str>,
+    recorded_family: Option<WireFamilyId>,
+) -> Option<u64> {
+    if let Some(family) = family_override {
+        let canonical = (family == WireFamilyId::GoogleCodeAssist)
+            .then(|| {
+                catalog
+                    .code_assist_route(provider_id, model_id, variant)
+                    .ok()
+            })
+            .flatten()
+            .map(|route| route.0);
+        return catalog.context_limit(provider_id, canonical.as_deref().unwrap_or(model_id));
+    }
+    let serving = match recorded_family {
+        Some(family) => catalog.model_for_serving_with_family(provider_id, model_id, family),
+        None => catalog.model_for_serving(provider_id, model_id),
+    };
+    serving.and_then(|(_, model_spec)| model_spec.limits.context)
+}
+
 struct ResolveContext<'a> {
     auth: &'a AuthMode,
     opts: &'a ResolveOptions<'a>,
@@ -1248,7 +1328,14 @@ fn resolve_provider_inner(
             // would understate a large window as an absent one.
             //
             // Tier spellings use the row that explicitly published the selected backend id.
-            context_limit: catalog.context_limit(provider_id, catalog_model_id),
+            context_limit: catalog_context_limit(
+                &catalog,
+                provider_id,
+                model_id,
+                Some(family),
+                opts.variant,
+                None,
+            ),
         });
     }
     let recorded_opencode_go_family = if provider_id == "opencode-go" {
@@ -1458,7 +1545,14 @@ fn resolve_provider_inner(
         auth_desc,
         provider_tag: provider_id.to_string(),
         // The catalog model's context window (the transform's pressure ground truth).
-        context_limit: model_spec.limits.context,
+        context_limit: catalog_context_limit(
+            &catalog,
+            provider_id,
+            model_id,
+            None,
+            None,
+            recorded_opencode_go_family,
+        ),
     })
 }
 
@@ -2995,6 +3089,86 @@ mod tests {
             frozen,
             resolved.provider.render_request(&anthropic_options()),
         )
+    }
+
+    /// The limit a refresh resolves for a model (`episode_context_limit`) is the one a fresh
+    /// run's resolution freezes, for every way a run resolves its catalog model: a plain catalog
+    /// row, an operator's endpoint for a listed model, an auth method's wire family, a model
+    /// variant, and an endpoint for a model the catalog doesn't list, which gives none.
+    #[test]
+    fn the_refresh_time_context_limit_is_the_one_a_fresh_run_freezes() {
+        seed_catalog_for_resolution();
+        let client = broca_provider::build_provider_http_client;
+        let secret = AuthMode::Secret(TOP_LEVEL.to_owned());
+        let plain = ResolveOptions::default();
+        let chatgpt = ResolveOptions {
+            auth_method: Some(AuthMethod::Chatgpt),
+            family_override: Some(WireFamilyId::OpenAiResponsesChatgpt),
+            ..ResolveOptions::default()
+        };
+        let varied = ResolveOptions {
+            variant: Some("high"),
+            ..ResolveOptions::default()
+        };
+        let endpoint = "http://127.0.0.1:9";
+        let cases: [(&str, &str, Option<&str>, &ResolveOptions); 5] = [
+            (
+                "a plain catalog row",
+                "anthropic/claude-opus-4-5",
+                None,
+                &plain,
+            ),
+            (
+                "an operator's endpoint",
+                "anthropic/claude-opus-4-5",
+                Some(endpoint),
+                &plain,
+            ),
+            (
+                "a wire-family override",
+                "openai/gpt-5.4-mini",
+                None,
+                &chatgpt,
+            ),
+            ("a variant", "openai/gpt-5.4-mini", None, &varied),
+            (
+                "an opaque endpoint",
+                "local/unlisted-model",
+                Some(endpoint),
+                &plain,
+            ),
+        ];
+        for (case, model, base_url, opts) in cases {
+            let resolved = match base_url {
+                Some(base_url) => resolve_catalog_episode_at_base_url(
+                    model,
+                    base_url,
+                    None,
+                    &secret,
+                    opts,
+                    client(),
+                    EpisodeRenderConfig::default(),
+                ),
+                None => resolve_catalog_episode_with_client(
+                    model,
+                    None,
+                    &secret,
+                    opts,
+                    client(),
+                    EpisodeRenderConfig::default(),
+                ),
+            }
+            .unwrap_or_else(|error| panic!("{case}: {model} resolves: {error}"));
+            let at_refresh =
+                episode_context_limit(model, base_url, opts.family_override, opts.variant)
+                    .unwrap_or_else(|error| panic!("{case}: {error}"));
+            assert_eq!(at_refresh, resolved.context_limit, "{case}");
+            assert_eq!(
+                at_refresh.is_none(),
+                case == "an opaque endpoint",
+                "{case}: only an opaque endpoint has no limit"
+            );
+        }
     }
 
     #[test]

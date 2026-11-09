@@ -13,6 +13,7 @@ fn model() -> ModelHandle {
 
 fn input(text: &str, placement: Placement) -> Record {
     Record::Input(Input {
+        media: Vec::new(),
         run_id: "r".into(),
         placement,
         message: Message::new(Role::User, vec![ContentBlock::Text { text: text.into() }]),
@@ -68,6 +69,7 @@ fn reply(id: &str, text: &str) -> Record {
         },
         finished_at_ms: None,
         tags_v1: None,
+        media: Vec::new(),
     })
 }
 
@@ -119,6 +121,7 @@ fn ledger_records_and_misplaced_records_refuse() {
     let ledger = Record::StepStart(StepStart {
         run_id: "r".into(),
         step_id: 1,
+        mid: None,
     });
     assert_eq!(
         fold(&[ledger], false).unwrap_err(),
@@ -189,11 +192,13 @@ fn a_budget_finalize_step_enters_at_once_without_its_calls() {
 #[test]
 fn delivered_text_joins_its_result_only_where_the_session_stores_it_there() {
     let append = Record::ResultAppend(ResultAppend {
+        send_id: None,
         run_id: "r".into(),
         tool_call_id: ToolCallId("a".into()),
         text: " +note".into(),
         notice: None,
         written_at_ms: None,
+        ride: None,
     });
     let records = [assistant(&["a"]), reply("a", "out"), append];
     let text = |conversation: &Conversation| match &conversation.messages[1].content[0] {
@@ -207,10 +212,62 @@ fn delivered_text_joins_its_result_only_where_the_session_stores_it_there() {
     assert_eq!(text(&fold(&records, false).unwrap()), "out");
 }
 
+/// A ride (text delivered with an envelope) is never joined into the stored result, in either
+/// layout: it waits beside the call's entry, envelope and all, for requests to render it.
+#[test]
+fn a_ride_is_kept_beside_its_call_in_both_layouts() {
+    let ride = crate::record::RideEnvelope {
+        call_key: "s:4".into(),
+        sender: "reminders".into(),
+        forms: vec!["tool_result".into()],
+        form: crate::record::RideForm::Append,
+        speaks_for: None,
+    };
+    let append = Record::ResultAppend(ResultAppend {
+        send_id: Some("q".into()),
+        run_id: "r".into(),
+        tool_call_id: ToolCallId("a".into()),
+        text: "\n\nnote".into(),
+        notice: None,
+        written_at_ms: None,
+        ride: Some(ride.clone()),
+    });
+    let records = [assistant(&["a"]), reply("a", "out"), append];
+    for appends in [true, false] {
+        let conversation = fold(&records, appends).unwrap();
+        match &conversation.messages[1].content[0] {
+            ContentBlock::ToolResult(ToolResult {
+                output: ToolOutput::Text { text },
+                ..
+            }) => assert_eq!(text, "out", "appends in conversation: {appends}"),
+            other => panic!("{other:?}"),
+        }
+        let (_, state) = conversation.window_entry(1).unwrap();
+        assert_eq!(
+            state.delivered,
+            [Delivered {
+                part: 0,
+                notice: None,
+                text: "\n\nnote".into(),
+                send_id: Some("q".into()),
+                ride: Some(ride.clone()),
+            }]
+        );
+    }
+}
+
 fn facts(ordinal: u64, tag_base: u64) -> Record {
     Record::EntryFacts(EntryFacts {
+        client_message_id: None,
+        sender: None,
+        marks: None,
+        no_display_facts: None,
+        reasoning_summaries: Vec::new(),
+        rich_ui: None,
+        runner_tag_base: None,
+        legacy_view_seq: None,
         ordinal,
-        written_at_ms: 1_000 + ordinal,
+        written_at_ms: Some(1_000 + ordinal),
         tag_base,
         notice: None,
         usage: None,
@@ -219,6 +276,11 @@ fn facts(ordinal: u64, tag_base: u64) -> Record {
         render_tags: true,
         clean_reply: true,
         mid: format!("m{}", ordinal - 1),
+        run_id: None,
+        created_at_ms: None,
+        delivery_mode: None,
+        delivery_tool_call_id: None,
+        notices: Vec::new(),
     })
 }
 
@@ -301,11 +363,13 @@ fn delivered_text_attaches_to_the_call_that_made_it() {
     };
     let append = |id: &str| {
         Record::ResultAppend(ResultAppend {
+            send_id: None,
             run_id: "r".into(),
             tool_call_id: ToolCallId(id.into()),
             text: "\n\nnote".into(),
             notice: Some(notice.clone()),
             written_at_ms: None,
+            ride: None,
         })
     };
     let conversation = fold(
@@ -326,6 +390,8 @@ fn delivered_text_attaches_to_the_call_that_made_it() {
             part: 1,
             notice: Some(notice),
             text: "\n\nnote".into(),
+            send_id: None,
+            ride: None,
         }],
         "an unknown call's text attaches nowhere"
     );

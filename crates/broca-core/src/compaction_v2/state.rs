@@ -1,7 +1,6 @@
 //! Accepted and applied views are separate durable facts. An acknowledgement
 //! confirms storage, not a change to a request already in progress.
 
-use async_trait::async_trait;
 use cortexkit_role_compaction::{
     notice::Event,
     read::Entry,
@@ -30,8 +29,14 @@ pub struct State {
 
 /// Each method returns only after its record has crossed the durability barrier.
 /// The WAL adapter owns record encoding, including deduplication of stored edits.
-#[async_trait]
-pub trait Journal: Send + Sync {
+///
+/// Its methods are plain `async fn`s, so a journal whose writer's futures can't move between
+/// threads can implement it too; a caller whose future must be `Send` gets that from the
+/// journal it passes, since every function here takes the journal by its concrete type.
+#[allow(async_fn_in_trait)]
+pub trait Journal {
+    /// Called when a published view is refused, so the session's journal can log it; the
+    /// refusal itself writes nothing. A journal with no log of its own keeps this no-op.
     fn view_refused(&self, _publication: &super::diagnostics::Publication, _code: &str) {}
     async fn accepted(
         &self,
@@ -67,6 +72,12 @@ impl State {
 
     pub fn applied_by(&self) -> Option<&str> {
         self.applied_by.as_deref()
+    }
+
+    /// The module that handed the newest accepted view over, which becomes `applied_by` once a
+    /// step applies that view. `None` for a view a run's step accepted.
+    pub fn accepted_by(&self) -> Option<&str> {
+        self.latest_applied_by.as_deref()
     }
 
     pub fn restore_accepted_by(&mut self, module: Option<String>) {
@@ -171,7 +182,7 @@ impl State {
 
     pub async fn accept(
         &mut self,
-        journal: &dyn Journal,
+        journal: &impl Journal,
         entries: &[Entry],
         received: impl Into<ReceivedView>,
         rules: &ProviderRules,
@@ -194,7 +205,7 @@ impl State {
     /// the cut covers the whole current transcript.
     pub async fn apply(
         &mut self,
-        journal: &dyn Journal,
+        journal: &impl Journal,
         boundary: Boundary<'_>,
     ) -> Result<Vec<Event>, String> {
         let Some(received) = self.latest.as_ref() else {
@@ -243,7 +254,7 @@ impl State {
     /// that marker for the frozen step without adopting a newer accepted view.
     pub async fn recover_marker(
         &mut self,
-        journal: &dyn Journal,
+        journal: &impl Journal,
         boundary: Boundary<'_>,
     ) -> Result<Vec<Event>, String> {
         let Some(view) = self.view_for_step(boundary.step) else {

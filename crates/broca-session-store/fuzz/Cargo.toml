@@ -1,0 +1,62 @@
+[package]
+name = "broca-session-store-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+description = "Coverage-guided fuzz targets for broca-session-store's decoders. Run with cargo-fuzz on nightly; the root workspace excludes this crate, so the normal build never builds it."
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+broca-session-store = { path = ".." }
+
+# A workspace of its own: the root workspace excludes this directory.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "record"
+path = "fuzz_targets/record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "frame_log"
+path = "fuzz_targets/frame_log.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "segment"
+path = "fuzz_targets/segment.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "head_checkpoint"
+path = "fuzz_targets/head_checkpoint.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "directory_idindex"
+path = "fuzz_targets/directory_idindex.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "plain"
+path = "fuzz_targets/plain.rs"
+test = false
+doc = false
+bench = false

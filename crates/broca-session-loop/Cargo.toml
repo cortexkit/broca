@@ -1,0 +1,40 @@
+[package]
+name = "broca-session-loop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The run loop for sessions on broca's new session storage: model steps and tool batches driven from the store's fold state."
+publish = false
+
+[dependencies]
+async-trait.workspace = true
+futures.workspace = true
+broca-core = { path = "../broca-core" }
+broca-protocol = { path = "../broca-protocol" }
+broca-provider = { path = "../broca-provider" }
+broca-session-store = { path = "../broca-session-store" }
+broca-wal = { path = "../broca-wal" }
+cortexkit-compaction-view.workspace = true
+cortexkit-role-compaction.workspace = true
+cortexkit-role-step-transform-provider.workspace = true
+# llm-runner's reasoning summaries, which a message's entry facts record as reads serve them.
+cortexkit-role-llm-runner.workspace = true
+# llm-runner's encoded schema pin, which a tool turn's facts record as reads serve it.
+cortexkit-role-tool-provider.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_jcs.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+
+[dev-dependencies]
+# Today's loop writes a ride's envelope in the comparisons only through its test seam.
+broca-core = { path = "../broca-core", features = ["test-clock"] }
+broca-crash-harness = { path = "../broca-crash-harness" }
+broca-session-convert = { path = "../broca-session-convert" }
+broca-test-support = { path = "../broca-test-support" }
+futures = { workspace = true, features = ["executor"] }
+tokio = { workspace = true, features = ["test-util"] }

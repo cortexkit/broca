@@ -33,6 +33,7 @@ fn one_of_each() -> Vec<Record> {
     };
     vec![
         Record::Input(Input {
+            media: Vec::new(),
             run_id: "run-1".into(),
             placement: Placement::RunInput,
             message: Message::new(Role::User, vec![ContentBlock::Text { text: "hi".into() }]),
@@ -67,24 +68,36 @@ fn one_of_each() -> Vec<Record> {
             result: result.clone(),
             finished_at_ms: Some(3),
             tags_v1: None,
+            media: Vec::new(),
         }),
         Record::ResultAppend(ResultAppend {
+            send_id: None,
             run_id: "run-1".into(),
             tool_call_id: ToolCallId("c1".into()),
             text: "reminder".into(),
             notice: None,
             written_at_ms: None,
+            ride: Some(RideEnvelope {
+                call_key: "lineage:4".into(),
+                sender: "reminders".into(),
+                forms: vec!["tool_result".into(), "turn_system".into()],
+                form: RideForm::Append,
+                speaks_for: None,
+            }),
         }),
         Record::SetupStub(SetupStub {
             parts: vec![part.clone()],
             model: model(),
             tool_names: vec!["read".into(), "bash".into()],
+            render_key: Some(Digest([4; 32])),
         }),
         Record::Compaction(Compaction {
             version: 2,
             body: serde_json::json!({"first_kept_ordinal": 12}),
         }),
         Record::RunStart(Box::new(RunStart {
+            imported_ids: None,
+            message_marks: None,
             run_id: "run-1".into(),
             model: model(),
             setup: vec![part],
@@ -101,7 +114,6 @@ fn one_of_each() -> Vec<Record> {
             service_tier: None,
             route_decision_id: None,
             compaction_plan_version: Some(2),
-            render_config: Some(serde_json::json!({"wire": "anthropic"})),
             auth_selection: None,
             run_choices: Some(serde_json::json!({"generation": {"max_output_tokens": 2048}})),
             origin: Some(serde_json::json!({"kind": "fresh"})),
@@ -125,6 +137,7 @@ fn one_of_each() -> Vec<Record> {
         Record::StepStart(StepStart {
             run_id: "run-1".into(),
             step_id: 1,
+            mid: Some("gabc.4".into()),
         }),
         Record::StepEnd(StepEnd {
             run_id: "run-1".into(),
@@ -141,6 +154,12 @@ fn one_of_each() -> Vec<Record> {
             total_usage: None,
             stop_met: None,
             limiting_stop_met: None,
+            by_model: vec![ModelStepUsage {
+                provider: "anthropic".into(),
+                model: "claude".into(),
+                variant: Some("high".into()),
+                usage,
+            }],
         }),
         Record::Attempt(Attempt {
             run_id: "run-1".into(),
@@ -161,12 +180,15 @@ fn one_of_each() -> Vec<Record> {
             served_account_ref: None,
             billing: None,
             telemetry: Some(serde_json::json!({"max_content_gap_ms": 613})),
+            reached_cache: Some(true),
+            requested_cache_ttl_ms: Some(300_000),
         }),
         Record::BatchStart(BatchStart {
             run_id: "run-1".into(),
             batch_id: "b1".into(),
             step_id: 1,
             planned: vec![ToolCallId("c1".into())],
+            mid: Some("gabc.9".into()),
         }),
         Record::BatchEnd(BatchEnd {
             run_id: "run-1".into(),
@@ -185,6 +207,7 @@ fn one_of_each() -> Vec<Record> {
             dispatched_at_ms: Some(6),
             schema_pin: None,
             hooks: None,
+            key_derived: None,
         }),
         Record::ToolOutcome(ToolOutcome {
             run_id: "run-1".into(),
@@ -197,8 +220,10 @@ fn one_of_each() -> Vec<Record> {
             finished_at_ms: Some(7),
             detail: None,
             hooks: None,
+            call_key: None,
         }),
         Record::QueuedSend(QueuedSend {
+            media: Vec::new(),
             submission_id: "sub".into(),
             send_id: Some("s2".into()),
             input: vec![Message::new(
@@ -213,6 +238,7 @@ fn one_of_each() -> Vec<Record> {
             request: Some(serde_json::json!({"model": {}})),
             receipt: None,
             delivery: Some("interrupt".into()),
+            message_marks: None,
         }),
         Record::SessionRefresh(SessionRefresh {
             generation: 2,
@@ -221,6 +247,23 @@ fn one_of_each() -> Vec<Record> {
             applies_from_next_run: true,
             setup: vec![],
             manifest: None,
+            selection: Some(serde_json::json!({"provider": "p", "model": "m"})),
+        }),
+        Record::RefreshPolicy(RefreshPolicy {
+            generation: 2,
+            policy: "on_prefix_rebuild".into(),
+            send_id: "policy-1".into(),
+        }),
+        Record::PrefixFlush(PrefixFlush {
+            send_id: "flush-1".into(),
+            pending_generation: Some(2),
+        }),
+        Record::RefreshApplied(RefreshApplied {
+            generation: 2,
+            applied_by: "fold".into(),
+            manifest_digest: "m".into(),
+            composition_digest: Some("c".into()),
+            absent_items: vec![serde_json::json!({"provider": "p", "kind": "tool"})],
         }),
         Record::StructuredResult(StructuredResult {
             run_id: "run-1".into(),

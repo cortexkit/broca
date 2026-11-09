@@ -1022,3 +1022,223 @@ mod account_limit_pause_config_tests {
         assert!(!config.max_same_account_wait.enabled());
     }
 }
+
+/// Where a head's file-source import may read from: `import.roots` in `broca.jsonc`, each an
+/// absolute folder. Absent, broca's own import folder under its state root is the only root,
+/// the folder Thalamus's `session.export` writes to. A source is read only under a root,
+/// resolved after symlinks, and deleted after its import only inside broca's own folder. Loaded
+/// once at boot and handed to the new storage's runtime (`StoreRuntime::with_import_roots`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ImportConfig {
+    pub roots: Option<Vec<std::path::PathBuf>>,
+}
+
+impl ImportConfig {
+    pub fn load_default() -> Result<Self, String> {
+        use crate::config_home::ConfigHome;
+        match crate::config_home::config_file(crate::cache_routing::CONFIG_PATH_ENV, "broca.jsonc")
+        {
+            ConfigHome::Resolved { path, .. } => match std::fs::read_to_string(&path) {
+                Ok(text) => Self::parse(&text).map_err(|e| format!("{}: {e}", path.display())),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+                Err(e) => Err(format!("read import from {}: {e}", path.display())),
+            },
+            ConfigHome::Unresolvable => Ok(Self::default()),
+        }
+    }
+
+    pub fn parse(text: &str) -> Result<Self, String> {
+        #[derive(serde::Deserialize)]
+        struct File {
+            #[serde(default)]
+            import: Option<Section>,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Section {
+            #[serde(default)]
+            roots: Option<Vec<std::path::PathBuf>>,
+        }
+        let text = crate::cache_routing::strip_trailing_commas(
+            &crate::cache_routing::strip_jsonc_comments(text),
+        );
+        let file = serde_json::from_str::<File>(&text).map_err(|e| format!("parse import: {e}"))?;
+        let roots = file.import.and_then(|section| section.roots);
+        if let Some(root) = roots.iter().flatten().find(|root| !root.is_absolute()) {
+            return Err(format!(
+                "import.roots holds {}, which is not an absolute folder",
+                root.display()
+            ));
+        }
+        Ok(Self { roots })
+    }
+}
+
+/// How the new session storage is configured: `session_storage` in `broca.jsonc`.
+///
+/// `deployment_key_id` names the deployment key encrypted sessions are opened with, 1 when
+/// absent. The key itself is the vault record `opaque:broca-deployment:<id>` (see `store_key`).
+/// Keys form a ring: a rotation adds a record under a new id and names it here, and never
+/// rewrites an existing record.
+///
+/// `encryption`, `"on"` (the default) or `"off"`, chooses the mode of the sessions created from
+/// now on: encrypted, or plain, stored without encryption and served without the deployment key.
+/// A session keeps the mode it was created in, so changing it leaves existing sessions as they
+/// are, and a deployment can hold both kinds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SessionStorageConfig {
+    pub deployment_key_id: u16,
+    pub encryption: Encryption,
+}
+
+/// `session_storage.encryption`: whether the sessions the new storage creates are encrypted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Encryption {
+    #[default]
+    On,
+    Off,
+}
+
+impl Default for SessionStorageConfig {
+    fn default() -> Self {
+        Self {
+            deployment_key_id: crate::store_key::DEFAULT_KEY_ID,
+            encryption: Encryption::On,
+        }
+    }
+}
+
+impl SessionStorageConfig {
+    /// The mode of the sessions the new storage creates.
+    pub fn new_sessions(&self) -> broca_session_store::keys::Cipher {
+        match self.encryption {
+            Encryption::On => broca_session_store::keys::Cipher::XChaCha20Poly1305,
+            Encryption::Off => broca_session_store::keys::Cipher::None,
+        }
+    }
+
+    pub fn load_default() -> Result<Self, String> {
+        use crate::config_home::ConfigHome;
+        match crate::config_home::config_file(crate::cache_routing::CONFIG_PATH_ENV, "broca.jsonc")
+        {
+            ConfigHome::Resolved { path, .. } => match std::fs::read_to_string(&path) {
+                Ok(text) => Self::parse(&text).map_err(|e| format!("{}: {e}", path.display())),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+                Err(e) => Err(format!("read session_storage from {}: {e}", path.display())),
+            },
+            ConfigHome::Unresolvable => Ok(Self::default()),
+        }
+    }
+
+    pub fn parse(text: &str) -> Result<Self, String> {
+        #[derive(serde::Deserialize)]
+        struct File {
+            #[serde(default)]
+            session_storage: Option<Section>,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Section {
+            #[serde(default)]
+            deployment_key_id: Option<u16>,
+            #[serde(default)]
+            encryption: Option<Encryption>,
+        }
+        let text = crate::cache_routing::strip_trailing_commas(
+            &crate::cache_routing::strip_jsonc_comments(text),
+        );
+        let file = serde_json::from_str::<File>(&text)
+            .map_err(|e| format!("parse session_storage: {e}"))?;
+        let section = file.session_storage;
+        let defaults = Self::default();
+        Ok(Self {
+            deployment_key_id: section
+                .as_ref()
+                .and_then(|section| section.deployment_key_id)
+                .unwrap_or(defaults.deployment_key_id),
+            encryption: section
+                .and_then(|section| section.encryption)
+                .unwrap_or(defaults.encryption),
+        })
+    }
+}
+
+#[cfg(test)]
+mod session_storage_config_tests {
+    use super::{Encryption, SessionStorageConfig};
+    use broca_session_store::keys::Cipher;
+
+    #[test]
+    fn the_deployment_key_id_defaults_to_1_and_is_named_by_session_storage() {
+        assert_eq!(
+            SessionStorageConfig::parse("{}").unwrap(),
+            SessionStorageConfig {
+                deployment_key_id: 1,
+                encryption: Encryption::On,
+            }
+        );
+        let config = SessionStorageConfig::parse(
+            r#"{"session_storage": {"deployment_key_id": 2,}, // the rotated key
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(config.deployment_key_id, 2);
+        assert!(SessionStorageConfig::parse(r#"{"session_storage": {"key_id": 2}}"#).is_err());
+        assert!(
+            SessionStorageConfig::parse(r#"{"session_storage": {"deployment_key_id": -1}}"#)
+                .is_err()
+        );
+    }
+
+    /// Encryption is on unless `session_storage.encryption` turns it off, which makes the
+    /// sessions created from then on plain. Any other value refuses the configuration.
+    #[test]
+    fn encryption_is_on_unless_session_storage_turns_it_off() {
+        let default = SessionStorageConfig::parse(r#"{"session_storage": {}}"#).unwrap();
+        assert_eq!(default.encryption, Encryption::On);
+        assert_eq!(default.new_sessions(), Cipher::XChaCha20Poly1305);
+        let on =
+            SessionStorageConfig::parse(r#"{"session_storage": {"encryption": "on"}}"#).unwrap();
+        assert_eq!(on.new_sessions(), Cipher::XChaCha20Poly1305);
+        let off = SessionStorageConfig::parse(
+            r#"{"session_storage": {"deployment_key_id": 3, "encryption": "off"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            off,
+            SessionStorageConfig {
+                deployment_key_id: 3,
+                encryption: Encryption::Off,
+            }
+        );
+        assert_eq!(off.new_sessions(), Cipher::None);
+        for refused in [r#""none""#, r#""OFF""#, "false", "0"] {
+            assert!(
+                SessionStorageConfig::parse(&format!(
+                    r#"{{"session_storage": {{"encryption": {refused}}}}}"#
+                ))
+                .is_err(),
+                "{refused}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod import_config_tests {
+    use super::ImportConfig;
+
+    #[test]
+    fn import_roots_default_to_brocas_import_folder() {
+        assert_eq!(ImportConfig::parse("{}").unwrap(), ImportConfig::default());
+        let config = ImportConfig::parse(
+            r#"{"import": {"roots": ["/srv/heads",],}, // a comment
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(config.roots, Some(vec!["/srv/heads".into()]));
+        assert!(ImportConfig::parse(r#"{"import": {"roots": ["heads"]}}"#).is_err());
+        assert!(ImportConfig::parse(r#"{"import": {"root": ["/x"]}}"#).is_err());
+    }
+}

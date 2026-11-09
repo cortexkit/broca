@@ -147,6 +147,20 @@ pub trait RunExecutor: Send + Sync + 'static {
         )
     }
 
+    /// The context limit a fresh run of `model` would freeze, resolved as the run resolves it
+    /// but without choosing an account, reading a credential or touching a connection: what a
+    /// plan refresh that adds a compaction provider is checked against, since a run on the
+    /// compaction contract can't run without one. A send may name its own `context_limit`, which
+    /// a run prefers, but a refresh carries none and a later send may not, so only the resolved
+    /// limit counts here. `Ok(None)` when resolution gives none (an opaque endpoint); `Err` when
+    /// it couldn't run, with its cause. A runner that can't resolve models answers `Err`.
+    async fn compaction_context_limit(
+        &self,
+        _model: &cortexkit_role_llm_runner::head_selection::PlanModel,
+    ) -> Result<Option<u64>, String> {
+        Err("this runner can't resolve a model's context limit".into())
+    }
+
     /// Validate the abstract level before a send can enter the durable queue.
     fn check_service_tier(
         &self,
@@ -220,6 +234,22 @@ pub trait RunExecutor: Send + Sync + 'static {
         job: RunJob,
         out: mpsc::Sender<OutputEvent>,
     ) -> Result<RunSummary, RunError>;
+
+    /// Runs one run of a session kept in the new storage. An executor that can't refuses with
+    /// nothing written, so a session opts into the new storage only on a build whose executor
+    /// serves it.
+    async fn execute_on_store(
+        &self,
+        job: StoreRunJob,
+        _out: mpsc::Sender<OutputEvent>,
+    ) -> StoreRunEnd {
+        StoreRunEnd {
+            parts: job.parts,
+            result: Err(StoreRunError::Admission(RunError::Config(
+                "this runner cannot run sessions kept in the new storage".into(),
+            ))),
+        }
+    }
 
     /// Called by the actor's CLOSE teardown when a session ends (the lineage idles to
     /// close), so an executor holding per-session resources keyed off a SHARED handle can
@@ -309,6 +339,54 @@ pub trait RunExecutor: Send + Sync + 'static {
             "this runner cannot warm a prompt cache".into(),
         ))
     }
+}
+
+/// One run of a session kept in the new storage, as the store actor hands it to the executor.
+/// Like [`RunJob`], the actor builds the request and the session's part of the run control; the
+/// executor resolves the credential, routing, provider and the model's entry in the model catalog,
+/// completes the control, admits the run by `broca_session_loop::admit::admission` and runs it
+/// through `writer`.
+pub struct StoreRunJob {
+    pub req: RunRequest,
+    /// Caller-scoped credential selection, resolved at admission as for [`RunJob::auth`].
+    pub auth: Option<broca_protocol::AuthRequest>,
+    pub control: RunControl,
+    /// The run's writer: a client of the store actor, which owns the session.
+    pub writer: broca_session_loop::shared::ActorWriter,
+    /// Where the run's setup parts are stored and read back, lent by the actor for the run and
+    /// handed back in [`StoreRunEnd`].
+    pub parts: Box<dyn broca_session_loop::parts::Parts>,
+    pub mode: StoreRunMode,
+    /// What the run renders media from, as today's runs render it (see `store_media`), sent
+    /// once the session's media fold is ready. `None` for a seal, which calls no model.
+    pub media: Option<crate::store_media::StoreRunMediaWait>,
+}
+
+/// What a store run does: admit a new run, or carry on or end the session's unfinished one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreRunMode {
+    /// Admit the job's request as a new run.
+    Fresh,
+    /// Continue the session's unfinished run from its last durable boundary.
+    Resume,
+    /// End the session's unfinished run `Interrupted` without calling the model, writing what
+    /// today's seal writes (`broca_core::resume::interrupted_seal`): `broca_session_loop::seal`.
+    Seal(broca_core::resume::SealCause),
+}
+
+/// How a store run ended, with the parts store its job lent.
+pub struct StoreRunEnd {
+    pub parts: Box<dyn broca_session_loop::parts::Parts>,
+    pub result: Result<broca_session_loop::run::Finished, StoreRunError>,
+}
+
+/// Why a store run ended without a finish the loop recorded.
+#[derive(Debug)]
+pub enum StoreRunError {
+    /// Resolving or admitting the run failed before anything was written.
+    Admission(RunError),
+    /// The loop stopped; see [`broca_session_loop::run::LoopError`].
+    Loop(broca_session_loop::run::LoopError),
 }
 
 /// A run the actor sealed `Interrupted`, as [`RunExecutor::on_run_sealed`] receives it.

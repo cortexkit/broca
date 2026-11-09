@@ -736,6 +736,9 @@ const STORE_BUSY_ERROR_MARKERS: [&str; 4] = [
 ];
 const LIVE_WRITER_ERROR_MARKER: &str = "held by a live writer";
 
+/// Why retention refuses to read or delete a session: the new session storage owns it.
+const STORE_OWNED: &str = "session is owned by the new session storage";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EnrollmentFailureKind {
     VanishedFile,
@@ -955,6 +958,9 @@ impl RetentionService {
         #[cfg(test)]
         self.file_work
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if self.path_owned_by_store(path)? {
+            return Err(STORE_OWNED.into());
+        }
         broca_wal::read_records_range(path, self.wal.max_read_bytes(), 0, None, None)
             .map_err(|e| e.to_string())
     }
@@ -966,8 +972,38 @@ impl RetentionService {
         #[cfg(test)]
         self.file_work
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if self.path_owned_by_store(path)? {
+            return Err(STORE_OWNED.to_owned().into());
+        }
         broca_wal::read_records_range(path, self.wal.max_read_bytes(), 0, None, None)
             .map_err(EnrollmentFailure::wal)
+    }
+
+    /// Whether the new session storage owns `key`, or a move into it is in flight. Retention
+    /// then leaves the session alone: it neither reads nor expires nor deletes its WAL, whose
+    /// content the new storage holds or is copying.
+    fn owned_by_store(&self, key: &BindIdentity) -> Result<bool, String> {
+        self.wal
+            .owned_by_store(key)
+            .map_err(|error| error.to_string())
+    }
+
+    /// [`Self::owned_by_store`] for the session whose WAL (or a WAL moved aside for deletion)
+    /// is at `path`: every such file name starts with the session's address.
+    fn path_owned_by_store(&self, path: &Path) -> Result<bool, String> {
+        let Some(address) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.split('.').next())
+            .filter(|address| {
+                address.len() == 16 && address.bytes().all(|b| b.is_ascii_hexdigit())
+            })
+        else {
+            return Ok(false);
+        };
+        self.wal
+            .address_owned_by_store(address)
+            .map_err(|error| error.to_string())
     }
 
     fn initial_lineage(&self, path: &Path) -> Result<String, String> {
@@ -1079,6 +1115,9 @@ impl RetentionService {
         let broca_wal::WalRangeRecords::Complete(records) = read.records() else {
             return Err("retention export requires complete durable records".into());
         };
+        if self.owned_by_store(key)? {
+            return Err(STORE_OWNED.into());
+        }
         let projection = crate::approval::projection_from_frames(read.lineage_id, records)?;
         let mut rows = Vec::new();
         for owed in projection.obligations().withdrawals {
@@ -1142,6 +1181,11 @@ impl RetentionService {
     ) -> Result<Option<u64>, RetentionReadError> {
         if self.defer_overhaul() {
             crate::diagnostics::retention_fenced(key, "overhaul_deferred", self.clock.now_ms());
+            return Ok(None);
+        }
+        // Today's retention doesn't decide a session the new storage owns: its WAL is a copy
+        // being moved, or the retired one a move left behind.
+        if self.owned_by_store(key)? {
             return Ok(None);
         }
         let overhaul_path = self
@@ -1476,6 +1520,9 @@ impl RetentionService {
     /// durable facts periodically, under the lease, instead of waiting for new traffic.
     pub(crate) fn repair_discovery_flags(&self) -> Result<(), String> {
         for key in self.index.discovery_lineages()? {
+            if self.owned_by_store(&key)? {
+                continue;
+            }
             let Ok(_lease) = self.lease(&key) else {
                 continue;
             };
@@ -1622,6 +1669,10 @@ impl RetentionService {
         #[cfg(test)]
         self.file_work
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // A WAL the new storage owns is not enrolled: retention doesn't decide that session.
+        if self.path_owned_by_store(path)? {
+            return Ok(false);
+        }
         let bytes = match fs::metadata(path) {
             Ok(metadata) => metadata.len(),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -1811,6 +1862,11 @@ impl RetentionService {
     ) -> Result<Option<String>, RetentionReadError> {
         if self.defer_overhaul() {
             crate::diagnostics::retention_fenced(key, "overhaul_deferred", now_ms);
+            return Ok(None);
+        }
+        // Nothing of a session the new storage owns is deleted here: its WAL is the copy a
+        // move reads, or the retired one a move leaves behind.
+        if self.owned_by_store(key)? {
             return Ok(None);
         }
         let overhaul_path = self
@@ -2115,6 +2171,9 @@ impl RetentionService {
         now_ms: u64,
         for_run: bool,
     ) -> Result<(), RetentionReadError> {
+        if self.owned_by_store(key)? {
+            return Err(STORE_OWNED.to_owned().into());
+        }
         self.validate_recovery_artifacts(key, &stone.recovery_artifacts)?;
         #[cfg(test)]
         deletion_boundary("prepared");
@@ -2323,6 +2382,10 @@ impl RetentionService {
                         self.index
                             .deletion_pending(&stone.lineage_id, &key, false)?;
                     }
+                    return Ok(false);
+                }
+                // A session the new storage owns keeps its WAL until the move retires it.
+                if self.owned_by_store(&key)? {
                     return Ok(false);
                 }
                 let _lease = self.lease(&key)?;

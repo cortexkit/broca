@@ -6,14 +6,49 @@ use super::{
 };
 use broca_wal::{FramedRecord, PlanManifest, RunConfig, WalRecord};
 
+/// What a send's compaction conditions and context read from its run's frozen configuration.
+/// Today's loop takes it from the run's `RunConfig` ([`Frozen::of`]); a loop that keeps its
+/// frozen choices in another shape builds it from those.
+pub struct Frozen<'a> {
+    pub model: &'a broca_protocol::request::ModelHandle,
+    pub variant: Option<&'a str>,
+    pub service_tier: Option<broca_protocol::request::ServiceTier>,
+    pub frozen_render_config: &'a serde_json::Value,
+    pub tools: &'a [broca_protocol::request::Tool],
+    pub global_system: Option<&'a [broca_protocol::Message]>,
+    pub auth_selection: Option<&'a broca_wal::AuthSelection>,
+    pub context_limit: Option<u64>,
+    pub max_output_tokens: Option<u64>,
+}
+
+impl<'a> Frozen<'a> {
+    pub fn of(config: &'a RunConfig) -> Self {
+        Self {
+            model: &config.model,
+            variant: config.variant.as_deref(),
+            service_tier: config.service_tier,
+            frozen_render_config: &config.frozen_render_config,
+            tools: &config.tools,
+            global_system: config.global_system.as_deref().map(Vec::as_slice),
+            auth_selection: config.auth_selection.as_ref(),
+            context_limit: config.context_limit,
+            max_output_tokens: config.generation.max_output_tokens,
+        }
+    }
+}
+
 pub fn context(config: &RunConfig, manifest: Option<&PlanManifest>) -> SendContext {
+    context_of(&Frozen::of(config), manifest)
+}
+
+pub fn context_of(config: &Frozen<'_>, manifest: Option<&PlanManifest>) -> SendContext {
     let mut model = ModelRef::new(&config.model.provider_module_id, &config.model.model_id);
-    model.variant = config.variant.clone();
+    model.variant = config.variant.map(str::to_owned);
     model.service_tier = Some(
         config
             .service_tier
             .map_or_else(
-                || broca_protocol::frozen_service_tier(&config.frozen_render_config),
+                || broca_protocol::frozen_service_tier(config.frozen_render_config),
                 |tier| tier.as_str(),
             )
             .to_owned(),
@@ -28,7 +63,6 @@ pub fn context(config: &RunConfig, manifest: Option<&PlanManifest>) -> SendConte
         model,
         account: config
             .auth_selection
-            .as_ref()
             .and_then(crate::compaction::view::selection_account_label),
         surface,
     }
@@ -42,6 +76,16 @@ pub fn conditions(
     chained: bool,
     newest_step_fill: Option<(&str, u64)>,
 ) -> Result<Conditions, String> {
+    conditions_of(&Frozen::of(config), entries, chained, newest_step_fill)
+}
+
+/// [`conditions`] from a run's frozen choices in any shape.
+pub fn conditions_of(
+    config: &Frozen<'_>,
+    entries: &[Entry],
+    chained: bool,
+    newest_step_fill: Option<(&str, u64)>,
+) -> Result<Conditions, String> {
     let window = config
         .context_limit
         .ok_or("compaction requires a frozen context_limit")?;
@@ -49,7 +93,6 @@ pub fn conditions(
     // ChatGPT route never sends one, since that backend refuses the field) still writes up to
     // the model's output cap, which the frozen render config holds.
     let reserve = config
-        .generation
         .max_output_tokens
         .or_else(|| {
             config
@@ -64,7 +107,7 @@ pub fn conditions(
         );
     }
     let mut conditions =
-        conditions::conditions(context(config, None).model, window, reserve, chained);
+        conditions::conditions(context_of(config, None).model, window, reserve, chained);
     conditions.accepts_images = config
         .frozen_render_config
         .pointer("/media/modalities/image")

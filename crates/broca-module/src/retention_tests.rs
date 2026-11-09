@@ -6144,3 +6144,80 @@ async fn older_expiry_cannot_mask_an_unidentified_new_run_missing_log() {
         "{read:?}"
     );
 }
+
+/// Plants the new session storage's head for `key` under the state root `root`, as a session
+/// published there has. Today's readers look only at whether it exists.
+fn plant_store_head(root: &Path, key: &BindIdentity) {
+    let head = broca_wal::session_storage_head(root, &broca_core::session_addr(key));
+    fs::create_dir_all(head.parent().unwrap()).unwrap();
+    fs::write(head, b"head").unwrap();
+}
+
+/// Today's retention never expires or deletes a session the new storage holds, however long
+/// ago its WAL's deadline passed: the WAL is the retired copy of a session that lives on.
+#[test]
+fn retention_never_expires_or_deletes_a_session_the_new_storage_holds() {
+    let rig = Rig::new();
+    rig.seed(1, 100, Some(200));
+    assert_eq!(rig.service.expired(&rig.key, None).unwrap(), Some(1200));
+    plant_store_head(&rig.root, &rig.key);
+    assert_eq!(rig.service.expired(&rig.key, None).unwrap(), None);
+    assert_eq!(rig.service.expired(&rig.key, Some("r1")).unwrap(), None);
+    let _lease = rig.service.lease(&rig.key).unwrap();
+    assert_eq!(rig.service.delete_expired(&rig.key, 1200).unwrap(), None);
+    assert!(rig.service.wal.ephemeral_wal_path(&rig.key).exists());
+    assert!(rig.service.tombstones(&rig.key).unwrap().is_empty());
+}
+
+/// The registry's expiry check passes a session the new storage holds rather than refusing it
+/// as expired by its old WAL's deadline.
+#[tokio::test]
+async fn the_registry_expiry_check_passes_a_session_the_new_storage_holds() {
+    let rig = Rig::new();
+    rig.seed(1, 100, Some(200));
+    let registry = rig.registry(None);
+    assert!(matches!(
+        registry.check_expired(&rig.key, None).await,
+        Err(crate::registry::OpenError::Expired { .. })
+    ));
+    crate::registry::store_owner_tests::plant_journal(&rig.root, &rig.key);
+    assert!(registry.check_expired(&rig.key, None).await.is_ok());
+    assert!(registry.check_expired(&rig.key, Some("r1")).await.is_ok());
+}
+
+/// Retention's raw reads and its withdrawal export refuse a session the new storage holds,
+/// including through the name a deletion moves a WAL aside to.
+#[test]
+fn raw_reads_and_withdrawal_export_refuse_a_session_the_new_storage_holds() {
+    let rig = Rig::new();
+    let lineage = rig.seed(1, 100, Some(200));
+    let path = rig.service.wal.ephemeral_wal_path(&rig.key);
+    let read = rig.service.read_path(&path).unwrap();
+    assert!(rig.service.read_enrollment_path(&path).is_ok());
+    assert!(rig.service.withdrawal_export(&rig.key, &read).is_ok());
+    let deleting = rig.service.deleting(&rig.key, &lineage);
+    fs::copy(&path, &deleting).unwrap();
+    assert!(rig.service.read_path(&deleting).is_ok());
+
+    plant_store_head(&rig.root, &rig.key);
+    assert_eq!(rig.service.read_path(&path).unwrap_err(), STORE_OWNED);
+    assert_eq!(rig.service.read_path(&deleting).unwrap_err(), STORE_OWNED);
+    assert!(rig.service.read_enrollment_path(&path).is_err());
+    assert_eq!(
+        rig.service.withdrawal_export(&rig.key, &read).unwrap_err(),
+        STORE_OWNED
+    );
+}
+
+/// Enrollment skips the WAL of a session the new storage holds: it neither indexes it nor
+/// keeps retrying it.
+#[test]
+fn enrollment_skips_a_wal_the_new_storage_holds() {
+    let rig = Rig::new();
+    rig.seed(1, 100, Some(200));
+    plant_store_head(&rig.root, &rig.key);
+    assert_eq!(rig.service.recover_enrollment().unwrap(), 0);
+    assert!(rig.service.enrollment.lock().unwrap().retry.is_empty());
+    assert_eq!(rig.service.unreadable_sessions(), 0);
+    assert!(rig.service.index.live(&rig.key).unwrap().is_none());
+}

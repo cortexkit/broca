@@ -149,6 +149,125 @@ pub trait SessionBackend {
     /// included.
     async fn put_setup(&self, name: &str, bytes: &[u8]) -> Result<(), BackendError>;
     async fn get_setup(&self, name: &str) -> Result<Option<Vec<u8>>, BackendError>;
+    /// The names of every setup part stored, in both cipher modes' name spaces, in no particular
+    /// order. A part being written is not listed until it is complete.
+    async fn list_setup(&self) -> Result<Vec<String>, BackendError>;
+}
+
+/// A borrowed backend is a backend, so a session can borrow one for a short task (a test, a
+/// converter pass) or own a handle for its whole life (a session actor).
+impl<T: SessionBackend + ?Sized> SessionBackend for &T {
+    async fn read_head(&self, s: &SessionAddr) -> Result<Option<(Vec<u8>, Version)>, BackendError> {
+        (**self).read_head(s).await
+    }
+    async fn write_head(
+        &self,
+        s: &SessionAddr,
+        head: &[u8],
+        expected: Option<Version>,
+        next: Version,
+    ) -> Result<Version, BackendError> {
+        (**self).write_head(s, head, expected, next).await
+    }
+    async fn create_log(
+        &self,
+        s: &SessionAddr,
+        log: &Id128,
+        at: Version,
+    ) -> Result<(), BackendError> {
+        (**self).create_log(s, log, at).await
+    }
+    async fn read_log(
+        &self,
+        s: &SessionAddr,
+        log: &Id128,
+        range: Range<u64>,
+    ) -> Result<Vec<u8>, BackendError> {
+        (**self).read_log(s, log, range).await
+    }
+    async fn log_end(&self, s: &SessionAddr, log: &Id128) -> Result<u64, BackendError> {
+        (**self).log_end(s, log).await
+    }
+    async fn append_log(
+        &self,
+        s: &SessionAddr,
+        log: &Id128,
+        bytes: &[u8],
+        expected_end: u64,
+        at: Version,
+        barrier: bool,
+    ) -> Result<u64, BackendError> {
+        (**self)
+            .append_log(s, log, bytes, expected_end, at, barrier)
+            .await
+    }
+    async fn truncate_log(
+        &self,
+        s: &SessionAddr,
+        log: &Id128,
+        to: u64,
+        expected_end: u64,
+        at: Version,
+    ) -> Result<(), BackendError> {
+        (**self).truncate_log(s, log, to, expected_end, at).await
+    }
+    async fn delete_log(
+        &self,
+        s: &SessionAddr,
+        log: &Id128,
+        at: Version,
+    ) -> Result<(), BackendError> {
+        (**self).delete_log(s, log, at).await
+    }
+    async fn put_object(
+        &self,
+        s: &SessionAddr,
+        name: &str,
+        bytes: &[u8],
+        at: Version,
+    ) -> Result<(), BackendError> {
+        (**self).put_object(s, name, bytes, at).await
+    }
+    async fn sync_objects(
+        &self,
+        s: &SessionAddr,
+        change: &Id128,
+        at: Version,
+    ) -> Result<(), BackendError> {
+        (**self).sync_objects(s, change, at).await
+    }
+    async fn get_object(
+        &self,
+        s: &SessionAddr,
+        name: &str,
+    ) -> Result<Option<Vec<u8>>, BackendError> {
+        (**self).get_object(s, name).await
+    }
+    async fn delete_object(
+        &self,
+        s: &SessionAddr,
+        name: &str,
+        at: Version,
+    ) -> Result<(), BackendError> {
+        (**self).delete_object(s, name, at).await
+    }
+    async fn delete_change(
+        &self,
+        s: &SessionAddr,
+        change: &Id128,
+        at: Version,
+    ) -> Result<(), BackendError> {
+        (**self).delete_change(s, change, at).await
+    }
+    async fn put_setup(&self, name: &str, bytes: &[u8]) -> Result<(), BackendError> {
+        (**self).put_setup(name, bytes).await
+    }
+    async fn get_setup(&self, name: &str) -> Result<Option<Vec<u8>>, BackendError> {
+        (**self).get_setup(name).await
+    }
+    async fn list_setup(&self) -> Result<Vec<String>, BackendError> {
+        (**self).list_setup().await
+    }
 }
 
 /// The change id an object's name starts with.
@@ -244,6 +363,16 @@ impl MemoryBackend {
     /// Every setup part name stored. Tests only.
     pub fn setup_names(&self) -> Vec<String> {
         self.setup.lock().unwrap().keys().cloned().collect()
+    }
+
+    /// Replaces an object's bytes, as damage would leave them. Tests only.
+    pub fn set_object(&self, s: &SessionAddr, name: &str, bytes: Vec<u8>) {
+        let mut sessions = self.sessions.lock().unwrap();
+        sessions
+            .entry(s.clone())
+            .or_default()
+            .objects
+            .insert(name.to_owned(), bytes);
     }
 
     /// Replaces a log's bytes, as a crash or damage would leave them. Tests only.
@@ -453,6 +582,10 @@ impl SessionBackend for MemoryBackend {
     async fn get_setup(&self, name: &str) -> Result<Option<Vec<u8>>, BackendError> {
         Ok(self.setup.lock().unwrap().get(name).cloned())
     }
+
+    async fn list_setup(&self) -> Result<Vec<String>, BackendError> {
+        Ok(self.setup_names())
+    }
 }
 
 /// A backend on local files:
@@ -463,8 +596,11 @@ impl SessionBackend for MemoryBackend {
 ///   `sync_all`, which issues `F_FULLFSYNC` on macOS and survives power loss.
 /// - `<root>/objects/<addr>/<change id>/<name>`: immutable objects, one folder per change, so
 ///   undoing a change deletes one folder.
-/// - `<root>/setup/<name>`: setup parts, shared by every session. Written to a temporary file,
-///   synced, and renamed into place, so a part is either whole or absent.
+/// - `<root>/setup/<name>`: setup parts of encrypted sessions, shared by every session. Written to
+///   a temporary file, synced, and renamed into place, so a part is either whole or absent.
+/// - `<root>/setup-plain/<hex>`: setup parts of plain sessions, named `plain/<hex>` (see
+///   `setup::PLAIN_PREFIX`), written the same way. A folder of their own, so a build that knows
+///   no plain sessions never lists them among the encrypted parts.
 ///
 /// Only one process may write a session: the caller holds the session's lease (an OS file
 /// lock) for as long as it writes. So the head version the fences compare against is kept in
@@ -476,6 +612,9 @@ pub struct LocalBackend {
 }
 
 const VERSION_LEN: usize = 8;
+
+/// The folder plain sessions' setup parts live in, beside the encrypted parts' `setup`.
+const PLAIN_SETUP_DIR: &str = "setup-plain";
 
 impl LocalBackend {
     pub fn new(root: impl Into<PathBuf>) -> Self {
@@ -521,12 +660,27 @@ impl LocalBackend {
         Ok(self.object_dir(s).join(name))
     }
 
-    /// A setup part's path. A name is lowercase hex only, so it can't leave the setup folder.
+    /// A setup part's path. A name is lowercase hex only, after the plain prefix for a plain
+    /// part, so it can't leave its setup folder.
     fn setup_path(&self, name: &str) -> Result<PathBuf, BackendError> {
-        if name.is_empty() || !name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        let (folder, file) = match name.strip_prefix(crate::setup::PLAIN_PREFIX) {
+            Some(file) => (PLAIN_SETUP_DIR, file),
+            None => ("setup", name),
+        };
+        if file.is_empty() || !file.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
             return Err(BackendError::Corrupt("setup part name is not hex"));
         }
-        Ok(self.root.join("setup").join(name))
+        Ok(self.root.join(folder).join(file))
+    }
+
+    /// The stored head of `s` and its version, read from its file now, leaving the fences a
+    /// writer keeps untouched: for a caller that only routes on what a head names, such as its
+    /// cipher mode, and never writes.
+    pub fn read_stored_head(
+        &self,
+        s: &SessionAddr,
+    ) -> Result<Option<(Vec<u8>, Version)>, BackendError> {
+        self.read_head_file(s)
     }
 
     fn read_head_file(&self, s: &SessionAddr) -> Result<Option<(Vec<u8>, Version)>, BackendError> {
@@ -820,8 +974,15 @@ impl SessionBackend for LocalBackend {
             .parent()
             .expect("a setup part lives in the setup folder");
         std::fs::create_dir_all(dir)?;
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("a setup part's path ends in its hex name");
         // A unique temporary name, so two writers storing the same part never share a file.
-        let temp = dir.join(format!(".{name}.{}.tmp", hex(&crate::keys::random_id().0)));
+        let temp = dir.join(format!(
+            ".{file_name}.{}.tmp",
+            hex(&crate::keys::random_id().0)
+        ));
         let mut file = File::create(&temp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
@@ -837,5 +998,27 @@ impl SessionBackend for LocalBackend {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error.into()),
         }
+    }
+
+    async fn list_setup(&self) -> Result<Vec<String>, BackendError> {
+        let mut names = Vec::new();
+        for (folder, prefix) in [("setup", ""), (PLAIN_SETUP_DIR, crate::setup::PLAIN_PREFIX)] {
+            let entries = match std::fs::read_dir(self.root.join(folder)) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            for entry in entries {
+                let name = entry?.file_name();
+                let name = name.to_str().ok_or(BackendError::Corrupt(
+                    "a setup part's file name is not text",
+                ))?;
+                // A part being written sits in a dot-prefixed temporary file until it is renamed.
+                if !name.starts_with('.') {
+                    names.push(format!("{prefix}{name}"));
+                }
+            }
+        }
+        Ok(names)
     }
 }

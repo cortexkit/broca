@@ -67,7 +67,9 @@ pub fn account_limit_pause_declined() -> serde_json::Value {
     counts.into()
 }
 
-pub(crate) struct PauseBudget {
+/// What may bound a timed same-account pause: the boot setting, and when the session's cache
+/// on that account expires.
+pub struct PauseBudget {
     pub setting: SameAccountWait,
     pub cache_expiry_ms: Option<u64>,
 }
@@ -124,7 +126,7 @@ pub(crate) enum TimingRefusal {
     Stale,
 }
 
-pub(crate) fn request_changed_error() -> ProviderError {
+pub fn request_changed_error() -> ProviderError {
     ProviderError {
         class: ErrorClass::Permanent,
         message: "The paused account-limit request no longer renders to its recorded bytes".into(),
@@ -143,7 +145,7 @@ pub(crate) fn request_changed_error() -> ProviderError {
     }
 }
 
-pub(crate) fn selection_changed_error() -> ProviderError {
+pub fn selection_changed_error() -> ProviderError {
     let mut error = request_changed_error();
     error.message =
         "A timed account pause cannot change its frozen credential or account selection".into();
@@ -153,7 +155,7 @@ pub(crate) fn selection_changed_error() -> ProviderError {
 
 /// Compare identity, not routing or vault-request diagnostics that a resolver may refresh.
 /// Known served IDs must match; missing IDs remain unknown without rewriting frozen config.
-pub(crate) fn same_selection(actual: &AuthSelection, frozen: Option<&AuthSelection>) -> bool {
+pub fn same_selection(actual: &AuthSelection, frozen: Option<&AuthSelection>) -> bool {
     fn known_ids_match(actual: &Option<String>, frozen: &Option<String>) -> bool {
         actual
             .as_ref()
@@ -207,7 +209,7 @@ pub(crate) fn resume_floor(
     Ok(floor)
 }
 
-pub(crate) fn attempt_record(step: StepId, attempt: ModelAttempt, enabled: bool) -> WalRecord {
+pub fn attempt_record(step: StepId, attempt: ModelAttempt, enabled: bool) -> WalRecord {
     let disposition = enabled
         .then(|| {
             attempt
@@ -229,7 +231,7 @@ pub(crate) fn attempt_record(step: StepId, attempt: ModelAttempt, enabled: bool)
 }
 
 /// Only source-classified attempt evidence can authorize a timed account pause.
-pub(crate) struct FailedAccountLimitAttempt {
+pub struct FailedAccountLimitAttempt {
     pub seq: u64,
     pub attempt: ModelAttempt,
 }

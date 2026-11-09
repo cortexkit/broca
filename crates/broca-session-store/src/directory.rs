@@ -97,7 +97,7 @@ impl From<BackendError> for DirectoryError {
     }
 }
 
-fn aad(session: &Id128, name: &str) -> Vec<u8> {
+pub(crate) fn aad(session: &Id128, name: &str) -> Vec<u8> {
     let mut aad = PAGE_CONTEXT.to_vec();
     aad.extend_from_slice(&session.0);
     aad.extend_from_slice(&(name.len() as u32).to_le_bytes());
@@ -189,6 +189,16 @@ impl<B: SessionBackend> Pages<'_, B> {
         let decoded =
             Page::decode(&plain).map_err(|_| DirectoryError::Corrupt(page.object.clone()))?;
         if decoded.level != page.level {
+            return Err(DirectoryError::Corrupt(page.object.clone()));
+        }
+        // Every child sits one level below its page, so a walk down the tree ends at a leaf. A
+        // page naming itself, or a page at or above it, would make a walk loop forever.
+        let child_level = decoded.level.checked_sub(1);
+        if decoded
+            .children
+            .iter()
+            .any(|child| Some(child.level) != child_level)
+        {
             return Err(DirectoryError::Corrupt(page.object.clone()));
         }
         Ok(decoded)
@@ -429,8 +439,11 @@ impl<B: SessionBackend> Pages<'_, B> {
     ) -> Result<Abandoned, DirectoryError> {
         let mut out = Abandoned::default();
         let mut stack: Vec<PageRef> = old.into_iter().cloned().collect();
+        // A tree names each page once. Pages that name one page many times would otherwise make
+        // the walk read it once per path to it, which grows exponentially with the levels.
+        let mut seen = std::collections::HashSet::new();
         while let Some(page_ref) = stack.pop() {
-            if page_ref.last_seq < cut {
+            if page_ref.last_seq < cut || !seen.insert(page_ref.object.clone()) {
                 continue;
             }
             let page = self.read(&page_ref).await?;
@@ -532,6 +545,39 @@ impl<B: SessionBackend> Pages<'_, B> {
             };
             page = self.read(&child).await?;
         }
+    }
+
+    /// Every entry whose segment holds a record at or after `seq`, in seq order. Walks only the
+    /// pages whose range reaches `seq`.
+    pub async fn entries_from(
+        &self,
+        root: Option<&PageRef>,
+        seq: u64,
+    ) -> Result<Vec<DirEntry>, DirectoryError> {
+        let mut out = Vec::new();
+        let Some(root) = root else {
+            return Ok(out);
+        };
+        // Pages still to read, the next one last, so entries come out in seq order.
+        let mut pending = vec![root.clone()];
+        while let Some(page) = pending.pop() {
+            let page = self.read(&page).await?;
+            if page.level == 0 {
+                out.extend(
+                    page.entries
+                        .into_iter()
+                        .filter(|entry| entry.last_seq >= seq),
+                );
+            } else {
+                pending.extend(
+                    page.children
+                        .into_iter()
+                        .filter(|child| child.last_seq >= seq)
+                        .rev(),
+                );
+            }
+        }
+        Ok(out)
     }
 }
 

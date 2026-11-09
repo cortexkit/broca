@@ -473,6 +473,10 @@ enum Cmd {
         #[arg(long)]
         display: bool,
     },
+    /// `session.move_to_store`: move this live, idle session from today's storage into the new
+    /// storage. Operator only, and it can't be undone. Prints the daemon's reply, or its
+    /// refusal (`not_movable` names what the session still needs) and exits 1.
+    MoveToStore,
     /// Import a canonical JSON message array into an empty session.
     Import {
         #[arg(long)]
@@ -1029,6 +1033,25 @@ async fn run(args: Args) -> Result<i32, String> {
                 || format!("IMPORT {response:?}"),
             );
             Ok(0)
+        }
+        Cmd::MoveToStore => {
+            let started = std::time::Instant::now();
+            let reply = client
+                .management_raw("session.move_to_store", &serde_json::json!({}))
+                .await
+                .map_err(|error| format!("move-to-store transport: {error}"))?;
+            let elapsed_ms = started.elapsed().as_millis();
+            let (body, exit) = match reply {
+                Ok(body) => (body, 0),
+                Err(body) => (body, 1),
+            };
+            write_raw_reply_to(
+                &body,
+                Some(elapsed_ms),
+                &mut std::io::stdout().lock(),
+                &mut std::io::stderr().lock(),
+            )?;
+            Ok(exit)
         }
         Cmd::Raw { op, params } => {
             if op == "session.subscribe" {

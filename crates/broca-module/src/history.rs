@@ -393,6 +393,28 @@ pub fn project(entry: &SessionReadMessage, limits: Option<&Limits>) -> DisplayRo
     row
 }
 
+/// One entry of the raw form: the message as `session.read` serves it, with the time it was
+/// written, which the raw form always carries. Of the facts a display-facts read adds, the raw
+/// form keeps only the sender.
+pub fn raw_entry(entry: &SessionReadMessage, written_at: u64) -> Value {
+    let mut value = serde_json::to_value(entry).expect("history entry JSON");
+    for field in [
+        "client_message_id",
+        "created_at",
+        "completed_at",
+        "reasoning_summaries",
+        "tool_times",
+        "notices",
+    ] {
+        value
+            .as_object_mut()
+            .expect("an entry is an object")
+            .remove(field);
+    }
+    value["written_at"] = written_at.into();
+    value
+}
+
 /// Read one page only; output-reference derivation shares the page's entries and target cache.
 pub async fn read<H: ServeHandler + ?Sized>(
     handler: &H,
@@ -403,7 +425,26 @@ pub async fn read<H: ServeHandler + ?Sized>(
         field: field.into(),
         message: format!("session.history does not accept {field} in this request"),
     })?;
-    let head = handler.head(session).await?;
+    let named = match mode {
+        HistoryMode::FromMid(mid) | HistoryMode::BeforeMid(mid) => Some(mid),
+        _ => None,
+    };
+    // A session kept in the new storage is read from it: its head facts here, its pages through
+    // `handler.read`, and what output references need through the handler's store reads.
+    let store = handler.store_history_head(session, named).await?;
+    let stored = store.is_some();
+    // The store's own ids aren't positions, so it resolves a named message itself.
+    let store_mid = store.as_ref().map(|store| store.mid_ordinal);
+    let head = match store {
+        Some(store) => broca_wire::HeadResponse {
+            incarnation: store.incarnation,
+            history_version: store.history_version,
+            last_ordinal: store.last_ordinal,
+            first_ordinal: store.last_ordinal.map(|_| 1),
+            ..Default::default()
+        },
+        None => handler.head(session).await?,
+    };
     if head.incarnation == "unwritten" {
         if let HistoryMode::Cursor(token) = mode {
             parse_cursor(token)?;
@@ -449,15 +490,18 @@ pub async fn read<H: ServeHandler + ?Sized>(
             (position.boundary, position.backward)
         }
         HistoryMode::FromMid(mid) | HistoryMode::BeforeMid(mid) => {
-            let at = broca_core::position_of_mid(mid, head.mode3, head.lineage_id.as_deref())
-                .map(|position| position + 1)
-                .filter(|at| *at < end)
-                .ok_or_else(|| {
-                    refused(
-                        "unknown_mid",
-                        format!("session.history mid {mid} is not retained"),
-                    )
-                })?;
+            let at = match store_mid {
+                Some(found) => found,
+                None => broca_core::position_of_mid(mid, head.mode3, head.lineage_id.as_deref())
+                    .map(|position| position + 1),
+            }
+            .filter(|at| *at < end)
+            .ok_or_else(|| {
+                refused(
+                    "unknown_mid",
+                    format!("session.history mid {mid} is not retained"),
+                )
+            })?;
             (at, matches!(mode, HistoryMode::BeforeMid(_)))
         }
         HistoryMode::FromOrdinal(at) | HistoryMode::BeforeOrdinal(at) => {
@@ -528,7 +572,9 @@ pub async fn read<H: ServeHandler + ?Sized>(
             field: "written_at",
         })?);
     }
-    let records = if request.form() == HistoryForm::Display {
+    // Today's sender and send metadata come from the session's log; a session kept in the new
+    // storage recorded them beside each message, and its pages serve them.
+    let records = if request.form() == HistoryForm::Display && !stored {
         match entries.iter().find_map(|entry| entry.run.as_ref()) {
             Some(run) => handler.session_log(session, &run.run_id).await?,
             None => None,
@@ -582,7 +628,9 @@ pub async fn read<H: ServeHandler + ?Sized>(
                 }
             }
             if entry.message.role == Role::User {
-                if let Some(metadata) = metadata.get(&entry.ordinal.saturating_sub(1)) {
+                if stored {
+                    row.client_message_id.clone_from(&entry.client_message_id);
+                } else if let Some(metadata) = metadata.get(&entry.ordinal.saturating_sub(1)) {
                     row.client_message_id = metadata.client_message_id.clone();
                     row.sender = metadata.sender.clone();
                 }
@@ -596,19 +644,7 @@ pub async fn read<H: ServeHandler + ?Sized>(
             )
             .expect("display entry JSON")
         } else {
-            let mut value = serde_json::to_value(entry).expect("history entry JSON");
-            for field in [
-                "client_message_id",
-                "created_at",
-                "completed_at",
-                "reasoning_summaries",
-                "tool_times",
-                "notices",
-            ] {
-                value.as_object_mut().unwrap().remove(field);
-            }
-            value["written_at"] = written_at.into();
-            value
+            raw_entry(entry, written_at)
         };
         messages.push(value);
     }

@@ -1,4 +1,5 @@
-//! Entry facts for sessions on the current compaction contract.
+//! Entry facts: what `session.read`, and on the current compaction contract `session.entries`,
+//! serve about each message.
 //!
 //! Today's `session.entries` derives what it serves about each message (its time, part numbers,
 //! notice, usage, the view in force, who delivered text with its tool calls) by folding the whole
@@ -11,33 +12,155 @@
 use std::collections::{BTreeMap, HashMap};
 
 use broca_core::compaction_v2::metadata::{Fold, Metadata};
-use broca_protocol::content::Role;
 use broca_session_store::record::{EntryFacts, Notice, StepUsage, ViewRef};
-use broca_session_store::session::StoredEntry;
 use broca_wal::{FramedRecord, WalRecord};
-use cortexkit_role_compaction::read::Entry;
 
-/// What today's projection derives for a mode-3 log.
+/// Today's facts for one message: its metadata, its written time and its id.
+pub type Row = (Metadata, Option<u64>, String);
+
+/// What today's projections derive for a log.
 #[derive(Debug, Default)]
 pub struct Legacy {
+    /// Whether the log is off the current compaction contract, so only `session.read` facts are
+    /// derived: the metadata is empty, and native messages are told by their record.
+    pub page_only: bool,
     /// By the message's position in today's conversation, from 0: its metadata, time and id.
-    pub rows: BTreeMap<u64, (Metadata, u64, String)>,
+    pub rows: BTreeMap<u64, Row>,
     /// Who delivered the text a tool-result delivery carried, by the seq of today's record
     /// that delivered it.
     pub delivery_notices: HashMap<u64, Notice>,
+    /// The tool-results message of an assistant message still waiting in today's projection,
+    /// at the position after it. Today's projection places a tool turn when its batch ends; the
+    /// new format places it when its last call has a result, so a log a crash cut between the
+    /// two places this message only in the new format. Its facts are today's for that message
+    /// when the batch ends: the part numbers so far, and no parts of its own.
+    pub pending_results: Option<(u64, Row)>,
+    /// By position: the run today's read names as the message's run (`message_runs`, and the
+    /// running tool turn's run for an assistant message still waiting).
+    pub runs: BTreeMap<u64, String>,
+    /// By position: the creation time today's read serves (`creation_times::project`).
+    pub created: BTreeMap<u64, u64>,
+    /// By position: how a delivered send reached the message, as today's read names it beside
+    /// the message's run (`message_runs`).
+    pub deliveries: BTreeMap<u64, broca_protocol::tags::DeliveryAttribution>,
+    /// By position: what today's `include_display_facts` read names about the send that placed
+    /// the message (`broca_core::display_facts`), for the messages it names anything about.
+    pub display: BTreeMap<u64, SendDisplay>,
+    /// By position: the base today's read numbers the message's parts after, for a message a
+    /// run with computed tag rules numbered (its `ComputedTags::base`).
+    pub runner_bases: BTreeMap<u64, u64>,
 }
 
-/// Today's facts for `old`, or `None` when it isn't a mode-3 log. `lineage` is the log's lineage
-/// id, which today's message ids carry; a mode-3 log without one can't keep its ids.
+/// Who sent the send that placed a message, the `client_message_id` it carried, and its display
+/// marks, as today's display facts name them: on every message of a run's input or of a steer
+/// or delivered send.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SendDisplay {
+    pub sender: Option<String>,
+    pub client_message_id: Option<String>,
+    /// llm-runner's `MessageMarks` JSON.
+    pub marks: Option<serde_json::Value>,
+}
+
+/// Today's send display facts for `old`, by position, from the fold today's read runs over the
+/// whole log (`DisplayFactsSeed::fold`). The fold decides them when it places each message and
+/// never changes them after. A log the fold refuses has none: today's display read of it
+/// refuses too.
+fn send_display(old: &[FramedRecord], lineage: Option<&str>) -> BTreeMap<u64, SendDisplay> {
+    let Ok(versions) = broca_core::display_facts::DisplayFactsSeed::default()
+        .fold(old, lineage.unwrap_or_default())
+    else {
+        return BTreeMap::new();
+    };
+    let mut display = BTreeMap::new();
+    for version in versions {
+        let row = SendDisplay {
+            sender: version.facts.sender,
+            client_message_id: version.facts.client_message_id,
+            marks: version
+                .facts
+                .message_marks
+                .map(|marks| serde_json::to_value(marks).expect("marks encode")),
+        };
+        if row == SendDisplay::default() {
+            display.remove(&version.ordinal);
+        } else {
+            display.insert(version.ordinal, row);
+        }
+    }
+    display
+}
+
+/// Today's facts for `old`. `lineage` is the log's lineage id, which today's message ids carry;
+/// a mode-3 log without one can't keep its ids.
 pub fn legacy(old: &[FramedRecord], lineage: Option<&str>) -> Result<Option<Legacy>, String> {
     let raw: Vec<WalRecord> = old.iter().map(|frame| frame.record.clone()).collect();
-    if !broca_core::is_mode3_log(&raw) {
-        return Ok(None);
-    }
-    let stored = broca_core::replay(&raw)
-        .map_err(|error| error.to_string())?
+    let mut legacy = if broca_core::is_mode3_log(&raw) {
+        contract(old, &raw, lineage)?
+    } else {
+        page_only(&raw, lineage)?
+    };
+    legacy.display = send_display(old, lineage);
+    legacy.runner_bases = runner_bases(&raw)?;
+    Ok(Some(legacy))
+}
+
+/// The base each message's computed part numbers continue after, by position, as today's read
+/// numbers the messages it serves: the replay's own numbering (`broca_core::replay`), and for an
+/// assistant message still waiting for its tool results, at the position after the stored ones,
+/// the numbers the replay gives it ahead of its batch's commit.
+fn runner_bases(raw: &[WalRecord]) -> Result<BTreeMap<u64, u64>, String> {
+    let replayed = broca_core::replay(raw).map_err(|error| error.to_string())?;
+    let base =
+        |message: &broca_protocol::Message| Some(message.part_tags()?.computed.as_ref()?.base);
+    let held = replayed
+        .open_tool_turn
+        .as_ref()
+        .and_then(|(message, _)| Some((replayed.prompt.len() as u64, base(message)?)));
+    Ok(replayed
         .prompt
-        .len() as u64;
+        .iter()
+        .enumerate()
+        .filter_map(|(position, message)| Some((position as u64, base(message)?)))
+        .chain(held)
+        .collect())
+}
+
+/// Today's facts for a log on the current compaction contract.
+fn contract(
+    old: &[FramedRecord],
+    raw: &[WalRecord],
+    lineage: Option<&str>,
+) -> Result<Legacy, String> {
+    let replayed = broca_core::replay(raw).map_err(|error| error.to_string())?;
+    let stored = replayed.prompt.len() as u64;
+    let mut runs: BTreeMap<u64, String> = replayed
+        .message_runs
+        .iter()
+        .enumerate()
+        .filter_map(|(position, run)| {
+            run.as_ref()
+                .map(|run| (position as u64, run.run_id.clone()))
+        })
+        .collect();
+    let mut deliveries: BTreeMap<u64, broca_protocol::tags::DeliveryAttribution> = replayed
+        .message_runs
+        .iter()
+        .enumerate()
+        .filter_map(|(position, run)| {
+            run.as_ref()?
+                .delivery
+                .clone()
+                .map(|delivery| (position as u64, delivery))
+        })
+        .collect();
+    let created = broca_core::creation_times::project(
+        raw.iter(),
+        broca_core::placement::Placement::default(),
+        BTreeMap::new(),
+        Default::default(),
+    )?
+    .times;
     let mut times = broca_core::message_times::mode3_written_times(
         raw.iter(),
         broca_core::placement::Placement::default(),
@@ -51,6 +174,7 @@ pub fn legacy(old: &[FramedRecord], lineage: Option<&str>) -> Result<Option<Lega
         rows.extend(fold.observe(frame)?.rows);
     }
     let mut placed = stored;
+    let mut pending_results = None;
     // An assistant message still waiting for its tool results is served at its reserved
     // position, with the time of the step that wrote it.
     if let Some((position, metadata)) = fold.pending_assistant() {
@@ -76,9 +200,33 @@ pub fn legacy(old: &[FramedRecord], lineage: Option<&str>) -> Result<Option<Lega
             );
         }
         rows.insert(position, metadata.clone());
+        if let Some(run) = &replayed.open_tool_run {
+            runs.insert(position, run.run_id.clone());
+        }
+        if let Some(delivery) = replayed
+            .open_tool_run
+            .as_ref()
+            .and_then(|run| run.delivery.clone())
+        {
+            deliveries.insert(position, delivery);
+        }
         placed += 1;
+        pending_results = Some((
+            position + 1,
+            Metadata {
+                tag_base: fold.high(),
+                source_seq: metadata.source_seq,
+                render_tags: metadata.render_tags,
+                ..Metadata::default()
+            },
+        ));
     }
-    let mut legacy = Legacy::default();
+    let mut legacy = Legacy {
+        runs,
+        created,
+        deliveries,
+        ..Legacy::default()
+    };
     let mut prior = 0;
     for position in 0..placed {
         let metadata = rows
@@ -95,13 +243,113 @@ pub fn legacy(old: &[FramedRecord], lineage: Option<&str>) -> Result<Option<Lega
             );
         }
         let mid = broca_core::message_mid(true, lineage, position)?;
-        legacy.rows.insert(position, (metadata, prior, mid));
+        legacy.rows.insert(position, (metadata, Some(prior), mid));
     }
-    Ok(Some(legacy))
+    if let Some((position, metadata)) = pending_results {
+        let mid = broca_core::message_mid(true, lineage, position)?;
+        legacy.pending_results = Some((position, (metadata, Some(prior), mid)));
+    }
+    Ok(legacy)
 }
 
-/// The record for the message at `ordinal` (counting from 1).
-pub fn record(ordinal: u64, metadata: &Metadata, written_at_ms: u64, mid: String) -> EntryFacts {
+/// Today's `session.read` facts for a log off the current compaction contract, from the same
+/// projections today's page builder uses: each message's own written time
+/// (`message_times::fold` with `mode3` false), creation time, run and delivery, and id.
+fn page_only(raw: &[WalRecord], lineage: Option<&str>) -> Result<Legacy, String> {
+    let replayed = broca_core::replay(raw).map_err(|error| error.to_string())?;
+    let mut runs = BTreeMap::new();
+    let mut deliveries = BTreeMap::new();
+    let mut attribution = |position: u64, run: &broca_core::RunAttribution| {
+        runs.insert(position, run.run_id.clone());
+        if let Some(delivery) = &run.delivery {
+            deliveries.insert(position, delivery.clone());
+        }
+    };
+    for (position, run) in replayed.message_runs.iter().enumerate() {
+        if let Some(run) = run {
+            attribution(position as u64, run);
+        }
+    }
+    let stored = replayed.prompt.len() as u64;
+    // An assistant message still waiting for its tool results is held at the position after
+    // the stored ones from its step's end, as today's placement holds it, and the new format
+    // places its tool-results message after it when the last call has a result, before
+    // today's log closes the batch.
+    let mut placement = broca_core::placement::Placement::default();
+    for record in raw {
+        placement.observe(record)?;
+    }
+    let waiting = placement.held_assistant_ordinal().is_some();
+    if waiting {
+        let run = replayed.open_tool_run.clone().or_else(|| {
+            replayed
+                .run_id
+                .as_ref()
+                .map(|run| broca_core::RunAttribution {
+                    run_id: run.0.clone(),
+                    episode: run.0.clone(),
+                    is_final: false,
+                    delivery: None,
+                })
+        });
+        if let Some(run) = &run {
+            attribution(stored, run);
+        }
+    }
+    let times = broca_core::message_times::fold(
+        raw.iter(),
+        broca_core::placement::Placement::default(),
+        BTreeMap::new(),
+        false,
+        Default::default(),
+    )?
+    .times;
+    let created = broca_core::creation_times::project(
+        raw.iter(),
+        broca_core::placement::Placement::default(),
+        BTreeMap::new(),
+        Default::default(),
+    )?
+    .times;
+    let mut legacy = Legacy {
+        page_only: true,
+        runs,
+        created,
+        deliveries,
+        ..Legacy::default()
+    };
+    let row = |position: u64| -> Result<Row, String> {
+        Ok((
+            Metadata::default(),
+            times.get(&position).copied(),
+            broca_core::message_mid(false, lineage, position)?,
+        ))
+    };
+    for position in 0..stored + u64::from(waiting) {
+        legacy.rows.insert(position, row(position)?);
+    }
+    if waiting {
+        legacy.pending_results = Some((stored + 1, row(stored + 1)?));
+    }
+    Ok(legacy)
+}
+
+/// The record for the message at `ordinal` (counting from 1), whose run and creation time are
+/// `run_id` and `created_at_ms`, and whose send `display` names, if any.
+// Each argument is one fact of the record, from a different projection; grouping them would only
+// rename the record's own fields.
+#[allow(clippy::too_many_arguments)]
+pub fn record(
+    ordinal: u64,
+    metadata: &Metadata,
+    written_at_ms: Option<u64>,
+    native: bool,
+    mid: String,
+    run_id: Option<String>,
+    created_at_ms: Option<u64>,
+    delivery: Option<&broca_protocol::tags::DeliveryAttribution>,
+    display: Option<&SendDisplay>,
+) -> EntryFacts {
     let usage = metadata.usage.map(|usage| {
         // `StepUsage` can't be built field by field outside its crate; its JSON form is its
         // contract.
@@ -116,6 +364,14 @@ pub fn record(ordinal: u64, metadata: &Metadata, written_at_ms: u64, mid: String
         }
     });
     EntryFacts {
+        client_message_id: display.and_then(|display| display.client_message_id.clone()),
+        sender: display.and_then(|display| display.sender.clone()),
+        marks: display.and_then(|display| display.marks.clone()),
+        no_display_facts: None,
+        reasoning_summaries: Vec::new(),
+        rich_ui: None,
+        runner_tag_base: None,
+        legacy_view_seq: None,
         ordinal,
         written_at_ms,
         tag_base: metadata.tag_base,
@@ -128,92 +384,20 @@ pub fn record(ordinal: u64, metadata: &Metadata, written_at_ms: u64, mid: String
             version: view.version,
             checksum: view.checksum.clone(),
         }),
-        native: metadata.source_input.is_none(),
+        native,
         render_tags: metadata.render_tags,
         clean_reply: metadata.clean_reply,
         mid,
+        run_id,
+        created_at_ms,
+        // The mode's wire name, as the contract spells it.
+        delivery_mode: delivery.and_then(|delivery| {
+            serde_json::to_value(delivery.mode)
+                .ok()
+                .and_then(|mode| mode.as_str().map(str::to_owned))
+        }),
+        delivery_tool_call_id: delivery.and_then(|delivery| delivery.tool_call_id.clone()),
+        // A ride's notice is added where the ride lands, by restating these facts after it.
+        notices: Vec::new(),
     }
-}
-
-/// The compaction entry for a message the new format stored, built only from what it stored:
-/// the message, the message after it, its entry facts and the text delivered with its calls.
-/// Projected with today's projection function, so the result can be compared with today's
-/// entry.
-pub fn project(stored: &StoredEntry) -> Result<Entry, String> {
-    use broca_core::compaction_v2::entries::{project, Deliveries, EntryFacts as Facts};
-    let facts = stored
-        .state
-        .facts
-        .as_ref()
-        .ok_or_else(|| format!("message {} has no entry facts", stored.ordinal))?;
-    let mid = facts.mid.as_str();
-    let usage = facts.usage.map(|usage| {
-        let mut out = cortexkit_role_compaction::read::StepUsage::default();
-        out.prompt_tokens = usage.prompt_tokens;
-        out.cache_read_tokens = usage.cache_read_tokens;
-        out.cache_write_tokens = usage.cache_write_tokens;
-        out.output_tokens = usage.output_tokens;
-        out.reasoning_tokens = usage.reasoning_tokens;
-        out
-    });
-    let generated_under = facts
-        .generated_under
-        .as_ref()
-        .map(|view| {
-            serde_json::from_value(serde_json::json!({
-                "version": view.version,
-                "checksum": view.checksum,
-            }))
-        })
-        .transpose()
-        .map_err(|e| e.to_string())?;
-    let notice = facts.notice.as_ref().map(|notice| {
-        let mut origin = cortexkit_role_compaction::read::NoticeOrigin::new(&notice.sender);
-        origin.template = notice.template.clone();
-        origin
-    });
-    let first = Facts {
-        mid: mid.to_owned(),
-        ordinal: stored.ordinal,
-        tag_base: Some(facts.tag_base),
-        written_at: facts.written_at_ms,
-        completed_at: (stored.message.role == Role::Assistant && facts.native)
-            .then_some(facts.written_at_ms),
-        notice,
-        usage,
-        generated_under,
-    };
-    let mut messages = vec![stored.message.clone()];
-    let mut all = vec![first];
-    if let Some(next) = &stored.next {
-        messages.push(next.clone());
-        all.push(Facts {
-            mid: format!("{mid}:next"),
-            ordinal: stored.ordinal + 1,
-            tag_base: Some(facts.tag_base),
-            written_at: facts.written_at_ms,
-            ..Facts::default()
-        });
-    }
-    let mut deliveries = Deliveries::new();
-    for delivered in &stored.state.delivered {
-        let notice = delivered
-            .notice
-            .as_ref()
-            .ok_or("delivered text has no sender")?;
-        let text = delivered
-            .text
-            .strip_prefix("\n\n")
-            .unwrap_or(&delivered.text);
-        let mut out = cortexkit_role_compaction::part::Delivered::new(&notice.sender, text);
-        out.template = notice.template.clone();
-        deliveries
-            .entry((mid.to_owned(), delivered.part.to_string()))
-            .or_default()
-            .push(out);
-    }
-    project(&messages, &all, &deliveries, true)
-        .into_iter()
-        .next()
-        .ok_or_else(|| "empty projection".into())
 }

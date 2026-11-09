@@ -1,12 +1,12 @@
-//! Frames: how one record sits in an open log, encrypted.
+//! Frames: how one record sits in an open log, sealed.
 //!
 //! ```text
-//! length      u32 LE: bytes after this field (header, checksum, nonce, ciphertext, tag)
+//! length      u32 LE: bytes after this field (header, checksum, then the sealed body)
 //! header      35 bytes, fixed layout below; plaintext but authenticated
 //! header_crc  u32 LE: CRC32C over the length and the header
-//! nonce       24 random bytes
-//! ciphertext  the record body, XChaCha20-Poly1305
-//! tag         16 bytes
+//! body        the record body as one sealed unit (see `FrameKey::seal_unit`):
+//!               encrypted: 24 random nonce bytes, the XChaCha20-Poly1305 ciphertext, a 16-byte tag
+//!               plain: the record body, then a 16-byte unkeyed check
 //! ```
 //!
 //! The header has a fixed width so a reader that has met damage can test any byte offset for a
@@ -17,11 +17,12 @@
 //!   that never finished;
 //! - a complete header failing its checksum: **damage**, never an unfinished write, so a damaged
 //!   length can't make acknowledged bytes look like a torn tail;
-//! - a frame failing authentication: **damage**.
+//! - a frame failing authentication, or its plain check: **damage**.
 //!
 //! The authenticated data binds each frame to its place: the caller's `bind` bytes (the session
 //! id and the log's name), then the length and the header. A frame moved to another log, another
-//! session, or another position fails to authenticate or fails the frame-index check.
+//! session, or another position fails to authenticate or fails the frame-index check. A plain
+//! frame's check covers the same bytes, so the same holds for it.
 //!
 //! Nonces are random, never derived from position: a crash can leave a log's tail rewritten at
 //! the same position with different bytes, and a repeated nonce under a different plaintext would
@@ -29,6 +30,9 @@
 
 use chacha20poly1305::aead::{AeadInPlace, KeyInit};
 use chacha20poly1305::{Key, Tag, XChaCha20Poly1305, XNonce};
+use sha2::{Digest as _, Sha256};
+
+use crate::keys::Cipher;
 
 pub const FRAME_VERSION: u8 = 1;
 pub const HEADER_LEN: usize = 35;
@@ -36,8 +40,15 @@ const LENGTH_LEN: usize = 4;
 const CRC_LEN: usize = 4;
 const NONCE_LEN: usize = 24;
 const TAG_LEN: usize = 16;
-/// Bytes a frame adds around a record body.
+/// Bytes a plain unit's check adds after its plaintext.
+pub const CHECK_LEN: usize = 16;
+/// What a plain unit's check is the SHA-256 of, before its authenticated data and plaintext.
+const CHECK_CONTEXT: &[u8] = b"broca-plain-unit-v1";
+/// Bytes an encrypted frame adds around a record body. A plain frame adds
+/// [`PLAIN_FRAME_OVERHEAD`]; [`FrameKey::frame_overhead`] gives a key's.
 pub const FRAME_OVERHEAD: usize = LENGTH_LEN + HEADER_LEN + CRC_LEN + NONCE_LEN + TAG_LEN;
+/// Bytes a plain frame adds around a record body.
+pub const PLAIN_FRAME_OVERHEAD: usize = LENGTH_LEN + HEADER_LEN + CRC_LEN + CHECK_LEN;
 /// The largest body a frame may carry. Larger bodies are blobs; a length above this is damage.
 pub const MAX_BODY: usize = 64 << 20;
 
@@ -88,18 +99,56 @@ pub enum FrameError {
     BodyTooLarge,
 }
 
-/// A data key with the id frames name it by.
+/// A session's key with the id frames name it by, in the session's mode: a data key's cipher for
+/// an encrypted session, or none for a plain one. Every sealed unit of the session goes through
+/// [`seal_unit`](Self::seal_unit) and [`open_unit`](Self::open_unit), so the mode lives here and
+/// callers don't change with it.
 #[derive(Clone)]
 pub struct FrameKey {
     id: u16,
-    cipher: XChaCha20Poly1305,
+    /// `None` for a plain key.
+    cipher: Option<XChaCha20Poly1305>,
+}
+
+/// The check a plain unit carries: the first 16 bytes of SHA-256 over a fixed context, the
+/// length of the authenticated data, the authenticated data and the plaintext. It covers what an
+/// encrypted unit's tag covers, so torn bytes, damage and a unit moved to another place fail it,
+/// but it holds no key, so it can't detect a deliberate edit.
+pub(crate) fn plain_check(aad: &[u8], plaintext: &[u8]) -> [u8; CHECK_LEN] {
+    let digest = Sha256::new()
+        .chain_update(CHECK_CONTEXT)
+        .chain_update((aad.len() as u64).to_le_bytes())
+        .chain_update(aad)
+        .chain_update(plaintext)
+        .finalize();
+    digest[..CHECK_LEN]
+        .try_into()
+        .expect("a SHA-256 digest is longer than the check")
 }
 
 impl FrameKey {
     pub fn new(id: u16, key: &[u8; 32]) -> Self {
         Self {
             id,
-            cipher: XChaCha20Poly1305::new(Key::from_slice(key)),
+            cipher: Some(XChaCha20Poly1305::new(Key::from_slice(key))),
+        }
+    }
+
+    /// The key of a plain session's units, under key id [`crate::keys::PLAIN_KEY_ID`].
+    pub fn plain() -> Self {
+        Self {
+            id: crate::keys::PLAIN_KEY_ID,
+            cipher: None,
+        }
+    }
+
+    /// A key in mode `cipher` under key id `id`: `key` encrypts in the encrypted mode and is
+    /// ignored in the plain one. Tests and fuzz targets only, so one test runs in either mode.
+    #[cfg(any(test, fuzzing))]
+    pub fn for_tests(cipher: Cipher, id: u16, key: &[u8; 32]) -> Self {
+        match cipher {
+            Cipher::XChaCha20Poly1305 => Self::new(id, key),
+            Cipher::None => Self { id, cipher: None },
         }
     }
 
@@ -107,14 +156,41 @@ impl FrameKey {
         self.id
     }
 
-    /// Encrypts `plaintext` as one sealed unit: a random nonce, the ciphertext and the tag.
-    /// `aad` names where the unit lives; [`open_unit`](Self::open_unit) must get the same bytes.
+    /// The mode this key seals in.
+    pub fn cipher(&self) -> Cipher {
+        match self.cipher {
+            Some(_) => Cipher::XChaCha20Poly1305,
+            None => Cipher::None,
+        }
+    }
+
+    /// Bytes a sealed unit adds to its plaintext.
+    pub fn unit_overhead(&self) -> usize {
+        match self.cipher {
+            Some(_) => NONCE_LEN + TAG_LEN,
+            None => CHECK_LEN,
+        }
+    }
+
+    /// Bytes a frame sealed under this key adds around its record body.
+    pub fn frame_overhead(&self) -> usize {
+        LENGTH_LEN + HEADER_LEN + CRC_LEN + self.unit_overhead()
+    }
+
+    /// Seals `plaintext` as one unit. Encrypted: a random nonce, the ciphertext and the tag.
+    /// Plain: the plaintext, then its check (see `plain_check`). `aad` names where the unit
+    /// lives; [`open_unit`](Self::open_unit) must get the same bytes.
     pub(crate) fn seal_unit(&self, aad: &[u8], plaintext: &[u8]) -> Vec<u8> {
+        let Some(cipher) = &self.cipher else {
+            let mut out = Vec::with_capacity(plaintext.len() + CHECK_LEN);
+            out.extend_from_slice(plaintext);
+            out.extend_from_slice(&plain_check(aad, plaintext));
+            return out;
+        };
         let mut nonce = [0u8; NONCE_LEN];
         getrandom::getrandom(&mut nonce).expect("the OS random source is available");
         let mut buffer = plaintext.to_vec();
-        let tag = self
-            .cipher
+        let tag = cipher
             .encrypt_in_place_detached(XNonce::from_slice(&nonce), aad, &mut buffer)
             .expect("encryption of a bounded unit cannot fail");
         let mut out = Vec::with_capacity(NONCE_LEN + buffer.len() + TAG_LEN);
@@ -124,16 +200,22 @@ impl FrameKey {
         out
     }
 
-    /// Decrypts a unit [`seal_unit`](Self::seal_unit) produced, or `None` when it fails to
-    /// authenticate under `aad`.
+    /// The plaintext of a unit [`seal_unit`](Self::seal_unit) produced under this key, or `None`
+    /// when it fails to authenticate, or fails its check, under `aad`. A unit is only ever read
+    /// in this key's mode.
     pub(crate) fn open_unit(&self, aad: &[u8], sealed: &[u8]) -> Option<Vec<u8>> {
+        let Some(cipher) = &self.cipher else {
+            let body_len = sealed.len().checked_sub(CHECK_LEN)?;
+            let (body, check) = sealed.split_at(body_len);
+            return (check == plain_check(aad, body)).then(|| body.to_vec());
+        };
         if sealed.len() < NONCE_LEN + TAG_LEN {
             return None;
         }
         let (nonce, rest) = sealed.split_at(NONCE_LEN);
         let (ciphertext, tag) = rest.split_at(rest.len() - TAG_LEN);
         let mut buffer = ciphertext.to_vec();
-        self.cipher
+        cipher
             .decrypt_in_place_detached(
                 XNonce::from_slice(nonce),
                 aad,
@@ -235,7 +317,7 @@ fn read_header(bytes: &[u8; HEADER_LEN]) -> Result<FrameHeader, FrameError> {
     })
 }
 
-/// Encrypts `body` into a frame. `bind` names where the frame lives (session id and log name);
+/// Seals `body` into a frame. `bind` names where the frame lives (session id and log name);
 /// a reader must pass the same bytes.
 pub fn seal(
     header: &FrameHeader,
@@ -249,31 +331,21 @@ pub fn seal(
     if header.key_id != key.id {
         return Err(FrameError::UnknownKey(header.key_id));
     }
-    let length = (HEADER_LEN + CRC_LEN + NONCE_LEN + body.len() + TAG_LEN) as u32;
+    let length = (HEADER_LEN + CRC_LEN + key.unit_overhead() + body.len()) as u32;
     let mut out = Vec::with_capacity(LENGTH_LEN + length as usize);
     out.extend_from_slice(&length.to_le_bytes());
     write_header(header, &mut out)?;
     let crc = crc32c::crc32c(&out);
     out.extend_from_slice(&crc.to_le_bytes());
 
-    let mut nonce = [0u8; NONCE_LEN];
-    getrandom::getrandom(&mut nonce).expect("the OS random source is available");
-    out.extend_from_slice(&nonce);
-
     let mut aad = Vec::with_capacity(bind.len() + LENGTH_LEN + HEADER_LEN);
     aad.extend_from_slice(bind);
     aad.extend_from_slice(&out[..LENGTH_LEN + HEADER_LEN]);
-    let mut buffer = body.to_vec();
-    let tag = key
-        .cipher
-        .encrypt_in_place_detached(XNonce::from_slice(&nonce), &aad, &mut buffer)
-        .expect("encryption of a bounded body cannot fail");
-    out.extend_from_slice(&buffer);
-    out.extend_from_slice(&tag);
+    out.extend_from_slice(&key.seal_unit(&aad, body));
     Ok(out)
 }
 
-/// Reads and decrypts the frame at the start of `bytes`. `key` finds a data key by its id.
+/// Reads and opens the frame at the start of `bytes`. `key` finds a data key by its id.
 pub fn open<'k>(
     bytes: &[u8],
     key: impl Fn(u16) -> Option<&'k FrameKey>,
@@ -292,7 +364,10 @@ pub fn open<'k>(
         .try_into()
         .unwrap();
     let header = read_header(header_bytes)?;
-    let smallest = HEADER_LEN + CRC_LEN + NONCE_LEN + TAG_LEN;
+    // The smallest frame is the one its key seals around an empty body. A key id this reader
+    // doesn't hold refuses below, after the length is judged as an encrypted frame's.
+    let unit_overhead = key(header.key_id).map_or(NONCE_LEN + TAG_LEN, FrameKey::unit_overhead);
+    let smallest = HEADER_LEN + CRC_LEN + unit_overhead;
     if !(smallest..=smallest + MAX_BODY).contains(&length) {
         return Err(FrameError::BadHeader("length out of range"));
     }
@@ -301,23 +376,12 @@ pub fn open<'k>(
         return Ok(FrameRead::Incomplete);
     }
     let cipher = key(header.key_id).ok_or(FrameError::UnknownKey(header.key_id))?;
-    let nonce = &bytes[fixed..fixed + NONCE_LEN];
-    let ciphertext = &bytes[fixed + NONCE_LEN..total - TAG_LEN];
-    let tag = &bytes[total - TAG_LEN..total];
-
     let mut aad = Vec::with_capacity(bind.len() + LENGTH_LEN + HEADER_LEN);
     aad.extend_from_slice(bind);
     aad.extend_from_slice(&bytes[..LENGTH_LEN + HEADER_LEN]);
-    let mut body = ciphertext.to_vec();
-    cipher
-        .cipher
-        .decrypt_in_place_detached(
-            XNonce::from_slice(nonce),
-            &aad,
-            &mut body,
-            Tag::from_slice(tag),
-        )
-        .map_err(|_| FrameError::Authentication)?;
+    let body = cipher
+        .open_unit(&aad, &bytes[fixed..total])
+        .ok_or(FrameError::Authentication)?;
     Ok(FrameRead::Frame {
         header,
         body,

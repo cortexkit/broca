@@ -36,7 +36,10 @@ pub fn possible(frozen: &FrozenRenderConfig, prompt: &[broca_protocol::Message])
     possible_after(frozen, prompt.last(), false)
 }
 
-pub(crate) fn possible_after(
+/// Whether a template delivered right after `preceding` can go out at system authority on the
+/// route `frozen` names; `followed_by_user` says another send in the same request will place a
+/// user message after it.
+pub fn possible_after(
     frozen: &FrozenRenderConfig,
     preceding: Option<&broca_protocol::Message>,
     followed_by_user: bool,
@@ -55,10 +58,7 @@ pub(crate) fn possible_after(
 
 /// Downgrade only the rendered copy: history retains its bytes, role and delivery mode.
 /// A borrowed result leaves every legacy request on its original rendering path.
-pub(crate) fn prepare<'a>(
-    frozen: &FrozenRenderConfig,
-    opts: &'a CallOptions,
-) -> Cow<'a, CallOptions> {
+pub fn prepare<'a>(frozen: &FrozenRenderConfig, opts: &'a CallOptions) -> Cow<'a, CallOptions> {
     if supported(frozen) || !opts.prompt.iter().any(|message| message.turn_system) {
         return Cow::Borrowed(opts);
     }

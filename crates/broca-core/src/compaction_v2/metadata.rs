@@ -16,7 +16,7 @@ use crate::placement::{AppendKind, HoldKind, Placement, PlacementAction};
 
 /// Compaction-view metadata and live display use the same frozen render configuration
 /// to decide whether assistant replies are cleaned.
-pub(crate) fn clean_replies(render_tags: bool, frozen_render_config: &serde_json::Value) -> bool {
+pub fn clean_replies(render_tags: bool, frozen_render_config: &serde_json::Value) -> bool {
     render_tags
         && !broca_protocol::structured_output::FrozenStructuredOutput::from_frozen_render_config(
             Some(frozen_render_config),
@@ -114,17 +114,12 @@ impl Origin {
     /// unverified caller has no module id to name, so its send carries no notice origin,
     /// even when it was recorded with `notice: true`.
     fn notice(&self) -> Option<NoticeOrigin> {
-        if self
-            .marks
-            .as_ref()
-            .is_some_and(|marks| marks.speaks_for.is_some() && !marks.notice)
-        {
-            return None;
-        }
         let sender = super::entries::delivery_sender(self.principal.as_ref(), DeliveryMode::Steer)?;
-        let mut notice = NoticeOrigin::new(sender);
-        notice.template = self.template.clone();
-        Some(notice)
+        super::entries::recorded_notice_origin(
+            Some(&sender),
+            self.template.as_deref(),
+            self.marks.as_ref(),
+        )
     }
 }
 
@@ -259,6 +254,22 @@ fn numbered_flags(message: &Message) -> Vec<bool> {
                 _ => return false,
             };
             cortexkit_compaction_view::tags::is_numbered(&role, &body)
+        })
+        .collect()
+}
+
+/// The part number each block of `message` shows under the compaction projection, when its
+/// numbering continues after `tag_base`: what [`attach_native_tags`] attaches, and what a
+/// request rendered on the compaction contract shows the model.
+pub fn compaction_part_numbers(message: &Message, tag_base: u64) -> Vec<Option<u64>> {
+    let mut high = tag_base;
+    numbered_flags(message)
+        .into_iter()
+        .map(|numbered| {
+            numbered.then(|| {
+                high += 1;
+                high
+            })
         })
         .collect()
 }

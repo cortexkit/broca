@@ -10,10 +10,12 @@
 
 pub mod actor;
 pub mod cache;
+pub mod claude_code_identity;
 mod compaction_watch;
 pub mod diagnostics;
 pub mod executor;
 pub mod fanout;
+pub mod head_time;
 pub mod held_slots;
 pub mod held_withdrawals;
 pub mod history;
@@ -31,7 +33,24 @@ mod send_fate;
 mod sender_admission;
 pub mod serve;
 pub mod session_class;
+pub mod store_actor;
+pub mod store_billing;
+pub mod store_calls;
+pub mod store_control;
+pub mod store_entries;
+pub mod store_fanout;
+pub mod store_head;
+pub mod store_import;
+pub mod store_media;
+pub mod store_open;
+pub mod store_output_refs;
+mod store_plan_change;
+pub mod store_read;
+pub mod store_reads;
+pub mod store_status;
+pub mod store_tool_calls;
 mod uploads;
+pub mod wal_render;
 
 pub use cache::{CacheDeclaration, CacheDeclarer};
 pub use executor::{RunExecutor, RunJob, RunKind, SealedRun, WarmBase, WarmError, WarmJob};

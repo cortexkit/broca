@@ -20,6 +20,9 @@ use broca_protocol::usage::Usage;
 
 use crate::fold::Bound;
 use crate::record::{BudgetFiring, CallOutcome, CancelPoint, Record, Stream};
+use broca_protocol::session_change::{
+    model_key, Applying, Pending as PendingTransition, Transitions,
+};
 
 /// Why the ledger can't be folded.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +36,9 @@ pub enum FoldError {
     /// A record arrived after a change's intent closed the log, other than that change's abort;
     /// or an abort with no open change.
     LogClosed(&'static str),
+    /// A second `CompactionEnrolled`, or one that follows no run start: a session enrolls once,
+    /// in its enrolling run's start batch.
+    Enrollment(&'static str),
 }
 
 /// The ledger events that change a run's state but aren't folded yet.
@@ -40,7 +46,6 @@ const NOT_FOLDED: &[&str] = &[
     "approval_recorded",
     "awaiting_approval",
     "input_token_budget_exhausted",
-    "model_step_refused",
     "recovery_call_closed",
     "recovery_cut",
     "tool_call_deferred",
@@ -56,6 +61,15 @@ crate::message! {
         /// A provider took the call to answer later; `Some(true)` when later calls wait for it.
         3 opt held: bool,
         4 opt terminal: CallOutcome,
+        /// The key its intent recorded, which a resume sends it again with. A call answered
+        /// without an intent takes the key its outcome recorded instead; it is bounded with the
+        /// batch's calls.
+        5 opt key: String,
+        /// The provider's held reply, which a resume rejoins the call's wait with.
+        6 opt held_reply: crate::record::ToolHeld,
+        /// The input its intent recorded when it differs from the model's message (an approval
+        /// policy narrowed it); a resume that sends the call again sends this.
+        7 opt args: serde_json::Value,
     }
 }
 
@@ -85,6 +99,9 @@ state! {
             reset: "batch_start",
             bound: Bound::OpenWork("one step's tool calls"),
         },
+        /// The id the batch's `BatchStart` decided for the tool-results message its replies
+        /// make (`BatchStart::mid`).
+        4 opt pub results_mid: String => { owner: "run loop", reset: "batch_start", bound: Bound::Fixed },
     }
 }
 
@@ -107,6 +124,34 @@ impl OpenBatch {
         !self.calls[..position]
             .iter()
             .any(|call| call.id == self.calls[position].id)
+    }
+
+    /// The id of the planned call at `position`.
+    pub fn id(&self, position: usize) -> &ToolCallId {
+        &self.calls[position].id
+    }
+
+    /// The key the intent of the planned call at `position` recorded, or for a call answered
+    /// without an intent the key its outcome recorded, if it has one.
+    pub fn key(&self, position: usize) -> Option<&str> {
+        self.calls[position].key.as_deref()
+    }
+
+    /// The input the intent of the planned call at `position` recorded, when it differs from the
+    /// model's message.
+    pub fn args(&self, position: usize) -> Option<&serde_json::Value> {
+        self.calls[position].args.as_ref()
+    }
+
+    /// The provider's held reply for the planned call at `position`, if a provider holds it.
+    pub fn held_reply(&self, position: usize) -> Option<&crate::record::ToolHeld> {
+        self.calls[position].held_reply.as_ref()
+    }
+
+    /// The state of the planned call `id`, if the batch plans it.
+    pub fn state_of(&self, id: &ToolCallId) -> Option<CallState> {
+        let position = self.calls.iter().position(|call| &call.id == id)?;
+        Some(self.state(position))
     }
 
     pub fn state(&self, position: usize) -> CallState {
@@ -157,6 +202,64 @@ impl OpenBatch {
         } else {
             RunFinishReason::Completed
         })
+    }
+}
+
+crate::message! {
+    /// Messages accepted into the running run that wait for its next step boundary: a steer's,
+    /// or a queued send's delivered as user or turn-scoped system messages. The record that
+    /// accepted them keeps them; the boundary places copies in the transcript.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct PendingInput {
+        /// The seq of the record that accepted the messages; absent when folded without seqs.
+        1 opt seq: u64,
+        2 req placement: crate::record::Placement,
+        3 rep messages: broca_protocol::content::Message,
+        4 opt written_at_ms: u64,
+        /// The v1 part numbers, one entry per message.
+        5 opt tags_v1: serde_json::Value,
+        /// The queued send a delivery came from.
+        6 opt submission_id: String,
+        /// The attested module id of the send's sender, when a module sent it: a steer's
+        /// `sent_by`, or a delivered send's (see [`Pending::sender`]).
+        7 opt sender: String,
+        /// The send's request identity digest, as its record kept it, which names the
+        /// `client_message_id` the caller gave it.
+        8 opt request_identity_digest: String,
+        /// Where the bytes of the messages' media are stored, as the accepting record named
+        /// them, so each placed copy points at the same objects.
+        9 rep [must] media: crate::record::SendMedia,
+        /// The send's display marks, as its record kept them (llm-runner's `MessageMarks`
+        /// JSON), which the placed messages' facts carry.
+        10 opt [must] message_marks: serde_json::Value,
+    }
+}
+
+impl PendingInput {
+    /// Where the media of the `index`th message are stored, as its transcript copy names them.
+    pub fn media_at(&self, index: usize) -> Vec<crate::record::InputMedia> {
+        self.media
+            .iter()
+            .filter(|medium| medium.message as usize == index)
+            .map(|medium| crate::record::InputMedia {
+                block: medium.block,
+                part: medium.part,
+                log: medium.log,
+                generation: medium.generation,
+                seq: medium.seq,
+            })
+            .collect()
+    }
+
+    /// The v1 part numbers of the `index`th message, when the record lists one entry per
+    /// message.
+    pub fn tags_at(&self, index: usize) -> Option<serde_json::Value> {
+        match &self.tags_v1 {
+            Some(serde_json::Value::Array(list)) if list.len() == self.messages.len() => {
+                list.get(index).cloned()
+            }
+            _ => None,
+        }
     }
 }
 
@@ -238,11 +341,11 @@ state! {
             reset: "run_start",
             bound: Bound::Fixed,
         },
-        /// Steered or delivered messages waiting for a step boundary.
-        14 req pub pending_steers: usize => {
+        /// Steered or delivered messages waiting for a step boundary, in the order accepted.
+        14 rep pub pending_steers: PendingInput => {
             owner: "queue",
             reset: "step_start",
-            bound: Bound::Fixed,
+            bound: Bound::OpenWork("messages accepted since the last step boundary"),
         },
         15 opt pub cancel: CancelPoint => {
             owner: "admission",
@@ -280,6 +383,152 @@ state! {
             reset: "run_start",
             bound: Bound::Fixed,
         },
+        /// The run's start as written: its frozen choices and render config, which a resume
+        /// continues under.
+        22 opt pub start: crate::record::RunStart => {
+            owner: "admission",
+            reset: "run_start",
+            bound: Bound::Config("the run's frozen start: its choices, render config and setup parts"),
+        },
+        /// The context-ceiling detail the run ended on, which `run.status` reports.
+        23 opt pub context_ceiling: serde_json::Value => {
+            owner: "run loop",
+            reset: "run_start",
+            bound: Bound::Fixed,
+        },
+        /// The lowered output cap a step of this run recorded, until that step ends: a resume
+        /// that sends the step again sends it with this cap.
+        24 opt pub output_cap: OutputCap => {
+            owner: "run loop",
+            reset: "a step's end",
+            bound: Bound::Fixed,
+        },
+        /// The run's strict structured-output schema was downgraded after the provider refused
+        /// its grammar: every later request renders it without the strict flag.
+        25 req pub structured_downgraded: bool => {
+            owner: "run loop",
+            reset: "run_start",
+            bound: Bound::Fixed,
+        },
+        /// The warms the run's own keep-warm sent during the tool wait after its newest step,
+        /// which that wait's spending cap counts after a restart. Bounded by the cap: a wait
+        /// stops warming before it spends what one cache rewrite costs.
+        26 rep pub warms: WarmSpend => {
+            owner: "run loop",
+            reset: "a step's start",
+            bound: Bound::OpenWork("the warms of one tool wait"),
+        },
+        /// The render config a paused run's resume refroze before any provider call, which the
+        /// run renders with in place of its start's: `{renderer_version, render_config}`.
+        27 opt pub refrozen_render: serde_json::Value => {
+            owner: "provider layer",
+            reset: "run_start",
+            bound: Bound::Config("one render config"),
+        },
+        /// The provider account a paused run's resume refroze, which the run uses in place of
+        /// its start's.
+        28 opt pub refrozen_auth: serde_json::Value => {
+            owner: "admission",
+            reset: "run_start",
+            bound: Bound::Fixed,
+        },
+        /// The step the run's own model refused, now being re-sent to the refusal-fallback
+        /// model: a resume sends it there again, and it is never refused a second time. Only the
+        /// step in progress can be one; cleared when a step ends.
+        29 opt pub refused_step: u64 => {
+            owner: "run loop",
+            reset: "a step's end",
+            bound: Bound::Fixed,
+        },
+        /// When the request that produced the current step's response was sent: the newest
+        /// attempt that completed the step and wasn't a warm. An assistant message's creation
+        /// time is this. A warm for the step clears it, and an attempt with no send time leaves
+        /// it unknown, as `broca_core::creation_times` rules.
+        30 opt pub step_request: StepRequest => {
+            owner: "run loop",
+            reset: "step_start",
+            bound: Bound::Fixed,
+        },
+        /// When the newest attempt that completed the current step finished, warm or not. An
+        /// assistant message without its own written time takes this, as
+        /// `broca_core::message_times` rules.
+        31 opt pub step_attempt: StepAttempt => {
+            owner: "run loop",
+            reset: "step_start",
+            bound: Bound::Fixed,
+        },
+        /// Owned by the provider layer: the typed error the run's end or pause recorded, so a
+        /// read names it without reading the log back.
+        32 opt pub end_error: serde_json::Value => {
+            owner: "run loop",
+            reset: "run_start",
+            bound: Bound::Fixed,
+        },
+        /// The usage the run's end recorded.
+        33 opt pub end_usage: Usage => {
+            owner: "run loop",
+            reset: "run_start",
+            bound: Bound::Fixed,
+        },
+        /// The id the current step's `StepStart` decided for the assistant message it writes
+        /// (`StepStart::mid`), kept until the next step starts so the message's `EntryFacts` can
+        /// be checked against it.
+        34 opt pub step_mid: String => {
+            owner: "run loop",
+            reset: "step_start",
+            bound: Bound::Fixed,
+        },
+    }
+}
+
+crate::message! {
+    /// The request that produced a step's response (`Run::step_request`).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct StepRequest {
+        1 req step_id: u64,
+        2 opt sent_at_ms: u64,
+    }
+}
+
+crate::message! {
+    /// When the newest attempt that completed a step finished (`Run::step_attempt`).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct StepAttempt {
+        1 req step_id: u64,
+        2 req ts_ms: u64,
+    }
+}
+
+crate::message! {
+    /// One warm a tool wait sent, with what its price is read from.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct WarmSpend {
+        1 req step_id: u64,
+        2 req reached_cache: bool,
+        3 req usage: broca_protocol::usage::Usage,
+        /// Owned by billing: the warm's reservation and envelope, when it carries them.
+        4 opt billing: serde_json::Value,
+        5 opt ttl_ms: u64,
+    }
+}
+
+crate::message! {
+    /// A step's lowered output cap.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct OutputCap {
+        1 req step_id: u64,
+        2 req max_output_tokens: u32,
+    }
+}
+
+crate::message! {
+    /// A step's measured input: what the provider reported as its full input, the body length of
+    /// the attempt that produced it, and the model that measured it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct OutputMeasure {
+        1 req input_tokens: u64,
+        2 req request_bytes: u64,
+        3 req model: broca_protocol::request::ModelHandle,
     }
 }
 
@@ -315,14 +564,27 @@ impl Run {
             open_batch: None,
             unknown: Vec::new(),
             hard_stopped: None,
-            pending_steers: 0,
+            pending_steers: Vec::new(),
             cancel: None,
             budget: Budget::default(),
             last_step_usage: None,
             provider_call_started: false,
             account_limit_pause: None,
+            context_ceiling: None,
+            output_cap: None,
+            structured_downgraded: false,
+            refrozen_render: None,
+            refrozen_auth: None,
+            refused_step: None,
+            step_request: None,
+            step_attempt: None,
+            end_error: None,
+            end_usage: None,
+            step_mid: None,
+            warms: Vec::new(),
             keep_warm: start.keep_warm.clone(),
             on_restart: start.on_restart.clone(),
+            start: Some(start.clone()),
         }
     }
 
@@ -340,6 +602,14 @@ impl Run {
     }
 
     /// What a resume must do. The order matters: the first rule that applies decides.
+    /// How many steered or delivered messages wait for the next step boundary.
+    pub fn pending_messages(&self) -> usize {
+        self.pending_steers
+            .iter()
+            .map(|input| input.messages.len())
+            .sum()
+    }
+
     pub fn resolution(&self) -> Resolution {
         let indeterminate = self.indeterminate();
         let open = self.finished.is_none();
@@ -388,7 +658,7 @@ impl Run {
             return Resolution::Idle(reason);
         }
         if let Some(end) = self.natural_end {
-            if !(end.extendable && self.pending_steers > 0) {
+            if !(end.extendable && self.pending_messages() > 0) {
                 return Resolution::Idle(end.stop.unwrap_or(RunFinishReason::Completed));
             }
         }
@@ -424,6 +694,17 @@ crate::message! {
         1 req submission_id: String,
         /// Queued by an interrupting send: it drains ahead of every plain send.
         2 req interrupt: bool,
+        /// Queued with a delivery order (its `DeliveryOrdered` record): a running run may
+        /// deliver it at a boundary, by the first mode in its order possible there.
+        3 req ordered: bool,
+        /// The attested module id of the send's sender, when a module sent it: the principal
+        /// its receipt names as sender, else as owner, as today's reads name it.
+        4 opt sender: String,
+        /// The send's request identity digest, as its receipt kept it.
+        5 opt request_identity_digest: String,
+        /// The send's display marks, as its record kept them (llm-runner's `MessageMarks`
+        /// JSON), which the messages it places carry.
+        6 opt [must] message_marks: serde_json::Value,
     }
 }
 
@@ -494,6 +775,704 @@ state! {
             reset: "never",
             bound: Bound::Fixed,
         },
+        /// The setup the latest run started with. A run whose setup equals it starts without a
+        /// new `SetupStub`.
+        10 opt pub setup: SetupInForce => {
+            owner: "admission",
+            reset: "run_start",
+            bound: Bound::Declared,
+        },
+        /// The send a `DeliveryOrdered` record just named. Its `QueuedSend` follows in the same
+        /// batch and takes the mark.
+        11 opt pub ordered_next: String => {
+            owner: "queue",
+            reset: "queued_send",
+            bound: Bound::Fixed,
+        },
+        /// What compaction estimates the next request's size from: the newest step and the
+        /// request body lengths around it. Session-scoped, so a new run's first estimate still
+        /// counts from the previous run's last step.
+        12 opt pub estimate: Estimate => {
+            owner: "compaction",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
+        /// The run of the newest request the provider accepted: a step's end, or an attempt
+        /// that reached the cache. A compaction ride compares that run's model, tier, account
+        /// and surface with the current run's.
+        13 opt pub last_send_run: String => {
+            owner: "compaction",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
+        /// The newest request that reached the provider's cache, by when it was sent: the cache's
+        /// lifetime counts from it.
+        14 opt pub last_cache_send: CacheSend => {
+            owner: "compaction",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
+        /// The ledger holds a record of the first compaction protocol (its notices, waits and
+        /// applied views stay generic events under their old names; the current contract's are
+        /// typed). Only today's run loop renders such a session, so the new run loop refuses it.
+        15 req pub first_protocol_compaction: bool => {
+            owner: "compaction",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
+        /// The newest step whose input the provider measured, which the run loop estimates the
+        /// next request's input from when it decides whether a step's output cap must be
+        /// lowered. A step without a measurement leaves the older one in place. Session-scoped:
+        /// an earlier run's step still measures this run's model.
+        16 opt pub output_measure: OutputMeasure => {
+            owner: "run loop",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
+        /// The body length of the newest attempt no step's end has closed yet, which the next
+        /// step's end measures against.
+        17 opt pub output_attempt_bytes: u64 => {
+            owner: "run loop",
+            reset: "run_start",
+            bound: Bound::Fixed,
+        },
+        /// The request digest of the newest attempt that reached the cache. A warm of the
+        /// source model's cache counts as reaching the cache only when it refreshed that
+        /// request, as today's cache clock reads it.
+        18 opt pub last_cache_attempt_digest: crate::codec::Digest => {
+            owner: "compaction",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
+        /// Who drove the session's runs, which decides who may act on it as its owner.
+        19 req pub owner: Owner => {
+            owner: "admission",
+            reset: "never",
+            bound: Bound::Declared,
+        },
+        /// The session's usage over every step, by model. Absent until a step counted.
+        20 opt pub session_usage: SessionUsage => {
+            owner: "run loop",
+            reset: "never",
+            bound: Bound::Declared,
+        },
+        /// The runs whose spend facts are owed to the usage export: a run's end adds it, unless
+        /// the run was seeded from an import or fork and so never called a provider, and its
+        /// `Billed` record removes it. The store actor bills every run listed here.
+        21 rep pub billing_owed: String => {
+            owner: "billing",
+            reset: "billed",
+            bound: Bound::OpenWork("runs that ended and aren't billed yet"),
+        },
+        /// Where an import's id map is stored, from the seeded run start that names it. Reads
+        /// resolve an imported message's source id through it.
+        22 opt pub imported_ids: crate::record::ImportedIds => {
+            owner: "import",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
+        /// The newest title a send to the session carried: on a run start, or in a queued
+        /// send's or a steer's receipt, whichever came last. `session.head` serves it, as
+        /// today's head serves the newest title its log holds on those three records. A later
+        /// send without a title leaves it.
+        23 opt pub title: String => {
+            owner: "admission",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
+        /// The session's plan changes and the manifests in force, as today's
+        /// `SessionChangeState` folds them: absent until the session's first run start or
+        /// refresh. Only fixed-size facts are kept; what was recorded under one generation or
+        /// one `send_id` is found by looking up that id.
+        24 opt pub plan: Plan => {
+            owner: "admission",
+            reset: "never",
+            bound: Bound::Declared,
+        },
+        /// The session's move onto the current compaction contract, once a run made it
+        /// (`CompactionEnrolled`). A session moves at most once, and never back.
+        25 opt pub enrolled: Enrollment => {
+            owner: "admission",
+            reset: "never",
+            bound: Bound::Declared,
+        },
+        /// The highest part number the projection's numbering is known to have given, from the
+        /// records that set or lower it: an enrollment, and a revert that dropped messages.
+        /// Never decreases. The highest part number any message ever took is the larger of this
+        /// and the newest message's (`broca_session_loop::entries::lifetime_tag_high`).
+        26 req pub tag_high_water: u64 => {
+            owner: "admission",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
+    }
+}
+
+state! {
+    /// A session's move onto the current compaction contract: the enrollment record's facts,
+    /// and the run that made it.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct Enrollment {
+        1 req pub through_ordinal: u64 => { owner: "admission", reset: "never", bound: Bound::Fixed },
+        2 req pub tag_floor: u64 => { owner: "admission", reset: "never", bound: Bound::Fixed },
+        3 req pub tag_high: u64 => { owner: "admission", reset: "never", bound: Bound::Fixed },
+        /// Where the per-message decisions are stored: one object per enrollment, sized by the
+        /// messages placed before it.
+        4 req pub overlay: crate::record::EnrollmentOverlayRef => {
+            owner: "admission",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
+        /// The enrolling run, whose start the record's batch holds.
+        5 req pub run_id: String => { owner: "admission", reset: "never", bound: Bound::Fixed },
+    }
+}
+
+state! {
+    /// A plan manifest, referenced as a run start references the manifest it froze: the setup
+    /// parts it is stored as (its plan, each provider's answer, its tools, its system text and its
+    /// declarations, in that order) and the rest of its members.
+    #[derive(Debug, Clone, Default, PartialEq)]
+    pub struct ManifestRef {
+        1 rep pub parts: crate::record::PartRef => {
+            owner: "admission",
+            reset: "a run start or a refresh",
+            bound: Bound::Config("one part per manifest member: its plan, its tools, its system text, its declarations, and one answer per provider its plan names"),
+        },
+        2 opt pub rest: serde_json::Value => {
+            owner: "admission",
+            reset: "a run start or a refresh",
+            bound: Bound::Fixed,
+        },
+    }
+}
+
+state! {
+    /// The refresh accepted and not yet applied.
+    #[derive(Debug, Clone, Default, PartialEq)]
+    pub struct PendingChange {
+        1 req pub generation: u64 => { owner: "admission", reset: "session_refresh", bound: Bound::Fixed },
+        2 req pub policy: String => { owner: "admission", reset: "session_refresh", bound: Bound::Fixed },
+        3 req pub manifest: ManifestRef => {
+            owner: "admission",
+            reset: "session_refresh",
+            bound: Bound::Declared,
+        },
+    }
+}
+
+state! {
+    /// The latest applied refresh, with the facts its application recorded for the baseline.
+    #[derive(Debug, Clone, Default, PartialEq)]
+    pub struct EffectiveChange {
+        1 req pub generation: u64 => { owner: "admission", reset: "refresh_applied", bound: Bound::Fixed },
+        2 req pub applied_by: String => { owner: "admission", reset: "refresh_applied", bound: Bound::Fixed },
+        3 req pub manifest_digest: String => {
+            owner: "admission",
+            reset: "refresh_applied",
+            bound: Bound::Fixed,
+        },
+        4 opt pub composition_digest: String => {
+            owner: "admission",
+            reset: "refresh_applied",
+            bound: Bound::Fixed,
+        },
+        /// Owned by the fetch-plan code: each plan item the applied manifest's fetch left absent.
+        5 rep pub absent_items: serde_json::Value => {
+            owner: "admission",
+            reset: "refresh_applied",
+            bound: Bound::Config("the applied plan's items"),
+        },
+    }
+}
+
+state! {
+    /// The session's plan changes, folded by the transitions today's fold makes
+    /// (`broca_protocol::session_change::Transitions`): what was accepted and applied, the change
+    /// still pending, and the manifests the latest run and the latest prefix rebuild froze.
+    #[derive(Debug, Clone, Default, PartialEq)]
+    pub struct Plan {
+        1 req pub accepted_generation: u64 => {
+            owner: "admission",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
+        2 req pub applied_generation: u64 => {
+            owner: "admission",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
+        3 opt pub pending: PendingChange => {
+            owner: "admission",
+            reset: "refresh_applied",
+            bound: Bound::Declared,
+        },
+        4 opt pub effective: EffectiveChange => {
+            owner: "admission",
+            reset: "refresh_applied",
+            bound: Bound::Declared,
+        },
+        /// The latest run's frozen manifest; absent when it froze none.
+        5 opt pub current: ManifestRef => {
+            owner: "admission",
+            reset: "run_start",
+            bound: Bound::Declared,
+        },
+        /// The manifest of the latest prefix rebuild, or of the first run before any.
+        6 opt pub prefix: ManifestRef => {
+            owner: "admission",
+            reset: "a prefix rebuild",
+            bound: Bound::Declared,
+        },
+        /// A real prefix rebuild happened since the pending acceptance: a compaction view
+        /// applied, a model switch between runs, or a prefix flush.
+        7 req pub rebuild_since_accept: bool => {
+            owner: "admission",
+            reset: "session_refresh",
+            bound: Bound::Fixed,
+        },
+        /// A flush has not reached a new run yet.
+        8 req pub flushed_since_accept: bool => {
+            owner: "admission",
+            reset: "run_start",
+            bound: Bound::Fixed,
+        },
+        /// The latest run's model, as `provider:model`.
+        9 opt pub last_model: String => {
+            owner: "admission",
+            reset: "run_start",
+            bound: Bound::Fixed,
+        },
+        /// The latest accepted refresh's manifest, applied or not: the session's senders follow
+        /// it from its acceptance, as today's head and sender checks do.
+        10 opt pub accepted: ManifestRef => {
+            owner: "admission",
+            reset: "session_refresh",
+            bound: Bound::Declared,
+        },
+        /// The model the latest refresh that chooses one chose for the session's next runs, as
+        /// that refresh recorded it. Before any does, the session's first run's plan decides.
+        11 opt pub selection: serde_json::Value => {
+            owner: "admission",
+            reset: "a refresh that chooses a model",
+            bound: Bound::Fixed,
+        },
+    }
+}
+
+impl ManifestRef {
+    /// The manifest `start` froze, as its setup parts from its plan on and the rest its choices
+    /// keep; `None` for a run started without a plan.
+    pub fn of_start(start: &crate::record::RunStart) -> Option<Self> {
+        let first = start
+            .setup
+            .iter()
+            .position(|part| part.kind == crate::record::PartKind::Plan)?;
+        Some(Self {
+            parts: start.setup[first..].to_vec(),
+            rest: start
+                .run_choices
+                .as_ref()
+                .and_then(|choices| choices.get("manifest"))
+                .cloned(),
+        })
+    }
+
+    /// The manifest `refresh` fetched.
+    pub fn of_refresh(refresh: &crate::record::SessionRefresh) -> Self {
+        Self {
+            parts: refresh.setup.clone(),
+            rest: refresh.manifest.clone(),
+        }
+    }
+
+    /// The referenced manifest's plan identity, which stays with the rest of its members.
+    pub fn plan_identity(&self) -> Option<&str> {
+        self.rest.as_ref()?.get("plan_identity")?.as_str()
+    }
+}
+
+impl Plan {
+    /// The shared transitions over this state, which the fold applies a record through.
+    fn transitions(&mut self) -> Transitions<ManifestRef> {
+        let plan = std::mem::take(self);
+        // What the shared transitions don't touch stays here.
+        self.effective = plan.effective;
+        self.accepted = plan.accepted;
+        self.selection = plan.selection;
+        Transitions {
+            accepted_generation: plan.accepted_generation,
+            applied_generation: plan.applied_generation,
+            pending: plan.pending.map(|pending| PendingTransition {
+                generation: pending.generation,
+                policy: pending.policy,
+                manifest: pending.manifest,
+            }),
+            current: plan.current,
+            prefix: plan.prefix,
+            rebuild_since_accept: plan.rebuild_since_accept,
+            flushed_since_accept: plan.flushed_since_accept,
+            last_model: plan.last_model,
+        }
+    }
+
+    /// This state, back from `transitions`.
+    fn settle(&mut self, transitions: Transitions<ManifestRef>) {
+        self.accepted_generation = transitions.accepted_generation;
+        self.applied_generation = transitions.applied_generation;
+        self.pending = transitions.pending.map(|pending| PendingChange {
+            generation: pending.generation,
+            policy: pending.policy,
+            manifest: pending.manifest,
+        });
+        self.current = transitions.current;
+        self.prefix = transitions.prefix;
+        self.rebuild_since_accept = transitions.rebuild_since_accept;
+        self.flushed_since_accept = transitions.flushed_since_accept;
+        self.last_model = transitions.last_model;
+    }
+
+    /// Folds one ledger record's effect on the session's plan changes. A run start that applied
+    /// the pending change is followed in its batch by a `RefreshApplied` naming it, which applies
+    /// it after the start's own transitions, as today's fold applies it at the start.
+    fn apply(plan: &mut Option<Plan>, record: &Record) {
+        let changes_plan = match record {
+            Record::Event(event) => event.name == FIRST_PROTOCOL_VIEW_APPLIED,
+            Record::SessionRefresh(_)
+            | Record::RefreshPolicy(_)
+            | Record::PrefixFlush(_)
+            | Record::ViewApplied(_)
+            | Record::RunStart(_)
+            | Record::RefreshApplied(_) => true,
+            _ => false,
+        };
+        if !changes_plan {
+            return;
+        }
+        let state = plan.get_or_insert_with(Plan::default);
+        if let Record::SessionRefresh(refresh) = record {
+            state.accepted = Some(ManifestRef::of_refresh(refresh));
+            if refresh.selection.is_some() {
+                state.selection.clone_from(&refresh.selection);
+            }
+        }
+        let mut change = state.transitions();
+        match record {
+            Record::SessionRefresh(refresh) => change.accepted(
+                refresh.generation,
+                &refresh.policy,
+                ManifestRef::of_refresh(refresh),
+            ),
+            Record::RefreshPolicy(policy) => {
+                change.policy_changed(policy.generation, &policy.policy);
+            }
+            Record::PrefixFlush(_) => change.flushed(),
+            Record::ViewApplied(_) | Record::Event(_) => change.view_applied(),
+            Record::RunStart(start) => {
+                change.run_started(model_key(&start.model), ManifestRef::of_start(start));
+            }
+            Record::RefreshApplied(applied) => {
+                let applying = Applying {
+                    generation: applied.generation,
+                    applied_by: if applied.applied_by == "fold" {
+                        "fold"
+                    } else {
+                        "append"
+                    },
+                };
+                if change.applied(applying).is_some() {
+                    state.effective = Some(EffectiveChange {
+                        generation: applied.generation,
+                        applied_by: applied.applied_by.clone(),
+                        manifest_digest: applied.manifest_digest.clone(),
+                        composition_digest: applied.composition_digest.clone(),
+                        absent_items: applied.absent_items.clone(),
+                    });
+                }
+            }
+            _ => {}
+        }
+        state.settle(change);
+    }
+}
+
+/// The name the first compaction protocol's applied view keeps as a generic ledger event. Today's
+/// fold counts it as a prefix rebuild, as it counts the current contract's.
+const FIRST_PROTOCOL_VIEW_APPLIED: &str = "compaction_view_applied";
+
+state! {
+    /// The session's usage summed over every step, as the runner contract's `SessionUsage`
+    /// serves it on `session.head`: one count per `by_model` entry a step records, so a step
+    /// two models shared counts once under each and twice in the totals, as today's head
+    /// counts it.
+    #[derive(Debug, Clone, Default, PartialEq)]
+    pub struct SessionUsage {
+        /// The run of the first counted step.
+        1 req pub since: String => {
+            owner: "run loop",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
+        2 req pub totals: UsageTotals => {
+            owner: "run loop",
+            reset: "never",
+            bound: Bound::Declared,
+        },
+        /// One entry per distinct (provider, model, variant), in order of first use.
+        3 rep pub by_model: ModelTotals => {
+            owner: "run loop",
+            reset: "never",
+            bound: Bound::Distinct("(provider, model, variant)"),
+        },
+    }
+}
+
+state! {
+    /// Step counts and token sums. A sum is absent until a step reported that count, so an
+    /// unmeasured count never reads as zero.
+    #[derive(Debug, Clone, Default, PartialEq)]
+    pub struct UsageTotals {
+        1 req pub steps: u64 => { owner: "run loop", reset: "never", bound: Bound::Fixed },
+        /// Steps whose provider reported no usage at all.
+        2 req pub unreported_steps: u64 => {
+            owner: "run loop",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
+        3 opt pub input_tokens: u64 => { owner: "run loop", reset: "never", bound: Bound::Fixed },
+        4 opt pub cached_input_tokens: u64 => {
+            owner: "run loop",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
+        5 opt pub cache_write_tokens: u64 => {
+            owner: "run loop",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
+        6 opt pub output_tokens: u64 => { owner: "run loop", reset: "never", bound: Bound::Fixed },
+        7 opt pub reasoning_tokens: u64 => {
+            owner: "run loop",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
+    }
+}
+
+state! {
+    /// One model's share of the session's usage.
+    #[derive(Debug, Clone, Default, PartialEq)]
+    pub struct ModelTotals {
+        1 req pub provider: String => { owner: "run loop", reset: "never", bound: Bound::Fixed },
+        2 req pub model: String => { owner: "run loop", reset: "never", bound: Bound::Fixed },
+        3 opt pub variant: String => { owner: "run loop", reset: "never", bound: Bound::Fixed },
+        4 req pub totals: UsageTotals => {
+            owner: "run loop",
+            reset: "never",
+            bound: Bound::Declared,
+        },
+    }
+}
+
+impl UsageTotals {
+    /// Counts one step, as the runner contract's `RunUsage::record_step` does.
+    fn record(&mut self, usage: &broca_protocol::usage::Usage) {
+        fn add(total: &mut Option<u64>, step: Option<u64>) {
+            if let Some(step) = step {
+                *total = Some(total.unwrap_or(0).saturating_add(step));
+            }
+        }
+        let counts = [
+            usage.input_tokens,
+            usage.cached_input_tokens,
+            usage.cache_write_tokens,
+            usage.output_tokens,
+            usage.reasoning_tokens,
+        ];
+        self.steps = self.steps.saturating_add(1);
+        if counts.iter().all(Option::is_none) {
+            self.unreported_steps = self.unreported_steps.saturating_add(1);
+        }
+        add(&mut self.input_tokens, usage.input_tokens);
+        add(&mut self.cached_input_tokens, usage.cached_input_tokens);
+        add(&mut self.cache_write_tokens, usage.cache_write_tokens);
+        add(&mut self.output_tokens, usage.output_tokens);
+        add(&mut self.reasoning_tokens, usage.reasoning_tokens);
+    }
+}
+
+impl SessionUsage {
+    /// Counts each of a step's model shares.
+    fn record_step(
+        usage: &mut Option<SessionUsage>,
+        run_id: &str,
+        shares: &[crate::record::ModelStepUsage],
+    ) {
+        for share in shares {
+            let session = usage.get_or_insert_with(|| SessionUsage {
+                since: run_id.to_owned(),
+                ..SessionUsage::default()
+            });
+            session.totals.record(&share.usage);
+            let position = session.by_model.iter().position(|entry| {
+                entry.provider == share.provider
+                    && entry.model == share.model
+                    && entry.variant == share.variant
+            });
+            let entry = match position {
+                Some(position) => &mut session.by_model[position],
+                None => {
+                    session.by_model.push(ModelTotals {
+                        provider: share.provider.clone(),
+                        model: share.model.clone(),
+                        variant: share.variant.clone(),
+                        totals: UsageTotals::default(),
+                    });
+                    session.by_model.last_mut().expect("just pushed")
+                }
+            };
+            entry.totals.record(&share.usage);
+        }
+    }
+}
+
+state! {
+    /// The owner facts the session's run starts recorded, as today's admission summarises them
+    /// (`SessionOwnershipV1`). Principals and scopes stay in the run start's own JSON form.
+    #[derive(Debug, Clone, Default, PartialEq)]
+    pub struct Owner {
+        /// How many runs have started.
+        1 req pub episodes: u64 => {
+            owner: "admission",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
+        /// The principal the first run recorded, if it recorded one.
+        2 opt pub first_principal: serde_json::Value => {
+            owner: "admission",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
+        /// Whether any run recorded no principal.
+        3 req pub any_unrecorded_principal: bool => {
+            owner: "admission",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
+        /// The first two distinct principals the runs recorded, in the order each first
+        /// appeared. Today's summary keeps every distinct one, but its only reader asks for the
+        /// first that differs from one given principal, and the first two always answer that.
+        4 rep pub principals: serde_json::Value => {
+            owner: "admission",
+            reset: "never",
+            bound: Bound::Capped(2),
+        },
+        /// The scope the latest scoped run froze. A run start without a scope leaves it.
+        5 opt pub scope: serde_json::Value => {
+            owner: "admission",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
+        /// The session's first run start, kept for what it froze for the session's whole life:
+        /// a fetch plan's manifest, among the setup parts it names, which today's rules read as
+        /// the first episode's. The run fold keeps only the latest run's start.
+        6 opt pub first_start: crate::record::RunStart => {
+            owner: "admission",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
+    }
+}
+
+impl Owner {
+    /// Folds one run start's principal and scope, as `SessionOwnershipV1::fold_run_started`
+    /// folds them, and keeps the session's first run start.
+    fn fold_run_start(&mut self, start: &crate::record::RunStart) {
+        let principal = start.principal.as_ref();
+        let scope = start.scope.as_ref();
+        if self.episodes == 0 {
+            self.first_principal = principal.cloned();
+            self.first_start = Some(start.clone());
+        }
+        self.episodes = self.episodes.saturating_add(1);
+        match principal {
+            None => self.any_unrecorded_principal = true,
+            Some(principal) => {
+                if self.principals.len() < 2 && !self.principals.contains(principal) {
+                    self.principals.push(principal.clone());
+                }
+            }
+        }
+        if let Some(scope) = scope {
+            self.scope = Some(scope.clone());
+        }
+    }
+}
+
+crate::message! {
+    /// The facts compaction's request-size estimate reads, as today's loop folds them.
+    #[derive(Debug, Clone, Default, PartialEq)]
+    pub struct Estimate {
+        /// The current run's model.
+        1 opt run_model: broca_protocol::request::ModelHandle,
+        /// The newest step's end: its run's model, its usage and its fallback (owned by the run
+        /// loop: the model that served it and any server-side iterations).
+        2 opt step_model: broca_protocol::request::ModelHandle,
+        3 opt step_usage: broca_protocol::usage::Usage,
+        4 opt step_fallback: serde_json::Value,
+        /// Whether a step has ended in this session at all.
+        5 req stepped: bool,
+        /// The newest attempt's request body length, and the one before the newest step's end.
+        6 opt current_request_bytes: u64,
+        7 opt previous_request_bytes: u64,
+    }
+}
+
+crate::message! {
+    /// When a request that reached the provider's cache was sent, and its run.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct CacheSend {
+        1 req sent_at_ms: u64,
+        2 req run_id: String,
+        /// The cache lifetime that request asked for, when it asked for one the provider
+        /// honours; only then can the cache be proven expired.
+        3 opt requested_ttl_ms: u64,
+    }
+}
+
+state! {
+    /// A run's setup as a run start names it: its parts, sorted, and its model.
+    #[derive(Debug, Clone, Default, PartialEq)]
+    pub struct SetupInForce {
+        1 rep pub parts: crate::record::PartRef => {
+            owner: "admission",
+            reset: "run_start",
+            bound: Bound::Config("the run's setup parts: its tool lists, formats, system text and plan answers"),
+        },
+        2 opt pub model: broca_protocol::request::ModelHandle => {
+            owner: "admission",
+            reset: "run_start",
+            bound: Bound::Fixed,
+        },
+    }
+}
+
+/// The title a queued send's or a steer's receipt holds, under the name today's records give it.
+fn receipt_title(receipt: Option<&serde_json::Value>) -> Option<String> {
+    receipt?.get("title")?.as_str().map(str::to_owned)
+}
+
+/// The string field `name` of a receipt.
+fn receipt_string(receipt: Option<&serde_json::Value>, name: &str) -> Option<String> {
+    receipt?.get(name)?.as_str().map(str::to_owned)
+}
+
+/// The module id a principal names, when the principal is a module's (a reserved one): who reads
+/// name as a message's sender. A person's principal names none.
+fn receipt_module(principal: Option<&serde_json::Value>) -> Option<String> {
+    match serde_json::from_value(principal?.clone()).ok()? {
+        broca_protocol::BindPrincipal::Reserved { module_id } => Some(module_id),
+        _ => None,
     }
 }
 
@@ -502,11 +1481,27 @@ impl Operations {
     /// delivery into a running run removes it.
     fn apply_queue(&mut self, record: &Record) {
         let removed = match record {
+            Record::DeliveryOrdered(ordered) => {
+                self.ordered_next = Some(ordered.submission_id.clone());
+                return;
+            }
             Record::QueuedSend(send) => {
-                let pending = Pending {
-                    submission_id: send.submission_id.clone(),
-                    interrupt: send.delivery.as_deref() == Some("interrupt"),
-                };
+                let ordered =
+                    self.ordered_next.take().as_deref() == Some(send.submission_id.as_str());
+                let pending =
+                    Pending {
+                        submission_id: send.submission_id.clone(),
+                        interrupt: send.delivery.as_deref() == Some("interrupt"),
+                        ordered,
+                        sender: receipt_module(send.receipt.as_ref().and_then(|receipt| {
+                            receipt.get("sent_by").or(receipt.get("principal"))
+                        })),
+                        request_identity_digest: receipt_string(
+                            send.receipt.as_ref(),
+                            "request_identity_digest",
+                        ),
+                        message_marks: send.message_marks.clone(),
+                    };
                 let at = if pending.interrupt {
                     self.queue
                         .iter()
@@ -529,10 +1524,216 @@ impl Operations {
         }
     }
 
+    /// Whether a run starting with `parts` and `model` changes the setup in force, and so
+    /// starts with a `SetupStub`.
+    pub fn setup_changed(
+        &self,
+        parts: &[crate::record::PartRef],
+        model: &broca_protocol::request::ModelHandle,
+    ) -> bool {
+        let mut sorted = parts.to_vec();
+        sorted.sort();
+        match &self.setup {
+            Some(setup) => setup.parts != sorted || setup.model.as_ref() != Some(model),
+            None => true,
+        }
+    }
+
     pub fn apply(&mut self, record: &Record) -> Result<(), FoldError> {
+        self.apply_at(None, record)
+    }
+
+    /// The newest message placed before the session enrolled in the current compaction
+    /// contract, if it enrolled.
+    pub fn enrolled_through(&self) -> Option<u64> {
+        self.enrolled
+            .as_ref()
+            .map(|enrolled| enrolled.through_ordinal)
+    }
+
+    /// Whether the session is on the current compaction contract: its latest run started under
+    /// a compaction plan version. A session moves onto the contract at the run that enrolls it
+    /// and never moves back, so its earlier runs may have started off it. Every reader on the
+    /// new storage asks here.
+    pub fn on_contract(&self) -> bool {
+        self.run
+            .as_ref()
+            .and_then(|run| run.start.as_ref())
+            .is_some_and(|start| start.compaction_plan_version.is_some())
+    }
+
+    /// A run's end makes its billing owed, unless the latest run it ends was seeded and never
+    /// called a provider; `Billed` settles it. Applied before the run fold, which reads the
+    /// same end.
+    fn apply_billing(&mut self, record: &Record) {
+        match record {
+            Record::RunEnd(end) => {
+                let billable = self
+                    .run
+                    .as_ref()
+                    .is_some_and(|run| run.run_id == end.run_id && !run.seeded);
+                if billable && !self.billing_owed.contains(&end.run_id) {
+                    self.billing_owed.push(end.run_id.clone());
+                }
+            }
+            Record::Billed(billed) => self.billing_owed.retain(|owed| *owed != billed.run_id),
+            _ => {}
+        }
+    }
+
+    /// The session's latest sends: a run's start names the current model, an attempt its
+    /// request's size and whether it reached the cache, and a step's end the newest step.
+    fn apply_sends(&mut self, record: &Record) {
+        match record {
+            Record::RunStart(start) => {
+                self.estimate
+                    .get_or_insert_with(Estimate::default)
+                    .run_model = Some(start.model.clone());
+                self.output_attempt_bytes = None;
+                self.owner.fold_run_start(start);
+            }
+            Record::Attempt(attempt) => {
+                self.output_attempt_bytes = Some(attempt.request_body_len);
+                self.estimate
+                    .get_or_insert_with(Estimate::default)
+                    .current_request_bytes = Some(attempt.request_body_len);
+                if attempt.reached_cache == Some(true) {
+                    self.last_cache_attempt_digest = Some(attempt.request_body_sha256);
+                    self.last_send_run = Some(attempt.run_id.clone());
+                    if let Some(sent_at_ms) = attempt.sent_at_ms {
+                        if self
+                            .last_cache_send
+                            .as_ref()
+                            .is_none_or(|latest| sent_at_ms >= latest.sent_at_ms)
+                        {
+                            self.last_cache_send = Some(CacheSend {
+                                sent_at_ms,
+                                run_id: attempt.run_id.clone(),
+                                requested_ttl_ms: attempt.requested_cache_ttl_ms,
+                            });
+                        }
+                    }
+                }
+            }
+            Record::Warmed(warmed) => {
+                // A warm that reached the cache restarts its lifetime, as today's cache clock
+                // dates it; a warm of the source model's cache only if it refreshed the newest
+                // request that reached the cache.
+                let refreshed_newest = warmed.trigger.as_deref() != Some("source_keep_warm")
+                    || self
+                        .last_cache_attempt_digest
+                        .is_none_or(|digest| digest == warmed.request_body_sha256);
+                if warmed.reached_cache == Some(true)
+                    && refreshed_newest
+                    && self
+                        .last_cache_send
+                        .as_ref()
+                        .is_none_or(|latest| warmed.sent_at_ms >= latest.sent_at_ms)
+                {
+                    self.last_cache_send = Some(CacheSend {
+                        sent_at_ms: warmed.sent_at_ms,
+                        run_id: warmed.run_id.clone(),
+                        requested_ttl_ms: warmed.requested_cache_ttl_ms,
+                    });
+                }
+            }
+            Record::StepEnd(step) => {
+                self.measure_step(step);
+                let estimate = self.estimate.get_or_insert_with(Estimate::default);
+                estimate.step_model = estimate.run_model.clone();
+                estimate.step_usage = step.usage;
+                estimate.step_fallback = step.fallback.clone();
+                estimate.stepped = true;
+                estimate.previous_request_bytes = estimate.current_request_bytes;
+                self.last_send_run = Some(step.run_id.clone());
+            }
+            _ => {}
+        }
+    }
+
+    /// The records a send writes, a run start, a queued send and a steer, each carry the send's
+    /// title when it had one; the newest such title is the session's.
+    fn apply_title(&mut self, record: &Record) {
+        let title = match record {
+            Record::RunStart(start) => start.title.clone(),
+            Record::QueuedSend(send) => receipt_title(send.receipt.as_ref()),
+            Record::Steer(steer) => receipt_title(steer.receipt.as_ref()),
+            _ => None,
+        };
+        if title.is_some() {
+            self.title = title;
+        }
+    }
+
+    /// A step's end measures its input when the provider reported it, an attempt's body length
+    /// is known and the model that served the measured call is: the model the step was routed
+    /// to, else the run's, with a server-side handoff measured on the last model that served it.
+    /// Today's `OutputReservationHistory::note_served_step` decides the same.
+    fn measure_step(&mut self, step: &crate::record::StepEnd) {
+        let bytes = self.output_attempt_bytes.take();
+        let fallback = step.fallback.as_ref();
+        let routed: Option<broca_protocol::request::ModelHandle> = fallback
+            .and_then(|fallback| fallback.get("route"))
+            .and_then(|route| route.get("model"))
+            .and_then(|model| serde_json::from_value(model.clone()).ok());
+        let Some(requested) = routed.or_else(|| {
+            self.estimate
+                .as_ref()
+                .and_then(|estimate| estimate.run_model.clone())
+        }) else {
+            return;
+        };
+        let served = fallback
+            .and_then(|fallback| fallback.get("served_model"))
+            .and_then(|model| model.as_str());
+        let iterations: Option<Vec<broca_protocol::usage::UsageIteration>> = fallback
+            .and_then(|fallback| fallback.get("usage_iterations"))
+            .and_then(|iterations| serde_json::from_value(iterations.clone()).ok());
+        let measured = broca_protocol::usage::model_usage(
+            served.unwrap_or(&requested.model_id),
+            step.usage.unwrap_or_default(),
+            iterations.as_deref(),
+        )
+        .last()
+        .map(|(model, usage)| {
+            (
+                *usage,
+                broca_protocol::request::ModelHandle::new(&requested.provider_module_id, *model),
+            )
+        });
+        if let (Some((usage, model)), Some(request_bytes)) = (measured, bytes) {
+            if let Some(input_tokens) = usage.fill_tokens() {
+                self.output_measure = Some(OutputMeasure {
+                    input_tokens,
+                    request_bytes,
+                    model,
+                });
+            }
+        }
+    }
+
+    /// Folds `record`, which has `seq` in its log. A pending input remembers the seq of the
+    /// record that accepted it, so the copy a boundary places can name it.
+    pub fn apply_at(&mut self, seq: Option<u64>, record: &Record) -> Result<(), FoldError> {
         if record.stream() != Stream::Ledger {
             return Err(FoldError::TranscriptRecord(record.name()));
         }
+        // A delivery takes its send out of the queue; the messages it delivers keep who sent it,
+        // and the send's marks.
+        let delivered_send = match record {
+            Record::Delivery(delivery) => self
+                .queue
+                .iter()
+                .find(|pending| pending.submission_id == delivery.submission_id)
+                .map(|pending| {
+                    (
+                        pending.sender.clone(),
+                        pending.request_identity_digest.clone(),
+                        pending.message_marks.clone(),
+                    )
+                }),
+            _ => None,
+        };
         self.apply_queue(record);
         match (record, self.open_change) {
             (Record::ChangeAborted(aborted), Some(open)) if aborted.change == open => {
@@ -572,6 +1773,25 @@ impl Operations {
                         .map_or(reverted.ordinal, |owed| owed.min(reverted.ordinal)),
                 );
                 self.history_version = reverted.history_version;
+                if let Some(high) = reverted.tag_high {
+                    self.tag_high_water = self.tag_high_water.max(high);
+                }
+            }
+            Record::CompactionEnrolled(enrolled) => {
+                if self.enrolled.is_some() {
+                    return Err(FoldError::Enrollment("the session already enrolled"));
+                }
+                let Some(run) = self.run.as_ref() else {
+                    return Err(FoldError::Enrollment("no run start precedes it"));
+                };
+                self.enrolled = Some(Enrollment {
+                    through_ordinal: enrolled.through_ordinal,
+                    tag_floor: enrolled.tag_floor,
+                    tag_high: enrolled.tag_high,
+                    overlay: enrolled.overlay.clone(),
+                    run_id: run.run_id.clone(),
+                });
+                self.tag_high_water = self.tag_high_water.max(enrolled.tag_high);
             }
             Record::ViewApplied(applied) => {
                 self.view_applied = Some(AppliedView {
@@ -584,12 +1804,30 @@ impl Operations {
             }
             _ => {}
         }
+        self.apply_sends(record);
+        self.apply_title(record);
+        self.apply_billing(record);
+        Plan::apply(&mut self.plan, record);
         if let Record::RunStart(start) = record {
             self.run = Some(Run::new(start));
             self.refusal_schedule = start.refusal_schedule.clone();
+            if let Some(ids) = &start.imported_ids {
+                self.imported_ids = Some(ids.clone());
+            }
+            let mut parts = start.setup.clone();
+            parts.sort();
+            self.setup = Some(SetupInForce {
+                parts,
+                model: Some(start.model.clone()),
+            });
             return Ok(());
         }
+        if let Record::StepRefused(refused) = record {
+            self.refusal_schedule = Some(refused.schedule.clone());
+            SessionUsage::record_step(&mut self.session_usage, &refused.run_id, &refused.by_model);
+        }
         if let Record::StepEnd(step) = record {
+            SessionUsage::record_step(&mut self.session_usage, &step.run_id, &step.by_model);
             if let Some(next) = step
                 .fallback
                 .as_ref()
@@ -603,19 +1841,67 @@ impl Operations {
             if NOT_FOLDED.contains(&event.name.as_str()) {
                 return Err(FoldError::NotFolded(event.name.clone()));
             }
+            self.first_protocol_compaction |= event.name.starts_with("compaction_");
         }
         let Some(run) = self.run.as_mut() else {
             return Ok(());
         };
+        if let Record::Attempt(attempt) = record {
+            if attempt.run_id == run.run_id
+                && matches!(
+                    attempt.outcome.as_str(),
+                    "complete" | "tool_args_trailing_garbage"
+                )
+            {
+                run.step_attempt = Some(StepAttempt {
+                    step_id: attempt.step_id,
+                    ts_ms: attempt.ts_ms,
+                });
+            }
+        }
         match record {
-            Record::StepStart(_) => {
+            Record::Attempt(attempt)
+                if attempt.run_id == run.run_id
+                    && matches!(
+                        attempt.outcome.as_str(),
+                        "complete" | "tool_args_trailing_garbage"
+                    )
+                    && !attempt
+                        .billing
+                        .as_ref()
+                        .is_some_and(|billing| billing["reservation"]["warm"] == true) =>
+            {
+                run.step_request = Some(StepRequest {
+                    step_id: attempt.step_id,
+                    sent_at_ms: attempt.sent_at_ms,
+                });
+            }
+            Record::Warmed(warmed)
+                if warmed.run_id == run.run_id
+                    && run
+                        .step_request
+                        .as_ref()
+                        .is_some_and(|request| request.step_id == warmed.step_id) =>
+            {
+                run.step_request = None;
+            }
+            _ => {}
+        }
+        match record {
+            Record::StepStart(start) => {
+                run.step_request = None;
+                run.step_attempt = None;
+                run.step_mid = start.mid.clone();
+                run.warms.clear();
                 run.provider_call_started = true;
                 run.account_limit_pause = None;
                 run.paused = None;
                 run.natural_end = None;
-                run.pending_steers = 0;
+                run.pending_steers.clear();
             }
             Record::StepEnd(step) => {
+                run.output_cap = None;
+                run.refused_step = None;
                 let usage = step.total_usage.or(step.usage).unwrap_or_default();
                 run.usage.accumulate(&usage);
                 run.last_step_usage = Some(usage);
@@ -658,6 +1944,7 @@ impl Operations {
                 run.open_batch = Some(OpenBatch {
                     batch_id: batch.batch_id.clone(),
                     step_id: batch.step_id,
+                    results_mid: batch.mid.clone(),
                     calls: batch
                         .planned
                         .iter()
@@ -665,6 +1952,9 @@ impl Operations {
                             id: id.clone(),
                             intent: false,
                             held: None,
+                            key: None,
+                            held_reply: None,
+                            args: None,
                             terminal: None,
                         })
                         .collect(),
@@ -678,6 +1968,8 @@ impl Operations {
                         .filter(|c| c.id == intent.tool_call_id)
                     {
                         call.intent = true;
+                        call.key = intent.call_key.clone();
+                        call.args = intent.args.clone();
                     }
                 }
             }
@@ -685,6 +1977,7 @@ impl Operations {
                 if let Some(batch) = run.open_batch.as_mut() {
                     for call in batch.calls.iter_mut().filter(|c| c.id == held.tool_call_id) {
                         call.held = Some(held.sequential);
+                        call.held_reply = Some(held.clone());
                     }
                 }
             }
@@ -695,6 +1988,10 @@ impl Operations {
                     .and_then(|batch| batch.first_open(&outcome.tool_call_id))
                 {
                     call.terminal = Some(outcome.outcome);
+                    // A call answered without a dispatch intent has its key on its outcome.
+                    if call.key.is_none() {
+                        call.key.clone_from(&outcome.call_key);
+                    }
                 }
                 if outcome.outcome == CallOutcome::Unknown {
                     run.unknown.push(outcome.tool_call_id.clone());
@@ -712,6 +2009,45 @@ impl Operations {
                     run.open_batch = None;
                 }
             }
+            // Today's replay keeps the latest decision of the run still going.
+            Record::CeilingDecided(decided) if run.finished.is_none() => {
+                run.context_ceiling = decided.detail.clone();
+            }
+            // The refused call was billed: today's replay counts it toward the run.
+            Record::StepRefused(refused) if refused.run_id == run.run_id => {
+                run.usage.accumulate(&refused.usage);
+                run.refused_step = Some(refused.step_id);
+            }
+            Record::StructuredDowngraded(downgraded) if downgraded.run_id == run.run_id => {
+                run.structured_downgraded = true;
+            }
+            Record::ConfigRefrozen(refrozen) if refrozen.run_id == run.run_id => {
+                run.refrozen_render = Some(serde_json::json!({
+                    "renderer_version": refrozen.renderer_version,
+                    "render_config": refrozen.render_config,
+                }));
+            }
+            Record::AuthRefrozen(refrozen) if refrozen.run_id == run.run_id => {
+                run.refrozen_auth = Some(refrozen.auth_selection.clone());
+            }
+            Record::Warmed(warmed)
+                if warmed.trigger.as_deref() == Some("keep_warm")
+                    && warmed.run_id == run.run_id =>
+            {
+                run.warms.push(WarmSpend {
+                    step_id: warmed.step_id,
+                    reached_cache: warmed.reached_cache == Some(true),
+                    usage: warmed.usage,
+                    billing: warmed.billing.clone(),
+                    ttl_ms: warmed.ttl_ms,
+                });
+            }
+            Record::OutputCapLowered(lowered) => {
+                run.output_cap = Some(OutputCap {
+                    step_id: lowered.step_id,
+                    max_output_tokens: lowered.max_output_tokens,
+                });
+            }
             Record::CancelRequest(cancel) => {
                 if cancel.run_id == run.run_id
                     && run.finished.is_none()
@@ -720,8 +2056,48 @@ impl Operations {
                     run.cancel = Some(cancel.at);
                 }
             }
-            Record::Steer(steer) => run.pending_steers += steer.input.len(),
-            Record::Delivery(delivery) => run.pending_steers += delivery.input.len(),
+            Record::Steer(steer) => run.pending_steers.push(PendingInput {
+                seq,
+                placement: crate::record::Placement::Steer,
+                messages: steer.input.clone(),
+                written_at_ms: steer.written_at_ms,
+                tags_v1: steer.tags_v1.clone(),
+                submission_id: None,
+                sender: receipt_module(
+                    steer
+                        .receipt
+                        .as_ref()
+                        .and_then(|receipt| receipt.get("sent_by")),
+                ),
+                request_identity_digest: receipt_string(
+                    steer.receipt.as_ref(),
+                    "request_identity_digest",
+                ),
+                media: steer.media.clone(),
+                message_marks: steer.message_marks.clone(),
+            }),
+            Record::Delivery(delivery) if !delivery.input.is_empty() => {
+                let (sender, request_identity_digest, message_marks) =
+                    delivered_send.unwrap_or_default();
+                run.pending_steers.push(PendingInput {
+                    seq,
+                    placement: if delivery.mode == "turn_system" {
+                        crate::record::Placement::DeliveredTurnSystem
+                    } else {
+                        crate::record::Placement::Delivered
+                    },
+                    messages: delivery.input.clone(),
+                    written_at_ms: delivery.written_at_ms,
+                    tags_v1: delivery.tags_v1.clone(),
+                    submission_id: Some(delivery.submission_id.clone()),
+                    sender,
+                    request_identity_digest,
+                    // A delivery names no stored media of its own. The loop writes one only for an
+                    // ordered send, which a session in the new storage doesn't take yet.
+                    media: Vec::new(),
+                    message_marks,
+                })
+            }
             Record::BudgetFire(fire) => match fire.firing {
                 BudgetFiring::Nudge => {
                     if let Some(index) = fire.nudge_index {
@@ -737,13 +2113,17 @@ impl Operations {
                 run.account_limit_pause = None;
                 run.finished = Some(end.reason);
                 run.retries_used = end.retries_used;
-                run.pending_steers = 0;
+                run.pending_steers.clear();
                 run.paused = None;
+                run.end_error = end.error.clone();
+                run.end_usage = end.usage;
             }
             Record::Pause(pause) => {
                 run.account_limit_pause = pause.account_limit.clone();
                 run.paused = Some(pause.reason);
                 run.finished = None;
+                run.end_error = pause.error.clone();
+                run.end_usage = None;
             }
             Record::Retraction(retraction) if retraction.failure.is_some() => {
                 // A send that failed admission ends as a run of its own with no step, so the

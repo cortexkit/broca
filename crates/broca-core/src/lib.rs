@@ -15,10 +15,11 @@ pub mod account_report;
 pub mod admission;
 pub mod attempt_id;
 pub mod billing;
-mod budget_kernel;
+pub mod budget_kernel;
 pub use budget_kernel::{next_due, DueFiring};
 pub mod cache_warm;
-mod call_identity;
+/// Which copy of a tool call each durable record answers, and the key today's readers give it.
+pub mod call_identity;
 pub mod capability;
 pub mod clock;
 pub mod compaction;
@@ -61,6 +62,7 @@ pub mod replay;
 pub mod served_history;
 pub use served_history::ServedHistory;
 
+pub use context::state_for_terminal;
 pub use context::StorePageReadError;
 pub use replay::RunAttribution;
 pub mod resume;
@@ -163,12 +165,12 @@ pub use cache_warm::{
 pub use run::{
     input_transformations_reported, input_transformations_unmeasured_attempts,
     load_prior_wal_snapshot, read_prior_run_config, recover_prior_run_config, run_loop,
-    run_loop_append_episode, run_loop_on_writer, run_loop_on_writer_admitted,
-    run_loop_on_writer_admitted_with_prior_snapshot, run_loop_resume_after_auth,
-    run_loop_resume_after_auth_with_control, run_loop_under_lease, run_loop_with_control,
-    run_loop_with_store, AccountSelectionRefusal, OutputEvent, PriorWalSnapshot,
-    RoutingUnavailable, RoutingUnavailableReason, RunControl, RunError, RunRequest, RunSummary,
-    StartMode,
+    run_loop_append_episode, run_loop_append_episode_with_control, run_loop_on_writer,
+    run_loop_on_writer_admitted, run_loop_on_writer_admitted_with_prior_snapshot,
+    run_loop_resume_after_auth, run_loop_resume_after_auth_with_control, run_loop_under_lease,
+    run_loop_with_control, run_loop_with_store, AccountSelectionRefusal, OutputEvent,
+    PriorWalSnapshot, RoutingUnavailable, RoutingUnavailableReason, RunControl, RunError,
+    RunRequest, RunSummary, StartMode,
 };
 pub use shutdown_seal::{SealedAttempt, ShutdownSeal};
 pub use steer::{OrderedAcceptance, SteerInbox};
@@ -176,20 +178,20 @@ pub use stub_plane::{StubEvent, StubReply, StubToolPlane};
 pub use tags::LineageTags;
 pub use tool_plane::{BatchCtx, DispatchResult, ToolPlane, ToolPlaneError};
 pub use wal_writer::{
-    agent_session_ref, session_addr, FileWalStore, ObservedRecord, ReadOnlyWalReader,
-    RecordObserver, RecordOutcome, SessionRefIndex, WalHandle, WalOpenError, WalStore,
-    WalWriteError, WAL_MANIFEST_FILENAME,
+    agent_session_ref, is_session_storage_refusal, session_addr, session_storage_refusal,
+    FileWalStore, ObservedRecord, ReadOnlyWalReader, RecordObserver, RecordOutcome,
+    SessionRefIndex, WalHandle, WalOpenError, WalStore, WalWriteError, WAL_MANIFEST_FILENAME,
 };
 pub use wal_writer::{
     session_projection_incomplete, ProjectionAdmission, ProjectionRepair,
     SESSION_PROJECTION_INCOMPLETE,
 };
 
-mod account_limit_pause;
+pub mod account_limit_pause;
 pub use account_limit_pause::{
     account_limit_pause_declined, account_limit_stale_resets, session_account_cache_expiry_ms,
     SameAccountWait,
 };
 pub mod keep_warm;
 pub mod keep_warm_wait;
-mod plan_system;
+pub mod plan_system;

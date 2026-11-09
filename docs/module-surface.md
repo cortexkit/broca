@@ -465,6 +465,28 @@ continue counting. Counts, `overflow` and the epoch-millisecond `last_ms` values
 restart; `since_ms` is the daemon's process-start coverage timestamp. No census is written
 to a log or store.
 
+Sessions kept in the new session storage are encrypted unless they were created plain. The root
+`broca.jsonc` setting `"session_storage": {"encryption": "off"}` makes the sessions created from
+then on plain: stored without encryption, with an unkeyed check that catches damage but not a
+deliberate edit, and served without the deployment key. `"on"` (the default) creates encrypted
+sessions. A session keeps the mode it was created in, so changing the setting leaves existing
+sessions as they are, and a deployment can hold both kinds.
+
+Encrypted sessions are opened with a deployment key read from the vault
+when broca starts: the static record `opaque:broca-deployment:<key_id>`, read by grant
+(`credential.get_scoped`, an exact `read` grant to `reserved:broca`), whose value is 32 bytes
+written as 64 lowercase hex characters. The root `broca.jsonc` setting
+`"session_storage": {"deployment_key_id": 1}` names the key (1 when absent); a rotation adds a
+record under a new id and never rewrites one. Startup never waits for or fails on the key. Until
+it loads (the vault is unreachable, answers `not_found`, or holds a malformed value), today's
+sessions and plain sessions are served as before, and an encrypted session kept in the new
+storage is refused `open_failed`, class `transient`, its reason starting `key_unavailable:`;
+broca reads the record again with backoff and serves those sessions once it loads, without a
+restart. A deployment with encryption off and no encrypted sessions never needs the key. The
+key is kept in memory only; logs name only its id, with one WARN while it is missing and one
+INFO when it loads. `health.check.metrics.store` reports `{key_id, loaded, new_sessions}`,
+`new_sessions` being `"encrypted"` or `"plain"`.
+
 To see one debug record per served operation, add a `CK_LOG` value to broca's module environment
 in `subc.jsonc`:
 

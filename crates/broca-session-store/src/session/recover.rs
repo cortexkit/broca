@@ -30,12 +30,18 @@
 //!    closing records. The damaged bytes are saved for an operator for a week. Then one
 //!    compare-and-swap makes the new log the session's open log.
 //!
-//! Not built yet: rebuilding a damaged checkpoint (recovery refuses as `CheckpointLost`), entry
-//! facts for the records a recovery writes, steers pending inside an interrupted run, withdrawals
+//! **A damaged checkpoint** is rebuilt, not cut: cutting at the log's first batch would cut the
+//! whole log. Every change that creates an open log keeps a copy of that log's checkpoint in the
+//! ledger segment it seals, so the newest ledger segment holds it. A session's first log, which
+//! no ledger segment precedes, started from empty state. With the rebuilt checkpoint, the records
+//! after it chain to its bases, so a damaged checkpoint alone loses nothing.
+//!
+//! Not built yet: entry facts for the records a recovery writes, steers pending inside an interrupted run, withdrawals
 //! owed for provider-held calls, the crash-loop limit, and showing the damage notice at system
 //! authority and keeping it in view until a model step has seen it (the run loop's part).
 
-use std::collections::{BTreeMap, BTreeSet};
+use super::media::OpenLogIndex;
+use std::collections::BTreeSet;
 
 use broca_protocol::caller::RunFinishReason;
 use broca_protocol::content::{ContentBlock, Message, Role, ToolOutput, ToolResult};
@@ -47,7 +53,6 @@ use crate::checkpoint::Checkpoint;
 use crate::codec::{hex, Digest, Id128, Message as _};
 use crate::damage::{self, Lost, Verdict};
 use crate::fold::conversation::Conversation;
-use crate::frame::FRAME_OVERHEAD;
 use crate::head::{self, PendingDeletion, Residence, SessionTriple};
 use crate::idindex::OpenIds;
 use crate::keys::{random_id, DeploymentKey};
@@ -59,6 +64,8 @@ use crate::record::{
 
 use super::seal::{Created, Sealed, GRACE_MS};
 use super::{chain_base, log_bind, Session, SessionError};
+use crate::directory::{Pages, FANOUT};
+use crate::segment::Segment;
 
 /// How long the damaged bytes a recovery removed are kept for an operator.
 pub const REMOVED_KEEP_MS: u64 = 7 * 24 * 60 * 60 * 1000;
@@ -134,11 +141,11 @@ fn digest(bytes: &[u8]) -> Digest {
     Digest(Sha256::digest(bytes).into())
 }
 
-impl<'b, B: SessionBackend> Session<'b, B> {
+impl<B: SessionBackend> Session<B> {
     /// Repairs the session at `addr` if its open log holds debris, or finishes a recovery a
     /// crash interrupted. Afterwards, load the session as usual.
     pub async fn recover(
-        backend: &'b B,
+        backend: B,
         addr: SessionAddr,
         triple: &SessionTriple,
         deployment: &DeploymentKey,
@@ -187,10 +194,31 @@ impl<'b, B: SessionBackend> Session<'b, B> {
                 return Err(SessionError::Corrupt { at, durable_bound })
             }
         };
-        let Some(body) = &debris.checkpoint else {
-            return Err(SessionError::CheckpointLost);
+        let (debris, body) = match debris.checkpoint.clone() {
+            Some(body) => (debris, body),
+            None => {
+                let body = rebuild_checkpoint(&backend, &addr, &head, &key, &open.change).await?;
+                // Analyse again from the rebuilt checkpoint's chain bases, so a damaged
+                // checkpoint alone reads as losing nothing.
+                let base = chain_base(&body).map_err(SessionError::Fold)?;
+                let verdict = damage::analyse(
+                    &bytes,
+                    &frame_key,
+                    &bind,
+                    open.synced_len,
+                    chain_base,
+                    Some(base),
+                )?;
+                match verdict {
+                    Verdict::Debris(debris) => (debris, body),
+                    Verdict::Corrupt { at, durable_bound } => {
+                        return Err(SessionError::Corrupt { at, durable_bound })
+                    }
+                    Verdict::Opens(_) => return Err(SessionError::CheckpointLost),
+                }
+            }
         };
-        let checkpoint = Checkpoint::decode(body).map_err(SessionError::Checkpoint)?;
+        let checkpoint = Checkpoint::decode(&body).map_err(SessionError::Checkpoint)?;
         let first_damage = debris.at();
 
         // The intent, in the head: nothing writes to the damaged log again.
@@ -244,13 +272,31 @@ impl<'b, B: SessionBackend> Session<'b, B> {
             .iter()
             .any(|region| region.ledger == Lost::CantProve);
 
+        // In seq order: a session's enrollment in the current compaction contract changes how
+        // the conversation folds the transcript records after it (`Conversation::enrolled`).
         let mut conversation = checkpoint.conversation.clone();
-        for (_, _, record) in &transcript {
-            conversation.apply(record).map_err(fold_error)?;
-        }
         let mut operations = checkpoint.operational.clone();
-        for (_, record) in &ledger {
+        let mut activity =
+            OpenLogIndex::from_checkpoint(checkpoint.activity_ms, checkpoint.next_seq);
+        conversation.enrolled(operations.enrolled_through());
+        let mut kept_transcript = transcript
+            .iter()
+            .map(|(seq, _, record)| (*seq, record))
+            .peekable();
+        for (seq, record) in &ledger {
+            while let Some((kept_seq, kept)) =
+                kept_transcript.next_if(|(transcript_seq, _)| transcript_seq < seq)
+            {
+                conversation.apply(kept).map_err(fold_error)?;
+                activity.note(kept_seq, kept);
+            }
             operations.apply(record).map_err(fold_error)?;
+            activity.note(*seq, record);
+            conversation.enrolled(operations.enrolled_through());
+        }
+        for (seq, kept) in kept_transcript {
+            conversation.apply(kept).map_err(fold_error)?;
+            activity.note(seq, kept);
         }
 
         // A change whose intent the damaged log holds never committed: the head's open log is
@@ -343,6 +389,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
                         finished_at_ms: Some(now_ms),
                         detail: None,
                         hooks: None,
+                        call_key: None,
                     }));
                 }
                 if open_turn.contains(id) && !has_reply {
@@ -361,6 +408,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
                         },
                         finished_at_ms: Some(now_ms),
                         tags_v1: None,
+                        media: Vec::new(),
                     }));
                 } else if call.intent && !in_transcript.contains(&id.0) {
                     lost_parts.push(lost_part_line(id, call));
@@ -389,6 +437,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
                 }));
             }
             notice = Some(Record::Input(Input {
+                media: Vec::new(),
                 run_id: latest_run.unwrap_or_default(),
                 placement: Placement::DamageNotice,
                 message: Message::new(
@@ -406,7 +455,8 @@ impl<'b, B: SessionBackend> Session<'b, B> {
             }));
         }
 
-        // Seqs above every seq the removed bytes could hold.
+        // Seqs above every seq the removed bytes could hold: no frame is smaller than the
+        // overhead its session's key seals a frame with.
         let highest = debris
             .harvested
             .iter()
@@ -417,7 +467,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
             .max(head.next_seq.saturating_sub(1))
             .max(checkpoint.next_seq.saturating_sub(1));
         let removed_len = bytes.len() as u64 - first_damage;
-        let ceiling = highest + removed_len.div_ceil(FRAME_OVERHEAD as u64);
+        let ceiling = highest + removed_len.div_ceil(frame_key.frame_overhead() as u64);
         let before_damage = debris
             .harvested
             .iter()
@@ -458,6 +508,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
         let mut settled = operations;
         settled.open_change = None;
 
+        let activity_ms = activity.newest_activity_ms;
         let mut session = Session {
             backend,
             addr: addr.clone(),
@@ -470,13 +521,31 @@ impl<'b, B: SessionBackend> Session<'b, B> {
             conversation: checkpoint.conversation.clone(),
             operations: settled.clone(),
             open_ids: OpenIds::default(),
-            window_facts: BTreeMap::new(),
+            window: OpenLogIndex::from_checkpoint(activity_ms, intent_seq + 1),
+            imported: Default::default(),
+            enrollment: Default::default(),
+            sealed_entries: Default::default(),
+            observer: None,
+            kept: super::kept::KeptRecords::from_next(intent_seq + 1, false),
+            memory_only: Default::default(),
+            memory_refused: Default::default(),
         };
+        let checkpoint_body = Checkpoint {
+            covers_through: intent_seq,
+            next_seq: intent_seq + 1,
+            conversation: checkpoint.conversation.clone(),
+            operational: settled.clone(),
+            transcript_base: checkpoint.transcript_base,
+            ledger_base: Some(intent_seq),
+            activity_ms,
+        }
+        .encode();
         let created = async {
             let ledger_sealed = session
-                .seal_ledger(&name, &ledger, &settled, now_ms)
+                .seal_ledger(&name, &ledger, &settled, &checkpoint_body, now_ms)
                 .await?;
-            backend
+            session
+                .backend()
                 .put_object(&addr, &saved, &bytes[first_damage as usize..], version)
                 .await?;
 
@@ -491,22 +560,15 @@ impl<'b, B: SessionBackend> Session<'b, B> {
                     ledger: Some(intent_seq),
                 },
             );
-            backend.create_log(&addr, &change, version).await?;
+            session
+                .backend()
+                .create_log(&addr, &change, version)
+                .await?;
             let mut out = encoder
-                .checkpoint(
-                    &Checkpoint {
-                        covers_through: intent_seq,
-                        next_seq: intent_seq + 1,
-                        conversation: checkpoint.conversation.clone(),
-                        operational: settled.clone(),
-                        transcript_base: checkpoint.transcript_base,
-                        ledger_base: Some(intent_seq),
-                    }
-                    .encode(),
-                )?
+                .checkpoint(&checkpoint_body)?
                 .into_written(&mut encoder);
             let mut conversation = checkpoint.conversation.clone();
-            let mut window_facts = BTreeMap::new();
+            let mut window = OpenLogIndex::from_checkpoint(activity_ms, intent_seq + 1);
             let mut batch_start = 0;
             while batch_start < transcript.len() {
                 let first = transcript[batch_start].1;
@@ -520,9 +582,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
                     .collect();
                 for (seq, record) in &kept {
                     conversation.apply(record).map_err(fold_error)?;
-                    if let Record::EntryFacts(facts) = record {
-                        window_facts.insert(*seq, facts.ordinal);
-                    }
+                    window.note(*seq, record);
                 }
                 out.extend(encoder.copy_batch(&kept)?.into_written(&mut encoder));
                 batch_start = batch_end;
@@ -537,6 +597,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
             let mut operations = settled.clone();
             let mut open_ids = OpenIds::default();
             for (offset, record) in batch.iter().enumerate() {
+                window.note(first + offset as u64, record);
                 match record.stream() {
                     Stream::Transcript => conversation.apply(record).map_err(fold_error)?,
                     Stream::Ledger => {
@@ -546,11 +607,15 @@ impl<'b, B: SessionBackend> Session<'b, B> {
                 }
             }
             out.extend(encoder.batch(&batch)?.into_written(&mut encoder));
-            backend
+            session
+                .backend()
                 .append_log(&addr, &change, &out, 0, version, true)
                 .await?;
             encoder.synced();
-            backend.sync_objects(&addr, &change, version).await?;
+            session
+                .backend()
+                .sync_objects(&addr, &change, version)
+                .await?;
             Ok::<_, SessionError>(Created {
                 sealed: Sealed {
                     change,
@@ -566,7 +631,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
                 encoder,
                 conversation,
                 operations,
-                window_facts,
+                window,
                 open_ids,
                 transcript_dir: session.head.transcript_dir.clone(),
                 ledger_dir: ledger_sealed.ledger_dir,
@@ -593,6 +658,48 @@ impl<'b, B: SessionBackend> Session<'b, B> {
         session.commit(change, intent_seq, created, now_ms).await?;
         Ok(Recovery::Recovered(recovered))
     }
+}
+
+/// Rebuilds the checkpoint of open log `log`: the copy in the newest ledger segment, which the
+/// change that created the log sealed, or empty state for the session's first log. Refuses as
+/// `CheckpointLost` when the newest segment belongs to another change or holds no copy.
+async fn rebuild_checkpoint<B: SessionBackend>(
+    backend: &B,
+    addr: &SessionAddr,
+    head: &head::Head,
+    key: &crate::keys::DataKey,
+    log: &Id128,
+) -> Result<Vec<u8>, SessionError> {
+    let frame_key = key.frame_key();
+    let pages = Pages {
+        backend,
+        addr,
+        session: head.session_id,
+        key: &frame_key,
+        fanout: FANOUT,
+    };
+    let newest = pages
+        .find_before(head.ledger_dir.as_ref(), u64::MAX)
+        .await
+        .map_err(SessionError::Directory)?;
+    let Some(entry) = newest else {
+        // The session's first log, which creation started from empty state.
+        return Ok(super::stored::first_log_checkpoint(head).encode());
+    };
+    if entry.object != format!("{}/l", hex(&log.0)) {
+        return Err(SessionError::CheckpointLost);
+    }
+    let bytes = backend
+        .get_object(addr, &entry.object)
+        .await?
+        .ok_or(SessionError::CheckpointLost)?;
+    let segment = Segment::open(&bytes, &frame_key, entry.object.as_bytes())
+        .map_err(SessionError::Segment)?;
+    segment
+        .index
+        .log_start
+        .map(|body| body.0)
+        .ok_or(SessionError::CheckpointLost)
 }
 
 /// The closing result of a call whose outcome was lost.

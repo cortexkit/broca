@@ -63,6 +63,13 @@ crate::values! {
         4 CallKey,
         /// A session refresh's generation.
         5 RefreshGeneration,
+        /// The `send_id` of a `session.refresh_policy`, a namespace of its own: the same string
+        /// as a send's or a flush's send id is another key.
+        6 RefreshPolicySendId,
+        /// The `send_id` of a `session.flush_prefix`.
+        7 PrefixFlushSendId,
+        /// The generation of a refresh a run start applied, named by that application.
+        8 AppliedGeneration,
     }
 }
 
@@ -74,6 +81,9 @@ impl IdKind {
             IdKind::SendId => 3,
             IdKind::CallKey => 4,
             IdKind::RefreshGeneration => 5,
+            IdKind::RefreshPolicySendId => 6,
+            IdKind::PrefixFlushSendId => 7,
+            IdKind::AppliedGeneration => 8,
         }
     }
 }
@@ -98,13 +108,15 @@ pub fn record_ids(record: &Record) -> Vec<(IdKind, String)> {
         | Record::SetupStub(_)
         | Record::Compaction(_)
         | Record::Marker(_)
-        | Record::EntryFacts(_) => {}
+        | Record::EntryFacts(_)
+        | Record::TurnFacts(_) => {}
         Record::RunStart(start) => {
             push(IdKind::RunId, Some(&start.run_id));
             push(IdKind::SubmissionId, start.submission_id.as_deref());
             push(IdKind::SendId, start.send_id.as_deref());
         }
         Record::RunEnd(end) => push(IdKind::RunId, Some(&end.run_id)),
+        Record::Resumed(resumed) => push(IdKind::RunId, Some(&resumed.run_id)),
         Record::StructuredResult(result) => push(IdKind::RunId, Some(&result.run_id)),
         // Records inside a run are found through the run, never by an id of their own.
         Record::StepStart(_)
@@ -115,7 +127,16 @@ pub fn record_ids(record: &Record) -> Vec<(IdKind, String)> {
         | Record::ToolOutcome(_)
         | Record::Pause(_)
         | Record::BudgetFire(_)
-        | Record::CancelRequest(_) => {}
+        | Record::CancelRequest(_)
+        | Record::CeilingDecided(_)
+        | Record::OutputCapLowered(_)
+        | Record::StructuredDowngraded(_)
+        | Record::Warmed(_)
+        | Record::ConfigRefrozen(_)
+        | Record::AuthRefrozen(_)
+        | Record::StepRefused(_) => {}
+        // Whether a run is billed is read from the operational fold's owed set, never looked up.
+        Record::Billed(_) => {}
         Record::ToolIntent(intent) => push(IdKind::CallKey, intent.call_key.as_deref()),
         Record::ToolHeld(held) => push(IdKind::CallKey, Some(&held.call_key)),
         Record::QueuedSend(send) => {
@@ -136,6 +157,20 @@ pub fn record_ids(record: &Record) -> Vec<(IdKind, String)> {
                 Some(&refresh.generation.to_string()),
             );
         }
+        Record::RefreshPolicy(policy) => {
+            push(IdKind::RefreshPolicySendId, Some(&policy.send_id));
+        }
+        Record::PrefixFlush(flush) => push(IdKind::PrefixFlushSendId, Some(&flush.send_id)),
+        Record::RefreshApplied(applied) => {
+            push(
+                IdKind::AppliedGeneration,
+                Some(&applied.generation.to_string()),
+            );
+        }
+        // A session enrolls once, and the operational fold keeps the enrollment whole.
+        Record::CompactionEnrolled(_) => {}
+        // A move names no id a read looks a record up by.
+        Record::Moved(_) => {}
         // A steer's send id is part of its receipt, which the queue owns.
         Record::Steer(steer) => push(IdKind::SendId, json_str(steer.receipt.as_ref(), "send_id")),
         // Events carry the old record's fields whole; their idempotency keys keep their names.
@@ -283,7 +318,7 @@ impl From<BackendError> for IndexError {
     }
 }
 
-fn aad(session: &Id128, name: &str) -> Vec<u8> {
+pub(crate) fn aad(session: &Id128, name: &str) -> Vec<u8> {
     let mut aad = PAGE_CONTEXT.to_vec();
     aad.extend_from_slice(&session.0);
     aad.extend_from_slice(&(name.len() as u32).to_le_bytes());
@@ -462,6 +497,18 @@ impl<B: SessionBackend> IndexPages<'_, B> {
         at: Version,
         share: u64,
     ) -> Result<Updated, IndexError> {
+        // A merge names the runs it reads by counting from its level's oldest, and a level's runs
+        // stay until its merge finishes, so a count past them wasn't written by this code.
+        if root.levels.iter().any(|level| {
+            level
+                .merge
+                .as_ref()
+                .is_some_and(|merge| merge.inputs as usize > level.runs.len())
+        }) {
+            return Err(IndexError::Corrupt(
+                "index root: a merge counts more runs than its level holds".into(),
+            ));
+        }
         entries.sort_unstable();
         entries.dedup();
         if root.levels.is_empty() {
@@ -578,10 +625,15 @@ impl<B: SessionBackend> IndexPages<'_, B> {
             cursors[at_cursor].advance(self).await?;
         }
         let finished = cursors.iter().all(|cursor| cursor.peek().is_none());
+        // The count so far comes from the stored root, so it is added to with a check, before
+        // anything is written.
+        let written = merge.written.checked_add(out.len() as u64).ok_or_else(|| {
+            IndexError::Corrupt("index root: a merge's count of entries written overflows".into())
+        })?;
         if let Some(info) = self.write_entries(&out, prefix, at).await? {
             merge.done.push(info);
         }
-        merge.written += out.len() as u64;
+        merge.written = written;
         Ok((out.len() as u64, finished))
     }
 

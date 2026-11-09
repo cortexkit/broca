@@ -132,6 +132,46 @@ message! {
         8 opt receipt_seq: u64,
         /// Opaque payloads removed when the record left the open log (see `prune`).
         9 rep [must] pruned: crate::prune::PrunedOpaque,
+        /// Where the bytes of each medium the message carries are stored: a media block, or a
+        /// media part of a tool result in it. Only an imported message carries any. A reader
+        /// that renders the message needs them, so a record carrying any is refused by a reader
+        /// that doesn't know the field.
+        10 rep [must] media: InputMedia,
+    }
+}
+
+message! {
+    /// The stored bytes of one medium of an input message, stored as a tool result's are (see
+    /// [`MediaObject`]).
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    pub struct InputMedia {
+        /// The message's content block holding the medium.
+        1 req block: u32,
+        /// For a medium inside a tool result block: its position in the result's parts.
+        2 opt part: u32,
+        /// The open log the object was written under.
+        3 req log: crate::codec::Id128,
+        4 req generation: crate::codec::Id128,
+        5 req seq: u64,
+    }
+}
+
+message! {
+    /// The stored bytes of one medium of a message accepted before it is placed: a queued send's
+    /// or a steer's. The object is written under the accepting record, as an input message's is
+    /// (see [`InputMedia`]), and the message's copy in the transcript points at the same object.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    pub struct SendMedia {
+        /// The message's position in the record's messages.
+        1 req message: u32,
+        /// The message's content block holding the medium.
+        2 req block: u32,
+        /// For a medium inside a tool result block: its position in the result's parts.
+        3 opt part: u32,
+        /// The open log the object was written under.
+        4 req log: crate::codec::Id128,
+        5 req generation: crate::codec::Id128,
+        6 req seq: u64,
     }
 }
 
@@ -174,6 +214,25 @@ message! {
         3 req result: ToolResult,
         4 opt finished_at_ms: u64,
         5 opt tags_v1: serde_json::Value,
+        /// Where the bytes of each media part of `result` are stored. A reader that renders the
+        /// result needs them, so a record carrying any is refused by a reader that doesn't know
+        /// the field.
+        6 rep [must] media: MediaObject,
+    }
+}
+
+message! {
+    /// The stored bytes of one media part: an append object, named by the record that first
+    /// named it (`log`, `generation`, `seq`) and a keyed hash of the bytes' digest. A later record
+    /// naming the same bytes while that object is in the open log points at the same object.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    pub struct MediaObject {
+        /// The media part's position in the result's parts.
+        1 req part: u32,
+        /// The open log the object was written under.
+        2 req log: crate::codec::Id128,
+        3 req generation: crate::codec::Id128,
+        4 req seq: u64,
     }
 }
 
@@ -186,6 +245,46 @@ message! {
         3 req text: String,
         4 opt notice: Notice,
         5 opt written_at_ms: u64,
+        /// The id of the send whose text this is, which reads serve beside the text. A reader
+        /// that doesn't know the field would serve the text without it, so it is
+        /// must-understand.
+        6 opt [must] send_id: String,
+        /// The ride envelope (llm-runner 0.8.11): the carrying call's key, the sender and the
+        /// forms the send allowed, fixed when the text was delivered. Text with an envelope is
+        /// a ride: it is never joined into the stored result, and every request renders it
+        /// after the result through the runner's own ride rules. Text without one was delivered
+        /// before envelopes existed and keeps its historical rendering. A reader that doesn't
+        /// know the field would render a ride the old way, so it is must-understand.
+        7 opt [must] ride: RideEnvelope,
+    }
+}
+
+values! {
+    /// How a ride renders. Only the append form is ever recorded: broca never renders a ride
+    /// as system text.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+    pub enum RideForm {
+        1 Append,
+    }
+}
+
+message! {
+    /// What a ride carries besides its text and its send's id, as today's `SendDelivered`
+    /// record holds it in its `ride` member.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    pub struct RideEnvelope {
+        /// The key of the tool call whose result carries the ride, recorded at delivery and
+        /// never looked up again: a call id can repeat in a session, a key can't.
+        1 req call_key: String,
+        /// The module that sent it, or `broca`.
+        2 req sender: String,
+        /// The send's delivery list restricted to `tool_result` and `turn_system`, in order.
+        3 rep forms: String,
+        4 req form: RideForm,
+        /// The agent the sending module spoke for (llm-runner's `SpeaksFor` JSON), which reads
+        /// serve on the ride's notice. A reader that doesn't know the field would serve the
+        /// notice without it, so it is must-understand.
+        5 opt [must] speaks_for: serde_json::Value,
     }
 }
 
@@ -212,18 +311,46 @@ message! {
 }
 
 message! {
+    /// A note a send delivered riding on one of a tool results message's results, as
+    /// `session.read` serves it among the message's display facts (llm-runner's `NoticeFact`).
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    pub struct RideNotice {
+        /// The result's position among the message's results: its call's position among the
+        /// tool calls of the assistant message before it.
+        1 req part: u32,
+        2 req send_id: String,
+        /// The module that sent it, or `broca`.
+        3 req sender: String,
+        /// The key of the call whose result carries it.
+        4 req call_key: String,
+        /// The text the send delivered, without the blank line that separates it from the
+        /// result when it is rendered.
+        5 req text: String,
+        /// The agent the sending module spoke for, as the ride's envelope recorded it
+        /// (llm-runner's `SpeaksFor` JSON). A reader that doesn't know the field would serve the
+        /// notice without it, so it is must-understand.
+        6 opt [must] speaks_for: serde_json::Value,
+    }
+}
+
+message! {
     /// What `session.entries` serves about one conversation message besides the message itself,
     /// decided when the message was placed and never derived again. Written right after the
     /// record that places the message (or, for an assistant message still waiting for its tool
     /// results, the record that reserves its ordinal), in the same batch. A later `EntryFacts`
-    /// for the same ordinal replaces it. Content-free: delivered text stays in its
-    /// `ResultAppend`.
+    /// for the same ordinal replaces it. Content-free but for the reasoning summaries and ride
+    /// notices reads show: delivered text itself stays in its `ResultAppend`, and a notice
+    /// repeats it so a read of the message needs no other record.
     #[derive(Debug, Clone, PartialEq, Serialize)]
     pub struct EntryFacts {
         /// The message's place in the whole conversation, counting from 1.
         1 req ordinal: u64,
-        /// When the message was written. Never moves later than an earlier entry's.
-        2 req written_at_ms: u64,
+        /// When the message was written. On a session on the current compaction contract it is
+        /// always set and never moves later than an earlier entry's: a message without its own
+        /// time takes the newest earlier entry's, as `session.entries` serves it. Off the
+        /// contract it is the message's own time, absent when it has none, as `session.read`
+        /// serves it there.
+        2 opt written_at_ms: u64,
         /// The part number before this message's first numbered part: its parts take the
         /// numbers after it, in order.
         3 req tag_base: u64,
@@ -242,6 +369,163 @@ message! {
         /// converted from today's storage keeps today's id. A new message's id is minted from
         /// the writer generation and the seq this record takes (`Session::message_id`).
         10 req mid: String,
+        /// The run that placed the message. Absent when no run owns it, such as an imported
+        /// seed. `session.read` names it as the message's run.
+        11 opt run_id: String,
+        /// When the message was accepted, as `session.read` serves it. An input, steer or
+        /// delivered send takes its send's acceptance time, kept across a queue. An assistant
+        /// message takes the send time of its step's last complete attempt, not counting a warm
+        /// request. A tool result message has none.
+        12 opt created_at_ms: u64,
+        /// How a delivered send reached the conversation, as `session.read` names it beside the
+        /// message's run: `steer` or `turn_system` for the messages it placed, `idle_start` for
+        /// the input of a run it started, `tool_result` for the tool result message it rode
+        /// on. A steer that wasn't queued, and every other message, has none.
+        13 opt delivery_mode: String,
+        /// For a send that rode on a tool result: the call whose result carried it.
+        14 opt delivery_tool_call_id: String,
+        /// The `client_message_id` of the send that placed the message, as `session.read`
+        /// serves it in the message's display facts.
+        15 opt client_message_id: String,
+        /// The attested module id of whoever sent the message, as recorded at its send.
+        16 opt sender: String,
+        /// The send's display marks, as llm-runner's `MessageMarks` JSON: `speaks_for` and a
+        /// true `notice`.
+        17 opt marks: serde_json::Value,
+        /// The message was converted from a log of today's storage that had no lineage, so
+        /// today's read serves it none of what an `include_display_facts` read adds, and nor does
+        /// the new storage's. Absent for every message broca places itself.
+        18 opt no_display_facts: bool,
+        /// For an assistant message: the summaries its reasoning blocks carry, in the order of
+        /// its content blocks, as `session.read` serves them with display facts. Recorded when
+        /// the message is placed because a seal prunes the encrypted reasoning they are read
+        /// from. Absent when it has none.
+        19 rep reasoning_summaries: ReasoningSummary,
+        /// For an assistant message a run placed: the Rich UI stamp the run's plan froze, which
+        /// `session.read` serves on it with `include_rich_ui`. Recorded here so a read finds it
+        /// without looking up the run's start. Absent when the run's plan has none.
+        20 opt rich_ui: RichUi,
+        /// The highest part number the runner's own numbering (llm-runner's tags: stamped on a
+        /// v1 run's records, computed by `broca_protocol::tags::number_message` from each later
+        /// run's checkpoint) shows before this message. The message's numbered parts take the
+        /// numbers after it, under its run's rules. It is the numbering today's read attaches to
+        /// each message and output references resolve a reply's `$$tc(N)` against; on the
+        /// compaction contract the model is shown `tag_base`'s numbering instead. Absent on
+        /// sessions written before it was recorded.
+        21 opt runner_tag_base: u64,
+        /// On a session converted from a log whose compaction provider spoke the first
+        /// compaction protocol only: the seq of that log's view event (`compaction_view_applied`,
+        /// kept whole as a ledger event) in force when the model step that wrote this message
+        /// sent its request, which output references check a named part against. Absent when no
+        /// such view had applied; the run loop never writes first-protocol views.
+        22 opt legacy_view_seq: u64,
+        /// For a tool results message: each send that rode on one of its results, in the order
+        /// delivered, as `session.read` serves it in the message's `notices` display fact. Only
+        /// a ride delivered with its envelope has one; text delivered before envelopes existed
+        /// stays joined into its result and has none.
+        23 rep notices: RideNotice,
+    }
+}
+
+message! {
+    /// A run's Rich UI stamp: which Rich UI dialect its system text taught, and against which
+    /// catalog (llm-runner's `RichUiStamp`).
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct RichUi {
+        1 req dialect: String,
+        2 req catalog_digest: String,
+    }
+}
+
+message! {
+    /// The summary one reasoning block of an assistant message carries.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct ReasoningSummary {
+        /// The block's position among the message's content blocks.
+        1 req part: u32,
+        2 req text: String,
+    }
+}
+
+message! {
+    /// What reads serve about each tool call of one assistant message besides the message
+    /// itself, decided once and never derived again. Written in the batch that places the
+    /// message's tool results, so a sealed block never splits it from its turn. A later
+    /// `TurnFacts` for the same ordinal replaces it: a run that ends cancelled restates its last
+    /// turn's calls it abandoned as cancelled.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct TurnFacts {
+        /// The ordinal of the assistant message that made the calls.
+        1 req ordinal: u64,
+        /// One per call that has a key, in the order the message made them: a dispatched call's
+        /// is its intent's, a call answered without an intent its outcome's
+        /// (`ToolOutcome::call_key`).
+        2 rep calls: CallFacts,
+    }
+}
+
+message! {
+    /// One tool call's identity and times, as reads serve them.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct CallFacts {
+        /// The call's id in the message.
+        1 req tool_call_id: ToolCallId,
+        /// The call's durable key, unique within the runner that minted it.
+        2 req call_key: String,
+        /// The schema pin the call ran under: for a call broca dispatched, the pin as reads
+        /// serve it (llm-runner's encoded `SchemaPin`); for an imported call, as its runner
+        /// recorded it.
+        3 opt schema_pin: serde_json::Value,
+        /// The attested module id of the runner that minted `call_key`, when that wasn't broca:
+        /// a call imported from another runner keeps its key, which is unique only within that
+        /// runner.
+        4 opt carrier: String,
+        /// The module the call was dispatched to.
+        5 opt dispatched_to: String,
+        6 opt dispatched_at_ms: u64,
+        7 opt finished_at_ms: u64,
+        /// Why the call has no answer from its tool, when it has none: reads serve it as the
+        /// call's `unanswered`. Absent for a call its tool answered.
+        8 opt unanswered: Unanswered,
+    }
+}
+
+values! {
+    /// Why a tool call has no answer from its tool, as reads name it (llm-runner's
+    /// `ToolTime::unanswered`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+    pub enum Unanswered {
+        /// Refused: denied by a person or an approval, or blocked by policy.
+        1 Denied,
+        /// Never run: its input failed validation, or its tool provider couldn't take it.
+        2 NotExecuted,
+        /// Abandoned before it finished, or sent with no answer back.
+        3 Interrupted,
+        /// Stopped by a cancel, or by a step limit while it was pending.
+        4 Cancelled,
+    }
+}
+
+impl Unanswered {
+    /// The name reads serve.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Unanswered::Denied => "denied",
+            Unanswered::NotExecuted => "not_executed",
+            Unanswered::Interrupted => "interrupted",
+            Unanswered::Cancelled => "cancelled",
+        }
+    }
+
+    /// The value read as `name`, if reads serve one by that name.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "denied" => Unanswered::Denied,
+            "not_executed" => Unanswered::NotExecuted,
+            "interrupted" => Unanswered::Interrupted,
+            "cancelled" => Unanswered::Cancelled,
+            _ => return None,
+        })
     }
 }
 
@@ -262,6 +546,9 @@ values! {
         6 ResponseFormat,
         /// Global instructions of a run without a plan.
         7 GlobalSystem,
+        /// The provider's frozen render config, from which the renderer of each of the run's
+        /// requests is rebuilt. Opaque to the store and the run loop.
+        8 RenderConfig,
     }
 }
 
@@ -282,6 +569,11 @@ message! {
         1 rep parts: PartRef,
         2 req model: ModelHandle,
         3 rep tool_names: String,
+        /// A digest of what renderers read from this setup's render config when rendering
+        /// another run's messages (`broca_provider`'s `episode_render_key`). The conversation
+        /// keeps runs past the window only where it changes. Absent on setups converted before
+        /// it was recorded.
+        4 opt render_key: Digest,
     }
 }
 
@@ -307,8 +599,6 @@ message! {
         14 opt service_tier: String,
         15 opt route_decision_id: String,
         16 opt compaction_plan_version: u32,
-        /// Owned by the provider: the frozen render config the renderer is rebuilt from.
-        17 opt render_config: serde_json::Value,
         /// Owned by the vault client: the credential and account chosen for the run.
         18 opt auth_selection: serde_json::Value,
         /// The run loop's remaining frozen choices (generation settings, budgets, stop
@@ -330,6 +620,72 @@ message! {
         /// run was admitted (`broca_core::refusal_fallback::on_episode_admitted`). Absent when
         /// the run starts with none.
         27 opt refusal_schedule: serde_json::Value,
+        /// On an import's seeded run: the session object that maps each imported message's
+        /// source id to its ordinal. Message ids broca mints name where their message is, and
+        /// an imported id doesn't, so a reader resolving an imported id needs the map.
+        28 opt [must] imported_ids: ImportedIds,
+        /// The display marks of the send whose input the run places (llm-runner's
+        /// `MessageMarks` JSON: `speaks_for` and a true `notice`), which reads serve on each of
+        /// those messages. A reader that doesn't know the field would serve them without their
+        /// marks, so it is must-understand.
+        29 opt [must] message_marks: serde_json::Value,
+    }
+}
+
+message! {
+    /// Where an import's id map and receipt are stored: session objects written under the open
+    /// log by the batch whose seeded run start names them, before that batch.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    pub struct ImportedIds {
+        1 req log: crate::codec::Id128,
+        2 req generation: crate::codec::Id128,
+        /// The seq of the run start naming it.
+        3 req seq: u64,
+    }
+}
+
+message! {
+    /// One imported message's source id and ordinal.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    pub struct ImportedId {
+        1 req mid: String,
+        2 req ordinal: u64,
+    }
+}
+
+message! {
+    /// An import's id map, the body of the object [`ImportedIds`] names: every imported
+    /// message's source id, sorted by id.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    pub struct ImportedIdMap {
+        1 rep ids: ImportedId,
+    }
+}
+
+message! {
+    /// One source message of an import's move list and the ordinal it became, if any.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    pub struct ImportedMove {
+        1 req mid: String,
+        2 opt ordinal: u64,
+    }
+}
+
+message! {
+    /// What an import answered, kept so a retry of it is answered the same after its source is
+    /// gone: the body of a session object written before the import's batch, beside the id
+    /// map, at the place [`ImportedIds`] names.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    pub struct ImportReceipt {
+        /// The import's idempotency key, and the digest of the payload it was made with.
+        1 req import_id: String,
+        2 req digest: String,
+        /// The move list's shape, as the reply names it.
+        3 req shape: String,
+        /// One per source message on the session's path, in source order.
+        4 rep moves: ImportedMove,
+        5 req imported_messages: u64,
+        6 req dropped_system_messages: u64,
     }
 }
 
@@ -354,6 +710,13 @@ message! {
     pub struct StepStart {
         1 req run_id: String,
         2 req step_id: u64,
+        /// The id of the assistant message this step writes, decided here so a live subscriber
+        /// can name the message from the step's start. The new loop mints it from its writer
+        /// generation and this record's seq; a step converted from a WAL log keeps the id the
+        /// WAL projection gives the message at that position. The message's `EntryFacts`
+        /// carries the same id, and a fold refuses one that doesn't. A step that writes no
+        /// message leaves it unused. Absent on steps written before it was recorded.
+        3 opt mid: String,
     }
 }
 
@@ -384,6 +747,23 @@ message! {
         /// Whether a stop condition other than "the loop finished" was met, which forbids an
         /// extra step to place a steer that arrived during this one.
         14 opt limiting_stop_met: bool,
+        /// The step's usage split by the model each part counts under, as the run loop decides
+        /// it when it writes the step: a refusal fallback's or a provider's own hand-off moves
+        /// usage off the run's model. The session's usage by model is the sum of these.
+        15 rep [must] by_model: ModelStepUsage,
+    }
+}
+
+message! {
+    /// One model's share of a step's usage, as `StepEnd::by_model` and `StepRefused::by_model`
+    /// record it. `variant` is the run's variant only when the run's own model answered the
+    /// whole step: another model doesn't run the caller's variant.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct ModelStepUsage {
+        1 req provider: String,
+        2 req model: String,
+        3 opt variant: String,
+        4 req usage: Usage,
     }
 }
 
@@ -412,6 +792,16 @@ message! {
         /// Owned by diagnostics: stream event counts, cache evidence, WebSocket and input
         /// transformation details.
         18 opt telemetry: serde_json::Value,
+        /// Whether the provider accepted the request for processing, so its prompt prefix was
+        /// read into or written to the provider's cache, as the run loop decides it when it
+        /// records the attempt. Absent means it didn't, or isn't known to have.
+        19 opt reached_cache: bool,
+        /// For a request that reached the cache: the cache lifetime it asked the provider for,
+        /// when it asked for one the provider honours (a first-party Anthropic marker's `ttl`,
+        /// or first-party OpenAI's 24-hour retention), as the run loop decides it from the
+        /// run's frozen render config when it records the attempt. Only this lifetime can prove
+        /// the cache expired. Absent when the request named none.
+        20 opt requested_cache_ttl_ms: u64,
     }
 }
 
@@ -423,6 +813,9 @@ message! {
         2 req batch_id: String,
         3 req step_id: u64,
         4 rep planned: ToolCallId,
+        /// The id of the tool-results message this batch's replies make, decided here as
+        /// `StepStart::mid` is for the step's assistant message, with the same rules.
+        5 opt mid: String,
     }
 }
 
@@ -457,6 +850,12 @@ message! {
         /// schema pin the call was dispatched under.
         11 opt schema_pin: serde_json::Value,
         12 opt hooks: serde_json::Value,
+        /// The converter derived `call_key` from today's log: today's intent stores no key, and
+        /// the runner sent `<log lineage id>:<intent's position>`, which the provider keys the
+        /// call's late result, approval and withdrawal on. The key is stored so it never has to
+        /// be derived from a position again; this marks it as derived, so the record converts
+        /// back exactly.
+        13 opt key_derived: bool,
     }
 }
 
@@ -495,6 +894,13 @@ message! {
         /// Owned by the tool router: why a call wasn't dispatched, held or withdrawn.
         9 opt detail: serde_json::Value,
         10 opt hooks: serde_json::Value,
+        /// The key of a call answered without a dispatch intent (denied, invalid, synthetic, or
+        /// refused with its batch), which no intent holds: the new loop mints it from this
+        /// record's writer generation and seq, in the form of the store's ids, and a converted
+        /// call keeps today's key, made from the log's lineage and its terminal record's seq.
+        /// Absent for a dispatched call, whose key is its intent's, and on outcomes written
+        /// before it was recorded.
+        11 opt call_key: String,
     }
 }
 
@@ -539,6 +945,17 @@ message! {
         /// provider's edit as raw JSON or the index of the identical edit in the previous
         /// accepted view.
         3 req edits: serde_json::Value,
+        /// The view's build metadata as the provider sealed it: the entry it was built
+        /// through, and its policy for blocks signed after that. Both are part of the view's
+        /// checksum, so a reader that doesn't know them can't rebuild the view; they are
+        /// must-understand.
+        4 opt [must] built_through: String,
+        5 opt [must] new_signed: String,
+        /// The compaction provider that handed the view over through `session.apply_view`, as
+        /// its route admitted it. Absent for a view a run's step accepted or an import installed.
+        /// `session.applied_view` names it, so a reader that doesn't know it would serve the
+        /// applied view without it; it is must-understand.
+        6 opt [must] applied_by: String,
     }
 }
 
@@ -572,6 +989,15 @@ message! {
         /// How the send asked to be delivered, as the caller named it (`interrupt` drains ahead
         /// of every plain send). Absent for a plain queued send.
         9 opt delivery: String,
+        /// Where the bytes of each medium the send's messages carry are stored. The run or
+        /// boundary that places the messages points their transcript copies at the same objects.
+        /// A reader that places or renders the messages needs them, so a record carrying any is
+        /// refused by a reader that doesn't know the field.
+        10 rep [must] media: SendMedia,
+        /// The send's display marks (llm-runner's `MessageMarks` JSON), which reads serve on the
+        /// messages it places. A reader that doesn't know the field would place them without
+        /// their marks, so it is must-understand.
+        11 opt [must] message_marks: serde_json::Value,
     }
 }
 
@@ -586,6 +1012,133 @@ message! {
         5 rep setup: PartRef,
         /// The rest of the refreshed manifest, owned by the fetch-plan code.
         6 opt manifest: serde_json::Value,
+        /// The model the refreshed plan chooses for the session's next runs (its `model`), as
+        /// admission read it from the plan; absent when the plan chooses none. A send that
+        /// leaves its model to the session, and `session.head`, follow the latest refresh that
+        /// chooses one.
+        7 opt selection: serde_json::Value,
+    }
+}
+
+message! {
+    /// The pending refresh's policy changed (`session.refresh_policy`), durable before the
+    /// caller is answered. `send_id` is the change's idempotency key: a repeat is answered from
+    /// this record.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct RefreshPolicy {
+        1 req generation: u64,
+        2 req policy: String,
+        3 req send_id: String,
+    }
+}
+
+message! {
+    /// The session's frozen prefix was flushed (`session.flush_prefix`): the next run applies any
+    /// pending refresh, whatever its policy. `pending_generation` is the refresh pending when the
+    /// flush was accepted, which a repeat under the same `send_id` is answered with.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct PrefixFlush {
+        1 req send_id: String,
+        2 opt pending_generation: u64,
+    }
+}
+
+message! {
+    /// The run whose start shares this record's batch applied the pending refresh `generation`:
+    /// `applied_by` is `fold` when a prefix rebuild applied it and `append` when the run applied
+    /// it with the prefix intact. It carries the facts the session's baseline reports for the
+    /// applied change, decided with it: the whole manifest's digest, its composition digest when
+    /// it has one, and the plan items its fetch left absent. Written after the run's input
+    /// records, so the run's start is still followed directly by its input.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct RefreshApplied {
+        1 req generation: u64,
+        2 req applied_by: String,
+        3 req manifest_digest: String,
+        4 opt composition_digest: String,
+        /// Owned by the fetch-plan code: each absent item as the baseline reports it.
+        5 rep absent_items: serde_json::Value,
+    }
+}
+
+message! {
+    /// The session moved here from today's storage (`session.move_to_store`), written in the
+    /// batch that holds the last of its converted records. Nothing happened in the session: the
+    /// record's time is the one today's `session.head` served as the session's last update before
+    /// the move, so the head reads the same after it, and later records advance it.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    pub struct Moved {
+        /// The move that wrote it, `store-move:<uuid>`.
+        1 req move_id: String,
+        /// When the session last changed, as today's `session.head` served it (`updated_at`).
+        2 req source_activity_ms: u64,
+    }
+}
+
+message! {
+    /// A session that ran outside the current compaction contract moved onto it: the run whose
+    /// start shares this record's batch is its first run on the contract. The messages already
+    /// placed, ordinals 1 through `through_ordinal`, keep their records and their facts; what
+    /// `session.entries` serves about them on the contract was decided here, once, and is stored
+    /// in the session object `overlay` names. Written after the run's input records, so the run's
+    /// start is still followed directly by its input. A session enrolls at most once.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct CompactionEnrolled {
+        /// The newest message placed before the enrolling run.
+        1 req through_ordinal: u64,
+        /// The highest part number any request before the enrolling run showed the model, or 0:
+        /// the earlier messages' parts are numbered after it.
+        2 req tag_floor: u64,
+        /// The last part number the earlier messages took. The enrolling run's own messages are
+        /// numbered after it.
+        3 req tag_high: u64,
+        4 req overlay: EnrollmentOverlayRef,
+    }
+}
+
+message! {
+    /// Where an enrollment's per-message decisions are stored: a session object written under the
+    /// open log, as an import's id map is, and durable before the batch whose
+    /// `CompactionEnrolled` names it. Its body is an [`EnrolledEntries`].
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    pub struct EnrollmentOverlayRef {
+        1 req log: crate::codec::Id128,
+        2 req generation: crate::codec::Id128,
+        /// The seq the session's next record would take when the object was written, which the
+        /// enrolling run's start batch then takes unless another record came first. It keeps the
+        /// object's name apart from every other enrollment object the session could write: a
+        /// later one is written at a later seq, unless no batch named this one.
+        3 req seq: u64,
+    }
+}
+
+message! {
+    /// What `session.entries` serves about one message placed before a session enrolled in the
+    /// current compaction contract, in place of its own facts' contract members, which were
+    /// recorded off the contract.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct EnrolledEntry {
+        1 req ordinal: u64,
+        /// The part number before the message's first numbered part, in the projection's
+        /// numbering.
+        2 req tag_base: u64,
+        /// The message's own time, else the newest earlier entry's, else 0.
+        3 req written_at_ms: u64,
+        /// A global system message: the enrolling run's system text takes its place, so it is
+        /// neither served nor rendered, and takes no part numbers.
+        4 req suppressed: bool,
+        /// Who delivered it, where the session's records show a module other than the owner
+        /// sent it.
+        5 opt notice: Notice,
+    }
+}
+
+message! {
+    /// An enrollment's per-message decisions, the body of the object [`EnrollmentOverlayRef`]
+    /// names: one entry per ordinal from 1 through the enrollment's `through_ordinal`, in order.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct EnrolledEntries {
+        1 rep entries: EnrolledEntry,
     }
 }
 
@@ -624,6 +1177,36 @@ impl Value for PauseReason {
                 ))
             }
         })
+    }
+}
+
+message! {
+    /// A run continued after a crash or a restart: what it rebuilt from its records without
+    /// calling anyone, what it does again because no durable record of it survived, and which
+    /// calls may have run without a recorded result. Those calls are never sent again.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct Resumed {
+        1 req run_id: String,
+        /// The seq of the last durable record the resume read.
+        2 req resumed_from_seq: u64,
+        /// Messages of the rebuilt conversation, every earlier run included.
+        3 req messages: u64,
+        /// The run's model steps whose answer is durable and isn't asked for again.
+        4 req model_steps: u64,
+        /// Durable results of the run's open tool batch, used as recorded.
+        5 req tool_results: u64,
+        6 rep redone: Redo,
+        7 rep indeterminate: ToolCallId,
+    }
+}
+
+message! {
+    /// One thing a resume does again: a model step asked for again (`step_id`), or a planned
+    /// call dispatched because it has no durable intent (`tool_call_id`). Exactly one is set.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    pub struct Redo {
+        1 opt step_id: u64,
+        2 opt tool_call_id: ToolCallId,
     }
 }
 
@@ -699,6 +1282,14 @@ message! {
         3 opt tags_v1: serde_json::Value,
         /// The receipt: sender, send id, delivery, retention, title and hooks.
         4 opt receipt: serde_json::Value,
+        /// Where the bytes of each medium the steer's messages carry are stored, which the
+        /// messages' transcript copies point at. A record carrying any is refused by a reader
+        /// that doesn't know the field.
+        5 rep [must] media: SendMedia,
+        /// The steer's display marks (llm-runner's `MessageMarks` JSON), which reads serve on the
+        /// messages it places. A reader that doesn't know the field would place them without
+        /// their marks, so it is must-understand.
+        6 opt [must] message_marks: serde_json::Value,
     }
 }
 
@@ -761,6 +1352,145 @@ message! {
         2 req order: serde_json::Value,
         /// The sender whose dedupe key the send carries, when it isn't the session's owner.
         3 opt sent_by: serde_json::Value,
+    }
+}
+
+message! {
+    /// The context-ceiling check before a step's request: the request doesn't fit the model's
+    /// window even after the compaction provider's answer, so the run ends without sending it.
+    /// `detail` is the protocol's `ContextCeilingDetail` (the usable window, the request's tokens
+    /// and why), kept as the caller reads it; absent when the check let the step send.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct CeilingDecided {
+        1 req step_id: u64,
+        2 opt detail: serde_json::Value,
+    }
+}
+
+message! {
+    /// A step's output-token cap, lowered below the run's frozen cap before the step's request
+    /// was sent, so the estimated input plus the output reservation stays inside the context
+    /// limit. Written only for a step whose cap was lowered, and durable before the request goes
+    /// out, so a resume renders the cap the provider saw.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct OutputCapLowered {
+        1 req step_id: u64,
+        /// The cap the step's request carries.
+        2 req max_output_tokens: u32,
+        /// The input-token estimate the cap was derived from, kept for diagnosis only.
+        3 req estimated_input_tokens: u64,
+        /// The run's frozen context limit the estimate was checked against.
+        4 req context_limit: u64,
+    }
+}
+
+message! {
+    /// The provider refused a run's strict structured-output schema as too large a grammar, so
+    /// the run's schema goes out without the strict flag from here on: its step is sent again,
+    /// and a resume renders the run downgraded. Durable before the step is sent again.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct StructuredDowngraded {
+        1 req run_id: String,
+    }
+}
+
+message! {
+    /// The run's own model refused a step with a content filter, and the step goes to the
+    /// run's refusal-fallback model instead. The refused answer is not kept. Its billed usage
+    /// counts toward the run, and the schedule the refusal armed applies to the session. Durable
+    /// before the step is sent to the fallback, and a resume sends the step there again.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct StepRefused {
+        1 req run_id: String,
+        2 req step_id: u64,
+        3 req usage: Usage,
+        /// Owned by the provider layer: the model that answered and each model's usage, when
+        /// the provider handed the request on itself.
+        4 opt served_model: String,
+        5 opt usage_iterations: serde_json::Value,
+        /// How many content blocks the refused answer held.
+        6 req discarded_blocks: u32,
+        /// Owned by the run loop: the refusal-fallback schedule after this refusal.
+        7 req schedule: serde_json::Value,
+        8 opt ts_ms: u64,
+        /// The refused step's usage split by model, as `StepEnd::by_model`: a refused step was
+        /// billed, so it counts as a step of the model that refused.
+        9 rep [must] by_model: ModelStepUsage,
+    }
+}
+
+message! {
+    /// A paused run resumed before any provider call, and its provider now renders with a
+    /// different config than the run froze: the run renders with this one from here on. Only
+    /// before the first call is that safe, since no request bytes depend on the old config.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct ConfigRefrozen {
+        1 req run_id: String,
+        2 opt ts_ms: u64,
+        3 req renderer_version: u32,
+        /// Owned by the provider layer, as the run start's render config is.
+        4 req render_config: serde_json::Value,
+    }
+}
+
+message! {
+    /// A paused run resumed on another provider account than it froze, which routing gave it:
+    /// its later requests and its spend name this account. Account metadata changes no request
+    /// bytes, so this may follow provider calls. Not written for a run paused on its account's
+    /// limit, which resumes only on that account.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct AuthRefrozen {
+        1 req run_id: String,
+        2 opt ts_ms: u64,
+        /// Owned by admission, as the run start's auth selection is.
+        3 req auth_selection: serde_json::Value,
+    }
+}
+
+message! {
+    /// The runner sent a request to keep the session's prompt cache warm: the prefix a step's
+    /// request wrote, read again so it outlives the wait. Billed, and counted toward how long
+    /// the cache lives.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct Warmed {
+        1 req run_id: String,
+        /// The step whose request was refreshed.
+        2 req step_id: u64,
+        /// What asked for it: `keep_warm` for a run's own tool wait, `source_keep_warm`, or
+        /// absent for a caller's manual warm.
+        3 opt trigger: String,
+        /// The step's request whose prefix was refreshed.
+        4 req request_body_sha256: Digest,
+        /// The warm request's own body.
+        5 req warm_body_sha256: Digest,
+        6 req usage: Usage,
+        7 opt served_account_ref: String,
+        8 req sent_at_ms: u64,
+        /// The cache lifetime the warm was scheduled by, and when the cache then expires.
+        9 opt ttl_ms: u64,
+        10 opt expires_at_ms: u64,
+        11 opt attempt_id: String,
+        /// Owned by billing: the reservation and envelope of a billed warm.
+        12 opt billing: serde_json::Value,
+        /// Owned by account routing: the provider's rate-limit headers on the warm's answer.
+        13 opt ratelimit_headers: serde_json::Value,
+        /// Whether the warm reached the provider's cache, as decided when it was recorded.
+        /// Absent means it didn't, or isn't known to have.
+        14 opt reached_cache: bool,
+        /// For a warm that reached the cache: the lifetime the run's requests ask for, when
+        /// they ask for one the provider honours, as on `Attempt`.
+        15 opt requested_cache_ttl_ms: u64,
+    }
+}
+
+message! {
+    /// A run's spend facts are in the usage export. A run's end makes its billing owed (see
+    /// `Operations::billing_owed`); this record, written only after the facts' insert commits,
+    /// settles it. Billing a run again inserts nothing new, so a crash between the insert and
+    /// this record only bills the run again.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct Billed {
+        1 req run_id: String,
     }
 }
 
@@ -926,6 +1656,12 @@ message! {
         4 req ordinal: u64,
         /// The session's history version after the revert.
         5 req history_version: u64,
+        /// On a session on the current compaction contract: the highest part number any message
+        /// had taken before the revert, which the dropped branch's messages may have held. Part
+        /// numbers never repeat in a session, so later messages are numbered above it. A reader
+        /// that ignored it would number them again from the kept branch, so it is
+        /// must-understand. Absent off the contract, where part numbers aren't served.
+        6 opt [must] tag_high: u64,
     }
 }
 
@@ -978,7 +1714,7 @@ impl Record {
             Record::Assistant(r) => r.last_content_at_ms.or(r.written_at_ms),
             Record::ToolReply(r) => r.finished_at_ms,
             Record::ResultAppend(r) => r.written_at_ms,
-            Record::EntryFacts(r) => Some(r.written_at_ms),
+            Record::EntryFacts(r) => r.written_at_ms,
             Record::RunStart(r) => r.written_at_ms.or(r.ts_ms),
             Record::RunEnd(r) => r.ts_ms,
             Record::Attempt(r) => r.last_content_at_ms.or(Some(r.ts_ms)),
@@ -987,6 +1723,7 @@ impl Record {
             Record::Pause(r) => r.ts_ms,
             Record::Steer(r) => r.written_at_ms,
             Record::Delivery(r) => r.written_at_ms,
+            Record::Moved(r) => Some(r.source_activity_ms),
             _ => None,
         }
     }
@@ -1002,6 +1739,7 @@ records! {
         6 Compaction,
         7 Marker,
         8 EntryFacts,
+        9 TurnFacts,
     }
     ledger {
         // One per run, and much larger than the rest.
@@ -1034,6 +1772,20 @@ records! {
         90 ChangeAborted,
         91 TranscriptReverted,
         92 RecoveryCut,
+        93 Resumed,
+        94 CeilingDecided,
+        95 OutputCapLowered,
+        96 StructuredDowngraded,
+        97 Warmed,
+        98 ConfigRefrozen,
+        99 AuthRefrozen,
+        100 StepRefused,
+        101 Billed,
+        102 RefreshPolicy,
+        103 PrefixFlush,
+        104 RefreshApplied,
+        105 CompactionEnrolled,
+        106 Moved,
     }
 }
 

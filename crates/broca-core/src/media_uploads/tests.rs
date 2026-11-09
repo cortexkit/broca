@@ -395,3 +395,22 @@ fn committed_reads_verify_identity_expiry_state_and_bytes_without_writes() {
     assert!(uploads.read_committed(&identity(), &id, 3).is_err());
     assert_eq!(snapshot(&root), before);
 }
+
+/// A session the new session storage holds keeps its media there: today's media-class lookup
+/// refuses it instead of choosing one of today's stores for it.
+#[test]
+fn session_media_store_refuses_a_session_the_new_storage_holds() {
+    let (root, uploads) = fixture();
+    let wal = crate::FileWalStore::new(root.join("wal"));
+    drop(crate::WalStore::open(&wal, &identity()).unwrap());
+    // On today's storage the session's media store is its WAL's class.
+    assert!(uploads.session_media_store(&identity()).is_ok());
+    let head = broca_wal::session_storage_head(&root, &crate::session_addr(&identity()));
+    fs::create_dir_all(head.parent().unwrap()).unwrap();
+    fs::write(&head, b"head").unwrap();
+    let refused = uploads.session_media_store(&identity()).unwrap_err();
+    assert!(
+        refused.to_string().contains("new session storage"),
+        "{refused}"
+    );
+}

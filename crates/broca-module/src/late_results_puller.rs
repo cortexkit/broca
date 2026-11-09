@@ -1303,6 +1303,11 @@ fn rebuild_with_publication_hook(
     let paths = rebuild_inventory(state_root)?;
     let mut identities = Vec::new();
     for (path, archive) in &paths {
+        // The new session storage owns this session, or a move is taking it there: its
+        // calls are the new storage's to settle, not this intake's.
+        if !*archive && path_owned_by_store(state_root, path)? {
+            continue;
+        }
         let scanned = (|| -> Result<(), String> {
             let mut file = std::fs::File::open(path).map_err(|error| error.to_string())?;
             let identity = input_identity(&mut file, path, *archive)?;
@@ -1323,6 +1328,11 @@ fn rebuild_with_publication_hook(
                     broca_wal::archive::fold_timestamp(path).map_err(|error| error.to_string())?,
                 );
                 for expected in &container.members {
+                    if broca_wal::owned_by_store(state_root, &expected.address)
+                        .map_err(|error| error.to_string())?
+                    {
+                        continue;
+                    }
                     report.files += 1;
                     progress(&report);
                     let member = reader
@@ -1493,6 +1503,15 @@ fn input_identity(
         digest: hasher.finalize().into(),
         archive,
     })
+}
+
+/// Whether the new session storage owns the session whose live WAL is `path`, which is named
+/// after the session's address.
+fn path_owned_by_store(state_root: &Path, path: &Path) -> Result<bool, String> {
+    let Some(address) = path.file_stem().and_then(|stem| stem.to_str()) else {
+        return Ok(false);
+    };
+    broca_wal::owned_by_store(state_root, address).map_err(|error| error.to_string())
 }
 
 fn rebuild_inventory(root: &Path) -> Result<Vec<(std::path::PathBuf, bool)>, String> {
@@ -4050,6 +4069,40 @@ mod tests {
         assert_eq!(keys, ["lineage:4", "lineage:7"]);
         assert!(store.feed("tools").unwrap().unwrap().ack_owed);
         assert!(store.feed("core").unwrap().unwrap().ack_owed);
+    }
+
+    /// A session the new session storage holds settles its calls there: a rebuild neither reads
+    /// its WAL nor registers its calls, so today's puller never takes them as its own.
+    #[test]
+    fn a_rebuild_leaves_out_a_session_the_new_storage_holds() {
+        let root = rig_root("rebuild-store-held");
+        let _ = std::fs::remove_dir_all(&root);
+        let wal_root = root.join("wal-root");
+        let moved = session("moved-held");
+        let kept = session("kept-held");
+        let wal = FileWalStore::new(wal_root.join("wal"));
+        write_wal_gated(&wal, &moved, &held_records("lineage:4", "tools", &moved));
+        write_wal_gated(&wal, &kept, &held_records("lineage:7", "core", &kept));
+        broca_wal::raise_floor(
+            &wal_root.join(broca_wal::FEATURE_FLOOR_FILENAME),
+            &[broca_wal::PROVIDER_HELD_FEATURE],
+        )
+        .unwrap();
+        let head = broca_wal::session_storage_head(&wal_root, &broca_core::session_addr(&moved));
+        std::fs::create_dir_all(head.parent().unwrap()).unwrap();
+        std::fs::write(&head, b"head").unwrap();
+        let store = LateResultsStore::open(&root.join("late-results.db")).unwrap();
+        let report = rebuild_store_from_wals(&store, &wal_root).unwrap();
+        assert_eq!(report.files, 1, "only today's session is read");
+        assert!(report.unreadable.is_empty());
+        let keys: Vec<String> = store
+            .registrations()
+            .unwrap()
+            .into_iter()
+            .map(|call| call.call_key)
+            .collect();
+        assert_eq!(keys, ["lineage:7"]);
+        assert!(store.feed("tools").unwrap().is_none());
     }
 
     /// A state root whose feature floor never named `provider-held/v1` holds no held frame, so a

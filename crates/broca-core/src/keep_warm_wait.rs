@@ -38,43 +38,42 @@ pub enum WarmTick {
 /// the request instead of leaving it running. Once a warm reports usage, queue `CacheWarmed`
 /// (the warm and its usage in the session's write-ahead log) before any further await, so
 /// cancellation cannot lose the reported usage.
+///
+/// `C` is what the driver reads a run's frozen request from: today's run loop hands it the
+/// run's `RunConfig`; another run loop may hand it its own frozen admission.
 #[async_trait::async_trait]
-pub trait KeepWarmDriver: Send + Sync {
-    fn timing(&self, config: &RunConfig) -> Result<WarmTiming, String>;
+pub trait KeepWarmDriver<C: ?Sized + Sync = RunConfig>: Send + Sync {
+    fn timing(&self, config: &C) -> Result<WarmTiming, String>;
     /// The cache lifetime requests under `config` ask the provider for, when they ask for one
     /// it honours. Unlike `timing`'s lifetime, which may be broca's own estimate for scheduling
     /// warms, this one can prove the cache expired. `None` when the request names none.
-    fn requested_ttl_ms(&self, _config: &RunConfig) -> Option<u64> {
+    fn requested_ttl_ms(&self, _config: &C) -> Option<u64> {
         None
     }
     fn last_sent_at_ms(&self) -> Option<u64>;
     fn note_attempt(&self, _attempt: &broca_protocol::ModelAttempt) {}
-    fn costs(&self, config: &RunConfig) -> Result<crate::keep_warm::WarmCosts, String>;
+    fn costs(&self, config: &C) -> Result<crate::keep_warm::WarmCosts, String>;
     /// Price a durable warm exactly as the live driver did. Responses drivers must
     /// override this with usage pricing, not the fixed output-token quote.
-    fn recorded_cost(
-        &self,
-        config: &RunConfig,
-        _usage: &broca_protocol::Usage,
-    ) -> Result<f64, String> {
+    fn recorded_cost(&self, config: &C, _usage: &broca_protocol::Usage) -> Result<f64, String> {
         self.costs(config).map(|costs| costs.warm)
     }
     /// Price measured usage of a failed sent attempt, never the successful-refresh estimate.
     fn failed_cost(
         &self,
-        _config: &RunConfig,
+        _config: &C,
         _reservation: &broca_wal::record::AttemptReservation,
         _envelope: &broca_wal::record::AttemptEnvelope,
         _ttl_ms: Option<u64>,
     ) -> Result<f64, String> {
         Err("reported warm usage pricing unavailable".into())
     }
-    async fn warm(&self, config: &RunConfig, run_id: &RunId) -> WarmTick;
+    async fn warm(&self, config: &C, run_id: &RunId) -> WarmTick;
 }
 
-pub struct WarmWait<'a> {
-    pub driver: &'a Arc<dyn KeepWarmDriver>,
-    pub config: &'a RunConfig,
+pub struct WarmWait<'a, C: ?Sized + Sync = RunConfig> {
+    pub driver: &'a Arc<dyn KeepWarmDriver<C>>,
+    pub config: &'a C,
     pub run_id: &'a RunId,
     pub cancel: Option<&'a CancellationToken>,
     /// Records whether this run already logged that prompt-cache warming is unsupported,
@@ -84,7 +83,7 @@ pub struct WarmWait<'a> {
     pub warm_missed: &'a std::sync::atomic::AtomicBool,
 }
 
-impl WarmWait<'_> {
+impl<C: ?Sized + Sync> WarmWait<'_, C> {
     fn log_unsupported(&self) -> bool {
         !self
             .unsupported_logged
@@ -99,7 +98,7 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn delay(driver: &dyn KeepWarmDriver, timing: WarmTiming) -> Option<Duration> {
+fn delay<C: ?Sized + Sync>(driver: &dyn KeepWarmDriver<C>, timing: WarmTiming) -> Option<Duration> {
     let sent = driver.last_sent_at_ms()?;
     let interval = timing
         .after_send_ms
@@ -113,13 +112,16 @@ fn delay(driver: &dyn KeepWarmDriver, timing: WarmTiming) -> Option<Duration> {
 /// to dispatch. If a tool result and warm timer are ready together, prioritize the result.
 /// Keep the warm future here rather than spawning it so results cancel its local IO before
 /// the next model request. Cancellation likewise drops the future without awaiting it.
-pub async fn wait_tools<F: Future>(tools: F, warm: Option<WarmWait<'_>>) -> F::Output {
+pub async fn wait_tools<F: Future, C: ?Sized + Sync>(
+    tools: F,
+    warm: Option<WarmWait<'_, C>>,
+) -> F::Output {
     wait_tools_with_spend(tools, warm, 0.0).await
 }
 
-pub async fn wait_tools_with_spend<F: Future>(
+pub async fn wait_tools_with_spend<F: Future, C: ?Sized + Sync>(
     tools: F,
-    warm: Option<WarmWait<'_>>,
+    warm: Option<WarmWait<'_, C>>,
     initial_spend: f64,
 ) -> F::Output {
     let Some(warm) = warm else {

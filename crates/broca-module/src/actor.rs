@@ -61,13 +61,13 @@ pub const IDLE_TTL: Duration = Duration::from_secs(30);
 /// How long the close teardown waits for the executor's `on_session_close` hook (a
 /// best-effort wire send to free a tool-route channel) before proceeding with the close
 /// anyway. Bounds external I/O so a stalled send can't hold the registry slot + lease open.
-const ON_SESSION_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const ON_SESSION_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Deadline for the Interrupted seal write (WAL barriers, replay and index update), measured
 /// from entry to shutdown sealing. Attempt handover and the aborted run's join spend this
 /// time too, but the join itself is not timed out. Child teardown and the writer join retain
 /// the slot and lease until complete; only the registry's total deadline bounds that wait.
-const SHUTDOWN_SEAL_BOUND: Duration = Duration::from_secs(5);
+pub(crate) const SHUTDOWN_SEAL_BOUND: Duration = Duration::from_secs(5);
 
 /// How long the seal waits for the provider transport to hand over the record of the attempt
 /// it had in flight. The transport does so without any network wait the moment it sees the
@@ -156,8 +156,8 @@ pub struct CutLockReply {
     pub busy: Option<String>,
     /// Dropping or signalling this ends the cut's critical section for the actor.
     pub release: oneshot::Sender<()>,
-    /// Set when an idle owned-tenure actor retired for a mutating cut: it closed its
-    /// writer and will not resume when released.
+    /// Set when an idle actor retired for a mutating cut: it closed its writer and will not
+    /// resume when released.
     pub retired: Option<RetiredForCut>,
 }
 
@@ -165,10 +165,23 @@ pub struct CutLockReply {
 pub struct RetiredForCut {
     /// The session lease, handed over only after the writer's descriptor is gone.
     /// `None` when the writer could not be closed and joined cleanly.
-    pub tenure: Option<broca_core::wal_writer::ClosedWriterTenure>,
+    pub tenure: Option<CutTenure>,
     /// The close of the actor's registry slot, already `Closing`. The cut commits it
     /// when it releases its gates, so the slot is absent before anyone else gets in.
     pub close: crate::registry::CloseToken,
+}
+
+/// The session lease a retired actor hands to a cut. Only the actor builds one, once its
+/// writer was joined and its WAL closed, so holding one proves no writer of the session is
+/// live. It can only keep the session locked: dropping it releases the lease.
+pub struct CutTenure(#[allow(dead_code)] CutLease);
+
+enum CutLease {
+    /// The lease the writer task owned, which its close handed back.
+    Writer(#[allow(dead_code)] broca_core::wal_writer::ClosedWriterTenure),
+    /// The lease the actor held itself, beside its writer: an actor opened without an owned
+    /// writer tenure, as a legacy state root opens every actor.
+    Actor(#[allow(dead_code)] Box<dyn LeaseHandle>),
 }
 
 /// Who holds the session lease while an actor serves its session.
@@ -197,7 +210,7 @@ struct WriterClosed {
 pub enum LineageCmd {
     /// Pause dispatch while the cut holds its actor critical section. The reply
     /// carries a release channel whose drop also unblocks a cancelled operation.
-    /// A mutating cut may instead retire an idle owned-tenure actor; see
+    /// A mutating cut may instead retire an idle actor; see
     /// [`crate::registry::CutLockMode`].
     CutLock {
         reply: oneshot::Sender<CutLockReply>,
@@ -245,6 +258,20 @@ pub enum LineageCmd {
     Import {
         request: Box<broca_core::ImportRequest>,
         reply: oneshot::Sender<ImportOutcome>,
+    },
+    /// A command only a session kept in the new storage serves: a file-source import, or
+    /// installing the compaction provider's first view (see `store_import`). This actor refuses
+    /// it: a session on today's storage already exists.
+    Store {
+        command: crate::store_import::StoreCommand,
+        reply: oneshot::Sender<crate::store_import::StoreOutcome>,
+    },
+    /// A read of a session kept in the new storage, which its store actor answers from the
+    /// session it holds (see `store_reads`). This actor holds no such session: it answers
+    /// `Reopen`, and the reader reads the session as stored.
+    StoreRead {
+        request: Box<crate::store_reads::StoreReadRequest>,
+        reply: oneshot::Sender<crate::store_reads::StoreReadOutcome>,
     },
     /// Cancel a run by id. A boundary request preserves the in-flight step and tool batch.
     Cancel {
@@ -890,17 +917,19 @@ fn deliver_terminal(
 /// it exactly. Any other send starts a run: its admitted tool set (the plan's frozen tools, the
 /// send's own, or the tools it inherits by omitting them) must not include `submit_result`, and
 /// must be empty for `final_text`.
-fn check_structured_output(
+///
+/// `latest` is the session's latest run as frozen: its provider render config and its tools.
+pub(crate) fn check_structured_output(
     structured_output: &broca_protocol::structured_output::StructuredOutput,
     request: &SubmissionRequest,
     plan: Option<&SendPlan>,
-    latest: Option<&broca_wal::RunConfig>,
+    latest: Option<(&serde_json::Value, &[broca_protocol::request::Tool])>,
     joins_active_run: bool,
 ) -> Result<(), String> {
     use broca_protocol::structured_output::{FrozenStructuredOutput, FIELD};
     if joins_active_run {
-        let frozen = latest.and_then(|config| {
-            FrozenStructuredOutput::from_frozen_render_config(Some(&config.frozen_render_config))
+        let frozen = latest.and_then(|(render, _)| {
+            FrozenStructuredOutput::from_frozen_render_config(Some(render))
         });
         return match frozen {
             Some(frozen) if frozen.matches(structured_output) => Ok(()),
@@ -915,7 +944,7 @@ fn check_structured_output(
             .collect(),
         (None, Some(tools)) => tools.iter().map(|tool| tool.name.clone()).collect(),
         (None, None) => latest
-            .map(|config| config.tools.iter().map(|tool| tool.name.clone()).collect())
+            .map(|(_, tools)| tools.iter().map(|tool| tool.name.clone()).collect())
             .unwrap_or_default(),
     };
     structured_output.check(true, &tools)
@@ -1061,7 +1090,7 @@ fn steer_auth_pin_matches(
 }
 
 /// Now, in milliseconds since the Unix epoch.
-fn epoch_ms() -> u64 {
+pub(crate) fn epoch_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis() as u64)
@@ -1069,7 +1098,7 @@ fn epoch_ms() -> u64 {
 }
 
 /// The reply to a warm the executor did not complete.
-fn warm_error_outcome(
+pub(crate) fn warm_error_outcome(
     error: crate::executor::WarmError,
     request_body_sha256: String,
 ) -> WarmOutcome {
@@ -1311,7 +1340,7 @@ fn permanent_queued_refusal(message: String, provider_code: &'static str) -> Pro
 }
 
 /// The run id a queued submission starts under: `queue_submission` names it `sub-<run_id>`.
-fn run_id_of_queued(submission_id: &broca_protocol::SubmissionId) -> RunId {
+pub(crate) fn run_id_of_queued(submission_id: &broca_protocol::SubmissionId) -> RunId {
     RunId(
         submission_id
             .0
@@ -1457,7 +1486,7 @@ mod account_route_resume_tests {
 }
 
 /// How a send with a legacy string `delivery` is admitted ([`LineageActor::string_sender`]).
-enum StringSender {
+pub(crate) enum StringSender {
     /// The session's owner, or a caller the plan does not name: admitted as before.
     Owner,
     /// A plan-named sender's `queue` or `steer`, admitted and delivered as the list it stands
@@ -1472,6 +1501,24 @@ fn effective_plan_senders(
     ownership: &broca_core::SessionOwnershipV1,
 ) -> Vec<cortexkit_role_llm_runner::delivery_order::PlanSender> {
     ownership.effective_senders()
+}
+
+/// Whether a keyed send's retry asks for the same delivery order as the send it repeats: the
+/// list, dedupe key and template, by llm-runner's comparison (`same_payload`), which leaves out
+/// the expiry.
+pub(crate) fn same_order(
+    retry: &broca_protocol::DeliveryOrder,
+    earlier: &broca_protocol::DeliveryOrder,
+) -> bool {
+    let role_order = |order: &broca_protocol::DeliveryOrder| {
+        let mut published =
+            cortexkit_role_llm_runner::delivery_order::DeliveryOrder::new(order.modes.clone());
+        published.dedupe_key = order.dedupe_key.clone();
+        published.expires_at_ms = order.expires_at_ms;
+        published.template = order.template.clone();
+        published
+    };
+    role_order(retry).same_payload(&role_order(earlier))
 }
 
 /// The actor's run state.
@@ -2551,11 +2598,17 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     Err(_) => Some("unknown".into()),
                 }
             };
-            if busy.is_none()
-                && mode == crate::registry::CutLockMode::Mutate
-                && !self.restart_admitting
-                && matches!(self.lease, Some(ActorTenure::InWriter))
-            {
+            // A cut that may publish markers retires an idle actor whose writer owns its
+            // tenure. A cut that takes the session out of today's storage retires any idle
+            // actor, whichever holds its lease.
+            let retires = match mode {
+                crate::registry::CutLockMode::Inspect => false,
+                crate::registry::CutLockMode::Mutate => {
+                    matches!(self.lease, Some(ActorTenure::InWriter))
+                }
+                crate::registry::CutLockMode::Retire => self.lease.is_some(),
+            };
+            if busy.is_none() && retires && !self.restart_admitting {
                 return self.retire_for_cut(reply).await;
             }
             let (release, wait) = oneshot::channel();
@@ -2663,6 +2716,19 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     self.on_import(*request).await
                 };
                 let _ = reply.send(outcome);
+                false
+            }
+            LineageCmd::StoreRead { reply, .. } => {
+                let _ = reply.send(crate::store_reads::StoreReadOutcome::Reopen);
+                false
+            }
+            LineageCmd::Store { reply, .. } => {
+                let _ = reply.send(crate::store_import::StoreOutcome::Refused(
+                    crate::store_import::ImportRefusal::new(
+                        "session_exists",
+                        "the session already exists on today's storage",
+                    ),
+                ));
                 false
             }
             LineageCmd::Cancel { run_id, at, reply } => {
@@ -2928,6 +2994,12 @@ impl<W: WalStore + 'static> LineageActor<W> {
             }
             LineageCmd::Import { reply, .. } => {
                 let _ = reply.send(ImportOutcome::Error(broca_core::ImportError::Wal(error)));
+            }
+            LineageCmd::Store { reply, .. } => {
+                let _ = reply.send(crate::store_import::StoreOutcome::Reopen);
+            }
+            LineageCmd::StoreRead { reply, .. } => {
+                let _ = reply.send(crate::store_reads::StoreReadOutcome::Reopen);
             }
             LineageCmd::Cancel { reply, .. } | LineageCmd::CancelFrom { reply, .. } => {
                 let _ = reply.send(CancelOutcome::Reopen);
@@ -3821,10 +3893,12 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 structured_output,
                 &request,
                 plan.as_ref(),
-                checkpoint
-                    .last_episode
-                    .as_ref()
-                    .map(|episode| &episode.config),
+                checkpoint.last_episode.as_ref().map(|episode| {
+                    (
+                        &episode.config.frozen_render_config,
+                        episode.config.tools.as_slice(),
+                    )
+                }),
                 joins_active_run,
             ) {
                 return SendOutcome::StructuredOutputInvalid { field };
@@ -4052,15 +4126,16 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     Err(error) => return SendOutcome::Transient(error),
                 },
             };
-            if !retry
-                && ((!matches!(key, SendKey::RunId)
-                    && (self.first_episode.get().is_some() || exists))
-                    || planned
+            if crate::plan_episode::tools_are_frozen(
+                retry,
+                matches!(key, SendKey::RunId),
+                self.first_episode.get().is_some() || exists,
+                planned
                     || self
                         .first_episode
                         .get()
-                        .is_some_and(|first| first.manifest.is_some()))
-            {
+                        .is_some_and(|first| first.manifest.is_some()),
+            ) {
                 return crate::plan_episode::tools_frozen_refusal();
             }
         }
@@ -5862,16 +5937,13 @@ impl<W: WalStore + 'static> LineageActor<W> {
         let mut input_hooks = None;
         let mut pre_model_error = None;
         if let Some(submission_id) = &submission_id {
-            input_hooks = self
-                .pending_fifo
-                .iter()
-                .find(|pending| &pending.submission_id == submission_id)
-                .and_then(|pending| pending.hooks.clone())
-                .map(|mut hooks| {
-                    hooks.original =
-                        Some(serde_json::to_value(&resolved_request.input).expect("message JSON"));
-                    hooks
-                });
+            input_hooks = pre_user::drained_hooks(
+                self.pending_fifo
+                    .iter()
+                    .find(|pending| &pending.submission_id == submission_id)
+                    .and_then(|pending| pending.hooks.clone()),
+                &resolved_request.input,
+            );
         } else if !cancel_before_execute
             && (admits_the_session
                 || matches!(kind, RunKind::AppendEpisode)
@@ -5896,10 +5968,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     ))
                 })?;
             if let Some(provider) = prepared.refused {
-                pre_model_error = Some(serde_json::from_value(serde_json::json!({
-                    "class": "permanent", "provider_code": cortexkit_role_llm_runner::errors::PRE_USER_UNAVAILABLE,
-                    "message": format!("pre_user unavailable: {provider}"),
-                })).expect("input refusal error JSON"));
+                pre_model_error = Some(pre_user::refusal_error(&provider));
             }
             resolved_request.input = prepared.input;
             input_hooks = prepared.hooks;
@@ -6059,12 +6128,9 @@ impl<W: WalStore + 'static> LineageActor<W> {
             // compaction keep the established log layout. An existing log keeps the mode its
             // first run recorded: the run loop reads that before looking at this field, so a
             // legacy session is never upgraded here.
-            new_log_compaction_plan_version: manifest
-                .as_deref()
-                .is_some_and(|manifest| {
-                    matches!(broca_core::compaction::item(manifest), Ok(Some(_)))
-                })
-                .then_some(broca_core::compaction_v2::PLAN_VERSION),
+            new_log_compaction_plan_version: crate::plan_episode::plan_compaction_version(
+                manifest.as_deref(),
+            ),
             emit_display_context: true,
             step_progress: Some(Arc::clone(&step_progress)),
             clock: self
@@ -6682,19 +6748,11 @@ impl<W: WalStore + 'static> LineageActor<W> {
         let submission_id = broca_protocol::SubmissionId(format!("sub-{}", run_id.0));
         let used = self.recorded_send_keys.contains_key(run_id)
             || self.ordered_submissions.contains_key(&submission_id);
-        let role_order = |order: &broca_protocol::DeliveryOrder| {
-            let mut published =
-                cortexkit_role_llm_runner::delivery_order::DeliveryOrder::new(order.modes.clone());
-            published.dedupe_key = order.dedupe_key.clone();
-            published.expires_at_ms = order.expires_at_ms;
-            published.template = order.template.clone();
-            published
-        };
         let same = match (
             self.ordered_submissions.get(&submission_id),
             self.admitting_order.as_ref(),
         ) {
-            (Some(earlier), Some(retry)) => role_order(retry).same_payload(&role_order(earlier)),
+            (Some(earlier), Some(retry)) => same_order(retry, earlier),
             (None, None) => true,
             _ => false,
         };
@@ -7074,26 +7132,10 @@ impl<W: WalStore + 'static> LineageActor<W> {
         {
             return crate::person_media::outcome(error);
         }
-        if has_media
-            && !order.modes.iter().any(|mode| {
-                matches!(
-                    mode,
-                    broca_protocol::DeliveryMode::Steer | broca_protocol::DeliveryMode::IdleStart
-                )
-            })
+        if let Err(error) =
+            crate::person_media::ordered_carrier(&order, &request.input, &media_model)
         {
-            let kind = broca_provider::person_media::references(&request.input)
-                .next()
-                .unwrap()
-                .kind;
-            return crate::person_media::outcome(RunError::MediaUnsupported(
-                broca_provider::person_media::refusal(
-                    &media_model,
-                    kind,
-                    broca_protocol::MediaMarkerReason::Carrier,
-                )
-                .to_string(),
-            ));
+            return crate::person_media::outcome(error);
         }
         let manifest = match self.frozen_input_manifest().await {
             Ok(manifest) => manifest,
@@ -9091,6 +9133,12 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 LineageCmd::Import { reply, .. } => {
                     let _ = reply.send(ImportOutcome::Reopen);
                 }
+                LineageCmd::Store { reply, .. } => {
+                    let _ = reply.send(crate::store_import::StoreOutcome::Reopen);
+                }
+                LineageCmd::StoreRead { reply, .. } => {
+                    let _ = reply.send(crate::store_reads::StoreReadOutcome::Reopen);
+                }
                 LineageCmd::Cancel { reply, .. } | LineageCmd::CancelFrom { reply, .. } => {
                     let _ = reply.send(CancelOutcome::Reopen);
                 }
@@ -9989,12 +10037,24 @@ impl<W: WalStore + 'static> LineageActor<W> {
             self.executor.on_session_close(&self.key),
         )
         .await;
-        // The lease is in `closed.tenure` now (or still with an unjoined writer), so this
-        // generation holds nothing that a later teardown could release again.
-        drop(self.lease.take());
+        // The lease is in `closed.tenure` now (or still with an unjoined writer) when the
+        // writer owned it. A lease the actor held itself is handed over only once its writer
+        // was joined; after a close that wasn't clean it is released as an ordinary close
+        // releases it. Either way this generation holds nothing a later teardown could
+        // release again.
+        let tenure = match (closed.tenure, self.lease.take()) {
+            (Some(writer), _) => Some(CutTenure(CutLease::Writer(writer))),
+            (None, Some(ActorTenure::Lease(lease))) if closed.clean => {
+                Some(CutTenure(CutLease::Actor(lease)))
+            }
+            (None, held) => {
+                drop(held);
+                None
+            }
+        };
         // A failed final sync or a writer that could not be joined leaves the session's
         // durable state unproven, so the cut must not move it this time.
-        let busy = (!closed.clean || closed.tenure.is_none()).then(|| "unknown".to_string());
+        let busy = (!closed.clean || tenure.is_none()).then(|| "unknown".to_string());
         // If the cut has gone away, dropping the unsent reply releases the lease and
         // commits the slot closed (an unresolved close token commits on drop).
         if reply
@@ -10002,7 +10062,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 busy,
                 release,
                 retired: Some(RetiredForCut {
-                    tenure: closed.tenure,
+                    tenure,
                     close: close_token,
                 }),
             })
@@ -10033,6 +10093,12 @@ impl<W: WalStore + 'static> LineageActor<W> {
             }
             LineageCmd::Import { reply, .. } => {
                 let _ = reply.send(ImportOutcome::Reopen);
+            }
+            LineageCmd::Store { reply, .. } => {
+                let _ = reply.send(crate::store_import::StoreOutcome::Reopen);
+            }
+            LineageCmd::StoreRead { reply, .. } => {
+                let _ = reply.send(crate::store_reads::StoreReadOutcome::Reopen);
             }
             LineageCmd::Cancel { reply, .. } | LineageCmd::CancelFrom { reply, .. } => {
                 let _ = reply.send(CancelOutcome::Reopen);
@@ -16907,7 +16973,7 @@ mod steer_terminal_tests;
 mod writer_shutdown_tests;
 
 #[path = "pre_user.rs"]
-mod pre_user;
+pub(crate) mod pre_user;
 
 #[cfg(test)]
 #[path = "pre_user_tests.rs"]
@@ -17625,6 +17691,45 @@ mod owned_cut_tests {
         );
         assert!(rig.lease_held());
         assert_eq!(std::fs::read(&path).ok(), before);
+        assert!(rig.registry.stop_and_seal().await);
+    }
+
+    /// A cut that takes the session out of today's storage retires an idle actor that holds
+    /// its own lease too: the actor closes its writer and hands its lease to the guard, with no
+    /// moment the lease is free, and its slot is gone once the guard is released. A send that
+    /// reached the retired generation meanwhile is re-routed, never acknowledged by it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_retiring_cut_takes_an_idle_legacy_lease_actors_lease() {
+        let rig = Rig::legacy("legacy-retire");
+        let old = rig.registry.actor_for(&rig.session).await.unwrap();
+        assert!(rig.lease_held());
+        let path = rig.wal.wal_path(&rig.session);
+        let before = std::fs::read(&path).ok();
+
+        let guard = rig.lock(CutLockMode::Retire).await;
+        assert_eq!(guard.busy[0].1, None, "the idle actor reports idle");
+        assert!(
+            guard.holds_tenure(&rig.session),
+            "the actor handed its own lease"
+        );
+        assert_eq!(rig.registry.slot_state(&rig.session), Some("closing"));
+        assert!(
+            rig.lease_held(),
+            "the lease never became free during the handoff"
+        );
+        let (reply, sent) = tokio::sync::oneshot::channel();
+        let reached = old.send(send_cmd(reply)).await.is_ok();
+        assert_eq!(std::fs::read(&path).ok(), before, "the WAL is unchanged");
+        drop(guard);
+
+        assert_eq!(rig.registry.slot_state(&rig.session), None);
+        assert!(!rig.lease_held(), "the guard released the lease");
+        if reached {
+            assert!(matches!(sent.await, Ok(SendOutcome::Reopen) | Err(_)));
+        }
+        let fresh = rig.registry.actor_for(&rig.session).await.unwrap();
+        assert_ne!(fresh.gen, old.gen, "the retired generation is never reused");
+        assert!(rig.lease_held(), "the new generation took the lease");
         assert!(rig.registry.stop_and_seal().await);
     }
 

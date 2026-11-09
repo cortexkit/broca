@@ -11,16 +11,21 @@
 //! a request is rendered, never to the conversation itself.
 //!
 //! Beside each window message the fold keeps what `session.entries` serves about it: its
-//! `EntryFacts` record, and the text delivered with its tool calls (from `ResultAppend`, in
-//! sessions that keep delivered text apart from results). An assistant message still waiting for
+//! `EntryFacts` record, and the text delivered with its tool calls (from `ResultAppend`: every
+//! ride, which carries an envelope, and in sessions that keep delivered text apart from results,
+//! text delivered before envelopes existed too). An assistant message still waiting for
 //! its tool results already has an ordinal reserved, one past the last placed message, and its
 //! facts are kept with it until it is placed.
 
 use broca_protocol::content::{ContentBlock, Message, Role, ToolResult};
 use broca_protocol::ids::ToolCallId;
 
+use crate::codec::Digest;
 use crate::fold::Bound;
-use crate::record::{EntryFacts, Marker, Notice, Placement, Record, Stream};
+use crate::record::{
+    EntryFacts, Marker, Notice, PartKind, PartRef, Placement, Record, RideEnvelope, Stream,
+    TurnFacts,
+};
 
 /// Why a record can't be folded into the conversation. Each one means the records don't
 /// describe a conversation a provider would accept, so the fold refuses rather than guess.
@@ -30,7 +35,7 @@ pub enum FoldError {
     LedgerRecord(&'static str),
     /// A reply for a call no held assistant message made.
     ReplyWithoutCall(String),
-    /// A second reply for a call that already has one.
+    /// A reply for a call whose every copy already has one.
     SecondReply(String),
     /// A message other than a run's own input arrived while an assistant message was still
     /// waiting for replies, where it would land between a call and its result.
@@ -39,6 +44,8 @@ pub enum FoldError {
     AssistantInsideToolTurn,
     /// Entry facts for an ordinal the conversation hasn't placed or reserved.
     FactsWithoutEntry(u64),
+    /// A seal would keep more runs past the window than their declared cap.
+    Bound(&'static str),
 }
 
 crate::message! {
@@ -50,6 +57,11 @@ crate::message! {
         2 opt notice: Notice,
         /// As delivered, before any rendering.
         3 req text: String,
+        /// The id of the send the text is, when its record names one.
+        4 opt send_id: String,
+        /// The ride envelope, when the text was delivered with one: requests render it after
+        /// the result through the runner's ride rules, and never join it into the result.
+        5 opt ride: RideEnvelope,
     }
 }
 
@@ -60,6 +72,26 @@ crate::message! {
         /// Absent for sessions written before entry facts were recorded.
         1 opt facts: EntryFacts,
         2 rep delivered: Delivered,
+        /// For an assistant message that made tool calls: what reads serve about each call.
+        3 opt turn: TurnFacts,
+    }
+}
+
+crate::message! {
+    /// Where one run's input sits in the window, and the render config it ran under. A
+    /// request carries every window run's place and config, so a renderer can tell each run's
+    /// requests apart from the next one's.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct Episode {
+        1 req run_id: String,
+        /// The ordinal of the run's first input message.
+        2 req start: u64,
+        /// The ordinal of its first user message, if its input has one.
+        3 opt first_user: u64,
+        /// The render config part in force when the run started.
+        4 opt render_config: PartRef,
+        /// What renderers read from that config when rendering other runs' messages.
+        5 opt render_key: Digest,
     }
 }
 
@@ -93,10 +125,10 @@ state! {
             reset: "tool replies",
             bound: Bound::OpenWork("one assistant message's tool calls"),
         },
-        /// Whether text delivered with a tool result becomes part of that result in the
-        /// conversation. Sessions on the first compaction protocol stored it that way; sessions
-        /// on the current contract keep the result as returned and add the text when a request
-        /// renders.
+        /// Whether text delivered with a tool result without a ride envelope becomes part of
+        /// that result in the conversation. Sessions on the first compaction protocol stored it
+        /// that way; sessions on the current contract keep the result as returned and add the
+        /// text when a request renders. A ride is always kept apart.
         3 req pub appends_in_conversation: bool => {
             owner: "admission",
             reset: "never",
@@ -139,8 +171,75 @@ state! {
             reset: "a window copied back in",
             bound: Bound::Fixed,
         },
+        /// The render config part the latest setup marker named.
+        9 opt pub render_config: PartRef => {
+            owner: "admission",
+            reset: "setup_stub",
+            bound: Bound::Fixed,
+        },
+        /// One per run whose input is in the window, in run order. After a cut, the first is
+        /// the run whose input the cut split, when its later messages are in the window.
+        10 rep pub episodes: Episode => {
+            owner: "run loop",
+            reset: "never",
+            bound: Bound::Window,
+        },
+        /// The render key the latest setup marker named.
+        11 opt pub render_key: Digest => {
+            owner: "admission",
+            reset: "setup_stub",
+            bound: Bound::Fixed,
+        },
+        /// The runs before the window whose settings still shape a request: the session's first
+        /// run, and every later one whose render key differs from the run before it. A request
+        /// carries them ahead of the window's runs, as it carried every run before history was
+        /// sealed. The key changes rarely (at most 6 times in any stored session), so a seal
+        /// that would keep more than the cap refuses.
+        12 rep pub sealed_episodes: Episode => {
+            owner: "seal",
+            reset: "never",
+            bound: Bound::Capped(SEALED_EPISODES_CAP),
+        },
+        /// When the latest cut split a run whose steps continue above it, that run's
+        /// repetition-warning counters over its sealed steps (call signatures, result digests and
+        /// counts, never call text), so a request's warnings still count them. The run loop
+        /// computes and reads them; the store only keeps them.
+        13 opt pub window_repetition: serde_json::Value => {
+            owner: "seal",
+            reset: "a cut",
+            bound: Bound::PerRun("one count per distinct failing call"),
+        },
+        /// The transcript holds a message of the first compaction protocol, which only today's
+        /// run loop renders, so the new run loop refuses the session.
+        14 req pub first_protocol_compaction: bool => {
+            owner: "compaction",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
+        /// How many human prompts the session's runs started with: user messages in a run's
+        /// input with anything besides tool results. Steers and delivered sends join the
+        /// running prompt, so they don't count. A Claude Code persona numbers its prompts by
+        /// this, so it counts the whole history, sealed runs too.
+        15 req pub human_prompts: u64 => {
+            owner: "run loop",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
+        /// On a session that joins delivered text into its tool results
+        /// (`appends_in_conversation`) and then enrolled in the current compaction contract: the
+        /// last ordinal placed before the enrollment. Results up to it keep the text joined into
+        /// them, as they were stored; text delivered with a later result stays apart from it, as
+        /// on the contract. Absent on every other session.
+        16 opt pub joined_through: u64 => {
+            owner: "admission",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
     }
 }
+
+/// The most change points [`Conversation::sealed_episodes`] keeps besides the session's first run.
+pub const SEALED_EPISODES_CAP: usize = 64;
 
 impl Conversation {
     pub fn new(appends_in_conversation: bool) -> Self {
@@ -153,6 +252,66 @@ impl Conversation {
             entries: Vec::new(),
             open_entry: None,
             window_pending: false,
+            render_config: None,
+            episodes: Vec::new(),
+            render_key: None,
+            sealed_episodes: Vec::new(),
+            window_repetition: None,
+            first_protocol_compaction: false,
+            human_prompts: 0,
+            joined_through: None,
+        }
+    }
+
+    /// The session enrolled in the current compaction contract after placing message
+    /// `through_ordinal`: a session that joined delivered text into its results keeps the text
+    /// joined into results up to it, and keeps text delivered with a later result apart from it,
+    /// as the contract does. Which results join depends only on their ordinals, so a fold that
+    /// learns of the enrollment before it folds the records placing them (a session's window,
+    /// folded again from a checkpoint older than the enrollment) folds them the same.
+    pub fn enrolled(&mut self, through_ordinal: Option<u64>) {
+        if let (true, Some(through)) = (self.appends_in_conversation, through_ordinal) {
+            self.joined_through = Some(through);
+        }
+    }
+
+    /// Whether text delivered with a result of the newest tool message is joined into it: on a
+    /// session that joins delivered text, unless that message was placed after the session
+    /// enrolled in the current compaction contract.
+    fn joins_delivered_text(&self) -> bool {
+        if !self.appends_in_conversation {
+            return false;
+        }
+        let Some(through) = self.joined_through else {
+            return true;
+        };
+        self.messages
+            .iter()
+            .rposition(|message| message.role == Role::Tool)
+            .is_some_and(|at| self.window_start() + at as u64 <= through)
+    }
+
+    /// A copy without the window: the count of placed messages, the held tool turn and its
+    /// entry, and the marker. Applying records to it tells which ordinals they place, for the
+    /// cost of one tool turn rather than the window.
+    pub fn without_window(&self) -> Self {
+        Self {
+            messages: Vec::new(),
+            open: self.open.clone(),
+            appends_in_conversation: self.appends_in_conversation,
+            marker: self.marker.clone(),
+            placed: self.placed,
+            entries: Vec::new(),
+            open_entry: self.open_entry.clone(),
+            window_pending: self.window_pending,
+            render_config: self.render_config.clone(),
+            episodes: Vec::new(),
+            render_key: self.render_key,
+            sealed_episodes: self.sealed_episodes.clone(),
+            window_repetition: self.window_repetition.clone(),
+            first_protocol_compaction: self.first_protocol_compaction,
+            human_prompts: self.human_prompts,
+            joined_through: self.joined_through,
         }
     }
 
@@ -161,6 +320,54 @@ impl Conversation {
     pub fn clear_window(&mut self) {
         self.messages.clear();
         self.entries.clear();
+        self.episodes.clear();
+    }
+
+    /// Empties the window for a log that starts at a cut, keeping what of the window's runs still
+    /// shapes a request: the run whose input the cut split stays a window run (its later messages
+    /// are above the cut), and the runs wholly below the cut join the sealed ones where their
+    /// render key changes. `first_kept` is the ordinal of the first entry above the cut, and
+    /// `starts_run` the run whose input that entry is, if it's a run's input: a run other than
+    /// the last one before the cut starts exactly at the cut, and no earlier run spans it.
+    pub fn seal_window(
+        &mut self,
+        first_kept: u64,
+        starts_run: Option<&str>,
+    ) -> Result<(), FoldError> {
+        self.messages.clear();
+        self.entries.clear();
+        self.window_repetition = None;
+        let episodes = std::mem::take(&mut self.episodes);
+        // The run in force at the cut: the last one starting before it, unless the next run
+        // starts at the cut.
+        let spanning = episodes
+            .iter()
+            .rposition(|episode| episode.start < first_kept)
+            .filter(|at| {
+                let next_at_cut = match episodes.get(at + 1) {
+                    Some(next) => next.start <= first_kept,
+                    None => starts_run.is_some_and(|run| run != episodes[*at].run_id),
+                };
+                !next_at_cut
+            });
+        for (at, episode) in episodes.into_iter().enumerate() {
+            if episode.start >= first_kept || Some(at) == spanning {
+                self.episodes.push(episode);
+                continue;
+            }
+            let changes = match self.sealed_episodes.last() {
+                None => true,
+                Some(last) => last.render_key != episode.render_key || last.render_key.is_none(),
+            };
+            if changes {
+                // The session's first run, then at most the cap of change points.
+                if self.sealed_episodes.len() > SEALED_EPISODES_CAP {
+                    return Err(FoldError::Bound("sealed_episodes"));
+                }
+                self.sealed_episodes.push(episode);
+            }
+        }
+        Ok(())
     }
 
     /// The window message with `ordinal` and its entry state.
@@ -199,6 +406,38 @@ impl Conversation {
         self.placed += 1;
     }
 
+    /// A run's input message is about to be placed: the first one of a run starts its episode,
+    /// and the first user message among them is the episode's first user message.
+    fn note_run_input(&mut self, input: &crate::record::Input) {
+        let ordinal = self.placed + 1;
+        let starts = self
+            .episodes
+            .last()
+            .is_none_or(|episode| episode.run_id != input.run_id);
+        if starts {
+            self.episodes.push(Episode {
+                run_id: input.run_id.clone(),
+                start: ordinal,
+                first_user: None,
+                render_config: self.render_config.clone(),
+                render_key: self.render_key,
+            });
+        }
+        let episode = self.episodes.last_mut().expect("pushed above");
+        if episode.first_user.is_none() && input.message.role == Role::User {
+            episode.first_user = Some(ordinal);
+        }
+        if input.message.role == Role::User
+            && input
+                .message
+                .content
+                .iter()
+                .any(|block| !matches!(block, ContentBlock::ToolResult(_)))
+        {
+            self.human_prompts += 1;
+        }
+    }
+
     /// The assistant message still waiting for replies, if any.
     pub fn open_tool_turn(&self) -> Option<&Message> {
         self.open.as_ref().map(|turn| &turn.assistant)
@@ -219,6 +458,9 @@ impl Conversation {
                     }
                     self.open = None;
                     self.open_entry = None;
+                }
+                if input.placement == Placement::RunInput {
+                    self.note_run_input(input);
                 }
                 self.place(input.message.clone(), EntryState::default());
             }
@@ -260,7 +502,15 @@ impl Conversation {
                 let Some(turn) = self.open.as_mut().filter(|turn| turn.calls.contains(id)) else {
                     return Err(FoldError::ReplyWithoutCall(id.0.clone()));
                 };
-                if turn.replies.iter().any(|known| &known.tool_call_id == id) {
+                // A model can repeat a call id in one message; each copy gets its own reply, in
+                // the order they come, and no copy gets a second one.
+                let replied = turn
+                    .replies
+                    .iter()
+                    .filter(|known| &known.tool_call_id == id)
+                    .count();
+                let asked = turn.calls.iter().filter(|call| *call == id).count();
+                if replied >= asked {
                     return Err(FoldError::SecondReply(id.0.clone()));
                 }
                 turn.replies.push(reply.result.clone());
@@ -275,7 +525,7 @@ impl Conversation {
                                 .iter()
                                 .position(|reply| &reply.tool_call_id == id)
                                 .expect("every call has a reply");
-                            ContentBlock::ToolResult(turn.replies.swap_remove(at))
+                            ContentBlock::ToolResult(turn.replies.remove(at))
                         })
                         .collect();
                     let entry = self.open_entry.take().unwrap_or_default();
@@ -284,7 +534,13 @@ impl Conversation {
                 }
             }
             Record::ResultAppend(append) => {
-                if self.appends_in_conversation {
+                // A ride (text with an envelope) is never joined into the stored result, in
+                // either layout: requests render it after the result through the runner's ride
+                // rules, and reads serve the result as the tool returned it. Text without one is
+                // joined on a session that joins delivered text, unless the result was placed
+                // after the session enrolled in the current compaction contract
+                // (`joined_through`).
+                if append.ride.is_none() && self.joins_delivered_text() {
                     append_to_newest_result(&mut self.messages, &append.tool_call_id, &append.text);
                 } else {
                     self.attach_delivery(append);
@@ -304,8 +560,29 @@ impl Conversation {
                 // Facts for a message below the window have nothing to attach to here, as the
                 // message itself isn't held: a fold that keeps only counts drops both.
             }
+            Record::TurnFacts(turn) => {
+                let start = self.window_start();
+                if self.open.is_some() && turn.ordinal == self.placed + 1 {
+                    self.open_entry.get_or_insert_with(EntryState::default).turn =
+                        Some(turn.clone());
+                } else if turn.ordinal >= start && turn.ordinal <= self.placed {
+                    self.entries[(turn.ordinal - start) as usize].turn = Some(turn.clone());
+                } else if turn.ordinal > self.placed {
+                    return Err(FoldError::FactsWithoutEntry(turn.ordinal));
+                }
+            }
             Record::Marker(marker) => self.marker = Some(marker.clone()),
-            Record::SetupStub(_) | Record::Compaction(_) => {}
+            Record::SetupStub(stub) => {
+                self.render_config = stub
+                    .parts
+                    .iter()
+                    .find(|part| part.kind == PartKind::RenderConfig)
+                    .cloned();
+                self.render_key = stub.render_key;
+            }
+            Record::Compaction(compaction) => {
+                self.first_protocol_compaction |= compaction.version == 1;
+            }
             _ => unreachable!("every transcript kind is matched above"),
         }
         Ok(())
@@ -326,6 +603,8 @@ impl Conversation {
                     part: part as u32,
                     notice: append.notice.clone(),
                     text: append.text.clone(),
+                    send_id: append.send_id.clone(),
+                    ride: append.ride.clone(),
                 });
                 return;
             }
@@ -335,6 +614,9 @@ impl Conversation {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod generate;
 
 /// Appends `text` to the named result in the newest tool message, if it holds that result.
 /// Delivered text is only ever attached to a result of the batch that just finished.

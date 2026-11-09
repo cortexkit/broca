@@ -24,7 +24,7 @@ pub struct DisplaySender {
 }
 
 impl DisplaySender {
-    pub(super) fn new(capacity: usize) -> Self {
+    pub(crate) fn new(capacity: usize) -> Self {
         Self {
             ring: LazyRing::new(capacity),
             state: Arc::default(),
@@ -77,7 +77,7 @@ impl DisplaySender {
 
     /// Register under the same lock as publication: the snapshot ends exactly where this
     /// receiver starts, even when provider output arrives during a slow durable replay.
-    pub(super) fn subscribe_snapshot(
+    pub(crate) fn subscribe_snapshot(
         &self,
     ) -> (broadcast::Receiver<Arc<DisplayEvent>>, Vec<DisplayEvent>) {
         let state = self.state.lock().unwrap();

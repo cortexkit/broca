@@ -4,17 +4,26 @@ use broca_protocol::ids::MessageId;
 use broca_protocol::request::ModelHandle;
 use futures::executor::block_on;
 
+use super::super::Carry;
 use super::Cold;
 use crate::backend::{MemoryBackend, SessionAddr, SessionBackend};
 use crate::codec::Message as _;
 use crate::head::{self, SessionTriple};
 use crate::idindex::IdKind;
-use crate::keys::DeploymentKey;
+use crate::keys::{Cipher, DeploymentKey};
 use crate::record::{Assistant, Input, Placement, Record, RunEnd, RunStart};
 use crate::session::{Session, SessionError};
 
 const DAY: u64 = 24 * 60 * 60 * 1000;
 const IDLE: u64 = 7 * DAY;
+
+cipher_tests!(
+    a_finished_idle_session_goes_cold_with_its_reasoning_pruned,
+    an_active_session_is_left_alone,
+    a_session_with_no_timed_record_is_left_alone,
+    an_unfinished_run_keeps_its_reasoning,
+    a_cold_step_that_fails_before_its_commit_undoes_itself,
+);
 
 fn triple() -> SessionTriple {
     SessionTriple {
@@ -24,8 +33,9 @@ fn triple() -> SessionTriple {
     }
 }
 
-fn deployment() -> DeploymentKey {
-    DeploymentKey::new(1, &[5; 32])
+/// The test deployment key, creating sessions in mode `cipher`.
+fn deployment(cipher: Cipher) -> DeploymentKey {
+    DeploymentKey::new(1, &[5; 32]).creating(cipher)
 }
 
 fn addr() -> SessionAddr {
@@ -38,6 +48,8 @@ fn model() -> ModelHandle {
 
 fn start(run: &str, at: u64) -> Record {
     Record::RunStart(Box::new(RunStart {
+        imported_ids: None,
+        message_marks: None,
         run_id: run.into(),
         model: model(),
         setup: Vec::new(),
@@ -54,7 +66,6 @@ fn start(run: &str, at: u64) -> Record {
         service_tier: None,
         route_decision_id: None,
         compaction_plan_version: None,
-        render_config: None,
         auth_selection: None,
         run_choices: None,
         origin: None,
@@ -82,6 +93,7 @@ fn end(run: &str, at: u64) -> Record {
 
 fn input(run: &str, text: &str, at: u64) -> Record {
     Record::Input(Input {
+        media: Vec::new(),
         run_id: run.into(),
         placement: Placement::RunInput,
         message: Message::new(Role::User, vec![ContentBlock::Text { text: text.into() }]),
@@ -143,8 +155,8 @@ fn texts(messages: &[Message]) -> Vec<String> {
 }
 
 /// Two finished runs, the last record written at `at`.
-async fn finished<B: SessionBackend>(backend: &B, at: u64) -> Session<'_, B> {
-    let mut session = Session::create(backend, addr(), triple(), &deployment(), false)
+async fn finished<B: SessionBackend>(backend: &B, at: u64, cipher: Cipher) -> Session<&B> {
+    let mut session = Session::create(backend, addr(), triple(), &deployment(cipher), false)
         .await
         .unwrap();
     for run in ["a", "b"] {
@@ -161,23 +173,25 @@ async fn finished<B: SessionBackend>(backend: &B, at: u64) -> Session<'_, B> {
     session
 }
 
-async fn stored_cold_since(backend: &MemoryBackend) -> Option<u64> {
+async fn stored_cold_since(backend: &MemoryBackend, cipher: Cipher) -> Option<u64> {
     let (bytes, _) = backend.read_head(&addr()).await.unwrap().unwrap();
-    head::open(&bytes, &deployment()).unwrap().0.cold_since_ms
+    head::open(&bytes, &deployment(cipher))
+        .unwrap()
+        .0
+        .cold_since_ms
 }
 
 /// A session idle for longer than the threshold, with every run finished, goes cold: its ledger
 /// is sealed, the window keeps every message but loses its opaque reasoning, and the stored head
 /// records when it went cold. A reload rebuilds exactly that window, and opening the writer wakes
 /// the session.
-#[test]
-fn a_finished_idle_session_goes_cold_with_its_reasoning_pruned() {
+fn a_finished_idle_session_goes_cold_with_its_reasoning_pruned(cipher: Cipher) {
     let backend = MemoryBackend::default();
     block_on(async {
-        let mut session = finished(&backend, 1_000).await;
+        let mut session = finished(&backend, 1_000, cipher).await;
         assert_eq!(opaque(&session.conversation.messages).len(), 2);
         let now = 1_000 + IDLE + 1;
-        let cold = session.cold(now, IDLE).await.unwrap();
+        let cold = session.cold(now, IDLE, &Carry::default()).await.unwrap();
         assert!(
             matches!(cold, Cold::Applied { pruned: true, .. }),
             "{cold:?}"
@@ -188,30 +202,32 @@ fn a_finished_idle_session_goes_cold_with_its_reasoning_pruned() {
             ["ask a", "a", "ask b", "b"]
         );
         assert_eq!(session.head().cold_since_ms, Some(now));
-        assert_eq!(stored_cold_since(&backend).await, Some(now));
+        assert_eq!(stored_cold_since(&backend, cipher).await, Some(now));
         // The ledger is sealed: its ids are found through the id index.
         assert_eq!(session.find_id(IdKind::RunId, "a").await.unwrap().len(), 2);
         let window = session.conversation.encode();
         session.close().await.unwrap();
 
-        let loaded = Session::load(&backend, addr(), &triple(), &deployment())
+        let loaded = Session::load(&backend, addr(), &triple(), &deployment(cipher))
             .await
             .unwrap();
         assert_eq!(loaded.conversation.encode(), window);
         assert_eq!(loaded.head().cold_since_ms, None);
-        assert_eq!(stored_cold_since(&backend).await, None);
+        assert_eq!(stored_cold_since(&backend, cipher).await, None);
     });
 }
 
 /// A session used more recently than the threshold is left alone.
-#[test]
-fn an_active_session_is_left_alone() {
+fn an_active_session_is_left_alone(cipher: Cipher) {
     let backend = MemoryBackend::default();
     block_on(async {
-        let mut session = finished(&backend, 1_000).await;
+        let mut session = finished(&backend, 1_000, cipher).await;
         let before = (session.conversation.encode(), session.operations.encode());
         let logs = backend.log_names(&addr());
-        let cold = session.cold(1_000 + IDLE - 1, IDLE).await.unwrap();
+        let cold = session
+            .cold(1_000 + IDLE - 1, IDLE, &Carry::default())
+            .await
+            .unwrap();
         assert_eq!(
             cold,
             Cold::Active {
@@ -228,38 +244,45 @@ fn an_active_session_is_left_alone() {
 }
 
 /// A session whose open log carries no time can't be confirmed idle, so nothing happens.
-#[test]
-fn a_session_with_no_timed_record_is_left_alone() {
+fn a_session_with_no_timed_record_is_left_alone(cipher: Cipher) {
     let backend = MemoryBackend::default();
     block_on(async {
-        let mut session = Session::create(&backend, addr(), triple(), &deployment(), false)
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(cipher), false)
             .await
             .unwrap();
-        assert_eq!(session.cold(100 * DAY, IDLE).await.unwrap(), Cold::Unknown);
+        assert_eq!(
+            session
+                .cold(100 * DAY, IDLE, &Carry::default())
+                .await
+                .unwrap(),
+            Cold::Unknown
+        );
         assert!(backend.object_names(&addr()).is_empty());
     });
 }
 
 /// A session with an unfinished run keeps every byte: its ledger is sealed, but nothing is
 /// pruned, so the run can resume exactly.
-#[test]
-fn an_unfinished_run_keeps_its_reasoning() {
+fn an_unfinished_run_keeps_its_reasoning(cipher: Cipher) {
     let backend = MemoryBackend::default();
     block_on(async {
-        let mut session = finished(&backend, 1_000).await;
+        let mut session = finished(&backend, 1_000, cipher).await;
         session.append(&[start("c", 1_000)], true).await.unwrap();
         session
             .append(&[input("c", "ask c", 1_000), answer("c", "c", 1_000)], true)
             .await
             .unwrap();
-        let cold = session.cold(1_000 + IDLE, IDLE).await.unwrap();
+        let cold = session
+            .cold(1_000 + IDLE, IDLE, &Carry::default())
+            .await
+            .unwrap();
         assert!(
             matches!(cold, Cold::Applied { pruned: false, .. }),
             "{cold:?}"
         );
         assert_eq!(opaque(&session.conversation.messages).len(), 3);
         session.close().await.unwrap();
-        let loaded = Session::load(&backend, addr(), &triple(), &deployment())
+        let loaded = Session::load(&backend, addr(), &triple(), &deployment(cipher))
             .await
             .unwrap();
         assert_eq!(opaque(&loaded.conversation.messages).len(), 3);
@@ -268,16 +291,18 @@ fn an_unfinished_run_keeps_its_reasoning() {
 
 /// A cold step that fails before its commit undoes itself, like every change: nothing it created
 /// is left, and the next cold step runs.
-#[test]
-fn a_cold_step_that_fails_before_its_commit_undoes_itself() {
+fn a_cold_step_that_fails_before_its_commit_undoes_itself(cipher: Cipher) {
     let backend = MemoryBackend::default();
     block_on(async {
-        let mut session = finished(&backend, 1_000).await;
+        let mut session = finished(&backend, 1_000, cipher).await;
         backend.fail_once(2);
-        assert!(session.cold(1_000 + IDLE, IDLE).await.is_err());
+        assert!(session
+            .cold(1_000 + IDLE, IDLE, &Carry::default())
+            .await
+            .is_err());
         assert!(backend.object_names(&addr()).is_empty());
-        assert_eq!(stored_cold_since(&backend).await, None);
-        let cold = session.cold(1_000 + IDLE, IDLE).await;
+        assert_eq!(stored_cold_since(&backend, cipher).await, None);
+        let cold = session.cold(1_000 + IDLE, IDLE, &Carry::default()).await;
         assert!(
             matches!(cold, Ok(Cold::Applied { pruned: true, .. })),
             "{cold:?}"

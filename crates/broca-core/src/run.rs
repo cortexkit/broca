@@ -803,6 +803,10 @@ pub struct RunControl {
     /// Replace the provider-view system text only after a recorded refresh applies. A
     /// difference between legacy transcript text and manifest metadata is not a refresh.
     pub manifest_system_override: bool,
+    /// The pending plan change a fresh run applies by freezing `manifest`, with its baseline
+    /// facts. The new storage's run loop records it in the batch of the run's start; today's
+    /// loop ignores it, because today's storage works the application out again from the WAL.
+    pub applies_refresh: Option<broca_protocol::session_change::AppliedChange>,
     /// Told the WAL position of a fresh run's `RunStarted` once it is durable, and of each
     /// provider attempt record as it is appended, so the caller can report them to the routing
     /// module that chooses provider accounts. `None` reports nothing; either way the loop writes
@@ -962,6 +966,7 @@ impl Default for RunControl {
             live_steer_after_seq: None,
             manifest: None,
             manifest_system_override: false,
+            applies_refresh: None,
             account_reporter: None,
             keep_warm: None,
             elicitation_plane: None,
@@ -1439,6 +1444,43 @@ where
         true,
         false,
         RunControl::default(),
+        out,
+    )
+    .await
+}
+
+/// [`run_loop_append_episode`] under `control`, as the session actor drives a later run with
+/// its planes (compaction, hooks) and the session's layout.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_loop_append_episode_with_control<P, T, L, A, W>(
+    req: RunRequest,
+    provider: &P,
+    tool_plane: &T,
+    lease_store: &L,
+    approval: &A,
+    wal_store: &W,
+    store: Option<Arc<dyn SessionStore>>,
+    control: RunControl,
+    out: &mpsc::Sender<OutputEvent>,
+) -> Result<RunSummary, RunError>
+where
+    P: Provider,
+    T: ToolPlane,
+    L: LeaseStore,
+    A: ApprovalPolicy,
+    W: WalStore,
+{
+    run_loop_inner(
+        req,
+        provider,
+        tool_plane,
+        lease_store,
+        approval,
+        wal_store,
+        store,
+        true,
+        false,
+        control,
         out,
     )
     .await
@@ -3193,23 +3235,36 @@ pub(crate) fn first_system_message(messages: &[Message]) -> Option<&Message> {
 /// byte-identically (its own version, or an earlier one it has proven), and the recorded frozen
 /// config must then equal the blob the provider would have recorded at that version, exactly.
 fn render_config_error<P: Provider>(provider: &P, recorded: &RunConfig) -> Option<ProviderError> {
+    render_identity_error(
+        provider,
+        recorded.renderer_version,
+        &recorded.frozen_render_config,
+    )
+}
+
+/// Why `provider` can't resume a run frozen with `renderer_version` and `frozen_render_config`
+/// byte for byte, if it can't: either config is null, the provider doesn't reproduce that
+/// renderer version, or it renders that version with another config. `None` when it can.
+pub fn render_identity_error<P: Provider + ?Sized>(
+    provider: &P,
+    renderer_version: u32,
+    frozen_render_config: &serde_json::Value,
+) -> Option<ProviderError> {
     let current = provider.render_config_blob();
-    let (message, provider_code) = if current.is_null() || recorded.frozen_render_config.is_null() {
+    let (message, provider_code) = if current.is_null() || frozen_render_config.is_null() {
         (
             "resume refused: the current provider or the recorded WAL has a null frozen render \
              config, so render identity cannot be verified; old WALs with a null frozen config \
              were never resume-safe and must be discarded",
             "frozen_render_config_unverifiable",
         )
-    } else if !provider.reproduces_renderer_version(recorded.renderer_version) {
+    } else if !provider.reproduces_renderer_version(renderer_version) {
         (
             "resume refused: the provider renderer version differs from the version recorded at \
              run start, and the provider does not reproduce the recorded version's bytes",
             "renderer_version_drift",
         )
-    } else if provider.render_config_blob_for_version(recorded.renderer_version)
-        != recorded.frozen_render_config
-    {
+    } else if provider.render_config_blob_for_version(renderer_version) != *frozen_render_config {
         (
             "resume refused: the provider frozen render config differs from the config recorded \
              at run start",
@@ -4167,7 +4222,6 @@ where
             plan,
             plane,
             bind: &hook_bind,
-            writer,
             cancel: control.cancel.as_ref(),
             stop: control.stop_requested.as_ref(),
             seal: control.shutdown_seal.as_ref(),
@@ -8652,7 +8706,7 @@ pub(crate) async fn project_committed<W: WalStore>(
 ///   so it never changes a retry decision.
 ///
 /// Every other error is returned unchanged.
-fn stamp_credential(
+pub fn stamp_credential(
     mut error: ProviderError,
     account_ref: Option<&str>,
     credential_id: Option<&str>,
@@ -9089,7 +9143,7 @@ fn log_step_transition(
 /// Count and warn about every entry of an attempt's `input_transformations`, whatever its reason:
 /// on an account that is not enforced, a mismatched thinking block is dropped silently, so this
 /// log line and the counter are the only place the loss shows up.
-fn report_input_transformations(
+pub fn report_input_transformations(
     session: &BindIdentity,
     run_id: &RunId,
     step_id: StepId,
@@ -9260,6 +9314,63 @@ fn attach_repetition_guidance<'a>(
 /// decoration the run loop sends to the provider.
 pub fn restore_repetition_guidance(prompt: &mut [Message]) {
     restore_guidance_with_originals(prompt, 0, None);
+}
+
+/// [`restore_repetition_guidance`] for a run whose earlier steps aren't in `prompt`: counting
+/// starts from `seed`, the run's [`repetition_checkpoint`] just before `prompt`'s first message,
+/// so the warnings are the ones the whole run would get. False, with nothing changed, when the
+/// checkpoint was taken under other warning rules or doesn't read as one.
+pub fn restore_repetition_guidance_seeded(
+    prompt: &mut [Message],
+    seed: &crate::tool_repetition::RepetitionCheckpoint,
+) -> bool {
+    let Some(mut fold) = RepetitionFold::seeded(seed) else {
+        return false;
+    };
+    for message in prompt.iter_mut() {
+        for (index, verdict) in fold.push(message) {
+            if let Some(guidance) = verdict.guidance() {
+                if let ContentBlock::ToolResult(result) = &mut message.content[index] {
+                    append_repetition_guidance(result, &guidance);
+                }
+            }
+        }
+    }
+    true
+}
+
+/// What [`repetition_checkpoint`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepetitionCheckpointTaken {
+    /// The counters after the steps given.
+    Taken(crate::tool_repetition::RepetitionCheckpoint),
+    /// An assistant's calls among the steps still wait for their results. A checkpoint keeps no
+    /// call text to pair them with, so none can be taken there.
+    CallsWaiting,
+    /// The seed doesn't read as a checkpoint under today's warning rules.
+    SeedRejected,
+}
+
+/// The repetition counters after a run's raw, undecorated steps `prompt`, from its first step,
+/// continuing from `seed` when the run's steps before `prompt` were counted already.
+pub fn repetition_checkpoint(
+    prompt: &[Message],
+    seed: Option<&crate::tool_repetition::RepetitionCheckpoint>,
+) -> RepetitionCheckpointTaken {
+    let mut fold = match seed {
+        Some(seed) => match RepetitionFold::seeded(seed) {
+            Some(fold) => fold,
+            None => return RepetitionCheckpointTaken::SeedRejected,
+        },
+        None => RepetitionFold::default(),
+    };
+    for message in prompt {
+        fold.push(message);
+    }
+    match fold.checkpoint() {
+        Some(checkpoint) => RepetitionCheckpointTaken::Taken(checkpoint),
+        None => RepetitionCheckpointTaken::CallsWaiting,
+    }
 }
 
 fn restore_guidance_with_originals(
@@ -9608,7 +9719,9 @@ async fn complete_pending_turn<T: ToolPlane, A: ApprovalPolicy>(
 
 /// The `context_overflow` refusal of a request whose estimated input leaves less room for output
 /// than the provider's floor. Nothing was sent; compacting the conversation is what helps.
-fn output_reservation_overflow(
+/// The error a run ends with when not even the provider's smallest output cap fits beside a
+/// step's estimated input: the request is not sent.
+pub fn output_reservation_overflow(
     estimate: u64,
     available: u64,
     floor: u32,
@@ -10346,7 +10459,7 @@ struct AttemptCallbacks<'a> {
 /// How long a cancelled step's stream is read for its last attempt record. The transport sends
 /// that record and closes the stream without any network wait, so this bound is only reached
 /// if the provider task is starved; the record is then lost rather than the cancel delayed.
-const CANCELLED_STEP_ATTEMPT_DRAIN: std::time::Duration = std::time::Duration::from_secs(5);
+pub const CANCELLED_STEP_ATTEMPT_DRAIN: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Drive ONE model step: forward display deltas, capture the assembled message +
 /// usage, end on the provider's terminal `Finished`/`Error`.
@@ -10821,7 +10934,7 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
 ) -> Result<BatchOutcome, RunError> {
     let batch_id = tool_batch_id(run_id, step_id);
     let ctx = BatchCtx {
-        media_capture: writer.media_capture(),
+        media_capture: writer.tool_media_capture(),
         batch_id: batch_id.clone(),
         bind: session.clone(),
         run_id: run_id.clone(),
@@ -12323,7 +12436,7 @@ fn tool_open_guard(
 
 /// The `route_drained` result for a call a scope drain stopped before it was sent. The text
 /// leads with the name so the model, and anyone reading the transcript, sees why.
-fn route_drained_result(id: &ToolCallId, reason: &str) -> ToolResult {
+pub fn route_drained_result(id: &ToolCallId, reason: &str) -> ToolResult {
     ToolResult {
         tool_call_id: id.clone(),
         output: ToolOutput::error(format!(
@@ -12725,7 +12838,8 @@ async fn finalize_hard_stop(
 
 /// The text parts of `message` joined exactly as `run.result` joins them: in order, with
 /// nothing inserted.
-fn joined_text(message: &AssistantMessage) -> String {
+/// A message's text parts joined as one answer: what a `final_text` run validates.
+pub fn joined_text(message: &AssistantMessage) -> String {
     message
         .content
         .iter()
@@ -12741,7 +12855,9 @@ fn joined_text(message: &AssistantMessage) -> String {
 
 /// The `submit_result` call that ends a `submit_tool` run at this step: the first one the
 /// model emitted whose arguments parsed. `None` for a `final_text` run or a step without one.
-fn counted_submit(
+/// The `submit_result` call that ends a `submit_tool` run: the step's first one that wasn't
+/// refused for unparseable arguments. `None` in any other mode.
+pub fn counted_submit(
     frozen: &FrozenStructuredOutput,
     message: &AssistantMessage,
     rejected: &[ToolResult],
@@ -12856,9 +12972,11 @@ mod delivery_order_tests;
 mod display_text;
 #[path = "run/hook_dispatch.rs"]
 mod hook_dispatch;
+pub use hook_dispatch::{
+    post_tool_text, pre_tool_refusal, pre_tool_subject, transformed_tool_result,
+};
 use hook_dispatch::{
-    pre_tool_subject, pre_tool_terminal, record_hook_stage, record_model_hook, resolve_hooked,
-    restream_message,
+    pre_tool_terminal, record_hook_stage, record_model_hook, resolve_hooked, restream_message,
 };
 
 #[cfg(test)]
@@ -17695,7 +17813,7 @@ mod approval_gate {
             .await;
         }
         let ctx = BatchCtx {
-            media_capture: writer.media_capture(),
+            media_capture: writer.tool_media_capture(),
             batch_id: tool_batch_id(run_id, step),
             bind: session.clone(),
             run_id: run_id.clone(),
@@ -19162,7 +19280,7 @@ mod approval_gate {
                     &projected.run_id,
                 ) {
                     let ctx = BatchCtx {
-                        media_capture: writer.media_capture(),
+                        media_capture: writer.tool_media_capture(),
                         batch_id: batch_id.clone(),
                         bind: bind.clone(),
                         run_id: run_id.clone(),
@@ -19236,7 +19354,7 @@ mod approval_gate {
                 ) = (&call.elicitation_id, &call.run_id, call.prepared.as_ref())
                 {
                     let ctx = BatchCtx {
-                        media_capture: writer.media_capture(),
+                        media_capture: writer.tool_media_capture(),
                         batch_id: batch_id.clone(),
                         bind: session.clone(),
                         run_id: run_id.clone(),
@@ -19283,7 +19401,7 @@ mod approval_gate {
                 backoff: 50,
             };
             let ctx = BatchCtx {
-                media_capture: writer.media_capture(),
+                media_capture: writer.tool_media_capture(),
                 batch_id: BatchId(format!("late:{key}")),
                 bind: session.clone(),
                 run_id: projected
@@ -19428,7 +19546,7 @@ mod approval_gate {
                 );
                 writer.sync().await?;
                 let ctx = call.ctx(&BatchCtx {
-                    media_capture: writer.media_capture(),
+                    media_capture: writer.tool_media_capture(),
                     batch_id: BatchId(format!("late:{}", call.key)),
                     bind: session.clone(),
                     run_id: projected.run_id.clone().expect("originating run"),
@@ -19472,7 +19590,7 @@ mod approval_gate {
                 })
                 .ok_or_else(|| RunError::Wal("late execution lacks RunStarted".into()))?;
             let ctx = call.ctx(&BatchCtx {
-                media_capture: writer.media_capture(),
+                media_capture: writer.tool_media_capture(),
                 batch_id: BatchId(format!("late:{key}")),
                 bind: session.clone(),
                 run_id: originating.0,
@@ -19510,7 +19628,6 @@ mod approval_gate {
                     plan,
                     plane: adapter,
                     bind: session,
-                    writer,
                     cancel: control.cancel.as_ref(),
                     stop: control.stop_requested.as_ref(),
                     seal: control.shutdown_seal.as_ref(),
@@ -19876,7 +19993,7 @@ async fn pause_approval(
         _ => return Err(RunError::Wal("approval pause lacks open calls".into())),
     };
     let ctx = BatchCtx {
-        media_capture: writer.media_capture(),
+        media_capture: writer.tool_media_capture(),
         batch_id,
         bind: session.clone(),
         run_id: run.clone(),

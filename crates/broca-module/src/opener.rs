@@ -45,6 +45,9 @@ pub struct DefaultOpener<L: LeaseStore, W: WalStore> {
     /// directory; an opener built from an arbitrary `LeaseStore` cannot prove its root
     /// and therefore accepts none.
     lease_root: Option<PathBuf>,
+    /// Serves sessions kept in the new storage, and starts new ones there when the registry
+    /// marks their creating send. `None` keeps every session on today's storage.
+    store: Option<Arc<crate::store_open::StoreSlot>>,
     #[cfg(feature = "test-clock")]
     test_fs: Option<Arc<dyn broca_wal::fs_ops::FsOps>>,
     #[cfg(feature = "test-clock")]
@@ -147,11 +150,25 @@ impl<L: LeaseStore, W: WalStore> DefaultOpener<L, W> {
             charge_basis_resolver: None,
             lease_domain: None,
             lease_root: None,
+            store: None,
             #[cfg(feature = "test-clock")]
             test_fs: None,
             #[cfg(feature = "test-clock")]
             ride_writer_for_test: false,
         }
+    }
+
+    /// Serves sessions kept in the new storage through `store`.
+    pub fn with_store_runtime(mut self, store: Arc<crate::store_open::StoreRuntime>) -> Self {
+        self.store = Some(Arc::new(crate::store_open::StoreSlot::loaded(store)));
+        self
+    }
+
+    /// Serves sessions kept in the new storage through `slot`, whose runtime is installed once
+    /// the deployment key loads. Until then those sessions are refused `key_unavailable`.
+    pub fn with_store_slot(mut self, slot: Arc<crate::store_open::StoreSlot>) -> Self {
+        self.store = Some(slot);
+        self
     }
 
     pub fn with_readers(mut self, readers: Arc<ActorReadSources>) -> Self {
@@ -240,8 +257,26 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> LineageOpener for DefaultOp
     > {
         self.executor.check_plan_selection(plan).await
     }
+    async fn compaction_context_limit(
+        &self,
+        model: &cortexkit_role_llm_runner::head_selection::PlanModel,
+    ) -> Result<Option<u64>, String> {
+        self.executor.compaction_context_limit(model).await
+    }
     fn on_session_deleted(&self, session: &LineageKey) {
         self.executor.on_session_deleted(session);
+    }
+    fn store_runtime(&self) -> Option<Arc<crate::store_open::StoreRuntime>> {
+        self.store.as_ref().and_then(|slot| slot.runtime())
+    }
+    fn store_holding(
+        &self,
+        key: &LineageKey,
+    ) -> Result<Option<Arc<crate::store_open::StoreRuntime>>, OpenError> {
+        match &self.store {
+            Some(slot) => slot.holding(key),
+            None => Ok(None),
+        }
     }
     fn run_index_reader(&self) -> Option<Arc<dyn broca_core::RunIndex>> {
         self.run_index.clone()
@@ -266,9 +301,23 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> LineageOpener for DefaultOp
         self.executor.media_profile(request).await
     }
     fn check_move(&self, key: &LineageKey, write: bool) -> Result<(), OpenError> {
+        if self.serves_from_store(key)? {
+            return Ok(());
+        }
         self.wal_store
             .check_move(key, write)
             .map_err(|e| OpenError::from_wal_read(e.to_string(), &e))
+    }
+    fn serves_from_store(&self, key: &LineageKey) -> Result<bool, OpenError> {
+        Ok(self.store_holding(key)?.is_some())
+    }
+    fn store_owner_refusal(&self, key: &LineageKey) -> Result<Option<OpenError>, OpenError> {
+        let wal = |error: broca_wal::WalError| OpenError::from_wal_read(error.to_string(), &error);
+        Ok(self
+            .wal_store
+            .store_owner_refusal(key)
+            .map_err(wal)?
+            .map(wal))
     }
     async fn backfill_attribution(
         &self,
@@ -381,9 +430,13 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> DefaultOpener<L, W> {
         session_class: Option<String>,
         status: bool,
     ) -> Result<ActorHandle, OpenError> {
-        self.wal_store
-            .check_move(key, true)
-            .map_err(|e| OpenError::from_wal_read(e.to_string(), &e))?;
+        // A session in the new storage has no WAL: its move fence and today's checks don't
+        // apply, and today's store refuses it by name.
+        if !self.serves_from_store(key)? {
+            self.wal_store
+                .check_move(key, true)
+                .map_err(|e| OpenError::from_wal_read(e.to_string(), &e))?;
+        }
         debug_assert!(
             key.validate_keyable().is_ok(),
             "DefaultOpener identity must be validated before durable key derivation"
@@ -438,6 +491,30 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> DefaultOpener<L, W> {
                 drop(authority);
                 return Err(error);
             }
+        }
+        if let Some(slot) = &self.store {
+            // Decided under the lease, so no other open of this session decides beside it. A
+            // session in the new storage is served from there, and refused while it is encrypted
+            // and its key hasn't loaded; one that exists in neither storage starts there when the
+            // registry marked its creating send and the runtime can create it in the mode new
+            // sessions take. The actor keeps the lease until its session is closed.
+            let held = slot.holding(key)?;
+            let create = held.is_none()
+                && !status
+                && registry.take_store_eligible(key)
+                && self.wal_store.wal_present(key) == Some(false);
+            let store = match held {
+                Some(store) => Some(store),
+                None if create => slot.creating_runtime(),
+                None => None,
+            };
+            if let Some(store) = store {
+                return store
+                    .open_actor(key, gen, registry, Box::new(authority), create)
+                    .await;
+            }
+        }
+        if let OpenAuthority::Tenure(_) = &authority {
             // The one move-fence validation of this tenure, before any mutation the open
             // performs: expiry deletion, archive restore, torn-tail recovery or lineage
             // creation. The check before acquisition proves nothing about the tenure, since

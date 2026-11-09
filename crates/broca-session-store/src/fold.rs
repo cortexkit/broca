@@ -25,6 +25,9 @@ pub enum Bound {
     Window,
     /// Capped at this many items; the oldest go first.
     Capped(usize),
+    /// One entry per distinct value of the named key, which grows only when a value first
+    /// appears: the set of values is small and closed, such as the models a session has used.
+    Distinct(&'static str),
     /// A struct whose own fields are declared with `state!`, each with its own bound.
     Declared,
 }
@@ -134,6 +137,8 @@ macro_rules! state {
         }
     };
 }
+
+pub(crate) use state;
 
 pub mod conversation;
 pub mod operations;

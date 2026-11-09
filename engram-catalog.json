@@ -15,6 +15,12 @@
       "path": "wal-archive-durable"
     },
     {
+      "entry_id": "broca/session-store",
+      "class": "portable",
+      "mechanism": "filetree",
+      "path": "session-store"
+    },
+    {
             "entry_id": "broca/session-wals",
             "class": "excluded",
             "mechanism": "filetree",

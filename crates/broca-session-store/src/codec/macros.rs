@@ -3,7 +3,7 @@
 //!
 //! `message!` declares a struct. Each field is `<number> <cardinality> [must]? <name>: <type>`:
 //! - `req`: the field has type `T`; omitted when it holds `T`'s default, refused when absent and
-//!   `T` has no default.
+//!   `T` has no default, and refused when written holding the default, which no writer does.
 //! - `opt`: the field has type `Option<T>`; written whenever `Some`.
 //! - `rep`: the field has type `Vec<T>`; one occurrence per element.
 //! - `map`: the field's type is a `BTreeMap<K, V>`, written in full; one entry per pair.
@@ -66,7 +66,7 @@ macro_rules! __codec_put {
 #[macro_export]
 macro_rules! __codec_take {
     (req, $slot:expr, $field:expr, $at:expr) => {
-        $crate::codec::take_one($slot, $field, $at)
+        $crate::codec::take_req($slot, $field, $at)
     };
     (opt, $slot:expr, $field:expr, $at:expr) => {
         $crate::codec::take_one($slot, $field, $at)
@@ -150,7 +150,11 @@ macro_rules! message {
                             $num => $crate::__codec_take!(
                                 $card,
                                 &mut $field,
-                                field,
+                                $crate::codec::declared(
+                                    field,
+                                    $crate::__codec_must!($($must)?),
+                                    concat!(stringify!($name), ".", stringify!($field)),
+                                )?,
                                 concat!(stringify!($name), ".", stringify!($field))
                             )?,
                         )*

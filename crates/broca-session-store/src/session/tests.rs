@@ -5,8 +5,23 @@ use super::{Session, SessionError};
 use crate::backend::{LocalBackend, MemoryBackend, SessionAddr, SessionBackend};
 use crate::codec::Message as _;
 use crate::head::SessionTriple;
-use crate::keys::DeploymentKey;
+use crate::keys::{Cipher, DeploymentKey};
 use crate::record::{Event, Input, Placement, Record};
+
+cipher_tests!(
+    a_created_session_loads_back_with_the_same_state,
+    the_same_holds_on_local_files,
+    a_replaced_writer_is_fenced,
+    a_moved_head_alone_fences_the_writer,
+    a_torn_tail_is_cut_on_load,
+    damage_refuses_and_changes_nothing,
+    another_triple_or_deployment_key_refuses,
+    a_view_reads_a_held_session_and_writes_nothing,
+    a_view_of_a_damaged_log_refuses_and_changes_nothing,
+    the_open_logs_newest_activity_is_kept_and_read_back,
+    an_append_is_observed_only_once_it_returned,
+    an_append_without_a_barrier_is_told_durable_once_synced,
+);
 
 fn triple() -> SessionTriple {
     SessionTriple {
@@ -16,8 +31,9 @@ fn triple() -> SessionTriple {
     }
 }
 
-fn deployment() -> DeploymentKey {
-    DeploymentKey::new(1, &[5; 32])
+/// The test deployment key, creating sessions in mode `cipher`.
+fn deployment(cipher: Cipher) -> DeploymentKey {
+    DeploymentKey::new(1, &[5; 32]).creating(cipher)
 }
 
 fn addr() -> SessionAddr {
@@ -26,6 +42,7 @@ fn addr() -> SessionAddr {
 
 fn input(text: &str) -> Record {
     Record::Input(Input {
+        media: Vec::new(),
         run_id: "r".into(),
         placement: Placement::RunInput,
         message: Message::new(Role::User, vec![ContentBlock::Text { text: text.into() }]),
@@ -47,13 +64,13 @@ fn event(name: &str) -> Record {
 }
 
 /// The state a session holds, as bytes, so two sessions can be compared.
-fn state<B: SessionBackend>(session: &Session<'_, B>) -> (Vec<u8>, Vec<u8>) {
+fn state<B: SessionBackend>(session: &Session<B>) -> (Vec<u8>, Vec<u8>) {
     (session.conversation.encode(), session.operations.encode())
 }
 
-fn create_and_write<B: SessionBackend>(backend: &B) -> (Vec<u8>, Vec<u8>) {
+fn create_and_write<B: SessionBackend>(backend: &B, cipher: Cipher) -> (Vec<u8>, Vec<u8>) {
     block_on(async {
-        let mut session = Session::create(backend, addr(), triple(), &deployment(), false)
+        let mut session = Session::create(backend, addr(), triple(), &deployment(cipher), false)
             .await
             .unwrap();
         session.append(&[input("one")], true).await.unwrap();
@@ -68,6 +85,14 @@ fn create_and_write<B: SessionBackend>(backend: &B) -> (Vec<u8>, Vec<u8>) {
     })
 }
 
+/// A byte 23 bytes into the claim-only frame `close` writes last, which is inside that frame's
+/// header, in a log `len` bytes long whose frames are sealed in mode `cipher`. A claim frame
+/// has an empty body, so it is exactly the mode's frame overhead long.
+fn in_closing_claim(cipher: Cipher, len: usize) -> usize {
+    let claim = crate::frame::FrameKey::for_tests(cipher, 1, &[0; 32]).frame_overhead();
+    len - claim + 23
+}
+
 fn texts(messages: &[Message]) -> Vec<String> {
     messages
         .iter()
@@ -79,12 +104,11 @@ fn texts(messages: &[Message]) -> Vec<String> {
         .collect()
 }
 
-#[test]
-fn a_created_session_loads_back_with_the_same_state() {
+fn a_created_session_loads_back_with_the_same_state(cipher: Cipher) {
     let backend = MemoryBackend::default();
-    let written = create_and_write(&backend);
+    let written = create_and_write(&backend, cipher);
     block_on(async {
-        let mut session = Session::load(&backend, addr(), &triple(), &deployment())
+        let mut session = Session::load(&backend, addr(), &triple(), &deployment(cipher))
             .await
             .unwrap();
         assert_eq!(state(&session), written);
@@ -95,15 +119,18 @@ fn a_created_session_loads_back_with_the_same_state() {
     });
 }
 
-#[test]
-fn the_same_holds_on_local_files() {
-    let root = std::env::temp_dir().join(format!("broca-session-test-{}", std::process::id()));
+fn the_same_holds_on_local_files(cipher: Cipher) {
+    let root = std::env::temp_dir().join(format!(
+        "broca-session-test-{}-{}",
+        std::process::id(),
+        cipher.label()
+    ));
     let backend = LocalBackend::new(&root);
-    let written = create_and_write(&backend);
+    let written = create_and_write(&backend, cipher);
     // A fresh backend, as another process after a restart would have.
     let reopened = LocalBackend::new(&root);
     let loaded = block_on(async {
-        let session = Session::load(&reopened, addr(), &triple(), &deployment())
+        let session = Session::load(&reopened, addr(), &triple(), &deployment(cipher))
             .await
             .unwrap();
         state(&session)
@@ -113,15 +140,14 @@ fn the_same_holds_on_local_files() {
 }
 
 /// A writer whose head was replaced by another writer's can't append: the backend refuses it.
-#[test]
-fn a_replaced_writer_is_fenced() {
+fn a_replaced_writer_is_fenced(cipher: Cipher) {
     let backend = MemoryBackend::default();
-    create_and_write(&backend);
+    create_and_write(&backend, cipher);
     block_on(async {
-        let mut first = Session::load(&backend, addr(), &triple(), &deployment())
+        let mut first = Session::load(&backend, addr(), &triple(), &deployment(cipher))
             .await
             .unwrap();
-        let mut second = Session::load(&backend, addr(), &triple(), &deployment())
+        let mut second = Session::load(&backend, addr(), &triple(), &deployment(cipher))
             .await
             .unwrap();
         assert!(matches!(
@@ -139,12 +165,11 @@ fn a_replaced_writer_is_fenced() {
 
 /// A head that moved with no append to the log (another writer's head-only update) still fences
 /// the stale writer, even though the log ends where it expects.
-#[test]
-fn a_moved_head_alone_fences_the_writer() {
+fn a_moved_head_alone_fences_the_writer(cipher: Cipher) {
     let backend = MemoryBackend::default();
-    create_and_write(&backend);
+    create_and_write(&backend, cipher);
     block_on(async {
-        let mut session = Session::load(&backend, addr(), &triple(), &deployment())
+        let mut session = Session::load(&backend, addr(), &triple(), &deployment(cipher))
             .await
             .unwrap();
         let (stored, version) = backend.read_head(&addr()).await.unwrap().unwrap();
@@ -161,11 +186,10 @@ fn a_moved_head_alone_fences_the_writer() {
 
 /// An append cut off mid-write is dropped, the log cut back, and the writer continues after
 /// the last complete batch.
-#[test]
-fn a_torn_tail_is_cut_on_load() {
+fn a_torn_tail_is_cut_on_load(cipher: Cipher) {
     let backend = MemoryBackend::default();
     let (log, end) = block_on(async {
-        let mut session = Session::create(&backend, addr(), triple(), &deployment(), false)
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(cipher), false)
             .await
             .unwrap();
         session.append(&[input("one")], true).await.unwrap();
@@ -176,31 +200,42 @@ fn a_torn_tail_is_cut_on_load() {
     let bytes = block_on(backend.read_log(&addr(), &log, 0..end + 40)).unwrap();
     backend.set_log(&addr(), &log, bytes);
     block_on(async {
-        let mut session = Session::load(&backend, addr(), &triple(), &deployment())
+        let mut session = Session::load(&backend, addr(), &triple(), &deployment(cipher))
             .await
             .unwrap();
         assert_eq!(texts(&session.conversation.messages), ["one"]);
         session.append(&[input("two")], true).await.unwrap();
     });
-    let session = block_on(Session::load(&backend, addr(), &triple(), &deployment())).unwrap();
+    let session = block_on(Session::load(
+        &backend,
+        addr(),
+        &triple(),
+        &deployment(cipher),
+    ))
+    .unwrap();
     assert_eq!(texts(&session.conversation.messages), ["one", "two"]);
 }
 
 /// A flipped byte in the last batch is damage. No later frame claims that batch durable, so it is
 /// debris that only a recovery may repair: loading refuses without changing anything.
-#[test]
-fn damage_refuses_and_changes_nothing() {
+fn damage_refuses_and_changes_nothing(cipher: Cipher) {
     let backend = MemoryBackend::default();
-    create_and_write(&backend);
+    create_and_write(&backend, cipher);
     let (stored, _) = block_on(backend.read_head(&addr())).unwrap().unwrap();
-    let (head, _) = crate::head::open(&stored, &deployment()).unwrap();
+    let (head, _) = crate::head::open(&stored, &deployment(cipher)).unwrap();
     let log = head.open_log.unwrap().change;
     let end = block_on(backend.log_end(&addr(), &log)).unwrap();
     let mut bytes = block_on(backend.read_log(&addr(), &log, 0..end)).unwrap();
-    let flip = bytes.len() - 60;
+    let flip = in_closing_claim(cipher, bytes.len());
     bytes[flip] ^= 1;
     backend.set_log(&addr(), &log, bytes.clone());
-    let error = block_on(Session::load(&backend, addr(), &triple(), &deployment())).err();
+    let error = block_on(Session::load(
+        &backend,
+        addr(),
+        &triple(),
+        &deployment(cipher),
+    ))
+    .err();
     assert!(
         matches!(error, Some(SessionError::NeedsRecovery)),
         "{error:?}"
@@ -213,23 +248,252 @@ fn damage_refuses_and_changes_nothing() {
     assert_eq!(after, stored);
 }
 
-#[test]
-fn another_triple_or_deployment_key_refuses() {
+/// Another triple refuses in both modes. Another deployment key refuses an encrypted session,
+/// which can't unwrap its data key; a plain session needs no deployment key, so it opens with
+/// any.
+fn another_triple_or_deployment_key_refuses(cipher: Cipher) {
     let backend = MemoryBackend::default();
-    create_and_write(&backend);
+    create_and_write(&backend, cipher);
     let mut other = triple();
     other.session = "t".into();
     assert!(matches!(
-        block_on(Session::load(&backend, addr(), &other, &deployment())),
+        block_on(Session::load(&backend, addr(), &other, &deployment(cipher))),
         Err(SessionError::TripleMismatch)
     ));
+    let loaded = block_on(Session::load(
+        &backend,
+        addr(),
+        &triple(),
+        &DeploymentKey::new(1, &[6; 32]),
+    ));
+    match cipher {
+        Cipher::XChaCha20Poly1305 => assert!(matches!(loaded, Err(SessionError::Head(_)))),
+        Cipher::None => assert!(loaded.is_ok()),
+    }
+}
+
+/// A view reads what a writer still holding the session wrote, writes nothing (not even the
+/// generation a writer's open commits), and reads a torn tail as not yet written without
+/// cutting it.
+fn a_view_reads_a_held_session_and_writes_nothing(cipher: Cipher) {
+    let backend = MemoryBackend::default();
+    let (log, synced) = block_on(async {
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(cipher), false)
+            .await
+            .unwrap();
+        session.append(&[input("one")], true).await.unwrap();
+        session.append(&[input("two")], true).await.unwrap();
+        let view = Session::view(&backend, addr(), &triple(), &deployment(cipher))
+            .await
+            .unwrap();
+        assert_eq!(texts(&view.conversation.messages), ["one", "two"]);
+        assert_eq!(view.next_seq(), session.next_seq());
+        session.open_log()
+    });
+    let (head_before, _) = block_on(backend.read_head(&addr())).unwrap().unwrap();
+    // A write cut short past the last batch.
+    let mut bytes = block_on(backend.read_log(&addr(), &log, 0..synced)).unwrap();
+    bytes.extend_from_slice(&[0xA5; 40]);
+    backend.set_log(&addr(), &log, bytes.clone());
+    let view = block_on(Session::view(
+        &backend,
+        addr(),
+        &triple(),
+        &deployment(cipher),
+    ))
+    .unwrap();
+    assert_eq!(texts(&view.conversation.messages), ["one", "two"]);
+    drop(view);
+    assert_eq!(
+        block_on(backend.read_log(&addr(), &log, 0..synced + 40)).unwrap(),
+        bytes,
+        "the view left the torn tail in place"
+    );
+    let (head_after, _) = block_on(backend.read_head(&addr())).unwrap().unwrap();
+    assert_eq!(head_after, head_before, "the view committed no head");
+}
+
+/// A view refuses a log only a recovery may repair, and changes nothing.
+fn a_view_of_a_damaged_log_refuses_and_changes_nothing(cipher: Cipher) {
+    let backend = MemoryBackend::default();
+    create_and_write(&backend, cipher);
+    let (stored, _) = block_on(backend.read_head(&addr())).unwrap().unwrap();
+    let (head, _) = crate::head::open(&stored, &deployment(cipher)).unwrap();
+    let log = head.open_log.unwrap().change;
+    let end = block_on(backend.log_end(&addr(), &log)).unwrap();
+    let mut bytes = block_on(backend.read_log(&addr(), &log, 0..end)).unwrap();
+    let flip = in_closing_claim(cipher, bytes.len());
+    bytes[flip] ^= 1;
+    backend.set_log(&addr(), &log, bytes.clone());
+    let error = block_on(Session::view(
+        &backend,
+        addr(),
+        &triple(),
+        &deployment(cipher),
+    ))
+    .err();
+    assert!(
+        matches!(error, Some(SessionError::NeedsRecovery)),
+        "{error:?}"
+    );
+    assert_eq!(
+        block_on(backend.read_log(&addr(), &log, 0..end)).unwrap(),
+        bytes
+    );
+}
+
+/// The open log's newest activity time is the newest time any of its records carries, whatever
+/// order they were appended in, and a load for a read finds the same.
+fn the_open_logs_newest_activity_is_kept_and_read_back(cipher: Cipher) {
+    let backend = MemoryBackend::default();
+    let timed = |text: &str, at: u64| {
+        let mut record = input(text);
+        if let Record::Input(input) = &mut record {
+            input.written_at_ms = Some(at);
+        }
+        record
+    };
+    block_on(async {
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(cipher), false)
+            .await
+            .unwrap();
+        assert_eq!(session.open_log_activity_ms(), None);
+        session
+            .append(&[timed("one", 9), event("a")], true)
+            .await
+            .unwrap();
+        session.append(&[timed("two", 5)], true).await.unwrap();
+        assert_eq!(session.open_log_activity_ms(), Some(9));
+        session.close().await.unwrap();
+        let view = Session::view(&backend, addr(), &triple(), &deployment(cipher))
+            .await
+            .unwrap();
+        assert_eq!(view.open_log_activity_ms(), Some(9));
+    });
+}
+
+/// The observer of a session's appends hears of a batch only once its append returned, under
+/// the seqs its records took: a batch the backend refuses is never told.
+fn an_append_is_observed_only_once_it_returned(cipher: Cipher) {
+    use std::sync::{Arc, Mutex};
+    let backend = MemoryBackend::default();
+    block_on(async {
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(cipher), false)
+            .await
+            .unwrap();
+        let told = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&told);
+        session.observe_appends(Box::new(move |appended| match appended {
+            super::Appended::Records {
+                first,
+                records,
+                durable,
+            } => seen
+                .lock()
+                .unwrap()
+                .push(format!("{first}+{} {durable}", records.len())),
+            super::Appended::Synced => seen.lock().unwrap().push("synced".into()),
+            super::Appended::Replaced => seen.lock().unwrap().push("replaced".into()),
+        }));
+        let first = session
+            .append(&[input("one"), event("a")], true)
+            .await
+            .unwrap();
+        backend.fail_once(0);
+        assert!(session.append(&[input("two")], true).await.is_err());
+        assert_eq!(*told.lock().unwrap(), [format!("{first}+2 true")]);
+    });
+}
+
+/// A batch appended without a barrier is told as not yet durable, and the sync that makes it
+/// durable is told after it.
+fn an_append_without_a_barrier_is_told_durable_once_synced(cipher: Cipher) {
+    use std::sync::{Arc, Mutex};
+    let backend = MemoryBackend::default();
+    block_on(async {
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(cipher), false)
+            .await
+            .unwrap();
+        let told = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&told);
+        session.observe_appends(Box::new(move |appended| match appended {
+            super::Appended::Records { durable, .. } => {
+                seen.lock()
+                    .unwrap()
+                    .push(if durable { "durable" } else { "written" })
+            }
+            super::Appended::Synced => seen.lock().unwrap().push("synced"),
+            super::Appended::Replaced => seen.lock().unwrap().push("replaced"),
+        }));
+        session.append(&[event("a")], false).await.unwrap();
+        session.sync().await.unwrap();
+        session.sync().await.unwrap();
+        assert_eq!(*told.lock().unwrap(), ["written", "synced"]);
+    });
+}
+
+/// A session's mode is chosen when it is created and kept in its head: a deployment key that
+/// creates plain sessions creates the next one plain, and an encrypted session created before
+/// stays encrypted when it loads under that key. A plain session loads before the deployment key
+/// has loaded; an encrypted one refuses until it has.
+#[test]
+fn the_mode_is_chosen_at_creation_and_kept() {
+    let encrypted_addr = SessionAddr("encrypted0000000".into());
+    let plain_addr = SessionAddr("plain00000000000".into());
+    let backend = MemoryBackend::default();
+    let stored_mode = |addr: &SessionAddr| {
+        let (stored, _) = block_on(backend.read_head(addr)).unwrap().unwrap();
+        crate::head::stored_cipher(&stored).unwrap()
+    };
+    block_on(async {
+        let session = Session::create(
+            &backend,
+            encrypted_addr.clone(),
+            triple(),
+            &deployment(Cipher::XChaCha20Poly1305),
+            false,
+        )
+        .await
+        .unwrap();
+        session.close().await.unwrap();
+        // The deployment now creates plain sessions.
+        let plain_now = deployment(Cipher::None);
+        let session = Session::create(&backend, plain_addr.clone(), triple(), &plain_now, false)
+            .await
+            .unwrap();
+        assert_eq!(session.head().cipher(), Cipher::None);
+        assert!(session.head().keys.is_empty());
+        session.close().await.unwrap();
+        let session = Session::load(&backend, encrypted_addr.clone(), &triple(), &plain_now)
+            .await
+            .unwrap();
+        assert_eq!(session.head().cipher(), Cipher::XChaCha20Poly1305);
+        session.close().await.unwrap();
+    });
+    assert_eq!(stored_mode(&encrypted_addr), Cipher::XChaCha20Poly1305);
+    assert_eq!(stored_mode(&plain_addr), Cipher::None);
+
+    let unloaded = DeploymentKey::unloaded(1);
+    let plain = block_on(Session::load(&backend, plain_addr, &triple(), &unloaded)).unwrap();
+    assert_eq!(plain.head().cipher(), Cipher::None);
     assert!(matches!(
         block_on(Session::load(
             &backend,
-            addr(),
+            encrypted_addr,
             &triple(),
-            &DeploymentKey::new(1, &[6; 32])
+            &unloaded
         )),
-        Err(SessionError::Head(_))
+        Err(SessionError::Head(crate::head::HeadError::NotLoaded))
+    ));
+    // An unloaded key can't create an encrypted session.
+    assert!(matches!(
+        block_on(Session::create(
+            &backend,
+            SessionAddr("refused000000000".into()),
+            triple(),
+            &DeploymentKey::unloaded(1).creating(Cipher::XChaCha20Poly1305),
+            false,
+        )),
+        Err(SessionError::Head(crate::head::HeadError::NotLoaded))
     ));
 }

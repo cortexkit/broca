@@ -900,10 +900,10 @@ async fn negotiated_media_dispatch_captures_with_nullable_error_code() {
         broca_test_support::scratch_root().join(format!("negotiated-media-{}", std::process::id()));
     let wal = broca_core::FileWalStore::new(root.join("wal"));
     drop(wal.open(&ctx.bind).unwrap());
-    ctx.media_capture = Some(ToolMediaCapture::new(
+    ctx.media_capture = Some(std::sync::Arc::new(ToolMediaCapture::new(
         wal.uploads().unwrap(),
         ctx.bind.clone(),
-    ));
+    )));
     let call = call("captured");
     plane
         .batch_started(&ctx, std::slice::from_ref(&call), &manifest())

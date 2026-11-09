@@ -22,21 +22,32 @@ use broca_protocol::usage::Usage;
 use broca_session_store::codec::{Digest, Message as _};
 use broca_session_store::fold::conversation::Conversation;
 use broca_session_store::record::{
-    Assistant, Attempt, BatchEnd, BatchStart, BudgetFire, BudgetFiring, CallOutcome, CancelPoint,
-    CancelRequest, Compaction, Delivery, DeliveryOrdered, Event, Input, Marker, Notice, PartKind,
-    PartRef, Pause, Placement, QueuedSend, Record, ResultAppend, Retraction, RunEnd, RunStart,
-    SendEnded, SessionRefresh, SetupStub, Steer, StepEnd, StepStart, Stream, StructuredResult,
-    ToolHeld, ToolIntent, ToolOutcome, ToolReply, View, ViewApplied,
+    Assistant, Attempt, AuthRefrozen, BatchEnd, BatchStart, Billed, BudgetFire, BudgetFiring,
+    CallFacts, CallOutcome, CancelPoint, CancelRequest, CeilingDecided, Compaction, ConfigRefrozen,
+    Delivery, DeliveryOrdered, Event, Input, Marker, ModelStepUsage, Notice, OutputCapLowered,
+    PartKind, PartRef, Pause, Placement, PrefixFlush, QueuedSend, Record, Redo, RefreshApplied,
+    RefreshPolicy, ResultAppend, Resumed, Retraction, RunEnd, RunStart, SendEnded, SessionRefresh,
+    SetupStub, Steer, StepEnd, StepRefused, StepStart, Stream, StructuredDowngraded,
+    StructuredResult, ToolHeld, ToolIntent, ToolOutcome, ToolReply, TurnFacts, Unanswered, View,
+    ViewApplied, Warmed,
 };
 use broca_wal::{FramedRecord, WalRecord};
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 use sha2::{Digest as _, Sha256};
 
+pub mod billing;
+pub mod counting;
 pub mod entry_facts;
-pub mod inverse;
+/// The inverse lives with the new run loop, where a session's media fold reads it too.
+pub use broca_session_loop::inverse;
 pub mod measure;
+pub mod preconditions;
+pub mod read_cost;
 pub mod split;
+pub mod stage;
+pub mod stored_history;
+pub mod verify;
 
 /// A count of old records, fields or values, and their stored JSON size.
 #[derive(Debug, Default, Clone, Copy, serde::Serialize)]
@@ -89,8 +100,16 @@ fn err(message: impl Into<String>) -> ConvertError {
 /// only when they differ from the call's.
 #[derive(Default)]
 struct State {
+    /// The cache lifetime the requests sent now ask the provider for, from the run config in
+    /// force (the run's start, then any refreeze), as today's cache-expiry rule reads it.
+    requested_cache_ttl: Option<u64>,
+    /// The log's lineage id, which today's call keys are made of.
+    lineage: Option<String>,
     run_id: String,
     model: Option<ModelHandle>,
+    /// The current run's frozen variant; an empty value counts as none, as `HeadProjection`
+    /// treats it.
+    variant: Option<String>,
     setup: Vec<PartRef>,
     call_inputs: HashMap<String, Value>,
     /// Copies of steered and delivered messages accepted but not placed yet. Today's log
@@ -118,6 +137,23 @@ struct State {
     /// In a mode-3 log: who delivered each tool-result delivery's text, by the delivering
     /// record's seq (see `entry_facts`).
     delivery_notices: HashMap<u64, Notice>,
+    /// The copies of the current step's calls and the records that anchored them, as today's
+    /// readers key them (`broca_core::call_identity`).
+    anchors: broca_core::call_identity::CallAnchors,
+    /// The copy the record being converted is about, if it is about one.
+    call: Option<broca_core::call_identity::CallAnchor>,
+    /// Whether today's message ids carry the log's lineage (`broca_core::message_mid`).
+    mode3: bool,
+    /// For the step or batch start being converted: today's id of the message it announces,
+    /// the step's assistant message or the batch's tool-results message, at the position
+    /// today's placement gives it.
+    announced_mid: Option<String>,
+    /// The seq, in the converted session, of the newest first-protocol compaction view event
+    /// (`compaction_view_applied`, kept whole as a ledger event) converted so far.
+    legacy_view: Option<u64>,
+    /// That view as it stood when the newest model step finished: the view in force for the
+    /// request that step sent (`output_refs::view_at_writing_step`).
+    step_legacy_view: Option<u64>,
 }
 
 /// Writes the held copies as transcript entries at the boundary that places them.
@@ -138,11 +174,19 @@ fn hold(inputs: Vec<Input>, state: &mut State, out: &Converted) {
     }));
 }
 
+/// The seq a converted session's first record takes, which a converted record that names another
+/// by its seq counts from: creating a session opens its writer, which writes `WriterOpened` at
+/// seq 1, and the converted records are appended right after it, in order, by that writer.
+pub const FIRST_SEQ: u64 = 2;
+
 /// Converts one log. `lineage` is the log's lineage id: a log on the current compaction
 /// contract needs it, because today's message ids carry it and a converted message keeps its id.
 pub fn convert(old: &[FramedRecord], lineage: Option<&str>) -> Result<Converted, ConvertError> {
     let mut out = Converted::default();
-    let mut state = State::default();
+    let mut state = State {
+        lineage: lineage.map(str::to_owned),
+        ..State::default()
+    };
     // A mode-3 log gets an `EntryFacts` record right after each record that places (or
     // reserves) a message, with what today's projection serves about it. A fold that keeps only
     // counts tells which ordinals each converted record placed.
@@ -150,6 +194,7 @@ pub fn convert(old: &[FramedRecord], lineage: Option<&str>) -> Result<Converted,
         .map_err(err)?
         .map(|legacy| {
             state.delivery_notices = legacy.delivery_notices.clone();
+            state.mode3 = !legacy.page_only;
             (legacy, Conversation::new(false), 0u64)
         });
     // Today's placement and budget rules decide what older records left implicit: the firing a
@@ -160,9 +205,38 @@ pub fn convert(old: &[FramedRecord], lineage: Option<&str>) -> Result<Converted,
     let mut stop_when = Vec::new();
     // Session-scoped: the schedule carries from run to run under the same model.
     let mut schedule: Option<broca_wal::RefusalFallbackSchedule> = None;
+    // Today's display facts, folded record by record as the conversion goes, as today's read
+    // folds them: what a tool turn's facts say about its calls when its results place it, and
+    // whether a later record changes that (a run that ends cancelled turns its abandoned calls
+    // from interrupted to cancelled). Without a lineage today's reads key no call, so no turn
+    // has facts.
+    let mut display = lineage.map(|lineage| {
+        (
+            broca_core::display_facts::DisplayFactsSeed::default(),
+            lineage,
+            // The module each call was dispatched to, by today's ordinal of its message.
+            broca_core::tool_call_dispatches(old).unwrap_or_default(),
+            // The latest facts of each message whose calls today's facts time, by today's
+            // ordinal.
+            HashMap::<u64, broca_core::display_facts::DisplayFacts>::new(),
+        )
+    });
+    // The latest tool turn placed, with the facts written for it.
+    let mut last_turn: Option<TurnFacts> = None;
+    // Each run's Rich UI stamp, as today's read finds it: the first start of the run that
+    // carries one.
+    let mut stamps: HashMap<String, Option<broca_session_store::record::RichUi>> = HashMap::new();
+    // The provider serving the run in force, which decides what lifetime its requests ask for.
+    let mut provider_id = String::new();
+    // Today's plan-change fold, record by record, so the run start that applied each refresh is
+    // known: the new storage records that application after the run's input.
+    let mut plan_changes = broca_fetch_plan::session_change::SessionChangeFold::default();
     for framed in old {
         match &framed.record {
             WalRecord::RunStarted { config, ts_ms, .. } => {
+                provider_id = config.model.provider_module_id.clone();
+                state.requested_cache_ttl =
+                    requested_cache_ttl(&provider_id, &config.frozen_render_config);
                 budget = config.budget.clone();
                 stop_when = config.stop_when.clone();
                 state.budget_configured = budget.is_some();
@@ -179,6 +253,12 @@ pub fn convert(old: &[FramedRecord], lineage: Option<&str>) -> Result<Converted,
                 }
             }
             WalRecord::ModelStepRefused { schedule: next, .. } => schedule = Some(next.clone()),
+            WalRecord::RunConfigRefrozen {
+                frozen_render_config,
+                ..
+            } => {
+                state.requested_cache_ttl = requested_cache_ttl(&provider_id, frozen_render_config);
+            }
             WalRecord::BudgetFired { .. } => {
                 state.due_firing = budget
                     .as_ref()
@@ -189,6 +269,17 @@ pub fn convert(old: &[FramedRecord], lineage: Option<&str>) -> Result<Converted,
         // A record today's placement refuses is one today's replay refuses too; the conversion
         // still carries it, and the conversation check reports the log.
         let actions = placement.observe(&framed.record).unwrap_or_default();
+        // A step announces its assistant message at the position placement now gives the next
+        // message, after any steers the step's start placed; a batch announces the tool-results
+        // message that follows the assistant message it holds.
+        let announced = match &framed.record {
+            WalRecord::StepStarted { .. } => Some(placement.next_ordinal()),
+            WalRecord::ToolBatchStarted { .. } => placement.held_tool_result_ordinal(),
+            _ => None,
+        };
+        state.announced_mid = announced.and_then(|position| {
+            broca_core::message_mid(state.mode3, state.lineage.as_deref(), position).ok()
+        });
         // A step taken after the budget's finalize firing enters today's conversation at once,
         // calls and all.
         state.finalize_step = actions.iter().any(|action| {
@@ -210,41 +301,219 @@ pub fn convert(old: &[FramedRecord], lineage: Option<&str>) -> Result<Converted,
             state.limiting_stop_met =
                 broca_core::run::limiting_stop_satisfied(&stop_when, steps, assistant_message);
         }
+        if let WalRecord::RunStarted {
+            run_id, manifest, ..
+        } = &framed.record
+        {
+            let stamp = stamps.entry(run_id.0.clone()).or_default();
+            if stamp.is_none() {
+                *stamp = manifest
+                    .as_ref()
+                    .and_then(|manifest| manifest.rich_ui.as_ref())
+                    .and_then(broca_session_loop::entries::rich_ui);
+            }
+        }
         state.seq = framed.seq;
+        // Today's call keys come from the record that first anchors each copy of a step's calls.
+        state.call = state
+            .anchors
+            .observe(&framed.record, framed.seq)
+            .map(|(_, copy)| copy);
         let before = out.records.len();
+        let applied = plan_changes.record(&framed.record).map(refresh_applied);
         convert_one(&framed.record, &mut state, &mut out)?;
+        out.records.extend(applied.map(Record::RefreshApplied));
+        // Today's display facts of each message this record gave a new version, by today's
+        // ordinal; a fold today's read refuses leaves them as they were.
+        let mut changed = Vec::new();
+        if let Some((seed, lineage, _, calls)) = &mut display {
+            for version in seed
+                .fold(std::slice::from_ref(framed), lineage)
+                .unwrap_or_default()
+            {
+                if !version.facts.tool_times.is_empty() || calls.contains_key(&version.ordinal) {
+                    changed.push(version.ordinal);
+                    calls.insert(version.ordinal, version.facts);
+                }
+            }
+        }
+        // A turn today's facts don't time (a log without a lineage keys no call) has no calls.
+        let turn_of = |ordinal: u64| -> TurnFacts {
+            match display.as_ref().and_then(|(_, _, dispatches, calls)| {
+                Some((calls.get(&(ordinal - 1))?, dispatches.get(&(ordinal - 1))))
+            }) {
+                Some((facts, dispatches)) => turn_from_display(ordinal, facts, dispatches),
+                None => TurnFacts {
+                    ordinal,
+                    calls: Vec::new(),
+                },
+            }
+        };
         if let Some((legacy, counts, emitted)) = &mut facts {
             let mut known = *emitted;
+            // Whether broca wrote each newly known message, told by the record that placed it.
+            let mut native_of = BTreeMap::new();
+            // The reasoning summaries of each newly known message, from the record that placed
+            // it, as the run loop records them.
+            let mut summaries_of = BTreeMap::new();
+            // Which newly known messages are the assistant's.
+            let mut assistant_of = BTreeMap::new();
+            // The ordinal of the assistant message of a tool turn these records place.
+            let mut placing = None;
             for record in &out.records[before..] {
                 if record.stream() != Stream::Transcript {
                     continue;
                 }
+                let open_turn = counts.open_tool_turn().is_some();
                 counts
                     .apply(record)
                     .map_err(|e| err(format!("entry facts: conversation {e:?}")))?;
                 counts.clear_window();
+                if open_turn
+                    && matches!(record, Record::ToolReply(_))
+                    && counts.open_tool_turn().is_none()
+                {
+                    placing = Some(counts.placed - 1);
+                }
                 let reserved = counts.open_tool_turn().is_some();
-                known = known.max(counts.placed + u64::from(reserved));
+                let now = counts.placed + u64::from(reserved);
+                for ordinal in known + 1..=now {
+                    native_of.insert(ordinal, broca_session_loop::entries::native(record));
+                    let placed = match record {
+                        Record::Input(input) => Some(&input.message),
+                        Record::Assistant(assistant) => Some(&assistant.message),
+                        _ => None,
+                    };
+                    summaries_of.insert(
+                        ordinal,
+                        placed
+                            .map(broca_session_loop::entries::reasoning_summaries)
+                            .unwrap_or_default(),
+                    );
+                    assistant_of.insert(
+                        ordinal,
+                        placed.is_some_and(|message| message.role == Role::Assistant),
+                    );
+                }
+                known = known.max(now);
             }
             for ordinal in *emitted + 1..=known {
+                let pending = legacy
+                    .pending_results
+                    .as_ref()
+                    .filter(|(position, _)| *position == ordinal - 1)
+                    .map(|(_, row)| row);
                 let (metadata, written_at, mid) =
-                    legacy.rows.get(&(ordinal - 1)).ok_or_else(|| {
+                    legacy.rows.get(&(ordinal - 1)).or(pending).ok_or_else(|| {
                         err(format!(
                             "entry facts: today's projection has no message {ordinal}"
                         ))
                     })?;
-                out.records.push(Record::EntryFacts(entry_facts::record(
+                // Off the contract, whether broca wrote the message is told by the record that
+                // placed it, as the run loop tells it.
+                let native = if legacy.page_only {
+                    native_of.get(&ordinal).copied().unwrap_or(false)
+                } else {
+                    metadata.source_input.is_none()
+                };
+                let mut entry = entry_facts::record(
                     ordinal,
                     metadata,
                     *written_at,
+                    native,
                     mid.clone(),
-                )));
+                    legacy.runs.get(&(ordinal - 1)).cloned(),
+                    legacy.created.get(&(ordinal - 1)).copied(),
+                    legacy.deliveries.get(&(ordinal - 1)),
+                    legacy.display.get(&(ordinal - 1)),
+                );
+                // Today's read serves display facts only on a log with a lineage.
+                entry.no_display_facts = lineage.is_none().then_some(true);
+                entry.reasoning_summaries = summaries_of.remove(&ordinal).unwrap_or_default();
+                entry.runner_tag_base = legacy.runner_bases.get(&(ordinal - 1)).copied();
+                entry.legacy_view_seq = state.step_legacy_view;
+                // A run's assistant messages carry its Rich UI stamp, as today's read serves it.
+                if assistant_of.get(&ordinal) == Some(&true) {
+                    entry.rich_ui = entry
+                        .run_id
+                        .as_ref()
+                        .and_then(|run| stamps.get(run).cloned().flatten());
+                }
+                out.records.push(Record::EntryFacts(entry));
             }
             *emitted = known;
+            // The facts of a tool turn these records place, written after the turn's entry
+            // facts, as the run loop writes them.
+            if let Some(turn) = placing.map(turn_of) {
+                last_turn = Some(turn.clone());
+                out.records.push(Record::TurnFacts(turn));
+            } else if let Some(ordinal) = last_turn
+                .as_ref()
+                .map(|turn| turn.ordinal)
+                .filter(|ordinal| changed.contains(&(ordinal - 1)))
+            {
+                // A later record changed what today's facts say about the turn's calls. They
+                // are restated ahead of any message this record placed, so they share a sealed
+                // block with their turn.
+                if let Some(turn) =
+                    Some(turn_of(ordinal)).filter(|turn| Some(turn) != last_turn.as_ref())
+                {
+                    let at = out.records[before..]
+                        .iter()
+                        .position(|record| matches!(record, Record::Input(_)))
+                        .map_or(out.records.len(), |at| before + at);
+                    out.records.insert(at, Record::TurnFacts(turn.clone()));
+                    last_turn = Some(turn);
+                }
+            }
+            // A send that rode on a result here is served with the results message carrying
+            // it, the newest message placed: that message's facts are restated right after the
+            // ride with its notice added, as the run loop writes them.
+            let mut at = before;
+            while at < out.records.len() {
+                if let Record::ResultAppend(append) = &out.records[at] {
+                    let calls = out.records[..at]
+                        .iter()
+                        .rev()
+                        .find_map(|record| match record {
+                            Record::Assistant(assistant) => {
+                                Some(broca_session_loop::entries::call_ids(&assistant.message))
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or_default();
+                    if let Some(notice) = broca_session_loop::entries::ride_notice(append, &calls) {
+                        let ordinal = counts.placed;
+                        let placed = out.records[..at]
+                            .iter()
+                            .rev()
+                            .find_map(|record| match record {
+                                Record::EntryFacts(facts) if facts.ordinal == ordinal => {
+                                    Some(facts)
+                                }
+                                _ => None,
+                            })
+                            .ok_or_else(|| {
+                                err(format!(
+                                    "entry facts: the results message {ordinal} a send rode on \
+                                     has no facts"
+                                ))
+                            })?;
+                        let restated = broca_session_loop::entries::with_ride(placed, notice);
+                        out.records.insert(at + 1, Record::EntryFacts(restated));
+                        at += 1;
+                    }
+                }
+                at += 1;
+            }
         }
     }
     if let Some((legacy, _, emitted)) = &facts {
-        if emitted != &(legacy.rows.len() as u64) {
+        let results_placed = legacy
+            .pending_results
+            .as_ref()
+            .is_some_and(|(position, _)| *position < *emitted);
+        if *emitted != legacy.rows.len() as u64 + u64::from(results_placed) {
             return Err(err(format!(
                 "entry facts: today's projection has {} messages, the conversion placed {emitted}",
                 legacy.rows.len()
@@ -252,6 +521,44 @@ pub fn convert(old: &[FramedRecord], lineage: Option<&str>) -> Result<Converted,
         }
     }
     Ok(out)
+}
+
+/// The record of a refresh's application, from the facts today's fold reports for it, as the
+/// store's run loop records it.
+fn refresh_applied(effective: &broca_fetch_plan::session_change::EffectiveState) -> RefreshApplied {
+    broca_session_loop::run::refresh_applied(&effective.applied_change())
+}
+
+/// The facts of the tool turn whose assistant message is at `ordinal`, from today's display
+/// facts of that message (`facts`) and the dispatch facts of its calls (`dispatches`), both in
+/// the order the message made the calls. A call today's facts give no key (a log without a
+/// lineage keys none) has none here.
+fn turn_from_display(
+    ordinal: u64,
+    facts: &broca_core::display_facts::DisplayFacts,
+    dispatches: Option<&Vec<broca_core::ToolCallDispatch>>,
+) -> TurnFacts {
+    let calls = facts
+        .tool_times
+        .iter()
+        .enumerate()
+        .filter_map(|(index, time)| {
+            Some(CallFacts {
+                tool_call_id: ToolCallId(time.tool_call_id.clone()),
+                call_key: time.call_key.clone()?,
+                schema_pin: time.schema_pin.clone().map(Value::String),
+                carrier: None,
+                dispatched_to: dispatches
+                    .and_then(|dispatches| dispatches.get(index))
+                    .filter(|dispatch| dispatch.tool_call_id == time.tool_call_id)
+                    .and_then(|dispatch| dispatch.dispatched_to.clone()),
+                dispatched_at_ms: time.started_at,
+                finished_at_ms: time.finished_at,
+                unanswered: time.unanswered.as_deref().and_then(Unanswered::from_name),
+            })
+        })
+        .collect();
+    TurnFacts { ordinal, calls }
 }
 
 fn sha256(bytes: &[u8]) -> Digest {
@@ -397,6 +704,70 @@ fn convert_one(
     state: &mut State,
     out: &mut Converted,
 ) -> Result<(), ConvertError> {
+    if let WalRecord::RunStarted { config, .. } = record {
+        state.variant = config.variant.clone().filter(|variant| !variant.is_empty());
+    }
+    convert_record(record, state, out)?;
+    record_model_shares(record, state, out);
+    record_refresh_selection(record, out);
+    Ok(())
+}
+
+/// Records on the refresh just written the model its plan chooses, as the store actor records it
+/// when it accepts one (`broca_session_loop::plan::recorded_selection`).
+fn record_refresh_selection(record: &WalRecord, out: &mut Converted) {
+    if let (
+        WalRecord::SessionRefreshAccepted { manifest, .. },
+        Some(Record::SessionRefresh(refresh)),
+    ) = (record, out.records.last_mut())
+    {
+        refresh.selection = broca_session_loop::plan::recorded_selection(manifest);
+    }
+}
+
+/// Records which model each part of a step's usage counts under, by today's own rule
+/// (`refusal_fallback::usage_by_model`), on the step record just written. The new loop records
+/// the same split when it writes a step, so the session's usage by model folds from it.
+fn record_model_shares(record: &WalRecord, state: &State, out: &mut Converted) {
+    let Some(model) = state.model.as_ref() else {
+        return;
+    };
+    let shares: Vec<ModelStepUsage> =
+        broca_core::refusal_fallback::usage_by_model(model, state.variant.as_deref(), record)
+            .into_iter()
+            .map(|(provider, model, variant, usage)| ModelStepUsage {
+                provider: provider.to_owned(),
+                model: model.to_owned(),
+                variant: variant.map(str::to_owned),
+                usage,
+            })
+            .collect();
+    if shares.is_empty() {
+        return;
+    }
+    let step = out
+        .records
+        .iter_mut()
+        .rev()
+        .find_map(|written| match (record, written) {
+            (WalRecord::ModelStepFinished { .. }, Record::StepEnd(step)) => {
+                Some(&mut step.by_model)
+            }
+            (WalRecord::ModelStepRefused { .. }, Record::StepRefused(step)) => {
+                Some(&mut step.by_model)
+            }
+            _ => None,
+        });
+    if let Some(by_model) = step {
+        *by_model = shares;
+    }
+}
+
+fn convert_record(
+    record: &WalRecord,
+    state: &mut State,
+    out: &mut Converted,
+) -> Result<(), ConvertError> {
     if let WalRecord::ToolNoDispatch { .. } = record {
         return tool_no_dispatch(record, state, out);
     }
@@ -411,6 +782,15 @@ fn convert_one(
     };
     let mut f = Fields::new(kind.clone(), object);
     match kind.as_str() {
+        "model_step_finished" => state.step_legacy_view = state.legacy_view,
+        "compaction_view_applied" => {
+            // The event about to be pushed takes the seq after the records before it, counting
+            // from the seq a converted session's first record takes.
+            state.legacy_view = Some(out.records.len() as u64 + FIRST_SEQ);
+        }
+        _ => {}
+    }
+    match kind.as_str() {
         "run_started" => run_started(&mut f, state, out)?,
         "model_step_finished" => model_step_finished(&mut f, state, out)?,
         "model_attempt_finished" => model_attempt(&mut f, state, out),
@@ -419,6 +799,7 @@ fn convert_one(
             out.records.push(Record::StepStart(StepStart {
                 run_id: state.run_id.clone(),
                 step_id: f.req_u64("step_id"),
+                mid: state.announced_mid.take(),
             }));
         }
         "tool_batch_started" => {
@@ -428,6 +809,7 @@ fn convert_one(
                 batch_id: f.req_string("batch_id"),
                 step_id: f.req_u64("step_id"),
                 planned,
+                mid: state.announced_mid.take(),
             }));
         }
         "tool_batch_finished" => out.records.push(Record::BatchEnd(BatchEnd {
@@ -450,6 +832,11 @@ fn convert_one(
                 interrupt_reason: f.string("interrupt_reason"),
                 error: f.take("error"),
             }));
+            // Today's storage billed this run when it ended, so the converted session owes no
+            // billing for it and never bills it again.
+            out.records.push(Record::Billed(Billed {
+                run_id: state.run_id.clone(),
+            }));
         }
         "steered" => {
             let input: Vec<Message> = f.parse("input")?.unwrap_or_default();
@@ -460,12 +847,15 @@ fn convert_one(
                 state,
                 out,
             );
-            // The record keeps everything it accepted: the messages, and the receipt (send id,
-            // delivery, retention, sender) the queue reads.
+            // The record keeps everything it accepted: the messages, their display marks, and
+            // the receipt (send id, delivery, retention, sender) the queue reads.
+            let message_marks = f.take("message_marks");
             out.records.push(Record::Steer(Steer {
+                media: Vec::new(),
                 input,
                 written_at_ms: written,
                 tags_v1: tags,
+                message_marks,
                 receipt: f.rest(),
             }));
         }
@@ -500,6 +890,7 @@ fn convert_one(
             out.records.push(Record::BudgetFire(fire));
             if let (Some(text), true) = (text, state.budget_configured) {
                 out.records.push(Record::Input(Input {
+                    media: Vec::new(),
                     run_id: state.run_id.clone(),
                     placement: Placement::BudgetNudge,
                     message: Message::new(Role::User, vec![ContentBlock::Text { text }]),
@@ -511,6 +902,34 @@ fn convert_one(
                     pruned: Vec::new(),
                 }));
             }
+        }
+        "resume_started" => {
+            let mut replayed = f
+                .object("replayed")
+                .ok_or_else(|| err("resume_started without replayed"))?;
+            let resumed = Resumed {
+                run_id: f.req_string("episode"),
+                resumed_from_seq: f.req_u64("resumed_from_seq"),
+                messages: replayed.u64("messages").unwrap_or_default(),
+                model_steps: replayed.u64("model_steps").unwrap_or_default(),
+                tool_results: replayed.u64("tool_results").unwrap_or_default(),
+                redone: match f.take("redone") {
+                    Some(Value::Array(redone)) => redone
+                        .into_iter()
+                        .map(|redo| Redo {
+                            step_id: redo.get("step_id").and_then(Value::as_u64),
+                            tool_call_id: redo
+                                .get("tool_call_id")
+                                .and_then(Value::as_str)
+                                .map(|id| ToolCallId(id.into())),
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                },
+                indeterminate: f.parse("indeterminate")?.unwrap_or_default(),
+            };
+            replayed.finish(out);
+            out.records.push(Record::Resumed(resumed));
         }
         "run_paused" => {
             let reason = f
@@ -553,6 +972,85 @@ fn convert_one(
             submission_id: f.req_string("submission_id"),
             failure: f.take("failure"),
         })),
+        "context_ceiling_decided" => out.records.push(Record::CeilingDecided(CeilingDecided {
+            step_id: f.req_u64("step_id"),
+            detail: f.take("detail"),
+        })),
+        "model_step_refused" => out.records.push(Record::StepRefused(StepRefused {
+            run_id: state.run_id.clone(),
+            step_id: f.req_u64("step_id"),
+            usage: f.parse("usage")?.unwrap_or_default(),
+            served_model: f.string("served_model"),
+            usage_iterations: f.take("usage_iterations"),
+            discarded_blocks: f.req_u64("discarded_blocks") as u32,
+            schedule: f.take("schedule").unwrap_or(Value::Null),
+            ts_ms: f.u64("ts_ms"),
+            // Filled after this record is built, by `record_model_shares`.
+            by_model: Vec::new(),
+        })),
+        // Today's refreezes name no run: they belong to the run whose resume wrote them.
+        "run_config_refrozen" => out.records.push(Record::ConfigRefrozen(ConfigRefrozen {
+            run_id: state.run_id.clone(),
+            ts_ms: f.u64("ts_ms"),
+            renderer_version: f.req_u64("renderer_version") as u32,
+            render_config: f.take("frozen_render_config").unwrap_or(Value::Null),
+        })),
+        "run_auth_refrozen" => out.records.push(Record::AuthRefrozen(AuthRefrozen {
+            run_id: state.run_id.clone(),
+            ts_ms: f.u64("ts_ms"),
+            auth_selection: f.take("auth_selection").unwrap_or(Value::Null),
+        })),
+        "cache_warmed" => {
+            let mut billing = Map::new();
+            for key in ["reservation", "envelope"] {
+                if let Some(value) = f.take(key) {
+                    billing.insert(key.into(), value);
+                }
+            }
+            // Decided by today's rule, which the new format records instead of working out
+            // again.
+            let reached_cache = broca_core::cache_warm::warm_reached_the_cache(
+                billing
+                    .get("envelope")
+                    .map(|envelope| serde_json::from_value(envelope.clone()))
+                    .transpose()
+                    .map_err(|e| err(format!("cache_warmed envelope: {e}")))?
+                    .as_ref(),
+            );
+            out.records.push(Record::Warmed(Warmed {
+                run_id: f.req_string("run_id"),
+                step_id: f.req_u64("step_id"),
+                trigger: f.string("trigger"),
+                request_body_sha256: digest_field(&mut f, "request_body_sha256"),
+                warm_body_sha256: digest_field(&mut f, "warm_body_sha256"),
+                usage: f
+                    .parse::<Usage>("usage")?
+                    .ok_or_else(|| err("cache_warmed without usage"))?,
+                served_account_ref: f.string("served_account_ref"),
+                sent_at_ms: f.req_u64("sent_at_ms"),
+                ttl_ms: f.u64("ttl_ms"),
+                expires_at_ms: f.u64("expires_at_ms"),
+                attempt_id: f.string("attempt_id"),
+                billing: (!billing.is_empty()).then_some(Value::Object(billing)),
+                ratelimit_headers: f.take("ratelimit_headers"),
+                reached_cache: reached_cache.then_some(true),
+                requested_cache_ttl_ms: state.requested_cache_ttl.filter(|_| reached_cache),
+            }))
+        }
+        "structured_output_downgraded" => {
+            out.records
+                .push(Record::StructuredDowngraded(StructuredDowngraded {
+                    run_id: f.req_string("run_id"),
+                }))
+        }
+        "output_reservation_clamped" => {
+            out.records.push(Record::OutputCapLowered(OutputCapLowered {
+                step_id: f.req_u64("step_id"),
+                max_output_tokens: f.req_u64("max_output_tokens") as u32,
+                estimated_input_tokens: f.req_u64("estimated_input_tokens"),
+                context_limit: f.req_u64("context_limit"),
+            }))
+        }
         "run_cancel_requested" => {
             let at = match f.req_string("at").as_str() {
                 "now" => CancelPoint::Now,
@@ -581,6 +1079,21 @@ fn convert_one(
                 applies_from_next_run: f.req_bool("applies_from_next_run"),
                 setup,
                 manifest,
+                // Filled in from the record's manifest once converted (`record_refresh_selection`).
+                selection: None,
+            }));
+        }
+        "session_refresh_policy_changed" => {
+            out.records.push(Record::RefreshPolicy(RefreshPolicy {
+                generation: f.req_u64("generation"),
+                policy: f.req_string("policy"),
+                send_id: f.req_string("send_id"),
+            }));
+        }
+        "session_prefix_flushed" => {
+            out.records.push(Record::PrefixFlush(PrefixFlush {
+                send_id: f.req_string("send_id"),
+                pending_generation: f.u64("pending_generation"),
             }));
         }
         "structured_output_result" => {
@@ -609,6 +1122,9 @@ fn convert_one(
                 version,
                 checksum,
                 edits,
+                built_through: f.string("built_through"),
+                new_signed: f.string("new_signed"),
+                applied_by: f.string("applied_by"),
             }));
         }
         "compaction_view_applied_v2" => out.records.push(Record::ViewApplied(ViewApplied {
@@ -631,6 +1147,7 @@ fn convert_one(
                 result,
                 finished_at_ms: None,
                 tags_v1: None,
+                media: Vec::new(),
             }));
             event(&mut f, kind.clone(), out);
         }
@@ -642,6 +1159,7 @@ fn convert_one(
                     result,
                     finished_at_ms: f.u64("closed_at_ms"),
                     tags_v1: f.take("tags"),
+                    media: Vec::new(),
                 }));
             }
             event(&mut f, kind.clone(), out);
@@ -746,6 +1264,7 @@ fn copies_of(
         .iter()
         .enumerate()
         .map(|(index, message)| Input {
+            media: Vec::new(),
             run_id: String::new(),
             placement,
             message: message.clone(),
@@ -781,7 +1300,10 @@ fn queued(f: &mut Fields, out: &mut Converted) -> Result<(), ConvertError> {
     }
     let request_rest = request.rest();
     request.finish(out);
+    let message_marks = f.take("message_marks");
     out.records.push(Record::QueuedSend(QueuedSend {
+        media: Vec::new(),
+        message_marks,
         submission_id,
         send_id: f.string("send_id"),
         input,
@@ -814,6 +1336,7 @@ fn run_started(f: &mut Fields, state: &mut State, out: &mut Converted) -> Result
         ("tools", PartKind::Tools),
         ("response_format", PartKind::ResponseFormat),
         ("global_system", PartKind::GlobalSystem),
+        ("frozen_render_config", PartKind::RenderConfig),
     ] {
         if let Some(value) = config.take(key) {
             add_part(kind, &value, &mut parts, out)?;
@@ -827,10 +1350,19 @@ fn run_started(f: &mut Fields, state: &mut State, out: &mut Converted) -> Result
     let mut sorted = parts.clone();
     sorted.sort();
     if sorted != state.setup || state.model.as_ref() != Some(&model) {
+        let render_key = parts
+            .iter()
+            .find(|part| part.kind == PartKind::RenderConfig)
+            .and_then(|part| out.parts.get(&part.digest))
+            .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok())
+            .map(|config| broca_session_loop::parts::render_key(&config))
+            .transpose()
+            .map_err(err)?;
         out.records.push(Record::SetupStub(SetupStub {
             parts: parts.clone(),
             model: model.clone(),
             tool_names: tool_names(&parts, out),
+            render_key,
         }));
         state.setup = sorted;
     }
@@ -851,6 +1383,8 @@ fn run_started(f: &mut Fields, state: &mut State, out: &mut Converted) -> Result
     let tags = f.take("tags");
 
     let mut start = RunStart {
+        imported_ids: None,
+        message_marks: f.take("message_marks"),
         run_id: run_id.clone(),
         model: model.clone(),
         setup: parts,
@@ -867,7 +1401,6 @@ fn run_started(f: &mut Fields, state: &mut State, out: &mut Converted) -> Result
         service_tier: config.string("service_tier"),
         route_decision_id: config.string("route_decision_id"),
         compaction_plan_version: f.u64("compaction_plan_version").map(|v| v as u32),
-        render_config: config.take("frozen_render_config"),
         auth_selection: config.take("auth_selection"),
         run_choices: None,
         origin: f.take("origin"),
@@ -905,6 +1438,7 @@ fn run_started(f: &mut Fields, state: &mut State, out: &mut Converted) -> Result
     out.records.push(Record::RunStart(Box::new(start)));
     for (index, message) in input.into_iter().enumerate() {
         out.records.push(Record::Input(Input {
+            media: Vec::new(),
             run_id: run_id.clone(),
             placement: Placement::RunInput,
             message,
@@ -970,6 +1504,25 @@ fn model_step_finished(
     let speed_used = f.string("speed_used");
     let hooks = f.take("hooks");
     let fallback = f.rest();
+    // A step routed to the refusal-fallback model is that model's message, as today's replay
+    // reads it: rendering decides by a message's model which reasoning it may echo.
+    if let Some(routed) = fallback
+        .as_ref()
+        .and_then(|fallback| fallback.get("route"))
+        .and_then(|route| route.get("model"))
+    {
+        let routed: broca_protocol::request::ModelHandle =
+            serde_json::from_value(routed.clone())
+                .map_err(|e| err(format!("model_step_finished.route.model: {e}")))?;
+        if let Some(Record::Assistant(assistant)) = out
+            .records
+            .iter_mut()
+            .rev()
+            .find(|record| matches!(record, Record::Assistant(_)))
+        {
+            assistant.message.origin = Some(routed);
+        }
+    }
     // A provider fallback inside the step served several model calls; `usage` holds the last
     // one's and the fallback's iterations hold each. The step's whole usage is their sum.
     let iterations: Option<Vec<broca_protocol::usage::UsageIteration>> = fallback
@@ -994,6 +1547,8 @@ fn model_step_finished(
         total_usage: (Some(total) != usage).then_some(total),
         stop_met: std::mem::take(&mut state.stop_met).then_some(true),
         limiting_stop_met: std::mem::take(&mut state.limiting_stop_met).then_some(true),
+        // Filled after this record is built, by `record_model_shares`.
+        by_model: Vec::new(),
     }));
     Ok(())
 }
@@ -1016,13 +1571,22 @@ fn model_attempt(f: &mut Fields, state: &mut State, out: &mut Converted) {
             billing.insert(key.into(), value);
         }
     }
+    let outcome = f.req_string("outcome");
+    let http_status = f.u64("http_status").map(|v| v as u32);
+    // Decided by today's rule, which the new format records instead of working out again.
+    let reached_cache = broca_core::cache_warm::attempt_reached_the_cache(
+        http_status.and_then(|status| u16::try_from(status).ok()),
+        &serde_json::from_value(Value::String(outcome.clone())).unwrap_or(
+            broca_protocol::provider::AttemptOutcome::Unknown(outcome.clone()),
+        ),
+    );
     let attempt = Attempt {
         run_id: state.run_id.clone(),
         step_id: f.req_u64("step_id"),
         attempt: f.req_u64("attempt") as u32,
         attempt_id: f.string("attempt_id"),
-        outcome: f.req_string("outcome"),
-        http_status: f.u64("http_status").map(|v| v as u32),
+        outcome,
+        http_status,
         request_body_len: f.req_u64("request_body_len"),
         request_body_sha256: digest_field(f, "request_body_sha256"),
         response_body_len: f.req_u64("response_body_len"),
@@ -1035,6 +1599,8 @@ fn model_attempt(f: &mut Fields, state: &mut State, out: &mut Converted) {
         served_account_ref: f.string("served_account_ref"),
         billing: (!billing.is_empty()).then_some(Value::Object(billing)),
         telemetry: f.rest(),
+        reached_cache: reached_cache.then_some(true),
+        requested_cache_ttl_ms: state.requested_cache_ttl.filter(|_| reached_cache),
     };
     out.records.push(Record::Attempt(attempt));
 }
@@ -1046,6 +1612,13 @@ fn tool_intent(f: &mut Fields, state: &mut State, out: &mut Converted) -> Result
     let args = f.take("args").unwrap_or(Value::Null);
     let args_digest = sha256(&canonical(&args)?);
     let same_as_call = state.call_inputs.get(&call.0) == Some(&args);
+    // Today's intent stores a key only when one was made before it (an approved call); every
+    // other call was sent with the key derived from the log and the intent's position.
+    let recorded = f.string("call_key");
+    let derived = recorded
+        .is_none()
+        .then(|| broca_core::context::tool_call_key(state.lineage.as_deref(), state.seq, None))
+        .flatten();
     out.records.push(Record::ToolIntent(ToolIntent {
         run_id: state.run_id.clone(),
         batch_id: f.req_string("batch_id"),
@@ -1054,7 +1627,8 @@ fn tool_intent(f: &mut Fields, state: &mut State, out: &mut Converted) -> Result
         module_id: f.string("module_id"),
         args_digest,
         args: (!same_as_call).then_some(args),
-        call_key: f.string("call_key"),
+        key_derived: derived.is_some().then_some(true),
+        call_key: recorded.or(derived),
         approval_digest: f.string("approval_digest"),
         dispatched_at_ms: f.u64("dispatched_at_ms"),
         schema_pin: f.take("schema_pin"),
@@ -1090,12 +1664,26 @@ fn reply_and_outcome(terminal: Terminal, state: &State, out: &mut Converted) {
     let result_digest = sha256(&result.encode());
     let tool_call_id = result.tool_call_id.clone();
     let is_error = result.is_error;
+    // A copy no dispatch intent anchored keeps the key today's projection gives it: the log's
+    // lineage and the seq of the record that first anchored that copy, its deferral or this
+    // terminal, or the key an approval recorded for it. So a repeated id's refused copy has a
+    // key of its own, apart from the dispatched copy's. A terminal for a call the step didn't
+    // make is keyed by its own seq.
+    let call_key = match &state.call {
+        Some(copy) if copy.id == tool_call_id => copy
+            .intent_seq
+            .is_none()
+            .then(|| copy.key(state.lineage.as_deref()))
+            .flatten(),
+        _ => broca_core::context::tool_call_key(state.lineage.as_deref(), state.seq, None),
+    };
     out.records.push(Record::ToolReply(ToolReply {
         run_id: state.run_id.clone(),
         batch_id: Some(batch_id.clone()),
         result,
         finished_at_ms,
         tags_v1: tags,
+        media: Vec::new(),
     }));
     out.records.push(Record::ToolOutcome(ToolOutcome {
         run_id: state.run_id.clone(),
@@ -1108,6 +1696,7 @@ fn reply_and_outcome(terminal: Terminal, state: &State, out: &mut Converted) {
         finished_at_ms,
         detail,
         hooks,
+        call_key,
     }));
 }
 
@@ -1185,6 +1774,9 @@ fn send_delivered(
     out: &mut Converted,
 ) -> Result<(), ConvertError> {
     let input: Option<Vec<Message>> = f.parse("input")?;
+    // The envelope today's writer adds to a ride (llm-runner 0.8.11). A delivery recorded
+    // before envelopes existed has none, and keeps rendering its joined bytes as before.
+    let ride: Option<broca_wal::record::RideMetadata> = f.parse("ride")?;
     let delivery = Delivery {
         submission_id: f.req_string("submission_id"),
         run_id: f.req_string("run_id"),
@@ -1212,12 +1804,21 @@ fn send_delivered(
     };
     if let (Some(call), Some(text)) = (&delivery.tool_call_id, &delivery.appended_text) {
         out.records.push(Record::ResultAppend(ResultAppend {
+            send_id: ride.as_ref().map(|ride| ride.send_id.clone()),
             run_id: state.run_id.clone(),
             tool_call_id: call.clone(),
             text: text.clone(),
             notice: state.delivery_notices.get(&state.seq).cloned(),
             written_at_ms: delivery.written_at_ms,
+            ride: ride.as_ref().map(ride_envelope),
         }));
+    } else if let Some(ride) = &ride {
+        // Only text delivered with a tool result carries an envelope; one anywhere else has
+        // no record to go on.
+        f.lose(
+            "ride (no tool result text)".into(),
+            json_len(&serde_json::to_value(ride).unwrap_or(Value::Null)),
+        );
     }
     let copies = copies_of(
         &delivery.input,
@@ -1231,5 +1832,43 @@ fn send_delivered(
     Ok(())
 }
 
+/// A ride's envelope as the new format keeps it: everything today's `ride` member holds but its
+/// send id, which `ResultAppend` keeps in its own field.
+fn ride_envelope(
+    ride: &broca_wal::record::RideMetadata,
+) -> broca_session_store::record::RideEnvelope {
+    broca_session_store::record::RideEnvelope {
+        call_key: ride.call_key.clone(),
+        sender: ride.sender.clone(),
+        forms: ride.forms.clone(),
+        form: match ride.form {
+            broca_wal::record::RideForm::Append => broca_session_store::record::RideForm::Append,
+        },
+        speaks_for: ride
+            .speaks_for
+            .as_ref()
+            .map(|speaks_for| serde_json::to_value(speaks_for).expect("a speaks_for encodes")),
+    }
+}
+
+#[cfg(test)]
+mod inverse_tests;
+#[cfg(test)]
+mod marks_tests;
+#[cfg(test)]
+mod read_cost_tests;
+#[cfg(test)]
+mod stage_tests;
+#[cfg(test)]
+mod summaries_tests;
 #[cfg(test)]
 mod tests;
+
+/// The cache lifetime requests rendered from `frozen` ask `provider_id` for, when they ask for
+/// one it honours, as today's cache declaration reads it. `None` for a config that doesn't
+/// read as a frozen render config, as today's declaration then declares nothing.
+pub fn requested_cache_ttl(provider_id: &str, frozen: &Value) -> Option<u64> {
+    let frozen: broca_provider::wire::FrozenRenderConfig =
+        serde_json::from_value(frozen.clone()).ok()?;
+    broca_provider::cache_warm::requested_ttl_ms(provider_id, &frozen)
+}

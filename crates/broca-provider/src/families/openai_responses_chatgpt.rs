@@ -55,6 +55,60 @@ thread_local! {
     pub(crate) static EFFORT_PLANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// What any renderer reads from the render config of a run other than the ones whose messages
+/// it renders: [`effort_plan`]'s inputs, the family, the wire model, the reasoning effort and
+/// whether effort updates are on.
+///
+/// A store that no longer holds every earlier run keeps only the first run and the runs where
+/// this key changes, so a renderer that starts reading another member of an earlier run's config
+/// must add it here, or those requests change bytes once history is sealed. A config that doesn't
+/// read as a render config has its own key, which [`effort_plan`] treats the same way.
+pub fn episode_render_key(frozen_config: &serde_json::Value) -> serde_json::Value {
+    let Ok(config) = serde_json::from_value::<FrozenRenderConfig>(frozen_config.clone()) else {
+        return serde_json::json!({ "unreadable": true });
+    };
+    let effort = config.reasoning_effort.clone().or(match &config.reasoning {
+        crate::policy::ReasoningPolicy::OpenAiResponsesReasoning { effort, .. } => {
+            Some(effort.clone())
+        }
+        _ => None,
+    });
+    serde_json::json!({
+        "family_id": config.family_id,
+        "wire_model_id": config.wire_model_id,
+        "effort": effort,
+        "chatgpt_effort_updates": config.chatgpt_effort_updates,
+    })
+}
+
+/// The runs of `history` a request must carry when the messages before prompt position
+/// `first_kept` no longer render (a compaction view cut them): the first run, every later run
+/// whose [`episode_render_key`] differs from the run before it, and every run starting at or after
+/// `first_kept`. Every renderer gives the same bytes for the reduced list as for the whole one,
+/// which is what lets a store that seals history keep only these runs.
+pub fn reduce_episodes(
+    history: &broca_protocol::request::RenderHistory,
+    first_kept: usize,
+) -> broca_protocol::request::RenderHistory {
+    let mut reduced = history.clone();
+    let mut previous_key = None;
+    reduced.episodes = history
+        .episodes
+        .iter()
+        .enumerate()
+        .filter(|(index, episode)| {
+            let key = episode_render_key(&episode.frozen_config);
+            let keep = *index == 0
+                || previous_key.as_ref() != Some(&key)
+                || episode.prompt_start >= first_kept;
+            previous_key = Some(key);
+            keep
+        })
+        .map(|(_, episode)| episode.clone())
+        .collect();
+    reduced
+}
+
 pub(crate) fn effort_plan(
     frozen: &FrozenRenderConfig,
     opts: &CallOptions,

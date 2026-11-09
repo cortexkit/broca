@@ -1,0 +1,8 @@
+[
+  {"mid": "msg_u1", "send_id": "send-1", "client_message_id": "cm-1", "sender": "prefrontal-core",
+   "marks": {"speaks_for": {"agent_id": "alfonso"}}, "delivered_as": "queue"},
+  {"mid": "msg_syn", "send_id": "send-2", "sender": "magic-context", "marks": {"notice": true},
+   "template": {"id": "mc-nudge", "slots": {"n": 1}}, "delivered_as": "steer"},
+  {"call_key": "msg_a1/call_2", "send_id": "send-3", "sender": "occi", "delivered_as": "tool_result",
+   "text": "\n\n[note from occi]"}
+]

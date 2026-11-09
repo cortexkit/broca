@@ -8,7 +8,9 @@ repository.workspace = true
 description = "Foreign harness session readers that convert transcripts to broca's canonical message schema."
 
 [dependencies]
+base64 = "0.22"
 broca-protocol = { path = "../broca-protocol" }
+cortexkit-role-llm-runner.workspace = true
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde_json.workspace = true
 sha2.workspace = true

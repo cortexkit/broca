@@ -1850,20 +1850,23 @@ fn held_admission_id(decision: &AccountDecision) -> Option<&str> {
 impl RunReporter {
     /// Report only an allocation routing granted to this runner. Older static decisions can
     /// contain fabricated admission ids; their presence must not enable live or recovery reports.
+    /// New-storage runs pass their session id to name reports without a WAL lineage.
     pub fn start_for_decision(
         client: Arc<RoutingClient>,
         decision: &AccountDecision,
         run_id: String,
         view_digest: Option<String>,
         durable_head: Arc<AtomicU64>,
+        session_id: Option<String>,
     ) -> Option<Arc<Self>> {
         let admission_id = held_admission_id(decision)?.to_owned();
-        Some(Self::start(
+        Some(Self::start_named(
             client,
             admission_id,
             run_id,
             view_digest,
             durable_head,
+            session_id,
         ))
     }
 
@@ -1877,6 +1880,24 @@ impl RunReporter {
         view_digest: Option<String>,
         durable_head: Arc<AtomicU64>,
     ) -> Arc<Self> {
+        Self::start_named(
+            client,
+            admission_id,
+            run_id,
+            view_digest,
+            durable_head,
+            None,
+        )
+    }
+
+    fn start_named(
+        client: Arc<RoutingClient>,
+        admission_id: String,
+        run_id: String,
+        view_digest: Option<String>,
+        durable_head: Arc<AtomicU64>,
+        store_session: Option<String>,
+    ) -> Arc<Self> {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ReportEvent>();
         tokio::spawn(async move {
             let mut latest_headers: Option<BTreeMap<String, String>> = None;
@@ -1884,7 +1905,9 @@ impl RunReporter {
             while let Some(event) = rx.recv().await {
                 match event {
                     ReportEvent::Started { lineage, wal_seq } => {
-                        let Some(id) = event_id_or_count(&client, lineage, wal_seq) else {
+                        let Some(id) =
+                            event_id_or_count(&client, lineage, store_session.as_deref(), wal_seq)
+                        else {
                             continue;
                         };
                         client
@@ -1906,7 +1929,9 @@ impl RunReporter {
                         let Some(retry_at_ms) = observed_at_ms.checked_add(delay_ms as u64) else {
                             continue;
                         };
-                        if let Some(id) = event_id_or_count(&client, lineage, wal_seq) {
+                        if let Some(id) =
+                            event_id_or_count(&client, lineage, store_session.as_deref(), wal_seq)
+                        {
                             let mut body = report(
                                 "transient_backoff",
                                 &format!("{id}:backoff"),
@@ -1922,7 +1947,9 @@ impl RunReporter {
                         credential_id,
                         provider_code,
                     } => {
-                        if let Some(id) = event_id_or_count(&client, lineage, wal_seq) {
+                        if let Some(id) =
+                            event_id_or_count(&client, lineage, store_session.as_deref(), wal_seq)
+                        {
                             client
                                 .observe(credential_refused_body(
                                     &format!("{id}:credential_refused"),
@@ -1952,7 +1979,9 @@ impl RunReporter {
                             );
                             continue;
                         }
-                        let Some(id) = event_id_or_count(&client, lineage, wal_seq) else {
+                        let Some(id) =
+                            event_id_or_count(&client, lineage, store_session.as_deref(), wal_seq)
+                        else {
                             continue;
                         };
                         // Only a failed final attempt can block its account. A successful or
@@ -1995,7 +2024,9 @@ impl RunReporter {
                         wal_seq,
                         reason,
                     } => {
-                        if let Some(id) = event_id_or_count(&client, lineage, wal_seq) {
+                        if let Some(id) =
+                            event_id_or_count(&client, lineage, store_session.as_deref(), wal_seq)
+                        {
                             client
                                 .observe(run_finished_body(
                                     &id,
@@ -2101,9 +2132,11 @@ impl broca_core::AccountReporter for RunReporter {
 fn event_id_or_count(
     client: &RoutingClient,
     lineage: Option<WalLineageId>,
+    store_session: Option<&str>,
     wal_seq: u64,
 ) -> Option<String> {
-    let id = event_id(lineage, wal_seq);
+    let id = event_id(lineage, wal_seq)
+        .or_else(|| store_session.map(|session| format!("{session}:{wal_seq}")));
     if id.is_none() {
         client.counters.bump("observe_failed");
         tracing::warn!(
@@ -2138,7 +2171,7 @@ pub fn report_sealed(client: Arc<RoutingClient>, sealed: &broca_module::SealedRu
     else {
         return;
     };
-    let Some(id) = event_id_or_count(&client, sealed.lineage, sealed.terminal_seq) else {
+    let Some(id) = event_id_or_count(&client, sealed.lineage, None, sealed.terminal_seq) else {
         return;
     };
     let body = run_finished_body(

@@ -405,9 +405,7 @@ fn latest_cache_request_digest(records: &[WalRecord]) -> Option<&str> {
     })
 }
 
-pub(crate) fn warm_reached_the_cache(
-    envelope: Option<&broca_wal::record::AttemptEnvelope>,
-) -> bool {
+pub fn warm_reached_the_cache(envelope: Option<&broca_wal::record::AttemptEnvelope>) -> bool {
     use broca_wal::record::{AttemptSent, BillingAttemptOutcome};
     envelope.is_none_or(|e| {
         e.sent == AttemptSent::Yes
@@ -432,10 +430,7 @@ pub(crate) fn warm_reached_the_cache(
 /// (`eof_before_completion`, `chunk_error`, `idle_timeout`, `content_timeout`, `byte_limit`,
 /// `decode_error`, `rate_floor`, `cancelled`, `sealed_in_flight`). Leaving out a doubtful attempt
 /// only falls back to an earlier send, which errs early.
-pub(crate) fn attempt_reached_the_cache(
-    http_status: Option<u16>,
-    outcome: &AttemptOutcome,
-) -> bool {
+pub fn attempt_reached_the_cache(http_status: Option<u16>, outcome: &AttemptOutcome) -> bool {
     http_status.is_some_and(|status| (200..300).contains(&status) || status == 101)
         && !matches!(
             outcome,

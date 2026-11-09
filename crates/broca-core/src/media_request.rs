@@ -13,7 +13,7 @@ use broca_protocol::{
 use broca_wal::WalRecord;
 use serde::{Deserialize, Serialize};
 
-use crate::media_store::{MediaReadError, MediaStore, MediaStoreClass, ReadOnlyMediaStore};
+use crate::media_store::{MediaBytes, MediaReadError, MediaStoreClass, ReadOnlyMediaStore};
 use crate::placement::{AppendKind, Placement, PlacementAction};
 
 mod initialization;
@@ -83,7 +83,9 @@ impl seed::MediaCheckpoint {
     }
 }
 pub use seed::count_seed_fallback;
-pub use seed::{seed_fallback_count, DurableMediaSeed, MediaCheckpoint, MediaHistory};
+pub use seed::{
+    seed_fallback_count, DurableMediaSeed, MediaCheckpoint, MediaHistory, MediaSeedFold,
+};
 
 /// A capture occurrence, not a digest. Two admissions of identical bytes have different ids
 /// and can have different protection lifetimes.
@@ -137,7 +139,7 @@ pub enum MediaChange {
 /// the session lease; offline readers verify afresh and refuse objects reclaimed meanwhile.
 #[derive(Debug, Clone)]
 pub struct SessionMedia {
-    store: Option<MediaStore>,
+    store: Option<std::sync::Arc<dyn MediaBytes>>,
     read_only: Option<(std::path::PathBuf, MediaStoreClass)>,
     placement: Placement,
     records: u64,
@@ -163,8 +165,8 @@ pub struct SessionMedia {
 }
 
 impl SessionMedia {
-    pub fn new(store: MediaStore) -> Self {
-        Self::metadata(Some(store))
+    pub fn new(store: impl MediaBytes + 'static) -> Self {
+        Self::metadata(Some(std::sync::Arc::new(store)))
     }
 
     /// Resolve no files until preparation actually requires an eligible native object.
@@ -175,7 +177,7 @@ impl SessionMedia {
         session
     }
 
-    fn metadata(store: Option<MediaStore>) -> Self {
+    fn metadata(store: Option<std::sync::Arc<dyn MediaBytes>>) -> Self {
         Self {
             store,
             read_only: None,

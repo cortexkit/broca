@@ -1,5 +1,54 @@
 use super::*;
 
+/// What today's read serves in its approval members (`deferred_calls`, `late_approvals`,
+/// `open_batch`, `next_late_after`) for a session that never asked an approval question:
+/// nothing, whether its last tool batch finished or is still open, on the first page and a later
+/// one, with and without every opt-in. A read of a session kept in the new storage, which takes
+/// no approval questions, serves exactly this.
+#[tokio::test]
+async fn a_session_without_approvals_serves_no_approval_members() {
+    let rig = Rig::new("no-approval-members", Arc::new(NoopExec));
+    let finished = rig.key("finished");
+    let open = rig.key("open");
+    append_seed(
+        &rig.wal_store,
+        &finished,
+        &dispatch_module_episode(&finished, "done", "call-1"),
+    );
+    // Started, the tool step, its batch's start and the call's dispatch intent: the batch is
+    // open, its call in flight.
+    append_seed(
+        &rig.wal_store,
+        &open,
+        &dispatch_module_episode(&open, "open", "call-1")[..4],
+    );
+    for key in [&finished, &open] {
+        for (from, limit) in [(None, Some(32)), (Some(1), Some(1))] {
+            for opted in [false, true] {
+                let mut request = read_request(key, from, limit);
+                request.include_display_facts = opted;
+                request.include_tools = opted;
+                request.include_rich_ui = opted;
+                let reply =
+                    serde_json::to_value(rig.registry.read(request).await.unwrap()).unwrap();
+                for member in [
+                    "deferred_calls",
+                    "late_approvals",
+                    "open_batch",
+                    "next_late_after",
+                ] {
+                    assert_eq!(
+                        reply.get(member),
+                        None,
+                        "{} from {from:?}, opted in {opted}: {member}",
+                        key.session
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn budget_finalize_answer_has_its_model_step_completion_time() {
     let rig = Rig::new("budget-finalize-completion", Arc::new(NoopExec));
