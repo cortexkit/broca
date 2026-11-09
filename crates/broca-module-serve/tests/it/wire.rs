@@ -2173,6 +2173,9 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         "opening",
         "closing",
         "vault",
+        // This library-only rig publishes no new-storage slot or deployment key. The metric
+        // remains present as null, without degrading the healthy process.
+        "store",
         "catalog_age_ms",
         "catalog_source",
         // Runs executing right now, as opposed to open session slots. Shipped in v0.3.27 for
@@ -2329,6 +2332,11 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         metrics["scoped_role_route_refusals"],
         serde_json::json!({}),
         "a process with no refused scoped role opens has an empty refusal-code map"
+    );
+    assert_eq!(
+        metrics["store"],
+        serde_json::Value::Null,
+        "a process without a published new-storage slot reports no deployment-key state"
     );
     assert_eq!(
         metrics["usage_observe"],

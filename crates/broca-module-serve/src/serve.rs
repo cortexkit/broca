@@ -2803,27 +2803,24 @@ where
             PreparedRouteRequest::Request(req) => &req.params,
             PreparedRouteRequest::Subscribe { params, .. } => params,
         };
-        // A session kept in the new storage has no WAL. An op without a store implementation
-        // would fall through to today's WAL reads, which the rollback guard refuses with advice
-        // to run a newer build: wrong on a build that serves the session. So such an op is
-        // refused here by name, before authorization reads anything.
-        if !served_on_new_storage(method, params) {
-            match handler.kept_in_new_storage(&session) {
-                Ok(false) => {}
-                Ok(true) => {
-                    return send_error(
-                        &writer,
-                        ver,
-                        channel,
-                        epoch,
-                        corr,
-                        NOT_SERVED_ON_NEW_STORAGE,
-                        &format!("{method} isn't served yet for a session kept in the new storage"),
-                    )
-                    .await;
-                }
-                Err(error) => return send_serve_error(&writer, ver, channel, epoch, corr, &error).await,
+        // Establish storage ownership before authorization or dispatch can answer from today's
+        // WAL. Without a store runtime the rollback guard refuses every op; with one, only ops
+        // implemented for the new storage may proceed.
+        match handler.kept_in_new_storage(&session) {
+            Ok(true) if !served_on_new_storage(method, params) => {
+                return send_error(
+                    &writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    NOT_SERVED_ON_NEW_STORAGE,
+                    &format!("{method} isn't served yet for a session kept in the new storage"),
+                )
+                .await;
             }
+            Ok(_) => {}
+            Err(error) => return send_serve_error(&writer, ver, channel, epoch, corr, &error).await,
         }
         if let Err(error) = authorize_route_request(handler.as_ref(), &session, &bind, method, params).await {
             return send_serve_error(&writer, ver, channel, epoch, corr, &error).await;

@@ -2688,8 +2688,8 @@ pub trait ServeHandler: Send + Sync {
         ))
     }
 
-    /// Whether `session` is kept in the new storage. A handler without the new storage keeps
-    /// none.
+    /// Whether `session` is served from the new storage. Refuses a session owned by the new
+    /// storage when this handler has no runtime for it, before dispatch can consult today's WAL.
     fn kept_in_new_storage(&self, _session: &LineageKey) -> Result<bool, ServeError> {
         Ok(false)
     }
@@ -3854,7 +3854,15 @@ impl ServeHandler for crate::LineageRegistry {
     }
 
     fn kept_in_new_storage(&self, session: &LineageKey) -> Result<bool, ServeError> {
-        Ok(self.store_holding(session)?.is_some())
+        if self.store_holding(session)?.is_some() {
+            return Ok(true);
+        }
+        match self.store_owner_refusal(session)? {
+            // A move journal without a published head still follows today's authorization
+            // path, where the owner's standing is checked before the migration fence.
+            Some(OpenError::SessionMoving { .. }) | None => Ok(false),
+            Some(refusal) => Err(refusal.into()),
+        }
     }
 
     async fn move_to_store(
