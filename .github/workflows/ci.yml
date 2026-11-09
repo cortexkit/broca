@@ -252,8 +252,15 @@ jobs:
         with:
           node-version: 20
       - run: npm ci
+      # The checksum-pinned NATS archive, kept between runs so integration shards don't each
+      # depend on GitHub's release download, which answers 504 for minutes at a time.
+      - name: Restore the pinned NATS archive
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ runner.temp }}/nats-cache
+          key: nats-server-v2.10.26-${{ runner.os }}
       - name: Install pinned private NATS broker
-        run: python3 scripts/install-ci-nats.py
+        run: python3 scripts/install-ci-nats.py --cache-dir "$RUNNER_TEMP/nats-cache"
       - name: Wait for this platform's fixtures and test archive
         env:
           GH_TOKEN: ${{ github.token }}

@@ -45,14 +45,35 @@ def download(url, sleep=time.sleep):
         sleep(delay)
 
 
-def install(destination, os_name, machine, archive_path=None):
+def fetch(url, checksum, cache_dir, sleep=time.sleep):
+    """The pinned archive, from `cache_dir` when it holds a copy with the pinned checksum.
+
+    CI keeps that folder in the Actions cache, so most runs never reach GitHub's release
+    download at all. A cached copy with any other checksum is ignored and replaced.
+    """
+    cached = Path(cache_dir) / url.rsplit('/', 1)[1] if cache_dir else None
+    if cached is not None and cached.is_file():
+        archive = cached.read_bytes()
+        if hashlib.sha256(archive).hexdigest() == checksum:
+            print(f'NATS archive from cache {cached}')
+            return archive
+    archive = download(url, sleep=sleep)
+    if cached is not None and hashlib.sha256(archive).hexdigest() == checksum:
+        cached.parent.mkdir(parents=True, exist_ok=True)
+        partial = cached.with_name(cached.name + '.partial')
+        partial.write_bytes(archive)
+        partial.replace(cached)
+    return archive
+
+
+def install(destination, os_name, machine, archive_path=None, cache_dir=None):
     if machine.lower() not in ('amd64', 'x86_64') or os_name not in ARCHIVES:
         raise RuntimeError(f'no pinned NATS archive for {os_name}/{machine}')
     target, checksum = ARCHIVES[os_name]
     stem = f'nats-server-v{VERSION}-{target}'
     url = f'https://github.com/nats-io/nats-server/releases/download/v{VERSION}/{stem}.tar.gz'
     if archive_path is None:
-        archive = download(url)
+        archive = fetch(url, checksum, cache_dir)
     else:
         archive = Path(archive_path).read_bytes()
     if hashlib.sha256(archive).hexdigest() != checksum:
@@ -78,9 +99,10 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--archive', help='read a pre-staged archive; still verify checksum and version')
+    parser.add_argument('--cache-dir', help='reuse and refresh a checksum-verified archive copy here')
     args = parser.parse_args()
     binary = install(Path(os.environ['RUNNER_TEMP']) / 'broca-nats',
-                     platform.system(), platform.machine(), args.archive)
+                     platform.system(), platform.machine(), args.archive, args.cache_dir)
     with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as env:
         env.write(f'CK_NATS_SERVER_BIN={binary}\n')
     print(f'CK_NATS_SERVER_BIN={binary}')

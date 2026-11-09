@@ -6,6 +6,7 @@ import io
 import importlib.util
 import os
 from pathlib import Path
+import re
 import shlex
 import shutil
 import subprocess
@@ -1100,8 +1101,18 @@ class WorkflowGraph(unittest.TestCase):
             job = self.workflow(workflow)['jobs'][name]
             self.assertEqual(job['env']['CK_BUS_TESTKIT_REQUIRE'], '1', workflow)
             install = next(i for i, step in enumerate(job['steps'])
-                           if step.get('run') == 'python3 scripts/install-ci-nats.py')
+                           if step.get('run', '').startswith('python3 scripts/install-ci-nats.py'))
             self.assertNotIn('if', job['steps'][install], workflow)
+            self.assertIn('--cache-dir "$RUNNER_TEMP/nats-cache"', job['steps'][install]['run'])
+            # The cache restores before the install, and its key names the pinned version, so a
+            # version bump can never reuse an older archive.
+            cache = next(i for i, step in enumerate(job['steps'])
+                         if step.get('uses', '').startswith('actions/cache@')
+                         and step['with']['path'] == '${{ runner.temp }}/nats-cache')
+            self.assertLess(cache, install, workflow)
+            version = re.search(r"VERSION = '([^']+)'",
+                                (ROOT / 'scripts/install-ci-nats.py').read_text()).group(1)
+            self.assertIn(f'v{version}', job['steps'][cache]['with']['key'])
             replay = next(i for i, step in enumerate(job['steps'])
                           if 'ci-integration.sh run' in step.get('run', ''))
             self.assertLess(install, replay, workflow)
@@ -1357,6 +1368,36 @@ class NatsInstall(unittest.TestCase):
                 self.installer.download('https://example.test', sleep=sleeps.append)
         self.assertEqual(urlopen.call_count, self.installer.ATTEMPTS)
         self.assertEqual(len(sleeps), self.installer.ATTEMPTS - 1)
+
+    def test_fetch_uses_a_verified_cached_archive_without_network(self):
+        cache = Path(self.tmp.name) / 'cache'
+        cache.mkdir()
+        (cache / 'a.tar.gz').write_bytes(b'cached')
+        checksum = hashlib.sha256(b'cached').hexdigest()
+        with patch.object(self.installer.urllib.request, 'urlopen') as urlopen:
+            data = self.installer.fetch('https://example.test/a.tar.gz', checksum, cache)
+        self.assertEqual(data, b'cached')
+        urlopen.assert_not_called()
+
+    def test_fetch_replaces_a_cached_archive_with_the_wrong_checksum(self):
+        cache = Path(self.tmp.name) / 'cache'
+        cache.mkdir()
+        (cache / 'a.tar.gz').write_bytes(b'stale')
+        checksum = hashlib.sha256(b'fresh').hexdigest()
+        with patch.object(self.installer.urllib.request, 'urlopen',
+                          return_value=io.BytesIO(b'fresh')) as urlopen:
+            data = self.installer.fetch('https://example.test/a.tar.gz', checksum, cache)
+        self.assertEqual(data, b'fresh')
+        self.assertEqual(urlopen.call_count, 1)
+        self.assertEqual((cache / 'a.tar.gz').read_bytes(), b'fresh')
+
+    def test_fetch_never_caches_an_archive_that_fails_its_checksum(self):
+        cache = Path(self.tmp.name) / 'cache'
+        with patch.object(self.installer.urllib.request, 'urlopen',
+                          return_value=io.BytesIO(b'tampered')):
+            data = self.installer.fetch('https://example.test/a.tar.gz', '0' * 64, cache)
+        self.assertEqual(data, b'tampered')
+        self.assertFalse((cache / 'a.tar.gz').exists())
 
     def test_refuses_an_unpinned_platform_before_downloading(self):
         with patch.object(self.installer.urllib.request, 'urlopen') as download:
