@@ -24,6 +24,9 @@ use broca_wal::WalRecord;
 use crate::run::{Admission, LoopError, Seams};
 use crate::writer::Writer;
 
+mod window;
+pub use window::WindowTranscript;
+
 /// What a run whose plan names a compaction provider needs for its calls to that provider.
 pub struct Ctx {
     /// Today's per-session compaction state and call runtime, held for the session's life by
@@ -38,6 +41,9 @@ pub struct Ctx {
     /// compaction contract, before the session enrolled: no request on the contract preceded
     /// this run's, so its first ride compares with none.
     pub earlier: Option<(String, Option<v2::conditions::SendContext>)>,
+    /// The transcript the run's reads keep between them (see [`WindowTranscript`]). A new one
+    /// keeps nothing.
+    pub window: WindowTranscript,
 }
 
 /// The send context of the session's newest accepted request when an earlier run than
@@ -282,8 +288,7 @@ pub struct Transcript {
 /// What the transcript keeps, for the open session, of the sealed entries its views name: the
 /// session holds it while it's open and drops it when its history version moves (see
 /// `Session::keep_sealed_derived`). Sealed history never changes otherwise, so each named entry
-/// is read and projected once, and a later step with the same views and the same seal only
-/// replaces the window's entries behind the sealed ones it built before.
+/// is read and projected once, by the first run that needs it.
 #[derive(Default)]
 struct SealedTranscript(std::sync::Mutex<SealedParts>);
 
@@ -291,8 +296,6 @@ struct SealedTranscript(std::sync::Mutex<SealedParts>);
 struct SealedParts {
     /// Each sealed entry read so far, by message id.
     by_mid: std::collections::HashMap<String, SealedEntry>,
-    /// The transcript last built.
-    built: Option<Built>,
 }
 
 /// One sealed entry as read: its projection, its ordinal and message, and the texts delivered
@@ -301,17 +304,6 @@ struct SealedEntry {
     entry: cortexkit_role_compaction::read::Entry,
     message: (u64, broca_protocol::Message),
     delivered: Vec<Delivered>,
-}
-
-/// A transcript as built for `key`: the sealed entries its views name, then the window's.
-struct Built {
-    key: BuiltFor,
-    /// How many of `entries` are sealed ones, in front.
-    sealed: usize,
-    entries: Arc<Vec<cortexkit_role_compaction::read::Entry>>,
-    messages: Arc<Vec<(u64, broca_protocol::Message)>>,
-    /// The sealed entries' delivered texts, by message id, for their ride envelopes.
-    delivered: Arc<Vec<(String, Vec<Delivered>)>>,
 }
 
 /// What decides which sealed entries a transcript holds: where the window starts, and the
@@ -335,73 +327,66 @@ async fn sealed_transcript<W: Writer>(writer: &W) -> Result<Arc<SealedTranscript
     Ok(fresh)
 }
 
-/// The transcript a step's compaction reads (see [`Transcript`]). A sealed entry is read back
-/// through the session's id lookup, which finds broca's own ids and an import's source ids
-/// alike, named entries close together in one read. What it reads is kept for the open session
-/// (see [`SealedTranscript`]), so a view naming hundreds of sealed messages reads and projects
-/// them once, not at every step. A view's cut target the session doesn't hold fails the step;
-/// any other named message it doesn't hold is left out, and the check refuses a view naming it,
-/// by that id.
+/// The transcript a step's compaction reads (see [`Transcript`]). The window's entries are kept
+/// by the run (see [`window`]), so each read projects only the messages placed since the last
+/// one. A sealed entry is read back through the session's id lookup, which finds broca's own ids
+/// and an import's source ids alike, named entries close together in one read. What it reads is
+/// kept for the open session (see [`SealedTranscript`]), so a view naming hundreds of sealed
+/// messages reads and projects them once, not at every step. A view's cut target the session
+/// doesn't hold fails the step; any other named message it doesn't hold is left out, and the
+/// check refuses a view naming it, by that id.
 pub async fn transcript<W: Writer>(writer: &W, ctx: &Ctx) -> Result<Transcript, LoopError> {
-    use cortexkit_role_compaction::view::{EditOp, InsertAt};
     let conversation = writer.conversation();
     // A session that enrolled serves its earlier messages as its enrollment decided, leaving
     // out the global system messages it suppressed, as the request's prompt leaves them out.
     let enrollment = writer.enrollment().await?;
-    let window = broca_session_store::session::EnrollmentOverlay::serve(
-        enrollment.as_ref(),
-        broca_session_store::session::served_window(conversation),
-    );
-    let window_entries = window
-        .iter()
-        .map(crate::entries::project)
-        .collect::<Result<Vec<_>, _>>()
+    ctx.window
+        .update(writer.session_id(), conversation, enrollment.as_ref())
         .map_err(LoopError::Parts)?;
     let window_start = conversation.window_start();
-    // Each entry's rides, sealed ones first, keyed as the entries key their deliveries.
-    let rides_with = |sealed: &[(String, Vec<Delivered>)]| {
-        let mut rides = v2::entries::RideEnvelopes::default();
-        for (mid, delivered) in sealed {
-            crate::entries::push_rides(&mut rides, mid, delivered);
-        }
-        for entry in &window {
-            if let Some(facts) = &entry.state.facts {
-                crate::entries::push_rides(&mut rides, &facts.mid, &entry.state.delivered);
-            }
-        }
-        Arc::new(rides)
-    };
     if window_start <= 1 {
-        return Ok(Transcript {
-            entries: Arc::new(window_entries),
-            sealed: Arc::default(),
-            rides: rides_with(&[]),
-        });
-    }
-    let key = {
-        let state = ctx.session.state.lock().await;
-        BuiltFor {
-            window_start,
-            views: [state.applied(), state.latest()]
-                .map(|view| view.map(|view| (view.version, view.checksum.clone()))),
-        }
-    };
-    let kept = sealed_transcript(writer).await?;
-    {
-        let mut parts = kept.0.lock().expect("sealed transcript");
-        if let Some(built) = parts.built.as_mut().filter(|built| built.key == key) {
-            // The entries the last transcript was built from are kept whole; once that
-            // transcript is gone, only the window's entries behind the sealed ones change.
-            let entries = Arc::make_mut(&mut built.entries);
-            entries.truncate(built.sealed);
-            entries.extend(window_entries);
-            return Ok(Transcript {
-                entries: built.entries.clone(),
-                sealed: built.messages.clone(),
-                rides: rides_with(&built.delivered),
-            });
+        ctx.window
+            .set_sealed(None, Vec::new(), Vec::new(), Vec::new());
+    } else {
+        let key = {
+            let state = ctx.session.state.lock().await;
+            BuiltFor {
+                window_start,
+                views: [state.applied(), state.latest()]
+                    .map(|view| view.map(|view| (view.version, view.checksum.clone()))),
+            }
+        };
+        if ctx.window.sealed_for().as_ref() != Some(&key) {
+            let (entries, messages, delivered) =
+                sealed_entries(writer, ctx, enrollment.as_ref()).await?;
+            ctx.window
+                .set_sealed(Some(key), entries, messages, delivered);
         }
     }
+    let transcript = ctx.window.transcript();
+    #[cfg(debug_assertions)]
+    matches_full_projection(&transcript, ctx, conversation, enrollment.as_ref());
+    Ok(transcript)
+}
+
+/// The sealed entries the applied and accepted views name, in ordinal order, with their messages
+/// and delivered texts: what a transcript puts in front of the window's entries.
+#[allow(clippy::type_complexity)]
+async fn sealed_entries<W: Writer>(
+    writer: &W,
+    ctx: &Ctx,
+    enrollment: Option<&broca_session_store::session::EnrollmentOverlay>,
+) -> Result<
+    (
+        Vec<cortexkit_role_compaction::read::Entry>,
+        Vec<(u64, broca_protocol::Message)>,
+        Vec<(String, Vec<Delivered>)>,
+    ),
+    LoopError,
+> {
+    use cortexkit_role_compaction::view::{EditOp, InsertAt};
+    let conversation = writer.conversation();
+    let window_start = conversation.window_start();
     // Every message the views name, each once: the cut targets, and the rest.
     let (cuts, named) = {
         let state = ctx.session.state.lock().await;
@@ -429,15 +414,28 @@ pub async fn transcript<W: Writer>(writer: &W, ctx: &Ctx) -> Result<Transcript, 
         }
         (cuts, named)
     };
-    let in_window: std::collections::HashSet<&str> = window
+    // The ids of the window's served entries, the held assistant message's included.
+    let suppressed = |ordinal: u64| enrollment.is_some_and(|overlay| overlay.suppressed(ordinal));
+    let in_window: std::collections::HashSet<&str> = conversation
+        .entries
         .iter()
-        .filter_map(|entry| entry.state.facts.as_ref())
+        .enumerate()
+        .filter(|(at, _)| !suppressed(window_start + *at as u64))
+        .map(|(_, state)| state)
+        .chain(
+            conversation
+                .open_entry()
+                .filter(|(ordinal, _, _)| !suppressed(*ordinal))
+                .map(|(_, _, state)| state),
+        )
+        .filter_map(|state| state.facts.as_ref())
         .map(|facts| facts.mid.as_str())
         .collect();
     let wanted: Vec<&String> = cuts
         .union(&named)
         .filter(|mid| !in_window.contains(mid.as_str()))
         .collect();
+    let kept = sealed_transcript(writer).await?;
     let missing: Vec<String> = {
         let parts = kept.0.lock().expect("sealed transcript");
         wanted
@@ -480,28 +478,59 @@ pub async fn transcript<W: Writer>(writer: &W, ctx: &Ctx) -> Result<Transcript, 
         .collect();
     sealed.sort_by_key(|named| named.message.0);
     sealed.dedup_by_key(|named| named.message.0);
-    let mut entries: Vec<_> = sealed.iter().map(|named| named.entry.clone()).collect();
-    let messages: Vec<_> = sealed.iter().map(|named| named.message.clone()).collect();
-    let delivered: Vec<_> = sealed
+    Ok((
+        sealed.iter().map(|named| named.entry.clone()).collect(),
+        sealed.iter().map(|named| named.message.clone()).collect(),
+        sealed
+            .iter()
+            .map(|named| (named.entry.mid.clone(), named.delivered.clone()))
+            .collect(),
+    ))
+}
+
+/// Debug builds check the kept transcript against the window projected whole, as every read
+/// projected it before the run kept it: the same entries behind the sealed ones, and the same
+/// ride envelope for every text delivered with a window entry's calls.
+#[cfg(debug_assertions)]
+fn matches_full_projection(
+    transcript: &Transcript,
+    ctx: &Ctx,
+    conversation: &broca_session_store::fold::conversation::Conversation,
+    enrollment: Option<&broca_session_store::session::EnrollmentOverlay>,
+) {
+    let window = broca_session_store::session::EnrollmentOverlay::serve(
+        enrollment,
+        broca_session_store::session::served_window(conversation),
+    );
+    let full: Vec<_> = window
         .iter()
-        .map(|named| (named.entry.mid.clone(), named.delivered.clone()))
+        .map(|stored| crate::entries::project(stored).expect("the kept entries projected"))
         .collect();
-    let count = entries.len();
-    entries.extend(window_entries);
-    let built = Built {
-        key,
-        sealed: count,
-        entries: Arc::new(entries),
-        messages: Arc::new(messages),
-        delivered: Arc::new(delivered),
-    };
-    let transcript = Transcript {
-        entries: built.entries.clone(),
-        sealed: built.messages.clone(),
-        rides: rides_with(&built.delivered),
-    };
-    parts.built = Some(built);
-    Ok(transcript)
+    assert!(
+        transcript.entries[ctx.window.sealed_count()..] == full[..],
+        "the kept transcript's window entries differ from the window projected whole"
+    );
+    let mut rides = v2::entries::RideEnvelopes::default();
+    for entry in &window {
+        if let Some(facts) = &entry.state.facts {
+            crate::entries::push_rides(&mut rides, &facts.mid, &entry.state.delivered);
+        }
+    }
+    for entry in &window {
+        let Some(facts) = &entry.state.facts else {
+            continue;
+        };
+        let mut index = std::collections::HashMap::<u32, usize>::new();
+        for delivered in &entry.state.delivered {
+            let at = index.entry(delivered.part).or_default();
+            let part = delivered.part.to_string();
+            assert!(
+                transcript.rides.get(&facts.mid, &part, *at) == rides.get(&facts.mid, &part, *at),
+                "the kept transcript's ride envelopes differ from the window's"
+            );
+            *at += 1;
+        }
+    }
 }
 
 /// `opts` with the sealed messages a [`Transcript`] put in front of the window's prepended to its
@@ -579,6 +608,7 @@ pub async fn offline_prompt<W: Writer>(
         provider: String::new(),
         preset: String::new(),
         earlier: None,
+        window: WindowTranscript::default(),
     };
     let transcript = transcript(writer, &ctx).await?;
     let opts = with_sealed(opts, &transcript);
@@ -1013,8 +1043,18 @@ impl<'a> Changes<'a> {
                 provider,
                 preset: preset?,
                 earlier: None,
+                window: WindowTranscript::default(),
             },
         })
+    }
+
+    /// These changes, told through the transcript `steps` keeps for the run's own steps, so the
+    /// run projects each window entry once for both.
+    pub fn sharing(mut self, steps: Option<&Ctx>) -> Self {
+        if let Some(steps) = steps {
+            self.ctx.window = steps.window.clone();
+        }
+        self
     }
 
     /// Tells the provider of every change since its last notice. A failure is left for the next
