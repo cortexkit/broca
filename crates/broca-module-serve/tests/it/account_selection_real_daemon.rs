@@ -283,7 +283,6 @@ impl Vault {
     }
 
     /// How many times the daemon read a deployment-key record.
-    #[cfg(unix)]
     fn deployment_key_reads(&self) -> usize {
         self.requests
             .lock()
