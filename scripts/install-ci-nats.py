@@ -7,6 +7,8 @@ from pathlib import Path
 import platform
 import subprocess
 import tarfile
+import time
+import urllib.error
 import urllib.request
 
 
@@ -16,6 +18,31 @@ ARCHIVES = {
     'Linux': ('linux-amd64', '6cbac67107e69c9e5a352d6f1555027f9da6a6b3fa81cceafefa9598b4451512'),
     'Windows': ('windows-amd64', 'fa5f29094dd2d25d42060e5c9df7d86a8b8c0820b319e9c6566a0bffa923f35f'),
 }
+# GitHub's release download answers 5xx or drops the connection now and then; one such answer
+# used to fail every integration shard of a CI run. The archive is checksum-pinned, so a retry
+# can't install anything but the pinned bytes. A 4xx is a wrong URL or a removed release and is
+# raised at once.
+ATTEMPTS = 4
+RETRY_DELAYS_S = (5, 15, 30)
+REQUEST_TIMEOUT_S = 60
+
+
+def download(url, sleep=time.sleep):
+    for attempt in range(1, ATTEMPTS + 1):
+        try:
+            with urllib.request.urlopen(url, timeout=REQUEST_TIMEOUT_S) as response:
+                return response.read()
+        except urllib.error.HTTPError as error:
+            if error.code < 500 or attempt == ATTEMPTS:
+                raise
+            reason = f'HTTP {error.code}'
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as error:
+            if attempt == ATTEMPTS:
+                raise
+            reason = str(error)
+        delay = RETRY_DELAYS_S[attempt - 1]
+        print(f'NATS download attempt {attempt} failed ({reason}); retrying in {delay} s')
+        sleep(delay)
 
 
 def install(destination, os_name, machine, archive_path=None):
@@ -25,8 +52,7 @@ def install(destination, os_name, machine, archive_path=None):
     stem = f'nats-server-v{VERSION}-{target}'
     url = f'https://github.com/nats-io/nats-server/releases/download/v{VERSION}/{stem}.tar.gz'
     if archive_path is None:
-        with urllib.request.urlopen(url) as response:
-            archive = response.read()
+        archive = download(url)
     else:
         archive = Path(archive_path).read_bytes()
     if hashlib.sha256(archive).hexdigest() != checksum:

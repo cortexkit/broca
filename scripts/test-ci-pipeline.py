@@ -1327,6 +1327,37 @@ class NatsInstall(unittest.TestCase):
         self.assertFalse(self.destination.exists())
         run.assert_not_called()
 
+    def http_error(self, code):
+        return self.installer.urllib.error.HTTPError('https://example.test', code, 'x', {}, None)
+
+    def test_download_retries_a_gateway_timeout_then_returns_the_archive(self):
+        sleeps = []
+        answers = [self.http_error(504), self.installer.urllib.error.URLError('reset'),
+                   io.BytesIO(b'archive bytes')]
+        with patch.object(self.installer.urllib.request, 'urlopen', side_effect=answers) as urlopen:
+            data = self.installer.download('https://example.test', sleep=sleeps.append)
+        self.assertEqual(data, b'archive bytes')
+        self.assertEqual(urlopen.call_count, 3)
+        self.assertEqual(sleeps, list(self.installer.RETRY_DELAYS_S[:2]))
+
+    def test_download_raises_a_client_error_without_retrying(self):
+        sleeps = []
+        with patch.object(self.installer.urllib.request, 'urlopen',
+                          side_effect=[self.http_error(404)]) as urlopen:
+            with self.assertRaises(self.installer.urllib.error.HTTPError):
+                self.installer.download('https://example.test', sleep=sleeps.append)
+        self.assertEqual(urlopen.call_count, 1)
+        self.assertEqual(sleeps, [])
+
+    def test_download_gives_up_after_the_last_attempt(self):
+        sleeps = []
+        errors = [self.http_error(503) for _ in range(self.installer.ATTEMPTS)]
+        with patch.object(self.installer.urllib.request, 'urlopen', side_effect=errors) as urlopen:
+            with self.assertRaises(self.installer.urllib.error.HTTPError):
+                self.installer.download('https://example.test', sleep=sleeps.append)
+        self.assertEqual(urlopen.call_count, self.installer.ATTEMPTS)
+        self.assertEqual(len(sleeps), self.installer.ATTEMPTS - 1)
+
     def test_refuses_an_unpinned_platform_before_downloading(self):
         with patch.object(self.installer.urllib.request, 'urlopen') as download:
             with self.assertRaisesRegex(RuntimeError, 'no pinned NATS archive'):
