@@ -8,7 +8,7 @@
 //! session-class table, which did not list it.
 
 use super::*;
-use crate::framing::{
+use crate::features::{
     AGENT_RUN_SCOPE_FEATURE, CLIENT_MESSAGE_ID_FEATURE, DEFERRED_CALL_FEATURE, FLOW_SCOPE_FEATURE,
     INPUT_TOKEN_CAP_FEATURE, MEDIA_CONTENT_FEATURE, MESSAGE_TIMES_FEATURE, PLAN_MANIFEST_FEATURE,
     PROVIDER_DECLARATIONS_FEATURE, RETENTION_FEATURE, SCOPE_FEATURE, SESSION_CLASS_FEATURE,
@@ -161,7 +161,7 @@ const DIGEST_WITH_CLIENT_MESSAGE_ID: &str = r#"{"version":1,"model":"m","input":
 
 fn plan_manifest(declared: bool) -> Value {
     let fixture: Value = serde_json::from_str(include_str!(
-        "../../tests/fixtures/plan_manifest_run_started.json"
+        "../../../broca-wal/tests/fixtures/plan_manifest_run_started.json"
     ))
     .unwrap();
     let mut manifest = fixture["manifest"].clone();
@@ -174,7 +174,7 @@ fn plan_manifest(declared: bool) -> Value {
 
 fn run_started(shape: RunStartedShape, manifest: &Value, declared_manifest: &Value) -> WalRecord {
     let mut raw: Value = serde_json::from_str(
-        include_str!("../../tests/fixtures/before_message_times.jsonl")
+        include_str!("../../../broca-wal/tests/fixtures/before_message_times.jsonl")
             .lines()
             .next()
             .unwrap(),

@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::framing::SESSION_STORAGE_DIR;
+use crate::features::SESSION_STORAGE_DIR;
 use crate::fs_ops as fs;
 
 /// The folder of a state root holding the new storage's durable sessions, the one class of the

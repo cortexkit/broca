@@ -2,7 +2,7 @@ use std::{io, path::Path};
 
 /// Directory handles are syncable on Unix. On other platforms this function
 /// deliberately performs no directory I/O rather than trying to open a directory.
-pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
+pub fn sync_dir(path: &Path) -> io::Result<()> {
     let path = if path.as_os_str().is_empty() {
         Path::new(".")
     } else {
@@ -10,7 +10,7 @@ pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
     };
     #[cfg(unix)]
     {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-io-trace"))]
         fail_if_injected(path)?;
         crate::fs_ops::sync_dir(path)
     }
@@ -20,12 +20,12 @@ pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(any(test, feature = "test-io-trace"), unix))]
 thread_local! {
     static FAILURE: std::cell::RefCell<Option<std::path::PathBuf>> = const { std::cell::RefCell::new(None) };
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(any(test, feature = "test-io-trace"), unix))]
 fn fail_if_injected(path: &Path) -> io::Result<()> {
     if FAILURE.with(|fault| fault.borrow().as_deref() == Some(path)) {
         return Err(io::Error::from_raw_os_error(5));
@@ -33,8 +33,9 @@ fn fail_if_injected(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(all(test, unix))]
-pub(crate) fn with_failure<T>(path: &Path, action: impl FnOnce() -> T) -> T {
+#[cfg(all(any(test, feature = "test-io-trace"), unix))]
+#[doc(hidden)]
+pub fn with_failure<T>(path: &Path, action: impl FnOnce() -> T) -> T {
     struct Restore(Option<std::path::PathBuf>);
     impl Drop for Restore {
         fn drop(&mut self) {
