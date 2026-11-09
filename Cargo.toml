@@ -116,8 +116,10 @@ tracing = "0.1"
 tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "4fffad30fe373adbdcffab9545e9e9bf4f2fc19f" }
 
 [patch.crates-io]
-# Fix the kit's media-only first-send bookkeeping; drop with conformance kit 0.17.34.
-cortexkit-role-llm-runner-conformance = { git = "https://github.com/cortexkit/commons", rev = "f01b58afab9311f2254ea912c0bd31a9c096bbd8" }
+# Fix the kit's media-only first-send bookkeeping, and keep every oversize argument of its media
+# fixtures on its own sibling call, under the runner's tool-input cap. Drop with a released kit
+# that carries both fixes (the second ships in conformance kit 0.17.39).
+cortexkit-role-llm-runner-conformance = { git = "https://github.com/cortexkit/commons", rev = "6a24eec5be2a14af121030391454f665027ab5df" }
 # JetStream's retry dependency must not enable Tokio's production test clock.
 # See commons third_party/tryhard/CORTEXKIT.md; remove once upstream drops test-util.
 tryhard = { git = "https://github.com/cortexkit/commons", rev = "fe59258998db48975f43cb892b71a9952db4eb86" }
