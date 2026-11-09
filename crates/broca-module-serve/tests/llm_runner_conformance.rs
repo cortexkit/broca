@@ -448,6 +448,7 @@ struct Shared {
     read_part_keys: Mutex<HashMap<String, Vec<String>>>,
     read_entries: Mutex<HashMap<(String, String), Value>>,
     plan_sessions: Mutex<BTreeSet<String>>,
+    catalog_requests: Mutex<HashMap<String, Vec<Value>>>,
     flow_scope_sessions: Mutex<BTreeSet<String>>,
     output_refs_sessions: Mutex<BTreeSet<String>>,
     model_id_marker_sessions: Mutex<BTreeSet<String>>,
@@ -1139,6 +1140,13 @@ impl ToolProvider {
             .get(&route)
             .cloned()
             .unwrap_or_default();
+        self.shared
+            .catalog_requests
+            .lock()
+            .unwrap()
+            .entry(session.clone())
+            .or_default()
+            .push(request.clone());
         let mut answer = catalog::catalog(request);
         held_late_results::declare_in_catalog(&self.shared, &session, &mut answer);
         answer
@@ -2464,6 +2472,70 @@ impl RunnerRoute for BrocaRoute {
 
 #[async_trait]
 impl LlmRunnerSubject for BrocaSubject {
+    async fn call_yield_admission_state(
+        &self,
+        session: &str,
+    ) -> Result<Option<Vec<u8>>, HarnessError> {
+        let root = self
+            .shared
+            .session_roots
+            .lock()
+            .unwrap()
+            .get(session)
+            .cloned()
+            .ok_or_else(|| HarnessError::new(format!("no state root for session {session}")))?;
+        let bind = self.bind_identity(session);
+        // Refusal must leave the log (including baseline, reservations and queued sends)
+        // and the session's projections untouched, not merely return an error reply.
+        let wal_path = broca_core::FileWalStore::new(root.join("wal")).wal_path(&bind);
+        let wal = match std::fs::read(wal_path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(HarnessError::new(error.to_string())),
+        };
+        let store = broca_store::SqliteStore::open_read_only(root.join("run-index.db"))
+            .map_err(|error| HarnessError::new(error.to_string()))?;
+        let checkpoint = broca_core::MaterializedStore::read_admission_snapshot(&store, &bind)
+            .map_err(HarnessError::new)?;
+        let connection = rusqlite::Connection::open_with_flags(
+            root.join("run-index.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .map_err(|error| HarnessError::new(error.to_string()))?;
+        // run_index.session stores JSON BindIdentity, unlike the admission metadata key.
+        let key =
+            serde_json::to_string(&bind).map_err(|error| HarnessError::new(error.to_string()))?;
+        let mut query = connection
+            .prepare("SELECT * FROM run_index WHERE session=?1 ORDER BY run_id")
+            .map_err(|error| HarnessError::new(error.to_string()))?;
+        let columns = query.column_count();
+        let runs = query
+            .query_map([key], |row| {
+                (0..columns)
+                    .map(|column| row.get::<_, rusqlite::types::Value>(column))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+            .map_err(|error| HarnessError::new(error.to_string()))?;
+        // Catalog requests are observed at the provider, independently of runner replies.
+        let requests = self
+            .shared
+            .catalog_requests
+            .lock()
+            .unwrap()
+            .get(session)
+            .cloned()
+            .unwrap_or_default();
+        serde_json::to_vec(&(
+            wal,
+            format!("{checkpoint:?}"),
+            format!("{runs:?}"),
+            requests,
+        ))
+        .map(Some)
+        .map_err(|error| HarnessError::new(error.to_string()))
+    }
+
     async fn notices_stored_output(
         &self,
         handle: &Self::Handle,
@@ -6885,6 +6957,118 @@ mod held_call_tests {
             #[cfg(feature = "test-clock")]
             bus: None,
         }
+    }
+
+    #[tokio::test]
+    async fn call_yield_admission_snapshot_observes_wal_index_and_plan_fetches() {
+        use broca_core::{SessionInventory, WalStore};
+
+        let root = broca_test_support::scratch_root().join("call-yield-admission-state");
+        broca_test_support::remove_rig_dir(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let subject = subject(Arc::new(Shared::default()));
+        let store = broca_store::SqliteStore::open(root.join("run-index.db")).unwrap();
+        store.rebuild_inventory(&root).unwrap();
+        let session = "admission-snapshot";
+        let claim = subject.raw_bind_identity(session);
+        let bind = store.resolve_session_address(&claim, None, None).unwrap();
+        assert_ne!(bind, claim);
+        subject
+            .shared
+            .session_roots
+            .lock()
+            .unwrap()
+            .insert(session.into(), root.clone());
+        let snapshot = || async {
+            subject
+                .call_yield_admission_state(session)
+                .await
+                .unwrap()
+                .expect("independent admission snapshot")
+        };
+        let empty = snapshot().await;
+        assert_eq!(snapshot().await, empty);
+
+        let wal_store = broca_core::FileWalStore::new(root.join("wal"));
+        let mut wal = wal_store.open(&bind).unwrap();
+        wal.append(
+            1,
+            &broca_wal::WalRecord::RunFinished {
+                interrupt_reason: None,
+                reason: broca_protocol::RunFinishReason::Completed,
+                ts_ms: Some(1),
+                usage: Default::default(),
+                error: None,
+                retries_used: 0,
+            },
+            true,
+        )
+        .unwrap();
+        let with_wal = snapshot().await;
+        assert_ne!(with_wal, empty);
+        assert_eq!(snapshot().await, with_wal);
+
+        let connection = rusqlite::Connection::open(root.join("run-index.db")).unwrap();
+        let metadata_key = format!(
+            "{}\u{1f}{}\u{1f}{}",
+            bind.project_root.display(),
+            bind.harness,
+            bind.session
+        );
+        connection
+            .execute(
+                "INSERT INTO meta(session,watermark_seq,context_epoch) VALUES (?1,1,0)",
+                [metadata_key],
+            )
+            .unwrap();
+        let with_checkpoint = snapshot().await;
+        assert_ne!(with_checkpoint, with_wal);
+        let insert =
+            "INSERT INTO run_index(run_id,session,state,submission_id) VALUES (?1,?2,'active',?3)";
+        connection
+            .execute(
+                insert,
+                rusqlite::params!["other-run", "unrelated", "other-send"],
+            )
+            .unwrap();
+        assert_eq!(snapshot().await, with_checkpoint);
+        connection
+            .execute(
+                insert,
+                rusqlite::params![
+                    "observed-run",
+                    serde_json::to_string(&bind).unwrap(),
+                    "queued-send"
+                ],
+            )
+            .unwrap();
+        let with_index = snapshot().await;
+        assert_ne!(with_index, with_checkpoint);
+        connection
+            .execute(
+                "UPDATE run_index SET submission_id='another-send' WHERE run_id='observed-run'",
+                [],
+            )
+            .unwrap();
+        assert_ne!(snapshot().await, with_index);
+
+        let provider = ToolProvider {
+            shared: subject.shared.clone(),
+            routes: Mutex::new(HashMap::from([
+                ((1, 1), session.into()),
+                ((2, 1), "other".into()),
+            ])),
+        };
+        let before_fetch = snapshot().await;
+        let request = json!({"name":"tool.catalog", "arguments":{}});
+        provider.catalog_for_route((2, 1), &request);
+        assert_eq!(snapshot().await, before_fetch);
+        provider.catalog_for_route((1, 1), &request);
+        assert_ne!(snapshot().await, before_fetch);
+        assert!(subject
+            .call_yield_admission_state("unrouted")
+            .await
+            .is_err());
     }
 
     #[test]
