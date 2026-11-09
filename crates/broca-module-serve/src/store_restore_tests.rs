@@ -9,7 +9,11 @@ use super::Report;
 
 fn report() -> Report {
     let mut report = Report::new(StorageClass::Durable, &SessionAddr("ab12".into()));
-    report.session(&broca_protocol::BindIdentity::new("/p", "opencode2", "ses_head"));
+    report.session(&broca_protocol::BindIdentity::new(
+        "/p",
+        "opencode2",
+        "ses_head",
+    ));
     report
 }
 
@@ -46,8 +50,16 @@ fn each_outcome_is_reported_as_one_line_with_its_facts() {
     });
     assert_eq!(rolled["outcome"], "rolled_back");
     assert_eq!(
-        (&rolled["from_version"], &rolled["to_version"], &rolled["written_version"]),
-        (&serde_json::json!(9), &serde_json::json!(6), &serde_json::json!(10))
+        (
+            &rolled["from_version"],
+            &rolled["to_version"],
+            &rolled["written_version"]
+        ),
+        (
+            &serde_json::json!(9),
+            &serde_json::json!(6),
+            &serde_json::json!(10)
+        )
     );
     assert_eq!(
         rolled["report"],

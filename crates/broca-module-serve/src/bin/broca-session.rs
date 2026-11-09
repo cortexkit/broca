@@ -3458,19 +3458,30 @@ mod tests {
             {"outcome": "kept", "report": "durable a: kept"},
             {"outcome": "log_cut", "report": "durable b: log cut"},
         ]});
-        let mut lines = Vec::new();
-        let exit =
-            restore_report(false, reply.to_string().as_bytes(), &mut |line| lines.push(line))
-                .unwrap();
-        assert_eq!((exit, lines), (0, vec!["durable a: kept".to_owned(), "durable b: log cut".to_owned()]));
+        let mut lines: Vec<String> = Vec::new();
+        let exit = super::restore_report(false, reply.to_string().as_bytes(), &mut |line| {
+            lines.push(line)
+        })
+        .unwrap();
+        assert_eq!(
+            (exit, lines),
+            (
+                0,
+                vec![
+                    "durable a: kept".to_owned(),
+                    "durable b: log cut".to_owned()
+                ]
+            )
+        );
         let reply = serde_json::json!({"sessions": [
             {"outcome": "rolled_back", "report": "durable a: rolled back"},
             {"outcome": "unrecoverable", "report": "durable b: unrecoverable"},
         ]});
-        let mut lines = Vec::new();
-        let exit =
-            restore_report(true, reply.to_string().as_bytes(), &mut |line| lines.push(line))
-                .unwrap();
+        let mut lines: Vec<String> = Vec::new();
+        let exit = super::restore_report(true, reply.to_string().as_bytes(), &mut |line| {
+            lines.push(line)
+        })
+        .unwrap();
         assert_eq!(exit, 1);
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&lines[1]).unwrap()["outcome"],

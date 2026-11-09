@@ -54,6 +54,12 @@ non-zero at once, without writing to the root. The file holds no data and never 
 as holding state. The command-line tools (store-maintenance, wal-fold, broca-session) do not
 take it (`crates/broca-module-serve/src/state_root_lock.rs`).
 
+In each `session-store*` root, a session's head is `heads/<addr>/head`, and every head
+version is also kept as its own file, `heads/<addr>/v/<version>`, for a restore from a
+backup; loading reads only `head`. A restore that cut a session's open log leaves the cut
+bytes beside it, as `logs/<addr>/<log>.restore-cut-<ms>`. See
+[module-surface.md, Restoring the new storage from a backup](module-surface.md#restoring-the-new-storage-from-a-backup).
+
 The WAL is the source of truth. Everything in `run-index.db` is derived from it, although
 not all of it can be regenerated (section 4 says which parts cannot).
 

@@ -1384,6 +1384,7 @@ async fn every_read_and_control_refuses_new_storage_without_a_runtime() {
         ),
         ("session.warm", serde_json::json!({})),
         ("session.move_to_store", serde_json::json!({})),
+        ("session.restore_from_backup", serde_json::json!({})),
         (
             "session.import",
             serde_json::json!({"import_id": "import-1", "origin": {"kind": "import", "source_ref": "fixture:guard"},

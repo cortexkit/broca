@@ -124,6 +124,11 @@ impl StoreRestore {
             Ok(Some(Finding::Lacks(_))) => {}
             Err(error) => return report.error(error),
         }
+        // An actor serving the session refuses to be held, and asking it would only keep it
+        // from going idle, so restore waits for it to close by itself.
+        if let Some(state) = self.registry.slot_state(&bind) {
+            return report.busy(&format!("an actor serves it ({state})"));
+        }
         let fence = match self
             .registry
             .fence_store_move(&bind, self.leases.as_ref())
@@ -135,7 +140,8 @@ impl StoreRestore {
                 return report.failed(format!("the session couldn't be held: {error}"))
             }
         };
-        let restored = restore::restore(&store, addr, deployment, broca_diagnostics::now_ms()).await;
+        let restored =
+            restore::restore(&store, addr, deployment, broca_diagnostics::now_ms()).await;
         drop(fence);
         match restored {
             Ok(restored) => report.restored(restored),
@@ -202,14 +208,20 @@ impl Report {
     fn refused(mut self, reason: impl Into<String>) -> Value {
         let reason = reason.into();
         self.fields.insert("reason".into(), json!(reason));
-        self.finish("refused", format!("not restored, {reason}; nothing changed"))
+        self.finish(
+            "refused",
+            format!("not restored, {reason}; nothing changed"),
+        )
     }
 
     fn busy(mut self, reason: &str) -> Value {
         self.fields.insert("reason".into(), json!(reason));
         self.finish(
             "busy",
-            format!("not restored, the session is busy ({reason}); nothing changed"),
+            format!(
+                "not restored, the session is busy ({reason}); nothing changed, and it can be \
+                 restored once it is idle"
+            ),
         )
     }
 
