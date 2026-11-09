@@ -90,6 +90,9 @@ pub enum StoreReadRequest {
     /// The plan identities a later send's plan is checked against once the session took a
     /// refresh (see `store_plan_change::identities`).
     PlanIdentities,
+    /// What `session.baseline` reports, before its owner check and cache declaration (see
+    /// `store_plan_change::baseline`).
+    Baseline,
 }
 
 impl StoreReadRequest {
@@ -166,6 +169,8 @@ pub enum StoreReadReply {
     WritingView(Result<Option<broca_core::compaction_provider::view::CompactionView>, ServeError>),
     PlanChange(Result<PlanChangeRead, String>),
     PlanIdentities(Result<RefreshedIdentities, String>),
+    /// `None` before the session's first run.
+    Baseline(Result<Option<Box<crate::store_plan_change::BaselineFacts>>, String>),
 }
 
 /// A medium a record of the session names: its reference, and its bytes or why they couldn't be
@@ -362,6 +367,9 @@ pub async fn execute<B: SessionBackend>(
         StoreReadRequest::PlanIdentities => {
             StoreReadReply::PlanIdentities(crate::store_plan_change::identities(session).await)
         }
+        StoreReadRequest::Baseline => StoreReadReply::Baseline(
+            crate::store_plan_change::baseline(session, ctx.parts).map(|facts| facts.map(Box::new)),
+        ),
     }
 }
 

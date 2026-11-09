@@ -126,9 +126,14 @@ fn send(run_id: &'static str, plan: &'static str) -> Step {
 }
 
 /// Runs `steps` on `module`, whose first send freezes `first`, and answers what each step was
-/// answered with.
-async fn drive(module: &Module, first: &broca_wal::PlanManifest, steps: &[Step]) -> Vec<String> {
+/// answered with, and the session's baseline after each step.
+async fn drive(
+    module: &Module,
+    first: &broca_wal::PlanManifest,
+    steps: &[Step],
+) -> (Vec<String>, Vec<String>) {
     let mut answers = Vec::new();
+    let mut baselines = Vec::new();
     let mut sent = false;
     for step in steps {
         let answer = match step {
@@ -217,8 +222,29 @@ async fn drive(module: &Module, first: &broca_wal::PlanManifest, steps: &[Step])
         };
         module.closed().await;
         answers.push(answer);
+        baselines.push(baseline(module).await);
     }
-    answers
+    (answers, baselines)
+}
+
+/// `session.baseline` as the session's owner reads it, and as another module is refused it,
+/// so every scenario compares the baseline after each of its steps.
+async fn baseline(module: &Module) -> String {
+    let mut read = Vec::new();
+    for principal in [core(), occipital()] {
+        read.push(
+            match module
+                .registry
+                .baseline(&module.key, Some(&principal), &SendScope::default())
+                .await
+            {
+                Ok(reply) => format!("Ok({})", serde_json::to_string(&reply).unwrap()),
+                Err(error) => format!("Err({error:?})"),
+            },
+        );
+    }
+    module.closed().await;
+    read.join(" | ")
 }
 
 /// Each run of today's session with the plan identity and model its start froze.
@@ -321,9 +347,10 @@ async fn compared(
     Vec<String>,
     Vec<(String, Option<String>, String)>,
 ) {
-    let today_answers = drive(&today, first, steps).await;
-    let store_answers = drive(&store, first, steps).await;
+    let (today_answers, today_baselines) = drive(&today, first, steps).await;
+    let (store_answers, store_baselines) = drive(&store, first, steps).await;
     assert_eq!(store_answers, today_answers);
+    assert_eq!(store_baselines, today_baselines);
     let (runs, applied) = store_runs(&store).await;
     assert_eq!(runs, today_runs(&today));
     let frames = today.wal.read_records(&today.key).unwrap();
@@ -369,6 +396,65 @@ async fn an_immediate_refresh_applies_at_the_next_run_alike() {
         "{answers:?}"
     );
     assert_eq!(runs[1].1.as_deref(), Some("plan-2"));
+}
+
+/// `session.baseline` on the new storage reports what today's does after a refresh is accepted
+/// and after it applies: the generations, the pending change, the effective plan and its tools,
+/// and it refuses a module that isn't the session's owner. `compared` already requires the two
+/// storages to agree after every step of every scenario here; this pins what they agree on, so
+/// two equally wrong answers can't pass.
+#[tokio::test]
+async fn the_baseline_reports_accepted_pending_and_applied_changes_alike() {
+    let steps = [
+        send("r1", "plan-1"),
+        Step::Refresh {
+            generation: 1,
+            policy: "on_prefix_rebuild",
+            manifest: second_plan(),
+        },
+        Step::Flush { send_id: "flush-1" },
+        send("r2", "plan-2"),
+    ];
+    let (today, store, _, _) = both(
+        (0..steps.len())
+            .map(|n| text_step(&format!("a{n}"), "hello"))
+            .collect(),
+        false,
+    )
+    .await;
+    let (_, today_baselines) = drive(&today, &first_plan(), &steps).await;
+    let (_, baselines) = drive(&store, &first_plan(), &steps).await;
+    assert_eq!(baselines, today_baselines);
+    // The baseline the owner read, from its `Ok(<reply JSON>)`.
+    let owner = |read: &str| -> Value {
+        let owner = read.split(" | ").next().unwrap();
+        let json = owner
+            .strip_prefix("Ok(")
+            .unwrap()
+            .strip_suffix(')')
+            .unwrap();
+        let reply: Value = serde_json::from_str(json).unwrap();
+        assert_eq!(reply["state"], "ready", "{reply}");
+        reply["baseline"].clone()
+    };
+    // After the first run: the first plan, nothing accepted yet.
+    let first = owner(&baselines[0]);
+    assert_eq!(first["accepted_generation"], 0, "{first}");
+    assert_eq!(first["tool_names"], json!(["read"]), "{first}");
+    // Accepted and waiting for a prefix rebuild.
+    let accepted = owner(&baselines[1]);
+    assert_eq!(accepted["accepted_generation"], 1, "{accepted}");
+    assert_eq!(accepted["applied_generation"], 0, "{accepted}");
+    assert_eq!(accepted["pending"]["generation"], 1, "{accepted}");
+    // Applied by the run after the flush: the refreshed plan's tools, nothing pending.
+    let applied = owner(&baselines[3]);
+    assert_eq!(applied["applied_generation"], 1, "{applied}");
+    assert!(applied.get("pending").is_none(), "{applied}");
+    assert_eq!(applied["effective"]["generation"], 1, "{applied}");
+    assert_eq!(applied["tool_names"], json!(["read", "write"]), "{applied}");
+    // Another module is refused as not the owner.
+    let refused = baselines[3].split(" | ").nth(1).unwrap();
+    assert!(refused.contains("OwnerMismatch"), "{refused}");
 }
 
 /// An `on_prefix_rebuild` refresh waits: a run without a rebuild keeps the session's plan, and
@@ -696,8 +782,8 @@ async fn only_the_new_storage_takes_a_refresh_that_adds_a_compaction_provider(
         cipher,
     )
     .await;
-    let today_answers = drive(&today, &first_plan(), &steps).await;
-    let store_answers = drive(&store, &first_plan(), &steps).await;
+    let (today_answers, _) = drive(&today, &first_plan(), &steps).await;
+    let (store_answers, _) = drive(&store, &first_plan(), &steps).await;
     assert_eq!(
         today_answers[1],
         format!(

@@ -57,7 +57,8 @@ fn masked(mut value: Value) -> Value {
 }
 
 /// What the session answers to every read the move must keep: each `session.read` mode,
-/// `session.history` in both forms, `session.head`, and each of `runs`' status, result and calls.
+/// `session.history` in both forms, `session.head`, `session.baseline`, and each of `runs`'
+/// status, result and calls.
 async fn reads(rig: &mut Rig, runs: &[String]) -> Vec<(String, Value)> {
     let mut asked = vec![
         ("session.read", json!({"limit": 500})),
@@ -73,6 +74,7 @@ async fn reads(rig: &mut Rig, runs: &[String]) -> Vec<(String, Value)> {
         ("session.history", json!({"form": "raw"})),
         ("session.history", json!({"form": "display"})),
         ("session.head", json!({})),
+        ("session.baseline", json!({})),
     ];
     for run in runs {
         for method in ["run.status", "run.result", "run.tool_calls"] {

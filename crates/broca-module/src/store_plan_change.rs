@@ -204,6 +204,87 @@ pub(crate) async fn identities<B: SessionBackend>(
     Ok(Some((effective, accepted)))
 }
 
+/// What `session.baseline` reads about a session kept in the new storage, before the serve layer
+/// checks the caller is the owner and adds the cache declaration (see `crate::serve`'s
+/// `baseline`, which reads the same facts from a WAL).
+#[derive(Debug)]
+pub struct BaselineFacts {
+    /// The scope and principal the session's first run froze; only its owner reads the baseline.
+    pub first_run: (
+        Option<broca_protocol::SessionScope>,
+        Option<broca_protocol::BindPrincipal>,
+    ),
+    /// The first run's frozen config, whose prompt-cache declaration the reply carries.
+    pub first_config: broca_wal::RunConfig,
+    /// The reply's baseline, without its cache declaration.
+    pub baseline: broca_wire::BaselineWire,
+}
+
+/// The baseline facts of `session`, read from its owner and plan folds and the parts its first
+/// run named: `None` before the session's first run. Built as today's handler builds them: the
+/// first run's manifest (or its tools, without one), replaced by the latest prefix rebuild's
+/// manifest once there is one, with the change counters, the pending and effective changes and
+/// the rungs this runner supports.
+pub(crate) fn baseline<B: SessionBackend>(
+    session: &Session<B>,
+    parts: &dyn Parts,
+) -> Result<Option<BaselineFacts>, String> {
+    let Some(first) = session.operations.owner.first_start.as_ref() else {
+        return Ok(None);
+    };
+    let first_run = (
+        decode(first.scope.as_ref(), "the first run's scope")?,
+        decode(first.principal.as_ref(), "the first run's principal")?,
+    );
+    let admission = broca_session_loop::run::admission_of_start(first, parts)
+        .map_err(|error| format!("the session's first run's start: {error:?}"))?;
+    let first_config = broca_session_loop::run::run_config_of_start(first, parts)
+        .map_err(|error| format!("the session's first run's config: {error:?}"))?;
+    let default = broca_session_store::fold::operations::Plan::default();
+    let plan = session.operations.plan.as_ref().unwrap_or(&default);
+    let mut baseline = match &plan.prefix {
+        Some(prefix) => {
+            let prefix = stored(prefix, parts)?;
+            crate::serve::planned_baseline(&prefix)
+        }
+        None => match admission.manifest.as_deref() {
+            Some(manifest) => crate::serve::planned_baseline(manifest),
+            None => broca_wire::BaselineWire::plan_less(
+                admission
+                    .tools
+                    .iter()
+                    .map(|tool| tool.name.clone())
+                    .collect(),
+            ),
+        },
+    };
+    baseline.accepted_generation = plan.accepted_generation;
+    baseline.applied_generation = plan.applied_generation;
+    baseline.pending =
+        plan.pending.as_ref().map(
+            |pending| cortexkit_role_llm_runner::baseline::PendingChange {
+                generation: pending.generation,
+                policy: pending.policy.clone(),
+            },
+        );
+    baseline.effective =
+        plan.effective
+            .as_ref()
+            .map(|effective| broca_wire::EffectiveBaselineWire {
+                generation: effective.generation,
+                applied_by: effective.applied_by.clone(),
+                manifest_digest: effective.manifest_digest.clone(),
+                composition_digest: effective.composition_digest.clone(),
+                absent_items: effective.absent_items.clone(),
+            });
+    baseline.rungs = Some(crate::serve::supported_rungs());
+    Ok(Some(BaselineFacts {
+        first_run,
+        first_config,
+        baseline,
+    }))
+}
+
 /// The newest record the session's id index names under `kind` and `id`, as today's fold keeps
 /// the last record it folded under the same key.
 async fn latest<B: SessionBackend>(

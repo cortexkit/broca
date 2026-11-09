@@ -439,7 +439,8 @@ async fn a_module_without_the_new_storage_refuses_file_imports_by_name() {
 
 /// On a session kept in the new storage, an op with no store implementation yet is refused by
 /// name before authorization reads anything, never with today's storage's advice to run a newer
-/// build. `run.tool_calls` is served from the store: a run the session never started is unknown.
+/// build. `run.tool_calls` and `session.baseline` are served from the store: a run the session
+/// never started is unknown, and the owner reads the baseline the import froze.
 /// `role.describe` still answers on the session's route. Cancels are authorized from the
 /// stored owner: a stranger is refused as not the owner, and the owner's cancel is answered.
 #[tokio::test]
@@ -450,10 +451,15 @@ async fn a_store_session_refuses_unbuilt_ops_by_name_and_checks_owners_from_the_
     rig.result(1, "session.import", params).await;
 
     assert_eq!(
-        rig.refused(1, "session.baseline", serde_json::json!({"run_id": "r1"}))
+        rig.refused(1, "run.event.get", serde_json::json!({"run_id": "r1"}))
             .await,
         "not_served_on_new_storage"
     );
+    // The baseline is served from the store, to the owner.
+    let baseline = rig
+        .result(1, "session.baseline", serde_json::json!({}))
+        .await;
+    assert_eq!(baseline["state"], "ready", "{baseline}");
     assert_eq!(
         rig.refused(1, "run.tool_calls", serde_json::json!({"run_id": "r1"}))
             .await,

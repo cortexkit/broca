@@ -996,6 +996,20 @@ pub(crate) fn send_status_reply(
     })
 }
 
+/// The plan-change rungs this runner supports per surface, which every ready baseline states.
+pub(crate) fn supported_rungs() -> cortexkit_role_llm_runner::baseline::Rungs {
+    cortexkit_role_llm_runner::baseline::Rungs {
+        tools: broca_fetch_plan::session_change::TOOLS_RUNGS
+            .iter()
+            .map(|rung| rung.to_string())
+            .collect(),
+        system_text: broca_fetch_plan::session_change::SYSTEM_TEXT_RUNGS
+            .iter()
+            .map(|rung| rung.to_string())
+            .collect(),
+    }
+}
+
 /// The baseline of a session admitted with a fetch plan, read from its frozen manifest alone.
 pub(crate) fn planned_baseline(manifest: &broca_wal::PlanManifest) -> broca_wire::BaselineWire {
     let facts = broca_fetch_plan::baseline_facts(manifest);
@@ -4921,65 +4935,78 @@ impl ServeHandler for crate::LineageRegistry {
         principal: Option<&broca_protocol::BindPrincipal>,
         scope: &broca_protocol::SendScope,
     ) -> Result<broca_wire::BaselineReply, ServeError> {
-        let (records, _) = self.read_durable_wal(session).await?;
-        let Some(start) = first_run_started(&records) else {
-            // Missing history must not be reported as a never-written baseline.
-            self.check_session_log(session).await?;
-            return Ok(broca_wire::BaselineReply::not_yet());
-        };
-        if let Some(mismatch) = baseline_owner_mismatch(start, principal, scope) {
-            return Err(ServeError::ScopeRefused(
-                broca_core::ScopeRefusal::OwnerMismatch(Box::new(mismatch)),
-            ));
+        if let Some(store) = self.store_holding(session)? {
+            return crate::store_status::StoreRead::new(&store, session, self)
+                .baseline(principal, scope)
+                .await;
         }
-        let mut baseline = baseline_of(start);
-        if let broca_wal::WalRecord::RunStarted { config, .. } = start {
-            baseline.cache = self
-                .cache_declaration(config)
-                .map(|declaration| declaration.to_wire());
-        }
-        // Every ready baseline on a runner declaring `session_change` states the rungs it
-        // supports per surface, and the generations it accepted, applied and holds pending.
-        let change = broca_fetch_plan::session_change::SessionChangeState::fold(&records);
-        if let Some(manifest) = &change.prefix_manifest {
-            let cache = baseline.cache.take();
-            baseline = planned_baseline(manifest);
-            baseline.cache = cache;
-        }
-        baseline.accepted_generation = change.accepted_generation;
-        baseline.applied_generation = change.applied_generation;
-        baseline.pending = change.pending.as_ref().map(|pending| {
-            cortexkit_role_llm_runner::baseline::PendingChange {
-                generation: pending.generation,
-                policy: pending.policy.clone(),
+        // As `read`: a head published meanwhile serves the answer once more, from there.
+        let today = async {
+            let (records, _) = self.read_durable_wal(session).await?;
+            let Some(start) = first_run_started(&records) else {
+                // Missing history must not be reported as a never-written baseline.
+                self.check_session_log(session).await?;
+                return Ok(broca_wire::BaselineReply::not_yet());
+            };
+            if let Some(mismatch) = baseline_owner_mismatch(start, principal, scope) {
+                return Err(ServeError::ScopeRefused(
+                    broca_core::ScopeRefusal::OwnerMismatch(Box::new(mismatch)),
+                ));
             }
-        });
-        baseline.effective =
-            change
-                .effective
-                .as_ref()
-                .map(|effective| broca_wire::EffectiveBaselineWire {
-                    generation: effective.generation,
-                    applied_by: effective.applied_by.clone(),
-                    manifest_digest: effective.manifest_digest.clone(),
-                    composition_digest: effective.composition_digest.clone(),
-                    absent_items: effective
-                        .absent_items
-                        .iter()
-                        .map(|item| serde_json::to_value(item).expect("a baseline item is JSON"))
-                        .collect(),
-                });
-        baseline.rungs = Some(cortexkit_role_llm_runner::baseline::Rungs {
-            tools: broca_fetch_plan::session_change::TOOLS_RUNGS
-                .iter()
-                .map(|rung| rung.to_string())
-                .collect(),
-            system_text: broca_fetch_plan::session_change::SYSTEM_TEXT_RUNGS
-                .iter()
-                .map(|rung| rung.to_string())
-                .collect(),
-        });
-        Ok(broca_wire::BaselineReply::ready(baseline))
+            let mut baseline = baseline_of(start);
+            if let broca_wal::WalRecord::RunStarted { config, .. } = start {
+                baseline.cache = self
+                    .cache_declaration(config)
+                    .map(|declaration| declaration.to_wire());
+            }
+            // Every ready baseline on a runner declaring `session_change` states the rungs it
+            // supports per surface, and the generations it accepted, applied and holds pending.
+            let change = broca_fetch_plan::session_change::SessionChangeState::fold(&records);
+            if let Some(manifest) = &change.prefix_manifest {
+                let cache = baseline.cache.take();
+                baseline = planned_baseline(manifest);
+                baseline.cache = cache;
+            }
+            baseline.accepted_generation = change.accepted_generation;
+            baseline.applied_generation = change.applied_generation;
+            baseline.pending = change.pending.as_ref().map(|pending| {
+                cortexkit_role_llm_runner::baseline::PendingChange {
+                    generation: pending.generation,
+                    policy: pending.policy.clone(),
+                }
+            });
+            baseline.effective =
+                change
+                    .effective
+                    .as_ref()
+                    .map(|effective| broca_wire::EffectiveBaselineWire {
+                        generation: effective.generation,
+                        applied_by: effective.applied_by.clone(),
+                        manifest_digest: effective.manifest_digest.clone(),
+                        composition_digest: effective.composition_digest.clone(),
+                        absent_items: effective
+                            .absent_items
+                            .iter()
+                            .map(|item| {
+                                serde_json::to_value(item).expect("a baseline item is JSON")
+                            })
+                            .collect(),
+                    });
+            baseline.rungs = Some(supported_rungs());
+            Ok(broca_wire::BaselineReply::ready(baseline))
+        }
+        .await;
+        match today {
+            Err(error) => match self.store_after_refusal(session, &error)? {
+                Some(store) => {
+                    crate::store_status::StoreRead::new(&store, session, self)
+                        .baseline(principal, scope)
+                        .await
+                }
+                None => Err(error),
+            },
+            served => served,
+        }
     }
 
     fn admission_baseline(
@@ -4998,16 +5025,7 @@ impl ServeHandler for crate::LineageRegistry {
                     .admitted_cache(session, run_id)
                     .map(|declaration| declaration.to_wire());
                 // The admitting send carries the same rungs `session.baseline` will report.
-                baseline.rungs = Some(cortexkit_role_llm_runner::baseline::Rungs {
-                    tools: broca_fetch_plan::session_change::TOOLS_RUNGS
-                        .iter()
-                        .map(|rung| rung.to_string())
-                        .collect(),
-                    system_text: broca_fetch_plan::session_change::SYSTEM_TEXT_RUNGS
-                        .iter()
-                        .map(|rung| rung.to_string())
-                        .collect(),
-                });
+                baseline.rungs = Some(supported_rungs());
                 baseline
             })
     }

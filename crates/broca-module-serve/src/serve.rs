@@ -5281,8 +5281,9 @@ pub(crate) fn served_on_new_storage(method: &str, params: &serde_json::Value) ->
         OP_RUN_TOOL_CALLS => true,
         // The store actor serves sends, cancels and retractions.
         OP_SEND | OP_CANCEL | OP_RETRACT => true,
-        // Plan refreshes, through today's preflight, decided and written by the store actor.
-        OP_REFRESH | OP_REFRESH_POLICY | OP_FLUSH_PREFIX => true,
+        // Plan refreshes, through today's preflight, decided and written by the store actor,
+        // and the baseline they are checked against (`store_plan_change::baseline`).
+        OP_REFRESH | OP_REFRESH_POLICY | OP_FLUSH_PREFIX | OP_BASELINE => true,
         // A head import from a file creates the session in the new storage. An import carrying
         // its messages inline is today's import, which writes a WAL.
         OP_IMPORT => params.get("source").is_some(),

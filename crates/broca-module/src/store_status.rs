@@ -1169,6 +1169,46 @@ impl StoreRead<'_> {
             Some(_) => Err(crate::store_reads::mismatched()),
         }
     }
+
+    /// `session.baseline`, answered only to the session's owner as today's handler answers it:
+    /// `not_yet` before the session's first run, else what it froze and the plan changes it
+    /// took since, with the first run's prompt-cache declaration.
+    pub async fn baseline(
+        &self,
+        principal: Option<&broca_protocol::BindPrincipal>,
+        scope: &broca_protocol::SendScope,
+    ) -> Result<broca_wire::BaselineReply, crate::serve::ServeError> {
+        use crate::serve::ServeError;
+        use crate::store_reads::{StoreReadReply, StoreReadRequest};
+        let facts = match self.read(StoreReadRequest::Baseline).await? {
+            // The session's creation never committed, so nothing has been frozen yet.
+            None => None,
+            Some(StoreReadReply::Baseline(facts)) => facts.map_err(|error| {
+                ServeError::Open(
+                    format!("the session's baseline can't be read: {error}"),
+                    None,
+                )
+            })?,
+            Some(_) => return Err(crate::store_reads::mismatched()),
+        };
+        let Some(facts) = facts else {
+            return Ok(broca_wire::BaselineReply::not_yet());
+        };
+        let (frozen, first) = &facts.first_run;
+        if let Some(mismatch) =
+            crate::serve::owner_mismatch(frozen.as_ref(), first.as_ref(), principal, scope)
+        {
+            return Err(ServeError::ScopeRefused(
+                broca_core::ScopeRefusal::OwnerMismatch(Box::new(mismatch)),
+            ));
+        }
+        let mut baseline = facts.baseline;
+        baseline.cache = self
+            .registry
+            .cache_declaration(&facts.first_config)
+            .map(|declaration| declaration.to_wire());
+        Ok(broca_wire::BaselineReply::ready(baseline))
+    }
 }
 
 /// Serves run and send facts from a loaded session kept in the new storage: the module through
