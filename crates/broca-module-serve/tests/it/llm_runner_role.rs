@@ -1304,6 +1304,109 @@ async fn a_session_on_the_new_storage_is_refused_by_name_and_never_gets_a_log() 
 
 /// The tail is the newest page, a range stops at its limit with a cursor, and `after_mid` reads
 /// strictly after the message it names; every page carries the same snapshot identity.
+/// Session reads and controls must establish storage ownership even when they can otherwise
+/// answer from an empty log or refuse before opening one. Keep probing after a wrong answer so
+/// the failure names every operation that bypassed the rollback guard.
+#[tokio::test]
+async fn every_read_and_control_refuses_new_storage_without_a_runtime() {
+    let mut rig = Rig::start("newer-storage-operations").await;
+    let head = broca_wal::session_storage_head(&rig.dir, &broca_core::session_addr(&rig.session));
+    std::fs::create_dir_all(head.parent().unwrap()).unwrap();
+    std::fs::write(&head, b"head").unwrap();
+    let mut gaps = Vec::new();
+    for (method, params) in [
+        ("session.read", serde_json::json!({})),
+        ("session.head", serde_json::json!({})),
+        ("send.status", serde_json::json!({"send_id": "s1"})),
+        ("session.send_status", serde_json::json!({"send_id": "s1"})),
+        ("run.status", serde_json::json!({"run_id": "run-1"})),
+        ("run.result", serde_json::json!({"run_id": "run-1"})),
+        ("session.subscribe", serde_json::json!({})),
+        ("session.history", serde_json::json!({})),
+        ("session.baseline", serde_json::json!({})),
+        ("run.tool_calls", serde_json::json!({"run_id": "run-1"})),
+        ("run.status", serde_json::json!({})),
+        (
+            "run.event.get",
+            serde_json::json!({"event_key": "0".repeat(64)}),
+        ),
+        (
+            "session.output_refs",
+            serde_json::json!({"set_id": "set-1"}),
+        ),
+        (
+            "session.output_ref_read",
+            serde_json::json!({"ref_id": "set-1/r0", "offset": 0, "length": 1}),
+        ),
+        (
+            "session.media_read",
+            serde_json::json!({"sha256": "0".repeat(64), "offset": 0, "length": 1}),
+        ),
+        (
+            "session.upload_begin",
+            serde_json::json!({"mime": "image/png", "bytes": 1, "sha256": "0".repeat(64)}),
+        ),
+        (
+            "session.upload_append",
+            serde_json::json!({"upload_id": "upload-1", "offset": 0, "data": "AA=="}),
+        ),
+        (
+            "session.upload_commit",
+            serde_json::json!({"upload_id": "upload-1"}),
+        ),
+        (
+            "session.upload_status",
+            serde_json::json!({"upload_id": "upload-1"}),
+        ),
+        ("run.cancel", serde_json::json!({"run_id": "run-1"})),
+        (
+            "session.retract",
+            serde_json::json!({"submission_id": "sub-1"}),
+        ),
+        (
+            "session.refresh",
+            serde_json::json!({"plan": [], "policy": "immediately", "generation": 1}),
+        ),
+        (
+            "session.refresh_policy",
+            serde_json::json!({"generation": 1, "policy": "immediately", "send_id": "policy-1"}),
+        ),
+        (
+            "session.flush_prefix",
+            serde_json::json!({"send_id": "flush-1"}),
+        ),
+        ("session.warm", serde_json::json!({})),
+        ("session.move_to_store", serde_json::json!({})),
+        (
+            "session.import",
+            serde_json::json!({"import_id": "import-1", "origin": {"kind": "import", "source_ref": "fixture:guard"},
+                "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]}),
+        ),
+        (
+            "session.import",
+            serde_json::json!({"import_id": "import-file-1", "origin": {"kind": "import", "source_ref": "fixture:guard"},
+                "source": {"harness": "opencode2", "path": "absent.json", "session": "session-1", "sha256": "0".repeat(64)}}),
+        ),
+        ("session.install_view", serde_json::json!({"view": {}})),
+    ] {
+        let frame = call(&mut rig, method, params).await;
+        let body: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
+        if frame.header.ty != FrameType::Error
+            || body["code"] != "wal_newer_writer"
+            || body["detail"]
+                != serde_json::json!({"kind": "newer_writer", "missing": ["session-storage/v1"]})
+        {
+            gaps.push(format!("{method}: {body}"));
+        }
+        assert!(
+            !rig.wal_path.exists(),
+            "{method} created a log beside the new storage's session"
+        );
+    }
+    rig.finish().await;
+    assert!(gaps.is_empty(), "rollback guard bypasses: {gaps:#?}");
+}
+
 #[tokio::test]
 async fn tail_range_and_after_mid_reads() {
     let mut rig = three_turns("modes").await;
