@@ -289,6 +289,108 @@ fn tag_base(conversation: &Conversation, ordinal: u64) -> Option<u64> {
     state.facts.as_ref().map(|facts| facts.tag_base)
 }
 
+fn delivered(call: &str, text: &str) -> Record {
+    Record::ResultAppend(ResultAppend {
+        send_id: None,
+        run_id: "r".into(),
+        tool_call_id: ToolCallId(call.into()),
+        text: text.into(),
+        notice: None,
+        written_at_ms: None,
+        ride: None,
+    })
+}
+
+/// The fold says which placed messages changed since a reader's mark, by the lowest ordinal of
+/// each kind of change: restated facts, text delivered beside a call, and text joined into a
+/// result. Messages placed since the mark aren't changes; a copy of the fold, and an emptied
+/// window, answer every mark with "everything".
+#[test]
+fn the_fold_names_the_lowest_message_changed_since_a_mark() {
+    for appends in [false, true] {
+        let mut conversation = fold(
+            &[
+                input("hi", Placement::RunInput),
+                assistant(&["a"]),
+                reply("a", "one"),
+                assistant(&["b"]),
+                reply("b", "two"),
+            ],
+            appends,
+        )
+        .unwrap();
+        let changes = |conversation: &Conversation, mark| {
+            (
+                conversation.changes.states_since(mark),
+                conversation.changes.messages_since(mark),
+            )
+        };
+        let mark = conversation.changes.mark();
+        assert_eq!(changes(&conversation, mark), (None, None));
+
+        // Facts restated for the third message, then the second: the lowest counts.
+        conversation.apply(&facts(3, 0)).unwrap();
+        conversation.apply(&facts(2, 0)).unwrap();
+        assert_eq!(changes(&conversation, mark), (Some(2), None));
+        let later = conversation.changes.mark();
+        assert_eq!(changes(&conversation, later), (None, None));
+
+        // Text delivered with the newest call: kept beside it, or joined into its result.
+        conversation.apply(&delivered("b", " +note")).unwrap();
+        let expected = if appends {
+            (None, Some(5))
+        } else {
+            (Some(4), None)
+        };
+        assert_eq!(changes(&conversation, later), expected, "joins: {appends}");
+        assert_eq!(changes(&conversation, mark).0, Some(2));
+
+        // Messages placed since a mark aren't changes to it.
+        let placed = conversation.changes.mark();
+        conversation
+            .apply(&input("more", Placement::RunInput))
+            .unwrap();
+        assert_eq!(changes(&conversation, placed), (None, None));
+
+        assert_eq!(
+            changes(&conversation.clone(), placed),
+            (Some(0), Some(0)),
+            "a copy is another fold"
+        );
+        conversation.clear_window();
+        assert_eq!(changes(&conversation, placed), (Some(0), Some(0)));
+    }
+}
+
+/// Past its cap, the record of changes keeps the lowest ordinal changed since every mark it
+/// still answers, or a lower one, never a higher one.
+#[test]
+fn the_record_of_changes_stays_bounded_without_missing_a_change() {
+    let mut conversation = fold(&[input("hi", Placement::RunInput)], false).unwrap();
+    for _ in 0..200 {
+        conversation
+            .apply(&input("more", Placement::Steer))
+            .unwrap();
+    }
+    let first = conversation.changes.mark();
+    let mut marks = Vec::new();
+    for ordinal in 2..=200 {
+        marks.push((ordinal, conversation.changes.mark()));
+        conversation.apply(&facts(ordinal, 0)).unwrap();
+    }
+    assert!(conversation.changes.states.0.len() <= super::RESTATED_CAP);
+    assert_eq!(conversation.changes.states_since(first), Some(2));
+    for (ordinal, mark) in marks {
+        let lowest = conversation.changes.states_since(mark).unwrap();
+        assert!(
+            lowest <= ordinal,
+            "since the mark before {ordinal}: {lowest}"
+        );
+    }
+    let newest = conversation.changes.mark();
+    assert_eq!(conversation.changes.states_since(newest), None);
+}
+
 /// Entry facts attach to the message at their ordinal. A held assistant message's facts wait at
 /// its reserved ordinal and move with it when its last result places it; its tool message, placed
 /// with it, has none of its own. A later record for the same ordinal replaces the first.

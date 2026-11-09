@@ -14,7 +14,7 @@ use broca_session_store::keys::DeploymentKey;
 use broca_session_store::session::Session;
 use serde_json::{json, Value};
 
-use super::PROJECTED;
+use super::{CHECKED, PROJECTED};
 use crate::parts::MemoryParts;
 use crate::run::Seams;
 use crate::writer::Writer;
@@ -200,9 +200,9 @@ async fn compacted_run(
         .unwrap();
 }
 
-/// How many window entries a run of `tool_steps` tool steps and an answer projects, on a session
-/// holding six answered runs.
-async fn projected_by_a_run(tool_steps: usize) -> usize {
+/// How many window entries a run of `tool_steps` tool steps and an answer projects, and how many
+/// kept entries its reads went back over, on a session holding `history` answered runs.
+async fn by_a_run(history: usize, tool_steps: usize) -> (usize, usize) {
     let backend = MemoryBackend::default();
     let mut session = Session::create(
         &backend,
@@ -218,7 +218,7 @@ async fn projected_by_a_run(tool_steps: usize) -> usize {
     .await
     .unwrap();
     let mut parts = MemoryParts::default();
-    for index in 0..6 {
+    for index in 0..history {
         compacted_run(
             &mut session,
             &mut parts,
@@ -231,9 +231,13 @@ async fn projected_by_a_run(tool_steps: usize) -> usize {
         .map(|n| tool_step(&format!("c{n}")))
         .collect();
     steps.push(answer_step("last"));
-    let before = PROJECTED.with(std::cell::Cell::get);
+    let projected = PROJECTED.with(std::cell::Cell::get);
+    let checked = CHECKED.with(std::cell::Cell::get);
     compacted_run(&mut session, &mut parts, "measured", steps).await;
-    PROJECTED.with(std::cell::Cell::get) - before
+    (
+        PROJECTED.with(std::cell::Cell::get) - projected,
+        CHECKED.with(std::cell::Cell::get) - checked,
+    )
 }
 
 /// A run's transcript reads project each window entry once, then only what each step adds: the
@@ -242,11 +246,24 @@ async fn projected_by_a_run(tool_steps: usize) -> usize {
 /// four times over.
 #[tokio::test]
 async fn a_step_projects_only_the_entries_it_added() {
-    let short = projected_by_a_run(1).await;
-    let long = projected_by_a_run(9).await;
+    let (short, _) = by_a_run(6, 1).await;
+    let (long, _) = by_a_run(6, 9).await;
     let per_step = (long - short) as f64 / 8.0;
     assert!(
         per_step <= 6.0,
         "each more step projected {per_step} entries ({short} for 2 steps, {long} for 10)"
+    );
+}
+
+/// A read learns which kept entries changed from the conversation's record of changes, so what
+/// a run's reads go back over doesn't grow with the window. Comparing every kept entry with the
+/// window's at each read would go over the whole window four times a step.
+#[tokio::test]
+async fn a_read_goes_back_only_over_what_changed() {
+    let (_, small) = by_a_run(6, 4).await;
+    let (_, large) = by_a_run(30, 4).await;
+    assert_eq!(
+        large, small,
+        "a run went back over {small} kept entries behind 6 runs, {large} behind 30"
     );
 }

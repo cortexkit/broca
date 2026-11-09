@@ -56,6 +56,11 @@ impl RideEnvelopes {
             .or_default()
             .push(ride);
     }
+
+    /// Forgets the envelopes of every text delivered with the part `part` of message `mid`.
+    pub fn forget(&mut self, mid: &str, part: &str) {
+        self.0.remove(&(mid.to_owned(), part.to_owned()));
+    }
 }
 
 /// Copies a ride's envelope onto the delivered text a compaction part carries, as the ride's

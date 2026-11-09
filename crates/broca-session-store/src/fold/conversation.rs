@@ -236,6 +236,145 @@ state! {
             bound: Bound::Fixed,
         },
     }
+    runtime {
+        /// Which placed window messages changed after they were placed, for a reader that keeps
+        /// what it derived from the window and brings it up to date at each read (see
+        /// [`WindowChanges`]).
+        pub changes: WindowChanges => {
+            owner: "run loop",
+            reset: "a copy, or a read from storage",
+            bound: Bound::Capped(RESTATED_CAP),
+        },
+    }
+}
+
+/// The most restatements [`WindowChanges`] keeps of each kind; past it, the oldest two become
+/// one.
+pub const RESTATED_CAP: usize = 64;
+
+/// Which placed window messages changed after they were placed: a later record restated a
+/// message's entry state (its facts, its turn facts, or the texts delivered with its calls), or
+/// joined delivered text into the message itself. A reader that keeps what it derived from the
+/// window takes a [`ChangeMark`] at each read, and at its next read asks for the lowest ordinal
+/// changed since, rather than comparing every kept message with the window's.
+///
+/// Kept only in memory, for the fold it belongs to: a fold read from storage or copied starts a
+/// new one, which answers a mark taken on another fold with "everything".
+pub struct WindowChanges {
+    /// Tells this fold's changes apart from any other fold's.
+    origin: u64,
+    /// How many changes it recorded.
+    count: u64,
+    states: Restated,
+    messages: Restated,
+}
+
+/// Where a reader of the window last looked (see [`WindowChanges`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChangeMark {
+    origin: u64,
+    count: u64,
+}
+
+/// Restatements of one kind, each as (the change count after it, the ordinal it changed), in
+/// change order. Only those that can still be the lowest ordinal changed since some mark are
+/// kept, so both the counts and the ordinals ascend.
+#[derive(Debug, Clone, Default)]
+struct Restated(Vec<(u64, u64)>);
+
+impl Restated {
+    fn push(&mut self, count: u64, ordinal: u64) {
+        // An earlier change at the same or a later ordinal is never the lowest since any mark
+        // this one is after.
+        while self.0.last().is_some_and(|(_, last)| *last >= ordinal) {
+            self.0.pop();
+        }
+        self.0.push((count, ordinal));
+        if self.0.len() > RESTATED_CAP {
+            // The oldest two become one at the lower ordinal, which a mark between them reads
+            // as an earlier change than it was: more is derived again, never less.
+            let (_, oldest) = self.0.remove(0);
+            self.0[0].1 = oldest;
+        }
+    }
+
+    /// The lowest ordinal changed after the change count `count`.
+    fn since(&self, count: u64) -> Option<u64> {
+        let at = self.0.partition_point(|(changed, _)| *changed <= count);
+        self.0.get(at).map(|(_, ordinal)| *ordinal)
+    }
+}
+
+impl Default for WindowChanges {
+    fn default() -> Self {
+        static ORIGINS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self {
+            origin: ORIGINS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            count: 0,
+            states: Restated::default(),
+            messages: Restated::default(),
+        }
+    }
+}
+
+/// A copy is another fold's: it answers the original's marks with "everything".
+impl Clone for WindowChanges {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl std::fmt::Debug for WindowChanges {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Nothing a fold's content decides: two folds of the same records print alike.
+        f.write_str("WindowChanges")
+    }
+}
+
+impl WindowChanges {
+    /// Where a reader looking now stands.
+    pub fn mark(&self) -> ChangeMark {
+        ChangeMark {
+            origin: self.origin,
+            count: self.count,
+        }
+    }
+
+    /// The lowest ordinal whose entry state a record restated since `mark`, if any. A mark
+    /// taken on another fold reads as everything changed: ordinal 0.
+    pub fn states_since(&self, mark: ChangeMark) -> Option<u64> {
+        self.since(&self.states, mark)
+    }
+
+    /// The lowest ordinal whose message itself changed since `mark` (delivered text joined into
+    /// a tool message), if any. A mark taken on another fold reads as everything changed:
+    /// ordinal 0.
+    pub fn messages_since(&self, mark: ChangeMark) -> Option<u64> {
+        self.since(&self.messages, mark)
+    }
+
+    fn since(&self, restated: &Restated, mark: ChangeMark) -> Option<u64> {
+        if mark.origin != self.origin || mark.count > self.count {
+            return Some(0);
+        }
+        restated.since(mark.count)
+    }
+
+    fn state(&mut self, ordinal: u64) {
+        self.count += 1;
+        self.states.push(self.count, ordinal);
+    }
+
+    fn message(&mut self, ordinal: u64) {
+        self.count += 1;
+        self.messages.push(self.count, ordinal);
+    }
+
+    /// The window was emptied or replaced: every reader derives it again.
+    fn everything(&mut self) {
+        self.state(0);
+        self.message(0);
+    }
 }
 
 /// The most change points [`Conversation::sealed_episodes`] keeps besides the session's first run.
@@ -260,6 +399,7 @@ impl Conversation {
             first_protocol_compaction: false,
             human_prompts: 0,
             joined_through: None,
+            changes: WindowChanges::default(),
         }
     }
 
@@ -312,6 +452,7 @@ impl Conversation {
             first_protocol_compaction: self.first_protocol_compaction,
             human_prompts: self.human_prompts,
             joined_through: self.joined_through,
+            changes: WindowChanges::default(),
         }
     }
 
@@ -321,6 +462,7 @@ impl Conversation {
         self.messages.clear();
         self.entries.clear();
         self.episodes.clear();
+        self.changes.everything();
     }
 
     /// Empties the window for a log that starts at a cut, keeping what of the window's runs still
@@ -337,6 +479,7 @@ impl Conversation {
         self.messages.clear();
         self.entries.clear();
         self.window_repetition = None;
+        self.changes.everything();
         let episodes = std::mem::take(&mut self.episodes);
         // The run in force at the cut: the last one starting before it, unless the next run
         // starts at the cut.
@@ -541,7 +684,14 @@ impl Conversation {
                 // after the session enrolled in the current compaction contract
                 // (`joined_through`).
                 if append.ride.is_none() && self.joins_delivered_text() {
-                    append_to_newest_result(&mut self.messages, &append.tool_call_id, &append.text);
+                    if let Some(at) = append_to_newest_result(
+                        &mut self.messages,
+                        &append.tool_call_id,
+                        &append.text,
+                    ) {
+                        let ordinal = self.window_start() + at as u64;
+                        self.changes.message(ordinal);
+                    }
                 } else {
                     self.attach_delivery(append);
                 }
@@ -554,6 +704,7 @@ impl Conversation {
                         .facts = Some(facts.clone());
                 } else if facts.ordinal >= start && facts.ordinal <= self.placed {
                     self.entries[(facts.ordinal - start) as usize].facts = Some(facts.clone());
+                    self.changes.state(facts.ordinal);
                 } else if facts.ordinal > self.placed {
                     return Err(FoldError::FactsWithoutEntry(facts.ordinal));
                 }
@@ -567,6 +718,7 @@ impl Conversation {
                         Some(turn.clone());
                 } else if turn.ordinal >= start && turn.ordinal <= self.placed {
                     self.entries[(turn.ordinal - start) as usize].turn = Some(turn.clone());
+                    self.changes.state(turn.ordinal);
                 } else if turn.ordinal > self.placed {
                     return Err(FoldError::FactsWithoutEntry(turn.ordinal));
                 }
@@ -594,7 +746,14 @@ impl Conversation {
     /// only ever attached to a result of a batch that already finished, so an unknown call is
     /// one whose message left the window, and the text goes with it.
     fn attach_delivery(&mut self, append: &crate::record::ResultAppend) {
-        for (message, entry) in self.messages.iter().zip(&mut self.entries).rev() {
+        let start = self.window_start();
+        for (at, (message, entry)) in self
+            .messages
+            .iter()
+            .zip(&mut self.entries)
+            .enumerate()
+            .rev()
+        {
             let part = message.content.iter().position(|block| {
                 matches!(block, ContentBlock::ToolCall(call) if call.tool_call_id == append.tool_call_id)
             });
@@ -606,6 +765,7 @@ impl Conversation {
                     send_id: append.send_id.clone(),
                     ride: append.ride.clone(),
                 });
+                self.changes.state(start + at as u64);
                 return;
             }
         }
@@ -618,14 +778,13 @@ mod tests;
 #[cfg(test)]
 mod generate;
 
-/// Appends `text` to the named result in the newest tool message, if it holds that result.
-/// Delivered text is only ever attached to a result of the batch that just finished.
-fn append_to_newest_result(messages: &mut [Message], id: &ToolCallId, text: &str) {
+/// Appends `text` to the named result in the newest tool message, if it holds that result, and
+/// says where that message is in `messages`. Delivered text is only ever attached to a result of
+/// the batch that just finished.
+fn append_to_newest_result(messages: &mut [Message], id: &ToolCallId, text: &str) -> Option<usize> {
     use broca_protocol::content::{ToolOutput, ToolOutputPart};
-    let Some(message) = messages.iter_mut().rev().find(|m| m.role == Role::Tool) else {
-        return;
-    };
-    for block in &mut message.content {
+    let at = messages.iter().rposition(|m| m.role == Role::Tool)?;
+    for block in &mut messages[at].content {
         if let ContentBlock::ToolResult(result) = block {
             if &result.tool_call_id == id {
                 match &mut result.output {
@@ -634,10 +793,11 @@ fn append_to_newest_result(messages: &mut [Message], id: &ToolCallId, text: &str
                     ToolOutput::Parts { parts } => parts.push(ToolOutputPart::Text {
                         text: text.to_owned(),
                     }),
-                    ToolOutput::Json { .. } | ToolOutput::Denied { .. } => {}
+                    ToolOutput::Json { .. } | ToolOutput::Denied { .. } => return None,
                 }
-                return;
+                return Some(at);
             }
         }
     }
+    None
 }
