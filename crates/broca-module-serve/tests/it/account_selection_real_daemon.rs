@@ -1536,6 +1536,26 @@ impl Rig {
         .await
     }
 
+    /// Every request routing received after its first `mark` other than `route.account_for`, as
+    /// `(method, kind)`, once an unexpected report has had as long to arrive as `reports` waits
+    /// for one. A run whose decision holds no routing admission must leave this empty.
+    async fn reported_since(&self, mark: usize) -> Vec<(String, String)> {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        self.routing.requests.lock().unwrap()[mark..]
+            .iter()
+            .filter(|request| request["method"] != "route.account_for")
+            .map(|request| {
+                (
+                    request["method"].as_str().unwrap_or_default().to_string(),
+                    request["params"]["kind"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                )
+            })
+            .collect()
+    }
+
     async fn broca_metrics(&self) -> Value {
         let conn = SubcConnection::connect(&self.connection_file)
             .await
@@ -1740,8 +1760,11 @@ async fn routing_decides_reports_and_never_blocks_admission_through_the_real_dae
         .await;
     assert_eq!(rig.routing.account_for_count(&run_id), 1);
 
-    // 3. A caller pin wins: routing is not asked, the run is still reported.
+    // 3. A caller pin wins: routing is neither asked nor told. broca holds no routing admission
+    // for a pinned run, so its frozen decision carries no admission id and routing gets no
+    // admission_started, attempt or run_finished report for it.
     let client = rig.client("pinned").await;
+    let pinned_mark = rig.routing.requests.lock().unwrap().len();
     let run_id = send(
         &client,
         "send-pinned",
@@ -1758,10 +1781,13 @@ async fn routing_decides_reports_and_never_blocks_admission_through_the_real_dae
     assert_eq!(chosen["credential_id"], "oauth:anthropic:work");
     assert_eq!(
         chosen["account_decision"],
-        json!({ "conversation_key": session_affinity(&frames), "conversation_key_source": "session", "path": "pinned", "admission_id": run_id })
+        json!({ "conversation_key": session_affinity(&frames), "conversation_key_source": "session", "path": "pinned" })
     );
-    rig.reports(&run_id, &["admission_started", "attempt", "run_finished"])
-        .await;
+    let reported = rig.reported_since(pinned_mark).await;
+    assert!(
+        reported.is_empty(),
+        "a pinned run is never reported to routing: {reported:?}"
+    );
     assert_eq!(
         rig.routing.account_for_count(&run_id),
         0,
@@ -1854,9 +1880,11 @@ async fn routing_decides_reports_and_never_blocks_admission_through_the_real_dae
 
     // 5. Routing says every candidate needs a fresh login: the run is admitted on the configured
     // default account and paused for re-authentication; resending the same send_id (the vault
-    // serves that credential) resumes it WITHOUT asking routing a second time.
+    // serves that credential) resumes it WITHOUT asking routing a second time. Routing's refusal
+    // granted no admission, so the decision carries no admission id and the run is not reported.
     rig.routing.set(RoutingMode::AuthRequired);
     let client = rig.client("login").await;
+    let login_mark = rig.routing.requests.lock().unwrap().len();
     let run_id = send(&client, "send-login", None).await;
     let frames = rig
         .wait_for("login", "pause", |record| {
@@ -1865,7 +1893,7 @@ async fn routing_decides_reports_and_never_blocks_admission_through_the_real_dae
         .await;
     assert_eq!(
         selection(&frames)["account_decision"],
-        json!({ "conversation_key": session_affinity(&frames), "conversation_key_source": "session", "path": "auth_required", "admission_id": run_id, "decision_id": "acd-login" })
+        json!({ "conversation_key": session_affinity(&frames), "conversation_key_source": "session", "path": "auth_required", "decision_id": "acd-login" })
     );
     let paused = broca_test_support::wait_until("routing auth pause status", || async {
         let status = client.run_status(&run_id).await.unwrap();
@@ -1898,8 +1926,11 @@ async fn routing_decides_reports_and_never_blocks_admission_through_the_real_dae
     let resumed = send(&client, "send-login", None).await;
     assert_eq!(resumed, run_id);
     rig.finished("login").await;
-    rig.reports(&run_id, &["admission_started", "attempt", "run_finished"])
-        .await;
+    let reported = rig.reported_since(login_mark).await;
+    assert!(
+        reported.is_empty(),
+        "a run admitted on a login refusal is never reported to routing: {reported:?}"
+    );
     assert_eq!(
         rig.routing.account_for_count(&run_id),
         1,
@@ -2299,6 +2330,7 @@ async fn account_selection_disabled_admits_the_send_on_the_static_credential() {
         retry_after_s: None,
     });
     let client = rig.client("selection-disabled").await;
+    let mark = rig.routing.requests.lock().unwrap().len();
     let run_id = send(&client, "send-selection-disabled", None).await;
     let frames = rig.finished("selection-disabled").await;
     let chosen = selection(&frames);
@@ -2309,11 +2341,16 @@ async fn account_selection_disabled_admits_the_send_on_the_static_credential() {
             "conversation_key": session_affinity(&frames),
             "conversation_key_source": "session",
             "path": "disabled",
-            "admission_id": run_id,
             "decision_id": "acd-refused",
         })
     );
     assert_eq!(rig.routing.account_for_count(&run_id), 1);
+    // Routing's refusal granted no admission, so broca reports nothing about the run.
+    let reported = rig.reported_since(mark).await;
+    assert!(
+        reported.is_empty(),
+        "a run admitted with selection disabled is never reported to routing: {reported:?}"
+    );
     assert_eq!(
         rig.vault.scoped_reads().last().map(String::as_str),
         Some("oauth:anthropic")
