@@ -61,6 +61,15 @@ impl RideEnvelopes {
     pub fn forget(&mut self, mid: &str, part: &str) {
         self.0.remove(&(mid.to_owned(), part.to_owned()));
     }
+
+    /// The envelopes of the texts delivered with the part `part` of message `mid`, in order.
+    pub fn of_part(
+        &self,
+        mid: &str,
+        part: &str,
+    ) -> Option<&Vec<Option<broca_wal::record::RideMetadata>>> {
+        self.0.get(&(mid.to_owned(), part.to_owned()))
+    }
 }
 
 /// Copies a ride's envelope onto the delivered text a compaction part carries, as the ride's

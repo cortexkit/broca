@@ -1691,8 +1691,10 @@ where
     // the window during the run.
     let contract = admission.compaction_plan_version.is_some();
     let mut tag_rules_read = false;
-    // A compacted run's stored prompt, kept between its steps (see `compaction::prompt`).
+    // A compacted run's stored prompt, kept between its steps (see `compaction::prompt`), and
+    // what its renders rendered of each entry, which the next reuses where unchanged.
     let mut kept_prompt = crate::compaction::prompt::KeptPrompt::default();
+    let rendered = broca_core::compaction_v2::render::RenderCache::default();
     let tools = Arc::new(admission.tools.clone());
     let manifest = ToolManifest::from_tools(admission.tools.clone());
     // As today's loop asks once per run: a provider whose media renderer tags its own copy of
@@ -2030,6 +2032,7 @@ where
                 step_id,
                 opts,
                 &mut kept_prompt,
+                &rendered,
             )
             .await?
             {

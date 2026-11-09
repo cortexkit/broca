@@ -6412,6 +6412,7 @@ where
                     chain_reset: chained && provider.prepare_chain_reset(),
                     now,
                     next_mid: &next_mid,
+                    render: None,
                 },
                 |image| crate::compaction_v2::host::image(writer, image),
                 |prompt| {

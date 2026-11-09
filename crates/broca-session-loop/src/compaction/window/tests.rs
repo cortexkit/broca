@@ -16,6 +16,7 @@ use serde_json::{json, Value};
 
 use super::{CHECKED, PROJECTED};
 use crate::compaction::prompt::TAKEN;
+use crate::compaction::RENDERED;
 use crate::parts::MemoryParts;
 use crate::run::Seams;
 use crate::writer::Writer;
@@ -209,6 +210,8 @@ struct Counts {
     checked: usize,
     /// Window messages copied into a stored prompt.
     taken: usize,
+    /// Entries the requests' renders rendered rather than reused.
+    rendered: usize,
 }
 
 /// What a run of `tool_steps` tool steps and an answer does (see [`Counts`]) on a session
@@ -245,11 +248,13 @@ async fn by_a_run(history: usize, tool_steps: usize) -> Counts {
     let projected = PROJECTED.with(std::cell::Cell::get);
     let checked = CHECKED.with(std::cell::Cell::get);
     let taken = TAKEN.with(std::cell::Cell::get);
+    let rendered = RENDERED.with(std::cell::Cell::get);
     compacted_run(&mut session, &mut parts, "measured", steps).await;
     Counts {
         projected: PROJECTED.with(std::cell::Cell::get) - projected,
         checked: CHECKED.with(std::cell::Cell::get) - checked,
         taken: TAKEN.with(std::cell::Cell::get) - taken,
+        rendered: RENDERED.with(std::cell::Cell::get) - rendered,
     }
 }
 
@@ -292,5 +297,19 @@ async fn a_step_takes_into_its_stored_prompt_only_the_messages_it_added() {
     assert_eq!(
         large, small,
         "8 more steps copied {small} more messages behind 6 runs, {large} behind 30"
+    );
+}
+
+/// A compacted run's requests render only the entries that changed since its last request,
+/// and reuse what they rendered of the rest, so what each more step renders doesn't grow with
+/// the window.
+#[tokio::test]
+async fn a_request_renders_only_the_entries_that_changed() {
+    let extra = |short: Counts, long: Counts| long.rendered - short.rendered;
+    let small = extra(by_a_run(6, 1).await, by_a_run(6, 9).await);
+    let large = extra(by_a_run(30, 1).await, by_a_run(30, 9).await);
+    assert_eq!(
+        large, small,
+        "8 more steps rendered {small} more entries behind 6 runs, {large} behind 30"
     );
 }

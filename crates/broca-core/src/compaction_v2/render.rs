@@ -82,7 +82,7 @@ pub fn prompt_with_rides(
     let edits = render::edits_for_transcript(entries, edits);
     let plan = render::plan(entries, &edits)
         .map_err(|error| format!("compaction render plan refused: {error:?}"))?;
-    render_planned(stored, entries, rides, &edits, plan, image)
+    render_planned(stored, entries, rides, &edits, plan, image, None)
 }
 
 /// Plan the complete applied view, including permission to strip newer signatures.
@@ -96,8 +96,25 @@ pub fn prompt_view_with_rides(
     rules: &ProviderRules,
     image: impl FnMut(&InsertedImage) -> Result<MediaRef, String>,
 ) -> Result<Vec<Message>, String> {
+    prompt_view_kept(stored, entries, rides, view, rules, image, None)
+}
+
+/// [`prompt_view_with_rides`], reusing what `kept` holds of the entries an earlier render
+/// rendered, and keeping what this one renders for the next (see [`RenderCache`]).
+pub fn prompt_view_kept(
+    stored: &[Message],
+    entries: &[Entry],
+    rides: &super::entries::RideEnvelopes,
+    view: Option<&View>,
+    rules: &ProviderRules,
+    image: impl FnMut(&InsertedImage) -> Result<MediaRef, String>,
+    kept: Option<&RenderCache>,
+) -> Result<Vec<Message>, String> {
     let Some(view) = view else {
-        return prompt_with_rides(stored, entries, rides, &[], image);
+        let edits = render::edits_for_transcript(entries, &[]);
+        let plan = render::plan(entries, &edits)
+            .map_err(|error| format!("compaction render plan refused: {error:?}"))?;
+        return render_planned(stored, entries, rides, &edits, plan, image, kept);
     };
     if !view.verify() {
         return Err("compaction render plan refused: BadChecksum".into());
@@ -110,7 +127,71 @@ pub fn prompt_view_with_rides(
     );
     let plan = render::plan_view(entries, &filtered, rules)
         .map_err(|error| format!("compaction render plan refused: {error:?}"))?;
-    render_planned(stored, entries, rides, &filtered.edits, plan, image)
+    render_planned(stored, entries, rides, &filtered.edits, plan, image, kept)
+}
+
+/// What a run's renders keep of each transcript entry they rendered: the entry's rendered
+/// message and tool results, with everything they were rendered from. The next render reuses
+/// an entry's whose inputs are unchanged (the entry by ordinal, id and digest, the parts the
+/// plan keeps of it, its stored message and the tool message after it, and its rides'
+/// envelopes) rather than rendering it again, and keeps only the entries it rendered. Debug
+/// builds render every reused entry again and compare.
+#[derive(Default)]
+pub struct RenderCache {
+    kept: std::sync::Mutex<HashMap<u64, RenderedEntry>>,
+    rendered: std::sync::atomic::AtomicU64,
+}
+
+impl RenderCache {
+    /// How many entries renders through this cache rendered rather than reused.
+    pub fn rendered(&self) -> u64 {
+        self.rendered.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// One entry as a render left it (see [`RenderCache`]).
+struct RenderedEntry {
+    mid: String,
+    digest: String,
+    parts: Vec<PlanPart>,
+    original: Message,
+    next: Option<Message>,
+    rides: Vec<Option<Vec<Option<broca_wal::record::RideMetadata>>>>,
+    message: Message,
+    results: Vec<(usize, ContentBlock)>,
+}
+
+/// The inputs entry `position` renders from beyond itself: the tool message after its stored
+/// message, and the ride envelopes of each of its parts.
+#[allow(clippy::type_complexity)]
+fn entry_inputs<'a>(
+    stored: &'a [Message],
+    entry: &Entry,
+    rides: &'a super::entries::RideEnvelopes,
+    position: usize,
+) -> (
+    Option<&'a Message>,
+    Vec<Option<&'a Vec<Option<broca_wal::record::RideMetadata>>>>,
+) {
+    let next = stored
+        .get(position + 1)
+        .filter(|next| next.role == HostRole::Tool);
+    let rides = entry
+        .parts
+        .iter()
+        .map(|part| rides.of_part(&entry.mid, &part.id))
+        .collect();
+    (next, rides)
+}
+
+/// The position of the entry with ordinal `ordinal` and id `mid` in `entries`, which come in
+/// ordinal order; by its id alone, the last entry with it, should they not.
+fn position_of(entries: &[Entry], ordinal: u64, mid: &str) -> Option<usize> {
+    entries
+        .binary_search_by_key(&ordinal, |entry| entry.ordinal)
+        .ok()
+        .filter(|at| entries[*at].mid == mid)
+        .or_else(|| entries.iter().rposition(|entry| entry.mid == mid))
 }
 
 fn render_planned(
@@ -120,15 +201,36 @@ fn render_planned(
     edits: &[Edit],
     plan: render::RenderPlan,
     mut image: impl FnMut(&InsertedImage) -> Result<MediaRef, String>,
+    kept: Option<&RenderCache>,
 ) -> Result<Vec<Message>, String> {
     if stored.len() != entries.len() {
         return Err("compaction transcript projection does not match native message count".into());
     }
-    let positions: HashMap<_, _> = entries
-        .iter()
-        .enumerate()
-        .map(|(index, entry)| (entry.mid.as_str(), index))
-        .collect();
+    // Where each message an insert is anchored before sits: found through the plan's own item
+    // for it, by ordinal, rather than by indexing every entry.
+    let mut anchors: HashMap<&str, usize> = HashMap::new();
+    for edit in edits {
+        if let EditOp::Insert {
+            at: InsertAt::Before(before),
+            ..
+        } = &edit.op
+        {
+            let ordinal = plan.items.iter().find_map(|item| match item {
+                PlanItem::Entry { ordinal, mid, .. } if mid == before => Some(*ordinal),
+                _ => None,
+            });
+            let position = match ordinal {
+                Some(ordinal) => position_of(entries, ordinal, before),
+                None => entries.iter().rposition(|entry| &entry.mid == before),
+            };
+            if let Some(position) = position {
+                anchors.insert(before.as_str(), position);
+            }
+        }
+    }
+    let mut previous =
+        kept.map(|kept| std::mem::take(&mut *kept.kept.lock().expect("render cache")));
+    let mut kept_now = HashMap::new();
     let mut result_blocks: HashMap<usize, Vec<(usize, ContentBlock)>> = HashMap::new();
     let mut output = Vec::new();
     for (order, item) in plan.items.into_iter().enumerate() {
@@ -144,7 +246,7 @@ fn render_planned(
                     .find_map(|edit| match &edit.op {
                         EditOp::Insert { at, message } if message.id == id => Some(match at {
                             InsertAt::Start => 0,
-                            InsertAt::Before(before) => positions[before.as_str()],
+                            InsertAt::Before(before) => anchors[before.as_str()],
                             _ => unreachable!("render plan checked insert anchor"),
                         }),
                         _ => None,
@@ -167,133 +269,81 @@ fn render_planned(
                 message.turn_system = message.role == HostRole::System;
                 output.push((position, 0, order, message));
             }
-            PlanItem::Entry { mid, parts, .. } => {
-                let position = positions[mid.as_str()];
-                let original = &stored[position];
+            PlanItem::Entry {
+                ordinal,
+                mid,
+                parts,
+            } => {
+                let position = position_of(entries, ordinal, &mid)
+                    .ok_or("compaction render plan names an entry the transcript doesn't hold")?;
                 let entry = &entries[position];
-                let mut result_queues: HashMap<&str, VecDeque<usize>> = HashMap::new();
-                if let Some(next) = stored
-                    .get(position + 1)
-                    .filter(|next| next.role == HostRole::Tool)
-                {
-                    for (index, block) in next.content.iter().enumerate() {
-                        if let ContentBlock::ToolResult(result) = block {
-                            result_queues
-                                .entry(&result.tool_call_id.0)
-                                .or_default()
-                                .push_back(index);
-                        }
+                let (next, entry_rides) = entry_inputs(stored, entry, rides, position);
+                let reused = previous
+                    .as_mut()
+                    .and_then(|previous| previous.remove(&ordinal))
+                    .filter(|was| {
+                        was.mid == entry.mid
+                            && was.digest == entry.digest
+                            && was.parts == parts
+                            && was.original == stored[position]
+                            && was.next.as_ref() == next
+                            && was.rides.len() == entry_rides.len()
+                            && was
+                                .rides
+                                .iter()
+                                .zip(&entry_rides)
+                                .all(|(was, now)| was.as_ref() == *now)
+                    });
+                let (message, results) = match reused {
+                    Some(was) => {
+                        #[cfg(debug_assertions)]
+                        assert!(
+                            render_entry(stored, entries, rides, position, &mid, &parts)?
+                                == (was.message.clone(), was.results.clone()),
+                            "a kept rendered entry differs from the entry rendered again"
+                        );
+                        (was.message, was.results)
                     }
-                }
-                let mut result_positions = HashMap::new();
-                for (index, block) in original.content.iter().enumerate() {
-                    if let ContentBlock::ToolCall(call) = block {
-                        if let Some(result) = result_queues
-                            .get_mut(call.tool_call_id.0.as_str())
-                            .and_then(VecDeque::pop_front)
-                        {
-                            result_positions.insert(index, result);
+                    None => {
+                        if let Some(kept) = kept {
+                            kept.rendered
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
+                        render_entry(stored, entries, rides, position, &mid, &parts)?
                     }
+                };
+                if !results.is_empty() {
+                    result_blocks
+                        .entry(position + 1)
+                        .or_default()
+                        .extend(results.iter().cloned());
                 }
-                let mut message = original.clone();
-                message.ordinal = Some(entry.ordinal - 1);
-                message.tags = Default::default();
-                message.content.clear();
-                let mut kept_indices = Vec::new();
-                let mut kept = HashMap::new();
-                for part in parts {
-                    let index = part
-                        .id
-                        .parse::<usize>()
-                        .map_err(|_| "compaction part id is not a native block index")?;
-                    let source = original
-                        .content
-                        .get(index)
-                        .ok_or("compaction part id exceeds native block count")?;
-                    let neutral = entry
-                        .parts
-                        .iter()
-                        .find(|candidate| candidate.id == part.id)
-                        .ok_or("compaction part missing from projection")?;
-                    let mut block = source.clone();
-                    match (&mut block, &neutral.body) {
-                        (
-                            ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. },
-                            PartBody::Text { text: clean_text },
-                        ) => {
-                            let replaced = part.replace.iter().find(|field| field.field == "text");
-                            if let Some(replaced) = replaced {
-                                block = ContentBlock::Text {
-                                    text: replaced.value.as_str().expect("checked text").into(),
-                                };
-                            } else if part.prefix {
-                                *text = numbered_reply(
-                                    text,
-                                    clean_text,
-                                    part.tag.expect("numbered text has a tag"),
-                                    original.role == HostRole::Assistant,
-                                );
-                            } else {
-                                *text = clean_text.clone();
-                            }
-                        }
-                        (ContentBlock::ToolCall(call), PartBody::Tool(tool)) => {
-                            for field in &part.replace {
-                                if let Some(key) = field.field.strip_prefix("input.") {
-                                    call.input[key] = field.value.clone();
-                                }
-                            }
-                            if let Some(&result_index) = result_positions.get(&index) {
-                                let result_position = position + 1;
-                                let ContentBlock::ToolResult(mut result) =
-                                    stored[result_position].content[result_index].clone()
-                                else {
-                                    unreachable!()
-                                };
-                                render_result(&mut result.output, tool, &part, &mid, rides);
-                                if matches!(tool.status, ToolStatus::Error | ToolStatus::Denied) {
-                                    result.is_error = true;
-                                }
-                                result_blocks
-                                    .entry(result_position)
-                                    .or_default()
-                                    .push((result_index, ContentBlock::ToolResult(result)));
-                            }
-                        }
-                        (ContentBlock::Media(_), PartBody::File(_)) => {
-                            if let Some(field) =
-                                part.replace.iter().find(|field| field.field == "text")
-                            {
-                                block = ContentBlock::Text {
-                                    text: field
-                                        .value
-                                        .as_str()
-                                        .expect("checked file replacement")
-                                        .into(),
-                                };
-                            }
-                        }
-                        _ => {}
-                    }
-                    kept.insert(index, block);
+                if kept.is_some() {
+                    output.push((position, 1, order, message.clone()));
+                    kept_now.insert(
+                        ordinal,
+                        RenderedEntry {
+                            mid,
+                            digest: entry.digest.clone(),
+                            parts,
+                            original: stored[position].clone(),
+                            next: next.cloned(),
+                            rides: entry_rides
+                                .into_iter()
+                                .map(|rides| rides.cloned())
+                                .collect(),
+                            message,
+                            results,
+                        },
+                    );
+                } else {
+                    output.push((position, 1, order, message));
                 }
-                for (index, source) in original.content.iter().enumerate() {
-                    if let Some(block) = kept.remove(&index) {
-                        kept_indices.push(index);
-                        message.content.push(block);
-                    } else if matches!(source, ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } if text.is_empty())
-                    {
-                        // Empty native separators have no neutral part or number, but can
-                        // carry provider state between the kept signed blocks of a row.
-                        kept_indices.push(index);
-                        message.content.push(source.clone());
-                    }
-                }
-                message.cache_prefix_blocks = remap_cache_prefix(original, &kept_indices);
-                output.push((position, 1, order, message));
             }
         }
+    }
+    if let Some(kept) = kept {
+        *kept.kept.lock().expect("render cache") = kept_now;
     }
     for (position, mut blocks) in result_blocks {
         blocks.sort_by_key(|(index, _)| *index);
@@ -312,6 +362,139 @@ fn render_planned(
         .into_iter()
         .map(|(_, _, _, message)| message)
         .collect())
+}
+
+/// Entry `position`'s message as the plan keeps it, with the parts `parts`, and the blocks of
+/// the tool message after it that answer its kept calls, each with its index in that message.
+#[allow(clippy::type_complexity)]
+fn render_entry(
+    stored: &[Message],
+    entries: &[Entry],
+    rides: &super::entries::RideEnvelopes,
+    position: usize,
+    mid: &str,
+    parts: &[PlanPart],
+) -> Result<(Message, Vec<(usize, ContentBlock)>), String> {
+    let mut results = Vec::new();
+    let original = &stored[position];
+    let entry = &entries[position];
+    let mut result_queues: HashMap<&str, VecDeque<usize>> = HashMap::new();
+    if let Some(next) = stored
+        .get(position + 1)
+        .filter(|next| next.role == HostRole::Tool)
+    {
+        for (index, block) in next.content.iter().enumerate() {
+            if let ContentBlock::ToolResult(result) = block {
+                result_queues
+                    .entry(&result.tool_call_id.0)
+                    .or_default()
+                    .push_back(index);
+            }
+        }
+    }
+    let mut result_positions = HashMap::new();
+    for (index, block) in original.content.iter().enumerate() {
+        if let ContentBlock::ToolCall(call) = block {
+            if let Some(result) = result_queues
+                .get_mut(call.tool_call_id.0.as_str())
+                .and_then(VecDeque::pop_front)
+            {
+                result_positions.insert(index, result);
+            }
+        }
+    }
+    let mut message = original.clone();
+    message.ordinal = Some(entry.ordinal - 1);
+    message.tags = Default::default();
+    message.content.clear();
+    let mut kept_indices = Vec::new();
+    let mut kept = HashMap::new();
+    for part in parts.iter().cloned() {
+        let index = part
+            .id
+            .parse::<usize>()
+            .map_err(|_| "compaction part id is not a native block index")?;
+        let source = original
+            .content
+            .get(index)
+            .ok_or("compaction part id exceeds native block count")?;
+        let neutral = entry
+            .parts
+            .iter()
+            .find(|candidate| candidate.id == part.id)
+            .ok_or("compaction part missing from projection")?;
+        let mut block = source.clone();
+        match (&mut block, &neutral.body) {
+            (
+                ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. },
+                PartBody::Text { text: clean_text },
+            ) => {
+                let replaced = part.replace.iter().find(|field| field.field == "text");
+                if let Some(replaced) = replaced {
+                    block = ContentBlock::Text {
+                        text: replaced.value.as_str().expect("checked text").into(),
+                    };
+                } else if part.prefix {
+                    *text = numbered_reply(
+                        text,
+                        clean_text,
+                        part.tag.expect("numbered text has a tag"),
+                        original.role == HostRole::Assistant,
+                    );
+                } else {
+                    *text = clean_text.clone();
+                }
+            }
+            (ContentBlock::ToolCall(call), PartBody::Tool(tool)) => {
+                for field in &part.replace {
+                    if let Some(key) = field.field.strip_prefix("input.") {
+                        call.input[key] = field.value.clone();
+                    }
+                }
+                if let Some(&result_index) = result_positions.get(&index) {
+                    let result_position = position + 1;
+                    let ContentBlock::ToolResult(mut result) =
+                        stored[result_position].content[result_index].clone()
+                    else {
+                        unreachable!()
+                    };
+                    render_result(&mut result.output, tool, &part, mid, rides);
+                    if matches!(tool.status, ToolStatus::Error | ToolStatus::Denied) {
+                        result.is_error = true;
+                    }
+                    debug_assert_eq!(result_position, position + 1);
+                    results.push((result_index, ContentBlock::ToolResult(result)));
+                }
+            }
+            (ContentBlock::Media(_), PartBody::File(_)) => {
+                if let Some(field) = part.replace.iter().find(|field| field.field == "text") {
+                    block = ContentBlock::Text {
+                        text: field
+                            .value
+                            .as_str()
+                            .expect("checked file replacement")
+                            .into(),
+                    };
+                }
+            }
+            _ => {}
+        }
+        kept.insert(index, block);
+    }
+    for (index, source) in original.content.iter().enumerate() {
+        if let Some(block) = kept.remove(&index) {
+            kept_indices.push(index);
+            message.content.push(block);
+        } else if matches!(source, ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } if text.is_empty())
+        {
+            // Empty native separators have no neutral part or number, but can
+            // carry provider state between the kept signed blocks of a row.
+            kept_indices.push(index);
+            message.content.push(source.clone());
+        }
+    }
+    message.cache_prefix_blocks = remap_cache_prefix(original, &kept_indices);
+    Ok((message, results))
 }
 
 /// Keep episode boundaries in native coordinates while translating explicit
