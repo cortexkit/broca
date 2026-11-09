@@ -1256,7 +1256,9 @@ fn project_control_record<S: ControlProjectionSink>(
                             .with_text(text);
                             notice.speaks_for =
                                 ride.as_ref().and_then(|ride| ride.speaks_for.clone());
-                            notice.delivered_as = Some("tool_result".into());
+                            // Leave delivered_as out: an absent member means tool_result, and
+                            // the live event carries it only for another form. Opted-in reads
+                            // still serve each notice with delivered_as "tool_result".
                             LiveEvent::NoticeDelivered(notice)
                         })
                         .unwrap_or(LiveEvent::DisplayReset)

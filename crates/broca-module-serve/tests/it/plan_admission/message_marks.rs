@@ -529,7 +529,8 @@ async fn marks_follow_steered_queued_and_riding_sends_into_reader_facts() {
                 let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.cortexkit/internal-docs/runner-0821-samples/notice-delivered.after.json");
                 std::fs::write(path, serde_json::to_vec(event).unwrap()).unwrap();
             }
-            assert_eq!(event.delivered_as.as_deref(), Some("tool_result"));
+            // llm-runner contract 9.7.2: notice_delivered omits delivered_as for tool_result.
+            assert_eq!(event.delivered_as, None);
             assert_eq!(
                 serde_json::to_value(&event.speaks_for).unwrap(),
                 marks["speaks_for"]
