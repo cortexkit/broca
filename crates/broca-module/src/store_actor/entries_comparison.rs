@@ -72,12 +72,14 @@ impl broca_core::CompactionPlane for ReadyProvider {
 /// One executor for both storages, as the module's is: today's loop for a session on today's
 /// storage, the new loop for one in the new storage, over one scripted provider script each.
 /// With `compaction`, both have a ready compaction provider, and a run whose plan names one
-/// starts under the current compaction contract with a context limit.
+/// starts under the current compaction contract with a context limit. With `hooks`, both have a
+/// `pre_user` provider.
 struct Loops {
     today: Gated,
     wal: Arc<FileWalStore>,
     store: Gated,
     compaction: Option<Arc<ReadyProvider>>,
+    hooks: Option<Arc<dyn broca_core::HookPlane>>,
 }
 
 impl Loops {
@@ -91,6 +93,10 @@ impl Loops {
 
 #[async_trait]
 impl RunExecutor for Loops {
+    fn hook_plane(&self) -> Option<Arc<dyn broca_core::HookPlane>> {
+        self.hooks.clone()
+    }
+
     fn compaction_plane(&self) -> Option<Arc<dyn broca_core::CompactionPlane>> {
         self.compaction
             .clone()
@@ -156,7 +162,8 @@ impl RunExecutor for Loops {
                 stop: Default::default(),
                 held: None,
                 approval: &AllowAll,
-                hook_plane: None,
+                // As the module's store executor hands the run the plane its control names.
+                hook_plane: control.hook_plane.clone(),
                 now_ms: &now,
                 session_address: None,
                 compaction_plane: control.compaction_plane.as_deref(),
@@ -249,12 +256,69 @@ async fn side_in(
     idle: Duration,
     deployment: broca_session_store::keys::DeploymentKey,
 ) -> Side {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static N: AtomicU64 = AtomicU64::new(0);
+    let build = Build {
+        runtime: true,
+        new_sessions: store,
+        gated,
+        compaction,
+        hooks: false,
+        idle,
+    };
+    side_with(build, steps, deployment).await
+}
+
+/// How a side's module is built.
+struct Build {
+    /// Whether the module's opener serves the new storage.
+    runtime: bool,
+    /// Whether the registry starts every session it can in the new storage, not only heads.
+    new_sessions: bool,
+    /// Whether every model step waits for the side's gate.
+    gated: bool,
+    /// Whether the executor offers a ready compaction provider.
+    compaction: bool,
+    /// Whether the executor offers a `pre_user` provider that passes every message unchanged.
+    hooks: bool,
+    /// How long a session waits idle before its actor closes.
+    idle: Duration,
+}
+
+/// A `pre_user` provider that passes every message it is asked about unchanged.
+struct Passes;
+
+#[async_trait]
+impl broca_core::HookPlane for Passes {
+    async fn hook(
+        &self,
+        _: &str,
+        _: &BindIdentity,
+        _: Option<&broca_protocol::SessionScope>,
+        _: broca_core::hooks::HookCall,
+    ) -> Result<broca_core::hooks::HookAnswer, broca_core::HookUnavailable> {
+        Ok(broca_core::hooks::HookAnswer::Pass)
+    }
+}
+
+/// A side built as `build` says, over the scripted provider `steps`, whose new storage creates
+/// sessions under `deployment`.
+async fn side_with(
+    build: Build,
+    steps: Vec<Vec<NormalizedEvent>>,
+    deployment: broca_session_store::keys::DeploymentKey,
+) -> Side {
+    let Build {
+        runtime,
+        new_sessions,
+        gated,
+        compaction,
+        hooks,
+        idle,
+    } = build;
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let dir = broca_test_support::scratch_root().join(format!(
         "store-entries-{}-{}",
         std::process::id(),
-        N.fetch_add(1, Ordering::SeqCst)
+        N.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
     ));
     let _ = std::fs::remove_dir_all(&dir);
     let gate = gated.then(|| Arc::new(Notify::new()));
@@ -270,25 +334,22 @@ async fn side_in(
         wal: Arc::clone(&wal),
         store: scripted(),
         compaction: compaction.then(|| Arc::new(ReadyProvider)),
+        hooks: hooks.then(|| Arc::new(Passes) as Arc<dyn broca_core::HookPlane>),
     });
-    let runtime =
-        crate::store_open::StoreRuntime::open(&dir, deployment, Arc::clone(&executor), idle)
+    let mut opener = crate::opener::DefaultOpener::new(
+        Arc::new(FileLeaseStore::new(dir.join("leases"))),
+        wal.clone(),
+        Arc::clone(&executor),
+    )
+    .with_idle_ttl(idle);
+    if runtime {
+        let runtime = crate::store_open::StoreRuntime::open(&dir, deployment, executor, idle)
             .await
             .unwrap();
-    let registry = LineageRegistry::new_with_reader(
-        Arc::new(
-            crate::opener::DefaultOpener::new(
-                Arc::new(FileLeaseStore::new(dir.join("leases"))),
-                wal.clone(),
-                executor,
-            )
-            .with_idle_ttl(idle)
-            .with_store_runtime(Arc::new(runtime)),
-        ),
-        wal,
-        None,
-    );
-    let registry = if store {
+        opener = opener.with_store_runtime(Arc::new(runtime));
+    }
+    let registry = LineageRegistry::new_with_reader(Arc::new(opener), wal, None);
+    let registry = if new_sessions {
         registry.with_store_new_sessions()
     } else {
         registry
@@ -312,6 +373,17 @@ impl Side {
         request: SubmissionRequest,
         plan: Option<crate::actor::SendPlan>,
     ) -> SendOutcome {
+        self.send_labelled(run_id, request, plan, None).await
+    }
+
+    /// [`Side::send_request`], naming the session label `class` when one is given.
+    async fn send_labelled(
+        &self,
+        run_id: &str,
+        request: SubmissionRequest,
+        plan: Option<crate::actor::SendPlan>,
+        class: Option<&str>,
+    ) -> SendOutcome {
         self.registry
             .route_submission_with_order(
                 &self.key,
@@ -325,7 +397,7 @@ impl Side {
                 None,
                 None,
                 None,
-                None,
+                class.map(str::to_owned),
                 false,
                 None,
             )
@@ -370,6 +442,7 @@ impl Side {
     /// gated model step through meanwhile.
     async fn settled(&self, run_id: &str) {
         use crate::serve::{ServeHandler, SessionReadRequest};
+        let mut last = None;
         for _ in 0..2000 {
             if let Some(gate) = &self.gate {
                 gate.notify_one();
@@ -384,9 +457,10 @@ impl Side {
             {
                 return;
             }
+            last = Some(read.lineage_state);
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        panic!("run {run_id} never settled");
+        panic!("run {run_id} never settled: {last:?}");
     }
 
     async fn history(&self, request: Value) -> Result<Value, crate::history::HistoryError> {
@@ -1723,6 +1797,382 @@ async fn an_idle_apply_view_reaches_the_next_runs_first_step_as_today() {
         })
         .collect();
     assert_eq!(applied, [1], "r3's first step applied the view");
+}
+
+/// One of core's sends to a new head, as core serializes it for transport: its `session.send`
+/// params. Core's runner-head sample (prefrontal-core's
+/// `write_broca_head_first_send_sample`, at core commit 83d9e536) gave them, with synthetic
+/// names: the creating send, carrying the head's fetch plan and `session_class: "head"`, and the
+/// next send, carrying neither. Core retries the creating send byte for byte. The creating send
+/// here leaves out the sample's `plan.cache`: core adds it only for a runner whose describe
+/// declares `cache_policy`, which broca's doesn't.
+fn core_head_send(name: &str) -> Value {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/core-head-send")
+        .join(name);
+    let body: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(body["method"], "session.send");
+    body["params"].clone()
+}
+
+/// The request the serve layer hands the registry for core's send `params` on core's head
+/// route, which broca's wire decoder must take: the prompt as the user's message, marked a
+/// notice, sent by core over its head scope. A send creating the session runs the model its
+/// plan selects; a later one names none, and inherits the session's.
+fn core_head_request(params: &Value, creating: bool) -> SubmissionRequest {
+    let decoded: broca_wire::SendParams =
+        serde_json::from_value(params.clone()).expect("broca decodes core's send");
+    let model = if creating {
+        let model = &params["plan"]["model"];
+        json!({"provider_module_id": model["provider"], "model_id": model["model"]})
+    } else {
+        json!({"provider_module_id": "", "model_id": ""})
+    };
+    let mut sent: SubmissionRequest = serde_json::from_value(json!({
+        "model": model,
+        "input": [{"role": "user", "content": [{"type": "text", "text": decoded.prompt}]}],
+    }))
+    .unwrap();
+    if creating {
+        sent.variant = params["plan"]["model"]["variant"]
+            .as_str()
+            .map(str::to_owned);
+    }
+    sent.inherit_frozen = [broca_protocol::request::InheritedParam::Model].into();
+    sent.message_marks = [("notice".to_owned(), params["notice"].clone())]
+        .into_iter()
+        .collect();
+    let core = broca_protocol::BindPrincipal::Reserved {
+        module_id: "prefrontal-core".into(),
+    };
+    sent.principal = Some(core.clone());
+    // The head stamp core's sample route carries.
+    sent.scope = broca_protocol::SendScope::Stamped(broca_protocol::BindScope {
+        scope: broca_protocol::SessionScope {
+            owner: core,
+            agent_id_frozen: false,
+            scope_ref: "d6f57d11448da25d6bba5edb0d2fd941".into(),
+            scope_epoch: 1,
+            flow_id: None,
+            sender: None,
+            agent_id: None,
+            run_id: None,
+        },
+        owner_authorized: true,
+        kind: broca_protocol::ScopeKind::Head,
+        parent: None,
+        parent_state: None,
+    });
+    sent
+}
+
+/// What admitting core's creating send fetches, as broca's plan admission freezes it: the plan
+/// as sent, which broca's plan reader must take, under its identity, with stand-in tools and
+/// system text in place of what the plan's providers would answer, and the `pre_user`
+/// subscription Magic Context declares for its head transform.
+fn core_head_plan(params: &Value) -> crate::actor::SendPlan {
+    let plan = &params["plan"];
+    let parsed = broca_fetch_plan::parse_plan_with(
+        plan,
+        broca_fetch_plan::CompactionSupport::Supported,
+        broca_fetch_plan::OutputRefsSupport::Unsupported,
+    )
+    .expect("broca's plan reader takes core's plan");
+    let subscriptions = plan["step_transform_items"][0]["subscriptions"].clone();
+    let manifest = broca_wal::PlanManifest {
+        rich_ui: None,
+        plan: broca_wal::OpaqueJson::from_json_text(plan.to_string()).unwrap(),
+        plan_identity: parsed.identity.clone(),
+        composition_digest: parsed.composition_digest.clone(),
+        tools: Arc::new(vec![serde_json::from_value(json!({
+            "name": "read",
+            "description": "reads a file",
+            "input_schema": {"type": "object"},
+        }))
+        .unwrap()]),
+        system_text: "You are the head of a synthetic agent.".into(),
+        system_digest: "e".repeat(64),
+        join_version: 1,
+        role_versions: Default::default(),
+        fetches: vec![],
+        declarations: vec![broca_wal::FrozenDeclaration {
+            provider: "magic-context".into(),
+            answer: broca_wal::OpaqueJson::from_json_text(
+                json!({ "subscriptions": subscriptions }).to_string(),
+            )
+            .unwrap(),
+        }],
+    };
+    planned(&parsed.identity, Some(manifest))
+}
+
+/// Sends core's `request` to `side` as the serve layer routes a keyed `session.send`, under
+/// `send_id`, with `plan` and the label `class`.
+async fn send_keyed(
+    side: &Side,
+    send_id: &str,
+    request: SubmissionRequest,
+    plan: Option<crate::actor::SendPlan>,
+    class: Option<&str>,
+) -> SendOutcome {
+    side.registry
+        .route_submission_with_order(
+            &side.key,
+            RunId(format!("run-{send_id}")),
+            request,
+            RunKind::FreshOrResume,
+            SendKey::SendId(send_id.into()),
+            false,
+            broca_protocol::Delivery::Queue,
+            plan,
+            None,
+            None,
+            None,
+            class.map(str::to_owned),
+            false,
+            None,
+        )
+        .await
+        .expect("the session opens")
+}
+
+/// Core's creating send to a new head starts the head in the new storage's durable root, on a
+/// module that creates no other session there, and on today's storage, on a module without the
+/// new storage, in today's durable folder; both on the current compaction contract. Core's retry
+/// of that send is answered as a retry, writing nothing, and core's next send runs as the
+/// session's next turn in the same storage. A view Magic Context applies while the head is idle
+/// is accepted alike, the turn after applies it at its first step alike, and the two histories
+/// read the same.
+#[tokio::test]
+async fn cores_creating_send_starts_a_head_in_the_new_storage_as_today() {
+    use broca_core::compaction_v2::protocol::view::{Edit, EditOp, View};
+    use broca_wal::StorageClass;
+    let first = core_head_send("first-send.json");
+    let second = core_head_send("second-send.json");
+    let first_id = first["send_id"].as_str().unwrap().to_owned();
+    let second_id = second["send_id"].as_str().unwrap().to_owned();
+    let class = first["session_class"].as_str();
+    assert_eq!(class, Some(crate::registry::HEAD_SESSION_CLASS));
+    let steps = vec![
+        text_step("a1", "Awake."),
+        text_step("a2", "Continuing."),
+        text_step("a3", "after the view"),
+    ];
+    let side = |runtime: bool| {
+        let steps = steps.clone();
+        async move {
+            let build = Build {
+                runtime,
+                new_sessions: false,
+                gated: false,
+                compaction: true,
+                hooks: true,
+                idle: Duration::from_secs(60),
+            };
+            let deployment = broca_session_store::keys::DeploymentKey::new(1, &[7; 32]);
+            let mut side = side_with(build, steps, deployment).await;
+            side.key = BindIdentity::new(
+                side.dir.join("project"),
+                "broca",
+                "alfonso:head:agent_0123456789abcdef",
+            );
+            side
+        }
+    };
+    let today = side(false).await;
+    let store = side(true).await;
+    let mut replies = Vec::new();
+    for side in [&today, &store] {
+        let reply = send_keyed(
+            side,
+            &first_id,
+            core_head_request(&first, true),
+            Some(core_head_plan(&first)),
+            class,
+        )
+        .await;
+        assert!(matches!(reply, SendOutcome::Active { .. }), "{reply:?}");
+        side.settled(&format!("run-{first_id}")).await;
+        side.assert_completed(&format!("run-{first_id}")).await;
+        replies.push(reply);
+    }
+    assert_eq!(replies[1], replies[0]);
+    let address = |side: &Side| broca_core::session_addr(&side.key);
+    let wal_folder = |side: &Side| {
+        let wal = FileWalStore::new(side.dir.join("wal"));
+        StorageClass::ALL
+            .into_iter()
+            .find(|class| wal.class_wal_path(*class, &side.key).is_file())
+    };
+    assert_eq!(
+        broca_wal::session_storage_class(&store.dir, &address(&store)).unwrap(),
+        Some(StorageClass::Durable)
+    );
+    assert_eq!(wal_folder(&store), None);
+    assert_eq!(
+        broca_wal::session_storage_class(&today.dir, &address(&today)).unwrap(),
+        None
+    );
+    assert_eq!(wal_folder(&today), Some(StorageClass::Durable));
+    let current = || async {
+        store
+            .registry
+            .store_runtime()
+            .unwrap()
+            .current_view(&store.key)
+            .await
+            .unwrap()
+            .unwrap()
+    };
+    let view = current().await;
+    assert!(crate::store_entries::on_contract(&view));
+
+    // Core's retry of the creating send, byte for byte, once the session holds its plan: the
+    // serve layer then fetches nothing and hands over the plan's identity alone.
+    let written = current().await.open_log_records().await.unwrap().len();
+    let mut retries = Vec::new();
+    for side in [&today, &store] {
+        let identity = core_head_plan(&first).identity;
+        retries.push(
+            send_keyed(
+                side,
+                &first_id,
+                core_head_request(&first, false),
+                Some(planned(&identity, None)),
+                class,
+            )
+            .await,
+        );
+    }
+    assert_eq!(
+        retries[1], retries[0],
+        "the store answers the retry as today's"
+    );
+    assert!(
+        !matches!(
+            retries[1],
+            SendOutcome::Active { .. } | SendOutcome::Pending { .. }
+        ),
+        "the retry started nothing: {:?}",
+        retries[1]
+    );
+    assert_eq!(
+        current().await.open_log_records().await.unwrap().len(),
+        written,
+        "the retry wrote nothing"
+    );
+
+    for side in [&today, &store] {
+        let next = send_keyed(
+            side,
+            &second_id,
+            core_head_request(&second, false),
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            matches!(
+                next,
+                SendOutcome::Active { .. } | SendOutcome::Pending { .. }
+            ),
+            "{next:?}"
+        );
+        side.settled(&format!("run-{second_id}")).await;
+        side.assert_completed(&format!("run-{second_id}")).await;
+    }
+    assert_eq!(
+        wal_folder(&store),
+        None,
+        "the next turn ran in the new storage"
+    );
+
+    // Magic Context drops the first turn's reply, entry 2, while the head is idle; the turn
+    // after applies the view at its first step.
+    let mut answers = Vec::new();
+    for side in [&today, &store] {
+        let page = side
+            .compaction(
+                Some("magic-context"),
+                "session.entries",
+                json!({"select": {"by": "after"}, "detail": "compact"}),
+            )
+            .await
+            .unwrap();
+        let reply = page["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["ordinal"] == 2)
+            .expect("the first turn's reply")["mid"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let view = View::seal(
+            1,
+            vec![Edit::new(
+                1,
+                EditOp::Drop {
+                    mid: reply,
+                    part: None,
+                },
+            )],
+        );
+        answers.push(
+            side.compaction(
+                Some("magic-context"),
+                "session.apply_view",
+                json!({ "view": view }),
+            )
+            .await,
+        );
+    }
+    assert_eq!(answers[0], Ok(json!({"answer": "accepted"})));
+    assert_eq!(answers[1], answers[0], "the store answers as today's");
+    let mut third = second.clone();
+    third["send_id"] = json!("send_sample_third_0123456789abcdef");
+    third["prompt"] = json!("Carry on with the synthetic project.");
+    for side in [&today, &store] {
+        let next = send_keyed(
+            side,
+            "send_sample_third_0123456789abcdef",
+            core_head_request(&third, false),
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            matches!(
+                next,
+                SendOutcome::Active { .. } | SendOutcome::Pending { .. }
+            ),
+            "{next:?}"
+        );
+        side.settled("run-send_sample_third_0123456789abcdef").await;
+        side.assert_completed("run-send_sample_third_0123456789abcdef")
+            .await;
+    }
+    // The third turn's first step is the provider's third request.
+    let prompt = |side: &Side| serde_json::to_value(&side.provider.calls()[2].prompt).unwrap();
+    assert_eq!(prompt(&store), prompt(&today));
+    assert!(
+        !prompt(&store).to_string().contains("Awake."),
+        "the view dropped the first reply: {}",
+        prompt(&store)
+    );
+    let applied: Vec<u64> = current()
+        .await
+        .open_log_records()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|(_, record)| match record {
+            broca_session_store::record::Record::ViewApplied(applied) => Some(applied.version),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(applied, [1], "the third turn's first step applied the view");
+    compare_history(&today, &store, "a head's three turns").await;
 }
 
 /// A view the compaction provider applies with its build metadata (the entry it was built

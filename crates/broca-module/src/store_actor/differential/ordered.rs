@@ -41,6 +41,8 @@ cipher_tests!(
     an_interrupt_during_a_model_step_cancels_the_run_and_runs_first_alike,
     an_interrupt_during_a_tool_call_waits_for_it_then_runs_alike,
     a_crash_between_an_interrupt_and_its_run_is_recovered_alike,
+    a_rides_marks_are_kept_alike,
+    an_idle_start_sends_marks_are_kept_alike,
 );
 
 /// The session's owner.
@@ -1190,6 +1192,103 @@ async fn a_crash_between_an_interrupt_and_its_run_is_recovered_alike(cipher: Cip
             "end completed"
         ]
     );
+}
+
+/// A send of `text` from the owner under its head scope, as a scoped session's sends come.
+fn scoped(text: &str) -> SubmissionRequest {
+    let mut request = from(core(), text);
+    request.scope = super::head_scope(core());
+    request
+}
+
+/// `request` carrying the display marks `marks`.
+fn marked(mut request: SubmissionRequest, marks: Value) -> SubmissionRequest {
+    request.message_marks = marks.as_object().expect("marks are an object").clone();
+    request
+}
+
+/// The scoped session's first send, from its owner, carrying the plan; both sides start its run.
+async fn first_scoped(pair: &Pair, run_id: &str) {
+    let (old, new) = pair
+        .send(run_id, scoped("first"), None, Some(plan()), None)
+        .await;
+    assert!(matches!(old, SendOutcome::Active { .. }), "{old:?}");
+    assert_eq!(new, old, "the first send's replies differ");
+}
+
+/// Sends queued to ride on a tool batch keep their display marks: a plan sender's notice, and
+/// the scope's owner speaking for its agent. Both ride on the next run's tool batch, and
+/// `session.read` serves each ride's notice, with the agent spoken for, alike.
+async fn a_rides_marks_are_kept_alike(cipher: Cipher) {
+    let pair = Pair::new(reading_later(), true, cipher).await;
+    first_scoped(&pair, "r1").await;
+    for (run_id, request) in [
+        (
+            "q1",
+            marked(from(module(AFT), "aft's note"), json!({"notice": true})),
+        ),
+        (
+            "q2",
+            marked(
+                scoped("core's note"),
+                json!({"speaks_for": {"agent_id": "agent-1"}}),
+            ),
+        ),
+    ] {
+        let outcome = pair
+            .alike(
+                run_id,
+                request,
+                Some(json!({"modes": ["tool_result"]})),
+                None,
+            )
+            .await;
+        assert!(
+            matches!(outcome, SendOutcome::Pending { .. }),
+            "{outcome:?}"
+        );
+    }
+    pair.release();
+    pair.idle().await;
+    pair.alike("r2", scoped("read a"), None, None).await;
+    pair.release();
+    pair.release();
+    pair.idle().await;
+    let (_, queue, notices) = pair.assert_alike().await;
+    assert!(queue.is_empty(), "both sends rode: {queue:?}");
+    assert_eq!(notices, (2, 2), "the rides' notices");
+}
+
+/// An `idle_start` send keeps its display marks for the run it starts: a plan sender's notice,
+/// and the scope's owner speaking for its agent, alike.
+async fn an_idle_start_sends_marks_are_kept_alike(cipher: Cipher) {
+    let pair = Pair::new(hello(), false, cipher).await;
+    first_scoped(&pair, "r1").await;
+    pair.idle().await;
+    let outcome = pair
+        .alike(
+            "q1",
+            marked(from(module(MC), "wake up"), json!({"notice": true})),
+            Some(json!({"modes": ["idle_start"]})),
+            None,
+        )
+        .await;
+    assert!(matches!(outcome, SendOutcome::Active { .. }), "{outcome:?}");
+    pair.idle().await;
+    let outcome = pair
+        .alike(
+            "q2",
+            marked(
+                scoped("go on"),
+                json!({"speaks_for": {"agent_id": "agent-1"}}),
+            ),
+            Some(json!({"modes": ["steer", "idle_start"]})),
+            None,
+        )
+        .await;
+    assert!(matches!(outcome, SendOutcome::Active { .. }), "{outcome:?}");
+    pair.idle().await;
+    pair.assert_alike().await;
 }
 
 mod frozen_tools;

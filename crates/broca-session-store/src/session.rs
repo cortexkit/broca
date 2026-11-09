@@ -863,6 +863,21 @@ impl<B: SessionBackend> Session<B> {
         Ok(())
     }
 
+    /// Deletes the session: its head, so the address reads as having no session, then its logs
+    /// and objects (see [`SessionBackend::delete_session`]). Its writer does this, under the
+    /// session's lease, when the session it created holds nothing anyone sent, so a refused
+    /// creating send leaves no session behind. A poisoned writer may not: it can't tell what its
+    /// failed append left in the log.
+    pub async fn discard(self) -> Result<(), SessionError> {
+        if self.poisoned {
+            return Err(SessionError::Poisoned);
+        }
+        self.backend
+            .delete_session(&self.addr, self.version)
+            .await?;
+        Ok(())
+    }
+
     /// The backend the session reads and writes through.
     pub fn backend(&self) -> &B {
         &self.backend

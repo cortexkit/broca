@@ -144,6 +144,11 @@ pub trait SessionBackend {
         change: &Id128,
         at: Version,
     ) -> Result<(), BackendError>;
+    /// Deletes the session `s` whole, if the stored head is still at `at`: its head first, so
+    /// from then on the session reads as one that never existed, then its logs and objects.
+    /// Durable on return. A crash part way leaves the session absent, with at most some of its
+    /// logs and objects behind, which nothing reads.
+    async fn delete_session(&self, s: &SessionAddr, at: Version) -> Result<(), BackendError>;
     /// Stores setup part `name`, unless a part of that name is already stored: names are derived
     /// from content, so the stored part already holds these bytes. Durable on return, name
     /// included.
@@ -258,6 +263,9 @@ impl<T: SessionBackend + ?Sized> SessionBackend for &T {
         at: Version,
     ) -> Result<(), BackendError> {
         (**self).delete_change(s, change, at).await
+    }
+    async fn delete_session(&self, s: &SessionAddr, at: Version) -> Result<(), BackendError> {
+        (**self).delete_session(s, at).await
     }
     async fn put_setup(&self, name: &str, bytes: &[u8]) -> Result<(), BackendError> {
         (**self).put_setup(name, bytes).await
@@ -566,6 +574,14 @@ impl SessionBackend for MemoryBackend {
         session.fence(at)?;
         let prefix = format!("{}/", hex(&change.0));
         session.objects.retain(|name, _| !name.starts_with(&prefix));
+        Ok(())
+    }
+
+    async fn delete_session(&self, s: &SessionAddr, at: Version) -> Result<(), BackendError> {
+        self.mutate()?;
+        let mut sessions = self.sessions.lock().unwrap();
+        sessions.get_mut(s).ok_or(BackendError::Fenced)?.fence(at)?;
+        sessions.remove(s);
         Ok(())
     }
 
@@ -961,6 +977,35 @@ impl SessionBackend for LocalBackend {
             Ok(()) => sync_dir(&self.object_dir(s))?,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
+        }
+        Ok(())
+    }
+
+    async fn delete_session(&self, s: &SessionAddr, at: Version) -> Result<(), BackendError> {
+        self.fence(s, at)?;
+        // The head goes first and alone decides whether the session exists, so whatever a crash
+        // leaves of the rest belongs to no session.
+        let heads = self.head_dir(s);
+        match std::fs::remove_file(heads.join("head")) {
+            Ok(()) => sync_dir(&heads)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        self.fences.lock().unwrap().remove(s);
+        self.open_logs
+            .lock()
+            .unwrap()
+            .retain(|(addr, _), _| addr != s);
+        for dir in [self.log_dir(s), self.object_dir(s), heads] {
+            match std::fs::remove_dir_all(&dir) {
+                Ok(()) => {
+                    if let Some(parent) = dir.parent() {
+                        sync_dir(parent)?;
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
         }
         Ok(())
     }

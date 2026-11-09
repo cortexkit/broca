@@ -116,6 +116,10 @@ impl<B: SessionBackend> SessionBackend for Counting<B> {
         self.inner.delete_log(s, log, at).await
     }
 
+    async fn delete_session(&self, s: &SessionAddr, at: Version) -> Result<(), BackendError> {
+        self.inner.delete_session(s, at).await
+    }
+
     async fn put_object(
         &self,
         s: &SessionAddr,

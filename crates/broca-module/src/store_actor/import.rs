@@ -120,6 +120,24 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 false,
             );
         }
+        // The import makes its principal the session's first owner, so it meets the scope
+        // reservation as a first send does: only the scope whose stamped bind reserved the
+        // session's address may import into it. An unreadable reservation refuses, transiently.
+        let reservation = match self.scope_reservation().await {
+            Ok(reservation) => reservation,
+            Err(error) => return (StoreOutcome::Transient(error), false),
+        };
+        let reserved = broca_core::SessionOwnershipV1 {
+            reservation,
+            ..Default::default()
+        };
+        if let Err(refusal) = broca_core::scope_admission::check_reserved_scope(
+            &reserved,
+            Some(&principal),
+            scope.as_ref(),
+        ) {
+            return (StoreOutcome::ScopeRefused(refusal), false);
+        }
         // Only the session's would-be owner imports, on a route scoped to it: the import makes
         // that principal the session's owner.
         match &scope {

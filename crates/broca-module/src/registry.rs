@@ -241,6 +241,12 @@ pub enum OpenError {
         missing: Vec<String>,
         reason: String,
     },
+    /// A send creating a head asked for `feature`, which the new storage doesn't serve on a
+    /// session's creating send yet. A head starts nowhere else, so it is refused, permanently,
+    /// before any session is opened or created.
+    NotServedOnNewStorage {
+        feature: &'static str,
+    },
 }
 
 /// Metadata from a successful would-be empty read. It carries no message content
@@ -448,6 +454,9 @@ impl std::fmt::Display for OpenError {
             | OpenError::NewerWriter { reason: s, .. } => {
                 write!(f, "open failed: {s}")
             }
+            OpenError::NotServedOnNewStorage { feature } => f.write_str(
+                &crate::store_actor::unserved_on_creation(feature),
+            ),
         }
     }
 }
@@ -990,7 +999,16 @@ pub(crate) enum StoreCreation {
     /// A file import, which only ever brings a long-lived agent head onto broca: its session is
     /// durable whatever its label.
     Import,
+    /// A send labelled [`HEAD_SESSION_CLASS`], placed as a send is. A head starts only in the
+    /// new storage: one whose send asks for `unserved`, a feature the store actor doesn't serve
+    /// on a creating send, or that the new storage can't create now, is refused, never started
+    /// on today's storage.
+    Head { unserved: Option<&'static str> },
 }
+
+/// The session label of an agent head. A session a send with this label creates starts in the
+/// new storage whenever the module has one (see [`StoreCreation::Head`]).
+pub const HEAD_SESSION_CLASS: &str = "head";
 
 struct Inner {
     /// The sessions a move into the new storage holds (see `store_move`), by address, and the
@@ -2411,7 +2429,8 @@ impl LineageRegistry {
     /// Lets a session that exists in neither storage start in the new storage when the send
     /// creating it asks only for what the store actor serves. The opener must have a store
     /// runtime (`DefaultOpener::with_store_runtime`); without one every session stays on today's
-    /// storage. Off by default, and in production.
+    /// storage. Off by default, and in production. A head ([`HEAD_SESSION_CLASS`]) starts in the
+    /// new storage whenever the opener has one, whether or not this is set.
     pub fn with_store_new_sessions(self) -> Self {
         self.inner.store_new_sessions.store(true, Ordering::SeqCst);
         self
@@ -4159,15 +4178,24 @@ impl LineageRegistry {
         }
         crate::retention::validate_retention(retention, None, false)
             .map_err(OpenError::RetentionInvalid)?;
-        let store_eligible = self.inner.store_new_sessions.load(Ordering::SeqCst)
-            && crate::store_actor::serves_creating_send(
-                &request,
-                kind,
-                delivery,
-                conversation_key.is_some(),
-                retention.is_some(),
-                order.is_some(),
-            );
+        let unserved = crate::store_actor::unserved_creating_send(
+            &request,
+            kind,
+            delivery,
+            conversation_key.is_some(),
+            retention.is_some(),
+            order.is_some(),
+        );
+        // How the session starts if this send creates it. A head starts only in the new
+        // storage, and the opener refuses one it can't start there; any other send starts there
+        // only when the registry creates sessions there and the store actor serves the send.
+        let creation = if session_class.as_deref() == Some(HEAD_SESSION_CLASS) {
+            Some(StoreCreation::Head { unserved })
+        } else if self.inner.store_new_sessions.load(Ordering::SeqCst) && unserved.is_none() {
+            Some(StoreCreation::Send)
+        } else {
+            None
+        };
         if !request.message_marks.is_empty() {
             // Refuse invalid marks before opening a writer, including its new-WAL header.
             // Ownership replay is large; carrying it inline multiplies the send future's stack
@@ -4193,12 +4221,12 @@ impl LineageRegistry {
             }
         }
         loop {
-            if store_eligible {
+            if let Some(creation) = creation {
                 self.inner
                     .store_eligible
                     .lock()
                     .unwrap()
-                    .insert(key.clone(), StoreCreation::Send);
+                    .insert(key.clone(), creation);
             }
             let handle = self
                 .actor_for_mode(key, retention, session_class.clone(), false)
@@ -4261,8 +4289,10 @@ impl LineageRegistry {
     }
 
     /// Route a command only the new storage serves to the session's store actor. An import may
-    /// create its session there; nothing else creates one. Refused by name unless the registry
-    /// creates sessions in the new storage (`with_store_new_sessions`).
+    /// create its session there; nothing else creates one. An import is refused by name unless
+    /// the registry creates sessions in the new storage (`with_store_new_sessions`); any other
+    /// command is refused so unless the new storage already keeps the session, as it keeps a
+    /// head, whose compaction provider applies its views through here.
     pub async fn route_store_command(
         &self,
         key: &LineageKey,
@@ -4270,13 +4300,15 @@ impl LineageRegistry {
     ) -> Result<crate::store_import::StoreOutcome, OpenError> {
         use crate::actor::LineageCmd;
         use crate::store_import::{ImportRefusal, StoreCommand, StoreOutcome};
-        if !self.inner.store_new_sessions.load(Ordering::SeqCst) {
+        let creates = matches!(command, StoreCommand::Import(_));
+        let served = self.inner.store_new_sessions.load(Ordering::SeqCst)
+            || (!creates && self.store_holding(key)?.is_some());
+        if !served {
             return Ok(StoreOutcome::Refused(ImportRefusal::new(
                 "new_storage_unavailable",
                 "this module doesn't create sessions in the new storage",
             )));
         }
-        let creates = matches!(command, StoreCommand::Import(_));
         loop {
             if creates {
                 self.inner
@@ -6887,7 +6919,9 @@ impl LineageRegistry {
                         | OpenError::Expired { .. }
                         | OpenError::SessionLogMissing { .. }
                         | OpenError::RetentionInvalid(_)
-                        | OpenError::SessionClassInvalid(_) => sweep.open_failed += 1,
+                        | OpenError::SessionClassInvalid(_)
+                        // Refused only to a send creating a head, never to this pass's open.
+                        | OpenError::NotServedOnNewStorage { .. } => sweep.open_failed += 1,
                         OpenError::LeaseHeld(_) => sweep.lease_held += 1,
                         OpenError::Open(reason)
                         | OpenError::Classified { reason, .. }

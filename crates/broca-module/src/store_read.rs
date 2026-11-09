@@ -976,6 +976,6 @@ impl DisplayFacts {
 
 /// A stored `speaks_for` mark (llm-runner's `SpeaksFor` JSON) as reads serve it, or `None` when
 /// there is none or it doesn't decode.
-fn speaks_for(stored: Option<&serde_json::Value>) -> Option<broca_protocol::SpeaksFor> {
+pub(crate) fn speaks_for(stored: Option<&serde_json::Value>) -> Option<broca_protocol::SpeaksFor> {
     stored.and_then(|value| serde_json::from_value(value.clone()).ok())
 }

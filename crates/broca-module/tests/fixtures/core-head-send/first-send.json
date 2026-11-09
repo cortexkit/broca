@@ -1,0 +1,281 @@
+{
+  "method": "session.send",
+  "params": {
+    "notice": true,
+    "plan": {
+      "compaction_item": {
+        "params": {},
+        "preset": "head",
+        "provider": "magic-context"
+      },
+      "composition": {
+        "compaction": {
+          "provider": "magic-context"
+        },
+        "providers": [
+          {
+            "provider": "aft",
+            "tools": [
+              {
+                "capabilities": [
+                  "code.read/v1"
+                ],
+                "name": "read"
+              }
+            ]
+          },
+          {
+            "provider": "magic-context",
+            "tools": [
+              {
+                "capabilities": [],
+                "name": "ctx_expand"
+              },
+              {
+                "capabilities": [],
+                "name": "ctx_memory"
+              },
+              {
+                "capabilities": [],
+                "name": "ctx_note"
+              },
+              {
+                "capabilities": [],
+                "name": "ctx_reduce"
+              },
+              {
+                "capabilities": [],
+                "name": "ctx_search"
+              }
+            ],
+            "upfront": [
+              "ctx_expand",
+              "ctx_memory",
+              "ctx_note",
+              "ctx_reduce",
+              "ctx_search"
+            ]
+          },
+          {
+            "provider": "prefrontal-core",
+            "tools": [
+              {
+                "capabilities": [
+                  "prefrontal-core:runner-head-tools/v1"
+                ],
+                "name": "ask"
+              },
+              {
+                "capabilities": [
+                  "prefrontal-core:runner-head-tools/v1"
+                ],
+                "name": "athena"
+              },
+              {
+                "capabilities": [
+                  "prefrontal-core:runner-head-tools/v1"
+                ],
+                "name": "athena_view"
+              },
+              {
+                "capabilities": [
+                  "prefrontal-core:inbox/v1"
+                ],
+                "name": "inbox"
+              },
+              {
+                "capabilities": [
+                  "prefrontal-core:knowhow.read/v1"
+                ],
+                "name": "knowhow"
+              },
+              {
+                "capabilities": [
+                  "prefrontal-core:runner-head-tools/v1"
+                ],
+                "name": "notify"
+              },
+              {
+                "capabilities": [
+                  "prefrontal-core:runner-head-tools/v1"
+                ],
+                "name": "peer_inbox"
+              },
+              {
+                "capabilities": [
+                  "prefrontal-core:runner-head-tools/v1"
+                ],
+                "name": "peer_list"
+              },
+              {
+                "capabilities": [
+                  "prefrontal-core:runner-head-tools/v1"
+                ],
+                "name": "peer_send"
+              },
+              {
+                "capabilities": [
+                  "prefrontal-core:review/v1"
+                ],
+                "name": "review"
+              },
+              {
+                "capabilities": [
+                  "prefrontal-core:runner-head-tools/v1"
+                ],
+                "name": "room"
+              },
+              {
+                "capabilities": [
+                  "call.yield/v1",
+                  "prefrontal-core:runner-head-tools/v1"
+                ],
+                "name": "room_wait"
+              },
+              {
+                "capabilities": [
+                  "call.yield/v1",
+                  "prefrontal-core:sidekick.research/v1"
+                ],
+                "name": "sidekick"
+              },
+              {
+                "capabilities": [
+                  "call.yield/v1",
+                  "prefrontal-core:runner-head-tools/v1"
+                ],
+                "name": "work"
+              }
+            ]
+          }
+        ],
+        "step_transform_items": [
+          {
+            "params": {},
+            "preset": "head",
+            "provider": "magic-context",
+            "subscriptions": [
+              {
+                "budget_ms": 1500,
+                "hook": "pre_user",
+                "on_unavailable": "pass",
+                "ops": [
+                  "prepend",
+                  "append"
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "composition_digest": "a57a6e1cb5183788a7d4b5755f6eff1ccf4a097733cc00fc7ae4e14475968591",
+      "model": {
+        "model": "gpt-6.1-sol",
+        "provider": "openai",
+        "service_tier": "standard",
+        "variant": "high"
+      },
+      "readers": [
+        "occipital",
+        "magic-context"
+      ],
+      "senders": [
+        {
+          "idle_start": true,
+          "interrupt": true,
+          "module": "occipital",
+          "person": true,
+          "succeeds": "thalamus-harness"
+        },
+        {
+          "module": "prefrontal-core",
+          "yields": true
+        },
+        {
+          "module": "magic-context"
+        }
+      ],
+      "step_transform_items": [
+        {
+          "params": {},
+          "preset": "head",
+          "provider": "magic-context",
+          "subscriptions": [
+            {
+              "budget_ms": 1500,
+              "hook": "pre_user",
+              "on_unavailable": "pass",
+              "ops": [
+                "prepend",
+                "append"
+              ]
+            }
+          ]
+        }
+      ],
+      "system_text_items": [
+        {
+          "params": {
+            "model": {
+              "id": "gpt-6.1-sol",
+              "provider": "openai",
+              "variant": "high"
+            }
+          },
+          "preset": "head",
+          "provider": "prefrontal-core"
+        },
+        {
+          "params": {},
+          "preset": "head",
+          "provider": "aft"
+        },
+        {
+          "params": {
+            "compacting": true
+          },
+          "preset": "head",
+          "provider": "magic-context"
+        }
+      ],
+      "tool_items": [
+        {
+          "params": {
+            "behavior": "interactive",
+            "scope": "all",
+            "tool_descs": "full"
+          },
+          "preset": "head",
+          "provider": "aft"
+        },
+        {
+          "params": {
+            "compacting": true
+          },
+          "preset": "head",
+          "provider": "magic-context",
+          "upfront": [
+            "ctx_expand",
+            "ctx_memory",
+            "ctx_note",
+            "ctx_reduce",
+            "ctx_search"
+          ]
+        },
+        {
+          "params": {
+            "exclude": [
+              "web_search"
+            ],
+            "relayed_tools": []
+          },
+          "preset": "runner_head",
+          "provider": "prefrontal-core"
+        }
+      ]
+    },
+    "prompt": "Start STRIATUM-SAMPLE on the synthetic project.",
+    "send_id": "send_sample_first_0123456789abcdef",
+    "session_class": "head"
+  }
+}

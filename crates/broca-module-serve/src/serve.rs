@@ -5105,6 +5105,7 @@ fn refused_send_code(error: &ServeError) -> String {
         ServeError::SendRetracted { .. } => "send_retracted".into(),
         ServeError::SendEnded { .. } => "send_ended".into(),
         ServeError::DeliveryRefused { code, .. } => (*code).into(),
+        ServeError::NotServedOnNewStorage { .. } => NOT_SERVED_ON_NEW_STORAGE.into(),
         ServeError::MediaTooLarge(_) => cortexkit_role_llm_runner::errors::MEDIA_TOO_LARGE.into(),
         ServeError::TemplatePartGone { .. } => {
             cortexkit_role_llm_runner::errors::TEMPLATE_PART_GONE.into()
@@ -5287,6 +5288,14 @@ async fn send_store_outcome<H: ServeHandler + ?Sized>(
             )
             .await
         }
+        Ok(StoreOutcome::ScopeRefused(refusal)) => {
+            let error = ServeError::ScopeRefused(refusal);
+            send_serve_error(writer, ver, channel, epoch, corr, &error).await
+        }
+        Ok(StoreOutcome::Transient(message)) => {
+            let error = ServeError::Transient(message);
+            send_serve_error(writer, ver, channel, epoch, corr, &error).await
+        }
         // The registry routes a command again when its session closes under it, so it never
         // hands this back.
         Ok(StoreOutcome::Reopen) => unreachable!("route_store_command reopens the session itself"),
@@ -5343,6 +5352,7 @@ async fn send_serve_error(
         | ServeError::VariantUnsupported(_)
         | ServeError::ToolAliasInvalid(_)
         | ServeError::DeliveryRefused { .. }
+        | ServeError::NotServedOnNewStorage { .. }
         | ServeError::MediaTooLarge(_)
         | ServeError::SendIdReuse { .. }
         | ServeError::Transient(_)

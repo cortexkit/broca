@@ -451,6 +451,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             send_id,
             identity,
             manifest,
+            message_marks,
             ..
         } = start;
         let submission_id = SubmissionId(format!("sub-{}", run_id.0));
@@ -533,6 +534,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             &request,
             &receipt,
             at,
+            message_marks.as_ref(),
             &mut self.parts,
         )
         .map_err(SendOutcome::Error)?;

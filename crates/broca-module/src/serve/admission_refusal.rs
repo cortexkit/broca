@@ -104,6 +104,10 @@ pub fn admission_refusal(error: &ServeError) -> Option<AdmissionRefusal> {
             ),
         ),
         ServeError::DeliveryRefused { code, .. } => (*code, Some(json!({"field": "delivery"}))),
+        ServeError::NotServedOnNewStorage { feature } => (
+            crate::store_entries::NOT_SERVED_ON_NEW_STORAGE,
+            Some(json!({"class": "permanent", "feature": feature})),
+        ),
         ServeError::InvalidParams { field, .. } => {
             (broca_wire::INVALID_PARAMS, Some(json!({"field": field})))
         }

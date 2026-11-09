@@ -21,6 +21,7 @@ cipher_tests!(
     the_open_logs_newest_activity_is_kept_and_read_back,
     an_append_is_observed_only_once_it_returned,
     an_append_without_a_barrier_is_told_durable_once_synced,
+    a_discarded_session_reads_as_never_created,
 );
 
 fn triple() -> SessionTriple {
@@ -91,6 +92,57 @@ fn create_and_write<B: SessionBackend>(backend: &B, cipher: Cipher) -> (Vec<u8>,
 fn in_closing_claim(cipher: Cipher, len: usize) -> usize {
     let claim = crate::frame::FrameKey::for_tests(cipher, 1, &[0; 32]).frame_overhead();
     len - claim + 23
+}
+
+/// A discarded session reads as one that was never created: loading it finds nothing, on local
+/// files no folder of it is left, and a session can be created at its address again. A writer
+/// another writer replaced can't discard the session.
+fn a_discarded_session_reads_as_never_created(cipher: Cipher) {
+    let root = std::env::temp_dir().join(format!(
+        "broca-session-discard-{}-{}",
+        std::process::id(),
+        cipher.label()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let backend = LocalBackend::new(&root);
+    block_on(async {
+        let session = Session::create(&backend, addr(), triple(), &deployment(cipher), false)
+            .await
+            .unwrap();
+        session.discard().await.unwrap();
+        assert!(matches!(
+            Session::load(&backend, addr(), &triple(), &deployment(cipher)).await,
+            Err(SessionError::Missing)
+        ));
+        for folder in ["heads", "logs", "objects"] {
+            assert!(
+                !root.join(folder).join(&addr().0).exists(),
+                "{folder} of the discarded session is left"
+            );
+        }
+        let stale = Session::create(&backend, addr(), triple(), &deployment(cipher), false)
+            .await
+            .unwrap();
+        let mut current = Session::load(&backend, addr(), &triple(), &deployment(cipher))
+            .await
+            .unwrap();
+        assert!(matches!(
+            stale.discard().await,
+            Err(SessionError::Backend(crate::backend::BackendError::Fenced))
+        ));
+        current.append(&[input("kept")], true).await.unwrap();
+    });
+    std::fs::remove_dir_all(&root).unwrap();
+
+    let memory = MemoryBackend::default();
+    block_on(async {
+        let session = Session::create(&memory, addr(), triple(), &deployment(cipher), false)
+            .await
+            .unwrap();
+        session.discard().await.unwrap();
+        assert_eq!(memory.read_head(&addr()).await.unwrap(), None);
+        assert!(memory.log_names(&addr()).is_empty());
+    });
 }
 
 fn texts(messages: &[Message]) -> Vec<String> {

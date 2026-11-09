@@ -2135,3 +2135,47 @@ async fn a_run_running_at_a_stop_ends_interrupted_by_the_shutdown_seal() {
     assert_eq!(ends[0].interrupt_reason.as_deref(), Some("runner_shutdown"));
     assert_eq!(session.operations().queue.len(), 1, "r2 stays queued");
 }
+
+/// A module's session address inventory, as a daemon's: the store a scoped `route.bind` records
+/// its reservation in.
+pub(super) struct Inventory {
+    pub(super) store: Arc<broca_store::SqliteStore>,
+    db: std::path::PathBuf,
+}
+
+impl Inventory {
+    /// A complete inventory in `dir`, beside the state root `state_root` it reads WALs from.
+    pub(super) fn open(dir: &std::path::Path, state_root: &std::path::Path) -> Self {
+        let db = dir.join("store.db");
+        let store = Arc::new(broca_store::SqliteStore::open(&db).unwrap());
+        broca_store::session_refs::migrate(&db, &broca_core::ReadOnlyWalReader::new(state_root))
+            .unwrap();
+        Self { store, db }
+    }
+
+    /// Records `session`'s address as a bind naming it does, from a route stamped with the scope
+    /// `reservation` names when one is given, which reserves the session for that scope.
+    pub(super) fn reserve(
+        &self,
+        session: &BindIdentity,
+        reservation: Option<&broca_store::session_address::ScopeReservation>,
+    ) {
+        let reserved = self
+            .store
+            .resolve_session_address(session, Some(&session.project_root), reservation)
+            .unwrap();
+        assert_eq!(&reserved, session);
+    }
+
+    /// Damages `session`'s reservation row so its owner no longer decodes.
+    pub(super) fn damage(&self, session: &BindIdentity) {
+        let changed = rusqlite::Connection::open(&self.db)
+            .unwrap()
+            .execute(
+                "UPDATE session_scope_reservation SET owner = 'not a principal' WHERE address = ?1",
+                [broca_core::session_addr(session)],
+            )
+            .unwrap();
+        assert_eq!(changed, 1, "the session's address was reserved");
+    }
+}

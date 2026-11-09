@@ -508,6 +508,9 @@ impl StoreRuntime {
         // A send's attachments are uploaded beside the session, under the state root, whichever
         // storage keeps it.
         .with_uploads(broca_core::media_uploads::Uploads::at(&self.state_root));
+        if create.is_some() {
+            actor = actor.created_here();
+        }
         let readers_root = class.store_root(&self.state_root);
         actor = actor.with_readers(Arc::new(move || LocalBackend::new(readers_root.clone())));
         if let Some(billing) = &self.billing {

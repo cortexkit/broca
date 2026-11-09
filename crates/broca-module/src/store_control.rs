@@ -564,14 +564,15 @@ impl StoreControl {
                 }
             }
             // A ride delivered with its envelope is a notice, once per ride, under the key, send
-            // id and sender its envelope recorded, as today's control stream names it. Text
-            // delivered before envelopes existed is no notice, and yields nothing.
+            // id and sender its envelope recorded, and with the agent its sender spoke for, as
+            // today's control stream names it. Text delivered before envelopes existed is no
+            // notice, and yields nothing.
             Record::ResultAppend(append) => {
                 let carrier = self.carriers.get(&append.tool_call_id).cloned();
                 if let (Some((mid, part, _)), Some(ride), Some(send_id)) =
                     (carrier, &append.ride, &append.send_id)
                 {
-                    if let Some(event) = notice_delivered_event(
+                    if let Some(mut event) = notice_delivered_event(
                         mid.clone(),
                         part,
                         Some(ride.call_key.clone()),
@@ -579,6 +580,12 @@ impl StoreControl {
                         ride.sender.clone(),
                         &append.text,
                     ) {
+                        if let cortexkit_role_llm_runner::live::LiveEvent::NoticeDelivered(notice) =
+                            &mut event
+                        {
+                            notice.speaks_for =
+                                crate::store_read::speaks_for(ride.speaks_for.as_ref());
+                        }
                         units.boundary(&mid, event);
                     }
                 }

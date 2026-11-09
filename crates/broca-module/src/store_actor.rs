@@ -133,6 +133,10 @@ pub struct StoreActor<B: SessionBackend> {
     registry: Option<crate::registry::RegistryHandle>,
     /// The warm the executor is sending, if any.
     warm: Option<warm::PendingStoreWarm>,
+    /// The seq the next record would have taken when this actor created the session, set only
+    /// when it did. A session it created that still has it when the actor closes holds nothing
+    /// anyone sent, and is deleted (see [`StoreActor::created_here`]).
+    created: Option<u64>,
 }
 
 /// How an actor lives in the module's registry. Tests serve an actor without one.
@@ -241,6 +245,9 @@ struct Start {
     session_class: Option<String>,
     /// What happened to the run's input before the run.
     prepared: Prepared,
+    /// The send's display marks as its admission kept them (`admit_message_marks`), which the
+    /// record that takes its input keeps: its run's start, its queued record or its steer.
+    message_marks: Option<broca_protocol::MessageMarks>,
 }
 
 /// What happened to a run's input before the run, which the run's control hands the loop, as
@@ -271,9 +278,6 @@ struct Drained {
     hooks: Option<Box<broca_wal::Hooks>>,
     /// Where the queued record stored the send's media, which the run's input points at.
     media: broca_session_loop::HeldInputMedia,
-    /// The send's display marks, as its record kept them, which the run's start records, as
-    /// today's drain records the queued send's.
-    message_marks: Option<broca_protocol::MessageMarks>,
 }
 
 /// How a keyed send is answered.
@@ -340,7 +344,27 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             media_build_gate: None,
             registry: None,
             warm: None,
+            created: None,
         }
+    }
+
+    /// Marks the session as one this actor created. If the actor closes with nothing appended
+    /// since, as when the send creating the session was refused, it deletes the session under
+    /// its lease, so the address reads as having no session again.
+    pub fn created_here(mut self) -> Self {
+        self.created = Some(self.session.next_seq());
+        self
+    }
+
+    /// Whether this actor created the session and nothing was appended to it since: no run
+    /// start, no placed message and no ledger record, only the creating writer's own.
+    fn created_and_untouched(&self) -> bool {
+        self.run.is_none() && self.created == Some(self.session.next_seq())
+    }
+
+    /// The actor's session, the rest of the actor dropped.
+    fn into_session(self) -> Session<B> {
+        self.session
     }
 
     /// The actor reads a send's attachments from `uploads`.
@@ -554,7 +578,22 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         )
         .await;
         let key = self.key.clone();
-        drop(self);
+        let untouched = self.created_and_untouched();
+        // Everything but the session is dropped here, before the lease, as the whole actor was.
+        let session = self.into_session();
+        if untouched {
+            // Still under the lease, so no other writer opens the session while it goes.
+            if let Err(error) = session.discard().await {
+                tracing::warn!(
+                    target: "broca.store_actor",
+                    session = %key.session,
+                    error = ?error,
+                    "the session this actor created holds nothing, but could not be deleted",
+                );
+            }
+        } else {
+            drop(session);
+        }
         drop(life.lease);
         match close {
             Some(close) => close.commit(),
@@ -795,6 +834,35 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                     ));
                     return false;
                 }
+                // As in today's actor, a send's display marks are admitted first, against the
+                // session's owner summary and the principal and scope the send came with, before
+                // a plan sender's send goes on under the session's principal. The record that
+                // takes the send's input keeps them.
+                let message_marks = if request.message_marks.is_empty() {
+                    None
+                } else {
+                    let ownership = match self.ownership() {
+                        Ok(ownership) => ownership,
+                        Err(error) => {
+                            let _ = reply.send(SendOutcome::Error(error));
+                            return false;
+                        }
+                    };
+                    match broca_core::scope_admission::admit_message_marks(
+                        &request.message_marks,
+                        &ownership,
+                        request.principal.as_ref(),
+                        &request.scope,
+                    ) {
+                        Ok(marks) => marks,
+                        Err(field) => {
+                            let _ = reply.send(SendOutcome::StructuredOutputInvalid {
+                                field: field.into(),
+                            });
+                            return false;
+                        }
+                    }
+                };
                 // As in today's actor, a send's label and its structured output are checked against
                 // the session before the owner check, so a retry naming another label is refused
                 // rather than answered.
@@ -890,7 +958,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 };
                 // As in today's actor, the owner and scope check comes first: a send the session's
                 // history refuses is refused before any retry is answered.
-                let scope = match self.send_scope(&run_id, &request, queue_starts_runs) {
+                let scope = match self.send_scope(&run_id, &request, queue_starts_runs).await {
                     Ok(scope) => scope,
                     Err(outcome) => {
                         let _ = reply.send(outcome);
@@ -1006,6 +1074,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                                 manifest: None,
                                 session_class: None,
                                 prepared: Prepared::default(),
+                                // The resumed run's start is already durable, with its marks.
+                                message_marks: None,
                             };
                             self.start_run(start, None, Some(reply), StoreRunMode::Resume)
                                 .await;
@@ -1197,6 +1267,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                     manifest,
                     session_class,
                     prepared: Prepared::default(),
+                    message_marks,
                 };
                 if let Some(order) = order {
                     self.queue_ordered(start, order, ordered_by, reply).await;
@@ -1385,6 +1456,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             manifest,
             session_class,
             prepared,
+            message_marks,
         } = start;
         // The executor resolves the send's credential selection; only the result is frozen.
         let auth = request.auth.take();
@@ -1422,11 +1494,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             compaction_plane: self.executor.compaction_plane(),
             compaction_session: Some(Arc::clone(&self.compaction_session)),
             display_sent_by: sent_by,
-            // A drained send's marks, as its queued record kept them; a send that starts its run
-            // directly carries none, as today's actor's doesn't.
-            display_message_marks: drained
-                .as_ref()
-                .and_then(|drained| drained.message_marks.clone()),
+            // The send's marks, as its admission kept them or, for a drained send, as its queued
+            // record kept them; the run's start records them, as today's actor's does.
+            display_message_marks: message_marks,
             // The version the run's plan asks for. The loop decides the session's mode from it
             // and the session's latest run: a session on the compaction contract stays on it,
             // and one that ran outside it moves onto it at the first run whose plan names a
@@ -1708,6 +1778,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             manifest: None,
             session_class: None,
             prepared: Prepared::default(),
+            message_marks: None,
         })
     }
 
@@ -2019,22 +2090,47 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             .map_err(|error| format!("the session's owner summary: {error}"))
     }
 
+    /// The scope whose stamped `route.bind` reserved the session's address, while the session
+    /// has no run start, read from the module's session inventory as today's actor reads it
+    /// (`LineageRegistry::scope_reservation`). `None` once a run started, since the session's
+    /// history names its owner then, and for an actor serving in no module. An unreadable
+    /// reservation is an error, never `None`, so a reserved session is never opened to everyone
+    /// because its row couldn't be read.
+    async fn scope_reservation(
+        &self,
+    ) -> Result<Option<broca_core::scope_admission::ScopeReservation>, String> {
+        match &self.registry {
+            Some(registry) if self.session.operations().owner.episodes == 0 => {
+                registry.scope_reservation(&self.key).await
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// The scope a send's run would record, decided as today's actor decides it: refused by the
     /// shared rule when the session's history refuses the send's principal or scope, and refused
     /// as busy when the send would freeze a scope while a run, or queued work that starts a run
     /// (`queue_starts_runs`), holds the session, since only a run's start can carry it. A send from broca itself (`SendScope::Internal`)
-    /// carries the scope the session already froze.
+    /// carries the scope the session already froze. While the session has no run start, a
+    /// caller's send meets the scope reservation too, so only the scope that reserved the
+    /// session's address may start it; an unreadable reservation refuses the send as transient.
     ///
     /// Reopening a scope at a later epoch, and agent-run scopes, are refused by name: today's
     /// actor checks more for each (whether the run can start now; for an agent run, that the
     /// send declares no tools of its own).
-    fn send_scope(
+    async fn send_scope(
         &self,
         run_id: &RunId,
         request: &SubmissionRequest,
         queue_starts_runs: bool,
     ) -> Result<Option<broca_protocol::SessionScope>, SendOutcome> {
-        let ownership = self.ownership().map_err(SendOutcome::Transient)?;
+        let mut ownership = self.ownership().map_err(SendOutcome::Transient)?;
+        if request.scope != broca_protocol::SendScope::Internal {
+            ownership.reservation = self
+                .scope_reservation()
+                .await
+                .map_err(SendOutcome::Transient)?;
+        }
         if let broca_protocol::SendScope::Stamped(bind) = &request.scope {
             if bind.scope.run_id.is_some() {
                 return Err(SendOutcome::Error(unserved(
@@ -2444,7 +2540,13 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         };
         // An interrupt is first in the queue (`Operations::queue` keeps interrupts ahead of every
         // plain send), so it drains first, as today's queue drains it.
-        match self.drained_start(&first.submission_id).await {
+        let own_admission = waiting
+            .as_ref()
+            .is_some_and(|(id, _)| id.0 == first.submission_id);
+        match self
+            .drained_start(&first.submission_id, own_admission)
+            .await
+        {
             Ok((mut start, mut drained)) => match self.freeze_plan(&mut start) {
                 Ok(()) => {
                     start.prepared.hooks = crate::actor::pre_user::drained_hooks(
@@ -2490,7 +2592,13 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
 
     /// The run a queued send drains into, as today's actor builds it from the queued entry: the
     /// request it was queued with, under the principal, sender, title and key its record kept.
-    async fn drained_start(&self, submission_id: &str) -> Result<(Start, Drained), String> {
+    /// `own_admission` says the send is drained by its own admission (an ordered send starting
+    /// its run at once), when today's queued entry is still the request as sent.
+    async fn drained_start(
+        &self,
+        submission_id: &str,
+        own_admission: bool,
+    ) -> Result<(Start, Drained), String> {
         let send = self
             .queued(submission_id)
             .await?
@@ -2503,6 +2611,22 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         };
         let mut request = queue::request_of(&send, &self.parts)?;
         request.principal = principal("principal")?;
+        // The send's marks, as its queued record kept them.
+        let message_marks: Option<broca_protocol::MessageMarks> = send
+            .message_marks
+            .as_ref()
+            .map(|marks| serde_json::from_value(marks.clone()))
+            .transpose()
+            .map_err(|error| format!("the queued send's marks: {error}"))?;
+        // A request's marks are left out of its stored bytes, so today's queue, read back from
+        // its log, drains a request without them, and a missing digest is computed without
+        // them. Only a send its own admission drains still has the request as sent, marks
+        // included, and today computes its digest over them too.
+        if own_admission {
+            if let Some(serde_json::Value::Object(marks)) = &send.message_marks {
+                request.message_marks = marks.clone();
+            }
+        }
         let identity = match queue::receipt_field(&send, "request_identity_digest") {
             Some(serde_json::Value::String(digest)) => digest.clone(),
             // A send queued without a digest gets one computed from its request, as today.
@@ -2524,6 +2648,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             manifest: self.frozen_manifest()?,
             session_class: self.frozen_session_class(),
             prepared: Prepared::default(),
+            // The drained run's start records them, as today's drain records the queued send's.
+            message_marks,
         };
         // The send's transforms ran when it was queued; its record keeps what they did, and
         // their final value is the input the run sends.
@@ -2532,12 +2658,6 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             .transpose()
             .map_err(|error| format!("the queued send's hooks: {error}"))?;
         let written_at_ms = send.written_at_ms;
-        let message_marks = send
-            .message_marks
-            .as_ref()
-            .map(|marks| serde_json::from_value(marks.clone()))
-            .transpose()
-            .map_err(|error| format!("the queued send's marks: {error}"))?;
         let mut media = broca_session_loop::HeldInputMedia::default();
         media.hold_stored(&Record::QueuedSend(send));
         Ok((
@@ -2547,7 +2667,6 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 written_at_ms,
                 hooks,
                 media,
-                message_marks,
             },
         ))
     }
@@ -2859,7 +2978,12 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             hooks: prepared.hooks,
             ..queue::SteerReceipt::default()
         };
-        let record = match queue::steer(prepared.input, prepared.at_ms, &receipt) {
+        let record = match queue::steer(
+            prepared.input,
+            prepared.at_ms,
+            &receipt,
+            start.message_marks.as_ref(),
+        ) {
             Ok(steer) => Record::Steer(steer),
             Err(error) => return SendOutcome::Error(error),
         };
@@ -2898,6 +3022,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             manifest: _,
             session_class: _,
             prepared: _,
+            message_marks,
         } = start;
         let submission_id = broca_protocol::SubmissionId(format!("sub-{}", run_id.0));
         match self.queued(&submission_id.0).await {
@@ -2971,6 +3096,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             &request,
             &receipt,
             at,
+            message_marks.as_ref(),
             &mut self.parts,
         ) {
             Ok(send) => Record::QueuedSend(send),
@@ -3138,23 +3264,31 @@ fn finished(run_id: &RunId, reason: broca_protocol::RunFinishReason) -> SendOutc
     }
 }
 
-/// Whether a send creating a session asks only for what this actor serves, so the session may
-/// start in the new storage. It makes the same checks the actor makes on a send before writing
-/// anything; a send failing one creates its session on today's storage instead, where it is
-/// served. A send carrying media still creates its session there too: a session's first send
-/// carrying media isn't yet proven against today's on the new storage, though later photo sends
-/// and the runs rendering them are.
-pub fn serves_creating_send(
+/// The first thing a send creating a session asks for that this actor doesn't serve on such a
+/// send, named as its refusals name it, or `None` when the session may start in the new storage.
+/// It makes the same checks the actor makes on a send before writing anything. A send carrying
+/// media is not served either: a session's first send carrying media isn't yet proven against
+/// today's on the new storage, though later photo sends and the runs rendering them are.
+pub fn unserved_creating_send(
     request: &SubmissionRequest,
     kind: RunKind,
     delivery: broca_protocol::Delivery,
     conversation_key: bool,
     retention: bool,
     ordered: bool,
-) -> bool {
-    unserved_delivery(ordered, delivery, conversation_key).is_none()
-        && unserved_request(request, kind, retention).is_none()
-        && !carries_media(request)
+) -> Option<&'static str> {
+    unserved_delivery(ordered, delivery, conversation_key)
+        .or_else(|| unserved_request(request, kind, retention))
+        .or_else(|| carries_media(request).then_some("a send carrying media"))
+}
+
+/// The message of a head refused because its creating send asks for `feature`, which the new
+/// storage doesn't serve on a creating send (see [`unserved_creating_send`]).
+pub(crate) fn unserved_on_creation(feature: &str) -> String {
+    format!(
+        "{feature} is not served yet on a send creating a head, which starts only in the new \
+         storage"
+    )
 }
 
 /// The media a run's model takes, as the run's start froze them, and the model's name, which a
@@ -3403,6 +3537,8 @@ mod import_tests;
 mod key_tests;
 #[cfg(test)]
 mod media_wait_tests;
+#[cfg(test)]
+mod new_heads_tests;
 #[cfg(test)]
 mod read_cost;
 #[cfg(test)]

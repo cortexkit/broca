@@ -2298,6 +2298,12 @@ pub enum ServeError {
         code: &'static str,
         message: String,
     },
+    /// A send creating a head asked for `feature`, which the new storage doesn't serve on a
+    /// creating send yet, and a head starts nowhere else. Refused
+    /// [`crate::store_entries::NOT_SERVED_ON_NEW_STORAGE`], permanent, with nothing written.
+    NotServedOnNewStorage {
+        feature: &'static str,
+    },
     /// A template send whose `part_tag` slot names a part the transcript does not show, refused
     /// `template_part_gone` with the slot named in its detail.
     TemplatePartGone {
@@ -2412,6 +2418,9 @@ impl From<OpenError> for ServeError {
             OpenError::NewerWriter { missing, reason } => {
                 ServeError::WalNewerWriter { missing, reason }
             }
+            OpenError::NotServedOnNewStorage { feature } => {
+                ServeError::NotServedOnNewStorage { feature }
+            }
         }
     }
 }
@@ -2449,6 +2458,9 @@ impl std::fmt::Display for ServeError {
                 outcome,
             } => write!(f, "submission '{submission_id}' ended {outcome}"),
             ServeError::DeliveryRefused { message, .. } => f.write_str(message),
+            ServeError::NotServedOnNewStorage { feature } => {
+                f.write_str(&crate::store_actor::unserved_on_creation(feature))
+            }
             ServeError::TemplatePartGone { slot } => write!(
                 f,
                 "the template's {slot} slot names a part the transcript does not show"

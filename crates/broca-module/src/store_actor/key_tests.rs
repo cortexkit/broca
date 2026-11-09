@@ -320,6 +320,56 @@ async fn a_flipped_head_mode_is_refused_as_damage_both_ways() {
     }
 }
 
+/// A head's creating send while the new storage can't create its session, because it creates
+/// encrypted sessions and the deployment key hasn't loaded, is refused `key_unavailable`,
+/// transient, and never started on today's storage: nothing of it is created in either storage.
+/// Once the key loads, the same send starts the head in the new storage's durable root.
+#[tokio::test]
+async fn a_head_is_refused_transient_until_the_new_storage_can_create_it() {
+    let module = module("head", None).await;
+    module.slot.open_without_key(&module.setup).await.unwrap();
+    let head = BindIdentity::new(module.dir.join("project"), "store-actor", "new-head");
+    let send = || {
+        module.registry.route_submission_with_class(
+            &head,
+            RunId("r1".into()),
+            request("first"),
+            RunKind::FreshOrResume,
+            SendKey::Minted,
+            false,
+            broca_protocol::Delivery::Queue,
+            None,
+            None,
+            None,
+            None,
+            Some(crate::registry::HEAD_SESSION_CLASS.into()),
+            false,
+        )
+    };
+    assert_key_unavailable(send().await.expect_err("the head is refused"));
+    let address = broca_core::session_addr(&head);
+    assert_eq!(
+        broca_wal::session_storage_class(&module.dir, &address).unwrap(),
+        None
+    );
+    let wal = FileWalStore::new(module.dir.join("wal"));
+    for class in broca_wal::StorageClass::ALL {
+        assert!(!wal.class_wal_path(class, &head).exists(), "{class:?}");
+    }
+    assert_eq!(module.registry.slot_state(&head), None);
+
+    module.load_key().await;
+    let outcome = send().await.expect("the head opens once the key loads");
+    assert!(matches!(outcome, SendOutcome::Active { .. }), "{outcome:?}");
+    assert_eq!(
+        broca_wal::session_storage_class(&module.dir, &address).unwrap(),
+        Some(broca_wal::StorageClass::Durable)
+    );
+    for class in broca_wal::StorageClass::ALL {
+        assert!(!wal.class_wal_path(class, &head).exists(), "{class:?}");
+    }
+}
+
 /// With new sessions plain, a send that creates a session creates it plain, before the key has
 /// loaded, and the encrypted session created before keeps its mode once served.
 #[tokio::test]
