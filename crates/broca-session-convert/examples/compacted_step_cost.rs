@@ -25,7 +25,14 @@
 //!   `--seal-every` messages, each sealing the history before its cut, as a head's history is
 //!   sealed over its life; the measured run's first step seals the rest up to its cut;
 //! - `open-log`: the session never seals, so the whole history stays in the open log behind the
-//!   cut (the run's writer skips the loop's seal).
+//!   cut (the run's writer skips the loop's seal);
+//! - `no-cut`, a worker's shape: the view cuts nothing, so every request carries the whole
+//!   session, but replaces the output of every tool call before the newest `--keep` messages
+//!   with a short marker, as a worker's view drops old tool results. A worker's session stays
+//!   within its context window, so this case is run at smaller sizes (`--sizes
+//!   1000,5000,20000 --cases no-cut`). The summary splits its request build into the renders of
+//!   the request's bytes and the rest, with each one's slope per message, and times the view's
+//!   planning over the window offline.
 //!
 //! Run it on a release build (it writes a few gigabytes under the store directory and takes
 //! minutes; `open-log` takes tens of seconds a step at the larger sizes):
@@ -33,7 +40,7 @@
 //! ```text
 //! cargo run --release -p broca-session-convert --example compacted_step_cost -- \
 //!     --out <results dir> [--store <scratch dir>] [--sizes 1000,150000,500000] \
-//!     [--cases sealed-once,sealed-often,open-log] [--warmup 10] [--steps 60] [--keep 300] \
+//!     [--cases sealed-once,sealed-often,open-log,no-cut] [--warmup 10] [--steps 60] [--keep 300] \
 //!     [--seal-every 2000] [--opens 3] [--open-log-warmup N] [--open-log-steps N] \
 //!     [--unbilled true] [--interleave true]
 //! ```
@@ -785,6 +792,8 @@ struct Compactor {
     outcomes: Mutex<BTreeMap<&'static str, usize>>,
     /// Each method the provider was called with, in order.
     methods: Mutex<Vec<String>>,
+    /// The provider rules the newest call stated, as the loop stated them.
+    rules: Mutex<Option<Value>>,
 }
 
 impl Compactor {
@@ -796,6 +805,7 @@ impl Compactor {
             cursor: Mutex::new(0),
             outcomes: Mutex::new(BTreeMap::new()),
             methods: Mutex::new(Vec::new()),
+            rules: Mutex::new(None),
         })
     }
 
@@ -900,6 +910,9 @@ impl broca_core::CompactionPlane for Compactor {
     {
         let start = self.timeline.now();
         self.methods.lock().unwrap().push(method.to_owned());
+        if let Some(rules) = params.pointer("/conditions/rules") {
+            *self.rules.lock().unwrap() = Some(rules.clone());
+        }
         // A real plane sends the call's parameters over the daemon's bus as JSON.
         let encoded = serde_json::to_vec(&params).unwrap();
         let entries = params
@@ -947,24 +960,10 @@ fn bucket(count: usize) -> String {
 /// The summarising view of version `version`: a summary inserted at the start, and a cut through
 /// `through`.
 fn summary_view(version: u64, through: &str) -> View {
-    let summary = "Summary of the session so far: the team moved the reader onto kept views, \
-                   fixed the seal at a cut, and reviewed three deliveries. Open threads: the \
-                   entries page cost, the actor's open cost, and the view cache bound. "
-        .repeat(40);
     View::seal(
         version,
         vec![
-            Edit::new(
-                version,
-                EditOp::Insert {
-                    at: InsertAt::Start,
-                    message: InsertedMessage::new(
-                        format!("summary-{version}"),
-                        broca_core::compaction_v2::protocol::read::Role::User,
-                        vec![summary],
-                    ),
-                },
-            ),
+            summary_insert(version),
             Edit::new(
                 version,
                 EditOp::Cut {
@@ -973,6 +972,65 @@ fn summary_view(version: u64, through: &str) -> View {
             ),
         ],
     )
+}
+
+/// The summary a view of version `version` inserts at the start.
+fn summary_insert(version: u64) -> Edit {
+    let summary = "Summary of the session so far: the team moved the reader onto kept views, \
+                   fixed the seal at a cut, and reviewed three deliveries. Open threads: the \
+                   entries page cost, the actor's open cost, and the view cache bound. "
+        .repeat(40);
+    Edit::new(
+        version,
+        EditOp::Insert {
+            at: InsertAt::Start,
+            message: InsertedMessage::new(
+                format!("summary-{version}"),
+                broca_core::compaction_v2::protocol::read::Role::User,
+                vec![summary],
+            ),
+        },
+    )
+}
+
+/// The window entries of `conversation`, projected as the compaction provider reads them.
+fn window_entries(
+    conversation: &Conversation,
+) -> Vec<broca_core::compaction_v2::protocol::read::Entry> {
+    broca_session_store::session::window_entries(conversation, 1, usize::MAX)
+        .iter()
+        .map(|stored| broca_session_loop::entries::project(stored).unwrap())
+        .collect()
+}
+
+/// The worker's view of version `version` (`no-cut`): a summary inserted at the start, no cut,
+/// and the output of every finished tool call in an entry up to ordinal `through` replaced by a
+/// short marker, as a worker's view drops old tool results.
+fn dropping_view(version: u64, conversation: &Conversation, through: u64) -> View {
+    use broca_core::compaction_v2::protocol::part::PartBody;
+    let mut edits = vec![summary_insert(version)];
+    for entry in window_entries(conversation) {
+        if entry.ordinal > through {
+            break;
+        }
+        for part in &entry.parts {
+            if let PartBody::Tool(tool) = &part.body {
+                if tool.output.is_some() && !tool.provider_executed {
+                    edits.push(Edit::new(
+                        version,
+                        EditOp::Replace {
+                            mid: entry.mid.clone(),
+                            part: part.id.clone(),
+                            field: "output".into(),
+                            value: json!("[output dropped]"),
+                            expect: part.digest.clone(),
+                        },
+                    ));
+                }
+            }
+        }
+    }
+    View::seal(version, edits)
 }
 
 /// Runs each store job through the new loop's admission and run, as the module's executor does,
@@ -1702,8 +1760,10 @@ struct Args {
     opens: usize,
 }
 
-/// The cases the bench knows: how the history behind the view's cut is kept.
-const CASES: [&str; 3] = ["sealed-once", "sealed-often", "open-log"];
+/// The cases the bench knows: how the history behind the view's cut is kept, or, in `no-cut`,
+/// a view that never cuts but leaves out the output of every tool call but the newest, as a
+/// worker's view does.
+const CASES: [&str; 4] = ["sealed-once", "sealed-often", "open-log", "no-cut"];
 
 impl Args {
     fn parse() -> Self {
@@ -1844,6 +1904,11 @@ struct Measured {
     after: OpenCosts,
     notes: Vec<String>,
     wire_bytes: Vec<usize>,
+    /// The view the run applied, and the provider rules its calls stated.
+    view: View,
+    rules: Option<Value>,
+    /// What planning that view over the session's window costs (see [`planner_costs`]).
+    planner: Vec<Duration>,
 }
 
 /// Sends a run of `warmup + steps` tool steps and an answer to the session under `root` and
@@ -1860,6 +1925,7 @@ async fn measure(
     let mut measured = run_measured(built, case, steps, parts, None).await;
     measured.before = before;
     measured.after = open_costs(&built.root, parts, args.opens).await;
+    measured.planner = planner_costs(&built.root, &measured, args.opens).await;
     measured
 }
 
@@ -1889,6 +1955,7 @@ async fn measure_interleaved(
     for ((one, before), (built, _)) in measured.iter_mut().zip(before).zip(runs) {
         one.before = before;
         one.after = open_costs(&built.root, parts, args.opens).await;
+        one.planner = planner_costs(&built.root, one, args.opens).await;
     }
     let check = turn_check(&measured);
     println!("{case}: {check}");
@@ -1961,7 +2028,20 @@ async fn run_measured(
     let root = &built.root;
     let timeline = Timeline::new();
     let compactor = Compactor::new(Arc::clone(&timeline));
-    *compactor.view.lock().unwrap() = Some(summary_view(built.views + 1, &built.cut.0));
+    let session = Session::load(
+        LocalBackend::new(root.clone()),
+        SessionAddr(ADDR.into()),
+        &triple(),
+        &deployment(),
+    )
+    .await
+    .unwrap();
+    let view = if case == "no-cut" {
+        dropping_view(built.views + 1, &session.conversation, built.cut.1)
+    } else {
+        summary_view(built.views + 1, &built.cut.0)
+    };
+    *compactor.view.lock().unwrap() = Some(view.clone());
     // The provider starts with every entry the session held before the run already read, so
     // each read after a notice asks only for the run's new entries.
     *compactor.cursor.lock().unwrap() = built.messages;
@@ -1975,16 +2055,8 @@ async fn run_measured(
         tool_text: tool_text(2_048),
         compactor: Arc::clone(&compactor),
         timeline: Arc::clone(&timeline),
-        seals: case != "open-log",
+        seals: case.starts_with("sealed"),
     });
-    let session = Session::load(
-        LocalBackend::new(root.clone()),
-        SessionAddr(ADDR.into()),
-        &triple(),
-        &deployment(),
-    )
-    .await
-    .unwrap();
     let (commands, served) = serve(root, session, Arc::clone(&executor), parts);
     *compactor.reader.lock().unwrap() = Some(EntriesReader {
         commands: commands.clone(),
@@ -2076,6 +2148,7 @@ async fn run_measured(
     let (warmup_cycles, cycles): (Vec<Cycle>, Vec<Cycle>) =
         all.into_iter().partition(|cycle| cycle.step <= warmup);
     let wire_bytes = executor.provider.wire_bytes.lock().unwrap().clone();
+    let rules = compactor.rules.lock().unwrap().clone();
     Measured {
         size: built.messages,
         case: case.to_owned(),
@@ -2086,7 +2159,51 @@ async fn run_measured(
         after: OpenCosts::default(),
         notes,
         wire_bytes,
+        view,
+        rules,
+        planner: Vec::new(),
     }
+}
+
+/// What planning the run's view over the session's window costs, `samples` times, after the
+/// run: the shared contract crate's planner (`plan_view`, through `views::check_boundary`, which
+/// is that call alone), which every render of a request runs once over every window entry.
+/// Measured only where the view's targets are all in the window (`open-log`, `no-cut`): after
+/// a seal the transcript holds sealed entries the window doesn't.
+async fn planner_costs(root: &Path, measured: &Measured, samples: usize) -> Vec<Duration> {
+    if !matches!(measured.case.as_str(), "open-log" | "no-cut") {
+        return Vec::new();
+    }
+    let Some(rules) = measured
+        .rules
+        .clone()
+        .and_then(|rules| serde_json::from_value(rules).ok())
+    else {
+        return Vec::new();
+    };
+    let session = Session::load(
+        LocalBackend::new(root.to_path_buf()),
+        SessionAddr(ADDR.into()),
+        &triple(),
+        &deployment(),
+    )
+    .await
+    .unwrap();
+    let entries = window_entries(&session.conversation);
+    session.close().await.unwrap();
+    (0..samples)
+        .map(|_| {
+            let started = Instant::now();
+            broca_core::compaction_v2::views::check_boundary(
+                &entries,
+                &measured.view,
+                &rules,
+                false,
+            )
+            .expect("the run's view plans over the window");
+            started.elapsed()
+        })
+        .collect()
 }
 
 /// The output of `command` with `args`, trimmed, or what failed.
@@ -2174,6 +2291,80 @@ fn write_raw(out: &Path, nominal: u64, measured: &Measured) {
         ));
     }
     std::fs::write(out.join(format!("labels-{name}.tsv")), tsv).unwrap();
+    if !measured.planner.is_empty() {
+        std::fs::write(
+            out.join(format!("planner-{name}.json")),
+            json!({"planner_ns": durations_ns(&measured.planner)}).to_string(),
+        )
+        .unwrap();
+    }
+}
+
+/// Request build's median (p50) split, per size: the renders of the request's bytes (the size
+/// estimate's canonical render and the provider's wire render, the `render (...)` items) and
+/// the rest, with each one's slope per message against the size before, and what planning the
+/// view costs offline (see [`planner_costs`]).
+fn request_split(measured: &[(u64, Measured)]) -> String {
+    let mut out = String::from(
+        "\nRequest build, split: byte assembly is the `render (...)` items (the size estimate's \
+         canonical render and the provider's wire render); the rest is everything else request \
+         build holds. A slope is the p50's change per message against the size before, in µs. \
+         The planner column is one plan of the run's view over the session's window after the \
+         run (`plan_view`, the shared contract crate's), timed offline; each render of a request \
+         runs it once.\n\n| size | request build p50 ms | byte assembly p50 ms | rest p50 ms | \
+         assembly slope µs/msg | rest slope µs/msg | planner p50 ms (offline) |\n\
+         |---|---|---|---|---|---|---|\n",
+    );
+    let mut previous: Option<(u64, f64, f64)> = None;
+    for (size, one) in measured {
+        let assembly: Vec<u64> = one
+            .cycles
+            .iter()
+            .map(|cycle| {
+                cycle
+                    .items
+                    .iter()
+                    .filter(|(label, _, part)| *part == PARTS[0] && label.starts_with("render ("))
+                    .map(|(_, ns, _)| ns)
+                    .sum()
+            })
+            .collect();
+        let rest: Vec<u64> = one
+            .cycles
+            .iter()
+            .zip(&assembly)
+            .map(|(cycle, assembly)| {
+                cycle
+                    .parts
+                    .get(PARTS[0])
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_sub(*assembly)
+            })
+            .collect();
+        let (assembly50, rest50) = (stats(&assembly).0, stats(&rest).0);
+        let slope = |now: f64, before: f64, from: u64| {
+            format!("{:.3}", (now - before) * 1000.0 / (*size - from) as f64)
+        };
+        let (assembly_slope, rest_slope) = match previous {
+            Some((from, assembly, rest)) if *size > from => {
+                (slope(assembly50, assembly, from), slope(rest50, rest, from))
+            }
+            _ => ("-".into(), "-".into()),
+        };
+        let planner = if one.planner.is_empty() {
+            "-".into()
+        } else {
+            format!("{:.3}", stats(&durations_ns(&one.planner)).0)
+        };
+        out.push_str(&format!(
+            "| {size} | {:.3} | {assembly50:.3} | {rest50:.3} | {assembly_slope} | {rest_slope} | \
+             {planner} |\n",
+            stats(&part_samples(&one.cycles, PARTS[0])).0,
+        ));
+        previous = Some((*size, assembly50, rest50));
+    }
+    out
 }
 
 /// The summary of every size of one case.
@@ -2227,6 +2418,7 @@ fn case_summary(case: &str, measured: &[(u64, Measured)]) -> String {
         }
         out.push('\n');
     }
+    out.push_str(&request_split(measured));
     out.push_str("\nNot per step: opening the session's actor, and seeding subscriptions.\n\n");
     out.push_str(
         "| size | when | open log records | window starts at | Session::load ms p50 / p95 / max | \
@@ -2236,7 +2428,7 @@ fn case_summary(case: &str, measured: &[(u64, Measured)]) -> String {
         for (when, costs) in [
             ("before the run", &one.before),
             (
-                if case == "open-log" {
+                if matches!(case, "open-log" | "no-cut") {
                     "after the run (still unsealed)"
                 } else {
                     "after the run (sealed at the cut)"
@@ -2358,8 +2550,9 @@ fn main() {
              {:.1} messages per run on average; encrypted, on local files; {}. The run measured \
              takes {} tool steps (2 KB results) and an answer (`open-log` above the smallest \
              size: {} warm-up and {} measured steps); the view inserts a summary and cuts \
-             through all but about the newest {} messages. `sealed-often` seals at a new cut \
-             about every {} messages.\n",
+             through all but about the newest {} messages (`no-cut`: cuts nothing, and replaces \
+             the output of every tool call before those messages). `sealed-often` seals at a new \
+             cut about every {} messages.\n",
             templates.len(),
             templates.iter().map(|t| t.messages).sum::<u64>() as f64 / templates.len() as f64,
             if args.unbilled {
