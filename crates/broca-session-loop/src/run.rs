@@ -1456,36 +1456,88 @@ pub(crate) struct RunTagRules {
     computed: Option<ComputedTagRules>,
 }
 
+/// What a run's start record froze about its part numbers: whether it renders them, and the
+/// number it continues after. A start record never changes once written.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct FrozenTags {
+    render_tags: bool,
+    computed: Option<ComputedTagRules>,
+}
+
+/// The frozen part-number choices of the window's runs, by run id, as a run has read them so
+/// far. Reading a run's start is a lookup in the session's id index, so a run reads each window
+/// run's start once rather than at every step: after its first step, only a run new to the window
+/// costs a lookup. When a seal moves the window's start, the runs that left the window are
+/// dropped; a run never comes back into the window.
+#[derive(Default)]
+pub(crate) struct TagRulesCache {
+    by_run: std::collections::HashMap<String, FrozenTags>,
+    /// The window start the map was last trimmed at.
+    window_start: u64,
+}
+
+/// The part-number choices `start` froze into its run config.
+fn frozen_tags(start: &RunStart) -> Result<FrozenTags, LoopError> {
+    let config = start
+        .run_choices
+        .as_ref()
+        .and_then(|choices| choices.get("config"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    Ok(FrozenTags {
+        render_tags: config["render_tags"].as_bool().unwrap_or(false),
+        computed: decode(config.get("computed_tags").cloned())?,
+    })
+}
+
 /// Each window run's frozen part-number rules, read from its start record: whether it renders
 /// numbers, the number it continues after, and its render config, combined by today's
-/// `rules_for`, the same function today's loop numbers a run's messages with.
+/// `rules_for`, the same function today's loop numbers a run's messages with. A run's start is
+/// read once and kept in `cache` (see [`TagRulesCache`]); the render config and the run's place
+/// in the prompt are read from `episodes` at every call, as before.
 async fn run_tag_rules<W: Writer>(
     writer: &W,
     episodes: &[EpisodeRenderInput],
+    cache: &mut TagRulesCache,
 ) -> Result<Vec<RunTagRules>, LoopError> {
     let conversation = writer.conversation();
     let window = &episodes[conversation.sealed_episodes.len()..];
     let first = (conversation.window_start() - 1) as usize;
+    if cache.window_start != conversation.window_start() {
+        cache.window_start = conversation.window_start();
+        let in_window: std::collections::HashSet<&str> = conversation
+            .episodes
+            .iter()
+            .map(|episode| episode.run_id.as_str())
+            .collect();
+        cache
+            .by_run
+            .retain(|run_id, _| in_window.contains(run_id.as_str()));
+    }
     let mut out = Vec::with_capacity(window.len());
     for (episode, render) in conversation.episodes.iter().zip(window) {
-        let start = writer.run_start(&episode.run_id).await?.ok_or_else(|| {
-            LoopError::Parts(format!(
-                "the window names run {} but the session holds no start for it",
-                episode.run_id
-            ))
-        })?;
-        let config = start
-            .run_choices
-            .as_ref()
-            .and_then(|choices| choices.get("config"))
-            .cloned()
-            .unwrap_or(Value::Null);
-        let render_tags = config["render_tags"].as_bool().unwrap_or(false);
-        let computed: Option<ComputedTagRules> = decode(config.get("computed_tags").cloned())?;
+        let frozen = match cache.by_run.get(&episode.run_id) {
+            Some(frozen) => *frozen,
+            None => {
+                let start = writer.run_start(&episode.run_id).await?.ok_or_else(|| {
+                    LoopError::Parts(format!(
+                        "the window names run {} but the session holds no start for it",
+                        episode.run_id
+                    ))
+                })?;
+                let frozen = frozen_tags(&start)?;
+                cache.by_run.insert(episode.run_id.clone(), frozen);
+                frozen
+            }
+        };
         out.push(RunTagRules {
             start: render.prompt_start.saturating_sub(first),
-            rules: broca_core::tags::rules_for(computed, render_tags, &render.frozen_config),
-            computed,
+            rules: broca_core::tags::rules_for(
+                frozen.computed,
+                frozen.render_tags,
+                &render.frozen_config,
+            ),
+            computed: frozen.computed,
         });
     }
     Ok(out)
@@ -1571,7 +1623,7 @@ async fn offline_request_for<W: Writer>(
         _ => false,
     };
     let episodes = render_episodes(writer, parts)?;
-    let run_rules = run_tag_rules(writer, &episodes).await?;
+    let run_rules = run_tag_rules(writer, &episodes, &mut TagRulesCache::default()).await?;
     let tools = Arc::new(admission.tools.clone());
     let enrollment = writer.enrollment().await?;
     let mut opts = call_options(
@@ -1625,6 +1677,8 @@ where
     // Each window run's place in the prompt and render config. A run adds no episode once
     // its input is placed, so these hold for the whole run.
     let episodes = render_episodes(writer, parts)?;
+    // Each window run's frozen part numbering, read from its start once for the whole run.
+    let mut tag_rules = TagRulesCache::default();
     let tools = Arc::new(admission.tools.clone());
     let manifest = ToolManifest::from_tools(admission.tools.clone());
     // As today's loop asks once per run: a provider whose media renderer tags its own copy of
@@ -1922,7 +1976,7 @@ where
             }
             _ => {}
         }
-        let run_rules = run_tag_rules(writer, &episodes).await?;
+        let run_rules = run_tag_rules(writer, &episodes, &mut tag_rules).await?;
         let enrollment = writer.enrollment().await?;
         let mut opts = call_options(
             writer,
