@@ -1582,6 +1582,64 @@ async fn a_store_session_reads_as_the_same_history_on_todays_storage() {
     let (_, all) = read_json(&store, Some(1), None, None).await;
     assert_eq!(all, store.stored_mids().await);
     opted_reads_alike(&today, &store, "two finished runs").await;
+    use cortexkit_role_llm_runner::read::MediaMode;
+    for media in [
+        MediaMode::Inline,
+        MediaMode::Blocks,
+        MediaMode::MediaRefs,
+        MediaMode::Descriptors,
+    ] {
+        for opted in OPTED {
+            for page in PAGES {
+                let mut roles = Vec::new();
+                for module in [&today, &store] {
+                    let mut request = opted_request(&module.key, page, opted);
+                    request.media = media;
+                    let reply = module.registry.read(request).await.unwrap();
+                    let mut envelope_roles = Vec::new();
+                    for entry in &reply.messages {
+                        let role = serde_json::to_value(entry.message.role).unwrap();
+                        let wire = serde_json::to_string(entry).unwrap();
+                        assert!(
+                            wire.ends_with(&format!(",\"role\":{role}}}")),
+                            "{media:?}, {opted:?}, {page:?}: role ends the read envelope: {wire}"
+                        );
+                        envelope_roles.push(role);
+                    }
+                    roles.push(envelope_roles);
+                }
+                assert_eq!(roles[1], roles[0], "{media:?}, {opted:?}, {page:?}");
+            }
+        }
+    }
+    let mut history_roles = Vec::new();
+    for module in [&today, &store] {
+        let request = serde_json::from_value(serde_json::json!({"form": "raw"})).unwrap();
+        let reply = crate::history::read(&module.registry, &module.key, &request)
+            .await
+            .unwrap();
+        let roles: Vec<_> = reply["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| {
+                assert_eq!(entry["role"], entry["message"]["role"]);
+                assert!(entry["role"].is_string(), "raw envelope role: {entry}");
+                (
+                    entry["role"].clone(),
+                    entry
+                        .as_object()
+                        .unwrap()
+                        .keys()
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        assert_eq!(roles.len(), 4);
+        history_roles.push(roles);
+    }
+    assert_eq!(history_roles[1], history_roles[0]);
     // A cursor naming another history version is refused, never answered.
     use crate::serve::{ServeHandler, SessionReadRequest};
     let mut stale = SessionReadRequest::new(store.key.clone(), None, Some(1));
