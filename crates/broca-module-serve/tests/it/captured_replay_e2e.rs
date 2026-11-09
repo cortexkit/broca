@@ -209,6 +209,16 @@ impl Daemon {
         aft_result: &str,
         catalog: Option<serde_json::Value>,
     ) -> Self {
+        Self::start_with_broca_env(provider_base_url, aft_tools, aft_result, catalog, &[]).await
+    }
+
+    async fn start_with_broca_env(
+        provider_base_url: &str,
+        aft_tools: &str,
+        aft_result: &str,
+        catalog: Option<serde_json::Value>,
+        broca_env: &[(&str, &str)],
+    ) -> Self {
         let subc_core = sibling_bin("ck-subc", "SUBC_CORE_BIN");
         let fake_aft = sibling_bin("fake-aft-stub", "FAKE_AFT_STUB_BIN");
         assert!(subc_core.exists(), "subc-core missing at {subc_core:?}");
@@ -254,7 +264,7 @@ impl Daemon {
             env!("CARGO_BIN_EXE_ck-broca"),
             broca_test_support::scratch_root(),
         );
-        let config = serde_json::json!({
+        let mut config = serde_json::json!({
             "version": 1,
             "modules": {
                 "broca": {
@@ -281,6 +291,9 @@ impl Daemon {
                 }
             }
         });
+        for (key, value) in broca_env {
+            config["modules"]["broca"]["env"][*key] = (*value).into();
+        }
         std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap())
             .expect("write subc config");
 
@@ -349,6 +362,29 @@ impl Daemon {
 
     fn broca_state_root(&self) -> PathBuf {
         self.connection_file.parent().unwrap().join("broca-state")
+    }
+
+    async fn wait_for_idle_close(&self, session: &str) {
+        broca_test_support::wait_until(&format!("session {session} idle-closes"), || async {
+            let connection = broca_subc::SubcConnection::connect(&self.connection_file)
+                .await
+                .map_err(|error| format!("connect for health probe: {error}"))?;
+            let metrics = connection
+                .supervisor_health_probe("broca")
+                .await
+                .map_err(|error| format!("health probe: {error}"))?
+                .metrics
+                .ok_or_else(|| "health probe omitted metrics".to_string())?;
+            if ["active_sessions", "opening", "closing"]
+                .iter()
+                .all(|key| metrics[*key].as_u64() == Some(0))
+            {
+                Ok(())
+            } else {
+                Err(metrics.to_string())
+            }
+        })
+        .await;
     }
 }
 
@@ -422,6 +458,118 @@ async fn run_client_with_deadline(
         },
     )
     .await
+}
+
+async fn run_json_client(
+    daemon: &Daemon,
+    project_root: &Path,
+    session: &str,
+    args: &[&str],
+) -> ClientRun {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_broca-session"));
+    command
+        .arg("--subc")
+        .arg(&daemon.connection_file)
+        .arg("--project-root")
+        .arg(project_root)
+        .arg("--session")
+        .arg(session)
+        .arg("--json-events")
+        .args(args);
+    session_client::run_with_deadline(
+        &mut command,
+        CLIENT_DEADLINE,
+        |_| {},
+        || session_client::daemon_diagnostics(&daemon.dir, session, &mut daemon.child.borrow_mut()),
+    )
+    .await
+    .unwrap_or_else(|diagnostics| panic!("client deadline expired\n{diagnostics}"))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn subscribe_cli_cursor_resumes_after_idle_close() {
+    let replay = ReplayServer::start(REFUSAL_CAPTURES).await;
+    let daemon = Daemon::start_with_broca_env(
+        &replay.base_url,
+        "get_time",
+        "unused",
+        None,
+        &[("BROCA_IDLE_TTL_MS", "800")],
+    )
+    .await;
+    let project_root = daemon.dir.join("project");
+    std::fs::create_dir_all(&project_root).expect("create project root");
+    let session = "subscribe-cursor";
+    let send_turn = || {
+        run_json_client(
+            &daemon,
+            &project_root,
+            session,
+            &[
+                "run",
+                "--prompt",
+                "Refuse this request.",
+                "--model",
+                "mock/mock-model",
+            ],
+        )
+    };
+    let first_run = send_turn().await;
+    assert_eq!(first_run.exit_code, 0, "{:?}", first_run.lines);
+    let first = run_json_client(
+        &daemon,
+        &project_root,
+        session,
+        &["subscribe", "--from", "start"],
+    )
+    .await;
+    assert_eq!(first.exit_code, 0, "{:?}", first.lines);
+    let events: Vec<serde_json::Value> = first
+        .lines
+        .iter()
+        .map(|line| serde_json::from_str(line).expect("subscriber emits JSON"))
+        .collect();
+    let observed = events.last().expect("observed summary");
+    assert_eq!(observed["event"], "observed");
+    assert_eq!(observed["runs_finished"], 1);
+    let cursor = observed["cursor"].as_str().expect("opaque cursor");
+    let first_finish = events
+        .iter()
+        .find(|event| event["event"] == "run_finished")
+        .expect("first run finished");
+    let boundary = first_finish["seq"].as_u64().expect("numeric seq");
+    eprintln!("first observed: {observed}");
+
+    daemon.wait_for_idle_close(session).await;
+    let second_run = send_turn().await;
+    assert_eq!(second_run.exit_code, 0, "{:?}", second_run.lines);
+    let resumed = run_json_client(
+        &daemon,
+        &project_root,
+        session,
+        &["subscribe", "--from-cursor", cursor],
+    )
+    .await;
+    assert_eq!(resumed.exit_code, 0, "{:?}", resumed.lines);
+    let resumed: Vec<serde_json::Value> = resumed
+        .lines
+        .iter()
+        .map(|line| serde_json::from_str(line).expect("resumed subscriber emits JSON"))
+        .collect();
+    let finishes: Vec<_> = resumed
+        .iter()
+        .filter(|event| event["event"] == "run_finished")
+        .collect();
+    assert_eq!(finishes.len(), 1, "only the second run is replayed");
+    assert_ne!(finishes[0]["run_id"], first_finish["run_id"]);
+    assert!(resumed.iter().any(|event| event["event"] == "run_started"));
+    for event in &resumed {
+        if let Some(seq) = event.get("seq") {
+            assert!(seq.as_u64().expect("numeric seq") > boundary, "{event}");
+        }
+    }
+    assert_eq!(observed["wal_seq"], boundary);
+    assert_eq!(replay.requests.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

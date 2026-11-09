@@ -460,10 +460,11 @@ enum Cmd {
         /// Where to attach: "start" (from seq 1) or "live" (the current tail).
         #[arg(long, default_value = "start")]
         from: String,
-        /// Resume from a durable cursor "<wal_seq>:<sub_index>" (overrides --from). The
-        /// client's last-processed position — replays strictly AFTER it (resubscribe path).
-        #[arg(long)]
-        from_cursor: Option<String>,
+        /// Resume strictly after the opaque cursor string printed by observed (overrides
+        /// --from). Pass the string unchanged; position-only cursors are not supported.
+        /// If observed has no cursor, use --from start instead.
+        #[arg(long, value_parser = parse_subscribe_cursor)]
+        from_cursor: Option<broca_wire::CursorWire>,
         /// Stop after this many RunFinished events (one per episode). 0 = until stream end.
         #[arg(long, default_value_t = 1)]
         until_runs: u32,
@@ -775,6 +776,23 @@ fn validate_max_output_tokens(cmd: &Cmd) -> Result<(), String> {
     Ok(())
 }
 
+fn parse_subscribe_cursor(raw: &str) -> Result<broca_wire::CursorWire, String> {
+    let position_only_error =
+        "position-only cursors are refused by broca since 0.3.322; pass the cursor from observed";
+    if raw
+        .split_once(':')
+        .is_some_and(|(seq, index)| seq.parse::<u64>().is_ok() && index.parse::<u32>().is_ok())
+    {
+        return Err(position_only_error.to_string());
+    }
+    let cursor: broca_wire::CursorWire = serde_json::from_str(raw)
+        .map_err(|error| format!("expected the opaque cursor string from observed: {error}"))?;
+    if cursor.incarnation.is_none() || cursor.digest.is_none() {
+        return Err(position_only_error.to_string());
+    }
+    Ok(cursor)
+}
+
 async fn run(args: Args) -> Result<i32, String> {
     match &args.cmd {
         Cmd::CacheDump(_) => return Err(offline_daemon_refusal("cache-dump")),
@@ -978,15 +996,7 @@ async fn run(args: Args) -> Result<i32, String> {
             display,
         } => {
             let from = match from_cursor {
-                Some(c) => {
-                    let (seq, idx) = c.split_once(':').ok_or_else(|| {
-                        format!("--from-cursor must be '<wal_seq>:<sub_index>', got '{c}'")
-                    })?;
-                    SubscribeFrom::After {
-                        wal_seq: seq.parse().map_err(|e| format!("bad wal_seq: {e}"))?,
-                        sub_index: idx.parse().map_err(|e| format!("bad sub_index: {e}"))?,
-                    }
-                }
+                Some(cursor) => SubscribeFrom::Resume { cursor },
                 None => match from.as_str() {
                     "start" => SubscribeFrom::Start,
                     "live" => SubscribeFrom::Live,
@@ -1879,6 +1889,40 @@ fn emit_unknown_control_unit(json: bool, wal_seq: u64, sub_index: u32, unit_type
     );
 }
 
+fn decode_observed_event(
+    body: &[u8],
+) -> Result<(SubscribeEvent, Option<broca_wire::CursorWire>), String> {
+    let event = decode_subscribe_event(body)?;
+    let cursor = match &event {
+        SubscribeEvent::Display(_) => None,
+        SubscribeEvent::Control { .. }
+        | SubscribeEvent::UnrecognizedRunState { .. }
+        | SubscribeEvent::UnknownControlUnit { .. } => {
+            // The typed event decoder retains only the cursor's position, which the server
+            // refuses for resuming. Read the original envelope to keep the full resume proof.
+            #[derive(serde::Deserialize)]
+            struct Envelope {
+                cursor: broca_wire::CursorWire,
+            }
+            Some(
+                serde_json::from_slice::<Envelope>(body)
+                    .map_err(|error| format!("decode subscribe cursor: {error}"))?
+                    .cursor,
+            )
+        }
+    };
+    Ok((event, cursor))
+}
+
+fn observed_event(finished: u32, cursor: Option<&broca_wire::CursorWire>) -> serde_json::Value {
+    serde_json::json!({
+        "event": "observed",
+        "runs_finished": finished,
+        "cursor": cursor.map(|cursor| serde_json::to_string(cursor).expect("cursor serializes")),
+        "wal_seq": cursor.map(|cursor| cursor.wal_seq),
+    })
+}
+
 /// A pure observer: subscribe and drain the control stream, printing each event, until
 /// `until_runs` RunFinished events are seen (or the stream ends). Exit 0 if the target run
 /// count was reached. Proves fan-out (run this alongside a `run`/`send` client) and
@@ -1897,20 +1941,20 @@ async fn observe(
     let mut finished = 0u32;
     // The last durable cursor this observer PROCESSED — emitted at the end so a caller can
     // resubscribe strictly after it (the client-owned last-processed position).
-    let mut last_cursor: Option<(u64, u32)> = None;
+    let mut last_cursor = None;
     loop {
         let event = match stream.next().await {
             Ok(Some(body)) => body,
             Ok(None) => break, // the stream ended cleanly (or its underlying connection closed)
             Err(e) => return Err(format!("subscribe stream: {e}")),
         };
-        match decode_subscribe_event(&event) {
-            Ok(SubscribeEvent::Control {
-                wal_seq,
-                sub_index,
-                unit,
-            }) => {
-                last_cursor = Some((wal_seq, sub_index));
+        let (event, cursor) = decode_observed_event(&event)
+            .map_err(|error| format!("decode subscribe event: {error}"))?;
+        if let Some(cursor) = cursor {
+            last_cursor = Some(cursor);
+        }
+        match event {
+            SubscribeEvent::Control { wal_seq, unit, .. } => {
                 emit_control(ControlRenderMode::Subscribe, json, wal_seq, &unit);
                 if matches!(unit, ControlUnit::RunFinished { .. }) {
                     finished += 1;
@@ -1919,12 +1963,7 @@ async fn observe(
                     }
                 }
             }
-            Ok(SubscribeEvent::UnrecognizedRunState {
-                wal_seq,
-                sub_index,
-                state,
-            }) => {
-                last_cursor = Some((wal_seq, sub_index));
+            SubscribeEvent::UnrecognizedRunState { wal_seq, state, .. } => {
                 emit_unrecognized_run_state(json, wal_seq, &state);
                 if matches!(state, UnrecognizedRunState::Finished { .. }) {
                     finished += 1;
@@ -1933,30 +1972,29 @@ async fn observe(
                     }
                 }
             }
-            Ok(SubscribeEvent::UnknownControlUnit {
+            SubscribeEvent::UnknownControlUnit {
                 wal_seq,
                 sub_index,
                 unit_type,
                 ..
-            }) => {
-                last_cursor = Some((wal_seq, sub_index));
+            } => {
                 emit_unknown_control_unit(json, wal_seq, sub_index, &unit_type);
             }
-            Ok(SubscribeEvent::Display(event)) => {
+            SubscribeEvent::Display(event) => {
                 if display {
                     let line = display_line(&event);
                     emit(json, &line, || line.to_string());
                 }
             }
-            Err(e) => return Err(format!("decode subscribe event: {e}")),
         }
     }
-    let (cseq, cidx) = last_cursor.unwrap_or((0, 0));
-    emit(
-        json,
-        &serde_json::json!({"event": "observed", "runs_finished": finished, "cursor": format!("{cseq}:{cidx}")}),
-        || format!("OBSERVED runs_finished={finished} cursor={cseq}:{cidx}"),
-    );
+    let observed = observed_event(finished, last_cursor.as_ref());
+    emit(json, &observed, || {
+        let cursor = observed["cursor"]
+            .as_str()
+            .unwrap_or("none (resume with --from start)");
+        format!("OBSERVED runs_finished={finished} cursor={cursor}")
+    });
     Ok(if until_runs == 0 || finished >= until_runs {
         0
     } else {
@@ -2581,7 +2619,10 @@ mod tests {
 
     use std::sync::Arc;
 
-    use super::{cache_params, load_plan, read_page_event, run, Args, Cmd, PathBuf};
+    use super::{
+        cache_params, decode_observed_event, load_plan, observed_event, parse_subscribe_cursor,
+        read_page_event, run, Args, Cmd, PathBuf,
+    };
 
     #[test]
     fn generic_raw_command_preserves_json_params() {
@@ -3329,6 +3370,84 @@ mod tests {
     fn absent_tools_flag_omits_surface_while_empty_json_is_explicit() {
         assert_eq!(parse_tools(&None).unwrap(), None);
         assert_eq!(parse_tools(&Some("[]".into())).unwrap(), Some(Vec::new()));
+    }
+
+    #[test]
+    fn subscribe_position_only_cursor_is_refused_before_opening_a_route() {
+        let error = Args::try_parse_from(["broca-session", "subscribe", "--from-cursor", "5:0"])
+            .unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+        assert!(
+            error.to_string().contains(
+                "position-only cursors are refused by broca since 0.3.322; pass the cursor from observed"
+            ),
+            "{error}"
+        );
+        assert!(parse_subscribe_cursor(r#"{"wal_seq":5,"sub_index":0}"#).is_err());
+    }
+
+    #[test]
+    fn subscribe_observed_json_pins_opaque_cursor_and_numeric_boundary() {
+        let cursor = broca_wire::CursorWire {
+            wal_seq: 5,
+            sub_index: 2,
+            incarnation: Some("0123456789abcdef0123456789abcdef".into()),
+            digest: Some("0123456789abcdef".into()),
+        };
+        let opaque = r#"{"wal_seq":5,"sub_index":2,"incarnation":"0123456789abcdef0123456789abcdef","digest":"0123456789abcdef"}"#;
+        assert_eq!(
+            observed_event(1, Some(&cursor)),
+            serde_json::json!({
+                "event": "observed",
+                "runs_finished": 1,
+                "cursor": opaque,
+                "wal_seq": 5,
+            })
+        );
+        let args =
+            Args::try_parse_from(["broca-session", "subscribe", "--from-cursor", opaque]).unwrap();
+        assert!(
+            matches!(args.cmd, Cmd::Subscribe { from_cursor: Some(parsed), .. } if parsed == cursor)
+        );
+        assert_eq!(
+            observed_event(0, None),
+            serde_json::json!({
+                "event": "observed",
+                "runs_finished": 0,
+                "cursor": null,
+                "wal_seq": null,
+            })
+        );
+    }
+
+    #[test]
+    fn subscribe_observer_preserves_full_cursor_for_every_control_kind() {
+        let cursor = broca_wire::CursorWire {
+            wal_seq: 7,
+            sub_index: 1,
+            incarnation: Some("lineage".into()),
+            digest: Some("0123456789abcdef".into()),
+        };
+        for unit in [
+            serde_json::json!({"type":"run_started", "run_id":"r1"}),
+            serde_json::json!({"type":"paused", "run_id":"r1", "reason":"future_pause"}),
+            serde_json::json!({"type":"run_finished", "run_id":"r1", "reason":"future_finish"}),
+            serde_json::json!({"type":"future_control_unit", "payload":"retained"}),
+        ] {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "kind": "control", "cursor": cursor, "unit": unit,
+            }))
+            .unwrap();
+            let (_, decoded_cursor) = decode_observed_event(&body).unwrap();
+            assert_eq!(decoded_cursor.as_ref(), Some(&cursor), "{unit}");
+        }
+        let (_, cursor) =
+            decode_observed_event(br#"{"kind":"display","event":{"type":"display_reset"}}"#)
+                .unwrap();
+        assert_eq!(
+            cursor, None,
+            "display events cannot advance a durable cursor"
+        );
     }
 
     #[test]
