@@ -497,6 +497,7 @@ async fn measure(built: &Built, parts: &SharedParts, sealed: bool, written: Dura
         provider: "compactor".into(),
         preset: "default".into(),
         earlier: None,
+        window: Default::default(),
     };
     let notice = |samples: &mut Vec<Duration>, started: Instant| samples.push(started.elapsed());
     let mut open_notice = Vec::new();

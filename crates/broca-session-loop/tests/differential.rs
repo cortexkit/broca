@@ -796,6 +796,12 @@ tokio::task_local! {
 }
 
 tokio::task_local! {
+    /// When set, the multi-run comparison adds the new loop's requests here, in the order they
+    /// were sent, after comparing them with today's, for a test to check more of them.
+    static NEW_REQUESTS: Arc<Mutex<Vec<CallOptions>>>;
+}
+
+tokio::task_local! {
     /// When set, the new side ends the cut log's run with this seal instead of resuming it.
     static SEALING: broca_core::resume::SealCause;
 }
@@ -3688,6 +3694,7 @@ async fn compare_runs_in_once(scenario: Scenario, runs: &[(&str, Vec<Message>)])
     }
     assert_eq!(new.records.len(), today.records.len(), "record count");
     assert_eq!(new.calls, today.calls, "tool calls");
+    let _ = NEW_REQUESTS.try_with(|seen| seen.lock().unwrap().extend(new.requests.clone()));
 }
 
 #[tokio::test]
@@ -6947,6 +6954,80 @@ async fn a_cut_past_two_runs_keeps_only_the_runs_that_shape_requests() {
             ),
         )
         .await;
+}
+
+/// The same four runs: the third run's first step applies the cut and seals the history before
+/// it, then the run takes another step. That step's request carries the runs a run starting
+/// after the seal reads (the session's first run, and the window's), not every run the history
+/// held when the third run started; the comparison with today's loop shows its bytes are
+/// unchanged.
+#[tokio::test]
+async fn a_seal_inside_a_run_bounds_the_runs_its_later_requests_carry() {
+    let seen: Arc<Mutex<Vec<CallOptions>>> = Arc::default();
+    NEW_REQUESTS
+        .scope(
+            Arc::clone(&seen),
+            LAYOUT.scope(
+                Some(cortexkit_compaction_view::PLAN_VERSION),
+                COMPACTION.scope(
+                    Some(Arc::new(CompactionScript {
+                        context_limit: 100_000,
+                        rides: vec![Ride::Cut(4)],
+                    })),
+                    Box::pin(compare_runs_in(
+                        compacted_scenario(vec![
+                            text_step("a1", "one"),
+                            text_step("a2", "two"),
+                            answer(
+                                "a3",
+                                vec![call("c1", "read", json!({"path": "a"}))],
+                                FinishReason::ToolCalls,
+                            ),
+                            text_step("a4", "three"),
+                            text_step("a5", "four"),
+                        ]),
+                        &[
+                            ("r1", vec![user("first")]),
+                            ("r2", vec![user("second")]),
+                            ("r3@m2", vec![user("third")]),
+                            ("r4@m2", vec![user("fourth")]),
+                        ],
+                    )),
+                ),
+            ),
+        )
+        .await;
+    let seen = seen.lock().unwrap();
+    // Five requests for each writer the comparison runs the new loop over.
+    assert_eq!(seen.len() % 5, 0, "{} requests", seen.len());
+    for requests in seen.chunks(5) {
+        let runs = |at: usize| requests[at].render_episodes.len();
+        assert_eq!(
+            runs(2),
+            3,
+            "the third run's first request carries every run"
+        );
+        assert_eq!(
+            runs(3),
+            2,
+            "after the seal the third run carries the first run and its own"
+        );
+        assert_eq!(runs(4), 3, "the fourth run carries those and its own");
+        // The request after the seal renders the same bytes as it would with every run the
+        // third run started with.
+        let mut unsealed = requests[3].clone();
+        unsealed.render_episodes = Arc::clone(&requests[2].render_episodes);
+        let renderer = broca_provider::LiveProvider::new(
+            broca_provider::families::AnthropicMessages,
+            broca_provider::families::anthropic_frozen_config("claude-sonnet-4-5"),
+            broca_provider::wire::AuthHandle::None,
+        );
+        let render = |opts: &CallOptions| {
+            broca_core::provider::Provider::try_render_request(&renderer, opts)
+                .expect("the request renders")
+        };
+        assert_eq!(render(&requests[3]), render(&unsealed));
+    }
 }
 
 /// A run whose repeated failing call spans a cut: two failures, then a big result pushes the next

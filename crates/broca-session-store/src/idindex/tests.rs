@@ -429,3 +429,48 @@ async fn session_finds_ids(cipher: Cipher) {
         .unwrap();
     check(&session, runs).await;
 }
+
+/// A run's start in the open log is found without reading the sealed id index: a run has one
+/// start, so the open log's answer is final. A run that spans a seal (its start sealed, its end
+/// in the open log) still finds its start in sealed history.
+#[test]
+fn an_open_run_start_reads_no_index_page() {
+    block_on(async {
+        let backend = MemoryBackend::default();
+        let addr = SessionAddr("0123456789abcdef".into());
+        let deployment = DeploymentKey::new(1, &[5; 32]);
+        let mut session = Session::create(&backend, addr, triple(), &deployment, false)
+            .await
+            .unwrap();
+        session
+            .append(&[start("sealed", None), end("sealed")], true)
+            .await
+            .unwrap();
+        session.append(&[start("spans", None)], true).await.unwrap();
+        session.seal(None, 1_000).await.unwrap();
+        session
+            .append(&[end("spans"), start("open", None)], true)
+            .await
+            .unwrap();
+        assert!(session.head().id_index.is_some(), "the seal wrote an index");
+
+        let before = backend.object_reads();
+        let open = session.find_run_start("open").await.unwrap();
+        assert_eq!(open.map(|start| start.run_id), Some("open".to_owned()));
+        assert_eq!(
+            backend.object_reads(),
+            before,
+            "a start in the open log fetched sealed objects"
+        );
+
+        for run in ["spans", "sealed"] {
+            let found = session.find_run_start(run).await.unwrap();
+            assert_eq!(found.map(|start| start.run_id), Some(run.to_owned()));
+        }
+        assert!(
+            backend.object_reads() > before,
+            "a sealed start is read from the index"
+        );
+        assert!(session.find_run_start("missing").await.unwrap().is_none());
+    });
+}

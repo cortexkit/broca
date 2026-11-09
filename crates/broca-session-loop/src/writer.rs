@@ -300,14 +300,7 @@ impl<B: SessionBackend> Writer for Session<B> {
         &self,
         run_id: &str,
     ) -> Result<Option<broca_session_store::record::RunStart>, SessionError> {
-        Ok(self
-            .find_id(broca_session_store::idindex::IdKind::RunId, run_id)
-            .await?
-            .into_iter()
-            .find_map(|(_, record)| match record {
-                Record::RunStart(start) => Some(*start),
-                _ => None,
-            }))
+        self.find_run_start(run_id).await
     }
 
     async fn tool_intent(

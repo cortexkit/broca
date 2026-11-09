@@ -111,13 +111,24 @@ impl PendingMedia {
         records: &[Record],
         barrier: bool,
     ) -> Result<u64, SessionError> {
+        Ok(self.append_records(session, records, barrier).await?.0)
+    }
+
+    /// [`PendingMedia::append`], returning the records as appended too: each one naming a stored
+    /// medium records where its bytes are.
+    pub async fn append_records<B: SessionBackend>(
+        &self,
+        session: &mut Session<B>,
+        records: &[Record],
+        barrier: bool,
+    ) -> Result<(u64, Vec<Record>), SessionError> {
         let (media, calls) = self.named(records);
-        let first = session.append_media(records, media, barrier).await?.0;
+        let appended = session.append_media(records, media, barrier).await?;
         let mut held = self.held.lock().expect("pending media lock");
         for call in calls {
             held.remove(&call);
         }
-        Ok(first)
+        Ok(appended)
     }
 }
 
