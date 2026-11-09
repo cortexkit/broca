@@ -8,6 +8,9 @@ from .archive_read import read_records
 SEALED = "sealed"
 UNCONFIRMED = "unconfirmed"
 CANCELLED = "cancelled"
+# Paused before the restart and still paused (waiting on a held tool call, a sign-in or an account
+# reset): no step was running, so the shutdown had nothing to seal, and none was expected.
+PAUSED = "paused"
 
 
 def _episodes(wal: pathlib.Path) -> list[tuple[str | None, list[dict]]]:
@@ -58,4 +61,13 @@ def classify_run(wal: pathlib.Path, run_id: str) -> str:
         for record in terminals
     ):
         return CANCELLED
-    return SEALED if terminals else UNCONFIRMED
+    if terminals:
+        return SEALED
+    # A pause counts only if nothing resumed the run after it; an earlier pause that was resumed
+    # says nothing about whether the shutdown sealed the step running at restart.
+    pauses = [i for i, record in enumerate(episode[1:]) if record.get("type") == "run_paused"]
+    if pauses and not any(
+        record.get("type") == "resume_started" for record in episode[1:][pauses[-1] + 1 :]
+    ):
+        return PAUSED
+    return UNCONFIRMED

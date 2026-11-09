@@ -219,6 +219,8 @@ report = json.load(open(sys.argv[1]))
 print("   pid        " + report["pid"])
 print("   sessions live at restart: " + (", ".join(report["sessions_at_restart"]) or "none"))
 print("   sessions sealed at restart (WAL readback): " + (", ".join(report["sessions_sealed"]) or "none"))
+if report.get("sessions_paused"):
+    print("   paused before restart (nothing to seal): " + ", ".join(report["sessions_paused"]))
 if report["sessions_unconfirmed"]:
     print("   WARNING seal not confirmed: " + ", ".join(report["sessions_unconfirmed"]))
 if report.get("sessions_cancelled"):

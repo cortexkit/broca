@@ -12,7 +12,14 @@ import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
-from lib.seal_readback import CANCELLED, SEALED, UNCONFIRMED, active_run_id, classify_run
+from lib.seal_readback import (
+    CANCELLED,
+    PAUSED,
+    SEALED,
+    UNCONFIRMED,
+    active_run_id,
+    classify_run,
+)
 
 
 def frame(seq: int, record: dict) -> bytes:
@@ -67,6 +74,15 @@ class SealReadbackTests(unittest.TestCase):
             {"type": "step_started"},
         )
         self.assertEqual(classify_run(self.wal, "run-auth-paused"), UNCONFIRMED)
+
+    def test_a_run_still_paused_on_a_held_tool_is_paused_not_unconfirmed(self) -> None:
+        self.write_records(
+            {"type": "run_started", "run_id": "run-held"},
+            {"type": "step_started"},
+            {"type": "run_paused", "reason": "tool_held"},
+        )
+        self.assertEqual(active_run_id(self.wal), "run-held")
+        self.assertEqual(classify_run(self.wal, "run-held"), PAUSED)
 
     def test_restart_pause_then_resume_counts_as_sealed(self) -> None:
         self.write_records(

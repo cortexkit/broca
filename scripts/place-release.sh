@@ -198,7 +198,7 @@ sessions = [line.split()[1] for line in snapshot.splitlines() if line.startswith
 sys.path.insert(0, scripts)
 from lib import state_root
 from lib.archive_read import logical_wals
-from lib.seal_readback import CANCELLED, SEALED, UNCONFIRMED, active_run_id, classify_run
+from lib.seal_readback import CANCELLED, PAUSED, SEALED, UNCONFIRMED, active_run_id, classify_run
 
 active_path = pathlib.Path(active_runs_file)
 seal_error = ""
@@ -210,7 +210,7 @@ if pid:
     except Exception as error:
         active_runs = [{"session": name, "run_id": None} for name in sessions]
         errors = [f"cannot read pre-restart run snapshot: {error}"]
-    statuses = {SEALED: [], UNCONFIRMED: [], CANCELLED: [], "idle": []}
+    statuses = {SEALED: [], UNCONFIRMED: [], CANCELLED: [], PAUSED: [], "idle": []}
     try:
         wals = {
             wal.name: wal
@@ -258,9 +258,10 @@ else:
         errors.append(str(error))
     seal_error = "; ".join(errors)
     active_path.write_text(json.dumps({"runs": active_runs, "error": seal_error}))
-    statuses = {SEALED: [], UNCONFIRMED: [], CANCELLED: [], "idle": []}
+    statuses = {SEALED: [], UNCONFIRMED: [], CANCELLED: [], PAUSED: [], "idle": []}
 
 runs_sealed = statuses[SEALED]
+sessions_paused = [run["session"] for run in statuses[PAUSED]]
 sessions_idle = [run["session"] for run in statuses["idle"]]
 runs_unconfirmed = statuses[UNCONFIRMED]
 runs_cancelled = statuses[CANCELLED]
@@ -284,6 +285,7 @@ pathlib.Path(path).write_text(json.dumps({"backup": backup, "pid": pid or None,
                                        "sessions_unconfirmed": sessions_unconfirmed,
                                        "sessions_cancelled": sessions_cancelled,
                                        "sessions_idle": sessions_idle,
+                                       "sessions_paused": sessions_paused,
                                        "seal_error": seal_error,
                                        "live_run_snapshot": snapshot}))
 PY
