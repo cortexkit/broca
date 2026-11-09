@@ -284,6 +284,8 @@ pub struct MemoryBackend {
     crash_after: Mutex<Option<usize>>,
     /// Mutations left before exactly one of them fails. Tests only.
     fail_at: Mutex<Option<usize>>,
+    /// How many objects were fetched (`get_object`), found or not. Tests only.
+    object_reads: std::sync::atomic::AtomicUsize,
 }
 
 #[derive(Default)]
@@ -335,6 +337,11 @@ impl MemoryBackend {
             }
             None => Ok(()),
         }
+    }
+
+    /// How many objects have been fetched from this backend so far, found or not. Tests only.
+    pub fn object_reads(&self) -> usize {
+        self.object_reads.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Every object name stored for `s`. Tests only.
@@ -534,6 +541,8 @@ impl SessionBackend for MemoryBackend {
         s: &SessionAddr,
         name: &str,
     ) -> Result<Option<Vec<u8>>, BackendError> {
+        self.object_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let sessions = self.sessions.lock().unwrap();
         Ok(sessions
             .get(s)
