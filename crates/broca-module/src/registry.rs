@@ -778,6 +778,7 @@ pub(crate) mod media_head;
 #[path = "run_rows.rs"]
 mod run_rows;
 pub mod store_move;
+pub mod store_restore;
 pub use run_rows::OverhaulRunSource;
 
 /// A failed durability boundary. Historical events survive successful session recovery.
@@ -1016,6 +1017,8 @@ struct Inner {
     store_moves: store_move::MoveFences,
     /// What runs `session.move_to_store`, installed by the daemon with its stores.
     store_mover: std::sync::OnceLock<Arc<dyn store_move::StoreMover>>,
+    /// What runs `session.restore_from_backup`, installed by the daemon with its stores.
+    store_restorer: std::sync::OnceLock<Arc<dyn store_restore::StoreRestorer>>,
     run_event_reader: std::sync::OnceLock<Arc<RunEventLookup>>,
     session_address_inventory: std::sync::OnceLock<Arc<dyn broca_store::SessionAddressResolver>>,
     episode_source: std::sync::OnceLock<Arc<EpisodeReadSource>>,
@@ -2482,6 +2485,7 @@ impl LineageRegistry {
                 retention: std::sync::OnceLock::new(),
                 store_moves: Default::default(),
                 store_mover: std::sync::OnceLock::new(),
+                store_restorer: std::sync::OnceLock::new(),
                 #[cfg(test)]
                 close_started: tokio::sync::watch::channel(0).0,
                 #[cfg(test)]

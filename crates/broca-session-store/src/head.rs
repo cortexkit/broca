@@ -203,6 +203,14 @@ pub fn stored_cipher(bytes: &[u8]) -> Result<Cipher, HeadError> {
     Ok(Head::decode(body).map_err(HeadError::Decode)?.cipher())
 }
 
+/// The (project root, harness, session) a stored head was created under, read without checking
+/// the head. Only for naming the session, as restore does to find who holds it; restore then
+/// opens the head and checks it.
+pub fn stored_triple(bytes: &[u8]) -> Result<SessionTriple, HeadError> {
+    let body = bytes.get(TAG_LEN..).ok_or(HeadError::Malformed)?;
+    Ok(Head::decode(body).map_err(HeadError::Decode)?.triple)
+}
+
 /// Opens a stored head: decodes it, then checks it in the mode it names. An encrypted head's data
 /// key is unwrapped under `deployment` and checks its tag; a plain head checks its unkeyed check
 /// and needs no deployment key.

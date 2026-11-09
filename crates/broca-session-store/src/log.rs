@@ -502,6 +502,9 @@ pub struct ReadLog {
     pub last: ChainBase,
     /// Each complete batch, as a range of indexes into `records`.
     pub batches: Vec<std::ops::Range<usize>>,
+    /// Where each complete batch starts in the log, in the order of `batches`: a length the log
+    /// can be cut back to and still end on a complete batch.
+    pub batch_starts: Vec<u64>,
 }
 
 /// A batch read so far, kept apart until its last frame arrives.
@@ -534,6 +537,7 @@ pub fn read(
         frames: 0,
         last: ChainBase::default(),
         batches: Vec::new(),
+        batch_starts: Vec::new(),
     };
     let mut offset = 0usize;
     let mut index = 0u32;
@@ -671,6 +675,7 @@ pub fn read(
             let start = log.records.len();
             log.records.extend(batch.records);
             log.batches.push(start..log.records.len());
+            log.batch_starts.push(batch.at);
             log.complete_through = offset as u64;
             log.frames = index;
             log.last = chain;

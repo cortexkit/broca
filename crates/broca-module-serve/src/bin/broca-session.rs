@@ -473,6 +473,20 @@ enum Cmd {
         #[arg(long)]
         display: bool,
     },
+    /// `session.restore_from_backup`: after the state root's files came back from a backup,
+    /// restore this session kept in the new storage, or with `--all` every such session, from
+    /// what the store holds. Operator only. A session whose head and everything it names are
+    /// there is kept untouched. Otherwise the newest complete head version is restored, and its
+    /// open log is cut back before the first record naming a file the backup lacks, the cut bytes
+    /// kept beside the log. Nothing is deleted. Prints one line per session (`--json-events`: one
+    /// JSON object per session) and exits 0 when every session was kept or restored, 1
+    /// otherwise.
+    RestoreFromBackup {
+        /// Every session kept in the new storage; the session identity given then only
+        /// attaches the command to the daemon.
+        #[arg(long)]
+        all: bool,
+    },
     /// `session.move_to_store`: move this live, idle session from today's storage into the new
     /// storage. Operator only, and it can't be undone. Prints the daemon's reply, or its
     /// refusal (`not_movable` names what the session still needs) and exits 1.
@@ -1039,6 +1053,28 @@ async fn run(args: Args) -> Result<i32, String> {
                 || format!("IMPORT {response:?}"),
             );
             Ok(0)
+        }
+        Cmd::RestoreFromBackup { all } => {
+            let reply = client
+                .management_raw(
+                    "session.restore_from_backup",
+                    &serde_json::json!({ "all": all }),
+                )
+                .await
+                .map_err(|error| format!("restore-from-backup transport: {error}"))?;
+            let body = match reply {
+                Ok(body) => body,
+                Err(body) => {
+                    write_raw_reply_to(
+                        &body,
+                        None,
+                        &mut std::io::stdout().lock(),
+                        &mut std::io::stderr().lock(),
+                    )?;
+                    return Ok(1);
+                }
+            };
+            restore_report(json, &body, &mut |line| println!("{line}"))
         }
         Cmd::MoveToStore { class } => {
             let started = std::time::Instant::now();
@@ -2430,6 +2466,32 @@ fn write_raw_reply_to(
 }
 
 /// Emit one event: a JSON line (`--json-events`) or a greppable human marker.
+/// Prints `session.restore_from_backup`'s reply `body` to `output`: each session's report line,
+/// or with `json` each session's report as one JSON object. Exits 0 when every session was kept
+/// or restored, 1 when any wasn't.
+fn restore_report(json: bool, body: &[u8], output: &mut impl FnMut(String)) -> Result<i32, String> {
+    let reply: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|error| format!("restore-from-backup reply doesn't decode: {error}"))?;
+    let sessions = reply["sessions"]
+        .as_array()
+        .ok_or("restore-from-backup reply names no sessions")?;
+    let mut exit = 0;
+    for session in sessions {
+        if !matches!(
+            session["outcome"].as_str(),
+            Some("kept" | "rolled_back" | "log_cut")
+        ) {
+            exit = 1;
+        }
+        output(if json {
+            session.to_string()
+        } else {
+            session["report"].as_str().unwrap_or_default().to_owned()
+        });
+    }
+    Ok(exit)
+}
+
 fn emit(json: bool, obj: &serde_json::Value, human: impl FnOnce() -> String) {
     emit_to(json, obj, human, &mut |line| println!("{line}"));
 }
@@ -3373,6 +3435,58 @@ mod tests {
             "--no-cache",
         ]);
         assert!(result.is_err());
+    }
+
+    /// `restore-from-backup` takes `--all`, prints each session's report line (or its JSON
+    /// object), and exits 1 when any session wasn't kept or restored.
+    #[test]
+    fn restore_from_backup_prints_a_line_per_session_and_fails_on_any_left_broken() {
+        let args = Args::try_parse_from([
+            "broca-session",
+            "--subc",
+            "/tmp/subc.json",
+            "--project-root",
+            "/tmp/project",
+            "--session",
+            "s1",
+            "restore-from-backup",
+            "--all",
+        ])
+        .expect("parse restore-from-backup");
+        assert!(matches!(args.cmd, Cmd::RestoreFromBackup { all: true }));
+        let reply = serde_json::json!({"sessions": [
+            {"outcome": "kept", "report": "durable a: kept"},
+            {"outcome": "log_cut", "report": "durable b: log cut"},
+        ]});
+        let mut lines: Vec<String> = Vec::new();
+        let exit = super::restore_report(false, reply.to_string().as_bytes(), &mut |line| {
+            lines.push(line)
+        })
+        .unwrap();
+        assert_eq!(
+            (exit, lines),
+            (
+                0,
+                vec![
+                    "durable a: kept".to_owned(),
+                    "durable b: log cut".to_owned()
+                ]
+            )
+        );
+        let reply = serde_json::json!({"sessions": [
+            {"outcome": "rolled_back", "report": "durable a: rolled back"},
+            {"outcome": "unrecoverable", "report": "durable b: unrecoverable"},
+        ]});
+        let mut lines: Vec<String> = Vec::new();
+        let exit = super::restore_report(true, reply.to_string().as_bytes(), &mut |line| {
+            lines.push(line)
+        })
+        .unwrap();
+        assert_eq!(exit, 1);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&lines[1]).unwrap()["outcome"],
+            "unrecoverable"
+        );
     }
 
     #[test]
