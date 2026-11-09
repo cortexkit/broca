@@ -187,7 +187,6 @@ macro_rules! impl_retention_index {
 }
 
 impl_retention_index!(SqliteStore);
-impl_retention_index!(broca_store::db::OverhaulDb);
 
 #[cfg(test)]
 mod operational_port_tests {
@@ -211,44 +210,15 @@ mod operational_port_tests {
         fs::create_dir_all(&root).unwrap();
         Root(root)
     }
-    fn open(root: &Path, overhaul: bool) -> Arc<dyn RetentionIndex> {
-        if overhaul {
-            fs::write(root.join("state-format"), b"broca-state/2\n").unwrap();
-            Arc::new(broca_store::db::OverhaulDb::open(root).unwrap())
-        } else {
-            Arc::new(SqliteStore::open(root.join("run-index.db")).unwrap())
-        }
-    }
-
-    #[test]
-    fn operational_retention_recovery_needs_no_legacy_export_on_overhaul_roots() {
-        let root = root();
-        fs::write(root.0.join("state-format"), b"broca-state/2\n").unwrap();
-        let index = Arc::new(broca_store::db::OverhaulDb::open(&root.0).unwrap());
-        let session = BindIdentity::new("/project", "runner", "retained");
-        index
-            .retention_deletion_pending("pending", &session, true)
-            .unwrap();
-        let wal = Arc::new(FileWalStore::with_config(
-            root.0.join("wal"),
-            broca_wal::WalConfig::OVERHAUL,
-        ));
-        let leases = Arc::new(broca_core::FileLeaseStore::new(root.0.join("leases")));
-        let service =
-            RetentionService::without_usage_export(wal, index.clone(), leases.clone()).unwrap();
-        assert!(service.resume_deletions(1000).unwrap().is_empty());
-        assert_eq!(service.enroll().unwrap(), 0);
-        assert_eq!(index.retention_pending_deletions().unwrap(), vec![session]);
-        assert!(!root.0.join("run-index.db").exists());
-        let legacy_wal = Arc::new(FileWalStore::new(root.0.join("wal")));
-        assert!(RetentionService::without_usage_export(legacy_wal, index, leases).is_err());
+    fn open(root: &Path) -> Arc<dyn RetentionIndex> {
+        Arc::new(SqliteStore::open(root.join("run-index.db")).unwrap())
     }
 
     #[test]
     fn retention_ports_preserve_expiry_deletion_and_withdrawal_work_across_restart() {
-        for overhaul in [false, true] {
+        {
             let root = root();
-            let index = open(&root.0, overhaul);
+            let index = open(&root.0);
             let session = BindIdentity::new("/project", "runner", "retained");
             let mut row = RetentionLineageRow {
                 lineage_id: "old".into(),
@@ -290,7 +260,7 @@ mod operational_port_tests {
             assert!(index.run("old-run").unwrap().unwrap().withdrawals_owed);
             index.deletion_pending("old", &session, true).unwrap();
             drop(index);
-            let index = open(&root.0, overhaul);
+            let index = open(&root.0);
             assert_eq!(
                 index.pending_deletions().unwrap().unwrap(),
                 vec![session.clone()]
@@ -324,7 +294,7 @@ mod operational_port_tests {
             assert!(index.settle_withdrawal("old", "known").unwrap());
             assert!(index.give_up_withdrawal("old", "unknown").unwrap());
             drop(index);
-            let index = open(&root.0, overhaul);
+            let index = open(&root.0);
             index
                 .expire_with_withdrawals(&row, std::slice::from_ref(&expired_run), &questions)
                 .unwrap();
@@ -343,16 +313,6 @@ mod operational_port_tests {
             assert_eq!(index.lineage("old").unwrap(), Some(row));
             index.deletion_pending("old", &session, false).unwrap();
             assert!(index.pending_deletions().unwrap().unwrap().is_empty());
-            if overhaul {
-                assert!(!root.0.join("run-index.db").exists());
-                for name in ["broca.db", "broca.db-wal"] {
-                    if let Ok(bytes) = fs::read(root.0.join(name)) {
-                        assert!(!bytes
-                            .windows(26)
-                            .any(|s| s == b"NEVER_COPY_RETENTION_TITLE"));
-                    }
-                }
-            }
         }
     }
 }

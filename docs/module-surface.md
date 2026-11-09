@@ -820,7 +820,7 @@ what it cost.
   `session.read` and projection skip it; it is never a transcript message. Billing turns it into
   its own export fact marked `warm: true`, priced from its own usage, whose id is taken over the
   record's WAL sequence so the run's ordinary facts keep their ids. Absent usage stays absent.
-  On opted-in `broca-state/2` roots, every physical warm send is durably reserved before sending
+  The retained version-4 WAL compatibility path reserves every physical warm send before sending
   and normally gets a `cache_warmed` terminal with its reservation and outcome envelope even
   when it fails;
   those records require the `bill-attempts/v1` WAL feature. A compression refusal and
@@ -829,6 +829,8 @@ what it cost.
   the outcome or a full WAL refuses its terminal, reclaim lets the billing reader report the
   reserved attempt as possibly billed,
   without inventing usage, deduplicated by its random `attempt_id`.
+  These low-level compatibility records do not enable daemon service on roots marked
+  `broca-state/2`: startup refuses those roots and requires a fresh state root.
 - **Head and declaration.** `session.head.cache` reports the clock from memory, with no WAL
   scan. The admitting send's `baseline` and `session.baseline` carry `cache {ttl_ms,
   ttl_options_ms, read_refreshes_ttl, warm: "supported" | "unsupported", basis}`, every member
@@ -1650,10 +1652,11 @@ synchronous client recorded and a crash left open is sealed on recovery with its
 exit, without calling the provider or the model.
 
 The provider-call watchdog is separate from caller cancellation. A timed-out provider attempt
-ends `Interrupted`, not `Cancelled`, and releases the lease on legacy-format roots. On an overhaul
-root, a billing-reservation durability failure takes precedence: the step fails with a WAL
+ends `Interrupted`, not `Cancelled`, and releases the lease on legacy-format roots. In the retained
+version-4 WAL compatibility path, a billing-reservation durability failure takes precedence: the step fails with a WAL
 durability error instead of `Interrupted`. A writer whose sync never returns remains a
 process-level failure for the supervisor, not a bounded close-out; ownership is not released early.
+Roots marked `broca-state/2` are not served by the daemon.
 
 ## 14. run.status enum + durable run index + busy-vs-stale
 

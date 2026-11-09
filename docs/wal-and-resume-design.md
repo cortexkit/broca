@@ -3,6 +3,11 @@
 Record semantics and replay rules are authoritative in `docs/durability-contract.md`.
 This document describes the WAL, writer, replay, materialized store, and renderer.
 
+The daemon serves only unmarked state roots. Roots marked `broca-state/2` belong
+to a removed staging redesign and refuse startup; start with a fresh state root.
+The version-4 framing, recovery, writer, offset-resume and warm-reservation rules
+below describe retained low-level WAL compatibility, not an available daemon mode.
+
 Implementation invariants:
 > - `run_started` is ONE ATOMIC record `{run_id, session, config, input}` (was 3) —
 > a torn start is all-or-nothing, never a partial-empty-prompt resume.

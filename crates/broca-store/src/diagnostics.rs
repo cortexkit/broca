@@ -9,6 +9,51 @@ pub const ERROR_PREDICATE: &str = "state='error'";
 pub const INTERRUPTED_PREDICATE: &str = "state IN ('interrupted','transform_unavailable')";
 pub const LIVE_PREDICATE: &str = "state IN ('active','paused')";
 
+pub trait DiagnosticEvidenceReader: Send + Sync {
+    fn diagnostic_evidence(&self, since: i64, now: i64) -> Result<Evidence, String>;
+}
+
+impl DiagnosticEvidenceReader for SqliteStore {
+    fn diagnostic_evidence(&self, since: i64, now: i64) -> Result<Evidence, String> {
+        SqliteStore::diagnostic_evidence(self, since, now)
+    }
+}
+
+/// Read-only tools must refuse a marked root instead of opening its legacy index.
+pub fn operational_database_name(root: &std::path::Path) -> Result<&'static str, String> {
+    match std::fs::read(root.join("state-format")) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok("run-index.db"),
+        Ok(bytes) => Err(format!(
+            "unsupported state-format marker {:?}; start with a fresh state root",
+            String::from_utf8_lossy(&bytes[..bytes.len().min(64)])
+        )),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+pub fn open_diagnostic_reader(
+    root: &std::path::Path,
+    config: broca_wal::WalConfig,
+) -> Result<Box<dyn DiagnosticEvidenceReader>, String> {
+    operational_database_name(root)?;
+    SqliteStore::open_read_only(root.join("run-index.db"))
+        .map(|db| Box::new(db.with_wal_config(config)) as Box<dyn DiagnosticEvidenceReader>)
+        .map_err(|e| e.to_string())
+}
+
+/// Daemon readers use the root decision retained at boot; tools still classify.
+pub fn open_diagnostic_reader_decided(
+    decision: broca_wal::state_format::StateRootDecision<'_>,
+    config: broca_wal::WalConfig,
+) -> Result<Box<dyn DiagnosticEvidenceReader>, String> {
+    let legacy = decision
+        .legacy()
+        .ok_or("unsupported state root; start with a fresh state root")?;
+    SqliteStore::open_boot_legacy_read_only(legacy)
+        .map(|db| Box::new(db.with_wal_config(config)) as Box<dyn DiagnosticEvidenceReader>)
+        .map_err(|e| e.to_string())
+}
+
 pub(crate) fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS diagnostics_errors_time ON run_index(state_changed_ms) WHERE state='error';

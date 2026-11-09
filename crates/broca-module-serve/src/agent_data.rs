@@ -868,7 +868,7 @@ mod operational_port_tests {
     }
 
     struct PortInventory {
-        db: Arc<broca_store::db::OverhaulDb>,
+        db: Arc<broca_store::SqliteStore>,
         repairs: std::sync::atomic::AtomicUsize,
         preparations: std::sync::atomic::AtomicUsize,
     }
@@ -918,8 +918,7 @@ mod operational_port_tests {
         let root = broca_test_support::scratch_root()
             .join(format!("port-inventory-readiness-{}", std::process::id()));
         std::fs::create_dir_all(root.join("wal")).unwrap();
-        std::fs::write(root.join("state-format"), b"broca-state/2\n").unwrap();
-        let db = Arc::new(broca_store::db::OverhaulDb::open(&root).unwrap());
+        let db = Arc::new(broca_store::SqliteStore::open(root.join("run-index.db")).unwrap());
         let inventory = Arc::new(PortInventory {
             db: db.clone(),
             repairs: 0.into(),
@@ -927,7 +926,7 @@ mod operational_port_tests {
         });
         let wal = Arc::new(FileWalStore::with_config(
             root.join("wal"),
-            broca_wal::WalConfig::OVERHAUL,
+            broca_wal::WalConfig::LEGACY,
         ));
         let registry =
             LineageRegistry::new_with_sources(Arc::new(NeverOpen), Some(wal.clone()), None);
@@ -971,42 +970,26 @@ mod operational_port_tests {
         assert!(!root
             .join(broca_core::SESSION_PROJECTION_INCOMPLETE)
             .exists());
-        for name in ["run-index.db", "run-index.db-wal", "run-index.db-shm"] {
-            assert!(!root.join(name).exists());
-        }
+        assert!(root.join("run-index.db").exists());
     }
 
     #[test]
     fn boot_and_move_discovery_use_the_selected_inventory_port() {
-        for overhaul in [false, true] {
+        {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .unwrap();
             let root = runtime.block_on(async {
                 let root = broca_test_support::scratch_root().join(format!(
-                    "agent-inventory-port-{}-{overhaul}",
+                    "agent-inventory-port-{}-legacy",
                     std::process::id()
                 ));
                 std::fs::create_dir_all(root.join("wal")).unwrap();
                 let wal = Arc::new(FileWalStore::new(root.join("wal")));
                 let registry =
                     LineageRegistry::new_with_sources(Arc::new(NeverOpen), Some(wal.clone()), None);
-                let (index, service): (Arc<dyn InventoryPort>, AgentDataService) = if overhaul {
-                    std::fs::write(root.join("state-format"), b"broca-state/2\n").unwrap();
-                    let db = Arc::new(broca_store::db::OverhaulDb::open(&root).unwrap());
-                    (
-                        db.clone(),
-                        AgentDataService::with_ports(
-                            root.clone(),
-                            registry,
-                            wal.clone(),
-                            db.clone(),
-                            db,
-                            Arc::new(NoDoor),
-                        ),
-                    )
-                } else {
+                let (index, service): (Arc<dyn InventoryPort>, AgentDataService) = {
                     let db = Arc::new(
                         broca_store::SqliteStore::open(root.join("run-index.db")).unwrap(),
                     );
@@ -1044,9 +1027,6 @@ mod operational_port_tests {
                 assert_eq!(found.sessions.len(), 1);
                 driver.drop_projection(&session).unwrap();
                 assert_eq!(driver.local_sessions(&refs).sessions.len(), 1);
-                if overhaul {
-                    assert!(!root.join("run-index.db").exists());
-                }
                 drop(service);
                 drop(driver);
                 drop(index);

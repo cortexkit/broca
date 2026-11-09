@@ -832,21 +832,6 @@ fn audit_classifier_keys_require_explicit_provider_binding() {
     );
 }
 
-#[test]
-fn audit_routing_recovery_is_started_outside_retention_gate() {
-    let main = include_str!("../../main.rs");
-    let start = main
-        .find("system_one.spawn_routing_recovery(")
-        .expect("routing recovery must be started explicitly on every root");
-    let gate = main
-        .find("state_format.start(BackgroundTask::RetentionSweeper")
-        .unwrap();
-    assert!(
-        start < gate,
-        "routing recovery must not be inside legacy-only retention"
-    );
-}
-
 #[tokio::test(start_paused = true)]
 async fn audit_pending_reports_do_not_extend_item_content_retention() {
     let mut rig = routed_rig(true, true);
@@ -1544,10 +1529,7 @@ async fn routed_modelless_validation_report_crash_keeps_only_cleanup_until_recov
     )
     .await;
     drop(rig);
-    let mut resumed = routed_rig_with_store(store.clone(), router.clone());
-    Arc::get_mut(&mut resumed.service)
-        .unwrap()
-        .routing_content_retention = false;
+    let resumed = routed_rig_with_store(store.clone(), router.clone());
     let valid = routed_request(&["valid-after-validation"]);
     assert_eq!(
         call(&resumed, &valid).await.unwrap_err()["code"],
@@ -1611,10 +1593,7 @@ async fn routed_acknowledged_validation_cleanup_recovers_before_id_reuse() {
         .unwrap();
     drop(rig);
 
-    let mut resumed = routed_rig_with_store(store.clone(), router.clone());
-    Arc::get_mut(&mut resumed.service)
-        .unwrap()
-        .routing_content_retention = false;
+    let resumed = routed_rig_with_store(store.clone(), router.clone());
     resumed.service.recover_routing().await.unwrap();
     assert_eq!(router.bodies("route.report").len(), 1);
     assert!(store.lookup(STORE_ROLE, "routed").unwrap().is_none());

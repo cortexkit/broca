@@ -1177,7 +1177,7 @@ async fn recover_batch(service: &Arc<SystemOne>, batch_id: &str) -> Result<(), E
         let expired = batch.as_ref().is_some_and(|batch| now.saturating_sub(batch.admitted_at_ms) >= broca_store::system_one::RETENTION_MS);
         let mut journal: Journal = match serde_json::from_str(&row.runs) {
             Ok(journal) => journal,
-            Err(_) if expired && service.routing_content_retention => {
+            Err(_) if expired => {
                 tracing::error!(target: "system_one", %batch_id, "expired routing journal is undecodable; scrubbing unrecoverable content");
                 let (store, role, id, owner) = (service.store.clone(), service.role.clone(), batch_id.to_owned(), service.owner.clone());
                 classify::blocking(move || store.expire_routed(&role, &id, &owner, None)).await?;
@@ -1214,13 +1214,9 @@ async fn recover_batch(service: &Arc<SystemOne>, batch_id: &str) -> Result<(), E
                 queue_abandoned_selection(&mut journal, &choice);
             }
             if let Some(selection) = &mut journal.reselection { selection.finished = true; }
-            if service.routing_content_retention {
-                journal.outbox.retain(|rpc| !rpc.closed);
-                journal = Journal { expired: true, outbox: journal.outbox, ..Default::default() };
-                archive_expired(service, batch_id, &journal).await?;
-            } else {
-                save(service, batch_id, &journal).await?;
-            }
+            journal.outbox.retain(|rpc| !rpc.closed);
+            journal = Journal { expired: true, outbox: journal.outbox, ..Default::default() };
+            archive_expired(service, batch_id, &journal).await?;
         } else if !journal.expired {
             recover_claimed(service, batch_id, &mut journal).await?;
         }

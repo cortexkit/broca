@@ -11,7 +11,7 @@ use broca_wal::state_format::decide_state_root;
 pub fn resolve_session_address(root: &Path, claim: &BindIdentity) -> Result<BindIdentity, String> {
     claim.validate_keyable()?;
     let reference = broca_core::agent_session_ref(claim);
-    let reader = broca_store::db::open_session_resolver(root)?;
+    let reader = broca_store::session_inventory::open_session_resolver(root)?;
     let mut snapshot = reader.resolve_refs(&[&reference])?;
     match snapshot.sessions.remove(&reference) {
         Some((_, identity))
@@ -47,14 +47,10 @@ fn with_inventory<T>(
 ) -> Result<T, String> {
     std::fs::create_dir_all(root).map_err(|error| error.to_string())?;
     let decision = decide_state_root(root).map_err(|error| error.to_string())?;
-    if let Some(legacy) = decision.legacy() {
-        let store = broca_store::SqliteStore::open_boot_legacy(legacy)
-            .map_err(|error| error.to_string())?;
-        operation(&store, &store)
-    } else {
-        let store = broca_store::db::OverhaulDb::open(root).map_err(|error| error.to_string())?;
-        operation(&store, &store)
-    }
+    let legacy = decision.legacy().ok_or("unsupported state root")?;
+    let store =
+        broca_store::SqliteStore::open_boot_legacy(legacy).map_err(|error| error.to_string())?;
+    operation(&store, &store)
 }
 
 #[cfg(test)]
@@ -126,16 +122,5 @@ mod tests {
         register_legacy_session(&root, &first).unwrap();
         assert!(register_legacy_session(&root, &second).is_err());
         assert!(resolve_session_address(&root, &first).is_err());
-    }
-
-    #[test]
-    fn marked_roots_use_the_selected_inventory_not_a_legacy_index() {
-        let root = root("address-overhaul");
-        std::fs::write(root.join("state-format"), b"broca-state/2\n").unwrap();
-        let seed = BindIdentity::new(root.join("legacy"), "harness", "session");
-        assert_eq!(register_legacy_session(&root, &seed).unwrap(), seed);
-        assert_eq!(resolve_session_address(&root, &seed).unwrap(), seed);
-        assert!(root.join("broca.db").exists());
-        assert!(!root.join("run-index.db").exists());
     }
 }
