@@ -159,6 +159,9 @@ fn manifest() -> Arc<broca_wal::PlanManifest> {
     })
 }
 
+/// The context window the `no-cut` case's measured run is admitted with (see `run_measured`).
+const NO_CUT_CONTEXT_LIMIT: u64 = 20_000_000;
+
 /// A send naming no tools of its own (the plan's apply), on model `model`, with a context window
 /// a head's model has.
 fn request(text: &str, model: &str, max_steps: u32) -> SubmissionRequest {
@@ -2063,21 +2066,23 @@ async fn run_measured(
         root: root.clone(),
         parts: parts.clone(),
     });
+    let mut submission = request(
+        "Carry on with the review: read each file the plan names and report what changed.",
+        // Another model than the history's runs, so the first step rides the compaction
+        // provider, which hands the view over there.
+        "m2",
+        (total + 5) as u32,
+    );
+    if case == "no-cut" {
+        // The history's runs are copies of small template runs, so the first request's size
+        // estimate counts the whole uncut request as growth since the last request measured;
+        // past a few thousand messages that passes a 1,000,000-token window and the run would
+        // end at the context ceiling before its first model call.
+        submission.context_limit = Some(NO_CUT_CONTEXT_LIMIT);
+    }
     idle(&commands).await;
     timeline.take();
-    let outcome = send(
-        &commands,
-        "measure001",
-        request(
-            "Carry on with the review: read each file the plan names and report what changed.",
-            // Another model than the history's runs, so the first step rides the compaction
-            // provider, which hands the view over there.
-            "m2",
-            (total + 5) as u32,
-        ),
-        None,
-    )
-    .await;
+    let outcome = send(&commands, "measure001", submission, None).await;
     assert!(matches!(outcome, SendOutcome::Active { .. }), "{outcome:?}");
     idle(&commands).await;
     if let Some(seat) = &seat {
@@ -2165,11 +2170,12 @@ async fn run_measured(
     }
 }
 
-/// What planning the run's view over the session's window costs, `samples` times, after the
-/// run: the shared contract crate's planner (`plan_view`, through `views::check_boundary`, which
-/// is that call alone), which every render of a request runs once over every window entry.
-/// Measured only where the view's targets are all in the window (`open-log`, `no-cut`): after
-/// a seal the transcript holds sealed entries the window doesn't.
+/// What planning the run's view over the session's window costs, at least `samples` times,
+/// after the run: `render::plan_for_render`, the part of every render of a request that runs
+/// before any message is rendered (the view's checksum, and the shared view crate's
+/// `edits_for_transcript`, `seal_with_policy` and `plan_view`, each over every window entry or
+/// every edit). Measured only where the view's targets are all in the window (`open-log`,
+/// `no-cut`): after a seal the transcript holds sealed entries the window doesn't.
 async fn planner_costs(root: &Path, measured: &Measured, samples: usize) -> Vec<Duration> {
     if !matches!(measured.case.as_str(), "open-log" | "no-cut") {
         return Vec::new();
@@ -2191,14 +2197,13 @@ async fn planner_costs(root: &Path, measured: &Measured, samples: usize) -> Vec<
     .unwrap();
     let entries = window_entries(&session.conversation);
     session.close().await.unwrap();
-    (0..samples)
+    (0..samples.max(5))
         .map(|_| {
             let started = Instant::now();
-            broca_core::compaction_v2::views::check_boundary(
+            broca_core::compaction_v2::render::plan_for_render(
                 &entries,
-                &measured.view,
+                Some(&measured.view),
                 &rules,
-                false,
             )
             .expect("the run's view plans over the window");
             started.elapsed()
@@ -2310,8 +2315,9 @@ fn request_split(measured: &[(u64, Measured)]) -> String {
          canonical render and the provider's wire render); the rest is everything else request \
          build holds. A slope is the p50's change per message against the size before, in µs. \
          The planner column is one plan of the run's view over the session's window after the \
-         run (`plan_view`, the shared contract crate's), timed offline; each render of a request \
-         runs it once.\n\n| size | request build p50 ms | byte assembly p50 ms | rest p50 ms | \
+         run, timed offline (`render::plan_for_render`: the view's checksum and the shared view \
+         crate's `edits_for_transcript`, `seal_with_policy` and `plan_view`); each render of a \
+         request runs it once, before rendering any message.\n\n| size | request build p50 ms | byte assembly p50 ms | rest p50 ms | \
          assembly slope µs/msg | rest slope µs/msg | planner p50 ms (offline) |\n\
          |---|---|---|---|---|---|---|\n",
     );
@@ -2450,12 +2456,17 @@ fn case_summary(case: &str, measured: &[(u64, Measured)]) -> String {
         out.push_str(&format!("\n### {size} messages, `{case}`\n\n"));
         out.push_str(&format!(
             "Built {} messages in {:.1} s, {:.1} MB on disk, sealed at {} cuts as it was written; \
-             the view cuts through ordinal {}. {} measured steps after {} warm-up steps. \
+             the view {} through ordinal {}. {} measured steps after {} warm-up steps. \
              Anthropic request body p50 {} KB.\n\n",
             one.built.messages,
             one.built.written.as_secs_f64(),
             one.built.bytes as f64 / 1e6,
             one.built.views,
+            if case == "no-cut" {
+                "drops tool outputs"
+            } else {
+                "cuts"
+            },
             one.built.cut.1,
             one.cycles.len(),
             one.warmup_cycles.len(),
@@ -2551,7 +2562,9 @@ fn main() {
              takes {} tool steps (2 KB results) and an answer (`open-log` above the smallest \
              size: {} warm-up and {} measured steps); the view inserts a summary and cuts \
              through all but about the newest {} messages (`no-cut`: cuts nothing, and replaces \
-             the output of every tool call before those messages). `sealed-often` seals at a new \
+             the output of every tool call before those messages; its run is admitted with a \
+             20,000,000-token window, since the first request's size estimate counts the whole \
+             uncut request as growth over the copied history's small requests). `sealed-often` seals at a new \
              cut about every {} messages.\n",
             templates.len(),
             templates.iter().map(|t| t.messages).sum::<u64>() as f64 / templates.len() as f64,

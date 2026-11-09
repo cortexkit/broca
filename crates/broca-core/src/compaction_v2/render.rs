@@ -110,11 +110,23 @@ pub fn prompt_view_kept(
     image: impl FnMut(&InsertedImage) -> Result<MediaRef, String>,
     kept: Option<&RenderCache>,
 ) -> Result<Vec<Message>, String> {
+    let (edits, plan) = plan_for_render(entries, view, rules)?;
+    render_planned(stored, entries, rides, &edits, plan, image, kept)
+}
+
+/// What rendering `view` over `entries` keeps of them, before any message is rendered: the
+/// view's edits whose targets the transcript still holds, and the plan the shared view crate
+/// makes from them (no view keeps every entry whole). It checks the view's checksum first.
+pub fn plan_for_render(
+    entries: &[Entry],
+    view: Option<&View>,
+    rules: &ProviderRules,
+) -> Result<(Vec<Edit>, render::RenderPlan), String> {
     let Some(view) = view else {
         let edits = render::edits_for_transcript(entries, &[]);
         let plan = render::plan(entries, &edits)
             .map_err(|error| format!("compaction render plan refused: {error:?}"))?;
-        return render_planned(stored, entries, rides, &edits, plan, image, kept);
+        return Ok((edits, plan));
     };
     if !view.verify() {
         return Err("compaction render plan refused: BadChecksum".into());
@@ -127,7 +139,7 @@ pub fn prompt_view_kept(
     );
     let plan = render::plan_view(entries, &filtered, rules)
         .map_err(|error| format!("compaction render plan refused: {error:?}"))?;
-    render_planned(stored, entries, rides, &filtered.edits, plan, image, kept)
+    Ok((filtered.edits, plan))
 }
 
 /// What a run's renders keep of each transcript entry they rendered: the entry's rendered
@@ -277,6 +289,18 @@ fn render_planned(
                 let position = position_of(entries, ordinal, &mid)
                     .ok_or("compaction render plan names an entry the transcript doesn't hold")?;
                 let entry = &entries[position];
+                let Some(kept) = kept else {
+                    let (message, results) =
+                        render_entry(stored, entries, rides, position, &mid, &parts)?;
+                    if !results.is_empty() {
+                        result_blocks
+                            .entry(position + 1)
+                            .or_default()
+                            .extend(results);
+                    }
+                    output.push((position, 1, order, message));
+                    continue;
+                };
                 let (next, entry_rides) = entry_inputs(stored, entry, rides, position);
                 let reused = previous
                     .as_mut()
@@ -294,7 +318,9 @@ fn render_planned(
                                 .zip(&entry_rides)
                                 .all(|(was, now)| was.as_ref() == *now)
                     });
-                let (message, results) = match reused {
+                // An entry kept from the last render goes back into the cache as it was, its
+                // inputs being equal to this render's; only an entry rendered now copies them.
+                let entry_now = match reused {
                     Some(was) => {
                         #[cfg(debug_assertions)]
                         assert!(
@@ -302,26 +328,13 @@ fn render_planned(
                                 == (was.message.clone(), was.results.clone()),
                             "a kept rendered entry differs from the entry rendered again"
                         );
-                        (was.message, was.results)
+                        was
                     }
                     None => {
-                        if let Some(kept) = kept {
-                            kept.rendered
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        }
-                        render_entry(stored, entries, rides, position, &mid, &parts)?
-                    }
-                };
-                if !results.is_empty() {
-                    result_blocks
-                        .entry(position + 1)
-                        .or_default()
-                        .extend(results.iter().cloned());
-                }
-                if kept.is_some() {
-                    output.push((position, 1, order, message.clone()));
-                    kept_now.insert(
-                        ordinal,
+                        let (message, results) =
+                            render_entry(stored, entries, rides, position, &mid, &parts)?;
+                        kept.rendered
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         RenderedEntry {
                             mid,
                             digest: entry.digest.clone(),
@@ -334,11 +347,17 @@ fn render_planned(
                                 .collect(),
                             message,
                             results,
-                        },
-                    );
-                } else {
-                    output.push((position, 1, order, message));
+                        }
+                    }
+                };
+                if !entry_now.results.is_empty() {
+                    result_blocks
+                        .entry(position + 1)
+                        .or_default()
+                        .extend(entry_now.results.iter().cloned());
                 }
+                output.push((position, 1, order, entry_now.message.clone()));
+                kept_now.insert(ordinal, entry_now);
             }
         }
     }
