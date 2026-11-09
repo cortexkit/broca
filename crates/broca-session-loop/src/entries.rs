@@ -1442,6 +1442,29 @@ pub fn native(record: &Record) -> bool {
     }
 }
 
+/// Interpret recorded marks when writing facts and when reading facts from older writers.
+/// Without marks, retain the stored origin rather than changing an existing entry's digest.
+fn stored_notice_origin(
+    legacy: Option<&Notice>,
+    sender: Option<&str>,
+    marks: Option<&serde_json::Value>,
+) -> Result<Option<cortexkit_role_compaction::read::NoticeOrigin>, String> {
+    let marks = marks
+        .map(|marks| serde_json::from_value::<broca_protocol::MessageMarks>(marks.clone()))
+        .transpose()
+        .map_err(|error| format!("entry notice marks: {error}"))?;
+    let sender = if marks.is_some() {
+        sender.or_else(|| legacy.map(|notice| notice.sender.as_str()))
+    } else {
+        legacy.map(|notice| notice.sender.as_str())
+    };
+    Ok(broca_core::compaction_v2::entries::recorded_notice_origin(
+        sender,
+        legacy.and_then(|notice| notice.template.as_deref()),
+        marks.as_ref(),
+    ))
+}
+
 /// The message `record` placed or reserved, and its facts besides number and time. A tool result
 /// that completes its turn places the tool-results message, which has no numbered parts.
 fn describe<'r>(
@@ -1471,41 +1494,53 @@ fn describe<'r>(
                 send: SendFacts::default(),
             },
         ),
-        Record::Input(input) => (
-            Some(&input.message),
-            Described {
-                written_at_ms: input.written_at_ms,
-                // An imported seed belongs to no run.
-                run_id: (input.placement != Placement::Imported).then(|| input.run_id.clone()),
-                created_at_ms: accepted_at(input, at),
-                // A run started by a queued send's `idle_start` delivery and text delivered on a
-                // tool result without an envelope aren't named here: `with_facts` names them,
-                // from the run's start and the batch's deliveries.
-                delivery_mode: match input.placement {
-                    Placement::Delivered => Some("steer"),
-                    Placement::DeliveredTurnSystem => Some("turn_system"),
-                    _ => None,
-                },
-                notice: match input.placement {
-                    Placement::RunInput => run_sender.cloned(),
-                    _ => input.notice.clone(),
+        Record::Input(input) => {
+            let send = match input.placement {
+                Placement::RunInput => run_send.clone(),
+                Placement::Steer | Placement::Delivered | Placement::DeliveredTurnSystem => {
+                    held_send_facts(input, at)
                 }
-                .filter(|_| input.message.role == Role::User),
-                usage: None,
-                generated_under: None,
-                native: native(record),
-                clean_reply: at.tags.clean_replies && input.message.role == Role::Assistant,
-                send: match input.placement {
-                    Placement::RunInput => run_send.clone(),
-                    Placement::Steer | Placement::Delivered | Placement::DeliveredTurnSystem => {
-                        held_send_facts(input, at)
-                    }
-                    Placement::BudgetNudge | Placement::Imported | Placement::DamageNotice => {
-                        SendFacts::default()
-                    }
+                Placement::BudgetNudge | Placement::Imported | Placement::DamageNotice => {
+                    SendFacts::default()
+                }
+            };
+            let legacy_notice = match input.placement {
+                Placement::RunInput => run_sender.cloned(),
+                _ => input.notice.clone(),
+            };
+            let notice = stored_notice_origin(
+                legacy_notice.as_ref(),
+                send.sender.as_deref(),
+                send.marks.as_ref(),
+            )?
+            .map(|origin| Notice {
+                sender: origin.sender,
+                template: origin.template,
+            });
+            (
+                Some(&input.message),
+                Described {
+                    written_at_ms: input.written_at_ms,
+                    // An imported seed belongs to no run.
+                    run_id: (input.placement != Placement::Imported).then(|| input.run_id.clone()),
+                    created_at_ms: accepted_at(input, at),
+                    // A run started by a queued send's `idle_start` delivery and text delivered on a
+                    // tool result without an envelope aren't named here: `with_facts` names them,
+                    // from the run's start and the batch's deliveries.
+                    delivery_mode: match input.placement {
+                        Placement::Delivered => Some("steer"),
+                        Placement::DeliveredTurnSystem => Some("turn_system"),
+                        _ => None,
+                    },
+                    notice: notice.filter(|_| input.message.role == Role::User),
+                    usage: None,
+                    generated_under: None,
+                    native: native(record),
+                    clean_reply: at.tags.clean_replies && input.message.role == Role::Assistant,
+                    send,
                 },
-            },
-        ),
+            )
+        }
         Record::Assistant(assistant) => (
             Some(&assistant.message),
             Described {
@@ -1709,11 +1744,11 @@ pub fn project(stored: &StoredEntry) -> Result<Entry, String> {
         })
         .transpose()
         .map_err(|e| e.to_string())?;
-    let notice = facts.notice.as_ref().map(|notice| {
-        let mut origin = cortexkit_role_compaction::read::NoticeOrigin::new(&notice.sender);
-        origin.template = notice.template.clone();
-        origin
-    });
+    let notice = stored_notice_origin(
+        facts.notice.as_ref(),
+        facts.sender.as_deref(),
+        facts.marks.as_ref(),
+    )?;
     let first = Facts {
         mid: mid.to_owned(),
         ordinal: stored.ordinal,

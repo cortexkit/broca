@@ -114,17 +114,12 @@ impl Origin {
     /// unverified caller has no module id to name, so its send carries no notice origin,
     /// even when it was recorded with `notice: true`.
     fn notice(&self) -> Option<NoticeOrigin> {
-        if self
-            .marks
-            .as_ref()
-            .is_some_and(|marks| marks.speaks_for.is_some() && !marks.notice)
-        {
-            return None;
-        }
         let sender = super::entries::delivery_sender(self.principal.as_ref(), DeliveryMode::Steer)?;
-        let mut notice = NoticeOrigin::new(sender);
-        notice.template = self.template.clone();
-        Some(notice)
+        super::entries::recorded_notice_origin(
+            Some(&sender),
+            self.template.as_deref(),
+            self.marks.as_ref(),
+        )
     }
 }
 

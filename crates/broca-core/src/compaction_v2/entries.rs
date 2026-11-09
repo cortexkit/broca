@@ -99,6 +99,21 @@ pub fn delivery_sender(
     }
 }
 
+/// Recorded agent speech is not a module notice unless `notice: true` was also recorded.
+/// An unmarked module send keeps its original origin, preserving existing entry digests.
+pub fn recorded_notice_origin(
+    sender: Option<&str>,
+    template: Option<&str>,
+    marks: Option<&broca_protocol::MessageMarks>,
+) -> Option<NoticeOrigin> {
+    if marks.is_some_and(|marks| marks.speaks_for.is_some() && !marks.notice) {
+        return None;
+    }
+    let mut notice = NoticeOrigin::new(sender?);
+    notice.template = template.map(str::to_owned);
+    Some(notice)
+}
+
 /// Recover attribution from admission records, not the current plan or the run
 /// that happened to carry the send. Records are joined by submission identity.
 pub fn delivered_from_records<'a>(

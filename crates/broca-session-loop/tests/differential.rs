@@ -840,6 +840,11 @@ fn send_facts() -> bool {
     SEND_FACTS.try_with(|set| *set).unwrap_or(false)
 }
 
+tokio::task_local! {
+    /// Recorded owner-send marks and the notice presence the compaction contract promises.
+    static RECORDED_MARKS: (Option<broca_protocol::MessageMarks>, bool);
+}
+
 /// The principal that sends in the send-facts scenario, and owns its scope.
 fn owner() -> broca_protocol::BindPrincipal {
     broca_protocol::BindPrincipal::Reserved {
@@ -1003,6 +1008,38 @@ async fn entries_alike(today: &LogImage, session: &Session<&MemoryBackend>) {
         .iter()
         .map(|entry| broca_session_loop::entries::project(entry).expect("an entry projects"))
         .collect();
+    if let Ok((marks, notice)) = RECORDED_MARKS.try_with(Clone::clone) {
+        let first = serde_json::to_value(&new[0]).unwrap();
+        assert_eq!(first.get("notice").is_some(), notice, "{first}");
+        if notice {
+            assert_eq!(first["notice"], json!({"sender": "prefrontal-core"}));
+        }
+        // Earlier writers stored a module origin even for marked agent speech.
+        // Reads must decide from the recorded marks without rewriting those facts.
+        for (mut stored, expected) in session
+            .entries(1, usize::MAX)
+            .await
+            .unwrap()
+            .into_iter()
+            .zip(&new)
+        {
+            if stored.message.role == Role::User {
+                stored.state.facts.as_mut().unwrap().notice = if marks.is_some() && notice {
+                    None
+                } else {
+                    Some(broca_session_store::record::Notice {
+                        sender: "prefrontal-core".into(),
+                        template: None,
+                    })
+                };
+            }
+            let served = broca_session_loop::entries::project(&stored).unwrap();
+            assert_eq!(
+                serde_json::to_value(served).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
+        }
+    }
     fn masked(entries: &[cortexkit_role_compaction::read::Entry]) -> Value {
         fn rename(value: &mut Value, names: &mut std::collections::HashMap<String, usize>) {
             match value {
@@ -1944,6 +1981,9 @@ impl Scenario {
 
     fn request_for(&self, run_id: &str, input: &[Message]) -> RunRequest {
         let mut request = self.plain_request_for(run_id, input);
+        if RECORDED_MARKS.try_with(|_| ()).is_ok() {
+            request.principal = Some(owner());
+        }
         if send_facts() {
             request.send_id = Some(format!("send-{run_id}"));
             request.request_identity_digest = Some(format!("digest-{run_id}"));
@@ -2038,6 +2078,7 @@ impl Scenario {
 /// this file is given them, and the new loop's admission is derived from the same values.
 fn admission_control(scenario: &Scenario) -> RunControl {
     RunControl {
+        display_message_marks: RECORDED_MARKS.try_with(|(marks, _)| marks.clone()).ok().flatten(),
         auth_selection: account_selection(),
         account_limit_pause: account().is_some(),
         manifest: scenario.manifest.clone(),
@@ -3714,6 +3755,37 @@ async fn every_send_fact_reaches_the_run_start() {
         .await;
 }
 
+#[tokio::test]
+async fn recorded_send_marks_decide_notice_origins_alike() {
+    for (marks, notice) in [
+        (Some(json!({"notice": true})), true),
+        (Some(json!({"speaks_for": {"agent_id": "Ada"}})), false),
+        (
+            Some(json!({"speaks_for": {"agent_id": "Ada"}, "notice": true})),
+            true,
+        ),
+        (None, true),
+    ] {
+        let marks = marks.map(|value| serde_json::from_value(value).unwrap());
+        RECORDED_MARKS
+            .scope(
+                (marks, notice),
+                reading_entries(async {
+                    compare(Scenario {
+                        input: vec![user("owner words")],
+                        tools: vec![],
+                        manifest: None,
+                        stop_when: vec![StopCondition::StepCount { n: 2 }],
+                        steps: vec![text_step("a1", "answer")],
+                    })
+                    .await;
+                    compare_steered(calling("read", 0), vec![a_note("owner steer")]).await;
+                }),
+            )
+            .await;
+    }
+}
+
 /// A later run that sends the session's system prompt again, as a client naturally does on every
 /// turn, renders it once. Outside the compaction contract the repeat is stripped from the run's
 /// input before it is written; on the contract it is the session's system text, accepted again.
@@ -3924,6 +3996,7 @@ impl SteerSink for NewSink {
         let input = serde_json::from_value(object.remove("input").unwrap()).unwrap();
         let written_at_ms = object.remove("written_at_ms").and_then(|v| v.as_u64());
         let tags_v1 = object.remove("tags");
+        let message_marks = object.remove("message_marks");
         let receipt = (!object.is_empty()).then(|| value.clone());
         self.injected
             .lock()
@@ -3934,7 +4007,7 @@ impl SteerSink for NewSink {
                 written_at_ms,
                 tags_v1,
                 receipt,
-                message_marks: None,
+                message_marks,
             }));
     }
 
@@ -4056,7 +4129,7 @@ impl Provider for SteeringProvider {
 
 fn steered(call: usize, index: usize, messages: Vec<Message>) -> WalRecord {
     WalRecord::Steered {
-        sent_by: None,
+        sent_by: RECORDED_MARKS.try_with(|_| owner()).ok(),
         written_at_ms: Some(HARNESS_TIME_MS),
         retention: None,
         ts_ms: Some(HARNESS_TIME_MS),
@@ -4067,7 +4140,10 @@ fn steered(call: usize, index: usize, messages: Vec<Message>) -> WalRecord {
         input: Arc::new(messages),
         hooks: None,
         tags: None,
-        message_marks: None,
+        message_marks: RECORDED_MARKS
+            .try_with(|(marks, _)| marks.clone())
+            .ok()
+            .flatten(),
     }
 }
 
