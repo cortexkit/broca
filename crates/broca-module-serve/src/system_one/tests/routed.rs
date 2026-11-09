@@ -590,6 +590,12 @@ async fn audit_paid_answer_is_committed_before_observation_crash() {
             Arc::new(SystemOneStore::open(&path).unwrap()),
             router.clone(),
         );
+        // Panic cleanup releases its hold on a detached blocking task. Keep that task
+        // pending so restart cannot accidentally depend on how quickly it is scheduled.
+        let (release_fallback, gate) = std::sync::mpsc::channel::<()>();
+        if crash {
+            *rig.service.fallback_release_gate.lock().unwrap() = Some(gate);
+        }
         rig.provider
             .script("paid", vec![Script::Answer(answered(Some(7)))]);
         router.panic_on_attempt.store(crash, Ordering::SeqCst);
@@ -600,6 +606,8 @@ async fn audit_paid_answer_is_committed_before_observation_crash() {
                 first.is_ok(),
                 "routing delivery failure must not delay the answer"
             );
+        } else {
+            assert_eq!(first.as_ref().unwrap_err()["code"], "internal_error");
         }
         let stored = rig.store.lookup(STORE_ROLE, "routed").unwrap().unwrap();
         assert!(
@@ -610,7 +618,24 @@ async fn audit_paid_answer_is_committed_before_observation_crash() {
             "paid outcome must precede routing delivery"
         );
         assert_eq!(rig.provider.calls("paid"), 1);
+        let old_store = Arc::clone(&rig.store);
         drop(rig);
+        assert_eq!(
+            Arc::strong_count(&old_store),
+            if crash { 2 } else { 1 },
+            "only detached panic cleanup may still share the old store"
+        );
+        drop(release_fallback);
+        wait_for("panic cleanup drops its store reference", || {
+            Arc::strong_count(&old_store) == 1
+        })
+        .await;
+        // Own the final reference so destruction, including closing the owner-lock file,
+        // finishes here rather than racing a background task's last Arc drop.
+        let Ok(old_store) = Arc::try_unwrap(old_store) else {
+            panic!("restart requires sole ownership of the old store");
+        };
+        drop(old_store);
         router.fail_attempts.store(false, Ordering::SeqCst);
         let store = Arc::new(SystemOneStore::open(&path).unwrap());
         store.release_abandoned().unwrap();
