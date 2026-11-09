@@ -63,6 +63,11 @@ fn the_tracked_descriptor_declares_brocas_entries_with_their_classes() {
         ("broca/durable-wals", "portable", "filetree"),
         ("broca/durable-archive", "portable", "filetree"),
         ("broca/durable-media", "portable", "filetree"),
+        // The new session storage. Only sessions an operator moved there live in it. Those are
+        // long-lived agent sessions that today's storage marks durable and keeps in the
+        // backed-up `wal-durable/`, so the whole tree is captured. Before new sessions of other classes are placed there, this entry must split
+        // by class the way `wal/` and `wal-durable/` do.
+        ("broca/session-store", "portable", "filetree"),
         ("broca/session-media", "excluded", "filetree"),
         ("broca/ephemeral-media", "excluded", "filetree"),
         ("broca/media-uploads", "excluded", "filetree"),
@@ -101,7 +106,8 @@ fn the_tracked_descriptor_declares_brocas_entries_with_their_classes() {
         [
             "broca/durable-archive",
             "broca/durable-media",
-            "broca/durable-wals"
+            "broca/durable-wals",
+            "broca/session-store"
         ]
     );
     for (id, path) in [
@@ -111,6 +117,7 @@ fn the_tracked_descriptor_declares_brocas_entries_with_their_classes() {
         ("broca/durable-wals", "wal-durable"),
         ("broca/durable-archive", "wal-archive-durable"),
         ("broca/durable-media", "media-durable"),
+        ("broca/session-store", "session-store"),
         ("broca/session-media", "media"),
         ("broca/ephemeral-media", "media-ephemeral"),
         ("broca/media-uploads", "media-uploads"),

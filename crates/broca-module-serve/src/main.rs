@@ -8485,7 +8485,9 @@ fn create_state_directories(state_root: &std::path::Path) -> Result<(), ServeIoE
         })
         .map_err(|e| ServeIoError(format!("create lease directory: {e}")))?;
 
-    for name in ["wal-durable", "wal-archive-durable"] {
+    // `session-store` is created here, not on the new storage's first write, because the backup
+    // descriptor names it, and engram refuses a capture whose declared path is missing.
+    for name in ["wal-durable", "wal-archive-durable", "session-store"] {
         let path = state_root.join(name);
         match broca_owner_only::create_dir(&path) {
             Ok(()) => {}
@@ -8567,6 +8569,7 @@ mod windows_acl_tests {
         assert_private(&root.join("leases"));
         assert_private(&root.join("wal-durable"));
         assert_private(&root.join("wal-archive-durable"));
+        assert_private(&root.join("session-store"));
         assert_private(&root.join("engram-catalog.json"));
     }
 }
