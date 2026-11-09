@@ -565,32 +565,49 @@ pub fn deliveries_only_with_rides(
     Ok(prompt)
 }
 
+/// `opts` with `prompt`, a rendered view of its prompt: each declared marker moves to the
+/// rendered message with its marked message's ordinal, and the episode list reads each run's
+/// place as a raw ordinal. A list already read that way is shared, not copied.
 pub fn options(
     opts: &broca_protocol::CallOptions,
     prompt: Vec<Message>,
 ) -> broca_protocol::CallOptions {
-    let positions: HashMap<_, _> = prompt
-        .iter()
-        .enumerate()
-        .filter_map(|(index, message)| message.ordinal.map(|ordinal| (ordinal, index)))
-        .collect();
-    let markers = opts
-        .declared_markers
-        .iter()
-        .filter_map(|marker| {
-            let ordinal = opts.prompt.get(marker.message_index)?.ordinal?;
-            Some(broca_protocol::request::DeclaredMessageMarker {
-                message_index: *positions.get(&ordinal)?,
-                rank: marker.rank,
+    let markers = if opts.declared_markers.is_empty() {
+        Vec::new()
+    } else {
+        let positions: HashMap<_, _> = prompt
+            .iter()
+            .enumerate()
+            .filter_map(|(index, message)| message.ordinal.map(|ordinal| (ordinal, index)))
+            .collect();
+        opts.declared_markers
+            .iter()
+            .filter_map(|marker| {
+                let ordinal = opts.prompt.get(marker.message_index)?.ordinal?;
+                Some(broca_protocol::request::DeclaredMessageMarker {
+                    message_index: *positions.get(&ordinal)?,
+                    rank: marker.rank,
+                })
             })
-        })
-        .collect();
+            .collect()
+    };
     let mut view = opts.with_prompt(prompt);
-    let mut history = opts.render_episodes.as_ref().clone();
-    history.raw_ordinals = true;
-    view.render_episodes = std::sync::Arc::new(history);
+    view.render_episodes = raw_ordinals(&opts.render_episodes);
     view.declared_markers = markers;
     view
+}
+
+/// `episodes` reading each run's place as a raw ordinal: shared when it already does, a copy
+/// that does otherwise.
+pub fn raw_ordinals(
+    episodes: &std::sync::Arc<broca_protocol::request::RenderHistory>,
+) -> std::sync::Arc<broca_protocol::request::RenderHistory> {
+    if episodes.raw_ordinals {
+        return std::sync::Arc::clone(episodes);
+    }
+    let mut history = episodes.as_ref().clone();
+    history.raw_ordinals = true;
+    std::sync::Arc::new(history)
 }
 
 fn remap_cache_prefix(original: &Message, kept: &[usize]) -> Option<u32> {

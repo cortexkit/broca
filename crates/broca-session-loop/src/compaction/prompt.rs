@@ -26,10 +26,20 @@ use broca_wal::ComputedTagRules;
 use crate::run::LoopError;
 use crate::writer::Writer;
 
-/// A run's stored prompt between its steps (see the module's notes). A new one keeps nothing,
-/// and its first step takes in the whole window.
+/// A run's stored prompt between its steps (see the module's notes), and the episode list its
+/// requests carry. A new one keeps nothing, and its first step takes in the whole window.
 #[derive(Default)]
-pub struct KeptPrompt(Option<Kept>);
+pub struct KeptPrompt(Option<Kept>, Option<KeptEpisodes>);
+
+/// The episode list a compacted run's requests carry: the run's list, moved past the global
+/// system messages an enrollment suppressed, read as raw ordinals, as rendering a view reads it
+/// (`render::options`). Kept while the run's list and the enrollment stay the same, so each
+/// request shares it rather than copying it.
+struct KeptEpisodes {
+    of: Arc<RenderHistory>,
+    enrolled_through: Option<u64>,
+    episodes: Arc<RenderHistory>,
+}
 
 /// What the kept prompt was derived under: a change to any of it derives it again.
 struct Key {
@@ -142,6 +152,34 @@ pub(crate) fn taken(count: usize) {
 }
 
 impl KeptPrompt {
+    /// The episode list a request built from `episodes` under `enrollment` carries (see
+    /// [`KeptEpisodes`]).
+    pub(crate) fn request_episodes(
+        &mut self,
+        episodes: &Arc<RenderHistory>,
+        enrollment: Option<&EnrollmentOverlay>,
+    ) -> Arc<RenderHistory> {
+        let enrolled_through = enrollment.map(EnrollmentOverlay::through_ordinal);
+        let kept = self.1.as_ref().filter(|kept| {
+            Arc::ptr_eq(&kept.of, episodes) && kept.enrolled_through == enrolled_through
+        });
+        if let Some(kept) = kept {
+            return Arc::clone(&kept.episodes);
+        }
+        let mut list = RenderHistory::from(episodes.episodes.clone());
+        if let Some(enrollment) = enrollment {
+            crate::enroll::translate_episodes(&mut list.episodes, enrollment);
+        }
+        list.raw_ordinals = true;
+        let list = Arc::new(list);
+        self.1 = Some(KeptEpisodes {
+            of: Arc::clone(episodes),
+            enrolled_through,
+            episodes: Arc::clone(&list),
+        });
+        list
+    }
+
     /// Brings the kept prompt up to `writer`'s window, read under `enrollment` with the window's
     /// runs `episodes`: takes in the messages placed since the last step, or derives it again
     /// (see the module's notes).

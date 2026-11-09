@@ -137,13 +137,13 @@ fn answer_step(id: &str) -> Vec<NormalizedEvent> {
 }
 
 /// Runs `run_id` on `session` under a plan naming a compaction provider, the model answering
-/// `steps` in turn.
+/// `steps` in turn, and answers the requests the model was sent.
 async fn compacted_run(
     session: &mut Session<&MemoryBackend>,
     parts: &mut MemoryParts,
     run_id: &str,
     steps: Vec<Vec<NormalizedEvent>>,
-) {
+) -> Vec<broca_protocol::request::CallOptions> {
     let provider = StubProvider::new(steps);
     let request: SubmissionRequest = serde_json::from_value(json!({
         "model": {"provider_module_id": "stub", "model_id": "m"},
@@ -200,6 +200,7 @@ async fn compacted_run(
     crate::run::run(session, parts, admission, &seams)
         .await
         .unwrap();
+    provider.calls()
 }
 
 /// What a measured run's steps did, as the tests count it.
@@ -312,4 +313,37 @@ async fn a_request_renders_only_the_entries_that_changed() {
         large, small,
         "8 more steps rendered {small} more entries behind 6 runs, {large} behind 30"
     );
+}
+
+/// A compacted run's requests share one episode list rather than each copying the run's.
+#[tokio::test]
+async fn a_runs_requests_share_one_episode_list() {
+    let backend = MemoryBackend::default();
+    let mut session = Session::create(
+        &backend,
+        SessionAddr("0123456789abcdef".into()),
+        SessionTriple {
+            project_root: "/project".into(),
+            harness: "window".into(),
+            session: "s1".into(),
+        },
+        &DeploymentKey::new(1, &[7; 32]),
+        false,
+    )
+    .await
+    .unwrap();
+    let mut parts = MemoryParts::default();
+    compacted_run(&mut session, &mut parts, "h0", vec![answer_step("a0")]).await;
+    let mut steps: Vec<_> = (0..4).map(|n| tool_step(&format!("c{n}"))).collect();
+    steps.push(answer_step("last"));
+    let calls = compacted_run(&mut session, &mut parts, "measured", steps).await;
+    assert_eq!(calls.len(), 5);
+    assert!(calls[0].render_episodes.raw_ordinals);
+    for (step, call) in calls.iter().enumerate() {
+        assert!(
+            Arc::ptr_eq(&call.render_episodes, &calls[0].render_episodes),
+            "step {} carried a copy of the episode list",
+            step + 1
+        );
+    }
 }

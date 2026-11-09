@@ -2904,7 +2904,8 @@ fn call_options<W: Writer>(
 ) -> Result<CallOptions, LoopError> {
     let contract = admission.compaction_plan_version.is_some();
     let overflow = |_| LoopError::Unsupported("part numbers past the numbering limit");
-    let mut prompt = match kept.filter(|_| contract && compacted) {
+    let mut kept = kept.filter(|_| contract && compacted);
+    let mut prompt = match kept.as_mut() {
         Some(kept) => {
             kept.update(writer, episodes, enrollment)?;
             Vec::new()
@@ -2951,9 +2952,11 @@ fn call_options<W: Writer>(
     };
     // A session that enrolled leaves out the global system messages it carried before (see
     // `compaction::prompt::contract_prompt`), and each run's place moves past them. Otherwise
-    // the request shares the run's episode list rather than copying it.
-    let episodes = match (contract, enrollment) {
-        (true, Some(enrollment)) => {
+    // the request shares the run's episode list rather than copying it, as a compacted run
+    // shares the one its stored prompt keeps.
+    let episodes = match (kept, contract, enrollment) {
+        (Some(kept), _, _) => kept.request_episodes(episodes, enrollment),
+        (None, true, Some(enrollment)) => {
             let mut translated = episodes.episodes.clone();
             crate::enroll::translate_episodes(&mut translated, enrollment);
             Arc::new(RenderHistory::from(translated))
