@@ -2410,6 +2410,28 @@ impl WalRecord {
         } else {
             base
         };
+        // A speaker's display name is gated apart from the marks themselves: a reader that knows
+        // marks but not names would decode the mark and silently drop the name.
+        let named_speaker = match self {
+            Self::RunStarted { message_marks, .. }
+            | Self::Queued { message_marks, .. }
+            | Self::Steered { message_marks, .. } => message_marks
+                .as_ref()
+                .and_then(|marks| marks.speaks_for.as_ref())
+                .is_some_and(|speaker| speaker.name.is_some()),
+            Self::SendDelivered {
+                ride: Some(ride), ..
+            } => ride
+                .speaks_for
+                .as_ref()
+                .is_some_and(|speaker| speaker.name.is_some()),
+            _ => false,
+        };
+        let base = if named_speaker || identity_digest.is_some_and(digest_names_a_speaker) {
+            with_feature(base, crate::framing::SPEAKS_FOR_NAME_FEATURE)
+        } else {
+            base
+        };
         let codex_wire = match self {
             Self::RunStarted { config, .. } => config.frozen_render_config.get("chatgpt_wire"),
             Self::RunConfigRefrozen {
@@ -7406,6 +7428,22 @@ fn digest_carries_message_marks(digest: &str) -> bool {
         message_marks: Option<serde::de::IgnoredAny>,
     }
     serde_json::from_str::<Probe>(digest).is_ok_and(|probe| probe.message_marks.is_some())
+}
+
+// A retry's identity keeps the whole speaker, so a named speaker in it needs the name reader
+// even when the record itself places no marked entry.
+fn digest_names_a_speaker(digest: &str) -> bool {
+    #[derive(serde::Deserialize)]
+    struct Probe {
+        #[serde(default)]
+        message_marks: Option<broca_protocol::MessageMarks>,
+    }
+    serde_json::from_str::<Probe>(digest).is_ok_and(|probe| {
+        probe
+            .message_marks
+            .and_then(|marks| marks.speaks_for)
+            .is_some_and(|speaker| speaker.name.is_some())
+    })
 }
 
 #[cfg(test)]

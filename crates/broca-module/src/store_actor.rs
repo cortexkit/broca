@@ -434,6 +434,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 run_id: active.run_id.0.clone(),
                 step: active.step.lock().unwrap().clone(),
             });
+        let entry_speaks_for = self.entry_attribution(request).await;
         let context = crate::store_reads::ReadContext {
             parts: &self.parts,
             held: true,
@@ -445,8 +446,38 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             session_name: &self.key.session,
             live_step: live_step.as_ref(),
             stream_head: self.fanout.as_ref().and_then(|fanout| fanout.head()),
+            entry_speaks_for,
         };
         crate::store_reads::answer_in_memory(&mut self.session, &context, request).await
+    }
+
+    /// Whether the compaction entries `request` serves keep `speaks_for`: what the latest Setup
+    /// this actor sent found in the provider's catalog entry. Before this actor has sent one, a
+    /// `session.entries` read asks the catalog for the provider the session's plan names, and the
+    /// answer is kept until the next Setup.
+    async fn entry_attribution(
+        &self,
+        request: &crate::store_reads::StoreReadRequest,
+    ) -> crate::store_entries::EntryAttribution {
+        use crate::store_entries::EntryAttribution;
+        let runtime = &self.compaction_session.runtime;
+        if let Some(declared) = runtime.entry_speaks_for() {
+            return EntryAttribution::Known(declared);
+        }
+        let entries = matches!(request, crate::store_reads::StoreReadRequest::Compaction { method, .. }
+            if method == "session.entries");
+        let provider = entries
+            .then(|| crate::store_entries::frozen_provider(&self.parts, &self.session).ok())
+            .flatten()
+            .flatten();
+        let Some(provider) = provider else {
+            return EntryAttribution::Known(false);
+        };
+        let declared = EntryAttribution::Catalog(self.executor.compaction_plane())
+            .declared(&provider)
+            .await;
+        runtime.learn_entry_speaks_for(declared);
+        EntryAttribution::Known(runtime.entry_speaks_for().unwrap_or(declared))
     }
 
     /// The actor writes the spend facts of each run that ends to `billing`.

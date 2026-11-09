@@ -556,6 +556,7 @@ impl Module {
             session_name: &self.key.session,
             live_step: None,
             stream_head: None,
+            entry_speaks_for: crate::store_entries::EntryAttribution::Known(false),
         };
         execute(&view, &context, request).await
     }

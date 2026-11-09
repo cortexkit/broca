@@ -285,6 +285,12 @@ message! {
         /// serve on the ride's notice. A reader that doesn't know the field would serve the
         /// notice without it, so it is must-understand.
         5 opt [must] speaks_for: serde_json::Value,
+        /// True, and present, exactly when `speaks_for` names its speaker (llm-runner's
+        /// `SpeaksFor.name`, a display name). It carries nothing a reader uses: the name is in
+        /// `speaks_for`. Its must-understand bit makes a reader that predates speaker names refuse the
+        /// record rather than serve the speaker without its name. Absent otherwise, so a record
+        /// without a name keeps the bytes it had before names existed.
+        6 opt [must] named_speaker: bool,
     }
 }
 
@@ -330,6 +336,12 @@ message! {
         /// (llm-runner's `SpeaksFor` JSON). A reader that doesn't know the field would serve the
         /// notice without it, so it is must-understand.
         6 opt [must] speaks_for: serde_json::Value,
+        /// True, and present, exactly when `speaks_for` names its speaker (llm-runner's
+        /// `SpeaksFor.name`, a display name). It carries nothing a reader uses: the name is in
+        /// `speaks_for`. Its must-understand bit makes a reader that predates speaker names refuse the
+        /// record rather than serve the speaker without its name. Absent otherwise, so a record
+        /// without a name keeps the bytes it had before names existed.
+        7 opt [must] named_speaker: bool,
     }
 }
 
@@ -424,6 +436,12 @@ message! {
         /// a ride delivered with its envelope has one; text delivered before envelopes existed
         /// stays joined into its result and has none.
         23 rep notices: RideNotice,
+        /// True, and present, exactly when `marks` names its speaker (llm-runner's
+        /// `SpeaksFor.name`, a display name). It carries nothing a reader uses: the name is in
+        /// `marks`. Its must-understand bit makes a reader that predates speaker names refuse the
+        /// record rather than serve the speaker without its name. Absent otherwise, so a record
+        /// without a name keeps the bytes it had before names existed.
+        24 opt [must] named_speaker: bool,
     }
 }
 
@@ -629,6 +647,12 @@ message! {
         /// those messages. A reader that doesn't know the field would serve them without their
         /// marks, so it is must-understand.
         29 opt [must] message_marks: serde_json::Value,
+        /// True, and present, exactly when `message_marks` names its speaker (llm-runner's
+        /// `SpeaksFor.name`, a display name). It carries nothing a reader uses: the name is in
+        /// `message_marks`. Its must-understand bit makes a reader that predates speaker names refuse the
+        /// record rather than serve the speaker without its name. Absent otherwise, so a record
+        /// without a name keeps the bytes it had before names existed.
+        30 opt [must] named_speaker: bool,
     }
 }
 
@@ -998,6 +1022,12 @@ message! {
         /// messages it places. A reader that doesn't know the field would place them without
         /// their marks, so it is must-understand.
         11 opt [must] message_marks: serde_json::Value,
+        /// True, and present, exactly when `message_marks` names its speaker (llm-runner's
+        /// `SpeaksFor.name`, a display name). It carries nothing a reader uses: the name is in
+        /// `message_marks`. Its must-understand bit makes a reader that predates speaker names refuse the
+        /// record rather than serve the speaker without its name. Absent otherwise, so a record
+        /// without a name keeps the bytes it had before names existed.
+        12 opt [must] named_speaker: bool,
     }
 }
 
@@ -1290,6 +1320,12 @@ message! {
         /// messages it places. A reader that doesn't know the field would place them without
         /// their marks, so it is must-understand.
         6 opt [must] message_marks: serde_json::Value,
+        /// True, and present, exactly when `message_marks` names its speaker (llm-runner's
+        /// `SpeaksFor.name`, a display name). It carries nothing a reader uses: the name is in
+        /// `message_marks`. Its must-understand bit makes a reader that predates speaker names refuse the
+        /// record rather than serve the speaker without its name. Absent otherwise, so a record
+        /// without a name keeps the bytes it had before names existed.
+        7 opt [must] named_speaker: bool,
     }
 }
 
@@ -1789,5 +1825,22 @@ records! {
     }
 }
 
+/// The value of a `named_speaker` field beside a stored speaker (llm-runner's `SpeaksFor` JSON):
+/// `Some(true)` when the speaker carries a display name, else `None`. Every writer of a speaker
+/// sets its sibling field from this, so a named speaker is never stored without the
+/// must-understand bit that keeps it from older readers.
+pub fn named_speaker(speaks_for: Option<&serde_json::Value>) -> Option<bool> {
+    speaks_for
+        .and_then(|speaker| speaker.get("name"))
+        .map(|_| true)
+}
+
+/// [`named_speaker`] for a send's stored marks (llm-runner's `MessageMarks` JSON).
+pub fn marks_name_speaker(marks: Option<&serde_json::Value>) -> Option<bool> {
+    named_speaker(marks.and_then(|marks| marks.get("speaks_for")))
+}
+
+#[cfg(test)]
+mod speaker_name_tests;
 #[cfg(test)]
 mod tests;

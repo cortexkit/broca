@@ -1,7 +1,14 @@
 //! Per-session, in-memory call lane. Notices are serialized and coalesced, not
 //! written to the log or published on a bus.
 
-use std::{collections::BTreeMap, sync::Mutex, time::Duration};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        atomic::{AtomicU8, Ordering},
+        Mutex,
+    },
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use cortexkit_role_compaction::{
@@ -35,6 +42,12 @@ pub trait Plane: Send + Sync {
         method: &str,
         params: serde_json::Value,
     ) -> Result<Box<RawValue>, CallError>;
+    /// Whether the provider's catalog entry lists `compaction-entry-speaks-for/v1`, asked when
+    /// the runner sends Setup. A plane that can't read the catalog answers false, so the
+    /// provider is sent no attribution it may not understand.
+    async fn provides_entry_speaks_for(&self) -> bool {
+        false
+    }
 }
 
 pub struct BoundPlane<'a> {
@@ -73,6 +86,16 @@ impl Plane for BoundPlane<'_> {
                 deadline,
             )
             .await
+    }
+
+    async fn provides_entry_speaks_for(&self) -> bool {
+        let Some(plane) = self.plane else {
+            return false;
+        };
+        plane
+            .provider_capabilities(self.provider)
+            .await
+            .is_some_and(|provides| cortexkit_role_compaction::provides_entry_speaks_for(&provides))
     }
 }
 
@@ -118,6 +141,24 @@ impl Default for Lane {
 pub struct Runtime {
     pending: Mutex<Pending>,
     lane: tokio::sync::Mutex<Lane>,
+    /// Whether the provider declared `compaction-entry-speaks-for/v1` in its catalog entry when
+    /// the latest Setup was sent, kept until the next Setup: one of the `ATTRIBUTION_` values.
+    /// Kept apart from the lane, so a `session.entries` read the provider makes while a notice
+    /// holds the lane never waits for that notice's answer.
+    entry_speaks_for: AtomicU8,
+}
+
+/// No Setup was sent in this runtime's life, and no read has asked the catalog since.
+const ATTRIBUTION_UNKNOWN: u8 = 0;
+const ATTRIBUTION_UNDECLARED: u8 = 1;
+const ATTRIBUTION_DECLARED: u8 = 2;
+
+fn attribution(declared: bool) -> u8 {
+    if declared {
+        ATTRIBUTION_DECLARED
+    } else {
+        ATTRIBUTION_UNDECLARED
+    }
 }
 
 impl Runtime {
@@ -211,7 +252,45 @@ impl Runtime {
     /// before any model I/O.
     pub async fn setup(&self, plane: &dyn Plane, request: &SetupRequest) -> bool {
         let mut lane = self.lane.lock().await;
-        setup(&mut lane, plane, request).await
+        setup(&mut lane, plane, request, &self.entry_speaks_for).await
+    }
+
+    /// Whether entries handed to the provider may carry `speaks_for`: its catalog entry declared
+    /// `compaction-entry-speaks-for/v1` when the session's latest Setup was sent. `None` when this
+    /// runtime has sent no Setup and learned nothing since (see [`Self::learn_entry_speaks_for`]).
+    pub fn entry_speaks_for(&self) -> Option<bool> {
+        match self.entry_speaks_for.load(Ordering::Acquire) {
+            ATTRIBUTION_DECLARED => Some(true),
+            ATTRIBUTION_UNDECLARED => Some(false),
+            _ => None,
+        }
+    }
+
+    /// Keeps a declaration read from the provider's catalog outside a Setup, for a session whose
+    /// provider was set up before this runtime existed (an actor reopened after closing idle, or
+    /// a restarted daemon). A provider can't withdraw the declaration without restarting, and a
+    /// restarted provider is sent Setup again, so the catalog answers what the latest Setup found.
+    /// A Setup sent meanwhile wins: this only fills a runtime that still knows nothing.
+    pub fn learn_entry_speaks_for(&self, declared: bool) {
+        let _ = self.entry_speaks_for.compare_exchange(
+            ATTRIBUTION_UNKNOWN,
+            attribution(declared),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    /// [`Self::entry_speaks_for`], reading the provider's catalog through `plane` and keeping the
+    /// answer when no Setup has told this runtime yet.
+    pub async fn entry_speaks_for_or_read(&self, plane: &dyn Plane) -> bool {
+        if let Some(declared) = self.entry_speaks_for() {
+            return declared;
+        }
+        let declared = tokio::time::timeout(CALL_DEADLINE, plane.provides_entry_speaks_for())
+            .await
+            .unwrap_or(false);
+        self.learn_entry_speaks_for(declared);
+        self.entry_speaks_for().unwrap_or(declared)
     }
 
     /// A failed Setup without an applied view is retried before the next send,
@@ -238,7 +317,7 @@ impl Runtime {
     pub async fn ensure_setup(&self, plane: &dyn Plane, request: &SetupRequest) -> bool {
         let mut lane = self.lane.lock().await;
         if !lane.ready && lane.setup_due {
-            setup(&mut lane, plane, request).await
+            setup(&mut lane, plane, request, &self.entry_speaks_for).await
         } else {
             lane.ready
         }
@@ -268,7 +347,10 @@ impl Runtime {
     ) {
         let mut restarted = false;
         loop {
-            if !lane.ready && (!lane.setup_due || !setup(lane, plane, setup_request).await) {
+            if !lane.ready
+                && (!lane.setup_due
+                    || !setup(lane, plane, setup_request, &self.entry_speaks_for).await)
+            {
                 return;
             }
             let batch = {
@@ -287,6 +369,10 @@ impl Runtime {
                     .into_values()
                     .map(|(entry, _)| entry)
                     .collect();
+                super::entries::gate_speaks_for(
+                    &mut notice.entries,
+                    self.entry_speaks_for().unwrap_or(false),
+                );
                 pending.entry_bytes = 0;
                 pending.entries_omitted = false;
                 pending.changed = false;
@@ -380,8 +466,20 @@ impl Runtime {
     }
 }
 
-async fn setup(lane: &mut Lane, plane: &dyn Plane, request: &SetupRequest) -> bool {
+async fn setup(
+    lane: &mut Lane,
+    plane: &dyn Plane,
+    request: &SetupRequest,
+    entry_speaks_for: &AtomicU8,
+) -> bool {
     lane.seq = 0;
+    // The provider's attribution declaration is read from the catalog at every Setup, before
+    // the Setup is sent, so a provider that reads entries as soon as it is ready already sees
+    // them as declared. A catalog that can't be read in time counts as no declaration.
+    let declared = tokio::time::timeout(CALL_DEADLINE, plane.provides_entry_speaks_for())
+        .await
+        .unwrap_or(false);
+    entry_speaks_for.store(attribution(declared), Ordering::Release);
     let answer: Result<SetupAnswer, _> =
         call(plane, "compaction.setup", request, CALL_DEADLINE).await;
     lane.ready = match answer {

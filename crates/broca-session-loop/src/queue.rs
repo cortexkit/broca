@@ -96,6 +96,7 @@ pub fn queued_send(
         delivery,
         // Today's actor admits no display marks on a send yet, so its queued record has none.
         message_marks: None,
+        named_speaker: None,
     })
 }
 
@@ -164,6 +165,7 @@ pub fn steer(
         receipt,
         // Today's actor admits no display marks on a steer yet, so its record has none.
         message_marks: None,
+        named_speaker: None,
     })
 }
 

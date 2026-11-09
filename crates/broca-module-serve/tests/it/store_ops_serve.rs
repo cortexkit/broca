@@ -49,8 +49,12 @@ fn provider() -> Principal {
     }
 }
 
-/// A compaction provider that is always ready and never hands over a view.
-struct ReadyProvider;
+/// A compaction provider that is always ready and never hands over a view. Its catalog entry
+/// declares entry attribution (`compaction-entry-speaks-for/v1`) when `declares` is set.
+#[derive(Default)]
+struct ReadyProvider {
+    declares: bool,
+}
 
 #[async_trait]
 impl broca_core::CompactionPlane for ReadyProvider {
@@ -85,6 +89,20 @@ impl broca_core::CompactionPlane for ReadyProvider {
         };
         Ok(serde_json::value::to_raw_value(&answer).unwrap())
     }
+
+    async fn provider_capabilities(&self, provider: &str) -> Option<Vec<String>> {
+        assert_eq!(
+            provider, PROVIDER,
+            "the catalog entry read is the plan's provider's"
+        );
+        let mut provides = vec!["compaction-provider/v2".to_owned()];
+        if self.declares {
+            provides.push(
+                broca_core::compaction_v2::protocol::COMPACTION_ENTRY_SPEAKS_FOR_PROVIDES.into(),
+            );
+        }
+        Some(provides)
+    }
 }
 
 /// Runs a store session's runs through the new loop over a scripted provider, as the module's
@@ -94,6 +112,8 @@ impl broca_core::CompactionPlane for ReadyProvider {
 struct StoreLoop {
     provider: broca_core::provider::StubProvider,
     compaction: Arc<ReadyProvider>,
+    /// The display marks every send's run records, as admission would have checked them.
+    marks: Option<broca_protocol::MessageMarks>,
 }
 
 impl StoreLoop {
@@ -136,6 +156,9 @@ impl RunExecutor for StoreLoop {
         if Self::compacts(&control) {
             control.new_log_compaction_plan_version = Some(broca_core::compaction_v2::PLAN_VERSION);
             control.admitted_context_limit = Some(200_000);
+        }
+        if self.marks.is_some() {
+            control.display_message_marks = self.marks.clone();
         }
         let result = async {
             let tools = broca_core::StubToolPlane::new().with_canned_text("read", "file contents");
@@ -261,6 +284,17 @@ impl Rig {
     /// A module on a fresh state root whose new storage creates sessions, its runs scripted by
     /// `steps`.
     async fn start(tag: &str, steps: Vec<Vec<NormalizedEvent>>) -> Self {
+        Self::start_with(tag, steps, ReadyProvider::default(), None).await
+    }
+
+    /// [`Rig::start`] with `compaction` as the compaction provider, and every run recording
+    /// `marks` as its send's display marks.
+    async fn start_with(
+        tag: &str,
+        steps: Vec<Vec<NormalizedEvent>>,
+        compaction: ReadyProvider,
+        marks: Option<broca_protocol::MessageMarks>,
+    ) -> Self {
         let dir = broca_test_support::scratch_root().join(format!(
             "broca-store-ops-serve-{}-{tag}",
             std::process::id()
@@ -271,7 +305,8 @@ impl Rig {
         let wal = Arc::new(FileWalStore::new(dir.join("wal")));
         let executor: Arc<dyn RunExecutor> = Arc::new(StoreLoop {
             provider: broca_core::provider::StubProvider::new(steps),
-            compaction: Arc::new(ReadyProvider),
+            compaction: Arc::new(compaction),
+            marks,
         });
         let runtime = broca_module::store_open::StoreRuntime::open(
             &dir,
@@ -684,6 +719,48 @@ async fn compaction_entries_reach_the_store_through_serve() {
         "a page from ordinal 3 holds one entry: {page}"
     );
     assert_eq!(page["entries"][0]["ordinal"], 3, "{page}");
+}
+
+/// A stored agent mark reaches the provider's `session.entries` only when its catalog entry
+/// declares entry attribution, whether an actor holds the session or not, and never moves the
+/// entry's digest.
+#[tokio::test]
+async fn compaction_entries_carry_a_stored_speaker_only_for_a_declaring_provider() {
+    let speaker = json!({"agent_id": "agent-a", "name": "Ada"});
+    let mut digests = Vec::new();
+    for declares in [true, false] {
+        let mut rig = Rig::start_with(
+            &format!("entries-speaker-{declares}"),
+            vec![text_step("a1", "hello")],
+            ReadyProvider { declares },
+            Some(serde_json::from_value(json!({"speaks_for": speaker})).unwrap()),
+        )
+        .await;
+        rig.send("r1", "agent words", Some(compacting_plan())).await;
+        rig.assert_store_only();
+        let compaction = Some(BTreeMap::from([(
+            "compaction-runner".to_owned(),
+            "v1".to_owned(),
+        )]));
+        let bound = rig.bind(1, provider(), compaction).await;
+        assert_eq!(bound.header.ty, FrameType::Response);
+        let page = rig
+            .answered(
+                1,
+                "session.entries",
+                json!({"select": {"by": "after"}, "detail": "full"}),
+            )
+            .await;
+        let first = &page["entries"][0];
+        assert_eq!(first["role"], "user", "{page}");
+        if declares {
+            assert_eq!(first["speaks_for"], speaker, "{page}");
+        } else {
+            assert!(first.get("speaks_for").is_none(), "{page}");
+        }
+        digests.push(first["digest"].clone());
+    }
+    assert_eq!(digests[0], digests[1], "attribution moves no digest");
 }
 
 /// A one-pixel PNG.

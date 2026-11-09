@@ -332,7 +332,7 @@ dependencies = [
  "cortexkit-lease",
  "cortexkit-role-compaction",
  "cortexkit-role-compaction-provider",
- "cortexkit-role-llm-runner 0.8.28",
+ "cortexkit-role-llm-runner 0.8.34",
  "cortexkit-role-step-transform-provider",
  "cortexkit-role-tool-provider",
  "futures",
@@ -357,7 +357,7 @@ dependencies = [
  "broca-store",
  "broca-test-support",
  "broca-wal",
- "cortexkit-role-llm-runner 0.8.28",
+ "cortexkit-role-llm-runner 0.8.34",
  "serde_json",
  "tokio",
  "tokio-util",
@@ -380,7 +380,7 @@ dependencies = [
  "broca-test-support",
  "broca-wal",
  "cortexkit-role-compaction-provider",
- "cortexkit-role-llm-runner 0.8.28",
+ "cortexkit-role-llm-runner 0.8.34",
  "cortexkit-role-step-transform-provider",
  "cortexkit-role-tool-provider",
  "futures",
@@ -429,7 +429,7 @@ dependencies = [
  "cortexkit-bus-trait",
  "cortexkit-compaction-view",
  "cortexkit-role-llm-runner 0.7.48",
- "cortexkit-role-llm-runner 0.8.28",
+ "cortexkit-role-llm-runner 0.8.34",
  "cortexkit-role-step-transform-provider",
  "cortexkit-role-tool-provider",
  "futures",
@@ -483,7 +483,7 @@ dependencies = [
  "cortexkit-role-classifier",
  "cortexkit-role-classifier-conformance",
  "cortexkit-role-harness",
- "cortexkit-role-llm-runner 0.8.28",
+ "cortexkit-role-llm-runner 0.8.34",
  "cortexkit-role-llm-runner-conformance",
  "cortexkit-role-routing",
  "cortexkit-role-step-transform-provider",
@@ -530,7 +530,7 @@ dependencies = [
  "cortexkit-bus-naming",
  "cortexkit-compaction-view",
  "cortexkit-role-llm-runner 0.7.48",
- "cortexkit-role-llm-runner 0.8.28",
+ "cortexkit-role-llm-runner 0.8.34",
  "jsonschema",
  "serde",
  "serde_jcs",
@@ -627,7 +627,7 @@ dependencies = [
  "broca-test-support",
  "broca-wal",
  "cortexkit-role-compaction",
- "cortexkit-role-llm-runner 0.8.28",
+ "cortexkit-role-llm-runner 0.8.34",
  "futures",
  "serde",
  "serde_jcs",
@@ -652,7 +652,7 @@ dependencies = [
  "broca-wal",
  "cortexkit-compaction-view",
  "cortexkit-role-compaction",
- "cortexkit-role-llm-runner 0.8.28",
+ "cortexkit-role-llm-runner 0.8.34",
  "cortexkit-role-step-transform-provider",
  "cortexkit-role-tool-provider",
  "futures",
@@ -729,7 +729,7 @@ dependencies = [
  "broca-test-support",
  "broca-wal",
  "cortexkit-model-batch",
- "cortexkit-role-llm-runner 0.8.28",
+ "cortexkit-role-llm-runner 0.8.34",
  "cortexkit-role-step-transform-provider",
  "cortexkit-role-tool-provider",
  "cortexkit-role-tool-provider-conformance",
@@ -798,7 +798,7 @@ dependencies = [
  "broca-protocol",
  "cortexkit-bus-naming",
  "cortexkit-role-agent-data",
- "cortexkit-role-llm-runner 0.8.28",
+ "cortexkit-role-llm-runner 0.8.34",
  "serde",
  "serde_jcs",
  "serde_json",
@@ -962,7 +962,7 @@ dependencies = [
  "broca-protocol",
  "broca-provider",
  "broca-test-support",
- "cortexkit-role-llm-runner 0.8.28",
+ "cortexkit-role-llm-runner 0.8.34",
  "rusqlite",
  "serde_json",
  "sha2",
@@ -1149,9 +1149,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-compaction-view"
-version = "0.1.8"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a0496c267e395e4d04e903fa14c6320e942c89ad7f615469d839f25bbd6af40a"
+checksum = "292fd30e100dbbcb75097d70c990832842b95ad3e83b5a1c7afea73a0ceac7b2"
 dependencies = [
  "cortexkit-role-compaction",
  "serde",
@@ -1258,11 +1258,11 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-compaction"
-version = "0.2.10"
+version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "603ca6aa9779c0895653fbbefeba7e1f38c2eaf438748eb01c5f7d7c96b17ba7"
+checksum = "dde3ac1dce73e3cfc2d51ae664915463e1fe0e9a5619dfe9de9077863723ba08"
 dependencies = [
- "cortexkit-role-llm-runner 0.8.28",
+ "cortexkit-role-llm-runner 0.8.34",
  "serde",
  "serde_json",
  "serde_path_to_error",
@@ -1317,9 +1317,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-llm-runner"
-version = "0.8.28"
+version = "0.8.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "67fb888ecb25371f90043c7384afc67fa30d71de6a12d4b982d3445936008b83"
+checksum = "829f90a52fd8a0fcb9a6dc24975a77573f8033676ef01b60dc5f1b847c830368"
 dependencies = [
  "cortexkit-rich-ui-syntax",
  "cortexkit-role-tool-provider",
@@ -1331,14 +1331,15 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-llm-runner-conformance"
-version = "0.17.33"
-source = "git+https://github.com/cortexkit/commons?rev=6a24eec5be2a14af121030391454f665027ab5df#6a24eec5be2a14af121030391454f665027ab5df"
+version = "0.17.42"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9a0ae8d929df7c9b256aca905c8c5f18e6643ee093873e6f683c6cfcfeddee33"
 dependencies = [
  "async-trait",
  "base64",
  "cortexkit-rich-ui-syntax",
  "cortexkit-role-harness",
- "cortexkit-role-llm-runner 0.8.28",
+ "cortexkit-role-llm-runner 0.8.34",
  "futures-util",
  "serde",
  "serde_jcs",
@@ -1376,7 +1377,7 @@ version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f5b7e30ac9b2ed17eddc93876f71cd5b6ebd5c6af415ef58aa679f017ed5d3f0"
 dependencies = [
- "cortexkit-role-llm-runner 0.8.28",
+ "cortexkit-role-llm-runner 0.8.34",
  "serde",
  "serde_json",
 ]

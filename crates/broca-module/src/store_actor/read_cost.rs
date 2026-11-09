@@ -414,6 +414,7 @@ async fn measure(built: &Built, parts: &SharedParts, sealed: bool, written: Dura
             session_name,
             live_step: open.then_some(live),
             stream_head,
+            entry_speaks_for: crate::store_entries::EntryAttribution::Known(false),
         }
     }
     let (session_triple, key) = (triple(), deployment());

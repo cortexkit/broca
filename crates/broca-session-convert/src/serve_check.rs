@@ -589,5 +589,6 @@ fn read_context<'a>(
         session_name: name,
         live_step: None,
         stream_head: None,
+        entry_speaks_for: broca_module::store_entries::EntryAttribution::Known(false),
     }
 }

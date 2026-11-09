@@ -44,11 +44,14 @@ fn current_reference(bind: &BindIdentity, supplied: &str) -> Result<String, Comp
 pub struct SubcCompactionPlane {
     route: RoleRoute,
     v2_route: RoleRoute,
+    /// Asks the daemon's catalog what a provider declares; no route is opened for it.
+    conn: Arc<SubcConnection>,
 }
 
 impl SubcCompactionPlane {
     pub fn new(conn: Arc<SubcConnection>) -> Self {
         Self {
+            conn: conn.clone(),
             v2_route: RoleRoute::without_discovery(conn.clone(), "compaction-provider", "v2"),
             route: RoleRoute::new(conn, ROLE, VERSION, |describe| {
                 check_describe(describe)
@@ -158,6 +161,18 @@ fn bounded(deadline: Instant) -> Instant {
 
 #[async_trait]
 impl CompactionPlane for SubcCompactionPlane {
+    /// The provider's `provides` from the daemon's `catalog.list`, read fresh on every call: a
+    /// provider declares compaction capabilities there, and Setup reads them each time it is
+    /// sent. A catalog that can't be read, or has no entry for the provider, answers `None`.
+    async fn provider_capabilities(&self, provider: &str) -> Option<Vec<String>> {
+        let entries = self.conn.catalog_list().await.ok()?;
+        entries
+            .into_iter()
+            .find(|entry| entry.module_id == provider)
+            .and_then(|entry| entry.capabilities)
+            .map(|capabilities| capabilities.provides)
+    }
+
     async fn call_v2(
         &self,
         provider: &str,

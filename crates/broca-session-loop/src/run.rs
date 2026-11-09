@@ -2619,9 +2619,11 @@ async fn admit<W: Writer>(
             ),
         }));
     }
+    let message_marks = to_value(admission.send.message_marks.as_ref())?;
     records.push(Record::RunStart(Box::new(RunStart {
         imported_ids: None,
-        message_marks: to_value(admission.send.message_marks.as_ref())?,
+        named_speaker: broca_session_store::record::marks_name_speaker(message_marks.as_ref()),
+        message_marks,
         run_id: admission.run_id.clone(),
         model: admission.model.clone(),
         setup,
@@ -4964,6 +4966,9 @@ fn tool_batch_deliveries(
                     .as_ref()
                     .and_then(|marks| marks.get("speaks_for"))
                     .cloned(),
+                named_speaker: broca_session_store::record::marks_name_speaker(
+                    pending.message_marks.as_ref(),
+                ),
             }),
         }));
         records.push(Record::Delivery(Delivery {

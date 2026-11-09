@@ -217,6 +217,7 @@ fn delivered_text_joins_its_result_only_where_the_session_stores_it_there() {
 #[test]
 fn a_ride_is_kept_beside_its_call_in_both_layouts() {
     let ride = crate::record::RideEnvelope {
+        named_speaker: None,
         call_key: "s:4".into(),
         sender: "reminders".into(),
         forms: vec!["tool_result".into()],
@@ -258,6 +259,7 @@ fn a_ride_is_kept_beside_its_call_in_both_layouts() {
 
 fn facts(ordinal: u64, tag_base: u64) -> Record {
     Record::EntryFacts(EntryFacts {
+        named_speaker: None,
         client_message_id: None,
         sender: None,
         marks: None,

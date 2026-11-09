@@ -59,6 +59,7 @@ fn image(bytes: &[u8]) -> MediaRef {
 
 fn start(run: &str, seeded: bool) -> Record {
     Record::RunStart(Box::new(RunStart {
+        named_speaker: None,
         run_id: run.into(),
         model: model(),
         setup: Vec::new(),
@@ -123,6 +124,7 @@ fn text(text: &str) -> ContentBlock {
 
 fn facts(ordinal: u64, mid: &str) -> Record {
     Record::EntryFacts(EntryFacts {
+        named_speaker: None,
         ordinal,
         written_at_ms: Some(ordinal),
         tag_base: 0,

@@ -193,6 +193,8 @@ pub enum StoreReadOutcome {
     Stored {
         position: Position,
         live_step: Option<LiveStep>,
+        /// The actor's `ReadContext::entry_speaks_for`, which the read keeps.
+        entry_speaks_for: crate::store_entries::EntryAttribution,
     },
     /// The read can't be answered now. Transient.
     Refused(ServeError),
@@ -227,6 +229,9 @@ pub struct ReadContext<'a> {
     /// (`Some(None)` for a stream with no unit yet), or `None` when no seeded projection knows
     /// it, so a page projects it from storage.
     pub stream_head: Option<Option<broca_core::Cursor>>,
+    /// Whether compaction entries the read serves keep `speaks_for`: whether the session's
+    /// compaction provider declared `compaction-entry-speaks-for/v1`.
+    pub entry_speaks_for: crate::store_entries::EntryAttribution,
 }
 
 impl ReadContext<'_> {
@@ -327,6 +332,7 @@ pub async fn execute<B: SessionBackend>(
                 caller.as_deref(),
                 method,
                 params,
+                &ctx.entry_speaks_for,
             )
             .await,
         ),
@@ -446,6 +452,7 @@ pub async fn answer_in_memory<B: SessionBackend>(
         _ => StoreReadOutcome::Stored {
             position: session.position(),
             live_step: ctx.live_step.cloned(),
+            entry_speaks_for: ctx.entry_speaks_for.clone(),
         },
     }
 }

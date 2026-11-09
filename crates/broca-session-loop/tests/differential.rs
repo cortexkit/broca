@@ -1014,6 +1014,17 @@ async fn entries_alike(today: &LogImage, session: &Session<&MemoryBackend>) {
         if notice {
             assert_eq!(first["notice"], json!({"sender": "prefrontal-core"}));
         }
+        // The speaker the marks name, display name included, rides on the entry outside its
+        // digest.
+        assert_eq!(
+            first.get("speaks_for"),
+            marks
+                .as_ref()
+                .and_then(|marks| marks.speaks_for.as_ref())
+                .map(|speaker| serde_json::to_value(speaker).unwrap())
+                .as_ref(),
+            "{first}"
+        );
         // Earlier writers stored a module origin even for marked agent speech.
         // Reads must decide from the recorded marks without rewriting those facts.
         for (mut stored, expected) in session
@@ -3764,6 +3775,14 @@ async fn recorded_send_marks_decide_notice_origins_alike() {
             Some(json!({"speaks_for": {"agent_id": "Ada"}, "notice": true})),
             true,
         ),
+        (
+            Some(json!({"speaks_for": {"agent_id": "agent-a", "name": "Ada"}})),
+            false,
+        ),
+        (
+            Some(json!({"speaks_for": {"agent_id": "agent-a", "name": "Ada"}, "notice": true})),
+            true,
+        ),
         (None, true),
     ] {
         let marks = marks.map(|value| serde_json::from_value(value).unwrap());
@@ -4002,6 +4021,7 @@ impl SteerSink for NewSink {
             .lock()
             .unwrap()
             .push(Record::Steer(broca_session_store::record::Steer {
+                named_speaker: None,
                 media: Vec::new(),
                 input,
                 written_at_ms,
