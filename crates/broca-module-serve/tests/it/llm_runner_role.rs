@@ -786,7 +786,8 @@ async fn read_and_subscribe_bytes_without_new_params_are_pinned() {
 
 #[tokio::test]
 async fn tagged_open_tool_turn_read_bytes_are_pinned() {
-    // Only the resume cursor's incarnation and source-frame digest extend the historical pin.
+    // The pinned bytes include two members added after the golden was first written: the
+    // resume cursor's incarnation and source-frame digest, and the `role` each read entry carries.
     let (mut rig, _) = crate::plan_admission::plan_rig("pin-tagged-open-read").await;
     rig.script.push(&[
         Step::Usage {
