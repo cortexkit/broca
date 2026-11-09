@@ -141,3 +141,161 @@ fn rename(value: &mut Value, names: &mut HashMap<String, usize>) {
         _ => {}
     }
 }
+
+/// The durable controls preceding the display snapshot of one live attach.
+async fn before_display_reset(mut deliveries: mpsc::Receiver<Delivery>) -> Vec<Arc<ControlEvent>> {
+    let mut controls = Vec::new();
+    loop {
+        let delivery = broca_test_support::wait_until("live attach delivery", || {
+            std::future::ready(deliveries.try_recv().map_err(|error| format!("{error:?}")))
+        })
+        .await;
+        match delivery {
+            Delivery::Control(event) => controls.push(event),
+            Delivery::Display(event)
+                if matches!(*event, broca_protocol::DisplayEvent::DisplayReset) =>
+            {
+                return controls
+            }
+            other => panic!("unexpected delivery before display_reset: {other:?}"),
+        }
+    }
+}
+
+async fn live_actor(commands: &mpsc::UnboundedSender<LineageCmd>) -> mpsc::Receiver<Delivery> {
+    let (sink, deliveries) = mpsc::channel(4096);
+    let (reply, answer) = oneshot::channel();
+    commands
+        .send(LineageCmd::Subscribe {
+            from: FromCursor::Start,
+            live: true,
+            sink,
+            reply,
+        })
+        .unwrap();
+    assert_eq!(answer.await.unwrap(), SubscribeOutcome::Attached);
+    deliveries
+}
+
+async fn live_routed(registry: &LineageRegistry, key: &BindIdentity) -> mpsc::Receiver<Delivery> {
+    let (sink, deliveries) = mpsc::channel(4096);
+    assert_eq!(
+        registry.route_subscribe_live(key, sink).await.unwrap(),
+        SubscribeOutcome::Attached
+    );
+    deliveries
+}
+
+async fn live_attach_during_step(seed_held: bool) {
+    use super::super::tests as rig;
+    use crate::serve::ServeHandler;
+    use crate::store_reads::{StoreReadOutcome, StoreReadReply, StoreReadRequest};
+    let steps = vec![rig::text_step("a1", "hello")];
+    let old_gate = Arc::new(tokio::sync::Notify::new());
+    let new_gate = Arc::new(tokio::sync::Notify::new());
+    let seed_gate = seed_held.then(|| Arc::new(tokio::sync::Notify::new()));
+    let today = super::today(steps.clone(), Some(Arc::clone(&old_gate)));
+    let (commands, served, _) = rig::actor_with_seed_gate(
+        rig::executor(steps, Some(Arc::clone(&new_gate))),
+        broca_session_loop::parts::SharedParts::new(Box::new(
+            broca_session_loop::parts::MemoryParts::default(),
+        )),
+        seed_gate.clone(),
+    )
+    .await;
+    assert!(matches!(
+        today
+            .send(
+                "r1",
+                rig::request("first"),
+                crate::actor::SendKey::Minted,
+                broca_protocol::Delivery::Queue,
+                None
+            )
+            .await,
+        crate::actor::SendOutcome::Active { .. }
+    ));
+    assert!(matches!(
+        rig::send(&commands, "r1", "first").await,
+        crate::actor::SendOutcome::Active { .. }
+    ));
+    broca_test_support::wait_until("both model steps in flight", || async {
+        let old = serde_json::to_value(
+            today
+                .registry
+                .run_status_reply(&today.key, broca_protocol::RunId("r1".into()))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let (reply, answer) = oneshot::channel();
+        commands
+            .send(LineageCmd::StoreRead {
+                request: Box::new(StoreReadRequest::RunStatusReply(broca_protocol::RunId(
+                    "r1".into(),
+                ))),
+                reply,
+            })
+            .unwrap();
+        let StoreReadOutcome::Served(answer) = answer.await.unwrap() else {
+            return Err("read not in memory".into());
+        };
+        let StoreReadReply::RunStatusReply(Ok(answer)) = *answer else {
+            return Err("status refused".into());
+        };
+        let new = serde_json::to_value(answer).unwrap();
+        if old["step"]["step_id"] == 1 && new["step"]["step_id"] == 1 {
+            Ok(())
+        } else {
+            Err("step not in flight".into())
+        }
+    })
+    .await;
+    let old = before_display_reset(live_routed(&today.registry, &today.key).await).await;
+    assert_eq!(old.len(), 1);
+    assert_eq!(
+        old[0].1,
+        broca_protocol::ControlUnit::StepStarted {
+            step_id: broca_protocol::StepId(1)
+        }
+    );
+    let mut deliveries = live_actor(&commands).await;
+    if let Some(seed_gate) = seed_gate {
+        assert!(matches!(
+            deliveries.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        // The run ends before seeding catches up. The attach must still receive its earlier H,
+        // not the later empty step state.
+        new_gate.notify_one();
+        rig::idle(&commands).await;
+        seed_gate.notify_one();
+    }
+    let new = before_display_reset(deliveries).await;
+    assert_alike(&normalized(&new), &normalized(&old));
+    old_gate.notify_one();
+    new_gate.notify_one();
+    today.idle().await;
+    rig::idle(&commands).await;
+    assert!(
+        before_display_reset(live_routed(&today.registry, &today.key).await)
+            .await
+            .is_empty()
+    );
+    assert!(before_display_reset(live_actor(&commands).await)
+        .await
+        .is_empty());
+    drop(commands);
+    served.await.unwrap();
+    assert!(today.registry.stop_and_seal().await);
+}
+
+#[tokio::test]
+async fn a_mid_step_live_attach_replays_controls_before_display_reset_alike() {
+    live_attach_during_step(false).await;
+}
+
+#[tokio::test]
+async fn a_mid_step_live_attach_while_seeding_uses_its_exact_barrier() {
+    live_attach_during_step(true).await;
+}

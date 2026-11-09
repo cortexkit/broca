@@ -325,20 +325,65 @@ fn project_attach_with_identities(
     project_attach_with_index(durable_prefix, state, from, identities, None)
 }
 
-fn in_flight_step_start(records: &[broca_wal::FramedRecord]) -> Option<usize> {
-    let mut start = None;
-    for (index, frame) in records.iter().enumerate() {
-        match frame.record {
-            broca_wal::WalRecord::StepStarted { .. } => start = Some(index),
-            broca_wal::WalRecord::RunStarted { .. }
-            | broca_wal::WalRecord::ToolBatchFinished { .. }
-            | broca_wal::WalRecord::TurnFinished { .. }
-            | broca_wal::WalRecord::RunFinished { .. }
-            | broca_wal::WalRecord::RunPaused { .. } => start = None,
+/// A record's step boundary in either storage. Model completion alone leaves a tool step open.
+pub(crate) enum StepRecord<'a> {
+    Wal(&'a broca_wal::WalRecord),
+    Store(&'a broca_session_store::record::Record),
+}
+
+/// Retains only the open step's replay state, shared by both subscribe implementations.
+pub(crate) struct StepReplay<T> {
+    current: Option<Vec<T>>,
+}
+
+impl<T> Default for StepReplay<T> {
+    fn default() -> Self {
+        Self { current: None }
+    }
+}
+
+impl<T> StepReplay<T> {
+    pub(crate) fn observe(&mut self, record: StepRecord<'_>) {
+        use broca_session_store::record::Record as S;
+        use broca_wal::WalRecord as W;
+        match record {
+            StepRecord::Wal(W::StepStarted { .. }) | StepRecord::Store(S::StepStart(_)) => {
+                self.current = Some(Vec::new());
+            }
+            StepRecord::Wal(
+                W::RunStarted { .. }
+                | W::ToolBatchFinished { .. }
+                | W::TurnFinished { .. }
+                | W::RunFinished { .. }
+                | W::RunPaused { .. },
+            )
+            | StepRecord::Store(S::RunStart(_) | S::BatchEnd(_) | S::RunEnd(_) | S::Pause(_)) => {
+                self.current = None;
+            }
             _ => {}
         }
     }
-    start
+
+    pub(crate) fn push(&mut self, value: T) {
+        if let Some(current) = &mut self.current {
+            current.push(value);
+        }
+    }
+
+    pub(crate) fn units(&self) -> &[T] {
+        self.current.as_deref().unwrap_or_default()
+    }
+}
+
+fn in_flight_step_start(records: &[broca_wal::FramedRecord]) -> Option<usize> {
+    let mut step = StepReplay::default();
+    for (index, frame) in records.iter().enumerate() {
+        step.observe(StepRecord::Wal(&frame.record));
+        if step.units().is_empty() {
+            step.push(index);
+        }
+    }
+    step.units().first().copied()
 }
 
 fn project_attach_with_index(

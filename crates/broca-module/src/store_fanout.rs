@@ -7,7 +7,8 @@
 //! - **The barrier.** The actor registers the subscriber's live receiver and takes the session's
 //!   durable end H in one step between appends: its last seq, short of a batch appended without
 //!   a barrier, which is published once a barrier makes it durable. A task then projects the
-//!   stored records through H, and delivers live units only past H
+//!   stored records through H for a cursor attach. A live attach instead takes the open step's
+//!   retained durable controls at H, before the display snapshot. Both deliver live units only past H
 //!   ([`crate::fanout::deliver_from_ring`]), so a unit in both is delivered once.
 //! - **Live.** The session calls [`Publisher::appended`] right after each append returns; each
 //!   batch is projected once, when durable, and its units published on a bounded broadcast. A
@@ -15,7 +16,8 @@
 //!   the live projection in the background when it opens, from the open log's checkpoint through
 //!   H, and again after the projection loses continuity; batches made durable meanwhile wait for
 //!   it. The projection keeps its state and the cursor of the stream's last unit, which actor
-//!   reads serve as `session.read`'s `head` from memory.
+//!   reads serve as `session.read`'s `head` from memory. Only the open step's visible controls are
+//!   retained for live attaches; a queued attach is answered exactly when seeding reaches its H.
 //! - **Cursors.** `wal_seq` is the store record's seq and `sub_index` the unit's index among that
 //!   record's units. `incarnation` is the session head's incarnation in hex, as `session.read`
 //!   serves it, and `digest` the first 8 bytes of HMAC-SHA256 over the record's canonical
@@ -42,12 +44,13 @@ use broca_session_store::backend::SessionBackend;
 use broca_session_store::keys::CursorKey;
 use broca_session_store::record::Record;
 use broca_session_store::session::{Appended, LogFrom, Session, StoredRecords};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::fanout::{
     deliver, deliver_from_ring, AttachFrom, ControlEvent, Delivery, DisplaySender, FromCursor,
+    StepRecord, StepReplay,
 };
 use crate::store_control::{StoreControl, StoreUnit};
 
@@ -93,12 +96,63 @@ enum Live {
         generation: u64,
         waiting: Vec<(u64, Vec<Record>)>,
     },
-    Seeded(Box<StoreControl>),
+    Seeded(Box<LiveProjection>),
+}
+
+const SEED_FAILED: &str = "the catch-up seeding the live projection failed";
+type LiveReplay = Result<Vec<Arc<ControlEvent>>, String>;
+type LiveAttaches = Vec<(u64, oneshot::Sender<LiveReplay>)>;
+
+struct LiveProjection {
+    control: StoreControl,
+    last: Option<Cursor>,
+    step: StepReplay<Arc<ControlEvent>>,
+    through: u64,
+}
+
+impl LiveProjection {
+    fn project(
+        &mut self,
+        seq: u64,
+        record: &Record,
+        next: Option<&Record>,
+        identity: &CursorIdentity,
+    ) -> Result<Vec<Arc<ControlEvent>>, String> {
+        self.step.observe(StepRecord::Store(record));
+        let units = self.control.project(seq, record, next)?;
+        let digest = identity.key.digest(record);
+        let mut visible = Vec::new();
+        for unit in units {
+            let cursor = identity.cursor(&unit, digest);
+            self.last = Some(cursor);
+            if unit.visible {
+                let event = Arc::new((cursor, unit.unit, unit.event));
+                self.step.push(Arc::clone(&event));
+                visible.push(event);
+            }
+        }
+        self.through = seq;
+        Ok(visible)
+    }
+
+    fn answer_attaches(&self, attaches: &mut LiveAttaches) {
+        let mut pending = Vec::new();
+        for (head, answer) in std::mem::take(attaches) {
+            if head == self.through {
+                let _ = answer.send(Ok(self.step.units().to_vec()));
+            } else if head < self.through {
+                let _ = answer.send(Err(SEED_FAILED.into()));
+            } else {
+                pending.push((head, answer));
+            }
+        }
+        *attaches = pending;
+    }
 }
 
 /// The live side of a store session's stream, shared by the session's append hook and the
 /// catch-ups that seed it. It holds the projector's state, which the session's folds bound, and
-/// the cursor of the stream's last unit, never the units themselves.
+/// the cursor of the stream's last unit, and only the open step's controls for live attaches.
 pub(crate) struct Publisher {
     live: Live,
     /// Counts seedings, so a catch-up that started before the projection lost continuity can't
@@ -106,9 +160,7 @@ pub(crate) struct Publisher {
     seedings: u64,
     /// Batches appended without a barrier, published once a barrier makes them durable.
     unsynced: Vec<(u64, Vec<Record>)>,
-    /// The cursor of the last unit the live projection made through the durable end, while it
-    /// is seeded; `None` when the stream has no unit yet.
-    last: Option<Cursor>,
+    live_attaches: LiveAttaches,
     ring: broadcast::Sender<LiveItem>,
     display: DisplaySender,
     /// The id of the message the current step writes, which its display deltas name.
@@ -147,9 +199,16 @@ impl Publisher {
             match &mut self.live {
                 Live::Unseeded => {}
                 Live::Seeding { waiting, .. } => waiting.push((first, records)),
-                Live::Seeded(control) => {
-                    match publish(control, &self.identity, &self.ring, first, &records) {
-                        Ok(last) => self.last = last.or(self.last),
+                Live::Seeded(projection) => {
+                    match publish(
+                        projection,
+                        &self.identity,
+                        &self.ring,
+                        first,
+                        &records,
+                        &mut self.live_attaches,
+                    ) {
+                        Ok(()) => {}
                         Err(error) => self.lose_continuity(&error),
                     }
                 }
@@ -185,7 +244,9 @@ impl Publisher {
             "the live projection lost continuity; subscribers resume from their cursors",
         );
         self.live = Live::Unseeded;
-        self.last = None;
+        for (_, answer) in std::mem::take(&mut self.live_attaches) {
+            let _ = answer.send(Err(SEED_FAILED.into()));
+        }
         let _ = self.ring.send(LiveItem::Detach);
     }
 
@@ -206,7 +267,7 @@ impl Publisher {
     /// The state the seeding catch-up reached at its head and the cursor of the last unit
     /// through it, or `None` when it failed. The batches made durable since are projected and
     /// published from it.
-    fn seeded(&mut self, generation: u64, seed: Option<(StoreControl, Option<Cursor>)>) {
+    fn seeded(&mut self, generation: u64, seed: Option<LiveProjection>) {
         if !matches!(&self.live, Live::Seeding { generation: seeding, .. } if *seeding == generation)
         {
             return;
@@ -215,27 +276,37 @@ impl Publisher {
         else {
             unreachable!("checked above");
         };
-        let Some((mut control, mut last)) = seed else {
-            self.lose_continuity("the catch-up seeding the live projection failed");
+        let Some(mut projection) = seed else {
+            self.lose_continuity(SEED_FAILED);
             return;
         };
+        projection.answer_attaches(&mut self.live_attaches);
         for (first, records) in waiting {
-            match publish(&mut control, &self.identity, &self.ring, first, &records) {
-                Ok(batch_last) => last = batch_last.or(last),
+            match publish(
+                &mut projection,
+                &self.identity,
+                &self.ring,
+                first,
+                &records,
+                &mut self.live_attaches,
+            ) {
+                Ok(()) => {}
                 Err(error) => {
                     self.lose_continuity(&error);
                     return;
                 }
             }
         }
-        self.live = Live::Seeded(Box::new(control));
-        self.last = last;
+        self.live = Live::Seeded(Box::new(projection));
     }
 
     /// The cursor of the stream's last unit, when the live projection is seeded: `Some(None)`
     /// for a stream with no unit yet, `None` while nothing is seeded.
     pub(crate) fn head(&self) -> Option<Option<Cursor>> {
-        matches!(self.live, Live::Seeded(_)).then_some(self.last)
+        match &self.live {
+            Live::Seeded(projection) => Some(projection.last),
+            _ => None,
+        }
     }
 
     /// The seq of the last durable record, given `last`, the seq of the last record appended:
@@ -247,32 +318,23 @@ impl Publisher {
     }
 }
 
-/// Projects `records`, the first at seq `first`, and publishes the units subscribers see.
-/// Returns the cursor of the last unit the batch made, hidden notices included.
+/// Projects each durable record once and answers live attaches at their exact barrier.
 fn publish(
-    control: &mut StoreControl,
+    projection: &mut LiveProjection,
     identity: &CursorIdentity,
     ring: &broadcast::Sender<LiveItem>,
     first: u64,
     records: &[Record],
-) -> Result<Option<Cursor>, String> {
-    let mut last = None;
+    attaches: &mut LiveAttaches,
+) -> Result<(), String> {
     for (offset, record) in records.iter().enumerate() {
         let seq = first + offset as u64;
-        let units = control.project(seq, record, records.get(offset + 1))?;
-        if units.is_empty() {
-            continue;
+        for event in projection.project(seq, record, records.get(offset + 1), identity)? {
+            let _ = ring.send(LiveItem::Unit(event));
         }
-        let digest = identity.key.digest(record);
-        for unit in units {
-            let cursor = identity.cursor(&unit, digest);
-            last = Some(cursor);
-            if unit.visible {
-                let _ = ring.send(LiveItem::Unit(Arc::new((cursor, unit.unit, unit.event))));
-            }
-        }
+        projection.answer_attaches(attaches);
     }
-    Ok(last)
+    Ok(())
 }
 
 /// The subscriptions of one store session, held by its actor.
@@ -319,7 +381,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreFanout<B> {
             live: Live::Unseeded,
             seedings: 0,
             unsynced: Vec::new(),
-            last: None,
+            live_attaches: Vec::new(),
             ring: broadcast::channel(crate::fanout::RING_CAPACITY).0,
             display: display.clone(),
             display_mid: Arc::clone(&display_mid),
@@ -410,11 +472,29 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreFanout<B> {
         self.subscribers.retain(|(_, task)| !task.is_finished());
         // The live projection a subscriber's stream continues from.
         self.ensure_seeded(session);
-        let (rx, identity, head) = {
-            let publisher = self.publisher.lock().unwrap();
+        let (rx, identity, head, live_replay) = {
+            let mut publisher = self.publisher.lock().unwrap();
             let rx = publisher.ring.subscribe();
             let head = publisher.durable_end(session.next_seq().saturating_sub(1));
-            (rx, publisher.identity.clone(), head)
+            let live_replay = if matches!(from, AttachFrom::Live) {
+                let (answer, replay) = oneshot::channel();
+                publisher.live_attaches.push((head, answer));
+                if let Live::Seeded(projection) = &publisher.live {
+                    // The publisher lock makes snapshot and ring registration one attach barrier.
+                    let through = projection.through;
+                    let step = projection.step.units().to_vec();
+                    let (_, answer) = publisher.live_attaches.pop().unwrap();
+                    let _ = answer.send(if through == head {
+                        Ok(step)
+                    } else {
+                        Err(SEED_FAILED.into())
+                    });
+                }
+                Some(replay)
+            } else {
+                None
+            };
+            (rx, publisher.identity.clone(), head, live_replay)
         };
         let cancel = CancellationToken::new();
         let task = subscriber(Attach {
@@ -426,6 +506,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreFanout<B> {
             identity,
             display: self.display.clone(),
             cancel: cancel.clone(),
+            live_replay,
         });
         self.subscribers.push((cancel, tokio::spawn(task)));
     }
@@ -453,6 +534,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreFanout<B> {
 
 impl<B> Drop for StoreFanout<B> {
     fn drop(&mut self) {
+        for (_, answer) in std::mem::take(&mut self.publisher.lock().unwrap().live_attaches) {
+            let _ = answer.send(Err(SEED_FAILED.into()));
+        }
         for (cancel, _) in &self.subscribers {
             cancel.cancel();
         }
@@ -486,6 +570,7 @@ struct Attach<R> {
     identity: CursorIdentity,
     display: DisplaySender,
     cancel: CancellationToken,
+    live_replay: Option<oneshot::Receiver<LiveReplay>>,
 }
 
 /// What a catch-up delivers.
@@ -581,25 +666,23 @@ impl<R: SessionBackend> Logs for StoredRecords<R> {
     }
 }
 
-/// `log` projected from its checkpoint: the projector's state at its end, and the cursor of the
-/// last unit it made.
-fn project_log(
-    log: LogFrom,
-    identity: &CursorIdentity,
-) -> Result<(StoreControl, Option<Cursor>), String> {
-    let mut control = StoreControl::at_checkpoint(
-        &log.checkpoint.conversation,
-        &log.checkpoint.operational,
-        log.checkpoint.covers_through,
-    );
-    let mut last = None;
+/// The open log projected once, retaining only the current step's visible controls.
+fn project_log(log: LogFrom, identity: &CursorIdentity) -> Result<LiveProjection, String> {
+    let mut projection = LiveProjection {
+        control: StoreControl::at_checkpoint(
+            &log.checkpoint.conversation,
+            &log.checkpoint.operational,
+            log.checkpoint.covers_through,
+        ),
+        last: None,
+        step: StepReplay::default(),
+        through: log.checkpoint.covers_through,
+    };
     for (at, (seq, record)) in log.records.iter().enumerate() {
         let next = log.records.get(at + 1).map(|(_, next)| next);
-        if let Some(unit) = control.project(*seq, record, next)?.pop() {
-            last = Some(identity.cursor(&unit, identity.key.digest(record)));
-        }
+        projection.project(*seq, record, next, identity)?;
     }
-    Ok((control, last))
+    Ok(projection)
 }
 
 /// The cursor of the stream's last unit through seq `through`, starting from the log holding
@@ -614,7 +697,7 @@ async fn last_unit(
     loop {
         let log = logs.log_holding(seq, through).await?;
         let covers = log.checkpoint.covers_through;
-        if let (_, Some(last)) = project_log(log, identity)? {
+        if let Some(last) = project_log(log, identity)?.last {
             return Ok(Some(last));
         }
         if covers == 0 {
@@ -630,17 +713,18 @@ async fn seed(
     logs: &impl Logs,
     head: u64,
     identity: &CursorIdentity,
-) -> Result<(StoreControl, Option<Cursor>), String> {
+) -> Result<LiveProjection, String> {
     let log = logs.log_holding(head + 1, head).await?;
     let covers = log.checkpoint.covers_through;
-    let (control, last) = project_log(log, identity)?;
-    let last = match last {
+    let mut projection = project_log(log, identity)?;
+    projection.last = match projection.last {
         Some(last) => Some(last),
         None if covers == 0 => None,
         // The open log has no unit yet: the last one is in sealed history.
         None => last_unit(logs, covers, covers, identity).await?,
     };
-    Ok((control, last))
+    projection.through = head;
+    Ok(projection)
 }
 
 /// The cursor of the last unit of `session`'s control stream, which `session.read` serves as its
@@ -663,8 +747,8 @@ pub async fn measure_seed<B: SessionBackend>(
     session: &Session<B>,
 ) -> Result<(usize, Option<Cursor>), String> {
     let head = session.next_seq().saturating_sub(1);
-    let (control, last) = seed(session, head, &CursorIdentity::of(session)).await?;
-    Ok((control.held_bytes(), last))
+    let projection = seed(session, head, &CursorIdentity::of(session)).await?;
+    Ok((projection.control.held_bytes(), projection.last))
 }
 
 /// The cursor of the first unit of `session`'s open log, which a subscriber that followed the
@@ -738,8 +822,33 @@ async fn subscriber<R: SessionBackend + Send + Sync + 'static>(attach: Attach<R>
         identity,
         display,
         cancel,
+        live_replay,
     } = attach;
-    // A live attach starts after the barrier: nothing to catch up.
+    if let Some(replay) = live_replay {
+        let replay = tokio::select! {
+            _ = cancel.cancelled() => Err(SEED_FAILED.into()),
+            _ = sink.closed() => return,
+            replay = replay => replay.unwrap_or_else(|_| Err(SEED_FAILED.into())),
+        };
+        let units = match replay {
+            Ok(units) => units,
+            Err(error) => {
+                // Closing the actor cancels subscribers too; still finish a queued attach with
+                // the same error as a failed seed, without waiting on a closed or full sink.
+                let _ = sink.try_send(Delivery::Error(error));
+                return;
+            }
+        };
+        for unit in units {
+            if deliver(&sink, &cancel, Delivery::Control(unit))
+                .await
+                .is_break()
+            {
+                return;
+            }
+        }
+    }
+    // Cursor attaches read history; live attaches use only the projection's open-step snapshot.
     if !matches!(from, AttachFrom::Live) {
         let start = match from {
             AttachFrom::Live => head + 1,

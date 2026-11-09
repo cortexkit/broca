@@ -365,6 +365,19 @@ pub(super) async fn actor_with(
     tokio::task::JoinHandle<Session<&'static MemoryBackend>>,
     &'static MemoryBackend,
 ) {
+    actor_with_seed_gate(executor, parts, None).await
+}
+
+/// [`actor_with`], optionally holding the live projector's initial seed.
+pub(super) async fn actor_with_seed_gate(
+    executor: LoopExecutor,
+    parts: SharedParts,
+    seed_gate: Option<Arc<Notify>>,
+) -> (
+    Commands,
+    tokio::task::JoinHandle<Session<&'static MemoryBackend>>,
+    &'static MemoryBackend,
+) {
     let backend: &'static MemoryBackend = Box::leak(Box::default());
     let session = Session::create(
         backend,
@@ -375,8 +388,11 @@ pub(super) async fn actor_with(
     )
     .await
     .unwrap();
-    let actor = StoreActor::new(bind(), session, Arc::new(executor), Box::new(parts))
-        .with_readers(Arc::new(move || backend));
+    let actor = StoreActor::new(bind(), session, Arc::new(executor), Box::new(parts));
+    let actor = match seed_gate {
+        Some(gate) => actor.with_readers_held(Arc::new(move || backend), gate),
+        None => actor.with_readers(Arc::new(move || backend)),
+    };
     let (commands, receiver) = mpsc::unbounded_channel();
     let served = tokio::spawn(actor.serve(receiver));
     (Commands::over(commands, backend), served, backend)

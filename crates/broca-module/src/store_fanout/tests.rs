@@ -113,3 +113,101 @@ async fn ending_read_access_ends_the_stream_with_the_refusal_and_nothing_after()
     );
     assert!(deliveries.recv().await.is_none(), "the stream ended");
 }
+
+async fn before_reset(deliveries: &mut mpsc::Receiver<Delivery>) -> Vec<Arc<ControlEvent>> {
+    let mut controls = Vec::new();
+    loop {
+        let delivery = broca_test_support::wait_until("live attach snapshot", || {
+            std::future::ready(deliveries.try_recv().map_err(|error| format!("{error:?}")))
+        })
+        .await;
+        match delivery {
+            Delivery::Control(event) => controls.push(event),
+            Delivery::Display(event)
+                if matches!(*event, broca_protocol::DisplayEvent::DisplayReset) =>
+            {
+                return controls
+            }
+            other => panic!("unexpected attach delivery: {other:?}"),
+        }
+    }
+}
+
+fn step_start(step: u64) -> Record {
+    Record::StepStart(broca_session_store::record::StepStart {
+        run_id: "r1".into(),
+        step_id: step,
+        mid: Some(format!("m{step}")),
+    })
+}
+
+#[tokio::test]
+async fn live_attaches_between_steps_and_after_a_boundary_keep_no_previous_controls() {
+    let mut session = session().await;
+    let mut fanout = fanout(&mut session);
+    session.append(&[step_start(1)], true).await.unwrap();
+    let (sink, mut deliveries) = mpsc::channel(64);
+    fanout.attach(&session, AttachFrom::Live, sink);
+    let first = before_reset(&mut deliveries).await;
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].0.wal_seq, session.next_seq() - 1);
+    assert_eq!(
+        first[0].1,
+        ControlUnit::StepStarted {
+            step_id: broca_protocol::StepId(1)
+        }
+    );
+
+    session
+        .append(
+            &[Record::BatchEnd(broca_session_store::record::BatchEnd {
+                run_id: "r1".into(),
+                batch_id: "b1".into(),
+            })],
+            true,
+        )
+        .await
+        .unwrap();
+    let (sink, mut deliveries) = mpsc::channel(64);
+    fanout.attach(&session, AttachFrom::Live, sink);
+    assert!(before_reset(&mut deliveries).await.is_empty());
+
+    session.append(&[step_start(2)], true).await.unwrap();
+    let (sink, mut deliveries) = mpsc::channel(64);
+    fanout.attach(&session, AttachFrom::Live, sink);
+    let next = before_reset(&mut deliveries).await;
+    assert_eq!(next.len(), 1);
+    assert_eq!(next[0].0.wal_seq, session.next_seq() - 1);
+    assert_eq!(
+        next[0].1,
+        ControlUnit::StepStarted {
+            step_id: broca_protocol::StepId(2)
+        }
+    );
+    assert_ne!(next[0].0, first[0].0);
+}
+
+#[tokio::test]
+async fn queued_live_attaches_fail_when_seeding_fails_or_the_session_closes() {
+    for close in [false, true] {
+        let mut session = session().await;
+        let backend = *session.backend();
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let mut fanout =
+            StoreFanout::held(&mut session, Arc::new(move || backend), Arc::clone(&gate));
+        let (sink, mut deliveries) = mpsc::channel(64);
+        fanout.attach(&session, AttachFrom::Live, sink);
+        if close {
+            drop(fanout);
+        } else {
+            fanout.publisher.lock().unwrap().seeded(1, None);
+        }
+        let delivered = controls(&mut deliveries).await;
+        assert!(
+            matches!(delivered.as_slice(), [Delivery::Error(error)] if error == SEED_FAILED),
+            "{delivered:?}"
+        );
+        assert!(deliveries.recv().await.is_none());
+        gate.notify_one();
+    }
+}
