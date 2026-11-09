@@ -2528,6 +2528,8 @@ async fn provider_call(
                 }
             }
         };
+        // The observation and its reset deadline must use the same refusal receipt time.
+        let received_at_ms = (service.clock)();
         let mapped = if let super::ProviderReply::Credential(message) = &reply {
             Err(ItemError::for_code(
                 errors::PROVIDER_ERROR,
@@ -2547,11 +2549,11 @@ async fn provider_call(
         };
         if mapped.as_ref().is_err_and(account_error) {
             journal.runs[run_index].reset_at_ms =
-                retry_after.map(|delay| ((service.clock)().max(0) as u64).saturating_add(delay));
+                retry_after.map(|delay| (received_at_ms.max(0) as u64).saturating_add(delay));
         }
         let run = &journal.runs[run_index];
         let event_id = format!("{}:{}:{attempt}", run.id, run.dispatched);
-        let mut observation = json!({"event_id":event_id,"kind":"attempt","admission_id":run.observation_admission(),"run_id":run.id,"observed_at_ms":(service.clock)(),"upstream_origin":"upstream"});
+        let mut observation = json!({"event_id":event_id,"kind":"attempt","admission_id":run.observation_admission(),"run_id":run.id,"observed_at_ms":received_at_ms,"upstream_origin":"upstream"});
         if let Err(error) = &mapped {
             if error.code == errors::ACCOUNT_LIMIT_EXHAUSTED {
                 observation["kind"] = json!("account_limit_exhausted");

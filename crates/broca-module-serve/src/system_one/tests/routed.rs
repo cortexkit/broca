@@ -2213,6 +2213,28 @@ async fn routed_resettable_account_limit_reports_reset_without_reselection() {
 }
 
 #[tokio::test]
+async fn routed_resettable_account_limit_uses_one_receipt_time() {
+    let mut rig = routed_rig(true, true);
+    // Advance every read so a second timestamp for the same refusal cannot accidentally match.
+    let clock = AtomicUsize::new(1_000_000);
+    Arc::get_mut(&mut rig.service).unwrap().clock =
+        Arc::new(move || clock.fetch_add(1, Ordering::SeqCst) as i64);
+    rig.provider
+        .script("limited", vec![Script::AccountLimit(10_000)]);
+    call(&rig, &routed_request(&["limited"])).await.unwrap();
+
+    let observations = rig.router.bodies("route.account_observe");
+    let observation = observations
+        .iter()
+        .find(|body| body["kind"] == "account_limit_exhausted")
+        .unwrap();
+    let receipt = observation["observed_at_ms"].as_u64().unwrap();
+    let reset = observation["resets_at_ms"].as_u64().unwrap();
+    assert_eq!(reset, receipt + 10_000);
+    assert_eq!(rig.router.bodies("route.report")[0]["reset_at_ms"], reset);
+}
+
+#[tokio::test]
 async fn routed_invalid_key_is_retried_before_credential_refused_observation() {
     let rig = routed_rig(true, true);
     rig.provider.script(
