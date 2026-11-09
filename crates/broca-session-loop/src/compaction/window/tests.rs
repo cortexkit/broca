@@ -15,6 +15,7 @@ use broca_session_store::session::Session;
 use serde_json::{json, Value};
 
 use super::{CHECKED, PROJECTED};
+use crate::compaction::prompt::TAKEN;
 use crate::parts::MemoryParts;
 use crate::run::Seams;
 use crate::writer::Writer;
@@ -200,9 +201,19 @@ async fn compacted_run(
         .unwrap();
 }
 
-/// How many window entries a run of `tool_steps` tool steps and an answer projects, and how many
-/// kept entries its reads went back over, on a session holding `history` answered runs.
-async fn by_a_run(history: usize, tool_steps: usize) -> (usize, usize) {
+/// What a measured run's steps did, as the tests count it.
+struct Counts {
+    /// Window entries projected through the kept transcript.
+    projected: usize,
+    /// Kept entries the transcript's reads went back over.
+    checked: usize,
+    /// Window messages copied into a stored prompt.
+    taken: usize,
+}
+
+/// What a run of `tool_steps` tool steps and an answer does (see [`Counts`]) on a session
+/// holding `history` answered runs.
+async fn by_a_run(history: usize, tool_steps: usize) -> Counts {
     let backend = MemoryBackend::default();
     let mut session = Session::create(
         &backend,
@@ -233,11 +244,13 @@ async fn by_a_run(history: usize, tool_steps: usize) -> (usize, usize) {
     steps.push(answer_step("last"));
     let projected = PROJECTED.with(std::cell::Cell::get);
     let checked = CHECKED.with(std::cell::Cell::get);
+    let taken = TAKEN.with(std::cell::Cell::get);
     compacted_run(&mut session, &mut parts, "measured", steps).await;
-    (
-        PROJECTED.with(std::cell::Cell::get) - projected,
-        CHECKED.with(std::cell::Cell::get) - checked,
-    )
+    Counts {
+        projected: PROJECTED.with(std::cell::Cell::get) - projected,
+        checked: CHECKED.with(std::cell::Cell::get) - checked,
+        taken: TAKEN.with(std::cell::Cell::get) - taken,
+    }
 }
 
 /// A run's transcript reads project each window entry once, then only what each step adds: the
@@ -246,8 +259,8 @@ async fn by_a_run(history: usize, tool_steps: usize) -> (usize, usize) {
 /// four times over.
 #[tokio::test]
 async fn a_step_projects_only_the_entries_it_added() {
-    let (short, _) = by_a_run(6, 1).await;
-    let (long, _) = by_a_run(6, 9).await;
+    let short = by_a_run(6, 1).await.projected;
+    let long = by_a_run(6, 9).await.projected;
     let per_step = (long - short) as f64 / 8.0;
     assert!(
         per_step <= 6.0,
@@ -260,10 +273,24 @@ async fn a_step_projects_only_the_entries_it_added() {
 /// window's at each read would go over the whole window four times a step.
 #[tokio::test]
 async fn a_read_goes_back_only_over_what_changed() {
-    let (_, small) = by_a_run(6, 4).await;
-    let (_, large) = by_a_run(30, 4).await;
+    let small = by_a_run(6, 4).await.checked;
+    let large = by_a_run(30, 4).await.checked;
     assert_eq!(
         large, small,
         "a run went back over {small} kept entries behind 6 runs, {large} behind 30"
+    );
+}
+
+/// A compacted run keeps its stored prompt between steps, so each more step copies in only the
+/// messages it added, however long the window: copying the window into every step's request
+/// would cost the window's size per step.
+#[tokio::test]
+async fn a_step_takes_into_its_stored_prompt_only_the_messages_it_added() {
+    let extra = |short: Counts, long: Counts| long.taken - short.taken;
+    let small = extra(by_a_run(6, 1).await, by_a_run(6, 9).await);
+    let large = extra(by_a_run(30, 1).await, by_a_run(30, 9).await);
+    assert_eq!(
+        large, small,
+        "8 more steps copied {small} more messages behind 6 runs, {large} behind 30"
     );
 }

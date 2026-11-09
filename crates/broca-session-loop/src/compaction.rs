@@ -24,6 +24,7 @@ use broca_wal::WalRecord;
 use crate::run::{Admission, LoopError, Seams};
 use crate::writer::Writer;
 
+pub(crate) mod prompt;
 mod window;
 pub use window::WindowTranscript;
 
@@ -869,7 +870,9 @@ pub async fn apply_boundary<W: Writer, P, T>(
 
 /// Prepares step `step`'s request through today's compaction code: Setup when the provider
 /// needs it, a ride when something changed, the notices owed, and the prompt the applied view
-/// renders.
+/// renders from the run's stored prompt, `stored`, brought up to date for the step. `opts`
+/// carries the request's settings; its own prompt is left empty.
+#[allow(clippy::too_many_arguments)]
 pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
     writer: &mut W,
     admission: &Admission,
@@ -877,9 +880,10 @@ pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
     ctx: &Ctx,
     step: u64,
     opts: broca_protocol::request::CallOptions,
+    stored: &mut prompt::KeptPrompt,
 ) -> Result<Send, LoopError> {
     let transcript = transcript(writer, ctx).await?;
-    let opts = with_sealed(opts, &transcript);
+    let stored = stored.stored(&transcript.sealed);
     let entries = transcript.entries;
     let transcript_rides = transcript.rides;
     let now = (seams.now_ms)();
@@ -918,7 +922,7 @@ pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
             preset: &ctx.preset,
             entries: &entries,
             rides: &rides,
-            stored: &opts.prompt,
+            stored,
             conditions: &conditions,
             previous: previous.as_ref(),
             current: &current,
