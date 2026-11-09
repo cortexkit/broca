@@ -4561,16 +4561,21 @@ fn expected_0821_cases() -> Vec<(&'static str, CaseOutcome)> {
 fn check_0821_cases(
     cases: &[cortexkit_role_llm_runner_conformance::CaseReport],
 ) -> Result<(), String> {
+    let mut mismatches = Vec::new();
     for (name, expected) in expected_0821_cases() {
-        let case = cases
-            .iter()
-            .find(|case| case.case == name)
-            .ok_or_else(|| format!("the suite has no case {name}"))?;
-        if case.outcome != expected {
-            return Err(format!("{name}: {:?}, expected {expected:?}", case.outcome));
+        match cases.iter().find(|case| case.case == name) {
+            None => mismatches.push(format!("the suite has no case {name}")),
+            Some(case) if case.outcome != expected => {
+                mismatches.push(format!("{name}: {:?}, expected {expected:?}", case.outcome))
+            }
+            Some(_) => {}
         }
     }
-    Ok(())
+    if mismatches.is_empty() {
+        Ok(())
+    } else {
+        Err(mismatches.join("\n"))
+    }
 }
 
 #[test]
@@ -4673,6 +4678,34 @@ fn runner_0821_cases_pin_exact_native_outcomes() {
         missing.remove(index);
         assert!(check_0821_cases(&missing).is_err());
     }
+}
+
+#[test]
+fn runner_0821_pin_check_reports_every_mismatch_and_missing_case() {
+    use cortexkit_role_llm_runner_conformance::CaseReport;
+    let mut cases: Vec<_> = expected_0821_cases()
+        .into_iter()
+        .map(|(case, outcome)| CaseReport {
+            case,
+            requires: vec![],
+            outcome,
+        })
+        .collect();
+    let missing = cases.remove(0).case;
+    let first = cases[0].case;
+    let second = cases[1].case;
+    for case in &mut cases[..2] {
+        case.outcome = CaseOutcome::Failed {
+            reason: "pin regression fixture".into(),
+        };
+    }
+    let mismatches = check_0821_cases(&cases).unwrap_err();
+    let lines: Vec<_> = mismatches.lines().collect();
+    assert_eq!(lines.len(), 3, "{mismatches}");
+    assert_eq!(lines[0], format!("the suite has no case {missing}"));
+    assert!(lines[1].starts_with(&format!("{first}: Failed")));
+    assert!(lines[2].starts_with(&format!("{second}: Failed")));
+    assert!(lines[1..].iter().all(|line| line.contains(", expected ")));
 }
 
 #[test]
@@ -5119,7 +5152,17 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         // test output, not the scratch directories this evidence is read from.
         eprintln!("{}", subject.failure_evidence());
     }
-    assert!(failed.is_empty(), "{}", report.render());
+    // Report every pin drift even when a failed case would stop the later contract checks.
+    let pinned = check_0821_cases(&report.cases);
+    if let Err(mismatches) = &pinned {
+        eprintln!("Conformance pin mismatches:\n{mismatches}");
+    }
+    assert!(
+        failed.is_empty() && pinned.is_ok(),
+        "{}\n{}",
+        report.render(),
+        pinned.err().unwrap_or_default()
+    );
     check_routed_account_cases(&report.cases).unwrap();
     check_head_selection_cases(&report.cases, subject.service_tier_enabled).unwrap();
     // Broca does not promise caller-selected output caps on every provider. Only that
@@ -5175,7 +5218,6 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
     check_0811_cases(&report.cases).unwrap();
     check_0814_undeclared_cases(&report.cases).unwrap();
     check_message_marks_cases(&report.cases).unwrap();
-    check_0821_cases(&report.cases).unwrap();
     let attachment_gaps = attachment_contract_gaps(&report);
     assert!(
         attachment_gaps.is_empty(),
