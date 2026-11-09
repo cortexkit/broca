@@ -284,6 +284,10 @@ impl WalStore for ObservedWalStore {
         WalStore::check_move(self.inner.as_ref(), session, write)
     }
 
+    fn store_owner_refusal(&self, session: &BindIdentity) -> Result<Option<WalError>, WalError> {
+        WalStore::store_owner_refusal(self.inner.as_ref(), session)
+    }
+
     fn open(&self, session: &BindIdentity) -> Result<Box<dyn Wal + Send>, WalError> {
         Ok(self.observe(WalStore::open(self.inner.as_ref(), session)?))
     }
