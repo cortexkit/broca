@@ -1302,8 +1302,6 @@ async fn a_session_on_the_new_storage_is_refused_by_name_and_never_gets_a_log() 
     rig.finish().await;
 }
 
-/// The tail is the newest page, a range stops at its limit with a cursor, and `after_mid` reads
-/// strictly after the message it names; every page carries the same snapshot identity.
 /// Session reads and controls must establish storage ownership even when they can otherwise
 /// answer from an empty log or refuse before opening one. Keep probing after a wrong answer so
 /// the failure names every operation that bypassed the rollback guard.
@@ -1407,6 +1405,8 @@ async fn every_read_and_control_refuses_new_storage_without_a_runtime() {
     assert!(gaps.is_empty(), "rollback guard bypasses: {gaps:#?}");
 }
 
+/// The tail is the newest page, a range stops at its limit with a cursor, and `after_mid` reads
+/// strictly after the message it names; every page carries the same snapshot identity.
 #[tokio::test]
 async fn tail_range_and_after_mid_reads() {
     let mut rig = three_turns("modes").await;
