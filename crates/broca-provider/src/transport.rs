@@ -6154,7 +6154,6 @@ use cortexkit_anthropic_policy::{
     UNIFIED_RESET as ANTHROPIC_UNIFIED_RESET, UNIFIED_STATUS as ANTHROPIC_UNIFIED_STATUS,
 };
 
-const ANTHROPIC_CREDIT_BALANCE_MESSAGE: &str = "Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.";
 const KIMI_WEEKLY_MESSAGE: &str = "You've reached your weekly (7-day) usage limit. Your quota will reset when the current 7-day window ends. To continue now, purchase extra usage or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota";
 const KIMI_FIVE_HOUR_MESSAGE: &str = "You've reached your 5-hour usage limit. Your quota will reset when the current 5-hour window ends. To continue now, purchase extra usage or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota";
 const KIMI_BILLING_PRICING_MESSAGE: &str = "You've reached your usage limit for this billing cycle. Your quota will be refreshed in the next cycle. To continue now, purchase extra usage or upgrade your plan: https://www.kimi.com/code/#pricing";
@@ -6213,14 +6212,17 @@ fn http_error_in_family(
             Some(BILLING_EXHAUSTED.to_string())
         }
         Some("invalid_request_error")
-            if code == 400
-                && family == Some(WireFamilyId::AnthropicMessages)
+            if family == Some(WireFamilyId::AnthropicMessages)
                 && body.as_ref().is_some_and(|body| {
-                    body.pointer("/error/type").and_then(Value::as_str)
-                        == Some("invalid_request_error")
-                        && body.pointer("/error/code").is_none()
-                })
-                && message == ANTHROPIC_CREDIT_BALANCE_MESSAGE =>
+                    body.pointer("/error/code").is_none()
+                        && cortexkit_anthropic_policy::anthropic_credit_balance_exhausted_exact(
+                            code,
+                            body.pointer("/error/type")
+                                .and_then(Value::as_str)
+                                .unwrap_or(""),
+                            message,
+                        )
+                }) =>
         {
             Some(BILLING_EXHAUSTED.to_string())
         }
