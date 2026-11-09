@@ -21,7 +21,7 @@ use broca_session_store::session::Session;
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot, Notify};
 
-use super::tests::{bind, deployment, executor, idle, read_step, request, send, text_step, ADDR};
+use super::tests::{bind, deployment, executor, idle, read_step, request, text_step, ADDR};
 use super::StoreActor;
 use crate::actor::{LineageCmd, SendKey, SendOutcome};
 use crate::executor::{RunExecutor, RunKind};
@@ -207,8 +207,10 @@ async fn stopped_in_the_gap() -> (
     let (commands, receiver) = mpsc::unbounded_channel();
     let commands = super::tests::Commands::over(commands, backend);
     let served = tokio::spawn(actor.serve(receiver));
+    let mut first = request("first");
+    first.principal = Some(super::differential::core());
     assert!(matches!(
-        send(&commands, "r1", "first").await,
+        super::tests::send_with(&commands, "r1", first, crate::actor::SendKey::Minted).await,
         SendOutcome::Active { .. }
     ));
     reached.notified().await;
@@ -305,6 +307,96 @@ async fn a_read_whose_sync_fails_is_refused_with_no_answer() {
     assert!(durable < len);
     drop(commands);
     served.await.unwrap();
+}
+
+async fn authorization_owner(commands: &super::tests::Commands) -> broca_core::SessionOwnershipV1 {
+    match ask(commands, StoreReadRequest::AuthorizationOwnership).await {
+        StoreReadOutcome::Served(answer) => match *answer {
+            StoreReadReply::AuthorizationOwnership(Ok(owner)) => owner,
+            _ => panic!("authorization ownership is answered"),
+        },
+        _ => panic!("authorization ownership is in memory"),
+    }
+}
+
+#[tokio::test]
+async fn refused_flow_authorization_keeps_pending_log_byte_identical() {
+    let (commands, served, backend, release) = stopped_in_the_gap().await;
+    let before = backend.log_state();
+    assert!(before.1 < before.0);
+    let log = backend.last_log.lock().unwrap().unwrap();
+    let addr = SessionAddr(ADDR.into());
+    let bytes = backend.read_log(&addr, &log, 0..before.0).await.unwrap();
+    let owner = authorization_owner(&commands).await;
+    let mut scope = super::differential::head_scope(super::differential::core());
+    let broca_protocol::SendScope::Stamped(bind) = &mut scope else {
+        unreachable!()
+    };
+    bind.scope.flow_id = Some("flow-1".into());
+    assert!(matches!(
+        broca_core::scope_admission::decide_owner_access(
+            &owner,
+            Some(&super::differential::core()),
+            &scope,
+        ),
+        Err(broca_core::ScopeRefusal::OwnerMismatch(_))
+    ));
+    assert_eq!(backend.log_state(), before, "no append or barrier");
+    assert_eq!(
+        backend.read_log(&addr, &log, 0..before.0).await.unwrap(),
+        bytes
+    );
+    release.notify_one();
+    idle(&commands).await;
+    drop(commands);
+    served.await.unwrap();
+}
+
+#[tokio::test]
+async fn admitted_owner_operation_is_durable_after_pending_records() {
+    let (commands, served, backend, release) = stopped_in_the_gap().await;
+    let before = backend.log_state();
+    assert!(before.1 < before.0);
+    let owner = authorization_owner(&commands).await;
+    broca_core::scope_admission::decide_owner_access(
+        &owner,
+        Some(&super::differential::core()),
+        &broca_protocol::SendScope::Unstamped,
+    )
+    .unwrap();
+    assert_eq!(backend.log_state(), before, "authorization did not flush");
+    let (reply, answer) = oneshot::channel();
+    commands
+        .send(LineageCmd::Cancel {
+            run_id: RunId("r1".into()),
+            at: broca_wal::record::RunCancelAt::Now,
+            reply,
+        })
+        .unwrap();
+    assert!(matches!(
+        answer.await.unwrap(),
+        crate::actor::CancelOutcome::Ack
+    ));
+    let after = backend.log_state();
+    assert!(after.0 > before.0);
+    assert_eq!(after.1, after.0);
+    assert_eq!(after.2, before.2 + 1, "only the operation's barrier");
+    release.notify_one();
+    idle(&commands).await;
+    drop(commands);
+    let session = served.await.unwrap();
+    let records = session.records_from(0).await.unwrap();
+    let step = records
+        .iter()
+        .find(|(_, record)| matches!(record, Record::Assistant(_)))
+        .unwrap()
+        .0;
+    let cancel = records
+        .iter()
+        .find(|(_, record)| matches!(record, Record::CancelRequest(_)))
+        .unwrap()
+        .0;
+    assert!(step < cancel, "the cancel follows the pending step records");
 }
 
 /// The idle time of the module below: long enough that the session closes only when a test closes
@@ -632,7 +724,8 @@ fn shape(reply: StoreReadReply) -> String {
         StoreReadReply::PlanChange(read) => format!("{:?}", read.map(|read| read.0)),
         StoreReadReply::PlanIdentities(identities) => format!("{identities:?}"),
         StoreReadReply::Entries(entries) => format!("{entries:?}"),
-        StoreReadReply::Ownership(ownership) => format!("{ownership:?}"),
+        StoreReadReply::AuthorizationOwnership(ownership) => format!("{ownership:?}"),
+        StoreReadReply::AuthorizationSubmissionSender(sender) => format!("{sender:?}"),
         StoreReadReply::RunResult(reply) => match reply {
             Ok(reply) => serde_json::to_value(reply).unwrap().to_string(),
             Err(error) => format!("{error:?}"),
@@ -687,7 +780,7 @@ fn reads(runs: &[&str]) -> Vec<StoreReadRequest> {
             from: 1,
             limit: 200,
         },
-        StoreReadRequest::Ownership,
+        StoreReadRequest::AuthorizationOwnership,
     ]);
     reads
 }

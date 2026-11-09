@@ -410,19 +410,21 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         self
     }
 
-    /// Answers a read of the session from what the actor holds (see `store_reads`): made durable
-    /// first when the last batch was appended without a barrier, then read from memory only.
+    /// Answers a read from memory, flushing pending records first for caller data, but never
+    /// for internal authorization (see `store_reads::answer_in_memory`).
     async fn store_read(
         &mut self,
         request: &crate::store_reads::StoreReadRequest,
     ) -> crate::store_reads::StoreReadOutcome {
-        // Made durable first, so the live projection has published every batch the read sees
-        // and its last unit is the read's head.
-        if let Some(refused) = crate::store_reads::durable_for_read(&mut self.session).await {
-            return refused;
-        }
-        if let Some(fanout) = self.fanout.as_mut() {
-            fanout.ensure_seeded(&self.session);
+        if !request.is_authorization() {
+            // Flush before caller reads so their subscribe cursor includes the durable controls
+            // projected from every returned record.
+            if let Some(refused) = crate::store_reads::durable_for_read(&mut self.session).await {
+                return refused;
+            }
+            if let Some(fanout) = self.fanout.as_mut() {
+                fanout.ensure_seeded(&self.session);
+            }
         }
         let addr = broca_core::session_addr(&self.key);
         let live_step = self

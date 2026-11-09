@@ -57,8 +57,10 @@ pub enum StoreReadRequest {
     Page(PageRequest),
     /// A page of entries, as `session.entries` reads them: up to `limit` from ordinal `from`.
     Entries { from: u64, limit: usize },
-    /// The session's ownership, as every authorization path reads it.
-    Ownership,
+    /// Internal authorization only: ownership without forcing pending records durable.
+    AuthorizationOwnership,
+    /// Internal authorization only: the immutable sender of a queued submission.
+    AuthorizationSubmissionSender(String),
     /// One `compaction-runner/v1` operation (see `store_entries::serve_compaction`), for the
     /// session `key` and the daemon-attested route `caller`.
     Compaction {
@@ -88,6 +90,15 @@ pub enum StoreReadRequest {
     /// The plan identities a later send's plan is checked against once the session took a
     /// refresh (see `store_plan_change::identities`).
     PlanIdentities,
+}
+
+impl StoreReadRequest {
+    pub(crate) fn is_authorization(&self) -> bool {
+        matches!(
+            self,
+            Self::AuthorizationOwnership | Self::AuthorizationSubmissionSender(_)
+        )
+    }
 }
 
 /// What a `session.read` page asks of the session itself.
@@ -140,7 +151,8 @@ pub enum StoreReadReply {
     Head(Result<Box<crate::store_head::StoreHead>, ServeError>),
     Page(Result<PageAnswer, ServeError>),
     Entries(Result<Vec<StoredEntry>, ServeError>),
-    Ownership(Result<broca_core::SessionOwnershipV1, String>),
+    AuthorizationOwnership(Result<broca_core::SessionOwnershipV1, String>),
+    AuthorizationSubmissionSender(Result<Option<BindPrincipal>, ServeError>),
     Compaction(
         Result<
             Box<serde_json::value::RawValue>,
@@ -291,10 +303,17 @@ pub async fn execute<B: SessionBackend>(
                 .await
                 .map_err(crate::store_read::read_failed),
         ),
-        StoreReadRequest::Ownership => StoreReadReply::Ownership(
+        StoreReadRequest::AuthorizationOwnership => StoreReadReply::AuthorizationOwnership(
             broca_session_loop::owner::ownership_with_plan(&session.operations, ctx.parts)
                 .map_err(|error| format!("the session's stored owner can't be read: {error}")),
         ),
+        StoreReadRequest::AuthorizationSubmissionSender(id) => {
+            StoreReadReply::AuthorizationSubmissionSender(
+                crate::store_status::authorization_submission_sender(session, id)
+                    .await
+                    .map_err(Into::into),
+            )
+        }
         StoreReadRequest::Compaction {
             key,
             caller,
@@ -398,7 +417,7 @@ pub(crate) async fn durable_for_read<B: SessionBackend>(
     None
 }
 
-/// Answers `request` from `session` as its actor holds it: durable first, then from memory only.
+/// Answers `request` from memory only, flushing first unless the read is authorization-only.
 /// `None` from `answer` means the read needed storage. The actor calls this between its commands,
 /// with nothing else appending.
 pub async fn answer_in_memory<B: SessionBackend>(
@@ -407,8 +426,13 @@ pub async fn answer_in_memory<B: SessionBackend>(
     request: &StoreReadRequest,
 ) -> StoreReadOutcome {
     use futures::FutureExt as _;
-    if let Some(refused) = durable_for_read(session).await {
-        return refused;
+    // Authorization may inspect pending records without flushing them: an admitted operation
+    // writes after those records in this single-writer log, so its write cannot become durable
+    // without them. A refusal writes nothing. Never use these requests to serve caller data.
+    if !request.is_authorization() {
+        if let Some(refused) = durable_for_read(session).await {
+            return refused;
+        }
     }
     let session: &Session<B> = session;
     let memory = session.in_memory();

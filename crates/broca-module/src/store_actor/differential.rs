@@ -984,13 +984,13 @@ async fn a_queued_send_is_retracted_alike() {
     .await;
 }
 
-fn core() -> broca_protocol::BindPrincipal {
+pub(super) fn core() -> broca_protocol::BindPrincipal {
     broca_protocol::BindPrincipal::Reserved {
         module_id: "prefrontal-core".into(),
     }
 }
 
-fn head_scope(owner: broca_protocol::BindPrincipal) -> broca_protocol::SendScope {
+pub(super) fn head_scope(owner: broca_protocol::BindPrincipal) -> broca_protocol::SendScope {
     broca_protocol::SendScope::Stamped(broca_protocol::BindScope {
         scope: broca_protocol::SessionScope {
             owner,

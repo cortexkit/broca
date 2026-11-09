@@ -2912,17 +2912,25 @@ impl LineageRegistry {
         key: &LineageKey,
         submission_id: &str,
     ) -> Result<Option<broca_protocol::BindPrincipal>, OpenError> {
-        if self.store_holding(key)?.is_some() {
-            // This lookup lets a sender who isn't the owner retract a queued send it made
-            // itself. The new storage keeps each queued send's sender, but this method doesn't
-            // read it yet. Answering "no recorded sender" would refuse such a sender as not the
-            // owner, which isn't the reason, so refuse it by name instead.
-            return Err(OpenError::Classified {
-                reason: "not_served_on_new_storage: a sender retracting its own queued send \
-                         isn't served yet for a session kept in the new storage"
-                    .into(),
-                class: broca_protocol::ErrorClass::Permanent,
-            });
+        if let Some(store) = self.store_holding(key)? {
+            use crate::store_reads::{StoreReadReply, StoreReadRequest};
+            return match store
+                .read(
+                    self,
+                    key,
+                    StoreReadRequest::AuthorizationSubmissionSender(submission_id.into()),
+                )
+                .await
+                .map_err(crate::store_reads::open_error)?
+            {
+                None => Ok(None),
+                Some(StoreReadReply::AuthorizationSubmissionSender(sender)) => {
+                    sender.map_err(crate::store_reads::open_error)
+                }
+                Some(_) => Err(crate::store_reads::open_error(
+                    crate::store_reads::mismatched(),
+                )),
+            };
         }
         let (records, _) = self
             .read_durable_wal_for(key, ReadPurpose::Authorization)
@@ -3714,12 +3722,14 @@ async fn store_session_ownership(
 ) -> Result<broca_core::SessionOwnershipV1, OpenError> {
     use crate::store_reads::{StoreReadReply, StoreReadRequest};
     match store
-        .read(registry, key, StoreReadRequest::Ownership)
+        .read(registry, key, StoreReadRequest::AuthorizationOwnership)
         .await
         .map_err(crate::store_reads::open_error)?
     {
         None => Ok(broca_core::SessionOwnershipV1::default()),
-        Some(StoreReadReply::Ownership(ownership)) => ownership.map_err(OpenError::Open),
+        Some(StoreReadReply::AuthorizationOwnership(ownership)) => {
+            ownership.map_err(OpenError::Open)
+        }
         Some(_) => Err(crate::store_reads::open_error(
             crate::store_reads::mismatched(),
         )),

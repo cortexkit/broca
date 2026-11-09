@@ -1443,6 +1443,15 @@ fn carrier_key(step: &[(u64, Record)], call: &broca_protocol::ToolCallId) -> Opt
     key
 }
 
+/// Read-only authorization attribution; the same immutable sender lookup used by send status.
+pub(crate) async fn authorization_submission_sender<B: SessionBackend>(
+    session: &Session<B>,
+    submission_id: &str,
+) -> Result<Option<broca_protocol::BindPrincipal>, StatusError> {
+    let records = session.find_id(IdKind::SubmissionId, submission_id).await?;
+    SendLookup::<B>::submission_sender(&records, submission_id)
+}
+
 impl<B: SessionBackend> SendLookup<'_, B> {
     /// Every record naming the queued submission minted from `run`, in seq order.
     async fn submission(&self, run: &RunId) -> Result<Vec<(u64, Record)>, StatusError> {

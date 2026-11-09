@@ -301,6 +301,82 @@ async fn a_cancelled_run_heads_alike() {
     streams_alike(&today, &store).await;
 }
 
+#[tokio::test]
+async fn flow_and_run_routes_have_no_owner_authority_alike() {
+    use crate::serve::{ServeError, ServeHandler};
+    let (today, store, today_gate, store_gate) = both(vec![text_step("a1", "hello")], true).await;
+    for module in [&today, &store] {
+        let mut sent = request("first");
+        sent.principal = Some(core());
+        assert!(matches!(
+            send_titled(module, "r1", sent, None, None).await,
+            SendOutcome::Active { .. }
+        ));
+    }
+    for route in ["flow", "run"] {
+        let mut scope = super::head_scope(core());
+        let SendScope::Stamped(bind) = &mut scope else {
+            unreachable!()
+        };
+        if route == "flow" {
+            bind.scope.flow_id = Some("flow-1".into());
+        } else {
+            bind.scope.run_id = Some("run-1".into());
+        }
+        let mut answers = Vec::new();
+        for module in [&today, &store] {
+            let mut refused = Vec::new();
+            for answer in [
+                ServeHandler::authorize_session_cancel(
+                    &module.registry,
+                    &module.key,
+                    Some(&core()),
+                    &scope,
+                    Some(broca_wal::record::RunCancelAt::Now),
+                )
+                .await,
+                ServeHandler::authorize_session_retract(
+                    &module.registry,
+                    &module.key,
+                    Some(&core()),
+                    &scope,
+                    Some("missing-send"),
+                )
+                .await,
+                ServeHandler::upload(
+                    &module.registry,
+                    &module.key,
+                    Some(&core()),
+                    &scope,
+                    "session.upload_begin",
+                    serde_json::json!({"mime": "image/png", "bytes": 1}),
+                )
+                .await
+                .map(|_| ()),
+            ] {
+                let Err(ServeError::ScopeRefused(refusal)) = answer else {
+                    panic!("{route} owner operation was not refused: {answer:?}");
+                };
+                assert!(matches!(
+                    refusal,
+                    broca_core::ScopeRefusal::OwnerMismatch(_)
+                ));
+                refused.push(format!("{refusal:?}"));
+            }
+            let head = module
+                .registry
+                .head_for(&module.key, Some(&core()), &scope)
+                .await
+                .unwrap();
+            assert!(head.sender.is_none(), "{route} route received owner grant");
+            answers.push(refused);
+        }
+        assert_eq!(answers[1], answers[0], "{route} refusals");
+    }
+    run_out(&today, &today_gate).await;
+    run_out(&store, &store_gate).await;
+}
+
 /// A subscriber from the start of each module's session gets the same control stream.
 async fn streams_alike(today: &Module, store: &Module) {
     super::streams::assert_alike(
