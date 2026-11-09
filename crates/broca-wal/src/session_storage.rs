@@ -12,9 +12,9 @@
 //! writes a journal naming the session ([`session_storage_move_journal`]) before it touches
 //! anything else, and deletes it last, so while a move is in flight the journal names the session
 //! too. Readers of today's storage that don't go through `FileWalStore::check_move` ask
-//! [`owned_by_store`] and skip or refuse a session it claims: otherwise they could expire,
-//! project or rewrite a WAL that a move is copying, or that the new storage has already taken
-//! over.
+//! [`owned_by_store`] and skip or refuse a session it claims: otherwise they could expire a
+//! WAL, copy its records into the run index, or rewrite it while a move is copying it, or after
+//! the new storage has already taken the session over.
 
 use std::io;
 use std::path::{Path, PathBuf};
