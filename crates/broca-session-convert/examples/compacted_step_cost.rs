@@ -703,7 +703,11 @@ impl Compactor {
                 StoreReadReply::Compaction(page) => (page, "served by the actor"),
                 _ => panic!("an entries read answered with another read's reply"),
             },
-            StoreReadOutcome::Stored { position, .. } => {
+            StoreReadOutcome::Stored {
+                position,
+                entry_speaks_for,
+                ..
+            } => {
                 // The actor needed storage: the module reads the session as it stood there.
                 let view = Session::view_at(
                     LocalBackend::new(reader.root.clone()),
@@ -721,6 +725,7 @@ impl Compactor {
                     Some(COMPACTOR),
                     "session.entries",
                     &params,
+                    &entry_speaks_for,
                 )
                 .await;
                 (page, "handed back, read from a view")

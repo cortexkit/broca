@@ -93,6 +93,7 @@ fn reply(id: &str, text: String) -> Record {
 /// returns another message's facts shows it.
 fn facts(ordinal: u64) -> Record {
     Record::EntryFacts(EntryFacts {
+        named_speaker: None,
         client_message_id: None,
         sender: None,
         marks: None,

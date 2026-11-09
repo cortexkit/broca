@@ -116,6 +116,12 @@ pub trait CompactionPlane: Send + Sync {
         Err(crate::compaction_v2::runtime::CallError::Unavailable)
     }
 
+    /// The capabilities `provider`'s catalog entry lists (`provides`), read from the daemon's
+    /// catalog when asked. `None` when the catalog can't be read or names no such module.
+    async fn provider_capabilities(&self, _provider: &str) -> Option<Vec<String>> {
+        None
+    }
+
     async fn setup(
         &self,
         provider: &str,

@@ -456,6 +456,9 @@ pub fn seed(history: HeadHistory, at: &SeedFacts<'_>) -> Result<Seed, ImportRefu
             client_message_id: send.and_then(|send| send.client_message_id.clone()),
             sender: send.map(|send| send.sender.clone()),
             marks: send.and_then(|send| send.marks.clone()),
+            named_speaker: broca_session_store::record::marks_name_speaker(
+                send.and_then(|send| send.marks.as_ref()),
+            ),
             no_display_facts: None,
             reasoning_summaries: broca_session_loop::entries::reasoning_summaries(&message.message),
             rich_ui: None,
@@ -630,6 +633,7 @@ fn seed_start(
         refusal_schedule: None,
         imported_ids: None,
         message_marks: None,
+        named_speaker: None,
     })
 }
 

@@ -170,7 +170,104 @@ fn replies(read: impl Fn(&SessionReadRequest) -> SessionReadResponse) -> Vec<Ses
 /// send's notices, and the ride's notice speaking for Grace.
 #[test]
 fn a_converted_session_serves_its_marks_as_todays_read_does() {
-    let old = marked();
+    serves_marks_as_today(marked(), None);
+}
+
+/// The same with every speaker carrying a display name: the new storage reads each name back
+/// as today's read serves it.
+#[test]
+fn a_converted_session_serves_named_speakers_as_todays_read_does() {
+    serves_marks_as_today(named_marked(), Some(("Ada Lovelace", "Grace Hopper")));
+}
+
+/// `marked` with each speaker named: Ada as "Ada Lovelace", Grace as "Grace Hopper".
+fn named_marked() -> Vec<FramedRecord> {
+    marked()
+        .into_iter()
+        .map(|mut frame| {
+            let text = serde_json::to_string(&frame.record)
+                .unwrap()
+                .replace(
+                    r#"{"agent_id":"Ada"}"#,
+                    r#"{"agent_id":"Ada","name":"Ada Lovelace"}"#,
+                )
+                .replace(
+                    r#"{"agent_id":"Grace"}"#,
+                    r#"{"agent_id":"Grace","name":"Grace Hopper"}"#,
+                );
+            frame.record = serde_json::from_str(&text).unwrap();
+            frame
+        })
+        .collect()
+}
+
+/// A named speaker converts with its name in the stored marks and, beside every place a name is
+/// stored, the must-understand flag that keeps it from readers predating names; nothing is lost,
+/// and the records invert to the same log.
+#[test]
+fn named_speakers_convert_beside_their_flags_and_round_trip() {
+    let old = named_marked();
+    let converted = crate::convert(&old, Some(LINEAGE)).unwrap();
+    assert!(converted.lost.is_empty(), "{:?}", converted.lost);
+    let mut flagged = Vec::new();
+    for record in &converted.records {
+        match record {
+            Record::RunStart(start) if start.message_marks.is_some() => {
+                flagged.push(("run start", start.named_speaker));
+            }
+            Record::QueuedSend(send) if send.message_marks.is_some() => {
+                let speaker = send.message_marks.as_ref().unwrap().get("speaks_for");
+                flagged.push((
+                    "queued send",
+                    send.named_speaker.filter(|_| speaker.is_some()),
+                ));
+                assert_eq!(send.named_speaker.is_some(), speaker.is_some());
+            }
+            Record::Steer(steer) => assert_eq!(steer.named_speaker, None, "a notice names no one"),
+            Record::ResultAppend(append) => {
+                flagged.push(("ride", append.ride.as_ref().unwrap().named_speaker));
+            }
+            Record::EntryFacts(facts) => {
+                let speaker = facts
+                    .marks
+                    .as_ref()
+                    .and_then(|marks| marks.get("speaks_for"));
+                assert_eq!(
+                    facts.named_speaker.is_some(),
+                    speaker.is_some(),
+                    "{facts:?}"
+                );
+                for notice in &facts.notices {
+                    assert_eq!(notice.named_speaker, Some(true), "{notice:?}");
+                }
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        flagged,
+        [
+            ("run start", Some(true)),
+            ("queued send", Some(true)),
+            ("ride", Some(true)),
+            ("queued send", None),
+        ]
+    );
+    let rebuilt: Vec<_> = invert(&converted.records, &converted.parts)
+        .unwrap()
+        .iter()
+        .map(without_nulls)
+        .collect();
+    let original = comparable(&old);
+    assert_eq!(rebuilt.len(), original.len());
+    for (index, (a, b)) in original.iter().zip(&rebuilt).enumerate() {
+        assert_eq!(first_difference(a, b, ""), None, "record {index}");
+    }
+}
+
+/// Converts `old`, and compares every read mode of the converted session with today's read of
+/// `old`. `names` are the display names the input's and the ride's speakers carry, if any.
+fn serves_marks_as_today(old: Vec<FramedRecord>, names: Option<(&str, &str)>) {
     let converted = crate::convert(&old, Some(LINEAGE)).unwrap();
     let parts = MemoryParts {
         parts: converted.parts.clone(),
@@ -207,6 +304,25 @@ fn a_converted_session_serves_its_marks_as_todays_read_does() {
         .map(|speaks_for| speaks_for.agent_id.as_str())
         .collect();
     assert_eq!(speaking, ["Ada"]);
+    let speaker_names: Vec<_> = display
+        .iter()
+        .filter_map(|message| message.speaks_for.as_ref())
+        .map(|speaks_for| speaks_for.name.as_deref())
+        .chain(
+            display
+                .iter()
+                .flat_map(|message| &message.notices)
+                .filter_map(|notice| notice.speaks_for.as_ref())
+                .map(|speaks_for| speaks_for.name.as_deref()),
+        )
+        .collect();
+    assert_eq!(
+        speaker_names,
+        match names {
+            Some((input, ride)) => vec![Some(input), Some(ride)],
+            None => vec![None, None],
+        }
+    );
     assert_eq!(
         display.iter().filter(|message| message.notice).count(),
         2,

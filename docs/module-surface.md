@@ -1877,6 +1877,23 @@ absent and `notice: false` compare equal and retain the original answer. The WAL
 `message-marks/v1` reader shipped before the writer. After marked sends have been written,
 rolling back the daemon requires a build retaining that reader; older builds refuse the
 must-understand WAL feature rather than silently lose the attribution.
+Without `notice_with_speaks_for`, the describe group that admits a speaker's display name and
+a notice with a speaker together, a send carrying `speaks_for.name` refuses `invalid_params`
+naming `speaks_for.name`. Reads already decode a stored name, a display-only 1–64 printable
+ASCII byte string. On today's storage, a record with a named speaker (on its marks, its ride
+or its retry identity) requires the must-understand WAL feature `speaks-for-name/v1`. On the
+new storage, every stored speaker with a name has a must-understand `named_speaker` field
+beside it. Builds without the reader refuse such a record rather than drop the name.
+
+**Compaction entry attribution.** A marked send's user entries carry `speaks_for`
+(`agent_id` and, when sent, `name`) in `session.entries` pages and `compaction.notice`
+entries. This applies only when the session's compaction provider lists
+`compaction-entry-speaks-for/v1` in its catalog entry. Broca reads that declaration from the
+catalog at every Setup and keeps it until the next Setup. An actor that has not sent Setup
+yet reads the catalog once for the provider the plan names. Every other provider gets
+entries without the member. Attribution is outside every checksum, so it never changes entry
+digests, `history_version` or views. On today's storage, entries projected before this
+release keep no attribution until their projection is rebuilt.
 
 **Media-only references.** Broca declares `media_refs`. `media: "media_refs"` on
 `session.read` or raw `session.history` replaces byte-backed media outside tool results with exactly

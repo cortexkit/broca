@@ -371,6 +371,11 @@ async fn an_imported_session_cannot_enroll_in_compaction() {
 }
 
 fn seed_mode3(rig: &Rig) {
+    seed_mode3_marked(rig, None);
+}
+
+/// [`seed_mode3`], its run's input sent with `marks`.
+fn seed_mode3_marked(rig: &Rig, marks: Option<serde_json::Value>) {
     let mut start: broca_wal::WalRecord = serde_json::from_str(
         include_str!("../../../broca-wal/tests/fixtures/compaction_v2_records.jsonl")
             .lines()
@@ -385,9 +390,11 @@ fn seed_mode3(rig: &Rig) {
         manifest: plan,
         input,
         submission_id,
+        message_marks,
         ..
     } = &mut start
     {
+        *message_marks = marks.map(|marks| serde_json::from_value(marks).unwrap());
         *session = rig.key.clone();
         *run_id = RunId("seed".into());
         config.model = broca_protocol::ModelHandle::new("stub", "model");
@@ -678,4 +685,137 @@ async fn compaction_v2_bound_ops_check_provider_and_store_before_accepted_withou
     assert_eq!(restored.applied_by(), Some("provider"));
     rig.model.finish.add_permits(1);
     rig.close().await;
+}
+
+/// A compaction provider on the current protocol whose catalog entry declares entry attribution
+/// (`compaction-entry-speaks-for/v1`) when `declares` is set. It counts the Setups it is sent
+/// and the reads of its catalog entry.
+struct Attributing {
+    declares: bool,
+    setups: AtomicU64,
+    catalog_reads: AtomicU64,
+}
+
+#[async_trait]
+impl CompactionPlane for Attributing {
+    async fn setup(
+        &self,
+        _: &str,
+        _: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
+        _: SetupRequest,
+    ) -> Result<SetupAnswer, CompactionUnavailable> {
+        panic!("a session on the current compaction contract never calls the first protocol")
+    }
+
+    async fn call_v2(
+        &self,
+        _: &str,
+        _: &BindIdentity,
+        _: Option<&broca_protocol::SessionScope>,
+        method: &str,
+        _: serde_json::Value,
+        _: u64,
+    ) -> Result<Box<serde_json::value::RawValue>, broca_core::compaction_v2::runtime::CallError>
+    {
+        let answer = match method {
+            "compaction.setup" => {
+                self.setups.fetch_add(1, Ordering::SeqCst);
+                json!({"answer": "ready"})
+            }
+            "compaction.notice" => json!({"answer": "received"}),
+            _ => return Err(broca_core::compaction_v2::runtime::CallError::Unavailable),
+        };
+        Ok(serde_json::value::to_raw_value(&answer).unwrap())
+    }
+
+    async fn provider_capabilities(&self, provider: &str) -> Option<Vec<String>> {
+        assert_eq!(
+            provider, "provider",
+            "the catalog entry read is the plan's provider's"
+        );
+        self.catalog_reads.fetch_add(1, Ordering::SeqCst);
+        let mut provides = vec!["compaction-provider/v2".to_owned()];
+        if self.declares {
+            provides.push(
+                broca_core::compaction_v2::protocol::COMPACTION_ENTRY_SPEAKS_FOR_PROVIDES.into(),
+            );
+        }
+        Some(provides)
+    }
+}
+
+/// The first entry `session.entries` serves the plan's provider, as JSON.
+async fn first_served_entry(rig: &Rig) -> serde_json::Value {
+    let page = rig
+        .registry
+        .route_compaction_v2(
+            &rig.key,
+            Some("provider".into()),
+            "session.entries".into(),
+            serde_json::value::to_raw_value(&json!({"select": {"by": "after"}, "detail": "full"}))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    serde_json::from_str::<serde_json::Value>(page.get()).unwrap()["entries"][0].clone()
+}
+
+/// A stored agent mark reaches the provider's entries only when its catalog entry declares
+/// attribution; a provider that doesn't declare it gets entries without `speaks_for`. Before
+/// the session's actor has sent Setup, its first entries read asks the catalog once and keeps
+/// the answer; the Setup reads the catalog again. The attribution never moves the digest.
+#[tokio::test]
+async fn compaction_v2_entries_carry_a_stored_speaker_only_for_a_declaring_provider() {
+    let speaker = json!({"agent_id": "agent-a", "name": "Ada"});
+    for declares in [true, false] {
+        let provider = Arc::new(Attributing {
+            declares,
+            setups: AtomicU64::new(0),
+            catalog_reads: AtomicU64::new(0),
+        });
+        let rig = Rig::with_compactor(0, provider.clone());
+        seed_mode3_marked(&rig, Some(json!({"speaks_for": speaker})));
+        let before = first_served_entry(&rig).await;
+        assert_eq!(before["role"], "user", "{before}");
+        assert_eq!(provider.setups.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.catalog_reads.load(Ordering::SeqCst), 1);
+        assert_eq!(first_served_entry(&rig).await, before, "the answer is kept");
+        assert_eq!(provider.catalog_reads.load(Ordering::SeqCst), 1);
+        if declares {
+            assert_eq!(before["speaks_for"], speaker, "{before}");
+        } else {
+            assert!(before.get("speaks_for").is_none(), "{before}");
+        }
+        // The provider's route bind starts serving, which sends Setup.
+        rig.registry
+            .route_compaction_v2(
+                &rig.key,
+                Some("provider".into()),
+                "bind".into(),
+                serde_json::value::to_raw_value(&json!({})).unwrap(),
+            )
+            .await
+            .unwrap();
+        broca_test_support::wait_until("the provider is sent Setup", || async {
+            match provider.setups.load(Ordering::SeqCst) {
+                0 => Err("no Setup yet".to_owned()),
+                _ => Ok(()),
+            }
+        })
+        .await;
+        let after = first_served_entry(&rig).await;
+        assert_eq!(
+            provider.catalog_reads.load(Ordering::SeqCst),
+            2,
+            "the Setup read the catalog again"
+        );
+        assert_eq!(after["digest"], before["digest"], "{after}");
+        if declares {
+            assert_eq!(after["speaks_for"], speaker, "{after}");
+        } else {
+            assert!(after.get("speaks_for").is_none(), "{after}");
+        }
+        rig.close().await;
+    }
 }
