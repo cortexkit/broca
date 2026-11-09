@@ -1755,6 +1755,7 @@ async fn a_view_naming_800_sealed_messages_reads_them_once() {
         provider: "compactor".into(),
         preset: "head".into(),
         earlier: None,
+        window: Default::default(),
     };
     let started = std::time::Instant::now();
     let first = broca_session_loop::compaction::transcript(&session, &ctx)

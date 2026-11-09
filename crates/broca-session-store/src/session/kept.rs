@@ -208,6 +208,16 @@ impl<B: SessionBackend> Session<B> {
         self.kept.start_of(run_id)
     }
 
+    /// Every record of the open log from seq `first` on, from memory only, or `None` when the
+    /// session doesn't keep them all. A writer keeps every record from its latest run's start on
+    /// (the records it appended since, and those it loaded), so a reader that follows the
+    /// writer's appends takes them here rather than reading the log again. Unlike a writer's
+    /// read ([`Session::records_between`]), this doesn't read the stored log back to check that
+    /// it still decodes cleanly.
+    pub fn kept_from(&self, first: u64) -> Option<Vec<(u64, Record)>> {
+        self.kept.between(first, u64::MAX)
+    }
+
     /// How many of the open log's records the session keeps in memory.
     pub fn kept_records(&self) -> usize {
         self.kept.len()

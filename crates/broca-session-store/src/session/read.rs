@@ -658,6 +658,34 @@ impl<B: SessionBackend> Session<B> {
         Ok(found)
     }
 
+    /// The start record of the session's run `run_id`, sealed or in the open log, or `None` when
+    /// the session has no such run. A run has exactly one start, so a start the open log holds is
+    /// the answer and the sealed id index isn't read. Other records naming the run don't settle
+    /// it: a run that spans a seal has its start sealed and its later records (its end, say) in
+    /// the open log, so without an open start this reads the index as [`Self::find_id`] does.
+    pub async fn find_run_start(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<crate::record::RunStart>, SessionError> {
+        let start_of = |(_, record): (u64, Record)| match record {
+            Record::RunStart(start) => Some(*start),
+            _ => None,
+        };
+        if let Some(start) = self
+            .open_ids
+            .find(IdKind::RunId, run_id)
+            .into_iter()
+            .find_map(start_of)
+        {
+            return Ok(Some(start));
+        }
+        Ok(self
+            .find_id(IdKind::RunId, run_id)
+            .await?
+            .into_iter()
+            .find_map(start_of))
+    }
+
     /// The ledger record with `seq`, by lookup, never a scan: a sealed one from the one block of
     /// the one segment the ledger directory names for it (the directory's pages above it, then
     /// that segment), an open one from the records the session keeps in memory, else from the
