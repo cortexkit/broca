@@ -1408,11 +1408,11 @@ where
         .or(inputs.inherited_conversation_key)
         .unwrap_or(&derived);
     let decision = |path: &str, admission_id, decision_id| {
-        // The caller owns reports for an explicit decision; only runner allocations have
-        // an admission id that enables broca's normal and sealed-run reporters.
+        // Only a runner-owned account_for allocation grants an admission to report. Static
+        // fallbacks and login refusals reserve nothing; explicit decisions belong to the caller.
         let mut result = decision(
             path,
-            if inputs.decision_id.is_some() {
+            if inputs.decision_id.is_some() || path != broca_wal::ACCOUNT_DECISION_ROUTED {
                 None
             } else {
                 admission_id
@@ -1729,7 +1729,7 @@ pub fn attempt_body(
         if let Some(source) = &limit.resets_at_source {
             body.insert("resets_at_source".into(), json!(source));
         }
-        body.insert("observed_at_ms".into(), json!(attempt.ts_ms));
+        body.insert("observed_at_ms".into(), json!(limit.observed_at_ms));
         if !headers.is_empty() {
             body.insert("upstream_origin".into(), json!("upstream"));
             body.insert("headers".into(), json!(headers));
@@ -1839,7 +1839,37 @@ pub struct RunReporter {
     tx: tokio::sync::mpsc::UnboundedSender<ReportEvent>,
 }
 
+fn held_admission_id(decision: &AccountDecision) -> Option<&str> {
+    if decision.path == broca_wal::ACCOUNT_DECISION_ROUTED {
+        decision.admission_id.as_deref()
+    } else {
+        None
+    }
+}
+
 impl RunReporter {
+    /// Report only an allocation routing granted to this runner. Older static decisions can
+    /// contain fabricated admission ids; their presence must not enable live or recovery reports.
+    /// New-storage runs pass their session id to name reports without a WAL lineage.
+    pub fn start_for_decision(
+        client: Arc<RoutingClient>,
+        decision: &AccountDecision,
+        run_id: String,
+        view_digest: Option<String>,
+        durable_head: Arc<AtomicU64>,
+        session_id: Option<String>,
+    ) -> Option<Arc<Self>> {
+        let admission_id = held_admission_id(decision)?.to_owned();
+        Some(Self::start_named(
+            client,
+            admission_id,
+            run_id,
+            view_digest,
+            durable_head,
+            session_id,
+        ))
+    }
+
     /// Start reporting run `run_id`, known to routing as `admission_id`. `durable_head` is the
     /// run's WAL writer's durable-sequence gauge. `view_digest` is the listing digest the
     /// run's credential was chosen from, when this process chose it.
@@ -1857,27 +1887,6 @@ impl RunReporter {
             view_digest,
             durable_head,
             None,
-        )
-    }
-
-    /// [`RunReporter::start`] for a run kept in the new session storage, which has no WAL
-    /// lineage. Its events are named `<session_id>:<seq>`, as the run loop names them
-    /// (`broca_session_loop::AccountReports`), and are reported with no lineage.
-    pub fn start_for_store(
-        client: Arc<RoutingClient>,
-        admission_id: String,
-        run_id: String,
-        view_digest: Option<String>,
-        durable_head: Arc<AtomicU64>,
-        session_id: String,
-    ) -> Arc<Self> {
-        Self::start_named(
-            client,
-            admission_id,
-            run_id,
-            view_digest,
-            durable_head,
-            Some(session_id),
         )
     }
 
@@ -1981,6 +1990,9 @@ impl RunReporter {
                         // an unrelated internal error after a final failed attempt can still
                         // cause a five-second false block. This bounded cost is accepted instead
                         // of adding a separate core signal identifying the error that ended the run.
+                        // Only the observing process holds receipt evidence. After a restart,
+                        // the abandoned run finishes as Interrupted, with no reconstructed
+                        // transient report. Never substitute record or report time for a receipt.
                         last_failed_attempt_at_ms = matches!(
                             &attempt.outcome,
                             AttemptOutcome::EofBeforeCompletion
@@ -1996,7 +2008,8 @@ impl RunReporter {
                                 | AttemptOutcome::HeaderTimeout
                                 | AttemptOutcome::NoStatus
                         )
-                        .then_some(attempt.ts_ms);
+                        .then_some(attempt.account_observation.failure_received_at_ms)
+                        .flatten();
                         client
                             .observe(attempt_body(
                                 &id,
@@ -2154,7 +2167,7 @@ pub fn report_sealed(client: Arc<RoutingClient>, sealed: &broca_module::SealedRu
         .auth_selection
         .as_ref()
         .and_then(|selection| selection.account_decision.as_ref())
-        .and_then(|decision| decision.admission_id.clone())
+        .and_then(held_admission_id)
     else {
         return;
     };
@@ -2163,7 +2176,7 @@ pub fn report_sealed(client: Arc<RoutingClient>, sealed: &broca_module::SealedRu
     };
     let body = run_finished_body(
         &id,
-        &admission_id,
+        admission_id,
         &sealed.run_id.0,
         RunFinishReason::Interrupted,
         None,

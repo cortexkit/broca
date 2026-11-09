@@ -1,4 +1,397 @@
 use super::*;
+use broca_core::{
+    run_loop_with_control,
+    tool_plane::{DispatchKey, ProviderHeldLifecycle, ProviderHeldReply},
+    BatchCtx, DispatchResult, RunControl, ToolManifest, ToolPlane, ToolPlaneError,
+};
+use broca_protocol::{PauseReason, ToolCall, ToolOutput, ToolResult};
+
+struct HeldLookup;
+
+#[async_trait]
+impl ToolPlane for HeldLookup {
+    async fn batch_started(
+        &self,
+        _: &BatchCtx,
+        _: &[ToolCall],
+        _: &ToolManifest,
+    ) -> Result<(), ToolPlaneError> {
+        Ok(())
+    }
+    async fn batch_finished(&self, _: &BatchCtx) -> Result<(), ToolPlaneError> {
+        Ok(())
+    }
+    async fn dispatch(&self, _: &BatchCtx, _: &ToolCall) -> DispatchResult {
+        panic!("held lookup requires keyed dispatch")
+    }
+    async fn dispatch_keyed(
+        &self,
+        _: &BatchCtx,
+        call: &ToolCall,
+        key: DispatchKey<'_>,
+    ) -> DispatchResult {
+        key.held_recorder
+            .unwrap()
+            .sync_held(&ProviderHeldReply {
+                tool_call_id: call.tool_call_id.clone(),
+                call_key: key.call_key.into(),
+                module: "tools".into(),
+                reason: "running".into(),
+                detail_digest: None,
+            })
+            .await
+            .unwrap();
+        std::future::pending().await
+    }
+}
+
+#[async_trait]
+impl ProviderHeldLifecycle for HeldLookup {
+    async fn wait(&self, _: &BatchCtx, call: &ToolCall, _: &ProviderHeldReply) -> DispatchResult {
+        DispatchResult::Completed(ToolResult {
+            tool_call_id: call.tool_call_id.clone(),
+            is_error: false,
+            output: ToolOutput::Text {
+                text: "found".into(),
+            },
+        })
+    }
+}
+
+async fn held_resume_case(idle: Duration, retire: bool) -> (Vec<WalRecord>, Value) {
+    let mock = Mock::start(vec![tool_events(), text_events()], false, false).await;
+    let client = build_provider_http_client();
+    let provider = run_provider(&mock, &client, "one");
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let root = broca_test_support::scratch_root().join(format!(
+        "held-resume-{}",
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let bind = BindIdentity::new(root.join("project"), "websocket", "held-resume");
+    let wal = FileWalStore::new(root.join("wal"));
+    let leases = FileLeaseStore::new(root.join("lease"));
+    let request = tool_run_request(&bind);
+    let (tx, mut rx) = mpsc::channel(256);
+    let collect = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let paused = run_loop(
+        request.clone(),
+        &provider,
+        &HeldLookup,
+        &leases,
+        &AllowAll,
+        &wal,
+        &tx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(paused.paused, Some(PauseReason::ToolHeld));
+    let before = wal.read_records(&bind).unwrap();
+    assert!(matches!(
+        before.last().unwrap().record,
+        WalRecord::RunPaused {
+            reason: PauseReason::ToolHeld,
+            ..
+        }
+    ));
+    assert!(!before.iter().any(|frame| matches!(
+        frame.record,
+        WalRecord::RunFinished { .. } | WalRecord::ToolResult { .. }
+    )));
+    if retire {
+        client.chatgpt_connections().retire_session(&bind);
+    }
+    // A new provider borrows the same session's retained socket, as the executor does on resume.
+    let resumed = run_provider(&mock, &client, "one");
+    resumed.websocket.advance_clock(idle);
+    let control = RunControl {
+        provider_held_lifecycle: Some(Arc::new(HeldLookup)),
+        ..Default::default()
+    };
+    let summary = run_loop_with_control(
+        request,
+        &resumed,
+        &HeldLookup,
+        &leases,
+        &AllowAll,
+        &wal,
+        None,
+        control,
+        &tx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(summary.reason, RunFinishReason::Completed);
+    assert_eq!(summary.paused, None);
+    assert_eq!(summary.steps, 2);
+    drop(tx);
+    collect.await.unwrap();
+    let records: Vec<_> = wal
+        .read_records(&bind)
+        .unwrap()
+        .into_iter()
+        .map(|frame| frame.record)
+        .collect();
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| matches!(record, WalRecord::RunStarted { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| matches!(record, WalRecord::ResumeStarted { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| matches!(record, WalRecord::ToolDispatchIntent { .. }))
+            .count(),
+        1,
+        "resume must not dispatch the held call again"
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| matches!(record, WalRecord::ToolResult { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| matches!(record, WalRecord::ToolCallProviderHeld { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| matches!(record, WalRecord::RunFinished { .. }))
+            .count(),
+        1
+    );
+    assert!(!records.iter().any(|record| matches!(
+        record,
+        WalRecord::RunConfigRefrozen { .. } | WalRecord::RunAuthRefrozen { .. }
+    )));
+    let result_at = records
+        .iter()
+        .position(|record| matches!(record, WalRecord::ToolResult { .. }))
+        .unwrap();
+    let next_step = records
+        .iter()
+        .position(|record| {
+            matches!(
+                record,
+                WalRecord::StepStarted {
+                    step_id: StepId(2),
+                    ..
+                }
+            )
+        })
+        .unwrap();
+    assert!(
+        result_at < next_step,
+        "the held result is durable before the resumed model step"
+    );
+    let seen = mock.observed.lock().unwrap();
+    assert_eq!(seen.requests.len(), 2);
+    assert_eq!(
+        seen.handshakes,
+        if retire || idle >= Duration::from_secs(10 * 60) {
+            2
+        } else {
+            1
+        }
+    );
+    assert!(seen.http_bodies.is_empty());
+    let frame = serde_json::from_slice(&seen.requests[1]).unwrap();
+    (records, frame)
+}
+
+fn held_attempts(
+    records: &[WalRecord],
+) -> Vec<(
+    &str,
+    u64,
+    &broca_protocol::provider::ChatgptContinuationTrace,
+)> {
+    records
+        .iter()
+        .filter_map(|record| match record {
+            WalRecord::ModelAttemptFinished {
+                request_body_sha256,
+                request_body_len,
+                websocket_request: Some(wire),
+                ..
+            } => Some((
+                request_body_sha256.as_str(),
+                *request_body_len,
+                wire.codex.as_deref().unwrap(),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn codex_tool_held_resume_reuses_socket_and_response_suffix() {
+    let (records, frame) = tokio::time::timeout(
+        broca_test_support::EVENT_HANG_GUARD,
+        held_resume_case(Duration::from_secs(34), false),
+    )
+    .await
+    .unwrap();
+    let attempts = held_attempts(&records);
+    assert_eq!(attempts.len(), 2);
+    eprintln!("resumed request: {frame}; trace: {:?}", attempts[1].2);
+    assert!(attempts[1].2.continuation, "{:?}", attempts[1].2);
+    assert_eq!(
+        attempts[1].2.connection_generation,
+        attempts[0].2.connection_generation
+    );
+    assert_eq!(frame["previous_response_id"], "r1");
+    assert_eq!(
+        frame["input"],
+        serde_json::json!([{"type":"function_call_output","call_id":"call1","output":"found"}])
+    );
+}
+
+#[tokio::test]
+async fn codex_tool_held_resume_after_idle_is_full() {
+    let (records, frame) = tokio::time::timeout(
+        broca_test_support::EVENT_HANG_GUARD,
+        held_resume_case(Duration::from_secs(10 * 60 + 1), false),
+    )
+    .await
+    .unwrap();
+    let attempts = held_attempts(&records);
+    assert!(!attempts[1].2.continuation);
+    assert_eq!(
+        attempts[1].2.full_input_reason.as_deref(),
+        Some("new_connection_idle")
+    );
+    assert!(frame.get("previous_response_id").is_none());
+    assert_eq!(frame["input"].as_array().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn codex_tool_held_resume_preserves_canonical_request_and_wal_lifecycle() {
+    tokio::time::timeout(broca_test_support::EVENT_HANG_GUARD, async {
+        let (retained, suffix) = held_resume_case(Duration::from_secs(34), false).await;
+        let (closed, full) = held_resume_case(Duration::from_secs(34), true).await;
+        let retained_attempts = held_attempts(&retained);
+        let closed_attempts = held_attempts(&closed);
+        assert!(retained_attempts[1].2.continuation);
+        assert_eq!(
+            closed_attempts[1].2.full_input_reason.as_deref(),
+            Some("new_connection_run_start")
+        );
+        assert_eq!(
+            retained_attempts[1].0, closed_attempts[1].0,
+            "canonical request hash is independent of socket retention"
+        );
+        assert_eq!(retained_attempts[1].1, closed_attempts[1].1);
+        assert_eq!(suffix["input"][0], full["input"][2]);
+        // Compare durable conversation/control records, not timing or physical-send diagnostics.
+        let lifecycle = |records: &[WalRecord]| {
+            records
+                .iter()
+                .filter_map(|record| match record {
+                    WalRecord::ModelStepFinished {
+                        assistant_message, ..
+                    } => Some(serde_json::json!({"assistant":assistant_message.content})),
+                    WalRecord::ToolResult { result, .. } => {
+                        Some(serde_json::json!({"result":result}))
+                    }
+                    WalRecord::RunPaused { run_id, reason, .. } => {
+                        Some(serde_json::json!({"paused":reason,"run_id":run_id}))
+                    }
+                    WalRecord::ResumeStarted { .. } => Some(serde_json::json!({"resumed":true})),
+                    WalRecord::RunFinished { reason, .. } => {
+                        Some(serde_json::json!({"finished":reason}))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(lifecycle(&retained), lifecycle(&closed));
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn codex_auth_required_pause_retires_healthy_socket() {
+    tokio::time::timeout(broca_test_support::EVENT_HANG_GUARD, async {
+        let mock = Mock::start(vec![text_events()], false, false).await;
+        let client = build_provider_http_client();
+        let first = run_provider(&mock, &client, "one");
+        let root = broca_test_support::scratch_root().join("auth-pause-retirement");
+        let bind = BindIdentity::new(root.join("project"), "websocket", "auth-pause");
+        first.bind_run_transport(&bind);
+        step(&first, 1, &opts()).await;
+        first.complete_run_transport();
+        let paused = run_provider(&mock, &client, "one");
+        let (tx, mut rx) = mpsc::channel(256);
+        let collect = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let control = RunControl {
+            pause_for_auth_at_start: Some(ProviderError {
+                provider_details: None,
+                provider_subcode: None,
+                refusal: None,
+                class: ErrorClass::Auth,
+                message: "sign in again".into(),
+                status: None,
+                retry_after_secs: None,
+                provider_code: Some("needs_reauth".into()),
+                resets_at_ms: None,
+                resets_at_source: None,
+                limit_window: None,
+                account_ref: None,
+                credential_id: None,
+                affordable_max_tokens: None,
+            }),
+            ..Default::default()
+        };
+        let wal = FileWalStore::new(root.join("wal"));
+        let summary = run_loop_with_control(
+            tool_run_request(&bind),
+            &paused,
+            &StubToolPlane::new(),
+            &FileLeaseStore::new(root.join("lease")),
+            &AllowAll,
+            &wal,
+            None,
+            control,
+            &tx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(summary.paused, Some(PauseReason::AuthRequired));
+        drop(tx);
+        collect.await.unwrap();
+        mock.wait_closes(1).await;
+        assert_eq!(
+            mock.observed.lock().unwrap().requests.len(),
+            1,
+            "auth pause sends no request"
+        );
+        assert!(matches!(
+            wal.read_records(&bind).unwrap().last().unwrap().record,
+            WalRecord::RunPaused {
+                reason: PauseReason::AuthRequired,
+                ..
+            }
+        ));
+    })
+    .await
+    .unwrap();
+}
 
 fn run_provider(
     mock: &Mock,

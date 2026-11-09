@@ -335,7 +335,7 @@ async fn imports_reads_and_continues_on_real_module_rig() {
             model: "gpt-4o-mini",
             variant: None,
             service_tier: None,
-            tools: Some(Vec::new()),
+            tools: None,
             send_id: Some("continue-import-e2e"),
             max_output_tokens: None,
             cache: None,

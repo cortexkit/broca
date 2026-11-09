@@ -4146,6 +4146,30 @@ impl LineageRegistry {
                 retention.is_some(),
                 order.is_some(),
             );
+        if !request.message_marks.is_empty() {
+            // Refuse invalid marks before opening a writer, including its new-WAL header.
+            // Ownership replay is large; carrying it inline multiplies the send future's stack
+            // footprint at every await site, overflowing unoptimized lifecycle tests.
+            let ownership = match Box::pin(self.bind_ownership(key)).await {
+                BindOwnership::Known(ownership) => ownership,
+                BindOwnership::NoHistorySource => {
+                    return Ok(SendOutcome::Error(
+                        "message marks require an ownership history reader".into(),
+                    ));
+                }
+                BindOwnership::Unreadable(error) => return Ok(SendOutcome::Error(error)),
+            };
+            if let Err(field) = broca_core::scope_admission::admit_message_marks(
+                &request.message_marks,
+                &ownership,
+                request.principal.as_ref(),
+                &request.scope,
+            ) {
+                return Ok(SendOutcome::StructuredOutputInvalid {
+                    field: field.into(),
+                });
+            }
+        }
         loop {
             if store_eligible {
                 self.inner

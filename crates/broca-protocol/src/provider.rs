@@ -293,9 +293,13 @@ pub struct ChatgptContinuationTrace {
 }
 
 /// The account evidence of one HTTP attempt, carried in memory from the transport to the run's
-/// account reporter. Values are kept exactly as the provider sent them; nothing is parsed.
+/// account reporter. Header values are kept exactly as the provider sent them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AttemptAccountObservation {
+    /// When this process received the attempt's failure, before asynchronous cache and billing
+    /// settlement. Never persisted: decoding an attempt from the write-ahead log cannot
+    /// restore its receipt evidence.
+    pub failure_received_at_ms: Option<u64>,
     /// Every response header whose lowercase name starts with
     /// [`RATELIMIT_UNIFIED_HEADER_PREFIX`], keyed by that lowercase name, its value as received.
     /// Empty when no status line arrived or the provider sent none of them.

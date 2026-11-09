@@ -126,6 +126,8 @@ pub fn admission_refusal(error: &ServeError) -> Option<AdmissionRefusal> {
 
 pub fn send_field_of(differing: &str) -> Option<&'static str> {
     Some(match differing {
+        "speaks_for" => "speaks_for",
+        "notice" => "notice",
         "input" => "prompt",
         "policy_allowed" | "tools" => "tools",
         "delivery" => "delivery",

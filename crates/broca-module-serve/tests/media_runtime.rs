@@ -922,3 +922,117 @@ async fn runner_committed_image_limits_refuse_before_wal_or_media_publication() 
         assert_eq!(error["detail"], expected);
     }
 }
+
+#[tokio::test]
+async fn runner_media_refs_records_photo_and_matches_descriptor_reference() {
+    let mut rig = runner_media_rig(
+        "media-refs-recorded-photo",
+        WireFamilyId::AnthropicMessages,
+        false,
+    )
+    .await;
+    let upload_id = upload(&mut rig, "image/png", PERSON_PNG).await;
+    rig.script.push(&[Step::Text("seen")]);
+    let sent = call(&mut rig, "session.send", json!({"send_id":"recorded-photo","model":{"provider":"fake","model":"fake"},"prompt":"A recorded test photograph","content":[{"type":"upload","upload_id":upload_id}]})).await;
+    assert_eq!(
+        sent.header.ty,
+        subc_protocol::FrameType::Response,
+        "{}",
+        String::from_utf8_lossy(&sent.body)
+    );
+    rig.wait_idle().await;
+    let refs = call(
+        &mut rig,
+        "session.read",
+        json!({"from_ordinal":3,"limit":1,"media":"media_refs"}),
+    )
+    .await;
+    sample(
+        "runner-0821",
+        "photo-media-refs",
+        std::slice::from_ref(&refs),
+    );
+    let refs = result(&refs);
+    let content = &refs["messages"][0]["message"]["content"];
+    assert_eq!(
+        content[0],
+        json!({"type":"text","text":"A recorded test photograph"})
+    );
+    let media = &content[1];
+    assert_eq!(media["type"], "media_ref", "{refs}");
+    assert_eq!(media["sha256"], digest(PERSON_PNG));
+    assert_eq!(media["mime"], "image/png");
+    assert_eq!(media["byte_size"], PERSON_PNG.len());
+    let described = result(
+        &call(
+            &mut rig,
+            "session.read",
+            json!({"from_ordinal":3,"limit":1,"media":"descriptors"}),
+        )
+        .await,
+    );
+    assert_eq!(media, &described["messages"][0]["message"]["content"][1]);
+    let history = result(
+        &call(
+            &mut rig,
+            "session.history",
+            json!({"from_mid":"m2","limit":1,"media":"media_refs"}),
+        )
+        .await,
+    );
+    assert_eq!(history["messages"][0]["message"]["content"][1], *media);
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn runner_media_refs_tool_result_keeps_inline_text_without_parts() {
+    let mut rig = runner_media_rig(
+        "media-refs-tool-result",
+        WireFamilyId::AnthropicMessages,
+        false,
+    )
+    .await;
+    *rig.script.tool_plane.lock().unwrap() = Some(Arc::new(ImageTool));
+    rig.script
+        .push(&[Step::Call("media-tool"), Step::Text("seen")]);
+    let sent = call(&mut rig, "session.send", json!({"send_id":"media-tool","model":{"provider":"fake","model":"fake"},"prompt":"show tool media"})).await;
+    assert_eq!(sent.header.ty, subc_protocol::FrameType::Response);
+    rig.wait_idle().await;
+    let inline = call(&mut rig, "session.read", json!({"media":"inline"})).await;
+    sample(
+        "runner-0821",
+        "tool-result-inline",
+        std::slice::from_ref(&inline),
+    );
+    let refs = call(&mut rig, "session.read", json!({"media":"media_refs"})).await;
+    sample(
+        "runner-0821",
+        "tool-result-media-refs",
+        std::slice::from_ref(&refs),
+    );
+    assert_eq!(
+        refs.body, inline.body,
+        "tool-result refs have no wire position; keep every inline byte"
+    );
+    let refs = result(&refs);
+    let output = refs["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find_map(|entry| {
+            entry["message"]["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|part| part["type"] == "tool_result")
+                .map(|part| part["output"].clone())
+        })
+        .expect("the recorded read contains a tool result");
+    assert_eq!(output["kind"], "text");
+    assert!(output.get("parts").is_none());
+    let text = output["text"].as_str().unwrap();
+    assert!(text.starts_with("before-media\n[media not shown: kind=image mime=image/png"));
+    assert!(text.contains("kind=document mime=application/pdf"));
+    assert!(text.ends_with("\nafter-media"));
+    rig.finish().await;
+}

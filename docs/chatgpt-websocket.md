@@ -24,11 +24,13 @@ already exhausted its socket-failure budget.
 ## Wire and lifetime
 
 A socket is opened lazily for the first eligible attempt and reused across steps and
-retries. For the Codex profile, healthy completed runs also return it to an in-memory
-owner keyed by the full session bind (project root, harness, session), on by default.
+retries. For the Codex profile, healthy completed runs and runs paused only for a
+provider-held tool return it to an in-memory owner keyed by the full session bind
+(project root, harness, session), on by default.
 Each run borrows exclusively; other sessions cannot borrow its socket. Failure, changed
-authentication, cancellation, graceful stop and task abort retire it. Before reuse,
-all connection-scoped headers are compared exactly with the authenticated headers;
+authentication, `auth_required`/`account_limit`/`restart` pauses, cancellation, graceful
+stop and task abort retire it. Before reuse, all connection-scoped headers are compared
+exactly with the authenticated headers;
 only turn id and start time inside `x-codex-turn-metadata` may vary. Its stable
 installation/session/thread/window fields still fence the connection; current turn
 metadata is also sent in each request. A refreshed token requires a fresh

@@ -199,6 +199,7 @@ impl RunRequest {
     /// [`from_submission`]: RunRequest::from_submission
     pub fn to_submission(&self) -> SubmissionRequest {
         SubmissionRequest {
+            message_marks: Default::default(),
             route_decision_id: self.route_decision_id.clone(),
             account_route: self.account_route.clone(),
             service_tier_level: None,
@@ -2101,13 +2102,17 @@ where
     #[cfg(feature = "test-clock")]
     let control = &test_control;
     // A guard also covers unwind and task abort, where an async cleanup call cannot run.
+    // Only completion and a tool_held pause may return a healthy socket to the pool.
+    // auth_required, account_limit and restart pauses, cancellation, errors and interrupts
+    // still close it: resuming those may change accounts or follow a restart, so the new
+    // request must not reuse response-continuation state from their connection.
     struct RunTransportGuard<'a, P: Provider> {
         provider: &'a P,
-        completed: bool,
+        retain: bool,
     }
     impl<P: Provider> Drop for RunTransportGuard<'_, P> {
         fn drop(&mut self) {
-            if self.completed {
+            if self.retain {
                 self.provider.complete_run_transport();
             } else {
                 self.provider.close_run_transport();
@@ -2116,7 +2121,7 @@ where
     }
     let mut transport_guard = RunTransportGuard {
         provider,
-        completed: false,
+        retain: false,
     };
     provider.bind_run_transport(&req.session);
     // If the run can't even reconstruct its resume state (a WAL read / replay failure
@@ -2264,8 +2269,9 @@ where
         approval_frames,
     )
     .await;
-    transport_guard.completed = result.as_ref().is_ok_and(|summary| {
-        summary.reason == RunFinishReason::Completed && summary.paused.is_none()
+    transport_guard.retain = result.as_ref().is_ok_and(|summary| {
+        summary.paused == Some(PauseReason::ToolHeld)
+            || (summary.reason == RunFinishReason::Completed && summary.paused.is_none())
     });
     result
 }

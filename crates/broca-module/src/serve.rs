@@ -510,6 +510,11 @@ pub(crate) fn apply_media_mode(
             entry.show_media_blocks_with_identity();
         }
     }
+    if media == cortexkit_role_llm_runner::read::MediaMode::MediaRefs {
+        for entry in &mut response.messages {
+            entry.show_media_refs();
+        }
+    }
     if media == cortexkit_role_llm_runner::read::MediaMode::Descriptors {
         for entry in &mut response.messages {
             // Only structure that is not payload can outgrow the per-message budget.

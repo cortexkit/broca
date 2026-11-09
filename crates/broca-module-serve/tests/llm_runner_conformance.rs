@@ -59,9 +59,14 @@ const FLOW_SCOPE_REF: &str = "conformance-flow";
 const FIRST_SCOPE_SYNC_CORR: u64 = 1_000_001;
 
 fn scope_fixture_records() -> Value {
+    // The plain-scope plan fetches the scripted catalog through broca's attested route.
+    // Grant that exact provider target; the tool-free flow fixture needs no extra carrier.
     json!([
         {"ref":PLAIN_SCOPE_REF,"scope_epoch":1,"kind":"head","attributes":{},
-         "carriers":[{"principal":{"kind":"reserved","module_id":SENDER_MODULE},"targets":["broca"]}]},
+         "carriers":[
+             {"principal":{"kind":"reserved","module_id":SENDER_MODULE},"targets":["broca"]},
+             {"principal":{"kind":"reserved","module_id":"broca"},"targets":[TOOL_MODULE]}
+         ]},
         {"ref":FLOW_SCOPE_REF,"scope_epoch":1,"kind":"head",
          "attributes":{"flow_id":"conformance-flow","agent_id":"conformance-agent"},
          "carriers":[{"principal":{"kind":"reserved","module_id":SENDER_MODULE},"targets":["broca"]}]}
@@ -251,6 +256,38 @@ fn history_display_kit_session(session: &str) -> bool {
         .any(|prefix| session.strip_prefix(*prefix).is_some_and(counter))
 }
 
+fn message_marks_kit_session(session: &str) -> bool {
+    ["cf-message-marks-", "cf-marks-retry-"]
+        .iter()
+        .any(|prefix| {
+            session.strip_prefix(*prefix).is_some_and(|counter| {
+                counter
+                    .parse::<u64>()
+                    .is_ok_and(|number| number > 0 && number.to_string() == counter)
+            })
+        })
+}
+
+/// A session the kit's media_refs_* and media_descriptors_* cases open: `cf-media-<counter>`.
+fn media_fixture_session(session: &str) -> bool {
+    session.strip_prefix("cf-media-").is_some_and(|counter| {
+        counter
+            .parse::<u64>()
+            .is_ok_and(|number| number > 0 && number.to_string() == counter)
+    })
+}
+
+fn message_marks_route_stamp(session: &str, stamp: &RouteStamp) -> RouteStamp {
+    if message_marks_kit_session(session)
+        && stamp.scope.is_none()
+        && stamp.principal == format!("reserved:{OWNER_MODULE}")
+    {
+        scope_fixture_stamps(PLAIN_SCOPE_REF).1
+    } else {
+        stamp.clone()
+    }
+}
+
 /// Refresh fixtures start with a plan so later sends omit legacy `tools` and `system` fields.
 /// Use the same model id for every send: switching models rebuilds the prompt prefix and would
 /// apply an `on_prefix_rebuild` refresh before the fixture's intended trigger.
@@ -279,6 +316,11 @@ const HARNESS: &str = "conformance";
 /// provider answers with as they are, instead of the result's JSON as one text block.
 const OWN_CONTENT: &str = "$broca_content";
 const OWN_STRUCTURED: &str = "$broca_structured";
+/// The model the kit's media fixture sessions use. It is scripted through the Messages
+/// stream, like the output-refs fixture, and its catalog row differs from that fixture's only
+/// in a context window large enough to send the frame-budget case's two 2.2 MB tool-call
+/// arguments back to the model.
+const MEDIA_FIXTURE_MODEL: &str = "conformance-media-blocks";
 #[cfg(feature = "test-clock")]
 #[path = "llm_runner_conformance/bus.rs"]
 mod bus;
@@ -597,6 +639,12 @@ fn seed_structured_output_catalog(state_root: &Path) -> std::io::Result<()> {
     models.insert(
         format!("{}/{}", output_refs::PROVIDER, output_refs::MODEL),
         output_refs::catalog_row(),
+    );
+    let mut media = output_refs::catalog_row();
+    media["limit.context"] = json!(16_000_000);
+    models.insert(
+        format!("{}/{MEDIA_FIXTURE_MODEL}", output_refs::PROVIDER),
+        media,
     );
     let lkg = json!({
         "catalog_version": 1,
@@ -982,8 +1030,9 @@ async fn serve_model_request(
             .lock()
             .unwrap()
             .contains_key(&session);
-    if model.ends_with(output_refs::MODEL) || native_messages {
-        let body = if native_messages {
+    let media_fixture = model.ends_with(MEDIA_FIXTURE_MODEL);
+    if model.ends_with(output_refs::MODEL) || native_messages || media_fixture {
+        let body = if native_messages || media_fixture {
             output_refs::stream_for_model(&id, model, &turn)
         } else {
             output_refs::stream(&id, &turn)
@@ -2809,6 +2858,7 @@ impl LlmRunnerSubject for BrocaSubject {
             Capability::HeadSelection,
             Capability::RoutedAccounts,
             Capability::AccountRoute,
+            Capability::AdmissionReports,
             Capability::RunCancel,
             Capability::Retract,
             Capability::DispatchAttribution,
@@ -2849,7 +2899,12 @@ impl LlmRunnerSubject for BrocaSubject {
         if self.service_tier_enabled {
             capabilities.insert(Capability::ServiceTier);
         }
-        capabilities.extend([Capability::Attachments, Capability::MediaOnlySend]);
+        capabilities.extend([
+            Capability::Attachments,
+            Capability::MediaOnlySend,
+            Capability::MessageMarks,
+            Capability::MediaRefs,
+        ]);
         capabilities
     }
 
@@ -2918,9 +2973,10 @@ impl LlmRunnerSubject for BrocaSubject {
         session: &str,
         stamp: &RouteStamp,
     ) -> Result<BrocaRoute, HarnessError> {
+        let stamp = message_marks_route_stamp(session, stamp);
         let routed_live = routed_accounts::session_live(self, handle, session).await?;
         let handle = routed_live.as_deref().unwrap_or(handle);
-        let connection = self.connection(handle, stamp).await?;
+        let connection = self.connection(handle, &stamp).await?;
         self.shared
             .session_roots
             .lock()
@@ -3026,6 +3082,13 @@ impl LlmRunnerSubject for BrocaSubject {
                 .send_fields_with_plan(session, first, &Map::new())
                 .unwrap();
         }
+        if message_marks_kit_session(session)
+            && !self.shared.plan_sessions.lock().unwrap().contains(session)
+        {
+            return self
+                .send_fields_with_plan(session, first, &Map::new())
+                .unwrap();
+        }
         if held_late_results::needs_plan(&self.shared, session)
             && !self.shared.plan_sessions.lock().unwrap().contains(session)
         {
@@ -3084,8 +3147,18 @@ impl LlmRunnerSubject for BrocaSubject {
             .lock()
             .unwrap()
             .contains(session);
+        // The kit's media fixtures script an answer as several text parts and check how reads
+        // describe each part. Chat-completions text deltas concatenate into one part, so those
+        // sessions use the Messages stream, whose content blocks keep each scripted part.
+        let model = if media_fixture_session(session) {
+            json!({"provider": output_refs::PROVIDER, "model": MEDIA_FIXTURE_MODEL})
+        } else if markerless {
+            json!({"provider": "mock", "model": format!("{PLAN_MODEL_PREFIX}{session}")})
+        } else {
+            json!({"provider": "mock", "model": "mock-model"})
+        };
         let mut fields = json!({
-            "model": {"provider": "mock", "model": if markerless { format!("{PLAN_MODEL_PREFIX}{session}") } else { "mock-model".into() }},
+            "model": model,
             "tools": [{
                 "name": SCRIPTED_TOOL,
                 "description": "Answers each call with its scripted result.",
@@ -3680,6 +3753,15 @@ impl LlmRunnerSubject for BrocaSubject {
             .collect()
     }
 
+    fn media_refs_tool_output_pointer(&self, message: &Value, part_key: &str) -> Option<String> {
+        self.read_parts(message)
+            .iter()
+            .position(|(key, part)| {
+                key == part_key && part["type"] == "tool_result" && part.get("output").is_some()
+            })
+            .map(|index| format!("/content/{index}/output"))
+    }
+
     /// Resolve identity from the listed call and the keys of the actual read entry.
     fn tool_result_part(
         &self,
@@ -3715,6 +3797,27 @@ impl LlmRunnerSubject for BrocaSubject {
             "type": "image",
             "mimeType": format!("image/png; name={marker}"),
             "data": "aGk=",
+        }]}))
+    }
+
+    /// The media fixture cases' byte-backed image: the scripted tool answers with exactly
+    /// these PNG bytes as its own image block, which broca stores inside that call's
+    /// tool_result. broca keeps a tool's image only inside its result, never as a bare image
+    /// block, so it cannot supply the un-nested form media_descriptors_image_bytes asks for,
+    /// and the kit reports that case inapplicable.
+    fn media_tool_result(&self, bytes: &[u8], nested: bool, _scenario: &str) -> Option<Value> {
+        use base64::Engine;
+        if !nested {
+            return None;
+        }
+        let image = broca_core::media_validation::validate_media(bytes, "image/png")
+            .expect("the kit's media fixture is a valid PNG");
+        Some(json!({OWN_CONTENT:[{
+            "type": "image",
+            "mimeType": "image/png",
+            "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+            "width": image.width,
+            "height": image.height,
         }]}))
     }
 
@@ -4341,6 +4444,65 @@ fn check_0811_cases(
     check_0811_cases_for_writer(cases, broca_core::delivery_order::RIDES_V2_WRITER_ENABLED)
 }
 
+const MESSAGE_MARK_CASES: [&str; 4] = [
+    "message_marks_served",
+    "message_marks_both_refused",
+    "message_marks_speaks_for_owner_only",
+    "message_marks_retry_changed",
+];
+
+fn check_message_marks_cases(
+    cases: &[cortexkit_role_llm_runner_conformance::CaseReport],
+) -> Result<(), String> {
+    for name in MESSAGE_MARK_CASES {
+        let case = cases
+            .iter()
+            .find(|case| case.case == name)
+            .ok_or_else(|| format!("the suite has no case {name}"))?;
+        if case.outcome != CaseOutcome::Passed {
+            return Err(format!("{name}: {:?}", case.outcome));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn message_marks_cases_require_exact_passes_and_reject_missing_cases() {
+    use cortexkit_role_llm_runner_conformance::{CaseReport, CASES};
+    let cases: Vec<_> = MESSAGE_MARK_CASES
+        .into_iter()
+        .map(|name| {
+            let spec = CASES.iter().find(|spec| spec.name == name).unwrap();
+            CaseReport {
+                case: spec.name,
+                requires: spec.requires.to_vec(),
+                outcome: CaseOutcome::Passed,
+            }
+        })
+        .collect();
+    check_message_marks_cases(&cases).unwrap();
+    for index in 0..cases.len() {
+        for outcome in [
+            CaseOutcome::Failed {
+                reason: "failed".into(),
+            },
+            CaseOutcome::Skipped {
+                missing: vec![Capability::MessageMarks],
+            },
+            CaseOutcome::Inapplicable {
+                reason: "message_marks is not declared".into(),
+            },
+        ] {
+            let mut changed = cases.clone();
+            changed[index].outcome = outcome;
+            assert!(check_message_marks_cases(&changed).is_err());
+        }
+        let mut missing = cases.clone();
+        missing.remove(index);
+        assert!(check_message_marks_cases(&missing).is_err());
+    }
+}
+
 fn check_0814_undeclared_cases(
     cases: &[cortexkit_role_llm_runner_conformance::CaseReport],
 ) -> Result<(), String> {
@@ -4364,6 +4526,7 @@ fn check_0814_undeclared_cases(
 fn expected_0821_cases() -> Vec<(&'static str, CaseOutcome)> {
     include_str!("golden/llm_runner_0821.applicability.txt")
         .lines()
+        .chain(include_str!("golden/llm_runner_0828.applicability.txt").lines())
         .map(|line| {
             let (status, row) = line.split_once(' ').unwrap();
             let (name, reason) = row.split_once(": ").unwrap_or((row, ""));
@@ -4371,7 +4534,7 @@ fn expected_0821_cases() -> Vec<(&'static str, CaseOutcome)> {
                 "N/A" => CaseOutcome::Inapplicable {
                     reason: reason.into(),
                 },
-                // cortexkit-role-llm-runner-conformance 0.17.25 skips missing fork_answer
+                // cortexkit-role-llm-runner-conformance skips missing fork_answer
                 // in runner::gate. Preserve that decision; an upstream fix must update the pin.
                 "SKIP" => {
                     assert_eq!(reason, "fork_answer");
@@ -4383,6 +4546,11 @@ fn expected_0821_cases() -> Vec<(&'static str, CaseOutcome)> {
                     assert!(reason.is_empty());
                     CaseOutcome::Passed
                 }
+                // An admitted unkeyed send need not return a submission id. The kit verifies
+                // absence instead; pin that exact rule rather than requiring an optional id.
+                "PASS_WITH_INAPPLICABLE_RULE" => CaseOutcome::PassedWithInapplicableRule {
+                    reason: reason.into(),
+                },
                 _ => panic!("unknown applicability status {status}"),
             };
             (name, outcome)
@@ -4406,6 +4574,55 @@ fn check_0821_cases(
 }
 
 #[test]
+fn runner_0821_unkeyed_send_identity_pins_the_exact_optional_rule() {
+    use cortexkit_role_llm_runner_conformance::{CaseReport, CASES};
+    const CASE: &str = "read_display_facts_send_id_when_present";
+    const REASON: &str = "read_display_facts_send_id_unkeyed: runner returned no submission_id; verified absence instead";
+    let mut cases: Vec<_> = expected_0821_cases()
+        .into_iter()
+        .map(|(name, outcome)| {
+            let spec = CASES.iter().find(|spec| spec.name == name).unwrap();
+            CaseReport {
+                case: spec.name,
+                requires: spec.requires.to_vec(),
+                outcome,
+            }
+        })
+        .collect();
+    let index = cases.iter().position(|case| case.case == CASE).unwrap();
+    cases[index].outcome = CaseOutcome::PassedWithInapplicableRule {
+        reason: REASON.into(),
+    };
+    check_0821_cases(&cases).unwrap();
+    for reason in [
+        "",
+        "runner returned no submission_id",
+        "read_display_facts_send_id_unkeyed: runner does not admit unkeyed non-owner sends",
+    ] {
+        let mut changed = cases.clone();
+        changed[index].outcome = CaseOutcome::PassedWithInapplicableRule {
+            reason: reason.into(),
+        };
+        assert!(check_0821_cases(&changed).unwrap_err().contains(CASE));
+    }
+    for outcome in [
+        CaseOutcome::Passed,
+        CaseOutcome::Inapplicable {
+            reason: REASON.into(),
+        },
+    ] {
+        let mut changed = cases.clone();
+        changed[index].outcome = outcome;
+        assert!(check_0821_cases(&changed).unwrap_err().contains(CASE));
+    }
+    cases.remove(index);
+    assert_eq!(
+        check_0821_cases(&cases).unwrap_err(),
+        format!("the suite has no case {CASE}")
+    );
+}
+
+#[test]
 fn runner_0821_cases_pin_exact_native_outcomes() {
     use cortexkit_role_llm_runner_conformance::{CaseReport, CASES};
     let cases: Vec<_> = expected_0821_cases()
@@ -4419,11 +4636,14 @@ fn runner_0821_cases_pin_exact_native_outcomes() {
             }
         })
         .collect();
-    assert_eq!(cases.len(), 59);
+    assert_eq!(cases.len(), 105);
     check_0821_cases(&cases).unwrap();
     for index in 0..cases.len() {
         for outcome in [
             CaseOutcome::Passed,
+            CaseOutcome::PassedWithInapplicableRule {
+                reason: "a different optional rule".into(),
+            },
             CaseOutcome::Failed {
                 reason: "failed".into(),
             },
@@ -4475,7 +4695,7 @@ fn account_route_undeclared_groups_report_exact_reasons_never_skips() {
             }
         })
         .collect();
-    assert_eq!(cases.len(), 7);
+    assert_eq!(cases.len(), 4);
     check_0814_undeclared_cases(&cases).unwrap();
     for index in 0..cases.len() {
         for outcome in [
@@ -4954,6 +5174,7 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
     );
     check_0811_cases(&report.cases).unwrap();
     check_0814_undeclared_cases(&report.cases).unwrap();
+    check_message_marks_cases(&report.cases).unwrap();
     check_0821_cases(&report.cases).unwrap();
     let attachment_gaps = attachment_contract_gaps(&report);
     assert!(
@@ -7185,6 +7406,101 @@ async fn conformance_subject_always_declares_attachments() {
     assert!(subject.capabilities().contains(&Capability::Attachments));
     assert!(subject.capabilities().contains(&Capability::MediaOnlySend));
     assert!(subject.image_tool_result("old-image-rule").is_some());
+    assert!(subject.capabilities().contains(&Capability::MessageMarks));
+    assert!(subject.capabilities().contains(&Capability::MediaRefs));
+}
+
+#[test]
+fn message_marks_fixture_grants_only_the_required_plan_fetch_target() {
+    let scopes = scope_fixture_records();
+    let scopes = scopes.as_array().unwrap();
+    let plain = scopes
+        .iter()
+        .find(|scope| scope["ref"] == PLAIN_SCOPE_REF)
+        .unwrap();
+    let flow = scopes
+        .iter()
+        .find(|scope| scope["ref"] == FLOW_SCOPE_REF)
+        .unwrap();
+    assert_eq!(
+        plain["carriers"],
+        json!([
+            {"principal":{"kind":"reserved","module_id":SENDER_MODULE},"targets":["broca"]},
+            {"principal":{"kind":"reserved","module_id":"broca"},"targets":[TOOL_MODULE]}
+        ])
+    );
+    assert_eq!(
+        flow["carriers"],
+        json!([
+            {"principal":{"kind":"reserved","module_id":SENDER_MODULE},"targets":["broca"]}
+        ])
+    );
+}
+
+#[tokio::test]
+async fn message_marks_fixture_scope_and_plan_are_limited_to_exact_kit_sessions() {
+    let root = broca_test_support::scratch_root().join("subject-message-marks-plan");
+    let subject = BrocaSubject::new(&root).await;
+    let owner = subject.owner_stamp();
+    for session in ["cf-message-marks-1", "cf-marks-retry-2"] {
+        let stamp = message_marks_route_stamp(session, &owner);
+        assert_eq!(stamp, scope_fixture_stamps(PLAIN_SCOPE_REF).1);
+        let first = subject.send_fields(session, true);
+        assert!(first["plan"].is_object(), "{first:?}");
+        let later = subject.send_fields(session, false);
+        for field in ["tools", "system", "plan"] {
+            assert!(!later.contains_key(field), "{later:?}");
+        }
+        let stranger = subject.stranger_stamp();
+        assert_eq!(message_marks_route_stamp(session, &stranger), stranger);
+    }
+    for session in [
+        "ordinary-message-marks-1",
+        "cf-message-marks-0",
+        "cf-message-marks-01",
+        "cf-message-marks-1-other",
+    ] {
+        assert!(!message_marks_kit_session(session));
+        assert_eq!(message_marks_route_stamp(session, &owner), owner);
+        assert!(subject.send_fields(session, true).get("plan").is_none());
+    }
+}
+
+#[tokio::test]
+async fn media_refs_output_pointer_identifies_only_the_named_tool_output() {
+    let root = broca_test_support::scratch_root().join("subject-media-refs-output-pointer");
+    let subject = BrocaSubject::new(&root).await;
+    for output in [
+        json!({"kind":"text","text":"before [image omitted] after"}),
+        json!({"kind":"parts","parts":[{"media":{"type":"media_ref","sha256":"a".repeat(64)}}]}),
+    ] {
+        let message = json!({"role":"tool","content":[
+            {"type":"text","text":"before"},
+            {"type":"tool_result","tool_call_id":"one","output":output,"metadata":{"type":"media_ref"}},
+            {"type":"tool_call","tool_call_id":"two","output":"not a tool result"},
+            {"type":"tool_result","tool_call_id":"three","output":{"kind":"text","text":"second result"}},
+            {"type":"tool_result","tool_call_id":"missing-output"}
+        ]});
+        subject.shared.read_part_keys.lock().unwrap().insert(
+            message.to_string(),
+            ["text", "opaque-first", "call", "opaque-second", "missing"]
+                .map(str::to_owned)
+                .to_vec(),
+        );
+        for (key, expected) in [
+            ("opaque-first", "/content/1/output"),
+            ("opaque-second", "/content/3/output"),
+        ] {
+            let pointer = subject
+                .media_refs_tool_output_pointer(&message, key)
+                .unwrap();
+            assert_eq!(pointer, expected);
+            assert!(message.pointer(&pointer).is_some());
+        }
+        for key in ["text", "call", "missing", "unknown"] {
+            assert_eq!(subject.media_refs_tool_output_pointer(&message, key), None);
+        }
+    }
 }
 
 #[tokio::test]
@@ -7306,6 +7622,22 @@ async fn assertion_wal_reader_uses_the_inventory_address_for_a_folderless_sessio
         }
     ));
     assert!(!store.wal_path(&claim).exists());
+}
+
+#[tokio::test]
+async fn conformance_subject_declares_the_served_admission_reports_group() {
+    let scratch = broca_test_support::scratch_root().join("admission-reports-declaration");
+    let subject = BrocaSubject::new(&scratch).await;
+    for writer in [false, true] {
+        let describe = broca_wire::broca_role_describe_with_writers("test", writer, writer, writer);
+        assert!(describe
+            .capabilities
+            .iter()
+            .any(|group| group == cortexkit_role_llm_runner::capabilities::ADMISSION_REPORTS));
+        assert!(subject
+            .capabilities()
+            .contains(&Capability::AdmissionReports));
+    }
 }
 
 #[tokio::test]

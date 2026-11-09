@@ -786,7 +786,8 @@ async fn read_and_subscribe_bytes_without_new_params_are_pinned() {
 
 #[tokio::test]
 async fn tagged_open_tool_turn_read_bytes_are_pinned() {
-    // Only the resume cursor's incarnation and source-frame digest extend the historical pin.
+    // The pinned bytes include two members added after the golden was first written: the
+    // resume cursor's incarnation and source-frame digest, and the `role` each read entry carries.
     let (mut rig, _) = crate::plan_admission::plan_rig("pin-tagged-open-read").await;
     rig.script.push(&[
         Step::Usage {
@@ -3278,7 +3279,11 @@ async fn pin_live_sample(rig: &mut Rig, frames: &[Frame], run_id: &str, file: &s
 
 #[tokio::test]
 async fn live_display_samples_match_stored_parts_and_attach_replays_current_step() {
-    // Only the resume cursor's incarnation and source-frame digest extend the historical pin.
+    // The pins include two additions to the original samples: the resume cursor's incarnation
+    // and source-frame digest, and, for the "live" attach made while step 1 is streaming, the
+    // replay of that step's durable controls (its step_started record) before the display
+    // snapshot. The replayed frame takes seq 1, so the snapshot frames after it are numbered
+    // one higher.
     use broca_protocol::{ToolCall, ToolCallId};
     let tool = ContentBlock::ToolCall(ToolCall {
         thought_signature: None,

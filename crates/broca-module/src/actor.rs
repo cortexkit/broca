@@ -1396,6 +1396,7 @@ fn submission_from_config(
     // refuses to finish the original run after a crash as a different send.
     let tools = (!config.tools_were_omitted).then(|| Arc::unwrap_or_clone(config.tools));
     SubmissionRequest {
+        message_marks: Default::default(),
         route_decision_id: config.route_decision_id,
         account_route: config.account_route,
         service_tier_level: None,
@@ -3793,6 +3794,27 @@ impl<W: WalStore + 'static> LineageActor<W> {
         }
         self.admitting_retention = None;
         self.admitting_session_class = session_class.clone();
+        let message_marks = if request.message_marks.is_empty() {
+            None
+        } else {
+            let ownership = match self.load_ownership().await {
+                Ok(ownership) => ownership,
+                Err(error) => return SendOutcome::Error(error),
+            };
+            match broca_core::scope_admission::admit_message_marks(
+                &request.message_marks,
+                &ownership,
+                request.principal.as_ref(),
+                &request.scope,
+            ) {
+                Ok(marks) => marks,
+                Err(field) => {
+                    return SendOutcome::StructuredOutputInvalid {
+                        field: field.into(),
+                    }
+                }
+            }
+        };
         if retention.is_some() {
             let records = match self.read_wal_framed_records().await {
                 Ok(records) => records,
@@ -4513,7 +4535,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         }
 
         let identity = SendIdentity {
-            message_marks: None,
+            message_marks,
             display_sent_by: self
                 .admitting_sent_by
                 .clone()
@@ -5251,7 +5273,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                         writer.record(WalRecord::InputTokenCapFrozen { limit });
                     }
                     writer.record(WalRecord::Steered {
-                        message_marks: None,
+                        message_marks: identity.message_marks,
                         sent_by: identity.display_sent_by,
                         written_at_ms: prepared.at_ms,
                         tags: None,
@@ -5395,7 +5417,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         let input = prepared.input.clone();
         let writer = Arc::clone(self.writer.as_ref().expect("writer live while open"));
         let record = WalRecord::Steered {
-            message_marks: None,
+            message_marks: identity.message_marks.clone(),
             sent_by: identity.display_sent_by.clone(),
             written_at_ms: prepared.at_ms,
             tags: None,
@@ -6514,6 +6536,30 @@ impl<W: WalStore + 'static> LineageActor<W> {
             .iter()
             .find(|pending| pending.submission_id == submission_id)
         {
+            // A retry of a pending send must keep the original display marks. Compare
+            // the normalized queue envelopes without adding marks to any checksum.
+            if existing
+                .message_marks
+                .as_ref()
+                .and_then(|marks| marks.speaks_for.as_ref())
+                != message_marks
+                    .as_ref()
+                    .and_then(|marks| marks.speaks_for.as_ref())
+            {
+                return SendOutcome::SendIdReuse {
+                    differing: "speaks_for",
+                };
+            }
+            if existing
+                .message_marks
+                .as_ref()
+                .is_some_and(|marks| marks.notice)
+                != message_marks.as_ref().is_some_and(|marks| marks.notice)
+            {
+                return SendOutcome::SendIdReuse {
+                    differing: "notice",
+                };
+            }
             if existing.conversation_key != conversation_key {
                 return SendOutcome::SendIdReuse {
                     differing: "conversation_key",

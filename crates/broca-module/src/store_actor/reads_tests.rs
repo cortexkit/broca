@@ -311,6 +311,18 @@ async fn a_read_whose_sync_fails_is_refused_with_no_answer() {
 /// it, so each read happens with the actor open or closed as the test means.
 const OPEN: Duration = Duration::from_secs(600);
 
+#[test]
+fn submission_admission_future_stays_small() {
+    fn size<'a, T: 'a, Fut>(_: impl FnOnce(&'a T) -> Fut) -> usize {
+        std::mem::size_of::<Fut>()
+    }
+    let bytes = size(|m: &Module| m.send("r", "text"));
+    assert!(
+        bytes <= 4096,
+        "registry send carries {bytes} bytes; keep ownership replay on the heap"
+    );
+}
+
 /// A module whose new sessions start in the new storage, over a scratch folder, whose scripted
 /// provider answers `steps`, each one once the test lets it through `gate`.
 struct Module {

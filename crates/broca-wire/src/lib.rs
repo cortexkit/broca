@@ -292,10 +292,23 @@ pub struct SendParams {
 /// Check the shared run parameters before broca's legacy parameter decoder can lose a
 /// nested field name. Legacy stop-condition lists remain accepted beside the role object.
 pub fn check_run_parameters(params: &serde_json::Value) -> Result<(), String> {
-    for field in ["speaks_for", "notice"] {
+    // Undeclared notice permissions must not fall through the permissive send decoder:
+    // silently dropping even a false member would accept a request broca cannot honour.
+    for field in ["keep", "yield"] {
         if params.get(field).is_some() {
             return Err(field.into());
         }
+    }
+    if let Some(index) = params
+        .pointer("/plan/senders")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|senders| {
+            senders
+                .iter()
+                .position(|sender| sender.get("yields").is_some())
+        })
+    {
+        return Err(format!("plan.senders[{index}].yields"));
     }
     if let Some(route) = params.get("account_route") {
         serde_json::from_value::<cortexkit_role_llm_runner::send::AccountRoute>(route.clone())
@@ -1088,8 +1101,8 @@ pub struct ReadParams {
     /// so no message carries any.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub include_originals: bool,
-    /// `inline` (the default), `blocks` (stored media references), or `descriptors`, which
-    /// serves large payloads as refs in place and every entry's content identities. Any other
+    /// `inline` (the default), `blocks` (stored media), `media_refs` (only media replaced by
+    /// references), or `descriptors` (large payload references and content identities). Any other
     /// value is refused naming `media`; a model-view read refuses `descriptors`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media: Option<cortexkit_role_llm_runner::read::MediaMode>,
@@ -1288,8 +1301,8 @@ impl Serialize for SessionReadMessage {
                 }
             }
         }
-        // The member order and omissions are the ones the derived form always wrote, so an
-        // inline read keeps its exact bytes.
+        // Keep the existing members in order and append the known stored role. Readers must
+        // learn who spoke from the envelope without decoding the private message schema.
         #[derive(Serialize)]
         struct Wire<'a> {
             #[serde(skip_serializing_if = "Option::is_none")]
@@ -1332,6 +1345,7 @@ impl Serialize for SessionReadMessage {
             created_at: Option<u64>,
             #[serde(skip_serializing_if = "<[_]>::is_empty")]
             reasoning_summaries: &'a [cortexkit_role_llm_runner::read::ReasoningSummary],
+            role: broca_protocol::Role,
         }
         Wire {
             speaks_for: &self.speaks_for,
@@ -1354,6 +1368,7 @@ impl Serialize for SessionReadMessage {
             completed_at: self.completed_at,
             created_at: self.created_at,
             reasoning_summaries: &self.reasoning_summaries,
+            role: self.message.role,
         }
         .serialize(serializer)
     }
@@ -1386,6 +1401,44 @@ impl SessionReadMessage {
             self.identify_content(&inline);
             self.described = Some(inline);
         }
+    }
+
+    /// Replace top-level media only. Tool-result text keeps its inline bytes and markers:
+    /// the tool-output contract has no parts form for serving structured media references.
+    pub fn show_media_refs(&mut self) {
+        if !self
+            .message
+            .content
+            .iter()
+            .any(|part| matches!(part, broca_protocol::ContentBlock::Media(_)))
+        {
+            return;
+        }
+        let stored = broca_protocol::caller_message::message_content_identity(&self.message).inline;
+        let mut served = serde_json::to_value(CallerMessage(&self.message, false))
+            .expect("a stored message serializes");
+        let stored_parts = stored["content"]
+            .as_array()
+            .expect("message content is an array");
+        let served_parts = served["content"]
+            .as_array_mut()
+            .expect("message content is an array");
+        // Tool-result media refs have no defined wire position. Keep their inline text
+        // and markers instead of introducing a multi-part tool-output shape.
+        for (index, part) in stored_parts.iter().enumerate() {
+            if part.get("type").and_then(serde_json::Value::as_str) == Some("media") {
+                served_parts[index] = serde_json::to_value(media_reference(
+                    part,
+                    Some(broca_protocol::tags::part_key(
+                        self.ordinal.saturating_sub(1),
+                        index,
+                    )),
+                ))
+                .expect("a stored media reference serializes");
+            }
+        }
+        self.identify_content(&stored);
+        self.described = Some(served);
     }
 
     fn identify_content(&mut self, inline: &serde_json::Value) {
@@ -4677,6 +4730,7 @@ mod tests {
         assert_json_round_trip::<SessionReadMessage>(serde_json::json!({
             "ordinal": 4,
             "mid": "m4",
+            "role": "user",
             "message": {"role": "user", "content": [{"type": "text", "text": "hello"}]}
         }));
         assert_json_round_trip::<SessionReadLineageState>(serde_json::json!({
@@ -6252,6 +6306,102 @@ mod caller_message_tests {
     }
 
     #[test]
+    fn media_refs_keep_large_payloads_and_flattened_tool_results() {
+        use broca_protocol::{
+            MediaKind, MediaRef, ToolCall, ToolCallId, ToolOutput, ToolOutputPart, ToolResult,
+        };
+        let media = MediaRef {
+            kind: MediaKind::Image,
+            mime: "image/png".into(),
+            byte_size: 69,
+            sha256: "b1ff9c8ea3a780bad09b346c423d2d0e46815926879b18e841d928376a946640".into(),
+            width: Some(1),
+            height: Some(1),
+        };
+        let payload = "x".repeat(300_000);
+        let original = read_message(vec![
+            ContentBlock::Text {
+                text: payload.clone(),
+            },
+            ContentBlock::Media(media.clone()),
+            ContentBlock::ToolCall(ToolCall {
+                tool_call_id: ToolCallId("call".into()),
+                tool_name: "work".into(),
+                input: json!({"large":payload}),
+                thought_signature: None,
+            }),
+            ContentBlock::ToolResult(ToolResult {
+                tool_call_id: ToolCallId("call".into()),
+                is_error: false,
+                output: ToolOutput::Parts {
+                    parts: vec![
+                        ToolOutputPart::Text {
+                            text: payload.clone(),
+                        },
+                        ToolOutputPart::Media { media },
+                    ],
+                },
+            }),
+            ContentBlock::ToolResult(ToolResult {
+                tool_call_id: ToolCallId("text-only".into()),
+                is_error: false,
+                output: ToolOutput::Parts {
+                    parts: vec![
+                        ToolOutputPart::Text {
+                            text: payload.clone(),
+                        },
+                        ToolOutputPart::Text {
+                            text: "tail".into(),
+                        },
+                    ],
+                },
+            }),
+            ContentBlock::Reasoning {
+                text: payload.clone(),
+                signature: Some("signature".into()),
+            },
+        ]);
+        let inline = serde_json::to_value(&original).unwrap();
+        let mut blocks = original.clone();
+        blocks.show_media_blocks_with_identity();
+        let blocks = serde_json::to_value(blocks).unwrap();
+        let mut refs = original.clone();
+        refs.show_media_refs();
+        assert_eq!(refs.message, original.message);
+        let refs = serde_json::to_value(refs).unwrap();
+        let mut expected = inline["message"].clone();
+        expected["content"][1] = json!({"type":"media_ref","part":"m3#1","kind":"image","mime":"image/png","byte_size":69,"sha256":"b1ff9c8ea3a780bad09b346c423d2d0e46815926879b18e841d928376a946640","width":1,"height":1});
+        assert_eq!(refs["message"], expected);
+        assert_eq!(refs["message"]["content"][0]["text"], payload);
+        assert_eq!(refs["digest"], blocks["digest"]);
+        assert_eq!(refs["part_digests"], blocks["part_digests"]);
+        for index in [0, 2, 3, 4, 5] {
+            assert_eq!(
+                refs["message"]["content"][index],
+                inline["message"]["content"][index]
+            );
+        }
+        let mut text_only = read_message(vec![original.message.content[4].clone()]);
+        let default_bytes = serde_json::to_vec(&text_only).unwrap();
+        text_only.show_media_refs();
+        assert_eq!(serde_json::to_vec(&text_only).unwrap(), default_bytes);
+        let mut media_tool_result = read_message(vec![original.message.content[3].clone()]);
+        let inline_bytes = serde_json::to_vec(&media_tool_result).unwrap();
+        media_tool_result.show_media_refs();
+        assert_eq!(
+            serde_json::to_vec(&media_tool_result).unwrap(),
+            inline_bytes
+        );
+        let mut descriptors = original;
+        descriptors.describe().unwrap();
+        let descriptors = serde_json::to_value(descriptors).unwrap();
+        assert_eq!(
+            refs["message"]["content"][1],
+            descriptors["message"]["content"][1]
+        );
+    }
+
+    #[test]
     fn default_media_read_uses_text_markers_without_changing_the_stored_message() {
         use broca_protocol::{
             MediaKind, MediaRef, ToolCallId, ToolOutput, ToolOutputPart, ToolResult,
@@ -6307,13 +6457,32 @@ mod caller_message_tests {
         names
     }
 
-    /// A consumer that re-encodes read messages byte-exactly decodes them strictly, so the
-    /// default (inline) read adds no member to an entry, its message or any block, whatever
-    /// the computed tag rules attach to the stored message. Only an opt-in descriptors read adds
-    /// `digest` and `part_digests`. The member sets below are the ones served before the
-    /// computed rules.
     #[test]
-    fn the_default_read_shape_has_exactly_the_members_it_always_had() {
+    fn default_read_envelope_names_every_known_stored_role() {
+        for (role, expected) in [
+            (broca_protocol::Role::System, "system"),
+            (broca_protocol::Role::User, "user"),
+            (broca_protocol::Role::Assistant, "assistant"),
+            (broca_protocol::Role::Tool, "tool"),
+        ] {
+            let mut entry = read_message(vec![ContentBlock::Text {
+                text: "stored".into(),
+            }]);
+            entry.message.role = role;
+            let body = serde_json::to_value(&entry).unwrap();
+            assert_eq!(body["role"], expected);
+            assert_eq!(body["message"]["role"], expected);
+            assert!(body.get("digest").is_none());
+            assert!(body.get("part_digests").is_none());
+        }
+    }
+
+    /// A consumer that re-encodes read messages byte-exactly decodes them strictly, so the
+    /// default read pins its member set. Beside the members served before, the envelope now
+    /// names the stored message's role. Computed tag rules add nothing to an entry, its message
+    /// or any block; only a descriptors read adds `digest` and `part_digests`.
+    #[test]
+    fn the_default_read_shape_adds_only_the_known_role_to_legacy_members() {
         use broca_protocol::content::{EncryptedReasoningFormat, ToolCall, ToolOutput, ToolResult};
         let result = |id: &str, output: ToolOutput| {
             ContentBlock::ToolResult(ToolResult {
@@ -6360,7 +6529,10 @@ mod caller_message_tests {
         let mut entry = computed(read_message(content.clone()), true);
         entry.message.origin = Some(broca_protocol::ModelHandle::new("p", "m"));
         let body = serde_json::to_value(&entry).unwrap();
-        assert_eq!(members(&body), ["message", "mid", "ordinal", "part_keys"]);
+        assert_eq!(
+            members(&body),
+            ["message", "mid", "ordinal", "part_keys", "role"]
+        );
         assert_eq!(members(&body["message"]), ["content", "origin", "role"]);
         let blocks: Vec<Vec<String>> = body["message"]["content"]
             .as_array()
@@ -6547,7 +6719,7 @@ mod caller_message_tests {
         assert_eq!(tagged_json["message"], plain_json["message"]);
         assert_eq!(
             serde_json::to_string(&tagged).unwrap(),
-            r#"{"ordinal":4,"mid":"m3","message":{"role":"assistant","content":[{"type":"text","text":"first"},{"type":"text","text":"second"}]},"part_keys":["m3#0","m3#1"]}"#
+            r#"{"ordinal":4,"mid":"m3","message":{"role":"assistant","content":[{"type":"text","text":"first"},{"type":"text","text":"second"}]},"part_keys":["m3#0","m3#1"],"role":"assistant"}"#
         );
         let decoded: SessionReadMessage = serde_json::from_value(tagged_json).unwrap();
         assert_eq!(decoded.part_keys, tagged.part_keys);
@@ -6854,11 +7026,15 @@ mod envelope_time_tests {
     use super::SessionReadMessage;
 
     #[test]
-    fn untimed_entries_keep_their_pre_addition_bytes() {
+    fn untimed_legacy_entries_add_only_the_known_role() {
         let pinned = r#"{"ordinal":0,"mid":"m0","message":{"role":"user","content":[{"type":"text","text":"legacy"}]}}"#;
         let entry: SessionReadMessage = serde_json::from_str(pinned).unwrap();
         assert_eq!(entry.written_at, None);
-        assert_eq!(serde_json::to_string(&entry).unwrap(), pinned);
+        let encoded = serde_json::to_string(&entry).unwrap();
+        assert_eq!(
+            encoded,
+            format!("{},\"role\":\"user\"}}", &pinned[..pinned.len() - 1])
+        );
     }
 }
 

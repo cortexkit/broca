@@ -514,7 +514,7 @@ async fn account_selection_disabled_keeps_the_static_credential() {
         panic!("selection off must retain the static credential")
     };
     assert_eq!(decision.path, broca_wal::ACCOUNT_DECISION_DISABLED);
-    assert_eq!(decision.admission_id.as_deref(), Some("run-1"));
+    assert_eq!(decision.admission_id, None);
     assert_eq!(decision.decision_id.as_deref(), Some("acd-disabled"));
     assert_eq!(routing.methods(), vec![ACCOUNT_FOR_OP]);
     assert_eq!(client.counters.get("disabled"), 1);
@@ -691,8 +691,8 @@ async fn a_caller_pin_is_kept_and_routing_is_not_asked() {
     assert_eq!(path_of(&choice), "pinned");
     assert_eq!(
         choice.decision().unwrap().admission_id.as_deref(),
-        Some("run-1"),
-        "a pinned run is still reported"
+        None,
+        "a static pin reserved no routing admission"
     );
     assert!(routing.methods().is_empty());
 }
@@ -1429,7 +1429,7 @@ async fn auth_required_admits_for_a_fresh_login() {
             conversation_key: Some(conversation_key(&session())),
             conversation_key_source: Some(broca_wal::ConversationKeySource::Session),
             path: "auth_required".into(),
-            admission_id: Some("run-1".into()),
+            admission_id: None,
             decision_id: Some("acd-9".into()),
         })
     );
@@ -1880,7 +1880,8 @@ fn the_removed_break_glass_and_any_unknown_key_are_refused() {
 
 // ---- report bodies --------------------------------------------------------------------------
 
-fn attempt(http_status: Option<u16>, observation: AttemptAccountObservation) -> ModelAttempt {
+fn attempt(http_status: Option<u16>, mut observation: AttemptAccountObservation) -> ModelAttempt {
+    observation.failure_received_at_ms = Some(NOW as u64);
     ModelAttempt {
         content_progress: Default::default(),
         attempt: 0,
@@ -1929,6 +1930,142 @@ fn admission_started_matches_routings_pinned_body() {
     );
 }
 
+fn report_key_limit(client: Arc<RoutingClient>, decision: &AccountDecision) -> bool {
+    let Some(reporter) = RunReporter::start_for_decision(
+        client,
+        decision,
+        "run-1".into(),
+        None,
+        Arc::new(AtomicU64::new(3)),
+        None,
+    ) else {
+        return false;
+    };
+    let lineage = lineage();
+    broca_core::AccountReporter::run_started(reporter.as_ref(), Some(lineage), 1);
+    let observed = attempt(
+        Some(429),
+        AttemptAccountObservation {
+            limit: Some(AttemptAccountLimit {
+                disposition: broca_protocol::provider::AccountLimitDisposition::ACCOUNT,
+                observed_at_ms: 12_000,
+                resets_at_ms: Some(42_000),
+                resets_at_source: Some("retry_after".into()),
+                limit_window: None,
+            }),
+            ..Default::default()
+        },
+    );
+    broca_core::AccountReporter::attempt_recorded(reporter.as_ref(), Some(lineage), 2, &observed);
+    reporter.finish(Some(lineage), 3, RunFinishReason::Error);
+    true
+}
+
+async fn wait_for_reporter_release(routing: &Arc<FakeRouting>) {
+    broca_test_support::wait_until("admission reporters release routing", || async {
+        if Arc::strong_count(routing) == 1 {
+            Ok(())
+        } else {
+            Err("a routing client or reporter is still active".into())
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn static_key_limits_send_nothing_but_routed_limits_name_the_issued_admission() {
+    for routed in [false, true] {
+        let routing = FakeRouting::answering(Ok(Ok(serde_json::to_vec(&json!({"result":{
+            "admission":{"id":"run-1","state":"reserved"},
+            "account":{"account_id":"key-b","credential_id":"key-b","method":"apikey"}
+        }}))
+        .unwrap())));
+        let client = Arc::new(client(&routing));
+        let choice = choose_api_key(
+            &client,
+            routed.then_some("key-pool"),
+            None,
+            !routed,
+            Some(api_keys()),
+        )
+        .await
+        .unwrap();
+        let decision = choice.decision().unwrap();
+        let started = report_key_limit(Arc::clone(&client), decision);
+        drop(client);
+        wait_for_reporter_release(&routing).await;
+        let reports = routing.observed();
+        if routed {
+            assert!(started);
+            assert_eq!(decision.admission_id.as_deref(), Some("run-1"));
+            assert_eq!(reports.len(), 3);
+            assert_eq!(reports[0]["kind"], "admission_started");
+            assert_eq!(reports[1]["kind"], "account_limit_exhausted");
+            assert_eq!(reports[1]["admission_id"], "run-1");
+            assert_eq!(reports[1]["observed_at_ms"], 12_000);
+            assert_eq!(reports[2]["kind"], "run_finished");
+            let requests = routing.requests.lock().unwrap();
+            let admission = requests
+                .iter()
+                .find(|request| request["method"] == ACCOUNT_FOR_OP)
+                .unwrap();
+            assert_eq!(admission["params"]["admission_id"], "run-1");
+        } else {
+            assert!(reports.is_empty(), "static-key reports: {reports:?}");
+            assert!(!started);
+            assert_eq!(decision.admission_id, None);
+            assert!(routing.methods().is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn legacy_unheld_admissions_never_start_reporters_or_report_sealed_runs() {
+    for path in [
+        "pinned",
+        "single_candidate",
+        "candidates_unknown",
+        "disabled",
+        "legacy_static",
+        "auth_required",
+        "future_static",
+    ] {
+        let routing = Arc::new(FakeRouting::default());
+        let client = Arc::new(client(&routing));
+        let decision = AccountDecision {
+            conversation_key: None,
+            conversation_key_source: None,
+            path: path.into(),
+            admission_id: Some("fabricated-by-an-older-runner".into()),
+            decision_id: None,
+        };
+        let started = report_key_limit(Arc::clone(&client), &decision);
+        report_sealed(
+            Arc::clone(&client),
+            &broca_module::SealedRun {
+                session: session(),
+                run_id: broca_protocol::RunId("run-1".into()),
+                auth_selection: Some(broca_core::AuthSelection {
+                    billing_vault_facts: None,
+                    auth_method: Some("apikey".into()),
+                    credential_id: "key-b".into(),
+                    account_ref: None,
+                    resolved_credential_id: None,
+                    vault_request: None,
+                    account_decision: Some(decision),
+                }),
+                lineage: Some(lineage()),
+                terminal_seq: 4,
+            },
+        );
+        drop(client);
+        wait_for_reporter_release(&routing).await;
+        let reports = routing.observed();
+        assert!(!started, "{path} created a reporter: {reports:?}");
+        assert!(reports.is_empty(), "{path} emitted reports: {reports:?}");
+    }
+}
+
 #[test]
 fn attempt_with_headers_matches_routings_pinned_body() {
     let routing_pin = json!({
@@ -1948,6 +2085,7 @@ fn attempt_with_headers_matches_routings_pinned_body() {
     let observed = attempt(
         Some(200),
         AttemptAccountObservation {
+            failure_received_at_ms: None,
             ratelimit_headers: headers(&[
                 ("anthropic-ratelimit-unified-5h-utilization", "0.995"),
                 (
@@ -1983,6 +2121,29 @@ fn attempt_without_a_status_line_matches_routings_pinned_body() {
 }
 
 #[test]
+fn account_limit_exhausted_uses_receipt_time_not_attempt_end() {
+    let mut observed = attempt(
+        Some(429),
+        AttemptAccountObservation {
+            failure_received_at_ms: None,
+            ratelimit_headers: BTreeMap::new(),
+            limit: Some(AttemptAccountLimit {
+                disposition: broca_protocol::provider::AccountLimitDisposition::ACCOUNT,
+                observed_at_ms: 12_000,
+                resets_at_ms: Some(42_000),
+                resets_at_source: Some("retry_after".into()),
+                limit_window: None,
+            }),
+        },
+    );
+    observed.ts_ms = 19_000;
+    let report = attempt_body("receipt-event", "admitted-run", &observed, None);
+    assert_eq!(report["kind"], "account_limit_exhausted");
+    assert_eq!(report["admission_id"], "admitted-run");
+    assert_eq!(report["observed_at_ms"], 12_000);
+}
+
+#[test]
 fn account_limit_exhausted_matches_routings_pinned_body() {
     let routing_pin = json!({
         "event_id": "e-2",
@@ -2004,6 +2165,7 @@ fn account_limit_exhausted_matches_routings_pinned_body() {
     let mut observed = attempt(
         Some(429),
         AttemptAccountObservation {
+            failure_received_at_ms: None,
             ratelimit_headers: BTreeMap::new(),
             limit: Some(limit.clone()),
         },
@@ -2086,6 +2248,7 @@ fn headers_pass_through_unknown_names_and_odd_values_verbatim() {
     let observed = attempt(
         Some(200),
         AttemptAccountObservation {
+            failure_received_at_ms: None,
             ratelimit_headers: odd.clone(),
             limit: None,
         },
@@ -2242,6 +2405,67 @@ async fn terminal_transient_backoff_is_gated_and_precedes_release() {
 }
 
 #[tokio::test]
+async fn terminal_transient_backoff_uses_receipt_time_not_settlement_time() {
+    for (receipt, retry_seconds, expected) in [
+        (Some(12_000), None, Some(17_000)),
+        (Some(12_000), Some(1.25), Some(13_250)),
+        (None, None, None),
+    ] {
+        let routing = Arc::new(FakeRouting {
+            backoff: true,
+            ..FakeRouting::default()
+        });
+        let reporter = RunReporter::start(
+            Arc::new(client(&routing)),
+            "adm-receipt".into(),
+            "run-receipt".into(),
+            None,
+            Arc::new(AtomicU64::new(4)),
+        );
+        let lineage = lineage();
+        let mut observed = attempt(Some(503), AttemptAccountObservation::default());
+        observed.account_observation.failure_received_at_ms = receipt;
+        observed.ts_ms = 19_000;
+        broca_core::AccountReporter::attempt_recorded(
+            reporter.as_ref(),
+            Some(lineage),
+            2,
+            &observed,
+        );
+        let error = serde_json::from_value(json!({
+            "class":"transient", "message":"unavailable", "status":503,
+            "retry_after_secs":retry_seconds,
+        }))
+        .unwrap();
+        reporter.terminal_transient(Some(lineage), 4, &error);
+        reporter.finish(Some(lineage), 4, RunFinishReason::Error);
+        drop(reporter);
+        broca_test_support::wait_until("receipt reports drained", || async {
+            if Arc::strong_count(&routing) == 1 {
+                Ok(())
+            } else {
+                Err("reporter still owns routing".into())
+            }
+        })
+        .await;
+        let reports = routing.observed();
+        let backoff: Vec<_> = reports
+            .iter()
+            .filter(|report| report["kind"] == "transient_backoff")
+            .collect();
+        if let Some(expected) = expected {
+            assert_eq!(backoff.len(), 1);
+            assert_eq!(backoff[0]["retry_at_ms"], expected);
+        } else {
+            assert!(
+                backoff.is_empty(),
+                "missing receipt must never use attempt end"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn terminal_transient_backoff_requires_a_failed_final_attempt_outcome() {
     for (outcome, status, backoff) in [
         (AttemptOutcome::Complete, Some(503), false),
@@ -2267,6 +2491,7 @@ async fn terminal_transient_backoff_requires_a_failed_final_attempt_outcome() {
         let lineage = lineage();
         let mut observed = attempt(Some(503), AttemptAccountObservation::default());
         observed.ts_ms = 1_000;
+        observed.account_observation.failure_received_at_ms = Some(1_000);
         broca_core::AccountReporter::attempt_recorded(
             reporter.as_ref(),
             Some(lineage),
@@ -2277,6 +2502,7 @@ async fn terminal_transient_backoff_requires_a_failed_final_attempt_outcome() {
         observed.http_status = status;
         observed.outcome = outcome.clone();
         observed.ts_ms = 42_000;
+        observed.account_observation.failure_received_at_ms = Some(42_000);
         broca_core::AccountReporter::attempt_recorded(
             reporter.as_ref(),
             Some(lineage),
@@ -2380,6 +2606,7 @@ async fn terminal_credential_reports(
     let lineage = lineage();
     broca_core::AccountReporter::run_started(reporter.as_ref(), Some(lineage), 1);
     let observation = AttemptAccountObservation {
+        failure_received_at_ms: None,
         limit: error
             .is_account_limit_exhausted()
             .then(|| AttemptAccountLimit {
@@ -2639,6 +2866,7 @@ async fn an_attempt_is_reported_only_once_its_record_is_durable_and_in_order() {
     let first = attempt(
         Some(200),
         AttemptAccountObservation {
+            failure_received_at_ms: None,
             ratelimit_headers: headers(&[("anthropic-ratelimit-unified-5h-utilization", "0.25")]),
             limit: None,
         },
@@ -2722,7 +2950,7 @@ async fn a_sealed_run_reports_its_interrupted_terminal_once() {
         &sealed(Some(selection(Some(AccountDecision {
             conversation_key: None,
             conversation_key_source: None,
-            path: "disabled".into(),
+            path: "routed".into(),
             admission_id: Some("run-1".into()),
             decision_id: None,
         })))),

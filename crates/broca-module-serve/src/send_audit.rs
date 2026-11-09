@@ -14,10 +14,9 @@ use std::sync::{Mutex, OnceLock};
 use broca_wire::{model_params_keys, send_params_keys};
 use serde_json::Value;
 
-/// Keys handled on `session.send` apart from `SendParams`: a non-null `seed_from` is refused (a
-/// `null` one is accepted and ignored), and `plan`, a session's fetch plan, is checked and
-/// admitted before the send reaches the session. Neither is an unknown key.
-const PRE_DECODE_SEND_KEYS: &[&str] = &["seed_from", "plan"];
+/// Keys handled apart from `SendParams`: `seed_from` is refused unless null, the fetch plan
+/// is admitted separately, and display marks are checked against the daemon-attested route.
+const PRE_DECODE_SEND_KEYS: &[&str] = &["seed_from", "plan", "speaks_for", "notice"];
 const SEND_NOTICE_CACHE_ENTRIES: usize = 4096;
 
 /// One thing worth a single warning. Equality is the dedupe key, so every field is part of it.
@@ -193,6 +192,12 @@ mod tests {
             "append_episode": false
         });
         assert!(auditor.first_seen(&send, "prefrontal").is_empty());
+        for marks in [
+            json!({"speaks_for":{"agent_id":"Ada"}}),
+            json!({"notice":true}),
+        ] {
+            assert!(auditor.first_seen(&marks, "prefrontal").is_empty());
+        }
     }
 
     #[test]
