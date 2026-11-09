@@ -936,6 +936,16 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     unsettled_moves.dedup();
     registry.refuse_unsettled_moves(unsettled_moves);
     let registry = Arc::new(registry);
+    // `session.restore_from_backup` repairs sessions kept in the new storage after their files
+    // came back from a backup, holding each one it writes as a move does.
+    registry.set_store_restorer(Arc::new(
+        broca_module_serve::store_restore::StoreRestore::new(
+            registry.as_ref().clone(),
+            &state_root,
+            Arc::clone(&store_slot),
+            Arc::clone(&store_move_leases),
+        ),
+    ));
     // `session.move_to_store` moves a session into the new storage, creating it in the mode
     // `session_storage.encryption` chose: a plain session once the runtime is open, an
     // encrypted one once the deployment key has loaded (`key_unavailable` until then).

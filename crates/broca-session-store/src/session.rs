@@ -705,6 +705,7 @@ impl<B: SessionBackend> Session<B> {
             frames: 1,
             last: self.encoder.last(),
             batches: Vec::new(),
+            batch_starts: Vec::new(),
         };
         self.open_writer_over(key, &read, end).await
     }
@@ -939,6 +940,7 @@ mod revert;
 pub use revert::{RevertRefusal, Reverted};
 mod seal;
 pub use seal::{Carry, Sealed, GRACE_MS};
+pub mod restore;
 
 #[cfg(test)]
 mod tests;
