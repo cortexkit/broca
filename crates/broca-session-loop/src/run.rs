@@ -28,11 +28,11 @@ use broca_protocol::caller::{PauseReason, RunFinishReason};
 use broca_protocol::content::{AssistantMessage, Message, Role, ToolCall, ToolOutput, ToolResult};
 use broca_protocol::error::ProviderError;
 use broca_protocol::provider::{ModelAttempt, NormalizedEvent, ProviderControl};
-use broca_protocol::request::EpisodeRenderInput;
 use broca_protocol::request::{
     CallOptions, ExecutionMode, ModelHandle, OnRestart, ResponseFormat, StepContext, StopCondition,
     Tool, ToolChoice,
 };
+use broca_protocol::request::{EpisodeRenderInput, RenderHistory};
 use broca_protocol::tags::{clean_computed_into, render_tags_into, ComputedRules, TagRendering};
 use broca_protocol::{
     BatchId, BindIdentity, FinishReason, GenerationConfig, RunId, StepId, ToolCallId, Usage,
@@ -1622,7 +1622,7 @@ async fn offline_request_for<W: Writer>(
             .is_some(),
         _ => false,
     };
-    let episodes = render_episodes(writer, parts)?;
+    let episodes = Arc::new(RenderHistory::from(render_episodes(writer, parts)?));
     let run_rules = run_tag_rules(writer, &episodes, &mut TagRulesCache::default()).await?;
     let tools = Arc::new(admission.tools.clone());
     let enrollment = writer.enrollment().await?;
@@ -1675,8 +1675,9 @@ where
     // The pause a timed same-account wait left, which the step it resumes must match.
     let mut account_limit_replay = account_limit_of(writer)?;
     // Each window run's place in the prompt and render config. A run adds no episode once
-    // its input is placed, so these hold for the whole run.
-    let episodes = render_episodes(writer, parts)?;
+    // its input is placed, so these hold until a seal inside the run moves runs out of the
+    // window, which replaces them (see below). Each request shares the list.
+    let mut episodes = Arc::new(RenderHistory::from(render_episodes(writer, parts)?));
     // Each window run's frozen part numbering, read from its start once for the whole run.
     let mut tag_rules = TagRulesCache::default();
     let tools = Arc::new(admission.tools.clone());
@@ -2038,6 +2039,13 @@ where
             {
                 crate::compaction::seal_at_cut(writer, seams, ctx, marker.first_kept_ordinal)
                     .await?;
+                // The seal moved the runs wholly before the cut out of the window and kept only
+                // those whose settings still shape a request (see `Conversation::seal_window`).
+                // The run's list is read again from the sealed conversation, as a run starting
+                // now would read it, so later steps carry the bounded list rather than every run
+                // the history held when this run started. Every renderer gives the same bytes
+                // for both lists (`openai_responses_chatgpt::reduce_episodes`).
+                episodes = Arc::new(RenderHistory::from(render_episodes(writer, parts)?));
             }
         }
         // Once a refresh applied, the model sees the system text of the plan the run froze in
@@ -2850,7 +2858,7 @@ fn call_options<W: Writer>(
     writer: &W,
     admission: &Admission,
     tools: &Arc<Vec<Tool>>,
-    episodes: &[EpisodeRenderInput],
+    episodes: &Arc<RenderHistory>,
     run_rules: &[RunTagRules],
     session_address: Option<String>,
     step_id: u64,
@@ -2880,12 +2888,17 @@ fn call_options<W: Writer>(
     }
     // The global system messages a session that enrolled carried in its transcript before are
     // left out, as a session on the contract never holds them: the run's system text takes
-    // their place above the conversation, and the entries leave them out alike.
-    let mut episodes = episodes.to_vec();
-    if let (true, Some(enrollment)) = (contract, enrollment) {
-        crate::enroll::without_suppressed(&mut prompt, enrollment);
-        crate::enroll::translate_episodes(&mut episodes, enrollment);
-    }
+    // their place above the conversation, and the entries leave them out alike. Otherwise the
+    // request shares the run's episode list rather than copying it.
+    let episodes = match (contract, enrollment) {
+        (true, Some(enrollment)) => {
+            crate::enroll::without_suppressed(&mut prompt, enrollment);
+            let mut translated = episodes.episodes.clone();
+            crate::enroll::translate_episodes(&mut translated, enrollment);
+            Arc::new(RenderHistory::from(translated))
+        }
+        _ => Arc::clone(episodes),
+    };
     // A session on the current compaction contract renders its numbers from the entries below;
     // one on the established layout numbers each run's messages by that run's frozen rules, in
     // the order they were placed, as today's loop numbers them, and renders them in place.
@@ -2942,7 +2955,7 @@ fn call_options<W: Writer>(
     }
     let mut opts = CallOptions::new(prompt);
     opts.marker_order_version = admission.marker_order_version;
-    opts.render_episodes = Arc::new(episodes.into());
+    opts.render_episodes = episodes;
     opts.tools = Arc::clone(tools);
     opts.tool_choice = Arc::new(admission.tool_choice.clone());
     opts.response_format = Arc::new(admission.response_format.clone());
