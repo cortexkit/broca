@@ -68,10 +68,10 @@ fn the_tracked_descriptor_declares_brocas_entries_with_their_classes() {
         ("broca/durable-media", "portable", "filetree"),
         // The new session storage, one complete store per backup class, placed by the rule
         // today's storage places a WAL by. Its durable root holds the sessions whose creating
-        // send carried a class in `backup_classes`, and the long-lived sessions an operator moved
-        // there; it is captured. Agent heads are created today without the `head` label, so
-        // their WALs are in the excluded `wal/` and `wal-durable/` holds none: an operator moves
-        // such a head with `class: "durable"` to place it in the captured root. Its ordinary
+        // send carried a class in `backup_classes`, the agent heads a file import brought onto
+        // broca, and the long-lived sessions an operator moved there; it is captured. A head is
+        // backed up only when it is created with `session_class: "head"`; an operator moves an
+        // unlabelled one from `wal/` with `class: "durable"`. Its ordinary
         // root holds disposable sessions, and its ephemeral root sessions with a retention
         // policy; neither is captured. A move keeps its journal and staged copy outside all
         // three, so no capture holds a half-staged session.

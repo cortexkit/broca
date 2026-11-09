@@ -496,27 +496,34 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> DefaultOpener<L, W> {
             // Decided under the lease, so no other open of this session decides beside it. A
             // session in the new storage is served from there, and refused while it is encrypted
             // and its key hasn't loaded; one that exists in neither storage starts there when the
-            // registry marked its creating send and the runtime can create it in the mode new
-            // sessions take. It starts in the root of the class its creating send places it in,
-            // by the rule today's storage places its WAL by. The actor keeps the lease until its
-            // session is closed.
+            // registry marked its creating send or import and the runtime can create it in the
+            // mode new sessions take. It starts in the root of the class the rule today's
+            // storage places a WAL by gives it: a send's label selects it for backup, and an
+            // import, which only brings an agent head onto broca, always is. The actor keeps the
+            // lease until its session is closed.
             let held = slot.holding(key)?;
-            let create = held.is_none()
-                && !status
-                && registry.take_store_eligible(key)
-                && self.wal_store.wal_present(key) == Some(false);
+            let creating = if held.is_none() && !status {
+                registry
+                    .take_store_eligible(key)
+                    .filter(|_| self.wal_store.wal_present(key) == Some(false))
+            } else {
+                None
+            };
             let store = match held {
                 Some(store) => Some(store),
-                None if create => slot.creating_runtime(),
+                None if creating.is_some() => slot.creating_runtime(),
                 None => None,
             };
             if let Some(store) = store {
-                let class = create.then(|| {
-                    broca_wal::placement(
-                        retention.is_some(),
-                        session_class.as_deref(),
-                        &self.wal_store.backup_classes(),
-                    )
+                let class = creating.map(|creation| {
+                    let durable = match creation {
+                        crate::registry::StoreCreation::Send => broca_wal::selected_for_backup(
+                            session_class.as_deref(),
+                            &self.wal_store.backup_classes(),
+                        ),
+                        crate::registry::StoreCreation::Import => true,
+                    };
+                    broca_wal::placement(retention.is_some(), durable)
                 });
                 return store
                     .open_actor(key, gen, registry, Box::new(authority), class)

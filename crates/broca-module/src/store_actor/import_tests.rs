@@ -755,6 +755,100 @@ async fn the_registry_creates_an_imported_session_in_the_new_storage() {
     };
 }
 
+/// An import only ever brings a long-lived agent head onto broca, so the session it creates is
+/// placed durable without any label, in the root backups capture, even when no backup classes
+/// are configured. It reopens from there after a restart, and nothing of it is in the other
+/// roots.
+#[tokio::test]
+async fn an_imported_head_is_created_in_the_durable_root_and_reopens_from_it() {
+    use broca_core::{FileLeaseStore, FileWalStore};
+    use broca_wal::StorageClass;
+    const IDLE: std::time::Duration = std::time::Duration::from_millis(100);
+    let source = Source::new("durable");
+    let dir = source.dir.join("state");
+    // No backup classes: an import's placement doesn't consult them.
+    let wal = Arc::new(FileWalStore::new(dir.join("wal")).with_backup_classes(Vec::new()));
+    let executor: Arc<dyn crate::executor::RunExecutor> = Arc::new(executor(Vec::new(), None));
+    let module = |runtime: Arc<crate::store_open::StoreRuntime>| {
+        crate::registry::LineageRegistry::new_with_reader(
+            Arc::new(
+                crate::opener::DefaultOpener::new(
+                    Arc::new(FileLeaseStore::new(dir.join("leases"))),
+                    wal.clone(),
+                    Arc::clone(&executor),
+                )
+                .with_idle_ttl(IDLE)
+                .with_store_runtime(runtime),
+            ),
+            wal.clone(),
+            None,
+        )
+        .with_store_new_sessions()
+    };
+    let open = || async {
+        Arc::new(
+            crate::store_open::StoreRuntime::open(&dir, deployment(), Arc::clone(&executor), IDLE)
+                .await
+                .unwrap(),
+        )
+    };
+    let key = broca_protocol::BindIdentity::new(dir.join("project"), "broca", "alfonso:head:d1");
+    let address = broca_core::session_addr(&key);
+    let runtime = open().await;
+    let registry = module(Arc::clone(&runtime));
+    let reply = imported(
+        registry
+            .route_store_command(&key, source.import(source.params("imp-1")))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(reply.imported_messages, 4);
+    assert_eq!(runtime.class_of(&key).unwrap(), Some(StorageClass::Durable));
+    let written = crate::store_read::transcript_len(
+        &runtime
+            .current_view(&key)
+            .await
+            .unwrap()
+            .expect("the imported session reads"),
+    );
+    assert!(written > 0);
+    for class in StorageClass::ALL {
+        assert_eq!(
+            broca_wal::session_storage_head(&dir, class, &address).is_file(),
+            class == StorageClass::Durable,
+            "the {class} root's head"
+        );
+    }
+    assert!(registry.stop_and_seal().await);
+
+    // After a restart the session opens from the durable root, holding what the import wrote,
+    // and a retry of the import is answered from its receipt there.
+    let restarted = open().await;
+    let registry = module(Arc::clone(&restarted));
+    assert_eq!(
+        restarted.class_of(&key).unwrap(),
+        Some(StorageClass::Durable)
+    );
+    let view = restarted
+        .current_view(&key)
+        .await
+        .unwrap()
+        .expect("the imported session reads");
+    assert_eq!(crate::store_read::transcript_len(&view), written);
+    let retry = imported(
+        registry
+            .route_store_command(&key, source.import(source.params("imp-1")))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(retry, reply);
+    assert_eq!(
+        broca_wal::session_storage_class(&dir, &address).unwrap(),
+        Some(StorageClass::Durable)
+    );
+    assert!(registry.stop_and_seal().await);
+}
+
 /// An imported history of four exchanges, each reply in two text parts, with no side file:
 /// `msg_u1` to `msg_a4` take ordinals 1 to 8.
 fn exchanges() -> Vec<u8> {

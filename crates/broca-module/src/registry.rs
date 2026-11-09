@@ -981,6 +981,17 @@ impl ReadOnlyLineage {
     }
 }
 
+/// What creates a session in the new storage, which decides the class of root it is created in
+/// (`broca_wal::placement`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StoreCreation {
+    /// A send: its session is durable when its `session_class` is one of `backup_classes`.
+    Send,
+    /// A file import, which only ever brings a long-lived agent head onto broca: its session is
+    /// durable whatever its label.
+    Import,
+}
+
 struct Inner {
     /// The sessions a move into the new storage holds (see `store_move`), by address, and the
     /// lease-free WAL reads in flight per address, which such a move waits out.
@@ -1022,9 +1033,10 @@ struct Inner {
     /// Whether a session that exists in neither storage may start in the new storage, when the
     /// send creating it asks only for what the store actor serves. Off unless a builder sets it.
     store_new_sessions: std::sync::atomic::AtomicBool,
-    /// Sessions whose creating send the store actor serves, marked by the send and taken by the
-    /// opener, which starts such a session in the new storage when it exists nowhere yet.
-    store_eligible: Mutex<std::collections::HashSet<LineageKey>>,
+    /// Sessions whose creating send or import the store actor serves, marked by it with how the
+    /// session it creates is placed, and taken by the opener, which starts such a session in the
+    /// new storage when it exists nowhere yet.
+    store_eligible: Mutex<HashMap<LineageKey, StoreCreation>>,
     opener: Arc<dyn LineageOpener>,
     reader: Option<ReadSources>,
     run_rows: Option<Arc<OverhaulRunSource>>,
@@ -2466,7 +2478,7 @@ impl LineageRegistry {
                 change_gates: Mutex::new(HashMap::new()),
                 next_gen: AtomicU64::new(1),
                 store_new_sessions: std::sync::atomic::AtomicBool::new(false),
-                store_eligible: Mutex::new(std::collections::HashSet::new()),
+                store_eligible: Mutex::new(HashMap::new()),
                 opener,
                 reader: wal_store.map(|wal_store| ReadSources { wal_store, store }),
                 run_rows,
@@ -4186,7 +4198,7 @@ impl LineageRegistry {
                     .store_eligible
                     .lock()
                     .unwrap()
-                    .insert(key.clone());
+                    .insert(key.clone(), StoreCreation::Send);
             }
             let handle = self
                 .actor_for_mode(key, retention, session_class.clone(), false)
@@ -4271,7 +4283,7 @@ impl LineageRegistry {
                     .store_eligible
                     .lock()
                     .unwrap()
-                    .insert(key.clone());
+                    .insert(key.clone(), StoreCreation::Import);
             }
             let handle = self.actor_for_mode(key, None, None, false).await;
             // A mark the open didn't take, because the session was already open, must not
@@ -6902,20 +6914,22 @@ impl LineageRegistry {
 }
 
 impl RegistryHandle {
-    /// Takes the mark that the send opening `key` is one the store actor serves.
-    pub(crate) fn take_store_eligible(&self, key: &LineageKey) -> bool {
+    /// Takes the mark that the send or import opening `key` is one the store actor serves, which
+    /// says how the session it creates is placed.
+    pub(crate) fn take_store_eligible(&self, key: &LineageKey) -> Option<StoreCreation> {
         self.inner.store_eligible.lock().unwrap().remove(key)
     }
 
-    /// Marks the next open of `key` as one a creating send the store actor serves asked for,
-    /// as a send does before it opens its session, so a test can open the session directly.
+    /// Marks the next open of `key` as one a creating `creation` the store actor serves asked
+    /// for, as a send or import does before it opens its session, so a test can open the
+    /// session directly.
     #[cfg(test)]
-    pub(crate) fn mark_store_eligible(&self, key: &LineageKey) {
+    pub(crate) fn mark_store_eligible(&self, key: &LineageKey, creation: StoreCreation) {
         self.inner
             .store_eligible
             .lock()
             .unwrap()
-            .insert(key.clone());
+            .insert(key.clone(), creation);
     }
 
     pub(crate) async fn check_session_log(&self, key: &LineageKey) -> Result<(), OpenError> {

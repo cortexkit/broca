@@ -58,11 +58,16 @@ fn stranger() -> BindPrincipal {
     }
 }
 
-/// The mode the stored head of the session `key` under the state root `dir` names.
+/// The mode the stored head of the session `key` under the state root `dir` names, read from
+/// whichever root holds it (an imported session is durable, a sent one ordinary).
 pub(super) fn stored_mode(dir: &std::path::Path, key: &BindIdentity) -> Cipher {
     use broca_session_store::backend::{LocalBackend, SessionAddr};
-    let (stored, _) = LocalBackend::new(dir.join(broca_wal::SESSION_STORAGE_DIR))
-        .read_stored_head(&SessionAddr(broca_core::session_addr(key)))
+    let address = broca_core::session_addr(key);
+    let class = broca_wal::session_storage_class(dir, &address)
+        .unwrap()
+        .expect("the session is kept in the new storage");
+    let (stored, _) = LocalBackend::new(class.store_root(dir))
+        .read_stored_head(&SessionAddr(address))
         .unwrap()
         .expect("the session is kept in the new storage");
     broca_session_store::head::stored_cipher(&stored).unwrap()

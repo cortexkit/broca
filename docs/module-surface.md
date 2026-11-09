@@ -2392,11 +2392,17 @@ of these populations. A send with `retention` always uses `wal-ephemeral/` and i
 never backed up, even if its class is listed: deletion takes precedence.
 
 Engram captures only `wal-durable/`, `wal-archive-durable/` and the new session
-storage's durable root, `session-store-durable/`. The new session storage places a
+storage's durable root, `session-store-durable/`. An agent head is backed up only when
+it is created with `session_class: "head"` (or another label listed in
+`backup_classes`). The new session storage places a
 session it creates by the same rule, in one complete store per class:
 `session-store-durable/`, `session-store/` (ordinary) and `session-store-ephemeral/`;
 the root holding a session's head is authoritative afterwards, and a head found in
-two roots is refused `session_in_two_classes`. `session.move_to_store` (operator only)
+two roots is refused `session_in_two_classes`. A file import (`session.import` with a
+file source, which brings an OpenCode 2 or Pi agent head onto broca) carries no
+label and is placed durable by the same rule: ephemeral if it carries a retention
+policy, else `session-store-durable/`, whatever `backup_classes` lists.
+`session.move_to_store` (operator only)
 places a moved session in the root matching its WAL's folder; its optional
 `class: "durable"` places a session from `wal/` in the durable root, and any other
 class change is refused `not_movable {reason: "class_refused"}`. Live-first reads,

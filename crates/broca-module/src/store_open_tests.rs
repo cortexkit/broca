@@ -15,7 +15,7 @@ use broca_wal::StorageClass;
 use super::{triple, StoreRuntime, StoreSlot};
 use crate::executor::{RunExecutor, RunJob};
 use crate::opener::DefaultOpener;
-use crate::registry::LineageOpener as _;
+use crate::registry::{LineageOpener as _, StoreCreation};
 use crate::LineageRegistry;
 
 /// An executor for sessions whose tests run nothing.
@@ -103,7 +103,7 @@ async fn create_in(root: &Path, class: StorageClass, key: &BindIdentity) {
 /// durable class, and anything else in the ordinary class. The new storage creates it in that
 /// class's root, and today's storage its WAL in that class's folder. After a restart with
 /// another `backup_classes`, a session stays in the root it was created in, and only new sessions
-/// follow the new setting.
+/// follow the new setting. An import is placed durable by the same rule, whatever the setting.
 #[tokio::test]
 async fn both_storages_place_a_new_session_by_one_rule() {
     let root = state_root("placement");
@@ -126,14 +126,17 @@ async fn both_storages_place_a_new_session_by_one_rule() {
     ];
     for (gen, (name, retention, class, expected)) in cases.into_iter().enumerate() {
         assert_eq!(
-            broca_wal::placement(retention.is_some(), class, &backup_classes),
+            broca_wal::placement(
+                retention.is_some(),
+                broca_wal::selected_for_backup(class, &backup_classes)
+            ),
             expected,
             "{name}"
         );
         // The new storage, as a send the store actor serves creates the session.
         let stored = key(&root, &format!("store-{name}"));
         let handle = registry.handle();
-        handle.mark_store_eligible(&stored);
+        handle.mark_store_eligible(&stored, StoreCreation::Send);
         opener
             .open_with_class(
                 &stored,
@@ -170,7 +173,7 @@ async fn both_storages_place_a_new_session_by_one_rule() {
     );
     let fresh = key(&root, "store-fresh-head");
     let handle = registry.handle();
-    handle.mark_store_eligible(&fresh);
+    handle.mark_store_eligible(&fresh, StoreCreation::Send);
     opener
         .open_with_class(&fresh, 1, handle, None, Some("head".into()))
         .await
@@ -183,6 +186,28 @@ async fn both_storages_place_a_new_session_by_one_rule() {
         broca_wal::session_storage_class(&root, &broca_core::session_addr(&held)).unwrap(),
         Some(StorageClass::Durable)
     );
+    // An import brings an agent head onto broca: it is durable without a label, even with no
+    // backup classes configured, and a retention policy would still place it ephemeral.
+    for (gen, (name, retention, expected)) in [
+        ("imported", None, StorageClass::Durable),
+        ("imported-retained", Some(3600), StorageClass::Ephemeral),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let imported = key(&root, name);
+        let handle = registry.handle();
+        handle.mark_store_eligible(&imported, StoreCreation::Import);
+        opener
+            .open_with_class(&imported, gen as u64 + 2, handle, retention, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            restarted.class_of(&imported).unwrap(),
+            Some(expected),
+            "{name}"
+        );
+    }
     let _ = std::fs::remove_dir_all(&root);
 }
 

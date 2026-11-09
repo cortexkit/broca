@@ -2,10 +2,10 @@
 //! durable root.
 //!
 //! The new storage first kept every session in one folder, `session-store/`, and the backup
-//! descriptor captured all of it. Only sessions an operator moved from the backed-up
-//! `wal-durable/`, or meant to be durable, were ever placed there, so everything in that tree is
-//! durable by construction. The storage now keeps one root per backup class
-//! (`broca_wal::StorageClass`), and `session-store/` is the ordinary root, which backups leave
+//! descriptor captured all of it. Only long-lived agent heads, moved or imported there, were
+//! ever placed in it, so everything in that tree is durable by construction. The storage now
+//! keeps one root per backup class (`broca_wal::StorageClass`), and `session-store/` is the
+//! ordinary root, which backups leave
 //! out. So at startup, before any store opens and before the class roots are created, a state
 //! root with no durable root and a `session-store/` holding anything has that folder renamed to
 //! `session-store-durable/`. Its move journals and staged sessions go to

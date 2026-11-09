@@ -1126,7 +1126,10 @@ impl FileWalStore {
         retention: Option<u64>,
         session_class: Option<&str>,
     ) -> broca_wal::StorageClass {
-        broca_wal::placement(retention.is_some(), session_class, &self.backup_classes)
+        broca_wal::placement(
+            retention.is_some(),
+            broca_wal::selected_for_backup(session_class, &self.backup_classes),
+        )
     }
 
     /// Move installation preserves the tree of a session already present locally.

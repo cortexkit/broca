@@ -148,8 +148,7 @@ impl AdmissionWal {
                 if let Some((ordinary, ephemeral, durable, classes)) = &self.placement {
                     let path = match broca_wal::placement(
                         retention.is_some(),
-                        session_class.as_deref(),
-                        classes,
+                        broca_wal::selected_for_backup(session_class.as_deref(), classes),
                     ) {
                         broca_wal::StorageClass::Ephemeral => ephemeral,
                         broca_wal::StorageClass::Durable => durable,

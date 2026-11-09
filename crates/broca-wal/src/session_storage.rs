@@ -110,22 +110,26 @@ impl std::fmt::Display for StorageClass {
     }
 }
 
-/// The class a new session is placed in, by what its creating send carries: a retention policy
-/// places it in the ephemeral class, whatever its label; else a `session_class` listed in
-/// `backup_classes` places it in the durable class; everything else is ordinary. Both storages
-/// decide through this one function, so they never place a session differently.
-pub fn placement(
-    retained: bool,
-    session_class: Option<&str>,
-    backup_classes: &[String],
-) -> StorageClass {
+/// The class a new session is placed in: a retention policy places it in the ephemeral class,
+/// whatever else holds; else a session selected for backup (`durable`) is placed in the durable
+/// class; everything else is ordinary. Both storages decide through this one function, so they
+/// never place a session differently. What selects a session for backup depends on what creates
+/// it: a send by its label ([`selected_for_backup`]), and an import, which only ever brings a
+/// long-lived agent head onto broca, always.
+pub fn placement(retained: bool, durable: bool) -> StorageClass {
     if retained {
         StorageClass::Ephemeral
-    } else if session_class.is_some_and(|class| backup_classes.iter().any(|value| value == class)) {
+    } else if durable {
         StorageClass::Durable
     } else {
         StorageClass::Ordinary
     }
+}
+
+/// Whether a send's `session_class` selects its session for backup: the label is one of
+/// `backup_classes` (the daemon's setting, `["head"]` by default).
+pub fn selected_for_backup(session_class: Option<&str>, backup_classes: &[String]) -> bool {
+    session_class.is_some_and(|class| backup_classes.iter().any(|value| value == class))
 }
 
 /// Where the new session storage keeps the head of the session at `address` in the root of
@@ -446,22 +450,17 @@ mod tests {
     #[test]
     fn placement_puts_retention_first_then_backup_classes() {
         let classes = vec!["head".to_owned()];
+        let send = |retained, class| placement(retained, selected_for_backup(class, &classes));
         // A retention policy wins over a durable label.
-        assert_eq!(
-            placement(true, Some("head"), &classes),
-            StorageClass::Ephemeral
-        );
-        assert_eq!(placement(true, None, &classes), StorageClass::Ephemeral);
-        assert_eq!(
-            placement(false, Some("head"), &classes),
-            StorageClass::Durable
-        );
-        assert_eq!(
-            placement(false, Some("worker"), &classes),
-            StorageClass::Ordinary
-        );
-        assert_eq!(placement(false, None, &classes), StorageClass::Ordinary);
-        assert_eq!(placement(false, Some("head"), &[]), StorageClass::Ordinary);
+        assert_eq!(send(true, Some("head")), StorageClass::Ephemeral);
+        assert_eq!(send(true, None), StorageClass::Ephemeral);
+        assert_eq!(send(false, Some("head")), StorageClass::Durable);
+        assert_eq!(send(false, Some("worker")), StorageClass::Ordinary);
+        assert_eq!(send(false, None), StorageClass::Ordinary);
+        assert!(!selected_for_backup(Some("head"), &[]));
+        // An import is selected for backup whatever its label, and its retention still wins.
+        assert_eq!(placement(false, true), StorageClass::Durable);
+        assert_eq!(placement(true, true), StorageClass::Ephemeral);
     }
 
     /// A journal written before the new storage had classes names no class; its session moves
