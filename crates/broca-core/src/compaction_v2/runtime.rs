@@ -77,6 +77,7 @@ impl Plane for BoundPlane<'_> {
 }
 
 #[derive(Default)]
+#[cfg_attr(debug_assertions, derive(Clone, PartialEq))]
 struct Pending {
     entries: BTreeMap<u64, (Entry, u64)>,
     entry_bytes: u64,
@@ -123,58 +124,37 @@ pub struct Runtime {
 impl Runtime {
     /// Observe durable entries. Completion metadata alone changes no digest and
     /// does not emit a notice, whereas final tool results and deliveries do.
+    ///
+    /// `entries` come in ordinal order, and only two kinds can change anything here: those past
+    /// the newest ordinal observed, and the newest assistant entry with parts, which can still
+    /// gain results or deliveries. So once an assistant entry has been observed, only the entries
+    /// from the lower of those two ordinals on are looked at; until then, all of them.
     pub fn observe(&self, entries: &[Entry]) {
         let mut pending = self
             .pending
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if let Some(newest) = views::newest(entries) {
-            if pending
-                .newest
-                .as_ref()
-                .is_none_or(|previous| previous.ordinal <= newest.ordinal)
-            {
-                pending.newest = Some(newest);
+        let from = match &pending.assistant {
+            Some((assistant, _)) => {
+                let first = pending.observed_through.saturating_add(1).min(*assistant);
+                entries.partition_point(|entry| entry.ordinal < first)
             }
-        }
-        let through = pending.observed_through;
-        let assistant = pending.assistant.clone();
-        for entry in entries {
-            let changed = entry.ordinal > through
-                || assistant.as_ref().is_some_and(|(ordinal, digest)| {
-                    *ordinal == entry.ordinal && digest != &entry.digest
-                });
-            if changed {
-                pending.changed = true;
-                if !pending.entries_omitted {
-                    let compact = super::entries::compact(entry);
-                    let bytes = broca_protocol::serialized_json_bytes(&compact);
-                    if let Some((_, old_bytes)) =
-                        pending.entries.insert(entry.ordinal, (compact, bytes))
-                    {
-                        pending.entry_bytes = pending.entry_bytes.saturating_sub(old_bytes);
-                    }
-                    pending.entry_bytes += bytes;
-                    if pending.entry_bytes + 2 + pending.entries.len().saturating_sub(1) as u64
-                        > 1_048_576
-                    {
-                        pending.entries.clear();
-                        pending.entry_bytes = 0;
-                        pending.entries_omitted = true;
-                    }
-                }
-            }
-            pending.observed_through = pending.observed_through.max(entry.ordinal);
-            if entry.role == cortexkit_role_compaction::read::Role::Assistant
-                && !entry.parts.is_empty()
-                && pending
-                    .assistant
-                    .as_ref()
-                    .is_none_or(|(ordinal, _)| *ordinal <= entry.ordinal)
-            {
-                pending.assistant = Some((entry.ordinal, entry.digest.clone()));
-            }
-        }
+            None => 0,
+        };
+        #[cfg(debug_assertions)]
+        let whole = {
+            let mut whole = pending.clone();
+            observe_from(&mut whole, entries, 0);
+            whole
+        };
+        observe_from(&mut pending, entries, from);
+        #[cfg(test)]
+        OBSERVED.with(|count| count.set(count.get() + entries.len().saturating_sub(from)));
+        #[cfg(debug_assertions)]
+        assert!(
+            *pending == whole,
+            "observing the entries from position {from} differs from observing them all"
+        );
     }
 
     pub fn event(&self, event: Event) {
@@ -438,6 +418,63 @@ pub fn detects(cache_expired: bool) -> Vec<RideCause> {
 }
 
 #[cfg(test)]
+thread_local! {
+    /// How many entries this thread's observations looked at.
+    static OBSERVED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// [`Runtime::observe`] of `entries[from..]`, with the newest of all `entries`.
+fn observe_from(pending: &mut Pending, entries: &[Entry], from: usize) {
+    if let Some(newest) = views::newest(entries) {
+        if pending
+            .newest
+            .as_ref()
+            .is_none_or(|previous| previous.ordinal <= newest.ordinal)
+        {
+            pending.newest = Some(newest);
+        }
+    }
+    let through = pending.observed_through;
+    let assistant = pending.assistant.clone();
+    for entry in &entries[from..] {
+        let changed = entry.ordinal > through
+            || assistant.as_ref().is_some_and(|(ordinal, digest)| {
+                *ordinal == entry.ordinal && digest != &entry.digest
+            });
+        if changed {
+            pending.changed = true;
+            if !pending.entries_omitted {
+                let compact = super::entries::compact(entry);
+                let bytes = broca_protocol::serialized_json_bytes(&compact);
+                if let Some((_, old_bytes)) =
+                    pending.entries.insert(entry.ordinal, (compact, bytes))
+                {
+                    pending.entry_bytes = pending.entry_bytes.saturating_sub(old_bytes);
+                }
+                pending.entry_bytes += bytes;
+                if pending.entry_bytes + 2 + pending.entries.len().saturating_sub(1) as u64
+                    > 1_048_576
+                {
+                    pending.entries.clear();
+                    pending.entry_bytes = 0;
+                    pending.entries_omitted = true;
+                }
+            }
+        }
+        pending.observed_through = pending.observed_through.max(entry.ordinal);
+        if entry.role == cortexkit_role_compaction::read::Role::Assistant
+            && !entry.parts.is_empty()
+            && pending
+                .assistant
+                .as_ref()
+                .is_none_or(|(ordinal, _)| *ordinal <= entry.ordinal)
+        {
+            pending.assistant = Some((entry.ordinal, entry.digest.clone()));
+        }
+    }
+}
+
+#[cfg(test)]
 mod pending_tests {
     use super::*;
     use cortexkit_role_compaction::{
@@ -466,5 +503,43 @@ mod pending_tests {
         assert!(pending.entries_omitted);
         assert!(pending.entries.is_empty());
         assert_eq!(pending.newest.as_ref().unwrap().ordinal, 1);
+    }
+
+    /// Once an assistant entry has been observed, an observation looks only at the entries past
+    /// the newest observed and at that assistant entry, so its cost doesn't grow with how many
+    /// entries it's handed.
+    #[test]
+    fn an_observation_looks_only_at_what_can_have_changed() {
+        let entry = |ordinal: u64| {
+            let role = if ordinal.is_multiple_of(2) {
+                Role::Assistant
+            } else {
+                Role::User
+            };
+            Entry::new(
+                ordinal,
+                format!("m{ordinal}"),
+                role,
+                1,
+                vec![Part::new("0", PartBody::Text { text: "x".into() })],
+            )
+        };
+        let looked_at = |window: u64| {
+            let runtime = Runtime::default();
+            let mut entries: Vec<Entry> = (1..=window).map(entry).collect();
+            runtime.observe(&entries);
+            entries.push(entry(window + 1));
+            let before = OBSERVED.with(std::cell::Cell::get);
+            runtime.observe(&entries);
+            let looked = OBSERVED.with(std::cell::Cell::get) - before;
+            // The new entry was noticed.
+            let pending = runtime.pending.lock().unwrap();
+            assert_eq!(pending.observed_through, window + 1);
+            assert!(pending.entries.contains_key(&(window + 1)));
+            looked
+        };
+        // The newest assistant entry (the window's last) and the new one.
+        assert_eq!(looked_at(10), 2);
+        assert_eq!(looked_at(1_000), 2);
     }
 }
