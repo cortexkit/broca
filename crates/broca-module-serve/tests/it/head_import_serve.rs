@@ -688,9 +688,23 @@ async fn a_restore_is_operator_only_keeps_a_whole_session_and_cuts_one_lacking_a
             .starts_with("import id map "),
         "{session}"
     );
+    let sidecar = session["cut"]["sidecar"].as_str().unwrap();
+    assert!(std::path::Path::new(sidecar).is_file(), "{session}");
+    // The sidecar is named by the wall clock, not by how long the daemon has run, so a restore
+    // in a later run never names the same file.
+    let stamp: u64 = sidecar
+        .rsplit("restore-cut-")
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
     assert!(
-        std::path::Path::new(session["cut"]["sidecar"].as_str().unwrap()).is_file(),
-        "{session}"
+        now - stamp < 60_000,
+        "{sidecar} names {stamp}, now is {now}"
     );
     let page = rig
         .lock()

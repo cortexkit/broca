@@ -140,8 +140,11 @@ impl StoreRestore {
                 return report.failed(format!("the session couldn't be held: {error}"))
             }
         };
-        let restored =
-            restore::restore(&store, addr, deployment, broca_diagnostics::now_ms()).await;
+        // The sidecar of a cut is named by the wall clock, so restores in later runs of the
+        // daemon never name the same file.
+        let now_ms =
+            broca_module::head_time::epoch_ms(std::time::SystemTime::now()).unwrap_or_default();
+        let restored = restore::restore(&store, addr, deployment, now_ms).await;
         drop(fence);
         match restored {
             Ok(restored) => report.restored(restored),
