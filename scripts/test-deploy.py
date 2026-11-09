@@ -367,6 +367,15 @@ sys.exit(19 if os.environ.get("FAIL_STEP") == name else 0)
         self.assertIn("CI log", result.stdout)
         self.assertEqual(self.git("status", "--porcelain"), "")
 
+    def test_no_publish_deploys_fully_but_never_starts_publication(self):
+        result = self.deploy("--live-approved", "--no-publish")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_gated_steps(["place", "verify", "accept", "worker-accept", "scoped-accept"])
+        self.assertNotIn("publish", self.steps())
+        self.assertIn(f"scripts/tag-when-green.sh {self.sha} 0.0.2", result.stdout)
+        self.assertNotIn("CI log", result.stdout)
+        self.assertIn("pid        4321", result.stdout)
+
 
 class PublicationTests(Fixture):
     def setUp(self):

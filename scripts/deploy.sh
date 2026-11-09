@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Deploy committed local bytes first; publishing and CI follow in a detached worker.
-# Usage: scripts/deploy.sh --marker STRING --control STRING [--live-approved]
+# Usage: scripts/deploy.sh --marker STRING --control STRING [--live-approved] [--no-publish]
+# --no-publish deploys to this machine only: nothing is pushed to GitHub, so no CI run, master
+# fast-forward or public tag follows. Use it for development deploys, whose release suites have
+# not run; publish later with the printed command.
 set -euo pipefail
 umask 077
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -8,6 +11,7 @@ cd "$ROOT"
 source scripts/lib/exit-guard.sh
 MARKER="" CONTROL=""
 placement_args=()
+publish=1
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --marker|--control)
@@ -15,11 +19,12 @@ while [ "$#" -gt 0 ]; do
       case "$1" in --marker) MARKER="$2" ;; --control) CONTROL="$2" ;; esac
       shift 2 ;;
     --live-approved) placement_args+=(--live-approved); shift ;;
+    --no-publish) publish=0; shift ;;
     *) echo "deploy: unknown argument: $1" >&2; exit 2 ;;
   esac
 done
 [ -n "$MARKER" ] && [ -n "$CONTROL" ] || {
-  echo "usage: scripts/deploy.sh --marker STRING --control STRING [--live-approved]" >&2; exit 2;
+  echo "usage: scripts/deploy.sh --marker STRING --control STRING [--live-approved] [--no-publish]" >&2; exit 2;
 }
 dirty="$(git status --porcelain)" || { echo "deploy: cannot read worktree status" >&2; exit 2; }
 if [ -n "$dirty" ]; then
@@ -199,7 +204,9 @@ if ! python3 scripts/lib/acceptance_scoped.py --placement-report "$report" \
 fi
 cat "$logdir/acceptance-scoped.log"
 ci_log="$logdir/ci.log"
-if ! TAG_WHEN_GREEN_LOG="$ci_log" bash scripts/tag-when-green.sh "$sha" "$version"; then
+if [ "$publish" -eq 0 ]; then
+  echo "deploy: --no-publish: deployed here only. Publish later with: scripts/tag-when-green.sh $sha $version"
+elif ! TAG_WHEN_GREEN_LOG="$ci_log" bash scripts/tag-when-green.sh "$sha" "$version"; then
   echo "deploy: live acceptance passed, but could not start background publication. Retry scripts/tag-when-green.sh $sha $version" >&2
   rollback_command >&2
   exit 1
@@ -223,5 +230,7 @@ if report.get("sessions_cancelled"):
 PY
 echo "   acceptance PASS (direct tool round trip; classed fetch-plan turn; scoped AFT dispatch)"
 rollback_command
-echo "   CI log     $ci_log (detached; CI does not gate deployment)"
+if [ "$publish" -eq 1 ]; then
+  echo "   CI log     $ci_log (detached; CI does not gate deployment)"
+fi
 BROCA_EXIT_GUARD_FINISHED=1
