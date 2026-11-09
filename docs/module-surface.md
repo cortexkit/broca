@@ -862,6 +862,13 @@ the lease fence (the writer's ownership generation) and payload.
 Missing or null `from`
 means live. On either refusal, drop the cursor, reopen live, and read `session.head`.
 
+The `broca-session --json-events subscribe` observer prints its last processed control
+cursor in an `observed` event as an opaque string containing compact cursor JSON, alongside
+the numeric `wal_seq` position. Pass the string unchanged as `subscribe --from-cursor
+'<opaque cursor>'` to resume strictly after that control unit; a position-only `seq:index`
+string is not a resume cursor. If no control event was delivered, both `cursor` and
+`wal_seq` are null: there is no resume position, so use `subscribe --from start`.
+
 Broca declares `notices` only when its envelope writer is enabled, with
 `read_display_facts`, `history_display` and `live_events`. A reader-only build can
 read older envelope records without promising to record new notices. Its existing
