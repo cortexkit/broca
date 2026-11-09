@@ -6148,7 +6148,11 @@ async fn older_expiry_cannot_mask_an_unidentified_new_run_missing_log() {
 /// Plants the new session storage's head for `key` under the state root `root`, as a session
 /// published there has. Today's readers look only at whether it exists.
 fn plant_store_head(root: &Path, key: &BindIdentity) {
-    let head = broca_wal::session_storage_head(root, &broca_core::session_addr(key));
+    let head = broca_wal::session_storage_head(
+        root,
+        broca_wal::StorageClass::Ephemeral,
+        &broca_core::session_addr(key),
+    );
     fs::create_dir_all(head.parent().unwrap()).unwrap();
     fs::write(head, b"head").unwrap();
 }

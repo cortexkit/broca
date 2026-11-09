@@ -15,10 +15,30 @@
       "path": "wal-archive-durable"
     },
     {
-      "entry_id": "broca/session-store",
+      "entry_id": "broca/session-store-durable",
       "class": "portable",
       "mechanism": "filetree",
-      "path": "session-store"
+      "path": "session-store-durable"
+    },
+    {
+      "entry_id": "broca/session-store",
+      "class": "excluded",
+      "mechanism": "filetree",
+      "path": "session-store",
+      "reason": "non-durable sessions in the new session storage (sidekicks, one-shots, consults, masons, other modules); only sessions marked durable are backed up, in session-store-durable, and none live in this tree"
+    },
+    {
+      "entry_id": "broca/session-store-ephemeral",
+      "class": "excluded",
+      "mechanism": "filetree",
+      "path": "session-store-ephemeral",
+      "reason": "sessions in the new session storage with caller-chosen retention; an immutable backup snapshot would outlive that promise"
+    },
+    {
+      "entry_id": "broca/session-store-moves",
+      "class": "device-local",
+      "mechanism": "filetree",
+      "path": "session-store-moves"
     },
     {
             "entry_id": "broca/session-wals",

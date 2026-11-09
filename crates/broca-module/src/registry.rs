@@ -6907,6 +6907,17 @@ impl RegistryHandle {
         self.inner.store_eligible.lock().unwrap().remove(key)
     }
 
+    /// Marks the next open of `key` as one a creating send the store actor serves asked for,
+    /// as a send does before it opens its session, so a test can open the session directly.
+    #[cfg(test)]
+    pub(crate) fn mark_store_eligible(&self, key: &LineageKey) {
+        self.inner
+            .store_eligible
+            .lock()
+            .unwrap()
+            .insert(key.clone());
+    }
+
     pub(crate) async fn check_session_log(&self, key: &LineageKey) -> Result<(), OpenError> {
         LineageRegistry {
             inner: self.inner.clone(),

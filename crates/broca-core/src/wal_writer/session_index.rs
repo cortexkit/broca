@@ -146,15 +146,14 @@ impl AdmissionWal {
             };
             if unstarted {
                 if let Some((ordinary, ephemeral, durable, classes)) = &self.placement {
-                    let path = if retention.is_some() {
-                        ephemeral
-                    } else if session_class
-                        .as_ref()
-                        .is_some_and(|class| classes.contains(class))
-                    {
-                        durable
-                    } else {
-                        ordinary
+                    let path = match broca_wal::placement(
+                        retention.is_some(),
+                        session_class.as_deref(),
+                        classes,
+                    ) {
+                        broca_wal::StorageClass::Ephemeral => ephemeral,
+                        broca_wal::StorageClass::Durable => durable,
+                        broca_wal::StorageClass::Ordinary => ordinary,
                     };
                     self.wal.relocate_unstarted(path)?;
                     self.legacy_fence.0 = path.clone();

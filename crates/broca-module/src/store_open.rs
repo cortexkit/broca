@@ -10,6 +10,12 @@
 //! plain session is served from the module's start; an encrypted one once the deployment key has
 //! loaded from the vault. `session_storage.encryption` in `broca.jsonc` chooses the mode of the
 //! sessions created here.
+//!
+//! The new storage is three complete stores, one per backup class (`broca_wal::StorageClass`):
+//! each root has its own heads, logs, objects and setup parts, and all share the deployment key.
+//! A session is created in the root its creating send's class places it in
+//! (`broca_wal::placement`), and from then on the root holding its head is where it is opened,
+//! read and written. A head found in two roots is refused by name, never served from either.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -24,6 +30,7 @@ use broca_session_store::head::SessionTriple;
 use broca_session_store::keys::{Cipher, DeploymentKey};
 use broca_session_store::session::{Position, Session, SessionError, SessionView};
 use broca_session_store::setup::SetupStore;
+use broca_wal::StorageClass;
 use tokio::sync::mpsc;
 
 use crate::executor::RunExecutor;
@@ -47,12 +54,10 @@ pub struct StoreRuntime {
     /// What sessions are opened with before the key has loaded: plain sessions open, encrypted
     /// ones refuse.
     unloaded: DeploymentKey,
-    /// The encrypted sessions' setup parts, loaded from their setup store when the key loaded.
-    /// Each mode keeps its own parts, so a part stored in one mode's name space never counts as
-    /// stored in the other's.
-    parts: SharedParts,
-    /// The plain sessions' setup parts, loaded from their setup store when the runtime opened.
-    plain_parts: SharedParts,
+    /// Each class root's setup parts, by [`StorageClass::index`]. A root keeps its own, so a
+    /// part stored in one root never counts as stored in another: a session's root holds every
+    /// part its runs name.
+    roots: [RootParts; 3],
     executor: Arc<dyn RunExecutor>,
     idle_ttl: Duration,
     /// Where the spend facts of a session's runs are written. Without it, runs that end stay
@@ -68,11 +73,22 @@ pub struct StoreRuntime {
     views: crate::store_reads::ViewCache,
 }
 
+/// One class root's setup parts.
+struct RootParts {
+    /// The encrypted sessions' setup parts, loaded from the root's setup store when the key
+    /// loaded. Each mode keeps its own parts, so a part stored in one mode's name space never
+    /// counts as stored in the other's.
+    parts: SharedParts,
+    /// The plain sessions' setup parts, loaded from the root's setup store when the runtime
+    /// opened.
+    plain_parts: SharedParts,
+}
+
 impl StoreRuntime {
-    /// The runtime for the new storage under `state_root`, its folder
-    /// [`broca_wal::SESSION_STORAGE_DIR`], with its deployment key loaded. Loads every setup
-    /// part the deployment holds, in both modes, so a run started before the module did reads its
-    /// parts back. It creates sessions in the mode `deployment` creates them in.
+    /// The runtime for the new storage under `state_root`, its three class roots (see
+    /// [`StorageClass::store_dir`]), with its deployment key loaded. Loads every setup part each
+    /// root holds, in both modes, so a run started before the module did reads its parts back.
+    /// It creates sessions in the mode `deployment` creates them in.
     pub async fn open(
         state_root: &Path,
         deployment: DeploymentKey,
@@ -93,8 +109,8 @@ impl StoreRuntime {
     }
 
     /// The runtime for the new storage under `state_root` before deployment key `key_id` has
-    /// loaded. It serves plain sessions, whose setup parts it loads, and creates sessions in mode
-    /// `new_sessions`, which it can do only for plain ones until the key loads.
+    /// loaded. It serves plain sessions, whose setup parts it loads from each root, and creates
+    /// sessions in mode `new_sessions`, which it can do only for plain ones until the key loads.
     pub async fn open_without_key(
         state_root: &Path,
         key_id: u16,
@@ -102,22 +118,34 @@ impl StoreRuntime {
         executor: Arc<dyn RunExecutor>,
         idle_ttl: Duration,
     ) -> Result<Self, String> {
-        let backend = LocalBackend::new(store_root(state_root));
         let plain = broca_session_store::setup::SetupKey::plain();
-        let loaded = SetupStore::new(&backend, &plain)
-            .load_all()
-            .await
-            .map_err(|error| {
-                format!("the new storage's plain setup parts could not be loaded: {error:?}")
-            })?;
+        let mut roots = Vec::with_capacity(StorageClass::ALL.len());
+        for class in StorageClass::ALL {
+            let backend = LocalBackend::new(class.store_root(state_root));
+            let loaded = SetupStore::new(&backend, &plain)
+                .load_all()
+                .await
+                .map_err(|error| {
+                    format!(
+                        "the new storage's plain setup parts in its {class} root could not be \
+                         loaded: {error:?}"
+                    )
+                })?;
+            roots.push(RootParts {
+                parts: SharedParts::new(Box::new(DeploymentParts::default())),
+                plain_parts: SharedParts::new(Box::new(DeploymentParts::loaded(loaded))),
+            });
+        }
+        let roots: [RootParts; 3] = roots
+            .try_into()
+            .unwrap_or_else(|_| unreachable!("one entry per class"));
         Ok(Self {
             state_root: state_root.to_path_buf(),
             key_id,
             new_sessions,
             deployment: OnceLock::new(),
             unloaded: DeploymentKey::unloaded(key_id).creating(new_sessions),
-            parts: SharedParts::new(Box::new(DeploymentParts::default())),
-            plain_parts: SharedParts::new(Box::new(DeploymentParts::loaded(loaded))),
+            roots,
             executor,
             idle_ttl,
             billing: None,
@@ -130,27 +158,41 @@ impl StoreRuntime {
         })
     }
 
-    /// The encrypted sessions' setup parts, read under `deployment`, which must have loaded.
+    /// The encrypted sessions' setup parts of each class root, by [`StorageClass::index`], read
+    /// under `deployment`, which must have loaded.
     async fn load_encrypted_parts(
         &self,
         deployment: &DeploymentKey,
-    ) -> Result<LoadedParts, String> {
-        let backend = LocalBackend::new(store_root(&self.state_root));
+    ) -> Result<Vec<LoadedParts>, String> {
         let key = deployment
             .setup_key_for(Cipher::XChaCha20Poly1305)
             .ok_or("the deployment key offered has not loaded")?;
-        SetupStore::new(&backend, &key)
-            .load_all()
-            .await
-            .map_err(|error| {
-                format!("the new storage's setup parts could not be loaded: {error:?}")
-            })
+        let mut loaded = Vec::with_capacity(StorageClass::ALL.len());
+        for class in StorageClass::ALL {
+            let backend = self.backend(class);
+            loaded.push(
+                SetupStore::new(&backend, &key)
+                    .load_all()
+                    .await
+                    .map_err(|error| {
+                        format!(
+                        "the new storage's setup parts in its {class} root could not be loaded: \
+                         {error:?}"
+                    )
+                    })?,
+            );
+        }
+        Ok(loaded)
     }
 
-    /// Installs the deployment key and the encrypted sessions' setup parts read under it, so
-    /// encrypted sessions are served from now on. The parts go in first: whoever sees the key
-    /// installed finds them. A runtime keeps the first key installed.
-    fn install_key(&self, deployment: DeploymentKey, parts: LoadedParts) -> Result<(), String> {
+    /// Installs the deployment key and the encrypted sessions' setup parts read under it, one
+    /// list per class root, so encrypted sessions are served from now on. The parts go in first:
+    /// whoever sees the key installed finds them. A runtime keeps the first key installed.
+    fn install_key(
+        &self,
+        deployment: DeploymentKey,
+        parts: Vec<LoadedParts>,
+    ) -> Result<(), String> {
         if deployment.id() != self.key_id {
             return Err(format!(
                 "deployment key {} was offered for the new storage, which is opened with key {}",
@@ -161,12 +203,14 @@ impl StoreRuntime {
         if self.key_loaded() {
             return Ok(());
         }
-        *self
-            .parts
-            .0
-            .lock()
-            .map_err(|_| "a holder of the encrypted setup parts panicked")? =
-            Box::new(DeploymentParts::loaded(parts));
+        for (root, parts) in self.roots.iter().zip(parts) {
+            *root
+                .parts
+                .0
+                .lock()
+                .map_err(|_| "a holder of the encrypted setup parts panicked")? =
+                Box::new(DeploymentParts::loaded(parts));
+        }
         let _ = self.deployment.set(deployment.creating(self.new_sessions));
         Ok(())
     }
@@ -212,13 +256,15 @@ impl StoreRuntime {
         Arc::clone(&self.import_roots)
     }
 
-    /// The setup parts of sessions in mode `cipher`. A run start names its tools and plan by
-    /// part, and a read or a head resolves them through these. The encrypted sessions' parts are
-    /// empty until the deployment key loads, and no encrypted session is served before then.
-    pub fn parts_for(&self, cipher: Cipher) -> &SharedParts {
+    /// The setup parts of the sessions in mode `cipher` in the root of `class`. A run start names
+    /// its tools and plan by part, and a read or a head resolves them through these. The
+    /// encrypted sessions' parts are empty until the deployment key loads, and no encrypted
+    /// session is served before then.
+    pub fn parts_for(&self, class: StorageClass, cipher: Cipher) -> &SharedParts {
+        let root = &self.roots[class.index()];
         match cipher {
-            Cipher::XChaCha20Poly1305 => &self.parts,
-            Cipher::None => &self.plain_parts,
+            Cipher::XChaCha20Poly1305 => &root.parts,
+            Cipher::None => &root.plain_parts,
         }
     }
 
@@ -249,10 +295,22 @@ impl StoreRuntime {
         self.key_id
     }
 
-    /// Whether the session `key` is kept in the new storage: whether its head exists. A head
-    /// that can't be checked is an error, never read as absent.
+    /// Whether the session `key` is kept in the new storage: whether its head exists in one of
+    /// its roots. A head that can't be checked, or one found in two roots, is an error, never
+    /// read as absent.
     pub fn holds(&self, key: &BindIdentity) -> Result<bool, OpenError> {
-        head_exists(&self.state_root, key)
+        Ok(self.class_of(key)?.is_some())
+    }
+
+    /// The class of the root holding the session `key`'s head, `None` when no root holds it.
+    /// Errors as [`holds`](Self::holds).
+    pub fn class_of(&self, key: &BindIdentity) -> Result<Option<StorageClass>, OpenError> {
+        head_class(&self.state_root, key)
+    }
+
+    /// The store of the root of `class`.
+    fn backend(&self, class: StorageClass) -> LocalBackend {
+        LocalBackend::new(class.store_root(&self.state_root))
     }
 
     /// The session `key` as it stands now, read-only: writing nothing and taking no lease (see
@@ -264,8 +322,20 @@ impl StoreRuntime {
         &self,
         key: &BindIdentity,
     ) -> Result<Option<Arc<SessionView<LocalBackend>>>, OpenError> {
+        match self.class_of(key)? {
+            Some(class) => self.current_view_in(key, class).await,
+            None => Ok(None),
+        }
+    }
+
+    /// [`current_view`](Self::current_view) of the session `key`, kept in the root of `class`.
+    async fn current_view_in(
+        &self,
+        key: &BindIdentity,
+        class: StorageClass,
+    ) -> Result<Option<Arc<SessionView<LocalBackend>>>, OpenError> {
         let addr = SessionAddr(broca_core::session_addr(key));
-        let backend = LocalBackend::new(store_root(&self.state_root));
+        let backend = self.backend(class);
         for _ in 0..POSITION_TRIES {
             let position = match Session::stored_position(&backend, &addr, self.deployment()).await
             {
@@ -273,7 +343,7 @@ impl StoreRuntime {
                 Ok(None) => return Ok(None),
                 Err(error) => return Err(view_error(error)),
             };
-            match self.view_at(key, position).await {
+            match self.view_at(key, class, position).await {
                 // A writer moved the head between the probe and the load: probe again.
                 Err(SessionError::Moved) => continue,
                 Err(SessionError::Missing) => return Ok(None),
@@ -288,16 +358,18 @@ impl StoreRuntime {
         }
     }
 
-    /// The session `key` as it stood at `position`: the kept view, or one loaded there and kept.
+    /// The session `key`, kept in the root of `class`, as it stood at `position`: the kept view,
+    /// or one loaded there and kept.
     pub async fn view_at(
         &self,
         key: &BindIdentity,
+        class: StorageClass,
         position: Position,
     ) -> Result<Arc<SessionView<LocalBackend>>, SessionError> {
         let addr = broca_core::session_addr(key);
         let triple = triple(key);
         let load = Session::view_at(
-            LocalBackend::new(store_root(&self.state_root)),
+            self.backend(class),
             SessionAddr(addr.clone()),
             &triple,
             self.deployment(),
@@ -317,10 +389,15 @@ impl StoreRuntime {
     ) -> Result<Option<crate::store_reads::StoreReadReply>, crate::serve::ServeError> {
         use crate::store_reads::{execute, ReadContext, StoreReadOutcome};
         let addr = broca_core::session_addr(key);
-        // A read resolves setup parts in the mode of the session it reads.
+        // The root the session is kept in. A session never changes roots, so a read that finds
+        // none finds no session.
+        let Some(class) = self.class_of(key)? else {
+            return Ok(None);
+        };
+        // A read resolves setup parts in the root and mode of the session it reads.
         let context =
             |view: &SessionView<LocalBackend>, held: bool, open: bool, live_step| ReadContext {
-                parts: self.parts_for(view.head().cipher()),
+                parts: self.parts_for(class, view.head().cipher()),
                 held,
                 open,
                 settled: Some((self.settled_runs(), &addr)),
@@ -347,7 +424,7 @@ impl StoreRuntime {
                 Some(StoreReadOutcome::Stored {
                     position,
                     live_step,
-                }) => match self.view_at(key, position).await {
+                }) => match self.view_at(key, class, position).await {
                     Ok(view) => {
                         let context = context(&view, true, true, live_step.as_ref());
                         return Ok(Some(execute(&view, &context, &request).await));
@@ -360,7 +437,7 @@ impl StoreRuntime {
                 Some(StoreReadOutcome::Reopen) | None => break,
             }
         }
-        let Some(view) = self.current_view(key).await? else {
+        let Some(view) = self.current_view_in(key, class).await? else {
             return Ok(None);
         };
         let slot = registry.slot_state(key);
@@ -368,20 +445,27 @@ impl StoreRuntime {
         Ok(Some(execute(&view, &context, &request).await))
     }
 
-    /// Opens the session `key` as the actor for registry slot `gen`, creating it when `create`.
-    /// The caller holds the session `lease`, which the actor keeps for its whole life.
+    /// Opens the session `key` as the actor for registry slot `gen`: creating it in the root of
+    /// class `create` when that is given, else loading it from the root holding its head. The
+    /// caller holds the session `lease`, which the actor keeps for its whole life.
     pub async fn open_actor(
         &self,
         key: &BindIdentity,
         gen: u64,
         registry: RegistryHandle,
         lease: Box<dyn std::any::Any + Send>,
-        create: bool,
+        create: Option<StorageClass>,
     ) -> Result<ActorHandle, OpenError> {
         let addr = SessionAddr(broca_core::session_addr(key));
         let triple = triple(key);
-        let backend = LocalBackend::new(store_root(&self.state_root));
-        let session = if create {
+        let class = match create {
+            Some(class) => class,
+            None => self
+                .class_of(key)?
+                .ok_or_else(|| open_error(SessionError::Missing, false))?,
+        };
+        let backend = self.backend(class);
+        let session = if create.is_some() {
             // The feature floor lists what this state root's logs need a build to understand.
             // Release placement (`scripts/place-release.sh`) refuses to install a build that
             // doesn't know a listed feature, and builds older than the one that refuses
@@ -402,29 +486,29 @@ impl StoreRuntime {
         } else {
             Session::load(backend, addr, &triple, self.deployment()).await
         }
-        .map_err(|error| open_error(error, create))?;
-        // The session reads and stores its setup parts in its own mode.
+        .map_err(|error| open_error(error, create.is_some()))?;
+        // The session reads and stores its setup parts in its own root and mode.
         let cipher = session.head().cipher();
         let setup_key = self
             .deployment()
             .setup_key_for(cipher)
             .ok_or_else(|| key_unavailable(self.key_id))?;
         let storage = SetupParts {
-            backend: LocalBackend::new(store_root(&self.state_root)),
+            backend: self.backend(class),
             key: setup_key,
         };
         let mut actor = StoreActor::new(
             key.clone(),
             session,
             Arc::clone(&self.executor),
-            Box::new(self.parts_for(cipher).clone()),
+            Box::new(self.parts_for(class, cipher).clone()),
         )
         .with_storage(storage)
         .with_settled(Arc::clone(&self.settled))
         // A send's attachments are uploaded beside the session, under the state root, whichever
         // storage keeps it.
         .with_uploads(broca_core::media_uploads::Uploads::at(&self.state_root));
-        let readers_root = store_root(&self.state_root);
+        let readers_root = class.store_root(&self.state_root);
         actor = actor.with_readers(Arc::new(move || LocalBackend::new(readers_root.clone())));
         if let Some(billing) = &self.billing {
             actor = actor.with_billing(billing.clone());
@@ -635,9 +719,10 @@ impl StoreSlot {
     }
 
     /// Whether the session `key` is kept in the new storage, whether or not the deployment key
-    /// has loaded: one `symlink_metadata` of its head.
+    /// has loaded: one check of its head in each class root. A head found in two roots is
+    /// refused `session_in_two_classes`.
     pub fn holds(&self, key: &BindIdentity) -> Result<bool, OpenError> {
-        head_exists(&self.state_root, key)
+        Ok(head_class(&self.state_root, key)?.is_some())
     }
 
     /// The runtime when the new storage keeps the session `key`; `None` for a session it
@@ -648,11 +733,12 @@ impl StoreSlot {
     /// session: the open that serves it checks the head in that mode, and refuses a head that
     /// fails as damage, never reading it in the other mode.
     pub fn holding(&self, key: &BindIdentity) -> Result<Option<Arc<StoreRuntime>>, OpenError> {
-        if !self.holds(key)? {
+        let Some(class) = head_class(&self.state_root, key)? else {
             return Ok(None);
-        }
+        };
         if let Some(runtime) = self.runtime.get() {
-            if runtime.key_loaded() || stored_cipher(&self.state_root, key)? == Cipher::None {
+            if runtime.key_loaded() || stored_cipher(&self.state_root, class, key)? == Cipher::None
+            {
                 return Ok(Some(Arc::clone(runtime)));
             }
         }
@@ -684,17 +770,31 @@ pub fn key_unavailable(key_id: u16) -> OpenError {
     }
 }
 
-/// Whether the session `key` has a head in the new storage under `state_root`: one
-/// `symlink_metadata`. A head that can't be checked is an error, never read as absent.
-fn head_exists(state_root: &Path, key: &BindIdentity) -> Result<bool, OpenError> {
-    let head = broca_wal::session_storage_head(state_root, &broca_core::session_addr(key));
-    match std::fs::symlink_metadata(head) {
+/// The refusal of a session whose head is in two of the new storage's roots: damage, which an
+/// operator must look at, so it is permanent and never served from either root.
+fn session_in_two_classes(refusal: &broca_wal::SessionInTwoClasses) -> OpenError {
+    OpenError::Classified {
+        reason: refusal.to_string(),
+        class: broca_protocol::ErrorClass::Permanent,
+    }
+}
+
+/// The class of the root under `state_root` holding the session `key`'s head: one
+/// `symlink_metadata` of its head in each root. A head that can't be checked is an error, never
+/// read as absent, and a head in two roots is refused `session_in_two_classes`.
+fn head_class(state_root: &Path, key: &BindIdentity) -> Result<Option<StorageClass>, OpenError> {
+    let present = |head: &Path| match std::fs::symlink_metadata(head) {
         Ok(_) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(OpenError::Open(format!(
-            "the new storage's head of this session could not be checked: {error}"
-        ))),
-    }
+        Err(error) => Err(error),
+    };
+    broca_wal::session_storage_class_by(state_root, &broca_core::session_addr(key), present)
+        .map_err(|error| match broca_wal::SessionInTwoClasses::of(&error) {
+            Some(refusal) => session_in_two_classes(refusal),
+            None => OpenError::Open(format!(
+                "the new storage's head of this session could not be checked: {error}"
+            )),
+        })
 }
 
 /// How many times a read probes the session's position again after a writer moved its head
@@ -717,16 +817,20 @@ fn view_error(error: SessionError) -> OpenError {
     }
 }
 
-/// The cipher mode the head of the session `key` names, read without checking the head: only to
-/// route the session before the deployment key has loaded. A head that can't be read or decoded
-/// is an error, so the session is never served on a guess.
-fn stored_cipher(state_root: &Path, key: &BindIdentity) -> Result<Cipher, OpenError> {
+/// The cipher mode the head of the session `key`, kept in the root of `class`, names, read
+/// without checking the head: only to route the session before the deployment key has loaded. A
+/// head that can't be read or decoded is an error, so the session is never served on a guess.
+fn stored_cipher(
+    state_root: &Path,
+    class: StorageClass,
+    key: &BindIdentity,
+) -> Result<Cipher, OpenError> {
     let unreadable = |error: String| {
         OpenError::Open(format!(
             "the new storage's head of this session could not be read: {error}"
         ))
     };
-    let (stored, _) = LocalBackend::new(store_root(state_root))
+    let (stored, _) = LocalBackend::new(class.store_root(state_root))
         .read_stored_head(&SessionAddr(broca_core::session_addr(key)))
         .map_err(|error| unreadable(format!("{error:?}")))?
         .ok_or_else(|| unreadable("it no longer exists".into()))?;
@@ -736,11 +840,6 @@ fn stored_cipher(state_root: &Path, key: &BindIdentity) -> Result<Cipher, OpenEr
 
 /// Setup parts as a setup store's `load_all` reads them.
 type LoadedParts = Vec<(broca_session_store::codec::Digest, Arc<[u8]>)>;
-
-/// The new storage's folder under `state_root`.
-fn store_root(state_root: &Path) -> PathBuf {
-    state_root.join(broca_wal::SESSION_STORAGE_DIR)
-}
 
 /// The triple a session is created and loaded under: the bind identity's, spelled as
 /// `broca_core::session_addr` spells it, so the triple and the address name one session.
@@ -758,3 +857,7 @@ fn open_error(error: SessionError, create: bool) -> OpenError {
         "the session could not be {action} in the new storage: {error:?}"
     ))
 }
+
+#[cfg(test)]
+#[path = "store_open_tests.rs"]
+mod tests;

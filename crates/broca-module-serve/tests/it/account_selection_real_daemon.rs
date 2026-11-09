@@ -1515,8 +1515,11 @@ impl Rig {
         .unwrap();
         let incarnation = broca_session_store::codec::hex(&session.head().incarnation.0);
         drop(session);
-        let head =
-            broca_wal::session_storage_head(&self.state_root, &broca_core::session_addr(identity));
+        let head = broca_wal::session_storage_head(
+            &self.state_root,
+            broca_wal::StorageClass::Ordinary,
+            &broca_core::session_addr(identity),
+        );
         assert!(
             head.exists(),
             "{}: the session's head is where the daemon looks for it: {}",

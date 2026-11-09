@@ -497,7 +497,9 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> DefaultOpener<L, W> {
             // session in the new storage is served from there, and refused while it is encrypted
             // and its key hasn't loaded; one that exists in neither storage starts there when the
             // registry marked its creating send and the runtime can create it in the mode new
-            // sessions take. The actor keeps the lease until its session is closed.
+            // sessions take. It starts in the root of the class its creating send places it in,
+            // by the rule today's storage places its WAL by. The actor keeps the lease until its
+            // session is closed.
             let held = slot.holding(key)?;
             let create = held.is_none()
                 && !status
@@ -509,8 +511,15 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> DefaultOpener<L, W> {
                 None => None,
             };
             if let Some(store) = store {
+                let class = create.then(|| {
+                    broca_wal::placement(
+                        retention.is_some(),
+                        session_class.as_deref(),
+                        &self.wal_store.backup_classes(),
+                    )
+                });
                 return store
-                    .open_actor(key, gen, registry, Box::new(authority), create)
+                    .open_actor(key, gen, registry, Box::new(authority), class)
                     .await;
             }
         }

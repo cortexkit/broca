@@ -72,6 +72,7 @@ pub(crate) fn plant_journal(root: &std::path::Path, key: &BindIdentity) {
         staging: format!("staging/{MOVE_ID}"),
         frozen: None,
         appends_in_conversation: None,
+        class: Some(broca_wal::StorageClass::Ordinary),
     };
     std::fs::write(path, serde_json::to_vec(&journal).unwrap()).unwrap();
 }
@@ -79,7 +80,11 @@ pub(crate) fn plant_journal(root: &std::path::Path, key: &BindIdentity) {
 /// Plants `key`'s head in the new storage under `root`: today's readers look only at whether
 /// it exists.
 pub(crate) fn plant_head(root: &std::path::Path, key: &BindIdentity) {
-    let head = broca_wal::session_storage_head(root, &broca_core::session_addr(key));
+    let head = broca_wal::session_storage_head(
+        root,
+        broca_wal::StorageClass::Ordinary,
+        &broca_core::session_addr(key),
+    );
     std::fs::create_dir_all(head.parent().unwrap()).unwrap();
     std::fs::write(head, b"head").unwrap();
 }

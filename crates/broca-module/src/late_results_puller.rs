@@ -4088,7 +4088,11 @@ mod tests {
             &[broca_wal::PROVIDER_HELD_FEATURE],
         )
         .unwrap();
-        let head = broca_wal::session_storage_head(&wal_root, &broca_core::session_addr(&moved));
+        let head = broca_wal::session_storage_head(
+            &wal_root,
+            broca_wal::StorageClass::Durable,
+            &broca_core::session_addr(&moved),
+        );
         std::fs::create_dir_all(head.parent().unwrap()).unwrap();
         std::fs::write(&head, b"head").unwrap();
         let store = LateResultsStore::open(&root.join("late-results.db")).unwrap();

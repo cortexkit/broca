@@ -413,7 +413,9 @@ impl Side {
     }
 
     fn holds(&self) -> bool {
-        broca_wal::session_storage_head(&self.dir, &broca_core::session_addr(&self.key)).exists()
+        broca_wal::session_storage_class(&self.dir, &broca_core::session_addr(&self.key))
+            .unwrap()
+            .is_some()
     }
 
     /// Asserts the session's latest run is `run_id` and completed.

@@ -2700,10 +2700,12 @@ pub trait ServeHandler: Send + Sync {
     }
 
     /// `session.move_to_store`: moves the session from today's storage into the new storage
-    /// (see `registry::store_move`). A handler without the new storage refuses by name.
+    /// (see `registry::store_move`), into the root of `class` when the operator asked for one. A
+    /// handler without the new storage refuses by name.
     async fn move_to_store(
         &self,
         _session: &LineageKey,
+        _class: Option<broca_wal::StorageClass>,
     ) -> Result<serde_json::Value, crate::registry::store_move::MoveRefusal> {
         Err(crate::registry::store_move::MoveRefusal::new(
             "store_unavailable",
@@ -3873,8 +3875,9 @@ impl ServeHandler for crate::LineageRegistry {
     async fn move_to_store(
         &self,
         session: &LineageKey,
+        class: Option<broca_wal::StorageClass>,
     ) -> Result<serde_json::Value, crate::registry::store_move::MoveRefusal> {
-        crate::LineageRegistry::move_to_store(self, session).await
+        crate::LineageRegistry::move_to_store(self, session, class).await
     }
 
     async fn import(&self, req: SessionImportRequest) -> Result<SessionImportResponse, ServeError> {

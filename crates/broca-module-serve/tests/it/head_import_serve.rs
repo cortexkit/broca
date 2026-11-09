@@ -515,7 +515,8 @@ async fn a_store_session_refuses_unbuilt_ops_by_name_and_checks_owners_from_the_
 /// `session.move_to_store` through real dispatch. Only the operator's own connection may call
 /// it. The new storage serves every operation a move requires, so precondition 1 passes; a
 /// session with no WAL on today's storage then has nothing to move, and the move refuses
-/// `not_movable {no_live_wal}`, writing nothing. The full move is
+/// `not_movable {no_live_wal}`, writing nothing. The operator's `class` param reaches the move
+/// when it is `"durable"` and is refused `invalid_params` otherwise. The full move is
 /// `store_move_serve::a_live_session_moves_to_the_new_storage_and_keeps_serving`.
 #[tokio::test]
 async fn a_move_is_operator_only_and_refuses_a_session_with_no_wal() {
@@ -545,10 +546,34 @@ async fn a_move_is_operator_only_and_refuses_a_session_with_no_wal() {
     assert_eq!(body["code"], "not_movable", "{body}");
     assert_eq!(body["detail"]["reason"], "no_live_wal", "{body}");
     assert!(
-        !rig.dir
-            .join(broca_wal::SESSION_STORAGE_DIR)
+        !broca_wal::session_storage_moves(&rig.dir)
             .join(broca_wal::MOVE_JOURNAL_DIR)
             .exists(),
         "a refused move writes no journal"
     );
+    // The operator may ask for the durable root; the request reaches the move, which refuses
+    // for the missing WAL as before. Any other class is refused before the move starts.
+    let durable = rig
+        .request(
+            2,
+            serde_json::json!({"method": "session.move_to_store", "params": {"class": "durable"}}),
+        )
+        .await;
+    let body: serde_json::Value = serde_json::from_slice(&durable.body).unwrap();
+    assert_eq!(body["detail"]["reason"], "no_live_wal", "{body}");
+    for class in [
+        serde_json::json!("ordinary"),
+        serde_json::json!("ephemeral"),
+        serde_json::json!(true),
+    ] {
+        let refused = rig
+            .request(
+                2,
+                serde_json::json!({"method": "session.move_to_store", "params": {"class": class}}),
+            )
+            .await;
+        assert_eq!(refused.header.ty, FrameType::Error);
+        let body: serde_json::Value = serde_json::from_slice(&refused.body).unwrap();
+        assert_eq!(body["code"], "invalid_params", "{class}: {body}");
+    }
 }

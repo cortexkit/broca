@@ -5,21 +5,26 @@
 //! `cursor_expired`.
 //!
 //! The operation, in order:
-//! 1. **Preconditions** refuse `not_movable {reason}` and write nothing.
-//! 2. **Journal** `session-store/moves/<addr>`, synced. Startup acts only on journals, and from
-//!    here every reader of today's storage treats the session as the new storage's
-//!    (`broca_wal::owned_by_store`).
+//! 1. **Preconditions** refuse `not_movable {reason}` and write nothing. The session moves into
+//!    the root of the class its WAL's folder has (`wal-durable/` → durable, `wal-ephemeral/` →
+//!    ephemeral, `wal/` → ordinary), or the durable root when the operator asks for it for a
+//!    session in `wal/` (see [`StoreMove::run`]).
+//! 2. **Journal** `session-store-moves/journals/<addr>`, synced, naming the destination class.
+//!    Startup acts only on journals, and from here every reader of today's storage treats the
+//!    session as the new storage's (`broca_wal::owned_by_store`).
 //! 3. **Fence** (`registry::store_move`), then **freeze** the WAL at its synced end with the
 //!    move id as cut id, record the frozen prefix's length and SHA-256, and check the
 //!    preconditions again on exactly that prefix.
-//! 4. **Stage** a complete session under `session-store/staging/<move id>/`
+//! 4. **Stage** a complete session under `session-store-moves/staging/<move id>/`
 //!    (`broca_session_convert::stage`) and **verify** it against the frozen prefix
-//!    (`broca_session_convert::verify`).
+//!    (`broca_session_convert::verify`). The staging folder is outside every class root, so a
+//!    backup of the durable root never carries a half-staged session, and on the state root's
+//!    filesystem, so publishing it is still a rename.
 //! 5. **Raise the feature floor** (the state root's list of log features a build must know to
 //!    be placed on it) to `session-storage/v1`, so no build that can't serve the moved session
 //!    from the new storage is installed afterwards.
-//! 6. **Publish**: rename the staged log and objects into the live root, sync, then write the
-//!    head with `expected = None`. The head write is the only point of no return.
+//! 6. **Publish**: rename the staged log and objects into the destination root, sync, then write
+//!    the head with `expected = None`. The head write is the only point of no return.
 //! 7. **Seal**: today's freeze becomes the `moved` marker (`migration::release`), the
 //!    registry's caches and the session's materialized rows are dropped, today's late-results
 //!    intake forgets the session, then the staging folder and the journal go, the journal last.
@@ -41,7 +46,9 @@ use broca_session_convert::verify::{MediaRoot, Mode, Verify};
 use broca_session_loop::parts::Parts as _;
 use broca_session_store::backend::{LocalBackend, SessionAddr, SessionBackend as _};
 use broca_wal::migration::{self, Freeze, MoveRefusal as MarkerRefusal};
-use broca_wal::{FramedRecord, FrozenPrefix, MoveJournal, StoreOwnership, WalLineageId};
+use broca_wal::{
+    FramedRecord, FrozenPrefix, MoveJournal, StorageClass, StoreOwnership, WalLineageId,
+};
 use serde_json::json;
 
 /// Who holds a moved session's WAL, as the `moved` marker names it.
@@ -232,8 +239,12 @@ impl StoreMove {
 
 #[async_trait::async_trait]
 impl StoreMover for StoreMove {
-    async fn move_to_store(&self, key: &BindIdentity) -> Result<serde_json::Value, MoveRefusal> {
-        match self.run(key).await {
+    async fn move_to_store(
+        &self,
+        key: &BindIdentity,
+        class: Option<StorageClass>,
+    ) -> Result<serde_json::Value, MoveRefusal> {
+        match self.run(key, class).await {
             Ok(reply) => Ok(reply),
             Err(Stop::Refused(refusal)) => Err(refusal),
             #[cfg(test)]
@@ -268,11 +279,6 @@ fn new_move_id() -> Result<String, MoveRefusal> {
         &hex[16..20],
         &hex[20..]
     ))
-}
-
-/// The new storage's root under `state_root`.
-fn store_root(state_root: &Path) -> PathBuf {
-    state_root.join(broca_wal::SESSION_STORAGE_DIR)
 }
 
 /// Writes `journal` to its file, synced: a temporary sibling, synced, renamed over the
@@ -330,6 +336,42 @@ struct TodaysMedia {
     class: broca_core::media_store::MediaStoreClass,
 }
 
+/// The class of the session whose live WAL is `wal`, as the WAL's folder has it: the folder
+/// today's storage placed it in when it was created.
+fn wal_class(wal_store: &broca_core::FileWalStore, wal: &Path) -> StorageClass {
+    if wal.parent() == Some(wal_store.durable_root().as_path()) {
+        StorageClass::Durable
+    } else if wal.parent() == Some(wal_store.ephemeral_root().as_path()) {
+        StorageClass::Ephemeral
+    } else {
+        StorageClass::Ordinary
+    }
+}
+
+/// The class a session whose WAL is of class `source` moves into, when the operator asked for
+/// `requested`. Without a request it keeps its class. The one change allowed is an ordinary
+/// session into the durable root, for a long-lived session created without the label that would
+/// have made it durable, which today's storage can't add later. Any other request is refused
+/// `not_movable {reason: "class_refused"}`: a session with a retention policy never moves
+/// where backups capture it, and a durable session never leaves the backed-up root.
+fn destination_class(
+    source: StorageClass,
+    requested: Option<StorageClass>,
+) -> Result<StorageClass, MoveRefusal> {
+    match requested {
+        None => Ok(source),
+        Some(requested) if requested == source => Ok(source),
+        Some(StorageClass::Durable) if source == StorageClass::Ordinary => {
+            Ok(StorageClass::Durable)
+        }
+        Some(requested) => Err(not_movable("class_refused").with_detail(json!({
+            "reason": "class_refused",
+            "class": requested.name(),
+            "wal_class": source.name(),
+        }))),
+    }
+}
+
 /// Today's media store for the session whose live WAL is `wal`: the store of the class the WAL's
 /// folder chooses, where the module publishes the session's media. `None` when the session's
 /// `records` name no medium, or when that store doesn't exist, since opening it would create it:
@@ -344,12 +386,10 @@ fn todays_media(
     if broca_session_convert::stage::media_digests(records).is_empty() {
         return Ok(None);
     }
-    let class = if wal.parent() == Some(wal_store.durable_root().as_path()) {
-        MediaStoreClass::Durable
-    } else if wal.parent() == Some(wal_store.ephemeral_root().as_path()) {
-        MediaStoreClass::Ephemeral
-    } else {
-        MediaStoreClass::NonDurable
+    let class = match wal_class(wal_store, wal) {
+        StorageClass::Durable => MediaStoreClass::Durable,
+        StorageClass::Ephemeral => MediaStoreClass::Ephemeral,
+        StorageClass::Ordinary => MediaStoreClass::NonDurable,
     };
     let root = state_root.join(class.directory());
     if !(root.join("objects").is_dir() && root.join("refs").is_dir()) {
@@ -367,6 +407,8 @@ fn media_bytes(media: &Option<TodaysMedia>) -> Option<&dyn MediaBytes> {
 /// The move's paths, from its journal.
 struct Paths {
     wal: PathBuf,
+    /// The root of the class the session moves into.
+    store: PathBuf,
     staging: PathBuf,
     live_logs: PathBuf,
     live_objects: PathBuf,
@@ -375,19 +417,26 @@ struct Paths {
 
 impl Paths {
     fn of(state_root: &Path, journal: &MoveJournal) -> Self {
-        let store = store_root(state_root);
+        let store = journal.destination().store_root(state_root);
         Self {
             wal: state_root.join(&journal.wal),
-            staging: store.join(&journal.staging),
+            staging: broca_wal::session_storage_moves(state_root).join(&journal.staging),
             live_logs: store.join("logs").join(&journal.address),
             live_objects: store.join("objects").join(&journal.address),
             journal: broca_wal::session_storage_move_journal(state_root, &journal.address),
+            store,
         }
     }
 }
 
 impl StoreMove {
-    pub(crate) async fn run(&self, key: &BindIdentity) -> Result<serde_json::Value, Stop> {
+    /// Moves the session `key` into the new storage, into the root of the class its WAL's folder
+    /// has, or of `class` when the operator asked for one (see [`destination_class`]).
+    pub(crate) async fn run(
+        &self,
+        key: &BindIdentity,
+        class: Option<StorageClass>,
+    ) -> Result<serde_json::Value, Stop> {
         let state_root = self.state_root().to_path_buf();
         let address = broca_core::session_addr(key);
         match broca_wal::store_ownership(&state_root, &address)
@@ -415,6 +464,7 @@ impl StoreMove {
         else {
             return Err(not_movable("no_live_wal").into());
         };
+        let destination = destination_class(wal_class(&self.wal_store, &wal), class)?;
         // The fast refusal: the preconditions on the WAL as it stands, read without a lease.
         // They are checked again on the frozen prefix under the fence.
         let (records, lineage) = read_wal(&wal)?;
@@ -441,9 +491,10 @@ impl StoreMove {
                 .map_err(|_| unavailable("the session's WAL", "outside the state root"))?
                 .to_string_lossy()
                 .into_owned(),
-            staging: format!("staging/{move_id}"),
+            staging: format!("{}/{move_id}", broca_wal::MOVE_STAGING_DIR),
             frozen: None,
             appends_in_conversation: None,
+            class: Some(destination),
         };
         write_journal(&state_root, &journal)
             .map_err(io_failed("the move's journal couldn't be written"))?;
@@ -662,7 +713,7 @@ impl StoreMove {
         before!(self.step("journal_layout"));
         // Stage. The moved session goes on serving the last update today's head serves for it.
         let lineage_text = lineage.map(|id| id.to_string());
-        let store = store_root(&state_root);
+        let store = paths.store.clone();
         let todays_updated_at = broca_module::head_time::updated_at_of_wal(
             &records,
             broca_module::head_time::file_written_ms(&paths.wal),
@@ -714,8 +765,8 @@ impl StoreMove {
         }));
         before!(self.step("verify"));
         // The runtime serving the session reads its setup parts from memory: hold the staged
-        // ones there, already stored.
-        before!(self.hold_parts(runtime, &staged.converted));
+        // ones there, already stored in the destination root.
+        before!(self.hold_parts(runtime, journal.destination(), &staged.converted));
         // Feature floor.
         before!(broca_wal::raise_floor(
             &state_root.join(broca_wal::FEATURE_FLOOR_FILENAME),
@@ -737,6 +788,7 @@ impl StoreMove {
         let reply = json!({
             "moved": true,
             "move_id": journal.move_id,
+            "class": journal.destination().name(),
             "runs": verified.runs,
             "messages": verified.messages,
             "media": verified.media,
@@ -747,6 +799,7 @@ impl StoreMove {
             session = %key.session,
             address = %journal.address,
             move_id = %journal.move_id,
+            class = %journal.destination(),
             runs = verified.runs,
             messages = verified.messages,
             media = verified.media,
@@ -756,15 +809,16 @@ impl StoreMove {
         Ok(reply)
     }
 
-    /// Holds the staged session's setup parts in the runtime's parts, marked stored: they are
-    /// in the setup store already.
+    /// Holds the staged session's setup parts in the runtime's parts of the root of `class`,
+    /// marked stored: they are in that root's setup store already.
     fn hold_parts(
         &self,
         runtime: &broca_module::store_open::StoreRuntime,
+        class: StorageClass,
         converted: &broca_session_convert::Converted,
     ) -> Result<(), MoveRefusal> {
         let mut parts = runtime
-            .parts_for(new_session_cipher(runtime).new_sessions())
+            .parts_for(class, new_session_cipher(runtime).new_sessions())
             .clone();
         for part in converted
             .records
@@ -791,10 +845,11 @@ impl StoreMove {
         Ok(())
     }
 
-    /// Renames the staged log and objects into the live root, then syncs `logs/`, `objects/`
-    /// and their parent. A missing staged folder (a session with no objects) is skipped.
+    /// Renames the staged log and objects into the destination root, then syncs `logs/`,
+    /// `objects/` and their parent. A missing staged folder (a session with no objects) is
+    /// skipped.
     fn publish_data(&self, journal: &MoveJournal, paths: &Paths) -> Result<(), Stop> {
-        let store = store_root(self.state_root());
+        let store = &paths.store;
         for (folder, live, step) in [
             ("logs", &paths.live_logs, "rename_logs"),
             ("objects", &paths.live_objects, "rename_objects"),
@@ -835,8 +890,8 @@ impl StoreMove {
             .await
             .map_err(|error| unavailable("the staged head couldn't be read", format!("{error:?}")))?
             .ok_or_else(|| unavailable("the staged head", "absent"))?;
-        let store = store_root(self.state_root());
-        let live = LocalBackend::new(&store);
+        let store = &paths.store;
+        let live = LocalBackend::new(store);
         live.write_head(&addr, &bytes, None, version)
             .await
             .map_err(|error| unavailable("the head couldn't be written", format!("{error:?}")))?;
@@ -961,7 +1016,7 @@ pub struct Recovered {
 /// The journals under `state_root`, by file name. A journal's temporary sibling (a write that
 /// never completed) is removed: nothing reads it.
 fn journals(state_root: &Path) -> std::io::Result<Vec<(String, PathBuf)>> {
-    let folder = store_root(state_root).join(broca_wal::MOVE_JOURNAL_DIR);
+    let folder = broca_wal::session_storage_moves(state_root).join(broca_wal::MOVE_JOURNAL_DIR);
     let entries = match std::fs::read_dir(&folder) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -990,9 +1045,11 @@ fn read_journal(name: &str, path: &Path) -> Result<MoveJournal, String> {
     Ok(journal)
 }
 
-/// Whether the session at `address` has a live head. Only a head found absent is absent.
-fn head_exists(state_root: &Path, address: &str) -> std::io::Result<bool> {
-    match std::fs::symlink_metadata(broca_wal::session_storage_head(state_root, address)) {
+/// Whether the session `journal` moves has a live head in its destination root. Only a head
+/// found absent is absent.
+fn head_exists(state_root: &Path, journal: &MoveJournal) -> std::io::Result<bool> {
+    let head = broca_wal::session_storage_head(state_root, journal.destination(), &journal.address);
+    match std::fs::symlink_metadata(head) {
         Ok(_) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error),
@@ -1020,7 +1077,7 @@ pub fn recover_at_startup(state_root: &Path) -> Recovered {
                 continue;
             }
         };
-        let outcome = match head_exists(state_root, &journal.address) {
+        let outcome = match head_exists(state_root, &journal) {
             Err(error) => Err(format!("its head couldn't be checked: {error}")),
             Ok(false) => roll_back(state_root, &journal)
                 .map(|()| recovered.rolled_back.push(name.clone()))
@@ -1064,7 +1121,7 @@ pub fn finish_at_startup(
             recovered.refused.push(name);
             continue;
         };
-        if !matches!(head_exists(state_root, &journal.address), Ok(true)) {
+        if !matches!(head_exists(state_root, &journal), Ok(true)) {
             recovered.refused.push(name);
             continue;
         }

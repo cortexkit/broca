@@ -461,8 +461,9 @@ impl Rig {
     /// The session is kept in the new storage, and nothing of it is on today's storage.
     fn assert_store_only(&self) {
         assert!(
-            broca_wal::session_storage_head(&self.dir, &broca_core::session_addr(&self.key))
-                .exists(),
+            broca_wal::session_storage_class(&self.dir, &broca_core::session_addr(&self.key))
+                .unwrap()
+                .is_some(),
             "the session's head is in the new storage"
         );
         assert_eq!(self.wal.wal_present(&self.key), Some(false), "no WAL");

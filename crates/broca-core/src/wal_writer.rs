@@ -793,10 +793,13 @@ impl FileWalStore {
     /// answers for it from an absent WAL or creates one, which would fork the session in two.
     /// A head that can't be checked refuses too, rather than reading as absent.
     fn check_session_storage(&self, session: &BindIdentity) -> Result<(), WalError> {
-        let head = broca_wal::session_storage_head(self.state_root(), &session_addr(session));
-        match std::fs::symlink_metadata(head) {
-            Ok(_) => Err(session_storage_refusal()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        match broca_wal::session_storage_class_by(
+            self.state_root(),
+            &session_addr(session),
+            head_present,
+        ) {
+            Ok(Some(_)) => Err(session_storage_refusal()),
+            Ok(None) => Ok(()),
             Err(error) => Err(WalError::Io(error)),
         }
     }
@@ -1103,6 +1106,29 @@ impl FileWalStore {
             .join(format!("{}.wal", session_addr(session)))
     }
 
+    /// Where a session of `class` keeps its live WAL: the ephemeral, durable or ordinary folder.
+    pub fn class_wal_path(
+        &self,
+        class: broca_wal::StorageClass,
+        session: &BindIdentity,
+    ) -> PathBuf {
+        match class {
+            broca_wal::StorageClass::Ephemeral => self.ephemeral_wal_path(session),
+            broca_wal::StorageClass::Durable => self.durable_wal_path(session),
+            broca_wal::StorageClass::Ordinary => self.wal_path(session),
+        }
+    }
+
+    /// The class a new session's WAL is placed in ([`broca_wal::placement`] over this store's
+    /// `backup_classes`).
+    fn placement(
+        &self,
+        retention: Option<u64>,
+        session_class: Option<&str>,
+    ) -> broca_wal::StorageClass {
+        broca_wal::placement(retention.is_some(), session_class, &self.backup_classes)
+    }
+
     /// Move installation preserves the tree of a session already present locally.
     /// For a new session, the receiving daemon applies its configured backup classes
     /// to the incoming WAL's first RunStarted label.
@@ -1118,8 +1144,7 @@ impl FileWalStore {
         let durable = if archived.member.is_some() {
             archived.durable
         } else {
-            session_class
-                .is_some_and(|class| self.backup_classes.iter().any(|value| value == class))
+            self.placement(None, session_class) == broca_wal::StorageClass::Durable
         };
         Ok(if durable {
             self.durable_wal_path(session)
@@ -1364,14 +1389,8 @@ impl FileWalStore {
             path
         } else if let Some(path) = self.resolve_live_path(session)? {
             path
-        } else if retention.is_some() {
-            self.ephemeral_wal_path(session)
-        } else if session_class
-            .is_some_and(|class| self.backup_classes.iter().any(|value| value == class))
-        {
-            self.durable_wal_path(session)
         } else {
-            self.wal_path(session)
+            self.class_wal_path(self.placement(retention, session_class), session)
         };
         let identity = format!(
             "{}\u{1f}{}\u{1f}{}",
@@ -1530,15 +1549,11 @@ impl FileWalStore {
             return Err(WalError::Io(io::Error::new(io::ErrorKind::InvalidData,
                 "wal_relocation_incomplete: a started session cannot have a pending first-send placement")));
         }
-        let destination = if retention.is_some() {
-            &paths[1]
-        } else if session_class
-            .is_some_and(|class| self.backup_classes.iter().any(|value| value == class))
-        {
-            &paths[2]
-        } else {
-            &paths[0]
-        };
+        let destination = &paths[match self.placement(retention, session_class) {
+            broca_wal::StorageClass::Ordinary => 0,
+            broca_wal::StorageClass::Ephemeral => 1,
+            broca_wal::StorageClass::Durable => 2,
+        }];
         let parent = destination.parent().expect("store WAL paths have a parent");
         let incomplete_paths = live
             .iter()
@@ -2342,6 +2357,17 @@ pub fn session_storage_refusal() -> WalError {
 pub fn is_session_storage_refusal(error: &WalError) -> bool {
     matches!(error, WalError::NewerWriter { missing, .. }
         if missing.iter().any(|name| name == broca_wal::SESSION_STORAGE_FEATURE))
+}
+
+/// Whether the new session storage's head file at `path` exists: one `symlink_metadata`, taken
+/// directly rather than through the WAL's file operations, so checking a session's heads adds
+/// nothing to the I/O today's storage performs through them. Only a head found absent is absent.
+fn head_present(path: &Path) -> io::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 impl WalStore for FileWalStore {
@@ -6681,10 +6707,10 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// A session with a head in the new session storage is refused by name for reads and
-    /// writes, so no path serves it from an absent WAL or creates one beside it. Other sessions
-    /// at the same state root are untouched. A head path that can't be checked refuses too,
-    /// instead of reading as no head.
+    /// A session with a head in any of the new session storage's roots is refused by name for
+    /// reads and writes, so no path serves it from an absent WAL or creates one beside it. Other
+    /// sessions at the same state root are untouched. A head path that can't be checked refuses
+    /// too, instead of reading as no head.
     #[test]
     fn a_session_on_the_new_storage_is_refused_for_reads_and_writes() {
         let root = broca_test_support::scratch_root()
@@ -6695,30 +6721,41 @@ mod tests {
         let session = broca_protocol::BindIdentity::new("/project", "runner", "stored");
         let other = broca_protocol::BindIdentity::new("/project", "runner", "other");
         wal.check_move(&session, true).unwrap();
-        let head = broca_wal::session_storage_head(&root, &super::session_addr(&session));
-        std::fs::create_dir_all(head.parent().unwrap()).unwrap();
-        std::fs::write(&head, b"head").unwrap();
-        for write in [false, true] {
-            match wal.check_move(&session, write) {
-                Err(error @ broca_wal::WalError::NewerWriter { .. }) => {
-                    let broca_wal::WalError::NewerWriter { missing, .. } = &error else {
-                        unreachable!()
-                    };
-                    assert_eq!(missing, &[broca_wal::SESSION_STORAGE_FEATURE]);
-                    assert!(
-                        error.to_string().contains("newer session storage"),
-                        "{error}"
-                    );
+        for class in broca_wal::StorageClass::ALL {
+            let head =
+                broca_wal::session_storage_head(&root, class, &super::session_addr(&session));
+            std::fs::create_dir_all(head.parent().unwrap()).unwrap();
+            std::fs::write(&head, b"head").unwrap();
+            for write in [false, true] {
+                match wal.check_move(&session, write) {
+                    Err(error @ broca_wal::WalError::NewerWriter { .. }) => {
+                        let broca_wal::WalError::NewerWriter { missing, .. } = &error else {
+                            unreachable!()
+                        };
+                        assert_eq!(missing, &[broca_wal::SESSION_STORAGE_FEATURE]);
+                        assert!(
+                            error.to_string().contains("newer session storage"),
+                            "{error}"
+                        );
+                    }
+                    other => panic!(
+                        "{class} write={write}: expected the session-storage refusal: {other:?}"
+                    ),
                 }
-                other => panic!("write={write}: expected the session-storage refusal: {other:?}"),
             }
+            wal.check_move(&other, true).unwrap();
+            std::fs::remove_file(&head).unwrap();
         }
-        wal.check_move(&other, true).unwrap();
         // A file where the head's folder belongs makes the head uncheckable on unix, which
         // reports it as `NotADirectory`; Windows reports the same path as not found.
         #[cfg(unix)]
         {
-            let blocked = broca_wal::session_storage_head(&root, &super::session_addr(&other));
+            let blocked = broca_wal::session_storage_head(
+                &root,
+                broca_wal::StorageClass::Durable,
+                &super::session_addr(&other),
+            );
+            std::fs::create_dir_all(blocked.parent().unwrap().parent().unwrap()).unwrap();
             std::fs::write(blocked.parent().unwrap(), b"not a folder").unwrap();
             match wal.check_move(&other, false) {
                 Err(broca_wal::WalError::Io(_)) => {}

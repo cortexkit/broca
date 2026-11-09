@@ -1355,7 +1355,12 @@ impl Module {
     }
 
     fn head(&self) -> std::path::PathBuf {
-        broca_wal::session_storage_head(&self.dir, &broca_core::session_addr(&self.key))
+        // A session created without a class is ordinary.
+        broca_wal::session_storage_head(
+            &self.dir,
+            broca_wal::StorageClass::Ordinary,
+            &broca_core::session_addr(&self.key),
+        )
     }
 
     fn floor(&self) -> String {

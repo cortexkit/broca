@@ -33,7 +33,10 @@ fn tracked_descriptor() -> serde_json::Value {
 /// `wal-archive/` hold disposable sessions whose callers relaunch rather than restore
 /// them, so both are `excluded`. Retention
 /// transcripts in `wal-ephemeral/` are `excluded` too: deleting a live WAL cannot remove a
-/// backup that already holds it, so a retained session must never be captured. Billing does
+/// backup that already holds it, so a retained session must never be captured. The new session
+/// storage splits the same way, one complete store per class: `session-store-durable/` is
+/// captured, `session-store/` and `session-store-ephemeral/` are not, and its moves' journals
+/// and staged copies (`session-store-moves/`) stay on the device. Billing does
 /// not depend on these trees surviving a disk loss: the billing collector ingests export
 /// facts into its own backed-up store.
 #[test]
@@ -63,11 +66,19 @@ fn the_tracked_descriptor_declares_brocas_entries_with_their_classes() {
         ("broca/durable-wals", "portable", "filetree"),
         ("broca/durable-archive", "portable", "filetree"),
         ("broca/durable-media", "portable", "filetree"),
-        // The new session storage. Only sessions an operator moved there live in it. Those are
-        // long-lived agent sessions that today's storage marks durable and keeps in the
-        // backed-up `wal-durable/`, so the whole tree is captured. Before new sessions of other classes are placed there, this entry must split
-        // by class the way `wal/` and `wal-durable/` do.
-        ("broca/session-store", "portable", "filetree"),
+        // The new session storage, one complete store per backup class, placed by the rule
+        // today's storage places a WAL by. Its durable root holds the sessions whose creating
+        // send carried a class in `backup_classes`, and the long-lived sessions an operator moved
+        // there; it is captured. Agent heads are created today without the `head` label, so
+        // their WALs are in the excluded `wal/` and `wal-durable/` holds none: an operator moves
+        // such a head with `class: "durable"` to place it in the captured root. Its ordinary
+        // root holds disposable sessions, and its ephemeral root sessions with a retention
+        // policy; neither is captured. A move keeps its journal and staged copy outside all
+        // three, so no capture holds a half-staged session.
+        ("broca/session-store-durable", "portable", "filetree"),
+        ("broca/session-store", "excluded", "filetree"),
+        ("broca/session-store-ephemeral", "excluded", "filetree"),
+        ("broca/session-store-moves", "device-local", "filetree"),
         ("broca/session-media", "excluded", "filetree"),
         ("broca/ephemeral-media", "excluded", "filetree"),
         ("broca/media-uploads", "excluded", "filetree"),
@@ -93,8 +104,9 @@ fn the_tracked_descriptor_declares_brocas_entries_with_their_classes() {
          captures, so this must be a deliberate edit rather than a surprise"
     );
 
-    // Pin the captured entries independently: making wal/ or wal-archive/ portable
-    // would silently include disposable sessions in every backup generation.
+    // Pin the captured entries independently: making wal/, wal-archive/ or the new storage's
+    // ordinary or ephemeral root portable would silently include disposable or retained
+    // sessions in every backup generation.
     let mut portable: Vec<&str> = entries
         .iter()
         .filter(|e| e["class"] == "portable")
@@ -107,7 +119,7 @@ fn the_tracked_descriptor_declares_brocas_entries_with_their_classes() {
             "broca/durable-archive",
             "broca/durable-media",
             "broca/durable-wals",
-            "broca/session-store"
+            "broca/session-store-durable"
         ]
     );
     for (id, path) in [
@@ -117,7 +129,10 @@ fn the_tracked_descriptor_declares_brocas_entries_with_their_classes() {
         ("broca/durable-wals", "wal-durable"),
         ("broca/durable-archive", "wal-archive-durable"),
         ("broca/durable-media", "media-durable"),
+        ("broca/session-store-durable", "session-store-durable"),
         ("broca/session-store", "session-store"),
+        ("broca/session-store-ephemeral", "session-store-ephemeral"),
+        ("broca/session-store-moves", "session-store-moves"),
         ("broca/session-media", "media"),
         ("broca/ephemeral-media", "media-ephemeral"),
         ("broca/media-uploads", "media-uploads"),

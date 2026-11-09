@@ -405,7 +405,12 @@ fn session_media_store_refuses_a_session_the_new_storage_holds() {
     drop(crate::WalStore::open(&wal, &identity()).unwrap());
     // On today's storage the session's media store is its WAL's class.
     assert!(uploads.session_media_store(&identity()).is_ok());
-    let head = broca_wal::session_storage_head(&root, &crate::session_addr(&identity()));
+    // The head is in the ephemeral root: every root of the new storage claims its session.
+    let head = broca_wal::session_storage_head(
+        &root,
+        broca_wal::StorageClass::Ephemeral,
+        &crate::session_addr(&identity()),
+    );
     fs::create_dir_all(head.parent().unwrap()).unwrap();
     fs::write(&head, b"head").unwrap();
     let refused = uploads.session_media_store(&identity()).unwrap_err();

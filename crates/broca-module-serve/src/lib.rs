@@ -58,6 +58,7 @@ pub mod state_root;
 pub mod state_root_lock;
 pub mod step_events;
 pub mod store_key;
+pub mod store_layout;
 pub mod store_move;
 pub mod system_one;
 pub mod trajectory;

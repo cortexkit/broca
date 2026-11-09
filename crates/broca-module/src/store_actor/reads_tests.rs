@@ -546,7 +546,10 @@ impl Module {
         let settled = SettledRuns::default();
         let addr = self.addr().0;
         let context = ReadContext {
-            parts: runtime.parts_for(broca_session_store::keys::Cipher::XChaCha20Poly1305),
+            parts: runtime.parts_for(
+                broca_wal::StorageClass::Ordinary,
+                broca_session_store::keys::Cipher::XChaCha20Poly1305,
+            ),
             held: slot.is_some(),
             open: slot == Some("open"),
             settled: Some((&settled, &addr)),

@@ -1273,7 +1273,11 @@ async fn a_never_written_session_has_an_unwritten_page_and_head() {
 #[tokio::test]
 async fn a_session_on_the_new_storage_is_refused_by_name_and_never_gets_a_log() {
     let mut rig = Rig::start("newer-storage").await;
-    let head = broca_wal::session_storage_head(&rig.dir, &broca_core::session_addr(&rig.session));
+    let head = broca_wal::session_storage_head(
+        &rig.dir,
+        broca_wal::StorageClass::Ordinary,
+        &broca_core::session_addr(&rig.session),
+    );
     std::fs::create_dir_all(head.parent().unwrap()).unwrap();
     std::fs::write(&head, b"head").unwrap();
     for (method, params) in [
@@ -1309,7 +1313,11 @@ async fn a_session_on_the_new_storage_is_refused_by_name_and_never_gets_a_log() 
 #[tokio::test]
 async fn every_read_and_control_refuses_new_storage_without_a_runtime() {
     let mut rig = Rig::start("newer-storage-operations").await;
-    let head = broca_wal::session_storage_head(&rig.dir, &broca_core::session_addr(&rig.session));
+    let head = broca_wal::session_storage_head(
+        &rig.dir,
+        broca_wal::StorageClass::Ordinary,
+        &broca_core::session_addr(&rig.session),
+    );
     std::fs::create_dir_all(head.parent().unwrap()).unwrap();
     std::fs::write(&head, b"head").unwrap();
     let mut gaps = Vec::new();

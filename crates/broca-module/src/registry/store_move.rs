@@ -23,7 +23,13 @@ use super::{CutLockMode, LineageKey, LineageRegistry, MoveSessionGuard};
 /// What runs `session.move_to_store` for the registry's sessions.
 #[async_trait::async_trait]
 pub trait StoreMover: Send + Sync {
-    async fn move_to_store(&self, key: &LineageKey) -> Result<serde_json::Value, MoveRefusal>;
+    /// Moves the session `key` into the new storage: into the root of the class its WAL's
+    /// folder has, or of `class` when the operator asked for one.
+    async fn move_to_store(
+        &self,
+        key: &LineageKey,
+        class: Option<broca_wal::StorageClass>,
+    ) -> Result<serde_json::Value, MoveRefusal>;
 }
 
 /// A move refused or aborted: its error code, message and detail, as the client receives them.
@@ -203,11 +209,16 @@ impl LineageRegistry {
         let _ = self.inner.store_mover.set(mover);
     }
 
-    /// Runs `session.move_to_store` for `key`, or refuses `store_unavailable` when this module
-    /// keeps no sessions in the new storage.
-    pub async fn move_to_store(&self, key: &LineageKey) -> Result<serde_json::Value, MoveRefusal> {
+    /// Runs `session.move_to_store` for `key`, into the root of `class` when the operator asked
+    /// for one, or refuses `store_unavailable` when this module keeps no sessions in the new
+    /// storage.
+    pub async fn move_to_store(
+        &self,
+        key: &LineageKey,
+        class: Option<broca_wal::StorageClass>,
+    ) -> Result<serde_json::Value, MoveRefusal> {
         match self.inner.store_mover.get() {
-            Some(mover) => mover.move_to_store(key).await,
+            Some(mover) => mover.move_to_store(key, class).await,
             None => Err(MoveRefusal::new(
                 "store_unavailable",
                 "this module keeps no sessions in the new storage",

@@ -172,10 +172,25 @@ impl Rig {
     }
 
     fn write_session(&self) -> Vec<u8> {
-        self.write(&session_records(&self.wal()));
-        std::fs::read(self.wal()).unwrap()
+        self.write_session_in(StorageClass::Ordinary)
     }
 
+    /// Writes the session's WAL in the folder of `class`, as today's storage places it.
+    fn write_session_in(&self, class: StorageClass) -> Vec<u8> {
+        let path = self.wal_store.class_wal_path(class, &key());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let records = session_records(&path);
+        let mut wal = broca_wal::FileWal::open(&path)
+            .unwrap()
+            .with_feature_floor(self.dir.join(broca_wal::FEATURE_FLOOR_FILENAME));
+        for record in &records {
+            wal.append(1, record, true).unwrap();
+        }
+        drop(wal);
+        std::fs::read(path).unwrap()
+    }
+
+    /// The new storage's ordinary root, where a session from `wal/` moves.
     fn store(&self) -> PathBuf {
         self.dir.join(broca_wal::SESSION_STORAGE_DIR)
     }
@@ -303,7 +318,7 @@ async fn a_session_whose_records_carry_no_time_keeps_its_heads_last_update() {
     rig.write(&records);
     let today = rig.registry.head(&key()).await.unwrap().updated_at;
     assert!(today.is_some_and(|at| at > 0), "{today:?}");
-    let moved = rig.mover().move_to_store(&key()).await.unwrap();
+    let moved = rig.mover().move_to_store(&key(), None).await.unwrap();
     assert_eq!(moved["moved"], true, "{moved}");
     let after = rig.registry.head(&key()).await.unwrap();
     assert!(
@@ -336,7 +351,7 @@ async fn a_move_keeps_frozen_file_time_even_when_record_time_is_later() {
         "today's head prioritizes the live file time"
     );
     eprintln!("head activity: live-file mtime={written}, last recorded time={newest}, today's selected={before}; the staged Moved record must preserve the selected file time, not the record maximum");
-    let moved = rig.mover().move_to_store(&key()).await.unwrap();
+    let moved = rig.mover().move_to_store(&key(), None).await.unwrap();
     assert_eq!(moved["moved"], true);
     assert_eq!(
         rig.registry.head(&key()).await.unwrap().updated_at,
@@ -365,24 +380,33 @@ fn tree(path: &Path) -> Vec<String> {
 }
 
 /// The session is on today's storage, exactly as it was: its WAL holds `bytes`, no freeze or
-/// marker sits beside it, and the new storage holds nothing under its address, no staging
-/// folder and no journal.
+/// marker sits beside it, and the new storage holds nothing under its address in any root, and
+/// no staging folder or journal.
 fn assert_today(rig: &Rig, bytes: &[u8]) {
+    assert_today_at(rig, &rig.wal(), bytes);
+}
+
+/// [`assert_today`] for a session whose WAL is `wal`.
+fn assert_today_at(rig: &Rig, wal: &Path, bytes: &[u8]) {
     let address = broca_core::session_addr(&key());
-    assert_eq!(
-        std::fs::read(rig.wal()).unwrap(),
-        bytes,
-        "the WAL is unchanged"
-    );
-    assert!(!rig.wal().with_extension("moving").exists(), "no freeze");
-    assert!(!rig.wal().with_extension("moved").exists(), "no marker");
-    let left: Vec<String> = tree(&rig.store())
-        .into_iter()
-        .filter(|path| {
-            path.contains(&address) || path.starts_with("staging/") || path.starts_with("moves/")
-        })
-        .collect();
-    assert!(left.is_empty(), "the new storage holds {left:?}");
+    assert_eq!(std::fs::read(wal).unwrap(), bytes, "the WAL is unchanged");
+    assert!(!wal.with_extension("moving").exists(), "no freeze");
+    assert!(!wal.with_extension("moved").exists(), "no marker");
+    for class in StorageClass::ALL {
+        let left: Vec<String> = tree(&class.store_root(&rig.dir))
+            .into_iter()
+            .filter(|path| {
+                path.contains(&address)
+                    || path.starts_with("staging/")
+                    || path.starts_with("moves/")
+            })
+            .collect();
+        assert!(
+            left.is_empty(),
+            "the new storage's {class} root holds {left:?}"
+        );
+    }
+    assert_no_move_left(rig);
     assert_eq!(
         broca_wal::store_ownership(&rig.dir, &address).unwrap(),
         broca_wal::StoreOwnership::Today
@@ -390,27 +414,46 @@ fn assert_today(rig: &Rig, bytes: &[u8]) {
     rig.wal_store.check_move(&key(), true).unwrap();
 }
 
-/// The session is the new storage's alone: its head and log exist, today's WAL is sealed with
-/// the `moved` marker naming the new storage, and no staging folder or journal is left. A
-/// runtime opened afresh, as after a restart, reads it.
+/// No journal or staged session is left in the moves folder.
+fn assert_no_move_left(rig: &Rig) {
+    let left: Vec<String> = tree(&broca_wal::session_storage_moves(&rig.dir))
+        .into_iter()
+        .filter(|path| Path::new(path).components().count() > 1)
+        .collect();
+    assert!(left.is_empty(), "the moves folder holds {left:?}");
+}
+
+/// The session is the new storage's alone: its head and log exist in the ordinary root, today's
+/// WAL is sealed with the `moved` marker naming the new storage, and no staging folder or
+/// journal is left. A runtime opened afresh, as after a restart, reads it.
 async fn assert_moved(rig: &Rig) {
+    assert_moved_into(rig, &rig.wal(), StorageClass::Ordinary).await;
+}
+
+/// [`assert_moved`] for a session whose WAL was `wal`, into the root of `class`.
+async fn assert_moved_into(rig: &Rig, wal: &Path, class: StorageClass) {
     let address = broca_core::session_addr(&key());
     assert_eq!(
         broca_wal::store_ownership(&rig.dir, &address).unwrap(),
         broca_wal::StoreOwnership::Held
     );
-    assert!(rig.store().join("logs").join(&address).exists());
-    assert!(!rig.wal().with_extension("moving").exists(), "no freeze");
+    assert_eq!(
+        broca_wal::session_storage_class(&rig.dir, &address).unwrap(),
+        Some(class)
+    );
+    assert!(class
+        .store_root(&rig.dir)
+        .join("logs")
+        .join(&address)
+        .exists());
+    assert!(!wal.with_extension("moving").exists(), "no freeze");
     let moved: broca_wal::migration::Moved =
-        serde_json::from_slice(&std::fs::read(rig.wal().with_extension("moved")).unwrap()).unwrap();
+        serde_json::from_slice(&std::fs::read(wal.with_extension("moved")).unwrap()).unwrap();
     assert_eq!(moved.holder, HOLDER);
-    let left: Vec<String> = tree(&rig.store())
-        .into_iter()
-        .filter(|path| path.starts_with("staging/") || path.starts_with("moves/"))
-        .collect();
-    assert!(left.is_empty(), "left behind: {left:?}");
-    let view = runtime(&rig.dir)
-        .await
+    assert_no_move_left(rig);
+    let restarted = runtime(&rig.dir).await;
+    assert_eq!(restarted.class_of(&key()).unwrap(), Some(class));
+    let view = restarted
         .current_view(&key())
         .await
         .unwrap()
@@ -422,7 +465,7 @@ async fn assert_moved(rig: &Rig) {
 async fn a_moved_session_is_the_new_storages_alone() {
     let rig = Rig::start("moves").await;
     rig.write_session();
-    let reply = rig.mover().move_to_store(&key()).await.unwrap();
+    let reply = rig.mover().move_to_store(&key(), None).await.unwrap();
     assert_eq!(reply["moved"], true);
     assert_eq!(reply["runs"], 2);
     assert_eq!(reply["messages"], 4);
@@ -442,14 +485,14 @@ async fn a_moved_session_is_the_new_storages_alone() {
     assert!(rig.wal_store.check_move(&key(), false).is_err());
     rig.registry.check_move(&key(), true).unwrap();
     // A second move refuses: the session is there already.
-    let again = rig.mover().move_to_store(&key()).await.unwrap_err();
+    let again = rig.mover().move_to_store(&key(), None).await.unwrap_err();
     assert_eq!(again.code, "not_movable");
     assert_eq!(again.detail.unwrap()["reason"], "in_new_storage");
 }
 
 /// Refuses with `reason` and writes nothing.
 async fn assert_refused(rig: &Rig, mover: StoreMove, bytes: &[u8], reason: &str) {
-    let refused = mover.move_to_store(&key()).await.unwrap_err();
+    let refused = mover.move_to_store(&key(), None).await.unwrap_err();
     assert_eq!(refused.code, "not_movable", "{refused:?}");
     assert_eq!(refused.detail.unwrap()["reason"], reason);
     assert_today(rig, bytes);
@@ -564,7 +607,7 @@ async fn each_precondition_refuses_by_name_and_writes_nothing() {
         let digest = with_media(&rig, object);
         let bytes = std::fs::read(rig.wal()).unwrap();
         let media = tree(&rig.dir.join("media"));
-        let refused = rig.mover().move_to_store(&key()).await.unwrap_err();
+        let refused = rig.mover().move_to_store(&key(), None).await.unwrap_err();
         assert_eq!(refused.code, "not_movable", "{refused:?}");
         assert_eq!(
             refused.detail.unwrap(),
@@ -613,7 +656,7 @@ async fn a_session_holding_media_is_staged_and_its_abort_leaves_nothing() {
     let rig = Rig::start("media-abort").await;
     with_media(&rig, Some(IMAGE));
     let bytes = std::fs::read(rig.wal()).unwrap();
-    let refused = rig.mover().move_to_store(&key()).await.unwrap_err();
+    let refused = rig.mover().move_to_store(&key(), None).await.unwrap_err();
     assert_eq!(refused.code, "move_verification_failed", "{refused:?}");
     assert_eq!(refused.detail.unwrap()["check"], "last_step");
     assert_today(&rig, &bytes);
@@ -623,7 +666,7 @@ async fn a_session_holding_media_is_staged_and_its_abort_leaves_nothing() {
 async fn a_module_without_a_mover_refuses_store_unavailable() {
     let rig = Rig::start("unavailable").await;
     let bytes = rig.write_session();
-    let refused = rig.registry.move_to_store(&key()).await.unwrap_err();
+    let refused = rig.registry.move_to_store(&key(), None).await.unwrap_err();
     assert_eq!(refused.code, "store_unavailable");
     assert_today(&rig, &bytes);
 }
@@ -639,7 +682,7 @@ async fn a_move_before_the_key_loads_refuses_key_unavailable() {
     mover.slot = Arc::new(broca_module::store_open::StoreSlot::awaiting_key(
         &rig.dir, 1,
     ));
-    let refused = mover.move_to_store(&key()).await.unwrap_err();
+    let refused = mover.move_to_store(&key(), None).await.unwrap_err();
     assert_eq!(refused.code, "key_unavailable", "{refused:?}");
     assert_today(&rig, &bytes);
 
@@ -650,7 +693,7 @@ async fn a_move_before_the_key_loads_refuses_key_unavailable() {
     assert!(slot.runtime().is_some(), "plain sessions are served");
     let mut mover = rig.mover();
     mover.slot = slot;
-    let refused = mover.move_to_store(&key()).await.unwrap_err();
+    let refused = mover.move_to_store(&key(), None).await.unwrap_err();
     assert_eq!(refused.code, "key_unavailable", "{refused:?}");
     assert_today(&rig, &bytes);
 }
@@ -674,7 +717,7 @@ async fn a_move_creates_the_session_in_the_configured_mode() {
     for cipher in Cipher::ALL {
         let rig = Rig::start_creating(&format!("mode-{}", cipher.label()), cipher).await;
         rig.write_session();
-        let reply = rig.mover().move_to_store(&key()).await.unwrap();
+        let reply = rig.mover().move_to_store(&key(), None).await.unwrap();
         assert_eq!(reply["moved"], true, "{}", cipher.label());
         assert_moved(&rig).await;
         let restarted = runtime_creating(&rig.dir, cipher).await;
@@ -693,7 +736,7 @@ async fn a_move_creates_the_session_in_the_configured_mode() {
     assert!(!slot.key_loaded());
     let mut mover = rig.mover();
     mover.slot = slot;
-    mover.move_to_store(&key()).await.unwrap();
+    mover.move_to_store(&key(), None).await.unwrap();
     assert_moved(&rig).await;
     let view = runtime(&rig.dir)
         .await
@@ -725,7 +768,7 @@ async fn a_planted_mismatch_aborts_naming_its_check() {
             }
         }
     }));
-    let refused = mover.move_to_store(&key()).await.unwrap_err();
+    let refused = mover.move_to_store(&key(), None).await.unwrap_err();
     assert_eq!(refused.code, "move_verification_failed", "{refused:?}");
     assert_eq!(refused.detail.unwrap()["check"], "run_result");
     assert_today(&rig, &bytes);
@@ -742,7 +785,7 @@ async fn startup_after_a_crash_at_every_step_leaves_one_owner() {
         let rig = Rig::start("crash-count").await;
         rig.write_session();
         let mover = rig.mover();
-        mover.move_to_store(&key()).await.unwrap();
+        mover.move_to_store(&key(), None).await.unwrap();
         let seen = mover.faults.seen.lock().unwrap().clone();
         seen
     };
@@ -756,7 +799,7 @@ async fn startup_after_a_crash_at_every_step_leaves_one_owner() {
         let bytes = rig.write_session();
         let mover = rig.mover();
         *mover.faults.crash_at.lock().unwrap() = Some(at);
-        let crashed = mover.move_to_store(&key()).await.unwrap_err();
+        let crashed = mover.move_to_store(&key(), None).await.unwrap_err();
         assert_eq!(crashed.code, "crashed", "step {at} ({})", steps[at - 1]);
         drop(mover);
         // Until startup settles the move, its journal or head keeps today's storage from
@@ -878,4 +921,136 @@ fn precondition_one_names_what_the_new_storage_still_does_not_serve() {
         .filter(|op| !served(op))
         .collect();
     assert_eq!(unserved, Vec::<&str>::new());
+}
+
+/// A session moves into the root of the class its WAL's folder has: `wal-durable/` into the
+/// durable root, `wal-ephemeral/` into the ephemeral root, `wal/` into the ordinary root. The
+/// other roots get nothing of it.
+#[tokio::test]
+async fn each_wal_folder_moves_into_its_class_root() {
+    let address = broca_core::session_addr(&key());
+    for class in StorageClass::ALL {
+        let rig = Rig::start(&format!("class-{class}")).await;
+        rig.write_session_in(class);
+        let reply = rig.mover().move_to_store(&key(), None).await.unwrap();
+        assert_eq!(reply["class"], class.name(), "{reply}");
+        let wal = rig.wal_store.class_wal_path(class, &key());
+        assert_moved_into(&rig, &wal, class).await;
+        for other in StorageClass::ALL
+            .into_iter()
+            .filter(|other| *other != class)
+        {
+            let left: Vec<String> = tree(&other.store_root(&rig.dir))
+                .into_iter()
+                .filter(|path| path.contains(&address))
+                .collect();
+            assert!(left.is_empty(), "{class}: the {other} root holds {left:?}");
+        }
+    }
+}
+
+/// The operator's `class: durable` moves a session from `wal/` into the durable root, with
+/// the setup parts its runs name, so a restore of that root needs nothing outside it.
+#[tokio::test]
+async fn an_operator_moves_an_ordinary_session_into_the_durable_root() {
+    let rig = Rig::start("class-durable").await;
+    rig.write_session();
+    let reply = rig
+        .mover()
+        .move_to_store(&key(), Some(StorageClass::Durable))
+        .await
+        .unwrap();
+    assert_eq!(reply["class"], "durable", "{reply}");
+    assert_moved_into(&rig, &rig.wal(), StorageClass::Durable).await;
+    let durable = tree(&StorageClass::Durable.store_root(&rig.dir));
+    assert!(
+        durable.iter().any(|path| path.starts_with("setup")),
+        "the durable root holds the session's setup parts: {durable:?}"
+    );
+    let ordinary = tree(&rig.store());
+    assert!(
+        ordinary
+            .iter()
+            .all(|path| !path.starts_with("setup")
+                && !path.contains(&broca_core::session_addr(&key()))),
+        "the ordinary root holds nothing of it: {ordinary:?}"
+    );
+}
+
+/// The one class change a move makes is an ordinary session into the durable root. A session
+/// with a retention policy never moves where backups capture it, and a durable session never
+/// leaves the backed-up root: both refuse `class_refused`, writing nothing.
+#[tokio::test]
+async fn any_other_class_change_is_refused_and_writes_nothing() {
+    for (tag, source, requested) in [
+        (
+            "ephemeral-to-durable",
+            StorageClass::Ephemeral,
+            StorageClass::Durable,
+        ),
+        (
+            "durable-to-ordinary",
+            StorageClass::Durable,
+            StorageClass::Ordinary,
+        ),
+    ] {
+        let rig = Rig::start(&format!("class-refused-{tag}")).await;
+        let bytes = rig.write_session_in(source);
+        let refused = rig
+            .mover()
+            .move_to_store(&key(), Some(requested))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code, "not_movable", "{tag}: {refused:?}");
+        let detail = refused.detail.unwrap();
+        assert_eq!(detail["reason"], "class_refused", "{tag}");
+        assert_eq!(detail["wal_class"], source.name(), "{tag}");
+        assert_eq!(detail["class"], requested.name(), "{tag}");
+        assert_today_at(&rig, &rig.wal_store.class_wal_path(source, &key()), &bytes);
+    }
+}
+
+/// A move keeps its journal and its staged session in the moves folder, outside every class
+/// root, and the journal names the class it moves into. Startup undoes a move that stopped
+/// there, leaving the moves folder empty.
+#[tokio::test]
+async fn a_moves_journal_and_staging_live_in_the_moves_folder() {
+    let staged_at = {
+        let rig = Rig::start("moves-folder-count").await;
+        rig.write_session();
+        let mover = rig.mover();
+        mover.move_to_store(&key(), None).await.unwrap();
+        let seen = mover.faults.seen.lock().unwrap().clone();
+        seen.iter().position(|step| *step == "stage").unwrap() + 1
+    };
+    let rig = Rig::start("moves-folder").await;
+    let bytes = rig.write_session();
+    let mover = rig.mover();
+    *mover.faults.crash_at.lock().unwrap() = Some(staged_at);
+    let crashed = mover
+        .move_to_store(&key(), Some(StorageClass::Durable))
+        .await
+        .unwrap_err();
+    assert_eq!(crashed.code, "crashed");
+    drop(mover);
+    let address = broca_core::session_addr(&key());
+    let moves = broca_wal::session_storage_moves(&rig.dir);
+    let journal_path = broca_wal::session_storage_move_journal(&rig.dir, &address);
+    assert!(journal_path.starts_with(moves.join(broca_wal::MOVE_JOURNAL_DIR)));
+    let journal: MoveJournal =
+        serde_json::from_slice(&std::fs::read(&journal_path).unwrap()).unwrap();
+    assert_eq!(journal.class, Some(StorageClass::Durable));
+    let staging = moves.join(&journal.staging);
+    assert!(staging.starts_with(moves.join(broca_wal::MOVE_STAGING_DIR)));
+    assert!(!tree(&staging).is_empty(), "the staged session is there");
+    for class in StorageClass::ALL {
+        let inside: Vec<String> = tree(&class.store_root(&rig.dir))
+            .into_iter()
+            .filter(|path| path.starts_with("staging") || path.starts_with("moves"))
+            .collect();
+        assert!(inside.is_empty(), "the {class} root holds {inside:?}");
+    }
+    let recovered = recover_at_startup(&rig.dir);
+    assert_eq!(recovered.rolled_back, std::slice::from_ref(&address));
+    assert_today(&rig, &bytes);
 }

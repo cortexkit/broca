@@ -411,20 +411,11 @@ pub const ARCHIVE_INDEX_V2_FEATURE: &str = "archive-index/v2";
 /// `FileWalStore` refuses them (its `check_move`), so this build only refuses.
 pub const SESSION_STORAGE_FEATURE: &str = "session-storage/v1";
 
-/// The folder of a state root that holds the new session storage.
+/// The folder of a state root that holds the new session storage's ordinary sessions, the ones
+/// backups leave out. The durable and ephemeral classes have their own folders
+/// (`session_storage::StorageClass`). Before the new storage had classes it kept every session
+/// here.
 pub const SESSION_STORAGE_DIR: &str = "session-store";
-
-/// Where the new session storage keeps the head of the session at `address` under
-/// `state_root`. The session exists on the new storage exactly when this file does: creating a
-/// session writes its head before anything else. The layout is the store's local backend's,
-/// `<root>/heads/<address>/head`, rooted at [`SESSION_STORAGE_DIR`].
-pub fn session_storage_head(state_root: &std::path::Path, address: &str) -> std::path::PathBuf {
-    state_root
-        .join(SESSION_STORAGE_DIR)
-        .join("heads")
-        .join(address)
-        .join("head")
-}
 
 /// The feature a `RunStarted` carrying the session's frozen plan manifest requires
 /// (`WalRecord::RunStarted::manifest`). A reader without it must refuse such a WAL: skipping the

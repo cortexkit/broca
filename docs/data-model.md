@@ -31,6 +31,10 @@ paths rather than begin an empty history (`crates/broca-module-serve/src/state_r
     fold-<unix-ms>.ark
     fold-<unix-ms>.journal
   wal-archive-durable/      sealed containers of durable WALs only
+  session-store-durable/    new session storage: sessions selected for backup at creation
+  session-store/            new session storage: ordinary sessions, never backed up
+  session-store-ephemeral/  new session storage: retained sessions, never backed up
+  session-store-moves/      journals and staged copies of moves into the new storage
   run-index.db              SQLite: run index, materialized transcript,   (section 4)
                             admission checkpoints, usage export facts
   caps.db                   left over from removed spend caps; not opened (section 4.6)

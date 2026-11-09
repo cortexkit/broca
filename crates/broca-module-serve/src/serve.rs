@@ -3717,7 +3717,22 @@ where
                 )
                 .await;
             }
-            match handler.move_to_store(session).await {
+            let class = match move_to_store_class(&req.params) {
+                Ok(class) => class,
+                Err(message) => {
+                    return send_error(
+                        writer,
+                        ver,
+                        channel,
+                        epoch,
+                        corr,
+                        "invalid_params",
+                        &message,
+                    )
+                    .await
+                }
+            };
+            match handler.move_to_store(session, class).await {
                 Ok(reply) => send_json_response(writer, ver, channel, epoch, corr, &reply).await,
                 Err(refusal) => {
                     let mut body = ErrorBody::new(refusal.code, refusal.message);
@@ -5171,6 +5186,23 @@ fn log_refused_send(
 fn upload_error_body(error: &broca_core::media_uploads::UploadError, for_send: bool) -> ErrorBody {
     let body = broca_module::serve::admission_refusal::upload_refusal(error, for_send);
     ErrorBody::new(body.code, body.message).with_detail(body.detail.expect("upload detail"))
+}
+
+/// The class `session.move_to_store`'s params ask the session to move into: none, so it keeps
+/// its WAL's class, or `"durable"`, for a session in `wal/` that belongs in the backed-up root.
+/// Any other value is refused, by message.
+fn move_to_store_class(
+    params: &serde_json::Value,
+) -> Result<Option<broca_wal::StorageClass>, String> {
+    match params.get("class") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(class))
+            if class == broca_wal::StorageClass::Durable.name() =>
+        {
+            Ok(Some(broca_wal::StorageClass::Durable))
+        }
+        Some(other) => Err(format!("class must be \"durable\" when given, not {other}")),
+    }
 }
 
 /// The refusal of an op that has no implementation yet for a session kept in the new storage.

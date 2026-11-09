@@ -2391,7 +2391,15 @@ when an archived session is reopened. Each fold container belongs to exactly one
 of these populations. A send with `retention` always uses `wal-ephemeral/` and is
 never backed up, even if its class is listed: deletion takes precedence.
 
-Engram captures only `wal-durable/` and `wal-archive-durable/`. Live-first reads,
+Engram captures only `wal-durable/`, `wal-archive-durable/` and the new session
+storage's durable root, `session-store-durable/`. The new session storage places a
+session it creates by the same rule, in one complete store per class:
+`session-store-durable/`, `session-store/` (ordinary) and `session-store-ephemeral/`;
+the root holding a session's head is authoritative afterwards, and a head found in
+two roots is refused `session_in_two_classes`. `session.move_to_store` (operator only)
+places a moved session in the root matching its WAL's folder; its optional
+`class: "durable"` places a session from `wal/` in the durable root, and any other
+class change is refused `not_movable {reason: "class_refused"}`. Live-first reads,
 exports and move discovery resolve all three live trees and both archive trees;
 session addressing and leases remain keyed by the original session triple.
 Classed records require the must-understand WAL feature `session-class/v1`.

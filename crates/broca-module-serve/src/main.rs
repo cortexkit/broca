@@ -334,6 +334,16 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     // default location is a contract with another module, not a local preference.
     // Create the state root up front so the SQLite run index can open its file (the file
     // stores create their own subdirs lazily, but SqliteStore::open needs the dir to exist).
+    // Before the new storage's class roots are created there, its first single-folder tree
+    // becomes the durable root, once: creating the durable root first would leave that tree
+    // where backups no longer capture it.
+    broca_module_serve::store_layout::class_single_folder_tree(&state_root).map_err(|error| {
+        ServeIoError(format!(
+            "the new storage's single-folder tree in {} couldn't be made its durable root: \
+             {error}",
+            state_root.display()
+        ))
+    })?;
     create_state_directories(&state_root)?;
     // A move of a session into the new storage that a crash interrupted is undone or
     // finished from its journal before anything sweeps the state root or opens a session.
@@ -8485,9 +8495,17 @@ fn create_state_directories(state_root: &std::path::Path) -> Result<(), ServeIoE
         })
         .map_err(|e| ServeIoError(format!("create lease directory: {e}")))?;
 
-    // `session-store` is created here, not on the new storage's first write, because the backup
-    // descriptor names it, and engram refuses a capture whose declared path is missing.
-    for name in ["wal-durable", "wal-archive-durable", "session-store"] {
+    // The new storage's three class roots and its moves folder are created here, not on the new
+    // storage's first write, because the backup descriptor names them, and engram refuses a
+    // capture whose declared path is missing.
+    for name in [
+        "wal-durable",
+        "wal-archive-durable",
+        broca_wal::SESSION_STORAGE_DURABLE_DIR,
+        broca_wal::SESSION_STORAGE_DIR,
+        broca_wal::SESSION_STORAGE_EPHEMERAL_DIR,
+        broca_wal::SESSION_STORAGE_MOVES_DIR,
+    ] {
         let path = state_root.join(name);
         match broca_owner_only::create_dir(&path) {
             Ok(()) => {}
@@ -8569,7 +8587,10 @@ mod windows_acl_tests {
         assert_private(&root.join("leases"));
         assert_private(&root.join("wal-durable"));
         assert_private(&root.join("wal-archive-durable"));
+        assert_private(&root.join("session-store-durable"));
         assert_private(&root.join("session-store"));
+        assert_private(&root.join("session-store-ephemeral"));
+        assert_private(&root.join("session-store-moves"));
         assert_private(&root.join("engram-catalog.json"));
     }
 }
@@ -8772,6 +8793,45 @@ mod state_directory_tests {
             "placed descriptor has no portable entries"
         );
         let _ = std::fs::remove_dir_all(&state_root);
+    }
+
+    /// The new storage's three class roots and its moves folder exist, owner-only and empty,
+    /// before any session is placed, and the descriptor names each with its backup class: only
+    /// the durable root is captured.
+    #[test]
+    fn session_store_class_roots_exist_before_catalog_and_match_backup_classes() {
+        let state_root = fresh_root("session-store-classes");
+        create_state_directories(&state_root).unwrap();
+        write_engram_catalog(&state_root).unwrap();
+        let catalog: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(state_root.join("engram-catalog.json")).unwrap())
+                .unwrap();
+        let entries = catalog["entries"].as_array().unwrap();
+        for (path, class) in [
+            (broca_wal::SESSION_STORAGE_DURABLE_DIR, "portable"),
+            (broca_wal::SESSION_STORAGE_DIR, "excluded"),
+            (broca_wal::SESSION_STORAGE_EPHEMERAL_DIR, "excluded"),
+            (broca_wal::SESSION_STORAGE_MOVES_DIR, "device-local"),
+        ] {
+            let folder = state_root.join(path);
+            assert!(folder.is_dir(), "startup must create {}", folder.display());
+            broca_owner_only::validate(&folder).unwrap();
+            assert_eq!(std::fs::read_dir(&folder).unwrap().count(), 0, "{path}");
+            let matching: Vec<_> = entries
+                .iter()
+                .filter(|entry| entry["path"] == path)
+                .collect();
+            assert_eq!(matching.len(), 1, "one catalog entry for {path}");
+            assert_eq!(matching[0]["class"], class, "backup class for {path}");
+            if class == "excluded" {
+                assert!(!matching[0]["reason"].as_str().unwrap().is_empty());
+            }
+        }
+        // The placement rule's classes name exactly these roots.
+        for class in broca_wal::StorageClass::ALL {
+            assert!(class.store_root(&state_root).is_dir(), "{class}");
+        }
+        let _ = std::fs::remove_dir_all(state_root);
     }
 
     #[test]

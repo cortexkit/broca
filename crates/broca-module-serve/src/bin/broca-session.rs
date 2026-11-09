@@ -476,7 +476,13 @@ enum Cmd {
     /// `session.move_to_store`: move this live, idle session from today's storage into the new
     /// storage. Operator only, and it can't be undone. Prints the daemon's reply, or its
     /// refusal (`not_movable` names what the session still needs) and exits 1.
-    MoveToStore,
+    MoveToStore {
+        /// Move the session into the new storage's durable (backed-up) root, though its WAL is
+        /// in `wal/`: for a long-lived session created without the label that makes a session
+        /// durable. Without it the session keeps its WAL's class.
+        #[arg(long, value_parser = ["durable"])]
+        class: Option<String>,
+    },
     /// Import a canonical JSON message array into an empty session.
     Import {
         #[arg(long)]
@@ -1034,10 +1040,14 @@ async fn run(args: Args) -> Result<i32, String> {
             );
             Ok(0)
         }
-        Cmd::MoveToStore => {
+        Cmd::MoveToStore { class } => {
             let started = std::time::Instant::now();
+            let params = match class {
+                Some(class) => serde_json::json!({ "class": class }),
+                None => serde_json::json!({}),
+            };
             let reply = client
-                .management_raw("session.move_to_store", &serde_json::json!({}))
+                .management_raw("session.move_to_store", &params)
                 .await
                 .map_err(|error| format!("move-to-store transport: {error}"))?;
             let elapsed_ms = started.elapsed().as_millis();

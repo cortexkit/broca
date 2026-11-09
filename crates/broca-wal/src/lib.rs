@@ -29,7 +29,6 @@ pub use file_wal::{
     WalError, WalRangeRead, WalRangeRecords, WalTailRead, DEFAULT_MAX_READ_BYTES,
 };
 pub use floor::{raise_floor, read_floor, FEATURE_FLOOR_FILENAME};
-pub use framing::session_storage_head;
 pub use framing::PreparedV4Frame;
 #[cfg(any(test, feature = "test-known-feature"))]
 pub use framing::{forget_feature_for_test, ForgottenFeature};
@@ -63,8 +62,11 @@ pub use record::{
     ACCOUNT_DECISION_UNSUPPORTED, MAX_REPLACEMENT_BYTES,
 };
 pub use session_storage::{
-    owned_by_store, session_storage_move_journal, store_ownership, FrozenPrefix, MoveJournal,
-    StoreOwnership, MOVE_JOURNAL_DIR,
+    owned_by_store, placement, session_storage_class, session_storage_class_by,
+    session_storage_head, session_storage_move_journal, session_storage_moves, store_ownership,
+    FrozenPrefix, MoveJournal, SessionInTwoClasses, StorageClass, StoreOwnership, MOVE_JOURNAL_DIR,
+    MOVE_STAGING_DIR, SESSION_IN_TWO_CLASSES, SESSION_STORAGE_DURABLE_DIR,
+    SESSION_STORAGE_EPHEMERAL_DIR, SESSION_STORAGE_MOVES_DIR,
 };
 pub use state_format::{classify_state_root, StateRootError, WalConfig, WalFormat};
 // `PauseReason` is shared caller/WAL vocabulary; it lives in `broca-protocol` (like

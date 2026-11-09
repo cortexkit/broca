@@ -614,7 +614,12 @@ fn fold_leaves_the_wals_of_sessions_the_new_storage_owns_live() {
     let (held, held_bytes) = f.session("held", Some(1));
     let (moving, moving_bytes) = f.session("moving", Some(1));
     let (cold, _) = f.session("cold", Some(1));
-    let head = broca_wal::session_storage_head(&f.root, &session_addr(&held));
+    // The head is in the durable root: every root of the new storage claims its session.
+    let head = broca_wal::session_storage_head(
+        &f.root,
+        broca_wal::StorageClass::Durable,
+        &session_addr(&held),
+    );
     fs::create_dir_all(head.parent().unwrap()).unwrap();
     fs::write(&head, b"head").unwrap();
     // A move journal claims its session by existing.

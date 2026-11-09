@@ -933,6 +933,7 @@ async fn prepare_refuses_a_session_the_new_storage_holds_before_any_freeze() {
     let rig = Rig::new("store-held", true);
     let head = broca_wal::session_storage_head(
         &rig.root,
+        broca_wal::StorageClass::Ordinary,
         &broca_core::session_addr(&rig.driver.plans[0].session),
     );
     std::fs::create_dir_all(head.parent().unwrap()).unwrap();

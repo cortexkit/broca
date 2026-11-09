@@ -171,7 +171,9 @@ impl Side {
     }
 
     fn in_store(&self) -> bool {
-        broca_wal::session_storage_head(&self.dir, &broca_core::session_addr(&self.key)).exists()
+        broca_wal::session_storage_class(&self.dir, &broca_core::session_addr(&self.key))
+            .unwrap()
+            .is_some()
     }
 
     async fn run_status(&self, run_id: &str) -> Value {
