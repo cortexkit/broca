@@ -157,6 +157,7 @@ pub fn write_log(cipher: Cipher, next_seq: u64, base: ChainBase, ops: &[LogOp]) 
         operational: Operations::default(),
         transcript_base: base.transcript,
         ledger_base: base.ledger,
+        activity_ms: None,
     }
     .encode();
     let mut log = WrittenLog {
@@ -495,6 +496,7 @@ pub fn sealed_frames(input: &mut Input<'_>, cipher: Cipher) -> Vec<u8> {
                     operational: Operations::default(),
                     transcript_base: (input.byte() & 1 == 1).then(|| input.number()),
                     ledger_base: (input.byte() & 1 == 1).then(|| input.number()),
+                    activity_ms: (input.byte() & 1 == 1).then(|| input.number()),
                 }
                 .encode()
             } else {

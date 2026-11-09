@@ -23,6 +23,8 @@ cipher_tests!(
     a_crash_at_any_point_of_a_seal_loads_to_before_or_after_it,
     a_seal_carries_ledger_records_into_the_new_log,
     a_seal_at_an_entry_cuts_where_that_entry_is_placed,
+    a_seal_preserves_unmoved_activity_when_ledger_times_leave_the_log,
+    a_seal_preserves_a_move_boundary_and_later_activity,
 );
 
 fn triple() -> SessionTriple {
@@ -269,6 +271,109 @@ fn a_ledger_seal_keeps_the_whole_transcript_open(cipher: Cipher) {
             texts(&loaded.conversation.messages),
             ["ask a", "a", "ask b", "b", "ask c", "c"]
         );
+    });
+}
+
+fn a_seal_preserves_unmoved_activity_when_ledger_times_leave_the_log(cipher: Cipher) {
+    let backend = MemoryBackend::default();
+    block_on(async {
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(cipher), false)
+            .await
+            .unwrap();
+        let mut started = start("a");
+        if let Record::RunStart(start) = &mut started {
+            start.written_at_ms = Some(1_000);
+        }
+        let mut asked = input("a", "ask");
+        if let Record::Input(input) = &mut asked {
+            input.written_at_ms = Some(1_001);
+        }
+        let mut ended = end("a");
+        if let Record::RunEnd(end) = &mut ended {
+            end.ts_ms = Some(2_003);
+        }
+        session
+            .append(&[started, asked, answer("a", "answer"), ended], true)
+            .await
+            .unwrap();
+        assert_eq!(session.open_log_activity_ms(), Some(2_003));
+        session.seal(None, 5_000).await.unwrap();
+        assert_eq!(
+            session.open_log_activity_ms(),
+            Some(2_003),
+            "sealing is not activity"
+        );
+        let mut loaded = Session::load(&backend, addr(), &triple(), &deployment(cipher))
+            .await
+            .unwrap();
+        assert_eq!(loaded.open_log_activity_ms(), Some(2_003));
+        loaded.seal(None, 6_000).await.unwrap();
+        let loaded = Session::load(&backend, addr(), &triple(), &deployment(cipher))
+            .await
+            .unwrap();
+        assert_eq!(loaded.open_log_activity_ms(), Some(2_003));
+    });
+}
+
+fn a_seal_preserves_a_move_boundary_and_later_activity(cipher: Cipher) {
+    let backend = MemoryBackend::default();
+    block_on(async {
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(cipher), false)
+            .await
+            .unwrap();
+        let mut asked = input("a", "converted input");
+        if let Record::Input(input) = &mut asked {
+            input.written_at_ms = Some(2_003);
+        }
+        session
+            .append(
+                &[
+                    start("a"),
+                    asked,
+                    answer("a", "answer"),
+                    end("a"),
+                    Record::Moved(crate::record::Moved {
+                        move_id: "store-move:test".into(),
+                        source_activity_ms: 2_002,
+                    }),
+                ],
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(session.open_log_activity_ms(), Some(2_002));
+        session.seal(None, 5_000).await.unwrap();
+        assert_eq!(session.open_log_activity_ms(), Some(2_002));
+        let mut loaded = Session::load(&backend, addr(), &triple(), &deployment(cipher))
+            .await
+            .unwrap();
+        assert_eq!(
+            loaded.open_log_activity_ms(),
+            Some(2_002),
+            "the copied prefix cannot outrank Moved"
+        );
+        let mut later = start("b");
+        if let Record::RunStart(start) = &mut later {
+            start.written_at_ms = Some(3_000);
+        }
+        loaded
+            .append(
+                &[
+                    later,
+                    input("b", "new send"),
+                    answer("b", "later"),
+                    end("b"),
+                ],
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(loaded.open_log_activity_ms(), Some(3_000));
+        loaded.seal(None, 6_000).await.unwrap();
+        let loaded = Session::load(&backend, addr(), &triple(), &deployment(cipher))
+            .await
+            .unwrap();
+        assert_eq!(loaded.open_log_activity_ms(), Some(3_000));
     });
 }
 

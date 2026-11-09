@@ -475,6 +475,7 @@ impl<B: SessionBackend> Session<B> {
             operational: settled.clone(),
             transcript_base,
             ledger_base: Some(intent_seq),
+            activity_ms: self.window.newest_activity_ms,
         }
         .encode();
         let ledger_sealed = self
@@ -505,7 +506,8 @@ impl<B: SessionBackend> Session<B> {
             .into_written(&mut encoder);
         let settled_after = settled;
         let mut conversation = at_cut;
-        let mut window = OpenLogIndex::default();
+        let mut window =
+            OpenLogIndex::from_checkpoint(self.window.newest_activity_ms, self.encoder.next_seq());
         for batch in batches {
             let kept: Vec<(u64, Record)> = records[batch.clone()]
                 .iter()

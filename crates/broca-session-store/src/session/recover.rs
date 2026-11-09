@@ -276,22 +276,27 @@ impl<B: SessionBackend> Session<B> {
         // the conversation folds the transcript records after it (`Conversation::enrolled`).
         let mut conversation = checkpoint.conversation.clone();
         let mut operations = checkpoint.operational.clone();
+        let mut activity =
+            OpenLogIndex::from_checkpoint(checkpoint.activity_ms, checkpoint.next_seq);
         conversation.enrolled(operations.enrolled_through());
         let mut kept_transcript = transcript
             .iter()
             .map(|(seq, _, record)| (*seq, record))
             .peekable();
         for (seq, record) in &ledger {
-            while let Some((_, kept)) =
+            while let Some((kept_seq, kept)) =
                 kept_transcript.next_if(|(transcript_seq, _)| transcript_seq < seq)
             {
                 conversation.apply(kept).map_err(fold_error)?;
+                activity.note(kept_seq, kept);
             }
             operations.apply(record).map_err(fold_error)?;
+            activity.note(*seq, record);
             conversation.enrolled(operations.enrolled_through());
         }
-        for (_, kept) in kept_transcript {
+        for (seq, kept) in kept_transcript {
             conversation.apply(kept).map_err(fold_error)?;
+            activity.note(seq, kept);
         }
 
         // A change whose intent the damaged log holds never committed: the head's open log is
@@ -503,6 +508,7 @@ impl<B: SessionBackend> Session<B> {
         let mut settled = operations;
         settled.open_change = None;
 
+        let activity_ms = activity.newest_activity_ms;
         let mut session = Session {
             backend,
             addr: addr.clone(),
@@ -515,7 +521,7 @@ impl<B: SessionBackend> Session<B> {
             conversation: checkpoint.conversation.clone(),
             operations: settled.clone(),
             open_ids: OpenIds::default(),
-            window: OpenLogIndex::default(),
+            window: OpenLogIndex::from_checkpoint(activity_ms, intent_seq + 1),
             imported: Default::default(),
             enrollment: Default::default(),
             sealed_entries: Default::default(),
@@ -531,6 +537,7 @@ impl<B: SessionBackend> Session<B> {
             operational: settled.clone(),
             transcript_base: checkpoint.transcript_base,
             ledger_base: Some(intent_seq),
+            activity_ms,
         }
         .encode();
         let created = async {
@@ -561,7 +568,7 @@ impl<B: SessionBackend> Session<B> {
                 .checkpoint(&checkpoint_body)?
                 .into_written(&mut encoder);
             let mut conversation = checkpoint.conversation.clone();
-            let mut window = OpenLogIndex::default();
+            let mut window = OpenLogIndex::from_checkpoint(activity_ms, intent_seq + 1);
             let mut batch_start = 0;
             while batch_start < transcript.len() {
                 let first = transcript[batch_start].1;
@@ -590,6 +597,7 @@ impl<B: SessionBackend> Session<B> {
             let mut operations = settled.clone();
             let mut open_ids = OpenIds::default();
             for (offset, record) in batch.iter().enumerate() {
+                window.note(first + offset as u64, record);
                 match record.stream() {
                     Stream::Transcript => conversation.apply(record).map_err(fold_error)?,
                     Stream::Ledger => {

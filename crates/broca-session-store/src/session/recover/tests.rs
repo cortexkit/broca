@@ -25,6 +25,7 @@ cipher_tests!(
     a_crash_at_any_point_of_a_recovery_recovers_again,
     a_damaged_checkpoint_is_rebuilt_and_loses_nothing,
     a_damaged_checkpoint_without_its_copy_refuses,
+    a_rebuilt_checkpoint_keeps_frozen_and_post_move_activity,
 );
 
 fn triple() -> SessionTriple {
@@ -620,6 +621,99 @@ fn a_damaged_checkpoint_is_rebuilt_and_loses_nothing(cipher: Cipher) {
         );
         assert_eq!(got, expected, "seal {seal}");
         assert!(!session.operations.unattributed_risk, "seal {seal}");
+    }
+}
+
+fn a_rebuilt_checkpoint_keeps_frozen_and_post_move_activity(cipher: Cipher) {
+    for moved in [false, true] {
+        for later in [false, true] {
+            let backend = MemoryBackend::default();
+            let expected = block_on(async {
+                let mut session =
+                    Session::create(&backend, addr(), triple(), &deployment(cipher), false)
+                        .await
+                        .unwrap();
+                let mut asked = input("a", "converted input");
+                if let Record::Input(input) = &mut asked {
+                    input.written_at_ms = Some(2_003);
+                }
+                session
+                    .append(
+                        &[
+                            start("a"),
+                            asked,
+                            assistant("a", 1, vec![text("answer")]),
+                            end("a"),
+                        ],
+                        true,
+                    )
+                    .await
+                    .unwrap();
+                if moved {
+                    session
+                        .append(
+                            &[Record::Moved(crate::record::Moved {
+                                move_id: "store-move:test".into(),
+                                source_activity_ms: 2_002,
+                            })],
+                            true,
+                        )
+                        .await
+                        .unwrap();
+                }
+                session.seal(None, 5_000).await.unwrap();
+                if later {
+                    let mut started = start("b");
+                    if let Record::RunStart(start) = &mut started {
+                        start.written_at_ms = Some(3_000);
+                    }
+                    session
+                        .append(
+                            &[
+                                started,
+                                input("b", "new send"),
+                                assistant("b", 1, vec![text("later")]),
+                                end("b"),
+                            ],
+                            true,
+                        )
+                        .await
+                        .unwrap();
+                }
+                let expected = if later {
+                    3_000
+                } else if moved {
+                    2_002
+                } else {
+                    2_003
+                };
+                assert_eq!(session.open_log_activity_ms(), Some(expected));
+                session.close().await.unwrap();
+                // Opening a writer supplies a ledger back-link after the checkpoint. Recovery
+                // can then prove that only the checkpoint was lost, without adding a loss notice
+                // that would itself be new session activity.
+                let loaded = Session::load(&backend, addr(), &triple(), &deployment(cipher))
+                    .await
+                    .unwrap();
+                assert_eq!(loaded.open_log_activity_ms(), Some(expected));
+                loaded.close().await.unwrap();
+                expected
+            });
+            damage(&backend, 60, cipher);
+            let Recovery::Recovered(recovered) = recover(&backend, 7_000, cipher).unwrap() else {
+                panic!("the checkpoint must be rebuilt");
+            };
+            assert!(
+                !recovered.loss_aware,
+                "moved={moved}, later={later}: {recovered:?}"
+            );
+            let loaded = load(&backend, cipher).unwrap();
+            assert_eq!(
+                loaded.open_log_activity_ms(),
+                Some(expected),
+                "moved={moved}, later={later}"
+            );
+        }
     }
 }
 

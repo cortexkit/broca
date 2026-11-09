@@ -397,6 +397,7 @@ impl<B: SessionBackend> Session<B> {
             operational: operations.clone(),
             transcript_base: None,
             ledger_base: None,
+            activity_ms: None,
         };
         let encoded = encoder.checkpoint(&checkpoint.encode())?;
         backend
@@ -624,7 +625,7 @@ impl<B: SessionBackend> Session<B> {
         let mut conversation = checkpoint.conversation;
         let mut operations = checkpoint.operational;
         let mut open_ids = OpenIds::default();
-        let mut window = OpenLogIndex::default();
+        let mut window = OpenLogIndex::from_checkpoint(checkpoint.activity_ms, checkpoint.next_seq);
         for (seq, record) in &read.records {
             window.note(*seq, record);
             if record.stream() == Stream::Ledger {
@@ -886,8 +887,8 @@ impl<B: SessionBackend> Session<B> {
         (self.log, self.encoder.offset())
     }
 
-    /// The newest time a record of the open log carries (`Record::activity_ms`), or `None` when
-    /// no record there carries one. Records a seal moved out of the open log aren't counted.
+    /// Known session activity: the checkpoint's baseline advanced by fresh open-log records
+    /// (`Record::activity_ms`), or `None` when neither carries a time. Sealing preserves it.
     pub fn open_log_activity_ms(&self) -> Option<u64> {
         self.window.newest_activity_ms
     }

@@ -313,6 +313,37 @@ async fn a_session_whose_records_carry_no_time_keeps_its_heads_last_update() {
     assert_eq!(after.updated_at, today);
 }
 
+#[tokio::test]
+async fn a_move_keeps_frozen_file_time_even_when_record_time_is_later() {
+    use broca_module::serve::ServeHandler as _;
+    let rig = Rig::start("record-ahead-of-file-time").await;
+    rig.write_session();
+    let (records, _) = read_wal(&rig.wal()).unwrap();
+    let newest = broca_module::head_time::newest_record_ms(&records).unwrap();
+    let written = newest - 1;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(rig.wal())
+        .unwrap()
+        .set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::UNIX_EPOCH + Duration::from_millis(written)),
+        )
+        .unwrap();
+    let before = rig.registry.head(&key()).await.unwrap().updated_at.unwrap();
+    assert_eq!(
+        before, written,
+        "today's head prioritizes the live file time"
+    );
+    eprintln!("head activity: live-file mtime={written}, last recorded time={newest}, today's selected={before}; the staged Moved record must preserve the selected file time, not the record maximum");
+    let moved = rig.mover().move_to_store(&key()).await.unwrap();
+    assert_eq!(moved["moved"], true);
+    assert_eq!(
+        rig.registry.head(&key()).await.unwrap().updated_at,
+        Some(before)
+    );
+}
+
 /// Every name under `path`, relative to it, for comparing what a folder holds.
 fn tree(path: &Path) -> Vec<String> {
     fn walk(root: &Path, path: &Path, out: &mut Vec<String>) {

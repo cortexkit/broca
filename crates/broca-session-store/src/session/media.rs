@@ -30,17 +30,35 @@ pub(crate) struct OpenLogIndex {
     pub facts: BTreeMap<u64, u64>,
     /// The object each media digest the open log names is stored as.
     pub media: BTreeMap<String, MediaObject>,
-    /// The newest time any of the open log's records says something happened in the session
+    /// The checkpoint's activity advanced by the open log's fresh records
     /// ([`Record::activity_ms`]), which `session.head` serves as the session's last update.
     pub newest_activity_ms: Option<u64>,
+    /// Records below this seq already contributed to the checkpoint's activity. They may be
+    /// copied into the new log for conversation reads, but are not new session activity.
+    activity_from_seq: u64,
 }
 
 impl OpenLogIndex {
+    pub fn from_checkpoint(activity_ms: Option<u64>, next_seq: u64) -> Self {
+        Self {
+            newest_activity_ms: activity_ms,
+            activity_from_seq: if activity_ms.is_some() { next_seq } else { 0 },
+            ..Self::default()
+        }
+    }
+
     /// Takes in one record of the open log.
     pub fn note(&mut self, seq: u64, record: &Record) {
-        if let Some(at) = record.activity_ms() {
-            self.newest_activity_ms =
-                Some(self.newest_activity_ms.map_or(at, |newest| newest.max(at)));
+        if seq >= self.activity_from_seq {
+            if let Record::Moved(moved) = record {
+                // Today's head can prefer the WAL file's time to a later recorded time. The move
+                // freezes that served value, so times in the converted prefix must not outrank it.
+                // Only records after this boundary can advance the session's activity again.
+                self.newest_activity_ms = Some(moved.source_activity_ms);
+            } else if let Some(at) = record.activity_ms() {
+                self.newest_activity_ms =
+                    Some(self.newest_activity_ms.map_or(at, |newest| newest.max(at)));
+            }
         }
         match record {
             Record::EntryFacts(facts) => {

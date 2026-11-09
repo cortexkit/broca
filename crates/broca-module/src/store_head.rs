@@ -258,11 +258,12 @@ pub async fn build<B: SessionBackend>(
             _ => Ok(None),
         },
     )?;
+    // A known open-log time includes the authoritative frozen time of a move. The latest
+    // run may belong to the converted prefix, so use its time only when the log has none;
+    // taking their maximum would let a pre-move clock override the head the move preserved.
     let updated_at = session
         .open_log_activity_ms()
-        .into_iter()
-        .chain(latest_start.and_then(|start| start.written_at_ms.or(start.ts_ms)))
-        .max()
+        .or_else(|| latest_start.and_then(|start| start.written_at_ms.or(start.ts_ms)))
         .ok_or(StoreHeadError::NoTime)?;
     let mut reply = head_reply(HeadFacts {
         lineage_state: state,

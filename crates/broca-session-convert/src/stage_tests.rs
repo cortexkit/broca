@@ -199,10 +199,46 @@ fn staged_updated_at(
         .map(|head| head.reply.updated_at.expect("a built head has a time"))
 }
 
+#[test]
+fn a_converted_session_without_a_move_keeps_its_record_time_across_a_seal() {
+    let root = scratch("unmoved-time");
+    let (records, lineage) = written(&root);
+    let expected = broca_module::head_time::newest_record_ms(&records).unwrap();
+    let lineage = lineage.map(|id| id.to_string());
+    let converted = crate::convert(&records, lineage.as_deref()).unwrap();
+    let backend = broca_session_store::backend::MemoryBackend::default();
+    let mut store = block_on(Session::create(
+        &backend,
+        SessionAddr(broca_core::session_addr(&session())),
+        crate::stage::triple(&session()),
+        &deployment(),
+        true,
+    ))
+    .unwrap();
+    block_on(store.append(&converted.records, true)).unwrap();
+    let parts = broca_session_loop::parts::MemoryParts {
+        parts: converted.parts,
+    };
+    let before = block_on(broca_module::store_head::build(&store, &parts, false)).unwrap();
+    assert_eq!(before.reply.updated_at, Some(expected));
+    block_on(store.seal(None, expected + 100)).unwrap();
+    block_on(store.close()).unwrap();
+    let store = block_on(Session::view(
+        &backend,
+        SessionAddr(broca_core::session_addr(&session())),
+        &crate::stage::triple(&session()),
+        &deployment(),
+    ))
+    .unwrap();
+    let after = block_on(broca_module::store_head::build(&store, &parts, false)).unwrap();
+    assert_eq!(after.reply.updated_at, Some(expected));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// A moved session's head goes on serving the last update today's head served for it, which
 /// its `Moved` record carries: for a log none of whose records carries a time too, which the
-/// new storage could otherwise only refuse (`session_time_unknown`). A record time later than
-/// that is served instead, and records written after the move advance it.
+/// new storage could otherwise only refuse (`session_time_unknown`). Converted record times
+/// do not override that frozen value, but records written after the move advance it.
 #[test]
 fn a_moved_sessions_head_keeps_todays_last_update() {
     use broca_session_store::record::{Moved, Record};
@@ -236,8 +272,7 @@ fn a_moved_sessions_head_keeps_todays_last_update() {
         today
     );
 
-    // A log whose records carry a time later than the WAL file's write time: the newest
-    // record time.
+    // Today's head prefers the live WAL file's time even when a record's clock is ahead.
     let (timed, lineage) = written(&root.join("timed"));
     let newest = broca_module::head_time::newest_record_ms(&timed).unwrap();
     let earlier = Moved {
@@ -248,8 +283,26 @@ fn a_moved_sessions_head_keeps_todays_last_update() {
     let staged = stage_with_moved(&timed, &earlier);
     assert_eq!(
         staged_updated_at(&staging, &staged.converted).unwrap(),
-        newest
+        earlier.source_activity_ms
     );
+    // The frozen source can also be earlier than the latest run's start. Neither that start
+    // nor transcript records copied by a seal may replace the value today's head selected.
+    let before_start = Moved {
+        source_activity_ms: 1,
+        ..earlier
+    };
+    let staged = stage_with_moved(&timed, &before_start);
+    assert_eq!(staged_updated_at(&staging, &staged.converted).unwrap(), 1);
+    let mut stored = block_on(Session::load(
+        LocalBackend::new(&staging),
+        SessionAddr(broca_core::session_addr(&session())),
+        &crate::stage::triple(&session()),
+        &deployment(),
+    ))
+    .unwrap();
+    block_on(stored.seal(None, newest + 100)).unwrap();
+    block_on(stored.close()).unwrap();
+    assert_eq!(staged_updated_at(&staging, &staged.converted).unwrap(), 1);
 
     // A later run on the new storage advances it past the move's time.
     let mut both = timeless_run("r1");
@@ -281,6 +334,17 @@ fn a_moved_sessions_head_keeps_todays_last_update() {
     let parts = broca_session_loop::parts::MemoryParts {
         parts: converted.parts.clone(),
     };
+    let head = block_on(broca_module::store_head::build(&store, &parts, false)).unwrap();
+    assert_eq!(head.reply.updated_at, Some(2_000_000));
+    block_on(store.seal(None, 3_000_000)).unwrap();
+    block_on(store.close()).unwrap();
+    let store = block_on(Session::view(
+        &backend,
+        SessionAddr(broca_core::session_addr(&session())),
+        &crate::stage::triple(&session()),
+        &deployment(),
+    ))
+    .unwrap();
     let head = block_on(broca_module::store_head::build(&store, &parts, false)).unwrap();
     assert_eq!(head.reply.updated_at, Some(2_000_000));
     let _ = std::fs::remove_dir_all(&root);

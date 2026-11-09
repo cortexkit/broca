@@ -1316,6 +1316,7 @@ mod stored {
         operational,
         transcript_base,
         ledger_base,
+        activity_ms,
     });
     crate::fuzzing::gen::fields!(SessionTriple {
         project_root,

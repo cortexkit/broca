@@ -421,6 +421,7 @@ impl<B: SessionBackend> Session<B> {
             operational: settled.clone(),
             transcript_base: base,
             ledger_base: Some(reverted_seq),
+            activity_ms: None,
         }
         .encode();
         let ledger_sealed = self
