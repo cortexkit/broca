@@ -51,7 +51,7 @@ pub struct DefaultOpener<L: LeaseStore, W: WalStore> {
     store: Option<Arc<crate::store_open::StoreSlot>>,
     #[cfg(feature = "test-clock")]
     test_fs: Option<Arc<dyn broca_wal::fs_ops::FsOps>>,
-    #[cfg(feature = "test-clock")]
+    #[cfg(any(test, feature = "test-clock"))]
     ride_writer_for_test: bool,
 }
 
@@ -146,7 +146,7 @@ impl<L: LeaseStore, W: WalStore> DefaultOpener<L, W> {
             store: None,
             #[cfg(feature = "test-clock")]
             test_fs: None,
-            #[cfg(feature = "test-clock")]
+            #[cfg(any(test, feature = "test-clock"))]
             ride_writer_for_test: false,
         }
     }
@@ -165,7 +165,7 @@ impl<L: LeaseStore, W: WalStore> DefaultOpener<L, W> {
     }
 
     /// Exercise live envelope writes in tests without changing shipping writer behavior.
-    #[cfg(feature = "test-clock")]
+    #[cfg(any(test, feature = "test-clock"))]
     pub fn with_ride_writer_for_test(mut self) -> Self {
         self.ride_writer_for_test = true;
         self
