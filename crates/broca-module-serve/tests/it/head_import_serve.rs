@@ -624,6 +624,120 @@ async fn thalamus_imported_heads_keep_calls_and_notices_in_wire_reads() {
     }
 }
 
+/// The side file's opaque keys, pins and per-call times survive `session.read` and display
+/// `session.history`. A call recorded as cancelled with no timestamps keeps unknown times
+/// instead of taking the import's clock.
+#[tokio::test]
+async fn thalamus_call_side_file_keeps_pins_times_and_unknown_facts_through_serve() {
+    let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../ck-session-import/tests/fixtures/thalamus-export-calls-v1");
+    for (host, journal, closure) in [
+        ("opencode2", "export.json", false),
+        ("pi", "export.jsonl", false),
+        ("opencode2", "export.json", true),
+    ] {
+        let source = fixtures.join(host);
+        let bytes = std::fs::read(source.join(journal)).unwrap();
+        let mut side: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(source.join("export.calls.json")).unwrap())
+                .unwrap();
+        if closure {
+            let call = side["calls"][0].as_object_mut().unwrap();
+            call.remove("started_at");
+            call.remove("finished_at");
+            call.insert("unanswered".into(), serde_json::json!("cancelled"));
+        }
+        let tag = format!("call-facts-{host}-{closure}");
+        let mut rig = Rig::start(&tag, true).await;
+        rig.bind(1, core(), Some(stamp(core()))).await;
+        let folder = rig.import_folder();
+        std::fs::create_dir_all(&folder).unwrap();
+        let path = folder.join(journal);
+        std::fs::write(&path, &bytes).unwrap();
+        std::fs::write(
+            folder.join("export.calls.json"),
+            serde_json::to_vec(&side).unwrap(),
+        )
+        .unwrap();
+        rig.result(
+            1,
+            "session.import",
+            serde_json::json!({
+                "import_id": "call-facts",
+                "source": {
+                    "harness": host, "path": path,
+                "session": "01a1c3a2-83cc-718b-bcb8-06f631d16cd7",
+                    "sha256": format!("{:x}", sha2::Sha256::digest(&bytes)),
+                },
+                "origin": {"kind": "import", "source_ref": "thalamus:call-facts"},
+            }),
+        )
+        .await;
+        let default = rig.result(1, "session.read", serde_json::json!({})).await;
+        let facts = rig
+            .result(
+                1,
+                "session.read",
+                serde_json::json!({"include_display_facts": true}),
+            )
+            .await;
+        let display = rig
+            .result(1, "session.history", serde_json::json!({"form": "display"}))
+            .await;
+        let rows = side["calls"].as_array().unwrap();
+        let mut count = 0;
+        for message in default["messages"].as_array().unwrap() {
+            assert!(message.get("tool_times").is_none());
+            for call in message["tool_calls"].as_array().into_iter().flatten() {
+                count += 1;
+                let expected = rows
+                    .iter()
+                    .find(|row| row["call_key"] == call["call_key"])
+                    .unwrap();
+                assert_eq!(message["mid"], expected["mid"]);
+                assert_eq!(call["tool_call_id"], expected["tool_call_id"]);
+                assert_eq!(call["call_carrier"], "thalamus-harness");
+                assert!(
+                    call.get("schema_pin").is_none(),
+                    "tool_calls has no pin member"
+                );
+            }
+        }
+        assert_eq!(count, 2);
+        let times: Vec<_> = facts["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|message| message["tool_times"].as_array().into_iter().flatten())
+            .collect();
+        let parts: Vec<_> = display["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|message| message["row"]["parts"].as_array().into_iter().flatten())
+            .filter(|part| part["type"] == "tool_call")
+            .collect();
+        assert_eq!(times.len(), 2);
+        assert_eq!(parts.len(), 2);
+        for expected in rows {
+            let time = times
+                .iter()
+                .find(|time| time["call_key"] == expected["call_key"])
+                .unwrap();
+            let part = parts
+                .iter()
+                .find(|part| part["call_key"] == expected["call_key"])
+                .unwrap();
+            for actual in [*time, *part] {
+                assert_eq!(actual["call_carrier"], "thalamus-harness");
+                for member in ["schema_pin", "started_at", "finished_at", "unanswered"] {
+                    assert_eq!(actual.get(member), expected.get(member), "{host}: {member}");
+                }
+            }
+        }
+    }
+}
+
 /// An import naming a file outside broca's import folder is refused under the store's own code,
 /// and the file is left alone.
 #[tokio::test]
