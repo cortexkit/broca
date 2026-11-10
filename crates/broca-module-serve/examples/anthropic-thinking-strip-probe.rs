@@ -57,6 +57,10 @@ const CREDENTIAL_ID: &str = "oauth:anthropic";
 const DEFAULT_MODEL_ID: &str = "claude-opus-5-5";
 /// The probed model's id without the provider prefix, set once from `--model` before any request.
 static MODEL_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+/// The dev-tools handle to spend, set once from `--credential`; [`CREDENTIAL_ID`] when absent.
+/// A probe names an account-bound handle (`oauth:anthropic:<account>`) when the default
+/// account has no quota to spare.
+static CREDENTIAL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 fn model_id() -> &'static str {
     MODEL_ID.get().map_or(DEFAULT_MODEL_ID, String::as_str)
@@ -137,10 +141,11 @@ impl DeferredCase {
                     result["content"] = json!([{"type": "text", "text": text}]);
                 }
                 if self == Self::Probe {
-                    result["content"]
-                        .as_array_mut()
-                        .expect("tool-result content array")
-                        .push(json!({"type": "tool_reference", "tool_name": "X"}));
+                    // Anthropic refuses a tool_result that mixes tool_reference blocks with
+                    // other content ("Tool definitions/code execution functions cannot be
+                    // mixed with other content", observed live on Fable 5.2), so the
+                    // reference replaces the result's text.
+                    result["content"] = json!([{"type": "tool_reference", "tool_name": "X"}]);
                 }
             }
         }
@@ -699,7 +704,8 @@ async fn deferred_run(
 }
 
 async fn load_auth() -> Result<(String, Option<String>), Box<dyn std::error::Error>> {
-    let credential = CredentialId::parse(CREDENTIAL_ID).expect("canonical credential id");
+    let credential = CredentialId::parse(CREDENTIAL.get().map_or(CREDENTIAL_ID, String::as_str))
+        .ok_or("--credential is not a credential id (method:provider[:account])")?;
     let handle = load_devtools_handle(&credential)?;
     let subc_path = std::env::var_os("BROCA_LIVE_SUBC")
         .map(std::path::PathBuf::from)
@@ -724,7 +730,7 @@ async fn load_auth() -> Result<(String, Option<String>), Box<dyn std::error::Err
 }
 
 async fn run() -> Result<String, Box<dyn std::error::Error>> {
-    let usage = "usage: anthropic-thinking-strip-probe [--dry-run] [--model <id>] [--tool-first] [--deferred-tool [--out <dir>]]";
+    let usage = "usage: anthropic-thinking-strip-probe [--dry-run] [--model <id>] [--credential <dev-tools handle id>] [--tool-first] [--deferred-tool [--out <dir>]]";
     let mut dry = false;
     let mut deferred_tool = false;
     let mut output = None;
@@ -736,6 +742,10 @@ async fn run() -> Result<String, Box<dyn std::error::Error>> {
             "--out" if output.is_none() => output = Some(PathBuf::from(args.next().ok_or(usage)?)),
             "--tool-first" if TOOL_FIRST.get().is_none() => {
                 TOOL_FIRST.set(true).map_err(|_| usage)?;
+            }
+            "--credential" if CREDENTIAL.get().is_none() => {
+                let id = args.next().ok_or(usage)?;
+                CREDENTIAL.set(id).map_err(|_| usage)?;
             }
             "--model" if MODEL_ID.get().is_none() => {
                 let id = args.next().ok_or(usage)?;
@@ -1018,10 +1028,11 @@ mod tests {
         assert_eq!(result["type"], "tool_result");
         assert_eq!(result["tool_use_id"], "toolu_dry_run");
         assert_eq!(
-            result["content"].as_array_mut().unwrap().pop().unwrap(),
-            json!({"type": "tool_reference", "tool_name": "X"})
+            result["content"],
+            json!([{"type": "tool_reference", "tool_name": "X"}])
         );
-        assert_eq!(probe, control, "only X and its reference may differ");
+        result["content"] = control["messages"][2]["content"][0]["content"].clone();
+        assert_eq!(probe, control, "only X and the result's content may differ");
         assert_eq!(immediate, control, "only X may differ");
 
         let control_result = &control["messages"][2]["content"][0];
