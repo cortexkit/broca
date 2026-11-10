@@ -31,6 +31,10 @@ pub enum Reserved {
 ///
 /// `model` and `context_limit` are the step's: the run's own, or the refusal-fallback model's
 /// on a step sent there.
+///
+/// `renders` is false when the step's request can't be rendered, because what its rendering
+/// waits for failed (`Seams::model_call_ready`). The input is then not estimated, so the cap is
+/// the frozen one or the one already recorded; the step's model call fails before sending.
 pub async fn reserve<W: Writer, P: Provider>(
     writer: &mut W,
     provider: &P,
@@ -38,6 +42,7 @@ pub async fn reserve<W: Writer, P: Provider>(
     mut opts: CallOptions,
     model: &broca_protocol::request::ModelHandle,
     context_limit: Option<u64>,
+    renders: bool,
 ) -> Result<Reserved, LoopError> {
     let history = history(writer.operations());
     let recorded = history.recorded_for(StepId(step_id));
@@ -45,7 +50,7 @@ pub async fn reserve<W: Writer, P: Provider>(
     if let (Some(limits), Some(context_limit)) = (provider.output_limits(), context_limit) {
         // The estimate costs a render of the whole request, so it is made only when a measured
         // earlier step on this model makes one possible.
-        let estimate = if history.has_measurement(model) {
+        let estimate = if renders && history.has_measurement(model) {
             let bytes = provider
                 .try_render_request(&opts)
                 .map_err(|error| LoopError::Parts(error.message))?
