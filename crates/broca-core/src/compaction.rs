@@ -972,6 +972,7 @@ pub(crate) fn model_options_indexed(
     view.render_episodes = Arc::new(broca_protocol::request::RenderHistory {
         raw_ordinals: false,
         compaction_prefix_len: Some(applied.thinking_prefix_len),
+        signed_floor: opts.render_episodes.signed_floor,
         episodes: retained_episodes(opts, &view.prompt, tail_start),
     });
     Ok(view)

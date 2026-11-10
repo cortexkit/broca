@@ -1206,7 +1206,13 @@ pub fn last_recorded_request_with_lineage(
                 .map_or_else(|| config.model.clone(), |route| route.model.clone()),
         ),
         marker_order_version: prior.marker_order_version,
-        render_episodes: Arc::new(prior.render_episodes.unwrap_or_default().into()),
+        render_episodes: Arc::new(broca_protocol::request::RenderHistory {
+            signed_floor: prior
+                .signed_floor
+                .known()
+                .and_then(crate::signed_floor::SignedFloor::floor),
+            ..prior.render_episodes.unwrap_or_default().into()
+        }),
     };
     // Compaction may apply after StepStarted and before the attempt. Recover the view
     // through the attempt boundary, not just the prompt boundary used for steers.

@@ -77,9 +77,11 @@ fn media_free_checkpoint_field_order_matches_surrogate_0_3_284_schema() {
     let bytes = serde_json::to_vec(&checkpoint).unwrap();
     let legacy: SurrogateAdmissionCheckpoint = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(checkpoint.has_model_attempt, Some(false));
-    // The old decoder ignores the additive summary. Its known fields must still serialize
-    // in exactly their old order after removing only the member it does not know.
+    // The old decoder ignores the additive summaries. Its known fields must still serialize
+    // in exactly their old order after removing only the members it does not know.
     checkpoint.has_model_attempt = None;
+    assert!(!checkpoint.tool_set_history.is_unknown());
+    checkpoint.tool_set_history = broca_core::signed_floor::ToolSetHistory::Unknown;
     assert_eq!(
         serde_json::to_vec(&checkpoint).unwrap(),
         serde_json::to_vec(&legacy).unwrap()

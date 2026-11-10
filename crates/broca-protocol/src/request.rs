@@ -308,6 +308,14 @@ pub struct RenderHistory {
     /// Raw messages with smaller ordinals were produced before that view. Absent
     /// means no compaction view; replacement messages have no ordinal.
     pub compaction_prefix_len: Option<u64>,
+    /// The ordinal of the first message of the newest run whose tool set differs from the tool
+    /// set of the run before it. Anthropic refuses signed thinking that was sent under another
+    /// tool set, so a route that binds reasoning to its prefix sends no signed reasoning from a
+    /// message with a smaller ordinal (or none), exactly as it drops reasoning before a
+    /// compaction view. Absent means no run changed the tool set. Computed from each run's start
+    /// record by `broca_core::signed_floor`, never from memory, so a resumed or rebuilt request
+    /// renders the same bytes.
+    pub signed_floor: Option<u64>,
 }
 
 impl From<Vec<EpisodeRenderInput>> for RenderHistory {
@@ -316,6 +324,7 @@ impl From<Vec<EpisodeRenderInput>> for RenderHistory {
             episodes,
             raw_ordinals: false,
             compaction_prefix_len: None,
+            signed_floor: None,
         }
     }
 }

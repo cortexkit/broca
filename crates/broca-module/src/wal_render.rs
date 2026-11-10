@@ -295,7 +295,14 @@ fn boundary_options_with_media_tags(
         declared_markers: Vec::new(),
         ephemeral_session: false,
         marker_order_version: prior.marker_order_version,
-        render_episodes: Arc::new(prior.render_episodes.unwrap_or_default().into()),
+        render_episodes: Arc::new(broca_protocol::request::RenderHistory {
+            // Folded from every run start in the WAL, as the live run folded them.
+            signed_floor: prior
+                .signed_floor
+                .known()
+                .and_then(broca_core::signed_floor::SignedFloor::floor),
+            ..prior.render_episodes.unwrap_or_default().into()
+        }),
         prompt: prior.prompt,
         tools: Arc::clone(&config.tools),
         tool_choice: Arc::new(if prior.budget_finalize_pending {

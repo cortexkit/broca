@@ -802,6 +802,11 @@ tokio::task_local! {
 }
 
 tokio::task_local! {
+    /// The tools a run of a multi-run comparison declares in place of the scenario's, by run id.
+    static RUN_TOOLS: std::collections::HashMap<String, Vec<Tool>>;
+}
+
+tokio::task_local! {
     /// When set, the new side ends the cut log's run with this seal instead of resuming it.
     static SEALING: broca_core::resume::SealCause;
 }
@@ -2017,6 +2022,11 @@ impl Scenario {
     }
 
     fn plain_request_for(&self, run_id: &str, input: &[Message]) -> RunRequest {
+        let tools = RUN_TOOLS
+            .try_with(|tools| tools.get(run_id).cloned())
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| self.tools.clone());
         RunRequest {
             route_decision_id: None,
             account_route: None,
@@ -2036,8 +2046,8 @@ impl Scenario {
             session: bind(),
             model: ModelHandle::new(provider_id(), run_model(run_id)),
             input: input.to_vec(),
-            tools: self.tools.clone(),
-            policy_allowed: self.tools.iter().map(|t| t.name.clone()).collect(),
+            policy_allowed: tools.iter().map(|t| t.name.clone()).collect(),
+            tools,
             tool_choice: ToolChoice::Auto,
             generation: GenerationConfig::default(),
             cache: None,
@@ -3726,6 +3736,73 @@ async fn a_second_run_on_the_same_session() {
         ],
     )
     .await;
+}
+
+/// A run declaring tools that differ from the run before it (one tool's description refreshed,
+/// then the original tools again) moves the signed floor to its first message. Both loops fold
+/// the floor from the runs' starts and send the same requests, the floor included.
+#[tokio::test]
+async fn runs_whose_tools_change_move_the_signed_floor_alike() {
+    let read = tool("read", ExecutionMode::Sequential);
+    let mut refreshed = read.clone();
+    refreshed.description = "read something, skipping binary content".into();
+    let thought = |id: &str, text: &str| {
+        answer(
+            id,
+            vec![
+                ContentBlock::Reasoning {
+                    text: format!("thinking for {id}"),
+                    signature: Some(format!("sig-{id}")),
+                },
+                ContentBlock::Text { text: text.into() },
+            ],
+            FinishReason::Stop,
+        )
+    };
+    let scenario = Scenario {
+        input: Vec::new(),
+        tools: vec![read],
+        manifest: None,
+        stop_when: vec![StopCondition::StepCount { n: 8 }],
+        steps: vec![
+            thought("a1", "one"),
+            thought("a2", "two"),
+            thought("a3", "three"),
+            thought("a4", "four"),
+        ],
+    };
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    RUN_TOOLS
+        .scope(
+            [("r2".to_owned(), vec![refreshed])].into_iter().collect(),
+            NEW_REQUESTS.scope(
+                Arc::clone(&seen),
+                compare_runs(
+                    scenario,
+                    &[
+                        ("r1", vec![user("first task")]),
+                        ("r2", vec![user("second task")]),
+                        ("r3", vec![user("third task")]),
+                        ("r4", vec![user("fourth task")]),
+                    ],
+                ),
+            ),
+        )
+        .await;
+    // Each run places its input and one answer: r2 starts at 2, r3 (back to r1's tools) at 4,
+    // and r4 keeps r3's tools.
+    let seen = seen.lock().unwrap();
+    assert!(!seen.is_empty());
+    for opts in seen.iter() {
+        let run = opts.step_context.as_ref().unwrap().run_id.as_str();
+        let expected = match run {
+            "r1" => None,
+            "r2" => Some(2),
+            "r3" | "r4" => Some(4),
+            other => panic!("unexpected run {other}"),
+        };
+        assert_eq!(opts.render_episodes.signed_floor, expected, "{run}");
+    }
 }
 
 /// A send that sets every field a run's start records about it: both loops record each one the
