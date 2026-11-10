@@ -44,17 +44,20 @@ fn current_reference(bind: &BindIdentity, supplied: &str) -> Result<String, Comp
 pub struct SubcCompactionPlane {
     route: RoleRoute,
     v2_route: RoleRoute,
+    /// Reads the catalog, where a mode-3 provider declares the capabilities it reads.
+    conn: Arc<SubcConnection>,
 }
 
 impl SubcCompactionPlane {
     pub fn new(conn: Arc<SubcConnection>) -> Self {
         Self {
             v2_route: RoleRoute::without_discovery(conn.clone(), "compaction-provider", "v2"),
-            route: RoleRoute::new(conn, ROLE, VERSION, |describe| {
+            route: RoleRoute::new(conn.clone(), ROLE, VERSION, |describe| {
                 check_describe(describe)
                     .map(|_| ())
                     .map_err(|problems| format!("{problems:?}"))
             }),
+            conn,
         }
     }
 
@@ -188,6 +191,33 @@ impl CompactionPlane for SubcCompactionPlane {
                 } => CallError::Refused(Refusal::new(&code, message, detail)),
                 _ => CallError::Unavailable,
             })
+    }
+
+    /// The provider's catalog entry's `provides`, within the call budget. A catalog that can't
+    /// be read, or a provider missing from it, declares nothing: the provider is then sent only
+    /// what every provider reads.
+    async fn v2_provides(&self, provider: &str) -> Vec<String> {
+        let listed = tokio::time::timeout(
+            Duration::from_millis(COMPACTION_CALL_BUDGET_MS),
+            self.conn.catalog_list(),
+        )
+        .await;
+        match listed {
+            Ok(Ok(entries)) => entries
+                .into_iter()
+                .find(|entry| entry.module_id == provider)
+                .and_then(|entry| entry.capabilities)
+                .map(|caps| caps.provides)
+                .unwrap_or_default(),
+            Ok(Err(error)) => {
+                tracing::warn!(%error, provider, "compaction provider catalog read failed");
+                Vec::new()
+            }
+            Err(_) => {
+                tracing::warn!(provider, "compaction provider catalog read timed out");
+                Vec::new()
+            }
+        }
     }
 
     async fn setup(

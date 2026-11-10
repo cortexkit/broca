@@ -15,6 +15,10 @@ pub struct Transcript {
     pub rides: super::entries::RideEnvelopes,
     /// Host-only attribution; never projected into `session.entries`.
     pub newest_step_fill: Option<(String, u64)>,
+    /// The signed floor the runs' starts set ([`crate::signed_floor::SignedFloor::floor`]),
+    /// when the projection replayed every run. A tail projection, which serves reads only,
+    /// leaves it `None`, as does a log whose earlier records were folded away.
+    pub signed_floor: Option<u64>,
 }
 
 impl Transcript {
@@ -35,14 +39,20 @@ pub fn project(records: &[FramedRecord], lineage: &str) -> Result<Transcript, St
         Default::default(),
     )?
     .times;
-    finish(
+    let signed_floor = replay
+        .signed_floor
+        .known()
+        .and_then(crate::signed_floor::SignedFloor::floor);
+    let mut transcript = finish(
         records,
         lineage,
         0,
         metadata::Fold::default(),
         replay.prompt,
         times,
-    )
+    )?;
+    transcript.signed_floor = signed_floor;
+    Ok(transcript)
 }
 
 pub fn tail(
@@ -191,5 +201,6 @@ fn finish(
         entries,
         rides,
         newest_step_fill,
+        signed_floor: None,
     })
 }

@@ -219,6 +219,18 @@ impl ToolSetHistory {
     }
 }
 
+/// The floor a lineage's whole WAL folds (`records` from its first record), for a caller that
+/// holds no run's fold, such as an operation served between runs. `None` when no run changed the
+/// tool set, and also when the records don't start at the lineage's first run, which leaves the
+/// earlier runs' tools unknown.
+pub fn floor_of_records(records: &[broca_wal::WalRecord]) -> Result<Option<u64>, String> {
+    Ok(crate::replay(records)
+        .map_err(|error| error.to_string())?
+        .signed_floor
+        .known()
+        .and_then(SignedFloor::floor))
+}
+
 /// The floor a run admitted on a route that binds reasoning to its prefix starts from: `prior`'s
 /// when the state it was admitted from folded every run (a replay of the whole WAL), else the
 /// checkpoint's when it proves no run changed the tool set, else the floor a replay of the whole

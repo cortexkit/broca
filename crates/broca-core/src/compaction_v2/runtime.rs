@@ -35,6 +35,11 @@ pub trait Plane: Send + Sync {
         method: &str,
         params: serde_json::Value,
     ) -> Result<Box<RawValue>, CallError>;
+    /// The manifest capabilities the provider's catalog entry declares (`provides`), read at
+    /// every Setup (compaction contract W1.4). The default declares none.
+    async fn provides(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 pub struct BoundPlane<'a> {
@@ -74,6 +79,13 @@ impl Plane for BoundPlane<'_> {
             )
             .await
     }
+
+    async fn provides(&self) -> Vec<String> {
+        match self.plane {
+            Some(plane) => plane.v2_provides(self.provider).await,
+            None => Vec::new(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -99,6 +111,10 @@ struct Lane {
     /// claims the cause only then, so the provider never hears a cause it was told broca can't
     /// detect.
     detects_cache_expired: bool,
+    /// Whether the provider's catalog entry declared `compaction-signed-floor/v1` when the last
+    /// Setup was sent. Setup, notices and rides carry the session's signed floor only then
+    /// (compaction contract W3.5); the declaration holds until the next Setup.
+    signed_floor_declared: bool,
 }
 
 impl Default for Lane {
@@ -108,7 +124,20 @@ impl Default for Lane {
             ready: false,
             setup_due: true,
             detects_cache_expired: false,
+            signed_floor_declared: false,
         }
+    }
+}
+
+impl Lane {
+    /// `conditions` as this lane's provider may receive them: without the signed floor unless
+    /// it declared that it reads one.
+    fn conditions(&self, conditions: &Conditions) -> Conditions {
+        let mut conditions = conditions.clone();
+        if !self.signed_floor_declared {
+            conditions.signed_floor = None;
+        }
+        conditions
     }
 }
 
@@ -280,7 +309,7 @@ impl Runtime {
                     return;
                 }
                 lane.seq += 1;
-                let mut notice = NoticeRequest::new(lane.seq, conditions.clone());
+                let mut notice = NoticeRequest::new(lane.seq, lane.conditions(conditions));
                 notice.newest = pending.newest.clone();
                 notice.applied_view = applied.cloned();
                 notice.entries = std::mem::take(&mut pending.entries)
@@ -344,10 +373,12 @@ impl Runtime {
             #[serde(default)]
             view: Option<Box<RawValue>>,
         }
+        let mut request = request.clone();
+        request.conditions = lane.conditions(&request.conditions);
         let answer: Result<RawRideAnswer, _> = call(
             plane,
             "compaction.ride",
-            request,
+            &request,
             Duration::from_millis(request.deadline_ms),
         )
         .await;
@@ -382,8 +413,16 @@ impl Runtime {
 
 async fn setup(lane: &mut Lane, plane: &dyn Plane, request: &SetupRequest) -> bool {
     lane.seq = 0;
+    // The provider's declaration is read again at every Setup, and what it says holds for every
+    // call until the next one.
+    lane.signed_floor_declared =
+        cortexkit_role_compaction::provides_signed_floor(&plane.provides().await);
+    let mut request = request.clone();
+    if !lane.signed_floor_declared {
+        request.signed_floor = None;
+    }
     let answer: Result<SetupAnswer, _> =
-        call(plane, "compaction.setup", request, CALL_DEADLINE).await;
+        call(plane, "compaction.setup", &request, CALL_DEADLINE).await;
     lane.ready = match answer {
         Ok(SetupAnswer::Ready) => true,
         Ok(_) => {

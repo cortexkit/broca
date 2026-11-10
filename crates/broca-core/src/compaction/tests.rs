@@ -1511,7 +1511,9 @@ async fn run_history_steps(
         })
     });
     let (out, _events) = tokio::sync::mpsc::channel(256);
-    crate::run_loop_on_writer(
+    // Boxed: the run loop's future is large in a debug build, and the callers that wrap this
+    // one (`capture_logs`) would otherwise hold it on the test thread's stack.
+    Box::pin(crate::run_loop_on_writer(
         request,
         &writer,
         crate::StartMode::FreshOrResume,
@@ -1522,7 +1524,7 @@ async fn run_history_steps(
         None,
         control,
         &out,
-    )
+    ))
     .await
     .unwrap();
     let _ = writer.shutdown().await;

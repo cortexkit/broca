@@ -6136,6 +6136,7 @@ where
                 &transcript.entries,
                 false,
                 None,
+                transcript.signed_floor,
             ) {
                 Ok(conditions) => conditions,
                 Err(message) => {
@@ -6164,6 +6165,7 @@ where
                     entries: &transcript.entries,
                     rules: &conditions.rules,
                     accepts_images: conditions.accepts_images == Some(true),
+                    floor: crate::compaction_v2::host::view_floor(&conditions),
                     next_mid: &next_mid,
                 },
             )
@@ -6357,6 +6359,7 @@ where
                 &transcript.entries,
                 chained,
                 transcript.newest_step_fill(),
+                transcript.signed_floor,
             ) {
                 Ok(conditions) => conditions,
                 Err(message) => {

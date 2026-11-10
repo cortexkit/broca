@@ -1,6 +1,7 @@
 //! Accepted and applied views are separate durable facts. An acknowledgement
 //! confirms storage, not a change to a request already in progress.
 
+use cortexkit_compaction_view::rules::Floor;
 use cortexkit_role_compaction::{
     notice::Event,
     read::Entry,
@@ -180,6 +181,7 @@ impl State {
         Ok(())
     }
 
+    /// `floor` is the session's signed floor (`host::view_floor`).
     pub async fn accept(
         &mut self,
         journal: &impl Journal,
@@ -187,11 +189,14 @@ impl State {
         received: impl Into<ReceivedView>,
         rules: &ProviderRules,
         accepts_images: bool,
+        floor: Floor<'_>,
     ) -> Result<Result<(), ViewRefusal>, String> {
         let received = received.into();
         received.check_size()?;
         let view = received.view();
-        if let Err(refusal) = views::check(entries, self.latest(), view, rules, accepts_images) {
+        if let Err(refusal) =
+            views::check(entries, self.latest(), view, rules, accepts_images, floor)
+        {
             return Ok(Err(refusal));
         }
         journal.accepted(self.latest.as_ref(), &received).await?;
@@ -222,6 +227,7 @@ impl State {
                 view,
                 boundary.rules,
                 boundary.accepts_images,
+                boundary.floor,
             ) {
                 journal.view_refused(
                     &super::diagnostics::Publication::from_view(view),
@@ -308,5 +314,7 @@ pub struct Boundary<'a> {
     pub entries: &'a [Entry],
     pub rules: &'a ProviderRules,
     pub accepts_images: bool,
+    /// The session's signed floor (`host::view_floor`).
+    pub floor: Floor<'a>,
     pub next_mid: &'a str,
 }

@@ -913,7 +913,14 @@ async fn compaction_v2_next_request_numbers_follow_the_view_the_next_request_ren
         let transcript =
             v2::transcript::project(&frames, &fixture_lineage_id().to_string()).unwrap();
         let (config, _) = v2::host::frozen(&frames).unwrap();
-        let conditions = v2::host::conditions(&config, &transcript.entries, false, None).unwrap();
+        let conditions = v2::host::conditions(
+            &config,
+            &transcript.entries,
+            false,
+            None,
+            transcript.signed_floor,
+        )
+        .unwrap();
         (
             v2::shown::next_request(&state, &transcript.entries, &conditions).unwrap(),
             transcript.entries,
@@ -1399,6 +1406,7 @@ async fn compaction_v2_fallback_fill_survives_resume_after_step_completion() {
         &transcript.entries,
         false,
         transcript.newest_step_fill(),
+        transcript.signed_floor,
     )
     .unwrap();
     assert_eq!(offline.last_prompt_tokens, Some(1_000));
@@ -1806,7 +1814,7 @@ async fn compaction_v2_context_folds_refreezes_and_tracks_accepted_attempts_befo
             false,
             false,
             0,
-            &v2::host::conditions(&config, &[], false, None).unwrap()
+            &v2::host::conditions(&config, &[], false, None, None).unwrap()
         ),
         vec![
             v2::protocol::ride::RideCause::TierChange,

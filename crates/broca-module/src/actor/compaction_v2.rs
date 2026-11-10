@@ -99,9 +99,30 @@ impl<W: WalStore + 'static> super::LineageActor<W> {
             .then(|| self.materialized_store.clone())
             .flatten();
         let entries = self.all_compaction_entries(&writer, store).await?;
-        let conditions = v2::host::conditions(config, &entries, false, None)?;
+        let floor = self.signed_floor(&checkpoint).await?;
+        let conditions = v2::host::conditions(config, &entries, false, None, floor)?;
         let state = self.compaction_session.state.lock().await;
         v2::shown::next_request(&state, &entries, &conditions).map(Some)
+    }
+
+    /// The session's signed floor (`broca_core::signed_floor`) for a call served between runs,
+    /// which holds no run's fold: none when the admission checkpoint proves that no run changed
+    /// its tool set, else what a replay of the whole WAL folds.
+    async fn signed_floor(
+        &self,
+        checkpoint: &broca_core::AdmissionCheckpointV1,
+    ) -> Result<Option<u64>, String> {
+        if let Some(floor) = checkpoint.tool_set_history.continued_floor() {
+            return Ok(floor.floor());
+        }
+        let wal = self.wal_store.clone();
+        let key = self.key.clone();
+        let frames = spawn_blocking(JobKind::WalRead, move || wal.read_records(&key))
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        let records: Vec<_> = frames.into_iter().map(|frame| frame.record).collect();
+        broca_core::signed_floor::floor_of_records(&records)
     }
 
     pub(super) async fn compaction_v2_call(
@@ -271,8 +292,9 @@ impl<W: WalStore + 'static> super::LineageActor<W> {
                     .all_compaction_entries(&writer, store)
                     .await
                     .map_err(internal)?;
+                let floor = self.signed_floor(&checkpoint).await.map_err(internal)?;
                 let conditions =
-                    v2::host::conditions(config, &entries, false, None).map_err(internal)?;
+                    v2::host::conditions(config, &entries, false, None, floor).map_err(internal)?;
                 let mut state = self.compaction_session.state.lock().await;
                 let answer = match state
                     .accept(
@@ -285,6 +307,7 @@ impl<W: WalStore + 'static> super::LineageActor<W> {
                         received,
                         &conditions.rules,
                         conditions.accepts_images == Some(true),
+                        v2::host::view_floor(&conditions),
                     )
                     .await
                     .map_err(internal)?

@@ -406,7 +406,8 @@ where
     // Every end a run writes is followed by a notice of the session's changes, as today's
     // loop follows each of its ends; a pause isn't an end.
     if finished.paused.is_none() {
-        if let Some(changes) = crate::compaction::Changes::of(&admission, seams)
+        let floor = signed_floor(&placed, parts, &mut ToolSetCache::default()).await?;
+        if let Some(changes) = crate::compaction::Changes::of(&admission, seams, floor)
             .map(|changes| changes.sharing(compaction.as_ref()))
         {
             changes.tell(&placed, seams).await;
@@ -490,7 +491,8 @@ where
             .as_ref()
             .map(|run| frozen_admission(run, parts))
         {
-            if let Some(changes) = crate::compaction::Changes::of(&admission, seams) {
+            let floor = signed_floor(writer, parts, &mut ToolSetCache::default()).await?;
+            if let Some(changes) = crate::compaction::Changes::of(&admission, seams, floor) {
                 changes.tell(writer, seams).await;
             }
         }
@@ -1673,9 +1675,6 @@ where
     T: ToolPlane,
 {
     let warming = Warming::of(admission, seams);
-    // The changes a batch tells the compaction provider read the transcript the run's steps keep.
-    let changes =
-        crate::compaction::Changes::of(admission, seams).map(|changes| changes.sharing(compaction));
     // The pause a timed same-account wait left, which the step it resumes must match.
     let mut account_limit_replay = account_limit_of(writer)?;
     // Each window run's place in the prompt and render config, and the signed floor its runs'
@@ -1684,6 +1683,10 @@ where
     // shares the list.
     let mut tool_sets = ToolSetCache::default();
     let mut episodes = Arc::new(render_history(writer, parts, &mut tool_sets).await?);
+    // The changes a batch tells the compaction provider read the transcript the run's steps keep,
+    // and report the signed floor the run's requests carry.
+    let changes = crate::compaction::Changes::of(admission, seams, episodes.signed_floor)
+        .map(|changes| changes.sharing(compaction));
     // Each window run's frozen part numbering, read from its start once for the whole run.
     let mut tag_rules = TagRulesCache::default();
     let tools = Arc::new(admission.tools.clone());
@@ -1842,8 +1845,15 @@ where
                 .as_ref()
                 .is_some_and(|run| run.cancel.is_some());
         if let (Some(ctx), false) = (compaction, ending) {
-            if let Err(message) =
-                crate::compaction::apply_boundary(writer, admission, seams, ctx, step_id).await?
+            if let Err(message) = crate::compaction::apply_boundary(
+                writer,
+                admission,
+                seams,
+                ctx,
+                step_id,
+                episodes.signed_floor,
+            )
+            .await?
             {
                 return compaction_unavailable(writer, seams, admission, &message).await;
             }
@@ -2436,7 +2446,7 @@ where
             )
             .await?;
         if let Some(ctx) = compaction {
-            crate::compaction::notice(writer, admission, seams, ctx).await?;
+            crate::compaction::notice(writer, admission, seams, ctx, episodes.signed_floor).await?;
         }
         if calls.is_empty() {
             // A message steered in during the step makes the run take one more step, unless a
@@ -2870,6 +2880,18 @@ async fn render_history<W: Writer>(
     floors: &mut ToolSetCache,
 ) -> Result<RenderHistory, LoopError> {
     let mut history = RenderHistory::from(render_episodes(writer, parts)?);
+    history.signed_floor = signed_floor(writer, parts, floors).await?;
+    Ok(history)
+}
+
+/// The session's signed floor (`broca_core::signed_floor::SignedFloor::floor`), folded from its
+/// runs' starts by the rule today's loop folds its `RunStarted` records by. [`render_history`]
+/// says how far past the window that fold reaches.
+pub async fn signed_floor<W: Writer>(
+    writer: &W,
+    parts: &dyn Parts,
+    floors: &mut ToolSetCache,
+) -> Result<Option<u64>, LoopError> {
     let conversation = writer.conversation();
     let mut floor = broca_core::signed_floor::SignedFloor::default();
     for episode in conversation
@@ -2895,14 +2917,13 @@ async fn render_history<W: Writer>(
             floor.observe_run(episode.start - 1, digest);
         }
     }
-    history.signed_floor = floor.floor();
-    Ok(history)
+    Ok(floor.floor())
 }
 
 /// Each run's tool-set digest as its start froze it, by run id, read once per run. `None` for a
 /// seeded run, which never sends a request.
 #[derive(Default)]
-pub(crate) struct ToolSetCache {
+pub struct ToolSetCache {
     by_run: std::collections::HashMap<String, Option<String>>,
 }
 

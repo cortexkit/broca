@@ -107,6 +107,7 @@ pub async fn prepare(
         at.rides,
         view.as_ref(),
         &at.conditions.rules,
+        super::host::view_floor(at.conditions),
         &mut image,
     )?;
     let mut tokens = estimate(&prompt)?;
@@ -142,6 +143,7 @@ pub async fn prepare(
             at.rides,
             view.as_ref(),
             &at.conditions.rules,
+            super::host::view_floor(at.conditions),
             &mut image,
         )?;
         tokens = estimate(&prompt)?;
@@ -167,6 +169,7 @@ pub async fn prepare(
             at.rides,
             view.as_ref(),
             &at.conditions.rules,
+            super::host::view_floor(at.conditions),
             &mut image,
         )?;
         tokens = estimate(&prompt)?;
@@ -227,6 +230,7 @@ async fn ride(
             received,
             &at.conditions.rules,
             at.conditions.accepts_images == Some(true),
+            super::host::view_floor(at.conditions),
         )
         .await
         .inspect_err(|_| journal.view_refused(&publication, "internal_error"))?;
@@ -261,6 +265,7 @@ async fn apply_ride_answer(
         entries: at.entries,
         rules: &at.conditions.rules,
         accepts_images: at.conditions.accepts_images == Some(true),
+        floor: super::host::view_floor(at.conditions),
         next_mid: at.next_mid,
     };
     for event in state.apply(journal, boundary).await? {

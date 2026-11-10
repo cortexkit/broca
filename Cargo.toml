@@ -87,21 +87,21 @@ cortexkit-role-harness = "=0.1.0"
 cortexkit-role-tool-provider = "=0.15.1"
 cortexkit-llm-tools = "=0.3.0"
 cortexkit-role-tool-provider-conformance = "=0.15.1"
-cortexkit-role-llm-runner = "=0.8.28"
+cortexkit-role-llm-runner = "=0.8.35"
 # Recorded v1 requests must keep the exact tag-rendering bytes of their original contract.
 cortexkit-role-llm-runner-v1 = { package = "cortexkit-role-llm-runner", version = "=0.7.48" }
 cortexkit-bus-naming = "=0.2.7"
 cortexkit-bus-trait = "=0.3.0"
 cortexkit-bus-nats = "=0.3.1"
-cortexkit-role-llm-runner-conformance = "=0.17.33"
+cortexkit-role-llm-runner-conformance = "=0.17.43"
 # Draft 2020-12 validation of structured-output values. Default features are off so the
 # validator has no HTTP or file retriever: a schema can never make broca fetch anything.
 jsonschema = { version = "=0.58.6", default-features = false }
 cortexkit-role-agent-data = "=0.2.2"
 cortexkit-role-step-transform-provider = "=0.5.0"
 cortexkit-role-compaction-provider = "=0.7.14"
-cortexkit-role-compaction = "=0.2.10"
-cortexkit-compaction-view = "=0.1.8"
+cortexkit-role-compaction = "=0.3.4"
+cortexkit-compaction-view = "=0.3.0"
 # System One: the one-pass decision-model role and the batch rules it shares with extraction.
 cortexkit-role-classifier = "=0.6.3"
 cortexkit-role-classifier-conformance = "=0.8.3"
@@ -120,10 +120,6 @@ tracing = "0.1"
 tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "4fffad30fe373adbdcffab9545e9e9bf4f2fc19f" }
 
 [patch.crates-io]
-# Fix the kit's media-only first-send bookkeeping, and keep every oversize argument of its media
-# fixtures on its own sibling call, under the runner's tool-input cap. Drop with a released kit
-# that carries both fixes (the second ships in conformance kit 0.17.39).
-cortexkit-role-llm-runner-conformance = { git = "https://github.com/cortexkit/commons", rev = "6a24eec5be2a14af121030391454f665027ab5df" }
 # JetStream's retry dependency must not enable Tokio's production test clock.
 # See commons third_party/tryhard/CORTEXKIT.md; remove once upstream drops test-util.
 tryhard = { git = "https://github.com/cortexkit/commons", rev = "fe59258998db48975f43cb892b71a9952db4eb86" }

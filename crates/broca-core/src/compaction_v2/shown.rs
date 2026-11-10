@@ -27,6 +27,7 @@ pub fn next_request(
                 view,
                 &conditions.rules,
                 conditions.accepts_images == Some(true),
+                super::host::view_floor(conditions),
             )
             .is_ok()
         })
