@@ -6,12 +6,9 @@
 //! policy schedules it, the executor prices it and checks the account's quota, and a warm the
 //! provider answered is recorded and dates the cache.
 //!
-//! The request warmed is the bytes the run's transport last started sending, which its model
-//! calls note on the driver's seal ([`StoreWarmer::step_seal`]), so a warm renders nothing.
-//! Today's driver falls back to a request rebuilt from the session's log when the run sent
-//! nothing yet in this process, as a resumed run waiting on tools before its first model call
-//! has; rebuilding that request from the new storage isn't built, so such a warm stops as
-//! today's stops with no request to warm (`warm_prefix_unavailable`).
+//! The request warmed is the bytes the run's transport last started sending. Before the first
+//! send after a restart, the driver instead rebuilds the recorded step's request from the view
+//! before its tool turn, waits for media readiness, and checks its recorded digest before sending.
 //!
 //! The run's writer is busy with the tool wait, so a warm's record goes to the actor, which
 //! appends it as its own record: it is queued before the driver awaits anything, so a warm the
@@ -42,6 +39,14 @@ pub(super) struct WarmRecord {
 /// under, so it is read again only when one changes.
 type ConfigSlot = Arc<Mutex<Option<(RefreezeKey, RunConfig)>>>;
 type RefreezeKey = (Option<serde_json::Value>, Option<serde_json::Value>);
+
+pub(super) type RecordedBase = Result<
+    (
+        broca_core::RecordedRequest,
+        Arc<crate::store_media::LazyRenderer>,
+    ),
+    String,
+>;
 
 /// The actor's end of a run's keep-warm.
 pub(super) struct RunWarming {
@@ -89,6 +94,7 @@ pub(super) struct StoreWarmer {
     declare: Declare,
     config: ConfigSlot,
     records: mpsc::UnboundedSender<WarmRecord>,
+    recorded: Option<RecordedBase>,
 }
 
 impl StoreWarmer {
@@ -100,6 +106,7 @@ impl StoreWarmer {
         executor: Arc<dyn RunExecutor>,
         declare: Declare,
         last_send: Option<(u64, Option<u64>, broca_protocol::Usage)>,
+        recorded: Option<RecordedBase>,
     ) -> (Arc<Self>, RunWarming) {
         let clock = CacheClock::default();
         if let Some((sent_at_ms, ttl_ms, usage)) = last_send {
@@ -117,6 +124,7 @@ impl StoreWarmer {
             declare,
             config: Arc::clone(&config),
             records,
+            recorded,
         });
         (
             warmer,
@@ -236,7 +244,7 @@ impl KeepWarmDriver<Admission> for StoreWarmer {
 
 impl StoreWarmer {
     /// One warm of run `run_id`'s cache, as today's driver sends it.
-    async fn warm_run(&self, run_id: &RunId) -> WarmTick {
+    pub(super) async fn warm_run(&self, run_id: &RunId) -> WarmTick {
         let Some(_permit) = self.slot.acquire() else {
             return WarmTick::Skipped;
         };
@@ -267,15 +275,36 @@ impl StoreWarmer {
         {
             return stop("unsupported", "cache_expired".into());
         }
-        let Some(sent) = self.seal.last_sent() else {
-            return stop("unsupported", "warm_prefix_unavailable".into());
+        let (base, step_id, job_config) = match self.seal.last_sent() {
+            Some(sent) => {
+                let step = sent.step_id;
+                (WarmBase::InFlight(sent), step, config.clone())
+            }
+            None => match self.recorded.as_ref() {
+                Some(Ok((request, renderer))) => (
+                    WarmBase::RecordedMedia {
+                        request: Box::new(request.clone()),
+                        renderer: Arc::clone(renderer),
+                    },
+                    request.step_id,
+                    request.config.clone(),
+                ),
+                unavailable => {
+                    let reason = unavailable
+                        .and_then(|result| result.as_ref().err())
+                        .map(String::as_str)
+                        .unwrap_or("no recorded request is available");
+                    tracing::warn!(target: "cache_warm", session = %self.session.session, run_id = %run_id.0, reason,
+                        "the resumed run's keep-warm prefix is unavailable");
+                    return stop("unsupported", "warm_prefix_unavailable".into());
+                }
+            },
         };
-        let step_id = sent.step_id;
-        let digest = sent.sha256.clone();
+        let digest = base.request_body_sha256().to_owned();
         let job = WarmJob {
             session: self.session.clone(),
-            config: config.clone(),
-            base: WarmBase::InFlight(sent),
+            config: job_config,
+            base,
             attempt_hook: None,
         };
         let sent = match self.executor.warm(job).await {
@@ -289,7 +318,11 @@ impl StoreWarmer {
                     broca_protocol::error::ACCOUNT_LIMIT_EXHAUSTED.into(),
                 );
             }
-            Err(error) => return stop("unsupported", format!("{error:?}")),
+            Err(error) => {
+                tracing::warn!(target: "cache_warm", session = %self.session.session, run_id = %run_id.0, ?error,
+                    "the keep-warm request was not sent");
+                return stop("unsupported", format!("{error:?}"));
+            }
         };
         self.slot.note_headers(
             sent.sent_at_ms,
@@ -385,10 +418,11 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> su
     /// The keep-warm of a run started in `mode` from `request`, when the run keeps its cache warm:
     /// a new run when its send asks for it, a run going on when its start froze it. Without the
     /// module's registry no cache policy can be read, so no run warms.
-    pub(super) fn keep_warm_for(
+    pub(super) async fn keep_warm_for(
         &self,
         request: &broca_protocol::request::SubmissionRequest,
         mode: crate::executor::StoreRunMode,
+        media: &mut Option<crate::store_media::StoreRunMediaWait>,
     ) -> Option<(Arc<StoreWarmer>, RunWarming)> {
         use crate::executor::StoreRunMode;
         use broca_protocol::request::KeepWarm;
@@ -423,12 +457,22 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> su
                 .unwrap_or_default();
             (send.sent_at_ms, ttl_ms, usage)
         });
-        Some(StoreWarmer::new(
+        let recorded = if mode == StoreRunMode::Resume {
+            Some(self.recorded_warm_request().await.and_then(|request| {
+                super::recorded_warm::media(media, &request.config)
+                    .map(|renderer| (request, renderer))
+            }))
+        } else {
+            None
+        };
+        let (driver, warming) = StoreWarmer::new(
             self.key.clone(),
             Arc::clone(&self.executor),
             Arc::new(move |config| registry.cache_declaration(config)),
             last_send,
-        ))
+            recorded,
+        );
+        Some((driver, warming))
     }
 
     /// Appends the record of a warm the active run's keep-warm sent, durable before the driver
@@ -576,15 +620,14 @@ mod tests {
                     ..Default::default()
                 },
             )),
+            None,
         );
         *warming.config.lock().unwrap() = Some(((None, None), config()));
         (warmer, warming)
     }
 
-    /// A run whose transport sent nothing yet in this process, as a resumed run waiting on tool
-    /// calls before its first model call, has no request to warm: its warm stops as today's
-    /// stops with none, before the executor is asked to render or send anything, so a session
-    /// whose media aren't ready to render yet is never rendered.
+    /// With neither an in-process send nor a recorded request, a warm stops before rendering or
+    /// sending anything, as today's driver does when both sources are absent.
     #[tokio::test]
     async fn a_run_that_sent_nothing_yet_warms_nothing() {
         let executor = Arc::new(Counting::default());

@@ -85,9 +85,9 @@ impl CacheDeclarer for FamilyDeclarer {
 
 /// The provider a warm goes through: the real Anthropic transport renders the request, and the
 /// warm is answered here instead of over the network, keeping the bytes it was asked to send.
-struct Probe {
-    live: broca_provider::LiveProvider<AnthropicMessages>,
-    sent: Arc<Mutex<Vec<Vec<u8>>>>,
+pub(super) struct Probe {
+    pub(super) live: broca_provider::LiveProvider<AnthropicMessages>,
+    pub(super) sent: Arc<Mutex<Vec<Vec<u8>>>>,
 }
 
 #[async_trait]
@@ -98,6 +98,13 @@ impl broca_core::provider::Provider for Probe {
 
     fn render_request(&self, opts: &CallOptions) -> Vec<u8> {
         broca_core::provider::Provider::render_request(&self.live, opts)
+    }
+
+    fn set_media_request_renderer(
+        &self,
+        renderer: Arc<broca_core::provider::MediaRequestRenderer>,
+    ) {
+        broca_core::provider::Provider::set_media_request_renderer(&self.live, renderer);
     }
 
     async fn warm(&self, base: &[u8]) -> Result<broca_core::WarmSent, broca_core::WarmFailure> {

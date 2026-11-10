@@ -1719,7 +1719,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         mode: StoreRunMode,
         cancel: CancellationToken,
     ) {
-        let media = match mode {
+        let mut media = match mode {
             StoreRunMode::Seal(_) => None,
             _ => Some(self.run_media().await),
         };
@@ -1740,7 +1740,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         // The executor resolves the send's credential selection; only the result is frozen.
         let auth = request.auth.take();
         // A run whose keep-warm is `auto` warms the prompt cache while it waits on tool calls.
-        let (keep_warm, warming) = match self.keep_warm_for(&request, mode) {
+        let (keep_warm, warming) = match self.keep_warm_for(&request, mode, &mut media).await {
             Some((driver, warming)) => (
                 Some(driver as Arc<dyn broca_core::keep_warm_wait::KeepWarmDriver<_>>),
                 Some(warming),
@@ -3912,6 +3912,7 @@ mod inline_import;
 mod keep_warm;
 mod ordered;
 mod pauses;
+mod recorded_warm;
 mod retries;
 mod scopes;
 mod service_tier;

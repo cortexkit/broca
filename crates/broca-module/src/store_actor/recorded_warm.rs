@@ -1,0 +1,285 @@
+//! Rebuild the request before a recorded tool turn, never the next request after its results.
+
+use std::sync::Arc;
+
+use broca_core::RecordedRequest;
+use broca_protocol::{BindIdentity, RunId, StepId};
+use broca_session_loop::{parts::Parts, writer::Writer};
+use broca_session_store::fold::{conversation::Conversation, operations::Operations};
+use broca_session_store::record::Record;
+use broca_session_store::record::Stream;
+use broca_session_store::session::{Carry, EnrollmentOverlay, SessionError, StoredEntry};
+
+/// Build from a snapshot: the actor and the running loop must keep the complete conversation.
+pub(super) async fn request<W: Writer>(
+    writer: &W,
+    records: &[(u64, Record)],
+    parts: &dyn Parts,
+    bind: &BindIdentity,
+) -> Result<RecordedRequest, String> {
+    let run = writer.operations().run.as_ref().ok_or("no recorded run")?;
+    let (attempt_at, attempt) = records
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(at, (_, record))| match record {
+            Record::Attempt(attempt) if attempt.run_id == run.run_id => Some((at, attempt)),
+            _ => None,
+        })
+        .ok_or("the run's last request has no recorded attempt")?;
+    let step = attempt.step_id;
+    let (start_at, mid) = records[..attempt_at]
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(at, (_, record))| match record {
+            Record::StepStart(start) if start.run_id == run.run_id && start.step_id == step => {
+                start.mid.as_deref().map(|mid| (at, mid))
+            }
+            _ => None,
+        })
+        .ok_or("the recorded step has no assistant message id")?;
+    let conversation = writer.conversation();
+    let ordinal = conversation
+        .open_entry()
+        .filter(|(_, _, entry)| entry.facts.as_ref().is_some_and(|facts| facts.mid == mid))
+        .map(|(ordinal, _, _)| ordinal)
+        .or_else(|| {
+            conversation
+                .entries
+                .iter()
+                .position(|entry| entry.facts.as_ref().is_some_and(|facts| facts.mid == mid))
+                .map(|at| conversation.window_start() + at as u64)
+        })
+        .ok_or("the recorded step's tool turn is outside the conversation window")?;
+    let run_at = records[..=attempt_at]
+        .iter()
+        .rposition(
+            |(_, record)| matches!(record, Record::RunStart(start) if start.run_id == run.run_id),
+        )
+        .ok_or("the recorded run's start is outside the readable history")?;
+    let mut prefix = Operations::default();
+    for (seq, record) in &records[run_at..=attempt_at] {
+        if record.stream() == Stream::Ledger {
+            prefix
+                .apply_at(Some(*seq), record)
+                .map_err(|error| format!("the recorded step's state: {error:?}"))?;
+        }
+    }
+    let mut operations = writer.operations().clone();
+    operations.run = prefix.run;
+    let before = Before {
+        writer,
+        conversation: conversation
+            .before_entry(ordinal)
+            .ok_or("the recorded step is outside the window")?,
+        operations,
+    };
+    let run = before
+        .operations
+        .run
+        .as_ref()
+        .ok_or("the recorded step has no run")?;
+    let start = run.start.as_ref().ok_or("the recorded run has no start")?;
+    let config = super::warm::run_config(run, start, parts)
+        .map_err(|error| format!("the recorded run's config: {error:?}"))?;
+    let mut opts = broca_session_loop::run::offline_media_request(&before, parts, bind, step)
+        .await
+        .map_err(|error| format!("the recorded step's request: {error:?}"))?;
+    let cap = records[start_at..attempt_at]
+        .iter()
+        .rev()
+        .find_map(|(_, record)| match record {
+            Record::OutputCapLowered(cap) if cap.step_id == step => Some(cap),
+            _ => None,
+        });
+    if let Some(context) = opts.step_context.as_mut() {
+        context.max_output_tokens = cap.map(|cap| cap.max_output_tokens);
+    }
+    let route = records[attempt_at..]
+        .iter()
+        .find_map(|(_, record)| match record {
+            Record::StepEnd(end) if end.run_id == run.run_id && end.step_id == step => {
+                end.fallback.as_ref()
+            }
+            _ => None,
+        })
+        .and_then(|fallback| fallback.get("route"))
+        .map(|route| serde_json::from_value::<broca_wal::StepRoute>(route.clone()))
+        .transpose()
+        .map_err(|error| format!("the recorded step's route: {error}"))?;
+    if let Some(route) = &route {
+        opts.target_model = Some(route.model.clone());
+    }
+    Ok(RecordedRequest {
+        run_id: RunId(run.run_id.clone()),
+        step_id: StepId(step),
+        config,
+        opts,
+        request_body_sha256: attempt
+            .request_body_sha256
+            .0
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+        route,
+    })
+}
+
+impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> super::StoreActor<B> {
+    pub(super) async fn recorded_warm_request(&self) -> Result<RecordedRequest, String> {
+        let mut records = self
+            .session
+            .open_log_records()
+            .await
+            .map_err(|error| format!("read the recorded request: {error:?}"))?;
+        let run_id = self
+            .session
+            .operations
+            .run
+            .as_ref()
+            .ok_or("no recorded run")?
+            .run_id
+            .as_str();
+        if !records.iter().any(
+            |(_, record)| matches!(record, Record::Attempt(attempt) if attempt.run_id == run_id),
+        ) || !records
+            .iter()
+            .any(|(_, record)| matches!(record, Record::RunStart(start) if start.run_id == run_id))
+        {
+            let readers = self
+                .readers
+                .as_ref()
+                .ok_or("the recorded request's sealed history cannot be read")?;
+            records = self
+                .session
+                .stored_records(readers())
+                .records_between(1, self.session.next_seq().saturating_sub(1))
+                .await
+                .map_err(|error| format!("read the recorded request's history: {error:?}"))?;
+        }
+        request(&self.session, &records, &self.parts, &self.key).await
+    }
+}
+
+/// Fork the media delivery, not its consuming tail reader. A warm rebuilds one fixed request;
+/// its renderer must not advance or drain the live run's renderer.
+pub(super) fn media(
+    wait: &mut Option<crate::store_media::StoreRunMediaWait>,
+    config: &broca_wal::RunConfig,
+) -> Result<Arc<crate::store_media::LazyRenderer>, String> {
+    let frozen: broca_provider::wire::FrozenRenderConfig =
+        serde_json::from_value(config.frozen_render_config.clone())
+            .map_err(|error| error.to_string())?;
+    let original = wait
+        .take()
+        .ok_or("the resumed run has no media readiness wait")?;
+    let (live, live_wait) = tokio::sync::oneshot::channel();
+    let (recorded, recorded_wait) = tokio::sync::oneshot::channel();
+    *wait = Some(live_wait);
+    tokio::spawn(async move {
+        if let Ok(media) = original.await {
+            let _ = recorded.send(media.snapshot());
+            let _ = live.send(media);
+        }
+    });
+    Ok(crate::store_media::LazyRenderer::new(
+        recorded_wait,
+        Box::new(move |bytes, checkpoint, tail| {
+            let media = broca_provider::media_request::LiveMedia::from_checkpoint(
+                bytes,
+                checkpoint,
+                None,
+                frozen.media,
+                tail,
+            )?;
+            Ok(Arc::new(
+                move |frozen: &serde_json::Value,
+                      opts: &broca_protocol::request::CallOptions,
+                      tags: bool,
+                      commit: bool,
+                      provenance: Option<
+                    &mut broca_protocol::render_provenance::RenderProvenance,
+                >| {
+                    media.render_with_provenance(frozen, opts, tags, commit, provenance)
+                },
+            )
+                as Arc<broca_core::provider::MediaRequestRenderer>)
+        }),
+    ))
+}
+
+/// Offline rendering reads the snapshot's conversation and the session's durable lookups. No
+/// write is permitted through this adapter, including a compaction seal.
+struct Before<'a, W> {
+    writer: &'a W,
+    conversation: Conversation,
+    operations: Operations,
+}
+
+impl<W: Writer> Writer for Before<'_, W> {
+    async fn append(&mut self, _: &[Record], _: bool) -> Result<u64, SessionError> {
+        Err(SessionError::OwnerGone)
+    }
+    async fn send_records(&mut self, _: &str) -> Result<Vec<Record>, SessionError> {
+        Err(SessionError::OwnerGone)
+    }
+    async fn append_with(
+        &mut self,
+        _: &mut (dyn for<'s> FnMut(&'s Conversation, &'s Operations, u64) -> Vec<Record> + Send),
+        _: bool,
+    ) -> Result<Vec<Record>, SessionError> {
+        Err(SessionError::OwnerGone)
+    }
+    fn conversation(&self) -> &Conversation {
+        &self.conversation
+    }
+    fn operations(&self) -> &Operations {
+        &self.operations
+    }
+    fn session_id(&self) -> String {
+        self.writer.session_id()
+    }
+    fn next_seq(&self) -> u64 {
+        self.writer.next_seq()
+    }
+    fn message_id_prefix(&self) -> String {
+        self.writer.message_id_prefix()
+    }
+    async fn open_log_records(&self) -> Result<Vec<(u64, Record)>, SessionError> {
+        self.writer.open_log_records().await
+    }
+    async fn run_start(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<broca_session_store::record::RunStart>, SessionError> {
+        self.writer.run_start(run_id).await
+    }
+    async fn tool_intent(
+        &self,
+        key: &str,
+    ) -> Result<Option<broca_session_store::record::ToolIntent>, SessionError> {
+        self.writer.tool_intent(key).await
+    }
+    async fn enrollment(&self) -> Result<Option<EnrollmentOverlay>, SessionError> {
+        self.writer.enrollment().await
+    }
+    async fn put_enrollment(
+        &mut self,
+        _: &broca_session_store::record::EnrolledEntries,
+    ) -> Result<broca_session_store::record::EnrollmentOverlayRef, SessionError> {
+        Err(SessionError::OwnerGone)
+    }
+    async fn seal_at_entry(&mut self, _: u64, _: &Carry<'_>, _: u64) -> Result<(), SessionError> {
+        Err(SessionError::OwnerGone)
+    }
+    async fn seal_ledger(&mut self, _: &Carry<'_>, _: u64) -> Result<(), SessionError> {
+        Err(SessionError::OwnerGone)
+    }
+    async fn entry_by_mid(&self, mid: &str) -> Result<Option<StoredEntry>, SessionError> {
+        self.writer.entry_by_mid(mid).await
+    }
+    async fn entries_by_mid(&self, mids: &[String]) -> Result<Vec<StoredEntry>, SessionError> {
+        self.writer.entries_by_mid(mids).await
+    }
+}

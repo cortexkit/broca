@@ -419,7 +419,7 @@ pub async fn send_warm(
     provider: &dyn broca_core::Provider,
     base: WarmBase,
 ) -> Result<broca_core::WarmSent, WarmError> {
-    let bytes = prepare_warm_base(provider, base)?;
+    let bytes = prepare_warm_base(provider, base).await?;
     provider.warm(&bytes).await.map_err(warm_failure)
 }
 
@@ -429,7 +429,7 @@ pub async fn send_warm_with_hook(
     base: WarmBase,
     hook: Option<Arc<dyn broca_core::run::AttemptHook>>,
 ) -> Result<broca_core::WarmSent, WarmError> {
-    let bytes = prepare_warm_base(provider, base)?;
+    let bytes = prepare_warm_base(provider, base).await?;
     let result = match hook {
         Some(hook) => provider.warm_with_hook(&bytes, Some(hook)).await,
         None => provider.warm(&bytes).await,
@@ -437,10 +437,22 @@ pub async fn send_warm_with_hook(
     result.map_err(warm_failure)
 }
 
-fn prepare_warm_base(
+async fn prepare_warm_base(
     provider: &dyn broca_core::Provider,
     base: WarmBase,
 ) -> Result<Vec<u8>, WarmError> {
+    let base = match base {
+        WarmBase::RecordedMedia { request, renderer } => {
+            use broca_session_loop::run::ModelCallReady as _;
+            renderer
+                .ready()
+                .await
+                .map_err(|error| WarmError::PrefixUnavailable(error.message))?;
+            provider.set_media_request_renderer(renderer.renderer());
+            WarmBase::Recorded(request)
+        }
+        base => base,
+    };
     let bytes = match base {
         WarmBase::InFlight(sent) => {
             // The in-flight bytes are already the ones the transport sent, for whichever model
@@ -462,7 +474,9 @@ fn prepare_warm_base(
             } else {
                 broca_core::refusal_fallback::StepRoute::Source
             });
-            let rendered = provider.render_request(&recorded.opts);
+            let rendered = provider
+                .try_render_request(&recorded.opts)
+                .map_err(|error| WarmError::PrefixUnavailable(error.message))?;
             let digest = broca_core::render::request_digest_hex(&rendered);
             if digest != recorded.request_body_sha256 {
                 return Err(WarmError::PrefixUnavailable(format!(
@@ -473,6 +487,7 @@ fn prepare_warm_base(
             }
             rendered
         }
+        WarmBase::RecordedMedia { .. } => unreachable!("media readiness was resolved above"),
     };
     Ok(bytes)
 }
@@ -494,6 +509,12 @@ pub enum WarmBase {
     /// The most recent request the WAL records, to be rendered again and checked against the
     /// digest its step recorded.
     Recorded(Box<broca_core::RecordedRequest>),
+    /// A recorded store request whose media bytes and rendering state must be ready first.
+    /// It passes through the same digest check as a recorded request without media.
+    RecordedMedia {
+        request: Box<broca_core::RecordedRequest>,
+        renderer: Arc<crate::store_media::LazyRenderer>,
+    },
 }
 
 impl WarmBase {
@@ -502,6 +523,7 @@ impl WarmBase {
         match self {
             WarmBase::InFlight(sent) => &sent.sha256,
             WarmBase::Recorded(recorded) => &recorded.request_body_sha256,
+            WarmBase::RecordedMedia { request, .. } => &request.request_body_sha256,
         }
     }
 }
