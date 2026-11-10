@@ -4185,10 +4185,8 @@ impl LineageRegistry {
         let unserved = crate::store_actor::unserved_creating_send(
             &request,
             kind,
-            delivery,
             conversation_key.is_some(),
             retention.is_some(),
-            order.is_some(),
         );
         // How the session starts if this send creates it. A head starts only in the new
         // storage, and the opener refuses one it can't start there; any other send starts there

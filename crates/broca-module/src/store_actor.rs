@@ -1087,7 +1087,12 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                         }
                     }
                 }
-                if let Some(what) = unserved_request(&request, kind, retention.is_some()) {
+                if let Some(what) = unserved_request(
+                    &request,
+                    kind,
+                    retention.is_some(),
+                    self.session.operations().owner.episodes > 0,
+                ) {
                     let _ = reply.send(SendOutcome::Error(unserved(what)));
                     return false;
                 }
@@ -3272,13 +3277,11 @@ fn finished(run_id: &RunId, reason: broca_protocol::RunFinishReason) -> SendOutc
 pub fn unserved_creating_send(
     request: &SubmissionRequest,
     kind: RunKind,
-    delivery: broca_protocol::Delivery,
     conversation_key: bool,
     retention: bool,
-    ordered: bool,
 ) -> Option<&'static str> {
-    unserved_delivery(ordered, delivery, conversation_key)
-        .or_else(|| unserved_request(request, kind, retention))
+    unserved_route(conversation_key)
+        .or_else(|| unserved_request(request, kind, retention, false))
         .or_else(|| carries_media(request).then_some("a send carrying media"))
 }
 
@@ -3311,23 +3314,6 @@ fn frozen_media(
     (profile, model)
 }
 
-/// The delivery a send creating a session asks for that keeps the new session out of the new
-/// storage, which then starts on today's: an ordered list or an interrupt. This actor serves both
-/// only on a session it already holds.
-fn unserved_delivery(
-    ordered: bool,
-    delivery: broca_protocol::Delivery,
-    conversation_key: bool,
-) -> Option<&'static str> {
-    if ordered {
-        Some("an ordered delivery")
-    } else if delivery == broca_protocol::Delivery::Interrupt {
-        Some("an interrupt")
-    } else {
-        unserved_route(conversation_key)
-    }
-}
-
 /// How a send asks to be routed, where this actor doesn't serve it yet.
 fn unserved_route(conversation_key: bool) -> Option<&'static str> {
     // Routing reads a conversation key when it picks the run's account, which a store session's
@@ -3335,15 +3321,19 @@ fn unserved_route(conversation_key: bool) -> Option<&'static str> {
     conversation_key.then_some("a send naming a conversation key")
 }
 
-/// What a send's request asks for, where this actor doesn't serve it yet.
+/// What a send's request asks for, where this actor doesn't serve it yet. On a session that never
+/// ran (`ran` false), as on a send creating one, a send resuming after sign-in has no paused run
+/// to resume: today's loop starts its run fresh, as it starts any other send's, and so does this
+/// actor.
 fn unserved_request(
     request: &SubmissionRequest,
     kind: RunKind,
     retention: bool,
+    ran: bool,
 ) -> Option<&'static str> {
     if retention {
         Some("a send setting retention")
-    } else if kind == RunKind::ResumeAfterAuth {
+    } else if kind == RunKind::ResumeAfterAuth && ran {
         Some("resuming after sign-in")
     } else {
         refuse_unbuilt_request(request)
