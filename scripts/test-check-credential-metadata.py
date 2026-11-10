@@ -52,7 +52,7 @@ class MetadataDeployGate(unittest.TestCase):
     def setUpClass(cls):
         # Reuse WalRecord's exact-byte pins as templates, then round-trip every
         # fixture through FileWal so Python cannot invent fields broca never writes.
-        pins = (ROOT / "crates/broca-wal/src/record/pinned_bytes_tests.rs").read_text()
+        pins = (ROOT / "crates/broca-records/src/record/pinned_bytes_tests.rs").read_text()
         records = [json.loads(raw) for raw in re.findall(
             r'^[ \t]*r#"(\{"type":[^\n]*\})"#,?[ \t]*$', pins, re.MULTILINE)]
         cls.start_template = next(record for record in records if record["type"] == "run_started"

@@ -445,6 +445,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         reply: &mut oneshot::Sender<SendOutcome>,
     ) -> Result<Option<SubmissionId>, SendOutcome> {
         let Start {
+            conversation_key,
             run_id,
             mut request,
             title,
@@ -475,6 +476,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 &existing,
                 request,
                 identity.as_deref(),
+                conversation_key.as_deref(),
                 broca_protocol::Delivery::Queue,
                 &self.parts,
                 submission_id,
@@ -515,6 +517,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             })
             .map(|queued| queued.submission_id);
         let receipt = queue::Receipt {
+            conversation_key,
             // The input's sender as the session shows it: the plan-named sender, else the
             // principal the send came under.
             sent_by: sender.clone(),

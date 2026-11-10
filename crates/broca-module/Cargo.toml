@@ -56,6 +56,7 @@ async-trait.workspace = true
 futures = { workspace = true, features = ["executor"] }
 
 [dev-dependencies]
+broca-session-convert = { path = "../broca-session-convert" }
 broca-crash-harness = { path = "../broca-crash-harness" }
 tokio-tungstenite.workspace = true
 cortexkit-role-llm-runner = { workspace = true, features = ["test-vectors"] }

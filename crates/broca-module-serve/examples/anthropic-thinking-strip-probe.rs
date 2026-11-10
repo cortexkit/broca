@@ -20,8 +20,18 @@
 //! five requests to that model on the `oauth:anthropic` dev-tools handle. `--dry-run` sends nothing and prints each request's
 //! rendered shape, including its `thinking` member, without credentials. The token is never
 //! printed: provider error messages are scrubbed of it before they are shown.
+//!
+//! `--deferred-tool` instead keeps signed thinking in a four-request experiment: `seed`,
+//! `control_a` (unchanged tools), `probe` (a deferred tool discovered in the tool result), and
+//! `control_b` (the same new tool loaded immediately, without a reference). Unchanged tools
+//! preserve the prefix bound to the signed thinking (expected 200); loading X immediately
+//! changes that prefix (expected 400). The probe's outcome is not assumed. This mode's dry run
+//! prints all four bodies. Optional `--out <dir>` also saves exact request bytes as
+//! `<model>-<name>.json` and measurements as `rows.jsonl`; existing files are never overwritten.
+//! Both live and dry deferred-tool runs freeze adaptive, summarized thinking with max effort
+//! directly from production family defaults, without consulting a mutable model catalog.
 
-use std::{sync::Arc, time::Duration};
+use std::{io::Write, path::PathBuf, sync::Arc, time::Duration};
 
 use broca_catalog::live::{
     resolve_catalog_episode_with_client, AuthMethod, AuthMode, EpisodeRenderConfig, ResolveOptions,
@@ -34,8 +44,14 @@ use broca_protocol::{
     request::{CacheRequest, CacheRole, CallOptions, ModelHandle, Tool, ToolChoice},
     BindIdentity, ContentBlock, Message, Role, ToolCall, ToolCallId, ToolOutput, ToolResult,
 };
-use broca_provider::{spec::WireFamilyId, wire::ClaudeCodePersona};
+use broca_provider::{
+    families::anthropic_messages::AnthropicMessages,
+    policy::SystemPromptPolicy,
+    spec::WireFamilyId,
+    wire::{AuthHandle, ClaudeCodePersona, FrozenRenderConfig, HttpRequest, WireFamily},
+};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 const CREDENTIAL_ID: &str = "oauth:anthropic";
 const DEFAULT_MODEL_ID: &str = "claude-opus-5-5";
@@ -56,9 +72,129 @@ struct Answer {
     content: Vec<ContentBlock>,
     input_tokens: u64,
     cache_read: u64,
+    cache_creation: u64,
+    has_usage: bool,
     status: Option<u16>,
     error: Option<(String, String)>,
     received_assistant_message: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeferredCase {
+    Seed,
+    ControlA,
+    Probe,
+    ControlB,
+}
+
+impl DeferredCase {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Seed => "seed",
+            Self::ControlA => "control_a",
+            Self::Probe => "probe",
+            Self::ControlB => "control_b",
+        }
+    }
+
+    fn patch(self, mut body: Value) -> Value {
+        // Anthropic documents these shapes in "Tool definition" / "Deferred tool loading"
+        // and "Custom tool search implementation":
+        // https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-search-tool
+        // "Anthropic-provided tools" lists no additional beta header for tool search:
+        // https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-reference
+        let tools = body["tools"].as_array_mut().expect("rendered tools");
+        tools.insert(
+            0,
+            json!({"type": "tool_search_tool_regex_20251119", "name": "tool_search_tool_regex"}),
+        );
+        if matches!(self, Self::Probe | Self::ControlB) {
+            let mut tool = json!({
+                "name": "X",
+                "description": "Read an additional fixed sample.",
+                "input_schema": {"type": "object", "properties": {}, "additionalProperties": false}
+            });
+            if self == Self::Probe {
+                tool["defer_loading"] = json!(true);
+            }
+            // Append at the end of the tools array so existing cache markers stay in place.
+            // Deferred definitions cannot carry cache_control ("Prompt caching" above).
+            tools.push(tool);
+        }
+        if self != Self::Seed {
+            let results = body["messages"]
+                .as_array_mut()
+                .expect("rendered messages")
+                .last_mut()
+                .expect("tool-result message")["content"]
+                .as_array_mut()
+                .expect("tool-result blocks");
+            for result in results {
+                if result["type"] != "tool_result" {
+                    continue;
+                }
+                if let Some(text) = result["content"].as_str() {
+                    result["content"] = json!([{"type": "text", "text": text}]);
+                }
+                if self == Self::Probe {
+                    result["content"]
+                        .as_array_mut()
+                        .expect("tool-result content array")
+                        .push(json!({"type": "tool_reference", "tool_name": "X"}));
+                }
+            }
+        }
+        body
+    }
+}
+
+// Only the experimental tool declarations and result content bypass production shaping;
+// authentication, endpoint selection, compression and response normalization stay production.
+struct DeferredFamily(DeferredCase);
+
+impl WireFamily for DeferredFamily {
+    fn shape(&self, frozen: &FrozenRenderConfig, opts: &CallOptions) -> Value {
+        self.0.patch(AnthropicMessages.shape(frozen, opts))
+    }
+
+    fn render_with_provenance(
+        &self,
+        frozen: &FrozenRenderConfig,
+        opts: &CallOptions,
+        provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+    ) -> Vec<u8> {
+        let body = self
+            .0
+            .patch(AnthropicMessages.shape_with_provenance(frozen, opts, provenance));
+        if matches!(
+            frozen.system_prompt,
+            SystemPromptPolicy::RequiredIdentityLead { .. }
+        ) && frozen.claude_code_persona.is_some()
+        {
+            // The billing signature covers the entire body, so sign after the experimental edits.
+            let serialized = broca_provider::claude_code_persona::to_persona_json(&body);
+            broca_provider::claude_code_persona::sign_body(&serialized).into_bytes()
+        } else {
+            broca_protocol::canonical_json_bytes(&body)
+        }
+    }
+
+    fn endpoint(
+        &self,
+        frozen: &FrozenRenderConfig,
+        auth: &AuthHandle,
+        body: Vec<u8>,
+    ) -> HttpRequest {
+        AnthropicMessages.endpoint(frozen, auth, body)
+    }
+
+    fn normalizer(
+        &self,
+        frozen: &FrozenRenderConfig,
+        step_id: broca_protocol::StepId,
+    ) -> Box<dyn broca_provider::wire::StreamNormalizer> {
+        AnthropicMessages.normalizer(frozen, step_id)
+    }
 }
 
 fn fixed_prefix() -> String {
@@ -195,6 +331,25 @@ fn cache_policy(
     .map_err(|error| Box::new(std::io::Error::other(error.to_string())) as _)
 }
 
+fn deferred_config(
+    persona: Option<&ClaudeCodePersona>,
+    session: &BindIdentity,
+) -> Result<FrozenRenderConfig, Box<dyn std::error::Error>> {
+    let mut frozen = broca_provider::families::anthropic_frozen_config(model_id());
+    frozen.cache = cache_policy(session)?;
+    frozen.claude_code_persona = persona.cloned();
+    // Freeze the same experimental settings for dry and live requests so catalog changes
+    // cannot silently change the thinking mode between inspecting a body and sending it.
+    frozen.variant = Some(broca_provider::variant::FrozenVariant {
+        name: THINKING_ON_VARIANT.into(),
+        request: broca_provider::variant::VariantRequest::Anthropic {
+            thinking: Some(json!({"type": "adaptive", "display": "summarized"})),
+            effort: Some("max".into()),
+        },
+    });
+    Ok(frozen)
+}
+
 fn resolve_provider(
     token: &str,
     persona: &ClaudeCodePersona,
@@ -291,6 +446,8 @@ async fn send(
                 NormalizedEvent::Control(ProviderControl::Finished { usage, .. }) => {
                     answer.input_tokens = usage.input_tokens.unwrap_or(0);
                     answer.cache_read = usage.cached_input_tokens.unwrap_or(0);
+                    answer.cache_creation = usage.cache_write_tokens.unwrap_or(0);
+                    answer.has_usage = true;
                     finished = true;
                 }
                 NormalizedEvent::Control(ProviderControl::Error { error, .. }) => {
@@ -341,6 +498,206 @@ fn accepted(answer: &Answer) -> bool {
     answer.status == Some(200) && answer.error.is_none() && answer.received_assistant_message
 }
 
+fn dry_seed() -> Answer {
+    Answer {
+        content: vec![
+            ContentBlock::Reasoning {
+                text: "brief private thought".into(),
+                signature: Some("dry-run-signature".into()),
+            },
+            ContentBlock::Text {
+                text: "I will read the sample.".into(),
+            },
+            ContentBlock::ToolCall(ToolCall {
+                thought_signature: None,
+                tool_call_id: ToolCallId("toolu_dry_run".into()),
+                tool_name: TOOL.into(),
+                input: json!({"path": "sample.txt"}),
+            }),
+        ],
+        received_assistant_message: true,
+        ..Answer::default()
+    }
+}
+
+fn first_sentence(message: &str) -> &str {
+    for (index, ch) in message.char_indices() {
+        if matches!(ch, '.' | '!' | '?') {
+            let end = index + ch.len_utf8();
+            if message[end..].starts_with(char::is_whitespace) || end == message.len() {
+                return &message[..end];
+            }
+        }
+    }
+    message
+}
+
+fn deferred_row(case: DeferredCase, body: &[u8], answer: Option<&Answer>) -> Value {
+    let usage = answer.filter(|answer| answer.has_usage);
+    json!({
+        "request_name": case.name(),
+        "model": model_id(),
+        "http_status": answer.and_then(|answer| answer.status),
+        "error_first_sentence": answer.and_then(|answer| answer.error.as_ref())
+            .map(|(_, message)| first_sentence(message)),
+        "cache_read_input_tokens": usage.map(|answer| answer.cache_read),
+        "cache_creation_input_tokens": usage.map(|answer| answer.cache_creation),
+        "input_tokens": usage.map(|answer| answer.input_tokens),
+        "request_body_sha256": format!("{:x}", Sha256::digest(body)),
+    })
+}
+
+struct DeferredOutput {
+    directory: PathBuf,
+    rows: std::fs::File,
+}
+
+impl DeferredOutput {
+    fn open(directory: PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
+        let in_cortexkit = |path: &std::path::Path| {
+            path.components()
+                .any(|component| component.as_os_str() == ".cortexkit")
+        };
+        let absolute = if directory.is_absolute() {
+            directory.clone()
+        } else {
+            std::env::current_dir()?.join(&directory)
+        };
+        let existing = absolute
+            .ancestors()
+            .find(|ancestor| ancestor.exists())
+            .ok_or("--out has no existing ancestor")?
+            .canonicalize()?;
+        if in_cortexkit(&absolute) || in_cortexkit(&existing) {
+            return Err("--out must not be under any .cortexkit/ folder".into());
+        }
+        if !model_id()
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+        {
+            return Err("--out requires a model id usable as a filename".into());
+        }
+        std::fs::create_dir_all(&directory)?;
+        let rows = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(directory.join("rows.jsonl"))?;
+        Ok(Self { directory, rows })
+    }
+
+    fn body(&self, case: DeferredCase, body: &[u8]) -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(
+                self.directory
+                    .join(format!("{}-{}.json", model_id(), case.name())),
+            )?;
+        file.write_all(body)
+    }
+
+    fn row(&mut self, row: &Value) -> Result<(), Box<dyn std::error::Error>> {
+        serde_json::to_writer(&mut self.rows, row)?;
+        writeln!(self.rows)?;
+        self.rows.flush()?;
+        Ok(())
+    }
+}
+
+async fn deferred_request(
+    case: DeferredCase,
+    frozen: &FrozenRenderConfig,
+    token: &str,
+    opts: &CallOptions,
+    dry: bool,
+    output: &mut Option<DeferredOutput>,
+) -> Result<Answer, Box<dyn std::error::Error>> {
+    use broca_core::Provider as _;
+
+    let provider = broca_provider::LiveProvider::new(
+        DeferredFamily(case),
+        frozen.clone(),
+        AuthHandle::Bearer(token.to_owned()),
+    );
+    let body = provider.render_request(opts);
+    if let Some(output) = output {
+        output.body(case, &body)?;
+    }
+    println!(
+        "{} {}: {}",
+        if dry { "dry-run" } else { "request" },
+        case.name(),
+        std::str::from_utf8(&body)?
+    );
+    let answer = if dry {
+        dry_seed()
+    } else {
+        let step = match case {
+            DeferredCase::Seed => 1,
+            DeferredCase::ControlA => 2,
+            DeferredCase::Probe => 3,
+            DeferredCase::ControlB => 4,
+        };
+        let answer = send(step, &provider, token, opts).await?;
+        print_result(case.name(), &answer);
+        answer
+    };
+    let row = deferred_row(case, &body, (!dry).then_some(&answer));
+    println!("{row}");
+    if let Some(output) = output {
+        output.row(&row)?;
+    }
+    Ok(answer)
+}
+
+async fn deferred_run(
+    frozen: &FrozenRenderConfig,
+    token: &str,
+    dry: bool,
+    mut output: Option<DeferredOutput>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let seed = deferred_request(
+        DeferredCase::Seed,
+        frozen,
+        token,
+        &with_tools(seed_prompt(), ToolChoice::Auto),
+        dry,
+        &mut output,
+    )
+    .await?;
+    if !dry
+        && (!accepted(&seed)
+            || signed_thinking_count(&seed.content) == 0
+            || tool_results(&seed.content).is_empty())
+    {
+        return Ok("INCONCLUSIVE: the seed did not return signed thinking with a tool_use; nothing else was sent.".into());
+    }
+    let opts = tool_loop(&seed, false);
+    let mut answers = Vec::new();
+    for case in [
+        DeferredCase::ControlA,
+        DeferredCase::Probe,
+        DeferredCase::ControlB,
+    ] {
+        answers.push(deferred_request(case, frozen, token, &opts, dry, &mut output).await?);
+    }
+    if dry {
+        return Ok(
+            "DRY RUN: nothing sent; seed and three deferred-tool follow-ups printed.".into(),
+        );
+    }
+    if !accepted(&answers[0]) || answers[2].status != Some(400) {
+        return Ok(format!(
+            "INCONCLUSIVE: expected control_a=200 and control_b=400; observed {:?} and {:?}.",
+            answers[0].status, answers[2].status
+        ));
+    }
+    Ok(format!(
+        "model {}: unchanged tools accepted={}; deferred tool referenced in tool_result accepted={}; immediate tool control HTTP {:?}.",
+        model_id(), accepted(&answers[0]), accepted(&answers[1]), answers[2].status
+    ))
+}
+
 async fn load_auth() -> Result<(String, Option<String>), Box<dyn std::error::Error>> {
     let credential = CredentialId::parse(CREDENTIAL_ID).expect("canonical credential id");
     let handle = load_devtools_handle(&credential)?;
@@ -367,12 +724,16 @@ async fn load_auth() -> Result<(String, Option<String>), Box<dyn std::error::Err
 }
 
 async fn run() -> Result<String, Box<dyn std::error::Error>> {
-    let usage = "usage: anthropic-thinking-strip-probe [--dry-run] [--model <id>] [--tool-first]";
+    let usage = "usage: anthropic-thinking-strip-probe [--dry-run] [--model <id>] [--tool-first] [--deferred-tool [--out <dir>]]";
     let mut dry = false;
+    let mut deferred_tool = false;
+    let mut output = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--dry-run" if !dry => dry = true,
+            "--deferred-tool" if !deferred_tool => deferred_tool = true,
+            "--out" if output.is_none() => output = Some(PathBuf::from(args.next().ok_or(usage)?)),
             "--tool-first" if TOOL_FIRST.get().is_none() => {
                 TOOL_FIRST.set(true).map_err(|_| usage)?;
             }
@@ -383,6 +744,10 @@ async fn run() -> Result<String, Box<dyn std::error::Error>> {
             _ => return Err(usage.into()),
         }
     }
+    if output.is_some() && !deferred_tool {
+        return Err("--out requires --deferred-tool".into());
+    }
+    let output = output.map(DeferredOutput::open).transpose()?;
     let thinking_disabled = broca_provider::variant::FrozenVariant {
         name: "probe-thinking-disabled".into(),
         request: broca_provider::variant::VariantRequest::Anthropic {
@@ -397,10 +762,18 @@ async fn run() -> Result<String, Box<dyn std::error::Error>> {
         "anthropic-thinking-strip-probe",
         format!("anthropic-thinking-strip-probe-{}", std::process::id()),
     );
-    let state_root = broca_module_serve::state_root::resolve_state_root()?;
-    broca_catalog::install_global_catalog_cache(Arc::new(broca_catalog::CatalogCache::open(
-        state_root.path.join("catalog/fusiform-lkg.json"),
-    )));
+    // The deferred-tool dry run needs neither a catalog nor the person's state root.
+    let state_root = if dry && deferred_tool {
+        None
+    } else {
+        let root = broca_module_serve::state_root::resolve_state_root()?;
+        if !deferred_tool {
+            broca_catalog::install_global_catalog_cache(Arc::new(
+                broca_catalog::CatalogCache::open(root.path.join("catalog/fusiform-lkg.json")),
+            ));
+        }
+        Some(root)
+    };
 
     let (token, account_id) = if dry {
         ("dry-run-token-never-sent".to_owned(), None)
@@ -410,7 +783,9 @@ async fn run() -> Result<String, Box<dyn std::error::Error>> {
     let install_id = if dry {
         "0".repeat(64)
     } else {
-        claude_code_identity::load_or_create_install_id(&state_root.path)?
+        claude_code_identity::load_or_create_install_id(
+            &state_root.as_ref().expect("live state root").path,
+        )?
     };
     let version = ClaudeCodePersona::CURRENT_VERSION;
     let suffix = broca_provider::families::anthropic_messages::cc_version_suffix_for_transcript(
@@ -425,6 +800,10 @@ async fn run() -> Result<String, Box<dyn std::error::Error>> {
         suffix,
         1,
     )?;
+    if deferred_tool {
+        let frozen = deferred_config(Some(&persona), &session)?;
+        return deferred_run(&frozen, &token, dry, output).await;
+    }
     let thinking_on =
         resolve_provider(&token, &persona, &session, Some(THINKING_ON_VARIANT), None)?;
     let thinking_off =
@@ -446,25 +825,7 @@ async fn run() -> Result<String, Box<dyn std::error::Error>> {
     let off_is_off = off_thinking.is_null() || off_thinking["type"].as_str() == Some("disabled");
 
     if dry {
-        let seed = Answer {
-            content: vec![
-                ContentBlock::Reasoning {
-                    text: "brief private thought".into(),
-                    signature: Some("dry-run-signature".into()),
-                },
-                ContentBlock::Text {
-                    text: "I will read the sample.".into(),
-                },
-                ContentBlock::ToolCall(ToolCall {
-                    thought_signature: None,
-                    tool_call_id: ToolCallId("toolu_dry_run".into()),
-                    tool_name: TOOL.into(),
-                    input: json!({"path": "sample.txt"}),
-                }),
-            ],
-            received_assistant_message: true,
-            ..Answer::default()
-        };
+        let seed = dry_seed();
         for (label, provider, strip) in [
             ("control", &thinking_on, false),
             ("strip_thinking_on", &thinking_on, true),
@@ -561,5 +922,228 @@ async fn main() {
             eprintln!("probe failed: {error}");
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frozen() -> FrozenRenderConfig {
+        let session = BindIdentity::new(PathBuf::from("."), "probe-test", "probe-test");
+        deferred_config(None, &session).unwrap()
+    }
+
+    fn rendered(case: DeferredCase, opts: &CallOptions) -> Value {
+        let family = DeferredFamily(case);
+        let frozen = frozen();
+        let bytes = family.render(&frozen, opts);
+        assert_eq!(bytes, family.render(&frozen, opts), "deterministic body");
+        let request = family.endpoint(&frozen, &AuthHandle::None, bytes.clone());
+        assert_eq!(request.body, bytes, "endpoint must send the recorded bytes");
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn assert_no_prefix_override(value: &Value) {
+        match value {
+            Value::Object(object) => {
+                assert!(!object.contains_key("prefix_mismatch_behavior"));
+                for value in object.values() {
+                    assert_no_prefix_override(value);
+                }
+            }
+            Value::Array(values) => {
+                for value in values {
+                    assert_no_prefix_override(value);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn deferred_followups_differ_only_in_x_and_its_reference() {
+        let seed = dry_seed();
+        let opts = tool_loop(&seed, false);
+        let baseline: Value =
+            serde_json::from_slice(&AnthropicMessages.render(&frozen(), &opts)).unwrap();
+        let seed_body = rendered(
+            DeferredCase::Seed,
+            &with_tools(seed_prompt(), ToolChoice::Auto),
+        );
+        let control = rendered(DeferredCase::ControlA, &opts);
+        let mut probe = rendered(DeferredCase::Probe, &opts);
+        let mut immediate = rendered(DeferredCase::ControlB, &opts);
+        for body in [&seed_body, &control, &probe, &immediate] {
+            assert_no_prefix_override(body);
+            assert_eq!(
+                body["tools"][0],
+                json!({"type": "tool_search_tool_regex_20251119", "name": "tool_search_tool_regex"})
+            );
+        }
+        assert_eq!(seed_body["tools"], control["tools"]);
+        assert_eq!(control["tools"][1], baseline["tools"][0]);
+        assert!(control["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|tool| tool.get("cache_control").is_none()));
+        assert_eq!(
+            control["system"].as_array().unwrap().last().unwrap()["cache_control"],
+            json!({"type": "ephemeral", "ttl": "5m"})
+        );
+        assert_eq!(control["system"], baseline["system"]);
+        assert_eq!(control["messages"][1], baseline["messages"][1]);
+        assert_eq!(control["messages"][1]["content"][0]["type"], "thinking");
+        assert_eq!(
+            control["messages"][1]["content"][0]["signature"],
+            "dry-run-signature"
+        );
+
+        let deferred_x = probe["tools"].as_array_mut().unwrap().pop().unwrap();
+        let immediate_x = immediate["tools"].as_array_mut().unwrap().pop().unwrap();
+        assert_eq!(
+            immediate_x,
+            json!({
+                "name": "X",
+                "description": "Read an additional fixed sample.",
+                "input_schema": {"type": "object", "properties": {}, "additionalProperties": false}
+            })
+        );
+        let mut expected_deferred = immediate_x;
+        expected_deferred["defer_loading"] = json!(true);
+        assert_eq!(deferred_x, expected_deferred);
+        assert!(deferred_x.get("cache_control").is_none());
+        let result = &mut probe["messages"][2]["content"][0];
+        assert_eq!(result["type"], "tool_result");
+        assert_eq!(result["tool_use_id"], "toolu_dry_run");
+        assert_eq!(
+            result["content"].as_array_mut().unwrap().pop().unwrap(),
+            json!({"type": "tool_reference", "tool_name": "X"})
+        );
+        assert_eq!(probe, control, "only X and its reference may differ");
+        assert_eq!(immediate, control, "only X may differ");
+
+        let control_result = &control["messages"][2]["content"][0];
+        let original_result = &baseline["messages"][2]["content"][0];
+        assert_eq!(
+            control_result["cache_control"],
+            original_result["cache_control"]
+        );
+        assert_eq!(
+            control_result["content"],
+            json!([{"type": "text", "text": original_result["content"]}])
+        );
+    }
+
+    #[test]
+    fn deferred_rows_record_measurements_and_hash_exact_bytes() {
+        let answer = Answer {
+            status: Some(400),
+            error: Some((
+                "invalid_request_error".into(),
+                "Prefix rejected. More detail.".into(),
+            )),
+            cache_read: 123,
+            cache_creation: 456,
+            input_tokens: 789,
+            has_usage: true,
+            ..Answer::default()
+        };
+        let row = deferred_row(DeferredCase::Probe, b"abc", Some(&answer));
+        assert_eq!(row["request_name"], "probe");
+        assert_eq!(row["model"], model_id());
+        assert_eq!(row["http_status"], 400);
+        assert_eq!(row["error_first_sentence"], "Prefix rejected.");
+        assert_eq!(row["cache_read_input_tokens"], 123);
+        assert_eq!(row["cache_creation_input_tokens"], 456);
+        assert_eq!(row["input_tokens"], 789);
+        assert_eq!(
+            row["request_body_sha256"],
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        let dry = deferred_row(DeferredCase::Seed, b"abc", None);
+        for key in [
+            "http_status",
+            "error_first_sentence",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+            "input_tokens",
+        ] {
+            assert!(dry[key].is_null(), "dry run must not invent {key}");
+        }
+    }
+
+    #[test]
+    fn deferred_persona_bodies_are_signed_after_patching() {
+        let session = BindIdentity::new(PathBuf::from("."), "probe-test", "probe-test");
+        let version = ClaudeCodePersona::CURRENT_VERSION;
+        let suffix = broca_provider::families::anthropic_messages::cc_version_suffix_for_transcript(
+            &seed_prompt(),
+            version,
+        );
+        let persona = claude_code_identity::fresh_persona(
+            &"0".repeat(64),
+            None,
+            CREDENTIAL_ID,
+            &session,
+            suffix,
+            1,
+        )
+        .unwrap();
+        let frozen = deferred_config(Some(&persona), &session).unwrap();
+        for case in [
+            DeferredCase::Seed,
+            DeferredCase::ControlA,
+            DeferredCase::Probe,
+            DeferredCase::ControlB,
+        ] {
+            let opts = if case == DeferredCase::Seed {
+                with_tools(seed_prompt(), ToolChoice::Auto)
+            } else {
+                tool_loop(&dry_seed(), false)
+            };
+            let body = String::from_utf8(DeferredFamily(case).render(&frozen, &opts)).unwrap();
+            let parsed: Value = serde_json::from_str(&body).unwrap();
+            assert!(parsed["system"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("cch="));
+            assert_eq!(
+                broca_provider::claude_code_persona::to_persona_json(&parsed),
+                body
+            );
+            assert_eq!(broca_provider::claude_code_persona::sign_body(&body), body);
+            assert_no_prefix_override(&parsed);
+        }
+    }
+
+    #[test]
+    fn deferred_output_refuses_cortexkit_and_preserves_exact_bodies() {
+        assert!(DeferredOutput::open(PathBuf::from(".cortexkit/probe-output")).is_err());
+        let directory = PathBuf::from(format!(
+            "target/scratch/deferred-probe-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let forbidden = directory.join(".cortexkit/output");
+        assert!(DeferredOutput::open(forbidden.clone()).is_err());
+        assert!(!forbidden.exists());
+        let mut output = DeferredOutput::open(directory.clone()).unwrap();
+        let body = b"{\"exact\":true}";
+        output.body(DeferredCase::Probe, body).unwrap();
+        assert!(output.body(DeferredCase::Probe, b"overwrite").is_err());
+        let row = deferred_row(DeferredCase::Probe, body, None);
+        output.row(&row).unwrap();
+        drop(output);
+        assert_eq!(
+            std::fs::read(directory.join(format!("{}-probe.json", model_id()))).unwrap(),
+            body
+        );
+        let rows = std::fs::read_to_string(directory.join("rows.jsonl")).unwrap();
+        assert_eq!(rows.lines().count(), 1);
+        assert_eq!(serde_json::from_str::<Value>(&rows).unwrap(), row);
+        assert!(DeferredOutput::open(directory.clone()).is_err());
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

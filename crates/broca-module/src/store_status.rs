@@ -28,9 +28,9 @@
 //! that end only when the fold alone decides it, so a terminal state served here never changes
 //! later; any other such run is refused by name, `run_end_unrecorded`, until the open records it.
 //!
-//! Facts this storage can't serve yet are refused by name, permanently, never guessed: a run
-//! waiting on calls a provider holds (`held_calls_unserved`), and a completed run whose final
-//! message a revert has since removed (`final_message_reverted`). `run.tool_calls` isn't served
+//! Facts this storage can't serve yet are refused by name, permanently, never guessed: a
+//! completed run whose final message a revert has since removed (`final_message_reverted`).
+//! `run.tool_calls` isn't served
 //! here.
 
 use std::collections::{HashMap, VecDeque};
@@ -126,23 +126,9 @@ pub struct RunFacts {
     pub wake_directive: bool,
     /// For a completed run: its final message, as `run.result` serves it, or why it can't be read.
     pub final_message: Option<Result<broca_wire::FinalMessage, FinalError>>,
-    /// The unfinished run waits on calls a provider holds. Today's status lists them
-    /// (`held_calls`), which this storage doesn't serve yet.
-    pub holds_calls: bool,
 }
 
 impl RunFacts {
-    /// Refuses a status that would have to list calls a provider holds.
-    fn check_held(&self) -> Result<(), StatusError> {
-        if self.holds_calls {
-            return Err(unserved(
-                "held_calls_unserved",
-                "the run waits on tool calls a provider holds, which this storage doesn't serve yet",
-            ));
-        }
-        Ok(())
-    }
-
     /// Whether the run has ended, so its facts never change.
     fn settled(&self) -> bool {
         !matches!(
@@ -298,8 +284,6 @@ struct Walk<'a> {
     /// Whether the run's frozen tag rules clean the model's text of tag notation on every
     /// exposure (`broca_core::tags::computed_rules`).
     cleans_text: bool,
-    /// Calls of this run a provider holds with no outcome recorded yet.
-    held: Vec<ToolCallId>,
     /// The call a tool reply just before a recovery event answered.
     last_reply: Option<ToolCallId>,
     /// The messages this run placed, by ordinal: each one's id.
@@ -333,7 +317,6 @@ impl<'a> Walk<'a> {
             interrupt_reason: None,
             wake_directive: false,
             cleans_text: false,
-            held: Vec::new(),
             last_reply: None,
             placed: Default::default(),
         }
@@ -459,9 +442,7 @@ impl<'a> Walk<'a> {
                     &outcome.tool_call_id,
                     outcome.outcome == CallOutcome::Unknown,
                 );
-                self.held.retain(|held| held != &outcome.tool_call_id);
             }
-            Record::ToolHeld(held) if ours => self.held.push(held.tool_call_id.clone()),
             Record::ToolReply(reply) => self.last_reply = Some(reply.result.tool_call_id.clone()),
             Record::Steer(steer) => {
                 if let Some(send_id) = steer
@@ -684,7 +665,6 @@ impl<'a> Walk<'a> {
             interrupt_reason: self.interrupt_reason,
             wake_directive: self.wake_directive,
             cleans_text: self.cleans_text,
-            held: self.held,
             placed: self.placed,
         };
         if self.active_run.as_deref() == Some(self.run_id) && self.active_zero_step_seed {
@@ -714,7 +694,6 @@ struct WalkRest {
     interrupt_reason: Option<String>,
     wake_directive: bool,
     cleans_text: bool,
-    held: Vec<ToolCallId>,
     placed: std::collections::BTreeMap<u64, String>,
 }
 
@@ -861,8 +840,9 @@ pub async fn run_facts<B: SessionBackend>(
         state.account_limit_pause = None;
         state.error = None;
     }
-    let holds_calls = matches!(state.state, RunIndexState::Active | RunIndexState::Paused)
-        && !rest.held.is_empty();
+    if matches!(state.state, RunIndexState::Active | RunIndexState::Paused) {
+        state.held_calls = held::calls(latest, &records);
+    }
     let final_message = if state.state == RunIndexState::Completed {
         Some(final_message(session, &rest.placed, rest.cleans_text).await)
     } else {
@@ -873,7 +853,6 @@ pub async fn run_facts<B: SessionBackend>(
         interrupt_reason: rest.interrupt_reason,
         wake_directive: rest.wake_directive,
         final_message,
-        holds_calls,
     };
     // A final message that couldn't be read is read again next time rather than kept refused.
     let complete = !matches!(facts.final_message, Some(Err(_)));
@@ -972,7 +951,6 @@ fn close_open_batch<B: SessionBackend>(
             Some(CallState::Terminated) | None => continue,
         };
         walk.indeterminate.record_dispatch_terminal(id, unknown);
-        walk.held.retain(|held| held != id);
     }
     true
 }
@@ -1309,7 +1287,6 @@ impl Reader<'_> {
         use crate::serve::ServeError;
         let unknown = || ServeError::UnknownRun(run_id.0.clone());
         let facts = self.facts(session, &run_id.0).await?.ok_or_else(unknown)?;
-        facts.check_held()?;
         let RunFacts {
             state,
             interrupt_reason,
@@ -1375,7 +1352,6 @@ pub(crate) fn status_response(
     let Some(mut facts) = facts else {
         return Ok(RunStatusResponse::Unknown);
     };
-    facts.check_held()?;
     if facts.state.state == RunIndexState::Active {
         facts.state.live_step = live_step;
     }
@@ -1919,6 +1895,22 @@ impl Reader<'_> {
         crate::serve::send_status_reply(outcome, &own_run, || baseline)
     }
 
+    /// What became of the send `send_id` whose own run id is `own_run`, as a keyed retry of it
+    /// is answered: the outcome `send.status` reads for it, from the same records. `None` when
+    /// the session holds no such send. With `legacy_steers`, a steer sent under `send_id`
+    /// answers for it.
+    pub(crate) async fn recorded_send_outcome<B: SessionBackend>(
+        &self,
+        session: &Session<B>,
+        own_run: &RunId,
+        send_id: &str,
+        legacy_steers: bool,
+    ) -> Result<Option<crate::actor::SendOutcome>, StatusError> {
+        let lookup = SendLookup { session };
+        self.send_outcome(session, &lookup, own_run, send_id, legacy_steers)
+            .await
+    }
+
     /// The recorded fate of the send `send_id` whose own run id is `own_run`, as
     /// `send_fate::recorded_send_outcome` reads it from today's records. `None` when the session
     /// holds no such send.
@@ -2030,3 +2022,5 @@ impl Reader<'_> {
         )
     }
 }
+
+mod held;

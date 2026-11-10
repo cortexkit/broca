@@ -426,6 +426,7 @@ fn tool(name: &str, mode: ExecutionMode) -> Tool {
 struct Spy {
     inner: StubToolPlane,
     log: Arc<Mutex<Vec<String>>>,
+    manifest: Mutex<Option<ToolManifest>>,
     keys: Mutex<Vec<(ToolCallId, String)>>,
     held: Arc<HeldScript>,
     /// The caller's cancel, which the `hold_cancel` tool's call triggers once its provider holds
@@ -536,6 +537,7 @@ impl Spy {
                 ended: Mutex::new(None),
             }),
             log,
+            manifest: Mutex::new(None),
             keys: Mutex::new(Vec::new()),
             cancel_on_hold: Mutex::new(None),
         }
@@ -562,6 +564,24 @@ impl Spy {
 
     fn note(&self, entry: String) {
         self.log.lock().unwrap().push(entry);
+    }
+
+    // Observe the provider and preset at dispatch from the ToolManifest received at batch start.
+    // Reading Scenario.manifest instead would hide a loop that omitted the plan's presets.
+    fn note_route(&self, call: &ToolCall) {
+        let manifest = self.manifest.lock().unwrap();
+        if let Some(manifest) = manifest.as_ref() {
+            if let Some(provider) = manifest
+                .get(&call.tool_name)
+                .and_then(|tool| tool.module.as_deref())
+            {
+                self.note(format!(
+                    "dispatch_route {} provider={provider:?} preset={:?}",
+                    call.tool_call_id.0,
+                    manifest.provider_preset(provider)
+                ));
+            }
+        }
     }
 
     /// `key#n` for `key`, numbered by first use; remembers it for `call`.
@@ -600,6 +620,7 @@ impl ToolPlane for Spy {
         calls: &[ToolCall],
         manifest: &ToolManifest,
     ) -> Result<(), ToolPlaneError> {
+        *self.manifest.lock().unwrap() = Some(manifest.clone());
         self.note(format!(
             "batch_started {:?}{}",
             ids(calls),
@@ -615,6 +636,7 @@ impl ToolPlane for Spy {
         manifest: &ToolManifest,
         guard: &ToolOpenGuard,
     ) -> Result<(), ToolPlaneError> {
+        *self.manifest.lock().unwrap() = Some(manifest.clone());
         self.note(format!(
             "batch_started_guarded {:?}{}",
             ids(calls),
@@ -650,6 +672,7 @@ impl ToolPlane for Spy {
     }
 
     async fn dispatch(&self, ctx: &BatchCtx, call: &ToolCall) -> DispatchResult {
+        self.note_route(call);
         self.note(format!("dispatch {} {}", call.tool_call_id.0, call.input));
         self.inner.dispatch(ctx, call).await
     }
@@ -660,6 +683,7 @@ impl ToolPlane for Spy {
         call: &ToolCall,
         key: DispatchKey<'_>,
     ) -> DispatchResult {
+        self.note_route(call);
         let token = self.key(&call.tool_call_id, key.call_key);
         self.note(format!(
             "dispatch_keyed {} {} {token} recorder={}",
@@ -677,6 +701,7 @@ impl ToolPlane for Spy {
         key: Option<DispatchKey<'_>>,
         guard: &ToolOpenGuard,
     ) -> DispatchResult {
+        self.note_route(call);
         let keyed = key.map(|key| {
             format!(
                 "{} recorder={}",
@@ -2571,14 +2596,16 @@ async fn new_from(
         model_call_ready: provider.model_call_ready(),
     };
     let sealing = SEALING.try_with(|cause| *cause).ok();
+    // A crash-cut comparison nests this driver several frames deep. Heap-own the loop bodies,
+    // as the production executor does for run and resume, rather than copying them there.
     through!(
         writer,
         |w| if let (true, Some(cause)) = (resuming, sealing) {
             seal(w, &parts, &seams, cause).await
         } else if resuming {
-            resume(w, &parts, &seams).await
+            Box::pin(resume(w, &parts, &seams)).await
         } else {
-            run(w, &mut parts, scenario.admission(&provider), &seams).await
+            Box::pin(run(w, &mut parts, scenario.admission(&provider), &seams)).await
         }
     )
     .expect("the new loop runs");
@@ -6323,6 +6350,63 @@ async fn every_cut_of_a_run_admitted_with_a_fetch_plan_resumes_alike() {
     compare_every_cut(planned_scenario()).await;
 }
 
+async fn assert_store_dispatch_preset(plan: Option<Value>, expected: Option<&str>) {
+    let route = format!("dispatch_route c1 provider=\"provider\" preset={expected:?}");
+    let expected_route = format!("{route:?}");
+    let mut scenario = planned_scenario();
+    scenario.tools[0].module = Some("provider".into());
+    scenario.manifest = plan.map(|plan| {
+        let mut manifest = planned_manifest(&scenario.tools);
+        Arc::make_mut(&mut manifest).plan =
+            broca_wal::OpaqueJson::from_json_text(plan.to_string()).unwrap();
+        manifest
+    });
+    for layout in LAYOUTS {
+        LAYOUT
+            .scope(
+                layout,
+                Box::pin(async {
+                    with_each_writer(|| {
+                        Box::pin(async {
+                            let outcome = new_loop(&scenario).await;
+                            let routes: Vec<_> = outcome
+                                .calls
+                                .iter()
+                                .filter(|entry| entry.contains("dispatch_route "))
+                                .collect();
+                            assert_eq!(routes, [&expected_route]);
+                        })
+                    })
+                    .await;
+                }),
+            )
+            .await;
+    }
+}
+
+#[tokio::test]
+async fn store_dispatch_uses_the_frozen_provider_preset() {
+    assert_store_dispatch_preset(
+        Some(json!({"tool_items": [{"provider": "provider", "preset": "head"}]})),
+        Some("head"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn store_dispatch_without_a_plan_preset_stays_presetless() {
+    assert_store_dispatch_preset(
+        Some(json!({"tool_items": [{"provider": "provider"}]})),
+        None,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn store_dispatch_without_a_plan_stays_presetless() {
+    assert_store_dispatch_preset(None, None).await;
+}
+
 /// The hook provider both loops call, keyed by the tool a call names: the mutate hook rewrites
 /// a `mutated` call's input to `{"path":"mutated"}`, the validate hook denies a `vetoed` call,
 /// the provider is unavailable for a `hook_down` call, and every other call passes.
@@ -7491,20 +7575,26 @@ async fn a_compacted_step_whose_cap_would_pass_the_context_limit_is_lowered() {
 
 /// A new-loop run whose requests can't be rendered until it waited for something (as a store
 /// run's media renderer renders nothing until its run waited for the session's media) waits
-/// before its compaction estimate and its output cap's estimate render the step's request, and
-/// makes the same run as today's loop.
+/// before its first step's compaction estimate renders the step's request, and makes the same
+/// run as today's loop.
 #[tokio::test]
 async fn a_compacted_step_waits_for_its_request_to_be_ready_before_estimating_it() {
-    let script = CompactionScript {
-        context_limit: lowering().context_limit,
-        rides: Vec::new(),
-    };
     READY
         .scope(
             Some(ReadyScript::Ready),
-            OUTPUT.scope(
-                Some(lowering()),
-                compare_compacted(measured_scenario(), script),
+            compare_compacted(
+                compacted_scenario(vec![
+                    answer(
+                        "a1",
+                        vec![call("c1", "read", json!({"path": "a"}))],
+                        FinishReason::ToolCalls,
+                    ),
+                    text_step("a2", "done"),
+                ]),
+                CompactionScript {
+                    context_limit: 100_000,
+                    rides: Vec::new(),
+                },
             ),
         )
         .await;
@@ -9068,9 +9158,10 @@ async fn served_entries(
 /// The enrolling run, after three runs outside the contract:
 /// - Setup is sent with no applied view and no earlier request to compare with, carrying the
 ///   prompt size the last step before the move reported;
-/// - the entries cover every earlier message but the suppressed global system messages, each
-///   with a time, numbered in the projection's numbering from the highest number an earlier
-///   request showed, contiguous and never repeating, the run's own after the enrollment's last;
+/// - the entries cover every message, the suppressed global system messages as system entries
+///   with no parts at their own ordinals, so the ordinals have no gaps; each has a time, numbered
+///   in the projection's numbering from the highest number an earlier request showed, contiguous
+///   and never repeating, the run's own after the enrollment's last;
 /// - the JSON tool result's run shows that numbering split from the runner's;
 /// - the request carries the plan's system text, not the session's;
 /// - ids and every earlier `session.read` are unchanged, and a pre-enrollment id still reads.
@@ -9124,7 +9215,7 @@ async fn an_enrolled_session_serves_and_renders_its_history_on_the_contract() {
                 "{calls:?}"
             );
 
-            // The entries: every earlier message but the global system messages, with times.
+            // The entries: every message, the global system messages with no parts, with times.
             let raw = session.entries(1, usize::MAX).await.unwrap();
             let globals: Vec<u64> = raw
                 .iter()
@@ -9136,12 +9227,12 @@ async fn an_enrolled_session_serves_and_renders_its_history_on_the_contract() {
             let served_stored = session.compaction_entries(1, usize::MAX).await.unwrap();
             let served_ordinals: Vec<u64> =
                 served_stored.iter().map(|entry| entry.ordinal).collect();
-            let expected_ordinals: Vec<u64> = raw
-                .iter()
-                .map(|entry| entry.ordinal)
-                .filter(|ordinal| !globals.contains(ordinal))
-                .collect();
+            let expected_ordinals: Vec<u64> = (1..=raw.len() as u64).collect();
             assert_eq!(served_ordinals, expected_ordinals);
+            for global in &globals {
+                let served = &served_stored[*global as usize - 1];
+                assert!(served.message.content.is_empty(), "{served:?}");
+            }
             // The projection's numbering, from the floor, a tool-results message taking none.
             let mut high = enrolled.tag_floor;
             for entry in served_stored
@@ -9235,7 +9326,12 @@ async fn an_enrolled_session_serves_and_renders_its_history_on_the_contract() {
                 .expect("found by id");
             assert_eq!(by_id.message, first_user.message);
             let global_mid = &read_before[0].state.facts.as_ref().unwrap().mid;
-            assert_eq!(session.entry_by_mid(global_mid).await.unwrap(), None);
+            let global = session
+                .entry_by_mid(global_mid)
+                .await
+                .unwrap()
+                .expect("the suppressed message is found by id");
+            assert_eq!(global, served_stored[0]);
         })
         .await;
     })
@@ -9932,6 +10028,176 @@ async fn a_converted_session_with_a_joined_ride_enrolls_and_keeps_its_bytes() {
         );
     })
     .await;
+}
+
+/// A session converted from today's storage whose first message is its global system text, with
+/// a turn-scoped note after the person's first message. Today's log is what today's loop wrote
+/// for one run that calls a tool.
+async fn converted_with_global_system(
+    backend: &MemoryBackend,
+) -> (Session<&MemoryBackend>, MemoryParts) {
+    let mut note = system("a turn-scoped note");
+    note.turn_system = true;
+    let today_run = Scenario {
+        input: vec![system("You are terse."), user("read a"), note],
+        tools: enrollment_tools(),
+        manifest: None,
+        stop_when: Vec::new(),
+        steps: vec![
+            answer(
+                "a1",
+                vec![call("c1", "read", json!({}))],
+                FinishReason::ToolCalls,
+            ),
+            text_step("a2", "done with a"),
+        ],
+    };
+    let (_, image, _) = today_from(&today_run, None, today_run.steps.clone()).await;
+    let converted =
+        convert_unbilled(&image.framed(), lineage(&image).as_deref()).expect("the log converts");
+    assert!(converted.lost.is_empty(), "{:?}", converted.lost);
+    let mut session = Session::create(
+        backend,
+        enrollment_addr(),
+        enrollment_triple(),
+        &enrollment_key(),
+        true,
+    )
+    .await
+    .unwrap();
+    session.append(&converted.records, true).await.unwrap();
+    let read = session.entries(1, usize::MAX).await.unwrap();
+    assert!(broca_core::compaction_v2::systems::is_global(
+        &read[0].message
+    ));
+    assert!(read[2].message.turn_system, "{:?}", read[2].message);
+    let mut parts = MemoryParts::default();
+    parts.parts = converted.parts;
+    (session, parts)
+}
+
+/// The converted session of [`converted_with_global_system`] enrolls through the new loop. Its
+/// global system message is suppressed: the plan's system text takes its place. The compaction
+/// provider is still told of it, as a system entry with no parts at ordinal 1, since the contract
+/// counts every message, so a view it builds can name that entry. A view that cuts through it,
+/// besides trimming the run's big output, is accepted at the step where the provider answers
+/// with it and applies; the requests, and the next run's, render byte for byte as under the same
+/// view without the cut, since an entry with no parts renders nothing.
+#[tokio::test]
+async fn a_view_naming_a_suppressed_system_message_applies_and_renders_as_without_it() {
+    in_each_cipher(|| async {
+        let mut rendered = Vec::new();
+        for cut in [false, true] {
+            let backend = MemoryBackend::default();
+            let (mut session, mut parts) = converted_with_global_system(&backend).await;
+            // The enrolling run's big tool result puts its second request over the window; the
+            // provider answers the ride with a view that trims the big output, and cuts through
+            // the suppressed system message too in the second pass.
+            let big_call = session.conversation.placed + 2;
+            let ride = if cut {
+                Ride::CutAndTrim(1, big_call)
+            } else {
+                Ride::Trim(big_call)
+            };
+            let spy = CompactionSpy::new(&CompactionScript {
+                context_limit: 1_200,
+                rides: vec![ride],
+            });
+            let mut enrolling = enrolling_run(vec![
+                answer(
+                    "a6",
+                    vec![call("c3", "big", json!({}))],
+                    FinishReason::ToolCalls,
+                ),
+                text_step("a7", "done"),
+            ]);
+            enrolling.limit = Some(1_200);
+            let requests = enroll_run(&mut session, &mut parts, &spy, &enrolling)
+                .await
+                .expect("the enrolling run");
+            assert!(session.operations.enrolled.is_some());
+            assert!(
+                session.operations.view_applied.is_some(),
+                "{:?}",
+                spy.calls()
+            );
+            assert_eq!(requests.len(), 2, "{:?}", spy.calls());
+            // The provider was told of the suppressed message's entry, with no parts.
+            let told = spy
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .flat_map(|(_, params)| told_entries(params))
+                .find(|entry| entry["ordinal"] == 1)
+                .expect("the provider was told of ordinal 1");
+            assert_eq!(told["role"], "system", "{told}");
+            assert_eq!(told["parts"], json!([]), "{told}");
+            assert!(spy.rides.lock().unwrap().is_empty(), "the ride was answered");
+            for request in &requests {
+                assert_eq!(text_of(&request.prompt[0]), ENROLLED_SYSTEM);
+                assert!(request.prompt[1..]
+                    .iter()
+                    .all(|message| !broca_core::compaction_v2::systems::is_global(message)));
+                assert!(request
+                    .prompt
+                    .iter()
+                    .any(|message| text_of(message).contains("a turn-scoped note")));
+            }
+            assert!(requests[1].prompt.iter().any(|message| {
+                message.content.iter().any(|block| {
+                    matches!(block, ContentBlock::ToolResult(result)
+                        if result.output == ToolOutput::Text { text: "compacted tool output".into() })
+                })
+            }));
+            let next = EnrollRun {
+                id: "r5",
+                input: vec![user("next")],
+                manifest: Some(enrolling_manifest()),
+                steps: vec![text_step("a8", "ok")],
+                limit: Some(1_200),
+            };
+            let next = enroll_run(&mut session, &mut parts, &spy, &next)
+                .await
+                .expect("the next run");
+            let render = ScriptedProvider::new(Vec::new());
+            rendered.push(
+                requests
+                    .iter()
+                    .chain(&next)
+                    .map(|request| render.render_request(request))
+                    .collect::<Vec<_>>(),
+            );
+        }
+        assert_eq!(rendered[0].len(), 3);
+        assert!(
+            rendered[0] == rendered[1],
+            "a cut through the suppressed system message changed what was sent"
+        );
+    })
+    .await;
+}
+
+/// Every entry a compaction call's params carry, wherever it sits in them.
+fn told_entries(params: &Value) -> Vec<Value> {
+    let mut out = Vec::new();
+    match params {
+        Value::Object(members) => {
+            if members.contains_key("ordinal") && members.contains_key("parts") {
+                out.push(params.clone());
+            }
+            for member in members.values() {
+                out.extend(told_entries(member));
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                out.extend(told_entries(item));
+            }
+        }
+        _ => {}
+    }
+    out
 }
 
 /// The spend facts of the run that enrolls a session are those of the same run on the same

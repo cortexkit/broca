@@ -12,8 +12,7 @@
 #![forbid(unsafe_code)]
 
 use std::path::Path;
-use std::sync::atomic::AtomicU64;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use broca_core::projection_plan::ProjectionSnapshot;
 #[cfg(test)]
@@ -41,10 +40,13 @@ use busy::STORE_BUSY_TIMEOUT;
 pub mod bus_events;
 pub mod compaction_facts;
 pub mod compaction_receipts;
-pub mod db;
 pub mod diagnostics;
 mod display_facts;
 pub mod export_index;
+mod keeper_connection;
+pub mod legacy_inventory;
+pub use export_index::ExportStore;
+pub use keeper_connection::KeeperOpenError;
 mod fold_identities;
 pub mod grants;
 pub mod late_results_store;
@@ -54,6 +56,8 @@ mod retained_head;
 pub mod retention;
 pub mod retention_withdrawals;
 pub mod session_address;
+pub mod session_inventory;
+pub use session_inventory::SessionInventory;
 pub mod session_log_evidence;
 pub mod session_ref_audit;
 pub mod session_refs;
@@ -116,158 +120,6 @@ impl SessionAddressResolver for SqliteStore {
     {
         SqliteStore::scope_reservation(self, session)
     }
-}
-
-impl SessionAddressResolver for db::OverhaulDb {
-    fn session_log_state(
-        &self,
-        session: &BindIdentity,
-        wal: &dyn broca_core::WalStore,
-    ) -> Result<session_log_evidence::SessionLogState, session_log_evidence::SessionLogError> {
-        db::OverhaulDb::session_log_state(self, session, wal)
-    }
-
-    fn scope_reservation(
-        &self,
-        session: &BindIdentity,
-    ) -> Result<Option<session_address::ScopeReservation>, session_address::SessionAddressError>
-    {
-        use session_address::SessionAddressError;
-        let address = broca_core::session_addr(session);
-        self.read_snapshot(|tx| {
-            Ok(session_address::read_scope_reservation(tx, &address)
-                .map_err(SessionAddressError::store_error))
-        })
-        .map_err(SessionAddressError::store_error)?
-    }
-
-    fn resolve_session_address(
-        &self,
-        bind: &BindIdentity,
-        workdir: Option<&Path>,
-        reservation: Option<&session_address::ScopeReservation>,
-    ) -> Result<BindIdentity, session_address::SessionAddressError> {
-        use session_address::{InventoryUnavailable, SessionAddressError};
-        let known = self
-            .read_snapshot(|tx| known_overhaul_address(tx, bind))
-            .map_err(SessionAddressError::store_error)??;
-        if let Some(identity) = known {
-            return Ok(identity);
-        }
-        let mut gap_during_reservation = false;
-        let mut reserved_root = None;
-        let result = self
-            .authoritative_transaction(|tx| {
-                match known_overhaul_address(tx, bind)? {
-                    Ok(Some(identity)) => return Ok(Ok(identity)),
-                    Err(error) => return Ok(Err(error)),
-                    Ok(None) => {}
-                }
-                let root = tx.path().and_then(|path| Path::new(path).parent());
-                if session_refs::projection_gap(root)
-                    .map_err(|e| db::DbError::Invalid(e.to_string()))?
-                {
-                    return Ok(Err(SessionAddressError::Unavailable(
-                        InventoryUnavailable::GapMarker,
-                    )));
-                }
-                let complete: bool = tx.query_row(
-                    "SELECT complete FROM inventory_status WHERE id=1",
-                    [],
-                    |r| r.get(0),
-                )?;
-                if !complete {
-                    return Ok(Err(SessionAddressError::Unavailable(
-                        InventoryUnavailable::IncompleteInventory,
-                    )));
-                }
-                let identity = BindIdentity::new(
-                    workdir.unwrap_or(&bind.project_root),
-                    &bind.harness,
-                    &bind.session,
-                );
-                if let Err(error) = identity.validate_keyable() {
-                    return Ok(Err(SessionAddressError::Invalid(error)));
-                }
-                let address = broca_core::session_addr(&identity);
-                tx.execute(
-                    "INSERT INTO session_identity VALUES(?1,?2,?3,?4,?5,?6)",
-                    rusqlite::params![
-                        address,
-                        identity.project_root.to_string_lossy(),
-                        identity.harness,
-                        identity.session,
-                        broca_core::wal_writer::legacy_session_ref(
-                            &identity.harness,
-                            &identity.project_root.to_string_lossy(),
-                            &identity.session
-                        ),
-                        broca_core::agent_session_ref(&identity),
-                    ],
-                )?;
-                if let Some(reservation) = reservation {
-                    session_address::record_scope_reservation(tx, &address, reservation)
-                        .map_err(db::DbError::Invalid)?;
-                }
-                if session_refs::projection_gap(root)
-                    .map_err(|e| db::DbError::Invalid(e.to_string()))?
-                {
-                    gap_during_reservation = true;
-                    return Err(db::DbError::Invalid(
-                        "session inventory gap during address reservation".into(),
-                    ));
-                }
-                reserved_root = root.map(Path::to_path_buf);
-                Ok(Ok(identity))
-            })
-            .map_err(|error| {
-                if gap_during_reservation {
-                    SessionAddressError::Unavailable(InventoryUnavailable::GapMarker)
-                } else {
-                    SessionAddressError::store_error(error)
-                }
-            })?;
-        if reserved_root.is_some()
-            && session_refs::projection_gap(reserved_root.as_deref())
-                .map_err(SessionAddressError::store_error)?
-        {
-            return Err(SessionAddressError::Unavailable(
-                InventoryUnavailable::GapMarker,
-            ));
-        }
-        result
-    }
-}
-
-fn known_overhaul_address(
-    conn: &Connection,
-    bind: &BindIdentity,
-) -> Result<Result<Option<BindIdentity>, session_address::SessionAddressError>, db::DbError> {
-    use session_address::SessionAddressError;
-    let mut stmt = conn.prepare("SELECT DISTINCT project_root FROM session_identity WHERE session_ref=?1 AND harness=?2 AND session_key=?3 LIMIT 2")?;
-    let roots = stmt
-        .query_map(
-            rusqlite::params![
-                broca_core::agent_session_ref(bind),
-                bind.harness,
-                bind.session
-            ],
-            |r| r.get::<_, String>(0),
-        )?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    if roots.len() > 1 {
-        return Ok(Err(SessionAddressError::Ambiguous));
-    }
-    Ok(roots
-        .first()
-        .map(|root| {
-            let identity = BindIdentity::new(root, &bind.harness, &bind.session);
-            identity
-                .validate_keyable()
-                .map(|()| identity)
-                .map_err(SessionAddressError::Invalid)
-        })
-        .transpose())
 }
 
 pub use system_one::SystemOneStore;
@@ -475,12 +327,10 @@ impl From<broca_core::ReplayError> for StoreError {
 /// checkpoint folding, and JSON serialization outside that mutex so unrelated sessions wait
 /// only for the short snapshot and commit phases.
 pub struct SqliteStore {
-    conn: Mutex<Connection>,
+    conn: Arc<Mutex<Connection>>,
     wal_config: broca_wal::WalConfig,
     bus_events: bus_events::State,
-    pub(crate) export_high_water: AtomicU64,
-    pub(crate) export_source_instance_id: String,
-    pub(crate) export_source_epoch: u64,
+    export: ExportStore,
 }
 
 struct SchemaUpgradeLog {
@@ -701,7 +551,7 @@ fn sqlite_open_observed() {
 /// SQLite's sidecars retain the token's default owner field (possibly Administrators when
 /// elevated), but their DACL grants only the account SID and SYSTEM inherited from the parent.
 #[cfg(windows)]
-fn prepare_private_sqlite(path: &Path) -> std::io::Result<()> {
+fn validate_private_sqlite(path: &Path) -> std::io::Result<()> {
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -713,6 +563,12 @@ fn prepare_private_sqlite(path: &Path) -> std::io::Result<()> {
         sidecar.push(suffix);
         broca_owner_only::validate_if_exists(std::path::PathBuf::from(sidecar))?;
     }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn prepare_private_sqlite(path: &Path) -> std::io::Result<()> {
+    validate_private_sqlite(path)?;
     match broca_owner_only::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -801,13 +657,12 @@ impl SqliteStore {
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
+        let conn = Arc::new(Mutex::new(conn));
         Ok(Self {
-            conn: Mutex::new(conn),
+            conn: Arc::clone(&conn),
             wal_config: broca_wal::WalConfig::LEGACY,
             bus_events: bus_events::State::default(),
-            export_source_instance_id: source_instance_id,
-            export_source_epoch: source_epoch,
-            export_high_water: AtomicU64::new(high_water),
+            export: ExportStore::from_shared(conn, (source_instance_id, source_epoch, high_water)),
         })
     }
 
@@ -847,13 +702,12 @@ impl SqliteStore {
         let conn = Connection::open(path)?;
         let (source_instance_id, source_epoch, high_water) = Self::init(&conn)?;
         restrict_to_owner(path);
+        let conn = Arc::new(Mutex::new(conn));
         Ok(Self {
-            conn: Mutex::new(conn),
+            conn: Arc::clone(&conn),
             wal_config: broca_wal::WalConfig::LEGACY,
             bus_events: crate::bus_events::State::default(),
-            export_high_water: AtomicU64::new(high_water),
-            export_source_instance_id: source_instance_id,
-            export_source_epoch: source_epoch,
+            export: ExportStore::from_shared(conn, (source_instance_id, source_epoch, high_water)),
         })
     }
 
@@ -861,13 +715,12 @@ impl SqliteStore {
     pub fn open_in_memory() -> Result<Self, StoreError> {
         let conn = Connection::open_in_memory()?;
         let (source_instance_id, source_epoch, high_water) = Self::init(&conn)?;
+        let conn = Arc::new(Mutex::new(conn));
         Ok(Self {
-            conn: Mutex::new(conn),
+            conn: Arc::clone(&conn),
             wal_config: broca_wal::WalConfig::LEGACY,
             bus_events: crate::bus_events::State::default(),
-            export_high_water: AtomicU64::new(high_water),
-            export_source_instance_id: source_instance_id,
-            export_source_epoch: source_epoch,
+            export: ExportStore::from_shared(conn, (source_instance_id, source_epoch, high_water)),
         })
     }
 
@@ -4164,137 +4017,6 @@ mod tests {
     }
 
     #[test]
-    fn overhaul_known_address_does_not_compete_with_a_held_writer() {
-        use super::SessionAddressResolver;
-        let root = broca_test_support::scratch_root()
-            .join(format!("known-address-reader-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("state-format"), "broca-state/2").unwrap();
-        let db = super::db::OverhaulDb::open(&root).unwrap();
-        db.reconcile_inventory().unwrap();
-        let bind = broca_protocol::BindIdentity::new("/route", "runner", "known");
-        let expected = db
-            .resolve_session_address(&bind, Some(std::path::Path::new("/first")), None)
-            .unwrap();
-        let writer = rusqlite::Connection::open(root.join("broca.db")).unwrap();
-        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
-        assert_eq!(
-            db.resolve_session_address(&bind, Some(std::path::Path::new("/later")), None)
-                .unwrap(),
-            expected
-        );
-        writer.execute_batch("ROLLBACK").unwrap();
-        drop(writer);
-        drop(db);
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn overhaul_address_reservations_keep_first_workdir_and_refuse_ambiguous_pairs() {
-        use super::SessionAddressResolver;
-        use broca_core::SessionRefIndex;
-        let root = broca_test_support::scratch_root()
-            .join(format!("overhaul-address-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("state-format"), "broca-state/2").unwrap();
-        let db = super::db::OverhaulDb::open(&root).unwrap();
-        let bind = broca_protocol::BindIdentity::new("/route", "runner", "seat");
-        assert!(matches!(
-            db.resolve_session_address(&bind, None, None),
-            Err(super::session_address::SessionAddressError::Unavailable(_))
-        ));
-        db.reconcile_inventory().unwrap();
-        let first = db
-            .resolve_session_address(&bind, Some(std::path::Path::new("/first")), None)
-            .unwrap();
-        assert_eq!(first.project_root, std::path::Path::new("/first"));
-        assert_eq!(
-            db.resolve_session_address(&bind, Some(std::path::Path::new("/later")), None)
-                .unwrap(),
-            first
-        );
-        let other = broca_protocol::BindIdentity::new("/other", "runner", "seat");
-        db.record_session(&broca_core::session_addr(&other), &other)
-            .unwrap();
-        assert!(matches!(
-            db.resolve_session_address(&bind, None, None),
-            Err(super::session_address::SessionAddressError::Ambiguous)
-        ));
-        for file in ["run-index.db", "run-index.db-wal", "run-index.db-shm"] {
-            assert!(!root.join(file).exists());
-        }
-        drop(db);
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    /// broca-state/2 records a stamped bind's scope owner with the address it reserves, and
-    /// records nothing for an unstamped reservation or for a pair that already exists.
-    #[test]
-    fn overhaul_reservations_record_only_a_stamped_new_pair() {
-        use super::session_address::ScopeReservation;
-        use super::SessionAddressResolver;
-        let root = broca_test_support::scratch_root()
-            .join(format!("overhaul-scope-reservation-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("state-format"), "broca-state/2").unwrap();
-        let db = super::db::OverhaulDb::open(&root).unwrap();
-        db.reconcile_inventory().unwrap();
-        let reservation = |module_id: &str| ScopeReservation {
-            owner: broca_protocol::BindPrincipal::Reserved {
-                module_id: module_id.into(),
-            },
-            scope_ref: format!("{module_id}-head"),
-        };
-        let rows = || -> i64 {
-            rusqlite::Connection::open(root.join("broca.db"))
-                .unwrap()
-                .query_row(
-                    "SELECT count(*) FROM session_scope_reservation",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap()
-        };
-
-        let stamped = broca_protocol::BindIdentity::new("/route", "runner", "head");
-        let reserved = db
-            .resolve_session_address(
-                &stamped,
-                Some(std::path::Path::new("/stamped")),
-                Some(&reservation("prefrontal-core")),
-            )
-            .unwrap();
-        assert_eq!(
-            db.scope_reservation(&reserved).unwrap(),
-            Some(reservation("prefrontal-core"))
-        );
-        assert_eq!(rows(), 1);
-        // Resolving the existing pair under another stamp leaves the first reservation alone.
-        assert_eq!(
-            db.resolve_session_address(&stamped, None, Some(&reservation("magic-context")))
-                .unwrap(),
-            reserved
-        );
-        assert_eq!(
-            db.scope_reservation(&reserved).unwrap(),
-            Some(reservation("prefrontal-core"))
-        );
-
-        let unstamped = broca_protocol::BindIdentity::new("/route", "runner", "plain");
-        let plain = db.resolve_session_address(&unstamped, None, None).unwrap();
-        assert_eq!(db.scope_reservation(&plain).unwrap(), None);
-        assert_eq!(
-            db.resolve_session_address(&unstamped, None, Some(&reservation("magic-context")))
-                .unwrap(),
-            plain
-        );
-        assert_eq!(db.scope_reservation(&plain).unwrap(), None);
-        assert_eq!(rows(), 1);
-        drop(db);
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
     fn legacy_store_refuses_overhaul_destinations_without_touching_files() {
         let root = broca_test_support::scratch_root()
             .join(format!("legacy-store-overhaul-{}", std::process::id()));
@@ -4558,7 +4280,10 @@ mod tests {
                 let barrier = barrier.clone();
                 std::thread::spawn(move || {
                     barrier.wait();
-                    SqliteStore::open(path).unwrap().export_source_instance_id
+                    SqliteStore::open(path)
+                        .unwrap()
+                        .source_instance_id()
+                        .to_owned()
                 })
             })
             .collect();
@@ -4643,12 +4368,15 @@ mod tests {
         );
     }
 
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    };
 
     use broca_core::{MaterializedStore, Persister, RunIndex, WalStore};
     use broca_wal::{Wal, WalError, WalRangeRead};
 
-    use super::{replay, ProjectionCommit, SqliteStore};
+    use super::{replay, ExportStore, ProjectionCommit, SqliteStore};
 
     #[test]
     fn model_pages_return_atomic_compaction_and_rows() {
@@ -5248,13 +4976,12 @@ mod tests {
 
         let (source_instance_id, source_epoch, high_water) =
             SqliteStore::init(&conn).expect("migrate legacy store");
+        let conn = Arc::new(Mutex::new(conn));
         let store = SqliteStore {
             wal_config: broca_wal::WalConfig::LEGACY,
             bus_events: crate::bus_events::State::default(),
-            conn: std::sync::Mutex::new(conn),
-            export_high_water: AtomicU64::new(high_water),
-            export_source_instance_id: source_instance_id,
-            export_source_epoch: source_epoch,
+            conn: Arc::clone(&conn),
+            export: ExportStore::from_shared(conn, (source_instance_id, source_epoch, high_water)),
         };
         let row = store
             .lookup_run("legacy-run")
@@ -5307,13 +5034,12 @@ mod tests {
                 .unwrap();
             assert_eq!(present, 1, "{table}.{column} is added");
         }
+        let conn = Arc::new(Mutex::new(conn));
         let store = SqliteStore {
             wal_config: broca_wal::WalConfig::LEGACY,
             bus_events: crate::bus_events::State::default(),
-            conn: std::sync::Mutex::new(conn),
-            export_high_water: AtomicU64::new(high_water),
-            export_source_instance_id: source_instance_id,
-            export_source_epoch: source_epoch,
+            conn: Arc::clone(&conn),
+            export: ExportStore::from_shared(conn, (source_instance_id, source_epoch, high_water)),
         };
         let row = store.lookup_run("legacy-run").unwrap().unwrap();
         assert_eq!(row.title, None);
@@ -6132,13 +5858,12 @@ mod tests {
             rusqlite::params![key, serde_json::to_string(&message).unwrap()],
         )
         .unwrap();
+        let conn = Arc::new(Mutex::new(conn));
         let store = SqliteStore {
             wal_config: broca_wal::WalConfig::LEGACY,
             bus_events: crate::bus_events::State::default(),
-            conn: std::sync::Mutex::new(conn),
-            export_high_water: AtomicU64::new(high_water),
-            export_source_instance_id: source_instance_id,
-            export_source_epoch: source_epoch,
+            conn: Arc::clone(&conn),
+            export: ExportStore::from_shared(conn, (source_instance_id, source_epoch, high_water)),
         };
 
         assert_eq!(store.projection_snapshot(&key).unwrap().next_ord, 1);

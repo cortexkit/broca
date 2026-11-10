@@ -5269,10 +5269,12 @@ const NOT_SERVED_ON_NEW_STORAGE: &str = "not_served_on_new_storage";
 /// `session.entries`, `session.applied_view`, `session.apply_view`) is dispatched by its role
 /// before this check, and the registry sends a store session's calls on it to the store
 /// (`LineageRegistry::route_compaction_v2`).
-pub(crate) fn served_on_new_storage(method: &str, params: &serde_json::Value) -> bool {
+pub(crate) fn served_on_new_storage(method: &str, _params: &serde_json::Value) -> bool {
     match method {
         // Reads served from the store (`store_read`, `store_head`).
         OP_READ | OP_HEAD => true,
+        cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REFS
+        | cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REF_READ => true,
         // The store actor's subscriptions (`store_fanout`).
         OP_SUBSCRIBE => true,
         // Run and send facts built from the store's own records (`store_status`), and a run's
@@ -5284,9 +5286,8 @@ pub(crate) fn served_on_new_storage(method: &str, params: &serde_json::Value) ->
         // Plan refreshes, through today's preflight, decided and written by the store actor,
         // and the baseline they are checked against (`store_plan_change::baseline`).
         OP_REFRESH | OP_REFRESH_POLICY | OP_FLUSH_PREFIX | OP_BASELINE => true,
-        // A head import from a file creates the session in the new storage. An import carrying
-        // its messages inline is today's import, which writes a WAL.
-        OP_IMPORT => params.get("source").is_some(),
+        // Both file and inline imports write one seeded batch through the store actor.
+        OP_IMPORT => true,
         OP_INSTALL_VIEW => true,
         // Restore repairs the new storage's own files (`store_restore`).
         OP_RESTORE_FROM_BACKUP => true,
@@ -5308,6 +5309,29 @@ pub(crate) fn served_on_new_storage(method: &str, params: &serde_json::Value) ->
         cortexkit_role_llm_runner::ops::SESSION_HISTORY => true,
         _ => false,
     }
+}
+
+#[cfg(test)]
+#[test]
+fn the_store_gate_serves_inline_import_and_both_output_reference_ops() {
+    for method in [
+        OP_IMPORT,
+        cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REFS,
+        cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REF_READ,
+    ] {
+        assert!(served_on_new_storage(
+            method,
+            &serde_json::json!({"messages":[]})
+        ));
+    }
+    assert!(served_on_new_storage(
+        OP_IMPORT,
+        &serde_json::json!({"source":{}})
+    ));
+    assert!(!served_on_new_storage(
+        "run.event.get",
+        &serde_json::json!({})
+    ));
 }
 
 /// Routes a command only the new storage serves, and sends its answer: the reply, or its

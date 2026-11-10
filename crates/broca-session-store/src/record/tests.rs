@@ -281,6 +281,39 @@ fn one_of_each() -> Vec<Record> {
 }
 
 #[test]
+fn source_lineage_round_trips_with_a_must_understand_bit() {
+    let moved = Moved {
+        move_id: "move".into(),
+        source_activity_ms: 9,
+        source_lineage: Some("0190a6b2-0000-7000-8000-000000000001".into()),
+    };
+    let record = Record::Moved(moved);
+    let body = record.encode_body();
+    assert_eq!(Record::decode(record.kind(), &body).unwrap(), record);
+    let field = crate::codec::Fields::new(&body, "old reader")
+        .map(Result::unwrap)
+        .find(|field| field.number == 3)
+        .unwrap();
+    assert!(field.must);
+    assert!(matches!(
+        crate::codec::skip_unknown(field, "old reader")
+            .unwrap_err()
+            .kind,
+        crate::codec::DecodeErrorKind::MustUnderstand { field: 3 }
+    ));
+    let old_move = Record::Moved(Moved {
+        move_id: "move".into(),
+        source_activity_ms: 9,
+        source_lineage: None,
+    });
+    let body = old_move.encode_body();
+    assert_eq!(Record::decode(old_move.kind(), &body).unwrap(), old_move);
+    assert!(!crate::codec::Fields::new(&body, "old move")
+        .map(Result::unwrap)
+        .any(|field| field.number == 3));
+}
+
+#[test]
 fn every_kind_round_trips_under_its_own_number_and_stream() {
     let records = one_of_each();
     let mut kinds: Vec<u32> = records.iter().map(Record::kind).collect();

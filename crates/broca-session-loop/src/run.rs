@@ -522,6 +522,13 @@ where
         return Ok(finished(writer, reason));
     }
     let resolution = run.resolution();
+    // A cancel tripped before a paused run resumes ends it `Cancelled` before anything else a
+    // resume does, as today's loop lets a cancel while paused win: nothing is refrozen, no
+    // resume is recorded, an account limit isn't waited on, and no model is called. A session's
+    // actor ends a paused run this way for an interrupt queued behind it.
+    if matches!(resolution, Resolution::Paused(_)) && seams.cancel.is_cancelled() {
+        return finish(writer, seams, &admission.run_id, RunFinishReason::Cancelled).await;
+    }
     // A run paused on its account's limit resumes on that same account, and only once the
     // account has reset, as today's resume decides it. Until then nothing is written and the
     // run stays paused; on another account it ends interrupted, saying why.
@@ -1640,6 +1647,7 @@ async fn offline_request_for<W: Writer>(
         compacted,
         defer_media_tags,
         enrollment.as_ref(),
+        None,
     )?;
     finalize_tool_choice(writer, &mut opts);
     if !compacted {
@@ -1685,6 +1693,16 @@ where
     let mut episodes = Arc::new(RenderHistory::from(render_episodes(writer, parts)?));
     // Each window run's frozen part numbering, read from its start once for the whole run.
     let mut tag_rules = TagRulesCache::default();
+    // On the current compaction contract a request numbers its parts from the entries, so the
+    // runs' frozen numbering goes unused there: it's read at the run's first step only, which
+    // refuses a window run whose start can't be read, as every step's read would. No run joins
+    // the window during the run.
+    let contract = admission.compaction_plan_version.is_some();
+    let mut tag_rules_read = false;
+    // A compacted run's stored prompt, kept between its steps (see `compaction::prompt`), and
+    // what its renders rendered of each entry, which the next reuses where unchanged.
+    let mut kept_prompt = crate::compaction::prompt::KeptPrompt::default();
+    let rendered = broca_core::compaction_v2::render::RenderCache::default();
     let tools = Arc::new(admission.tools.clone());
     // The run's frozen plan says which preset each tool provider's calls carry, which providers
     // were fetched and what they declared, as today's loop reads it from the same plan. A call
@@ -1990,7 +2008,12 @@ where
             }
             _ => {}
         }
-        let run_rules = run_tag_rules(writer, &episodes, &mut tag_rules).await?;
+        let run_rules = if contract && tag_rules_read {
+            Vec::new()
+        } else {
+            tag_rules_read = true;
+            run_tag_rules(writer, &episodes, &mut tag_rules).await?
+        };
         let enrollment = writer.enrollment().await?;
         let mut opts = call_options(
             writer,
@@ -2003,6 +2026,7 @@ where
             compaction.is_some(),
             defer_media_tags,
             enrollment.as_ref(),
+            compaction.map(|_| &mut kept_prompt),
         )?;
         // The step names the account routing gives the run now, as today's does.
         if let Some(context) = opts.step_context.as_mut() {
@@ -2032,7 +2056,18 @@ where
         };
         if let Some(ctx) = compaction.filter(|_| call_ready) {
             let marked = writer.conversation().marker.clone();
-            match crate::compaction::prepare(writer, admission, seams, ctx, step_id, opts).await? {
+            match crate::compaction::prepare(
+                writer,
+                admission,
+                seams,
+                ctx,
+                step_id,
+                opts,
+                &mut kept_prompt,
+                &rendered,
+            )
+            .await?
+            {
                 crate::compaction::Send::Ready(ready) => opts = *ready,
                 crate::compaction::Send::Unavailable(message) => {
                     return compaction_unavailable(writer, seams, admission, &message).await;
@@ -2888,7 +2923,10 @@ fn render_episodes<W: Writer>(
 /// frozen settings, with the render inputs today's loop gives a request: each message's
 /// position, its part numbers under the run's tag rules, and the run's place in the prompt.
 /// `enrollment` is what the session's move onto the current compaction contract decided about
-/// the messages placed before it, which a request on the contract renders them by.
+/// the messages placed before it, which a request on the contract renders them by. A compacted
+/// run on the contract passes the stored prompt it keeps, `kept`, which takes in the step's new
+/// messages instead of the request's prompt holding a copy of the window: the request's prompt
+/// is the one the compaction provider's view renders from it (`compaction::prepare`).
 #[allow(clippy::too_many_arguments)]
 fn call_options<W: Writer>(
     writer: &W,
@@ -2901,67 +2939,70 @@ fn call_options<W: Writer>(
     compacted: bool,
     defer_media_tags: bool,
     enrollment: Option<&broca_session_store::session::EnrollmentOverlay>,
+    kept: Option<&mut crate::compaction::prompt::KeptPrompt>,
 ) -> Result<CallOptions, LoopError> {
-    let mut prompt = writer.conversation().messages.clone();
     let contract = admission.compaction_plan_version.is_some();
-    // Off the compaction contract a ride renders into its result's copy here, before anything
-    // else edits the results, where today's replay joins it as it reads the ride's record. On
-    // the contract the entries below render it.
-    if !contract {
-        crate::entries::render_rides(&mut prompt, writer.conversation());
-    }
-    repetition_guidance(
-        &mut prompt,
-        episodes,
-        writer.conversation().window_start() - 1,
-        writer.conversation().window_repetition.as_ref(),
-    )?;
-    // Each message keeps its place in the session, which the window starts after once history
-    // is sealed: the window's first message has the 0-based position `window_start - 1`.
-    let first = writer.conversation().window_start() - 1;
-    for (index, message) in prompt.iter_mut().enumerate() {
-        message.ordinal = Some(first + index as u64);
-    }
-    // The global system messages a session that enrolled carried in its transcript before are
-    // left out, as a session on the contract never holds them: the run's system text takes
-    // their place above the conversation, and the entries leave them out alike. Otherwise the
-    // request shares the run's episode list rather than copying it.
-    let episodes = match (contract, enrollment) {
-        (true, Some(enrollment)) => {
-            crate::enroll::without_suppressed(&mut prompt, enrollment);
+    let overflow = |_| LoopError::Unsupported("part numbers past the numbering limit");
+    let mut kept = kept.filter(|_| contract && compacted);
+    let mut prompt = match kept.as_mut() {
+        Some(kept) => {
+            kept.update(writer, episodes, enrollment)?;
+            Vec::new()
+        }
+        // A session on the current compaction contract renders its numbers from the entries.
+        None if contract => {
+            crate::compaction::prompt::taken(writer.conversation().messages.len());
+            crate::compaction::prompt::contract_prompt(writer.conversation(), episodes, enrollment)?
+        }
+        None => {
+            let mut prompt = writer.conversation().messages.clone();
+            // Off the compaction contract a ride renders into its result's copy here, before
+            // anything else edits the results, where today's replay joins it as it reads the
+            // ride's record. On the contract the entries render it.
+            crate::entries::render_rides(&mut prompt, writer.conversation());
+            repetition_guidance(
+                &mut prompt,
+                episodes,
+                writer.conversation().window_start() - 1,
+                writer.conversation().window_repetition.as_ref(),
+            )?;
+            // Each message keeps its place in the session, which the window starts after once
+            // history is sealed: the window's first message has the 0-based position
+            // `window_start - 1`.
+            let first = writer.conversation().window_start() - 1;
+            for (index, message) in prompt.iter_mut().enumerate() {
+                message.ordinal = Some(first + index as u64);
+            }
+            // A session on the established layout numbers each run's messages by that run's
+            // frozen rules, in the order they were placed, as today's loop numbers them, and
+            // renders them in place.
+            for (at, run) in run_rules.iter().enumerate() {
+                let end = run_rules
+                    .get(at + 1)
+                    .map_or(prompt.len(), |next| next.start)
+                    .min(prompt.len());
+                let start = run.start.min(end);
+                TagNumbering::for_run(&prompt[..start], run.rules, run.computed)
+                    .number_new(&mut prompt[..end])
+                    .map_err(overflow)?;
+            }
+            prompt
+        }
+    };
+    // A session that enrolled sends none of the global system messages it carried before (its
+    // stored prompt holds an empty placeholder for each, see
+    // `compaction::prompt::contract_prompt`), and each run's place moves past them. Otherwise
+    // the request shares the run's episode list rather than copying it, as a compacted run
+    // shares the one its stored prompt keeps.
+    let episodes = match (kept, contract, enrollment) {
+        (Some(kept), _, _) => kept.request_episodes(episodes, enrollment),
+        (None, true, Some(enrollment)) => {
             let mut translated = episodes.episodes.clone();
             crate::enroll::translate_episodes(&mut translated, enrollment);
             Arc::new(RenderHistory::from(translated))
         }
         _ => Arc::clone(episodes),
     };
-    // A session on the current compaction contract renders its numbers from the entries below;
-    // one on the established layout numbers each run's messages by that run's frozen rules, in
-    // the order they were placed, as today's loop numbers them, and renders them in place.
-    let overflow = |_| LoopError::Unsupported("part numbers past the numbering limit");
-    if contract {
-        TagNumbering::for_run(
-            &[],
-            Some(ComputedRules {
-                render: false,
-                clean: false,
-            }),
-            Some(ComputedTagRules { checkpoint: 0 }),
-        )
-        .number_new(&mut prompt)
-        .map_err(overflow)?;
-    } else {
-        for (at, run) in run_rules.iter().enumerate() {
-            let end = run_rules
-                .get(at + 1)
-                .map_or(prompt.len(), |next| next.start)
-                .min(prompt.len());
-            let start = run.start.min(end);
-            TagNumbering::for_run(&prompt[..start], run.rules, run.computed)
-                .number_new(&mut prompt[..end])
-                .map_err(overflow)?;
-        }
-    }
     if !contract && defer_media_tags {
         // The provider's media renderer tags a message holding media itself, on its own copy of
         // the request, after preparing that message's media (see `defer_media_tags` above).
@@ -3019,7 +3060,9 @@ fn call_options<W: Writer>(
     }
     // On the current compaction contract a request renders from the entries, as today's loop
     // renders one: text delivered with a tool result is added to the result's copy, and the
-    // system text goes above the conversation.
+    // system text goes above the conversation. This render copies the stored prompt rather than
+    // rendering through a view's plan, so the placeholders the prompt holds for the global system
+    // messages an enrollment suppressed (`compaction::prompt::contract_prompt`) come out of it.
     let conversation = writer.conversation();
     let entries = broca_session_store::session::EnrollmentOverlay::serve(
         enrollment,
@@ -3030,12 +3073,15 @@ fn call_options<W: Writer>(
     .collect::<Result<Vec<_>, _>>()
     .map_err(LoopError::Parts)?;
     let rides = crate::entries::ride_envelopes(conversation);
-    let prompt = broca_core::compaction_v2::render::deliveries_only_with_rides(
+    let mut prompt = broca_core::compaction_v2::render::deliveries_only_with_rides(
         &opts.prompt,
         &entries,
         &rides,
     )
     .map_err(LoopError::Parts)?;
+    if let Some(enrollment) = enrollment {
+        crate::enroll::without_suppressed(&mut prompt, enrollment);
+    }
     let opts = broca_core::compaction_v2::render::options(&opts, prompt);
     Ok(
         broca_core::compaction_v2::systems::view(&opts, &admission.global_system)
@@ -3051,7 +3097,7 @@ fn call_options<W: Writer>(
 /// first message has session position `first`, while each run's place is a session position. A
 /// run that started before the window counts on from `spanning`, the counters the latest cut kept
 /// for its sealed steps; without them none of its steps were sealed.
-fn repetition_guidance(
+pub(crate) fn repetition_guidance(
     prompt: &mut [Message],
     episodes: &[EpisodeRenderInput],
     first: u64,
@@ -4489,7 +4535,21 @@ async fn end_with_error<W: Writer, P, T>(
     reason: RunFinishReason,
     error: &ProviderError,
 ) -> Result<Finished, LoopError> {
-    let mut record = run_end(writer, run_id, reason, (seams.now_ms)());
+    end_run_with_error(writer, run_id, reason, error, (seams.now_ms)()).await
+}
+
+/// Ends the session's unfinished latest run `run_id` as `reason`, with `error` on its end and
+/// `now_ms` as its time: the end the loop writes for a run that can't go on, durable before it
+/// returns, with the messages steered or delivered since the run's last step boundary. For the
+/// session's owner, when a run's loop stopped without writing an end.
+pub async fn end_run_with_error<W: Writer>(
+    writer: &mut W,
+    run_id: &str,
+    reason: RunFinishReason,
+    error: &ProviderError,
+    now_ms: u64,
+) -> Result<Finished, LoopError> {
+    let mut record = run_end(writer, run_id, reason, now_ms);
     if let Record::RunEnd(end) = &mut record {
         end.error = Some(serde_json::to_value(error).map_err(|e| LoopError::Parts(e.to_string()))?);
     }

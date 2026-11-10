@@ -425,8 +425,12 @@ fn tweaked(mut step: Step, change: fn(&mut SubmissionRequest)) -> Step {
 
 /// Runs `steps` on both sides over the same provider script, the first model step gated when
 /// `gated`. Every reply is compared as its step says; when every step is served alike, the two
-/// sessions' conversations must also be the same.
-async fn compare(script: Vec<Vec<NormalizedEvent>>, gated: bool, steps: Vec<Step>) {
+/// sessions' conversations must also be the same. Returns today's reply to each send, in order.
+async fn compare(
+    script: Vec<Vec<NormalizedEvent>>,
+    gated: bool,
+    steps: Vec<Step>,
+) -> Vec<SendOutcome> {
     let today_gate = gated.then(|| Arc::new(Notify::new()));
     let store_gate = gated.then(|| Arc::new(Notify::new()));
     let today = today(script.clone(), today_gate.clone());
@@ -439,6 +443,7 @@ async fn compare(script: Vec<Vec<NormalizedEvent>>, gated: bool, steps: Vec<Step
         super::tests::actor_with(executor(script, store_gate.clone()), parts.clone()).await;
     // Both sides get the request one caller shapes.
     let caller = super::tests::Caller::default();
+    let mut answers = Vec::new();
     for (index, step) in steps.into_iter().enumerate() {
         match step {
             Step::Send {
@@ -472,6 +477,7 @@ async fn compare(script: Vec<Vec<NormalizedEvent>>, gated: bool, steps: Vec<Step
                 )
                 .await;
                 assert_eq!(new, old, "step {index}: replies differ");
+                answers.push(old);
             }
             Step::Retract(submission_id) => {
                 let old = today
@@ -514,6 +520,7 @@ async fn compare(script: Vec<Vec<NormalizedEvent>>, gated: bool, steps: Vec<Step
     );
     display_reads_alike(&today, &session, &parts).await;
     assert!(today.registry.stop_and_seal().await);
+    answers
 }
 
 /// The read modes that add to a reply: display facts, tools, Rich UI stamps, each alone and all
@@ -1592,28 +1599,18 @@ async fn the_switch_starts_a_new_session_in_the_new_storage_and_reopens_it() {
     );
 }
 
-/// With the switch off, and with it on for a creating send the store actor doesn't serve, the
-/// session starts on today's storage and the new storage holds nothing.
+/// With the switch off, a session starts on today's storage and the new storage holds nothing.
 #[tokio::test]
-async fn sessions_stay_on_todays_storage_unless_the_switch_and_the_send_allow() {
-    for (on, conversation_key) in [(false, None), (true, Some("conversation"))] {
-        let module = module(on, vec![super::tests::text_step("a1", "hello")]).await;
-        assert!(
-            matches!(
-                module.send("r1", "first", conversation_key).await,
-                SendOutcome::Active { .. }
-            ),
-            "switch {on}, conversation key {conversation_key:?}"
-        );
-        module.closed().await;
-        assert!(!module.head().exists(), "switch {on}");
-        assert_eq!(
-            module.wal.wal_present(&module.key),
-            Some(true),
-            "switch {on}"
-        );
-        assert!(!module.floor().contains(broca_wal::SESSION_STORAGE_FEATURE));
-    }
+async fn sessions_stay_on_todays_storage_when_the_switch_is_off() {
+    let module = module(false, vec![super::tests::text_step("a1", "hello")]).await;
+    assert!(matches!(
+        module.send("r1", "first", None).await,
+        SendOutcome::Active { .. }
+    ));
+    module.closed().await;
+    assert!(!module.head().exists());
+    assert_eq!(module.wal.wal_present(&module.key), Some(true));
+    assert!(!module.floor().contains(broca_wal::SESSION_STORAGE_FEATURE));
 }
 
 /// One `session.read` reply as JSON, with what legitimately differs between the two storages
@@ -1778,12 +1775,17 @@ async fn a_store_session_reads_as_the_same_history_on_todays_storage() {
 
 mod controls;
 mod head;
+mod inline_refs;
 mod keep_warm;
 mod media;
 mod media_ready;
 mod media_render;
 mod ordered;
+mod pauses;
 mod photo_sends;
 mod refresh;
+mod scopes;
 mod streams;
 mod warm;
+
+mod held;

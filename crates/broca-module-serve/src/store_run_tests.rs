@@ -3,6 +3,36 @@
 // folds and runs the new run loop, its writes served on the session as the store actor serves
 // them.
 
+#[test]
+#[allow(unreachable_code, clippy::diverging_sub_expression)]
+fn store_run_parent_future_stays_small() {
+    fn future_size<F>(_: impl FnOnce() -> F) -> usize {
+        std::mem::size_of::<F>()
+    }
+    let bytes = future_size(|| {
+        LiveLoopExecutor::<FileWalStore>::run_on_store(
+            todo!(),
+            todo!(),
+            todo!(),
+            todo!(),
+            todo!(),
+            todo!(),
+            todo!(),
+            todo!(),
+            todo!(),
+            todo!(),
+            todo!(),
+        )
+    });
+    eprintln!("run_on_store future: {bytes} bytes");
+    // The executor is boxed by async_trait, but its poll frame must not also carry the large
+    // run and resume bodies inline. Guard their caller rather than the already-boxed executor.
+    assert!(
+        bytes <= 24 * 1024,
+        "run_on_store carries {bytes} bytes; box the loop futures it awaits"
+    );
+}
+
 /// Serves a store run's writes on `session` until the run ends, as the store actor does, and
 /// returns how it ended.
 async fn serve_store_run(

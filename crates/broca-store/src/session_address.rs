@@ -5,7 +5,7 @@ use std::path::Path;
 use broca_protocol::BindIdentity;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
-use crate::{session_refs, SqliteStore};
+use crate::{session_refs, SessionInventory, SqliteStore};
 
 /// The owner and `ref` of the scope whose stamped `route.bind` reserved a new session address;
 /// admission defines and compares it, and this inventory records it.
@@ -208,7 +208,7 @@ fn read_existing(
     Ok(found)
 }
 
-impl SqliteStore {
+impl SessionInventory {
     /// Existing pairs use a read snapshot, without competing for SQLite's writer
     /// lock. Only an absent pair takes a writer transaction and rechecks discovery
     /// before reserving its first root across connections and processes.
@@ -273,6 +273,28 @@ impl SqliteStore {
         let conn = self.conn.lock().map_err(SessionAddressError::store_error)?;
         read_scope_reservation(&conn, &broca_core::session_addr(session))
             .map_err(SessionAddressError::store_error)
+    }
+}
+
+impl SqliteStore {
+    pub fn resolve_session_address(
+        &self,
+        bind: &BindIdentity,
+        stamped_workdir: Option<&Path>,
+        reservation: Option<&ScopeReservation>,
+    ) -> Result<BindIdentity, SessionAddressError> {
+        SessionInventory::shared(&self.conn).resolve_session_address(
+            bind,
+            stamped_workdir,
+            reservation,
+        )
+    }
+
+    pub fn scope_reservation(
+        &self,
+        session: &BindIdentity,
+    ) -> Result<Option<ScopeReservation>, SessionAddressError> {
+        SessionInventory::shared(&self.conn).scope_reservation(session)
     }
 }
 

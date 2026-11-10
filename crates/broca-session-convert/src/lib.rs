@@ -1863,6 +1863,8 @@ fn ride_envelope(
 }
 
 #[cfg(test)]
+mod enrolled_entries_tests;
+#[cfg(test)]
 mod inverse_tests;
 #[cfg(test)]
 mod marks_tests;
@@ -1874,6 +1876,8 @@ mod stage_tests;
 mod summaries_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod views_tests;
 
 /// The cache lifetime requests rendered from `frozen` ask `provider_id` for, when they ask for
 /// one it honours, as today's cache declaration reads it. `None` for a config that doesn't

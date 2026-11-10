@@ -35,9 +35,10 @@ def broca_known_features(
     while broca learned five names, so every WAL holding a tool call since then read as
     written by a newer build, and the live-run gate refused every restart as "cannot compare".
     An entry may name a constant in another broca-wal module (`crate::head_proof::NAME`);
-    `module_source` returns that module's source text. Raises ValueError when the table or one
-    of its names cannot be found, so a renamed or moved constant fails loudly instead of
-    quietly shrinking the table.
+    `module_source` returns that module's source text, including explicitly re-exported record
+    constants. It also resolves re-exports from `framing` for unqualified names. Raises
+    ValueError when the table or one of its names cannot be found, so a renamed or moved
+    constant fails loudly instead of quietly shrinking the table.
     """
     table = re.search(r"pub const KNOWN_FEATURES: &\[&str\] = &\[(.*?)\];", source, re.DOTALL)
     if table is None:
@@ -48,6 +49,10 @@ def broca_known_features(
     ):
         text = module_source(module) if module else source
         value = re.search(rf'pub const {constant}: &str = "([^"]+)";', text)
+        if value is None and not module:
+            value = re.search(
+                rf'pub const {constant}: &str = "([^"]+)";', module_source("framing")
+            )
         if value is None:
             where = f"broca-wal's {module} module" if module else "framing.rs"
             raise ValueError(f"{constant} in KNOWN_FEATURES has no string value in {where}")
@@ -63,10 +68,23 @@ def broca_known_features(
 # so knowing a name broca knows is always safe here. Tests patch this module attribute to
 # exercise a gated frame whose features are known.
 def _broca_wal_module_source(module: str) -> str:
-    """The source of broca-wal's `module`, as `src/<module>.rs` or `src/<module>/mod.rs`."""
+    """Read a WAL module and the string constants it explicitly re-exports from records."""
     for path in (FRAMING_RS.parent / f"{module}.rs", FRAMING_RS.parent / module / "mod.rs"):
         if path.is_file():
-            return path.read_text()
+            source = path.read_text()
+            for imported in re.finditer(
+                r"pub use broca_records::([a-z_][a-z0-9_]*)::(?:\{([^}]+)\}|([A-Z][A-Z0-9_]*));",
+                source, re.DOTALL,
+            ):
+                records_path = FRAMING_RS.parents[2] / "broca-records/src" / f"{imported.group(1)}.rs"
+                if not records_path.is_file():
+                    continue
+                records = records_path.read_text()
+                for constant in re.findall(r"\b[A-Z][A-Z0-9_]*\b", imported.group(2) or imported.group(3)):
+                    definition = re.search(rf'pub const {constant}: &str = "[^"]+";', records)
+                    if definition is not None:
+                        source += "\n" + definition.group(0)
+            return source
     return ""
 
 

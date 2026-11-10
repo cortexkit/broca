@@ -305,13 +305,7 @@ impl OpenError {
             broca_store::session_log_evidence::SessionLogError::Inventory(error) => {
                 let temporary = error
                     .downcast_ref::<std::io::Error>()
-                    .is_some_and(Self::temporary_io)
-                    || matches!(error.downcast_ref::<broca_store::db::DbError>(), Some(broca_store::db::DbError::Io(io)) if Self::temporary_io(io));
-                if let Some(broca_store::db::DbError::Wal(wal)) =
-                    error.downcast_ref::<broca_store::db::DbError>()
-                {
-                    return Self::from_wal_read(error.to_string(), wal);
-                }
+                    .is_some_and(Self::temporary_io);
                 if temporary {
                     Self::Classified {
                         reason: error.to_string(),
@@ -775,11 +769,8 @@ pub trait SessionInventoryReadiness: Send + Sync {
 
 mod media;
 pub(crate) mod media_head;
-#[path = "run_rows.rs"]
-mod run_rows;
 pub mod store_move;
 pub mod store_restore;
-pub use run_rows::OverhaulRunSource;
 
 /// A failed durability boundary. Historical events survive successful session recovery.
 #[derive(Clone, Debug)]
@@ -1019,11 +1010,8 @@ struct Inner {
     store_mover: std::sync::OnceLock<Arc<dyn store_move::StoreMover>>,
     /// What runs `session.restore_from_backup`, installed by the daemon with its stores.
     store_restorer: std::sync::OnceLock<Arc<dyn store_restore::StoreRestorer>>,
-    run_event_reader: std::sync::OnceLock<Arc<RunEventLookup>>,
     session_address_inventory: std::sync::OnceLock<Arc<dyn broca_store::SessionAddressResolver>>,
-    episode_source: std::sync::OnceLock<Arc<EpisodeReadSource>>,
     session_inventory_readiness: std::sync::OnceLock<Arc<dyn SessionInventoryReadiness>>,
-    raw_pages: std::sync::OnceLock<Arc<RawPageSource>>,
     tool_route_health: std::sync::OnceLock<Arc<ToolRouteHealth>>,
     actor_idle_holds: Mutex<HashMap<LineageKey, (u64, Vec<&'static str>)>>,
     /// Raised and lowered by the System One batch service; read into `batches_in_flight`.
@@ -1060,7 +1048,6 @@ struct Inner {
     store_eligible: Mutex<HashMap<LineageKey, StoreCreation>>,
     opener: Arc<dyn LineageOpener>,
     reader: Option<ReadSources>,
-    run_rows: Option<Arc<OverhaulRunSource>>,
     /// No-actor reads retain a file-identity-scoped proof so transcript pagination does not fsync
     /// again while every requested frame remains within the already-proven durable prefix.
     read_proofs: Mutex<BoundedSessionCache<ReadProof>>,
@@ -1360,7 +1347,6 @@ pub struct RouteReadPage {
     pub at_seq: u64,
     pub head_facts: broca_core::head::HeadProjection,
     /// Log-only media metadata validated alongside this read page.
-    pub head_media: Option<broca_store::db::RawHeadMedia>,
     pub head_facts_complete: bool,
     pub page: broca_core::SessionReadPage,
     /// Projection commits only complete tool turns. Any open batch therefore remains in the
@@ -1394,295 +1380,6 @@ enum RoutedPage {
 struct ReadSources {
     wal_store: Arc<dyn broca_core::WalStore>,
     store: Option<Arc<dyn broca_core::MaterializedStore>>,
-}
-
-type EpisodePublication = dyn Fn(&LineageKey, Option<u64>) -> Result<broca_wal::file_wal::DurablePublication, String>
-    + Send
-    + Sync;
-pub type RunEventLookup =
-    dyn Fn(&str) -> Result<Option<(LineageKey, Vec<u8>)>, String> + Send + Sync;
-
-/// Opt-in database composition. The callback supplies the writer's durable publication
-/// at the sequence requested for an attach, or the latest publication for a page.
-/// Existing constructors never install this source.
-pub struct EpisodeReadSource {
-    db: Arc<broca_store::db::OverhaulDb>,
-    publication: Arc<EpisodePublication>,
-    gate: Option<Arc<broca_store::db::SessionGateFactory>>,
-    access: Option<broca_wal::access_counter::WalAccessCounter>,
-}
-
-// Validate the zero-record source before refusing its empty rebuild, so an
-// existing source I/O or witness refusal keeps its cause without changing rows.
-fn check_empty_publication_source(
-    publication: &broca_wal::file_wal::DurablePublication,
-) -> Result<(), OpenError> {
-    use std::io::Read;
-    let source_error = |error| {
-        let temporary = OpenError::temporary_io(&error);
-        let reason = broca_store::db::DbError::Io(error).to_string();
-        if temporary {
-            OpenError::Classified {
-                reason,
-                class: broca_protocol::ErrorClass::Transient,
-            }
-        } else {
-            OpenError::Open(reason)
-        }
-    };
-    let mut file = broca_wal::fs_ops::File::open(publication.path()).map_err(source_error)?;
-    let mut header = Vec::new();
-    (&mut file)
-        .take(broca_wal::framing::LINEAGE_FRAME_LEN as u64)
-        .read_to_end(&mut header)
-        .map_err(source_error)?;
-    match broca_wal::framing::decode_next(&header) {
-        broca_wal::framing::DecodeStep::Lineage {
-            lineage_id,
-            consumed,
-        } if consumed == header.len() && lineage_id == publication.lineage() => Ok(()),
-        _ => Err(OpenError::Open(
-            broca_store::db::DbError::Invalid(
-                "durable publication lineage differs from its witness".into(),
-            )
-            .to_string(),
-        )),
-    }
-}
-
-impl EpisodeReadSource {
-    pub fn new(db: Arc<broca_store::db::OverhaulDb>, publication: Arc<EpisodePublication>) -> Self {
-        Self {
-            db,
-            publication,
-            gate: None,
-            access: None,
-        }
-    }
-
-    pub fn with_gate(mut self, gate: Arc<Mutex<()>>) -> Self {
-        self.gate = Some(Arc::new(move |_| gate.clone()));
-        self
-    }
-    pub fn with_session_gates(mut self, gate: Arc<broca_store::db::SessionGateFactory>) -> Self {
-        self.gate = Some(gate);
-        self
-    }
-
-    pub fn with_access_counter(
-        mut self,
-        access: broca_wal::access_counter::WalAccessCounter,
-    ) -> Self {
-        self.access = Some(access);
-        self
-    }
-
-    pub(crate) fn with_reader<T>(
-        &self,
-        key: &LineageKey,
-        head: Option<u64>,
-        read: impl FnOnce(broca_store::db::DatabaseEpisodeReader) -> Result<T, String>,
-    ) -> Result<T, String> {
-        if let Some(access) = &self.access {
-            return access
-                .operation(if head.is_some() {
-                    "model attach"
-                } else {
-                    "model page"
-                })
-                .run(|| self.with_reader_inner(key, head, read));
-        }
-        self.with_reader_inner(key, head, read)
-    }
-
-    fn with_reader_checked<T>(
-        &self,
-        key: &LineageKey,
-        head: Option<u64>,
-        empty_history_check: Result<(), OpenError>,
-        read: impl FnOnce(broca_store::db::DatabaseEpisodeReader) -> Result<T, String>,
-    ) -> Result<T, OpenError> {
-        let work = || {
-            let gate = self.gate.as_ref().map(|factory| factory(key));
-            let _guard = gate
-                .as_ref()
-                .map(|gate| {
-                    gate.lock()
-                        .map_err(|error| OpenError::Open(error.to_string()))
-                })
-                .transpose()?;
-            let publication = (self.publication)(key, head).map_err(OpenError::Open)?;
-            if head.is_some_and(|head| publication.sequence() != head) {
-                return Err(OpenError::Open(
-                    "episode publication does not name attach barrier".into(),
-                ));
-            }
-            if publication.sequence() == 0 {
-                // Refuse before an empty publication can replace historical
-                // index rows. Nonempty publications keep their original source
-                // validation and refusal paths.
-                if empty_history_check.is_err() {
-                    check_empty_publication_source(&publication)?;
-                }
-                empty_history_check.map_err(|error| {
-                    error.for_empty_read(Some(publication.lineage().to_string()), None, false)
-                })?;
-            }
-            let reader = self
-                .db
-                .episode_reader(key.clone(), publication)
-                .map_err(|error| OpenError::Open(error.to_string()))?;
-            read(reader).map_err(OpenError::Open)
-        };
-        if let Some(access) = &self.access {
-            return access
-                .operation(if head.is_some() {
-                    "model attach"
-                } else {
-                    "model page"
-                })
-                .run(work);
-        }
-        work()
-    }
-
-    fn with_reader_inner<T>(
-        &self,
-        key: &LineageKey,
-        head: Option<u64>,
-        read: impl FnOnce(broca_store::db::DatabaseEpisodeReader) -> Result<T, String>,
-    ) -> Result<T, String> {
-        let gate = self.gate.as_ref().map(|factory| factory(key));
-        let _guard = gate
-            .as_ref()
-            .map(|gate| gate.lock().map_err(|e| e.to_string()))
-            .transpose()?;
-        read(self.reader(key, head)?)
-    }
-
-    pub(crate) fn reader(
-        &self,
-        key: &LineageKey,
-        head: Option<u64>,
-    ) -> Result<broca_store::db::DatabaseEpisodeReader, String> {
-        let publication = (self.publication)(key, head)?;
-        if head.is_some_and(|head| publication.sequence() != head) {
-            return Err("episode publication does not name attach barrier".into());
-        }
-        self.db
-            .episode_reader(key.clone(), publication)
-            .map_err(|error| error.to_string())
-    }
-}
-
-/// Explicitly supplied by tests; boot and all legacy constructors leave this absent.
-#[cfg(test)]
-pub(crate) struct RawPageTestBundle {
-    pub db: Arc<broca_store::db::OverhaulDb>,
-    pub publications: Mutex<HashMap<LineageKey, broca_wal::file_wal::DurablePublication>>,
-}
-
-/// WAL-backed raw reads installed only by the boot-selected overhaul bundle.
-pub struct RawPageSource {
-    db: Arc<broca_store::db::OverhaulDb>,
-    publication: Arc<EpisodePublication>,
-    gate: Option<Arc<broca_store::db::SessionGateFactory>>,
-}
-
-impl RawPageSource {
-    pub fn new(db: Arc<broca_store::db::OverhaulDb>, publication: Arc<EpisodePublication>) -> Self {
-        Self {
-            db,
-            publication,
-            gate: None,
-        }
-    }
-
-    pub fn with_gate(mut self, gate: Arc<Mutex<()>>) -> Self {
-        self.gate = Some(Arc::new(move |_| gate.clone()));
-        self
-    }
-    pub fn with_session_gates(mut self, gate: Arc<broca_store::db::SessionGateFactory>) -> Self {
-        self.gate = Some(gate);
-        self
-    }
-
-    fn page(
-        &self,
-        key: &LineageKey,
-        from: Option<u64>,
-        limit: Option<u64>,
-        tools: bool,
-        empty_history_check: Result<(), OpenError>,
-    ) -> Result<Box<RouteReadPage>, OpenError> {
-        let gate = self.gate.as_ref().map(|factory| factory(key));
-        let _guard = gate
-            .as_ref()
-            .map(|gate| gate.lock().map_err(|e| OpenError::Open(e.to_string())))
-            .transpose()?;
-        let publication = (self.publication)(key, None).map_err(OpenError::Open)?;
-        if publication.sequence() == 0 {
-            if empty_history_check.is_err() {
-                check_empty_publication_source(&publication)?;
-            }
-            empty_history_check.map_err(|error| {
-                error.for_empty_read(Some(publication.lineage().to_string()), Some(0), false)
-            })?;
-        }
-        let raw = self
-            .db
-            .read_raw_page(
-                key,
-                &broca_core::agent_session_ref(key),
-                broca_store::db::LogLocation::Live,
-                &publication,
-                broca_store::db::RawPageRequest {
-                    from_ordinal: from,
-                    limit,
-                    include_tools: tools,
-                },
-            )
-            .map_err(|e| OpenError::Open(e.to_string()))?;
-        Ok(Box::new(RouteReadPage {
-            page: raw.page,
-            at_seq: raw.at_seq,
-            head_facts: raw.head,
-            head_media: raw.head_media,
-            head_facts_complete: true,
-            tools: raw
-                .tools
-                .map(|(run_id, tools)| SessionReadTools { run_id, tools }),
-            dispatches: raw.dispatches,
-            native_tool_outputs: Some(raw.native_tool_outputs),
-            open_batch: None,
-            newest_record_ms: Some(raw.last_write_ms.unwrap_or(0)),
-            retention_activity_ms: raw.retention_activity_ms,
-            last_title: raw.last_title,
-        }))
-    }
-
-    fn tag_location(
-        &self,
-        key: &LineageKey,
-        tag: u64,
-    ) -> Result<Option<broca_core::TagLocation>, OpenError> {
-        let gate = self.gate.as_ref().map(|factory| factory(key));
-        let _guard = gate
-            .as_ref()
-            .map(|gate| gate.lock().map_err(|e| OpenError::Open(e.to_string())))
-            .transpose()?;
-        let publication = (self.publication)(key, None).map_err(OpenError::Open)?;
-        self.db
-            .read_raw_tag_location(
-                key,
-                &broca_core::agent_session_ref(key),
-                broca_store::db::LogLocation::Live,
-                &publication,
-                tag,
-            )
-            .map(Some)
-            .map_err(|e| OpenError::Open(e.to_string()))
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -1735,29 +1432,11 @@ impl LineageRegistry {
         &self,
         query: impl FnOnce(&dyn broca_core::ServedHistory) -> Result<T, String> + Send + 'static,
     ) -> Result<Option<T>, OpenError> {
-        let direct: Option<Arc<dyn broca_core::ServedHistory>> = self
+        let direct = self
             .inner
-            .raw_pages
-            .get()
-            .map(|source| source.db.clone() as Arc<dyn broca_core::ServedHistory>)
-            .or_else(|| {
-                self.inner
-                    .episode_source
-                    .get()
-                    .map(|source| source.db.clone() as Arc<dyn broca_core::ServedHistory>)
-            })
-            .or_else(|| {
-                self.inner
-                    .run_rows
-                    .as_ref()
-                    .map(|source| source.history_db() as Arc<dyn broca_core::ServedHistory>)
-            })
-            .or_else(|| {
-                self.inner
-                    .reader
-                    .as_ref()
-                    .and_then(|reader| reader.wal_store.served_history())
-            });
+            .reader
+            .as_ref()
+            .and_then(|reader| reader.wal_store.served_history());
         let store = self
             .inner
             .reader
@@ -1942,12 +1621,6 @@ impl LineageRegistry {
             }))
     }
 
-    pub fn set_run_event_reader(&self, reader: Arc<RunEventLookup>) {
-        assert!(
-            self.inner.run_event_reader.set(reader).is_ok(),
-            "run-event reader already installed"
-        );
-    }
     /// Supply the durable identity inventory before accepting routed session binds.
     pub fn set_session_address_inventory(&self, inventory: Arc<broca_store::SqliteStore>) {
         self.set_session_address_resolver(inventory);
@@ -2073,31 +1746,6 @@ impl LineageRegistry {
         Ok(ownership)
     }
 
-    /// Install the episode reader selected by the boot-time state format.
-    pub fn with_episode_source(self, source: Arc<EpisodeReadSource>) -> Self {
-        assert!(self.inner.episode_source.set(source).is_ok());
-        self
-    }
-    #[cfg(test)]
-    pub(crate) fn with_raw_pages_for_test(self, bundle: Arc<RawPageTestBundle>) -> Self {
-        self.with_raw_page_source(Arc::new(RawPageSource::new(
-            bundle.db.clone(),
-            Arc::new(move |key, _| {
-                bundle
-                    .publications
-                    .lock()
-                    .unwrap()
-                    .get(key)
-                    .cloned()
-                    .ok_or_else(|| "raw page publication not supplied".into())
-            }),
-        )))
-    }
-
-    pub fn with_raw_page_source(self, source: Arc<RawPageSource>) -> Self {
-        assert!(self.inner.raw_pages.set(source).is_ok());
-        self
-    }
     pub(crate) fn upload_store(&self) -> Option<broca_core::media_uploads::Uploads> {
         self.inner.reader.as_ref()?.wal_store.uploads()
     }
@@ -2195,26 +1843,17 @@ impl LineageRegistry {
         session: &LineageKey,
         event_key: &str,
     ) -> Result<broca_wire::RunEventGetResponse, crate::serve::ServeError> {
-        let native = self.inner.run_event_reader.get().cloned();
         let store = self.inner.reader.as_ref().and_then(|r| r.store.clone());
-        if native.is_none() && store.is_none() {
+        if store.is_none() {
             return Ok(broca_wire::RunEventGetResponse::Absent);
-        }
-        if native.is_some() {
-            self.check_move(session, false)
-                .map_err(|e| crate::serve::ServeError::Open(e.to_string(), None))?;
         }
         let event_key = event_key.to_owned();
         let key = event_key.clone();
-        let row = spawn_blocking(
-            broca_diagnostics::JobKind::StoreRead,
-            move || match native {
-                Some(reader) => reader(&key),
-                None => store
-                    .ok_or_else(|| "run-event reader unavailable".to_string())?
-                    .read_run_event(&key),
-            },
-        )
+        let row = spawn_blocking(broca_diagnostics::JobKind::StoreRead, move || {
+            store
+                .ok_or_else(|| "run-event reader unavailable".to_string())?
+                .read_run_event(&key)
+        })
         .await
         .map_err(|e| crate::serve::ServeError::Open(e.to_string(), None))?
         .map_err(|e| crate::serve::ServeError::Open(e, None))?;
@@ -2458,23 +2097,10 @@ impl LineageRegistry {
         wal_store: Option<Arc<dyn broca_core::WalStore>>,
         store: Option<Arc<dyn broca_core::MaterializedStore>>,
     ) -> Self {
-        Self::new_with_run_rows(opener, wal_store, store, None)
-    }
-
-    /// Boot supplies a run-row reader only when its state-format decision is `broca-state/2`.
-    pub fn new_with_run_rows(
-        opener: Arc<dyn LineageOpener>,
-        wal_store: Option<Arc<dyn broca_core::WalStore>>,
-        store: Option<Arc<dyn broca_core::MaterializedStore>>,
-        run_rows: Option<Arc<OverhaulRunSource>>,
-    ) -> Self {
         Self {
             inner: Arc::new(Inner {
-                run_event_reader: std::sync::OnceLock::new(),
                 session_address_inventory: std::sync::OnceLock::new(),
-                episode_source: std::sync::OnceLock::new(),
                 session_inventory_readiness: std::sync::OnceLock::new(),
-                raw_pages: std::sync::OnceLock::new(),
                 tool_route_health: std::sync::OnceLock::new(),
                 actor_idle_holds: Mutex::new(HashMap::new()),
                 batches_in_flight: Arc::new(AtomicUsize::new(0)),
@@ -2504,7 +2130,6 @@ impl LineageRegistry {
                 store_eligible: Mutex::new(HashMap::new()),
                 opener,
                 reader: wal_store.map(|wal_store| ReadSources { wal_store, store }),
-                run_rows,
                 read_proofs: Mutex::new(BoundedSessionCache::new(SESSION_CACHE_SESSIONS)),
                 media_heads: Mutex::default(),
                 dispatch_cache: Mutex::new(BoundedSessionCache::new(DISPATCH_CACHE_SESSIONS)),
@@ -2527,108 +2152,6 @@ impl LineageRegistry {
                 cache: crate::cache::CacheTable::default(),
             }),
         }
-    }
-
-    pub(crate) async fn read_run_row(
-        &self,
-        key: &LineageKey,
-        run_id: &RunId,
-    ) -> Result<Option<run_rows::RunRead>, OpenError> {
-        let Some(source) = self.inner.run_rows.clone() else {
-            return Ok(None);
-        };
-        self.check_expired(key, Some(&run_id.0)).await?;
-        if self.check_move(key, true).is_err() {
-            return Ok(None);
-        }
-        let key = key.clone();
-        let run_id = run_id.clone();
-        let read = spawn_blocking(JobKind::StoreRead, move || source.read(&key, &run_id)).await;
-        // Rows are rebuildable hints: a missing or unverifiable row is not an unknown run.
-        Ok(match read {
-            Ok(Ok(read)) => read,
-            Ok(Err(error)) => {
-                broca_wal::access_counter::seed_fallback("run row read failed");
-                tracing::debug!("run-row read fell back to WAL replay: {error}");
-                None
-            }
-            Err(_) => {
-                broca_wal::access_counter::seed_fallback("run row read task failed");
-                None
-            }
-        })
-    }
-
-    pub(crate) async fn read_run_row_state(
-        &self,
-        key: &LineageKey,
-        run_id: &RunId,
-    ) -> Result<Option<run_rows::RunRead>, OpenError> {
-        let Some(mut read) = self.read_run_row(key, run_id).await? else {
-            return Ok(None);
-        };
-        if read.state.state == broca_core::RunIndexState::Active {
-            if let Some(state) = self
-                .read_only_run_state(
-                    key,
-                    read.lineage_id.map(|id| id.to_string()),
-                    Some(&run_id.0),
-                    true,
-                    None,
-                )
-                .await?
-            {
-                state.apply(&mut read.state);
-                return Ok(Some(read));
-            }
-            // An active cold run still needs the existing orphan-recovery policy;
-            // an indexed row must not turn a dead writer into a live run.
-            let state = self.route_run_state(key, run_id.clone()).await?;
-            match state {
-                Some(state) if state.state == broca_core::RunIndexState::Active => {
-                    read.state = state
-                }
-                _ => return self.read_run_row(key, run_id).await,
-            }
-        }
-        Ok(Some(read))
-    }
-
-    /// Active candidates come from the overhaul run table when that source is installed.
-    pub fn overhaul_active_runs(
-        &self,
-        fallback: &[(RunId, LineageKey)],
-    ) -> Option<Result<Vec<(RunId, LineageKey)>, String>> {
-        self.inner.run_rows.as_ref().map(|source| {
-            source.active_runs(fallback).map(|candidates| {
-                candidates.into_iter().filter(|(run_id,key)| {
-                if self.check_move(key,true).is_err() { return true; }
-                !matches!(source.read(key,run_id),Ok(Some(read)) if read.state.state.is_terminal())
-            }).collect()
-            })
-        })
-    }
-
-    /// Resolve a run's content-free identity and state hint without replaying any WAL.
-    /// Status and result callers must still authenticate the run through the run-row reader.
-    pub fn overhaul_lookup_run(
-        &self,
-        run_id: &str,
-    ) -> Option<Result<Option<broca_core::RunIndexRow>, String>> {
-        self.inner
-            .run_rows
-            .as_ref()
-            .map(|source| source.lookup_run(run_id))
-    }
-
-    /// Discover possible restart pauses; only WAL-confirmed pause reasons authorize recovery.
-    pub fn overhaul_restart_resume_candidates(
-        &self,
-    ) -> Option<Result<Vec<(String, LineageKey)>, String>> {
-        self.inner
-            .run_rows
-            .as_ref()
-            .map(|source| source.restart_resume_candidates())
     }
 
     /// Install what reads a frozen config's prompt-cache declaration. Set once, before serving;
@@ -4182,12 +3705,8 @@ impl LineageRegistry {
         }
         crate::retention::validate_retention(retention, None, false)
             .map_err(OpenError::RetentionInvalid)?;
-        let unserved = crate::store_actor::unserved_creating_send(
-            &request,
-            kind,
-            conversation_key.is_some(),
-            retention.is_some(),
-        );
+        let unserved =
+            crate::store_actor::unserved_creating_send(&request, kind, retention.is_some());
         // How the session starts if this send creates it. A head starts only in the new
         // storage, and the opener refuses one it can't start there; any other send starts there
         // only when the registry creates sessions there and the store actor serves the send.
@@ -4273,7 +3792,16 @@ impl LineageRegistry {
     ) -> Result<crate::actor::ImportOutcome, OpenError> {
         use crate::actor::{ImportOutcome, LineageCmd};
         loop {
-            let handle = self.actor_for(key).await?;
+            if self.inner.store_new_sessions.load(Ordering::SeqCst) {
+                self.inner
+                    .store_eligible
+                    .lock()
+                    .unwrap()
+                    .insert(key.clone(), StoreCreation::Send);
+            }
+            let handle = self.actor_for(key).await;
+            self.inner.store_eligible.lock().unwrap().remove(key);
+            let handle = handle?;
             let (reply, rx) = tokio::sync::oneshot::channel();
             let cmd = LineageCmd::Import {
                 request: Box::new(request.clone()),
@@ -5466,16 +4994,6 @@ impl LineageRegistry {
         // The materialized tag index and transcript describe today's copy, which the new
         // storage owns, or is about to.
         self.refuse_store_owned(key)?;
-        if let Some(bundle) = self.inner.raw_pages.get() {
-            let bundle = bundle.clone();
-            let key = key.clone();
-            return spawn_blocking(
-                JobKind::StoreRead,
-                broca_wal::access_counter::inherit(move || bundle.tag_location(&key, tag)),
-            )
-            .await
-            .map_err(|error| OpenError::Open(error.to_string()))?;
-        }
         let Some(store) = self
             .inner
             .reader
@@ -5608,48 +5126,9 @@ impl LineageRegistry {
         // Every page source below (the materialized pages, episodes and today's WAL) reads
         // today's copy, which the new storage owns, or is about to.
         self.refuse_store_owned(key)?;
-        // Keep the evidence before a format-selected reader can rebuild rows,
+        // Keep the evidence before the materialized reader can rebuild rows,
         // but let that reader's established errors win over a new refusal.
         let empty_history_check = self.check_session_log(key).await;
-        if let (Some(request), Some(source)) = (model, self.inner.episode_source.get()) {
-            let source = source.clone();
-            let key = key.clone();
-            let request = request.clone();
-            return spawn_blocking(
-                JobKind::StoreRead,
-                broca_wal::access_counter::inherit(move || {
-                    source.with_reader_checked(&key, None, empty_history_check, |reader| {
-                        reader
-                            .read_model_page(&request)
-                            .map(|page| RoutedPage::Model(page.page))
-                            .map_err(|error| error.to_string())
-                    })
-                }),
-            )
-            .await
-            .map_err(|error| OpenError::Open(error.to_string()))?;
-        }
-        if model.is_none() {
-            if let Some(bundle) = self.inner.raw_pages.get() {
-                let bundle = bundle.clone();
-                let key = key.clone();
-                return spawn_blocking(
-                    JobKind::StoreRead,
-                    broca_wal::access_counter::inherit(move || {
-                        bundle.page(
-                            &key,
-                            from_ordinal,
-                            limit,
-                            include_tools,
-                            empty_history_check,
-                        )
-                    }),
-                )
-                .await
-                .map_err(|e| OpenError::Open(e.to_string()))?
-                .map(RoutedPage::Raw);
-            }
-        }
         let Some(reader) = &self.inner.reader else {
             return Err(OpenError::Open(
                 "session.read reader is not configured".into(),
@@ -6138,7 +5617,6 @@ impl LineageRegistry {
         Ok(RoutedPage::Raw(Box::new(RouteReadPage {
             at_seq,
             head_facts,
-            head_media: None,
             head_facts_complete,
             page,
             open_batch,
@@ -6603,6 +6081,24 @@ impl LineageRegistry {
             Entry::Open { .. } => "open",
             Entry::Closing { .. } => "closing",
         })
+    }
+
+    /// What the open actor serving `key` last said keeps it from closing idle, under the
+    /// reasons [`Self::tool_routes_health`] counts (`live_subscriber` for a subscriber still
+    /// attached). Empty when no actor holds the session open or it named nothing.
+    pub fn idle_holds(&self, key: &LineageKey) -> Vec<&'static str> {
+        let slots = self.inner.slots.lock().unwrap();
+        let Some(Entry::Open { gen, .. }) = slots.get(key) else {
+            return Vec::new();
+        };
+        self.inner
+            .actor_idle_holds
+            .lock()
+            .unwrap()
+            .get(key)
+            .filter(|(owner, _)| owner == gen)
+            .map(|(_, holds)| holds.clone())
+            .unwrap_or_default()
     }
 
     // Only the test-clock expiry tests close a slot by advancing time.
@@ -7179,7 +6675,14 @@ impl RegistryHandle {
         }
     }
 
-    pub(crate) fn note_idle_holds(&self, key: &LineageKey, gen: u64, reasons: Vec<&'static str>) {
+    /// Records what keeps generation `gen`'s actor for `key` from closing idle. Returns false,
+    /// recording nothing, unless that generation holds the slot open.
+    pub(crate) fn note_idle_holds(
+        &self,
+        key: &LineageKey,
+        gen: u64,
+        reasons: Vec<&'static str>,
+    ) -> bool {
         let slots = self.inner.slots.lock().unwrap();
         if matches!(slots.get(key), Some(Entry::Open { gen: owner, .. }) if *owner == gen) {
             self.inner
@@ -7187,7 +6690,9 @@ impl RegistryHandle {
                 .lock()
                 .unwrap()
                 .insert(key.clone(), (gen, reasons));
+            return true;
         }
+        false
     }
 }
 
@@ -7251,141 +6756,6 @@ impl Drop for CloseToken {
         }
         let _ = self.done.send(());
     }
-}
-
-/// Offset-based page assembly for overhaul roots only (not yet serving production).
-///
-/// Today's `route_read_page_view` replays from the materialized store or from byte zero.
-/// The offset index lets a read decode only the frames its page needs: each message row
-/// names the WAL byte range its message is built from, and the tail after `indexed_end`
-/// is decoded once. Production offset reads wire `broca.db` into this registry and advance the
-/// index when a Setup sits in the tail; these helpers already pin the byte-equality and
-/// decode-bounding properties those reads must keep.
-///
-/// A read serves rows through `indexed_seq`, then the published tail seeded from the
-/// tail seed. A Setup in the tail renumbers indexed tags, so the caller must advance the
-/// index before serving when [`setup_in_tail_needs_index_up`] is true. Held steers at
-/// `indexed_seq` are decoded from their indexed offsets and seeded into the tail replay,
-/// so the tail places them exactly as a full replay would.
-///
-/// Staged for the offset page reads; no production path calls these yet.
-#[allow(dead_code, reason = "used once broca.db opens on overhaul state roots")]
-pub(crate) struct OffsetPageRow {
-    /// Transcript ordinal of the message.
-    pub ord: u64,
-    /// WAL byte range the message is built from, as the index recorded it.
-    pub lo_off: u64,
-    pub hi_off: u64,
-}
-
-/// Byte range covering the requested ordinals, for a bounded WAL decode.
-///
-/// Returns `None` for an empty page. The range is contiguous because ordinals follow WAL
-/// order; a tool turn's two rows share the turn's range, so a page that splits the turn
-/// still decodes the whole turn once, never the whole log.
-#[allow(dead_code, reason = "used once broca.db opens on overhaul state roots")]
-pub(crate) fn page_byte_range_for_ordinals(
-    rows: &[OffsetPageRow],
-    from_ordinal: u64,
-    limit: u64,
-) -> Option<(u64, u64)> {
-    let mut range: Option<(u64, u64)> = None;
-    let end = from_ordinal.checked_add(limit)?;
-    for row in rows {
-        if row.ord < from_ordinal || row.ord >= end {
-            continue;
-        }
-        if row.hi_off < row.lo_off {
-            continue;
-        }
-        range = Some(match range {
-            None => (row.lo_off, row.hi_off),
-            Some((lo, hi)) => (lo.min(row.lo_off), hi.max(row.hi_off)),
-        });
-    }
-    range
-}
-
-/// Decode only the given WAL byte ranges, counting decoded frames when asked.
-///
-/// Each range must start at a frame boundary the index recorded. `decode_counter`
-/// counts decoded frames (records and lineage frames); torn-tail bytes at the end of a
-/// range stop the decode without an error, exactly as a read-only tail does. Decoding
-/// any other bytes is a caller bug: with counting on, a test asserts the count equals
-/// the frames of the requested range, never the whole log.
-#[allow(dead_code, reason = "used once broca.db opens on overhaul state roots")]
-pub(crate) fn decode_frames_at_offsets(
-    bytes: &[u8],
-    ranges: &[(u64, u64)],
-    decode_counter: Option<&std::cell::Cell<u64>>,
-) -> Result<Vec<broca_wal::FramedRecord>, String> {
-    let mut out = Vec::new();
-    for (lo, hi) in ranges {
-        let (mut lo_usize, mut hi_usize) = (
-            usize::try_from(*lo).map_err(|_| "offset out of range".to_string())?,
-            usize::try_from(*hi).map_err(|_| "offset out of range".to_string())?,
-        );
-        if lo_usize > hi_usize || hi_usize > bytes.len() {
-            return Err(format!(
-                "offset range [{lo},{hi}) outside {0} WAL bytes",
-                bytes.len()
-            ));
-        }
-        // Ranges from one page are contiguous; decode them as one slice so a torn
-        // tail at the range end is handled once, not once per row.
-        let _ = (&mut lo_usize, &mut hi_usize);
-        let slice = &bytes[lo_usize..hi_usize];
-        let mut off = 0usize;
-        while off < slice.len() {
-            match broca_wal::access_counter::decode_next(&slice[off..]) {
-                broca_wal::framing::DecodeStep::Record { framed, consumed } => {
-                    if let Some(counter) = decode_counter {
-                        counter.set(counter.get() + 1);
-                    }
-                    out.push(*framed);
-                    off += consumed;
-                }
-                broca_wal::framing::DecodeStep::Lineage { consumed, .. } => {
-                    if let Some(counter) = decode_counter {
-                        counter.set(counter.get() + 1);
-                    }
-                    off += consumed;
-                }
-                broca_wal::framing::DecodeStep::TornTail => break,
-                broca_wal::framing::DecodeStep::Corrupt(error) => {
-                    return Err(format!("corrupt WAL at offset {lo_usize}+{off}: {error}"));
-                }
-                broca_wal::framing::DecodeStep::NewerWriter { ver, .. } => {
-                    return Err(format!(
-                        "newer WAL writer version {ver} at offset {lo_usize}+{off}"
-                    ));
-                }
-            }
-        }
-    }
-    // Frame sequences must stay gapless across the decoded ranges; a gap means the
-    // caller's ranges skipped a frame the page needs.
-    for pair in out.windows(2) {
-        if pair[0].seq.checked_add(1) != Some(pair[1].seq) {
-            return Err(format!(
-                "decoded ranges skip from seq {} to {}",
-                pair[0].seq, pair[1].seq
-            ));
-        }
-    }
-    Ok(out)
-}
-
-/// Whether a tail with a durable Setup may be served from the current index.
-///
-/// A compaction Setup carries a tag checkpoint that renumbers tags inside the indexed
-/// prefix. Serving a page whose tail holds one without first advancing the index would
-/// show stale numbers. The caller advances the index (crash-cut: the Setup is durable
-/// before its index commit, so recovery replays it) and then serves. Delegates to the
-/// replay crate's detector so page and tail checks cannot drift apart.
-#[allow(dead_code, reason = "used once broca.db opens on overhaul state roots")]
-pub(crate) fn setup_in_tail_needs_index_up(tail: &[broca_wal::FramedRecord]) -> bool {
-    broca_core::replay::tail_contains_compaction_setup(tail)
 }
 
 #[cfg(test)]
@@ -8916,6 +8286,14 @@ impl LineageRegistry {
                 }
             }
         }
+        // The index above holds only today's sessions. The new storage's retained sessions are
+        // decided from its own records, by the same rule and under the same lease.
+        if let Some(runtime) = self.store_runtime() {
+            for key in service.sweep_store(&runtime, now_ms).await {
+                self.evict_retention_caches(&key);
+                deleted += 1;
+            }
+        }
         tracing::info!(target: "retention", deleted, "retention sweep complete");
         Ok(deleted)
     }
@@ -9155,605 +8533,3 @@ mod owner_tests;
 #[cfg(test)]
 #[path = "registry_store_owner_tests.rs"]
 pub(crate) mod store_owner_tests;
-
-/// Offset page assembly: pages and head from WAL offsets, with bounded decodes.
-///
-/// These tests pin the properties production reads must keep once `broca.db` is wired in:
-/// page bytes equal today's full replay for every page of the test corpus below,
-/// tail replay seeded with held steers equals full replay, a Setup in the tail
-/// forces an index catch-up (crash-cut: durable Setup before its index commit), and with
-/// frame-decode counting on one page and head decode only their requested ranges.
-#[cfg(test)]
-mod offset_page_tests {
-    use std::cell::Cell;
-    use std::sync::Arc;
-
-    use broca_protocol::{
-        caller::RunFinishReason,
-        content::{
-            AssistantMessage, ContentBlock, Message, Role, ToolCall, ToolOutput, ToolResult,
-        },
-        request::ModelHandle,
-        BatchId, BindIdentity, Delivery, MessageId, RunId, StepId, ToolCallId, Usage,
-    };
-    use broca_wal::{
-        CompactionMessageKind, DispatchOutcome, FramedRecord, RunConfig, RunOrigin,
-        SetupTagCheckpoint, WalRecord,
-    };
-
-    use super::{
-        decode_frames_at_offsets, page_byte_range_for_ordinals, setup_in_tail_needs_index_up,
-        OffsetPageRow,
-    };
-    use sha2::Digest;
-
-    fn user(text: &str) -> Message {
-        Message::new(Role::User, vec![ContentBlock::Text { text: text.into() }])
-    }
-
-    fn run_config() -> Box<RunConfig> {
-        Box::new(RunConfig {
-            global_system: None,
-            account_route: None,
-            route_decision_id: None,
-            account_limit_pause: false,
-            turn_directives_v1: None,
-            render_tags: false,
-            computed_tags: None,
-            model: ModelHandle::new("stub", "m"),
-            tools: vec![].into(),
-            tool_choice: Default::default(),
-            generation: Default::default(),
-            response_format: Default::default(),
-            provider_options: serde_json::Value::Null,
-            cache_tiers: serde_json::Value::Null,
-            context_epoch: 0,
-            renderer_version: 1,
-            frozen_render_config: serde_json::Value::Null,
-            auth_selection: None,
-            tools_were_omitted: false,
-            budget: None,
-            context_limit: None,
-            work_class: None,
-            variant: None,
-            service_tier: None,
-            stop_when: Vec::new(),
-            context_management: None,
-        })
-    }
-
-    fn run_started(run_id: &str, input: Vec<Message>) -> WalRecord {
-        WalRecord::RunStarted {
-            message_marks: None,
-            compaction_plan_version: None,
-            sent_by: None,
-            written_at_ms: None,
-            tags: None,
-            session_class: None,
-            retention: None,
-            hooks: None,
-            title: None,
-            on_restart: None,
-            keep_warm: None,
-            marker_order_version: None,
-            manifest: None,
-            scope: None,
-            send_id: None,
-            request_identity_digest: None,
-            project_id: None,
-            principal: None,
-            ts_ms: None,
-            run_id: RunId(run_id.into()),
-            session: BindIdentity::new("/tmp/project", "runner", "session"),
-            config: run_config(),
-            input: input.into(),
-            origin: RunOrigin::Fresh,
-            submission_id: None,
-        }
-    }
-
-    fn steered(text: &str) -> WalRecord {
-        WalRecord::Steered {
-            message_marks: None,
-            sent_by: None,
-            written_at_ms: None,
-            tags: None,
-            retention: None,
-            ts_ms: None,
-            title: None,
-            send_id: Some(format!("steer-{text}")),
-            request_identity_digest: None,
-            delivery: Some(Delivery::Steer),
-            input: Arc::new(vec![user(text)]),
-            hooks: None,
-        }
-    }
-
-    fn step_started(step: u64) -> WalRecord {
-        WalRecord::StepStarted {
-            step_id: StepId(step),
-        }
-    }
-
-    fn text_step(step: u64, text: &str) -> WalRecord {
-        WalRecord::ModelStepFinished {
-            raw_finish_reason: None,
-            fallback: Default::default(),
-            written_at_ms: None,
-            tags: None,
-            hooks: None,
-            step_id: StepId(step),
-            assistant_message: Arc::new(AssistantMessage {
-                message_id: MessageId(format!("m{step}")),
-                content: vec![ContentBlock::Text { text: text.into() }],
-            }),
-            usage: Usage::default(),
-            finish_reason: None,
-            retries_used: 0,
-            service_tier_used: None,
-            speed_used: None,
-        }
-    }
-
-    fn run_finished(reason: RunFinishReason) -> WalRecord {
-        WalRecord::RunFinished {
-            interrupt_reason: None,
-            ts_ms: None,
-            reason,
-            usage: Usage::default(),
-            error: None,
-            retries_used: 0,
-        }
-    }
-
-    /// One WAL carrying every offset-page corpus edge case: reverse-order tool results, a
-    /// `RunFinished` adding no message, a non-attributable import episode, unplaced
-    /// steers at the indexed cut, and a durable Setup not yet indexed.
-    fn corpus_wal() -> (Vec<u8>, Vec<WalRecord>) {
-        let mut records = vec![run_started("r1", vec![user("task")]), step_started(1)];
-        records.push(WalRecord::ModelStepFinished {
-            raw_finish_reason: None,
-            fallback: Default::default(),
-            written_at_ms: None,
-            tags: None,
-            hooks: None,
-            step_id: StepId(1),
-            assistant_message: Arc::new(AssistantMessage {
-                message_id: MessageId("m1".into()),
-                content: vec![
-                    ContentBlock::ToolCall(ToolCall {
-                        tool_call_id: ToolCallId("a".into()),
-                        tool_name: "work".into(),
-                        input: serde_json::json!({}),
-                        thought_signature: None,
-                    }),
-                    ContentBlock::ToolCall(ToolCall {
-                        tool_call_id: ToolCallId("b".into()),
-                        tool_name: "work".into(),
-                        input: serde_json::json!({}),
-                        thought_signature: None,
-                    }),
-                ],
-            }),
-            usage: Usage::default(),
-            finish_reason: None,
-            retries_used: 0,
-            service_tier_used: None,
-            speed_used: None,
-        });
-        let batch_id = BatchId("r1-b1".into());
-        records.push(WalRecord::ToolBatchStarted {
-            batch_id: batch_id.clone(),
-            step_id: StepId(1),
-            planned_calls: vec![ToolCallId("a".into()), ToolCallId("b".into())],
-        });
-        for call in ["a", "b"] {
-            records.push(WalRecord::ToolDispatchIntent {
-                dispatched_at_ms: None,
-                hooks: None,
-                batch_id: batch_id.clone(),
-                tool_call_id: ToolCallId(call.into()),
-                tool_name: Some("work".into()),
-                args: Arc::new(serde_json::json!({})),
-                module_id: None,
-                schema_pin: None,
-                approval_digest: None,
-                call_key: None,
-            });
-        }
-        // Results arrive reversed: the tools message still orders them [a, b].
-        for call in ["b", "a"] {
-            records.push(WalRecord::ToolResult {
-                finished_at_ms: None,
-                tags: None,
-                hooks: None,
-                batch_id: batch_id.clone(),
-                result: Arc::new(ToolResult {
-                    tool_call_id: ToolCallId(call.into()),
-                    output: ToolOutput::Text {
-                        text: format!("out-{call}"),
-                    },
-                    is_error: false,
-                }),
-                outcome: DispatchOutcome::Completed,
-                reason: None,
-                withdraw_elicitation: None,
-                provider_held: None,
-            });
-        }
-        records.push(WalRecord::ToolBatchFinished { batch_id });
-        records.push(WalRecord::TurnFinished { step_id: StepId(1) });
-        records.push(steered("held-at-index"));
-        // The terminal adds no message; the held steer lands at the close.
-        records.push(run_finished(RunFinishReason::Completed));
-        // A non-attributable import episode: renders, owns nothing.
-        let mut import = run_started("seed", vec![user("imported")]);
-        if let WalRecord::RunStarted { origin, .. } = &mut import {
-            *origin = RunOrigin::SeededFrom {
-                origin_kind: broca_wal::SeedOriginKind::Import,
-                source_ref: "fixture:import".into(),
-                origin_device_pseudonym: None,
-                base_seq: None,
-            };
-        }
-        records.push(import);
-        records.push(run_finished(RunFinishReason::Completed));
-        let mut bytes = Vec::new();
-        for (i, record) in records.iter().enumerate() {
-            bytes.extend(
-                broca_wal::framing::encode(i as u64 + 1, 1, record).expect("encode test wal"),
-            );
-        }
-        (bytes, records)
-    }
-
-    /// WAL offsets of every frame, plus the framed records, from one scan (test setup only).
-    fn scan_offsets(bytes: &[u8]) -> (Vec<(u64, u64)>, Vec<FramedRecord>) {
-        let mut offsets = Vec::new();
-        let mut framed = Vec::new();
-        let mut off = 0usize;
-        while off < bytes.len() {
-            match broca_wal::framing::decode_next(&bytes[off..]) {
-                broca_wal::framing::DecodeStep::Record {
-                    framed: frame,
-                    consumed,
-                } => {
-                    offsets.push((off as u64, (off + consumed) as u64));
-                    framed.push(*frame);
-                    off += consumed;
-                }
-                broca_wal::framing::DecodeStep::Lineage { consumed, .. } => {
-                    off += consumed;
-                }
-                broca_wal::framing::DecodeStep::TornTail => break,
-                broca_wal::framing::DecodeStep::Corrupt(_)
-                | broca_wal::framing::DecodeStep::NewerWriter { .. } => {
-                    panic!("test wal must decode at {off}")
-                }
-            }
-        }
-        (offsets, framed)
-    }
-
-    fn prompt_shape(prompt: &[Message]) -> Vec<(Role, String)> {
-        prompt
-            .iter()
-            .map(|message| {
-                let label = match message.content.first() {
-                    Some(ContentBlock::Text { text }) => text.clone(),
-                    Some(ContentBlock::ToolCall(_)) => "call".into(),
-                    Some(ContentBlock::ToolResult(_)) => "result".into(),
-                    _ => String::new(),
-                };
-                (message.role, label)
-            })
-            .collect()
-    }
-
-    #[test]
-    fn page_bytes_equal_today_for_every_corpus_page() {
-        let (bytes, records) = corpus_wal();
-        let full = broca_core::replay(&records.to_vec()).unwrap();
-        // Ordinal map from today's replay: each prompt message in order. Offsets come from
-        // the WAL scan: message `i` is built from the frames up to its turn's commit, so a
-        // page's byte range is the span of its messages' frames. For this corpus every
-        // message maps to one WAL frame except the tool turn, whose two messages share the
-        // turn's frame span; the test builds rows from the scan accordingly.
-        let (offsets, framed) = scan_offsets(&bytes);
-        assert_eq!(offsets.len(), records.len());
-        // Turn spans: group frames from each ModelStep with tool calls through its TurnFinished.
-        let mut rows: Vec<OffsetPageRow> = Vec::new();
-        let mut ord = 0u64;
-        let mut i = 0usize;
-        while i < framed.len() {
-            let is_tool_step = matches!(&framed[i].record, WalRecord::ModelStepFinished { assistant_message, .. } if assistant_message.tool_calls().next().is_some());
-            if is_tool_step {
-                let lo = offsets[i].0;
-                let mut j = i;
-                while j < framed.len()
-                    && !matches!(&framed[j].record, WalRecord::TurnFinished { .. })
-                {
-                    j += 1;
-                }
-                let hi = offsets[j.min(framed.len() - 1)].1;
-                rows.push(OffsetPageRow {
-                    ord,
-                    lo_off: lo,
-                    hi_off: hi,
-                });
-                rows.push(OffsetPageRow {
-                    ord: ord + 1,
-                    lo_off: lo,
-                    hi_off: hi,
-                });
-                ord += 2;
-                i = j + 1;
-            } else if matches!(&framed[i].record, WalRecord::RunStarted { input, .. } if !input.is_empty())
-            {
-                let input_len = match &framed[i].record {
-                    WalRecord::RunStarted { input, .. } => input.len() as u64,
-                    _ => 1,
-                };
-                for k in 0..input_len {
-                    rows.push(OffsetPageRow {
-                        ord: ord + k,
-                        lo_off: offsets[i].0,
-                        hi_off: offsets[i].1,
-                    });
-                }
-                ord += input_len;
-                i += 1;
-            } else if matches!(&framed[i].record, WalRecord::Steered { .. }) {
-                // Held until the next boundary; rows exist once placed. Model the placed row
-                // at the boundary's offsets: the steer plus its placing frame.
-                let lo = offsets[i].0;
-                let mut j = i + 1;
-                while j < framed.len()
-                    && !matches!(
-                        &framed[j].record,
-                        WalRecord::StepStarted { .. } | WalRecord::RunFinished { .. }
-                    )
-                {
-                    j += 1;
-                }
-                let hi = offsets[j.min(framed.len() - 1)].1;
-                rows.push(OffsetPageRow {
-                    ord,
-                    lo_off: lo,
-                    hi_off: hi,
-                });
-                ord += 1;
-                i += 1;
-            } else if matches!(
-                &framed[i].record,
-                WalRecord::ModelStepFinished { .. }
-                    | WalRecord::SendDelivered { input: Some(_), .. }
-            ) {
-                rows.push(OffsetPageRow {
-                    ord,
-                    lo_off: offsets[i].0,
-                    hi_off: offsets[i].1,
-                });
-                ord += 1;
-                i += 1;
-            } else {
-                // Terminals, boundaries and informational records add no message.
-                i += 1;
-            }
-        }
-        assert_eq!(
-            ord,
-            full.prompt.len() as u64,
-            "row model covers every prompt message: got {ord}, want {}",
-            full.prompt.len()
-        );
-        // Reverse-order results still read [a, b]: the tools message orders by plan.
-        let tools = full
-            .prompt
-            .iter()
-            .find(|m| m.role == Role::Tool)
-            .expect("tool turn");
-        let ids: Vec<String> = tools
-            .content
-            .iter()
-            .filter_map(|b| match b {
-                ContentBlock::ToolResult(r) => Some(r.tool_call_id.0.clone()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(ids, vec!["a".to_string(), "b".to_string()]);
-        // Every page decodes only its rows' span, then replays that span with the prefix
-        // seeds the index would supply. Seeds come from a full prefix replay here (setup,
-        // not counted); the counter covers only the page span decode below.
-        let total_frames = framed.len() as u64;
-        for from in 0..=full.prompt.len() as u64 {
-            for limit in [1u64, 2, 200] {
-                let (lo, hi) = match page_byte_range_for_ordinals(&rows, from, limit) {
-                    Some(range) => range,
-                    None => continue,
-                };
-                let counter = Cell::new(0u64);
-                let decoded =
-                    decode_frames_at_offsets(&bytes, &[(lo, hi)], Some(&counter)).unwrap();
-                assert!(!decoded.is_empty());
-                assert!(
-                    counter.get() < total_frames || (hi - lo) as usize == bytes.len(),
-                    "page [{from},{limit}) decoded {} of {total_frames} frames",
-                    counter.get()
-                );
-                // The decoded span replays to the same messages today's full replay holds
-                // at those ordinals (tool turns included, terminals excluded).
-                let slice_records: Vec<WalRecord> =
-                    decoded.iter().map(|f| f.record.clone()).collect();
-                // A span that starts mid-turn still decodes the whole turn (rows share the
-                // turn's range), so a turn-boundary replay of the span matches the oracle slice.
-                let span_state = broca_core::replay(&slice_records);
-                // Spans that start mid-episode without their RunStarted are not full replays;
-                // they are only required to decode the right bytes, which the counter pins.
-                // Spans starting at a RunStarted replay exactly.
-                if matches!(slice_records.first(), Some(WalRecord::RunStarted { .. })) {
-                    let state = span_state.unwrap();
-                    let end = (from + limit).min(full.prompt.len() as u64) as usize;
-                    let start = from as usize;
-                    // The span replay starts at ordinal zero; compare shapes, not ordinals.
-                    assert_eq!(
-                        prompt_shape(&state.prompt[..(end - start).min(state.prompt.len())]),
-                        prompt_shape(&full.prompt[start..end.min(full.prompt.len())]),
-                        "page [{from},{limit})"
-                    );
-                }
-            }
-        }
-        // The full-log decode is the ceiling a bounded read must stay under.
-        let all_counter = Cell::new(0u64);
-        let all = decode_frames_at_offsets(&bytes, &[(0, bytes.len() as u64)], Some(&all_counter))
-            .unwrap();
-        assert_eq!(all.len() as u64, total_frames);
-        assert_eq!(all_counter.get(), total_frames);
-    }
-
-    #[test]
-    fn tail_replay_seeded_with_held_steers_matches_full_replay() {
-        // No-tool step with a steer held before it: the boundary is the step, the tail is
-        // the terminal, and the seeded steer lands at the close exactly as full replay
-        // has it. The tail starts right after the boundary frame, so nothing vanishes.
-        let records = [
-            run_started("r1", vec![user("task")]),
-            step_started(1),
-            steered("held"),
-            text_step(1, "answer"),
-            run_finished(RunFinishReason::Completed),
-        ];
-        let full = broca_core::replay(records.as_ref()).unwrap();
-        assert_eq!(
-            prompt_shape(&full.prompt),
-            vec![
-                (Role::User, "task".into()),
-                (Role::Assistant, "answer".into()),
-                (Role::User, "held".into()),
-            ]
-        );
-        let mut bytes = Vec::new();
-        for (index, record) in records.iter().enumerate() {
-            bytes.extend(
-                broca_wal::framing::encode(index as u64 + 1, 1, record).expect("encode test log"),
-            );
-        }
-        let (offsets, framed) = scan_offsets(&bytes);
-        // Boundary at the no-tool step (seq 4); the tail is the terminal alone.
-        let boundary = broca_core::replay::SeedBoundary {
-            lineage_id: None,
-            seq: 4,
-            frame_off: offsets[3].0,
-            frame_end: offsets[3].1,
-            frame_identity: sha2::Sha256::digest(
-                &bytes[offsets[3].0 as usize..offsets[3].1 as usize],
-            )
-            .to_vec(),
-            qualified: true,
-        };
-        let tail = vec![broca_core::replay::PositionedFrame {
-            off: offsets[4].0,
-            framed: framed[4].clone(),
-        }];
-        let prefix_records: Vec<WalRecord> = records[..4].to_vec();
-        let prefix = broca_core::replay(&prefix_records).unwrap();
-        assert_eq!(prefix.pending_steers.len(), 1);
-        let read_at = move |off: u64, len: u64| -> std::io::Result<Vec<u8>> {
-            let off = off as usize;
-            let end = off.saturating_add(len as usize).min(bytes.len());
-            Ok(bytes.get(off..end).unwrap_or(&[]).to_vec())
-        };
-        let tail_state = broca_core::replay::replay_seeded_at_validated_boundary(
-            &read_at,
-            &boundary,
-            &tail,
-            None,
-            prefix.run_id.clone(),
-            None,
-            None,
-            prefix.prompt.len() as u64,
-            false,
-            Default::default(),
-            prefix.pending_steers.clone(),
-        )
-        .expect("validated boundary seeds the held steer");
-        let mut merged = prefix.prompt.clone();
-        merged.extend(tail_state.prompt.clone());
-        assert_eq!(prompt_shape(&merged), prompt_shape(&full.prompt));
-        assert_eq!(merged.len(), full.prompt.len());
-    }
-
-    #[test]
-    fn setup_in_tail_catches_index_up() {
-        let (bytes, records) = corpus_wal();
-        let (offsets, framed) = scan_offsets(&bytes);
-        // No Setup in the corpus tail: no catch-up.
-        assert!(!setup_in_tail_needs_index_up(&framed));
-        // A durable Setup appended after the indexed end forces a catch-up before serving.
-        let mut with_setup = framed.clone();
-        with_setup.push(FramedRecord {
-            seq: framed.len() as u64 + 1,
-            fence: 1,
-            record: WalRecord::CompactionMessage {
-                provider: "test".into(),
-                kind: CompactionMessageKind::Setup,
-                compaction_id: "cmp-1".into(),
-                version: 1,
-                range: broca_wal::CompactionRange { from: 0, to: 0 },
-                replacement: Arc::new(Vec::new()),
-                sha256: "0".repeat(64),
-                request_id: None,
-                cursor: None,
-                call_when: None,
-                stability: None,
-                ceiling: None,
-                tag_checkpoint: Some(SetupTagCheckpoint {
-                    tag_checkpoint: 7,
-                    cut: "m1".into(),
-                }),
-                ride_wait_ms: None,
-                view_features: None,
-                view_due: None,
-            },
-        });
-        assert!(setup_in_tail_needs_index_up(&with_setup));
-        // Crash-cut: the Setup bytes are durable while the index still ends before it.
-        // The reader sees the Setup in the tail (offsets past indexed_end) and advances
-        // the index instead of serving stale tags.
-        let indexed_end = offsets.last().map(|(_, end)| *end).unwrap_or(0);
-        assert!(indexed_end < bytes.len() as u64 + 1);
-        let _ = records;
-    }
-
-    #[test]
-    fn frame_decode_counting_bounds_one_page_to_its_range() {
-        let (bytes, _records) = corpus_wal();
-        let (offsets, framed) = scan_offsets(&bytes);
-        let total = framed.len() as u64;
-        assert!(
-            total > 4,
-            "corpus must span several frames for a bound to mean anything"
-        );
-        // One small page: decode only the first frame's bytes.
-        let (lo, hi) = offsets[0];
-        let counter = Cell::new(0u64);
-        let accesses = broca_wal::access_counter::WalAccessCounter::default();
-        let one = accesses
-            .operation("raw page decode")
-            .run(|| decode_frames_at_offsets(&bytes, &[(lo, hi)], Some(&counter)))
-            .unwrap();
-        assert_eq!(one.len(), 1);
-        assert_eq!(counter.get(), 1);
-        assert_eq!(accesses.snapshot()[0].frames_decoded, 1);
-        assert!(counter.get() < total);
-        // Head: the newest message's row range only. The head never scans the prefix.
-        let (last_lo, last_hi) = offsets[offsets.len() - 1];
-        let head_counter = Cell::new(0u64);
-        let head =
-            decode_frames_at_offsets(&bytes, &[(last_lo, last_hi)], Some(&head_counter)).unwrap();
-        assert_eq!(head.len(), 1);
-        assert_eq!(head_counter.get(), 1);
-        assert!(head_counter.get() < total);
-    }
-}

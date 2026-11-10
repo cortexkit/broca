@@ -45,6 +45,10 @@ transcript prefix, admission checkpoints and usage-export facts are projections
 of the WAL, updated asynchronously and bound to its `lineage_id`. The WAL wins when
 the store disagrees, and the projection is rebuilt.
 
+State roots without a `state-format` marker keep today's format. The staging-only
+`broca-state/2` redesign has been removed: a root whose marker names it refuses
+startup, rather than being read as today's format. Start with a fresh state root.
+
 **Providers and catalog** (`broca-provider`, `broca-catalog`). Wire families
 include Anthropic Messages, OpenAI Chat and Responses, ChatGPT/Codex, Gemini,
 Code Assist and Bedrock Converse. Each has a renderer and stream normalizer;

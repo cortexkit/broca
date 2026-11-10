@@ -37,9 +37,12 @@
 //!
 //! `session-convert move-check --dir <scratch> [--all-steps] [--every N] [--out FILE] <path>...`:
 //! for every session log, what moving its session into the new storage would do: the WAL's
-//! preconditions, then the move's staging writer and verifier, writing only under `--dir` (see
-//! `move_check`). `--all-steps` adds the verifier's offline check of every recorded model
-//! request, and `--every N` checks one log in N.
+//! preconditions, then the move's staging writer and verifier, with the session's media read
+//! from today's media store of the state root the log's folder sits in, writing only under
+//! `--dir` (see `move_check`). `--all-steps` adds the verifier's offline check of every recorded
+//! model request, and `--every N` checks one log in N. Over a copy of a whole state root, name its
+//! log folders (`wal`, `wal-durable`, `wal-ephemeral`, `wal-archive`, `wal-archive-durable`): the
+//! report counts every log that wouldn't move by class, and times reading, staging and verifying.
 //!
 //! Point it only at a copy of a state root (an APFS clone, `cp -c`), never at live files: it opens
 //! each log read-only, but a measurement run should never share a disk path with the daemon.
@@ -214,7 +217,9 @@ fn usage() -> ! {
          session-convert subscribe [--dir SCRATCH] [--out FILE] [--limit N] PATH...\n       \
          session-convert subscribe-cost --dir SCRATCH [--out FILE] PATH...\n       \
          session-convert move-check --dir SCRATCH [--all-steps] [--every N] [--out FILE] PATH...\n\
-         Any command takes --plain: store in the plain mode instead of encrypted."
+         Any command takes --plain: store in the plain mode instead of encrypted.\n\
+         move-check reads an existing served-history version without writing the source.\n\
+         Without a row it uses 1 for a log (0 without one), not a publishing read's clock-floor allocation."
     );
     std::process::exit(64);
 }
@@ -2313,6 +2318,9 @@ struct OldLog {
     /// When the log's file was last written, which today's `session.head` serves as the
     /// session's last update when nothing else says it.
     written_ms: Option<u64>,
+    /// The file the log was read from: the `.wal` itself, or the archive container holding it.
+    /// Its folder says which of today's media stores holds the session's media.
+    source: PathBuf,
 }
 
 impl OldLog {
@@ -2323,6 +2331,7 @@ impl OldLog {
             lineage: lineage_id.map(|id| id.to_string()),
             lineage_id,
             written_ms: broca_module::head_time::file_written_ms(path),
+            source: path.to_path_buf(),
         }
     }
 }
@@ -2438,6 +2447,11 @@ fn each_log(args: &Args, mut visit: impl FnMut(Item)) {
                 Ok(Some(member)) => match std::fs::write(&scratch, &member.payload) {
                     Ok(()) => {
                         let (old, read_ms) = read(&scratch);
+                        // Read from a scratch copy, the log is still the container's.
+                        let old = old.map(|old| OldLog {
+                            source: file.clone(),
+                            ..old
+                        });
                         Item::Log {
                             name,
                             size: member.payload.len() as u64,

@@ -728,6 +728,7 @@ fn shape(reply: StoreReadReply) -> String {
         StoreReadReply::Media(media) => format!("{media:?}"),
         StoreReadReply::TagLocation(location) => format!("{location:?}"),
         StoreReadReply::WritingView(view) => format!("{view:?}"),
+        StoreReadReply::OutputRefNamespace(namespace) => namespace,
         StoreReadReply::PlanChange(read) => format!("{:?}", read.map(|read| read.0)),
         StoreReadReply::PlanIdentities(identities) => format!("{identities:?}"),
         StoreReadReply::Baseline(facts) => format!("{facts:?}"),

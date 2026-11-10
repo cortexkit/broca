@@ -14,12 +14,19 @@ pub const SESSION_BUSY: &str = "session_busy";
 /// A tool batch whose results arrived but which didn't close. Today's storage and the new one
 /// place such a turn's message at different times, so it can't be carried across.
 pub const OPEN_TOOL_BATCH: &str = "open_tool_batch";
-/// Compaction views accepted or applied: a seal of the new storage needs the run loop's copies of
-/// them.
-pub const COMPACTION_VIEWS: &str = "compaction_views";
 /// Something the new run loop refuses to run: first-protocol compaction, approval questions, or
 /// an input-token budget.
 pub const UNSUPPORTED_FEATURE: &str = "unsupported_feature";
+
+// The features behind an `UNSUPPORTED_FEATURE` refusal, each named for counting the sessions it
+// keeps from moving. A move reports only `UNSUPPORTED_FEATURE`.
+
+/// A call deferred to a person's answer (an approval question).
+pub const APPROVAL_QUESTIONS: &str = "approval_questions";
+/// A run with an input-token budget.
+pub const INPUT_TOKEN_BUDGET: &str = "input_token_budget";
+/// Compaction under the first compaction protocol.
+pub const FIRST_PROTOCOL_COMPACTION: &str = "first_protocol_compaction";
 
 /// The first reason the WAL `records` gives for not moving its session now, if any.
 pub fn wal_refusal(
@@ -56,24 +63,36 @@ pub fn wal_refusal(
     if !open_batches.is_empty() {
         return Some(OPEN_TOOL_BATCH);
     }
-    let unsupported = raw.iter().any(|record| match record {
-        // Approval questions: a call deferred to a person's answer.
-        WalRecord::ToolCallDeferred { .. } => true,
-        WalRecord::RunStarted { config, .. } => config
-            .budget
-            .as_ref()
-            .is_some_and(|budget| budget.max_input_tokens.is_some()),
-        _ => false,
-    });
-    if unsupported {
+    if unsupported_in_wal(records).is_some() {
         return Some(UNSUPPORTED_FEATURE);
     }
     None
 }
 
+/// The first feature the new run loop refuses that the WAL `records` use, of those the WAL alone
+/// shows: [`APPROVAL_QUESTIONS`] or [`INPUT_TOKEN_BUDGET`]. [`wal_refusal`] refuses such a
+/// session as [`UNSUPPORTED_FEATURE`].
+pub fn unsupported_in_wal(records: &[FramedRecord]) -> Option<&'static str> {
+    records.iter().find_map(|frame| match &frame.record {
+        WalRecord::ToolCallDeferred { .. } => Some(APPROVAL_QUESTIONS),
+        WalRecord::RunStarted { config, .. }
+            if config
+                .budget
+                .as_ref()
+                .is_some_and(|budget| budget.max_input_tokens.is_some()) =>
+        {
+            Some(INPUT_TOKEN_BUDGET)
+        }
+        _ => None,
+    })
+}
+
 /// The first reason the converted session gives for not moving it now, read from the new
-/// storage's own folds of its records: compaction views, or compaction under the first protocol.
-/// Folds an in-memory copy, so nothing is written anywhere.
+/// storage's own folds of its records: compaction under the first protocol. Folds an in-memory
+/// copy, so nothing is written anywhere.
+///
+/// Compaction views on the current contract move with the session: its open log holds every view
+/// record, from which the run loop restores them and carries copies through each seal.
 pub async fn converted_refusal(
     prepared: &crate::stage::Prepared,
 ) -> Result<Option<&'static str>, String> {
@@ -97,9 +116,6 @@ pub async fn converted_refusal(
         .append(&prepared.converted.records, false)
         .await
         .map_err(|error| format!("fold the converted records: {error:?}"))?;
-    if session.operations.view_accepted.is_some() || session.operations.view_applied.is_some() {
-        return Ok(Some(COMPACTION_VIEWS));
-    }
     if session.conversation.first_protocol_compaction
         || session.operations.first_protocol_compaction
     {

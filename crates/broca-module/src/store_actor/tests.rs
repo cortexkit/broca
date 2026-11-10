@@ -341,7 +341,9 @@ impl RunExecutor for LoopExecutor {
                 bind: req.session.clone(),
                 out: Some(&out),
                 cancel: control.cancel.clone().unwrap_or_default(),
-                stop: Default::default(),
+                // A test asks a run to stop for a restart through its control, as the module's
+                // stop asks today's runs.
+                stop: control.stop_requested.clone().unwrap_or_default(),
                 held: None,
                 approval: &approval,
                 hook_plane: control.hook_plane.clone(),

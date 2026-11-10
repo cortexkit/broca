@@ -46,22 +46,40 @@ pub struct FieldSpec {
 /// Declares a fold state struct together with its schema, `SCHEMA` (one [`FieldSpec`] per
 /// field, in declaration order), and its encoding, which a log's checkpoint carries. Each field
 /// is written as
-/// `<number> <cardinality> name: Type => { owner: "...", reset: "...", bound: Bound::... },`,
+/// `<number> <cardinality> <visibility> [must]? name: Type => { owner: "...", reset: "...", bound: Bound::... },`,
 /// where the number and cardinality mean what they mean in the codec's `message!`: `req` holds
-/// `Type`, `opt` an `Option<Type>`, `rep` a `Vec<Type>`.
+/// `Type`, `opt` an `Option<Type>`, `rep` a `Vec<Type>`. As on records, `[must]` makes an older
+/// reader refuse a present field it does not understand instead of dropping it.
+///
+/// A `runtime { ... }` block after the struct declares fields the fold keeps only in memory, each
+/// written as `name: Type => { owner, reset, bound },` without a number. A checkpoint never
+/// carries them, and a state read from one starts them at `Type::default()`. They are in
+/// `SCHEMA` after the stored fields, bound like any other.
 macro_rules! state {
     (
         $(#[$meta:meta])*
         $vis:vis struct $name:ident {
             $(
                 $(#[$field_meta:meta])*
-                $num:literal $card:ident $field_vis:vis $field:ident: $ty:ty => {
+                $num:literal $card:ident $field_vis:vis $([$must:ident])? $field:ident: $ty:ty => {
                     owner: $owner:literal,
                     reset: $reset:literal,
                     bound: $bound:expr $(,)?
                 },
             )*
         }
+        $(
+            runtime {
+                $(
+                    $(#[$runtime_meta:meta])*
+                    $runtime_vis:vis $runtime:ident: $runtime_ty:ty => {
+                        owner: $runtime_owner:literal,
+                        reset: $runtime_reset:literal,
+                        bound: $runtime_bound:expr $(,)?
+                    },
+                )*
+            }
+        )?
     ) => {
         $(#[$meta])*
         $vis struct $name {
@@ -69,6 +87,10 @@ macro_rules! state {
                 $(#[$field_meta])*
                 $field_vis $field: $crate::__codec_field_ty!($card $ty),
             )*
+            $($(
+                $(#[$runtime_meta])*
+                $runtime_vis $runtime: $runtime_ty,
+            )*)?
         }
 
         const _: () = assert!(
@@ -82,7 +104,7 @@ macro_rules! state {
 
             fn write(&self, out: &mut ::std::vec::Vec<u8>) {
                 $(
-                    $crate::__codec_put!($card, out, $num, false, &self.$field);
+                    $crate::__codec_put!($card, out, $num, $crate::__codec_must!($($must)?), &self.$field);
                 )*
             }
 
@@ -102,7 +124,11 @@ macro_rules! state {
                             $num => $crate::__codec_take!(
                                 $card,
                                 &mut $field,
-                                field,
+                                $crate::codec::declared(
+                                    field,
+                                    $crate::__codec_must!($($must)?),
+                                    concat!(stringify!($name), ".", stringify!($field)),
+                                )?,
                                 concat!(stringify!($name), ".", stringify!($field))
                             )?,
                         )*
@@ -117,6 +143,9 @@ macro_rules! state {
                             concat!(stringify!($name), ".", stringify!($field))
                         ),
                     )*
+                    $($(
+                        $runtime: ::std::default::Default::default(),
+                    )*)?
                 })
             }
         }
@@ -133,6 +162,14 @@ macro_rules! state {
                         bound: $bound,
                     },
                 )*
+                $($(
+                    $crate::fold::FieldSpec {
+                        name: stringify!($runtime),
+                        owner: $runtime_owner,
+                        reset: $runtime_reset,
+                        bound: $runtime_bound,
+                    },
+                )*)?
             ];
         }
     };

@@ -141,51 +141,6 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     )
 }
 
-pub(crate) fn init_overhaul_event_schema(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS bus_event_outbox (
-            event_key TEXT PRIMARY KEY, run_id TEXT NOT NULL, seq INTEGER NOT NULL,
-            subject TEXT NOT NULL, epoch TEXT NOT NULL, session TEXT NOT NULL,
-            body BLOB NOT NULL, at_ms INTEGER NOT NULL, published_ms INTEGER,
-            best_effort INTEGER NOT NULL DEFAULT 0,
-            UNIQUE(epoch, run_id, seq, subject)
-         );
-         CREATE INDEX IF NOT EXISTS bus_event_pending ON bus_event_outbox(published_ms, at_ms);
-         -- Unpublished lifecycle rows only, in insertion order (every key is 0, so entries sort
-         -- by rowid). The drain's next-row query and the startup depth count read this index
-         -- instead of scanning a table that also holds a day of published bodies.
-         CREATE INDEX IF NOT EXISTS bus_event_unpublished ON bus_event_outbox(best_effort)
-            WHERE published_ms IS NULL AND best_effort=0;
-          CREATE INDEX IF NOT EXISTS bus_event_age ON bus_event_outbox(at_ms);",
-    )?;
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS bus_event_projection (
-            session TEXT PRIMARY KEY, epoch TEXT NOT NULL, seq INTEGER NOT NULL,
-            state_json TEXT NOT NULL
-         );
-         -- Sessions whose projection has a run started and not yet seen finish. Recovery after
-         -- process loss visits these and the run index's live runs of the current period.
-         CREATE TABLE IF NOT EXISTS bus_event_open (
-            session TEXT PRIMARY KEY, identity TEXT NOT NULL
-         );
-         -- The one row says when the current enabled period began. Absent means events were
-         -- off at the last start, so the next enable begins a new period.
-         CREATE TABLE IF NOT EXISTS bus_event_period (
-            id INTEGER PRIMARY KEY CHECK (id = 1), started_ms INTEGER NOT NULL
-         );
-         -- Compaction advance notices (compaction-provider/v1 §5), projected from the durable
-         -- WAL like run events. A notice is headers only: the bus message id names the session
-         -- and the notice's sequence number, and the bus digest is the notice digest.
-         CREATE TABLE IF NOT EXISTS compaction_notice_outbox (
-            message_id TEXT PRIMARY KEY, session TEXT NOT NULL, subject TEXT NOT NULL,
-            headers TEXT NOT NULL, digest TEXT NOT NULL, at_ms INTEGER NOT NULL,
-            published_ms INTEGER
-         );
-         CREATE INDEX IF NOT EXISTS compaction_notice_unpublished
-            ON compaction_notice_outbox(at_ms) WHERE published_ms IS NULL;",
-    )
-}
-
 #[derive(Default, Serialize, Deserialize)]
 struct Projection {
     #[serde(default)]
@@ -609,10 +564,6 @@ impl EventStore<'_> {
 
     pub fn bus_metrics(&self) -> &Metrics {
         &self.bus_events.metrics
-    }
-
-    pub fn bus_metrics_arc(&self) -> Arc<Metrics> {
-        self.bus_events.metrics.clone()
     }
 
     /// Begin, or continue after a restart, the period during which run events are on.

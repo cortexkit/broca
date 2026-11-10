@@ -22,6 +22,7 @@ cipher_tests!(
     an_append_is_observed_only_once_it_returned,
     an_append_without_a_barrier_is_told_durable_once_synced,
     a_discarded_session_reads_as_never_created,
+    a_deleted_session_keeps_no_file_and_a_moved_head_refuses,
 );
 
 fn triple() -> SessionTriple {
@@ -143,6 +144,63 @@ fn a_discarded_session_reads_as_never_created(cipher: Cipher) {
         assert_eq!(memory.read_head(&addr()).await.unwrap(), None);
         assert!(memory.log_names(&addr()).is_empty());
     });
+}
+
+/// A session deleted by a caller that opened no writer, at the head version it read, reads as one
+/// that was never created, and on local files nothing of it is left: not its head, its kept head
+/// versions, its logs, nor its objects (sealed segments, directory and id-index pages). A version
+/// the head has moved past refuses and deletes nothing.
+fn a_deleted_session_keeps_no_file_and_a_moved_head_refuses(cipher: Cipher) {
+    let root = std::env::temp_dir().join(format!(
+        "broca-session-delete-{}-{}",
+        std::process::id(),
+        cipher.label()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let backend = LocalBackend::new(&root);
+    block_on(async {
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(cipher), false)
+            .await
+            .unwrap();
+        session.append(&[input("one")], true).await.unwrap();
+        session.seal(None, 1_000).await.unwrap();
+        session.append(&[input("two")], true).await.unwrap();
+        session.close().await.unwrap();
+        for folder in ["heads", "logs", "objects"] {
+            assert!(root.join(folder).join(&addr().0).exists(), "{folder}");
+        }
+        assert!(backend.head_versions(&addr()).unwrap().len() > 1);
+        let position = Session::stored_position(&backend, &addr(), &deployment(cipher))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(matches!(
+            Session::delete(&backend, &addr(), position.version - 1).await,
+            Err(SessionError::Backend(crate::backend::BackendError::Fenced))
+        ));
+        assert!(
+            Session::view(&backend, addr(), &triple(), &deployment(cipher))
+                .await
+                .is_ok()
+        );
+
+        Session::delete(&backend, &addr(), position.version)
+            .await
+            .unwrap();
+        assert!(matches!(
+            Session::view(&backend, addr(), &triple(), &deployment(cipher)).await,
+            Err(SessionError::Missing)
+        ));
+        for folder in ["heads", "logs", "objects"] {
+            assert!(
+                !root.join(folder).join(&addr().0).exists(),
+                "{folder} of the deleted session is left"
+            );
+        }
+        assert!(backend.stored_sessions().unwrap().is_empty());
+    });
+    std::fs::remove_dir_all(&root).unwrap();
 }
 
 fn texts(messages: &[Message]) -> Vec<String> {

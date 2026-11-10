@@ -98,16 +98,7 @@ pub fn failing_field<T: serde::de::DeserializeOwned>(
 /// `dispatched_to` is the module the call was sent to, absent for a call never sent and for a
 /// call whose intent was written before broca recorded its module. `indeterminate` is true while
 /// the call has a durable dispatch intent and no result: it may or may not have run.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SessionReadToolCall {
-    pub tool_call_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub call_key: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dispatched_to: Option<String>,
-    #[serde(default)]
-    pub indeterminate: bool,
-}
+pub type SessionReadToolCall = cortexkit_role_llm_runner::read::ToolCallAttribution;
 
 /// `session.head` params: none. Strict, so a caller expecting a member that does not exist
 /// learns so.
@@ -731,6 +722,22 @@ mod pinned_reply_bytes {
     use super::*;
     use crate::scope_refusal_golden::assert_golden;
     use sha2::{Digest, Sha256};
+
+    #[test]
+    fn native_call_attribution_bytes_stay_unchanged() {
+        let native = SessionReadToolCall::new("call-1")
+            .with_call_key("lineage:42")
+            .with_dispatched_to("tool-provider");
+        assert_eq!(
+            serde_json::to_string(&native).unwrap(),
+            r#"{"tool_call_id":"call-1","call_key":"lineage:42","dispatched_to":"tool-provider","indeterminate":false}"#,
+        );
+        let imported = native.with_call_carrier("thalamus-pi");
+        assert_eq!(
+            serde_json::to_value(imported).unwrap()["call_carrier"],
+            "thalamus-pi",
+        );
+    }
 
     #[test]
     fn step_events_declaration_follows_only_the_publisher_switch() {

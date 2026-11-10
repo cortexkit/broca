@@ -174,7 +174,15 @@ fn one_wrong_root_copied_stub_with_reset_creation_time_refuses_unchanged() {
                 .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1)),
         )
         .unwrap();
-    fixture.refuses_unchanged("stub_creation_time_unreliable");
+    // macOS moves a file's creation time back to its modified time when the modified time is set
+    // earlier, so the stub never shows a creation time later than its last write there. The
+    // repair still refuses the stub, as not newer than the real log, and changes nothing.
+    let reason = if cfg!(target_os = "macos") {
+        "stub_not_newer_than_real_log"
+    } else {
+        "stub_creation_time_unreliable"
+    };
+    fixture.refuses_unchanged(reason);
     assert!(wal.wal_path(&fixture.stale).exists());
     assert!(!fixture.root.join("wal/repair-aside").exists());
 }

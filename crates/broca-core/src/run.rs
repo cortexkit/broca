@@ -698,6 +698,8 @@ pub struct RunControl {
     /// Attested input route, kept out of request rendering and admission identity.
     pub display_sent_by: Option<broca_protocol::BindPrincipal>,
     pub display_message_marks: Option<broca_protocol::MessageMarks>,
+    /// The send's provider-account affinity on the store executor, kept out of model input.
+    pub conversation_key: Option<String>,
     #[cfg(test)]
     pub(crate) held_prompt_probe: Option<Arc<held_prompt::Probe>>,
     #[cfg(test)]
@@ -932,6 +934,7 @@ impl Default for RunControl {
             new_log_compaction_plan_version: None,
             display_sent_by: None,
             display_message_marks: None,
+            conversation_key: None,
             #[cfg(test)]
             held_prompt_probe: None,
             #[cfg(test)]
@@ -6418,6 +6421,7 @@ where
                     chain_reset: chained && provider.prepare_chain_reset(),
                     now,
                     next_mid: &next_mid,
+                    render: None,
                 },
                 |image| crate::compaction_v2::host::image(writer, image),
                 |prompt| {
@@ -9330,11 +9334,41 @@ pub fn restore_repetition_guidance_seeded(
     prompt: &mut [Message],
     seed: &crate::tool_repetition::RepetitionCheckpoint,
 ) -> bool {
-    let Some(mut fold) = RepetitionFold::seeded(seed) else {
+    let Some(mut guidance) = RepetitionGuidance::seeded(seed) else {
         return false;
     };
     for message in prompt.iter_mut() {
-        for (index, verdict) in fold.push(message) {
+        guidance.guide(message);
+    }
+    true
+}
+
+/// [`restore_repetition_guidance`] one message at a time, for a caller that keeps a run's
+/// guided prompt and adds each new message as it comes: guiding a run's model-step messages
+/// one by one, in order, gives each the warnings the whole-slice fold gives it.
+pub struct RepetitionGuidance(RepetitionFold);
+
+impl Default for RepetitionGuidance {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RepetitionGuidance {
+    /// Fresh counters, for a run's first model-step message.
+    pub fn new() -> Self {
+        Self(RepetitionFold::default())
+    }
+
+    /// Counters continuing from `seed`, as [`restore_repetition_guidance_seeded`] starts. `None`
+    /// when the checkpoint was taken under other warning rules or doesn't read as one.
+    pub fn seeded(seed: &crate::tool_repetition::RepetitionCheckpoint) -> Option<Self> {
+        RepetitionFold::seeded(seed).map(Self)
+    }
+
+    /// Counts `message`, raw, then adds to its tool results the warnings due.
+    pub fn guide(&mut self, message: &mut Message) {
+        for (index, verdict) in self.0.push(message) {
             if let Some(guidance) = verdict.guidance() {
                 if let ContentBlock::ToolResult(result) = &mut message.content[index] {
                     append_repetition_guidance(result, &guidance);
@@ -9342,7 +9376,6 @@ pub fn restore_repetition_guidance_seeded(
             }
         }
     }
-    true
 }
 
 /// What [`repetition_checkpoint`] found.
