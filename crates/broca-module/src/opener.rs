@@ -480,12 +480,20 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> DefaultOpener<L, W> {
                         return Err(OpenError::LeaseHeld(key.session.clone()));
                     }
                     let deleting = if let Some(service) = registry.retention_service() {
-                        let session = key.clone();
-                        tokio::task::spawn_blocking(move || service.expired_typed(&session, None))
+                        // Retention deleting this session's expired copy in the new storage
+                        // holds the lease as today's deletion does; the open waits for it alike.
+                        if service.store_deletion_in_flight(key) {
+                            true
+                        } else {
+                            let session = key.clone();
+                            tokio::task::spawn_blocking(move || {
+                                service.expired_typed(&session, None)
+                            })
                             .await
                             .map_err(|error| OpenError::Open(error.to_string()))?
                             .map_err(OpenError::from_retention)?
                             .is_some()
+                        }
                     } else {
                         false
                     };

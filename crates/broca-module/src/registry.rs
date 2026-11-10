@@ -8918,6 +8918,14 @@ impl LineageRegistry {
                 }
             }
         }
+        // The index above holds only today's sessions. The new storage's retained sessions are
+        // decided from its own records, by the same rule and under the same lease.
+        if let Some(runtime) = self.store_runtime() {
+            for key in service.sweep_store(&runtime, now_ms).await {
+                self.evict_retention_caches(&key);
+                deleted += 1;
+            }
+        }
         tracing::info!(target: "retention", deleted, "retention sweep complete");
         Ok(deleted)
     }

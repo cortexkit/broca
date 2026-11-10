@@ -879,6 +879,17 @@ impl<B: SessionBackend> Session<B> {
         Ok(())
     }
 
+    /// Deletes the stored session at `addr` whole, as [`Session::discard`] does: its head first,
+    /// so the address reads as having no session, then its kept head versions, logs and objects,
+    /// which hold its media and its id index. This is for a caller that holds the session's lease
+    /// without having opened a writer: retention deleting a session whose policy has expired.
+    /// `at` is the head version the caller read when it decided, so a head that has moved since
+    /// refuses `Fenced` and nothing is deleted.
+    pub async fn delete(backend: B, addr: &SessionAddr, at: Version) -> Result<(), SessionError> {
+        backend.delete_session(addr, at).await?;
+        Ok(())
+    }
+
     /// The backend the session reads and writes through.
     pub fn backend(&self) -> &B {
         &self.backend
