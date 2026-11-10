@@ -50,13 +50,13 @@ struct WindowKey {
 struct Kept {
     key: Option<WindowKey>,
     /// Each window message projected so far, in window order: its entry state as it was when
-    /// projected, and whether it was served (an enrollment leaves out the global system messages
-    /// it suppressed).
+    /// projected, and whether it is a global system message the session's enrollment suppressed,
+    /// whose entry has no parts and which the request's stored prompt leaves out.
     states: Vec<(EntryState, bool)>,
     /// The newest tool message among them, by window position, as it was when projected.
     newest_tool: Option<(usize, Message)>,
-    /// The transcript: `sealed` sealed entries in front, then the served window messages'
-    /// entries, then the held assistant message's entry when `open` is set.
+    /// The transcript: `sealed` sealed entries in front, then one entry per window message, then
+    /// the held assistant message's entry when `open` is set.
     entries: Arc<Vec<Entry>>,
     sealed: usize,
     open: Option<OpenRides>,
@@ -91,12 +91,8 @@ impl Kept {
 
     /// Forgets the entries of the window messages from position `from` on.
     fn truncate_window(&mut self, from: usize, conversation: &Conversation) {
-        let served = self.states[..from]
-            .iter()
-            .filter(|(_, served)| *served)
-            .count();
         self.states.truncate(from);
-        let keep = self.sealed + served;
+        let keep = self.sealed + from;
         Arc::make_mut(&mut self.entries).truncate(keep);
         self.newest_tool = conversation.messages[..from]
             .iter()
@@ -130,8 +126,8 @@ impl Kept {
         for (mid, delivered) in self.sealed_delivered.iter() {
             crate::entries::push_rides(&mut rides, mid, delivered);
         }
-        for (state, served) in &self.states {
-            if let (true, Some(facts)) = (*served, &state.facts) {
+        for (state, suppressed) in &self.states {
+            if let (false, Some(facts)) = (*suppressed, &state.facts) {
                 crate::entries::push_rides(&mut rides, &facts.mid, &state.delivered);
             }
         }
@@ -141,11 +137,11 @@ impl Kept {
 }
 
 /// `stored` as the transcript serves it: as the session's enrollment decided for a message placed
-/// before it, `None` for one it suppressed.
-fn served(enrollment: Option<&EnrollmentOverlay>, stored: StoredEntry) -> Option<StoredEntry> {
+/// before it, with no content for one it suppressed.
+fn served(enrollment: Option<&EnrollmentOverlay>, stored: StoredEntry) -> StoredEntry {
     match enrollment {
         Some(overlay) => overlay.apply(stored),
-        None => Some(stored),
+        None => stored,
     }
 }
 
@@ -196,42 +192,42 @@ impl WindowTranscript {
             if stored.message.role == Role::Tool {
                 kept.newest_tool = Some((position, stored.message.clone()));
             }
-            let Some(stored) = served(enrollment, stored) else {
-                kept.states.push((state, false));
-                continue;
-            };
+            let suppressed = enrollment.is_some_and(|overlay| overlay.suppressed(stored.ordinal));
+            let stored = served(enrollment, stored);
             let entry = project(&stored)?;
             Arc::make_mut(&mut kept.entries).push(entry);
-            if let (false, Some(facts)) = (kept.rides_stale, &stored.state.facts) {
+            if let (false, false, Some(facts)) = (kept.rides_stale, suppressed, &stored.state.facts)
+            {
                 crate::entries::push_rides(
                     Arc::make_mut(&mut kept.rides),
                     &facts.mid,
                     &stored.state.delivered,
                 );
             }
-            kept.states.push((state, true));
+            kept.states.push((state, suppressed));
         }
         if let Some((ordinal, message, state)) = conversation.open_entry() {
-            let stored = StoredEntry {
-                ordinal,
-                message: message.clone(),
-                next: None,
-                state: state.clone(),
-                open: true,
-            };
-            if let Some(stored) = served(enrollment, stored) {
-                let entry = project(&stored)?;
-                Arc::make_mut(&mut kept.entries).push(entry);
-                kept.open = Some(OpenRides {
-                    mid: stored
-                        .state
-                        .facts
-                        .as_ref()
-                        .map(|facts| facts.mid.clone())
-                        .unwrap_or_default(),
-                    delivered: stored.state.delivered,
-                });
-            }
+            let stored = served(
+                enrollment,
+                StoredEntry {
+                    ordinal,
+                    message: message.clone(),
+                    next: None,
+                    state: state.clone(),
+                    open: true,
+                },
+            );
+            let entry = project(&stored)?;
+            Arc::make_mut(&mut kept.entries).push(entry);
+            kept.open = Some(OpenRides {
+                mid: stored
+                    .state
+                    .facts
+                    .as_ref()
+                    .map(|facts| facts.mid.clone())
+                    .unwrap_or_default(),
+                delivered: stored.state.delivered,
+            });
         }
         Ok(())
     }
@@ -282,6 +278,13 @@ impl WindowTranscript {
         Transcript {
             entries: Arc::clone(&kept.entries),
             sealed: Arc::clone(&kept.sealed_messages),
+            suppressed: kept
+                .states
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, suppressed))| *suppressed)
+                .map(|(position, _)| kept.sealed + position)
+                .collect(),
             rides,
         }
     }

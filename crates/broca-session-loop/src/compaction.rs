@@ -281,6 +281,10 @@ pub struct Transcript {
     pub entries: Arc<Vec<cortexkit_role_compaction::read::Entry>>,
     /// The sealed messages put in front of the window's, for the stored prompt, with ordinals.
     pub sealed: Arc<Vec<(u64, broca_protocol::Message)>>,
+    /// Where, among `entries`, the window's global system messages that the session's
+    /// enrollment suppressed sit, in order. Each has an entry with no parts, while the request's
+    /// stored prompt leaves the message out (see [`with_suppressed`]).
+    pub suppressed: Vec<usize>,
     /// The ride envelopes of the entries' delivered texts, for rendering each ride.
     pub rides: Arc<v2::entries::RideEnvelopes>,
 }
@@ -337,8 +341,8 @@ async fn sealed_transcript<W: Writer>(writer: &W) -> Result<Arc<SealedTranscript
 /// check refuses a view naming it, by that id.
 pub async fn transcript<W: Writer>(writer: &W, ctx: &Ctx) -> Result<Transcript, LoopError> {
     let conversation = writer.conversation();
-    // A session that enrolled serves its earlier messages as its enrollment decided, leaving
-    // out the global system messages it suppressed, as the request's prompt leaves them out.
+    // A session that enrolled serves its earlier messages as its enrollment decided, the global
+    // system messages it suppressed as entries with no parts, which render nothing.
     let enrollment = writer.enrollment().await?;
     ctx.window
         .update(writer.session_id(), conversation, enrollment.as_ref())
@@ -357,8 +361,7 @@ pub async fn transcript<W: Writer>(writer: &W, ctx: &Ctx) -> Result<Transcript, 
             }
         };
         if ctx.window.sealed_for().as_ref() != Some(&key) {
-            let (entries, messages, delivered) =
-                sealed_entries(writer, ctx, enrollment.as_ref()).await?;
+            let (entries, messages, delivered) = sealed_entries(writer, ctx).await?;
             ctx.window
                 .set_sealed(Some(key), entries, messages, delivered);
         }
@@ -375,7 +378,6 @@ pub async fn transcript<W: Writer>(writer: &W, ctx: &Ctx) -> Result<Transcript, 
 async fn sealed_entries<W: Writer>(
     writer: &W,
     ctx: &Ctx,
-    enrollment: Option<&broca_session_store::session::EnrollmentOverlay>,
 ) -> Result<
     (
         Vec<cortexkit_role_compaction::read::Entry>,
@@ -414,20 +416,11 @@ async fn sealed_entries<W: Writer>(
         }
         (cuts, named)
     };
-    // The ids of the window's served entries, the held assistant message's included.
-    let suppressed = |ordinal: u64| enrollment.is_some_and(|overlay| overlay.suppressed(ordinal));
+    // The ids of the window's entries, the held assistant message's included.
     let in_window: std::collections::HashSet<&str> = conversation
         .entries
         .iter()
-        .enumerate()
-        .filter(|(at, _)| !suppressed(window_start + *at as u64))
-        .map(|(_, state)| state)
-        .chain(
-            conversation
-                .open_entry()
-                .filter(|(ordinal, _, _)| !suppressed(*ordinal))
-                .map(|(_, _, state)| state),
-        )
+        .chain(conversation.open_entry().map(|(_, _, state)| state))
         .filter_map(|state| state.facts.as_ref())
         .map(|facts| facts.mid.as_str())
         .collect();
@@ -556,6 +549,30 @@ fn with_sealed(
     opts
 }
 
+/// `prompt`, a request's stored prompt as [`with_sealed`] completes it, lined up with the
+/// transcript's entries for rendering: an empty global system message put back at each position
+/// where the transcript serves a message the session's enrollment suppressed. The prompt leaves
+/// those messages out, since the run's system text takes their place above the conversation,
+/// while the entries keep each at its ordinal with no parts. The render plan renders an entry
+/// with no parts as nothing, so what goes in its place is never rendered: the request's bytes are
+/// those of the prompt without it.
+fn with_suppressed<'p>(
+    prompt: &'p [broca_protocol::Message],
+    transcript: &Transcript,
+) -> std::borrow::Cow<'p, [broca_protocol::Message]> {
+    if transcript.suppressed.is_empty() {
+        return std::borrow::Cow::Borrowed(prompt);
+    }
+    let mut lined_up = prompt.to_vec();
+    for &position in &transcript.suppressed {
+        let mut placeholder =
+            broca_protocol::Message::new(broca_protocol::content::Role::System, Vec::new());
+        placeholder.ordinal = Some(transcript.entries[position].ordinal - 1);
+        lined_up.insert(position.min(lined_up.len()), placeholder);
+    }
+    std::borrow::Cow::Owned(lined_up)
+}
+
 /// Seals the session's history before a cut the step just applied, and starts the new open log
 /// with full copies of both view slots: a seal moves the ledger out, and a stored view is a
 /// change against the views before it. The copies go applied view first, then the step that
@@ -612,8 +629,9 @@ pub async fn offline_prompt<W: Writer>(
     };
     let transcript = transcript(writer, &ctx).await?;
     let opts = with_sealed(opts, &transcript);
+    let stored = with_suppressed(&opts.prompt, &transcript);
     let prompt = v2::render::prompt_with_rides(
-        &opts.prompt,
+        &stored,
         &transcript.entries,
         &transcript.rides,
         view.as_ref().map_or(&[][..], |view| view.edits.as_slice()),
@@ -880,6 +898,7 @@ pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
 ) -> Result<Send, LoopError> {
     let transcript = transcript(writer, ctx).await?;
     let opts = with_sealed(opts, &transcript);
+    let stored = with_suppressed(&opts.prompt, &transcript);
     let entries = transcript.entries;
     let transcript_rides = transcript.rides;
     let now = (seams.now_ms)();
@@ -918,7 +937,7 @@ pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
             preset: &ctx.preset,
             entries: &entries,
             rides: &rides,
-            stored: &opts.prompt,
+            stored: &stored,
             conditions: &conditions,
             previous: previous.as_ref(),
             current: &current,

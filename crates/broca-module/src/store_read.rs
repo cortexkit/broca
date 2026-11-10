@@ -99,8 +99,8 @@ pub async fn served_entries<B: SessionBackend>(
 
 /// [`served_entries`] as compaction reads them (`Session::compaction_entries`): a session that
 /// enrolled in the current compaction contract serves the messages placed before it as the
-/// enrollment decided, and not the global system messages it suppressed, which don't count
-/// toward `limit`. What `session.entries` serves and a view is checked against.
+/// enrollment decided, the global system messages it suppressed as entries with no parts, at
+/// their own ordinals. What `session.entries` serves and a view is checked against.
 pub async fn served_compaction_entries<B: SessionBackend>(
     session: &Session<B>,
     from: u64,

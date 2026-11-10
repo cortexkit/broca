@@ -147,7 +147,8 @@ pub fn refused(refusal: Refusal) -> LoopError {
 ///   from `tag_floor + 1`, a tool-results message taking none, as a session on the contract
 ///   numbers them as it places them.
 /// - A global system message is suppressed: the run's own system text takes its place, so it is
-///   neither served nor rendered, and takes no numbers.
+///   served as an entry with no parts, at its own ordinal, is never rendered, and takes no
+///   numbers.
 /// - A message takes its own time, else the newest earlier served message's, else 0, as the
 ///   contract's entries take them.
 /// - A notice is set only where the records show a module other than the owner delivered the
@@ -274,8 +275,9 @@ async fn run_sender<W: Writer>(
 
 /// `prompt`, each of whose messages is stamped with its 0-based position in the session,
 /// without the global system messages an enrollment suppressed, as a session on the contract
-/// never holds them in its transcript. Done before the prompt is lined up with the entries,
-/// which leave them out alike.
+/// never holds them in its transcript. Done before the prompt is lined up with the entries, which
+/// serve each such message with no parts: a render either leaves those entries out too or puts
+/// an empty message back in the prompt's copy at each one's place, which renders nothing.
 pub fn without_suppressed(prompt: &mut Vec<Message>, overlay: &EnrollmentOverlay) {
     prompt.retain(|message| {
         !message

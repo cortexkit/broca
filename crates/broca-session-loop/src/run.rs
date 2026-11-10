@@ -2916,8 +2916,9 @@ fn call_options<W: Writer>(
     }
     // The global system messages a session that enrolled carried in its transcript before are
     // left out, as a session on the contract never holds them: the run's system text takes
-    // their place above the conversation, and the entries leave them out alike. Otherwise the
-    // request shares the run's episode list rather than copying it.
+    // their place above the conversation. Their entries have no parts and render nothing; a
+    // render lines the prompt up with them (`compaction::with_suppressed`) or leaves them out.
+    // Otherwise the request shares the run's episode list rather than copying it.
     let episodes = match (contract, enrollment) {
         (true, Some(enrollment)) => {
             crate::enroll::without_suppressed(&mut prompt, enrollment);
@@ -3011,9 +3012,10 @@ fn call_options<W: Writer>(
     }
     // On the current compaction contract a request renders from the entries, as today's loop
     // renders one: text delivered with a tool result is added to the result's copy, and the
-    // system text goes above the conversation.
+    // system text goes above the conversation. The prompt left out the global system messages
+    // the session's enrollment suppressed, so their entries are left out too, one per message.
     let conversation = writer.conversation();
-    let entries = broca_session_store::session::EnrollmentOverlay::serve(
+    let entries = broca_session_store::session::EnrollmentOverlay::serve_unsuppressed(
         enrollment,
         broca_session_store::session::window_entries(conversation, 1, usize::MAX),
     )
