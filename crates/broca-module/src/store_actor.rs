@@ -158,6 +158,7 @@ pub struct StoreActor<B: SessionBackend> {
     /// The wall clock the session's deletions come due by, in milliseconds since the epoch: the
     /// clock its runs stamp their seals with.
     now_ms: Arc<dyn Fn() -> u64 + Send + Sync>,
+    retention_clock: Option<broca_core::clock::Clock>,
 }
 
 /// How an actor lives in the module's registry. Tests serve an actor without one.
@@ -217,6 +218,7 @@ enum Exit {
     Idle,
     /// The module is stopping.
     Stop,
+    Expired(u64),
 }
 
 /// The run the session is running.
@@ -278,6 +280,7 @@ struct Start {
 /// today's actor hands it to today's loop.
 #[derive(Default)]
 struct Prepared {
+    retention: Option<u64>,
     /// Whether the send named no tools of its own, before a plan filled them in. The run's
     /// start records it.
     tools_were_omitted: bool,
@@ -392,6 +395,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             created: None,
             collect_due: false,
             now_ms: Arc::new(|| broca_core::run::epoch_millis().unwrap_or(0)),
+            retention_clock: None,
         }
     }
 
@@ -674,7 +678,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             )
             .await;
         let close = match exit {
-            Exit::Idle => life.registry.begin_close(&self.key, life.gen),
+            Exit::Idle | Exit::Expired(_) => life.registry.begin_close(&self.key, life.gen),
             Exit::Closed | Exit::Stop => None,
         };
         if close.is_some() {
@@ -685,6 +689,15 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             }
         }
         self.stop_for_shutdown().await;
+        if let Exit::Expired(deadline) = exit {
+            if let Some(pending) = self.warm.take() {
+                pending.task.abort();
+                let _ = pending.task.await;
+            }
+            if let Some(fanout) = &mut self.fanout {
+                fanout.expire(deadline).await;
+            }
+        }
         self.collect_on_exit(&exit).await;
         life.run_in_flight
             .store(0, std::sync::atomic::Ordering::SeqCst);
@@ -709,6 +722,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             }
         } else {
             drop(session);
+        }
+        if matches!(exit, Exit::Expired(_)) && close.is_some() {
+            expiry::delete(&life.registry, &key).await;
         }
         drop(life.lease);
         match close {
@@ -742,7 +758,20 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         // What the registry was last told holds the session open; `None` until it took a note,
         // which it refuses until this actor's slot reads open.
         let mut noted: Option<Vec<&'static str>> = None;
+        let mut retention = expiry::Timer::default();
+        let clock = self.retention_clock.clone().unwrap_or_default();
+        let mut clock_changes = clock.subscribe();
         loop {
+            let expiry_deadline = retention
+                .deadline(
+                    &self.session,
+                    self.run.is_some(),
+                    self.retention_clock.as_ref(),
+                )
+                .await;
+            if expiry_deadline.is_some_and(|deadline| deadline <= clock.now_ms()) {
+                return Exit::Expired(expiry_deadline.unwrap());
+            }
             if let Some(gauge) = gauge {
                 gauge.store(
                     u64::from(self.run.is_some()),
@@ -787,6 +816,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 None => tokio::select! {
                     biased;
                     _ = seal.cancelled() => return Exit::Stop,
+                    _ = clock_changes.changed() => continue,
+                    _ = expiry::wait(expiry_deadline, &clock) => continue,
                     result = warmed, if has_warm => Event::Warmed(result),
                     built = built => Event::MediaBuilt(built),
                     command = commands.recv() => Event::Command(command),
@@ -891,7 +922,10 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     /// Runs deletions still due when the actor stops serving, unless the module is stopping or
     /// the session is about to be deleted whole.
     async fn collect_on_exit(&mut self, exit: &Exit) {
-        if self.collect_due && !matches!(exit, Exit::Stop) && !self.created_and_untouched() {
+        if self.collect_due
+            && !matches!(exit, Exit::Stop | Exit::Expired(_))
+            && !self.created_and_untouched()
+        {
             self.collect_unreferenced().await;
         }
     }
@@ -1056,6 +1090,13 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                             });
                             return false;
                         }
+                    }
+                };
+                let retention = match self.send_retention(retention).await {
+                    Ok(retention) => retention,
+                    Err(outcome) => {
+                        let _ = reply.send(outcome);
+                        return false;
                     }
                 };
                 // As in today's actor, a send's label and its structured output are checked against
@@ -1491,7 +1532,10 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                     scope,
                     manifest,
                     session_class,
-                    prepared: Prepared::default(),
+                    prepared: Prepared {
+                        retention,
+                        ..Prepared::default()
+                    },
                     message_marks,
                 };
                 if let Some(order) = order {
@@ -1772,8 +1816,10 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         req.request_identity_digest = identity;
         req.scope = scope;
         req.session_class = session_class;
+        req.retention = prepared.retention;
         let step: broca_core::provider::LiveStepProgress = Arc::default();
         let control = RunControl {
+            clock: self.retention_clock.clone(),
             conversation_key,
             cancel: Some(cancel.clone()),
             step_progress: Some(Arc::clone(&step)),
@@ -2312,7 +2358,11 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         delivery: broca_protocol::Delivery,
         reply: &mut oneshot::Sender<SendOutcome>,
     ) -> Result<(), SendOutcome> {
-        let at_ms = broca_core::run::epoch_millis();
+        let at_ms = start
+            .prepared
+            .retention
+            .map(|_| (self.now_ms)())
+            .or_else(broca_core::run::epoch_millis);
         let prepared = self
             .transform_input(
                 start.request.input.clone(),
@@ -2817,7 +2867,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             credential_id: None,
             affordable_max_tokens: None,
         };
-        let now = broca_core::run::epoch_millis().unwrap_or(0);
+        let now = (self.now_ms)();
         if let Err(error) = broca_session_loop::run::end_run_with_error(
             &mut self.durable(),
             &run_id.0,
@@ -3050,7 +3100,11 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             },
             manifest: self.frozen_manifest()?,
             session_class: self.frozen_session_class(),
-            prepared: Prepared::default(),
+            prepared: Prepared {
+                retention: queue::receipt_field(&send, "retention")
+                    .and_then(serde_json::Value::as_u64),
+                ..Prepared::default()
+            },
             // The drained run's start records them, as today's drain records the queued send's.
             message_marks,
         };
@@ -3361,7 +3415,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 broca_protocol::Delivery::Steer,
                 manifest.as_deref(),
                 None,
-                broca_core::run::epoch_millis(),
+                self.retention_timestamp()
+                    .or_else(broca_core::run::epoch_millis),
                 reply,
             )
             .await
@@ -3379,6 +3434,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             title: start.title,
             delivery: Some(broca_protocol::Delivery::Steer),
             hooks: prepared.hooks,
+            ts_ms: self.retention_timestamp(),
             ..queue::SteerReceipt::default()
         };
         let record = match queue::steer(
@@ -3425,7 +3481,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             // drains, as today's queue freezes it at the episode's start.
             manifest: _,
             session_class: _,
-            prepared: _,
+            prepared: start_prepared,
             message_marks,
         } = start;
         let submission_id = broca_protocol::SubmissionId(format!("sub-{}", run_id.0));
@@ -3470,7 +3526,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 delivery,
                 manifest.as_deref(),
                 None,
-                broca_core::run::epoch_millis(),
+                self.retention_timestamp()
+                    .or_else(broca_core::run::epoch_millis),
                 reply,
             )
             .await
@@ -3489,12 +3546,13 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             request_identity_digest: identity,
             title,
             hooks: prepared.queued_hooks(),
+            retention: start_prepared.retention,
             ..queue::Receipt::default()
         };
         let at = queue::Queued {
             written_at_ms: prepared.at_ms,
+            ts_ms: self.retention_timestamp(),
             delivery: (delivery != broca_protocol::Delivery::Queue).then_some(delivery),
-            ..queue::Queued::default()
         };
         let record = match queue::queued_send(
             &submission_id.0,
@@ -3721,10 +3779,8 @@ fn frozen_media(
 /// What a send asks for, where this actor doesn't serve it yet. On a session that never ran (`ran`
 /// false), as on a send creating one, a send resuming after sign-in has no paused run to resume:
 /// today's loop starts its run fresh, as it starts any other send's, and so does this actor.
-fn unserved_request(kind: RunKind, retention: bool, ran: bool) -> Option<&'static str> {
-    if retention {
-        Some("a send setting retention")
-    } else if kind == RunKind::ResumeAfterAuth && ran {
+fn unserved_request(kind: RunKind, _retention: bool, ran: bool) -> Option<&'static str> {
+    if kind == RunKind::ResumeAfterAuth && ran {
         Some("resuming after sign-in")
     } else {
         None
@@ -3886,12 +3942,14 @@ fn refuse(command: LineageCmd) {
 }
 
 mod apply_view;
+mod expiry;
 mod held;
 mod import;
 mod inline_import;
 mod keep_warm;
 mod ordered;
 mod pauses;
+mod retention;
 mod retries;
 mod scopes;
 mod service_tier;

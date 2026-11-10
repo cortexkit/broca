@@ -59,6 +59,7 @@ pub mod codec;
 pub mod content;
 pub mod damage;
 pub mod directory;
+pub mod expired;
 pub mod fold;
 pub mod frame;
 /// Decode entry points for the fuzz targets in `fuzz/` and the tests that replay their inputs.

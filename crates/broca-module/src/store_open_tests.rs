@@ -71,15 +71,23 @@ fn module(
     Arc<DefaultOpener<FileLeaseStore, FileWalStore>>,
     LineageRegistry,
 ) {
-    let opener = Arc::new(
-        DefaultOpener::new(
-            Arc::new(FileLeaseStore::new(root.join("leases"))),
+    let leases = Arc::new(FileLeaseStore::new(root.join("leases")));
+    let index = Arc::new(broca_store::SqliteStore::open(root.join("run-index.db")).unwrap());
+    let retention = Arc::new(
+        crate::retention::RetentionService::new(
             wal_store.clone(),
-            Arc::new(NoRuns),
+            index.clone(),
+            leases.clone(),
+            index,
+            Arc::new(|_: &str, _: &str| (broca_core::ChargeBasis::Unknown, 1)),
         )
-        .with_store_runtime(runtime),
+        .unwrap(),
+    );
+    let opener = Arc::new(
+        DefaultOpener::new(leases, wal_store.clone(), Arc::new(NoRuns)).with_store_runtime(runtime),
     );
     let registry = LineageRegistry::new_with_reader(opener.clone(), wal_store, None);
+    registry.set_retention_service(retention);
     (opener, registry)
 }
 

@@ -1820,6 +1820,8 @@ mod ordered;
 mod pauses;
 mod photo_sends;
 mod refresh;
+#[cfg(feature = "test-clock")]
+mod retention;
 mod scopes;
 mod streams;
 mod warm;

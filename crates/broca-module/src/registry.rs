@@ -8349,6 +8349,32 @@ impl LineageRegistry {
         key: &LineageKey,
         run: Option<&str>,
     ) -> Result<(), OpenError> {
+        if let Some(runtime) = self.store_runtime() {
+            let now_ms = self
+                .inner
+                .retention
+                .get()
+                .map_or(0, |service| service.clock.now_ms());
+            if let Some(expired_at_ms) = runtime.expired_at(key, run, now_ms).await? {
+                // While creating sends may still use legacy storage, a fresh legacy WAL can
+                // follow store deletion. Its live history wins over the address's old marker,
+                // but deleted run IDs still expire. Remove this guard with legacy fallback.
+                let legacy_fallback = run.is_none()
+                    && !runtime.holds(key)?
+                    && self
+                        .inner
+                        .retention
+                        .get()
+                        .map(|service| service.live_path_for_retention(key))
+                        .transpose()
+                        .map_err(OpenError::from_retention)?
+                        .flatten()
+                        .is_some();
+                if !legacy_fallback {
+                    return Err(OpenError::Expired { expired_at_ms });
+                }
+            }
+        }
         // Today's retention doesn't decide a session the new storage owns, or a move is
         // taking there: its WAL is the copy being moved or the retired one left behind.
         if self.store_owner_refusal(key)?.is_some() {
@@ -8502,6 +8528,10 @@ impl RegistryHandle {
 
     pub(crate) fn retention_service(&self) -> Option<Arc<crate::retention::RetentionService>> {
         self.inner.retention.get().cloned()
+    }
+
+    pub(crate) fn store_runtime(&self) -> Option<Arc<crate::store_open::StoreRuntime>> {
+        self.inner.opener.store_runtime()
     }
     pub(crate) fn repair_retention(&self, key: &LineageKey) {
         self.inner.repairs.insert(key);

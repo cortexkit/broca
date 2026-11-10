@@ -60,6 +60,25 @@ backup; loading reads only `head`. A restore that cut a session's open log leave
 bytes beside it, as `logs/<addr>/<log>.restore-cut-<ms>`. See
 [module-surface.md, Restoring the new storage from a backup](module-surface.md#restoring-the-new-storage-from-a-backup).
 
+Retention publishes an expiry marker at
+`session-store-ephemeral/expired/<addr>/<session_id>` before deleting a session's head, logs
+and objects, under the same session lease. The marker remains after the address is reused:
+reads of deleted runs stay `expired`, while a send can create a fresh session that
+carries the deleted sessions' ledger-stamped tag floors. Computed numbering resets as on today's
+storage; only earlier ledger floors survive that reset. This entire root, including the
+markers, is excluded from backups (`engram-catalog.json`).
+
+The version-1 marker body is the store's tagged binary encoding of its version, session
+triple, expiry timestamp, monotonic deletion sequence, next part-tag and legacy notice-sequence
+floors, and deleted run IDs. Its envelope is a cipher byte (0 plain, 1 encrypted), a little-endian
+deployment-key ID, and one sealed unit. The unit authenticates the envelope, address and session
+ID as its location. Encrypted markers use a deployment-derived key with the
+`broca-expired-encrypt-v1` context; plain markers use the store's unkeyed unit checksum. A missing
+key refuses `key_unavailable`, never absence. The decoder bounds a marker to 64 MiB and
+1,048,576 run IDs, permitting over a million ordinary runs while bounding damaged-file memory
+use. A deletion exceeding either limit refuses without deleting content or forgetting run IDs.
+These markers are internal storage, not an external-reader contract.
+
 The WAL is the source of truth. Everything in `run-index.db` is derived from it, although
 not all of it can be regenerated (section 4 says which parts cannot).
 

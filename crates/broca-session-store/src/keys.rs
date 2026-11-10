@@ -167,6 +167,19 @@ impl DeploymentKey {
         self.setup_key_for(Cipher::XChaCha20Poly1305)
             .expect("the deployment key has loaded")
     }
+
+    /// The expiry sidecar's unit key, separate from the keys used for session content and setup.
+    pub(crate) fn expiry_key(&self, cipher: Cipher) -> Option<FrameKey> {
+        match cipher {
+            Cipher::None => Some(FrameKey::plain()),
+            Cipher::XChaCha20Poly1305 => self.loaded.as_ref().map(|loaded| {
+                FrameKey::new(
+                    self.id,
+                    &crate::prune::keyed_digest(&loaded.bytes, b"broca-expired-encrypt-v1").0,
+                )
+            }),
+        }
+    }
 }
 
 /// A session's data key in the clear, held only in memory. A plain session's "data key" names

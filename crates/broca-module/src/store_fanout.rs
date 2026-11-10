@@ -344,7 +344,13 @@ pub(crate) struct StoreFanout<B> {
     display_mid: Arc<Mutex<Option<String>>>,
     /// Handles on the session's storage that only read, one per catch-up.
     readers: Arc<dyn Fn() -> B + Send + Sync>,
-    subscribers: Vec<(CancellationToken, JoinHandle<()>)>,
+    // Only expiry upgrades the weak sender, before stopping the task. Keeping a strong sender
+    // here would leave a finished stream's channel open until the fanout itself was dropped.
+    subscribers: Vec<(
+        CancellationToken,
+        JoinHandle<()>,
+        mpsc::WeakSender<Delivery>,
+    )>,
     /// Holds each seeding until notified, so a test can read while nothing is seeded.
     #[cfg(test)]
     seed_gate: Option<Arc<tokio::sync::Notify>>,
@@ -469,7 +475,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreFanout<B> {
         from: AttachFrom,
         sink: mpsc::Sender<Delivery>,
     ) {
-        self.subscribers.retain(|(_, task)| !task.is_finished());
+        self.subscribers.retain(|(_, task, _)| !task.is_finished());
         // The live projection a subscriber's stream continues from.
         self.ensure_seeded(session);
         let (rx, identity, head, live_replay) = {
@@ -497,6 +503,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreFanout<B> {
             (rx, publisher.identity.clone(), head, live_replay)
         };
         let cancel = CancellationToken::new();
+        let terminal = sink.downgrade();
         let task = subscriber(Attach {
             from,
             head,
@@ -508,7 +515,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreFanout<B> {
             cancel: cancel.clone(),
             live_replay,
         });
-        self.subscribers.push((cancel, tokio::spawn(task)));
+        self.subscribers
+            .push((cancel, tokio::spawn(task), terminal));
     }
 
     /// Whether any subscriber is still attached. A subscriber's task is all there is of it: the
@@ -516,13 +524,34 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreFanout<B> {
     /// read access ending) or when this fanout is dropped. Finished tasks are let go of here, so
     /// a session held open for its subscribers keeps no entry for the ones that left.
     pub(crate) fn has_live_subscribers(&mut self) -> bool {
-        self.subscribers.retain(|(_, task)| !task.is_finished());
+        self.subscribers.retain(|(_, task, _)| !task.is_finished());
         !self.subscribers.is_empty()
     }
 
     /// The display lane's sender and the step its deltas belong to, for a run's output drain.
     pub(crate) fn display(&self) -> (DisplaySender, Arc<Mutex<Option<String>>>) {
         (self.display.clone(), Arc::clone(&self.display_mid))
+    }
+
+    /// Stops content delivery before deletion, then sends the content-free `Expired` terminal.
+    /// A slow subscriber never holds the session lease.
+    pub(crate) async fn expire(&mut self, expired_at_ms: u64) {
+        let subscribers: Vec<_> = self
+            .subscribers
+            .drain(..)
+            .map(|(cancel, task, sink)| (cancel, task, sink.upgrade()))
+            .collect();
+        for (cancel, _, _) in &subscribers {
+            cancel.cancel();
+        }
+        for (_, task, sink) in subscribers {
+            let _ = task.await;
+            if let Some(sink) = sink {
+                tokio::spawn(async move {
+                    let _ = sink.send(Delivery::Expired { expired_at_ms }).await;
+                });
+            }
+        }
     }
 
     /// Ends every stream at this point with `refusal`, the error a new subscribe would get: the
@@ -546,7 +575,7 @@ impl<B> Drop for StoreFanout<B> {
         for (_, answer) in std::mem::take(&mut self.publisher.lock().unwrap().live_attaches) {
             let _ = answer.send(Err(SEED_FAILED.into()));
         }
-        for (cancel, _) in &self.subscribers {
+        for (cancel, _, _) in &self.subscribers {
             cancel.cancel();
         }
     }

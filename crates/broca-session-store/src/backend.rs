@@ -888,7 +888,7 @@ fn read_head_at(path: &Path) -> Result<Option<(Vec<u8>, Version)>, BackendError>
 
 /// Makes a folder's entries durable. Windows has no folder sync; durability of renames there is
 /// unproven and is tested before the Windows backend is relied on.
-fn sync_dir(path: &Path) -> io::Result<()> {
+pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     File::open(path)?.sync_all()?;
     #[cfg(not(unix))]

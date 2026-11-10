@@ -292,8 +292,8 @@ async fn every_other_creating_send_still_starts_on_todays_storage() {
     assert!(module.store_leftovers().is_empty());
 }
 
-/// A head whose creating send asks for what the new storage doesn't serve on such a send (media,
-/// a retention policy) is refused `not_served_on_new_storage`, permanently, naming that feature.
+/// A head whose creating send carries media is refused `not_served_on_new_storage`, permanently,
+/// naming that feature.
 /// Nothing is created in either storage: no head, log or object in any of the new storage's roots,
 /// no WAL, no feature floor, and no actor.
 #[tokio::test]
@@ -301,15 +301,7 @@ async fn a_head_the_new_storage_does_not_serve_is_refused_and_creates_nothing() 
     let mut media = request("look");
     media.content =
         serde_json::from_value(json!([{"type": "upload", "upload_id": "up-1"}])).unwrap();
-    let cases = [
-        ("a send carrying media", media, None, None),
-        (
-            "a send setting retention",
-            request("first"),
-            Some(3600),
-            None,
-        ),
-    ];
+    let cases = [("a send carrying media", media, None, None)];
     for (feature, sent, retention, order) in cases {
         let module = module(true, Vec::new(), None).await;
         let refused = send(

@@ -529,6 +529,7 @@ impl<B: SessionBackend> Session<B> {
             kept: super::kept::KeptRecords::from_next(intent_seq + 1, false),
             memory_only: Default::default(),
             memory_refused: Default::default(),
+            retired_tag_floor: 1,
         };
         let checkpoint_body = Checkpoint {
             covers_through: intent_seq,

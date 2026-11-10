@@ -8,10 +8,11 @@
 //! session whose policy has expired, by the same rule ([`super::policy_of`]), read from the
 //! session's own records ([`store_policy`]).
 //!
-//! A session is deleted only under its lease, as today's are. An open store actor holds the lease
-//! for its whole life, so a session in use is left alone and decided again on a later pass, and no
-//! actor can open while the lease is held here: an open that finds it held waits for the deletion
-//! to finish ([`RetentionService::store_deletion_in_flight`]). Deletion removes, in this order:
+//! A session is deleted only under its lease, as today's are. The sweep leaves a held lease
+//! alone; an open actor expires itself once no run is active. No actor can open while deletion
+//! holds the lease: an open that finds it held waits for the deletion to finish
+//! ([`RetentionService::store_deletion_in_flight`]). Deletion first publishes a sealed,
+//! content-free expiry marker under `expired/`, then removes, in this order:
 //! 1. what a move from today's storage left behind: the retired WAL in `wal-ephemeral/` and its
 //!    identity sidecars, today's media manifest of the session, then the `moved` marker that
 //!    refuses the address on today's storage;
@@ -20,8 +21,8 @@
 //!
 //! The head goes last, so a crash part way leaves the session in place, still expired, and the
 //! next pass finishes the deletion. A crash inside the store's own deletion leaves at most logs
-//! and objects that no head names, which nothing reads. Afterwards the address holds no session in
-//! either storage, so the next send to it starts a new one.
+//! and objects that no head names, which nothing reads. Afterwards reads stay expired through
+//! the marker, while the next send may start a new session carrying the marker's counter floors.
 
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -38,6 +39,9 @@ use broca_wal::StorageClass;
 
 use super::{policy_of, sync_dir, PolicyEvent, RetentionService};
 use crate::store_open::StoreRuntime;
+
+#[path = "retention_store_counters.rs"]
+pub(crate) mod counters;
 
 /// What retention keeps between passes about the sessions in the new storage.
 #[derive(Default)]
@@ -85,7 +89,7 @@ impl Drop for Deleting<'_> {
 /// it set; a steer both in its receipt; a run's end and pause their time. A send queued or steered
 /// by the store actor, and one converted from today's log, keep these under today's names
 /// (`broca_session_loop::queue`).
-pub(super) fn store_policy(records: &[(u64, Record)]) -> Option<(u64, u64, Option<u64>)> {
+pub(crate) fn store_policy(records: &[(u64, Record)]) -> Option<(u64, u64, Option<u64>)> {
     // Whether a session may keep content is fixed by its first run, as it is for today's.
     let first = records.iter().find_map(|(_, record)| match record {
         Record::RunStart(start) => Some(start.retention_secs),
@@ -126,6 +130,25 @@ fn described(error: impl std::fmt::Debug) -> String {
 }
 
 impl RetentionService {
+    /// Checks and deletes a stored session while its opener or actor still holds the lease.
+    pub(crate) async fn delete_store_under_lease(
+        &self,
+        runtime: &StoreRuntime,
+        key: &BindIdentity,
+        now_ms: u64,
+    ) -> Result<bool, String> {
+        let _deleting = Deleting::start(&self.store.deleting, key);
+        let backend = LocalBackend::new(StorageClass::Ephemeral.store_root(runtime.state_root()));
+        self.delete_expired_store_session(
+            runtime,
+            &backend,
+            &SessionAddr(broca_core::session_addr(key)),
+            key,
+            &crate::store_open::triple(key),
+            now_ms,
+        )
+        .await
+    }
     /// Whether retention is deleting the session `key` from the new storage now, holding its
     /// lease. An open that finds the lease held waits for this, as it waits for today's deletion
     /// of an expired session, rather than refusing the send.
@@ -328,9 +351,10 @@ impl RetentionService {
         else {
             return Ok(false);
         };
-        let records = Session::view_at(backend, addr.clone(), triple, deployment, &position)
+        let view = Session::view_at(backend, addr.clone(), triple, deployment, &position)
             .await
-            .map_err(described)?
+            .map_err(described)?;
+        let records = view
             .records_from(0)
             .await
             .map_err(|error| self.unreadable_store_session(addr, error))?;
@@ -340,6 +364,44 @@ impl RetentionService {
         if deadline > now_ms {
             return Ok(false);
         }
+        let next_tag = counters::next_tag(&records)?.unwrap_or(1);
+        let next_notice_seq = records
+            .iter()
+            .filter_map(|(_, record)| match record {
+                Record::Compaction(record) => {
+                    serde_json::from_value::<broca_wal::WalRecord>(record.body.clone()).ok()
+                }
+                _ => None,
+            })
+            .filter_map(|record| match record {
+                broca_wal::WalRecord::CompactionNotice { seq, .. } => seq.checked_add(1),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(1);
+        broca_session_store::expired::write(
+            &StorageClass::Ephemeral.store_root(state_root),
+            addr,
+            &view.head().session_id,
+            broca_session_store::expired::Marker {
+                format: 1,
+                triple: triple.clone(),
+                expired_at_ms: deadline,
+                seq: 0,
+                next_tag,
+                next_notice_seq,
+                runs: records
+                    .iter()
+                    .filter_map(|(_, record)| match record {
+                        Record::RunStart(start) => Some(start.run_id.clone()),
+                        _ => None,
+                    })
+                    .collect(),
+            },
+            view.head().cipher(),
+            deployment,
+        )
+        .map_err(described)?;
         let moved = records.iter().find_map(|(_, record)| match record {
             Record::Moved(moved) => Some(moved.move_id.as_str()),
             _ => None,

@@ -116,6 +116,7 @@ pub struct ActorWriter {
     requests: mpsc::Sender<Request>,
     conversation: Conversation,
     operations: Operations,
+    retired_tag_floor: u64,
     session_id: String,
     next_seq: u64,
     message_id_prefix: String,
@@ -144,6 +145,7 @@ impl ActorWriter {
                 requests: sender,
                 conversation: session.conversation().clone(),
                 operations: session.operations().clone(),
+                retired_tag_floor: session.retired_tag_floor(),
                 session_id: session.session_id(),
                 next_seq: session.next_seq(),
                 message_id_prefix: session.message_id_prefix(),
@@ -302,6 +304,10 @@ impl Writer for ActorWriter {
 
     fn next_seq(&self) -> u64 {
         self.next_seq
+    }
+
+    fn retired_tag_floor(&self) -> u64 {
+        self.retired_tag_floor
     }
 
     fn message_id_prefix(&self) -> String {

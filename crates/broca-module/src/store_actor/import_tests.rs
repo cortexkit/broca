@@ -1143,6 +1143,10 @@ impl Writer for Unsealed<'_> {
         Writer::next_seq(&*self.0)
     }
 
+    fn retired_tag_floor(&self) -> u64 {
+        Writer::retired_tag_floor(&*self.0)
+    }
+
     fn message_id_prefix(&self) -> String {
         Writer::message_id_prefix(&*self.0)
     }

@@ -325,7 +325,7 @@ impl RunExecutor for LoopExecutor {
                         &control,
                         &self.provider,
                         writer.operations(),
-                        Some(1),
+                        Some(control.clock.as_ref().map_or(1, |clock| clock.now_ms())),
                     )
                     .map_err(StoreRunError::Admission)?,
                 )
@@ -333,7 +333,12 @@ impl RunExecutor for LoopExecutor {
             let tools = GatedTools::new(&self.tool_text, self.planes.tool_gate.clone());
             // The wall clock, as the module's executor reads it: a queued ordered send's expiry
             // is judged at a run's boundaries by the same clock today's loop reads.
-            let now = || broca_core::run::epoch_millis().unwrap_or(0);
+            let now = || {
+                control.clock.as_ref().map_or_else(
+                    || broca_core::run::epoch_millis().unwrap_or(0),
+                    |clock| clock.now_ms(),
+                )
+            };
             let approval = GatedApproval(self.approval_gate.clone());
             let seams = Seams {
                 provider: &self.provider,
@@ -796,11 +801,10 @@ async fn a_refused_send_writes_nothing() {
     assert!(session.conversation().messages.is_empty());
 }
 
-/// A send needing a rule this actor doesn't serve yet is refused by name, and the session stays
-/// as it was.
+/// A retained creating send carries its immutable policy into the stored run start.
 #[tokio::test]
-async fn an_unserved_send_is_refused_by_name() {
-    let (commands, served, _) = actor(executor(vec![], None)).await;
+async fn a_retained_send_records_its_policy() {
+    let (commands, served, _) = actor(executor(vec![text_step("a1", "hello")], None)).await;
     let (reply, answer) = oneshot::channel();
     commands
         .send(LineageCmd::Send {
@@ -820,15 +824,20 @@ async fn an_unserved_send_is_refused_by_name() {
             reply,
         })
         .unwrap();
-    assert_eq!(
-        answer.await.unwrap(),
-        SendOutcome::Error(
-            "a send setting retention is not served yet for a session kept in the new storage"
-                .into()
-        )
-    );
+    assert!(matches!(answer.await.unwrap(), SendOutcome::Active { .. }));
+    idle(&commands).await;
     drop(commands);
-    assert!(served.await.unwrap().operations().run.is_none());
+    let session = served.await.unwrap();
+    assert_eq!(
+        session
+            .operations()
+            .owner
+            .first_start
+            .as_ref()
+            .unwrap()
+            .retention_secs,
+        Some(3600)
+    );
 }
 
 /// A send attaching an upload to an actor that can't read uploads is refused before anything is

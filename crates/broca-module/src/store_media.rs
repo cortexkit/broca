@@ -574,6 +574,10 @@ impl<B: SessionBackend> broca_session_loop::Writer for RunAppends<'_, B> {
         self.session.next_seq()
     }
 
+    fn retired_tag_floor(&self) -> u64 {
+        self.session.retired_tag_floor()
+    }
+
     fn message_id_prefix(&self) -> String {
         self.session.message_id_prefix()
     }

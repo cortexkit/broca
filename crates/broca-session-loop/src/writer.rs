@@ -63,6 +63,10 @@ pub trait Writer {
     /// The run state as the folds hold it after every appended record.
     fn operations(&self) -> &Operations;
 
+    /// The first part number available after earlier sessions at this address were deleted.
+    /// Supplied by the expiry markers, not by this session's records or projection numbering.
+    fn retired_tag_floor(&self) -> u64;
+
     /// The session's id, which names the call keys of this session's tool calls.
     fn session_id(&self) -> String;
 
@@ -224,6 +228,10 @@ impl<B: SessionBackend> Writer for Session<B> {
 
     fn next_seq(&self) -> u64 {
         Session::next_seq(self)
+    }
+
+    fn retired_tag_floor(&self) -> u64 {
+        Session::retired_tag_floor(self)
     }
 
     fn message_id_prefix(&self) -> String {

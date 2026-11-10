@@ -4355,7 +4355,12 @@ mod executor {
         ) -> Result<broca_session_loop::Finished, broca_module::executor::StoreRunError> {
             use broca_module::executor::{StoreRunError, StoreRunMode};
             use broca_session_loop::writer::Writer as _;
-            let now = || epoch_millis().max(0) as u64;
+            let clock = control.clock.clone();
+            let now = || {
+                clock
+                    .as_ref()
+                    .map_or_else(|| epoch_millis().max(0) as u64, |clock| clock.now_ms())
+            };
             let tools = self.plane.as_ref();
             let held = control.provider_held_lifecycle.clone();
             let compaction_plane = control.compaction_plane.clone();
