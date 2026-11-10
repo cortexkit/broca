@@ -36,6 +36,7 @@ pub mod config;
 pub mod config_home;
 pub mod consumer_routes;
 pub mod context_management;
+pub mod conversion_ledger;
 pub mod held_runtime;
 pub mod keep_warm_quota;
 pub mod llm_tools;
