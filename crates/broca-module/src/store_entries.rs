@@ -151,6 +151,7 @@ pub async fn compaction_runner(
                 &params,
                 // No root holds the session, so it has no entries to attribute.
                 &EntryAttribution::Known(false),
+                None,
             )
             .await
         }
@@ -208,6 +209,7 @@ impl EntryAttribution {
 /// [`compaction_runner`] over a loaded `session`, whose runs name their setup parts in `parts`.
 /// `None` is a session whose creation never committed. `attribution` decides whether the
 /// entries served keep `speaks_for`.
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_compaction<B: SessionBackend>(
     parts: &dyn Parts,
     session: Option<&Session<B>>,
@@ -216,6 +218,7 @@ pub async fn serve_compaction<B: SessionBackend>(
     method: &str,
     params: &RawValue,
     attribution: &EntryAttribution,
+    token_counts: Option<&std::sync::Mutex<broca_core::compaction_v2::tokens::Counts>>,
 ) -> Result<Box<RawValue>, Refusal> {
     let session = admit(parts, session, caller)?;
     match method {
@@ -229,7 +232,31 @@ pub async fn serve_compaction<B: SessionBackend>(
                     "compaction entries limit must be at least 1",
                 ));
             }
-            let mut page = entries_page(session, &request).await.map_err(internal)?;
+            let mut full_request = request.clone();
+            full_request.detail = broca_core::compaction_v2::protocol::read::Detail::Full;
+            full_request.max_bytes = None;
+            let mut page = entries_page(session, &full_request)
+                .await
+                .map_err(internal)?;
+            let local = std::sync::Mutex::new(broca_core::compaction_v2::tokens::Counts::default());
+            let cache = token_counts.unwrap_or(&local);
+            if let Some(start) = session
+                .operations
+                .run
+                .as_ref()
+                .and_then(|run| run.start.as_ref())
+            {
+                let admission =
+                    broca_session_loop::run::admission_of_start(start, parts).map_err(|error| {
+                        internal(format!("token count run configuration: {error:?}"))
+                    })?;
+                let mut counts = cache.lock().unwrap_or_else(|error| error.into_inner());
+                counts.configure(
+                    &broca_session_loop::compaction::frozen(&admission),
+                    admission.manifest.as_deref(),
+                );
+                page = counts.finish_page(page, &request);
+            }
             // Admission let only the provider the plan in force names through, so the caller
             // is that provider.
             let declared = match caller {

@@ -575,6 +575,7 @@ async fn an_actor_served_reads_head_is_the_head_a_fresh_view_computes() {
     .await
     .unwrap();
     let context = crate::store_reads::ReadContext {
+        token_counts: None,
         parts: &parts,
         held: true,
         open: true,

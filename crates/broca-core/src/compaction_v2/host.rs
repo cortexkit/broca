@@ -335,6 +335,12 @@ pub async fn notice(
         .ok_or("mode-3 compaction requires a WAL lineage")?
         .to_string();
     let transcript = super::transcript::project(&frames, &lineage)?;
+    session
+        .runtime
+        .tokens
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .configure(&Frozen::of(&config), manifest);
     let conditions = conditions(
         &config,
         &transcript.entries,

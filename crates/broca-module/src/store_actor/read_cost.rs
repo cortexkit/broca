@@ -407,6 +407,7 @@ async fn measure(built: &Built, parts: &SharedParts, sealed: bool, written: Dura
         stream_head: Option<Option<broca_core::Cursor>>,
     ) -> ReadContext<'a> {
         ReadContext {
+            token_counts: None,
             parts,
             held: true,
             open,

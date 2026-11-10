@@ -27,7 +27,10 @@ use super::{today_with, Today};
 use crate::actor::{LineageCmd, SendKey, SendOutcome, SendPlan};
 use crate::executor::RunKind;
 
-cipher_tests!(a_view_handed_over_at_a_ride_is_applied_alike);
+cipher_tests!(
+    a_view_handed_over_at_a_ride_is_applied_alike,
+    token_count_pages_and_notices_are_alike
+);
 
 /// A `pre_user` provider that puts a note before the text of each user message it is asked
 /// about, as Magic Context's input transform does in production. Once `unavailable` is set, it
@@ -70,6 +73,7 @@ impl Noter {
 /// sequence number and the ordinals of the entries it carries.
 #[derive(Default)]
 pub(super) struct Compactor {
+    bodies: Mutex<Vec<(String, Value)>>,
     methods: Mutex<Vec<String>>,
     calls: Mutex<Vec<Value>>,
     /// The id of each entry the notices carried, by its ordinal. Each storage mints its own ids,
@@ -139,6 +143,10 @@ impl broca_core::CompactionPlane for Compactor {
     ) -> Result<Box<serde_json::value::RawValue>, broca_core::compaction_v2::runtime::CallError>
     {
         self.methods.lock().unwrap().push(method.to_owned());
+        self.bodies
+            .lock()
+            .unwrap()
+            .push((method.to_owned(), params.clone()));
         if let Some(events) = params.get("events").and_then(Value::as_array) {
             self.events.lock().unwrap().extend(events.iter().cloned());
         }
@@ -958,6 +966,139 @@ async fn a_tool_batchs_results_are_told_once_durable_alike() {
     pair.idle().await;
     assert_eq!(new.calls(), old.calls());
     let ended = pair.end().await;
+    ended.assert_alike().await;
+    ended.stop().await;
+}
+
+/// Count metadata travels through the real read routes and notice lanes on both storages.
+async fn token_count_pages_and_notices_are_alike(cipher: broca_session_store::keys::Cipher) {
+    let (pair, old, new) = compacting_pair_in(
+        vec![store::read_step("a1"), store::text_step("a2", "answer")],
+        false,
+        cipher,
+    )
+    .await;
+    let plan = compacting_plan();
+    let (today, store) = pair
+        .send(
+            "r1",
+            limited("count these parts"),
+            Some(&plan),
+            Delivery::Queue,
+        )
+        .await;
+    assert!(matches!(today, SendOutcome::Active { .. }), "{today:?}");
+    assert_eq!(store, today);
+    pair.idle().await;
+    let ended = pair.end().await;
+    let request =
+        serde_json::value::to_raw_value(&json!({"select": {"by": "after"}, "detail": "full"}))
+            .unwrap();
+    let old_page = ended
+        .today
+        .registry
+        .route_compaction_v2(
+            &ended.today.key,
+            Some("compactor".into()),
+            "session.entries".into(),
+            request.clone(),
+        )
+        .await
+        .unwrap();
+    let new_page = crate::store_entries::serve_compaction(
+        &ended.parts,
+        Some(&ended.session),
+        &store::bind(),
+        Some("compactor"),
+        "session.entries",
+        &request,
+        &crate::store_entries::EntryAttribution::Known(false),
+        None,
+    )
+    .await
+    .unwrap();
+    let old_page: Value = serde_json::from_str(old_page.get()).unwrap();
+    let new_page: Value = serde_json::from_str(new_page.get()).unwrap();
+    fn mask(value: &mut Value) {
+        match value {
+            Value::Object(object) => {
+                for (key, member) in object {
+                    if ["mid", "digest", "written_at", "completed_at"].contains(&key.as_str()) {
+                        *member = json!(!member.is_null());
+                    } else {
+                        mask(member);
+                    }
+                }
+            }
+            Value::Array(items) => items.iter_mut().for_each(mask),
+            _ => {}
+        }
+    }
+    let masked = |value: &Value| {
+        let mut value = value.clone();
+        mask(&mut value);
+        value
+    };
+    assert_eq!(
+        masked(&new_page),
+        masked(&old_page),
+        "full count-bearing pages"
+    );
+    assert!(new_page["token_family"].is_string());
+    assert!(
+        new_page["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|entry| entry["parts"].as_array().unwrap())
+            .any(|part| part["tokens"].get("output").is_some()),
+        "a finished tool has its pair of counts"
+    );
+    let old_notices: Vec<_> = old
+        .bodies
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(method, _)| method == "compaction.notice")
+        .map(|(_, body)| body.clone())
+        .collect();
+    let new_notices: Vec<_> = new
+        .bodies
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(method, _)| method == "compaction.notice")
+        .map(|(_, body)| body.clone())
+        .collect();
+    assert!(!new_notices.is_empty());
+    assert_eq!(
+        new_notices.iter().map(masked).collect::<Vec<_>>(),
+        old_notices.iter().map(masked).collect::<Vec<_>>()
+    );
+    for notice in &new_notices {
+        assert!(notice["token_family"].is_string());
+        assert!(notice["conditions"]["system_tokens"].is_object());
+        assert!(notice["conditions"]["tools_tokens"].is_object());
+    }
+    if cipher == broca_session_store::keys::Cipher::None {
+        if let Some(dir) = std::env::var_os("BROCA_TOKEN_SAMPLE_DIR") {
+            let dir = std::path::PathBuf::from(dir);
+            let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../..")
+                .join(dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("entries.json"),
+                serde_json::to_vec_pretty(&new_page).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(
+                dir.join("notice.json"),
+                serde_json::to_vec_pretty(new_notices.last().unwrap()).unwrap(),
+            )
+            .unwrap();
+        }
+    }
     ended.assert_alike().await;
     ended.stop().await;
 }

@@ -246,16 +246,29 @@ impl<W: WalStore + 'static> super::LineageActor<W> {
                     .lock()
                     .await
                     .applied_identity();
+                let mut full_request = request.clone();
+                full_request.detail = v2::protocol::read::Detail::Full;
+                full_request.max_bytes = None;
                 let mut page = v2::read::entries(
                     self.wal_store.as_ref(),
-                    store,
+                    store.clone(),
                     &self.key,
                     &writer,
-                    &request,
+                    &full_request,
                     applied,
                 )
                 .await
                 .map_err(internal)?;
+                if let Some(episode) = &checkpoint.last_episode {
+                    let mut counts = self
+                        .compaction_session
+                        .runtime
+                        .tokens
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    counts.configure(&v2::host::Frozen::of(&episode.config), manifest);
+                    page = counts.finish_page(page, &request);
+                }
                 let plane = self.executor.compaction_plane();
                 let declared = match item.as_ref() {
                     Some((provider, ..)) => {

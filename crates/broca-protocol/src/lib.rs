@@ -48,12 +48,14 @@ pub mod display;
 pub mod error;
 pub mod ids;
 pub mod provider;
+pub mod render_hash;
 pub mod render_provenance;
 pub mod request;
 pub mod session;
 pub mod session_change;
 pub mod structured_output;
 pub mod tags;
+pub mod tool_name_alias;
 pub mod usage;
 
 #[cfg(test)]

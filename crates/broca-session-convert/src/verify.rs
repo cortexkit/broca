@@ -611,6 +611,8 @@ async fn entries<B: SessionBackend>(
         .map_err(|error| mismatch(ENTRIES, format!("today's compaction item: {error}")))?
         .flatten()
         .map(|item| item.0);
+    let store_counts = std::sync::Mutex::new(broca_core::compaction_v2::tokens::Counts::default());
+    let store_counts = &store_counts;
     let serve = |caller: String, method: &'static str, params: Value| async move {
         let params = serde_json::value::to_raw_value(&params).expect("params encode");
         outcome(
@@ -623,6 +625,7 @@ async fn entries<B: SessionBackend>(
                 &params,
                 // Compared with today's projection, which keeps every entry's attribution.
                 &broca_module::store_entries::EntryAttribution::Known(true),
+                Some(store_counts),
             )
             .await
             .map(|reply| serde_json::from_str::<Value>(reply.get()).expect("a reply is JSON")),
@@ -657,6 +660,13 @@ async fn entries<B: SessionBackend>(
     let transcript = broca_core::compaction_v2::transcript::project(records, lineage)
         .map_err(|error| mismatch(ENTRIES, format!("today's entries: {error}")))?;
     let entries = transcript.entries;
+    let (config, frozen_manifest) = broca_core::compaction_v2::host::frozen(records)
+        .map_err(|error| mismatch(ENTRIES, format!("today's count configuration: {error}")))?;
+    let counts = std::sync::Mutex::new(broca_core::compaction_v2::tokens::Counts::default());
+    counts.lock().unwrap().configure(
+        &broca_core::compaction_v2::host::Frozen::of(&config),
+        frozen_manifest,
+    );
     let state = broca_core::compaction_v2::session::load(bind, records)
         .map_err(|error| mismatch(ENTRIES, format!("today's compaction state: {error}")))?;
     let applied = match state.applied_received() {
@@ -673,7 +683,11 @@ async fn entries<B: SessionBackend>(
         let mut head = Head::new();
         head.newest = broca_core::compaction_v2::views::newest(&entries);
         head.applied_view = state.applied_identity();
-        json!({ "ok": broca_core::compaction_v2::views::page(&entries, request, head) })
+        // Compare the actual read-time metadata too, without changing the durable projection
+        // or ignoring fields that could drift during conversion.
+        json!({ "ok": counts.lock().unwrap().finish_page(
+            broca_core::compaction_v2::protocol::read::ReadPage::new(entries.clone(), head), request,
+        ) })
     };
     let mut requests: Vec<ReadRequest> = Vec::new();
     for detail in [Detail::Full, Detail::Compact] {

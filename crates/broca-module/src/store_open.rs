@@ -400,6 +400,7 @@ impl StoreRuntime {
                        open: bool,
                        live_step,
                        entry_speaks_for| ReadContext {
+            token_counts: None,
             parts: self.parts_for(class, view.head().cipher()),
             held,
             open,
@@ -431,8 +432,10 @@ impl StoreRuntime {
                     entry_speaks_for,
                 }) => match self.view_at(key, class, position).await {
                     Ok(view) => {
-                        let context =
+                        let counts = self.views.token_counts(&addr);
+                        let mut context =
                             context(&view, true, true, live_step.as_ref(), entry_speaks_for);
+                        context.token_counts = Some(&counts);
                         return Ok(Some(execute(&view, &context, &request).await));
                     }
                     // The actor sealed since it answered: ask it again.
@@ -450,13 +453,15 @@ impl StoreRuntime {
         // No actor answered, so none holds a Setup: a compaction read asks the catalog.
         let attribution =
             crate::store_entries::EntryAttribution::Catalog(self.executor.compaction_plane());
-        let context = context(
+        let counts = self.views.token_counts(&addr);
+        let mut context = context(
             &view,
             slot.is_some(),
             slot == Some("open"),
             None,
             attribution,
         );
+        context.token_counts = Some(&counts);
         Ok(Some(execute(&view, &context, &request).await))
     }
 

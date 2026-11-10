@@ -221,6 +221,7 @@ pub struct LiveStep {
 
 /// What a read needs besides the session.
 pub struct ReadContext<'a> {
+    pub token_counts: Option<&'a std::sync::Mutex<broca_core::compaction_v2::tokens::Counts>>,
     /// The deployment's setup parts, which a run's start names.
     pub parts: &'a dyn Parts,
     /// The registry holds a slot for the session (an actor is open, opening or closing), so an
@@ -342,6 +343,7 @@ pub async fn execute<B: SessionBackend>(
                 method,
                 params,
                 &ctx.entry_speaks_for,
+                ctx.token_counts,
             )
             .await,
         ),
@@ -513,6 +515,7 @@ impl<V> Default for CacheInner<V> {
 }
 
 struct CacheEntry<V> {
+    token_counts: Arc<Mutex<broca_core::compaction_v2::tokens::Counts>>,
     position: Position,
     cell: Arc<tokio::sync::OnceCell<Arc<V>>>,
     /// The view's estimated size, once loaded.
@@ -571,9 +574,15 @@ impl<V> ViewCache<V> {
                 }
                 _ => {
                     let cell = Arc::new(tokio::sync::OnceCell::new());
+                    let token_counts = inner
+                        .entries
+                        .get(addr)
+                        .map(|entry| Arc::clone(&entry.token_counts))
+                        .unwrap_or_default();
                     let replaced = inner.entries.insert(
                         addr.to_owned(),
                         CacheEntry {
+                            token_counts,
                             position,
                             cell: Arc::clone(&cell),
                             bytes: 0,
@@ -607,6 +616,19 @@ impl<V> ViewCache<V> {
     pub fn usage(&self) -> (usize, u64) {
         let inner = self.inner.lock().unwrap();
         (inner.entries.len(), inner.bytes)
+    }
+
+    pub(crate) fn token_counts(
+        &self,
+        addr: &str,
+    ) -> Arc<Mutex<broca_core::compaction_v2::tokens::Counts>> {
+        self.inner
+            .lock()
+            .unwrap()
+            .entries
+            .get(addr)
+            .map(|entry| Arc::clone(&entry.token_counts))
+            .unwrap_or_default()
     }
 }
 

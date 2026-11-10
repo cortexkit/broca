@@ -582,6 +582,7 @@ fn read_context<'a>(
     settled: &'a SettledRuns,
 ) -> ReadContext<'a> {
     ReadContext {
+        token_counts: None,
         parts,
         held: true,
         open: true,
