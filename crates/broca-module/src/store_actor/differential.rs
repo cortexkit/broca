@@ -424,8 +424,12 @@ fn tweaked(mut step: Step, change: fn(&mut SubmissionRequest)) -> Step {
 
 /// Runs `steps` on both sides over the same provider script, the first model step gated when
 /// `gated`. Every reply is compared as its step says; when every step is served alike, the two
-/// sessions' conversations must also be the same.
-async fn compare(script: Vec<Vec<NormalizedEvent>>, gated: bool, steps: Vec<Step>) {
+/// sessions' conversations must also be the same. Returns today's reply to each send, in order.
+async fn compare(
+    script: Vec<Vec<NormalizedEvent>>,
+    gated: bool,
+    steps: Vec<Step>,
+) -> Vec<SendOutcome> {
     let today_gate = gated.then(|| Arc::new(Notify::new()));
     let store_gate = gated.then(|| Arc::new(Notify::new()));
     let today = today(script.clone(), today_gate.clone());
@@ -438,6 +442,7 @@ async fn compare(script: Vec<Vec<NormalizedEvent>>, gated: bool, steps: Vec<Step
         super::tests::actor_with(executor(script, store_gate.clone()), parts.clone()).await;
     // Both sides get the request one caller shapes.
     let caller = super::tests::Caller::default();
+    let mut answers = Vec::new();
     for (index, step) in steps.into_iter().enumerate() {
         match step {
             Step::Send {
@@ -471,6 +476,7 @@ async fn compare(script: Vec<Vec<NormalizedEvent>>, gated: bool, steps: Vec<Step
                 )
                 .await;
                 assert_eq!(new, old, "step {index}: replies differ");
+                answers.push(old);
             }
             Step::Retract(submission_id) => {
                 let old = today
@@ -513,6 +519,7 @@ async fn compare(script: Vec<Vec<NormalizedEvent>>, gated: bool, steps: Vec<Step
     );
     display_reads_alike(&today, &session, &parts).await;
     assert!(today.registry.stop_and_seal().await);
+    answers
 }
 
 /// The read modes that add to a reply: display facts, tools, Rich UI stamps, each alone and all
@@ -1781,5 +1788,6 @@ mod media_render;
 mod ordered;
 mod photo_sends;
 mod refresh;
+mod scopes;
 mod streams;
 mod warm;
