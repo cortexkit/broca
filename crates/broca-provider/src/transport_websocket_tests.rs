@@ -1602,9 +1602,14 @@ async fn retention_websocket_diagnostics_omit_backend_content() {
             failure.keys().all(|key| matches!(
                 key.as_str(),
                 "class" | "status" | "provider_code" | "message"
+                    | "max_content_gap_ms" | "first_content_ms" | "tail_gap_ms" | "max_gap_after_event"
             )),
             "{failure:?}"
         );
+        assert_eq!(failure["max_gap_after_event"], "private");
+        for field in ["max_content_gap_ms", "first_content_ms", "tail_gap_ms"] {
+            assert!(failure[field].parse::<u64>().is_ok(), "{field} is numeric");
+        }
     }
 }
 

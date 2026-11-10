@@ -125,6 +125,10 @@ mod responses_websocket;
 #[path = "transport_cache_evidence.rs"]
 mod cache_runtime;
 
+#[path = "transport/content_gaps.rs"]
+mod content_gaps;
+use content_gaps::{ContentGaps, SseObservationGuard};
+
 pub use responses_websocket::Connections as ChatgptConnections;
 
 #[path = "transport_codex_retry.rs"]
@@ -549,6 +553,7 @@ struct AttemptTrace {
     content_event_count: u64,
     /// Elapsed from `sent_at` when the most recent complete content record was parsed.
     last_content_elapsed: Option<Duration>,
+    content_gaps: ContentGaps,
     keepalives_after_content: u64,
     /// The response's own report of how the provider altered the request, once the stream
     /// normalizer has read it.
@@ -3854,6 +3859,7 @@ fn warn_attempt_retry(
     decision: &str,
     reason: &str,
 ) {
+    let gaps = trace.content_gaps.snapshot();
     #[cfg(test)]
     attempt_test_hooks::record(attempt_test_hooks::Event::Decision {
         action: decision.to_owned(),
@@ -3869,7 +3875,7 @@ fn warn_attempt_retry(
     }
     if let Some(chunk) = &trace.chunk_warning {
         if trace.ephemeral_session {
-            warn_private_failure(&failure.error, "model attempt ended chunk_error");
+            warn_private_failure(&failure.error, trace, "model attempt ended chunk_error");
         } else {
             tracing::warn!(
                 target: "provider",
@@ -3880,6 +3886,10 @@ fn warn_attempt_retry(
                 response_bytes = trace.response_len,
                 last_event_type = chunk.last_event_type,
                 last_content_ms = %trace.last_content_elapsed.map(|elapsed| elapsed.as_millis().to_string()).unwrap_or_else(|| "none".into()),
+                max_content_gap_ms = gaps.max_content_gap_ms,
+                first_content_ms = gaps.first_content_ms,
+                tail_gap_ms = gaps.tail_gap_ms,
+                max_gap_after_event = gaps.max_gap_after_event,
                 keepalives_after_content = trace.keepalives_after_content,
                 event_count = trace.content_event_count,
                 event_type_counts = chunk.event_type_counts,
@@ -3909,10 +3919,15 @@ fn warn_retry_metadata(
     decision: &str,
     reason: &str,
 ) {
+    let gaps = trace.content_gaps.snapshot();
     tracing::warn!(target: "provider",
         outcome = ?failure.outcome,
         class = ?failure.error.class,
         transport = trace.transport.as_deref().unwrap_or("https"),
+        max_content_gap_ms = gaps.max_content_gap_ms,
+        first_content_ms = gaps.first_content_ms,
+        tail_gap_ms = gaps.tail_gap_ms,
+        max_gap_after_event = if trace.ephemeral_session { "private" } else { gaps.max_gap_after_event },
         socket_generation = trace.socket_generation,
         socket_reused = trace.socket_reused,
         socket_age_ms = trace.socket_age_ms(),
@@ -4022,6 +4037,30 @@ async fn drive_attempt(
     client: &ProviderHttpClient,
     request: &PreparedHttpRequest,
     clock: &Clock,
+    normalizer: Box<dyn StreamNormalizer>,
+    tx: &mpsc::Sender<NormalizedEvent>,
+    header_timeout: Duration,
+    trace: &mut AttemptTrace,
+) -> Result<Vec<NormalizedEvent>, AttemptFailure> {
+    let mut observation = SseObservationGuard::begin(trace);
+    let result = drive_http_attempt(
+        client,
+        request,
+        clock,
+        normalizer,
+        tx,
+        header_timeout,
+        observation.trace,
+    )
+    .await;
+    observation.failed = result.is_err();
+    result
+}
+
+async fn drive_http_attempt(
+    client: &ProviderHttpClient,
+    request: &PreparedHttpRequest,
+    clock: &Clock,
     mut normalizer: Box<dyn StreamNormalizer>,
     tx: &mpsc::Sender<NormalizedEvent>,
     header_timeout: Duration,
@@ -4076,6 +4115,7 @@ async fn drive_attempt(
             // network error on the compressed send never gets here: it fails the attempt.
             client.request_gzip.latch(status, rejection);
             drop(resp);
+            content_gaps::log_sse_attempt(trace, true);
             if trace.attempt_hook.is_some() {
                 trace.http_status = Some(status);
                 trace.cache_evidence = trace
@@ -4272,6 +4312,7 @@ async fn send_attempt(
     // lifetime from the request, and after a restart this stamp is what dates it.
     trace.sent_at_ms = Some(now_millis());
     trace.sent_at = Some(std::time::Instant::now());
+    trace.content_gaps.start();
     let response = tokio::time::timeout(header_timeout, builder.body(body).send()).await;
     trace.cache_work.start(request);
     let response = response
@@ -4288,6 +4329,7 @@ async fn send_attempt(
                 if trace.attempt_hook.is_some() {
                     trace.sent_at_ms = None;
                     trace.sent_at = None;
+                    trace.content_gaps = ContentGaps::default();
                 }
                 AttemptOutcome::ConnectFailed
             } else {
@@ -4772,6 +4814,7 @@ where
         let websocket = trace.transport.as_deref() == Some("websocket");
         if websocket {
             if let Some(error) = responses_websocket::wrapped_error(chunk, trace) {
+                trace.content_gaps.observe(Some("error"));
                 return Err(error);
             }
         }
@@ -4783,6 +4826,9 @@ where
             chunk
         };
         let result = normalizer.push(normalized);
+        if normalizer.progress_marker() != progress_marker {
+            trace.content_gaps.observe(normalizer.last_event_type());
+        }
         let progress = normalizer.content_progress();
         if progress.content_bytes != trace.content_progress.content_bytes {
             trace.last_content_elapsed = trace.elapsed_since_send();
@@ -4855,6 +4901,9 @@ where
     // both as `eof_before_completion` keeps a body cut at the same point reading the same
     // across wire families.
     let result = normalizer.finish();
+    if normalizer.progress_marker() != progress_marker {
+        trace.content_gaps.observe(normalizer.last_event_type());
+    }
     let progress = normalizer.content_progress();
     if progress.content_bytes != trace.content_progress.content_bytes {
         trace.last_content_elapsed = trace.elapsed_since_send();
@@ -14475,12 +14524,17 @@ fn transport_error_chain(error: &dyn std::error::Error) -> String {
     formatted
 }
 
-fn warn_private_failure(error: &ProviderError, message: &'static str) {
+fn warn_private_failure(error: &ProviderError, trace: &AttemptTrace, message: &'static str) {
+    let gaps = trace.content_gaps.snapshot();
     tracing::warn!(
         target: "provider",
         class = ?error.class,
         status = error.status,
         provider_code = error.provider_code.as_deref().filter(|code| crate::safe_provider_code(code)).unwrap_or("none"),
+        max_content_gap_ms = gaps.max_content_gap_ms,
+        first_content_ms = gaps.first_content_ms,
+        tail_gap_ms = gaps.tail_gap_ms,
+        max_gap_after_event = "private",
         message,
     );
 }

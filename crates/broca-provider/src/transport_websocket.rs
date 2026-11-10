@@ -245,17 +245,19 @@ impl AttemptObservation {
     }
 }
 
-struct ObservationGuard {
+pub(super) struct ObservationGuard<'a> {
+    pub(super) trace: &'a mut AttemptTrace,
     observation: Arc<Mutex<AttemptObservation>>,
     started: Instant,
     failed: bool,
 }
 
-impl ObservationGuard {
-    fn begin(trace: &mut AttemptTrace) -> Self {
+impl<'a> ObservationGuard<'a> {
+    pub(super) fn begin(trace: &'a mut AttemptTrace) -> Self {
         let observation = Arc::new(Mutex::new(AttemptObservation::default()));
         trace.websocket_observation = Arc::downgrade(&observation);
         Self {
+            trace,
             observation,
             started: Instant::now(),
             failed: true,
@@ -263,8 +265,16 @@ impl ObservationGuard {
     }
 }
 
-impl Drop for ObservationGuard {
+impl Drop for ObservationGuard<'_> {
     fn drop(&mut self) {
+        let unsent = ContentGaps::default();
+        let gaps = if self.trace.transport.as_deref() == Some("websocket") {
+            self.trace.content_gaps.finish();
+            self.trace.content_gaps.snapshot()
+        } else {
+            // An upgrade failure may have fallen back to SSE using the same trace.
+            unsent.snapshot()
+        };
         let stats = self.observation.lock().unwrap();
         let frames = stats.frames.as_ref().map_or([0; 7], |(counts, before)| {
             let after = counts.snapshot();
@@ -275,6 +285,9 @@ impl Drop for ObservationGuard {
             ($($log:ident)::+ ! ($($prefix:tt)*)) => {
                 $($log)::+!($($prefix)*
                     transport = "websocket", failed = self.failed, elapsed_ms = elapsed.as_millis() as u64,
+                    max_content_gap_ms = gaps.max_content_gap_ms, first_content_ms = gaps.first_content_ms,
+                    tail_gap_ms = gaps.tail_gap_ms,
+                    max_gap_after_event = if self.trace.ephemeral_session { "private" } else { gaps.max_gap_after_event },
                     socket_generation = stats.generation, socket_reused = stats.reused, socket_age_ms = stats.age_ms,
                     continuation = stats.continuation, suffix_item_count = stats.suffix_item_count,
                     frame_len = stats.frame_len, frame_sha256 = stats.frame_sha256.as_deref(), full_input_reason = stats.full_input_reason,
@@ -1029,6 +1042,7 @@ pub(super) async fn drive(
         .await;
     }
     let mut observation = ObservationGuard::begin(trace);
+    let trace = &mut *observation.trace;
     let result = drive_socket(session, client, request, clock, normalizer, tx, trace).await;
     let result = apply_chatgpt_response_deadline(result, request, trace);
     observation.failed =
@@ -1269,6 +1283,7 @@ async fn drive_socket(
         now_millis()
     });
     trace.sent_at = Some(std::time::Instant::now());
+    trace.content_gaps.start();
     let _activity = AttemptActivity::begin(&socket);
     let (result, receive) = oneshot::channel();
     let sent = tokio::time::timeout(STREAM_IDLE_TIMEOUT, async {
@@ -1384,10 +1399,11 @@ pub(super) fn warn_failure_decision(
     reason: &str,
 ) {
     if trace.ephemeral_session {
-        warn_private_failure(&failure.error, "model websocket attempt failed");
+        warn_private_failure(&failure.error, trace, "model websocket attempt failed");
         return;
     }
     let cut = failure.output_ceiling.as_ref();
+    let gaps = trace.content_gaps.snapshot();
     tracing::warn!(
         target: "provider",
         outcome = ?failure.outcome,
@@ -1395,6 +1411,10 @@ pub(super) fn warn_failure_decision(
         provider_code = failure.error.provider_code.as_deref().unwrap_or("none"),
         elapsed_ms = %trace.elapsed_since_send().map(|elapsed| elapsed.as_millis().to_string()).unwrap_or_else(|| "unknown".into()),
         response_bytes = trace.response_len,
+        max_content_gap_ms = gaps.max_content_gap_ms,
+        first_content_ms = gaps.first_content_ms,
+        tail_gap_ms = gaps.tail_gap_ms,
+        max_gap_after_event = gaps.max_gap_after_event,
         transport = "websocket",
         close_code = %trace.websocket_close_code.as_ref().map(|code| code.load(Ordering::Acquire)).filter(|code| *code != 0).map(|code| code.to_string()).unwrap_or_else(|| "none".into()),
         provider_stop_reason = cut.map(|cut| cut.provider_stop_reason.as_str()),
