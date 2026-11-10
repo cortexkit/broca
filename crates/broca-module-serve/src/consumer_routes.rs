@@ -31,10 +31,10 @@ pub struct ConsumerRoutes {
     pub tool_module: String,
     /// The credential vault, present only when runs resolve credentials through it.
     pub vault_module: Option<String>,
-    /// The routing module broca asks which provider account a run uses and reports each run's
-    /// account evidence to. Present exactly on the vault path: that is when the route is
+    /// The routing modules broca asks which provider account a run uses and reports each run's
+    /// account evidence to. Nonempty exactly on the vault path: that is when the route is
     /// opened, since which account serves a send is always routing's decision there.
-    pub routing_module: Option<String>,
+    pub routing_modules: Vec<String>,
     pub bus_events: bool,
 }
 
@@ -51,7 +51,7 @@ impl ConsumerRoutes {
         Self {
             tool_module: non_blank(tool_module).unwrap_or_else(|| DEFAULT_TOOL_MODULE.to_string()),
             vault_module: vault_in_use.then(|| CREDENTIALS_MODULE_ID.to_string()),
-            routing_module: None,
+            routing_modules: Vec::new(),
             bus_events: false,
         }
     }
@@ -63,10 +63,11 @@ impl ConsumerRoutes {
         mut self,
         config: &crate::account_routing::AccountSelectionConfig,
     ) -> Self {
-        self.routing_module = self
-            .vault_module
-            .is_some()
-            .then(|| config.routing_module.clone());
+        self.routing_modules = if self.vault_module.is_some() {
+            config.routing_modules()
+        } else {
+            Vec::new()
+        };
         self
     }
 
@@ -77,7 +78,7 @@ impl ConsumerRoutes {
     pub fn consumer_roles(&self) -> Vec<ConsumerRole> {
         let mut services = vec![FUSIFORM_MODULE_ID.to_string()];
         services.extend(self.vault_module.iter().cloned());
-        services.extend(self.routing_module.iter().cloned());
+        services.extend(self.routing_modules.iter().cloned());
         if self.bus_events {
             services.push("ckbus".into());
         }

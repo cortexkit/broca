@@ -1035,8 +1035,19 @@ mod consumes_tests {
         let routes =
             ConsumerRoutes::resolve(Some("custom"), true).with_account_selection(&selection);
         let (_, services) = declared(&routes);
-        assert_eq!(routes.routing_module.as_deref(), Some("routing-b"));
+        assert_eq!(routes.routing_modules, vec!["routing-b"]);
         assert_eq!(services, vec!["fusiform", "claustrum", "routing-b"]);
+
+        let selection = crate::account_routing::AccountSelectionConfig::parse(
+            r#"{"account_selection":{"routing_module":"prefrontal-routing"}}"#,
+        )
+        .unwrap();
+        let (_, services) =
+            declared(&ConsumerRoutes::resolve(None, true).with_account_selection(&selection));
+        assert_eq!(
+            services,
+            vec!["fusiform", "claustrum", "prefrontal-routing"]
+        );
     }
 
     /// broca never opens a route to routing without the vault (the mock providers resolve no
@@ -1060,7 +1071,7 @@ mod consumes_tests {
             declared(&ConsumerRoutes::resolve(None, true).with_account_selection(&active));
         assert_eq!(
             services,
-            vec!["fusiform", "claustrum", "prefrontal-routing"]
+            vec!["fusiform", "claustrum", "prefrontal-routing", "striatum"]
         );
     }
 

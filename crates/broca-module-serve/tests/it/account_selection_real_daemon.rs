@@ -1,5 +1,5 @@
 //! Account selection through the real `ck-subc` daemon: the real `ck-broca` binary, supervised by
-//! the daemon, asks a stand-in routing module (`prefrontal-routing`) which provider account each
+//! the daemon, asks a stand-in routing module under either routing id which provider account each
 //! new subscription run uses, and reports each run's admission, attempts and end to it. The
 //! credentials vault (`claustrum`) is a stand-in too, registered from inside this process like
 //! the routing module, and the Anthropic upstream is a local HTTP server.
@@ -925,6 +925,10 @@ impl Rig {
     /// A rig whose `broca.jsonc` also holds the members of `broca_config`, such as
     /// `session_storage`, beside the provider endpoints every rig sets.
     async fn start_with(broca_config: Value) -> Option<Rig> {
+        Self::start_with_routing_id(broca_config, ROUTING).await
+    }
+
+    async fn start_with_routing_id(broca_config: Value, routing_id: &str) -> Option<Rig> {
         let daemon_bin = sibling_bin("ck-subc", "SUBC_CORE_BIN");
         if !daemon_bin.exists() {
             assert!(
@@ -1122,7 +1126,7 @@ impl Rig {
         });
         let routing_task = register(
             &connection_file,
-            ROUTING,
+            routing_id,
             &["route.account_for", "route.account_observe"],
             RoutingModule(Arc::clone(&routing)),
         )
@@ -1826,6 +1830,38 @@ fn event(params: &Value) -> (String, u64) {
     let (lineage, seq) = id.rsplit_once(':').expect("lineage:seq");
     assert_eq!(lineage.len(), 36, "a lineage id: {id}");
     (lineage.to_string(), seq.parse().expect("a sequence number"))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn striatum_only_selects_accounts_and_receives_reports_through_the_real_daemon() {
+    // Leave account_selection unset: naming striatum in broca.jsonc would not test fallback.
+    let Some(rig) = Rig::start_with_routing_id(json!({}), "striatum").await else {
+        return;
+    };
+    let client = rig.client("renamed-routing").await;
+    let run_id = send(&client, "send-renamed-routing", None).await;
+    let frames = rig.finished("renamed-routing").await;
+    let chosen = selection(&frames);
+    assert_eq!(chosen["account_ref"], "acct-a");
+    assert_eq!(chosen["credential_id"], "oauth:anthropic");
+    assert_eq!(chosen["account_decision"]["path"], "routed");
+    assert_eq!(chosen["account_decision"]["admission_id"], run_id);
+    let reports = rig
+        .reports(&run_id, &["admission_started", "attempt", "run_finished"])
+        .await;
+    let methods: Vec<_> = reports
+        .iter()
+        .map(|(method, kind, _)| (method.as_str(), kind.as_str()))
+        .collect();
+    assert_eq!(
+        methods,
+        vec![
+            ("route.account_for", ""),
+            ("route.account_observe", "admission_started"),
+            ("route.account_observe", "attempt"),
+            ("route.account_observe", "run_finished"),
+        ]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

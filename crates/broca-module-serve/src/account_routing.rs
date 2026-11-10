@@ -57,6 +57,8 @@ use crate::auth_routing::{AuthMethod, CredentialId};
 
 /// The routing module broca asks when `broca.jsonc` names none.
 pub const DEFAULT_ROUTING_MODULE: &str = "prefrontal-routing";
+/// The fallback routing module, tried only when no module id was configured.
+pub const ROUTING_MODULE_FALLBACK: &str = "striatum";
 /// Choose the account for one admission.
 pub const ACCOUNT_FOR_OP: &str = "route.account_for";
 /// Report admission, attempt and run-end evidence for an admission.
@@ -107,18 +109,11 @@ const RUNNER: &str = "broca";
 /// Which account serves a send is routing's decision alone, so there is no switch that
 /// bypasses routing: the former `legacy_static` key is refused as unknown by the strict loader
 /// below, so a leftover setting fails the load instead of silently doing nothing.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AccountSelectionConfig {
-    /// The routing module's id.
-    pub routing_module: String,
-}
-
-impl Default for AccountSelectionConfig {
-    fn default() -> Self {
-        Self {
-            routing_module: DEFAULT_ROUTING_MODULE.to_string(),
-        }
-    }
+    /// An explicit routing module id. Unset tries `DEFAULT_ROUTING_MODULE`, then
+    /// `ROUTING_MODULE_FALLBACK`.
+    pub routing_module: Option<String>,
 }
 
 // Strict, like the vault section beside it: an unknown key (a misspelling, or the removed
@@ -172,10 +167,19 @@ impl AccountSelectionConfig {
             Some(module) if module.trim().is_empty() => {
                 return Err("account_selection.routing_module must not be empty".into())
             }
-            Some(module) => module,
-            None => DEFAULT_ROUTING_MODULE.to_string(),
+            module => module,
         };
         Ok(Self { routing_module })
+    }
+
+    pub fn routing_modules(&self) -> Vec<String> {
+        match &self.routing_module {
+            Some(module) => vec![module.clone()],
+            None => vec![
+                DEFAULT_ROUTING_MODULE.into(),
+                ROUTING_MODULE_FALLBACK.into(),
+            ],
+        }
     }
 }
 
@@ -312,6 +316,56 @@ enum RouteSlot {
     Ready(broca_subc::RouteHandle),
 }
 
+/// Probe both default module ids before waiting, so a reserved or warming first module cannot
+/// hide the fallback. Single-attempt opens retain subc's shared availability gates: a cached
+/// refusal has the same code as the original open and needs the same fall-through decision.
+async fn open_routing_route<'a, F, Fut, T>(
+    configured: Option<&'a str>,
+    retry: broca_subc::RouteOpenRetry,
+    mut attempt: F,
+) -> Result<T, broca_subc::ConnError>
+where
+    F: FnMut(&'a str, broca_subc::RouteOpenRetry) -> Fut,
+    Fut: std::future::Future<Output = Result<T, broca_subc::ConnError>>,
+{
+    if let Some(module) = configured {
+        return attempt(module, retry).await;
+    }
+    let deadline = tokio::time::Instant::now() + retry.budget;
+    let mut interval = broca_subc::ROUTE_OPEN_RETRY_INTERVAL.min(retry.max_interval);
+    // In broca-subc a zero budget still admits one cold open, but never retries a refusal.
+    let once = broca_subc::RouteOpenRetry::within(Duration::ZERO, Duration::ZERO);
+    loop {
+        for module in [DEFAULT_ROUTING_MODULE, ROUTING_MODULE_FALLBACK] {
+            match attempt(module, once).await {
+                Ok(route) => return Ok(route),
+                Err(error)
+                    if matches!(
+                        error.code(),
+                        Some("unknown_module" | "target_unavailable" | "module_warming")
+                    ) =>
+                {
+                    if module == ROUTING_MODULE_FALLBACK {
+                        let remaining =
+                            deadline.saturating_duration_since(tokio::time::Instant::now());
+                        if remaining.is_zero() {
+                            return Err(error);
+                        }
+                        tokio::time::sleep(interval.min(remaining)).await;
+                        // No new pair starts after the budget, including when the sleep used
+                        // its last remaining time. In-flight attempts keep subc's own timeout.
+                        if tokio::time::Instant::now() >= deadline {
+                            return Err(error);
+                        }
+                        interval = interval.saturating_mul(2).min(retry.max_interval);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}
+
 /// The routing module's management route over the shared subc connection. The route is opened
 /// once, in a task of its own, so a caller that stops waiting (its admission budget ran out)
 /// does not abandon the open: the next caller finds the route ready. Connection errors forget
@@ -319,7 +373,7 @@ enum RouteSlot {
 /// once within the caller's existing budget; other failures wait for the next request.
 pub struct SubcRoutingTransport {
     conn: Arc<broca_subc::SubcConnection>,
-    module_id: String,
+    module_id: Option<String>,
     identity: BindIdentity,
     route: Arc<Mutex<RouteSlot>>,
     capabilities: tokio::sync::Mutex<Option<(broca_subc::RouteHandle, Vec<String>)>>,
@@ -330,7 +384,7 @@ pub struct SubcRoutingTransport {
 impl SubcRoutingTransport {
     pub fn new(
         conn: Arc<broca_subc::SubcConnection>,
-        module_id: String,
+        module_id: Option<String>,
         identity: BindIdentity,
     ) -> Self {
         Self {
@@ -358,12 +412,20 @@ impl SubcRoutingTransport {
                     let identity = self.identity.clone();
                     let route = Arc::clone(&self.route);
                     tokio::spawn(async move {
-                        let opened = conn
-                            .route_open_management(&module_id, &identity)
-                            .await
-                            .map_err(|error| {
-                                format!("route.open to routing module '{module_id}': {error}")
-                            });
+                        let opened = open_routing_route(
+                            module_id.as_deref(),
+                            broca_subc::RouteOpenRetry::default_patience(),
+                            |id, retry| conn.route_open_management_within(id, &identity, retry),
+                        )
+                        .await
+                        .map_err(|error| {
+                            format!(
+                                "route.open to routing module '{}': {error}",
+                                module_id
+                                    .as_deref()
+                                    .unwrap_or("prefrontal-routing or striatum")
+                            )
+                        });
                         *route.lock().unwrap() = match &opened {
                             Ok(handle) => RouteSlot::Ready(*handle),
                             Err(_) => RouteSlot::Empty,
@@ -480,7 +542,12 @@ impl RoutingTransport for SubcRoutingTransport {
     }
     async fn request(&self, body: Vec<u8>) -> RoutingReply {
         self.request_on_cached_route(body, |error| {
-            format!("routing module '{}': {error}", self.module_id)
+            format!(
+                "routing module '{}': {error}",
+                self.module_id
+                    .as_deref()
+                    .unwrap_or("prefrontal-routing or striatum")
+            )
         })
         .await
         .map(|(_, reply)| reply)
