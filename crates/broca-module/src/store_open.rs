@@ -846,7 +846,7 @@ type LoadedParts = Vec<(broca_session_store::codec::Digest, Arc<[u8]>)>;
 
 /// The triple a session is created and loaded under: the bind identity's, spelled as
 /// `broca_core::session_addr` spells it, so the triple and the address name one session.
-fn triple(key: &BindIdentity) -> SessionTriple {
+pub(crate) fn triple(key: &BindIdentity) -> SessionTriple {
     SessionTriple {
         project_root: key.project_root.display().to_string(),
         harness: key.harness.clone(),

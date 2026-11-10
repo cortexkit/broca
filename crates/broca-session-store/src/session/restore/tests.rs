@@ -8,7 +8,7 @@ use futures::executor::block_on;
 use sha2::{Digest as _, Sha256};
 
 use super::{check, restore, restore_with, Finding, Restored};
-use crate::backend::{LocalBackend, SessionAddr};
+use crate::backend::{LocalBackend, SessionAddr, HEAD_VERSION_KEEP_MS};
 use crate::codec::{hex, Message as _};
 use crate::head::SessionTriple;
 use crate::keys::{Cipher, DeploymentKey};
@@ -18,6 +18,7 @@ use crate::setup::SetupStore;
 
 cipher_tests!(
     a_walk_that_passed_a_seal_rolls_back_to_the_version_before_it,
+    a_version_inside_the_grace_keeps_its_files_and_restore_picks_it,
     a_walk_that_passed_a_new_medium_cuts_the_log_before_its_record,
     a_walk_that_passed_a_new_setup_part_cuts_the_log_before_its_record,
     a_log_read_in_the_middle_of_a_batch_is_kept_as_a_torn_tail,
@@ -322,6 +323,42 @@ fn a_walk_that_passed_a_seal_rolls_back_to_the_version_before_it(cipher: Cipher)
     assert_eq!(lacking.len(), 1);
     assert_eq!(lacking[0].0, sealed);
     assert!(lacking[0].1.starts_with("log "), "{lacking:?}");
+}
+
+/// A walk lists the store, then a seal commits, then the writer collects a moment before the day
+/// head versions are kept for is over, and only then does the walk read what it listed. The head
+/// version before the seal is still kept, and the collection deleted none of the files it names:
+/// restore rolls back to it, and the session loads back exactly as it stood then.
+fn a_version_inside_the_grace_keeps_its_files_and_restore_picks_it(cipher: Cipher) {
+    let live = Root::new("live");
+    let backend = LocalBackend::new(&live.0);
+    let (walk, before, unsealed) = block_on(async {
+        let mut session = history(&backend, cipher).await;
+        let before = state(&session);
+        let unsealed = backend.read_stored_head(&addr()).unwrap().unwrap().1;
+        let walk = Walk::list(&live.0);
+        session.seal(None, 1_000).await.unwrap();
+        let collected = session
+            .collect(1_000 + HEAD_VERSION_KEEP_MS - 1)
+            .await
+            .unwrap();
+        assert_eq!(collected, 0);
+        (walk, before, unsealed)
+    });
+    assert!(backend.head_versions(&addr()).unwrap().contains(&unsealed));
+    let sealed = backend.read_stored_head(&addr()).unwrap().unwrap().1;
+    let copy = Root::new("copy");
+    walk.restore_into(&copy.0);
+    assert_eq!(
+        restore_at(&copy.0, cipher),
+        Restored::Repaired {
+            from: sealed,
+            to: unsealed,
+            written: Some(sealed + 1),
+            cut: None,
+        }
+    );
+    assert_eq!(load(&copy.0, cipher).unwrap(), before);
 }
 
 /// A walk lists the store, then a run stores a new medium and appends the input naming it: the
