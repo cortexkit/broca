@@ -4494,6 +4494,16 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 Err(StartRunFailure::Admission(RunError::RoutingUnavailable(unavailable))) => {
                     SendOutcome::RoutingUnavailable(unavailable)
                 }
+                Err(StartRunFailure::Admission(RunError::CredentialsUnavailable)) => {
+                    SendOutcome::CredentialsUnavailable
+                }
+                Err(StartRunFailure::Admission(RunError::CredentialAmbiguous {
+                    credential,
+                    candidate_ids,
+                })) => SendOutcome::CredentialAmbiguous {
+                    credential,
+                    candidate_ids,
+                },
                 Err(StartRunFailure::Admission(RunError::SessionTooLarge { max_bytes })) => {
                     SendOutcome::SessionTooLarge { max_bytes }
                 }

@@ -49,6 +49,19 @@ pub fn upload_refusal(
 /// operation-specific rendering in the serving layer.
 pub fn admission_refusal(error: &ServeError) -> Option<AdmissionRefusal> {
     let (code, detail) = match error {
+        ServeError::CredentialsUnavailable => (
+            "credentials_unavailable",
+            Some(json!({"class":"transient"})),
+        ),
+        ServeError::CredentialAmbiguous {
+            credential,
+            candidate_ids,
+        } => (
+            "credential_ambiguous",
+            Some(
+                json!({"class":"permanent", "credential":credential, "candidate_ids":candidate_ids}),
+            ),
+        ),
         ServeError::AccountSelectionRefused(refusal) => {
             return Some(AdmissionRefusal::AccountSelection(
                 broca_wire::AccountSelectionRefused::new(
@@ -164,6 +177,14 @@ pub(crate) fn queued_admission_error(error: RunError) -> ProviderError {
             message,
         },
         RunError::Transient(message) => ServeError::Transient(message),
+        RunError::CredentialsUnavailable => ServeError::CredentialsUnavailable,
+        RunError::CredentialAmbiguous {
+            credential,
+            candidate_ids,
+        } => ServeError::CredentialAmbiguous {
+            credential,
+            candidate_ids,
+        },
         RunError::VariantUnsupported(refusal) => ServeError::VariantUnsupported(refusal),
         RunError::ToolAliasInvalid(refusal) => ServeError::ToolAliasInvalid(refusal),
         RunError::AccountSelectionRefused(refusal) => ServeError::AccountSelectionRefused(refusal),
@@ -217,6 +238,48 @@ pub(crate) fn queued_admission_error(error: RunError) -> ProviderError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credential_row_refusals_keep_their_codes_classes_and_public_ids() {
+        let ambiguous = ServeError::CredentialAmbiguous {
+            credential: "apikey:anthropic-platform".into(),
+            candidate_ids: vec![
+                "apikey:anthropic:acct1".into(),
+                "apikey:anthropic:acct2".into(),
+            ],
+        };
+        let body = serde_json::to_value(admission_refusal(&ambiguous).unwrap()).unwrap();
+        assert_eq!(body["code"], "credential_ambiguous");
+        assert_eq!(
+            body["detail"],
+            json!({"class":"permanent", "credential":"apikey:anthropic-platform",
+            "candidate_ids":["apikey:anthropic:acct1", "apikey:anthropic:acct2"]})
+        );
+        let body =
+            serde_json::to_value(admission_refusal(&ServeError::CredentialsUnavailable).unwrap())
+                .unwrap();
+        assert_eq!(body["code"], "credentials_unavailable");
+        assert_eq!(body["detail"], json!({"class":"transient"}));
+        for (error, code, class) in [
+            (
+                RunError::CredentialsUnavailable,
+                "credentials_unavailable",
+                ErrorClass::Transient,
+            ),
+            (
+                RunError::CredentialAmbiguous {
+                    credential: "key".into(),
+                    candidate_ids: vec!["row1".into(), "row2".into()],
+                },
+                "credential_ambiguous",
+                ErrorClass::Permanent,
+            ),
+        ] {
+            let queued = queued_admission_error(error);
+            assert_eq!(queued.provider_code.as_deref(), Some(code));
+            assert_eq!(queued.class, class);
+        }
+    }
 
     #[test]
     fn queued_account_refusal_preserves_its_class_wire_code_message_and_retry_hints() {

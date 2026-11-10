@@ -441,7 +441,6 @@ mod obsolete_media_tests {
             assert!(has_obsolete_media(text).unwrap());
             // Other boot loaders must not reject the retired top-level key either.
             crate::account_routing::AccountSelectionConfig::parse(text).unwrap();
-            crate::vault_config::VaultCredentialIds::parse(text).unwrap();
         }
     }
 }

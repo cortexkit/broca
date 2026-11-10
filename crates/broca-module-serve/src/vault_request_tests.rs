@@ -585,7 +585,7 @@ async fn executor_with_capturing_vault_within(
         root,
         daemon,
         ready_timeout,
-        broca_module_serve::VaultCredentialIds::default(),
+        listed_credentials([]),
         supervised_broca_identity(),
     )
     .await
@@ -599,14 +599,14 @@ fn supervised_broca_identity() -> Option<subc_control::ConsumerIdentity> {
     })
 }
 
-/// As [`executor_with_capturing_vault_within`], with `vault.credential_ids` aliases and the
+/// As [`executor_with_capturing_vault_within`], with cached credential rows and the
 /// consumer identity the vault connection presents chosen explicitly. The identity is passed
 /// in rather than read from the environment, which is shared by every test in this binary.
 async fn executor_with_vault_addressing(
     root: &std::path::Path,
     daemon: &CapturingVaultDaemon,
     ready_timeout: Duration,
-    credential_ids: broca_module_serve::VaultCredentialIds,
+    listing: Arc<broca_module_serve::account_routing::ListingCache>,
     consumer_identity: Option<subc_control::ConsumerIdentity>,
 ) -> LiveLoopExecutor {
     let mut vault_conn = broca_subc::SubcConnection::connect_with_consumer_identity(
@@ -632,11 +632,11 @@ async fn executor_with_vault_addressing(
             &broca_protocol::BindIdentity::new(root, "broca", "vault"),
             ready_timeout,
         ),
-        addressing: broca_module_serve::VaultAddressing::new(credential_ids),
-        methods: broca_module_serve::MethodConfig::empty(),
+        addressing: broca_module_serve::VaultAddressing::new(Arc::clone(&listing)),
+        methods: broca_module_serve::MethodConfig::from_listing(Arc::clone(&listing)),
         gauge: broca_module_serve::serve::VaultGauge::disconnected(),
         cache: VaultLkgCache::default(),
-        listing: Default::default(),
+        listing,
     })
 }
 
@@ -899,27 +899,27 @@ async fn a_refused_vault_route_served_from_cache_records_no_request() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// The aliases the scoped-read tests configure: `apikey:synthetic` is read as a different vault
-/// id, every other key without a handle as itself.
-fn synthetic_alias() -> broca_module_serve::VaultCredentialIds {
-    broca_module_serve::VaultCredentialIds::from_pairs([("apikey:synthetic", "apikey:synthetic:main")])
+/// Rows for scoped-read tests: the synthetic key has one metadata match whose id differs,
+/// and the other provider keys have exact matches.
+fn synthetic_rows() -> Arc<broca_module_serve::account_routing::ListingCache> {
+    listed_credentials([("apikey:synthetic", "apikey:synthetic:main")])
 }
 
-/// A KEY IS READ BY GRANT AS ITS MAPPED ID, OR AS ITSELF.
+/// A key is read by grant as its resolved vault row id.
 ///
 /// It sends `credential.get_scoped` with the credential id and the ttl demand, and neither a
 /// handle nor `force_refresh`, which the operation does not have. The run records what was
 /// sent: `op: get_scoped` and no `force_refresh` at all. The route it went out on presented
 /// the broca module's consumer identity, which is what lets the vault's grant apply.
 #[tokio::test]
-async fn a_key_is_read_by_grant_as_its_alias_or_itself_and_records_get_scoped() {
+async fn a_key_is_read_by_grant_as_its_resolved_row_and_records_get_scoped() {
     let root = fresh_vault_root("scoped-read");
     let daemon = CapturingVaultDaemon::start(&root).await;
     let executor = executor_with_vault_addressing(
         &root,
         &daemon,
         Duration::from_secs(2),
-        synthetic_alias(),
+        synthetic_rows(),
         supervised_broca_identity(),
     )
     .await;
@@ -992,11 +992,11 @@ async fn a_key_is_read_by_grant_as_its_alias_or_itself_and_records_get_scoped() 
 /// A RESUME KEEPS ITS FROZEN SELECTION, AND NOTHING RE-DERIVES IT.
 ///
 /// A selection frozen with its `auth_method` names the vault's own credential id: the resume
-/// reads exactly that id, with no parse and no `vault.credential_ids` alias lookup, and takes
+/// reads exactly that id, with no parse or row lookup, and takes
 /// the method from the frozen field. Here the ids would parse to another method (`apikey:...`)
-/// or not at all (`work-claude`), and an alias exists for one of them; none of that matters.
-/// A selection without the field is a broca key and resumes exactly as before: mapped through
-/// its alias, method from the key. A frozen method this build does not know refuses the
+/// or not at all (`work-claude`), and the listing holds a different id for that key; neither matters.
+/// A selection without the field is a broca key and resolves its row with the method from the
+/// key. A frozen method this build does not know refuses the
 /// resume rather than guess.
 #[tokio::test]
 async fn a_resume_reads_its_frozen_selection_verbatim_or_as_a_broca_key() {
@@ -1006,7 +1006,7 @@ async fn a_resume_reads_its_frozen_selection_verbatim_or_as_a_broca_key() {
         &root,
         &daemon,
         Duration::from_secs(2),
-        broca_module_serve::VaultCredentialIds::from_pairs([
+        listed_credentials([
             ("oauth:anthropic:work", "vault-alias-id"),
             ("apikey:openai:x", "aliased-key"),
         ]),
@@ -1016,17 +1016,7 @@ async fn a_resume_reads_its_frozen_selection_verbatim_or_as_a_broca_key() {
     let resume = |frozen: &'static str, method: Option<&'static str>| {
         let executor = &executor;
         async move {
-            executor
-                .decide_auth_with_account(
-                    "anthropic",
-                    Some(frozen),
-                    method,
-                    false,
-                    None,
-                    None,
-                    &AccountChoice::NotApplicable,
-                    None,
-                )
+            executor.decide_auth_with_account("anthropic", Some(frozen), method, None, false, None, None, &AccountChoice::NotApplicable, None)
                 .await
         }
     };
@@ -1074,7 +1064,7 @@ async fn a_scoped_not_found_is_final_and_names_both_causes() {
         &root,
         &daemon,
         Duration::from_secs(2),
-        synthetic_alias(),
+        synthetic_rows(),
         supervised_broca_identity(),
     )
     .await;
@@ -1126,7 +1116,7 @@ async fn a_scoped_read_without_a_consumer_identity_is_refused_before_sending() {
         &root,
         &daemon,
         Duration::from_secs(2),
-        synthetic_alias(),
+        synthetic_rows(),
         None,
     )
     .await;
@@ -1165,7 +1155,7 @@ async fn a_wire_auth_failure_is_reported_by_credential_id_on_the_exact_wire_shap
         &root,
         &daemon,
         Duration::from_secs(2),
-        synthetic_alias(),
+        synthetic_rows(),
         supervised_broca_identity(),
     )
     .await;
@@ -1721,7 +1711,7 @@ async fn routed_chatgpt_reads_the_second_credential_and_freezes_the_decision() {
     }).await;
     let executor = executor_with_capturing_vault(&root, &daemon).await;
     let choice = routed_chatgpt_choice().await;
-    let resolved = executor.decide_auth_with_account("openai", None, None, true, Some(AuthMethod::Chatgpt), None, &choice, None).await.unwrap();
+    let resolved = executor.decide_auth_with_account("openai", None, None, None, true, Some(AuthMethod::Chatgpt), None, &choice, None).await.unwrap();
     let selection = resolved.selection.unwrap();
     assert_eq!(selection.credential_id, "chatgpt:openai:second");
     assert_eq!(selection.account_ref.as_deref(), Some("chatgpt-b"));
@@ -1745,7 +1735,7 @@ async fn routed_chatgpt_refuses_a_different_vault_account_identity() {
     }).await;
     let executor = executor_with_capturing_vault(&root, &daemon).await;
     let choice = routed_chatgpt_choice().await;
-    match executor.decide_auth_with_account("openai", None, None, true, Some(AuthMethod::Chatgpt), None, &choice, None).await {
+    match executor.decide_auth_with_account("openai", None, None, None, true, Some(AuthMethod::Chatgpt), None, &choice, None).await {
         Err(RunError::Config(message)) => assert!(message.starts_with("account_identity_mismatch:"), "{message}"),
         _ => panic!("a token for another account must refuse admission"),
     }
@@ -1762,7 +1752,7 @@ async fn account_mismatch_does_not_populate_lkg() {
     let mut executor = executor_with_capturing_vault(&root, &daemon).await;
     let choice = routed_chatgpt_choice().await;
     let credential_id = "chatgpt:openai:second";
-    match executor.decide_auth_with_account("openai", None, None, true, Some(AuthMethod::Chatgpt), None, &choice, None).await {
+    match executor.decide_auth_with_account("openai", None, None, None, true, Some(AuthMethod::Chatgpt), None, &choice, None).await {
         Err(RunError::Config(message)) => assert!(message.starts_with("account_identity_mismatch:"), "{message}"),
         _ => panic!("a token for another account must refuse admission"),
     }
@@ -1781,7 +1771,7 @@ async fn account_mismatch_does_not_populate_lkg() {
         .unwrap_or_else(|_| panic!("outage fixture must own its vault"));
     Arc::get_mut(executor.vault.as_mut().unwrap()).unwrap().client = outage_vault.client;
 
-    assert!(matches!(executor.decide_auth_with_account("openai", None, None, true,
+    assert!(matches!(executor.decide_auth_with_account("openai", None, None, None, true,
         Some(AuthMethod::Chatgpt), None, &choice, None).await,
         Err(RunError::Config(message)) if message.starts_with("credential not configured or unusable:")),
         "a routed admission must not serve the mismatched token during an outage");
@@ -2329,4 +2319,30 @@ async fn chatgpt_expiring_jwt_account_mismatch_is_never_sent() {
     assert!(run.sent.is_empty());
     assert_eq!(run.summary.paused, Some(PauseReason::AuthRequired));
     assert_eq!(run.pause_code.as_deref(), Some("account_changed"));
+}
+
+/// Preload the metadata the stand-in vault would list, without adding list calls to read tests.
+fn listed_credentials<const N: usize>(pairs: [(&str, &str); N]) -> Arc<broca_module_serve::account_routing::ListingCache> {
+    let mut rows = std::collections::BTreeMap::from([
+        ("oauth:anthropic", "oauth:anthropic"), ("apikey:deepseek", "apikey:deepseek"),
+        ("chatgpt:openai", "chatgpt:openai"), ("apikey:openai", "apikey:openai"),
+        ("antigravity:google", "antigravity:google"), ("apikey:other", "apikey:other"),
+    ]);
+    rows.retain(|key, _| {
+        let key = broca_module_serve::CredentialId::parse(key).unwrap();
+        !pairs.iter().any(|(replacement, _)| {
+            let replacement = broca_module_serve::CredentialId::parse(replacement).unwrap();
+            replacement.method == key.method && replacement.provider == key.provider
+        })
+    });
+    rows.extend(pairs);
+    let credentials: Vec<broca_subc::vault::ScopedCredential> = rows.into_iter().map(|(key, id)| {
+        let key = broca_module_serve::CredentialId::parse(key).unwrap();
+        serde_json::from_value(serde_json::json!({"id":id, "type":key.method.as_token(),
+            "categories":["llm"], "serves":[], "state":"active", "record_version":1,
+            "operations":["read"], "auth_method":key.method.as_token(), "provider_ids":[key.provider]})).unwrap()
+    }).collect();
+    let cache = Arc::new(broca_module_serve::account_routing::ListingCache::default());
+    cache.store(broca_subc::vault::ScopedList { credentials, grants:1, grant_tuples:vec![], view:"fixture".into() });
+    cache
 }

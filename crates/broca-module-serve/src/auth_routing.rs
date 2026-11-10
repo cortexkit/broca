@@ -1,22 +1,9 @@
-//! Auth-method routing: which credential (and, for wire-changing methods, which wire
-//! family) a run uses for a provider.
-//!
-//! A provider can now have SEVERAL credentials — an api key, a provider OAuth token, a
-//! special-backend OAuth token (Google Antigravity / OpenAI ChatGPT). They are addressed by
-//! a `credential_id` of the form `<method>:<provider>[:<account>]` (e.g. `apikey:deepseek`,
-//! `antigravity:google`, `oauth:anthropic`). This module owns:
-//!  - [`AuthMethod`] — the method token (the first id segment),
-//!  - [`CredentialId`] — build/parse the `<method>:<provider>[:<account>]` id,
-//!  - [`MethodConfig`] — the per-provider DEFAULT method, read from config-home,
-//!  - [`resolve_credential_id`] — pick the run's `(provider, method, account)` → id.
-//!
-//! It is PURE (the only IO is loading the config file) so the routing rules are unit-tested
-//! in isolation from the vault and the loop. The token VALUE never appears here — this
-//! decides WHICH credential to fetch, not the secret.
+//! Credential keys and default sign-in methods derived from the cached vault rows.
+//! The vendor service name is not a catalog provider id; only `provider_ids` routes a row.
 
-use std::collections::HashMap;
-
-use serde::Deserialize;
+use crate::account_routing::ListingCache;
+use broca_subc::vault::{ScopedCredential, ScopedList};
+use std::sync::Arc;
 
 pub use broca_catalog::live::AuthMethod;
 
@@ -101,120 +88,100 @@ impl CredentialId {
     }
 }
 
-/// The per-provider DEFAULT auth method, loaded from config-home
-/// (`~/.config/cortexkit/broca/auth-methods.json`, override `BROCA_AUTH_METHODS_PATH`).
-/// A read-only consumer view; the CK app is the eventual writer. Providers ABSENT from the
-/// map fall back to the caller-supplied default (api-key for the long tail), so the config
-/// only needs to name the exceptions (the oauth / special-backend providers).
-///
-/// Format: `{ "defaults": { "google": "antigravity", "openai": "apikey", "anthropic": "oauth" } }`
-///
-/// Holds no secrets (only provider→method defaults), so `Debug` is safe to derive (unlike
-/// the handle map, whose values are bearer secrets).
-#[derive(Debug, Clone)]
-pub struct MethodConfig {
-    defaults: HashMap<String, AuthMethod>,
+/// Subscription credentials precede metered API keys when a provider has several methods.
+/// Keep the policy in one place so changing the default never depends on listing order.
+pub const DEFAULT_METHOD_ORDER: [AuthMethod; 4] = [
+    AuthMethod::Chatgpt,
+    AuthMethod::Oauth,
+    AuthMethod::Antigravity,
+    AuthMethod::ApiKey,
+];
+
+pub fn default_method(listing: &ScopedList, provider: &str) -> Option<AuthMethod> {
+    DEFAULT_METHOD_ORDER.into_iter().find(|method| {
+        listing.credentials.iter().any(|row| {
+            row.state == "active"
+                && row.provider_ids.iter().any(|id| id == provider)
+                && row.auth_method.as_deref() == Some(method.as_token())
+        })
+    })
 }
 
-#[derive(Deserialize)]
-// Strict BECAUSE of the default below, not despite it. A misspelled top-level key left
-// `defaults` unpopulated, serde supplied an empty map, and the loader returned a valid config
-// that routed every provider to API-key auth -- a legal value standing in for a missing one,
-// and the legal value was the one that looked healthy. Strictness here is a scar; on an
-// inbound wire it would be a refusal to interoperate with a newer peer, which is why this
-// file has it and crates/broca-subc/src/vault.rs deliberately does not. If you are making
-// serde attributes uniform across the crate, the inconsistency is the point.
-#[serde(deny_unknown_fields)]
-struct MethodConfigFile {
-    #[serde(default)]
-    defaults: HashMap<String, String>,
+/// Exact public keys take precedence; otherwise metadata must identify one active row.
+/// Empty provider mappings are deliberately excluded even from exact-id matches.
+pub fn credential_row<'a>(
+    listing: &'a ScopedList,
+    key: &CredentialId,
+) -> Result<Option<&'a ScopedCredential>, broca_core::RunError> {
+    let eligible = |row: &&ScopedCredential| row.state == "active" && !row.provider_ids.is_empty();
+    let key_text = key.to_id_string();
+    if let Some(row) = listing
+        .credentials
+        .iter()
+        .filter(eligible)
+        .find(|row| row.id == key_text)
+    {
+        return Ok(Some(row));
+    }
+    let mut candidates: Vec<_> = listing
+        .credentials
+        .iter()
+        .filter(eligible)
+        .filter(|row| {
+            row.auth_method.as_deref() == Some(key.method.as_token())
+                && row.provider_ids.iter().any(|id| id == &key.provider)
+        })
+        .collect();
+    candidates.sort_by(|a, b| a.id.cmp(&b.id));
+    match candidates.len() {
+        0 => Ok(None),
+        1 => Ok(candidates.pop()),
+        _ => Err(broca_core::RunError::CredentialAmbiguous {
+            credential: key_text,
+            candidate_ids: candidates.into_iter().map(|row| row.id.clone()).collect(),
+        }),
+    }
+}
+
+/// The default-method view shares the daemon's listing cache; it has no file-backed defaults.
+#[derive(Clone, Default)]
+pub struct MethodConfig {
+    listing: Arc<ListingCache>,
 }
 
 impl MethodConfig {
-    /// An empty config (every provider uses the caller's fallback default). The shape when
-    /// no config file exists — the api-key long tail needs no config entry.
     pub fn empty() -> Self {
-        Self {
-            defaults: HashMap::new(),
-        }
+        Self::default()
     }
-
-    /// The resolved config path: `$BROCA_AUTH_METHODS_PATH` if set, else `auth-methods.json`
-    /// under the shared config home (`crate::config_home`).
+    pub fn from_listing(listing: Arc<ListingCache>) -> Self {
+        Self { listing }
+    }
     pub fn default_path() -> crate::config_home::ConfigHome {
         crate::config_home::config_file(METHODS_PATH_ENV, "auth-methods.json")
     }
-
-    /// Load the selected file without losing whether an operator explicitly named it.
+    /// Only test for presence: obsolete file bytes, including invalid JSON, are never read.
     pub fn load_resolved(resolved: crate::config_home::ConfigHome) -> Result<Self, String> {
-        match resolved {
-            crate::config_home::ConfigHome::Resolved { path, explicit } => {
-                Self::load_with_origin(&path, explicit)
-            }
-            crate::config_home::ConfigHome::Unresolvable => Ok(Self::empty()),
+        if let crate::config_home::ConfigHome::Resolved { path, .. } = resolved {
+            return Self::load(&path);
         }
+        Ok(Self::empty())
     }
-
-    /// Load the config from `path`. A MISSING file is not an error — it yields the empty
-    /// config (every provider uses the fallback default). A present-but-malformed file IS an
-    /// error (a typo'd method would silently mis-route, so fail loud), and an unknown method
-    /// token is rejected by name.
     pub fn load(path: &std::path::Path) -> Result<Self, String> {
-        Self::load_with_origin(path, false)
-    }
-
-    fn load_with_origin(path: &std::path::Path, explicit: bool) -> Result<Self, String> {
-        let bytes = match std::fs::read(path) {
-            Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if explicit {
-                    return Err(format!(
-                        "{METHODS_PATH_ENV} selects missing auth-methods file {}: {e}",
-                        path.display()
-                    ));
-                }
-                return Ok(Self::empty());
-            }
-            Err(e) => return Err(format!("read auth-methods file {}: {e}", path.display())),
-        };
-        let parsed: MethodConfigFile = serde_json::from_slice(&bytes)
-            .map_err(|e| format!("parse auth-methods file {}: {e}", path.display()))?;
-        let mut defaults = HashMap::new();
-        for (provider, token) in parsed.defaults {
-            let method = AuthMethod::from_token(&token).ok_or_else(|| {
-                format!(
-                    "auth-methods file {}: provider '{provider}' has unknown method '{token}' \
-                     (expected apikey|oauth|antigravity|chatgpt)",
-                    path.display()
-                )
-            })?;
-            defaults.insert(provider, method);
+        if path.exists() {
+            tracing::warn!(
+                "auth-methods.json is no longer read and can be deleted: {}",
+                path.display()
+            );
         }
-        Ok(Self { defaults })
+        Ok(Self::empty())
     }
-
-    /// The configured default method for a provider, if any.
     pub fn method_for(&self, provider: &str) -> Option<AuthMethod> {
-        self.defaults.get(provider).copied()
-    }
-
-    /// Every configured `(provider, method)` default, sorted by provider.
-    pub fn defaults(&self) -> Vec<(&str, AuthMethod)> {
-        let mut defaults: Vec<(&str, AuthMethod)> = self
-            .defaults
-            .iter()
-            .map(|(provider, method)| (provider.as_str(), *method))
-            .collect();
-        defaults.sort_unstable_by(|left, right| left.0.cmp(right.0));
-        defaults
+        default_method(&self.listing.get()?.0, provider)
     }
 }
 
-/// Resolve the credential id for a run: a per-request `pinned` method wins; else the
-/// provider's configured default; else the caller's `fallback` (api-key for the long tail).
-/// The `account` rides through for the forward-compat multi-account segment. This is the
-/// METHOD decision that gets FROZEN at run start — on resume the frozen method/credential_id
-/// is read directly, this resolver is NEVER re-run (account/router state could differ).
+/// A caller pin takes precedence over the methods in the cached rows. The fallback only
+/// constructs a key for the existing not-found refusal; it never authorizes a credential.
 pub fn resolve_credential_id(
     provider: &str,
     pinned: Option<AuthMethod>,
@@ -228,15 +195,8 @@ pub fn resolve_credential_id(
     CredentialId::new(method, provider, account.map(str::to_string))
 }
 
-/// Pick the credential id for a run, honoring the resume invariant: if the
-/// run is resuming and the prior run froze a credential id, RE-USE that exact id — do NOT
-/// re-resolve from config/router (which could have drifted between run start and resume → a
-/// different method → a different wire family → cache bust + provider-invalid history).
-/// Only when there is no frozen id (a fresh run) does this resolve from the caller pin or config.
-///
-/// `frozen` is the prior run's `RunConfig.auth_selection.credential_id` (the durable value);
-/// a malformed frozen id falls through to a fresh resolve (defensive — a corrupt frozen id
-/// shouldn't strand the run, and the family-consistency guard still catches a bad pair).
+/// Preserve a frozen key's method and account. Older runs without a frozen vault id still
+/// resolve that key against the rows, but never reselect its method from today's defaults.
 pub fn select_credential_id(
     frozen: Option<&str>,
     provider: &str,
@@ -270,10 +230,128 @@ pub fn frozen_selection_credential(
 }
 
 #[cfg(test)]
+pub(crate) fn row_listing() -> ScopedList {
+    let mut rows = vec![
+        (
+            "antigravity:google",
+            "active",
+            "antigravity",
+            "antigravity",
+            vec!["google"],
+        ),
+        (
+            "antigravity:google:acct1",
+            "active",
+            "antigravity",
+            "antigravity",
+            vec!["google"],
+        ),
+        (
+            "apikey:cline-pass",
+            "active",
+            "apikey",
+            "cline-pass",
+            vec![],
+        ),
+        (
+            "apikey:google",
+            "active",
+            "apikey",
+            "google",
+            vec!["google"],
+        ),
+        (
+            "apikey:inception",
+            "retired",
+            "apikey",
+            "inception",
+            vec!["inception"],
+        ),
+        (
+            "apikey:kimi-for-coding",
+            "active",
+            "apikey",
+            "kimi-for-coding",
+            vec!["kimi-code-plan-global"],
+        ),
+        ("apikey:muse", "active", "apikey", "", vec![]),
+        (
+            "apikey:openai",
+            "active",
+            "apikey",
+            "openai",
+            vec!["openai"],
+        ),
+        (
+            "apikey:opencode-zen",
+            "active",
+            "apikey",
+            "opencode-zen",
+            vec!["opencode"],
+        ),
+        (
+            "chatgpt:openai",
+            "active",
+            "chatgpt",
+            "openai",
+            vec!["openai"],
+        ),
+        (
+            "oauth:anthropic",
+            "active",
+            "oauth",
+            "anthropic",
+            vec!["anthropic"],
+        ),
+        ("oauth:cursor", "active", "oauth", "cursor", vec![]),
+        ("opaque:broca-deployment:1", "active", "", "", vec![]),
+    ];
+    for id in [
+        "apikey:anthropic:acct1",
+        "apikey:anthropic:acct2",
+        "apikey:anthropic:acct3",
+        "apikey:anthropic:acct4",
+    ] {
+        rows.push((
+            id,
+            "active",
+            "apikey",
+            "anthropic",
+            vec!["anthropic-platform"],
+        ));
+    }
+    for id in [
+        "apikey:openai:acct1",
+        "apikey:openai:acct2",
+        "apikey:openai:acct3",
+    ] {
+        rows.push((id, "active", "apikey", "openai", vec!["openai"]));
+    }
+    for id in ["chatgpt:openai:acct1", "chatgpt:openai:acct2"] {
+        rows.push((id, "active", "chatgpt", "openai", vec!["openai"]));
+    }
+    for id in [
+        "oauth:anthropic:acct1",
+        "oauth:anthropic:acct2",
+        "oauth:anthropic:acct3",
+        "oauth:anthropic:acct4",
+        "oauth:anthropic:acct5",
+        "oauth:anthropic:acct6",
+    ] {
+        rows.push((id, "active", "oauth", "anthropic", vec!["anthropic"]));
+    }
+    ScopedList {
+        credentials: rows.into_iter().map(|(id,state,method,vendor,providers)| serde_json::from_value(serde_json::json!({
+            "id":id, "type":method, "categories":["llm"], "serves":[], "provider":vendor,
+            "state":state, "record_version":1, "operations":["read"],
+            "auth_method":if method.is_empty() { None } else { Some(method) }, "provider_ids":providers,
+        })).unwrap()).collect(), grants:1, grant_tuples:vec![], view:"synthetic-11-10".into(),
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
-    use std::path::PathBuf;
 
     #[test]
     fn method_token_round_trips() {
@@ -333,148 +411,127 @@ mod tests {
         }
     }
 
-    fn write_temp(name: &str, contents: &str) -> PathBuf {
-        let path = broca_test_support::scratch_root().join(format!(
-            "broca-auth-methods-{}-{}.json",
-            std::process::id(),
-            name
-        ));
-        let mut f = std::fs::File::create(&path).unwrap();
-        f.write_all(contents.as_bytes()).unwrap();
-        path
-    }
-
     #[test]
-    fn config_loads_defaults_and_unknown_method_fails_loud() {
-        let path = write_temp(
-            "ok",
-            r#"{ "defaults": { "google": "antigravity", "anthropic": "oauth" } }"#,
-        );
-        let c = MethodConfig::load(&path).unwrap();
-        assert_eq!(c.method_for("google"), Some(AuthMethod::Antigravity));
-        assert_eq!(c.method_for("anthropic"), Some(AuthMethod::Oauth));
-        assert_eq!(c.method_for("deepseek"), None); // not configured → caller's fallback
-        let _ = std::fs::remove_file(&path);
-
-        let bad = write_temp("bad", r#"{ "defaults": { "google": "antigrav" } }"#);
-        assert!(MethodConfig::load(&bad)
-            .unwrap_err()
-            .contains("unknown method"));
-        let _ = std::fs::remove_file(&bad);
-    }
-
-    #[test]
-    fn misspelled_top_level_key_is_rejected() {
-        let path = write_temp(
-            "misspelled-top-level",
-            r#"{ "default": { "google": "antigravity" } }"#,
-        );
-        let error = MethodConfig::load(&path).unwrap_err();
-        assert!(error.starts_with(&format!("parse auth-methods file {}:", path.display())));
-        assert!(error.contains("unknown field `default`"));
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn missing_config_is_empty_not_an_error() {
-        let path = broca_test_support::scratch_root()
-            .join(format!("broca-nope-{}.json", std::process::id()));
-        let _ = std::fs::remove_file(&path);
-        let c = MethodConfig::load(&path).unwrap();
-        assert_eq!(c.method_for("anything"), None);
-        assert!(c.defaults().is_empty());
-    }
-
-    #[test]
-    fn select_uses_frozen_id_even_when_config_drifted() {
-        // The resume invariant: a resume must re-use the FROZEN credential id, never
-        // re-resolve from config — even if the config default changed since run start.
-        // Frozen = oauth:anthropic. Config now says anthropic→apikey (drift). select must
-        // STILL return oauth:anthropic.
-        let path = write_temp("drift", r#"{ "defaults": { "anthropic": "apikey" } }"#);
-        let config = MethodConfig::load(&path).unwrap();
-        let got = select_credential_id(
-            Some("oauth:anthropic"),
-            "anthropic",
-            None,
-            None,
-            &config,
-            AuthMethod::ApiKey,
+    fn vault_rows_resolve_exact_unique_ambiguous_and_missing_keys() {
+        let listing = row_listing();
+        let resolve = |key| credential_row(&listing, &CredentialId::parse(key).unwrap());
+        assert_eq!(
+            resolve("apikey:openai").unwrap().unwrap().id,
+            "apikey:openai"
         );
         assert_eq!(
-            got.to_id_string(),
-            "oauth:anthropic",
-            "resume must honor the frozen id, not the drifted config default"
+            resolve("apikey:kimi-code-plan-global").unwrap().unwrap().id,
+            "apikey:kimi-for-coding"
         );
-        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            resolve("apikey:opencode").unwrap().unwrap().id,
+            "apikey:opencode-zen"
+        );
+        assert_eq!(
+            resolve("oauth:anthropic:acct1").unwrap().unwrap().id,
+            "oauth:anthropic:acct1"
+        );
+        assert!(resolve("apikey:missing").unwrap().is_none());
+        assert!(resolve("apikey:anthropic").unwrap().is_none());
+        assert!(resolve("chatgpt:anthropic").unwrap().is_none());
+        assert_eq!(
+            resolve("oauth:anthropic").unwrap().unwrap().id,
+            "oauth:anthropic"
+        );
+        let Err(broca_core::RunError::CredentialAmbiguous {
+            credential,
+            candidate_ids,
+        }) = resolve("apikey:anthropic-platform")
+        else {
+            panic!("platform keys are ambiguous");
+        };
+        assert_eq!(credential, "apikey:anthropic-platform");
+        assert_eq!(
+            candidate_ids,
+            [
+                "apikey:anthropic:acct1",
+                "apikey:anthropic:acct2",
+                "apikey:anthropic:acct3",
+                "apikey:anthropic:acct4"
+            ]
+        );
     }
 
     #[test]
-    fn meta_oauth_config_resolves_an_account_scoped_credential() {
-        let path = write_temp("meta-oauth", r#"{ "defaults": { "meta": "oauth" } }"#);
-        let defaults = MethodConfig::load(&path).unwrap();
-        let id = resolve_credential_id("meta", None, Some("test"), &defaults, AuthMethod::ApiKey);
-        assert_eq!(id.to_id_string(), "oauth:meta:test");
-
-        let long_tail =
-            resolve_credential_id("deepseek", None, None, &defaults, AuthMethod::ApiKey);
-        assert_eq!(long_tail.to_id_string(), "apikey:deepseek");
-        let _ = std::fs::remove_file(&path);
+    fn retired_unmapped_and_opaque_rows_never_match_even_by_exact_id() {
+        let listing = row_listing();
+        for key in [
+            "apikey:inception",
+            "apikey:cline-pass",
+            "apikey:muse",
+            "oauth:cursor",
+            "apikey:broca-deployment",
+        ] {
+            assert!(
+                credential_row(&listing, &CredentialId::parse(key).unwrap())
+                    .unwrap()
+                    .is_none(),
+                "{key}"
+            );
+        }
     }
 
     #[test]
-    fn select_resolves_fresh_when_no_frozen_id() {
-        // A fresh run (no frozen id) resolves from config; the drifted-config test above
-        // proves this branch is NOT taken on resume.
-        let path = write_temp("fresh", r#"{ "defaults": { "google": "antigravity" } }"#);
-        let config = MethodConfig::load(&path).unwrap();
-        let got = select_credential_id(None, "google", None, None, &config, AuthMethod::ApiKey);
-        assert_eq!(got.to_id_string(), "antigravity:google");
-        // A malformed frozen id falls through to a fresh resolve (defensive).
-        let got = select_credential_id(
-            Some("garbage-not-an-id"),
-            "google",
-            None,
-            None,
-            &config,
-            AuthMethod::ApiKey,
+    fn default_methods_use_only_active_provider_ids_and_subscription_order() {
+        let listing = row_listing();
+        for (provider, expected) in [
+            ("kimi-code-plan-global", Some(AuthMethod::ApiKey)),
+            ("anthropic", Some(AuthMethod::Oauth)),
+            ("openai", Some(AuthMethod::Chatgpt)),
+            ("google", Some(AuthMethod::Antigravity)),
+            ("missing", None),
+            ("cursor", None),
+            ("inception", None),
+        ] {
+            assert_eq!(default_method(&listing, provider), expected, "{provider}");
+        }
+        let cache = Arc::new(ListingCache::default());
+        cache.store(listing);
+        let methods = MethodConfig::from_listing(cache);
+        assert_eq!(
+            resolve_credential_id(
+                "openai",
+                Some(AuthMethod::ApiKey),
+                Some("acct1"),
+                &methods,
+                AuthMethod::ApiKey
+            )
+            .to_id_string(),
+            "apikey:openai:acct1"
         );
-        assert_eq!(got.to_id_string(), "antigravity:google");
-        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            select_credential_id(
+                Some("apikey:openai"),
+                "openai",
+                None,
+                None,
+                &methods,
+                AuthMethod::ApiKey
+            )
+            .to_id_string(),
+            "apikey:openai"
+        );
+        assert_eq!(
+            resolve_credential_id("openai", None, None, &methods, AuthMethod::ApiKey)
+                .to_id_string(),
+            "chatgpt:openai"
+        );
     }
 
     #[test]
-    fn resolve_precedence_pin_then_config_then_fallback() {
-        let path = write_temp("res", r#"{ "defaults": { "google": "antigravity" } }"#);
-        let config = MethodConfig::load(&path).unwrap();
-
-        // Pin wins over config.
-        let id = resolve_credential_id(
-            "google",
-            Some(AuthMethod::ApiKey),
-            None,
-            &config,
-            AuthMethod::ApiKey,
-        );
-        assert_eq!(id.to_id_string(), "apikey:google");
-
-        // No pin → config default.
-        let id = resolve_credential_id("google", None, None, &config, AuthMethod::ApiKey);
-        assert_eq!(id.to_id_string(), "antigravity:google");
-
-        // No pin, not configured → fallback (api-key long tail).
-        let id = resolve_credential_id("deepseek", None, None, &config, AuthMethod::ApiKey);
-        assert_eq!(id.to_id_string(), "apikey:deepseek");
-
-        // Account rides through.
-        let id = resolve_credential_id(
-            "anthropic",
-            Some(AuthMethod::Oauth),
-            Some("work"),
-            &config,
-            AuthMethod::ApiKey,
-        );
-        assert_eq!(id.to_id_string(), "oauth:anthropic:work");
-        let _ = std::fs::remove_file(&path);
+    fn obsolete_method_file_is_never_parsed() {
+        let path = broca_test_support::scratch_root().join("obsolete-auth-methods.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"not JSON or a method map").unwrap();
+        assert!(MethodConfig::load(&path)
+            .unwrap()
+            .method_for("openai")
+            .is_none());
+        std::fs::remove_file(path).unwrap();
     }
 }

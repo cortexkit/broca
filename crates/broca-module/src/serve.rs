@@ -2325,6 +2325,11 @@ pub enum ServeError {
     },
     /// Admission failed before durable start because a dependency is temporarily unavailable.
     Transient(String),
+    CredentialsUnavailable,
+    CredentialAmbiguous {
+        credential: String,
+        candidate_ids: Vec<String>,
+    },
     /// A read arrived while the session's running run waits for its compaction Setup answer,
     /// which may anchor the run's tag numbers at a checkpoint. Refused `transient`, writing
     /// nothing, so no reader sees a number that changes once the answer is durable.
@@ -2438,6 +2443,8 @@ impl From<OpenError> for ServeError {
 impl std::fmt::Display for ServeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ServeError::CredentialsUnavailable => write!(f, "the vault credential listing has not loaded yet"),
+            ServeError::CredentialAmbiguous { credential, candidate_ids } => write!(f, "credential {credential} is ambiguous: {}", candidate_ids.join(", ")),
             ServeError::SessionLogMissing { session, harness } => OpenError::SessionLogMissing { session: session.clone(), harness: harness.clone(), read: None }.fmt(f),
             Self::Upload(error) => error.fmt(f),
             Self::MediaTooLarge(_) => f.write_str("committed image exceeds a reported image limit"),
@@ -3752,6 +3759,14 @@ impl ServeHandler for crate::LineageRegistry {
                 Err(ServeError::WalNewerWriter { missing, reason })
             }
             SendOutcome::Transient(e) => Err(ServeError::Transient(e)),
+            SendOutcome::CredentialsUnavailable => Err(ServeError::CredentialsUnavailable),
+            SendOutcome::CredentialAmbiguous {
+                credential,
+                candidate_ids,
+            } => Err(ServeError::CredentialAmbiguous {
+                credential,
+                candidate_ids,
+            }),
             SendOutcome::AccountSelectionRefused(refusal) => {
                 Err(ServeError::AccountSelectionRefused(refusal))
             }

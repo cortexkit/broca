@@ -5123,6 +5123,8 @@ async fn send_response_bytes(
 
 fn refused_send_code(error: &ServeError) -> String {
     match error {
+        ServeError::CredentialsUnavailable => "credentials_unavailable".into(),
+        ServeError::CredentialAmbiguous { .. } => "credential_ambiguous".into(),
         ServeError::Upload(error) => error.code.into(),
         ServeError::ContextCeiling(_) => cortexkit_role_llm_runner::errors::CONTEXT_CEILING.into(),
         ServeError::UnknownSend => cortexkit_role_llm_runner::errors::UNKNOWN_SEND.into(),
@@ -5195,6 +5197,7 @@ fn refused_send_class(error: &ServeError) -> &'static str {
         ServeError::Open(_, Some(class)) => shared_class_name(*class),
         ServeError::AccountSelectionRefused(refusal) => shared_class_name(refusal.class),
         ServeError::RoutingUnavailable(_)
+        | ServeError::CredentialsUnavailable
         | ServeError::Transient(_)
         | ServeError::TagsAwaitSetup
         | ServeError::SessionMoving { .. }
@@ -5424,6 +5427,8 @@ async fn send_serve_error(
             return send_error_body(writer, ver, channel, epoch, corr, body).await;
         }
         ServeError::Upload(_)
+        | ServeError::CredentialsUnavailable
+        | ServeError::CredentialAmbiguous { .. }
         | ServeError::SessionTooLarge { .. }
         | ServeError::RetainedSessionTooLarge { .. }
         | ServeError::Open(_, _)

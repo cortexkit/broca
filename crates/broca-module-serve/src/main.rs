@@ -450,10 +450,9 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let _catalog_poll = spawn_catalog_poll(Arc::new(catalog_poller));
 
-    // Provider→method defaults name the vault credential
-    // selected for a run. The mock path deliberately skips this load; see the rule on
-    // `method_config_for_launch`.
-    let auth_methods = method_config_for_launch(mock_provider_path, || {
+    broca_module_serve::vault_config::warn_obsolete_vault_config().map_err(ServeIoError)?;
+    // The retired method file is only checked for presence, never opened.
+    let _obsolete_methods = method_config_for_launch(mock_provider_path, || {
         broca_module_serve::MethodConfig::load_resolved(
             broca_module_serve::MethodConfig::default_path(),
         )
@@ -591,9 +590,8 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         // Every credential is read by grant, by credential id. The daemon deliberately never
         // opens the capability-handle file: the vault revokes this module's handles once no
         // placed build reads them, so a handle read here would fail for every run.
-        let credential_ids =
-            broca_module_serve::VaultCredentialIds::load_default_path().map_err(ServeIoError)?;
-        let addressing = broca_module_serve::VaultAddressing::new(credential_ids);
+        let listing_cache = Arc::new(broca_module_serve::account_routing::ListingCache::default());
+        let addressing = broca_module_serve::VaultAddressing::new(Arc::clone(&listing_cache));
         // A process-global identity for broca's vault calls, not a conversation identity.
         // Only harness/session travel in the wire bind; the local storage-root field is not sent.
         let vault_bind = broca_protocol::BindIdentity::new(
@@ -702,12 +700,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
                 broca_module_serve::system_one::credential::VaultCredential {
                     client: Arc::clone(&system_one_vault),
                     credential_id: credential_id.to_owned(),
-                    vault_id: addressing
-                        .vault_id_for(
-                            &broca_module_serve::CredentialId::parse(credential_id)
-                                .expect("a System One credential id parses"),
-                        )
-                        .into_owned(),
+                    addressing: Some(addressing.clone()),
                 },
             )
         };
@@ -739,19 +732,16 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         // export fact is what made that unnecessary.
         tracing::info!(
             target: "credentials",
-            "auth source = vault (every credential is read by grant as {}; \
-             vault.credential_ids aliases: {:?})",
+            "auth source = vault (every credential is read by grant as {}; credentials resolved from listed rows)",
             client
                 .scoped_principal()
-                .unwrap_or_else(|| "nobody (no supervised consumer identity)".to_string()),
-            addressing.aliases()
+                .unwrap_or_else(|| "nobody (no supervised consumer identity)".to_string())
         );
-        let listing_cache = broca_module_serve::account_routing::ListingCache::default();
         broca_module_serve::account_routing::publish_unmapped(listing_cache.unmapped());
         executor_impl = executor_impl.with_vault(executor::VaultAuth {
             client,
             addressing,
-            methods: auth_methods,
+            methods: broca_module_serve::MethodConfig::from_listing(Arc::clone(&listing_cache)),
             gauge: vault_gauge.clone(),
             cache: executor::VaultLkgCache::default(),
             listing: listing_cache,
@@ -1530,30 +1520,16 @@ fn shutdown_signal() -> std::io::Result<impl std::future::Future<Output = ()>> {
     }
 }
 
-/// A mock/base-url launch must not load the developer's real auth-methods config.
-///
-/// Extracted from `main` so the rule is reachable by a test. Inline in `async fn main` it was
-/// stated in a comment and enforced by nothing, which is the shape where a refactor can drop the
-/// branch and every test still passes.
-///
-/// WHY IT MATTERS: on the mock path every run authenticates `AuthMode::None`, so there is no
-/// credential to name and `auth_selection` must stay unset. Loading the real config would give
-/// those runs a provider-method default they cannot honour, and the WAL would then freeze an
-/// `auth_selection` describing a credential the run never used -- durable, wrong, and carried
-/// into billing export as an account attribution for a run that authenticated with nothing.
-///
-/// It is also the reason a mock rig needs no config file on disk: reading one would make the
-/// e2e suites depend on developer state.
+/// Launches only check whether the obsolete method file exists so the operator can delete it.
+/// Mock launches may warn too, but neither path reads method defaults.
 fn method_config_for_launch<F>(
-    mock_provider_path: bool,
+    _mock_provider_path: bool,
     load: F,
 ) -> Result<broca_module_serve::MethodConfig, String>
 where
     F: FnOnce() -> Result<broca_module_serve::MethodConfig, String>,
 {
-    if mock_provider_path {
-        return Ok(broca_module_serve::MethodConfig::empty());
-    }
+    // Checking for an obsolete file is safe even for mocks: no credential values are read.
     load()
 }
 
@@ -2989,9 +2965,7 @@ mod executor {
         pub client: broca_subc::VaultClient,
         /// Per credential key: the vault credential id to read by grant.
         pub addressing: broca_module_serve::VaultAddressing,
-        /// The per-provider default auth method (config-home). Resolves a run's
-        /// `(provider[, pinned method])` → the credential id whose handle to look up. A
-        /// provider absent here uses [`FALLBACK_METHOD`] (api-key, the long tail).
+        /// Default methods from the same cached rows used for credential addressing.
         pub methods: broca_module_serve::MethodConfig,
         /// The health gauge this executor stamps from vault-call outcomes, so the
         /// `health.check` reply reports live vault reachability without probing anything.
@@ -3000,7 +2974,7 @@ mod executor {
         pub cache: VaultLkgCache,
         /// The latest `credential.list_scoped` answer: the candidate accounts broca offers
         /// routing when it asks which account a run should use.
-        pub listing: broca_module_serve::account_routing::ListingCache,
+        pub listing: Arc<broca_module_serve::account_routing::ListingCache>,
     }
 
     /// List the vault's credentials now and keep the answer as the latest listing.
@@ -3017,8 +2991,7 @@ mod executor {
         }
     }
 
-    /// The latest listing. A stale one is returned at once while one refresh runs behind it;
-    /// with none cached yet, this lists now.
+    /// Return cached rows immediately, refreshing in the background if absent or stale.
     async fn latest_listing(vault: Arc<VaultAuth>) -> Option<Arc<broca_subc::vault::ScopedList>> {
         match vault.listing.get() {
             Some((listing, stale)) => {
@@ -3030,7 +3003,15 @@ mod executor {
                 }
                 Some(listing)
             }
-            None => refresh_listing(&vault).await,
+            None => {
+                if vault.listing.begin_refresh() {
+                    tokio::spawn(async move {
+                        refresh_listing(&vault).await;
+                        vault.listing.end_refresh();
+                    });
+                }
+                None
+            }
         }
     }
 
@@ -3045,11 +3026,14 @@ mod executor {
             >,
         > {
             Box::pin(async move {
-                let referenced = broca_module_serve::vault_audit::referenced_credentials(
-                    &self.methods,
-                    &self.addressing,
-                );
                 let listing = self.client.list_scoped().await;
+                if let Ok(list) = &listing {
+                    self.listing.store(list.clone());
+                }
+                let referenced = listing
+                    .as_ref()
+                    .map(broca_module_serve::vault_audit::referenced_credentials)
+                    .unwrap_or_default();
                 broca_module_serve::vault_audit::audit_listing(
                     self.client.scoped_principal(),
                     listing,
@@ -3068,7 +3052,11 @@ mod executor {
         status: u16,
         record_version: u64,
     ) -> Result<(), VaultError> {
-        let Some(vault_id) = vault.addressing.vault_id_for_selection(selection) else {
+        let Some(vault_id) = vault
+            .addressing
+            .vault_id_for_selection(selection)
+            .map_err(|error| VaultError::Protocol(error.to_string()))?
+        else {
             return Ok(());
         };
         vault
@@ -3619,7 +3607,7 @@ mod executor {
         /// List the vault's credentials once at boot, in the background, so the first
         /// admission finds its candidates ready instead of listing inside its budget.
         pub fn prime_account_listing(&self) {
-            let (Some(vault), Some(_)) = (self.vault.clone(), self.routing.as_ref()) else {
+            let Some(vault) = self.vault.clone() else {
                 return;
             };
             tokio::spawn(async move {
@@ -3744,7 +3732,7 @@ mod executor {
                 .await
             {
                 Ok(choice) => choice,
-                Err(broca_module_serve::account_routing::ChoiceRefusal::Refused(refusal))
+                Err(RunError::AccountSelectionRefused(refusal))
                     if job.req.route_decision_id.is_some()
                         && refusal.routing_code == "unknown_decision" =>
                 {
@@ -3756,8 +3744,7 @@ mod executor {
                     AccountChoice::NotApplicable
                 }
                 Err(refusal) => {
-                    let error = RunError::from(refusal);
-                    return Err(error);
+                    return Err(refusal);
                 }
             };
             if let (
@@ -3795,6 +3782,14 @@ mod executor {
                         job.req.model.provider_module_id.as_str(),
                         frozen_credential_id.as_deref(),
                         frozen_auth_method.as_deref(),
+                        if fresh_episode {
+                            None
+                        } else {
+                            prior_run
+                                .as_ref()
+                                .and_then(|prior| prior.config.auth_selection.as_ref())
+                                .and_then(|selection| selection.resolved_credential_id.as_deref())
+                        },
                         fresh_episode,
                         pinned_method,
                         pinned_account,
@@ -4616,7 +4611,7 @@ mod executor {
             conversation: (Option<&str>, Option<&str>),
             hold_cap: broca_module_serve::account_routing::AccountHoldCap,
             service_tier: Option<&str>,
-        ) -> Result<AccountChoice, broca_module_serve::account_routing::ChoiceRefusal> {
+        ) -> Result<AccountChoice, RunError> {
             if !fresh_episode || self.provider_base_url.is_some() {
                 return Ok(AccountChoice::NotApplicable);
             }
@@ -4624,6 +4619,9 @@ mod executor {
                 return Ok(AccountChoice::NotApplicable);
             };
             let (pinned_method, pinned_account) = preference.pin;
+            let listing = latest_listing(Arc::clone(vault))
+                .await
+                .ok_or(RunError::CredentialsUnavailable)?;
             let (conversation_key, inherited_conversation_key) = conversation;
             let static_credential = broca_module_serve::auth_routing::resolve_credential_id(
                 req.model.provider_module_id.as_str(),
@@ -4656,10 +4654,11 @@ mod executor {
                     initial_input_bytes,
                     hold_cap,
                 },
-                latest_listing(Arc::clone(vault)),
+                async { Some(listing) },
                 deadline,
             )
             .await
+            .map_err(RunError::from)
         }
 
         /// Install the credential vault required for real provider calls.
@@ -4799,6 +4798,7 @@ mod executor {
                 provider_id,
                 frozen_credential_id,
                 None,
+                None,
                 fresh_episode,
                 pinned_method,
                 pinned_account,
@@ -4819,6 +4819,7 @@ mod executor {
             provider_id: &str,
             frozen_credential_id: Option<&str>,
             frozen_auth_method: Option<&str>,
+            frozen_resolved_id: Option<&str>,
             fresh_episode: bool,
             pinned_method: Option<AuthMethod>,
             pinned_account: Option<&str>,
@@ -4841,15 +4842,8 @@ mod executor {
             let vault = self.vault.as_ref().ok_or_else(|| {
                 RunError::Config("credential vault is required for real provider calls".into())
             })?;
-            // Which credential this run reads, under which broca key, and how it authenticates:
-            //  * a credential routing chose: the vault id routing returned, verbatim, with the
-            //    method from the vault metadata it was offered under. The id is never parsed;
-            //  * a resume of a selection frozen with its method: the frozen vault id verbatim,
-            //    with the frozen method, no parse and no `vault.credential_ids` alias lookup;
-            //  * anything else: a broca key, which a resume re-uses verbatim and a fresh run
-            //    resolves from the caller pin before config (api-key fallback for the long
-            //    tail). `select_credential_id` owns that branch so the resume invariant is
-            //    unit-tested in isolation.
+            // Routed and already-frozen vault ids are read verbatim. Fresh keys and older
+            // frozen keys use the same row resolver, with no file aliases or guessed ids.
             let routed = match account {
                 AccountChoice::Routed {
                     credential_id,
@@ -4878,10 +4872,18 @@ mod executor {
                     (Some((vault_id, _, _, _, method)), _) => {
                         ((*vault_id).clone(), (*vault_id).clone(), *method, true)
                     }
-                    (None, Some((vault_id, method))) => {
-                        (vault_id.to_string(), vault_id.to_string(), method, true)
-                    }
+                    (None, Some((vault_id, method))) => (
+                        vault_id.to_string(),
+                        frozen_resolved_id.unwrap_or(vault_id).to_string(),
+                        method,
+                        true,
+                    ),
                     (None, None) => {
+                        if frozen_resolved_id.is_none() {
+                            latest_listing(Arc::clone(vault))
+                                .await
+                                .ok_or(RunError::CredentialsUnavailable)?;
+                        }
                         let key = broca_module_serve::auth_routing::select_credential_id(
                             frozen_credential_id,
                             provider_id,
@@ -4894,7 +4896,29 @@ mod executor {
                         // credential id. A
                         // scoped not_found is final: nothing retries it another way, which
                         // would hide the misconfiguration the operator needs to see.
-                        let vault_id = vault.addressing.vault_id_for(&key).into_owned();
+                        let vault_id = match frozen_resolved_id {
+                            Some(id) => id.to_owned(),
+                            None => {
+                                let row = if frozen_credential_id.is_none()
+                                    && pinned_method.is_none()
+                                    && vault.methods.method_for(provider_id).is_none()
+                                {
+                                    None
+                                } else {
+                                    vault.addressing.vault_id_for(&key)?
+                                };
+                                row.ok_or_else(|| {
+                                    RunError::Config(broca_module_serve::scoped_not_found_message(
+                                        &vault
+                                            .client
+                                            .scoped_principal()
+                                            .unwrap_or_else(|| "this process's principal".into()),
+                                        &key.to_id_string(),
+                                        &key.to_id_string(),
+                                    ))
+                                })?
+                            }
+                        };
                         (key.to_id_string(), vault_id, key.method, false)
                     }
                 };
@@ -4990,10 +5014,7 @@ mod executor {
                     // Freeze the vault-served account id verbatim alongside the credential id so
                     // usage export labels spend with the account this run authenticated with.
                     account_ref: account_id.clone(),
-                    resolved_credential_id: outcome
-                        .as_ref()
-                        .ok()
-                        .and_then(|token| token.resolved_credential_id.clone()),
+                    resolved_credential_id: Some(vault_id.clone()),
                     // Present only if the vault replied; see `recorded_vault_request`.
                     vault_request: recorded_request,
                     // How the account was chosen; a resume carries the decision frozen at
@@ -5201,7 +5222,7 @@ mod executor {
             use cortexkit_role_llm_runner::head_selection::{self, PlanModelProblem};
             let listing = if plan.get("model").is_some() && self.provider_base_url.is_none() {
                 match &self.vault {
-                    Some(vault) => vault.client.list_scoped().await.ok(),
+                    Some(vault) => latest_listing(Arc::clone(vault)).await,
                     None => None,
                 }
             } else {
@@ -5215,12 +5236,12 @@ mod executor {
                         let vault = self.vault.as_ref()?;
                         let key = broca_module_serve::auth_routing::resolve_credential_id(
                             &model.provider,
-                            None,
+                            Some(vault.methods.method_for(&model.provider)?),
                             None,
                             &vault.methods,
                             FALLBACK_METHOD,
                         );
-                        let id = vault.addressing.vault_id_for(&key);
+                        let resolved = vault.addressing.vault_id_for(&key);
                         let listing = listing.as_ref()?;
                         let routed = self.routing.is_some()
                             && key.method != AuthMethod::ApiKey
@@ -5232,22 +5253,18 @@ mod executor {
                             )
                             .distinct_accounts()
                                 > 1;
-                        let available = listing.credentials.iter().any(|row| {
-                            row.state == "active"
-                                && row.operations.iter().any(|op| op == "read")
-                                && ((row.id == id
-                                    && row
-                                        .auth_method
-                                        .as_deref()
-                                        .is_none_or(|method| method == key.method.as_token())
-                                    && (row.provider_ids.is_empty()
-                                        || row.provider_ids.contains(&model.provider)))
-                                    || (routed
-                                        && row.account_id.is_some()
-                                        && row.provider_ids.contains(&model.provider)
-                                        && row.auth_method.as_deref()
-                                            == Some(key.method.as_token())))
-                        });
+                        let available = resolved.ok().flatten().is_some_and(|id| {
+                            listing.credentials.iter().any(|row| {
+                                row.id == id && row.operations.iter().any(|op| op == "read")
+                            })
+                        }) || (routed
+                            && listing.credentials.iter().any(|row| {
+                                row.state == "active"
+                                    && row.operations.iter().any(|op| op == "read")
+                                    && row.account_id.is_some()
+                                    && row.provider_ids.contains(&model.provider)
+                                    && row.auth_method.as_deref() == Some(key.method.as_token())
+                            }));
                         if !available {
                             return None;
                         }
@@ -5556,6 +5573,7 @@ mod executor {
                     provider_id,
                     selection.map(|selection| selection.credential_id.as_str()),
                     selection.and_then(|selection| selection.auth_method.as_deref()),
+                    selection.and_then(|selection| selection.resolved_credential_id.as_deref()),
                     false,
                     None,
                     None,
@@ -6314,11 +6332,14 @@ mod executor {
         /// test that merely checked the returned config was empty would pass even if the file
         /// had been read and happened to be empty.
         #[test]
-        fn a_mock_launch_never_reads_the_real_auth_methods_config() {
+        fn a_mock_launch_does_not_load_any_method_defaults() {
+            let path = fresh_vault_root("mock-obsolete-methods");
+            std::fs::create_dir_all(&path).unwrap();
             let mocked = crate::method_config_for_launch(true, || {
-                panic!("a mock launch must not touch the auth-methods config on disk")
+                broca_module_serve::MethodConfig::load(&path)
             })
-            .expect("the mock arm returns an empty config");
+            .expect("checking an obsolete directory does not read it");
+            std::fs::remove_dir_all(path).unwrap();
             // An empty config overrides nothing, so the caller's fallback survives. Uses the
             // real resolver rather than an accessor so the assertion is about the behaviour
             // that matters at admission.
@@ -6364,17 +6385,25 @@ mod executor {
             );
         }
 
-        fn load_method_config(label: &str, defaults: &str) -> broca_module_serve::MethodConfig {
-            let path = broca_test_support::scratch_root()
-                .join(format!("broca-methods-{label}-{}.json", std::process::id()));
-            std::fs::write(&path, format!(r#"{{"defaults":{defaults}}}"#)).unwrap();
-            let methods = broca_module_serve::MethodConfig::load(&path).unwrap();
-            std::fs::remove_file(path).unwrap();
-            methods
+        fn load_method_config(_label: &str, defaults: &str) -> broca_module_serve::MethodConfig {
+            let defaults: std::collections::BTreeMap<String, String> =
+                serde_json::from_str(defaults).unwrap();
+            let cache = Arc::new(broca_module_serve::account_routing::ListingCache::default());
+            let credentials = defaults.into_iter().map(|(provider, method)| serde_json::from_value(serde_json::json!({
+                "id":format!("{method}:{provider}"), "type":method, "auth_method":method,
+                "provider_ids":[provider], "state":"active", "categories":[], "serves":[], "operations":["read"], "record_version":1
+            })).unwrap()).collect();
+            cache.store(broca_subc::vault::ScopedList {
+                credentials,
+                grants: 1,
+                grant_tuples: vec![],
+                view: "methods-fixture".into(),
+            });
+            broca_module_serve::MethodConfig::from_listing(cache)
         }
 
         #[test]
-        fn caller_auth_pin_wins_over_provider_config_at_admission() {
+        fn caller_auth_pin_wins_over_vault_default_at_admission() {
             let methods = load_method_config("caller-pin", r#"{"openai":"oauth"}"#);
             let auth = AuthRequest {
                 pool: None,

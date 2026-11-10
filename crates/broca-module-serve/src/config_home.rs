@@ -333,7 +333,7 @@ mod tests {
 #[cfg(test)]
 mod config_loading {
     use super::*;
-    use crate::auth_routing::{AuthMethod, MethodConfig, METHODS_PATH_ENV};
+    use crate::auth_routing::{MethodConfig, METHODS_PATH_ENV};
     use crate::billing_routing::ChargeBasisTable;
     use crate::cache_routing::{CacheTtlTable, CONFIG_PATH_ENV};
     use crate::vault_config::VaultHandles;
@@ -399,19 +399,15 @@ mod config_loading {
     }
 
     #[test]
-    fn auth_explicit_missing_names_override_and_path() {
+    fn obsolete_explicit_missing_method_file_is_ignored() {
         let fixture = Fixture::new();
-        let error = MethodConfig::load_resolved(fixture.resolve(
+        let config = MethodConfig::load_resolved(fixture.resolve(
             METHODS_PATH_ENV,
             "auth-methods.json",
             true,
         ))
-        .unwrap_err();
-        assert!(error.contains(METHODS_PATH_ENV), "{error}");
-        assert!(
-            error.contains(&fixture.path("auth-methods.json").display().to_string()),
-            "{error}"
-        );
+        .unwrap();
+        assert_eq!(config.method_for("anthropic"), None);
     }
 
     #[test]
@@ -427,7 +423,7 @@ mod config_loading {
     }
 
     #[test]
-    fn auth_explicit_present_loads_configured_method() {
+    fn obsolete_explicit_present_method_file_is_ignored() {
         let fixture = Fixture::new();
         fixture.write("auth-methods.json", r#"{"defaults":{"anthropic":"oauth"}}"#);
         let config = MethodConfig::load_resolved(fixture.resolve(
@@ -436,7 +432,7 @@ mod config_loading {
             true,
         ))
         .unwrap();
-        assert_eq!(config.method_for("anthropic"), Some(AuthMethod::Oauth));
+        assert_eq!(config.method_for("anthropic"), None);
     }
 
     #[test]

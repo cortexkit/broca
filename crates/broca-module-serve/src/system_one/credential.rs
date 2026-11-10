@@ -71,8 +71,8 @@ pub struct VaultCredential {
     /// The credential's canonical id (for example `apikey:typesafe`), reported in
     /// `auth_failed`'s detail.
     pub credential_id: String,
-    /// The vault's id for the credential: `credential_id`, or its configured alias.
-    pub vault_id: String,
+    /// Fixed sources resolve a broca key from rows; routed sources already name a vault id.
+    pub addressing: Option<crate::VaultAddressing>,
 }
 
 /// The shortest life a token may have left when it is handed out, so one provider attempt
@@ -90,8 +90,19 @@ impl CredentialSource for VaultCredential {
     }
 
     async fn secret(&self) -> Result<Option<ProviderSecret>, String> {
+        let vault_id = match &self.addressing {
+            Some(addressing) => {
+                let key = crate::CredentialId::parse(&self.credential_id)
+                    .ok_or_else(|| format!("invalid credential key {}", self.credential_id))?;
+                addressing
+                    .vault_id_for(&key)
+                    .map_err(|error| error.to_string())?
+                    .ok_or_else(|| format!("credential {} not found", self.credential_id))?
+            }
+            None => self.credential_id.clone(),
+        };
         self.client
-            .get_scoped(&self.vault_id, Some(VAULT_MIN_TTL_MS))
+            .get_scoped(&vault_id, Some(VAULT_MIN_TTL_MS))
             .await
             .result
             .map(|token| {
@@ -100,7 +111,7 @@ impl CredentialSource for VaultCredential {
                     account_id: token.account_id,
                     auth_selection: token
                         .resolved_credential_id
-                        .or_else(|| Some(self.credential_id.clone())),
+                        .or_else(|| Some(vault_id.clone())),
                 })
             })
             .map_err(|error| error.to_string())

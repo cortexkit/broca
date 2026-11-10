@@ -4,13 +4,10 @@
 //! ## The daemon reads by credential id only
 //! The broca daemon never loads the handle file. Every credential it serves is read with
 //! `credential.get_scoped`, addressed by vault credential id and authorized by the read grant
-//! an operator gave this module's supervised principal (`reserved:broca`). The vault id is the
-//! routing key itself unless `vault.credential_ids` in `broca.jsonc` maps it:
-//! ```jsonc
-//! { "vault": { "credential_ids": { "apikey:synthetic": "apikey:synthetic:main" } } }
-//! ```
-//! That map is ordinary configuration because a credential id is not a secret. See
-//! [`VaultAddressing`]. A scoped `not_found` is not retried any other way: a fallback would
+//! an operator gave this module's supervised principal (`reserved:broca`). [`VaultAddressing`]
+//! finds the credential in cached vault rows, or uses an already-frozen vault id verbatim.
+//! The old `vault.credential_ids` section is ignored. A scoped `not_found` is not retried
+//! any other way: a fallback would
 //! hide exactly the misconfiguration the operator needs to see.
 //!
 //! ## The handle file (developer tools only)
@@ -51,7 +48,6 @@ struct HandleFile {
 
 // A plain HashMap deserializer silently keeps the last value when a JSON object repeats a
 // credential id. Reject the whole file instead of selecting one of two conflicting secrets.
-// Also used for `vault.credential_ids`, where a repeated key would silently pick one of two ids.
 fn deserialize_handles<'de, D>(deserializer: D) -> Result<HashMap<String, String>, D::Error>
 where
     D: Deserializer<'de>,
@@ -321,141 +317,68 @@ fn load_devtools_handle_with(
         })
 }
 
-/// The `vault` section of `broca.jsonc`. Only `credential_ids` exists; an unknown key is
-/// refused so a misspelt section name cannot silently leave every alias unapplied.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct VaultSection {
-    #[serde(default, deserialize_with = "deserialize_handles")]
-    credential_ids: HashMap<String, String>,
+/// Warn once at boot without interpreting the obsolete section or any of its values.
+pub fn warn_obsolete_vault_config() -> Result<(), String> {
+    let crate::config_home::ConfigHome::Resolved { path, .. } =
+        crate::config_home::config_file(crate::cache_routing::CONFIG_PATH_ENV, "broca.jsonc")
+    else {
+        return Ok(());
+    };
+    warn_obsolete_vault_config_at(&path)
 }
 
-/// The part of `broca.jsonc` this module reads. Other top-level keys belong to other loaders.
-#[derive(Deserialize)]
-struct BrocaConfigVaultView {
-    #[serde(default)]
-    vault: Option<VaultSection>,
+pub fn warn_obsolete_vault_config_at(path: &Path) -> Result<(), String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("read broca config {}: {error}", path.display())),
+    };
+    let stripped = crate::cache_routing::strip_trailing_commas(
+        &crate::cache_routing::strip_jsonc_comments(&text),
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(&stripped).map_err(|error| error.to_string())?;
+    if value.get("vault").is_some() {
+        tracing::warn!("broca.jsonc vault section is no longer read and can be deleted");
+    }
+    Ok(())
 }
 
-/// `vault.credential_ids` from `broca.jsonc`: broca credential key → the vault credential id
-/// to read by grant, for a key whose vault id differs from the key. Not a secret.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct VaultCredentialIds {
-    ids: HashMap<String, String>,
-}
-
-impl VaultCredentialIds {
-    /// Read from the config-home `broca.jsonc` (or `$BROCA_CONFIG_PATH`). A missing file, or
-    /// no config home, means no aliases.
-    pub fn load_default_path() -> Result<Self, String> {
-        match crate::config_home::config_file(crate::cache_routing::CONFIG_PATH_ENV, "broca.jsonc")
-        {
-            crate::config_home::ConfigHome::Resolved { path, .. } => Self::load(&path),
-            crate::config_home::ConfigHome::Unresolvable => Ok(Self::default()),
-        }
-    }
-
-    pub fn load(path: &Path) -> Result<Self, String> {
-        let text = match std::fs::read_to_string(path) {
-            Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Self::default())
-            }
-            Err(error) => return Err(format!("read broca config {}: {error}", path.display())),
-        };
-        Self::parse(&text)
-            .map_err(|error| format!("parse broca config {}: {error}", path.display()))
-    }
-
-    pub fn parse(text: &str) -> Result<Self, String> {
-        let stripped = crate::cache_routing::strip_trailing_commas(
-            &crate::cache_routing::strip_jsonc_comments(text),
-        );
-        let view: BrocaConfigVaultView =
-            serde_json::from_str(&stripped).map_err(|error| format!("vault: {error}"))?;
-        let ids = view
-            .vault
-            .map(|section| section.credential_ids)
-            .unwrap_or_default();
-        for (key, vault_id) in &ids {
-            // The key is matched against the routing key a run resolves, so one that cannot
-            // parse as a credential key can never apply: refuse it rather than ignore it.
-            if CredentialId::parse(key).is_none() {
-                return Err(format!(
-                    "vault.credential_ids key {key:?} is not a credential key \
-                     (<method>:<provider>[:<account>])"
-                ));
-            }
-            if vault_id.trim().is_empty() {
-                return Err(format!(
-                    "vault.credential_ids.{key} must name a credential id"
-                ));
-            }
-        }
-        Ok(Self { ids })
-    }
-
-    /// Build from explicit pairs, for callers that do not read `broca.jsonc`.
-    pub fn from_pairs<I, K, V>(pairs: I) -> Self
-    where
-        I: IntoIterator<Item = (K, V)>,
-        K: Into<String>,
-        V: Into<String>,
-    {
-        Self {
-            ids: pairs
-                .into_iter()
-                .map(|(key, id)| (key.into(), id.into()))
-                .collect(),
-        }
-    }
-}
-
-/// Which vault credential id the daemon reads for each broca credential key. Every read is by
-/// credential id under this module's grant (`credential.get_scoped`); the daemon holds no
-/// capability handles. The id is the key itself unless `vault.credential_ids` maps it.
-#[derive(Clone, Debug, Default)]
+/// Row-based addressing shares the same cached listing as default-method selection and routing.
+#[derive(Clone, Default)]
 pub struct VaultAddressing {
-    credential_ids: VaultCredentialIds,
+    listing: std::sync::Arc<crate::account_routing::ListingCache>,
 }
 
 impl VaultAddressing {
-    pub fn new(credential_ids: VaultCredentialIds) -> Self {
-        Self { credential_ids }
+    pub fn new(listing: std::sync::Arc<crate::account_routing::ListingCache>) -> Self {
+        Self { listing }
     }
 
-    /// The vault credential id for a broca credential key: its `vault.credential_ids` entry
-    /// when it has one, otherwise the key itself.
-    pub fn vault_id_for<'a>(&'a self, key: &CredentialId) -> std::borrow::Cow<'a, str> {
-        let key = key.to_id_string();
-        match self.credential_ids.ids.get(&key) {
-            Some(vault_id) => std::borrow::Cow::Borrowed(vault_id),
-            None => std::borrow::Cow::Owned(key),
+    pub fn vault_id_for(&self, key: &CredentialId) -> Result<Option<String>, broca_core::RunError> {
+        let (listing, _) = self
+            .listing
+            .get()
+            .ok_or(broca_core::RunError::CredentialsUnavailable)?;
+        Ok(crate::auth_routing::credential_row(&listing, key)?.map(|row| row.id.clone()))
+    }
+
+    /// Frozen vault ids are authoritative even before the listing is loaded. Older selections
+    /// without one resolve their frozen key, never today's default method.
+    pub fn vault_id_for_selection(
+        &self,
+        selection: &broca_wal::AuthSelection,
+    ) -> Result<Option<String>, broca_core::RunError> {
+        if let Some(id) = &selection.resolved_credential_id {
+            return Ok(Some(id.clone()));
         }
-    }
-
-    /// The vault credential id a frozen selection reads. A selection frozen with its
-    /// `auth_method` names the vault's own credential id, read verbatim with no alias lookup;
-    /// an older one holds a broca key, mapped like any key. `None` for a key that does not
-    /// parse, which no read ever used.
-    pub fn vault_id_for_selection(&self, selection: &broca_wal::AuthSelection) -> Option<String> {
         if selection.auth_method.is_some() {
-            return Some(selection.credential_id.clone());
+            return Ok(Some(selection.credential_id.clone()));
         }
-        CredentialId::parse(&selection.credential_id)
-            .map(|key| self.vault_id_for(&key).into_owned())
-    }
-
-    /// The `vault.credential_ids` aliases, sorted by key, for the startup census.
-    pub fn aliases(&self) -> Vec<(&str, &str)> {
-        let mut aliases: Vec<(&str, &str)> = self
-            .credential_ids
-            .ids
-            .iter()
-            .map(|(key, id)| (key.as_str(), id.as_str()))
-            .collect();
-        aliases.sort_unstable();
-        aliases
+        match CredentialId::parse(&selection.credential_id) {
+            Some(key) => self.vault_id_for(&key),
+            None => Ok(None),
+        }
     }
 }
 
@@ -466,18 +389,18 @@ impl VaultAddressing {
 /// therefore names both causes, the principal and the id that was asked for, and points to the
 /// vault's own audit log, which records which of the two it was.
 pub fn scoped_not_found_message(principal: &str, key: &str, vault_id: &str) -> String {
-    let alias = if key == vault_id {
+    let source = if key == vault_id {
         String::new()
     } else {
-        format!(" (broca key '{key}', mapped by vault.credential_ids)")
+        format!(" (broca key '{key}', resolved from vault rows)")
     };
     format!(
-        "vault credential '{vault_id}'{alias} was read by grant as '{principal}' and the vault \
-         answered not_found. That means either no credential has id '{vault_id}', or \
+        "vault credential '{vault_id}'{source} was looked up from the vault's rows by auth method \
+         and provider for '{principal}': not_found. That means either no credential has id '{vault_id}', or \
          '{principal}' holds no read grant on it: the vault answers both the same way on \
          purpose. `ck auth events` shows which one it was. To grant it: ck auth grant \
          --principal {principal} --selector-kind exact --selector {vault_id} --operation read; \
-         or map '{key}' to the right id under vault.credential_ids in broca.jsonc"
+         or set auth_method/provider_ids on the right active vault row for broca key '{key}'"
     )
 }
 
@@ -598,63 +521,50 @@ mod tests {
         CredentialId::parse(text).expect("a valid credential key")
     }
 
-    /// Every key is read by grant: as its alias when it has one, and as itself otherwise.
     #[test]
-    fn vault_id_is_the_alias_else_the_key() {
-        let addressing = VaultAddressing::new(VaultCredentialIds::from_pairs([(
-            "apikey:synthetic",
-            "apikey:synthetic:main",
-        )]));
+    fn addressing_uses_rows_and_frozen_ids_without_legacy_aliases() {
+        let cache = std::sync::Arc::new(crate::account_routing::ListingCache::default());
+        let addressing = VaultAddressing::new(cache.clone());
+        assert!(matches!(
+            addressing.vault_id_for(&key("apikey:openai")),
+            Err(broca_core::RunError::CredentialsUnavailable)
+        ));
+        let frozen: broca_wal::AuthSelection = serde_json::from_value(serde_json::json!({
+            "credential_id":"apikey:kimi-code-plan-global", "resolved_credential_id":"frozen-vault-id"
+        })).unwrap();
         assert_eq!(
-            addressing.vault_id_for(&key("apikey:synthetic")),
-            "apikey:synthetic:main"
+            addressing
+                .vault_id_for_selection(&frozen)
+                .unwrap()
+                .as_deref(),
+            Some("frozen-vault-id")
         );
+        cache.store(crate::auth_routing::row_listing());
         assert_eq!(
-            addressing.vault_id_for(&key("oauth:anthropic")),
-            "oauth:anthropic"
+            addressing
+                .vault_id_for(&key("apikey:kimi-code-plan-global"))
+                .unwrap()
+                .as_deref(),
+            Some("apikey:kimi-for-coding")
         );
-        assert_eq!(
-            addressing.aliases(),
-            vec![("apikey:synthetic", "apikey:synthetic:main")]
-        );
-    }
-
-    #[test]
-    fn credential_ids_parse_from_the_vault_section_of_broca_jsonc() {
-        let ids = VaultCredentialIds::parse(
-            r#"{
-                // other sections belong to other loaders
-                "providers": {},
-                "vault": { "credential_ids": { "apikey:synthetic": "apikey:synthetic:main", }, },
-            }"#,
+        let older: broca_wal::AuthSelection = serde_json::from_value(
+            serde_json::json!({"credential_id":"apikey:kimi-code-plan-global"}),
         )
         .unwrap();
         assert_eq!(
-            ids,
-            VaultCredentialIds::from_pairs([("apikey:synthetic", "apikey:synthetic:main")])
+            addressing
+                .vault_id_for_selection(&older)
+                .unwrap()
+                .as_deref(),
+            Some("apikey:kimi-for-coding")
         );
         assert_eq!(
-            VaultCredentialIds::parse(r#"{"providers":{}}"#).unwrap(),
-            VaultCredentialIds::default()
+            addressing
+                .vault_id_for_selection(&frozen)
+                .unwrap()
+                .as_deref(),
+            Some("frozen-vault-id")
         );
-        for (bad, needle) in [
-            (r#"{"vault":{"credential_id":{}}}"#, "unknown field"),
-            (
-                r#"{"vault":{"credential_ids":{"apikey:a":"x","apikey:a":"y"}}}"#,
-                "duplicate",
-            ),
-            (
-                r#"{"vault":{"credential_ids":{"synthetic":"x"}}}"#,
-                "not a credential key",
-            ),
-            (
-                r#"{"vault":{"credential_ids":{"apikey:a":" "}}}"#,
-                "must name",
-            ),
-        ] {
-            let error = VaultCredentialIds::parse(bad).expect_err(bad);
-            assert!(error.contains(needle), "{bad}: {error}");
-        }
     }
 
     #[test]
@@ -829,5 +739,67 @@ mod windows_acl_tests {
             assert_eq!(std::fs::read(&path).unwrap(), br#"{"handles":{}}"#);
             assert!(VaultHandles::load(&path).unwrap().handles.is_empty());
         }
+    }
+}
+
+#[cfg(test)]
+mod obsolete_credential_config_tests {
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct Log(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Log {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn obsolete_files_boot_normally_with_one_warning_each_and_no_values_loaded() {
+        let root = broca_test_support::scratch_root()
+            .join(format!("obsolete-credentials-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let methods = root.join("auth-methods.json");
+        let config = root.join("broca.jsonc");
+        // Invalid method bytes and an arbitrary vault value must not be deserialized as maps.
+        std::fs::write(&methods, b"not-json-and-not-readable-as-methods").unwrap();
+        std::fs::write(
+            &config,
+            r#"{"vault":{"credential_ids":false,"unknown":"ignored"}}"#,
+        )
+        .unwrap();
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let log = Log(bytes.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || log.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let defaults = crate::MethodConfig::load(&methods).unwrap();
+            assert_eq!(defaults.method_for("openai"), None);
+            super::warn_obsolete_vault_config_at(&config).unwrap();
+        });
+        let text = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        assert_eq!(text.matches("WARN").count(), 2, "{text}");
+        assert_eq!(
+            text.matches("auth-methods.json is no longer read and can be deleted")
+                .count(),
+            1,
+            "{text}"
+        );
+        assert_eq!(
+            text.matches("broca.jsonc vault section is no longer read and can be deleted")
+                .count(),
+            1,
+            "{text}"
+        );
+        assert!(!text.contains("not-json-and"));
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
