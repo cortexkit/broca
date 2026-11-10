@@ -71,6 +71,10 @@ impl Config {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Health {
     pub live_converting: bool,
+    pub live_background_converted: u64,
+    pub live_skipped_busy: u64,
+    pub live_remaining: u64,
+    pub deferred_no_identity: u64,
     pub progress: Progress,
     #[serde(skip)]
     pub failed_sessions: BTreeMap<String, String>,
@@ -107,6 +111,7 @@ pub struct Engine {
     pub ledger: Arc<Ledger>,
     health: Arc<RwLock<Health>>,
     config: Config,
+    stderr_warnings: bool,
     source_index: Option<broca_store::SqliteStore>,
     inventory: Option<broca_store::session_inventory::SessionInventory>,
     mover: OnceLock<Arc<crate::store_move::StoreMove>>,
@@ -116,6 +121,17 @@ pub struct Engine {
     pub(crate) crash: Option<&'static str>,
     #[cfg(test)]
     pub(crate) faults: crate::store_move::Faults,
+    #[cfg(test)]
+    pub(crate) background_fenced: Option<Arc<BackgroundProbe>>,
+    #[cfg(test)]
+    pub(crate) verification_records: Option<fn(&mut Vec<FramedRecord>)>,
+}
+
+#[cfg(test)]
+pub(crate) struct BackgroundProbe {
+    pub entered: tokio::sync::Notify,
+    pub release: tokio::sync::Semaphore,
+    pub sessions: Mutex<Vec<String>>,
 }
 
 #[derive(Default)]
@@ -187,6 +203,9 @@ impl Engine {
             ..Health::default()
         };
         for row in ledger.rows()? {
+            if row.source.member.is_none() && row.step != "done" {
+                health.live_remaining += 1;
+            }
             if !Path::new(&row.source.backup).starts_with(&backup) {
                 return Err(
                     "conversion ledger names a backup outside the configured backup root".into(),
@@ -227,6 +246,7 @@ impl Engine {
             ledger,
             health: Arc::new(RwLock::new(health)),
             config,
+            stderr_warnings: false,
             source_index,
             mover: OnceLock::new(),
             archive_inventory: Mutex::default(),
@@ -236,11 +256,23 @@ impl Engine {
             crash: None,
             #[cfg(test)]
             faults: Default::default(),
+            #[cfg(test)]
+            background_fenced: None,
+            #[cfg(test)]
+            verification_records: None,
         }))
     }
 
     pub fn publish_health(&self) {
         let _ = HEALTH.set(Arc::clone(&self.health));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn health_for_test(&self) -> Health {
+        self.health
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     /// Reuse the online move's checks for unsettled runs and held calls, and remove today's
@@ -303,13 +335,34 @@ impl Engine {
         outcome: Option<&str>,
         refusal: Option<&str>,
     ) -> Result<(), Failure> {
+        self.step_with_detail(source, step, outcome, refusal, None)
+    }
+
+    fn step_with_detail(
+        &self,
+        source: &Source,
+        step: &str,
+        outcome: Option<&str>,
+        refusal: Option<&str>,
+        detail: Option<&str>,
+    ) -> Result<(), Failure> {
         let old = self
             .ledger
             .row(&source.id)
             .map_err(io)?
             .ok_or_else(|| io("conversion source is not discovered"))?;
         self.ledger
-            .advance(&source.id, step, outcome, refusal)
+            .advance(
+                &source.id,
+                step,
+                outcome,
+                refusal,
+                detail.or_else(|| {
+                    (old.outcome.as_deref() == outcome && old.refusal.as_deref() == refusal)
+                        .then_some(old.detail.as_deref())
+                        .flatten()
+                }),
+            )
             .map_err(io)?;
         let mut health = self.health.write().unwrap_or_else(|p| p.into_inner());
         change_count(&mut health.progress.steps, &old.step, -1);
@@ -521,7 +574,8 @@ impl Engine {
         self.initialize_directories()?;
         let sources = self.enumerate_live()?;
         for source in sources {
-            self.process(&source, deployment, runtime, registry).await?;
+            self.process(&source, deployment, runtime, registry, false)
+                .await?;
         }
         self.health
             .write()
@@ -530,8 +584,8 @@ impl Engine {
         Ok(())
     }
 
-    /// Only one archive member is staged at once. The pause is outside every session fence;
-    /// ordinary requests can open actors between copies and always win a busy session.
+    /// One background pass: archives first, then closed idle live sessions by last write.
+    /// The pause is outside every session fence so other requests can open actors between copies.
     pub async fn run_archives(
         &self,
         deployment: &DeploymentKey,
@@ -543,13 +597,86 @@ impl Engine {
             return Ok(());
         }
         self.initialize_directories()?;
-        let sources = self.enumerate_archives()?;
+        let mut sources = self.enumerate_archives()?;
+        // Without a registry, there is no safe serving-session idleness check.
+        if registry.is_some() {
+            let mut live = self.enumerate_live()?;
+            live.sort_by_cached_key(|source| {
+                (
+                    broca_module::head_time::file_written_ms(&self.root.join(&source.path)),
+                    source.id.clone(),
+                )
+            });
+            self.health
+                .write()
+                .unwrap_or_else(|p| p.into_inner())
+                .live_remaining = self
+                .ledger
+                .rows()?
+                .iter()
+                .filter(|row| row.source.member.is_none() && row.step != "done")
+                .count() as u64;
+            sources.extend(live);
+        }
         for source in sources {
-            self.process(&source, deployment, runtime, registry).await?;
+            if registry.is_some_and(|registry| registry.stopping_signal().is_cancelled()) {
+                break;
+            }
+            let row = self
+                .ledger
+                .row(&source.id)?
+                .ok_or("conversion source is absent")?;
+            if row.step == "done" {
+                continue;
+            }
+            self.process(
+                &source,
+                deployment,
+                runtime,
+                registry,
+                source.member.is_none(),
+            )
+            .await?;
+            if source.member.is_none() {
+                let row = self
+                    .ledger
+                    .row(&source.id)?
+                    .ok_or("conversion source is absent")?;
+                if row.step == "done" {
+                    let mut health = self.health.write().unwrap_or_else(|p| p.into_inner());
+                    health.live_remaining = health.live_remaining.saturating_sub(1);
+                    if row.outcome.as_deref() == Some("converted") {
+                        health.live_background_converted += 1;
+                    }
+                }
+            }
             if !throttle.is_zero() {
                 tokio::time::sleep(throttle).await;
             }
             tokio::task::yield_now().await;
+        }
+        Ok(())
+    }
+
+    /// Revisit sessions skipped while busy, without rescanning the filesystem in a tight loop.
+    pub async fn run_background(
+        &self,
+        deployment: &DeploymentKey,
+        runtime: &broca_module::store_open::StoreRuntime,
+        registry: &broca_module::LineageRegistry,
+        throttle: Duration,
+    ) -> Result<(), String> {
+        if !self.config.archives {
+            return Ok(());
+        }
+        let stopping = registry.stopping_signal();
+        while !stopping.is_cancelled() {
+            self.run_archives(deployment, Some(runtime), Some(registry), throttle)
+                .await?;
+            tokio::select! {
+                _ = stopping.cancelled() => break,
+                _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+            }
         }
         Ok(())
     }
@@ -560,6 +687,7 @@ impl Engine {
         deployment: &DeploymentKey,
         runtime: Option<&broca_module::store_open::StoreRuntime>,
         registry: Option<&broca_module::LineageRegistry>,
+        background: bool,
     ) -> Result<(), String> {
         let row = self
             .ledger
@@ -579,18 +707,42 @@ impl Engine {
         } else {
             None
         };
-        let result = self.convert_one(&row, deployment, runtime, registry).await;
+        let result = self
+            .convert_one(&row, deployment, runtime, registry, background)
+            .await;
         match result {
             Ok(()) => Ok(()),
             Err(error) if error.class == "crash" => Err(error.message),
+            Err(error) if background && error.class == "session_busy" => {
+                self.health
+                    .write()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .live_skipped_busy += 1;
+                Ok(())
+            }
+            Err(error) if background && error.class == "deferred_no_identity" => {
+                self.health
+                    .write()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .deferred_no_identity += 1;
+                Ok(())
+            }
             Err(error) => {
-                tracing::warn!(target: "session_conversion", source = %source.id, class = %error.class, "{}", error.message);
+                tracing::warn!(target: "session_conversion", path = %source.path, source = %source.id, class = %error.class, detail = %error.message, "session conversion failed");
+                // The --convert-clone command runs without daemon logging, so warn on stderr too.
+                if self.stderr_warnings {
+                    eprintln!(
+                        "WARN session_conversion path={} class={} detail={:?}",
+                        source.id, error.class, error.message
+                    );
+                }
                 if error.terminal {
-                    self.step(
+                    self.step_with_detail(
                         source,
                         "awaiting_backup",
                         Some("refused"),
                         Some(&error.class),
+                        Some(&error.message),
                     )
                     .map_err(|error| error.message)?;
                     if let Some(address) = source_address(source) {
@@ -622,8 +774,14 @@ impl Engine {
                         self.record_error(error.message);
                         return Ok(());
                     }
-                    self.step(source, &current.step, Some("failed"), Some(&error.class))
-                        .map_err(|error| error.message)?;
+                    self.step_with_detail(
+                        source,
+                        &current.step,
+                        Some("failed"),
+                        Some(&error.class),
+                        Some(&error.message),
+                    )
+                    .map_err(|error| error.message)?;
                     if let Some(address) = source_address(source) {
                         self.health
                             .write()
@@ -646,8 +804,14 @@ impl Engine {
         registry: &broca_module::LineageRegistry,
     ) -> Result<(), String> {
         let row = self.ledger.row(id)?.ok_or("conversion source is absent")?;
-        self.process(&row.source, deployment, Some(runtime), Some(registry))
-            .await
+        self.process(
+            &row.source,
+            deployment,
+            Some(runtime),
+            Some(registry),
+            false,
+        )
+        .await
     }
 
     async fn convert_one(
@@ -656,6 +820,7 @@ impl Engine {
         deployment: &DeploymentKey,
         runtime: Option<&broca_module::store_open::StoreRuntime>,
         registry: Option<&broca_module::LineageRegistry>,
+        background: bool,
     ) -> Result<(), Failure> {
         let source = &row.source;
         if matches!(row.step.as_str(), "awaiting_backup" | "backing_up") {
@@ -688,29 +853,61 @@ impl Engine {
             self.step(source, "awaiting_backup", Some("superseded"), None)?;
             return self.backup_ready(source);
         }
-        let (records, _, _) = read_source(&path, source.member.as_deref())?;
+        let unidentified = |error: Failure| {
+            if background {
+                Failure::failed("deferred_no_identity", error.message)
+            } else {
+                error
+            }
+        };
+        let (records, _, _) = read_source(&path, source.member.as_deref()).map_err(unidentified)?;
         let session = records
             .iter()
             .find_map(|frame| match &frame.record {
                 WalRecord::RunStarted { session, .. } => Some(session.clone()),
                 _ => None,
             })
-            .ok_or_else(|| Failure::refused("damaged", "source contains no RunStarted"))?;
+            .ok_or_else(|| {
+                unidentified(Failure::refused("damaged", "source contains no RunStarted"))
+            })?;
         if broca_core::session_addr(&session) != address {
-            return Err(Failure::refused(
+            return Err(unidentified(Failure::refused(
                 "damaged",
                 "source address differs from its session identity",
-            ));
+            )));
         }
         let leases = broca_core::FileLeaseStore::new(self.root.join("leases"));
+        let _idle_fence = if background {
+            let registry =
+                registry.ok_or_else(|| io("background conversion requires a registry"))?;
+            Some(
+                registry
+                    .try_fence_idle_conversion(&session, &leases)
+                    .await
+                    .map_err(|error| Failure::failed("session_busy", error))?
+                    .ok_or_else(|| {
+                        Failure::failed("session_busy", "session is not closed and idle")
+                    })?,
+            )
+        } else {
+            None
+        };
+        #[cfg(test)]
+        if background {
+            if let Some(probe) = &self.background_fenced {
+                probe.sessions.lock().unwrap().push(address.clone());
+                probe.entered.notify_one();
+                probe.release.acquire().await.unwrap().forget();
+            }
+        }
         let _fence = match registry {
-            Some(registry) => Some(
+            Some(registry) if !background => Some(
                 registry
                     .fence_store_move(&session, &leases)
                     .await
                     .map_err(|error| Failure::failed("session_busy", format!("{error:?}")))?,
             ),
-            None => None,
+            _ => None,
         };
         let _lease = if registry.is_none() {
             use broca_core::LeaseStore;
@@ -795,7 +992,10 @@ impl Engine {
                         .and_then(|detail| detail.get("reason"))
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or("io_failed");
-                    Failure::failed(class, error.message)
+                    Failure::failed(
+                        if background { "session_busy" } else { class },
+                        error.message,
+                    )
                 })?;
         }
         if let Some(index) = &self.source_index {
@@ -806,7 +1006,11 @@ impl Engine {
                 .any(|row| !row.state.is_terminal() || row.usage.is_none() || row.withdrawals_owed)
             {
                 return Err(Failure::failed(
-                    "reconcile_owed",
+                    if background {
+                        "session_busy"
+                    } else {
+                        "reconcile_owed"
+                    },
                     "legacy run index still owes reconciliation or usage export",
                 ));
             }
@@ -902,9 +1106,21 @@ impl Engine {
             }
             let staged = staged.map_err(stage_failure)?;
             self.step(source, "verifying", None, None)?;
+            #[cfg(test)]
+            let verification_records = {
+                let mut compared = records.clone();
+                if let Some(change) = self.verification_records {
+                    change(&mut compared);
+                }
+                compared
+            };
+            #[cfg(test)]
+            let records_to_verify = &verification_records;
+            #[cfg(not(test))]
+            let records_to_verify = &records;
             let verified = broca_session_convert::verify::verify_with_progress(
                 Verify {
-                    records: &records,
+                    records: records_to_verify,
                     lineage,
                     session: &session,
                     deployment,
@@ -973,6 +1189,8 @@ impl Engine {
                 .retire_converted(&session)
                 .map_err(|error| io(error.message))?;
         }
+        // The published head now owns all requests; source backup cannot affect its writer.
+        drop(_idle_fence);
         self.step(source, "awaiting_backup", Some("converted"), None)?;
         self.backup_ready(source)?;
         self.health
@@ -1321,7 +1539,7 @@ pub async fn rehearse(root: &Path, backup: &Path) -> Result<Rehearsal, String> {
     // A clone carries the lock file's bytes, not the running daemon's OS lock. Refuse a
     // genuinely running root before opening the ledger or inspecting any source.
     let _root_lock = crate::state_root_lock::acquire(root).map_err(|error| error.to_string())?;
-    let engine = Engine::configured(
+    let mut engine = Engine::configured(
         root,
         Config {
             archives: true,
@@ -1330,6 +1548,7 @@ pub async fn rehearse(root: &Path, backup: &Path) -> Result<Rehearsal, String> {
         },
     )?
     .ok_or("conversion is disabled")?;
+    engine.stderr_warnings = true;
     let deployment = DeploymentKey::unloaded(1);
     engine.run_live(&deployment, None, None).await?;
     let live_ms = started.elapsed().as_millis();

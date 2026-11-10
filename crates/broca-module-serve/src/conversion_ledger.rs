@@ -29,6 +29,7 @@ pub struct Row {
     pub step: String,
     pub outcome: Option<String>,
     pub refusal: Option<String>,
+    pub detail: Option<String>,
     /// Bound under the session fence before staging; empty while only discovered/recovering.
     pub source_sha256: String,
 }
@@ -63,6 +64,7 @@ impl Ledger {
                      step TEXT NOT NULL,
                      outcome TEXT,
                      refusal_class TEXT,
+                     detail TEXT,
                      source_sha256 TEXT NOT NULL,
                      destination TEXT NOT NULL,
                      backup TEXT NOT NULL,
@@ -109,15 +111,16 @@ impl Ledger {
         step: &str,
         outcome: Option<&str>,
         refusal: Option<&str>,
+        detail: Option<&str>,
     ) -> Result<(), String> {
         let changed = self
             .connection
             .lock()
             .map_err(|error| error.to_string())?
             .execute(
-                "UPDATE sources SET step=?2,outcome=?3,refusal_class=?4,
+                "UPDATE sources SET step=?2,outcome=?3,refusal_class=?4,detail=?5,
                     updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE source_id=?1",
-                params![id, step, outcome, refusal],
+                params![id, step, outcome, refusal, detail],
             )
             .map_err(|error| error.to_string())?;
         if changed != 1 {
@@ -143,7 +146,7 @@ impl Ledger {
             .map_err(|error| error.to_string())?
             .query_row(
                 "SELECT source_id,source_path,member,storage_class,destination,backup,
-                        step,outcome,refusal_class,source_sha256 FROM sources WHERE source_id=?1",
+                        step,outcome,refusal_class,source_sha256,detail FROM sources WHERE source_id=?1",
                 [id],
                 read_row,
             )
@@ -157,7 +160,7 @@ impl Ledger {
 
     pub fn rows_for_path(&self, path: &str) -> Result<Vec<Row>, String> {
         let connection = self.connection.lock().map_err(|error| error.to_string())?;
-        let mut statement = connection.prepare("SELECT source_id,source_path,member,storage_class,destination,backup,step,outcome,refusal_class,source_sha256 FROM sources WHERE source_path=?1 ORDER BY source_id").map_err(|error| error.to_string())?;
+        let mut statement = connection.prepare("SELECT source_id,source_path,member,storage_class,destination,backup,step,outcome,refusal_class,source_sha256,detail FROM sources WHERE source_path=?1 ORDER BY source_id").map_err(|error| error.to_string())?;
         let rows = statement
             .query_map([path], read_row)
             .map_err(|error| error.to_string())?
@@ -171,7 +174,7 @@ impl Ledger {
         let mut statement = connection
             .prepare(
                 "SELECT source_id,source_path,member,storage_class,destination,backup,
-                             step,outcome,refusal_class,source_sha256 FROM sources ORDER BY source_id",
+                             step,outcome,refusal_class,source_sha256,detail FROM sources ORDER BY source_id",
             )
             .map_err(|error| error.to_string())?;
         let rows = statement
@@ -223,6 +226,7 @@ fn read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
         outcome: row.get(7)?,
         refusal: row.get(8)?,
         source_sha256: row.get(9)?,
+        detail: row.get(10)?,
     })
 }
 
@@ -247,7 +251,13 @@ mod tests {
             ledger.discover(&source).unwrap();
             ledger.bind_source(&source.id, &"a".repeat(64)).unwrap();
             ledger
-                .advance(&source.id, "backing_up", Some("refused"), Some("damaged"))
+                .advance(
+                    &source.id,
+                    "backing_up",
+                    Some("refused"),
+                    Some("damaged"),
+                    Some("source has no RunStarted"),
+                )
                 .unwrap();
         }
         let ledger = Ledger::open(&root).unwrap();
@@ -256,12 +266,13 @@ mod tests {
         assert_eq!(row.step, "backing_up");
         assert_eq!(row.source_sha256, "a".repeat(64));
         assert_eq!(row.refusal.as_deref(), Some("damaged"));
+        assert_eq!(row.detail.as_deref(), Some("source has no RunStarted"));
         assert_eq!(ledger.rows().unwrap(), vec![row]);
         let progress = ledger.progress().unwrap();
         assert_eq!(progress.sources, 1);
         assert_eq!(progress.outcomes.get("refused"), Some(&1));
         assert_eq!(progress.refusals.get("damaged"), Some(&1));
-        assert!(ledger.advance("missing", "done", None, None).is_err());
+        assert!(ledger.advance("missing", "done", None, None, None).is_err());
         let connection = ledger.connection.lock().unwrap();
         let mode: String = connection
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))

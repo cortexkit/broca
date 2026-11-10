@@ -113,16 +113,33 @@ impl Rig {
 
     /// A rig whose new storage creates sessions in mode `cipher`.
     async fn start_creating(tag: &str, cipher: Cipher) -> Self {
+        Self::start_with_executor(tag, cipher, Arc::new(NoRuns)).await
+    }
+
+    async fn start_with_executor(
+        tag: &str,
+        cipher: Cipher,
+        executor: Arc<dyn RunExecutor>,
+    ) -> Self {
         let dir = broca_test_support::scratch_root()
             .join(format!("broca-store-move-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let wal_store = Arc::new(FileWalStore::new(dir.join("wal")));
-        let runtime = runtime_creating(&dir, cipher).await;
+        let runtime = Arc::new(
+            broca_module::store_open::StoreRuntime::open(
+                &dir,
+                deployment().creating(cipher),
+                executor.clone(),
+                Duration::from_millis(100),
+            )
+            .await
+            .unwrap(),
+        );
         let opener = DefaultOpener::new(
             Arc::new(FileLeaseStore::new(dir.join("leases"))),
             wal_store.clone(),
-            Arc::new(NoRuns),
+            executor,
         )
         .with_store_runtime(runtime.clone());
         let registry = LineageRegistry::new_with_reader(Arc::new(opener), wal_store.clone(), None);
@@ -1374,6 +1391,8 @@ mod cutover {
     use super::*;
     use crate::session_conversion::{after_startup_recovery, Config, Engine};
     use broca_module::ServeHandler;
+
+    mod background;
 
     fn engine(rig: &Rig, archives: bool, live: bool) -> Engine {
         let backup = rig.dir.with_extension("converted-sources");

@@ -205,6 +205,7 @@ pub enum OpenError {
     SessionMoving {
         cut_id: String,
     },
+    SessionConverting,
     SessionMoved {
         holder: String,
     },
@@ -435,6 +436,7 @@ impl std::fmt::Display for OpenError {
             Self::HistoryRewriting => f.write_str("history is being rewritten; retry after its writer finishes recovery"),
             Self::HistoryChanged => f.write_str("history changed while the page was read; read the newest page"),
             Self::SessionMoving { cut_id } => write!(f, "session_moving {{cutId: {cut_id}}}"),
+            Self::SessionConverting => write!(f, "session is converting in the background"),
             Self::SessionMoved { holder } => write!(f, "session_moved {{holder: {holder}}}"),
             OpenError::Expired { expired_at_ms } => write!(f, "lineage expired at {expired_at_ms}"),
             OpenError::RetentionInvalid(_) => write!(f, "invalid retention"),
@@ -769,6 +771,7 @@ pub trait SessionInventoryReadiness: Send + Sync {
 
 mod media;
 pub(crate) mod media_head;
+pub mod session_conversion;
 pub mod store_move;
 pub mod store_restore;
 
@@ -1009,6 +1012,7 @@ struct Inner {
     /// What runs `session.move_to_store`, installed by the daemon with its stores.
     store_mover: std::sync::OnceLock<Arc<dyn store_move::StoreMover>>,
     conversion_guard: std::sync::OnceLock<Arc<SessionConversionGuard>>,
+    background_conversions: Mutex<HashSet<String>>,
     /// What runs `session.restore_from_backup`, installed by the daemon with its stores.
     store_restorer: std::sync::OnceLock<Arc<dyn store_restore::StoreRestorer>>,
     session_address_inventory: std::sync::OnceLock<Arc<dyn broca_store::SessionAddressResolver>>,
@@ -1441,6 +1445,9 @@ impl LineageRegistry {
     }
 
     pub fn conversion_refusal(&self, key: &LineageKey) -> Option<(bool, String)> {
+        if self.background_conversion_held(key) {
+            return Some((true, "this session is converting in the background".into()));
+        }
         self.inner
             .conversion_guard
             .get()
@@ -2027,6 +2034,9 @@ impl LineageRegistry {
         Ok(guard)
     }
     pub fn check_move(&self, key: &LineageKey, write: bool) -> Result<(), OpenError> {
+        if self.background_conversion_held(key) {
+            return Err(OpenError::SessionConverting);
+        }
         if self.inner.opener.serves_from_store(key)? {
             return self.inner.opener.check_move(key, write);
         }
@@ -2157,6 +2167,7 @@ impl LineageRegistry {
                 store_moves: Default::default(),
                 store_mover: std::sync::OnceLock::new(),
                 conversion_guard: std::sync::OnceLock::new(),
+                background_conversions: Mutex::new(HashSet::new()),
                 store_restorer: std::sync::OnceLock::new(),
                 #[cfg(test)]
                 close_started: tokio::sync::watch::channel(0).0,
@@ -6457,7 +6468,7 @@ impl LineageRegistry {
                 Err(error) => {
                     self.inner.crash_orphan_marks.lock().unwrap().remove(&key);
                     match error {
-                        OpenError::SessionMoving { .. } | OpenError::SessionMoved { .. } => {
+                        OpenError::SessionMoving { .. } | OpenError::SessionMoved { .. } | OpenError::SessionConverting => {
                             sweep.not_live += 1;
                         }
                         OpenError::HistoryRewriting
