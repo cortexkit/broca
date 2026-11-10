@@ -7765,3 +7765,140 @@ async fn account_route_wire_joins_inherit_and_queue_freezes_its_own_route() {
     assert_eq!(routes, vec![route, own_route]);
     rig.finish().await;
 }
+
+/// The startup conversion barrier refuses a send before admission opens a WAL; after the
+/// recovery prerequisite and live pass finish, the same connection can serve session reads.
+#[tokio::test]
+async fn cutover_startup_send_is_retryable_session_converting() {
+    use broca_module_serve::session_conversion::{Config, Engine};
+    let dir = tmpdir("cutover-send-barrier");
+    let (registry, wal) = registry_and_wal(&dir);
+    let session = BindIdentity::new("broca-unscoped-v1", "runner", "cutover-send");
+    let source = wal.wal_path(&session);
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    std::fs::write(&source, b"damaged live source").unwrap();
+    let engine = Engine::configured(
+        &dir,
+        Config {
+            archives: false,
+            live_at_startup: true,
+            backup_root: Some(dir.with_extension("converted-sources")),
+        },
+    )
+    .unwrap()
+    .unwrap();
+    engine.install_guard(registry.as_ref());
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (mut reader, mut writer) = tokio::io::split(client);
+    let (sreader, swriter) = tokio::io::split(server);
+    let serving_registry = registry.clone();
+    let serving = tokio::spawn(async move {
+        serve_connection(
+            sreader,
+            swriter,
+            "broca",
+            serving_registry.clone(),
+            serving_registry,
+            broca_module_serve::serve::VaultGauge::not_in_use(),
+        )
+        .await
+    });
+    let hello = read_one(&mut reader).await;
+    let ack = Frame::build(
+        FrameType::HelloAck,
+        Flags::new(false, Priority::Passive, false),
+        0,
+        0,
+        hello.header.corr,
+        serde_json::to_vec(&ModuleHelloAckBody {
+            negotiated_ver: PROTOCOL_VERSION,
+            subc_ops: vec![],
+            subc_capabilities: vec![],
+            storage: None,
+            machine_id: None,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    write_frame(&mut writer, &ack).await.unwrap();
+    let bind = ModuleControlRequest::RouteBind {
+        route_channel: 7,
+        epoch: 1,
+        target: RouteTarget::ManagementSurface {
+            module_id: "broca".into(),
+        },
+        identity: SubcBindIdentity::new(session.harness.clone(), session.session.clone()),
+        principal: None,
+        consumer_capabilities: None,
+        admission_facts: None,
+        scope: None,
+        role_versions: None,
+        call_mode: None,
+    };
+    write_req(&mut writer, 0, 10, serde_json::to_value(bind).unwrap()).await;
+    let _ = read_one(&mut reader).await;
+    write_req(&mut writer, 7, 11, serde_json::json!({
+        "method":"session.send", "params":{"prompt":"do not admit during conversion", "model":{"provider":"fake","model":"fake"}}
+    })).await;
+    let response = read_one(&mut reader).await;
+    assert_eq!(response.header.ty, FrameType::Error);
+    let error: ErrorBody = serde_json::from_slice(&response.body).unwrap();
+    assert_eq!(error.code, "session_converting");
+    assert_eq!(error.detail.as_ref().unwrap()["class"], "transient");
+    assert_eq!(error.detail.as_ref().unwrap()["retryable"], true);
+    assert_eq!(std::fs::read(&source).unwrap(), b"damaged live source");
+    engine
+        .run_live(
+            &broca_session_store::keys::DeploymentKey::unloaded(1),
+            None,
+            Some(registry.as_ref()),
+        )
+        .await
+        .unwrap();
+    write_req(
+        &mut writer,
+        7,
+        12,
+        serde_json::json!({"method":"run.status","params":{}}),
+    )
+    .await;
+    let response = read_one(&mut reader).await;
+    assert_eq!(response.header.ty, FrameType::Error);
+    let error: ErrorBody = serde_json::from_slice(&response.body).unwrap();
+    assert_eq!(error.code, "session_unconverted");
+    assert_eq!(error.detail.as_ref().unwrap()["class"], "permanent");
+    assert_eq!(error.detail.as_ref().unwrap()["refusal_class"], "damaged");
+    let other_bind = ModuleControlRequest::RouteBind {
+        route_channel: 8,
+        epoch: 1,
+        target: RouteTarget::ManagementSurface {
+            module_id: "broca".into(),
+        },
+        identity: SubcBindIdentity::new("runner", "cutover-other"),
+        principal: None,
+        consumer_capabilities: None,
+        admission_facts: None,
+        scope: None,
+        role_versions: None,
+        call_mode: None,
+    };
+    write_req(
+        &mut writer,
+        0,
+        13,
+        serde_json::to_value(other_bind).unwrap(),
+    )
+    .await;
+    let _ = read_one(&mut reader).await;
+    write_req(
+        &mut writer,
+        8,
+        14,
+        serde_json::json!({"method":"run.status","params":{}}),
+    )
+    .await;
+    assert_eq!(read_one(&mut reader).await.header.ty, FrameType::Response);
+    drop(writer);
+    drop(reader);
+    let _ = tokio::time::timeout(Duration::from_secs(2), serving).await;
+}

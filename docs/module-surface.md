@@ -520,6 +520,59 @@ A phase exceeding its budget emits one WARN on `session_storage`, with `phase`, 
 collection/sweep 1 s. Append and media wait have counters but no slow-line policy. Normal phases
 emit no lines.
 
+### Temporary storage cutover
+
+The cutover-only `broca.jsonc` switches `session_conversion.archives` and
+`session_conversion.live_at_startup` are independent and **off by default**. A default
+configuration does not inspect or convert legacy sources. Startup still creates the empty
+device-local ledger and staging folder because backup capture requires every declared path to
+exist. Enable archives
+first, after the operator verifies a clone rehearsal has no unexpected failures; enable the live startup window only for the cutover
+deploy. Both switches are removed with legacy storage, not permanent tuning options.
+
+When `live_at_startup` is enabled, routed session operations refuse `session_converting`, with
+`detail.class: "transient"` and `detail.retryable: true`, until startup recovery has completed,
+the configured encryption mode can create sessions, and every live source has an outcome.
+This is the exception to ordinary startup's nonblocking deployment-key load. The existing
+crash-orphan seal and usage-export backfill finish before conversion starts. An unexpected
+conversion failure blocks only its session: `session_unconverted`, `detail.class: "permanent"`,
+with the ledger's class in `detail.refusal_class`. Other sessions resume service after the live
+pass. Archived members convert one at a time while serving, with a pause between sessions.
+
+Conversion reuses the online move's staging, media copy and verification. It keeps storage
+class, compaction views and the legacy WAL lineage id, so previously issued output-reference
+IDs still resolve. A verified head publishes the session
+only after its data is durable and the root's minimum-reader feature list names
+`session-storage/v1`, preventing an older build from opening the converted root. The address
+inventory remains in `run-index.db`; conversion does not rewrite its immutable usage-export
+facts. The new run loop does not support the original compaction protocol (as opposed to current
+compaction-view records), approval history or input-token budgets. Logs using these features,
+and missing, empty or undecodable logs, are terminal refusals. Unexpected refusal classes retain their source for
+repair instead of silently publishing an incomplete session.
+
+Source files move, without `moved` markers, to `session_conversion.backup_root` (by default
+`broca-converted-sources/` beside the state root), preserving their relative paths. The backup
+must be outside the state root. A sealed archive moves whole only after every member has a
+terminal outcome; the converter never rewrites its members. Keep backups until the release has
+run a week without a conversion finding.
+
+The owner-only `conversion-ledger.db` in the state root uses SQLite WAL journaling with
+`synchronous=FULL`. Each source's identity, path, class, current intent, outcome/refusal class,
+destination, backup, source SHA-256 and timestamps are recorded independently, with each intent committed before
+its filesystem operation. The source fingerprint is bound under the session fence before staging;
+resume through publication or backup refuses `source_changed` without changing the source if its
+bytes no longer match. Restart resumes incomplete publication and backup steps. This ledger
+is temporary and is removed with the converter after its final counts enter the release notes.
+`health.check.metrics.session_conversion` reports cached ledger counts by step, outcome and
+refusal class, the live barrier, and any job-level error, without probing source files.
+
+For an operator-supplied **clone only**, `ck-broca --convert-clone ROOT --converted-sources BACKUP`
+runs the same conversion in plain mode without starting a daemon or reading the vault. It prints
+JSON counts, live-pass and total milliseconds, and session addresses whose legacy run-index rows
+still require terminal-state or usage-export reconciliation (`reconcile_owed`). It
+does not implement another billing reconciliation path or change export facts. Never point this
+command at a running state root; a rehearsal writes its clone and its outside-root backups.
+
 To see one debug record per served operation, add a `CK_LOG` value to broca's module environment
 in `subc.jsonc`:
 

@@ -41,6 +41,20 @@
       "path": "session-store-moves"
     },
     {
+      "entry_id": "broca/conversion-ledger",
+      "class": "device-local",
+      "mechanism": "whole-db",
+      "path": "conversion-ledger.db",
+      "reason": "cutover-only recovery bookkeeping, removed with legacy storage; paths refer to this device's converted-source backups"
+    },
+    {
+      "entry_id": "broca/conversion-staging",
+      "class": "device-local",
+      "mechanism": "filetree",
+      "path": "conversion-staging",
+      "reason": "cutover-only staged sessions, removed with legacy storage; may hold ordinary or retained sessions that must not enter portable backups"
+    },
+    {
             "entry_id": "broca/session-wals",
             "class": "excluded",
             "mechanism": "filetree",

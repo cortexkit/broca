@@ -79,6 +79,10 @@ fn the_tracked_descriptor_declares_brocas_entries_with_their_classes() {
         ("broca/session-store", "excluded", "filetree"),
         ("broca/session-store-ephemeral", "excluded", "filetree"),
         ("broca/session-store-moves", "device-local", "filetree"),
+        // Cutover-only recovery artifacts, removed with legacy storage. Neither staged
+        // ordinary/retained sessions nor device-specific source paths enter portable backups.
+        ("broca/conversion-ledger", "device-local", "whole-db"),
+        ("broca/conversion-staging", "device-local", "filetree"),
         ("broca/session-media", "excluded", "filetree"),
         ("broca/ephemeral-media", "excluded", "filetree"),
         ("broca/media-uploads", "excluded", "filetree"),
