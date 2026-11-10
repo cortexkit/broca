@@ -149,6 +149,7 @@ pub struct StoreActor<B: SessionBackend> {
     registry: Option<crate::registry::RegistryHandle>,
     /// The warm the executor is sending, if any.
     warm: Option<warm::PendingStoreWarm>,
+    step_event_warm_stops: crate::step_events::WarmStops,
     /// The scope the ordered send being admitted was admitted under, set only while it is: the
     /// run it starts at once, if it does, records it (see `drained_start`).
     ordered_scope: Option<broca_protocol::SessionScope>,
@@ -403,6 +404,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             media_build_gate: None,
             registry: None,
             warm: None,
+            step_event_warm_stops: Default::default(),
             ordered_scope: None,
             created: None,
             collect_due: false,
@@ -618,15 +620,13 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             self.key.clone(),
             self.session.head().incarnation.0,
             self.session.next_seq(),
+            self.parts.clone(),
+            self.step_event_warm_stops.clone(),
         );
-        if let Some(start) = self
-            .session
-            .operations()
-            .run
-            .as_ref()
-            .and_then(|run| run.start.as_ref())
-        {
-            observer.run_start(start);
+        if let Some(run) = self.session.operations().run.as_ref() {
+            if let Some(start) = run.start.as_ref() {
+                observer.seed_run(start, run.refrozen_render.as_ref());
+            }
         }
         self.session
             .add_append_observer(Box::new(move |appended| observer.appended(appended)));

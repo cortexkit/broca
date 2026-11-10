@@ -3054,6 +3054,11 @@ enum WalCommand {
     StepEventRun {
         run_id: broca_protocol::RunId,
         route_decision_id: Option<String>,
+        cache: StepEventCache,
+    },
+    StepEventWarmStop {
+        run_id: broca_protocol::RunId,
+        reason: String,
     },
     /// fsync everything pending + ack with the last FSYNCED seq (a barrier point).
     Sync(oneshot::Sender<Result<u64, WalWriteError>>),
@@ -3142,6 +3147,16 @@ pub struct DurableAttempt {
     /// Content intervals derived from recorded attempt stamps, not completion latency.
     pub sent_to_last_content_ms: Option<u64>,
     pub first_to_last_content_ms: Option<u64>,
+    pub cache: Option<StepEventCache>,
+}
+
+/// Live-only cache evidence. It is never serialized into the session log.
+#[derive(Clone, Debug)]
+pub struct StepEventCache {
+    pub frozen_render_config: serde_json::Value,
+    /// None means unavailable; an omitted setting at admission is explicitly Off.
+    pub keep_warm: Option<broca_protocol::request::KeepWarm>,
+    pub stop_reason: Option<String>,
 }
 
 #[derive(Clone)]
@@ -3152,9 +3167,19 @@ struct StepEventObserver {
     // A cache-maintenance request can finish after the next model run starts; keep decision ids
     // until this WAL writer closes.
     runs: std::collections::BTreeMap<String, Option<String>>,
+    caches: std::collections::BTreeMap<String, StepEventCache>,
+    current_run: Option<String>,
 }
 
 impl StepEventObserver {
+    fn note_cache(&mut self, run_id: &broca_protocol::RunId, mut cache: StepEventCache) {
+        if let Some(prior) = self.caches.get(&run_id.0) {
+            cache.keep_warm = cache.keep_warm.or(prior.keep_warm);
+            cache.stop_reason.clone_from(&prior.stop_reason);
+        }
+        self.caches.insert(run_id.0.clone(), cache);
+    }
+
     fn note_run(&mut self, run_id: &broca_protocol::RunId, route_decision_id: Option<String>) {
         for attempt in self
             .open
@@ -3180,8 +3205,34 @@ impl StepEventObserver {
         record: &WalRecord,
     ) {
         match record {
-            WalRecord::RunStarted { run_id, config, .. } => {
+            WalRecord::RunStarted {
+                run_id,
+                config,
+                keep_warm,
+                ..
+            } => {
+                self.current_run = Some(run_id.0.clone());
                 self.note_run(run_id, config.route_decision_id.clone());
+                self.note_cache(
+                    run_id,
+                    StepEventCache {
+                        frozen_render_config: config.frozen_render_config.clone(),
+                        keep_warm: Some(keep_warm.unwrap_or_default()),
+                        stop_reason: None,
+                    },
+                );
+            }
+            WalRecord::RunConfigRefrozen {
+                frozen_render_config,
+                ..
+            } => {
+                if let Some(cache) = self
+                    .current_run
+                    .as_ref()
+                    .and_then(|id| self.caches.get_mut(id))
+                {
+                    cache.frozen_render_config.clone_from(frozen_render_config);
+                }
             }
             WalRecord::AttemptReserved {
                 attempt_id,
@@ -3200,6 +3251,7 @@ impl StepEventObserver {
                         route_decision_id: self.route_decision(&reservation.run_id),
                         sent_to_last_content_ms: None,
                         first_to_last_content_ms: None,
+                        cache: self.caches.get(&reservation.run_id.0).cloned(),
                     },
                 );
             }
@@ -3249,6 +3301,7 @@ impl StepEventObserver {
                                 .or_else(|| self.route_decision(&reservation.run_id)),
                             sent_to_last_content_ms,
                             first_to_last_content_ms,
+                            cache: self.caches.get(&reservation.run_id.0).cloned(),
                         })
                     }
                     Err(_) => {
@@ -3263,6 +3316,7 @@ impl StepEventObserver {
                 let finished_at_ms = StampClock::wall().now_ms();
                 for (_, mut attempt) in std::mem::take(&mut self.open) {
                     attempt.interrupted_at_ms = Some(finished_at_ms);
+                    attempt.cache = self.caches.get(&attempt.reservation.run_id.0).cloned();
                     if self.tx.try_send(attempt).is_err() {
                         self.dropped.fetch_add(1, Ordering::Relaxed);
                     }
@@ -3274,6 +3328,8 @@ impl StepEventObserver {
             WalRecord::WriterOpened { .. } => {
                 self.open.clear();
                 self.runs.clear();
+                self.caches.clear();
+                self.current_run = None;
             }
             // Corrections are not another attempt and must not create another hint.
             _ => {}
@@ -3352,6 +3408,8 @@ impl RecordObserver {
             dropped,
             open: Default::default(),
             runs: Default::default(),
+            caches: Default::default(),
+            current_run: None,
         });
         self
     }
@@ -3797,7 +3855,16 @@ mod step_event_tests {
             Some(observer),
         )
         .unwrap();
-        handle.note_step_event_run_config(&broca_protocol::RunId("run".into()), &config);
+        let run_id = broca_protocol::RunId("run".into());
+        handle.note_step_event_run_config(
+            &run_id,
+            &config,
+            Some(broca_protocol::request::KeepWarm::Auto),
+        );
+        handle.note_step_event_warm_stop(&run_id, "tools_done");
+        handle.note_step_event_warm_stop(&run_id, "cancelled");
+        handle.note_step_event_warm_stop(&run_id, "budget");
+        handle.note_step_event_run_config(&run_id, &config, None);
         let mut value = serde_json::to_value(terminal(1, false)).unwrap();
         value["type"] = serde_json::json!("model_attempt_finished");
         for (field, data) in [
@@ -3826,6 +3893,13 @@ mod step_event_tests {
         assert_eq!(event.route_decision_id.as_deref(), Some("frozen-caller"));
         assert_eq!(event.sent_to_last_content_ms, Some(80));
         assert_eq!(event.first_to_last_content_ms, Some(60));
+        let cache = event.cache.unwrap();
+        assert_eq!(cache.frozen_render_config, config.frozen_render_config);
+        assert_eq!(
+            cache.keep_warm,
+            Some(broca_protocol::request::KeepWarm::Auto)
+        );
+        assert_eq!(cache.stop_reason.as_deref(), Some("budget"));
         assert_eq!(
             replays.load(Ordering::Relaxed),
             0,
@@ -5040,10 +5114,27 @@ impl WalHandle {
         &self,
         run_id: &broca_protocol::RunId,
         config: &broca_wal::RunConfig,
+        keep_warm: Option<broca_protocol::request::KeepWarm>,
     ) {
         let _ = self.tx.send(WalCommand::StepEventRun {
             run_id: run_id.clone(),
             route_decision_id: config.route_decision_id.clone(),
+            cache: StepEventCache {
+                frozen_render_config: config.frozen_render_config.clone(),
+                keep_warm,
+                stop_reason: None,
+            },
+        });
+    }
+
+    /// Preserve the warmer's stop reason for later step-event cache reports without writing another WAL record.
+    pub fn note_step_event_warm_stop(&self, run_id: &broca_protocol::RunId, reason: &str) {
+        if matches!(reason, "tools_done" | "cancelled") {
+            return;
+        }
+        let _ = self.tx.send(WalCommand::StepEventWarmStop {
+            run_id: run_id.clone(),
+            reason: reason.into(),
         });
     }
 
@@ -6350,12 +6441,26 @@ fn writer_loop_with_identity(
             WalCommand::StepEventRun {
                 run_id,
                 route_decision_id,
+                cache,
             } => {
                 if let Some(events) = observer
                     .as_mut()
                     .and_then(|observer| observer.step_events.as_mut())
                 {
                     events.note_run(&run_id, route_decision_id);
+                    if cache.keep_warm.is_some() {
+                        events.current_run = Some(run_id.0.clone());
+                    }
+                    events.note_cache(&run_id, cache);
+                }
+            }
+            WalCommand::StepEventWarmStop { run_id, reason } => {
+                if let Some(cache) = observer
+                    .as_mut()
+                    .and_then(|observer| observer.step_events.as_mut())
+                    .and_then(|events| events.caches.get_mut(&run_id.0))
+                {
+                    cache.stop_reason.get_or_insert(reason);
                 }
             }
             #[cfg(all(test, feature = "test-clock"))]

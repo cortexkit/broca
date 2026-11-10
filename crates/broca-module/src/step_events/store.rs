@@ -13,6 +13,8 @@ struct Run {
     work_class: Option<String>,
     context_limit: Option<u64>,
     route_decision_id: Option<String>,
+    frozen_render_config: serde_json::Value,
+    keep_warm: Option<broca_protocol::request::KeepWarm>,
 }
 
 fn apply_step_end(event: &mut StepFinished, end: &broca_session_store::record::StepEnd) {
@@ -94,6 +96,8 @@ pub(crate) struct Observer {
     emitted: BTreeSet<String>,
     tx: tokio::sync::mpsc::Sender<StepFinished>,
     dropped: Arc<AtomicU64>,
+    parts: broca_session_loop::parts::SharedParts,
+    warm_stops: super::WarmStops,
 }
 
 impl Observer {
@@ -103,6 +107,8 @@ impl Observer {
         first_live_seq: u64,
         tx: tokio::sync::mpsc::Sender<StepFinished>,
         dropped: Arc<AtomicU64>,
+        parts: broca_session_loop::parts::SharedParts,
+        warm_stops: super::WarmStops,
     ) -> Self {
         Self {
             bind,
@@ -114,6 +120,8 @@ impl Observer {
             emitted: BTreeSet::new(),
             tx,
             dropped,
+            parts,
+            warm_stops,
         }
     }
 
@@ -124,6 +132,16 @@ impl Observer {
                 model: start.model.clone(),
                 context_limit: start.context_limit,
                 route_decision_id: start.route_decision_id.clone(),
+                frozen_render_config: broca_session_loop::run::run_config_of_start(
+                    start,
+                    &self.parts,
+                )
+                .map(|config| config.frozen_render_config)
+                .unwrap_or_default(),
+                keep_warm: match &start.keep_warm {
+                    Some(setting) => serde_json::from_value(setting.clone()).ok(),
+                    None => Some(Default::default()),
+                },
                 work_class: start
                     .run_choices
                     .as_ref()
@@ -133,6 +151,39 @@ impl Observer {
                     .map(str::to_owned),
             },
         );
+    }
+
+    pub(crate) fn seed_run(&mut self, start: &RunStart, refrozen: Option<&serde_json::Value>) {
+        self.run_start(start);
+        if let Some(config) = refrozen.and_then(|refrozen| refrozen.get("render_config")) {
+            self.refrozen(&start.run_id, config);
+        }
+    }
+
+    fn refrozen(&mut self, run_id: &str, config: &serde_json::Value) {
+        if let Some(run) = self.runs.get_mut(run_id) {
+            run.frozen_render_config.clone_from(config);
+        }
+    }
+
+    fn cache(&self, event: &StepFinished) -> Option<cortexkit_role_llm_runner::cache::Report> {
+        let run = self.runs.get(&event.run_id)?;
+        let stops = self.warm_stops.lock().ok();
+        // A fallback on another provider did not necessarily use this run's frozen route.
+        let frozen = if event.provider == run.model.provider_module_id {
+            &run.frozen_render_config
+        } else {
+            &serde_json::Value::Null
+        };
+        super::cache_report(
+            frozen,
+            &event.provider,
+            stops.as_ref().and(run.keep_warm),
+            stops
+                .as_ref()
+                .and_then(|stops| stops.get(&event.run_id))
+                .map(String::as_str),
+        )
     }
 
     pub(crate) fn appended(&mut self, appended: Appended<'_>) {
@@ -164,6 +215,9 @@ impl Observer {
     fn record(&mut self, seq: u64, record: &Record) {
         match record {
             Record::RunStart(start) => self.run_start(start),
+            Record::ConfigRefrozen(refrozen) => {
+                self.refrozen(&refrozen.run_id, &refrozen.render_config);
+            }
             Record::Attempt(attempt) => {
                 let Some(id) = &attempt.attempt_id else {
                     return;
@@ -213,6 +267,7 @@ impl Observer {
                 event.work_class.clone_from(&run.work_class);
                 event.context_limit = run.context_limit;
                 event.route_decision_id.clone_from(&run.route_decision_id);
+                event.cache = self.cache(&event);
                 (
                     event.sent_to_last_content_ms,
                     event.first_to_last_content_ms,
@@ -235,6 +290,7 @@ impl Observer {
                 if let Some(events) = self.completed.remove(&(end.run_id.clone(), end.step_id)) {
                     for mut event in events {
                         apply_step_end(&mut event, end);
+                        event.cache = self.cache(&event);
                         self.unsynced
                             .push(finish(event, &step_envelope(end), false));
                     }
@@ -281,6 +337,7 @@ impl Observer {
                 event.work_class.clone_from(&run.work_class);
                 event.context_limit = run.context_limit;
                 event.route_decision_id.clone_from(&run.route_decision_id);
+                event.cache = self.cache(&event);
                 let envelope = broca_wal::record::AttemptEnvelope {
                     usage: Some(warmed.usage),
                     reasoning_included_in_output: warmed.usage.reasoning_tokens.map(|_| true),
@@ -329,6 +386,110 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn recovered_run_cache_uses_the_folded_refreeze_not_the_original_setup() {
+        use broca_provider::{
+            spec::WireFamilyId,
+            wire::{CacheClass, CachePolicy, CacheTtl, MarkerSyntax},
+        };
+        use broca_session_loop::parts::{MemoryParts, Parts, SharedParts};
+        use broca_session_store::{
+            fold::operations::Operations,
+            record::{ConfigRefrozen, PartKind},
+        };
+        let original = json!({"family_id": WireFamilyId::AnthropicMessages, "cache": CachePolicy {
+            version: 1,
+            class: CacheClass::Markers {
+                syntax: MarkerSyntax::AnthropicCacheControl, ttl: CacheTtl::FiveMinutes,
+                max_breakpoints: 4, lookback_blocks: 20, tail: None, omit_ttl: false,
+            },
+        }});
+        let mut parts = MemoryParts::default();
+        let setup = vec![parts.put(PartKind::RenderConfig, &original).unwrap()];
+        let start = RunStart {
+            run_id: "run".into(),
+            model: broca_protocol::ModelHandle::new("anthropic", "synthetic"),
+            setup,
+            renderer_version: 1,
+            submission_id: None,
+            send_id: None,
+            request_identity_digest: None,
+            ts_ms: None,
+            written_at_ms: None,
+            session_class: None,
+            retention_secs: None,
+            title: None,
+            context_limit: None,
+            service_tier: None,
+            route_decision_id: None,
+            compaction_plan_version: None,
+            auth_selection: None,
+            run_choices: Some(json!({"config": {
+                "tools": [], "tool_choice": broca_protocol::ToolChoice::Auto,
+                "generation": broca_protocol::GenerationConfig::default(),
+                "response_format": broca_protocol::request::ResponseFormat::default(),
+                "context_epoch": 0,
+            }})),
+            origin: None,
+            principal: None,
+            scope: None,
+            hooks: None,
+            keep_warm: Some(json!("auto")),
+            on_restart: None,
+            seeded: None,
+            refusal_schedule: None,
+            imported_ids: None,
+            message_marks: None,
+            named_speaker: None,
+        };
+        let mut operations = Operations::default();
+        operations
+            .apply(&Record::RunStart(Box::new(start)))
+            .unwrap();
+        let mut refrozen = original;
+        refrozen["cache"]["ttl"] = json!("1h");
+        operations
+            .apply(&Record::ConfigRefrozen(ConfigRefrozen {
+                run_id: "run".into(),
+                ts_ms: None,
+                renderer_version: 1,
+                render_config: refrozen,
+            }))
+            .unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let mut observer = Observer::new(
+            BindIdentity::new("/synthetic", "host", "session"),
+            [1; 16],
+            1,
+            tx,
+            Arc::new(AtomicU64::new(0)),
+            SharedParts::new(Box::new(parts)),
+            Default::default(),
+        );
+        let run = operations.run.as_ref().unwrap();
+        let start = run.start.as_ref().unwrap();
+        let event = StepFinished::new(
+            StepRef::new("broca", "synthetic", "incarnation", 1),
+            "run",
+            "1",
+            std::num::NonZeroU64::new(1).unwrap(),
+            "completed",
+            "host",
+            "session",
+            "anthropic",
+            "synthetic",
+            100,
+            200,
+        );
+        observer.seed_run(start, None);
+        assert_eq!(observer.cache(&event).unwrap().ttl_ms, Some(300_000));
+        observer.seed_run(start, run.refrozen_render.as_ref());
+        assert_eq!(
+            serde_json::to_value(observer.cache(&event)).unwrap(),
+            json!({"ttl_ms":3_600_000,"warming":{"on":true}})
+        );
+    }
+
+    #[test]
     fn stored_model_shares_and_iteration_ttls_are_used_without_guesses() {
         let mut end = StepEnd {
             run_id: "run".into(),
@@ -353,7 +514,7 @@ mod tests {
                 model: "served".into(),
                 variant: None,
                 usage: serde_json::from_value(
-                    json!({"input_tokens":100, "output_tokens":20, "reasoning_tokens":7}),
+                    json!({"input_tokens":100, "cache_write_tokens":20, "output_tokens":20, "reasoning_tokens":7}),
                 )
                 .unwrap(),
             }],
