@@ -6439,7 +6439,14 @@ impl<W: WalStore + 'static> LineageActor<W> {
             next_request = self
                 .next_request_numbers()
                 .await
-                .map_err(SendOutcome::Error)?;
+                .map_err(|error| match error {
+                    broca_core::compaction_v2::read::ReadError::ProjectionNotReady => {
+                        SendOutcome::Transient(error.to_string())
+                    }
+                    broca_core::compaction_v2::read::ReadError::Failure(message) => {
+                        SendOutcome::Error(message)
+                    }
+                })?;
             if next_request.is_none() {
                 let records = self.read_wal_records().await.map_err(SendOutcome::Error)?;
                 if !records.is_empty() {

@@ -11,13 +11,26 @@ fn internal(message: impl Into<String>) -> Refusal {
     Refusal::new("internal_error", message, None)
 }
 
+fn entry_read_refusal(error: v2::read::ReadError) -> Refusal {
+    match error {
+        v2::read::ReadError::ProjectionNotReady => Refusal::new(
+            "projection_not_ready",
+            error.to_string(),
+            Some(
+                serde_json::json!({"class": broca_protocol::ErrorClass::Transient.shared_class()}),
+            ),
+        ),
+        v2::read::ReadError::Failure(message) => internal(message),
+    }
+}
+
 impl<W: WalStore + 'static> super::LineageActor<W> {
     /// Every compaction entry of the session, as `session.entries` serves them.
     async fn all_compaction_entries(
         &self,
         writer: &broca_core::WalHandle,
         store: Option<std::sync::Arc<dyn broca_core::SessionStore>>,
-    ) -> Result<Vec<v2::protocol::read::Entry>, String> {
+    ) -> Result<Vec<v2::protocol::read::Entry>, v2::read::ReadError> {
         let mut entries = Vec::new();
         let mut after = None;
         loop {
@@ -51,7 +64,7 @@ impl<W: WalStore + 'static> super::LineageActor<W> {
     /// transcript.
     pub(super) async fn next_request_numbers(
         &mut self,
-    ) -> Result<Option<std::collections::HashMap<(String, String), u64>>, String> {
+    ) -> Result<Option<std::collections::HashMap<(String, String), u64>>, v2::read::ReadError> {
         let checkpoint = self.load_checkpoint_at_head().await?;
         let mode3 = match checkpoint.head.as_ref().and_then(|head| head.mode3) {
             Some(mode3) => mode3,
@@ -102,7 +115,9 @@ impl<W: WalStore + 'static> super::LineageActor<W> {
         let floor = self.signed_floor(&checkpoint).await?;
         let conditions = v2::host::conditions(config, &entries, false, None, floor)?;
         let state = self.compaction_session.state.lock().await;
-        v2::shown::next_request(&state, &entries, &conditions).map(Some)
+        v2::shown::next_request(&state, &entries, &conditions)
+            .map(Some)
+            .map_err(Into::into)
     }
 
     /// The session's signed floor (`broca_core::signed_floor`) for a call served between runs,
@@ -255,7 +270,7 @@ impl<W: WalStore + 'static> super::LineageActor<W> {
                     applied,
                 )
                 .await
-                .map_err(internal)?;
+                .map_err(entry_read_refusal)?;
                 let plane = self.executor.compaction_plane();
                 let declared = match item.as_ref() {
                     Some((provider, ..)) => {
@@ -311,7 +326,7 @@ impl<W: WalStore + 'static> super::LineageActor<W> {
                 let entries = self
                     .all_compaction_entries(&writer, store)
                     .await
-                    .map_err(internal)?;
+                    .map_err(entry_read_refusal)?;
                 let floor = self.signed_floor(&checkpoint).await.map_err(internal)?;
                 let conditions =
                     v2::host::conditions(config, &entries, false, None, floor).map_err(internal)?;

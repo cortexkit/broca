@@ -782,7 +782,7 @@ pub trait MaterializedStore: Send + Sync {
         &self,
         _session: &BindIdentity,
         _request: &crate::compaction_v2::protocol::read::ReadRequest,
-    ) -> Result<Option<CompactionStorePage>, String> {
+    ) -> Result<Option<CompactionStorePage>, crate::compaction_v2::read::ReadError> {
         Ok(None)
     }
 
