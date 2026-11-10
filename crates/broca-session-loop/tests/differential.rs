@@ -66,6 +66,9 @@ struct ScriptedProvider {
     drifted: Arc<std::sync::atomic::AtomicBool>,
     /// Where the loop sends the next step, when the run froze a refusal fallback.
     route: Arc<Mutex<Option<broca_core::refusal_fallback::StepRoute>>>,
+    /// What the current run's requests wait for before they can be rendered, when the
+    /// comparison gives the new loop one (see [`ScriptedProvider::model_call_ready`]).
+    readiness: Arc<Mutex<Option<Arc<Readiness>>>>,
 }
 
 /// Whether `script` is the provider refusing the strict schema's grammar.
@@ -88,7 +91,23 @@ impl ScriptedProvider {
             refused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             drifted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             route: Arc::new(Mutex::new(None)),
+            readiness: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// What a new-loop run or resume on this provider waits for before its requests can be
+    /// rendered, when the comparison running in this task asks for one (`READY`): a new one
+    /// for each call, not ready yet, as each store run gets a media renderer that renders
+    /// nothing until its run waited for the session's media. Until it is ready, this provider
+    /// refuses to render the run's requests.
+    fn model_call_ready(&self) -> Option<Arc<dyn broca_session_loop::run::ModelCallReady>> {
+        let script = READY.try_with(|script| *script).ok().flatten()?;
+        let readiness = Arc::new(Readiness {
+            script,
+            ready: Default::default(),
+        });
+        *self.readiness.lock().unwrap() = Some(Arc::clone(&readiness));
+        Some(readiness)
     }
 
     /// The render config the run freezes: the stateless default, or a real config for a cache
@@ -171,6 +190,22 @@ impl Provider for ScriptedProvider {
 
     fn output_limits(&self) -> Option<broca_core::output_reservation::OutputLimits> {
         output().map(|script| script.limits)
+    }
+
+    /// Refuses while the run's requests aren't ready to render, as a store run's media renderer
+    /// refuses before its run waited for the session's media.
+    fn try_render_request(
+        &self,
+        opts: &CallOptions,
+    ) -> Result<Vec<u8>, Box<broca_protocol::ProviderError>> {
+        if let Some(readiness) = self.readiness.lock().unwrap().as_ref() {
+            if !readiness.ready.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(Box::new(not_ready_error(
+                    "the session's media aren't ready to render yet",
+                )));
+            }
+        }
+        Ok(self.render_request(opts))
     }
 
     /// The default stateless config, carrying the run's structured output when the comparison
@@ -267,6 +302,52 @@ impl Provider for ScriptedProvider {
             }
         });
         rx
+    }
+}
+
+tokio::task_local! {
+    /// Whether the new loop's runs wait for their requests to be ready to render, and whether
+    /// that wait succeeds (see [`ScriptedProvider::model_call_ready`]). `None` gives no wait.
+    static READY: Option<ReadyScript>;
+}
+
+#[derive(Clone, Copy)]
+enum ReadyScript {
+    /// The wait succeeds, after yielding once.
+    Ready,
+    /// The wait fails with [`READINESS_FAILED`].
+    Fails,
+}
+
+/// The error a failed wait for a run's requests to be ready gives.
+const READINESS_FAILED: &str = "the session's media fold can't be built";
+
+fn not_ready_error(message: &str) -> broca_protocol::ProviderError {
+    serde_json::from_value(json!({
+        "class": "permanent",
+        "message": message,
+        "provider_code": "store_media_unavailable",
+    }))
+    .expect("a provider error decodes")
+}
+
+/// What one new-loop run or resume waits for before its requests can be rendered.
+struct Readiness {
+    script: ReadyScript,
+    ready: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait]
+impl broca_session_loop::run::ModelCallReady for Readiness {
+    async fn ready(&self) -> Result<(), broca_protocol::ProviderError> {
+        tokio::task::yield_now().await;
+        match self.script {
+            ReadyScript::Ready => {
+                self.ready.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+            ReadyScript::Fails => Err(not_ready_error(READINESS_FAILED)),
+        }
     }
 }
 
@@ -2487,7 +2568,7 @@ async fn new_from(
         max_same_account_wait: account().map_or_else(Default::default, |script| script.wait),
         auth_selection: account_selection(),
         step_progress: None,
-        model_call_ready: None,
+        model_call_ready: provider.model_call_ready(),
     };
     let sealing = SEALING.try_with(|cause| *cause).ok();
     through!(
@@ -5190,7 +5271,7 @@ async fn compare_auth_pause_in_once(
         max_same_account_wait: account().map_or_else(Default::default, |script| script.wait),
         auth_selection: account_selection(),
         step_progress: None,
-        model_call_ready: None,
+        model_call_ready: provider.model_call_ready(),
     };
     let first = through!(writer, |w| run(
         w,
@@ -5205,6 +5286,8 @@ async fn compare_auth_pause_in_once(
     let refrozen_to = resume_account.clone();
     let seams = Seams {
         auth_selection: resume_account.or(seams.auth_selection.clone()),
+        // A resume waits for its requests as a new run does.
+        model_call_ready: provider.model_call_ready(),
         ..seams
     };
     let second =
@@ -7406,6 +7489,40 @@ async fn a_compacted_step_whose_cap_would_pass_the_context_limit_is_lowered() {
         .await;
 }
 
+/// A new-loop run whose requests can't be rendered until it waited for something (as a store
+/// run's media renderer renders nothing until its run waited for the session's media) waits
+/// before its compaction estimate and its output cap's estimate render the step's request, and
+/// makes the same run as today's loop.
+#[tokio::test]
+async fn a_compacted_step_waits_for_its_request_to_be_ready_before_estimating_it() {
+    let script = CompactionScript {
+        context_limit: lowering().context_limit,
+        rides: Vec::new(),
+    };
+    READY
+        .scope(
+            Some(ReadyScript::Ready),
+            OUTPUT.scope(
+                Some(lowering()),
+                compare_compacted(measured_scenario(), script),
+            ),
+        )
+        .await;
+}
+
+/// A resume whose requests can't be rendered until it waited for something waits before the
+/// output cap's estimate renders the step it resumes, which an earlier step measured, and
+/// resumes as today's loop does at every crash cut.
+#[tokio::test]
+async fn a_resumed_step_waits_for_its_request_to_be_ready_before_estimating_its_cap() {
+    READY
+        .scope(
+            Some(ReadyScript::Ready),
+            OUTPUT.scope(Some(lowering()), compare_every_cut(measured_scenario())),
+        )
+        .await;
+}
+
 fn submit_call(id: &str, answer: Value) -> ContentBlock {
     call(
         id,
@@ -8184,6 +8301,27 @@ async fn an_account_limit_pause_stays_paused_before_the_reset() {
     .await;
 }
 
+/// A resume whose requests can't be rendered until it waited for something (as a store run's
+/// media renderer renders nothing until its run waited for the session's media) waits before it
+/// renders the step the account-limit pause refused, to check it is the same request, and resumes
+/// as today's loop does.
+#[tokio::test]
+async fn an_account_limit_resume_waits_for_its_request_to_be_ready_before_checking_it() {
+    READY
+        .scope(
+            Some(ReadyScript::Ready),
+            compare_routed(
+                AccountScript {
+                    selection: routed("acct-1"),
+                    wait: broca_core::SameAccountWait::default(),
+                    wait_for_reset: true,
+                },
+                compare_auth_pause(tool_then_limited(account_limited())),
+            ),
+        )
+        .await;
+}
+
 /// The step a pause resumes renders a request other than the one the provider refused: both
 /// loops end the run interrupted rather than send it.
 #[tokio::test]
@@ -8766,7 +8904,7 @@ async fn enroll_run_with(
         max_same_account_wait: Default::default(),
         auth_selection: None,
         step_progress: None,
-        model_call_ready: None,
+        model_call_ready: provider.model_call_ready(),
     };
     let mut writer = Recording {
         session,
@@ -8822,7 +8960,7 @@ async fn enroll_resume_with(
         max_same_account_wait: Default::default(),
         auth_selection: None,
         step_progress: None,
-        model_call_ready: None,
+        model_call_ready: provider.model_call_ready(),
     };
     let mut writer = Recording {
         session,
@@ -9546,6 +9684,69 @@ async fn the_enrolling_run_falls_back_only_when_its_own_request_fits() {
         }
     })
     .await;
+}
+
+/// The enrolling run under a refusal fallback renders its own request to estimate it, besides
+/// its compaction estimate. When what its requests wait for before they can be rendered fails,
+/// neither renders: the step fails with that error before anything is sent, and the run's end
+/// records it.
+#[tokio::test]
+async fn an_enrolling_run_whose_request_cant_be_ready_ends_with_the_error_and_sends_nothing() {
+    let fallback = FallbackScript {
+        model: ModelHandle::new(provider_id(), "fallback-model"),
+        context_limit: Some(1_000_000),
+    };
+    FALLBACK
+        .scope(Some(fallback), async {
+            let backend = MemoryBackend::default();
+            let mut session = enrollment_session(&backend).await;
+            let mut parts = MemoryParts::default();
+            let spy = CompactionSpy::new(&CompactionScript {
+                context_limit: ENROLLED_LIMIT,
+                rides: Vec::new(),
+            });
+            let refused = EnrollRun {
+                id: "r1",
+                input: vec![system("You are terse."), user("first task")],
+                manifest: None,
+                steps: vec![refusal("a0"), text_step("a1", "ok")],
+                limit: None,
+            };
+            enroll_run(&mut session, &mut parts, &spy, &refused)
+                .await
+                .expect("the refused run");
+            let provider = ScriptedProvider::new(vec![text_step("a2", "never sent")]);
+            let enrolling = EnrollRun {
+                id: "r2",
+                input: vec![user("second task")],
+                manifest: Some(enrolling_manifest()),
+                steps: Vec::new(),
+                limit: None,
+            };
+            let finished = READY
+                .scope(
+                    Some(ReadyScript::Fails),
+                    enroll_run_with(&mut session, &mut parts, &spy, &enrolling, &provider),
+                )
+                .await
+                .expect("the enrolling run ends");
+            assert!(session.operations.enrolled.is_some());
+            assert_eq!(finished.reason, broca_protocol::RunFinishReason::Error);
+            assert!(sent_requests(&provider).is_empty(), "nothing was sent");
+            let ends: Vec<Value> = session
+                .open_log_records()
+                .await
+                .unwrap()
+                .into_iter()
+                .filter_map(|(_, record)| match record {
+                    Record::RunEnd(end) if end.run_id == "r2" => end.error,
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(ends.len(), 1, "{ends:?}");
+            assert_eq!(ends[0]["message"], READINESS_FAILED, "{ends:?}");
+        })
+        .await;
 }
 
 /// A session converted from today's storage, which joined text delivered with a tool result into
