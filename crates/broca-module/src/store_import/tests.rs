@@ -73,8 +73,10 @@ fn only_files_inside_the_import_folder_are_ever_deleted() {
     let other = dir.join("other-root");
     write(&folder.join("head.json"), b"{}");
     write(&folder.join("head.sends.json"), b"[]");
+    write(&folder.join("head.calls.json"), b"{\"calls\":[]}");
     write(&other.join("elsewhere.json"), b"{}");
     write(&other.join("elsewhere.sends.json"), b"[]");
+    write(&other.join("elsewhere.calls.json"), b"{\"calls\":[]}");
     std::os::unix::fs::symlink(other.join("elsewhere.json"), folder.join("link.json")).unwrap();
     let roots = ImportRoots::new(vec![folder.clone(), other.clone()], Some(folder.clone()));
     assert!(roots.deletable(&folder.join("head.json")));
@@ -88,6 +90,7 @@ fn only_files_inside_the_import_folder_are_ever_deleted() {
     delete_sources(&roots, ImportHarness::OpenCode2, &folder.join("head.json"));
     assert!(!folder.join("head.json").exists());
     assert!(!folder.join("head.sends.json").exists());
+    assert!(!folder.join("head.calls.json").exists());
     delete_sources(
         &roots,
         ImportHarness::OpenCode2,
@@ -95,12 +98,15 @@ fn only_files_inside_the_import_folder_are_ever_deleted() {
     );
     assert!(other.join("elsewhere.json").exists());
     assert!(other.join("elsewhere.sends.json").exists());
+    assert!(other.join("elsewhere.calls.json").exists());
     // A Pi journal is never deleted, even inside the folder; its side file is.
     write(&folder.join("pi.jsonl"), b"{}\n");
     write(&folder.join("pi.sends.json"), b"[]");
+    write(&folder.join("pi.calls.json"), b"{\"calls\":[]}");
     delete_sources(&roots, ImportHarness::Pi, &folder.join("pi.jsonl"));
     assert!(folder.join("pi.jsonl").exists());
     assert!(!folder.join("pi.sends.json").exists());
+    assert!(!folder.join("pi.calls.json").exists());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -214,8 +220,13 @@ fn history() -> HeadHistory {
     });
     assistant.calls = vec![CallIdentity {
         tool_call_id: "c1".into(),
+        source_tool_call_id: "c1".into(),
         call_key: "a1/c1".into(),
         carrier: "thalamus-harness".into(),
+        schema_pin: None,
+        started_at: None,
+        finished_at: None,
+        unanswered: None,
     }];
     let mut results = message(None, Message::new(Role::Tool, vec![result]));
     let mut ride = send("occi", Some("occi-ride"));
@@ -440,6 +451,119 @@ fn call_keys_rides_and_send_facts_are_recorded() {
     assert!(all
         .iter()
         .all(|facts| facts.run_id.is_none() && !facts.native));
+}
+
+#[test]
+fn call_side_file_facts_are_stored_without_import_time_defaults() {
+    for (host, harness, journal, session) in [
+        (
+            "opencode2",
+            ImportHarness::OpenCode2,
+            "export.json",
+            "unused",
+        ),
+        (
+            "pi",
+            ImportHarness::Pi,
+            "export.jsonl",
+            "01a1c3a2-83cc-718b-bcb8-06f631d16cd7",
+        ),
+    ] {
+        let dir = scratch(host);
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../ck-session-import/tests/fixtures/thalamus-export-calls-v1")
+            .join(host);
+        let bytes = std::fs::read(fixtures.join(journal)).unwrap();
+        let path = dir.join(journal);
+        write(&path, &bytes);
+        let roots = ImportRoots::new(vec![dir.clone()], None);
+        let mut params = params(harness, &path, format!("{:x}", Sha256::digest(&bytes)));
+        params.source.session = session.into();
+        let (_, before) = read_source(&params, &roots).unwrap();
+        assert!(before
+            .messages
+            .iter()
+            .flat_map(|message| &message.calls)
+            .all(|call| {
+                call.carrier
+                    == if host == "pi" {
+                        "thalamus-pi"
+                    } else {
+                        "thalamus-harness"
+                    }
+                    && call.schema_pin.is_none()
+                    && call.started_at.is_none()
+                    && call.finished_at.is_none()
+                    && call.unanswered.is_none()
+            }));
+        let side = std::fs::read(fixtures.join("export.calls.json")).unwrap();
+        write(&ck_session_import::head::calls_path(&path), &side);
+        let (_, history) = read_source(&params, &roots).unwrap();
+        let seed = seeded(history, Some(0)).unwrap();
+        let calls: Vec<_> = seed
+            .records
+            .iter()
+            .filter_map(|record| match record {
+                Record::TurnFacts(turn) => Some(&turn.calls),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        let expected: serde_json::Value = serde_json::from_slice(&side).unwrap();
+        assert_eq!(calls.len(), 2);
+        for (index, call) in calls.iter().enumerate() {
+            let row = &expected["calls"][index];
+            assert_eq!(call.call_key, row["call_key"].as_str().unwrap());
+            assert_eq!(call.carrier.as_deref(), Some("thalamus-harness"));
+            assert_eq!(call.schema_pin.as_ref(), row.get("schema_pin"));
+            assert_eq!(call.dispatched_at_ms, row["started_at"].as_u64());
+            assert_eq!(call.finished_at_ms, row["finished_at"].as_u64());
+            assert_eq!(call.unanswered, None);
+        }
+        let ride = serde_json::json!([{
+            "call_key": expected["calls"][0]["call_key"], "send_id": "ride",
+            "sender": "occi", "delivered_as": "tool_result", "text": "a ride",
+        }]);
+        write(
+            &ck_session_import::head::sends_path(&path),
+            &serde_json::to_vec(&ride).unwrap(),
+        );
+        let (_, history) = read_source(&params, &roots).unwrap();
+        let rides: Vec<_> = history
+            .messages
+            .iter()
+            .flat_map(|message| &message.rides)
+            .collect();
+        assert_eq!(rides.len(), 1);
+        assert_eq!(rides[0].send_id, "ride");
+        assert_eq!(
+            rides[0].delivery_tool_call_id.as_deref(),
+            Some(expected["calls"][0]["tool_call_id"].as_str().unwrap())
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[test]
+fn call_side_file_recorded_closures_reach_turn_facts() {
+    for reason in ["denied", "not_executed", "interrupted", "cancelled"] {
+        let mut history = history();
+        let call = &mut history.messages[3].calls[0];
+        call.unanswered = Some(reason.into());
+        let seed = seeded(history, Some(0)).unwrap();
+        let call = seed
+            .records
+            .iter()
+            .find_map(|record| match record {
+                Record::TurnFacts(turn) => turn.calls.first(),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(call.unanswered.map(|why| why.as_str()), Some(reason));
+        assert_eq!(call.schema_pin, None);
+        assert_eq!(call.dispatched_at_ms, None);
+        assert_eq!(call.finished_at_ms, None);
+    }
 }
 
 #[test]

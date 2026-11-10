@@ -6,6 +6,264 @@ use sha2::{Digest, Sha256};
 
 use super::*;
 
+fn calls_fixture(path: &str) -> Vec<u8> {
+    std::fs::read(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/thalamus-export-calls-v1")
+            .join(path),
+    )
+    .unwrap()
+}
+
+fn calls_history(host: &str) -> HeadHistory {
+    match host {
+        "opencode2" => opencode2::read(&calls_fixture("opencode2/export.json"), &mut accept),
+        "pi" => pi::read(
+            &calls_fixture("pi/export.jsonl"),
+            "01a1c3a2-83cc-718b-bcb8-06f631d16cd7",
+            &mut accept,
+        ),
+        _ => unreachable!(),
+    }
+    .unwrap()
+}
+
+fn calls_side(host: &str) -> Value {
+    serde_json::from_slice(&calls_fixture(&format!("{host}/export.calls.json"))).unwrap()
+}
+
+fn apply_call_side(history: &mut HeadHistory, side: &Value) -> Result<(), HeadError> {
+    let rows = read_calls(&serde_json::to_vec(side).unwrap())?;
+    apply_calls(history, &rows)
+}
+
+#[test]
+fn calls_side_file_unknown_members_are_refused_by_name() {
+    for (side, member) in [
+        (json!({"calls": [], "extra": true}), "extra"),
+        (
+            json!({"calls": [{"call_key": "k", "extra": true}]}),
+            "extra",
+        ),
+    ] {
+        let error = read_calls(&serde_json::to_vec(&side).unwrap()).unwrap_err();
+        assert_eq!(error.code(), "import_calls_unreadable");
+        assert!(error.to_string().contains(member));
+    }
+}
+
+#[test]
+fn calls_side_file_duplicate_source_calls_refuse_even_with_different_carriers() {
+    let mut side = calls_side("opencode2");
+    let mut duplicate = side["calls"][0].clone();
+    duplicate["call_carrier"] = json!(PI_CARRIER);
+    side["calls"].as_array_mut().unwrap().push(duplicate);
+    let error = apply_call_side(&mut calls_history("opencode2"), &side).unwrap_err();
+    assert!(error.to_string().contains("duplicate call"));
+    assert!(error
+        .to_string()
+        .contains("msg_1c3a28ed1001vuQMbrQVVCiZ1S, call_probe"));
+}
+
+#[test]
+fn calls_side_file_unknown_call_refuses_by_source_location() {
+    let mut side = calls_side("opencode2");
+    side["calls"][0]["tool_call_id"] = json!("unknown-call");
+    let error = apply_call_side(&mut calls_history("opencode2"), &side).unwrap_err();
+    assert_eq!(error.code(), "import_calls_unreadable");
+    assert!(error.to_string().contains("unknown-call"));
+    assert!(error.to_string().contains("matches no call"));
+}
+
+#[test]
+fn calls_side_file_missing_call_refuses_by_source_location() {
+    let mut side = calls_side("opencode2");
+    side["calls"].as_array_mut().unwrap().remove(0);
+    let error = apply_call_side(&mut calls_history("opencode2"), &side).unwrap_err();
+    assert_eq!(error.code(), "import_calls_unreadable");
+    assert!(error
+        .to_string()
+        .contains("msg_1c3a28ed1001vuQMbrQVVCiZ1S, call_probe) has no row"));
+}
+
+#[test]
+fn calls_side_file_invalid_values_refuse_by_member() {
+    for (member, value) in [
+        ("call_key", json!(12)),
+        ("mid", json!(false)),
+        ("tool_call_id", json!(12)),
+        ("call_carrier", json!({"module_id": "runner"})),
+        ("schema_pin", json!({"digest": "abc"})),
+        ("started_at", json!(-1)),
+        ("finished_at", json!("now")),
+        ("unanswered", json!("unknown")),
+    ] {
+        let mut side = calls_side("opencode2");
+        side["calls"][0][member] = value;
+        let error = apply_call_side(&mut calls_history("opencode2"), &side).unwrap_err();
+        assert!(error.to_string().contains(member), "{error}");
+    }
+    for side in [
+        json!([]),
+        json!({}),
+        json!({"calls": {}}),
+        json!({"calls": [1]}),
+        json!({"calls": [{}]}),
+    ] {
+        assert!(read_calls(&serde_json::to_vec(&side).unwrap()).is_err());
+    }
+}
+
+#[test]
+fn calls_side_file_absent_facts_stay_unknown_and_closures_are_verbatim() {
+    let mut history = calls_history("opencode2");
+    assert!(history
+        .messages
+        .iter()
+        .flat_map(|message| &message.calls)
+        .all(|call| call.schema_pin.is_none()
+            && call.started_at.is_none()
+            && call.finished_at.is_none()
+            && call.unanswered.is_none()));
+    let mut side = calls_side("opencode2");
+    for row in side["calls"].as_array_mut().unwrap() {
+        row.as_object_mut()
+            .unwrap()
+            .retain(|key, _| matches!(key.as_str(), "call_key" | "mid" | "tool_call_id"));
+    }
+    for reason in ["denied", "not_executed", "interrupted", "cancelled"] {
+        side["calls"][0]["unanswered"] = json!(reason);
+        apply_call_side(&mut history, &side).unwrap();
+        let calls: Vec<_> = history
+            .messages
+            .iter()
+            .flat_map(|message| &message.calls)
+            .collect();
+        assert_eq!(calls[0].unanswered.as_deref(), Some(reason));
+        assert!(
+            calls[0].schema_pin.is_none()
+                && calls[0].started_at.is_none()
+                && calls[0].finished_at.is_none()
+        );
+        assert!(calls[1].unanswered.is_none());
+    }
+}
+
+#[test]
+fn calls_side_file_real_samples_keep_pins_and_each_calls_times() {
+    let pin = "tp1:bash:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1";
+    for (host, keys, times) in [
+        (
+            "opencode2",
+            [
+                "msg_1c3a28ed1001vuQMbrQVVCiZ1S/call_probe",
+                "msg_1c3a29e37001AjEeHT8n9cQUdO/call_each",
+            ],
+            [
+                (1794283573083, 1794283575337),
+                (1794283576969, 1794283577044),
+            ],
+        ),
+        (
+            "pi",
+            [
+                "01a1c3a2-83cc-718b-bcb8-06f631d16cd7/9e044dcd/call_probe_1",
+                "01a1c3a2-83cc-718b-bcb8-06f631d16cd7/5639ca60/call_probe_7",
+            ],
+            [
+                (1794283572782, 1794283572814),
+                (1794283574932, 1794283574945),
+            ],
+        ),
+    ] {
+        let mut history = calls_history(host);
+        apply_call_side(&mut history, &calls_side(host)).unwrap();
+        let calls: Vec<_> = history
+            .messages
+            .iter()
+            .flat_map(|message| &message.calls)
+            .collect();
+        assert_eq!(calls.len(), 2);
+        for (index, call) in calls.iter().enumerate() {
+            assert_eq!(call.call_key, keys[index]);
+            assert_eq!(call.carrier, OPENCODE2_CARRIER);
+            assert_eq!(call.schema_pin.as_deref(), (index == 1).then_some(pin));
+            assert_eq!(call.started_at, Some(times[index].0));
+            assert_eq!(call.finished_at, Some(times[index].1));
+            assert_eq!(call.unanswered, None);
+        }
+    }
+}
+
+#[test]
+fn calls_side_file_pi_carriers_belong_to_each_call_not_the_host() {
+    let mut history = calls_history("pi");
+    assert!(history
+        .messages
+        .iter()
+        .flat_map(|message| &message.calls)
+        .all(|call| call.carrier == PI_CARRIER));
+    let mut side = calls_side("pi");
+    side["calls"][0]["call_carrier"] = json!(PI_CARRIER);
+    apply_call_side(&mut history, &side).unwrap();
+    let calls: Vec<_> = history
+        .messages
+        .iter()
+        .flat_map(|message| &message.calls)
+        .collect();
+    assert_eq!(calls[0].carrier, PI_CARRIER);
+    assert_eq!(calls[1].carrier, OPENCODE2_CARRIER);
+}
+
+#[test]
+fn calls_side_file_keys_are_opaque_and_source_ids_survive_renaming() {
+    let mut source: Value =
+        serde_json::from_slice(&calls_fixture("opencode2/export.json")).unwrap();
+    let assistant = source["messages"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|message| message["id"] == "msg_1c3a29e37001AjEeHT8n9cQUdO")
+        .unwrap();
+    let tool = assistant["content"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|block| block["type"] == "tool")
+        .unwrap();
+    tool["id"] = json!("call_probe");
+    let mut history = opencode2::read(&serde_json::to_vec(&source).unwrap(), &mut accept).unwrap();
+    let mut side = calls_side("opencode2");
+    side["calls"][0]["call_key"] = json!("opaque:first");
+    side["calls"][1]["call_key"] = json!("unrelated-second-key");
+    side["calls"][1]["tool_call_id"] = json!("call_probe");
+    // History order is not a matching key: reversing rows must not swap their facts.
+    side["calls"].as_array_mut().unwrap().reverse();
+    apply_call_side(&mut history, &side).unwrap();
+    let calls: Vec<_> = history
+        .messages
+        .iter()
+        .flat_map(|message| &message.calls)
+        .collect();
+    assert_eq!(calls[0].tool_call_id, "call_probe");
+    assert_eq!(calls[1].tool_call_id, "call_probe-2");
+    assert_eq!(calls[0].call_key, "opaque:first");
+    assert_eq!(calls[1].call_key, "unrelated-second-key");
+    assert!(calls[0].schema_pin.is_none());
+    assert!(calls[1].schema_pin.is_some());
+    assert_eq!(calls[0].started_at, Some(1794283573083));
+    assert_eq!(calls[1].started_at, Some(1794283576969));
+}
+
+#[test]
+fn calls_side_file_does_not_change_pending_tool_refusal() {
+    let mut source: Value =
+        serde_json::from_slice(&calls_fixture("opencode2/export.json")).unwrap();
+    source["messages"][1]["content"][0]["state"]["status"] = json!("pending");
+    let error = opencode2::read(&serde_json::to_vec(&source).unwrap(), &mut accept).unwrap_err();
+    assert!(matches!(error, HeadError::OpenCall { ref call_id, .. } if call_id == "call_probe"));
+}
+
 fn fixture(path: &str) -> Vec<u8> {
     std::fs::read(
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
