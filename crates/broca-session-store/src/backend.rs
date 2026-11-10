@@ -1004,7 +1004,14 @@ impl SessionBackend for LocalBackend {
         self.fences.lock().unwrap().insert(s.clone(), next);
         // The head is committed, so a failure to delete old versions mustn't read as a failed
         // write: the versions stay, and the next write deletes them.
-        let _ = prune_versions(&versions, std::time::SystemTime::now());
+        // A move pins a pre-freeze head version. Even an old version must survive every
+        // residence update until the move has aborted or the retained source is collected.
+        if !matches!(
+            crate::head::stored_residence(head),
+            Ok(crate::head::Residence::Moving(_) | crate::head::Residence::Moved(_))
+        ) {
+            let _ = prune_versions(&versions, std::time::SystemTime::now());
+        }
         Ok(next)
     }
 

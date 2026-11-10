@@ -95,6 +95,14 @@ pub enum SessionError {
     /// The session's head moved past the version a read was pinned at (see [`Session::view_at`]),
     /// or its open log is no longer the one pinned. Nothing was read; read it again.
     Moved,
+    /// A move owns the session's writer until its cut aborts or releases.
+    SessionMoving {
+        cut_id: String,
+    },
+    /// The retained copy is fenced because another computer holds the session.
+    SessionMoved {
+        holder: String,
+    },
 }
 
 impl From<BackendError> for SessionError {
@@ -490,6 +498,11 @@ impl<B: SessionBackend> Session<B> {
                 mut read,
                 end,
             } => {
+                if let Residence::Moving(cut_id) = &session.head.residence {
+                    return Err(SessionError::SessionMoving {
+                        cut_id: cut_id.clone(),
+                    });
+                }
                 let key = session.key.clone();
                 session.kept = kept::KeptRecords::writer_of(
                     std::mem::take(&mut read.records),
@@ -530,10 +543,13 @@ impl<B: SessionBackend> Session<B> {
         let Some(open) = head
             .open_log
             .as_ref()
-            .filter(|_| matches!(head.residence, Residence::Local(())))
+            .filter(|_| matches!(head.residence, Residence::Local(()) | Residence::Moving(_)))
         else {
             return match head.residence {
                 Residence::Recovering(_) => Err(SessionError::NeedsRecovery),
+                Residence::Moved(moved) => Err(SessionError::SessionMoved {
+                    holder: moved.holder,
+                }),
                 _ => Ok(None),
             };
         };
@@ -598,6 +614,11 @@ impl<B: SessionBackend> Session<B> {
         }
         if let Residence::Recovering(_) = head.residence {
             return Err(SessionError::NeedsRecovery);
+        }
+        if let Residence::Moved(moved) = &head.residence {
+            return Err(SessionError::SessionMoved {
+                holder: moved.holder.clone(),
+            });
         }
         if let Residence::Creating(log) = head.residence {
             return Ok(Loaded::Creating {
@@ -966,6 +987,7 @@ impl<B: SessionBackend> Session<B> {
 }
 
 mod kept;
+pub mod moves;
 pub use kept::InMemory;
 mod media;
 use media::OpenLogIndex;

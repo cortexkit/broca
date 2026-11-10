@@ -169,6 +169,12 @@ impl<B: SessionBackend> Session<B> {
             Residence::Local(()) => false,
             // Loading finishes a creation, which has no records to recover.
             Residence::Creating(_) => return Ok(Recovery::NotNeeded),
+            Residence::Moving(cut_id) => return Err(SessionError::SessionMoving { cut_id }),
+            Residence::Moved(moved) => {
+                return Err(SessionError::SessionMoved {
+                    holder: moved.holder,
+                })
+            }
         };
         let open = head.open_log.clone().ok_or(SessionError::Backend(
             crate::backend::BackendError::Corrupt("local head without a log"),

@@ -30,6 +30,7 @@
 //! session unrecoverable, reported with what is lacking, and nothing changes.
 
 use std::path::PathBuf;
+use std::{collections::BTreeMap, sync::Mutex};
 
 use sha2::{Digest as _, Sha256};
 
@@ -140,17 +141,26 @@ fn refused(what: impl Into<String>) -> Stop {
 
 /// The session as one kept head version names it, for a check: the head it reads is that
 /// version's, every other read goes to the store, and nothing can be written.
-struct Pinned<'a> {
-    store: &'a LocalBackend,
+struct Pinned<'a, B: SessionBackend> {
+    store: &'a B,
     head: &'a [u8],
     version: Version,
+    capture: Option<&'a Mutex<BTreeMap<String, Vec<u8>>>>,
+}
+
+impl<B: SessionBackend> Pinned<'_, B> {
+    fn capture(&self, name: String, bytes: &[u8]) {
+        if let Some(files) = self.capture {
+            files.lock().unwrap().insert(name, bytes.to_vec());
+        }
+    }
 }
 
 fn read_only() -> BackendError {
     BackendError::Corrupt("a restore check only reads")
 }
 
-impl SessionBackend for Pinned<'_> {
+impl<B: SessionBackend> SessionBackend for Pinned<'_, B> {
     async fn read_head(
         &self,
         _s: &SessionAddr,
@@ -180,7 +190,12 @@ impl SessionBackend for Pinned<'_> {
         log: &Id128,
         range: std::ops::Range<u64>,
     ) -> Result<Vec<u8>, BackendError> {
-        self.store.read_log(s, log, range).await
+        let whole = range.start == 0 && range.end == self.store.log_end(s, log).await?;
+        let bytes = self.store.read_log(s, log, range).await?;
+        if whole {
+            self.capture(format!("logs/{}/{}", s.0, hex(&log.0)), &bytes);
+        }
+        Ok(bytes)
     }
     async fn log_end(&self, s: &SessionAddr, log: &Id128) -> Result<u64, BackendError> {
         self.store.log_end(s, log).await
@@ -236,7 +251,11 @@ impl SessionBackend for Pinned<'_> {
         s: &SessionAddr,
         name: &str,
     ) -> Result<Option<Vec<u8>>, BackendError> {
-        self.store.get_object(s, name).await
+        let bytes = self.store.get_object(s, name).await?;
+        if let Some(bytes) = &bytes {
+            self.capture(format!("objects/{}/{name}", s.0), bytes);
+        }
+        Ok(bytes)
     }
     async fn delete_object(
         &self,
@@ -261,7 +280,15 @@ impl SessionBackend for Pinned<'_> {
         Err(read_only())
     }
     async fn get_setup(&self, name: &str) -> Result<Option<Vec<u8>>, BackendError> {
-        self.store.get_setup(name).await
+        let bytes = self.store.get_setup(name).await?;
+        if let Some(bytes) = &bytes {
+            let path = match name.strip_prefix(crate::setup::PLAIN_PREFIX) {
+                Some(hex) => format!("setup-plain/{hex}"),
+                None => format!("setup/{name}"),
+            };
+            self.capture(path, bytes);
+        }
+        Ok(bytes)
     }
     async fn list_setup(&self) -> Result<Vec<String>, BackendError> {
         self.store.list_setup().await
@@ -327,14 +354,14 @@ fn named_by_state(operations: &Operations) -> Vec<Named> {
 }
 
 /// Checks the files records name, for one session.
-struct Objects<'a> {
-    store: &'a LocalBackend,
+struct Objects<'a, B: SessionBackend> {
+    store: &'a B,
     addr: &'a SessionAddr,
     key: &'a DataKey,
-    setup: SetupStore<'a, LocalBackend>,
+    setup: SetupStore<'a, B>,
 }
 
-impl Objects<'_> {
+impl<B: SessionBackend> Objects<'_, B> {
     /// What the first file `named` lists that the backup lacks is, if any.
     async fn first_lacking(&self, named: Vec<Named>) -> Result<Option<String>, Stop> {
         for file in named {
@@ -436,14 +463,15 @@ impl Complete {
 /// changes wrote must be there and pass its checks, or the version isn't complete; and the
 /// first record of its open log naming a file the backup lacks is found. `current` says it is
 /// the session's head, not a kept older version.
-async fn check_version(
-    store: &LocalBackend,
+async fn check_version<B: SessionBackend>(
+    store: &B,
     addr: &SessionAddr,
     deployment: &DeploymentKey,
     bytes: &[u8],
-    version: Version,
-    current: bool,
+    position: (Version, bool),
+    capture: Option<&Mutex<BTreeMap<String, Vec<u8>>>>,
 ) -> Result<Complete, Stop> {
+    let (version, current) = position;
     let (head, key) = match head::open(bytes, deployment) {
         Ok(opened) => opened,
         Err(HeadError::NotLoaded) => return Err(Stop::Error(RestoreError::KeyUnavailable)),
@@ -460,6 +488,8 @@ async fn check_version(
             ))
         }
         Residence::Recovering(_) => return Err(refused("a recovery is in progress")),
+        Residence::Moving(_) => return Err(refused("a move is in progress")),
+        Residence::Moved(_) => return Err(refused("the session moved to another computer")),
     }
     let Some(open) = head.open_log.clone() else {
         return Err(refused("its head names no open log"));
@@ -470,6 +500,7 @@ async fn check_version(
         store,
         head: bytes,
         version,
+        capture,
     };
     match Session::view(&pinned, addr.clone(), &head.triple, deployment).await {
         Ok(_) => {}
@@ -481,6 +512,7 @@ async fn check_version(
         }
         Err(error) => return Err(refused(format!("it doesn't load: {error:?}"))),
     }
+    let store = &pinned;
     let end = store.log_end(addr, &open.change).await?;
     let log_bytes = store.read_log(addr, &open.change, 0..end).await?;
     let frame_key = key.frame_key();
@@ -618,11 +650,38 @@ pub async fn check(
     let Some((bytes, version)) = store.read_stored_head(addr)? else {
         return Ok(Some(Finding::Refused("the session has no head".into())));
     };
-    match check_version(store, addr, deployment, &bytes, version, true).await {
+    match check_version(store, addr, deployment, &bytes, (version, true), None).await {
         Ok(complete) => Ok(complete.lacking().map(|what| Finding::Lacks(what.into()))),
         Err(Stop::Found(finding)) => Ok(Some(finding)),
         Err(Stop::Error(error)) => Err(error),
     }
+}
+
+/// Captures stored bytes while the restore checker walks a pinned head's complete graph.
+/// Using the same walk keeps media, setup and auxiliary objects in sync with restore's checks.
+pub(super) async fn reachable<B: SessionBackend>(
+    store: &B,
+    addr: &SessionAddr,
+    deployment: &DeploymentKey,
+    bytes: &[u8],
+    version: Version,
+) -> Result<(BTreeMap<String, Vec<u8>>, Option<Finding>), RestoreError> {
+    let files = Mutex::new(BTreeMap::new());
+    let finding = match check_version(
+        store,
+        addr,
+        deployment,
+        bytes,
+        (version, false),
+        Some(&files),
+    )
+    .await
+    {
+        Ok(complete) => complete.lacking().map(|what| Finding::Lacks(what.into())),
+        Err(Stop::Found(finding)) => Some(finding),
+        Err(Stop::Error(error)) => return Err(error),
+    };
+    Ok((files.into_inner().unwrap(), finding))
 }
 
 /// Restores the session at `addr` from the files its store holds after a backup came back (see
@@ -655,7 +714,16 @@ async fn restore_with(
     let lacking_in = |complete: &Complete| complete.lacking().unwrap_or_default().to_owned();
     let mut lacking = Vec::new();
     let mut chosen = None;
-    match check_version(store, addr, deployment, &current_bytes, current, true).await {
+    match check_version(
+        store,
+        addr,
+        deployment,
+        &current_bytes,
+        (current, true),
+        None,
+    )
+    .await
+    {
         Ok(complete) if complete.lacking().is_none() => {
             return Ok(Restored::Kept { version: current })
         }
@@ -678,7 +746,7 @@ async fn restore_with(
                 }
                 Err(error) => return Err(error.into()),
             };
-            match check_version(store, addr, deployment, &bytes, version, false).await {
+            match check_version(store, addr, deployment, &bytes, (version, false), None).await {
                 Ok(complete) if cut_logs || complete.lacking().is_none() => {
                     chosen = Some((version, bytes, complete));
                     break;
@@ -712,6 +780,7 @@ async fn restore_with(
                 store,
                 head: &bytes,
                 version,
+                capture: None,
             };
             let position = Position {
                 version,
