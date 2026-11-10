@@ -621,6 +621,8 @@ async fn entries<B: SessionBackend>(
                 Some(&caller),
                 method,
                 &params,
+                // Compared with today's projection, which keeps every entry's attribution.
+                &broca_module::store_entries::EntryAttribution::Known(true),
             )
             .await
             .map(|reply| serde_json::from_str::<Value>(reply.get()).expect("a reply is JSON")),

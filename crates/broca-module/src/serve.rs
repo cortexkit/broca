@@ -4344,6 +4344,11 @@ impl ServeHandler for crate::LineageRegistry {
         &self,
         session: &LineageKey,
     ) -> Result<(bool, Option<String>), ServeError> {
+        // The new storage keeps each message's public id as it was minted or converted, so its
+        // stream's ids need no translation; reading today's log for them would be refused.
+        if self.store_holding(session)?.is_some() {
+            return Ok((false, None));
+        }
         if let Some(identity) = self.message_identity_from_log(session).await? {
             return Ok(identity);
         }

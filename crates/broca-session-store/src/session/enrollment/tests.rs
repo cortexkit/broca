@@ -52,6 +52,7 @@ fn model() -> ModelHandle {
 
 fn start(run: &str, contract: bool) -> Record {
     Record::RunStart(Box::new(RunStart {
+        named_speaker: None,
         imported_ids: None,
         message_marks: None,
         run_id: run.into(),
@@ -133,6 +134,7 @@ fn answer(run: &str, content: Vec<ContentBlock>) -> Record {
 /// message's own time, which `written_at` gives when it has one.
 fn facts(ordinal: u64, mid: String, written_at: Option<u64>) -> Record {
     Record::EntryFacts(EntryFacts {
+        named_speaker: None,
         client_message_id: None,
         sender: None,
         marks: None,

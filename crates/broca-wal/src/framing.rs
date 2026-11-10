@@ -232,6 +232,11 @@ pub const TOOL_SCHEMA_PINS_FEATURE: &str = "tool-schema-pins/v1";
 /// Display marks stored beside send bodies and notices appended to tool results.
 pub const MESSAGE_MARKS_FEATURE: &str = "message-marks/v1";
 
+/// An optional display name on a stored `speaks_for` mark (llm-runner's `SpeaksFor.name`). It is
+/// gated apart from `message-marks/v1` because a reader of marks alone decodes a named speaker
+/// and silently drops the name, serving the agent without the name it was sent with.
+pub const SPEAKS_FOR_NAME_FEATURE: &str = "speaks-for-name/v1";
+
 /// The feature names this build understands in a gated frame's `requires` list.
 ///
 /// THIS IS THE ONLY TABLE. Every reader path (replay, the anchored range read behind
@@ -276,6 +281,7 @@ pub const KNOWN_FEATURES: &[&str] = &[
     INPUT_TOKEN_CAP_FEATURE,
     MEDIA_CONTENT_FEATURE,
     MESSAGE_MARKS_FEATURE,
+    SPEAKS_FOR_NAME_FEATURE,
     OPENROUTER_REASONING_FEATURE,
     OUTPUT_RESERVATION_FEATURE,
     PLAN_MANIFEST_FEATURE,
@@ -1745,6 +1751,7 @@ mod tests {
                 INPUT_TOKEN_CAP_FEATURE,
                 MEDIA_CONTENT_FEATURE,
                 MESSAGE_MARKS_FEATURE,
+                SPEAKS_FOR_NAME_FEATURE,
                 OPENROUTER_REASONING_FEATURE,
                 OUTPUT_RESERVATION_FEATURE,
                 PLAN_MANIFEST_FEATURE,
@@ -1779,6 +1786,7 @@ mod tests {
         assert_eq!(TOOL_REPLY_FEATURE, "tool-reply/v1");
         assert_eq!(BILL_ATTEMPTS_FEATURE, "bill-attempts/v1");
         assert_eq!(MESSAGE_TIMES_FEATURE, "message-times/v1");
+        assert_eq!(SPEAKS_FOR_NAME_FEATURE, "speaks-for-name/v1");
         assert_eq!(OUTPUT_RESERVATION_FEATURE, "output-reservation/v1");
         assert_eq!(RUNNER_TAGS_FEATURE, "runner-tags/v1");
         assert_eq!(RUNNER_TAGS_V2_FEATURE, "runner-tags/v2");
@@ -3460,6 +3468,9 @@ mod message_marks_tests {
             let record: WalRecord = serde_json::from_str(payload).unwrap();
             assert_eq!(serde_json::to_string(&record).unwrap(), payload);
             assert!(!record.required_features().contains(&MESSAGE_MARKS_FEATURE));
+            assert!(!record
+                .required_features()
+                .contains(&SPEAKS_FOR_NAME_FEATURE));
         }
     }
 
@@ -3496,6 +3507,74 @@ mod message_marks_tests {
                 assert_eq!(serde_json::to_value(&notice).unwrap(), value);
                 assert!(notice.required_features().contains(&MESSAGE_MARKS_FEATURE));
             }
+        }
+    }
+
+    #[test]
+    fn named_speakers_decode_and_require_the_name_reader() {
+        for payload in OLD_SENDS.into_iter().chain([OLD_RIDE]) {
+            let mut value: Value = serde_json::from_str(payload).unwrap();
+            let ride = value["type"] == "send_delivered";
+            let speaker = json!({"agent_id":"agent-a","name":"Ada"});
+            if ride {
+                value["ride"]["speaks_for"] = speaker;
+            } else {
+                value["message_marks"] = json!({"speaks_for":speaker,"notice":true});
+            }
+            let record: WalRecord = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(&record).unwrap(), value);
+            let requires = record.required_features();
+            assert!(requires.contains(&MESSAGE_MARKS_FEATURE));
+            assert!(requires.contains(&SPEAKS_FOR_NAME_FEATURE));
+            let bytes = encode(1, 1, &record).unwrap();
+            // A build that reads marks but not names refuses the frame rather than drop the name.
+            let marks_only: Vec<_> = KNOWN_FEATURES
+                .iter()
+                .copied()
+                .filter(|name| *name != SPEAKS_FOR_NAME_FEATURE)
+                .collect();
+            assert!(
+                matches!(decode_next_with(&bytes, &marks_only), DecodeStep::NewerWriter { missing, .. }
+                if missing == [SPEAKS_FOR_NAME_FEATURE])
+            );
+            match decode_next(&bytes) {
+                DecodeStep::Record { framed, .. } => {
+                    assert_eq!(framed.record, record);
+                    let name = match &framed.record {
+                        WalRecord::SendDelivered {
+                            ride: Some(ride), ..
+                        } => ride.speaks_for.as_ref().and_then(|s| s.name.clone()),
+                        WalRecord::RunStarted { message_marks, .. }
+                        | WalRecord::Queued { message_marks, .. }
+                        | WalRecord::Steered { message_marks, .. } => message_marks
+                            .as_ref()
+                            .and_then(|marks| marks.speaks_for.as_ref())
+                            .and_then(|s| s.name.clone()),
+                        other => panic!("unexpected record {other:?}"),
+                    };
+                    assert_eq!(name.as_deref(), Some("Ada"));
+                }
+                _ => panic!("a named speaker did not decode: {payload}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_named_speaker_in_retry_identity_alone_requires_the_name_reader() {
+        for payload in OLD_SENDS {
+            let mut value: Value = serde_json::from_str(payload).unwrap();
+            value["request_identity_digest"] = json!(
+                r#"{"version":1,"message_marks":{"speaks_for":{"agent_id":"agent-a","name":"Ada"}}}"#
+            );
+            let named: WalRecord = serde_json::from_value(value.clone()).unwrap();
+            assert!(named.required_features().contains(&SPEAKS_FOR_NAME_FEATURE));
+            value["request_identity_digest"] =
+                json!(r#"{"version":1,"message_marks":{"speaks_for":{"agent_id":"agent-a"}}}"#);
+            let unnamed: WalRecord = serde_json::from_value(value).unwrap();
+            assert!(unnamed.required_features().contains(&MESSAGE_MARKS_FEATURE));
+            assert!(!unnamed
+                .required_features()
+                .contains(&SPEAKS_FOR_NAME_FEATURE));
         }
     }
 }

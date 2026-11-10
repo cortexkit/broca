@@ -1793,7 +1793,9 @@ where
     W: WalStore,
 {
     let (append_episode, auth_resolved) = mode.flags();
-    run_on_writer(
+    // Heap-own the run body, as `run_under_lease` does, so a caller that awaits this entry
+    // (a coordinator, or a test on its thread's stack) holds a small future, not the whole run.
+    Box::pin(run_on_writer(
         &mut req,
         writer,
         append_episode,
@@ -1808,7 +1810,7 @@ where
         on_admitted,
         prior_snapshot,
         None,
-    )
+    ))
     .await
 }
 
@@ -1908,7 +1910,9 @@ where
         }
     };
     let (append_episode, auth_resolved) = mode.flags();
-    run_on_writer(
+    // Heap-own the run body, as `run_under_lease` does, so a caller that awaits this entry
+    // holds a small future, not the whole run.
+    Box::pin(run_on_writer(
         &mut req,
         writer,
         append_episode,
@@ -1923,7 +1927,7 @@ where
         on_admitted,
         None,
         Some(prepared),
-    )
+    ))
     .await
 }
 
@@ -2020,7 +2024,9 @@ where
     W: WalStore,
 {
     let (append_episode, auth_resolved) = mode.flags();
-    run_on_writer(
+    // Heap-own the run body, as `run_under_lease` does, so a caller that awaits this entry
+    // holds a small future, not the whole run.
+    Box::pin(run_on_writer(
         &mut req,
         writer,
         append_episode,
@@ -2035,7 +2041,7 @@ where
         on_admitted,
         None,
         Some(prepared),
-    )
+    ))
     .await
 }
 
@@ -12970,6 +12976,9 @@ mod boundary_cancel_tests;
 #[path = "run/delivery_order_tests.rs"]
 mod delivery_order_tests;
 mod display_text;
+#[cfg(test)]
+#[path = "run/future_size_tests.rs"]
+mod future_size_tests;
 #[path = "run/hook_dispatch.rs"]
 mod hook_dispatch;
 pub use hook_dispatch::{

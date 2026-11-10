@@ -9,6 +9,7 @@ description = "broca's session storage format: typed records, their compact tagg
 publish = false
 
 [dependencies]
+broca-owner-only = { path = "../broca-owner-only" }
 # Content types and renderer inputs only. This crate must never depend on broca-wal,
 # broca-store or broca-core: the new format is built standalone, and a converter crate is
 # the only place that reads both.

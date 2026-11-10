@@ -192,6 +192,12 @@ fn compaction_v2_recorded_queued_marks_survive_projection_checkpoint() {
         .unwrap();
         let value = serde_json::to_value(&entry).unwrap();
         assert_eq!(value["notice"]["sender"].as_str(), notice, "{marks:?}");
+        // The queued send's speaker survives the checkpoint into its delivered entry.
+        assert_eq!(
+            value.get("speaks_for"),
+            marks.as_ref().and_then(|marks| marks.get("speaks_for")),
+            "{marks:?}"
+        );
     }
 }
 
@@ -217,6 +223,7 @@ fn compaction_v2_unmarked_principals_keep_their_legacy_notice_and_digest() {
                 written_at: 10,
                 completed_at: None,
                 notice: notice.clone(),
+                speaks_for: None,
                 usage: None,
                 generated_under: None,
             }],
@@ -261,6 +268,62 @@ fn compaction_v2_recorded_steer_marks_decide_its_notice() {
         }
         let steer = serde_json::to_value(rows[&3].notice.as_ref()).unwrap();
         assert_eq!(steer["sender"].as_str(), notice, "{marks:?}");
+        assert_eq!(
+            serde_json::to_value(rows[&3].speaks_for.as_ref()).unwrap(),
+            marks
+                .as_ref()
+                .and_then(|marks| marks.get("speaks_for").cloned())
+                .unwrap_or(serde_json::Value::Null),
+            "{marks:?}"
+        );
+    }
+}
+
+/// A speaker is projected onto the entries of a marked send, named or not, alone or with a
+/// notice, and never moves the entry's digest: attribution is outside every checksum.
+#[test]
+fn compaction_v2_recorded_speaker_projects_without_moving_the_digest() {
+    let owner = broca_protocol::BindPrincipal::Reserved {
+        module_id: "core".into(),
+    };
+    assert!(marked_input_entry(owner.clone(), None).speaks_for.is_none());
+    let unnamed = marked_input_entry(
+        owner.clone(),
+        Some(json!({"speaks_for":{"agent_id":"agent-a"}})),
+    );
+    for marks in [
+        json!({"speaks_for":{"agent_id":"agent-a"}}),
+        json!({"speaks_for":{"agent_id":"agent-a","name":"Ada"}}),
+        json!({"speaks_for":{"agent_id":"agent-a","name":"Ada"},"notice":true}),
+    ] {
+        let entry = marked_input_entry(owner.clone(), Some(marks.clone()));
+        assert_eq!(
+            serde_json::to_value(entry.speaks_for.as_ref()).unwrap(),
+            marks["speaks_for"],
+        );
+        let notice = marks["notice"] == json!(true);
+        assert_eq!(entry.notice.is_some(), notice, "{marks}");
+        assert_eq!(
+            entry.digest,
+            cortexkit_role_compaction::read::entry_digest(
+                entry.role.clone(),
+                entry.notice.as_ref(),
+                &entry.parts,
+            ),
+            "{marks}"
+        );
+        if !notice {
+            // A name changes nothing but the speaker the entry carries.
+            let mut renamed = entry.clone();
+            renamed.speaks_for = unnamed.speaks_for.clone();
+            assert_eq!(renamed, unnamed, "{marks}");
+        }
+        let mut gated = entry.clone();
+        super::entries::gate_speaks_for(std::slice::from_mut(&mut gated), true);
+        assert_eq!(gated, entry);
+        super::entries::gate_speaks_for(std::slice::from_mut(&mut gated), false);
+        assert!(gated.speaks_for.is_none());
+        assert_eq!(gated.digest, entry.digest);
     }
 }
 

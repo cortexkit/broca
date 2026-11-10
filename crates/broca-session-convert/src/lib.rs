@@ -855,6 +855,9 @@ fn convert_record(
                 input,
                 written_at_ms: written,
                 tags_v1: tags,
+                named_speaker: broca_session_store::record::marks_name_speaker(
+                    message_marks.as_ref(),
+                ),
                 message_marks,
                 receipt: f.rest(),
             }));
@@ -1303,6 +1306,7 @@ fn queued(f: &mut Fields, out: &mut Converted) -> Result<(), ConvertError> {
     let message_marks = f.take("message_marks");
     out.records.push(Record::QueuedSend(QueuedSend {
         media: Vec::new(),
+        named_speaker: broca_session_store::record::marks_name_speaker(message_marks.as_ref()),
         message_marks,
         submission_id,
         send_id: f.string("send_id"),
@@ -1382,9 +1386,11 @@ fn run_started(f: &mut Fields, state: &mut State, out: &mut Converted) -> Result
     }
     let tags = f.take("tags");
 
+    let message_marks = f.take("message_marks");
     let mut start = RunStart {
         imported_ids: None,
-        message_marks: f.take("message_marks"),
+        named_speaker: broca_session_store::record::marks_name_speaker(message_marks.as_ref()),
+        message_marks,
         run_id: run_id.clone(),
         model: model.clone(),
         setup: parts,
@@ -1848,6 +1854,11 @@ fn ride_envelope(
             .speaks_for
             .as_ref()
             .map(|speaks_for| serde_json::to_value(speaks_for).expect("a speaks_for encodes")),
+        named_speaker: ride
+            .speaks_for
+            .as_ref()
+            .and_then(|speaks_for| speaks_for.name.as_ref())
+            .map(|_| true),
     }
 }
 

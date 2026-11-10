@@ -31,6 +31,7 @@ fn user(text: &str) -> Message {
 
 fn steer(text: &str) -> Record {
     Record::Steer(Steer {
+        named_speaker: None,
         input: vec![user(text)],
         written_at_ms: None,
         tags_v1: None,

@@ -232,6 +232,12 @@ crate::message! {
         /// The send's display marks, as its record kept them (llm-runner's `MessageMarks`
         /// JSON), which the placed messages' facts carry.
         10 opt [must] message_marks: serde_json::Value,
+        /// True, and present, exactly when `message_marks` names its speaker (llm-runner's
+        /// `SpeaksFor.name`, a display name). It carries nothing a reader uses: the name is in
+        /// `message_marks`. Its must-understand bit makes a reader that predates speaker names refuse the
+        /// record rather than serve the speaker without its name. Absent otherwise, so a record
+        /// without a name keeps the bytes it had before names existed.
+        11 opt [must] named_speaker: bool,
     }
 }
 
@@ -705,6 +711,12 @@ crate::message! {
         /// The send's display marks, as its record kept them (llm-runner's `MessageMarks`
         /// JSON), which the messages it places carry.
         6 opt [must] message_marks: serde_json::Value,
+        /// True, and present, exactly when `message_marks` names its speaker (llm-runner's
+        /// `SpeaksFor.name`, a display name). It carries nothing a reader uses: the name is in
+        /// `message_marks`. Its must-understand bit makes a reader that predates speaker names refuse the
+        /// record rather than serve the speaker without its name. Absent otherwise, so a record
+        /// without a name keeps the bytes it had before names existed.
+        7 opt [must] named_speaker: bool,
     }
 }
 
@@ -1488,20 +1500,22 @@ impl Operations {
             Record::QueuedSend(send) => {
                 let ordered =
                     self.ordered_next.take().as_deref() == Some(send.submission_id.as_str());
-                let pending =
-                    Pending {
-                        submission_id: send.submission_id.clone(),
-                        interrupt: send.delivery.as_deref() == Some("interrupt"),
-                        ordered,
-                        sender: receipt_module(send.receipt.as_ref().and_then(|receipt| {
+                let pending = Pending {
+                    submission_id: send.submission_id.clone(),
+                    interrupt: send.delivery.as_deref() == Some("interrupt"),
+                    ordered,
+                    sender: receipt_module(
+                        send.receipt.as_ref().and_then(|receipt| {
                             receipt.get("sent_by").or(receipt.get("principal"))
-                        })),
-                        request_identity_digest: receipt_string(
-                            send.receipt.as_ref(),
-                            "request_identity_digest",
-                        ),
-                        message_marks: send.message_marks.clone(),
-                    };
+                        }),
+                    ),
+                    request_identity_digest: receipt_string(
+                        send.receipt.as_ref(),
+                        "request_identity_digest",
+                    ),
+                    message_marks: send.message_marks.clone(),
+                    named_speaker: crate::record::marks_name_speaker(send.message_marks.as_ref()),
+                };
                 let at = if pending.interrupt {
                     self.queue
                         .iter()
@@ -2075,6 +2089,7 @@ impl Operations {
                 ),
                 media: steer.media.clone(),
                 message_marks: steer.message_marks.clone(),
+                named_speaker: crate::record::marks_name_speaker(steer.message_marks.as_ref()),
             }),
             Record::Delivery(delivery) if !delivery.input.is_empty() => {
                 let (sender, request_identity_digest, message_marks) =
@@ -2095,6 +2110,7 @@ impl Operations {
                     // A delivery names no stored media of its own. The loop writes one only for an
                     // ordered send, which a session in the new storage doesn't take yet.
                     media: Vec::new(),
+                    named_speaker: crate::record::marks_name_speaker(message_marks.as_ref()),
                     message_marks,
                 })
             }

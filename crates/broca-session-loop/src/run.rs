@@ -239,8 +239,9 @@ pub struct Seams<'a, P, T> {
     /// active run's `step`. It is cleared when the step's call ends. Never a durability input.
     pub step_progress: Option<broca_core::provider::LiveStepProgress>,
     /// What each model call waits for before the provider is asked to render and send it, such
-    /// as the media its requests are rendered with while they are still being prepared. A cancel
-    /// during the wait ends the step cancelled, as a cancel during the call does.
+    /// as the media its requests are rendered with while they are still being prepared. Each
+    /// step waits for it before anything renders the step's request, its estimates included. A
+    /// cancel during the wait ends the run cancelled, as a cancel during the call does.
     pub model_call_ready: Option<Arc<dyn ModelCallReady>>,
 }
 
@@ -1685,7 +1686,15 @@ where
     // Each window run's frozen part numbering, read from its start once for the whole run.
     let mut tag_rules = TagRulesCache::default();
     let tools = Arc::new(admission.tools.clone());
-    let manifest = ToolManifest::from_tools(admission.tools.clone());
+    // The run's frozen plan says which preset each tool provider's calls carry, which providers
+    // were fetched and what they declared, as today's loop reads it from the same plan. A call
+    // without its preset is refused by a provider whose route is bound under a scope.
+    let mut manifest = ToolManifest::from_tools(admission.tools.clone());
+    if let Some(plan) = admission.manifest.as_deref() {
+        manifest = manifest
+            .with_plan_manifest(plan)
+            .map_err(|error| LoopError::Parts(format!("the run's frozen plan: {error}")))?;
+    }
     // As today's loop asks once per run: a provider whose media renderer tags its own copy of
     // each request takes the run's tag choice here, and the loop leaves media-holding messages
     // untagged, since preparing their media needs the parts where the model put them.
@@ -2005,7 +2014,23 @@ where
         // The session's original system message, which a plan's system text takes the place of
         // in the provider view below.
         let durable_system: Vec<Message> = opts.prompt.first().cloned().into_iter().collect();
-        if let Some(ctx) = compaction {
+        // What the step's request waits for before it can be rendered (`Seams::model_call_ready`,
+        // such as the session's media) is waited for here, before anything below renders it: the
+        // compaction estimate, the enrolling run's own estimate, the output cap's estimate and the
+        // check of a request an account-limit pause refused. When the wait fails, none of those
+        // renders: the model call's own wait then fails the step with that error before anything
+        // is sent, so the run still ends with its end record.
+        let call_ready = match &seams.model_call_ready {
+            Some(ready) => tokio::select! {
+                ready = ready.ready() => ready.is_ok(),
+                _ = seams.cancel.cancelled() => {
+                    return finish(writer, seams, &admission.run_id, RunFinishReason::Cancelled)
+                        .await;
+                }
+            },
+            None => true,
+        };
+        if let Some(ctx) = compaction.filter(|_| call_ready) {
             let marked = writer.conversation().marker.clone();
             match crate::compaction::prepare(writer, admission, seams, ctx, step_id, opts).await? {
                 crate::compaction::Send::Ready(ready) => opts = *ready,
@@ -2077,7 +2102,7 @@ where
         // step's usage measures the request from before the move, which rebuilt it, so the
         // prepared request's own estimate decides whether it fits the fallback's window.
         let own_estimate = match (
-            crate::enroll::is_enrolling_run(writer.operations(), &admission.run_id),
+            call_ready && crate::enroll::is_enrolling_run(writer.operations(), &admission.run_id),
             seams.provider.refusal_fallback_model(),
         ) {
             (true, Some(_)) => {
@@ -2098,15 +2123,18 @@ where
         let mut route =
             crate::refusal::Route::decide(writer, seams.provider, step_id, own_estimate)?;
         let prepared = opts;
-        let mut opts =
-            match reserve_for(writer, seams, admission, step_id, &prepared, &route).await? {
-                Some(opts) => opts,
-                None => return Ok(finished(writer, RunFinishReason::Error)),
-            };
+        let mut opts = match reserve_for(
+            writer, seams, admission, step_id, &prepared, &route, call_ready,
+        )
+        .await?
+        {
+            Some(opts) => opts,
+            None => return Ok(finished(writer, RunFinishReason::Error)),
+        };
         // The step a timed account pause resumes is sent again only if it renders the request
         // the provider refused, byte for byte, as today's resume checks it: anything else ends
         // the run interrupted rather than send a request the pause wasn't for.
-        if let Some(pause) = account_limit_replay.take() {
+        if let Some(pause) = account_limit_replay.take().filter(|_| call_ready) {
             use sha2::Digest as _;
             let bytes = seams
                 .provider
@@ -2217,8 +2245,10 @@ where
                         .await?;
                     refusal_retries = step.retries_used;
                     route.reroute(seams.provider);
-                    opts = match reserve_for(writer, seams, admission, step_id, &prepared, &route)
-                        .await?
+                    opts = match reserve_for(
+                        writer, seams, admission, step_id, &prepared, &route, call_ready,
+                    )
+                    .await?
                     {
                         Some(opts) => opts,
                         None => return Ok(finished(writer, RunFinishReason::Error)),
@@ -2685,9 +2715,11 @@ async fn admit<W: Writer>(
             ),
         }));
     }
+    let message_marks = to_value(admission.send.message_marks.as_ref())?;
     records.push(Record::RunStart(Box::new(RunStart {
         imported_ids: None,
-        message_marks: to_value(admission.send.message_marks.as_ref())?,
+        named_speaker: broca_session_store::record::marks_name_speaker(message_marks.as_ref()),
+        message_marks,
         run_id: admission.run_id.clone(),
         model: admission.model.clone(),
         setup,
@@ -4381,7 +4413,8 @@ fn run_selection<'a, P, T>(
 
 /// The step's request with its output cap reserved for the model it goes to: the run's own, or
 /// the refusal-fallback model, with that model's window. `None` when even the provider's floor
-/// doesn't fit: the run's end with the overflow error is then durable.
+/// doesn't fit: the run's end with the overflow error is then durable. `renders` is false when
+/// the step's request can't be rendered, so the cap isn't estimated (see `output::reserve`).
 async fn reserve_for<W: Writer, P: Provider, T>(
     writer: &mut W,
     seams: &Seams<'_, P, T>,
@@ -4389,6 +4422,7 @@ async fn reserve_for<W: Writer, P: Provider, T>(
     step_id: u64,
     prepared: &CallOptions,
     route: &crate::refusal::Route,
+    renders: bool,
 ) -> Result<Option<CallOptions>, LoopError> {
     let mut opts = prepared.clone();
     let mut context_limit = admission.context_limit;
@@ -4398,8 +4432,16 @@ async fn reserve_for<W: Writer, P: Provider, T>(
         context_limit = seams.provider.refusal_fallback_context_limit();
     }
     let model = route.model(&admission.model).clone();
-    match crate::output::reserve(writer, seams.provider, step_id, opts, &model, context_limit)
-        .await?
+    match crate::output::reserve(
+        writer,
+        seams.provider,
+        step_id,
+        opts,
+        &model,
+        context_limit,
+        renders,
+    )
+    .await?
     {
         crate::output::Reserved::Send(opts) => Ok(Some(*opts)),
         crate::output::Reserved::Overflow(error) => {
@@ -5035,6 +5077,9 @@ fn tool_batch_deliveries(
                     .as_ref()
                     .and_then(|marks| marks.get("speaks_for"))
                     .cloned(),
+                named_speaker: broca_session_store::record::marks_name_speaker(
+                    pending.message_marks.as_ref(),
+                ),
             }),
         }));
         records.push(Record::Delivery(Delivery {
