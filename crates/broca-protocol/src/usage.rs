@@ -124,6 +124,24 @@ pub struct GenerationUsage {
 }
 
 impl Usage {
+    /// Keep cache-write lifetimes only as a complete breakdown of the reported total.
+    /// Billing readers price the breakdown instead of the total when it is present.
+    pub fn with_complete_cache_write_lifetimes(mut self) -> Self {
+        let complete = match (
+            self.cache_write_tokens,
+            self.cache_write_5m_tokens,
+            self.cache_write_1h_tokens,
+        ) {
+            (Some(total), Some(five), Some(hour)) => five.checked_add(hour) == Some(total),
+            _ => false,
+        };
+        if !complete {
+            self.cache_write_5m_tokens = None;
+            self.cache_write_1h_tokens = None;
+        }
+        self
+    }
+
     /// Context-fill metric: fresh request input + cache reads + cache writes.
     /// All three occupy the model's context window for the measured request.
     ///
@@ -222,7 +240,7 @@ pub fn model_usage<'a>(
     usage: Usage,
     iterations: Option<&'a [UsageIteration]>,
 ) -> Vec<(&'a str, Usage)> {
-    match iterations {
+    let entries = match iterations {
         Some(iterations) => iterations
             .iter()
             .map(|iteration| {
@@ -256,7 +274,11 @@ pub fn model_usage<'a>(
             })
             .collect(),
         None => vec![(served_or_requested_model, usage)],
-    }
+    };
+    entries
+        .into_iter()
+        .map(|(model, usage)| (model, usage.with_complete_cache_write_lifetimes()))
+        .collect()
 }
 
 /// A step's counters sum its iterations, preserving unreported fields as absent.
@@ -264,6 +286,7 @@ pub fn step_usage(usage: Usage, iterations: Option<&[UsageIteration]>) -> Usage 
     model_usage("", usage, iterations)
         .into_iter()
         .fold(Usage::default(), |total, (_, usage)| total + usage)
+        .with_complete_cache_write_lifetimes()
 }
 
 #[cfg(test)]
@@ -370,7 +393,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn cache_write_lifetimes_sum_reported_iterations_without_inflating_fill() {
+    fn cache_write_lifetimes_omit_partial_iterations_without_inflating_fill() {
         let iterations = serde_json::from_value::<Vec<UsageIteration>>(json!([
             {"model":"synthetic", "input_tokens":12, "cache_creation_input_tokens":30,
              "cache_creation":{"ephemeral_5m_input_tokens":10,"ephemeral_1h_input_tokens":20}},
@@ -381,8 +404,8 @@ mod tests {
         .unwrap();
         let usage = step_usage(Usage::default(), Some(&iterations));
         assert_eq!(usage.cache_write_tokens, Some(37));
-        assert_eq!(usage.cache_write_5m_tokens, Some(10));
-        assert_eq!(usage.cache_write_1h_tokens, Some(25));
+        assert_eq!(usage.cache_write_5m_tokens, None);
+        assert_eq!(usage.cache_write_1h_tokens, None);
         assert_eq!(usage.fill_tokens(), Some(52));
         let mut total = usage;
         total += Usage::default();
@@ -391,7 +414,37 @@ mod tests {
             cache_write_5m_tokens: Some(0),
             ..Usage::default()
         };
-        assert_eq!(total, usage);
+        assert_eq!(total.with_complete_cache_write_lifetimes(), usage);
+    }
+
+    #[test]
+    fn cache_write_lifetime_split_requires_a_complete_non_overflowing_total() {
+        for (total, five, hour, complete) in [
+            (Some(30), Some(10), Some(20), true),
+            (Some(0), Some(0), Some(0), true),
+            (Some(31), Some(10), Some(20), false),
+            (None, Some(10), Some(20), false),
+            (Some(30), None, Some(20), false),
+            (Some(30), Some(10), None, false),
+            (Some(u64::MAX), Some(u64::MAX), Some(1), false),
+        ] {
+            let usage = Usage {
+                cache_write_tokens: total,
+                cache_write_5m_tokens: five,
+                cache_write_1h_tokens: hour,
+                ..Usage::default()
+            }
+            .with_complete_cache_write_lifetimes();
+            assert_eq!(usage.cache_write_tokens, total);
+            assert_eq!(
+                usage.cache_write_5m_tokens,
+                if complete { five } else { None }
+            );
+            assert_eq!(
+                usage.cache_write_1h_tokens,
+                if complete { hour } else { None }
+            );
+        }
     }
 
     #[test]

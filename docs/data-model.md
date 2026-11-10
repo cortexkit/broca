@@ -662,11 +662,15 @@ reported it, the sum covers those steps only, a lower bound.
 **Cache-write lifetimes.** Anthropic Messages reports these subsets in
 `usage.cache_creation.ephemeral_5m_input_tokens` and `ephemeral_1h_input_tokens`.
 The total is retained independently; an absent lifetime is unknown and is never inferred from
-the total or the requested cache TTL. Bedrock Converse reads the subsets only when its usage
-carries the same `cache_creation` object. The subsets do not add to context fill. Both storage
-formats retain reported subsets, but usage-export facts omit them until the billing reader
-rollout enables `CACHE_WRITE_LIFETIMES_WRITER_ENABLED` in `broca-core::billing`; that switch also
-covers `usage_by_service_tier` and facts rebuilt from session storage.
+the total or the requested cache TTL. Normalized single-step usage and usage-export facts carry
+both lifetime fields or neither; when present, their sum equals `cache_write_tokens`. A single
+response whose split is incomplete, overflows, or disagrees with its total has neither lifetime
+field after normalization. Billing
+applies the same rule to each segment's usage and each `usage_by_service_tier` entry, so a
+mixture of split and total-only measurements cannot understate cache writes. Bedrock Converse
+reads the subsets only when its usage carries the same `cache_creation` object. The subsets do
+not add to context fill. Legacy WAL and session storage retain normalized subsets, and their
+shared billing builder exports complete splits without a rollout setting.
 
 **Which records carry usage:**
 

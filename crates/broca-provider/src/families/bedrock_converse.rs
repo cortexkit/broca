@@ -1503,7 +1503,7 @@ impl BedrockStreamNormalizer {
             NormalizedEvent::Control(ProviderControl::StepFinished {
                 raw_finish_reason: self.stop_reason.take(),
                 step_id: self.step_id,
-                usage: self.usage,
+                usage: self.usage.with_complete_cache_write_lifetimes(),
                 finish_reason: self.finish_reason,
                 service_tier_used: self.service_tier_used.clone(),
                 speed_used: None,
@@ -1512,7 +1512,7 @@ impl BedrockStreamNormalizer {
                 usage_iterations: None,
             }),
             NormalizedEvent::Control(ProviderControl::Finished {
-                usage: self.usage,
+                usage: self.usage.with_complete_cache_write_lifetimes(),
                 finish_reason: self.finish_reason,
                 retries_used: 0,
             }),
@@ -2247,6 +2247,28 @@ mod usage_presence_tests {
         normalizer.merge_usage(&serde_json::json!({"cache_creation":{"ephemeral_5m_input_tokens":10,"ephemeral_1h_input_tokens":20}}));
         assert_eq!(normalizer.usage.cache_write_5m_tokens, Some(10));
         assert_eq!(normalizer.usage.cache_write_1h_tokens, Some(20));
+    }
+
+    #[test]
+    fn bedrock_cache_write_lifetimes_omit_mismatched_splits_at_completion() {
+        let mut normalizer = BedrockStreamNormalizer::new(StepId(1));
+        normalizer.started = true;
+        normalizer.merge_usage(&serde_json::json!({"cacheWriteInputTokens":31,"cache_creation":{"ephemeral_5m_input_tokens":10,"ephemeral_1h_input_tokens":20}}));
+        let mut measurements = 0;
+        for event in normalizer.final_events().unwrap() {
+            let usage = match event {
+                NormalizedEvent::Control(
+                    ProviderControl::StepFinished { usage, .. }
+                    | ProviderControl::Finished { usage, .. },
+                ) => usage,
+                _ => continue,
+            };
+            measurements += 1;
+            assert_eq!(usage.cache_write_tokens, Some(31));
+            assert_eq!(usage.cache_write_5m_tokens, None);
+            assert_eq!(usage.cache_write_1h_tokens, None);
+        }
+        assert_eq!(measurements, 2);
     }
 
     #[test]

@@ -4504,7 +4504,8 @@ fn response_envelope(
                         .get("output_tokens_details")
                         .and_then(|details| details.get("thinking_tokens"))
                         .and_then(Value::as_u64),
-                };
+                }
+                .with_complete_cache_write_lifetimes();
                 let model = model_row(&mut models, model);
                 model.usage += usage;
                 model.cache_write_5m_tokens = broca_protocol::usage::sum_reported(

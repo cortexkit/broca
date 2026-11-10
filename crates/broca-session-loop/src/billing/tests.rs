@@ -170,13 +170,31 @@ fn stored_cache_write_lifetimes_reach_the_shared_billing_builder() {
             "synthetic-source",
             &resolver,
         );
+        for (fact, old) in facts.iter().zip(&old_facts) {
+            assert_eq!(fact.fact_id, old.fact_id);
+        }
+        assert_eq!(facts[0].usage.cache_write_tokens, Some(30));
+        assert_eq!(facts[0].usage.cache_write_5m_tokens, Some(10));
+        assert_eq!(facts[0].usage.cache_write_1h_tokens, Some(20));
         assert_eq!(
-            serde_json::to_vec(&facts).unwrap(),
+            facts[0].usage_by_service_tier.as_ref().unwrap()["priority"],
+            facts[0].usage
+        );
+        let mut comparable = facts.clone();
+        for fact in &mut comparable {
+            fact.usage.cache_write_5m_tokens = None;
+            fact.usage.cache_write_1h_tokens = None;
+            if let Some(tiers) = &mut fact.usage_by_service_tier {
+                for usage in tiers.values_mut() {
+                    usage.cache_write_5m_tokens = None;
+                    usage.cache_write_1h_tokens = None;
+                }
+            }
+        }
+        assert_eq!(
+            serde_json::to_vec(&comparable).unwrap(),
             serde_json::to_vec(&old_facts).unwrap()
         );
-        assert_eq!(facts[0].usage.cache_write_tokens, Some(30));
-        assert_eq!(facts[0].usage.cache_write_5m_tokens, None);
-        assert_eq!(facts[0].usage.cache_write_1h_tokens, None);
     });
 }
 
