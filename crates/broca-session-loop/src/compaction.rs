@@ -809,8 +809,10 @@ fn conditions_for<W: Writer>(
     admission: &Admission,
     entries: &[cortexkit_role_compaction::read::Entry],
     chained: bool,
+    signed_floor: Option<u64>,
 ) -> Result<cortexkit_role_compaction::notice::Conditions, String> {
-    let mut conditions = v2::host::conditions_of(&frozen(admission), entries, chained, None)?;
+    let mut conditions =
+        v2::host::conditions_of(&frozen(admission), entries, chained, None, signed_floor)?;
     if conditions.last_prompt_tokens.is_none() && writer.operations().enrolled.is_some() {
         conditions.last_prompt_tokens = crate::enroll::last_prompt_tokens(writer.operations());
     }
@@ -837,11 +839,12 @@ pub async fn apply_boundary<W: Writer, P, T>(
     seams: &Seams<'_, P, T>,
     ctx: &Ctx,
     step: u64,
+    signed_floor: Option<u64>,
 ) -> Result<Result<(), String>, LoopError> {
     let entries = transcript(writer, ctx).await?.entries;
     // The last serving model's fill isn't measured on this storage yet, so the newest entry's
     // own reported prompt stands for the session's fill.
-    let conditions = match conditions_for(writer, admission, &entries, false) {
+    let conditions = match conditions_for(writer, admission, &entries, false, signed_floor) {
         Ok(conditions) => conditions,
         Err(message) => return Ok(Err(message)),
     };
@@ -855,6 +858,7 @@ pub async fn apply_boundary<W: Writer, P, T>(
             entries: &entries,
             rules: &conditions.rules,
             accepts_images: conditions.accepts_images == Some(true),
+            floor: v2::host::view_floor(&conditions),
             next_mid: NEXT_MID,
         },
     )
@@ -887,7 +891,14 @@ pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
     let last_cache = writer.operations().last_cache_send.clone();
     let chained = seams.provider.history_edit_cost()
         == Some(broca_core::compaction_provider::notice::HistoryEditCost::FullResend);
-    let conditions = match conditions_for(writer, admission, &entries, chained) {
+    // The request carries the session's signed floor, which the compaction calls report.
+    let conditions = match conditions_for(
+        writer,
+        admission,
+        &entries,
+        chained,
+        opts.render_episodes.signed_floor,
+    ) {
         Ok(conditions) => conditions,
         Err(message) => return Ok(Send::Unavailable(message)),
     };
@@ -983,11 +994,13 @@ pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
 
 /// Tells the compaction provider about entries written since its last notice, as today's loop
 /// does after each durable model step.
+/// `signed_floor` is the session's signed floor ([`crate::run::signed_floor`]).
 pub async fn notice<W: Writer, P, T>(
     writer: &W,
     admission: &Admission,
     seams: &Seams<'_, P, T>,
     ctx: &Ctx,
+    signed_floor: Option<u64>,
 ) -> Result<(), LoopError> {
     // Without a frozen window no conditions can be stated, so nothing is announced; the next
     // step's boundary ends the run.
@@ -995,8 +1008,8 @@ pub async fn notice<W: Writer, P, T>(
         return Ok(());
     }
     let entries = transcript(writer, ctx).await?.entries;
-    let conditions =
-        conditions_for(writer, admission, &entries, false).map_err(LoopError::Parts)?;
+    let conditions = conditions_for(writer, admission, &entries, false, signed_floor)
+        .map_err(LoopError::Parts)?;
     let applied = ctx.session.state.lock().await.applied_identity();
     let mut setup =
         v2::conditions::setup_request(&ctx.preset, &conditions, (seams.now_ms)(), false);
@@ -1029,6 +1042,8 @@ pub async fn notice<W: Writer, P, T>(
 pub struct Changes<'a> {
     admission: &'a Admission,
     ctx: Ctx,
+    /// The session's signed floor ([`crate::run::signed_floor`]), which each notice reports.
+    signed_floor: Option<u64>,
 }
 
 impl<'a> Changes<'a> {
@@ -1037,7 +1052,12 @@ impl<'a> Changes<'a> {
     /// under a plan that names a compaction provider with a preset. They go through the
     /// session's own compaction state (`Seams::compaction_session`), the one the run's steps
     /// use, so the provider hears each change once.
-    pub fn of<P, T>(admission: &'a Admission, seams: &Seams<'_, P, T>) -> Option<Self> {
+    /// `signed_floor` is the session's signed floor ([`crate::run::signed_floor`]).
+    pub fn of<P, T>(
+        admission: &'a Admission,
+        seams: &Seams<'_, P, T>,
+        signed_floor: Option<u64>,
+    ) -> Option<Self> {
         if !seams.compaction_changes || admission.compaction_plan_version.is_none() {
             return None;
         }
@@ -1052,6 +1072,7 @@ impl<'a> Changes<'a> {
                 earlier: None,
                 window: WindowTranscript::default(),
             },
+            signed_floor,
         })
     }
 
@@ -1067,7 +1088,7 @@ impl<'a> Changes<'a> {
     /// Tells the provider of every change since its last notice. A failure is left for the next
     /// notice to make up, as `compaction_v2::host::notice` leaves its own.
     pub async fn tell<W: Writer, P, T>(&self, writer: &W, seams: &Seams<'_, P, T>) {
-        let _ = notice(writer, self.admission, seams, &self.ctx).await;
+        let _ = notice(writer, self.admission, seams, &self.ctx, self.signed_floor).await;
     }
 }
 

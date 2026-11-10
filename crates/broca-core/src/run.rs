@@ -2149,6 +2149,7 @@ where
             live_steer_after_seq: control
                 .live_steer_after_seq
                 .filter(|_| control.steer.is_some()),
+            prefix_bound: provider.reasoning_is_prefix_bound(),
         },
     )
     .await;
@@ -2297,6 +2298,9 @@ struct ResumeInitialization<'a> {
     prior_snapshot: Option<&'a PriorWalSnapshot>,
     offsets: Option<Box<PreparedOffsetResume>>,
     live_steer_after_seq: Option<u64>,
+    /// Whether the run's route binds signed reasoning to its prefix, so the run needs the
+    /// signed floor its lineage's tool sets set.
+    prefix_bound: bool,
 }
 
 async fn reconstruct_prior<W>(
@@ -2314,6 +2318,7 @@ where
         prior_snapshot,
         offsets,
         live_steer_after_seq,
+        prefix_bound,
     } = initialization;
     require_agent_run_scope_writer(req.scope.as_ref())?;
     let mut offset_prior = None;
@@ -2592,6 +2597,21 @@ where
         }
         _ => replay_complete_snapshot_or_wal(&snapshot, wal_store, &req.session)?,
     };
+    // A route that binds reasoning to its prefix needs the signed floor (`crate::signed_floor`):
+    // from a replay of the whole WAL, or from the checkpoint when it proves that no run ever
+    // changed its tool set. A lineage whose tool set changed needs the ordinal where the
+    // newest change took effect, which only the whole WAL holds, so it replays it.
+    if prefix_bound {
+        prior.signed_floor = crate::signed_floor::admission_floor(
+            std::mem::take(&mut prior.signed_floor),
+            &snapshot.checkpoint_at_head.tool_set_history,
+            // A replay from the WAL's first record always folds every run it holds.
+            || {
+                replay_complete_snapshot_or_wal(&snapshot, wal_store, &req.session)
+                    .map(|replayed| replayed.signed_floor)
+            },
+        )?;
+    }
     prior.manifest = snapshot
         .checkpoint_at_head
         .ownership
@@ -4535,6 +4555,7 @@ where
     // arms below move the reconstructed prompt out of `prior`.
     let episode_step_spans = prior.episode_step_spans.take();
     let mut render_episodes = prior.render_episodes.take().unwrap_or_default();
+    let mut signed_floor = std::mem::take(&mut prior.signed_floor);
     let tools = Arc::clone(&cfg.tools);
     let mut manifest = ToolManifest::from_shared_tools(Arc::clone(&tools));
     let frozen_plan = if is_resume && !append_episode {
@@ -5581,6 +5602,15 @@ where
                 .map(|i| lineage_prefix_stamped_len + i),
             frozen_config: provider.render_config_blob(),
         });
+        // The floor folds this run's tools as replay will fold its `RunStarted`. A fresh lineage
+        // has no earlier run.
+        if !append_episode {
+            signed_floor = crate::signed_floor::FloorFold::Known(Default::default());
+        }
+        signed_floor.observe_run(
+            lineage_prefix_stamped_len as u64,
+            crate::signed_floor::tool_set_digest(&tools, &provider.render_config_blob()),
+        );
         // Fresh: the WAL holds no prior episode, so there is no prefix to carry over.
         prompt = if append_episode {
             prior.prompt
@@ -5912,7 +5942,10 @@ where
     }
     let mut opts = Arc::new(CallOptions {
         ephemeral_session: retention_lineage()?,
-        render_episodes: Arc::new(render_episodes.into()),
+        render_episodes: Arc::new(broca_protocol::request::RenderHistory {
+            signed_floor: signed_floor.known().and_then(|floor| floor.floor()),
+            ..render_episodes.into()
+        }),
         prompt,
         tools: Arc::clone(&tools),
         tool_choice: Arc::new(cfg.tool_choice.clone()),
@@ -6001,8 +6034,9 @@ where
                 raw_len = opts.prompt.len();
             }
             if releasing_state.is_some_and(|state| state.view.is_some()) {
-                let history =
+                let mut history =
                     guidance_episodes.retain(&opts.prompt, stamped_len.extent(&opts.prompt));
+                history.signed_floor = opts.render_episodes.signed_floor;
                 mutable_call_options(&mut opts).render_episodes = Arc::new(history);
                 #[cfg(test)]
                 if let Some(probe) = &control.view_release_probe {
@@ -6111,6 +6145,7 @@ where
                 &transcript.entries,
                 false,
                 None,
+                transcript.signed_floor,
             ) {
                 Ok(conditions) => conditions,
                 Err(message) => {
@@ -6139,6 +6174,7 @@ where
                     entries: &transcript.entries,
                     rules: &conditions.rules,
                     accepts_images: conditions.accepts_images == Some(true),
+                    floor: crate::compaction_v2::host::view_floor(&conditions),
                     next_mid: &next_mid,
                 },
             )
@@ -6332,6 +6368,7 @@ where
                 &transcript.entries,
                 chained,
                 transcript.newest_step_fill(),
+                transcript.signed_floor,
             ) {
                 Ok(conditions) => conditions,
                 Err(message) => {
@@ -16338,6 +16375,7 @@ mod tests {
             admission_checkpoint: crate::AdmissionCheckpointV1 {
                 recovery_cuts: Vec::new(),
                 has_model_attempt: None,
+                tool_set_history: Default::default(),
                 media: None,
                 head: None,
                 has_deferred_calls: None,

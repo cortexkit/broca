@@ -83,13 +83,16 @@ pub fn signed_reasoning_is_echo_safe(
 pub const ANTHROPIC_PROVIDER_ID: &str = "anthropic";
 
 /// Thinking signed against an earlier conversation prefix cannot be reused after
-/// compaction rewrites it. Remove those blocks only from outbound request copies,
-/// preserving the transcript and the same boundary on every later render.
+/// compaction rewrites it, or after a later run's tool set differs from the one it was sent
+/// with. Remove those blocks only from outbound request copies, preserving the transcript and
+/// the same boundary on every later render. Both causes drop the same blocks: every signed or
+/// redacted reasoning block of a message before the later of the two boundaries.
 pub(crate) fn compaction_view(
     family: WireFamilyId,
     opts: &CallOptions,
 ) -> std::borrow::Cow<'_, CallOptions> {
-    let Some(prefix_len) = opts.render_episodes.compaction_prefix_len else {
+    let history = &opts.render_episodes;
+    let Some(prefix_len) = history.compaction_prefix_len.max(history.signed_floor) else {
         return std::borrow::Cow::Borrowed(opts);
     };
     if !family.thinking_is_prefix_bound() {

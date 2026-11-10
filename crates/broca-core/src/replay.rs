@@ -201,6 +201,10 @@ pub struct ReplayState {
     pub episode_step_spans: Option<Vec<std::ops::Range<usize>>>,
     /// All admitted episode render inputs; absent for a materialized prefix without WAL history.
     pub render_episodes: Option<Vec<broca_protocol::request::EpisodeRenderInput>>,
+    /// Where kept signed reasoning stops being sent because a run's tools changed
+    /// (`crate::signed_floor`), folded from every `RunStarted` when the replay starts at the
+    /// lineage's first record; unknown for a replay of a WAL tail.
+    pub signed_floor: crate::signed_floor::FloorFold,
     /// The last episode's uncommitted tool batch, backed by `tool_batch_started`
     /// or recovery attribution, with each planned call's durable state.
     ///
@@ -3375,6 +3379,13 @@ fn replay_seeded_with_compaction<'a>(
     let mut run_id = seed_run_id;
     let mut cancel_at = None;
     let mut seeded_budget = seed_budget;
+    // Known only for a walk from the lineage's first record: a tail doesn't see the tool sets of
+    // the runs before it.
+    let mut signed_floor = if ordinal_base == 0 && run_id.is_none() {
+        crate::signed_floor::FloorFold::Known(Default::default())
+    } else {
+        crate::signed_floor::FloorFold::Unknown
+    };
     // A tail can begin after the current episode's RunStarted. Only a RunStarted observed in
     // this walk may require a durable terminal before another episode opens.
     let mut saw_run_started = false;
@@ -3525,6 +3536,17 @@ fn replay_seeded_with_compaction<'a>(
                         .map(|i| extent_before as usize + i),
                     frozen_config: config.frozen_render_config.clone(),
                 });
+                // A seeded run (an import's) never sends a request, so its tools carry no
+                // reasoning and can't invalidate any.
+                if !matches!(origin, broca_wal::RunOrigin::SeededFrom { .. }) {
+                    signed_floor.observe_run(
+                        extent_before,
+                        crate::signed_floor::tool_set_digest(
+                            &config.tools,
+                            &config.frozen_render_config,
+                        ),
+                    );
+                }
                 let input_tags = rec.runner_tags();
                 let idle_delivery = submission_id
                     .as_ref()
@@ -4590,6 +4612,7 @@ fn replay_seeded_with_compaction<'a>(
         run_finished_durable,
         episode_step_spans: Some(episode_step_spans),
         render_episodes: Some(render_episodes),
+        signed_floor,
         open_tool_batch,
         pending_steers,
         resolution,
@@ -5926,6 +5949,7 @@ pub(crate) mod projection_boundary_tests {
             admission_checkpoint: crate::AdmissionCheckpointV1 {
                 recovery_cuts: Vec::new(),
                 has_model_attempt: None,
+                tool_set_history: Default::default(),
                 media: None,
                 head: None,
                 has_deferred_calls: None,

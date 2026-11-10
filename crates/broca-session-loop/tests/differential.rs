@@ -908,6 +908,17 @@ tokio::task_local! {
 }
 
 tokio::task_local! {
+    /// The tools a run of a multi-run comparison declares in place of the scenario's, by run id.
+    static RUN_TOOLS: std::collections::HashMap<String, Vec<Tool>>;
+}
+
+tokio::task_local! {
+    /// When set, the multi-run comparison adds here, once per comparison, the calls the new loop
+    /// made on its tool plane and compaction provider, after comparing them with today's.
+    static NEW_CALLS: Arc<Mutex<Vec<Vec<String>>>>;
+}
+
+tokio::task_local! {
     /// When set, the new side ends the cut log's run with this seal instead of resuming it.
     static SEALING: broca_core::resume::SealCause;
 }
@@ -1896,6 +1907,13 @@ impl broca_core::CompactionPlane for CompactionSpy {
         panic!("a session on the current compaction contract never calls the first protocol")
     }
 
+    /// The provider reads the signed floor, so both loops must report the same one.
+    async fn provider_capabilities(&self, _: &str) -> Option<Vec<String>> {
+        Some(vec![
+            cortexkit_role_compaction::COMPACTION_SIGNED_FLOOR_PROVIDES.into(),
+        ])
+    }
+
     async fn call_v2(
         &self,
         _: &str,
@@ -2134,6 +2152,11 @@ impl Scenario {
     }
 
     fn plain_request_for(&self, run_id: &str, input: &[Message]) -> RunRequest {
+        let tools = RUN_TOOLS
+            .try_with(|tools| tools.get(run_id).cloned())
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| self.tools.clone());
         RunRequest {
             route_decision_id: None,
             account_route: None,
@@ -2153,8 +2176,8 @@ impl Scenario {
             session: bind(),
             model: ModelHandle::new(provider_id(), run_model(run_id)),
             input: input.to_vec(),
-            tools: self.tools.clone(),
-            policy_allowed: self.tools.iter().map(|t| t.name.clone()).collect(),
+            policy_allowed: tools.iter().map(|t| t.name.clone()).collect(),
+            tools,
             tool_choice: ToolChoice::Auto,
             generation: GenerationConfig::default(),
             cache: None,
@@ -3814,6 +3837,7 @@ async fn compare_runs_in_once(scenario: Scenario, runs: &[(&str, Vec<Message>)])
     assert_eq!(new.records.len(), today.records.len(), "record count");
     assert_eq!(new.calls, today.calls, "tool calls");
     let _ = NEW_REQUESTS.try_with(|seen| seen.lock().unwrap().extend(new.requests.clone()));
+    let _ = NEW_CALLS.try_with(|seen| seen.lock().unwrap().push(new.calls.clone()));
 }
 
 #[tokio::test]
@@ -3845,6 +3869,73 @@ async fn a_second_run_on_the_same_session() {
         ],
     )
     .await;
+}
+
+/// A run declaring tools that differ from the run before it (one tool's description refreshed,
+/// then the original tools again) moves the signed floor to its first message. Both loops fold
+/// the floor from the runs' starts and send the same requests, the floor included.
+#[tokio::test]
+async fn runs_whose_tools_change_move_the_signed_floor_alike() {
+    let read = tool("read", ExecutionMode::Sequential);
+    let mut refreshed = read.clone();
+    refreshed.description = "read something, skipping binary content".into();
+    let thought = |id: &str, text: &str| {
+        answer(
+            id,
+            vec![
+                ContentBlock::Reasoning {
+                    text: format!("thinking for {id}"),
+                    signature: Some(format!("sig-{id}")),
+                },
+                ContentBlock::Text { text: text.into() },
+            ],
+            FinishReason::Stop,
+        )
+    };
+    let scenario = Scenario {
+        input: Vec::new(),
+        tools: vec![read],
+        manifest: None,
+        stop_when: vec![StopCondition::StepCount { n: 8 }],
+        steps: vec![
+            thought("a1", "one"),
+            thought("a2", "two"),
+            thought("a3", "three"),
+            thought("a4", "four"),
+        ],
+    };
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    RUN_TOOLS
+        .scope(
+            [("r2".to_owned(), vec![refreshed])].into_iter().collect(),
+            NEW_REQUESTS.scope(
+                Arc::clone(&seen),
+                compare_runs(
+                    scenario,
+                    &[
+                        ("r1", vec![user("first task")]),
+                        ("r2", vec![user("second task")]),
+                        ("r3", vec![user("third task")]),
+                        ("r4", vec![user("fourth task")]),
+                    ],
+                ),
+            ),
+        )
+        .await;
+    // Each run places its input and one answer: r2 starts at 2, r3 (back to r1's tools) at 4,
+    // and r4 keeps r3's tools.
+    let seen = seen.lock().unwrap();
+    assert!(!seen.is_empty());
+    for opts in seen.iter() {
+        let run = opts.step_context.as_ref().unwrap().run_id.as_str();
+        let expected = match run {
+            "r1" => None,
+            "r2" => Some(2),
+            "r3" | "r4" => Some(4),
+            other => panic!("unexpected run {other}"),
+        };
+        assert_eq!(opts.render_episodes.signed_floor, expected, "{run}");
+    }
 }
 
 /// A send that sets every field a run's start records about it: both loops record each one the
@@ -7052,6 +7143,81 @@ async fn a_compacted_run_with_every_send_fact_calls_compaction_alike() {
         .await;
 }
 
+/// On a compacted session whose model binds signed reasoning, a run whose tools differ from the
+/// run before it (one tool's description refreshed) sets the signed floor through the newest
+/// message before it. Both loops report that floor in Setup and in every notice and ride from
+/// that run on, and none before it.
+#[tokio::test]
+async fn a_compacted_run_whose_tools_change_reports_the_signed_floor_alike() {
+    let mut refreshed = compacted_scenario(Vec::new()).tools;
+    refreshed[0].description = "read something, skipping binary content".into();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let model = "claude-opus-5-5";
+    let (r1, r2, r3) = (
+        format!("r1@{model}"),
+        format!("r2@{model}"),
+        format!("r3@{model}"),
+    );
+    LAYOUT
+        .scope(
+            Some(cortexkit_compaction_view::PLAN_VERSION),
+            COMPACTION.scope(
+                Some(Arc::new(CompactionScript {
+                    context_limit: 100_000,
+                    rides: Vec::new(),
+                })),
+                RUN_TOOLS.scope(
+                    [(r2.clone(), refreshed)].into_iter().collect(),
+                    NEW_CALLS.scope(
+                        Arc::clone(&seen),
+                        Box::pin(compare_runs_in(
+                            compacted_scenario(vec![
+                                text_step("a1", "one"),
+                                text_step("a2", "two"),
+                                text_step("a3", "three"),
+                            ]),
+                            &[
+                                (r1.as_str(), vec![user("first")]),
+                                (r2.as_str(), vec![user("second")]),
+                                (r3.as_str(), vec![user("third")]),
+                            ],
+                        )),
+                    ),
+                ),
+            ),
+        )
+        .await;
+    let comparisons = seen.lock().unwrap();
+    assert!(!comparisons.is_empty());
+    for calls in comparisons.iter() {
+        let compaction: Vec<_> = calls
+            .iter()
+            .filter(|call| call.starts_with("compaction."))
+            .collect();
+        let first_floor = compaction
+            .iter()
+            .position(|call| call.contains("\"signed_floor\""))
+            .expect("a call reports the signed floor");
+        assert!(
+            first_floor > 0,
+            "the first run reports none: {compaction:#?}"
+        );
+        // From the first call that reports it on, every Setup, notice and ride reports one: the
+        // second run's, then the third run's, since going back to the first run's tools is a
+        // change too.
+        let floors: std::collections::BTreeSet<_> = compaction[first_floor..]
+            .iter()
+            .map(|call| {
+                let at = call
+                    .find("\"signed_floor\"")
+                    .unwrap_or_else(|| panic!("a later call without the floor: {call}"));
+                call[at..].split('}').next().unwrap().to_owned()
+            })
+            .collect();
+        assert_eq!(floors.len(), 2, "{floors:?}");
+    }
+}
+
 /// Two runs on one compacted session: the second run's first send compares the first run's
 /// last accepted request with its own, which the new loop rebuilds from the first run's start.
 #[tokio::test]
@@ -9638,6 +9804,10 @@ impl broca_core::CompactionPlane for SetupFailsOnce {
         self.inner
             .call_v2(module, bind, scope, method, params, deadline)
             .await
+    }
+
+    async fn provider_capabilities(&self, module: &str) -> Option<Vec<String>> {
+        self.inner.provider_capabilities(module).await
     }
 }
 

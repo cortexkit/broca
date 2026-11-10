@@ -105,6 +105,8 @@ pub fn setup_request(
         now,
     );
     setup.accepts_images = conditions.accepts_images;
+    // The runtime leaves the floor out for a provider that doesn't declare it reads one.
+    setup.signed_floor = conditions.signed_floor.clone();
     enable_metadata_writer_view_anchor(&mut setup);
     setup
 }
@@ -115,41 +117,7 @@ fn enable_metadata_writer_view_anchor(_setup: &mut SetupRequest) {
     // and this activation point belongs only to builds that durably store anchors.
 }
 
-/// Anthropic models released after the pinned view library (`cortexkit-compaction-view` 0.1.8)
-/// that enforce the thinking prefix check on every account, so an edit before their signed
-/// thinking breaks it. Each row is (family, major, minor), matched as the library matches its
-/// own `BOUND_SIGNED_MODELS`. Remove this table when broca pins a view library that lists
-/// these rows itself (0.2.2 onward).
-const BOUND_SIGNED_SINCE_PIN: &[(&str, u32, u32)] =
-    &[("fable", 5, 2), ("mythos", 5, 1), ("mythos", 5, 2)];
-
-/// Whether `model` names a row of [`BOUND_SIGNED_SINCE_PIN`] on any route: the library's own
-/// matcher, asked about the same version of a family it already lists. Each row maps to a
-/// listed model by family and version alone, so an id matches exactly when the library would
-/// match it with the row added.
-fn bound_signed_since_pin(model: &str) -> bool {
-    let lower = model.to_ascii_lowercase();
-    BOUND_SIGNED_SINCE_PIN.iter().any(|(family, major, minor)| {
-        // Rewrite the row's family and version into one the pinned list holds (Fable 5.1),
-        // keeping every byte around them, so the library's boundary rules decide the match.
-        ["-", "_", ".", ""].iter().any(|before| {
-            ["-", "_", "."].iter().any(|between| {
-                let needle = format!("{family}{before}{major}{between}{minor}");
-                lower.match_indices(&needle).any(|(start, _)| {
-                    let probe = format!(
-                        "{}fable{before}5{between}1{}",
-                        &lower[..start],
-                        &lower[start + needle.len()..]
-                    );
-                    cortexkit_compaction_view::rules::is_bound_signed_model(&probe)
-                })
-            })
-        })
-    })
-}
-
-/// The library owns the rule defaults; broca adds only models released after its pinned
-/// library ([`BOUND_SIGNED_SINCE_PIN`]).
+/// The library, rather than host-local tables, owns the rule defaults.
 pub fn conditions(
     model: ModelRef,
     context_window: u64,
@@ -157,9 +125,6 @@ pub fn conditions(
     chained: bool,
 ) -> Conditions {
     let mut rules = cortexkit_compaction_view::rules::defaults(&model.model);
-    if bound_signed_since_pin(&model.model) {
-        rules.signed_parts = cortexkit_role_compaction::rules::SignedParts::Bound;
-    }
     if chained {
         rules.history_edit_cost = cortexkit_role_compaction::rules::EditCost::FullResend;
     }
@@ -179,7 +144,7 @@ pub fn check_plan_version(recorded: u32) -> Result<(), String> {
 }
 
 #[cfg(test)]
-mod since_pin_tests {
+mod bound_signed_tests {
     use super::*;
     use cortexkit_role_compaction::rules::SignedParts;
 
@@ -191,9 +156,9 @@ mod since_pin_tests {
 
     /// Fable 5.2 and Mythos 5.1 and 5.2 enforce the thinking prefix check on every account, so
     /// a compacting session on them declares its signed parts bound, on every route's id form.
-    /// The pinned library alone declares them unbound.
+    /// The pinned view library lists them itself.
     #[test]
-    fn models_released_after_the_pinned_library_declare_bound_signed_parts() {
+    fn fable_5_2_and_mythos_declare_bound_signed_parts() {
         for model in [
             "claude-fable-5-2",
             "anthropic/claude-fable-5.2",
@@ -203,17 +168,12 @@ mod since_pin_tests {
             "claude-mythos-5-1",
             "claude-mythos-5-2",
         ] {
-            assert_eq!(
-                cortexkit_compaction_view::rules::defaults(model).signed_parts,
-                SignedParts::None,
-                "the pinned library already lists {model}; remove the table"
-            );
             assert_eq!(signed_parts(model), SignedParts::Bound, "{model}");
         }
     }
 
-    /// The added rows keep the library's boundaries: a longer version, a bare major, another
-    /// family's name inside a word, and models the library already decides are left to it.
+    /// The library's boundaries hold: a longer version, a bare major, another family's name
+    /// inside a word, and models it decides are unbound.
     #[test]
     fn near_misses_and_listed_models_keep_the_librarys_answer() {
         for model in [

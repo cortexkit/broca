@@ -1,19 +1,22 @@
 //! Checks shared by pushed views, ride answers and step-boundary application.
 
-use cortexkit_compaction_view::render;
+use cortexkit_compaction_view::{render, rules::Floor};
 use cortexkit_role_compaction::{
     read::{Cursor, Detail, Entry, Head, ReadPage, ReadRequest, Select},
     rules::ProviderRules,
     view::{EditOp, View, ViewRefusal},
 };
 
-/// Check a whole incoming view before any durable write or acknowledgement.
+/// Check a whole incoming view before any durable write or acknowledgement. `floor` is the
+/// session's signed floor (`host::view_floor`): a view keeping a signed part it covers is never
+/// refused for that part.
 pub fn check(
     entries: &[Entry],
     previous: Option<&View>,
     next: &View,
     provider_rules: &ProviderRules,
     accepts_images: bool,
+    floor: Floor<'_>,
 ) -> Result<(), ViewRefusal> {
     if !next.verify() {
         return Err(ViewRefusal::BadChecksum);
@@ -26,7 +29,7 @@ pub fn check(
         });
     }
     render::check_carried(previous, next)?;
-    check_boundary(entries, next, provider_rules, accepts_images)
+    check_boundary(entries, next, provider_rules, accepts_images, floor)
 }
 
 /// Recheck against the current transcript: a running tool or a newly signed reply
@@ -36,6 +39,7 @@ pub fn check_boundary(
     view: &View,
     provider_rules: &ProviderRules,
     accepts_images: bool,
+    floor: Floor<'_>,
 ) -> Result<(), ViewRefusal> {
     for (index, edit) in view.edits.iter().enumerate() {
         if !accepts_images
@@ -46,7 +50,7 @@ pub fn check_boundary(
             });
         }
     }
-    render::plan_view(entries, view, provider_rules).map(|_| ())
+    render::plan_view(entries, view, provider_rules, floor).map(|_| ())
 }
 
 pub fn newest(entries: &[Entry]) -> Option<Cursor> {

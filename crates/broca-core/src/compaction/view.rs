@@ -831,6 +831,7 @@ pub(crate) fn render(
             .applied
             .as_ref()
             .map(|applied| applied.thinking_prefix_len),
+        signed_floor: opts.render_episodes.signed_floor,
         episodes: super::retained_episodes(opts, &view.prompt, history_start),
     });
     Some(Ok(view))

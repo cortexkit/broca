@@ -182,6 +182,8 @@ impl KeptPrompt {
             crate::enroll::translate_episodes(&mut list.episodes, enrollment);
         }
         list.raw_ordinals = true;
+        // The floor is an ordinal, which leaving suppressed messages out doesn't move.
+        list.signed_floor = episodes.signed_floor;
         let list = Arc::new(list);
         self.1 = Some(KeptEpisodes {
             of: Arc::clone(episodes),

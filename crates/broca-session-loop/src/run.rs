@@ -407,7 +407,8 @@ where
     // Every end a run writes is followed by a notice of the session's changes, as today's
     // loop follows each of its ends; a pause isn't an end.
     if finished.paused.is_none() {
-        if let Some(changes) = crate::compaction::Changes::of(&admission, seams)
+        let floor = signed_floor(&placed, parts, &mut ToolSetCache::default()).await?;
+        if let Some(changes) = crate::compaction::Changes::of(&admission, seams, floor)
             .map(|changes| changes.sharing(compaction.as_ref()))
         {
             changes.tell(&placed, seams).await;
@@ -491,7 +492,8 @@ where
             .as_ref()
             .map(|run| frozen_admission(run, parts))
         {
-            if let Some(changes) = crate::compaction::Changes::of(&admission, seams) {
+            let floor = signed_floor(writer, parts, &mut ToolSetCache::default()).await?;
+            if let Some(changes) = crate::compaction::Changes::of(&admission, seams, floor) {
                 changes.tell(writer, seams).await;
             }
         }
@@ -1632,7 +1634,7 @@ async fn offline_request_for<W: Writer>(
             .is_some(),
         _ => false,
     };
-    let episodes = Arc::new(RenderHistory::from(render_episodes(writer, parts)?));
+    let episodes = Arc::new(render_history(writer, parts, &mut ToolSetCache::default()).await?);
     let run_rules = run_tag_rules(writer, &episodes, &mut TagRulesCache::default()).await?;
     let tools = Arc::new(admission.tools.clone());
     let enrollment = writer.enrollment().await?;
@@ -1682,15 +1684,18 @@ where
     T: ToolPlane,
 {
     let warming = Warming::of(admission, seams);
-    // The changes a batch tells the compaction provider read the transcript the run's steps keep.
-    let changes =
-        crate::compaction::Changes::of(admission, seams).map(|changes| changes.sharing(compaction));
     // The pause a timed same-account wait left, which the step it resumes must match.
     let mut account_limit_replay = account_limit_of(writer)?;
-    // Each window run's place in the prompt and render config. A run adds no episode once
-    // its input is placed, so these hold until a seal inside the run moves runs out of the
-    // window, which replaces them (see below). Each request shares the list.
-    let mut episodes = Arc::new(RenderHistory::from(render_episodes(writer, parts)?));
+    // Each window run's place in the prompt and render config, and the signed floor its runs'
+    // tools set. A run adds no episode once its input is placed, so these hold until a seal
+    // inside the run moves runs out of the window, which replaces them (see below). Each request
+    // shares the list.
+    let mut tool_sets = ToolSetCache::default();
+    let mut episodes = Arc::new(render_history(writer, parts, &mut tool_sets).await?);
+    // The changes a batch tells the compaction provider read the transcript the run's steps keep,
+    // and report the signed floor the run's requests carry.
+    let changes = crate::compaction::Changes::of(admission, seams, episodes.signed_floor)
+        .map(|changes| changes.sharing(compaction));
     // Each window run's frozen part numbering, read from its start once for the whole run.
     let mut tag_rules = TagRulesCache::default();
     // On the current compaction contract a request numbers its parts from the entries, so the
@@ -1867,8 +1872,15 @@ where
                 .as_ref()
                 .is_some_and(|run| run.cancel.is_some());
         if let (Some(ctx), false) = (compaction, ending) {
-            if let Err(message) =
-                crate::compaction::apply_boundary(writer, admission, seams, ctx, step_id).await?
+            if let Err(message) = crate::compaction::apply_boundary(
+                writer,
+                admission,
+                seams,
+                ctx,
+                step_id,
+                episodes.signed_floor,
+            )
+            .await?
             {
                 return compaction_unavailable(writer, seams, admission, &message).await;
             }
@@ -2109,7 +2121,7 @@ where
                 // now would read it, so later steps carry the bounded list rather than every run
                 // the history held when this run started. Every renderer gives the same bytes
                 // for both lists (`openai_responses_chatgpt::reduce_episodes`).
-                episodes = Arc::new(RenderHistory::from(render_episodes(writer, parts)?));
+                episodes = Arc::new(render_history(writer, parts, &mut tool_sets).await?);
             }
         }
         // Once a refresh applied, the model sees the system text of the plan the run froze in
@@ -2499,7 +2511,7 @@ where
             )
             .await?;
         if let Some(ctx) = compaction {
-            crate::compaction::notice(writer, admission, seams, ctx).await?;
+            crate::compaction::notice(writer, admission, seams, ctx, episodes.signed_floor).await?;
         }
         if calls.is_empty() {
             // A message steered in during the step makes the run take one more step, unless a
@@ -2919,6 +2931,92 @@ fn render_episodes<W: Writer>(
         .collect()
 }
 
+/// The request history every step of a run carries: [`render_episodes`], and the signed floor
+/// folded from the same runs' starts (`broca_core::signed_floor`), with the rule today's loop
+/// folds its `RunStarted` records by.
+///
+/// Past the window the conversation keeps only the runs whose render key changes (what renderers
+/// read from a run's render config to render another run's messages: the wire family, model and
+/// reasoning effort; see `episode_render_key`), so a run that changed only the tool set can be
+/// missing there and the fold may find a different change point than one over every run. That
+/// never changes a request: such a point is below the window, where no message the request
+/// renders sits, so either floor drops the same reasoning.
+async fn render_history<W: Writer>(
+    writer: &W,
+    parts: &dyn Parts,
+    floors: &mut ToolSetCache,
+) -> Result<RenderHistory, LoopError> {
+    let mut history = RenderHistory::from(render_episodes(writer, parts)?);
+    history.signed_floor = signed_floor(writer, parts, floors).await?;
+    Ok(history)
+}
+
+/// The session's signed floor (`broca_core::signed_floor::SignedFloor::floor`), folded from its
+/// runs' starts by the rule today's loop folds its `RunStarted` records by. [`render_history`]
+/// says how far past the window that fold reaches.
+pub async fn signed_floor<W: Writer>(
+    writer: &W,
+    parts: &dyn Parts,
+    floors: &mut ToolSetCache,
+) -> Result<Option<u64>, LoopError> {
+    let conversation = writer.conversation();
+    let mut floor = broca_core::signed_floor::SignedFloor::default();
+    for episode in conversation
+        .sealed_episodes
+        .iter()
+        .chain(&conversation.episodes)
+    {
+        let digest = match floors.by_run.get(&episode.run_id) {
+            Some(digest) => digest.clone(),
+            None => {
+                let start = writer.run_start(&episode.run_id).await?.ok_or_else(|| {
+                    LoopError::Parts(format!(
+                        "the conversation names run {} but the session holds no start for it",
+                        episode.run_id
+                    ))
+                })?;
+                let digest = tool_set_of_start(&start, parts)?;
+                floors.by_run.insert(episode.run_id.clone(), digest.clone());
+                digest
+            }
+        };
+        if let Some(digest) = digest {
+            floor.observe_run(episode.start - 1, digest);
+        }
+    }
+    Ok(floor.floor())
+}
+
+/// Each run's tool-set digest as its start froze it, by run id, read once per run. `None` for a
+/// seeded run, which never sends a request.
+#[derive(Default)]
+pub struct ToolSetCache {
+    by_run: std::collections::HashMap<String, Option<String>>,
+}
+
+/// The [`broca_core::signed_floor::tool_set_digest`] of the tools and render config `start`
+/// froze, read as [`admission_of_start`] reads them; `None` for a seeded run, as today's replay
+/// leaves an import's seeded `RunStarted` out of the fold.
+fn tool_set_of_start(start: &RunStart, parts: &dyn Parts) -> Result<Option<String>, LoopError> {
+    if start.seeded == Some(true) {
+        return Ok(None);
+    }
+    let part = |kind: PartKind| -> Result<Option<Value>, LoopError> {
+        start
+            .setup
+            .iter()
+            .find(|part| part.kind == kind)
+            .map(|part| parts.get(part).map_err(LoopError::Parts))
+            .transpose()
+    };
+    let tools: Vec<Tool> = decode(part(PartKind::Tools)?)?.unwrap_or_default();
+    let render_config = part(PartKind::RenderConfig)?.unwrap_or(Value::Null);
+    Ok(Some(broca_core::signed_floor::tool_set_digest(
+        &tools,
+        &render_config,
+    )))
+}
+
 /// The request for step `step_id`: the conversation as the folds hold it, under the run's
 /// frozen settings, with the render inputs today's loop gives a request: each message's
 /// position, its part numbers under the run's tag rules, and the run's place in the prompt.
@@ -2999,7 +3097,11 @@ fn call_options<W: Writer>(
         (None, true, Some(enrollment)) => {
             let mut translated = episodes.episodes.clone();
             crate::enroll::translate_episodes(&mut translated, enrollment);
-            Arc::new(RenderHistory::from(translated))
+            // The floor is an ordinal, which leaving suppressed messages out doesn't move.
+            Arc::new(RenderHistory {
+                signed_floor: episodes.signed_floor,
+                ..RenderHistory::from(translated)
+            })
         }
         _ => Arc::clone(episodes),
     };

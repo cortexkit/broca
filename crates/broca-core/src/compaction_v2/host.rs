@@ -2,9 +2,15 @@
 
 use super::{
     conditions::{self, SendContext},
-    protocol::{notice::Conditions, read::Entry, setup::ModelRef},
+    protocol::{
+        notice::Conditions,
+        read::Entry,
+        rules::{ProviderRules, SignedParts},
+        setup::ModelRef,
+    },
 };
 use broca_wal::{FramedRecord, PlanManifest, RunConfig, WalRecord};
+use cortexkit_compaction_view::rules::Floor;
 
 /// What a send's compaction conditions and context read from its run's frozen configuration.
 /// Today's loop takes it from the run's `RunConfig` ([`Frozen::of`]); a loop that keeps its
@@ -70,13 +76,58 @@ pub fn context_of(config: &Frozen<'_>, manifest: Option<&PlanManifest>) -> SendC
 
 /// The conditions a notice, ride or view check states. Entries retain billed usage; the
 /// host-only fill overrides it only for the newest step that reported input usage.
+/// `signed_floor` is the session's signed floor as an ordinal ([`crate::signed_floor`]); the
+/// conditions carry it as the entry it goes through ([`signed_floor`]).
 pub fn conditions(
     config: &RunConfig,
     entries: &[Entry],
     chained: bool,
     newest_step_fill: Option<(&str, u64)>,
+    signed_floor: Option<u64>,
 ) -> Result<Conditions, String> {
-    conditions_of(&Frozen::of(config), entries, chained, newest_step_fill)
+    conditions_of(
+        &Frozen::of(config),
+        entries,
+        chained,
+        newest_step_fill,
+        signed_floor,
+    )
+}
+
+/// The session's signed floor as the compaction contract names it (`signed_floor.through`): the
+/// entry it goes through, by its stable id. `floor` is the ordinal of the first message whose
+/// signed reasoning requests still send ([`crate::signed_floor::SignedFloor::floor`]), so the
+/// floor goes through the message before it, whose entry's one-based ordinal is that same
+/// number. This is the one place broca turns its floor into what the compaction provider and
+/// the view checks read.
+///
+/// `None` when no run changed the tool set, when the change came before any message (there is
+/// no earlier reasoning to drop), when `rules` say the model doesn't bind signed parts to the
+/// request prefix (the floor then constrains nothing), or when `entries` don't hold the entry.
+/// An absent floor keeps every view check as strict as it was before floors existed.
+pub fn signed_floor(
+    floor: Option<u64>,
+    entries: &[Entry],
+    rules: &ProviderRules,
+) -> Option<cortexkit_role_compaction::SignedFloor> {
+    if rules.signed_parts == SignedParts::None {
+        return None;
+    }
+    let through = floor.filter(|floor| *floor > 0)?;
+    entries
+        .iter()
+        .find(|entry| entry.ordinal == through)
+        .map(|entry| cortexkit_role_compaction::SignedFloor::new(entry.mid.as_str()))
+}
+
+/// The floor the view checks honour under `conditions`: signed parts it covers are already
+/// gone from every request, so a view that keeps them is never refused for them (compaction
+/// contract W3.5), whether or not the provider was told of the floor.
+pub fn view_floor(conditions: &Conditions) -> Floor<'_> {
+    conditions
+        .signed_floor
+        .as_ref()
+        .map_or(Floor::none(), |floor| Floor::through(&floor.through))
 }
 
 /// [`conditions`] from a run's frozen choices in any shape.
@@ -85,6 +136,7 @@ pub fn conditions_of(
     entries: &[Entry],
     chained: bool,
     newest_step_fill: Option<(&str, u64)>,
+    signed_floor: Option<u64>,
 ) -> Result<Conditions, String> {
     let window = config
         .context_limit
@@ -115,6 +167,9 @@ pub fn conditions_of(
     // The provider measures the session's fill from this field alone; without it a session
     // never reaches the provider's compaction threshold.
     conditions.last_prompt_tokens = last_prompt_tokens(entries, newest_step_fill);
+    // Every condition carries the floor; the runtime sends it only to a provider that declares
+    // it reads one (`runtime::Runtime`).
+    conditions.signed_floor = self::signed_floor(signed_floor, entries, &conditions.rules);
     Ok(conditions)
 }
 
@@ -285,6 +340,7 @@ pub async fn notice(
         &transcript.entries,
         false,
         transcript.newest_step_fill(),
+        transcript.signed_floor,
     )?;
     let applied = session.state.lock().await.applied_identity();
     let mut setup = conditions::setup_request(

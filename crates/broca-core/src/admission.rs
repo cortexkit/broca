@@ -897,6 +897,17 @@ pub struct AdmissionCheckpointV1 {
     /// Missing on older checkpoints means unknown, never proof that no request was sent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub has_model_attempt: Option<bool>,
+    /// The newest run's tool set and whether any run ever changed it, so an append admitted
+    /// from this checkpoint on a route that binds reasoning to its prefix knows where kept
+    /// signed reasoning stops (`crate::signed_floor`). Unknown on a checkpoint stored before the
+    /// field existed or folded from a WAL tail: admission then folds the complete WAL, and never
+    /// reads the absence as "unchanged". A digest only, never tool text. Serialized last, so an
+    /// older build, whose decoder ignores members it doesn't know, reads the rest unchanged.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::signed_floor::ToolSetHistory::is_unknown"
+    )]
+    pub tool_set_history: crate::signed_floor::ToolSetHistory,
 }
 
 /// A `DeliveryOrdered` record set aside for the `Queued` record that follows it.
@@ -947,6 +958,7 @@ impl AdmissionCheckpointV1 {
                 crate::output_reservation::OutputReservationHistory::default(),
             ),
             has_model_attempt: Some(false),
+            tool_set_history: crate::signed_floor::ToolSetHistory::Known(Default::default()),
         }
     }
 
@@ -960,6 +972,7 @@ impl AdmissionCheckpointV1 {
             checkpoint.tags = None;
             checkpoint.output_reservation = None;
             checkpoint.has_model_attempt = None;
+            checkpoint.tool_set_history = crate::signed_floor::ToolSetHistory::Unknown;
         }
         checkpoint.fold_frames(records)?;
         if checkpoint
@@ -1133,6 +1146,7 @@ impl AdmissionCheckpointV1 {
                 principal,
                 scope,
                 manifest,
+                origin,
                 ..
             } => {
                 if let Some(previous) = &self.last_episode {
@@ -1176,6 +1190,14 @@ impl AdmissionCheckpointV1 {
                 }
                 if let Some(history) = &mut self.effort_history {
                     history.observe(&config.frozen_render_config);
+                }
+                // A seeded run (an import's) sends no request, as replay folds it.
+                if !matches!(origin, broca_wal::RunOrigin::SeededFrom { .. }) {
+                    self.tool_set_history
+                        .observe(crate::signed_floor::tool_set_digest(
+                            &config.tools,
+                            &config.frozen_render_config,
+                        ));
                 }
                 self.last_episode = Some(LastEpisodeV1 {
                     account_limit_pause: None,
@@ -1532,6 +1554,7 @@ impl AdmissionCheckpointV1 {
     /// Older checkpoints need a complete WAL fold to recover these facts before incremental reuse.
     pub fn ownership_complete(&self) -> bool {
         self.effort_history.is_some()
+            && !self.tool_set_history.is_unknown()
             && self.input_budget.is_some()
             && self.lineage_retention.is_some()
             && self.tags.is_some()
@@ -2471,6 +2494,7 @@ impl AdmissionContinuation {
                     | "has_deferred_calls"
                     | "ownership"
                     | "effort_history"
+                    | "tool_set_history"
                     | "lineage_retention"
                     | "compaction"
                     | "tags"
@@ -3933,6 +3957,7 @@ mod tests {
             tags: full.tags,
             pending_order: full.pending_order,
             output_reservation: full.output_reservation,
+            tool_set_history: full.tool_set_history,
         }
     }
 
@@ -4315,12 +4340,12 @@ mod tests {
             (
                 "admission",
                 stored.admission().encode().unwrap(),
-                "4d605d45dd8adacaa81e235b9f8e6c0e36f8cb86dc049c287bef694d1a57be35",
+                "ac9223227b358ede865f140ff438f205469aa3d454647c47306315160315cd81",
             ),
             (
                 "projection",
                 stored.encode().unwrap(),
-                "40507101edf7f7a83927fcc16d75126dc2190f39951e9b97823e6b87fb959552",
+                "bb025264e4ef55e772476f3efd4ed7cb7e1a4bbc21d26042825023a5a97b74a7",
             ),
         ] {
             assert!(!encoded.contains("\"media\""));
@@ -6540,11 +6565,125 @@ mod tests {
         );
     }
 
+    /// An append admitted from the checkpoint starts from the floor a replay of the whole WAL
+    /// finds, and after folding its own run reaches the floor a later replay finds, for every
+    /// history: one tool set throughout, a change, and a change back (A, B, A), where the floor
+    /// moves on rather than back.
+    #[test]
+    fn an_append_from_the_checkpoint_reaches_the_signed_floor_a_full_replay_finds() {
+        use crate::signed_floor::{admission_floor, tool_set_digest, FloorFold};
+        let tools = |set: &str| {
+            Arc::new(vec![Tool {
+                name: "read".into(),
+                description: format!("read under set {set}"),
+                input_schema: serde_json::json!({"type": "object"}),
+                module: None,
+                execution_mode: ExecutionMode::Parallel,
+                reply: None,
+            }])
+        };
+        // Each run places one input message and finishes.
+        let lineage = |sets: &[&str]| -> Vec<FramedRecord> {
+            sets.iter()
+                .enumerate()
+                .flat_map(|(index, set)| {
+                    let seq = 2 * index as u64 + 1;
+                    let mut start = started(seq, &format!("r{index}"), None);
+                    let WalRecord::RunStarted { config, .. } = &mut start.record else {
+                        unreachable!()
+                    };
+                    config.tools = tools(set);
+                    let finished = frame(
+                        seq + 1,
+                        WalRecord::RunFinished {
+                            interrupt_reason: None,
+                            ts_ms: None,
+                            reason: RunFinishReason::Completed,
+                            usage: Usage::default(),
+                            error: None,
+                            retries_used: 0,
+                        },
+                    );
+                    [start, finished]
+                })
+                .collect()
+        };
+        let replayed = |records: &[FramedRecord]| {
+            crate::replay::replay(
+                &records
+                    .iter()
+                    .map(|frame| frame.record.clone())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap()
+        };
+        let floor = |fold: &FloorFold| fold.known().expect("a known floor").floor();
+        for (prefix, next, through_checkpoint, expected) in [
+            (&["A"][..], "A", true, None),
+            (&["A", "A"][..], "B", true, Some(2)),
+            (&["A", "B"][..], "B", false, Some(1)),
+            (&["A", "B"][..], "A", false, Some(2)),
+            (&["A", "B", "A"][..], "A", false, Some(2)),
+        ] {
+            let records = lineage(prefix);
+            let checkpoint = AdmissionCheckpointV1::from_frames(&records).unwrap();
+            assert!(checkpoint.ownership_complete());
+            let whole = replayed(&records);
+            // The store's prefix leaves the floor unknown; the checkpoint or the WAL decides.
+            let mut replays = 0;
+            let mut live = admission_floor(
+                FloorFold::Unknown,
+                &checkpoint.tool_set_history,
+                || -> Result<_, ()> {
+                    replays += 1;
+                    Ok(whole.signed_floor.clone())
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                replays == 0,
+                through_checkpoint,
+                "{prefix:?}: only a lineage whose set changed replays the WAL"
+            );
+            assert_eq!(floor(&live), floor(&whole.signed_floor), "{prefix:?}");
+            // The appended run folds its own tools at the ordinal its input starts at.
+            live.observe_run(
+                whole.extent,
+                tool_set_digest(&tools(next), &serde_json::json!({"wire": "old"})),
+            );
+            let mut appended = prefix.to_vec();
+            appended.push(next);
+            let later = replayed(&lineage(&appended));
+            assert_eq!(floor(&live), floor(&later.signed_floor), "{appended:?}");
+            assert_eq!(floor(&live), expected, "{appended:?}");
+        }
+        // A, B, A: the change to B sets the floor at B's start, the change back moves it on.
+        let floors: Vec<_> = (1..=3)
+            .map(|runs| floor(&replayed(&lineage(&["A", "B", "A"][..runs])).signed_floor))
+            .collect();
+        assert_eq!(floors, [None, Some(1), Some(2)]);
+    }
+
+    /// A checkpoint stored before the tool-set history existed is incomplete, so admission folds
+    /// the whole WAL instead of reading its absence as an unchanged history.
+    #[test]
+    fn a_checkpoint_without_the_tool_set_history_is_incomplete() {
+        let checkpoint = AdmissionCheckpointV1::from_frames(&[started(1, "r1", None)]).unwrap();
+        assert!(checkpoint.ownership_complete());
+        let mut stored = serde_json::to_value(&checkpoint).unwrap();
+        assert!(stored["tool_set_history"]["last"].is_string());
+        stored.as_object_mut().unwrap().remove("tool_set_history");
+        let older: AdmissionCheckpointV1 = serde_json::from_value(stored).unwrap();
+        assert!(older.tool_set_history.is_unknown());
+        assert!(!older.ownership_complete());
+    }
+
     #[test]
     fn checkpoint_json_with_pending_payload_is_byte_stable() {
         let checkpoint = AdmissionCheckpointV1 {
             recovery_cuts: Vec::new(),
             has_model_attempt: None,
+            tool_set_history: crate::signed_floor::ToolSetHistory::Unknown,
             media: None,
             output_reservation: None,
             head: None,
@@ -6703,8 +6842,26 @@ mod tests {
                 .expect("old checkpoint decoder accepts the new optional field");
             let mut expected = checkpoint.clone();
             expected.has_model_attempt = None;
+            // The old decoder predates the tool-set history too, and drops it the same way.
+            expected.tool_set_history = crate::signed_floor::ToolSetHistory::Unknown;
             assert_eq!(old, encode_admission_checkpoint(&expected).unwrap());
         }
+    }
+
+    /// A rollback build reads checkpoints this build wrote: its decoder ignores the tool-set
+    /// history, and the build after it reads that checkpoint as unknown, so it folds the WAL.
+    #[test]
+    fn checkpoint_tool_set_history_is_ignored_by_the_old_decoder() {
+        let checkpoint = AdmissionCheckpointV1::from_frames(&[started(1, "first", None)]).unwrap();
+        assert!(!checkpoint.tool_set_history.is_unknown());
+        let encoded = encode_admission_checkpoint(&checkpoint).unwrap();
+        assert!(encoded.contains("\"tool_set_history\""));
+        let old = super::checkpoint_legacy::round_trip(&encoded)
+            .expect("old checkpoint decoder accepts the new optional field");
+        assert!(!old.contains("tool_set_history"));
+        let reread = decode_admission_checkpoint(&old).unwrap();
+        assert!(reread.tool_set_history.is_unknown());
+        assert!(!reread.ownership_complete());
     }
 
     #[test]

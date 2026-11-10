@@ -48,6 +48,39 @@ pub trait Plane: Send + Sync {
     async fn provides_entry_speaks_for(&self) -> bool {
         false
     }
+    /// Whether the provider's catalog entry lists `compaction-signed-floor/v1` (compaction
+    /// contract W3.5). A plane that can't read the catalog answers false, so the provider is
+    /// sent no floor it may not understand.
+    async fn provides_signed_floor(&self) -> bool {
+        false
+    }
+    /// Both declarations, read together when the runner sends Setup. A plane that reads the
+    /// catalog answers both from one read.
+    async fn declarations(&self) -> Declarations {
+        Declarations {
+            entry_speaks_for: self.provides_entry_speaks_for().await,
+            signed_floor: self.provides_signed_floor().await,
+        }
+    }
+}
+
+/// What the provider's catalog entry declares that changes what the runner sends it, as the
+/// latest Setup read it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Declarations {
+    /// `compaction-entry-speaks-for/v1`: entries carry stored speaker marks.
+    pub entry_speaks_for: bool,
+    /// `compaction-signed-floor/v1`: Setup and conditions carry the signed floor.
+    pub signed_floor: bool,
+}
+
+impl Declarations {
+    fn of(provides: &[String]) -> Self {
+        Self {
+            entry_speaks_for: cortexkit_role_compaction::provides_entry_speaks_for(provides),
+            signed_floor: cortexkit_role_compaction::provides_signed_floor(provides),
+        }
+    }
 }
 
 pub struct BoundPlane<'a> {
@@ -89,13 +122,23 @@ impl Plane for BoundPlane<'_> {
     }
 
     async fn provides_entry_speaks_for(&self) -> bool {
+        self.declarations().await.entry_speaks_for
+    }
+
+    async fn provides_signed_floor(&self) -> bool {
+        self.declarations().await.signed_floor
+    }
+
+    async fn declarations(&self) -> Declarations {
         let Some(plane) = self.plane else {
-            return false;
+            return Declarations::default();
         };
         plane
             .provider_capabilities(self.provider)
             .await
-            .is_some_and(|provides| cortexkit_role_compaction::provides_entry_speaks_for(&provides))
+            .map_or_else(Declarations::default, |provides| {
+                Declarations::of(&provides)
+            })
     }
 }
 
@@ -123,6 +166,10 @@ struct Lane {
     /// claims the cause only then, so the provider never hears a cause it was told broca can't
     /// detect.
     detects_cache_expired: bool,
+    /// Whether the provider's catalog entry declared `compaction-signed-floor/v1` when the last
+    /// Setup was sent. Setup, notices and rides carry the session's signed floor only then
+    /// (compaction contract W3.5); the declaration holds until the next Setup.
+    signed_floor_declared: bool,
 }
 
 impl Default for Lane {
@@ -132,7 +179,20 @@ impl Default for Lane {
             ready: false,
             setup_due: true,
             detects_cache_expired: false,
+            signed_floor_declared: false,
         }
+    }
+}
+
+impl Lane {
+    /// `conditions` as this lane's provider may receive them: without the signed floor unless
+    /// it declared that it reads one.
+    fn conditions(&self, conditions: &Conditions) -> Conditions {
+        let mut conditions = conditions.clone();
+        if !self.signed_floor_declared {
+            conditions.signed_floor = None;
+        }
+        conditions
     }
 }
 
@@ -342,7 +402,7 @@ impl Runtime {
                     return;
                 }
                 lane.seq += 1;
-                let mut notice = NoticeRequest::new(lane.seq, conditions.clone());
+                let mut notice = NoticeRequest::new(lane.seq, lane.conditions(conditions));
                 notice.newest = pending.newest.clone();
                 notice.applied_view = applied.cloned();
                 notice.entries = std::mem::take(&mut pending.entries)
@@ -410,10 +470,12 @@ impl Runtime {
             #[serde(default)]
             view: Option<Box<RawValue>>,
         }
+        let mut request = request.clone();
+        request.conditions = lane.conditions(&request.conditions);
         let answer: Result<RawRideAnswer, _> = call(
             plane,
             "compaction.ride",
-            request,
+            &request,
             Duration::from_millis(request.deadline_ms),
         )
         .await;
@@ -453,15 +515,21 @@ async fn setup(
     entry_speaks_for: &AtomicU8,
 ) -> bool {
     lane.seq = 0;
-    // The provider's attribution declaration is read from the catalog at every Setup, before
-    // the Setup is sent, so a provider that reads entries as soon as it is ready already sees
-    // them as declared. A catalog that can't be read in time counts as no declaration.
-    let declared = tokio::time::timeout(CALL_DEADLINE, plane.provides_entry_speaks_for())
+    // The provider's declarations are read from the catalog at every Setup, before the Setup is
+    // sent, so a provider that reads entries as soon as it is ready already sees them as
+    // declared, and what they say holds for every call until the next Setup. A catalog that
+    // can't be read in time counts as no declaration.
+    let declared = tokio::time::timeout(CALL_DEADLINE, plane.declarations())
         .await
-        .unwrap_or(false);
-    entry_speaks_for.store(attribution(declared), Ordering::Release);
+        .unwrap_or_default();
+    entry_speaks_for.store(attribution(declared.entry_speaks_for), Ordering::Release);
+    lane.signed_floor_declared = declared.signed_floor;
+    let mut request = request.clone();
+    if !lane.signed_floor_declared {
+        request.signed_floor = None;
+    }
     let answer: Result<SetupAnswer, _> =
-        call(plane, "compaction.setup", request, CALL_DEADLINE).await;
+        call(plane, "compaction.setup", &request, CALL_DEADLINE).await;
     lane.ready = match answer {
         Ok(SetupAnswer::Ready) => true,
         Ok(_) => {

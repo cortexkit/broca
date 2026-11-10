@@ -2209,6 +2209,7 @@ async fn planner_costs(root: &Path, measured: &Measured, samples: usize) -> Vec<
                 &entries,
                 Some(&measured.view),
                 &rules,
+                broca_core::compaction_v2::Floor::none(),
             )
             .expect("the run's view plans over the window");
             started.elapsed()

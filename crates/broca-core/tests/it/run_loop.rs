@@ -3921,6 +3921,7 @@ fn prior_snapshot_handoff_excludes_pending_payloads_and_shares_pending_storage()
         checkpoint_at_head: AdmissionCheckpointV1 {
             recovery_cuts: Vec::new(),
             has_model_attempt: None,
+            tool_set_history: Default::default(),
             media: None,
             head: None,
             has_deferred_calls: None,

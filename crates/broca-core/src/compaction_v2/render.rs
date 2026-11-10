@@ -30,12 +30,20 @@ pub fn request_options(
     let transcript = super::transcript::project(records, lineage)?;
     let (config, manifest) = super::host::frozen(records)?;
     let prompt = if manifest.is_some_and(crate::compaction::has_compaction) {
+        let conditions = super::host::conditions(
+            &config,
+            &transcript.entries,
+            false,
+            None,
+            transcript.signed_floor,
+        )?;
         prompt_view_with_rides(
             &boundary.prompt,
             &transcript.entries,
             &transcript.rides,
             applied,
-            &super::host::conditions(&config, &transcript.entries, false, None)?.rules,
+            &conditions.rules,
+            super::host::view_floor(&conditions),
             super::host::image_reference,
         )?
     } else {
@@ -88,39 +96,46 @@ pub fn prompt_with_rides(
 /// Plan the complete applied view, including permission to strip newer signatures.
 /// Reverts filter obsolete edit targets, but preserve `built_through`: it marks the
 /// last message the provider had read when it authorized stripping newer signatures.
+/// `floor` is the session's signed floor (`host::view_floor`), which the plan honours as the
+/// view checks do; the request's own strip removes the parts it covers.
 pub fn prompt_view_with_rides(
     stored: &[Message],
     entries: &[Entry],
     rides: &super::entries::RideEnvelopes,
     view: Option<&View>,
     rules: &ProviderRules,
+    floor: cortexkit_compaction_view::rules::Floor<'_>,
     image: impl FnMut(&InsertedImage) -> Result<MediaRef, String>,
 ) -> Result<Vec<Message>, String> {
-    prompt_view_kept(stored, entries, rides, view, rules, image, None)
+    prompt_view_kept(stored, entries, rides, view, rules, floor, image, None)
 }
 
 /// [`prompt_view_with_rides`], reusing what `kept` holds of the entries an earlier render
 /// rendered, and keeping what this one renders for the next (see [`RenderCache`]).
+#[allow(clippy::too_many_arguments)]
 pub fn prompt_view_kept(
     stored: &[Message],
     entries: &[Entry],
     rides: &super::entries::RideEnvelopes,
     view: Option<&View>,
     rules: &ProviderRules,
+    floor: cortexkit_compaction_view::rules::Floor<'_>,
     image: impl FnMut(&InsertedImage) -> Result<MediaRef, String>,
     kept: Option<&RenderCache>,
 ) -> Result<Vec<Message>, String> {
-    let (edits, plan) = plan_for_render(entries, view, rules)?;
+    let (edits, plan) = plan_for_render(entries, view, rules, floor)?;
     render_planned(stored, entries, rides, &edits, plan, image, kept)
 }
 
 /// What rendering `view` over `entries` keeps of them, before any message is rendered: the
 /// view's edits whose targets the transcript still holds, and the plan the shared view crate
 /// makes from them (no view keeps every entry whole). It checks the view's checksum first.
+/// `floor` is the session's signed floor (`host::view_floor`).
 pub fn plan_for_render(
     entries: &[Entry],
     view: Option<&View>,
     rules: &ProviderRules,
+    floor: cortexkit_compaction_view::rules::Floor<'_>,
 ) -> Result<(Vec<Edit>, render::RenderPlan), String> {
     let Some(view) = view else {
         let edits = render::edits_for_transcript(entries, &[]);
@@ -137,7 +152,7 @@ pub fn plan_for_render(
         view.built_through.clone(),
         view.new_signed.clone(),
     );
-    let plan = render::plan_view(entries, &filtered, rules)
+    let plan = render::plan_view(entries, &filtered, rules, floor)
         .map_err(|error| format!("compaction render plan refused: {error:?}"))?;
     Ok((filtered.edits, plan))
 }

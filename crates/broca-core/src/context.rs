@@ -2606,6 +2606,13 @@ pub(crate) fn merge_prefix_and_tail(
         } else {
             None
         },
+        // The tail sees only the runs after the prefix, so it knows the floor only when the
+        // prefix is empty.
+        signed_floor: if seed.prefix_len == 0 {
+            tail_state.signed_floor
+        } else {
+            crate::signed_floor::FloorFold::Unknown
+        },
         open_tool_batch: tail_state.open_tool_batch,
         // The store's watermark is never placed with a steer pending across it (see
         // `latest_projection_boundary`), so every unplaced steer is in the tail.

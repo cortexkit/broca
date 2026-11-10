@@ -1,5 +1,5 @@
 use broca_protocol::{ContentBlock, Message, Role, ToolCall, ToolCallId, ToolOutput, ToolResult};
-use cortexkit_compaction_view::{rules, tags};
+use cortexkit_compaction_view::{rules, rules::Floor, tags};
 use cortexkit_role_compaction::{
     part::{Delivered, PartBody, Seal, ToolStatus},
     read::{Detail, ReadRequest, Select},
@@ -338,20 +338,35 @@ fn compaction_v2_view_checks_use_full_original_text_and_deliveries() {
         )
     };
     let rules = rules::defaults("gpt-5");
-    assert!(views::check(&entries, None, &replace("kept §99§"), &rules, true).is_ok());
+    assert!(views::check(
+        &entries,
+        None,
+        &replace("kept §99§"),
+        &rules,
+        true,
+        Floor::none()
+    )
+    .is_ok());
     assert!(matches!(
-        views::check(&entries, None, &replace("foreign §98§"), &rules, true),
+        views::check(
+            &entries,
+            None,
+            &replace("foreign §98§"),
+            &rules,
+            true,
+            Floor::none()
+        ),
         Err(ViewRefusal::ForeignTag { tag: 98, .. })
     ));
     let view = replace("replacement");
     assert!(matches!(
-        views::check(&entries, Some(&view), &view, &rules, true),
+        views::check(&entries, Some(&view), &view, &rules, true, Floor::none()),
         Err(ViewRefusal::StaleVersion { .. })
     ));
     let mut bad = view;
     bad.checksum = "invalid".into();
     assert!(matches!(
-        views::check(&entries, None, &bad, &rules, true),
+        views::check(&entries, None, &bad, &rules, true, Floor::none()),
         Err(ViewRefusal::BadChecksum)
     ));
 }
@@ -514,14 +529,21 @@ fn compaction_v2_strip_newest_signed_thinking_keeps_final_tool() {
     let provider_rules = rules::defaults("claude-opus-5-5");
     let strict = View::seal_with_policy(1, edits.clone(), Some(entries[0].mid.clone()), None);
     assert!(matches!(
-        views::check(&entries, None, &strict, &provider_rules, true),
+        views::check(
+            &entries,
+            None,
+            &strict,
+            &provider_rules,
+            true,
+            Floor::none()
+        ),
         Err(ViewRefusal::Rule(
             cortexkit_role_compaction::rules::RuleBreak::SignedPartInvalid { .. }
         ))
     ));
     let strip =
         View::seal_with_policy(1, edits, Some(entries[0].mid.clone()), Some("strip".into()));
-    assert!(views::check(&entries, None, &strip, &provider_rules, true).is_ok());
+    assert!(views::check(&entries, None, &strip, &provider_rules, true, Floor::none()).is_ok());
     let render = |view: &View| {
         render::prompt_view_with_rides(
             &messages,
@@ -529,6 +551,7 @@ fn compaction_v2_strip_newest_signed_thinking_keeps_final_tool() {
             &Default::default(),
             Some(view),
             &provider_rules,
+            Floor::none(),
             |_| panic!("no image"),
         )
         .unwrap()
@@ -572,6 +595,204 @@ fn compaction_v2_strip_newest_signed_thinking_keeps_final_tool() {
     assert_eq!(applied, &strip);
     assert_eq!(restored.applied_by(), Some("ck-mc"));
     assert_eq!(render(applied), rendered);
+}
+
+/// A run whose tools changed sets the signed floor through the newest message before that run
+/// (`host::signed_floor`). A view that edits a message before the floor keeps a signed part the
+/// floor covers, which every request strips anyway, so it is accepted and applied rather than
+/// refused (compaction contract W3.5). The same view without the floor is refused for
+/// invalidating that part.
+#[tokio::test]
+async fn compaction_v2_a_view_editing_before_the_signed_floor_is_applied() {
+    let messages = vec![
+        text(Role::User, "old question"),
+        Message::new(
+            Role::Assistant,
+            vec![
+                ContentBlock::Reasoning {
+                    text: "private".into(),
+                    signature: Some("signature".into()),
+                },
+                ContentBlock::Text {
+                    text: "old answer".into(),
+                },
+            ],
+        ),
+        // The run whose tools changed starts here, at message 2.
+        text(Role::User, "new question"),
+        text(Role::Assistant, "new answer"),
+    ];
+    let entries = project(&messages, &facts(4), &Deliveries::new(), true);
+    let bound = rules::defaults("claude-opus-5-5");
+    let floor = super::host::signed_floor(Some(2), &entries, &bound).expect("a floor");
+    assert_eq!(
+        floor.through, entries[1].mid,
+        "through the message before the run"
+    );
+    // No floor where nothing is bound, where the change came before any message, or where no
+    // run changed its tools.
+    let unbound = rules::defaults("gpt-5");
+    assert_eq!(super::host::signed_floor(Some(2), &entries, &unbound), None);
+    assert_eq!(super::host::signed_floor(Some(0), &entries, &bound), None);
+    assert_eq!(super::host::signed_floor(None, &entries, &bound), None);
+
+    let view = View::seal(
+        1,
+        vec![Edit::new(
+            1,
+            EditOp::Replace {
+                mid: entries[0].mid.clone(),
+                part: "0".into(),
+                field: "text".into(),
+                value: json!("summary"),
+                expect: entries[0].parts[0].digest.clone(),
+            },
+        )],
+    );
+    assert!(matches!(
+        views::check(&entries, None, &view, &bound, true, Floor::none()),
+        Err(ViewRefusal::Rule(
+            cortexkit_role_compaction::rules::RuleBreak::SignedPartInvalid { .. }
+        ))
+    ));
+    let through = Floor::through(&floor.through);
+    assert!(views::check(&entries, None, &view, &bound, true, through).is_ok());
+
+    let journal = MemoryJournal::default();
+    let mut state = state::State::default();
+    state
+        .accept(&journal, &entries, view.clone(), &bound, true, through)
+        .await
+        .unwrap()
+        .unwrap();
+    let events = state
+        .apply(
+            &journal,
+            state::Boundary {
+                step: 1,
+                entries: &entries,
+                rules: &bound,
+                accepts_images: true,
+                floor: through,
+                next_mid: "m12345678.4",
+            },
+        )
+        .await
+        .unwrap();
+    assert!(events.is_empty(), "{events:?}");
+    assert_eq!(state.applied(), Some(&view));
+    // The plan keeps the covered part; leaving it out is the request's own strip, which drops
+    // every signed part before the floor from the copy it sends.
+    let rendered = render::prompt_view_with_rides(
+        &messages,
+        &entries,
+        &Default::default(),
+        Some(&view),
+        &bound,
+        through,
+        |_| panic!("no image"),
+    )
+    .unwrap();
+    assert!(matches!(
+        &rendered[1].content[0],
+        ContentBlock::Reasoning { signature: Some(signature), .. } if signature == "signature"
+    ));
+    assert!(matches!(
+        &rendered[0].content[..],
+        [ContentBlock::Text { text }] if text == "summary"
+    ));
+}
+
+/// Setup, notices and rides carry the session's signed floor only to a provider whose catalog
+/// entry declares `compaction-signed-floor/v1`, read again at every Setup.
+#[tokio::test]
+async fn compaction_v2_only_a_declaring_provider_is_sent_the_signed_floor() {
+    use cortexkit_role_compaction::ride::{RideCause, RideRequest};
+    struct Declaring {
+        inner: RecordingPlane,
+        provides: std::sync::Mutex<Vec<String>>,
+    }
+    #[async_trait::async_trait]
+    impl runtime::Plane for Declaring {
+        async fn call(
+            &self,
+            method: &str,
+            params: serde_json::Value,
+        ) -> Result<Box<serde_json::value::RawValue>, runtime::CallError> {
+            self.inner.call(method, params).await
+        }
+        async fn provides_signed_floor(&self) -> bool {
+            cortexkit_role_compaction::provides_signed_floor(&self.provides.lock().unwrap())
+        }
+    }
+    let floor = cortexkit_role_compaction::SignedFloor::new("m12345678.1");
+    let mut conditions = conditions();
+    conditions.signed_floor = Some(floor.clone());
+    let mut setup = setup();
+    setup.signed_floor = Some(floor.clone());
+    let ride = RideRequest::new(vec![RideCause::OverLimit], 1000, conditions.clone());
+    let entries = |count| {
+        project(
+            &(0..count)
+                .map(|index| text(Role::User, &format!("message {index}")))
+                .collect::<Vec<_>>(),
+            &facts(count),
+            &Deliveries::new(),
+            true,
+        )
+    };
+    let plane = Declaring {
+        inner: RecordingPlane::default(),
+        provides: std::sync::Mutex::new(vec!["compaction-provider/v2".into()]),
+    };
+    plane.inner.answers.lock().unwrap().extend([
+        json!({"answer":"ready"}),
+        json!({"answer":"received"}),
+        json!({"answer":"nothing"}),
+        json!({"answer":"ready"}),
+        json!({"answer":"received"}),
+        json!({"answer":"nothing"}),
+    ]);
+    let runtime = runtime::Runtime::default();
+    // A provider that doesn't declare the capability hears no floor.
+    assert!(runtime.setup(&plane, &setup).await);
+    runtime.observe(&entries(1));
+    runtime.flush(&plane, &setup, &conditions, None).await;
+    runtime.ride(&plane, &setup, &ride).await;
+    // Once it declares it, the next Setup and everything after it carry the floor.
+    plane
+        .provides
+        .lock()
+        .unwrap()
+        .push(cortexkit_role_compaction::COMPACTION_SIGNED_FLOOR_PROVIDES.into());
+    assert!(runtime.setup(&plane, &setup).await);
+    runtime.observe(&entries(2));
+    runtime.flush(&plane, &setup, &conditions, None).await;
+    runtime.ride(&plane, &setup, &ride).await;
+    let calls = plane.inner.calls.lock().unwrap();
+    let floors: Vec<_> = calls
+        .iter()
+        .map(|(method, params)| {
+            let floor = if method == "compaction.setup" {
+                &params["signed_floor"]
+            } else {
+                &params["conditions"]["signed_floor"]
+            };
+            (method.as_str(), floor.clone())
+        })
+        .collect();
+    let sent = json!({"through": "m12345678.1"});
+    assert_eq!(
+        floors,
+        [
+            ("compaction.setup", serde_json::Value::Null),
+            ("compaction.notice", serde_json::Value::Null),
+            ("compaction.ride", serde_json::Value::Null),
+            ("compaction.setup", sent.clone()),
+            ("compaction.notice", sent.clone()),
+            ("compaction.ride", sent),
+        ]
+    );
 }
 
 fn setup() -> cortexkit_role_compaction::setup::SetupRequest {
@@ -903,7 +1124,14 @@ async fn compaction_v2_acceptance_is_not_application_and_failed_sync_does_not_ac
         .fail
         .store(true, std::sync::atomic::Ordering::SeqCst);
     assert!(state
-        .accept(&journal, &entries, view.clone(), &rules, true)
+        .accept(
+            &journal,
+            &entries,
+            view.clone(),
+            &rules,
+            true,
+            Floor::none()
+        )
         .await
         .is_err());
     assert!(state.latest().is_none());
@@ -911,7 +1139,14 @@ async fn compaction_v2_acceptance_is_not_application_and_failed_sync_does_not_ac
         .fail
         .store(false, std::sync::atomic::Ordering::SeqCst);
     state
-        .accept(&journal, &entries, view.clone(), &rules, true)
+        .accept(
+            &journal,
+            &entries,
+            view.clone(),
+            &rules,
+            true,
+            Floor::none(),
+        )
         .await
         .unwrap()
         .unwrap();
@@ -925,6 +1160,7 @@ async fn compaction_v2_acceptance_is_not_application_and_failed_sync_does_not_ac
                 entries: &entries,
                 rules: &rules,
                 accepts_images: true,
+                floor: Floor::none(),
                 next_mid: "m12345678.2",
             },
         )
@@ -967,6 +1203,7 @@ async fn compaction_v2_recovery_finishes_marker_after_applied_barrier() {
                 entries: &entries,
                 rules: &rules,
                 accepts_images: true,
+                floor: Floor::none(),
                 next_mid: "m12345678.1",
             },
         )
@@ -982,6 +1219,7 @@ async fn compaction_v2_recovery_finishes_marker_after_applied_barrier() {
                 entries: &entries,
                 rules: &rules,
                 accepts_images: true,
+                floor: Floor::none(),
                 next_mid: "m12345678.1",
             },
         )
@@ -1327,7 +1565,14 @@ async fn compaction_v2_midstep_acceptance_does_not_change_a_resumed_step_view() 
     let journal = MemoryJournal::default();
     let rules = rules::defaults("gpt-5");
     state
-        .accept(&journal, &entries, next.clone(), &rules, true)
+        .accept(
+            &journal,
+            &entries,
+            next.clone(),
+            &rules,
+            true,
+            Floor::none(),
+        )
         .await
         .unwrap()
         .unwrap();
@@ -1355,6 +1600,7 @@ async fn compaction_v2_midstep_acceptance_does_not_change_a_resumed_step_view() 
                 entries: &entries,
                 rules: &rules,
                 accepts_images: true,
+                floor: Floor::none(),
                 next_mid: "m12345678.1",
             },
         )
@@ -2142,7 +2388,7 @@ fn the_output_reserve_falls_back_to_the_models_output_cap() {
         context_management: None,
     };
     let reserve = |config: RunConfig| {
-        super::host::conditions(&config, &[], false, None)
+        super::host::conditions(&config, &[], false, None, None)
             .unwrap()
             .output_reserve
     };

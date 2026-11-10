@@ -283,7 +283,14 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         let config = broca_session_loop::run::run_config_of_start(start, &self.parts)
             .map_err(|error| format!("{error:?}"))?;
         let entries = crate::store_entries::all_entries(&self.session).await?;
-        let conditions = v2::host::conditions(&config, &entries, false, None)?;
+        let floor = broca_session_loop::run::signed_floor(
+            &self.session,
+            &self.parts,
+            &mut Default::default(),
+        )
+        .await
+        .map_err(|error| format!("{error:?}"))?;
+        let conditions = v2::host::conditions(&config, &entries, false, None, floor)?;
         if crate::store_entries::frozen_provider(&self.parts, &self.session)?.is_none() {
             return v2::shown::next_request(&Default::default(), &entries, &conditions);
         }
