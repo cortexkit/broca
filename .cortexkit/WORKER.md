@@ -10,7 +10,7 @@ them. Start with `CONTRIBUTING.md` and the public contracts under `docs/`.
   clear the compiler wrapper: if your shell sets `RUSTC_WRAPPER` or `CARGO_BUILD_RUSTC_WRAPPER`
   empty, `unset` them first.
 - Use the build server only for what needs its platform: Windows-only behaviour
-  (`runon: "windows"`), or a test that runs only on Linux (`runon: "linux,8c"`). A remote Linux
+  (`runon: "windows"`), or a test that runs only on Linux (`runon: "linux,4c,12gb"`). A remote Linux
   job can't change files git tracks, so edit tracked files locally, and name any file a remote job
   regenerates in `return_paths`.
 - Never run the native kill-conformance, real-daemon or crash-harness release lanes yourself. The
@@ -19,7 +19,11 @@ them. Start with `CONTRIBUTING.md` and the public contracts under `docs/`.
   your builds and tests to the Linux build server. Follow the brief then, without asking. Commit
   through a server attestation:
   1. Run `bash scripts/linux-quickcheck-attest.sh --output .cortexkit/linux-attestation.txt
-     <crates>` with `runon: "linux,8c"` and `return_paths: [".cortexkit/linux-attestation.txt"]`.
+     <crates>` with `runon: "linux,4c,12gb"`, `CARGO_BUILD_JOBS=4`, a 60-minute `timeout` and
+     `return_paths: [".cortexkit/linux-attestation.txt"]`. Always state the memory: a job that
+     names none gets 2 GiB per vCPU, and broca's attestation runs out at 8 GiB. 8-vCPU hosts are
+     often full, so a 4-vCPU job usually starts sooner. A refusal before the job starts (capacity,
+     or `workspace_setup_failed`) means it never ran: retry it once before asking.
   2. Run `cp .cortexkit/linux-attestation.txt "$(git rev-parse --git-path
      broca-linux-quickcheck-attestation)"` locally.
   3. Run `scripts/gated-commit.sh`. It reuses the attestation when the tree matches, and runs only
