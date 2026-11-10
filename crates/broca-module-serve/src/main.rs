@@ -5539,7 +5539,7 @@ mod executor {
             };
             let family = method.and_then(family_for_method).unwrap_or(catalog_family);
             Ok(Some(Box::new(
-                broca_provider::media_profile::select_media_profile(
+                broca_provider::media_profile::select_model_media_profile(
                     family,
                     provider.quirks.media.or_else(|| {
                         broca_provider::media_profile::media_quirk_for_catalog_provider(
@@ -5547,8 +5547,7 @@ mod executor {
                         )
                     }),
                     &model.id,
-                    model.input_modalities,
-                    model.limits.context,
+                    &model,
                 ),
             )))
         }

@@ -451,20 +451,24 @@ pub struct Capabilities {
     pub structured_output: CapabilityFlag,
 }
 
-/// Token limits (mirrors the catalog).
+/// Model limits (mirrors the catalog).
 ///
-/// `None` means the catalog stated no limit, which is NOT the same as zero. The upstream
-/// publishes `0` for fields that do not apply -- 186 models declare `output: 0` and 124
+/// `None` means the catalog stated no limit, which is NOT the same as zero. For token fields,
+/// the upstream publishes `0` for fields that do not apply -- 186 models declare `output: 0` and 124
 /// declare `context: 0`. A zero here is "not applicable" wearing the costume of a
 /// measurement, and a consumer that reads it as a real bound gets a silently absurd one.
 ///
-/// TREAT ZERO AS ABSENT PER FIELD, never per row. 90 models mix a real limit with a zero
+/// TREAT ZERO AS ABSENT PER TOKEN FIELD, never per row. 90 models mix a real limit with a zero
 /// one -- `alibaba-token-plan/qwen-image-2.0` declares `{context: 8192, output: 0}`, and
 /// eight such models sit under providers we serve. A row-level rule ("this model has no
 /// token model, ignore its limits") looks tidier and is wrong for those: it would discard
 /// a real context window alongside an inapplicable output cap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Limits {
+    /// Published per-request image count, frozen into the media profile at admission.
+    /// Absent means unknown, so the adapter's table remains the fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub images_per_request: Option<u32>,
     /// Consumed: surfaced as the run's `context_limit`, which is the prompt-reduction
     /// transform's pressure signal.
     #[serde(default, skip_serializing_if = "Option::is_none")]

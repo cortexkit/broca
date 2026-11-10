@@ -57,6 +57,7 @@ pub const FUSIFORM_FACT_PREFIXES: &[&str] = &[
     "provider.",
     "limit.context",
     "limit.output",
+    "limit.images_per_request",
     "capability.attachment",
     "capability.input_modalities",
     "capability.mid_conversation_system",
@@ -141,6 +142,8 @@ struct LoadedCatalog {
     /// the new fact. Without this bit that poll would republish an index with no output limits,
     /// and it would stay that way until fusiform happened to mint a new version.
     carries_output_limits: bool,
+    /// An equal-version poll must replace an older LKG that did not request image counts.
+    carries_image_counts: bool,
     /// Whether any row of the source document carried a mode rate. Same reason as
     /// `carries_output_limits`: an LKG fetched before broca requested mode rates has the same
     /// version as the next poll and none of them, and reusing its index would keep every tier
@@ -244,6 +247,13 @@ fn response_carries_output_limits(response: &FusiformCatalogResponse) -> bool {
         .any(|facts| facts.contains_key("limit.output"))
 }
 
+fn response_carries_image_counts(response: &FusiformCatalogResponse) -> bool {
+    response
+        .models
+        .values()
+        .any(|facts| facts.contains_key("limit.images_per_request"))
+}
+
 /// The bounded provider facts retained for admission. `raw` is always null, so cloning this spec
 /// for one lookup never copies another model or an ingestion-only catalog field.
 struct ServingProvider {
@@ -274,6 +284,7 @@ struct ServingModel {
     /// usable as a default cap is decided at resolution, not here, so the index keeps what was
     /// served.
     output_limit: Option<u64>,
+    images_per_request: Option<u32>,
     attachment: CapabilityFlag,
     input_modalities: InputModalities,
     reasoning: CapabilityFlag,
@@ -311,6 +322,7 @@ impl Default for ServingModel {
             cost: CostSchedule::default(),
             context_limit: None,
             output_limit: None,
+            images_per_request: None,
             attachment: CapabilityFlag::Absent,
             input_modalities: InputModalities::default(),
             reasoning: CapabilityFlag::Absent,
@@ -340,6 +352,7 @@ impl ServingModel {
             cost: model.cost.clone(),
             context_limit: model.limits.context,
             output_limit: model.limits.max_output,
+            images_per_request: model.limits.images_per_request,
             attachment: model.capabilities.attachment,
             input_modalities: model.input_modalities,
             reasoning: model.capabilities.reasoning,
@@ -375,6 +388,7 @@ impl ServingModel {
                 context: self.context_limit,
                 max_input: None,
                 max_output: self.output_limit,
+                images_per_request: self.images_per_request,
             },
             cost: self.cost.clone(),
             reasoning_options: self.reasoning_options.clone(),
@@ -1456,6 +1470,7 @@ fn serving_model_from_facts(
         cost: warm_cost_fact(facts),
         context_limit: context_fact(identity, facts)?,
         output_limit: output_fact(identity, facts)?,
+        images_per_request: images_per_request_fact(identity, facts)?,
         attachment: optional_capability_fact(identity, facts, "capability.attachment")?,
         input_modalities: facts
             .get("capability.input_modalities")
@@ -1738,6 +1753,30 @@ fn output_fact(
                 fact: "limit.output".to_string(),
                 reason: format!(
                     "expected unsigned integer or null, found {}",
+                    value_kind(value)
+                ),
+            }),
+    }
+}
+
+/// Read a positive image count that fits the media profile's counter. Absent or null is unknown;
+/// malformed bounds exclude the row rather than silently falling back to a different limit.
+fn images_per_request_fact(
+    identity: &str,
+    facts: &BTreeMap<String, Value>,
+) -> Result<Option<u32>, CatalogError> {
+    match facts.get("limit.images_per_request") {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .and_then(|count| u32::try_from(count).ok())
+            .filter(|&count| count > 0)
+            .map(Some)
+            .ok_or_else(|| CatalogError::FusiformFact {
+                model: identity.to_string(),
+                fact: "limit.images_per_request".to_string(),
+                reason: format!(
+                    "expected positive 32-bit unsigned integer or null, found {}",
                     value_kind(value)
                 ),
             }),
@@ -2152,6 +2191,7 @@ impl CatalogCache {
                 // LKG that `open` refuses after restart, even while the in-memory catalog keeps
                 // serving its last accepted snapshot.
                 if response_carries_output_limits(&response) != current.carries_output_limits
+                    || response_carries_image_counts(&response) != current.carries_image_counts
                     || response_carries_mode_rates(&response) != current.carries_mode_rates
                     || response_carries_warm_rates(&response) != current.carries_warm_rates
                     || response_carries_model_kinds(&response) != current.carries_model_kinds
@@ -2189,6 +2229,7 @@ impl CatalogCache {
                     catalog_version: current.catalog_version,
                     source: CatalogSource::Fusiform,
                     carries_output_limits: current.carries_output_limits,
+                    carries_image_counts: current.carries_image_counts,
                     carries_mode_rates: current.carries_mode_rates,
                     carries_warm_rates: current.carries_warm_rates,
                     carries_model_kinds: current.carries_model_kinds,
@@ -2282,6 +2323,7 @@ impl CatalogCache {
             catalog_version: 0,
             source,
             carries_output_limits: true,
+            carries_image_counts: true,
             carries_mode_rates: false,
             carries_warm_rates: true,
             // The vendored snapshot serves no `model.kind`.
@@ -2357,6 +2399,7 @@ fn loaded(
         catalog_version: response.catalog_version,
         source,
         carries_output_limits: response_carries_output_limits(response),
+        carries_image_counts: response_carries_image_counts(response),
         carries_mode_rates: response_carries_mode_rates(response),
         carries_warm_rates: response_carries_warm_rates(response),
         carries_model_kinds: response_carries_model_kinds(response),
@@ -4689,6 +4732,87 @@ mod tests {
         }
         let malformed = facts(&[("rate.input.mode.fast", serde_json::json!(2.0))]);
         assert!(priced_modes_fact("p/m", &malformed).is_err());
+    }
+
+    #[test]
+    fn catalog_image_count_is_requested_and_survives_equal_version_refresh() {
+        let cache = CatalogCache::empty();
+        let first = response(100);
+        let version = first.catalog_version;
+        cache.refresh(first).unwrap();
+        let before = cache.snapshot().unwrap();
+        let model = |snapshot: &CatalogSnapshot| {
+            snapshot
+                .model_for_serving("anthropic", "claude-sonnet-4-5")
+                .unwrap()
+                .1
+        };
+        assert_eq!(model(&before).limits.images_per_request, None);
+
+        let mut upgraded = response(200);
+        upgraded.catalog_version = version;
+        upgraded
+            .models
+            .get_mut("anthropic/claude-sonnet-4-5")
+            .unwrap()
+            .insert("limit.images_per_request".into(), serde_json::json!(3600));
+        for facts in upgraded.models.values_mut() {
+            facts.retain(|fact, _| {
+                FUSIFORM_FACT_PREFIXES
+                    .iter()
+                    .any(|prefix| fact.starts_with(prefix))
+            });
+        }
+        cache.refresh(upgraded).unwrap();
+        let after = cache.snapshot().unwrap();
+        assert!(!before.shares_index_with(&after));
+        assert_eq!(model(&after).limits.images_per_request, Some(3600));
+        assert_eq!(model(&before).limits.images_per_request, None);
+    }
+
+    #[test]
+    fn catalog_image_count_null_is_unknown_and_malformed_counts_exclude_the_row() {
+        let mut response = response(100);
+        response
+            .models
+            .get_mut("anthropic/claude-sonnet-4-5")
+            .unwrap()
+            .insert("limit.images_per_request".into(), Value::Null);
+        let installed = loaded(&response, CatalogSource::Fusiform, None).unwrap();
+        let model = installed
+            .catalog
+            .model_for_serving("anthropic", "claude-sonnet-4-5")
+            .unwrap()
+            .1;
+        assert_eq!(model.limits.images_per_request, None);
+        for malformed in [
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("3600"),
+            serde_json::json!(true),
+            serde_json::json!([]),
+            serde_json::json!({}),
+            serde_json::json!(u64::from(u32::MAX) + 1),
+        ] {
+            response
+                .models
+                .get_mut("anthropic/claude-sonnet-4-5")
+                .unwrap()
+                .insert("limit.images_per_request".into(), malformed.clone());
+            assert!(
+                loaded_excludes_for_fact(&response, "limit.images_per_request"),
+                "{malformed}"
+            );
+            assert!(
+                loaded(&response, CatalogSource::Fusiform, None)
+                    .unwrap()
+                    .catalog
+                    .model_for_serving("anthropic", "claude-sonnet-4-5")
+                    .is_none(),
+                "{malformed}"
+            );
+        }
     }
 
     /// `limit.output: null` is fusiform's "unknown" and must decode to `None`, never a zero cap;
