@@ -2879,6 +2879,15 @@ mod tests {
         // How the vault learned `plan_tier` (operator-set or detected). Unread by broca for the
         // same reason as `plan_tier`.
         plan_tier_source: Option<String>,
+        // When the vault last observed `plan_tier`, null when unknown (claustrum 62d65d78).
+        // Unread for the same reason as `plan_tier`.
+        plan_tier_observed_at_ms: Option<u64>,
+        // The vendor's service name, for display (claustrum 62d65d78). Unread: broca matches
+        // providers through `provider_ids` only.
+        provider: Option<String>,
+        // The record's identity across a delete and re-create under the same id (claustrum
+        // 62d65d78). Unread: broca keys credentials by id and re-reads them on every listing.
+        incarnation: Option<String>,
     }
 
     #[derive(Deserialize)]
