@@ -339,46 +339,93 @@ pub fn policy(records: &[FramedRecord]) -> Option<(u64, u64, Option<u64>)> {
     if !broca_core::is_retention_lineage(records) {
         return None;
     }
-    let mut seconds = 0;
-    let mut activity = 0;
-    let mut nonterminal = false;
-    for frame in records {
-        match &frame.record {
+    Some(policy_of(records.iter().filter_map(
+        |frame| match &frame.record {
             WalRecord::RunStarted {
                 retention, ts_ms, ..
-            } => {
-                if let Some(value) = retention {
-                    seconds = *value;
-                }
-                activity = ts_ms.unwrap_or(activity);
-                nonterminal = true;
-            }
+            } => Some(PolicyEvent::Started {
+                retention: *retention,
+                ts_ms: *ts_ms,
+            }),
             WalRecord::Queued {
                 retention, ts_ms, ..
             }
             | WalRecord::Steered {
                 retention, ts_ms, ..
-            } => {
-                if let Some(value) = retention {
-                    seconds = *value;
-                }
-                if let Some(time) = ts_ms {
-                    activity = *time;
-                }
-            }
+            } => Some(PolicyEvent::Sent {
+                retention: *retention,
+                ts_ms: *ts_ms,
+            }),
             WalRecord::RunFinished { ts_ms, .. } => {
-                activity = ts_ms.unwrap_or(activity);
-                nonterminal = false;
+                Some(PolicyEvent::RunFinished { ts_ms: *ts_ms })
             }
-            WalRecord::RunPaused { ts_ms, .. } => {
+            WalRecord::RunPaused { ts_ms, .. } => Some(PolicyEvent::RunPaused { ts_ms: *ts_ms }),
+            _ => None,
+        },
+    )))
+}
+
+/// What one record says about its session's retention clock. Each storage maps its own records to
+/// these, today's in [`policy`] and the new storage's in `store::store_policy`, and both decide
+/// through [`policy_of`], so a session expires by one rule whichever storage keeps it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PolicyEvent {
+    /// A run started, with the retention its send set, if it set one. Not named `RunStarted`:
+    /// broca-wal's retention-writer scan reads that name as a log record being written.
+    Started {
+        retention: Option<u64>,
+        ts_ms: Option<u64>,
+    },
+    /// A send was queued, or steered into a running run, with the retention it set, if any.
+    Sent {
+        retention: Option<u64>,
+        ts_ms: Option<u64>,
+    },
+    RunFinished {
+        ts_ms: Option<u64>,
+    },
+    RunPaused {
+        ts_ms: Option<u64>,
+    },
+}
+
+/// The retention seconds, the last activity and the deadline of a retained session whose records
+/// say `events`, in record order. The latest retention a run start or send set wins; each event's
+/// time is the session's latest activity; and a session whose latest run is active or paused has
+/// no deadline.
+pub(crate) fn policy_of(events: impl IntoIterator<Item = PolicyEvent>) -> (u64, u64, Option<u64>) {
+    let mut seconds = 0;
+    let mut activity = 0;
+    let mut nonterminal = false;
+    for event in events {
+        match event {
+            PolicyEvent::Started { retention, ts_ms } => {
+                if let Some(value) = retention {
+                    seconds = value;
+                }
                 activity = ts_ms.unwrap_or(activity);
                 nonterminal = true;
             }
-            _ => {}
+            PolicyEvent::Sent { retention, ts_ms } => {
+                if let Some(value) = retention {
+                    seconds = value;
+                }
+                if let Some(time) = ts_ms {
+                    activity = time;
+                }
+            }
+            PolicyEvent::RunFinished { ts_ms } => {
+                activity = ts_ms.unwrap_or(activity);
+                nonterminal = false;
+            }
+            PolicyEvent::RunPaused { ts_ms } => {
+                activity = ts_ms.unwrap_or(activity);
+                nonterminal = true;
+            }
         }
     }
     let deadline = (!nonterminal).then_some(activity.saturating_add(seconds.saturating_mul(1000)));
-    Some((seconds, activity, deadline))
+    (seconds, activity, deadline)
 }
 
 fn derive(
@@ -657,6 +704,8 @@ pub struct RetentionService {
     evict: std::sync::OnceLock<Arc<EvictCaches>>,
     acquire: Arc<AcquireLease>,
     export: Option<UsageExport>,
+    /// Retention of the sessions kept in the new storage (see `store`).
+    store: store::StoreRetention,
     #[cfg(test)]
     before_enroll: Mutex<Option<Arc<EnrollmentHook>>>,
 }
@@ -846,6 +895,7 @@ impl RetentionService {
             index,
             clock,
             export,
+            store: store::StoreRetention::default(),
             acquire: Arc::new(move |session| {
                 leases
                     .acquire(&broca_core::lease_key_for(session))
@@ -2420,6 +2470,9 @@ fn frames(read: &broca_wal::WalRangeRead) -> &[FramedRecord] {
 #[cfg(test)]
 #[path = "retention_tests.rs"]
 mod tests;
+
+#[path = "retention_store.rs"]
+mod store;
 
 /// Count file bytes through the actor's highest fsynced sequence, including the lineage-ID
 /// metadata between records but excluding later records appended by a concurrent run.
