@@ -281,6 +281,7 @@ pub struct Position {
 }
 
 /// What a session's writer tells the observer of its appends (see [`Session::observe_appends`]).
+#[derive(Clone, Copy)]
 pub enum Appended<'a> {
     /// Records the writer appended, the first at seq `first`, told once their append returned.
     /// `durable` says the append ended with a barrier; records appended without one become
@@ -851,6 +852,18 @@ impl<B: SessionBackend> Session<B> {
     /// replaces the last.
     pub fn observe_appends(&mut self, observer: AppendObserver) {
         self.observer = Some(observer);
+    }
+
+    /// Observe appends alongside the existing observer, without changing its records or order.
+    pub fn add_append_observer(&mut self, mut observer: AppendObserver) {
+        let prior = self.observer.take();
+        self.observer = Some(match prior {
+            Some(mut prior) => Box::new(move |appended| {
+                prior(appended);
+                observer(appended);
+            }),
+            None => observer,
+        });
     }
 
     fn observed(&mut self, appended: Appended<'_>) {

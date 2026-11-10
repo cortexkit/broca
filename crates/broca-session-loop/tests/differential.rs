@@ -2712,6 +2712,10 @@ const NORMALIZED: &[&str] = &[
     "updated_at_ms",
 ];
 
+/// New attempts have random durable identities; converted legacy attempts may have none.
+/// Event tests join these ids to their own records instead of comparing unrelated logs' ids.
+const INDEPENDENT_DURABLE_FIELDS: &[&str] = &["attempt_id"];
+
 /// Records as the comparison reads them. Message ids differ by design: today's are
 /// `m<lineage prefix>.<position>`, the new loop's `g<generation>.<seq>`, and a compaction view's
 /// checksum covers the ids its edits name. So each id, anywhere in a record, becomes its order of
@@ -2938,6 +2942,7 @@ fn scrub(value: &mut Value) {
     match value {
         Value::Object(map) => {
             map.retain(|key, _| !CONVERSION_ONLY.contains(&key.as_str()));
+            map.retain(|key, _| !INDEPENDENT_DURABLE_FIELDS.contains(&key.as_str()));
             for (key, field) in map.iter_mut() {
                 if NORMALIZED.contains(&key.as_str()) && !field.is_null() {
                     *field = json!("<normalized>");

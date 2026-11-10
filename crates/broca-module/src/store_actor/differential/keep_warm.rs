@@ -23,7 +23,10 @@ use crate::actor::{LineageStatus, SendKey, SendOutcome};
 use crate::executor::{RunExecutor, RunJob, RunKind, StoreRunEnd, StoreRunJob, WarmError, WarmJob};
 use crate::registry::LineageRegistry;
 
-cipher_tests!(a_keep_warm_resends_the_last_request_and_records_it_alike);
+cipher_tests!(
+    a_keep_warm_resends_the_last_request_and_records_it_alike,
+    keep_warm_step_events_match
+);
 
 /// How long after a request a warm of its cache is sent: short, so the tool wait sees one.
 const WARM_AFTER_MS: u64 = 200;
@@ -83,7 +86,35 @@ impl RunExecutor for Loops {
         if !first {
             std::future::pending::<()>().await;
         }
-        Ok(broca_core::WarmSent {
+        let id = if let Some(hook) = &job.attempt_hook {
+            Some(
+                hook.before_send(
+                    broca_core::run::PhysicalSend {
+                        attempt: 0,
+                        send_index: 1,
+                        endpoint_host: "api.anthropic.com".into(),
+                        model_sent: job.config.model.model_id.clone(),
+                        request_body_bytes: sent.bytes().len() as u64,
+                        compressed: false,
+                        account_ref: None,
+                        auth_refreshed: false,
+                        speed_requested: None,
+                        warm: Some(broca_core::cache_warm::WarmSendPolicy {
+                            provider: None,
+                            ttl_ms: Some(3_600_000),
+                            auth_refreshed: false,
+                        }),
+                    },
+                    Default::default(),
+                )
+                .await
+                .map_err(|e| WarmError::Provider(Box::new(e)))?,
+            )
+        } else {
+            None
+        };
+        let sent = broca_core::WarmSent {
+            request_body_bytes: Some(sent.bytes().len() as u64),
             warm_body_sha256: broca_core::render::request_digest_hex(sent.bytes()),
             sent_at_ms: crate::actor::epoch_ms(),
             usage: broca_protocol::Usage {
@@ -94,7 +125,25 @@ impl RunExecutor for Loops {
             served_account_ref: None,
             ratelimit_headers: Vec::new(),
             http_status: 200,
-        })
+        };
+        if let (Some(hook), Some(id)) = (job.attempt_hook, id) {
+            hook.warm_finished(
+                id,
+                broca_wal::record::AttemptEnvelope {
+                    sent: broca_wal::record::AttemptSent::Yes,
+                    outcome: broca_wal::record::BillingAttemptOutcome::Complete,
+                    sent_at_ms: Some(sent.sent_at_ms),
+                    finished_at_ms: Some(crate::actor::epoch_ms()),
+                    usage: Some(sent.usage),
+                    ..Default::default()
+                },
+                Some(sent.clone()),
+                sent.warm_body_sha256.clone(),
+            )
+            .await
+            .map_err(|e| WarmError::Provider(Box::new(e)))?;
+        }
+        Ok(sent)
     }
 }
 
@@ -120,6 +169,14 @@ impl Drop for Side {
 /// A module whose sessions start in the new storage when `store`; the new storage creates
 /// sessions in mode `cipher`.
 async fn side(store: bool, cipher: Cipher) -> Side {
+    side_events(store, cipher, None).await
+}
+
+async fn side_events(
+    store: bool,
+    cipher: Cipher,
+    events: Option<Arc<crate::step_events::StepEvents>>,
+) -> Side {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let dir = broca_test_support::scratch_root().join(format!(
@@ -140,7 +197,11 @@ async fn side(store: bool, cipher: Cipher) -> Side {
         tool_gate: Some(tool.clone()),
         ..Default::default()
     };
-    let wal = Arc::new(FileWalStore::new(dir.join("wal")));
+    let wal = Arc::new(if events.is_some() {
+        FileWalStore::with_config(dir.join("wal"), broca_wal::WalConfig::OVERHAUL)
+    } else {
+        FileWalStore::new(dir.join("wal"))
+    });
     let mut store_loop = super::executor(steps(), None);
     store_loop.provider.render_config = render_config.clone();
     store_loop.provider.notes_sends = true;
@@ -170,19 +231,17 @@ async fn side(store: bool, cipher: Cipher) -> Side {
         .await
         .unwrap(),
     );
-    let registry = LineageRegistry::new_with_reader(
-        Arc::new(
-            crate::opener::DefaultOpener::new(
-                Arc::new(FileLeaseStore::new(dir.join("leases"))),
-                wal.clone(),
-                executor,
-            )
-            .with_idle_ttl(IDLE)
-            .with_store_runtime(Arc::clone(&runtime)),
-        ),
+    let mut opener = crate::opener::DefaultOpener::new(
+        Arc::new(FileLeaseStore::new(dir.join("leases"))),
         wal.clone(),
-        None,
-    );
+        executor,
+    )
+    .with_idle_ttl(IDLE)
+    .with_store_runtime(Arc::clone(&runtime));
+    if let Some(events) = events {
+        opener = opener.with_step_events(events);
+    }
+    let registry = LineageRegistry::new_with_reader(Arc::new(opener), wal.clone(), None);
     registry.set_cache_declarer(Arc::new(FamilyDeclarer));
     let registry = if store {
         registry.with_store_new_sessions()
@@ -247,8 +306,8 @@ impl Side {
         assert!(matches!(outcome, SendOutcome::Active { .. }), "{outcome:?}");
         self.tool.0.notified().await;
         broca_test_support::wait_until("the run warmed while its tool call ran", || async {
-            match self.sent.lock().unwrap().len() {
-                0 => Err("no warm yet".to_owned()),
+            match self.warms().await.len() {
+                0 => Err("no durable warm yet".to_owned()),
                 _ => Ok(()),
             }
         })
@@ -350,4 +409,119 @@ async fn a_keep_warm_resends_the_last_request_and_records_it_alike(cipher: Ciphe
     assert_eq!(store.warms().await, warms);
     assert!(today.registry.stop_and_seal().await);
     assert!(store.registry.stop_and_seal().await);
+}
+
+async fn keep_warm_step_events_match(cipher: Cipher) {
+    use super::step_events::{normalized, sample, Capture};
+    use crate::step_events::{Config, StepEvents};
+    let mut bodies = Vec::new();
+    for new_storage in [false, true] {
+        let (calls, mut inbox) = mpsc::unbounded_channel();
+        let events = Arc::new(
+            StepEvents::start(
+                Config {
+                    step_events_enabled: true,
+                },
+                "fixture",
+                "broca",
+                Arc::new(Capture { calls, fail: false }),
+            )
+            .unwrap()
+            .unwrap(),
+        );
+        let side = side_events(new_storage, cipher, Some(events)).await;
+        side.keep_warm_once().await;
+        assert!(side.registry.stop_and_seal().await);
+        let (subject, body) =
+            broca_test_support::wait_for("durable keep-warm event", inbox.recv(), || {
+                format!("new={new_storage}")
+            })
+            .await
+            .unwrap();
+        assert_eq!(subject, "ck.fixture.live.broca.step.finished.v1");
+        let event =
+            cortexkit_role_llm_runner::step_events::decode_step_finished(&subject, &body).unwrap();
+        assert_eq!(event.runner, "broca");
+        assert_eq!(event.harness, side.key.harness);
+        assert_eq!(event.session, side.key.session);
+        assert_eq!(event.session_ref, broca_core::agent_session_ref(&side.key));
+        assert_eq!(event.input_tokens, Some(3));
+        assert_eq!(event.cached_input_tokens, Some(1_000));
+        assert_eq!(
+            event.request_body_bytes,
+            Some(side.sent.lock().unwrap()[0].len() as u64)
+        );
+        if let Some(runtime) = &side.runtime {
+            let view = runtime.current_view(&side.key).await.unwrap().unwrap();
+            let warms: Vec<_> = view
+                .open_log_records()
+                .await
+                .unwrap()
+                .into_iter()
+                .filter_map(|(seq, record)| match record {
+                    Record::Warmed(warmed) => Some((seq, warmed)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(warms.len(), 1);
+            let (seq, warmed) = &warms[0];
+            assert_eq!(event.seq, *seq);
+            assert_eq!(event.attempt_id, warmed.attempt_id);
+            assert_eq!(event.started_at_ms, warmed.sent_at_ms);
+            assert_eq!(
+                Some(event.finished_at_ms),
+                warmed.billing.as_ref().unwrap()["finished_at_ms"].as_u64()
+            );
+            let incarnation: String = view
+                .head()
+                .incarnation
+                .0
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            assert_eq!(event.log_incarnation, incarnation);
+        } else {
+            let records = side.wal.read_records(&side.key).unwrap();
+            let warms: Vec<_> = records
+                .iter()
+                .filter_map(|frame| match &frame.record {
+                    broca_wal::WalRecord::CacheWarmed {
+                        attempt_id,
+                        envelope: Some(envelope),
+                        ..
+                    } => Some((frame.seq, attempt_id, envelope)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(warms.len(), 1);
+            assert_eq!(event.seq, warms[0].0);
+            assert_eq!(
+                event.attempt_id.as_deref(),
+                warms[0].1.as_ref().map(|id| id.as_str())
+            );
+            assert_eq!(Some(event.started_at_ms), warms[0].2.sent_at_ms);
+            assert_eq!(Some(event.finished_at_ms), warms[0].2.finished_at_ms);
+            let writer = records
+                .iter()
+                .find_map(|frame| match &frame.record {
+                    broca_wal::WalRecord::WriterOpened { writer_id, .. } => Some(writer_id),
+                    _ => None,
+                })
+                .unwrap();
+            let writer: String = writer.iter().map(|b| format!("{b:02x}")).collect();
+            let lineage = side.wal.open(&side.key).unwrap().lineage_id().unwrap();
+            assert_eq!(event.log_incarnation, format!("{lineage}.{writer}"));
+        }
+        tokio::task::yield_now().await;
+        assert!(inbox.try_recv().is_err(), "a warm published twice");
+        let storage = if new_storage { "store" } else { "today" };
+        let mode = if cipher == Cipher::None {
+            "plain"
+        } else {
+            "encrypted"
+        };
+        sample(&format!("keep-warm-{storage}-{mode}.json"), &body);
+        bodies.push(body);
+    }
+    assert_eq!(normalized(&bodies[0]), normalized(&bodies[1]));
 }

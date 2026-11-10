@@ -308,6 +308,7 @@ impl Provider for ScriptedProvider {
         self.warm_requests.fetch_add(1, Ordering::SeqCst);
         assert_eq!(self.render, Render::WarmCompletion);
         Ok(broca_core::WarmSent {
+            request_body_bytes: None,
             warm_body_sha256: broca_core::render::request_digest_hex(base),
             sent_at_ms: broca_core::run::epoch_millis().unwrap(),
             usage: broca_protocol::Usage {

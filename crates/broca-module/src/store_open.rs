@@ -470,6 +470,7 @@ impl StoreRuntime {
         registry: RegistryHandle,
         lease: Box<dyn std::any::Any + Send>,
         create: Option<StorageClass>,
+        step_events: Option<&crate::step_events::StepEvents>,
     ) -> Result<ActorHandle, OpenError> {
         let addr = SessionAddr(broca_core::session_addr(key));
         let triple = triple(key);
@@ -523,6 +524,9 @@ impl StoreRuntime {
         // A send's attachments are uploaded beside the session, under the state root, whichever
         // storage keeps it.
         .with_uploads(broca_core::media_uploads::Uploads::at(&self.state_root));
+        if let Some(events) = step_events {
+            actor = actor.with_step_events(events);
+        }
         if create.is_some() {
             actor = actor.created_here();
         }

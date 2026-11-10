@@ -89,6 +89,100 @@ pub(super) struct Gated {
 
 #[async_trait]
 impl broca_core::provider::Provider for Gated {
+    async fn step_with_runtime(
+        &self,
+        step_id: broca_protocol::StepId,
+        opts: Arc<broca_protocol::request::CallOptions>,
+        runtime: broca_core::provider::StepRuntime,
+    ) -> mpsc::Receiver<NormalizedEvent> {
+        let mut input = match runtime.seal {
+            Some(seal) => {
+                self.step_with_shutdown_seal(
+                    step_id,
+                    opts.clone(),
+                    runtime.cancel,
+                    runtime.deadline,
+                    seal,
+                )
+                .await
+            }
+            None => {
+                self.step_with_shared_cancel(
+                    step_id,
+                    opts.clone(),
+                    runtime.cancel,
+                    runtime.deadline,
+                )
+                .await
+            }
+        };
+        let Some(hook) = runtime.attempt_hook else {
+            return input;
+        };
+        let model = opts
+            .target_model
+            .as_ref()
+            .expect("a run supplies its model")
+            .model_id
+            .clone();
+        let (tx, rx) = mpsc::channel(64);
+        tokio::spawn(async move {
+            // Scripted providers have no socket send site. Exercise the real journal seam before
+            // delivering their terminal evidence, using only facts supplied by the script.
+            let mut events = Vec::new();
+            while let Some(event) = input.recv().await {
+                events.push(event);
+            }
+            let usage = events.iter().find_map(|event| match event {
+                NormalizedEvent::Control(ProviderControl::Finished { usage, .. }) => Some(*usage),
+                _ => None,
+            });
+            for event in events {
+                if let NormalizedEvent::Control(ProviderControl::AttemptFinished { attempt }) =
+                    &event
+                {
+                    let id = hook
+                        .before_send(
+                            broca_core::run::PhysicalSend {
+                                attempt: attempt.attempt,
+                                send_index: 1,
+                                endpoint_host: "example.com".into(),
+                                model_sent: model.clone(),
+                                request_body_bytes: attempt.request_body_len,
+                                compressed: false,
+                                account_ref: None,
+                                auth_refreshed: false,
+                                speed_requested: None,
+                                warm: None,
+                            },
+                            Default::default(),
+                        )
+                        .await
+                        .unwrap();
+                    let outcome =
+                        serde_json::from_value(serde_json::to_value(&attempt.outcome).unwrap())
+                            .unwrap();
+                    let complete = attempt.outcome == broca_protocol::AttemptOutcome::Complete;
+                    let envelope = broca_wal::record::AttemptEnvelope {
+                        outcome,
+                        sent_at_ms: attempt.sent_at_ms,
+                        finished_at_ms: Some(attempt.ts_ms),
+                        usage: usage.filter(|_| complete),
+                        finish_reason: complete.then_some(broca_protocol::FinishReason::Stop),
+                        ..Default::default()
+                    };
+                    hook.finished(id, attempt.clone(), outcome, Some(envelope))
+                        .await
+                        .unwrap();
+                }
+                if tx.send(event).await.is_err() {
+                    break;
+                }
+            }
+        });
+        rx
+    }
+
     fn render_config_blob(&self) -> serde_json::Value {
         match &self.render_config {
             Some(config) => config.clone(),

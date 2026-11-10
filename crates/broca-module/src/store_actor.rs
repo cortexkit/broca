@@ -594,6 +594,27 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         self
     }
 
+    /// Install a content-free observer independent of transcript subscription demand.
+    pub fn with_step_events(mut self, events: &crate::step_events::StepEvents) -> Self {
+        let mut observer = events.store_observer(
+            self.key.clone(),
+            self.session.head().incarnation.0,
+            self.session.next_seq(),
+        );
+        if let Some(start) = self
+            .session
+            .operations()
+            .run
+            .as_ref()
+            .and_then(|run| run.start.as_ref())
+        {
+            observer.run_start(start);
+        }
+        self.session
+            .add_append_observer(Box::new(move |appended| observer.appended(appended)));
+        self
+    }
+
     /// The session's writer, storing setup parts not yet durable before each append.
     fn durable(
         &mut self,

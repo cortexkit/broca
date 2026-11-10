@@ -6151,7 +6151,12 @@ fn attempt_record(
         run_id: run_id.into(),
         step_id,
         attempt: attempt.attempt,
-        attempt_id: None,
+        attempt_id: Some(
+            broca_core::attempt_id::mint_attempt_id()
+                .map_err(|e| invalid(&format!("attempt identity: {e}")))?
+                .as_str()
+                .to_owned(),
+        ),
         outcome,
         http_status: attempt.http_status.map(u32::from),
         request_body_len: attempt.request_body_len,

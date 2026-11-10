@@ -495,6 +495,8 @@ pub fn check_warm_expiry(reading: Option<CacheClockReading>, now_ms: u64) -> Res
 /// What a sent warm reported.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WarmSent {
+    /// Actual warm request body length, absent when the sender did not measure it.
+    pub request_body_bytes: Option<u64>,
     /// Lowercase hex SHA-256 of the bytes actually sent.
     pub warm_body_sha256: String,
     /// When sending started, in milliseconds since the Unix epoch.

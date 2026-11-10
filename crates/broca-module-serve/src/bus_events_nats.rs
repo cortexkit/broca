@@ -585,6 +585,7 @@ impl NatsPublisher {
 trait Link: Send + Sync {
     fn credential_public(&self) -> &str;
     async fn publish(&self, event: &Publication) -> Result<PublishReceipt, String>;
+    async fn publish_live(&self, subject: &str, body: Vec<u8>) -> Result<(), String>;
     async fn attach_compaction(&self) -> Result<Box<dyn StreamCursor>, String>;
     async fn close(&self, deadline: Duration) -> Result<CloseOutcome, String>;
 }
@@ -610,6 +611,14 @@ impl Link for NatsLink {
     }
     async fn publish(&self, event: &Publication) -> Result<PublishReceipt, String> {
         self.publisher.publish(event).await
+    }
+    async fn publish_live(&self, subject: &str, body: Vec<u8>) -> Result<(), String> {
+        self.publisher
+            .connection
+            .client()
+            .publish(subject.to_owned(), body.into())
+            .await
+            .map_err(|_| "ckbus live publish failed".into())
     }
     async fn attach_compaction(&self) -> Result<Box<dyn StreamCursor>, String> {
         attach_compaction(&self.publisher.connection, &self.publisher.account).await
@@ -665,6 +674,29 @@ impl NatsConnector {
             .await
             .clone()
             .ok_or_else(|| "ckbus publisher absent".into())
+    }
+}
+
+#[async_trait]
+impl crate::step_events::StepEventPublisher for NatsConnector {
+    async fn live_subject(&self, runner: &str) -> Result<String, String> {
+        let publisher = self.shared_publisher().await?;
+        Ok(format!(
+            "ck.{}.live.{runner}.step.finished.v1",
+            publisher.account.account()
+        ))
+    }
+
+    async fn publish(&self, subject: &str, body: Vec<u8>) -> Result<(), String> {
+        let publisher = self.shared_publisher().await?;
+        let mut state = publisher.state.lock().await;
+        publisher.ensure_connected(&mut state).await?;
+        let link = state.link.as_ref().ok_or("ckbus connection absent")?;
+        let result = link.publish_live(subject, body).await;
+        if result.is_err() {
+            state.needs_redial = true;
+        }
+        result
     }
 }
 #[async_trait]
@@ -1046,6 +1078,7 @@ mod tests {
     /// and its inbox prefix belongs to that key: the real broker kicks a connection whose
     /// key was revoked, and refuses subscriptions outside a user's own inbox.
     struct Broker {
+        live: StdMutex<Vec<(String, Vec<u8>)>>,
         ckbus: Arc<CkBus>,
         published: StdMutex<Vec<String>>,
         /// The key each handshake authenticated with, in order.
@@ -1058,6 +1091,7 @@ mod tests {
     impl Broker {
         fn new(ckbus: Arc<CkBus>) -> Arc<Self> {
             Arc::new(Self {
+                live: StdMutex::new(vec![]),
                 ckbus,
                 published: StdMutex::new(vec![]),
                 auths: StdMutex::new(vec![]),
@@ -1082,6 +1116,14 @@ mod tests {
     impl Link for FakeLink {
         fn credential_public(&self) -> &str {
             &self.connection.inbox_key
+        }
+        async fn publish_live(&self, subject: &str, body: Vec<u8>) -> Result<(), String> {
+            self.broker
+                .live
+                .lock()
+                .unwrap()
+                .push((subject.into(), body));
+            Ok(())
         }
         async fn publish(&self, event: &Publication) -> Result<PublishReceipt, String> {
             if self.connection.closed.load(Ordering::SeqCst) {
@@ -1186,6 +1228,43 @@ mod tests {
             }
         }
         None
+    }
+
+    #[tokio::test]
+    async fn step_events_use_the_attested_account_and_shared_plain_connection() {
+        use crate::step_events::StepEventPublisher;
+        let ckbus = Arc::new(CkBus::default());
+        let broker = Broker::new(ckbus.clone());
+        let connector = NatsConnector {
+            holder: CredentialHolder::with_route(ckbus.clone()),
+            dialer: Arc::new(broker.clone()),
+            publisher: Mutex::new(None),
+        };
+        let bus = connector.connect().await.unwrap();
+        let subject = connector.live_subject("broca").await.unwrap();
+        assert_eq!(subject, "ck.box_test.live.broca.step.finished.v1");
+        StepEventPublisher::publish(&connector, &subject, b"step body".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(
+            *broker.live.lock().unwrap(),
+            vec![(subject, b"step body".to_vec())]
+        );
+        assert!(
+            broker.published.lock().unwrap().is_empty(),
+            "live hints must not use JetStream"
+        );
+        let store = SqliteStore::open_in_memory().unwrap();
+        store.enable_bus_events("box_test").unwrap();
+        queue_run(
+            &store,
+            &BindIdentity::new("/test", "test", "shared"),
+            "run",
+            1,
+        );
+        assert_eq!(drain(&store, bus.publisher.as_ref()).await, Some(2));
+        assert_eq!(broker.connections.lock().unwrap().len(), 1);
+        assert_eq!(ckbus.issued(), 1);
     }
 
     /// When ck-bus retires the process's key and the broker kicks its connection, the next

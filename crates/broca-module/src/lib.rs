@@ -34,6 +34,7 @@ mod sender_admission;
 pub mod serve;
 pub mod session_class;
 pub mod session_cmd;
+pub mod step_events;
 pub mod store_actor;
 pub mod store_billing;
 pub mod store_calls;

@@ -109,6 +109,7 @@ impl Provider for TestProvider {
             gate.notified().await;
         }
         let sent = broca_core::WarmSent {
+            request_body_bytes: None,
             warm_body_sha256: broca_core::render::request_digest_hex(&body),
             sent_at_ms: epoch_ms(),
             usage: Usage {

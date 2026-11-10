@@ -596,6 +596,7 @@ mod automatic_tests {
                     .unwrap()
                     .as_millis() as u64;
                 let sent = success.then(|| broca_core::WarmSent {
+                    request_body_bytes: None,
                     warm_body_sha256: "warm".into(),
                     sent_at_ms,
                     usage: broca_protocol::Usage {
