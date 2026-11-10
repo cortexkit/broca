@@ -454,6 +454,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         let Start {
             conversation_key,
             run_id,
+            one_shot,
             mut request,
             title,
             send_id,
@@ -589,6 +590,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 submission_id,
                 reason: SendEndReason::Expired,
             });
+        }
+        if one_shot {
+            self.one_shot_submissions.insert(submission_id.clone());
         }
         // On an idle session `idle_start` is the first possible mode of any list naming it:
         // nothing else is possible without a running run.
