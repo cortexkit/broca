@@ -217,7 +217,9 @@ fn usage() -> ! {
          session-convert subscribe [--dir SCRATCH] [--out FILE] [--limit N] PATH...\n       \
          session-convert subscribe-cost --dir SCRATCH [--out FILE] PATH...\n       \
          session-convert move-check --dir SCRATCH [--all-steps] [--every N] [--out FILE] PATH...\n\
-         Any command takes --plain: store in the plain mode instead of encrypted."
+         Any command takes --plain: store in the plain mode instead of encrypted.\n\
+         move-check reads an existing served-history version without writing the source.\n\
+         Without a row it uses 1 for a log (0 without one), not a publishing read's clock-floor allocation."
     );
     std::process::exit(64);
 }

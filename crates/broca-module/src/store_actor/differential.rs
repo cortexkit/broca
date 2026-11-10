@@ -1597,28 +1597,18 @@ async fn the_switch_starts_a_new_session_in_the_new_storage_and_reopens_it() {
     );
 }
 
-/// With the switch off, and with it on for a creating send the store actor doesn't serve, the
-/// session starts on today's storage and the new storage holds nothing.
+/// With the switch off, a session starts on today's storage and the new storage holds nothing.
 #[tokio::test]
-async fn sessions_stay_on_todays_storage_unless_the_switch_and_the_send_allow() {
-    for (on, conversation_key) in [(false, None), (true, Some("conversation"))] {
-        let module = module(on, vec![super::tests::text_step("a1", "hello")]).await;
-        assert!(
-            matches!(
-                module.send("r1", "first", conversation_key).await,
-                SendOutcome::Active { .. }
-            ),
-            "switch {on}, conversation key {conversation_key:?}"
-        );
-        module.closed().await;
-        assert!(!module.head().exists(), "switch {on}");
-        assert_eq!(
-            module.wal.wal_present(&module.key),
-            Some(true),
-            "switch {on}"
-        );
-        assert!(!module.floor().contains(broca_wal::SESSION_STORAGE_FEATURE));
-    }
+async fn sessions_stay_on_todays_storage_when_the_switch_is_off() {
+    let module = module(false, vec![super::tests::text_step("a1", "hello")]).await;
+    assert!(matches!(
+        module.send("r1", "first", None).await,
+        SendOutcome::Active { .. }
+    ));
+    module.closed().await;
+    assert!(!module.head().exists());
+    assert_eq!(module.wal.wal_present(&module.key), Some(true));
+    assert!(!module.floor().contains(broca_wal::SESSION_STORAGE_FEATURE));
 }
 
 /// One `session.read` reply as JSON, with what legitimately differs between the two storages
@@ -1783,6 +1773,7 @@ async fn a_store_session_reads_as_the_same_history_on_todays_storage() {
 
 mod controls;
 mod head;
+mod inline_refs;
 mod media;
 mod media_ready;
 mod media_render;

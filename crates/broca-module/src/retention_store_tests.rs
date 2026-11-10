@@ -477,6 +477,7 @@ async fn an_expired_session_in_the_new_storage_is_deleted_with_everything_it_own
             Record::Moved(Moved {
                 move_id: "store-move:1".into(),
                 source_activity_ms: ENDED_MS,
+                source_lineage: None,
             }),
         ],
         true,

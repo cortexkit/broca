@@ -31,6 +31,51 @@ fn session() -> BindIdentity {
     BindIdentity::new("/project", "runner", "s")
 }
 
+#[test]
+fn source_history_versions_are_read_without_allocating_or_changing_source_rows() {
+    use broca_core::ServedHistory as _;
+    let root = scratch("history-version");
+    let state = state_root(&root, &[]);
+    let source = log_in(&state, "wal");
+    let index = state.join("run-index.db");
+    assert_eq!(
+        super::source_history_version(&source, &session(), true).unwrap(),
+        1
+    );
+    assert_eq!(
+        super::source_history_version(&source, &session(), false).unwrap(),
+        0
+    );
+    assert!(!index.exists(), "a missing source index is not created");
+    let store = broca_store::SqliteStore::open(&index).unwrap();
+    let address = broca_core::session_addr(&session());
+    assert_eq!(
+        super::source_history_version(&source, &session(), true).unwrap(),
+        1
+    );
+    assert_eq!(
+        store.history_read_version(&address).unwrap(),
+        None,
+        "the read-only rehearsal allocates no row"
+    );
+    let version = store
+        .served_snapshot(&address, true, Some("source-lineage"), None)
+        .unwrap()
+        .history_version;
+    assert!(
+        version > 1,
+        "a publishing row allocation has a wall-clock floor"
+    );
+    drop(store);
+    let before = std::fs::read(&index).unwrap();
+    assert_eq!(
+        super::source_history_version(&source, &session(), true).unwrap(),
+        version
+    );
+    assert_eq!(std::fs::read(&index).unwrap(), before);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 fn scratch(tag: &str) -> PathBuf {
     let root = broca_test_support::scratch_root().join(format!(
         "session-convert-move-check-{}-{tag}",

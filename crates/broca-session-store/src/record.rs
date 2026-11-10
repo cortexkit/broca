@@ -1102,6 +1102,9 @@ message! {
         1 req move_id: String,
         /// When the session last changed, as today's `session.head` served it (`updated_at`).
         2 req source_activity_ms: u64,
+        /// The source WAL's lineage, retained as the session's output-reference namespace.
+        /// Readers must preserve it so references handed out before conversion still resolve.
+        3 opt [must] source_lineage: String,
     }
 }
 

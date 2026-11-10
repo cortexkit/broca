@@ -250,11 +250,13 @@ fn a_moved_sessions_head_keeps_todays_last_update() {
     assert_eq!(today, 1_234_000);
     let moved = Moved {
         move_id: "store-move:test".into(),
+        source_lineage: None,
         source_activity_ms: today,
     };
     let stage_with_moved = |records: &[FramedRecord], moved: &Moved| {
         let _ = std::fs::remove_dir_all(&root);
         block_on(stage(Stage {
+            source_history_version: 1,
             records,
             lineage: None,
             session: &session(),
@@ -277,6 +279,7 @@ fn a_moved_sessions_head_keeps_todays_last_update() {
     let newest = broca_module::head_time::newest_record_ms(&timed).unwrap();
     let earlier = Moved {
         move_id: "store-move:test".into(),
+        source_lineage: None,
         source_activity_ms: newest - 1,
     };
     let _ = lineage;
@@ -354,6 +357,7 @@ fn a_moved_sessions_head_keeps_todays_last_update() {
 fn moved(records: &[FramedRecord]) -> broca_session_store::record::Moved {
     broca_session_store::record::Moved {
         move_id: "store-move:test".into(),
+        source_lineage: None,
         source_activity_ms: todays_updated_at(records),
     }
 }
@@ -367,6 +371,7 @@ fn staged_in(
 ) -> Staged {
     let lineage = lineage.map(|id| id.to_string());
     block_on(stage(Stage {
+        source_history_version: 1,
         records,
         lineage: lineage.as_deref(),
         session: &session(),
@@ -644,6 +649,7 @@ fn stage_with(
 ) -> Result<Staged, StageError> {
     let lineage = lineage.map(|id| id.to_string());
     block_on(stage(Stage {
+        source_history_version: 1,
         records,
         lineage: lineage.as_deref(),
         session: &session(),

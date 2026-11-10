@@ -241,6 +241,7 @@ struct ActiveRun {
 
 /// A run to start: the send's request and what the run's start records about the send.
 struct Start {
+    conversation_key: Option<String>,
     run_id: RunId,
     request: SubmissionRequest,
     title: Option<String>,
@@ -967,6 +968,11 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     /// Handles one command. Returns whether the actor should go away.
     async fn handle(&mut self, command: LineageCmd) -> bool {
         match command {
+            LineageCmd::Import { request, reply } => {
+                let (outcome, retire) = self.inline_import(*request).await;
+                let _ = reply.send(outcome);
+                retire
+            }
             LineageCmd::Send {
                 session_class,
                 retention,
@@ -985,10 +991,6 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             } => {
                 // An ordered send is admitted below, by today's rules; how it is delivered is the
                 // order's, not the string `delivery` beside it. So is an interrupt.
-                if let Some(what) = unserved_route(conversation_key.is_some()) {
-                    let _ = reply.send(SendOutcome::Error(unserved(what)));
-                    return false;
-                }
                 // An imported session runs only once `session.adopt` gives it the plan its head
                 // ran under, which isn't built yet: without it, a run would start with none.
                 if self.session.operations().imported_ids.is_some() {
@@ -1244,6 +1246,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                         Ok(Keyed::Fresh(digest)) => identity = Some(digest),
                         Ok(Keyed::Resume) => {
                             let start = Start {
+                                conversation_key,
                                 run_id: run_id.clone(),
                                 sent_by: request.principal.clone(),
                                 request: *request,
@@ -1437,6 +1440,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                     }
                 }
                 let start = Start {
+                    conversation_key,
                     run_id,
                     // A plan sender's interrupt shows its sender, as today's actor records it,
                     // though it runs under the session's principal.
@@ -1684,6 +1688,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             title,
             send_id,
             identity,
+            conversation_key,
             sent_by,
             scope,
             manifest,
@@ -1719,6 +1724,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         req.session_class = session_class;
         let step: broca_core::provider::LiveStepProgress = Arc::default();
         let control = RunControl {
+            conversation_key,
             cancel: Some(cancel.clone()),
             step_progress: Some(Arc::clone(&step)),
             hook_plane: self.executor.hook_plane(),
@@ -2007,6 +2013,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         }))
         .map_err(|error| format!("the run's frozen request: {error}"))?;
         Ok(Start {
+            conversation_key: None,
             run_id: RunId(run.run_id.clone()),
             request,
             title: None,
@@ -2960,6 +2967,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         let submission = broca_protocol::SubmissionId(submission_id.to_owned());
         let start = Start {
             run_id: crate::actor::run_id_of_queued(&submission),
+            conversation_key: queue::receipt_field(&send, "conversation_key")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
             title: queue::receipt_field(&send, "title")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned),
@@ -3345,6 +3355,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             title,
             send_id,
             identity,
+            conversation_key,
             sent_by,
             scope: _,
             // A queued send keeps its request as sent; the plan is frozen into it when it
@@ -3372,6 +3383,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                     &existing,
                     request,
                     identity.as_deref(),
+                    conversation_key.as_deref(),
                     delivery,
                     &self.parts,
                     submission_id,
@@ -3408,6 +3420,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         }
         request.staged_uploads = None;
         let receipt = queue::Receipt {
+            conversation_key,
             sent_by,
             principal: request.principal.clone(),
             request_identity_digest: identity,
@@ -3524,12 +3537,15 @@ fn retry_of_queued(
     existing: &QueuedSend,
     mut request: SubmissionRequest,
     identity: Option<&str>,
+    conversation_key: Option<&str>,
     delivery: broca_protocol::Delivery,
     parts: &dyn Parts,
     submission_id: broca_protocol::SubmissionId,
 ) -> SendOutcome {
     let reuse = |differing| SendOutcome::SendIdReuse { differing };
-    if queue::receipt_field(existing, "conversation_key").is_some() {
+    if queue::receipt_field(existing, "conversation_key").and_then(serde_json::Value::as_str)
+        != conversation_key
+    {
         return reuse("conversation_key");
     }
     // A plain send's record names no mode, as `queue` writes it.
@@ -3649,22 +3665,15 @@ fn frozen_media(
 fn unserved_delivery(
     ordered: bool,
     delivery: broca_protocol::Delivery,
-    conversation_key: bool,
+    _conversation_key: bool,
 ) -> Option<&'static str> {
     if ordered {
         Some("an ordered delivery")
     } else if delivery == broca_protocol::Delivery::Interrupt {
         Some("an interrupt")
     } else {
-        unserved_route(conversation_key)
+        None
     }
-}
-
-/// How a send asks to be routed, where this actor doesn't serve it yet.
-fn unserved_route(conversation_key: bool) -> Option<&'static str> {
-    // Routing reads a conversation key when it picks the run's account, which a store session's
-    // runs don't do yet.
-    conversation_key.then_some("a send naming a conversation key")
 }
 
 /// What a send's request asks for, where this actor doesn't serve it yet.
@@ -3851,6 +3860,7 @@ fn refuse(command: LineageCmd) {
 mod apply_view;
 mod held;
 mod import;
+mod inline_import;
 mod ordered;
 mod pauses;
 mod retries;

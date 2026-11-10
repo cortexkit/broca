@@ -26,6 +26,7 @@ cipher_tests!(
     a_seal_at_an_entry_cuts_where_that_entry_is_placed,
     a_seal_preserves_unmoved_activity_when_ledger_times_leave_the_log,
     a_seal_preserves_a_move_boundary_and_later_activity,
+    a_moved_namespace_survives_a_sealed_history_checkpoint,
 );
 
 fn triple() -> SessionTriple {
@@ -335,6 +336,7 @@ fn a_seal_preserves_a_move_boundary_and_later_activity(cipher: Cipher) {
                     answer("a", "answer"),
                     end("a"),
                     Record::Moved(crate::record::Moved {
+                        source_lineage: None,
                         move_id: "store-move:test".into(),
                         source_activity_ms: 2_002,
                     }),
@@ -376,6 +378,49 @@ fn a_seal_preserves_a_move_boundary_and_later_activity(cipher: Cipher) {
             .await
             .unwrap();
         assert_eq!(loaded.open_log_activity_ms(), Some(3_000));
+    });
+}
+
+fn a_moved_namespace_survives_a_sealed_history_checkpoint(cipher: Cipher) {
+    let backend = MemoryBackend::default();
+    block_on(async {
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(cipher), false)
+            .await
+            .unwrap();
+        let records = vec![
+            start("a"),
+            input("a", "converted input"),
+            answer("a", "answer"),
+            end("a"),
+            Record::Moved(crate::record::Moved {
+                move_id: "move".into(),
+                source_activity_ms: 2_002,
+                source_lineage: Some("0190a6b2-0000-7000-8000-000000000001".into()),
+            }),
+        ];
+        let mut folded = crate::fold::operations::Operations::default();
+        for (index, record) in records.iter().enumerate() {
+            if record.stream() == crate::record::Stream::Ledger {
+                folded
+                    .apply_at(Some(session.next_seq() + index as u64), record)
+                    .unwrap();
+            }
+        }
+        session.append(&records, true).await.unwrap();
+        assert_eq!(session.operations.encode(), folded.encode());
+        session.seal(None, 5_000).await.unwrap();
+        let loaded = Session::load(&backend, addr(), &triple(), &deployment(cipher))
+            .await
+            .unwrap();
+        assert_eq!(
+            loaded.operations.encode(),
+            folded.encode(),
+            "checkpoint load equals whole-log folding"
+        );
+        assert_eq!(
+            loaded.operations.source_lineage.as_deref(),
+            Some("0190a6b2-0000-7000-8000-000000000001")
+        );
     });
 }
 

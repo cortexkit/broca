@@ -3798,7 +3798,16 @@ impl LineageRegistry {
     ) -> Result<crate::actor::ImportOutcome, OpenError> {
         use crate::actor::{ImportOutcome, LineageCmd};
         loop {
-            let handle = self.actor_for(key).await?;
+            if self.inner.store_new_sessions.load(Ordering::SeqCst) {
+                self.inner
+                    .store_eligible
+                    .lock()
+                    .unwrap()
+                    .insert(key.clone(), StoreCreation::Send);
+            }
+            let handle = self.actor_for(key).await;
+            self.inner.store_eligible.lock().unwrap().remove(key);
+            let handle = handle?;
             let (reply, rx) = tokio::sync::oneshot::channel();
             let cmd = LineageCmd::Import {
                 request: Box::new(request.clone()),

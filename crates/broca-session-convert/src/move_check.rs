@@ -21,7 +21,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use broca_core::media_store::{MediaBytes, MediaReadError, MediaStoreClass, ReadOnlyMediaStore};
-use broca_protocol::MediaRef;
+use broca_protocol::{BindIdentity, MediaRef};
 use broca_session_convert::preconditions::{
     unsupported_in_wal, FIRST_PROTOCOL_COMPACTION, UNSUPPORTED_FEATURE,
 };
@@ -190,6 +190,41 @@ fn todays_media(source: &Path, records: &[FramedRecord]) -> Option<TodaysMedia> 
     })
 }
 
+/// The rehearsal never allocates a served-history row in its source. An existing row is
+/// authoritative; without one it uses `LineageRegistry::served_snapshot`'s no-source fallback.
+/// A publishing conversion instead calls `served_snapshot`, whose row allocation has a clock floor.
+fn source_history_version(
+    source: &Path,
+    session: &BindIdentity,
+    has_log: bool,
+) -> Result<u64, String> {
+    use broca_core::ServedHistory as _;
+    let fallback = u64::from(has_log);
+    let Some(folder) = source.parent() else {
+        return Ok(fallback);
+    };
+    if folder
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(class_of_folder)
+        .is_none()
+    {
+        return Ok(fallback);
+    }
+    let Some(root) = folder.parent() else {
+        return Ok(fallback);
+    };
+    let index = root.join("run-index.db");
+    if !index.try_exists().map_err(|error| error.to_string())? {
+        return Ok(fallback);
+    }
+    let store =
+        broca_store::SqliteStore::open_read_only(index).map_err(|error| error.to_string())?;
+    Ok(store
+        .history_read_version(&broca_core::session_addr(session))?
+        .unwrap_or(fallback))
+}
+
 pub(super) fn run(args: &Args) {
     write_report(&check(args), args.out_file.as_deref());
 }
@@ -295,10 +330,17 @@ fn check(args: &Args) -> MoveCheckReport {
             let todays_updated_at =
                 broca_module::head_time::updated_at_of_wal(&old.records, old.written_ms);
             let moved = broca_session_store::record::Moved {
+                source_lineage: None,
                 move_id: "store-move:move-check".into(),
                 source_activity_ms: todays_updated_at,
             };
             let stage = Stage {
+                source_history_version: source_history_version(
+                    &old.source,
+                    &session,
+                    !old.records.is_empty(),
+                )
+                .map_err(StageError::Failed)?,
                 records: &old.records,
                 lineage: old.lineage.as_deref(),
                 session: &session,

@@ -44,6 +44,36 @@ const DECLARED: &[(&str, &str, &str)] = &[
 ];
 
 #[test]
+fn checkpoint_source_lineage_is_optional_but_must_be_understood_when_present() {
+    use crate::codec::{skip_unknown, Fields, Message as _};
+    // The previous operational reader knows fields through 26; it skips later optional fields
+    // and refuses later must-understand fields by the same codec rule used on checkpoint load.
+    let old_reader = |bytes: &[u8]| -> Result<(), crate::codec::DecodeError> {
+        for field in Fields::new(bytes, "old Operations") {
+            let field = field?;
+            if field.number > 26 {
+                skip_unknown(field, "old Operations")?;
+            }
+        }
+        Ok(())
+    };
+    let old = Operations::default();
+    let bytes = old.encode();
+    old_reader(&bytes).unwrap();
+    assert_eq!(Operations::decode(&bytes).unwrap().encode(), old.encode());
+    let moved = Operations {
+        source_lineage: Some("0190a6b2-0000-7000-8000-000000000001".into()),
+        ..old
+    };
+    let bytes = moved.encode();
+    assert!(matches!(
+        old_reader(&bytes).unwrap_err().kind,
+        crate::codec::DecodeErrorKind::MustUnderstand { field: 27 }
+    ));
+    assert_eq!(Operations::decode(&bytes).unwrap().encode(), moved.encode());
+}
+
+#[test]
 fn every_state_field_is_declared_once_with_an_owner_and_a_reset_rule() {
     for (state, schema) in STATES {
         assert!(!schema.is_empty(), "{state} declares no fields");

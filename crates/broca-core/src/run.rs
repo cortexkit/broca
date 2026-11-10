@@ -698,6 +698,8 @@ pub struct RunControl {
     /// Attested input route, kept out of request rendering and admission identity.
     pub display_sent_by: Option<broca_protocol::BindPrincipal>,
     pub display_message_marks: Option<broca_protocol::MessageMarks>,
+    /// The send's provider-account affinity on the store executor, kept out of model input.
+    pub conversation_key: Option<String>,
     #[cfg(test)]
     pub(crate) held_prompt_probe: Option<Arc<held_prompt::Probe>>,
     #[cfg(test)]
@@ -932,6 +934,7 @@ impl Default for RunControl {
             new_log_compaction_plan_version: None,
             display_sent_by: None,
             display_message_marks: None,
+            conversation_key: None,
             #[cfg(test)]
             held_prompt_probe: None,
             #[cfg(test)]

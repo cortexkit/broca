@@ -41,7 +41,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     /// Whether the session holds nothing but what creating and opening it wrote: no run, no
     /// message, nothing queued and no view. A crash between a session's creation and an
     /// import's batch leaves such a session, and the import's retry writes into it.
-    fn empty(&self) -> bool {
+    pub(super) fn empty(&self) -> bool {
         let operations = &self.session.operations;
         let conversation = &self.session.conversation;
         operations.run.is_none()

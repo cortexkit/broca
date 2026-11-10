@@ -917,6 +917,13 @@ state! {
             reset: "never",
             bound: Bound::Fixed,
         },
+        /// The converted session's reference namespace, from its move record. Absent on new
+        /// sessions and moves written before source lineage was recorded.
+        27 opt pub [must] source_lineage: String => {
+            owner: "Moved",
+            reset: "Moved",
+            bound: Bound::Fixed,
+        },
     }
 }
 
@@ -1763,6 +1770,7 @@ impl Operations {
             _ => {}
         }
         match record {
+            Record::Moved(moved) => self.source_lineage.clone_from(&moved.source_lineage),
             Record::View(view) => {
                 self.view_accepted = Some(ViewSlot {
                     version: view.version,

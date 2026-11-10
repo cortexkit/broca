@@ -229,71 +229,8 @@ pub async fn run_import_with_store<W: WalStore>(
         .and_then(|store| store.served_history())
         .or(wal_history.as_deref());
 
-    if !request
-        .origin
-        .source_ref
-        .split_once(':')
-        .is_some_and(|(namespace, id)| !namespace.is_empty() && !id.is_empty())
-    {
-        return Err(ImportError::InvalidSourceRef);
-    }
-    // Refuse before the digest, the lineage read, or any write. An accepted empty import is
-    // durable -- RunStarted{input: []} plus a Completed terminal -- and that consumes the
-    // lineage, so every later attempt fails: a new import id on LineageNotEmpty, the same id
-    // with real content on ImportIdReuse. The session becomes permanently unfillable, and the
-    // request that did it looked successful.
-    if request.messages.is_empty() {
-        return Err(ImportError::NoImportableContent);
-    }
-    if request.messages.len() > IMPORT_MAX_MESSAGES {
-        return Err(ImportError::TooManyMessages {
-            count: request.messages.len(),
-            max: IMPORT_MAX_MESSAGES,
-        });
-    }
-    if let Some(ordinal) = request
-        .messages
-        .iter()
-        .position(|message| message.content.is_empty())
-    {
-        return Err(ImportError::EmptyMessage { ordinal });
-    }
-    // Checked on the request as supplied, before normalization can drop a message (a system
-    // message, an orphan tool result) that still names media the caller tried to bring in.
-    if let Some(found) = crate::media_provenance::find_supplied_media(&request.messages) {
-        return Err(ImportError::SuppliedMedia(found));
-    }
-    let serialized = serde_json::to_vec(&request.messages)
-        .map_err(|error| ImportError::Wal(error.to_string()))?;
-    let serialized_bytes = serialized.len();
-    if serialized_bytes > IMPORT_MAX_SERIALIZED_BYTES {
-        return Err(ImportError::TooLarge {
-            bytes: serialized_bytes,
-            max: IMPORT_MAX_SERIALIZED_BYTES,
-        });
-    }
-
-    let identity_bytes = serde_json::to_vec(&serde_json::json!({
-        "messages": &request.messages,
-        "origin": {"kind": "import", "source_ref": &request.origin.source_ref},
-    }))
-    .map_err(|error| ImportError::Wal(error.to_string()))?;
-    let request_digest = format!("{:x}", Sha256::digest(identity_bytes));
-    let (messages, counts) = normalize_messages(request.messages);
-    // Normalization can empty a request that arrived non-empty: it drops system messages, which
-    // belong to the continuing session rather than the transcript, and orphan tool results. A
-    // system-only export reaches here with nothing left, and seeding an empty episode would
-    // consume the lineage exactly as an empty request would -- so the same refusal applies, and
-    // it must be checked after normalization rather than only at the edge.
-    if messages.is_empty() {
-        return Err(ImportError::NoImportableContent);
-    }
-    let origin = RunOrigin::SeededFrom {
-        origin_kind: SeedOriginKind::Import,
-        source_ref: request.origin.source_ref,
-        origin_device_pseudonym: None,
-        base_seq: None,
-    };
+    let (messages, counts, request_digest, origin) =
+        prepare_inline(request.messages, &request.origin.source_ref)?;
     let frames = wal_store
         .read_records(&request.session)
         .map_err(|error| ImportError::Wal(error.to_string()))?;
@@ -446,7 +383,78 @@ pub async fn run_import_with_store<W: WalStore>(
     })
 }
 
-fn import_marker_config(request_digest: &str, tag_checkpoint: u64) -> RunConfig {
+/// Validates and normalizes inline imports identically for both storage backends.
+pub fn prepare_inline(
+    messages: Vec<Message>,
+    source_ref: &str,
+) -> Result<(Vec<Message>, NormalizationCounts, String, RunOrigin), ImportError> {
+    if !source_ref
+        .split_once(':')
+        .is_some_and(|(namespace, id)| !namespace.is_empty() && !id.is_empty())
+    {
+        return Err(ImportError::InvalidSourceRef);
+    }
+    // Refuse before the digest, the lineage read, or any write. An accepted empty import is
+    // durable -- RunStarted{input: []} plus a Completed terminal -- and that consumes the
+    // lineage, so every later attempt fails: a new import id on LineageNotEmpty, the same id
+    // with real content on ImportIdReuse. The session becomes permanently unfillable, and the
+    // request that did it looked successful.
+    if messages.is_empty() {
+        return Err(ImportError::NoImportableContent);
+    }
+    if messages.len() > IMPORT_MAX_MESSAGES {
+        return Err(ImportError::TooManyMessages {
+            count: messages.len(),
+            max: IMPORT_MAX_MESSAGES,
+        });
+    }
+    if let Some(ordinal) = messages
+        .iter()
+        .position(|message| message.content.is_empty())
+    {
+        return Err(ImportError::EmptyMessage { ordinal });
+    }
+    // Checked on the request as supplied, before normalization can drop a message (a system
+    // message, an orphan tool result) that still names media the caller tried to bring in.
+    if let Some(found) = crate::media_provenance::find_supplied_media(&messages) {
+        return Err(ImportError::SuppliedMedia(found));
+    }
+    let serialized =
+        serde_json::to_vec(&messages).map_err(|error| ImportError::Wal(error.to_string()))?;
+    let serialized_bytes = serialized.len();
+    if serialized_bytes > IMPORT_MAX_SERIALIZED_BYTES {
+        return Err(ImportError::TooLarge {
+            bytes: serialized_bytes,
+            max: IMPORT_MAX_SERIALIZED_BYTES,
+        });
+    }
+
+    let identity_bytes = serde_json::to_vec(&serde_json::json!({
+        "messages": &messages,
+        "origin": {"kind": "import", "source_ref": &source_ref},
+    }))
+    .map_err(|error| ImportError::Wal(error.to_string()))?;
+    let request_digest = format!("{:x}", Sha256::digest(identity_bytes));
+    let (messages, counts) = normalize_messages(messages);
+    // Normalization can empty a request that arrived non-empty: it drops system messages, which
+    // belong to the continuing session rather than the transcript, and orphan tool results. A
+    // system-only export reaches here with nothing left, and seeding an empty episode would
+    // consume the lineage exactly as an empty request would -- so the same refusal applies, and
+    // it must be checked after normalization rather than only at the edge.
+    if messages.is_empty() {
+        return Err(ImportError::NoImportableContent);
+    }
+    let origin = RunOrigin::SeededFrom {
+        origin_kind: SeedOriginKind::Import,
+        source_ref: source_ref.to_owned(),
+        origin_device_pseudonym: None,
+        base_seq: None,
+    };
+    Ok((messages, counts, request_digest, origin))
+}
+
+/// The provider-free configuration frozen by an inline import.
+pub fn import_marker_config(request_digest: &str, tag_checkpoint: u64) -> RunConfig {
     RunConfig {
         global_system: None,
         account_route: None,
@@ -635,10 +643,10 @@ impl PendingToolCalls {
 
 /// Counts of every rewrite normalization performs, so the outcome can report all of them.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-struct NormalizationCounts {
-    synthesized_tool_results: usize,
-    dropped_orphan_tool_results: usize,
-    dropped_system_messages: usize,
+pub struct NormalizationCounts {
+    pub synthesized_tool_results: usize,
+    pub dropped_orphan_tool_results: usize,
+    pub dropped_system_messages: usize,
 }
 
 fn normalize_messages(messages: Vec<Message>) -> (Vec<Message>, NormalizationCounts) {

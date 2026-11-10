@@ -4386,7 +4386,7 @@ mod executor {
                         req,
                         kind: RunKind::FreshOrResume,
                         auth,
-                        conversation_key: &None,
+                        conversation_key: &control.conversation_key,
                         queued_service_tier: &mut queued_service_tier,
                         media_profile: &None,
                         clock: control.clock.as_ref(),

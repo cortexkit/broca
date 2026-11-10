@@ -314,6 +314,27 @@ impl<B: SessionBackend> Session<B> {
         deployment: &DeploymentKey,
         appends_in_conversation: bool,
     ) -> Result<Self, SessionError> {
+        Self::create_with_history_version(
+            backend,
+            addr,
+            triple,
+            deployment,
+            appends_in_conversation,
+            0,
+        )
+        .await
+    }
+
+    /// Creates a converted session whose served-history counter continues from the source.
+    /// The initial checkpoint and head carry the same version, including after creation recovery.
+    pub async fn create_with_history_version(
+        backend: B,
+        addr: SessionAddr,
+        triple: SessionTriple,
+        deployment: &DeploymentKey,
+        appends_in_conversation: bool,
+        history_version: u64,
+    ) -> Result<Self, SessionError> {
         let session_id = random_id();
         let (key, wrapped, cipher) = match deployment.new_sessions() {
             Cipher::XChaCha20Poly1305 => {
@@ -336,7 +357,7 @@ impl<B: SessionBackend> Session<B> {
             session_id,
             triple,
             incarnation: random_id(),
-            history_version: 0,
+            history_version,
             residence: Residence::Creating(log),
             features: Vec::new(),
             keys: wrapped,
@@ -389,7 +410,10 @@ impl<B: SessionBackend> Session<B> {
             ChainBase::default(),
         );
         let conversation = Conversation::new(appends_in_conversation);
-        let operations = Operations::default();
+        let operations = Operations {
+            history_version: head.history_version,
+            ..Operations::default()
+        };
         let checkpoint = Checkpoint {
             covers_through: 0,
             next_seq: head.next_seq,
