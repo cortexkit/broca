@@ -2721,6 +2721,11 @@ pub trait ServeHandler: Send + Sync {
         Ok(false)
     }
 
+    /// A temporary cutover refusal, checked before authorization can read a source WAL.
+    fn conversion_refusal(&self, _session: &LineageKey) -> Option<(bool, String)> {
+        None
+    }
+
     /// `session.restore_from_backup`: restores the session, or with `all` every session kept in
     /// the new storage, from the files the store holds after a backup came back (see
     /// `registry::store_restore`). A handler without the new storage refuses by name.
@@ -3930,6 +3935,10 @@ impl ServeHandler for crate::LineageRegistry {
             Some(OpenError::SessionMoving { .. }) | None => Ok(false),
             Some(refusal) => Err(refusal.into()),
         }
+    }
+
+    fn conversion_refusal(&self, session: &LineageKey) -> Option<(bool, String)> {
+        crate::LineageRegistry::conversion_refusal(self, session)
     }
 
     async fn move_to_store(

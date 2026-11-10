@@ -2286,6 +2286,9 @@ async fn handle_control_request(
             // Which deployment key the new session storage is opened with, and whether it has
             // loaded: while it hasn't, sessions kept there are refused `key_unavailable`.
             metrics["store"] = crate::store_key::health();
+            metrics["session_conversion"] =
+                serde_json::to_value(crate::session_conversion::health())
+                    .map_err(|error| ServeIoError(error.to_string()))?;
             metrics["usage_observe"] = crate::usage_observe::published_metrics();
             metrics["account_limit_stale_resets"] =
                 serde_json::json!(broca_core::account_limit_stale_resets());
@@ -2803,6 +2806,17 @@ where
             PreparedRouteRequest::Request(req) => &req.params,
             PreparedRouteRequest::Subscribe { params, .. } => params,
         };
+        if let Some((converting, reason)) = handler.conversion_refusal(&session) {
+            let body = ErrorBody::new(
+                if converting { "session_converting" } else { "session_unconverted" },
+                if converting { "live sessions are converting before service starts" } else { "this session could not be converted" },
+            ).with_detail(serde_json::json!({
+                "class": if converting { "transient" } else { "permanent" },
+                "retryable": converting,
+                "refusal_class": reason,
+            }));
+            return send_error_body(&writer, ver, channel, epoch, corr, body).await;
+        }
         // Establish storage ownership before authorization or dispatch can answer from today's
         // WAL. Without a store runtime the rollback guard refuses every op; with one, only ops
         // implemented for the new storage may proceed.

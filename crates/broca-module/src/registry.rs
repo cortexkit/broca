@@ -1008,6 +1008,7 @@ struct Inner {
     store_moves: store_move::MoveFences,
     /// What runs `session.move_to_store`, installed by the daemon with its stores.
     store_mover: std::sync::OnceLock<Arc<dyn store_move::StoreMover>>,
+    conversion_guard: std::sync::OnceLock<Arc<SessionConversionGuard>>,
     /// What runs `session.restore_from_backup`, installed by the daemon with its stores.
     store_restorer: std::sync::OnceLock<Arc<dyn store_restore::StoreRestorer>>,
     session_address_inventory: std::sync::OnceLock<Arc<dyn broca_store::SessionAddressResolver>>,
@@ -1425,6 +1426,23 @@ pub struct SlotCounts {
 #[derive(Clone)]
 pub struct RegistryHandle {
     inner: Arc<Inner>,
+}
+
+/// Temporary cutover admission check: true denotes a retryable startup barrier, false a
+/// permanent refusal whose string names the conversion ledger's failure class.
+pub type SessionConversionGuard = dyn Fn(&LineageKey) -> Option<(bool, String)> + Send + Sync;
+
+impl LineageRegistry {
+    pub fn set_conversion_guard(&self, guard: Arc<SessionConversionGuard>) {
+        let _ = self.inner.conversion_guard.set(guard);
+    }
+
+    pub fn conversion_refusal(&self, key: &LineageKey) -> Option<(bool, String)> {
+        self.inner
+            .conversion_guard
+            .get()
+            .and_then(|guard| guard(key))
+    }
 }
 
 impl LineageRegistry {
@@ -2111,6 +2129,7 @@ impl LineageRegistry {
                 retention: std::sync::OnceLock::new(),
                 store_moves: Default::default(),
                 store_mover: std::sync::OnceLock::new(),
+                conversion_guard: std::sync::OnceLock::new(),
                 store_restorer: std::sync::OnceLock::new(),
                 #[cfg(test)]
                 close_started: tokio::sync::watch::channel(0).0,

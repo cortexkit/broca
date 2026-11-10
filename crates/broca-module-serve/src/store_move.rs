@@ -331,9 +331,9 @@ fn read_wal(path: &Path) -> Result<(Vec<FramedRecord>, Option<WalLineageId>), Mo
 }
 
 /// Today's media store for a session, and the class of store the folder of its WAL chooses.
-struct TodaysMedia {
-    store: MediaStore,
-    class: broca_core::media_store::MediaStoreClass,
+pub(crate) struct TodaysMedia {
+    pub(crate) store: MediaStore,
+    pub(crate) class: broca_core::media_store::MediaStoreClass,
 }
 
 /// The class of the session whose live WAL is `wal`, as the WAL's folder has it: the folder
@@ -382,11 +382,19 @@ fn todays_media(
     wal: &Path,
     records: &[FramedRecord],
 ) -> Result<Option<TodaysMedia>, MoveRefusal> {
+    media_for_class(state_root, wal_class(wal_store, wal), records)
+}
+
+pub(crate) fn media_for_class(
+    state_root: &Path,
+    source_class: StorageClass,
+    records: &[FramedRecord],
+) -> Result<Option<TodaysMedia>, MoveRefusal> {
     use broca_core::media_store::MediaStoreClass;
     if broca_session_convert::stage::media_digests(records).is_empty() {
         return Ok(None);
     }
-    let class = match wal_class(wal_store, wal) {
+    let class = match source_class {
         StorageClass::Durable => MediaStoreClass::Durable,
         StorageClass::Ephemeral => MediaStoreClass::Ephemeral,
         StorageClass::Ordinary => MediaStoreClass::NonDurable,
@@ -518,7 +526,7 @@ impl StoreMove {
 
     /// The preconditions an idle session meets: no open work in its WAL, its late results and
     /// its held slots; and a settled run index.
-    fn check_idle(
+    pub(crate) fn check_idle(
         &self,
         key: &BindIdentity,
         records: &[FramedRecord],
@@ -561,6 +569,14 @@ impl StoreMove {
             return Err(not_movable("reconcile_owed"));
         }
         Ok(())
+    }
+
+    pub(crate) fn retire_converted(&self, key: &BindIdentity) -> Result<(), MoveRefusal> {
+        retire(
+            key,
+            self.forget_projection.as_ref(),
+            self.late_results.as_deref(),
+        )
     }
 
     /// Converts the session, refusing what the move can't carry and what the new run loop
@@ -779,7 +795,11 @@ impl StoreMove {
         before!(self.step("verify"));
         // The runtime serving the session reads its setup parts from memory: hold the staged
         // ones there, already stored in the destination root.
-        before!(self.hold_parts(runtime, journal.destination(), &staged.converted));
+        before!(Self::hold_parts(
+            runtime,
+            journal.destination(),
+            &staged.converted
+        ));
         // Feature floor.
         before!(broca_wal::raise_floor(
             &state_root.join(broca_wal::FEATURE_FLOOR_FILENAME),
@@ -824,8 +844,7 @@ impl StoreMove {
 
     /// Holds the staged session's setup parts in the runtime's parts of the root of `class`,
     /// marked stored: they are in that root's setup store already.
-    fn hold_parts(
-        &self,
+    pub(crate) fn hold_parts(
         runtime: &broca_module::store_open::StoreRuntime,
         class: StorageClass,
         converted: &broca_session_convert::Converted,
@@ -862,64 +881,124 @@ impl StoreMove {
     /// `objects/` and their parent. A missing staged folder (a session with no objects) is
     /// skipped.
     fn publish_data(&self, journal: &MoveJournal, paths: &Paths) -> Result<(), Stop> {
-        let store = &paths.store;
-        for (folder, live, step) in [
-            ("logs", &paths.live_logs, "rename_logs"),
-            ("objects", &paths.live_objects, "rename_objects"),
-        ] {
-            let staged = paths.staging.join(folder).join(&journal.address);
-            if !staged
-                .try_exists()
-                .map_err(io_failed("the staged session couldn't be checked"))?
-            {
-                continue;
-            }
-            let parent = live.parent().expect("a live folder has a parent");
-            migration::durable_dir(self.state_root(), parent)
-                .map_err(io_failed("the new storage's folders couldn't be made"))?;
-            std::fs::rename(&staged, live)
-                .map_err(io_failed("the staged session couldn't be published"))?;
-            self.step(step)?;
-        }
-        for folder in [store.join("logs"), store.join("objects"), store.clone()] {
-            match migration::sync_dir(&folder) {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                other => {
-                    other.map_err(io_failed("the new storage's folders couldn't be synced"))?
-                }
-            }
-        }
-        self.step("sync_data")?;
-        Ok(())
+        publish_data_at(
+            self.state_root(),
+            &paths.staging,
+            &paths.store,
+            &journal.address,
+            |step| self.step(step),
+        )
     }
 
-    /// Writes the staged head as the live head, through the backend's versioned head write,
-    /// with no head expected, then syncs `heads/` and reads the head back.
+    /// Writes the live head only after the data publication barrier.
     async fn write_head(&self, journal: &MoveJournal, paths: &Paths) -> Result<u64, Stop> {
-        let addr = SessionAddr(journal.address.clone());
-        let staged = LocalBackend::new(&paths.staging);
-        let (bytes, version) = staged
-            .read_head(&addr)
-            .await
-            .map_err(|error| unavailable("the staged head couldn't be read", format!("{error:?}")))?
-            .ok_or_else(|| unavailable("the staged head", "absent"))?;
-        let store = &paths.store;
-        let live = LocalBackend::new(store);
-        live.write_head(&addr, &bytes, None, version)
-            .await
-            .map_err(|error| unavailable("the head couldn't be written", format!("{error:?}")))?;
-        migration::sync_dir(&store.join("heads"))
-            .map_err(io_failed("the new storage's heads couldn't be synced"))?;
-        let read = live
-            .read_head(&addr)
-            .await
-            .map_err(|error| unavailable("the head couldn't be read back", format!("{error:?}")))?;
-        if read != Some((bytes, version)) {
-            return Err(unavailable("the head", "it reads back other than it was written").into());
-        }
-        Ok(version)
+        publish_head_at(&paths.staging, &paths.store, &journal.address).await
     }
+}
 
+/// Shared publication barrier for online moves and startup/archive conversion. Repeating a
+/// rename after a crash accepts only the already-published directory, never a second copy.
+pub(crate) fn publish_data_at(
+    state_root: &Path,
+    staging: &Path,
+    store: &Path,
+    address: &str,
+    mut step: impl FnMut(&'static str) -> Result<(), Stop>,
+) -> Result<(), Stop> {
+    let live_logs = store.join("logs").join(address);
+    let live_objects = store.join("objects").join(address);
+    for (folder, live, boundary) in [
+        ("logs", &live_logs, "rename_logs"),
+        ("objects", &live_objects, "rename_objects"),
+    ] {
+        let staged = staging.join(folder).join(address);
+        if !staged
+            .try_exists()
+            .map_err(io_failed("the staged session couldn't be checked"))?
+        {
+            if folder == "logs"
+                && !live
+                    .try_exists()
+                    .map_err(io_failed("the published log couldn't be checked"))?
+            {
+                return Err(unavailable(
+                    "the verified session log",
+                    "absent from staging and destination",
+                )
+                .into());
+            }
+            continue;
+        }
+        let parent = live.parent().expect("a live folder has a parent");
+        migration::durable_dir(state_root, parent)
+            .map_err(io_failed("the new storage's folders couldn't be made"))?;
+        std::fs::rename(&staged, live)
+            .map_err(io_failed("the staged session couldn't be published"))?;
+        // The online move's fault boundary remains immediately after the rename.
+        // Cutover recovery uses the same boundary before it publishes the head.
+        step(boundary)?;
+    }
+    for folder in [
+        store.join("logs"),
+        store.join("objects"),
+        store.to_path_buf(),
+    ] {
+        match migration::sync_dir(&folder) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            other => other.map_err(io_failed("the new storage's folders couldn't be synced"))?,
+        }
+    }
+    step("sync_data")?;
+    Ok(())
+}
+
+/// Writes the staged head as the live head, through the backend's versioned head write,
+/// with no head expected, then syncs `heads/` and reads the head back.
+pub(crate) async fn publish_head_at(
+    staging: &Path,
+    store: &Path,
+    address: &str,
+) -> Result<u64, Stop> {
+    let addr = SessionAddr(address.to_owned());
+    let staged = LocalBackend::new(staging);
+    let (bytes, version) = staged
+        .read_head(&addr)
+        .await
+        .map_err(|error| unavailable("the staged head couldn't be read", format!("{error:?}")))?
+        .ok_or_else(|| unavailable("the staged head", "absent"))?;
+    let live = LocalBackend::new(store);
+    match live
+        .read_head(&addr)
+        .await
+        .map_err(|error| unavailable("the live head couldn't be read", format!("{error:?}")))?
+    {
+        None => {
+            live.write_head(&addr, &bytes, None, version)
+                .await
+                .map_err(|error| {
+                    unavailable("the head couldn't be written", format!("{error:?}"))
+                })?;
+        }
+        Some(existing) if existing == (bytes.clone(), version) => {}
+        Some(_) => {
+            return Err(
+                unavailable("the live head", "differs from the verified staged head").into(),
+            )
+        }
+    }
+    migration::sync_dir(&store.join("heads"))
+        .map_err(io_failed("the new storage's heads couldn't be synced"))?;
+    let read = live
+        .read_head(&addr)
+        .await
+        .map_err(|error| unavailable("the head couldn't be read back", format!("{error:?}")))?;
+    if read != Some((bytes, version)) {
+        return Err(unavailable("the head", "it reads back other than it was written").into());
+    }
+    Ok(version)
+}
+
+impl StoreMove {
     /// Step 7: today's side is sealed, then the staging folder and the journal go.
     async fn seal(
         &self,

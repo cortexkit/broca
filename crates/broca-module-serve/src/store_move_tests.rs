@@ -279,6 +279,16 @@ fn compacting_run_started(run: &str, at: u64) -> WalRecord {
 /// today's loop records it (the view accepted, the step applying it, and the cut's marker), so
 /// that request leaves the first message out.
 fn session_records_with(path: &Path, compacted: bool) -> Vec<WalRecord> {
+    session_records_with_input(path, compacted, None)
+}
+
+/// Install media before rendering the fixture's recorded requests, so their digests describe
+/// the same verified native bytes that conversion must copy.
+fn session_records_with_input(
+    path: &Path,
+    compacted: bool,
+    first_input: Option<Arc<Vec<broca_protocol::Message>>>,
+) -> Vec<WalRecord> {
     use broca_core::compaction_v2::protocol::view::{Edit, EditOp, View};
     let lineage = {
         let wal = broca_wal::FileWal::open(path).unwrap();
@@ -291,11 +301,18 @@ fn session_records_with(path: &Path, compacted: bool) -> Vec<WalRecord> {
     for (index, run) in RUNS.iter().enumerate() {
         let step = index as u64 + 1;
         let at = 1_000 * step;
-        let start = if compacted {
+        let mut start = if compacted {
             compacting_run_started(run, at)
         } else {
             run_started(run, at)
         };
+        if index == 0 {
+            if let (Some(first_input), WalRecord::RunStarted { input, .. }) =
+                (&first_input, &mut start)
+            {
+                *input = Arc::clone(first_input);
+            }
+        }
         let WalRecord::RunStarted { config, .. } = &start else {
             unreachable!()
         };
@@ -326,16 +343,33 @@ fn session_records_with(path: &Path, compacted: bool) -> Vec<WalRecord> {
                 checkpoint: 0,
             });
         }
-        let (_, _, body) = broca_module::wal_render::render_step_with_lineage(
-            lineage.as_deref(),
-            &written,
-            &config,
-            run,
-            step,
-            None,
-            None,
-        )
-        .unwrap();
+        let (_, _, body) = if first_input.is_some() {
+            broca_module::wal_render::render_step_with_media(
+                &broca_module::wal_render::OfflineMediaContext {
+                    state_root: path.parent().unwrap().parent().unwrap(),
+                    identity: &key(),
+                    class: broca_core::media_store::MediaStoreClass::NonDurable,
+                    lineage: lineage.as_deref(),
+                },
+                &written,
+                &config,
+                run,
+                step,
+                None,
+            )
+            .unwrap()
+        } else {
+            broca_module::wal_render::render_step_with_lineage(
+                lineage.as_deref(),
+                &written,
+                &config,
+                run,
+                step,
+                None,
+                None,
+            )
+            .unwrap()
+        };
         let sha = |bytes: &[u8]| broca_wal::migration::digest(bytes);
         written.push(record(json!({
             "type": "model_attempt_finished", "step_id": step, "attempt": 0,
@@ -1189,4 +1223,633 @@ async fn a_moves_journal_and_staging_live_in_the_moves_folder() {
     let recovered = recover_at_startup(&rig.dir);
     assert_eq!(recovered.rolled_back, std::slice::from_ref(&address));
     assert_today(&rig, &bytes);
+}
+
+mod cutover {
+    use super::*;
+    use crate::session_conversion::{after_startup_recovery, Config, Engine};
+    use broca_module::ServeHandler;
+
+    fn engine(rig: &Rig, archives: bool, live: bool) -> Engine {
+        let backup = rig.dir.with_extension("converted-sources");
+        let _ = std::fs::remove_dir_all(&backup);
+        let engine = Engine::configured(
+            &rig.dir,
+            Config {
+                archives,
+                live_at_startup: live,
+                backup_root: Some(backup),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        engine.set_mover(Arc::new(rig.mover()));
+        engine
+    }
+
+    #[tokio::test]
+    async fn cutover_live_waits_for_recovery_and_keeps_compaction_views() {
+        let rig = Rig::start("cutover-live").await;
+        let records = session_records_with(&rig.wal(), true);
+        rig.write(&records);
+        let before = std::fs::read(rig.wal()).unwrap();
+        let engine = engine(&rig, false, true);
+        let (done, wait) = tokio::sync::oneshot::channel();
+        let deployment_key = deployment();
+        let conversion = after_startup_recovery(
+            async { wait.await.map_err(|error| error.to_string()) },
+            engine.run_live(
+                &deployment_key,
+                Some(rig.runtime.as_ref()),
+                Some(&rig.registry),
+            ),
+        );
+        tokio::pin!(conversion);
+        tokio::select! {
+            result = &mut conversion => panic!("conversion ran before recovery: {result:?}"),
+            _ = tokio::task::yield_now() => {}
+        }
+        assert_eq!(std::fs::read(rig.wal()).unwrap(), before);
+        assert!(engine.ledger.rows().unwrap().is_empty());
+        done.send(()).unwrap();
+        conversion.await.unwrap();
+        assert!(!rig.wal().exists());
+        let rows = engine.ledger.rows().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].outcome.as_deref(), Some("converted"));
+        assert_eq!(std::fs::read(&rows[0].source.backup).unwrap(), before);
+        assert!(broca_wal::session_storage_head(
+            &rig.dir,
+            StorageClass::Ordinary,
+            &broca_core::session_addr(&key())
+        )
+        .exists());
+        assert!(rig.registry.kept_in_new_storage(&key()).unwrap());
+        assert!(!rig.wal().with_extension("wal.moved").exists());
+        rig.registry.route_status(&key()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cutover_archived_member_converts_while_registry_serves() {
+        let rig = Rig::start("cutover-archive").await;
+        let bytes = rig.write_session_in(StorageClass::Durable);
+        let wal = rig.wal_store.class_wal_path(StorageClass::Durable, &key());
+        let archive = rig.dir.join("wal-archive-durable/fold-1000.ark");
+        std::fs::create_dir_all(archive.parent().unwrap()).unwrap();
+        let mut writer = broca_wal::archive::ArchiveWriter::create(&archive)
+            .unwrap()
+            .with_feature_floor(rig.dir.join(broca_wal::FEATURE_FLOOR_FILENAME));
+        writer
+            .append(&broca_core::session_addr(&key()), &bytes)
+            .unwrap();
+        writer.seal().unwrap();
+        let archived_bytes = std::fs::read(&archive).unwrap();
+        std::fs::remove_file(wal).unwrap();
+        let engine = engine(&rig, true, false);
+        let other = BindIdentity::new("/project", "runner", "other");
+        rig.registry.route_status(&other).await.unwrap();
+        engine
+            .run_archives(
+                &deployment(),
+                Some(rig.runtime.as_ref()),
+                Some(&rig.registry),
+                Duration::ZERO,
+            )
+            .await
+            .unwrap();
+        assert!(!archive.exists());
+        let rows = engine.ledger.rows().unwrap();
+        assert_eq!(rows[0].source.class, "durable");
+        assert_eq!(rows[0].step, "done");
+        assert_eq!(rows[0].outcome.as_deref(), Some("converted"));
+        assert_eq!(
+            std::fs::read(&rows[0].source.backup).unwrap(),
+            archived_bytes
+        );
+        assert!(broca_wal::session_storage_head(
+            &rig.dir,
+            StorageClass::Durable,
+            &broca_core::session_addr(&key())
+        )
+        .exists());
+        rig.registry.route_status(&other).await.unwrap();
+        rig.registry.route_status(&key()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cutover_refusal_and_garbage_are_backed_up_not_empty_sessions() {
+        for (tag, garbage) in [("cutover-budget", false), ("cutover-garbage", true)] {
+            let rig = Rig::start(tag).await;
+            if garbage {
+                std::fs::create_dir_all(rig.wal().parent().unwrap()).unwrap();
+                std::fs::write(rig.wal(), b"garbage is not an empty session").unwrap();
+            } else {
+                let mut start = run_started("budget", 1);
+                if let WalRecord::RunStarted { config, .. } = &mut start {
+                    config.budget =
+                        Some(serde_json::from_value(json!({"max_input_tokens":10})).unwrap());
+                }
+                rig.write(&[start, record(json!({"type":"run_finished","reason":"completed","usage":{},"retries_used":0}))]);
+            }
+            let before = std::fs::read(rig.wal()).unwrap();
+            let engine = engine(&rig, false, true);
+            engine
+                .run_live(
+                    &deployment(),
+                    Some(rig.runtime.as_ref()),
+                    Some(&rig.registry),
+                )
+                .await
+                .unwrap();
+            let rows = engine.ledger.rows().unwrap();
+            assert_eq!(rows[0].outcome.as_deref(), Some("refused"));
+            assert_eq!(
+                rows[0].refusal.as_deref(),
+                Some(if garbage {
+                    "damaged"
+                } else {
+                    "input_token_budget"
+                })
+            );
+            assert_eq!(std::fs::read(&rows[0].source.backup).unwrap(), before);
+            assert!(!rig.wal().exists());
+            assert!(!broca_wal::session_storage_head(
+                &rig.dir,
+                StorageClass::Ordinary,
+                &broca_core::session_addr(&key())
+            )
+            .exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn cutover_live_seal_marks_dispatched_calls_unknown_before_conversion() {
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        let rig = Rig::start("cutover-unknown-call").await;
+        rig.write(&[
+            run_started("orphan", 1),
+            record(json!({"type":"step_started","step_id":1})),
+            record(json!({"type":"model_step_finished","step_id":1,
+                "assistant_message":{"message_id":"call-message","content":[{"type":"tool_call","tool_call_id":"call","tool_name":"edit","input":{}}]},
+                "usage":{},"finish_reason":"tool_calls","retries_used":0})),
+            record(json!({"type":"tool_batch_started","batch_id":"batch","step_id":1,"planned_calls":["call"]})),
+            record(json!({"type":"tool_dispatch_intent","batch_id":"batch","tool_call_id":"call","tool_name":"edit","args":{}})),
+        ]);
+        let engine = engine(&rig, false, true);
+        engine
+            .run_live(
+                &deployment(),
+                Some(rig.runtime.as_ref()),
+                Some(&rig.registry),
+            )
+            .await
+            .unwrap();
+        let rows = engine.ledger.rows().unwrap();
+        assert_eq!(
+            rows[0].outcome.as_deref(),
+            Some("converted"),
+            "{:?}",
+            rows[0]
+        );
+        let source = broca_wal::replay_file(&rows[0].source.backup, u64::MAX).unwrap();
+        assert!(matches!(
+            source.last().unwrap().record,
+            WalRecord::RunFinished {
+                reason: broca_protocol::RunFinishReason::Interrupted,
+                ..
+            }
+        ));
+        assert_eq!(
+            source
+                .iter()
+                .filter(|frame| matches!(frame.record, WalRecord::ToolDispatchIntent { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            source
+                .iter()
+                .filter(|frame| matches!(
+                    frame.record,
+                    WalRecord::ToolResult {
+                        outcome: broca_wal::DispatchOutcome::Unknown,
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn cutover_media_and_inventory_survive_without_export_rewrites() {
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        use broca_core::SessionRefIndex;
+        let rig = Rig::start("cutover-media-inventory").await;
+        broca_core::media_store::create_media_directories(&rig.dir).unwrap();
+        let digest = broca_wal::migration::digest(IMAGE);
+        std::fs::write(rig.dir.join("media/objects").join(&digest), IMAGE).unwrap();
+        let input = Arc::new(vec![serde_json::from_value(json!({
+            "role":"user", "content":[{"type":"media","kind":"image","mime":"image/png",
+                "sha256":digest,"byte_size":IMAGE.len(),"width":1,"height":1}]
+        }))
+        .unwrap()]);
+        let records = session_records_with_input(&rig.wal(), false, Some(input));
+        rig.write(&records);
+        let db = rig.dir.join("run-index.db");
+        let _index = broca_store::SqliteStore::open(&db).unwrap();
+        let inventory = broca_store::SessionInventory::open(&db).unwrap();
+        let address = broca_core::session_addr(&key());
+        inventory.record_session(&address, &key()).unwrap();
+        let connection = rusqlite::Connection::open(&db).unwrap();
+        let export_bytes = " {\"immutable_usage\": 1.00} ";
+        connection
+            .execute(
+                "INSERT INTO export_facts(fact_id,run_id,segment_json) VALUES('sentinel','r1',?1)",
+                [export_bytes],
+            )
+            .unwrap();
+        connection
+            .execute("UPDATE export_meta SET high_water=1 WHERE id=1", [])
+            .unwrap();
+        let engine = engine(&rig, false, true);
+        engine
+            .run_live(
+                &deployment(),
+                Some(rig.runtime.as_ref()),
+                Some(&rig.registry),
+            )
+            .await
+            .unwrap();
+        let row = &engine.ledger.rows().unwrap()[0];
+        assert_eq!(row.outcome.as_deref(), Some("converted"), "{row:?}");
+        let kept: (i64, String, String, String) = connection
+            .query_row(
+                "SELECT export_seq,fact_id,run_id,segment_json FROM export_facts",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            kept,
+            (1, "sentinel".into(), "r1".into(), export_bytes.into())
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM export_facts", [], |row| row
+                    .get::<_, u64>(0))
+                .unwrap(),
+            1
+        );
+        let identity: (String, String, String) = connection
+            .query_row(
+                "SELECT project_root,harness,session FROM agent_data_session_ref WHERE address=?1",
+                [&address],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(identity, ("/project".into(), "runner".into(), "s".into()));
+        let view = rig.runtime.current_view(&key()).await.unwrap().unwrap();
+        let medium = view.named_media(&digest).await.unwrap().unwrap();
+        assert_eq!(view.named_media_bytes(&medium).await.unwrap(), IMAGE);
+    }
+
+    #[tokio::test]
+    async fn cutover_reuses_online_checks_for_unsettled_run_rows() {
+        let rig = Rig::start("cutover-unsettled-row").await;
+        let before = rig.write_session();
+        let mover = rig.mover().with_run_rows(Arc::new(|session| {
+            let mut row = settled_row(session, "r1");
+            row.usage = None;
+            Ok(vec![row])
+        }));
+        // Install the unsettled mover on a fresh engine; a configured engine's mover is fixed.
+        let engine = Engine::configured(
+            &rig.dir,
+            Config {
+                archives: false,
+                live_at_startup: true,
+                backup_root: Some(rig.dir.with_extension("converted-sources")),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        engine.set_mover(Arc::new(mover));
+        engine
+            .run_live(
+                &deployment(),
+                Some(rig.runtime.as_ref()),
+                Some(&rig.registry),
+            )
+            .await
+            .unwrap();
+        let rows = engine.ledger.rows().unwrap();
+        assert_eq!(rows[0].outcome.as_deref(), Some("failed"));
+        assert_eq!(rows[0].refusal.as_deref(), Some("reconcile_owed"));
+        assert_eq!(std::fs::read(rig.wal()).unwrap(), before);
+        assert!(!Path::new(&rows[0].source.backup).exists());
+    }
+
+    #[tokio::test]
+    async fn cutover_resume_refuses_changed_sources_before_publish_and_backup() {
+        for boundary in ["publishing", "awaiting_backup"] {
+            let rig = Rig::start(&format!("cutover-source-changed-{boundary}")).await;
+            let before = rig.write_session();
+            let mut engine = engine(&rig, false, true);
+            engine.install_guard(&rig.registry);
+            engine.crash = Some(boundary);
+            assert!(engine
+                .run_live(
+                    &deployment(),
+                    Some(rig.runtime.as_ref()),
+                    Some(&rig.registry)
+                )
+                .await
+                .is_err());
+            let row = &engine.ledger.rows().unwrap()[0];
+            assert_eq!(row.source_sha256, broca_wal::migration::digest(&before));
+            if boundary == "publishing" {
+                rig.write(&[run_started("newer-run", 9000), record(json!({"type":"run_finished","reason":"cancelled","ts_ms":9001,"usage":{},"retries_used":0}))]);
+            } else {
+                std::fs::write(rig.wal(), b"external edit after publication").unwrap();
+            }
+            let changed = std::fs::read(rig.wal()).unwrap();
+            engine.crash = None;
+            engine
+                .run_live(
+                    &deployment(),
+                    Some(rig.runtime.as_ref()),
+                    Some(&rig.registry),
+                )
+                .await
+                .unwrap();
+            let row = &engine.ledger.rows().unwrap()[0];
+            assert_eq!(row.outcome.as_deref(), Some("failed"));
+            assert_eq!(row.refusal.as_deref(), Some("source_changed"));
+            assert_eq!(std::fs::read(rig.wal()).unwrap(), changed);
+            if boundary == "publishing" {
+                assert!(!broca_wal::session_storage_head(
+                    &rig.dir,
+                    StorageClass::Ordinary,
+                    &broca_core::session_addr(&key())
+                )
+                .exists());
+            }
+            assert!(!Path::new(&row.source.backup).exists());
+            assert_eq!(
+                rig.registry.conversion_refusal(&key()),
+                Some((false, "source_changed".into()))
+            );
+            std::fs::write(rig.wal(), &before).unwrap();
+            engine
+                .run_live(
+                    &deployment(),
+                    Some(rig.runtime.as_ref()),
+                    Some(&rig.registry),
+                )
+                .await
+                .unwrap();
+            let row = &engine.ledger.rows().unwrap()[0];
+            assert_eq!(row.step, "done");
+            assert_eq!(row.outcome.as_deref(), Some("converted"));
+            assert_eq!(std::fs::read(&row.source.backup).unwrap(), before);
+            assert!(rig.registry.conversion_refusal(&key()).is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn cutover_backup_failure_preserves_committed_outcome_for_restart() {
+        let rig = Rig::start("cutover-backup-retry").await;
+        let before = rig.write_session();
+        let mut engine = engine(&rig, false, true);
+        engine.crash = Some("awaiting_backup");
+        assert!(engine
+            .run_live(
+                &deployment(),
+                Some(rig.runtime.as_ref()),
+                Some(&rig.registry)
+            )
+            .await
+            .is_err());
+        let backup = PathBuf::from(&engine.ledger.rows().unwrap()[0].source.backup);
+        std::fs::create_dir_all(backup.parent().unwrap()).unwrap();
+        std::fs::write(&backup, b"do not overwrite this backup").unwrap();
+        engine.crash = None;
+        engine
+            .run_live(
+                &deployment(),
+                Some(rig.runtime.as_ref()),
+                Some(&rig.registry),
+            )
+            .await
+            .unwrap();
+        let row = &engine.ledger.rows().unwrap()[0];
+        assert_eq!(row.step, "backing_up");
+        assert_eq!(row.outcome.as_deref(), Some("converted"));
+        assert_eq!(std::fs::read(rig.wal()).unwrap(), before);
+        assert_eq!(
+            std::fs::read(&backup).unwrap(),
+            b"do not overwrite this backup"
+        );
+        std::fs::remove_file(&backup).unwrap();
+        engine
+            .run_live(
+                &deployment(),
+                Some(rig.runtime.as_ref()),
+                Some(&rig.registry),
+            )
+            .await
+            .unwrap();
+        let row = &engine.ledger.rows().unwrap()[0];
+        assert_eq!(row.step, "done");
+        assert_eq!(row.outcome.as_deref(), Some("converted"));
+        assert_eq!(std::fs::read(backup).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn cutover_archive_backup_waits_for_every_member_and_resumes_as_one_file() {
+        let rig = Rig::start("cutover-archive-group").await;
+        let bytes = rig.write_session();
+        let archive = rig.dir.join("wal-archive/fold-2000.ark");
+        std::fs::create_dir_all(archive.parent().unwrap()).unwrap();
+        let mut writer = broca_wal::archive::ArchiveWriter::create(&archive)
+            .unwrap()
+            .with_feature_floor(rig.dir.join(broca_wal::FEATURE_FLOOR_FILENAME));
+        writer
+            .append(&broca_core::session_addr(&key()), &bytes)
+            .unwrap();
+        writer
+            .append("deadbeefdeadbeef", b"damaged member")
+            .unwrap();
+        writer.seal().unwrap();
+        let before = std::fs::read(&archive).unwrap();
+        std::fs::remove_file(rig.wal()).unwrap();
+        let mut engine = engine(&rig, true, false);
+        engine.crash = Some("awaiting_backup");
+        assert!(engine
+            .run_archives(
+                &deployment(),
+                Some(rig.runtime.as_ref()),
+                Some(&rig.registry),
+                Duration::ZERO
+            )
+            .await
+            .is_err());
+        assert_eq!(std::fs::read(&archive).unwrap(), before);
+        engine.crash = None;
+        engine
+            .run_archives(
+                &deployment(),
+                Some(rig.runtime.as_ref()),
+                Some(&rig.registry),
+                Duration::ZERO,
+            )
+            .await
+            .unwrap();
+        let rows = engine.ledger.rows().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.step == "done"));
+        assert_eq!(
+            engine.ledger.progress().unwrap().outcomes.get("converted"),
+            Some(&1)
+        );
+        assert_eq!(
+            engine.ledger.progress().unwrap().refusals.get("damaged"),
+            Some(&1)
+        );
+        assert!(!archive.exists());
+        assert_eq!(std::fs::read(&rows[0].source.backup).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn cutover_archive_refuses_a_newer_fold_created_after_enumeration() {
+        let rig = Rig::start("cutover-newer-fold").await;
+        let bytes = rig.write_session();
+        let folder = rig.dir.join("wal-archive");
+        std::fs::create_dir_all(&folder).unwrap();
+        let older = folder.join("fold-1000.ark");
+        let mut writer = broca_wal::archive::ArchiveWriter::create(&older)
+            .unwrap()
+            .with_feature_floor(rig.dir.join(broca_wal::FEATURE_FLOOR_FILENAME));
+        writer
+            .append(&broca_core::session_addr(&key()), &bytes)
+            .unwrap();
+        writer.seal().unwrap();
+        std::fs::remove_file(rig.wal()).unwrap();
+        let mut engine = engine(&rig, true, false);
+        engine.crash = Some("staging");
+        assert!(engine
+            .run_archives(
+                &deployment(),
+                Some(rig.runtime.as_ref()),
+                Some(&rig.registry),
+                Duration::ZERO
+            )
+            .await
+            .is_err());
+        let old_id = engine.ledger.rows().unwrap()[0].source.id.clone();
+        std::fs::write(rig.wal(), &bytes).unwrap();
+        rig.write(&[run_started("newer-run", 9000), record(json!({"type":"run_finished","reason":"cancelled","ts_ms":9001,"usage":{},"retries_used":0}))]);
+        let newer_bytes = std::fs::read(rig.wal()).unwrap();
+        let newer = folder.join("fold-2000.ark");
+        {
+            let _pass = broca_core::lease::acquire_archive_pass(&rig.dir).unwrap();
+            let mut writer = broca_wal::archive::ArchiveWriter::create(&newer)
+                .unwrap()
+                .with_feature_floor(rig.dir.join(broca_wal::FEATURE_FLOOR_FILENAME));
+            writer
+                .append(&broca_core::session_addr(&key()), &newer_bytes)
+                .unwrap();
+            writer.seal().unwrap();
+            std::fs::remove_file(rig.wal()).unwrap();
+        }
+        let old_archive = std::fs::read(&older).unwrap();
+        let new_archive = std::fs::read(&newer).unwrap();
+        engine.crash = None;
+        engine
+            .resume_one_for_test(&old_id, &deployment(), rig.runtime.as_ref(), &rig.registry)
+            .await
+            .unwrap();
+        let row = engine.ledger.row(&old_id).unwrap().unwrap();
+        assert_eq!(row.outcome.as_deref(), Some("failed"));
+        assert_eq!(row.refusal.as_deref(), Some("newer_archive"));
+        assert_eq!(std::fs::read(&older).unwrap(), old_archive);
+        assert_eq!(std::fs::read(&newer).unwrap(), new_archive);
+        assert!(!broca_wal::session_storage_head(
+            &rig.dir,
+            StorageClass::Ordinary,
+            &broca_core::session_addr(&key())
+        )
+        .exists());
+        engine
+            .run_archives(
+                &deployment(),
+                Some(rig.runtime.as_ref()),
+                Some(&rig.registry),
+                Duration::ZERO,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            engine.ledger.progress().unwrap().outcomes.get("converted"),
+            Some(&1)
+        );
+        assert!(!older.exists());
+        assert!(!newer.exists());
+    }
+
+    #[tokio::test]
+    async fn cutover_crashes_resume_each_ledger_and_publication_boundary() {
+        for boundary in [
+            "recovering",
+            "staging",
+            "verifying",
+            "verified",
+            "publishing",
+            "rename_logs",
+            "sync_data",
+            "publish_head",
+            "awaiting_backup",
+            "backing_up",
+            "done",
+        ] {
+            let rig = Rig::start(&format!("cutover-crash-{boundary}")).await;
+            let before = rig.write_session();
+            let mut engine = engine(&rig, false, true);
+            engine.crash = Some(boundary);
+            let first = engine
+                .run_live(
+                    &deployment(),
+                    Some(rig.runtime.as_ref()),
+                    Some(&rig.registry),
+                )
+                .await;
+            assert!(first.is_err(), "cut {boundary} wasn't reached");
+            drop(engine);
+            let engine = Engine::configured(
+                &rig.dir,
+                Config {
+                    archives: false,
+                    live_at_startup: true,
+                    backup_root: Some(rig.dir.with_extension("converted-sources")),
+                },
+            )
+            .unwrap()
+            .unwrap();
+            engine
+                .run_live(
+                    &deployment(),
+                    Some(rig.runtime.as_ref()),
+                    Some(&rig.registry),
+                )
+                .await
+                .unwrap();
+            let rows = engine.ledger.rows().unwrap();
+            assert_eq!(rows[0].step, "done", "{boundary}: {rows:?}");
+            assert_eq!(rows[0].outcome.as_deref(), Some("converted"));
+            assert_eq!(std::fs::read(&rows[0].source.backup).unwrap(), before);
+            assert!(rig.registry.kept_in_new_storage(&key()).unwrap());
+            assert!(!rig.wal().exists());
+        }
+    }
 }

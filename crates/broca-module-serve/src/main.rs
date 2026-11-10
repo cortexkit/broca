@@ -96,6 +96,13 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             }
             return Ok(());
         }
+        LaunchArgs::ConvertClone { root, backup } => {
+            let report = broca_module_serve::session_conversion::rehearse(&root, &backup)
+                .await
+                .map_err(ServeIoError)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            return Ok(());
+        }
         LaunchArgs::Daemon(path) => path,
     };
     // BROCA RESOLVES ITS OWN MODULE ID AND THE LOGGER USES THAT ANSWER. Reading the variable
@@ -327,6 +334,16 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         ))
     })?;
     create_state_directories(&state_root)?;
+    let conversion_config =
+        broca_module_serve::session_conversion::Config::load_default().map_err(ServeIoError)?;
+    let conversion = broca_module_serve::session_conversion::Engine::configured(
+        &state_root,
+        conversion_config.clone(),
+    )
+    .map_err(ServeIoError)?;
+    if let Some(conversion) = &conversion {
+        conversion.publish_health();
+    }
     // A move of a session into the new storage that a crash interrupted is undone or
     // finished from its journal before anything sweeps the state root or opens a session.
     let mut unsettled_moves =
@@ -341,7 +358,10 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             "could not publish the backup catalog; continuing to serve: {error}"
         );
     }
-    let _archive_timer = archive_config.spawn(state_root.clone());
+    // A cutover owns the archive containers until their members have moved. Do not launch a
+    // competing archive-packing job while either conversion switch is enabled.
+    let _archive_timer =
+        (!conversion_config.enabled()).then(|| archive_config.spawn(state_root.clone()));
     let lease_store = Arc::new(FileLeaseStore::new(state_root.join("leases")));
     let bus_hints = Arc::new(broca_module_serve::bus_events::Hints::default());
     let mut wal_store = FileWalStore::with_config(state_root.join("wal"), wal_config)
@@ -844,6 +864,9 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     unsettled_moves.dedup();
     registry.refuse_unsettled_moves(unsettled_moves);
     let registry = Arc::new(registry);
+    if let Some(conversion) = &conversion {
+        conversion.install_guard(registry.as_ref());
+    }
     // `session.restore_from_backup` repairs sessions kept in the new storage after their files
     // came back from a backup, holding each one it writes as a move does.
     registry.set_store_restorer(Arc::new(
@@ -889,14 +912,18 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
                 legacy.session_runs(session)
             }));
         }
-        registry.set_store_mover(Arc::new(mover));
+        let mover = Arc::new(mover);
+        if let Some(conversion) = &conversion {
+            conversion.set_mover(Arc::clone(&mover));
+        }
+        registry.set_store_mover(mover);
     }
     // The deployment key is read off the startup path: the module serves today's sessions at
     // once, and sessions kept in the new storage from when the key loads.
     let _store_key = tokio::spawn(
         broca_module_serve::store_key::KeyLoader {
             source: store_key_source,
-            slot: store_slot,
+            slot: Arc::clone(&store_slot),
             setup: store_setup,
             backoff: Default::default(),
         }
@@ -1121,7 +1148,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         process_started,
     )
     .await;
-    let _crash_orphan_seal = {
+    let crash_orphan_seal = {
         let registry = Arc::clone(&registry);
         #[cfg(feature = "test-clock")]
         let seal_gate = state_root.join(CRASH_ORPHAN_SEAL_GATE);
@@ -1255,6 +1282,50 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             }
         })
     };
+    let _conversion = conversion.map(|engine| {
+        let registry = Arc::clone(&registry);
+        let slot = Arc::clone(&store_slot);
+        tokio::spawn(async move {
+            let result = broca_module_serve::session_conversion::after_startup_recovery(
+                async {
+                    crash_orphan_seal
+                        .await
+                        .map_err(|error| format!("startup recovery did not complete: {error}"))
+                },
+                async {
+                    let stopping = registry.stopping_signal();
+                    let runtime = loop {
+                        if let Some(runtime) = slot.creating_runtime() {
+                            break runtime;
+                        }
+                        tokio::select! {
+                            _ = stopping.cancelled() => return Ok(()),
+                            _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+                        }
+                    };
+                    engine
+                        .run_live(
+                            runtime.deployment(),
+                            Some(runtime.as_ref()),
+                            Some(registry.as_ref()),
+                        )
+                        .await?;
+                    engine
+                        .run_archives(
+                            runtime.deployment(),
+                            Some(runtime.as_ref()),
+                            Some(registry.as_ref()),
+                            Duration::from_millis(250),
+                        )
+                        .await
+                },
+            )
+            .await;
+            if let Err(error) = result {
+                engine.record_error(error);
+            }
+        })
+    });
     let stream = connect(&conn_path).await?;
     let (read_half, write_half) = tokio::io::split(stream);
     let serving = broca_module_serve::serve::serve_connection_with_llm_tools(
@@ -1641,6 +1712,7 @@ enum LaunchArgs {
     Daemon(PathBuf),
     Version,
     WalKnownFeatures,
+    ConvertClone { root: PathBuf, backup: PathBuf },
 }
 
 fn parse_launch_args(args: impl IntoIterator<Item = OsString>) -> Result<LaunchArgs, String> {
@@ -1648,6 +1720,8 @@ fn parse_launch_args(args: impl IntoIterator<Item = OsString>) -> Result<LaunchA
     let mut conn_path = None;
     let mut version = false;
     let mut wal_known_features = false;
+    let mut clone_root = None;
+    let mut clone_backup = None;
     while let Some(arg) = args.next() {
         if arg == "--subc" {
             if conn_path.is_some() {
@@ -1658,6 +1732,19 @@ fn parse_launch_args(args: impl IntoIterator<Item = OsString>) -> Result<LaunchA
                 return Err(format!("missing value for --subc; got {value:?}"));
             }
             conn_path = Some(PathBuf::from(value));
+        } else if arg == "--convert-clone" || arg == "--converted-sources" {
+            let value = args.next().ok_or("missing conversion path")?;
+            if value.is_empty() || value.to_string_lossy().starts_with('-') {
+                return Err("missing conversion path".into());
+            }
+            let target = if arg == "--convert-clone" {
+                &mut clone_root
+            } else {
+                &mut clone_backup
+            };
+            if target.replace(PathBuf::from(value)).is_some() {
+                return Err("duplicate conversion path".into());
+            }
         } else if arg == "--version" || arg == "-V" {
             version = true;
         } else if arg == "--wal-known-features" {
@@ -1665,6 +1752,15 @@ fn parse_launch_args(args: impl IntoIterator<Item = OsString>) -> Result<LaunchA
         } else {
             return Err(format!("unknown argument {arg:?}"));
         }
+    }
+    if clone_root.is_some() || clone_backup.is_some() {
+        if conn_path.is_some() || version || wal_known_features {
+            return Err("clone conversion cannot start a daemon or run a probe".into());
+        }
+        return Ok(LaunchArgs::ConvertClone {
+            root: clone_root.ok_or("missing --convert-clone")?,
+            backup: clone_backup.ok_or("missing --converted-sources")?,
+        });
     }
     if version {
         return Ok(LaunchArgs::Version);
@@ -8106,8 +8202,8 @@ fn create_state_directories(state_root: &std::path::Path) -> Result<(), ServeIoE
         })
         .map_err(|e| ServeIoError(format!("create lease directory: {e}")))?;
 
-    // The new storage's three class roots and its moves folder are created here, not on the new
-    // storage's first write, because the backup descriptor names them, and engram refuses a
+    // Storage and conversion folders are created here, not on their first write, because the
+    // backup descriptor names them, and engram refuses a
     // capture whose declared path is missing.
     for name in [
         "wal-durable",
@@ -8116,6 +8212,7 @@ fn create_state_directories(state_root: &std::path::Path) -> Result<(), ServeIoE
         broca_wal::SESSION_STORAGE_DIR,
         broca_wal::SESSION_STORAGE_EPHEMERAL_DIR,
         broca_wal::SESSION_STORAGE_MOVES_DIR,
+        "conversion-staging",
     ] {
         let path = state_root.join(name);
         match broca_owner_only::create_dir(&path) {
@@ -8132,6 +8229,9 @@ fn create_state_directories(state_root: &std::path::Path) -> Result<(), ServeIoE
 
     broca_core::media_store::create_media_directories(state_root)
         .map_err(|error| ServeIoError(error.to_string()))?;
+    // Cutover-only device-local recovery state must exist even with conversion disabled:
+    // a missing declared database would block every module's backup capture.
+    broca_module_serve::conversion_ledger::Ledger::open(state_root).map_err(ServeIoError)?;
     Ok(())
 }
 
@@ -8210,6 +8310,22 @@ mod windows_acl_tests {
 mod state_directory_tests {
     use super::{create_state_directories, write_engram_catalog, EMBEDDED_ENGRAM_CATALOG};
     use std::path::PathBuf;
+
+    #[test]
+    fn cutover_recovery_artifacts_exist_before_catalog_even_when_switches_are_off() {
+        let root = fresh_root("cutover-artifacts");
+        assert!(!broca_module_serve::session_conversion::Config::default().enabled());
+        create_state_directories(&root).unwrap();
+        assert!(root.join("conversion-staging").is_dir());
+        assert!(root
+            .join(broca_module_serve::conversion_ledger::FILE)
+            .is_file());
+        let ledger = broca_module_serve::conversion_ledger::Ledger::open(&root).unwrap();
+        assert_eq!(ledger.progress().unwrap().sources, 0);
+        write_engram_catalog(&root).unwrap();
+        broca_owner_only::validate(root.join("conversion-staging")).unwrap();
+        broca_owner_only::validate(root.join(broca_module_serve::conversion_ledger::FILE)).unwrap();
+    }
 
     // broca's owner-only scratch root, not the system temp directory: on Windows the owner-only
     // checks refuse state under a shared temp folder.

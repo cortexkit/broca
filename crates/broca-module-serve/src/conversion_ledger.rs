@@ -29,6 +29,8 @@ pub struct Row {
     pub step: String,
     pub outcome: Option<String>,
     pub refusal: Option<String>,
+    /// Bound under the session fence before staging; empty while only discovered/recovering.
+    pub source_sha256: String,
 }
 
 #[derive(Debug, Default, Clone, Serialize, PartialEq, Eq)]
@@ -61,12 +63,14 @@ impl Ledger {
                      step TEXT NOT NULL,
                      outcome TEXT,
                      refusal_class TEXT,
+                     source_sha256 TEXT NOT NULL,
                      destination TEXT NOT NULL,
                      backup TEXT NOT NULL,
                      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
                      updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
                  );
-                 CREATE INDEX IF NOT EXISTS sources_path ON sources(source_path);",
+                 CREATE INDEX IF NOT EXISTS sources_path ON sources(source_path);
+                 CREATE INDEX IF NOT EXISTS sources_path_step ON sources(source_path,step);",
             )
             .map_err(|error| error.to_string())?;
         Ok(Self {
@@ -81,8 +85,8 @@ impl Ledger {
             .map_err(|error| error.to_string())?
             .execute(
                 "INSERT INTO sources
-                    (source_id,source_path,member,storage_class,step,destination,backup)
-                 VALUES (?1,?2,?3,?4,'discovered',?5,?6)
+                    (source_id,source_path,member,storage_class,step,destination,backup,source_sha256)
+                 VALUES (?1,?2,?3,?4,'discovered',?5,?6,'')
                  ON CONFLICT(source_id) DO NOTHING",
                 params![
                     source.id,
@@ -122,13 +126,24 @@ impl Ledger {
         Ok(())
     }
 
+    pub fn bind_source(&self, id: &str, sha256: &str) -> Result<(), String> {
+        let changed = self.connection.lock().map_err(|error| error.to_string())?.execute(
+            "UPDATE sources SET source_sha256=?2,updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE source_id=?1",
+            params![id,sha256],
+        ).map_err(|error| error.to_string())?;
+        if changed != 1 {
+            return Err(format!("conversion source {id} is absent from the ledger"));
+        }
+        Ok(())
+    }
+
     pub fn row(&self, id: &str) -> Result<Option<Row>, String> {
         self.connection
             .lock()
             .map_err(|error| error.to_string())?
             .query_row(
                 "SELECT source_id,source_path,member,storage_class,destination,backup,
-                        step,outcome,refusal_class FROM sources WHERE source_id=?1",
+                        step,outcome,refusal_class,source_sha256 FROM sources WHERE source_id=?1",
                 [id],
                 read_row,
             )
@@ -136,12 +151,27 @@ impl Ledger {
             .map_err(|error| error.to_string())
     }
 
+    pub fn unfinished_path(&self, path: &str) -> Result<bool, String> {
+        self.connection.lock().map_err(|error| error.to_string())?.query_row("SELECT EXISTS(SELECT 1 FROM sources WHERE source_path=?1 AND step IN ('discovered','recovering','staging','verifying','verified','publishing','failed'))", [path], |row| row.get(0)).map_err(|error| error.to_string())
+    }
+
+    pub fn rows_for_path(&self, path: &str) -> Result<Vec<Row>, String> {
+        let connection = self.connection.lock().map_err(|error| error.to_string())?;
+        let mut statement = connection.prepare("SELECT source_id,source_path,member,storage_class,destination,backup,step,outcome,refusal_class,source_sha256 FROM sources WHERE source_path=?1 ORDER BY source_id").map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([path], read_row)
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        Ok(rows)
+    }
+
     pub fn rows(&self) -> Result<Vec<Row>, String> {
         let connection = self.connection.lock().map_err(|error| error.to_string())?;
         let mut statement = connection
             .prepare(
                 "SELECT source_id,source_path,member,storage_class,destination,backup,
-                             step,outcome,refusal_class FROM sources ORDER BY source_id",
+                             step,outcome,refusal_class,source_sha256 FROM sources ORDER BY source_id",
             )
             .map_err(|error| error.to_string())?;
         let rows = statement
@@ -192,6 +222,7 @@ fn read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
         step: row.get(6)?,
         outcome: row.get(7)?,
         refusal: row.get(8)?,
+        source_sha256: row.get(9)?,
     })
 }
 
@@ -214,6 +245,7 @@ mod tests {
         {
             let ledger = Ledger::open(&root).unwrap();
             ledger.discover(&source).unwrap();
+            ledger.bind_source(&source.id, &"a".repeat(64)).unwrap();
             ledger
                 .advance(&source.id, "backing_up", Some("refused"), Some("damaged"))
                 .unwrap();
@@ -222,6 +254,7 @@ mod tests {
         ledger.discover(&source).unwrap();
         let row = ledger.row(&source.id).unwrap().unwrap();
         assert_eq!(row.step, "backing_up");
+        assert_eq!(row.source_sha256, "a".repeat(64));
         assert_eq!(row.refusal.as_deref(), Some("damaged"));
         assert_eq!(ledger.rows().unwrap(), vec![row]);
         let progress = ledger.progress().unwrap();

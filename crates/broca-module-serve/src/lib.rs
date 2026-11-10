@@ -51,6 +51,7 @@ pub mod send_audit;
 pub mod serve;
 mod session_address_health;
 pub mod session_class;
+pub mod session_conversion;
 mod session_inventory;
 pub mod session_lookup;
 mod session_readers;
