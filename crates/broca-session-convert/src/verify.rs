@@ -1398,7 +1398,7 @@ async fn next_request(
             .map_err(|error| mismatch(NEXT_REQUEST, format!("the conversion: {}", error.0)))?;
         // Reproduce the staged prefix at its stored origin. The synthetic next send adds only
         // a run input and step boundary, with no Input.receipt_seq naming a new Steer or Delivery.
-        converted.start_at(verify.converted.seq_offset + 1);
+        converted.start_at(verify.converted.first_seq.unwrap_or(crate::FIRST_SEQ));
         let staged = &verify.converted.records;
         if !converted.records.starts_with(staged) {
             return Err(mismatch(

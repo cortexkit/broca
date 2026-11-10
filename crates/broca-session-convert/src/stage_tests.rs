@@ -637,6 +637,40 @@ fn a_turn_system_deliverys_receipt_survives_staging_and_the_media_fold() {
 }
 
 #[test]
+fn conversion_rebasing_keeps_legacy_views_at_their_storage_sequences() {
+    let root = scratch("legacy-view-origin");
+    let (records, lineage) = written(&root);
+    let lineage = lineage.map(|id| id.to_string());
+    let mut converted = crate::convert(&records, lineage.as_deref()).unwrap();
+    // Legacy-view pointers already account for the destination's initial WriterOpened record.
+    // Receipts instead count from 1 when inverse::invert reconstructs the original WAL before
+    // storage. Keep the legacy-view pointers' existing origin when storing.
+    let view_seq = crate::FIRST_SEQ + 3;
+    let Record::EntryFacts(facts) = converted
+        .records
+        .iter_mut()
+        .find(|record| matches!(record, Record::EntryFacts(_)))
+        .unwrap()
+    else {
+        unreachable!()
+    };
+    facts.legacy_view_seq = Some(view_seq);
+    for (first, expected) in [
+        (crate::FIRST_SEQ, view_seq),
+        (crate::FIRST_SEQ + 7, view_seq + 7),
+        (crate::FIRST_SEQ, view_seq),
+    ] {
+        converted.start_at(first);
+        let recorded = converted.records.iter().find_map(|record| match record {
+            Record::EntryFacts(facts) => facts.legacy_view_seq,
+            _ => None,
+        });
+        assert_eq!(recorded, Some(expected));
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn a_legacy_request_replay_limit_is_verified_and_counted_once() {
     let root = scratch("legacy-replay-limit");
     let (mut records, lineage) = written(&root);
