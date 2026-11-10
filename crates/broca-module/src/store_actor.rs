@@ -1891,11 +1891,11 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     ///   writes just that end;
     /// - with no unfinished run, the first queued send drains.
     ///
-    /// A paused run stays paused: a held run parks until a late result resumes its original
-    /// batch, and a sign-in pause waits for its retry. An interrupt queued behind a paused run by
-    /// a process that stopped before ending that run ends it now, as today's drain does
-    /// (`end_paused`). Resuming after a restart and the account-limit pause's timer aren't
-    /// recovered on this storage yet, so nothing is written for them.
+    /// A held run parks until a late result resumes its original batch, even with an interrupt
+    /// queued behind it, as today's held-call recovery does. A sign-in pause waits for its retry,
+    /// unless an interrupt was queued before the process stopped: it ends the paused run now,
+    /// as today's drain does (`end_paused`). Resuming after a restart and the account-limit pause's
+    /// timer aren't recovered on this storage yet, so nothing is written for them.
     async fn recover(&mut self) {
         self.bill_owed().await;
         if self.park_held().await {

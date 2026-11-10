@@ -317,6 +317,121 @@ impl Side {
         )
         .await
     }
+
+    /// Seeds the crash boundary after the interrupt's queue append, before its cancellation
+    /// finalizer can run. This side has no actor yet, so no writer can race the seeded record.
+    async fn seed_queued_interrupt(&self) {
+        use broca_session_loop::queue::{self, Queued, Receipt};
+        use broca_session_store::backend::{LocalBackend, SessionAddr};
+        use broca_session_store::record::Record;
+        let request = request("stop and do this");
+        let at = Queued {
+            written_at_ms: Some(1),
+            ts_ms: None,
+            delivery: Some(broca_protocol::Delivery::Interrupt),
+        };
+        if self.store {
+            let runtime = self.registry.store_runtime().unwrap();
+            let class = runtime.class_of(&self.key).unwrap().unwrap();
+            let backend = LocalBackend::new(class.store_root(&self.dir));
+            let mut session = Session::load(
+                backend,
+                SessionAddr(broca_core::session_addr(&self.key)),
+                &crate::store_open::triple(&self.key),
+                runtime.deployment(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                session.operations.run.as_ref().unwrap().paused,
+                Some(broca_protocol::PauseReason::ToolHeld)
+            );
+            let mut parts = runtime.parts_for(class, self.cipher).clone();
+            let queued = queue::queued_send(
+                "sub-i1",
+                None,
+                &request,
+                &Receipt::default(),
+                at,
+                None,
+                &mut parts,
+            )
+            .unwrap();
+            Writer::append(&mut session, &[Record::QueuedSend(queued)], true)
+                .await
+                .unwrap();
+        } else {
+            assert!(self
+                .executor
+                .wal
+                .read_records(&self.key)
+                .unwrap()
+                .iter()
+                .any(|frame| matches!(
+                    &frame.record,
+                    broca_wal::WalRecord::RunPaused {
+                        reason: broca_protocol::PauseReason::ToolHeld,
+                        ..
+                    }
+                )));
+            self.executor
+                .wal
+                .open(&self.key)
+                .unwrap()
+                .append(
+                    1,
+                    &broca_wal::WalRecord::Queued {
+                        submission_id: broca_protocol::SubmissionId("sub-i1".into()),
+                        request: Box::new(request),
+                        written_at_ms: at.written_at_ms,
+                        ts_ms: at.ts_ms,
+                        delivery: at.delivery,
+                        request_identity_digest: None,
+                        principal: None,
+                        sent_by: None,
+                        retention: None,
+                        keep_warm: None,
+                        conversation_key: None,
+                        send_id: None,
+                        title: None,
+                        hooks: None,
+                        message_marks: None,
+                    },
+                    true,
+                )
+                .unwrap();
+        }
+    }
+
+    async fn pending(&self) -> Vec<String> {
+        if self.store {
+            self.registry
+                .store_runtime()
+                .unwrap()
+                .current_view(&self.key)
+                .await
+                .unwrap()
+                .unwrap()
+                .operations
+                .queue
+                .iter()
+                .map(|pending| pending.submission_id.clone())
+                .collect()
+        } else {
+            let records = self
+                .executor
+                .wal
+                .read_records(&self.key)
+                .unwrap()
+                .into_iter()
+                .map(|frame| frame.record)
+                .collect::<Vec<_>>();
+            broca_core::queue::pending_submissions(&records)
+                .into_iter()
+                .map(|pending| pending.submission_id.0)
+                .collect()
+        }
+    }
 }
 
 fn comparable(mut value: Value) -> Value {
@@ -335,8 +450,53 @@ fn comparable(mut value: Value) -> Value {
 
 cipher_tests!(
     held_status_and_late_continuation_match_after_restart,
-    boot_sweep_seals_store_orphans_without_a_run_index
+    boot_sweep_seals_store_orphans_without_a_run_index,
+    a_held_pause_keeps_a_queued_interrupt_parked_after_restart
 );
+
+/// A crash after an interrupt is queued but before it ends a held run leaves both parked on
+/// open. Today's held-call recovery returns before its ordinary paused-run interrupt drain.
+async fn a_held_pause_keeps_a_queued_interrupt_parked_after_restart(cipher: Cipher) {
+    let mut initial = Vec::new();
+    let mut restarted = Vec::new();
+    let mut statuses = Vec::new();
+    let mut results = Vec::new();
+    let mut queues = Vec::new();
+    for store in [false, true] {
+        let side = Side::new(store, cipher, vec![super::super::tests::read_step("m1")]).await;
+        side.send().await;
+        side.idle().await;
+        let recovered = side.restarted().await;
+        recovered.seed_queued_interrupt().await;
+        // The first command opens the actor and waits for its startup recovery to finish.
+        assert!(matches!(
+            recovered
+                .registry
+                .route_status(&recovered.key)
+                .await
+                .unwrap(),
+            LineageStatus::Idle
+        ));
+        let status = recovered.status().await;
+        assert_eq!(status["state"], "active");
+        assert_eq!(status["held_calls"].as_array().unwrap().len(), 1);
+        statuses.push(comparable(status));
+        results.push(comparable(recovered.result().await));
+        let queue = recovered.pending().await;
+        assert_eq!(queue, ["sub-i1"]);
+        queues.push(queue);
+        assert_eq!(recovered.executor.tools.0.load(Ordering::SeqCst), 1);
+        assert!(recovered.executor.provider.inner.calls().is_empty());
+        initial.push(side);
+        restarted.push(recovered);
+    }
+    assert_eq!(statuses[1], statuses[0]);
+    assert_eq!(results[1], results[0]);
+    assert_eq!(queues[1], queues[0]);
+    for side in initial.iter().chain(&restarted) {
+        assert!(side.registry.stop_and_seal().await);
+    }
+}
 
 async fn held_status_and_late_continuation_match_after_restart(cipher: Cipher) {
     let mut initial = Vec::new();
