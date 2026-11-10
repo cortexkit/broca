@@ -132,8 +132,9 @@ crate::message! {
         /// The roots of the transcript and ledger directories (see `directory`).
         13 opt transcript_dir: crate::directory::PageRef,
         14 opt ledger_dir: crate::directory::PageRef,
-        /// Deletions waiting out the grace period. Every change runs due deletions before it
-        /// commits, so this holds only the changes of the last grace period.
+        /// Deletions waiting out the grace period (see `session::collect`). The module collects
+        /// a session when its actor opens it, after each seal, and in a sweep of the sessions no
+        /// actor holds, so this holds about the changes of the last grace period.
         15 rep pending: PendingDeletion,
         /// The id index's root object (see `idindex`). Absent until the first seal.
         16 opt id_index: String,
@@ -209,6 +210,14 @@ pub fn stored_cipher(bytes: &[u8]) -> Result<Cipher, HeadError> {
 pub fn stored_triple(bytes: &[u8]) -> Result<SessionTriple, HeadError> {
     let body = bytes.get(TAG_LEN..).ok_or(HeadError::Malformed)?;
     Ok(Head::decode(body).map_err(HeadError::Decode)?.triple)
+}
+
+/// What a stored head is waiting to delete (see [`PendingDeletion`]), read without checking the
+/// head. Only for deciding whether a collection is due; the collection then opens the head and
+/// checks it.
+pub fn stored_pending(bytes: &[u8]) -> Result<Vec<PendingDeletion>, HeadError> {
+    let body = bytes.get(TAG_LEN..).ok_or(HeadError::Malformed)?;
+    Ok(Head::decode(body).map_err(HeadError::Decode)?.pending)
 }
 
 /// Opens a stored head: decodes it, then checks it in the mode it names. An encrypted head's data

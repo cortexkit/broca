@@ -39,7 +39,9 @@
 //! - `session.warm` on an idle session, re-sending the request its loop would send next (see
 //!   `warm`);
 //! - a send under an agent-run scope, and a send reopening the session's scope at a later epoch,
-//!   admitted by today's scope rules (see `scopes`).
+//!   admitted by today's scope rules (see `scopes`);
+//! - deleting what the session's seals replaced once the grace period is over, at the first
+//!   idle moment after it opens the session and after each seal (see `collect_unreferenced`).
 //!
 //! Every other command, and every send that needs an admission rule not built here yet, is
 //! refused by name with nothing written. Today's actor is the reference for each rule still to
@@ -143,6 +145,13 @@ pub struct StoreActor<B: SessionBackend> {
     /// when it did. A session it created that still has it when the actor closes holds nothing
     /// anyone sent, and is deleted (see [`StoreActor::created_here`]).
     created: Option<u64>,
+    /// Set when the session may hold deletions that have come due: when the actor opens it and
+    /// after each seal. They run at the actor's next idle moment, or as it closes (see
+    /// [`StoreActor::collect_unreferenced`]).
+    collect_due: bool,
+    /// The wall clock the session's deletions come due by, in milliseconds since the epoch: the
+    /// clock its runs stamp their seals with.
+    now_ms: Arc<dyn Fn() -> u64 + Send + Sync>,
 }
 
 /// How an actor lives in the module's registry. Tests serve an actor without one.
@@ -309,6 +318,8 @@ enum Event {
     ),
     /// The session's idle deadline passed with no run active and no warm being sent.
     IdleDeadline,
+    /// The session is idle and may hold deletions that have come due.
+    Collect,
 }
 
 /// The media fold build's end, or never when none is building.
@@ -354,7 +365,17 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             warm: None,
             ordered_scope: None,
             created: None,
+            collect_due: false,
+            now_ms: Arc::new(|| broca_core::run::epoch_millis().unwrap_or(0)),
         }
+    }
+
+    /// Reads the time the session's deletions come due by from `now_ms`, in place of the wall
+    /// clock.
+    #[cfg(test)]
+    pub(crate) fn with_clock(mut self, now_ms: Arc<dyn Fn() -> u64 + Send + Sync>) -> Self {
+        self.now_ms = now_ms;
+        self
     }
 
     /// Marks the session as one this actor created. If the actor closes with nothing appended
@@ -600,9 +621,11 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     /// closes it. A run still running when the channel closes is ended as a module stop ends it.
     pub async fn serve(mut self, commands: mpsc::UnboundedReceiver<LineageCmd>) -> Session<B> {
         let mut commands = Commands::from(commands);
-        self.serve_until_exit(&mut commands, None, None, None, None)
+        let exit = self
+            .serve_until_exit(&mut commands, None, None, None, None)
             .await;
         self.stop_for_shutdown().await;
+        self.collect_on_exit(&exit).await;
         self.session
     }
 
@@ -637,6 +660,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             }
         }
         self.stop_for_shutdown().await;
+        self.collect_on_exit(&exit).await;
         life.run_in_flight
             .store(0, std::sync::atomic::Ordering::SeqCst);
         let _ = tokio::time::timeout(
@@ -685,6 +709,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         let seal = seal.unwrap_or(&never);
         self.seal = seal.clone();
         self.recover().await;
+        // Deletions that came due while the session was closed run once the actor is idle, so
+        // they never hold up a command or a run.
+        self.collect_due = true;
         let idle_after = |now: tokio::time::Instant| idle_ttl.map(|ttl| now + ttl);
         let mut idle_deadline = idle_after(tokio::time::Instant::now());
         // What the registry was last told holds the session open; `None` until it took a note,
@@ -706,6 +733,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 }
             }
             let built = media_built(&mut self.media_build);
+            let collect_due = self.collect_due;
             // A warm the executor is sending ends whatever else the actor waits on.
             let has_warm = self.warm.is_some();
             let warm_task = self.warm.as_mut().map(|pending| &mut pending.task);
@@ -734,6 +762,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                     result = warmed, if has_warm => Event::Warmed(result),
                     built = built => Event::MediaBuilt(built),
                     command = commands.recv() => Event::Command(command),
+                    // Only once no command is waiting: the session is idle.
+                    () = std::future::ready(()), if collect_due => Event::Collect,
                     _ = async {
                         match idle_deadline {
                             Some(deadline) => tokio::time::sleep_until(deadline).await,
@@ -760,6 +790,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 Event::Done(end) => self.finish_run(end).await,
                 Event::MediaBuilt(built) => self.media_built(built).await,
                 Event::Warmed(result) => self.finish_warm(result).await,
+                Event::Collect => self.collect_unreferenced().await,
                 Event::Command(None) => return Exit::Closed,
                 Event::Command(Some(command)) => {
                     idle_deadline = idle_after(tokio::time::Instant::now());
@@ -774,6 +805,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
 
     /// Serves one write the active run asks for.
     async fn serve_request(&mut self, request: broca_session_loop::shared::Request) {
+        // A seal's own deletions come due a grace period after it, but earlier ones may be due.
+        let seals = matches!(request, broca_session_loop::shared::Request::Seal { .. });
         let active = self
             .run
             .as_mut()
@@ -795,6 +828,42 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         };
         active.link.serve(&mut writer, request).await;
         self.answer_admission();
+        if seals {
+            self.collect_due = true;
+        }
+    }
+
+    /// Deletes what the session's committed changes stopped naming, once it has gone unnamed for
+    /// the grace period (see `broca_session_store::session::collect`). With nothing due, which
+    /// is usual since a change's deletions come due a day after it, nothing is read or written.
+    /// The actor is the session's only writer, so no append or seal runs meanwhile.
+    async fn collect_unreferenced(&mut self) {
+        self.collect_due = false;
+        let now_ms = (self.now_ms)();
+        match self.session.collect(now_ms).await {
+            Ok(0) => {}
+            Ok(changes) => tracing::info!(
+                target: "broca.store_actor",
+                session = %self.key.session,
+                changes,
+                "deleted what the session's changes stopped naming",
+            ),
+            Err(error) => tracing::warn!(
+                target: "broca.store_actor",
+                session = %self.key.session,
+                error = ?error,
+                "what the session's changes stopped naming could not be deleted; the next open \
+                 or the store's collection sweep retries",
+            ),
+        }
+    }
+
+    /// Runs deletions still due when the actor stops serving, unless the module is stopping or
+    /// the session is about to be deleted whole.
+    async fn collect_on_exit(&mut self, exit: &Exit) {
+        if self.collect_due && !matches!(exit, Exit::Stop) && !self.created_and_untouched() {
+            self.collect_unreferenced().await;
+        }
     }
 
     /// Serves the active run, and nothing else, until no run is active.
@@ -825,7 +894,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 }
                 Event::Done(end) => return self.finish_run(end).await,
                 Event::MediaBuilt(built) => self.media_built(built).await,
-                Event::Command(_) | Event::Warmed(_) | Event::IdleDeadline => {
+                Event::Command(_) | Event::Warmed(_) | Event::IdleDeadline | Event::Collect => {
                     unreachable!("no command is read here, and no idle deadline is waited on")
                 }
             }
@@ -3727,6 +3796,8 @@ mod warm;
 
 #[cfg(test)]
 mod billing_tests;
+#[cfg(test)]
+mod collect_tests;
 #[cfg(test)]
 mod differential;
 #[cfg(test)]

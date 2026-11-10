@@ -966,6 +966,8 @@ mod revert;
 pub use revert::{RevertRefusal, Reverted};
 mod seal;
 pub use seal::{Carry, Sealed, GRACE_MS};
+mod collect;
+pub use collect::{collect_stored, stored_due};
 pub mod restore;
 
 #[cfg(test)]

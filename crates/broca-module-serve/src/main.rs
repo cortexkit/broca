@@ -854,6 +854,20 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             Arc::clone(&store_move_leases),
         ),
     ));
+    // Deletes what sealed changes left behind in sessions kept in the new storage that no actor
+    // holds, such as finished workers' sessions (see `store_collect`). An actor collects the
+    // session it serves itself.
+    let _store_collect = tokio::spawn(
+        Arc::new(
+            broca_module::store_collect::StoreCollectSweep::for_registry(
+                state_root.clone(),
+                Arc::clone(&store_slot),
+                Arc::clone(&store_move_leases),
+                registry.as_ref().clone(),
+            ),
+        )
+        .run(registry.stopping_signal()),
+    );
     // `session.move_to_store` moves a session into the new storage, creating it in the mode
     // `session_storage.encryption` chose: a plain session once the runtime is open, an
     // encrypted one once the deployment key has loaded (`key_unavailable` until then).

@@ -19,6 +19,7 @@ cipher_tests!(
     a_ledger_seal_keeps_the_whole_transcript_open,
     a_cut_that_does_not_start_an_entry_refuses_and_changes_nothing,
     the_replaced_log_is_deleted_only_after_the_grace_period,
+    a_session_no_writer_holds_is_collected_once_each_grace_is_over,
     a_seal_that_fails_before_its_commit_undoes_itself,
     a_crash_at_any_point_of_a_seal_loads_to_before_or_after_it,
     a_seal_carries_ledger_records_into_the_new_log,
@@ -411,6 +412,64 @@ fn the_replaced_log_is_deleted_only_after_the_grace_period(cipher: Cipher) {
         assert_eq!(session.collect(1_000 + GRACE_MS).await.unwrap(), 1);
         assert_eq!(backend.log_names(&addr()), [new]);
         assert!(session.head().pending.is_empty());
+    });
+}
+
+/// A session no writer holds is collected from its stored head: what each change stopped naming
+/// stays until that change's grace period is over, then goes, and the head is rewritten only
+/// when something was deleted.
+fn a_session_no_writer_holds_is_collected_once_each_grace_is_over(cipher: Cipher) {
+    use crate::session::{collect_stored, stored_due};
+    let backend = MemoryBackend::default();
+    let deployment = deployment(cipher);
+    block_on(async {
+        let (mut session, cut) = history(&backend, cipher).await;
+        let (created, _) = session.open_log();
+        session.seal(Some(cut), 1_000).await.unwrap();
+        let (first, _) = session.open_log();
+        session.append(&[end("c")], true).await.unwrap();
+        session.seal(None, 2_000).await.unwrap();
+        let (open, _) = session.open_log();
+        // The second seal rewrote the directory pages the first one wrote.
+        let replaced = session.head().pending[1].objects.clone();
+        assert!(!replaced.is_empty());
+        session.close().await.unwrap();
+        let at = addr();
+        let stored = || async { backend.read_head(&at).await.unwrap().unwrap() };
+        let collect = |now_ms| collect_stored(&backend, &at, &deployment, now_ms);
+
+        // Inside both grace periods: nothing is due, and nothing is written.
+        let (head, version) = stored().await;
+        assert!(!stored_due(&head, 1_000 + GRACE_MS - 1).unwrap());
+        assert_eq!(collect(1_000 + GRACE_MS - 1).await.unwrap(), 0);
+        assert_eq!(stored().await.1, version);
+        assert!(backend.log_names(&addr()).contains(&created));
+
+        // Past the first seal's grace, inside the second's: only the first's log goes.
+        assert!(stored_due(&head, 2_000 + GRACE_MS - 1).unwrap());
+        assert_eq!(collect(2_000 + GRACE_MS - 1).await.unwrap(), 1);
+        let logs = backend.log_names(&addr());
+        assert!(!logs.contains(&created));
+        assert!(logs.contains(&first));
+        let objects = backend.object_names(&addr());
+        assert!(replaced.iter().all(|object| objects.contains(object)));
+        assert_eq!(stored().await.1, version + 1);
+
+        // Past the second's: its log and the pages it replaced go too.
+        assert_eq!(collect(2_000 + GRACE_MS).await.unwrap(), 1);
+        assert_eq!(backend.log_names(&addr()), [open]);
+        let objects = backend.object_names(&addr());
+        assert!(replaced.iter().all(|object| !objects.contains(object)));
+        let (head, version) = stored().await;
+        assert!(!stored_due(&head, u64::MAX).unwrap());
+        assert_eq!(collect(u64::MAX).await.unwrap(), 0);
+        assert_eq!(stored().await.1, version);
+
+        let loaded = Session::load(&backend, addr(), &triple(), &deployment)
+            .await
+            .unwrap();
+        assert!(loaded.head().pending.is_empty());
+        assert_eq!(loaded.open_log().0, open);
     });
 }
 
