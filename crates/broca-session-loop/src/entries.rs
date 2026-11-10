@@ -837,6 +837,9 @@ pub fn with_facts(batch: Vec<Record>, at: &Placing<'_>) -> Result<Vec<Record>, S
                 pending.push(EntryFacts {
                     client_message_id: facts.send.client_message_id,
                     sender: facts.send.sender,
+                    named_speaker: broca_session_store::record::marks_name_speaker(
+                        facts.send.marks.as_ref(),
+                    ),
                     marks: facts.send.marks,
                     no_display_facts: None,
                     reasoning_summaries: message.map(reasoning_summaries).unwrap_or_default(),
@@ -1281,6 +1284,7 @@ pub fn ride_notice(append: &ResultAppend, calls: &[ToolCallId]) -> Option<RideNo
         call_key: ride.call_key.clone(),
         text: text.to_owned(),
         speaks_for: ride.speaks_for.clone(),
+        named_speaker: broca_session_store::record::named_speaker(ride.speaks_for.as_ref()),
     })
 }
 
@@ -1461,6 +1465,20 @@ fn stored_notice_origin(
     Ok(broca_core::compaction_v2::entries::recorded_notice_origin(
         sender,
         legacy.and_then(|notice| notice.template.as_deref()),
+        marks.as_ref(),
+    ))
+}
+
+/// The agent a message's stored marks (llm-runner's `MessageMarks` JSON) say it carries the
+/// words of.
+fn stored_speaks_for(
+    marks: Option<&serde_json::Value>,
+) -> Result<Option<broca_protocol::SpeaksFor>, String> {
+    let marks = marks
+        .map(|marks| serde_json::from_value::<broca_protocol::MessageMarks>(marks.clone()))
+        .transpose()
+        .map_err(|error| format!("entry speaker marks: {error}"))?;
+    Ok(broca_core::compaction_v2::entries::recorded_speaks_for(
         marks.as_ref(),
     ))
 }
@@ -1749,6 +1767,14 @@ pub fn project(stored: &StoredEntry) -> Result<Entry, String> {
         facts.sender.as_deref(),
         facts.marks.as_ref(),
     )?;
+    // As today's projection attributes them: on the user messages of a marked send, read from
+    // the marks stored with each message, so entries placed before attribution was projected
+    // carry it too.
+    let speaks_for = if stored.message.role == Role::User {
+        stored_speaks_for(facts.marks.as_ref())?
+    } else {
+        None
+    };
     let first = Facts {
         mid: mid.to_owned(),
         ordinal: stored.ordinal,
@@ -1757,6 +1783,7 @@ pub fn project(stored: &StoredEntry) -> Result<Entry, String> {
         completed_at: (stored.message.role == Role::Assistant && facts.native)
             .then_some(written_at),
         notice,
+        speaks_for,
         usage,
         generated_under,
     };
@@ -1848,6 +1875,17 @@ pub fn push_rides(
     }
 }
 
+/// Takes out of `rides` what [`push_rides`] added for message `mid`'s delivered texts.
+pub fn forget_rides(
+    rides: &mut broca_core::compaction_v2::entries::RideEnvelopes,
+    mid: &str,
+    delivered: &[Delivered],
+) {
+    for delivered in delivered {
+        rides.forget(mid, &delivered.part.to_string());
+    }
+}
+
 /// Renders each ride of the window after the result that carries it, as today's loop renders a
 /// ride recorded with its envelope: through the runner's own ride rules
 /// (`broca_core::delivery_order::append_ride`), never joined here. `prompt` holds the window's
@@ -1913,6 +1951,7 @@ mod lifetime_tag_high_tests {
             ));
             conversation.entries.push(EntryState {
                 facts: Some(EntryFacts {
+                    named_speaker: None,
                     ordinal,
                     written_at_ms: None,
                     tag_base: if ordinal == 2 { tag_base } else { 0 },

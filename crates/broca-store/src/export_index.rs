@@ -8,6 +8,10 @@
 //! and `fact_id` makes replay idempotent.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    path::Path,
+    sync::{Arc, Mutex},
+};
 
 use broca_core::{
     compute_segments_for_run, ChargeBasisResolver, ExportCursor, ExportError, ExportFact,
@@ -18,6 +22,48 @@ use broca_wal::FramedRecord;
 use rusqlite::{Connection, OptionalExtension};
 
 use super::SqliteStore;
+
+/// A connection to export_meta, export_facts and export_imported_runs in an existing
+/// run-index.db. It does not depend on the run_index or materialized message tables.
+/// Source identity and high-water getters retain the legacy open-time cache semantics.
+pub struct ExportStore {
+    conn: Arc<Mutex<Connection>>,
+    export_high_water: AtomicU64,
+    export_source_instance_id: String,
+    export_source_epoch: u64,
+}
+
+impl ExportStore {
+    /// Open an existing export database without creating or migrating tables or rows.
+    /// A missing file, table, or source identity is an error.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, crate::KeeperOpenError> {
+        let path = path.as_ref();
+        let conn = crate::keeper_connection::open(
+            path,
+            "ExportStore",
+            &["export_meta", "export_facts", "export_imported_runs"],
+        )?;
+        let source = conn
+            .query_row(
+                "SELECT source_instance_id, source_epoch, high_water FROM export_meta WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(|error| {
+                crate::keeper_connection::metadata_error(path, "ExportStore export_meta", error)
+            })?;
+        Ok(Self::from_shared(Arc::new(Mutex::new(conn)), source))
+    }
+
+    pub(crate) fn from_shared(conn: Arc<Mutex<Connection>>, source: (String, u64, u64)) -> Self {
+        Self {
+            conn,
+            export_source_instance_id: source.0,
+            export_source_epoch: source.1,
+            export_high_water: AtomicU64::new(source.2),
+        }
+    }
+}
 
 pub(crate) fn init_schema(conn: &Connection) -> Result<(String, u64, u64), rusqlite::Error> {
     conn.execute_batch(
@@ -134,7 +180,7 @@ fn u64_to_i64(value: u64, field: &str) -> Result<i64, ExportError> {
     i64::try_from(value).map_err(|_| storage(format!("{field} exceeds SQLite INTEGER")))
 }
 
-impl SqliteStore {
+impl ExportStore {
     /// Publish a sessionless measurement once. The caller's durable outbox keeps these exact
     /// bytes until this transaction commits, so a crash between databases can only replay it.
     pub fn emit_system_one_fact(
@@ -559,8 +605,8 @@ fn classify_collision(stored: &str, current: &str) -> CollisionKind {
     CollisionKind::ValueDisagreement { fields: differing }
 }
 
-impl ExportIndex for SqliteStore {
-    fn is_imported_run(
+impl ExportStore {
+    pub fn is_imported_run(
         &self,
         session: &broca_protocol::BindIdentity,
         run_id: &RunId,
@@ -577,7 +623,7 @@ impl ExportIndex for SqliteStore {
         .map_err(|e| ExportError::Storage(e.to_string()))
     }
 
-    fn record_imported_runs(
+    pub fn record_imported_runs(
         &self,
         session: &broca_protocol::BindIdentity,
         cut_id: &str,
@@ -601,7 +647,28 @@ impl ExportIndex for SqliteStore {
         }
         tx.commit().map_err(storage)
     }
+}
 
+impl ExportIndex for SqliteStore {
+    fn is_imported_run(
+        &self,
+        session: &broca_protocol::BindIdentity,
+        run_id: &RunId,
+    ) -> Result<bool, ExportError> {
+        self.export.is_imported_run(session, run_id)
+    }
+
+    fn record_imported_runs(
+        &self,
+        session: &broca_protocol::BindIdentity,
+        cut_id: &str,
+        run_ids: &[RunId],
+    ) -> Result<(), ExportError> {
+        self.export.record_imported_runs(session, cut_id, run_ids)
+    }
+
+    // Catch-up work comes from the legacy run index, not the standalone export tables.
+    // Keep this query in SqliteStore while catch-up work is sourced from run_index.
     fn missing_terminal_runs(&self) -> Result<Vec<MissingExportRun>, ExportError> {
         let conn = self
             .conn
@@ -670,6 +737,45 @@ impl ExportIndex for SqliteStore {
     }
 }
 
+impl SqliteStore {
+    pub fn emit_system_one_fact(
+        &self,
+        fact: &broca_core::system_one_fact::SystemOneFact,
+    ) -> Result<bool, ExportError> {
+        self.export.emit_system_one_fact(fact)
+    }
+
+    pub fn high_water(&self) -> u64 {
+        self.export.high_water()
+    }
+    pub fn export_high_water(&self) -> u64 {
+        self.export.export_high_water()
+    }
+    pub fn source_epoch(&self) -> u64 {
+        self.export.source_epoch()
+    }
+    pub fn source_instance_id(&self) -> &str {
+        self.export.source_instance_id()
+    }
+
+    pub fn read_export_page(
+        &self,
+        since: Option<ExportCursor>,
+        limit: u64,
+    ) -> Result<ExportPage, ExportError> {
+        self.export.read_export_page(since, limit)
+    }
+
+    pub fn emit_export_run(
+        &self,
+        records: &[FramedRecord],
+        run_id: &RunId,
+        resolver: &dyn ChargeBasisResolver,
+    ) -> Result<(), ExportError> {
+        self.export.emit_export_run(records, run_id, resolver)
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -707,6 +813,54 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let db = root.join("store.db");
         test(&|| SqliteStore::open(&db).unwrap());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn standalone_export_replays_legacy_fact_bytes_and_honors_imported_runs() {
+        let root = broca_test_support::scratch_root().join(format!(
+            "standalone-export-{}-{}",
+            std::process::id(),
+            test_fixture_nonce()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("run-index.db");
+        std::fs::write(&path, include_bytes!("../tests/fixtures/keepers-v044.db")).unwrap();
+        let export = ExportStore::open(&path).unwrap();
+        let before = export.read_export_page(None, 100).unwrap();
+        export
+            .emit_export_run(
+                &records("fixture-run", 2),
+                &RunId("fixture-run".into()),
+                &resolver,
+            )
+            .unwrap();
+        assert_eq!(export.read_export_page(None, 100).unwrap(), before);
+        let session = &before.facts[0].segment.as_session().unwrap().session;
+        export
+            .record_imported_runs(session, "cut", &[RunId("foreign".into())])
+            .unwrap();
+        export
+            .emit_export_run(&records("foreign", 1), &RunId("foreign".into()), &resolver)
+            .unwrap();
+        assert_eq!(export.read_export_page(None, 100).unwrap(), before);
+        export
+            .emit_export_run(&records("local", 1), &RunId("local".into()), &resolver)
+            .unwrap();
+        let after = export.read_export_page(None, 100).unwrap();
+        assert_eq!(after.facts.len(), 3);
+        assert_eq!(
+            after.facts[2].segment.as_session().unwrap().run_id.0,
+            "local"
+        );
+        drop(export);
+        assert_eq!(
+            ExportStore::open(&path)
+                .unwrap()
+                .read_export_page(None, 100)
+                .unwrap(),
+            after
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 

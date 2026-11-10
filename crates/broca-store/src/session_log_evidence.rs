@@ -7,7 +7,6 @@ use std::path::Path;
 type EvidenceError = Box<dyn std::error::Error + Send + Sync>;
 
 pub mod indexes;
-mod overhaul;
 
 /// Keep a WAL probe's typed cause until serving applies its established error
 /// classification. Inventory failures are not evidence that a log is healthy.

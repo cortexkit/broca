@@ -12,7 +12,7 @@ use cortexkit_role_compaction::{
         Attachment, AttachmentItem, Delivered, FileMedia, Opaque, OutputFormat, Part, PartBody,
         Seal, ToolPart, ToolStatus, Transport,
     },
-    read::{Entry, NoticeOrigin, Role, StepUsage},
+    read::{Entry, NoticeOrigin, Role, SpeaksFor, StepUsage},
     view::AppliedView,
 };
 
@@ -25,6 +25,10 @@ pub struct EntryFacts {
     pub written_at: u64,
     pub completed_at: Option<u64>,
     pub notice: Option<NoticeOrigin>,
+    /// The agent whose words the entry carries, from the send's recorded marks. Projected on
+    /// every entry; what a provider is sent depends on its declaration (see
+    /// [`gate_speaks_for`]).
+    pub speaks_for: Option<SpeaksFor>,
     pub usage: Option<StepUsage>,
     pub generated_under: Option<AppliedView>,
 }
@@ -55,6 +59,20 @@ impl RideEnvelopes {
             .entry((mid.into(), part.into()))
             .or_default()
             .push(ride);
+    }
+
+    /// Forgets the envelopes of every text delivered with the part `part` of message `mid`.
+    pub fn forget(&mut self, mid: &str, part: &str) {
+        self.0.remove(&(mid.to_owned(), part.to_owned()));
+    }
+
+    /// The envelopes of the texts delivered with the part `part` of message `mid`, in order.
+    pub fn of_part(
+        &self,
+        mid: &str,
+        part: &str,
+    ) -> Option<&Vec<Option<broca_wal::record::RideMetadata>>> {
+        self.0.get(&(mid.to_owned(), part.to_owned()))
     }
 }
 
@@ -112,6 +130,24 @@ pub fn recorded_notice_origin(
     let mut notice = NoticeOrigin::new(sender?);
     notice.template = template.map(str::to_owned);
     Some(notice)
+}
+
+/// The agent a send's recorded marks say its words are, which its entries carry as
+/// `speaks_for` whether or not the send is also a notice.
+pub fn recorded_speaks_for(marks: Option<&broca_protocol::MessageMarks>) -> Option<SpeaksFor> {
+    marks.and_then(|marks| marks.speaks_for.clone())
+}
+
+/// Removes `speaks_for` from entries bound for a provider that did not declare
+/// `compaction-entry-speaks-for/v1` in its catalog entry at the session's latest Setup. Entries
+/// are projected with the attribution, and every path that hands entries to the provider (its
+/// notices and its `session.entries` reads) passes them through here first.
+pub fn gate_speaks_for(entries: &mut [Entry], declared: bool) {
+    if !declared {
+        for entry in entries {
+            entry.speaks_for = None;
+        }
+    }
 }
 
 /// Recover attribution from admission records, not the current plan or the run
@@ -304,6 +340,8 @@ pub fn project(
         if let Some(notice) = &facts.notice {
             entry = entry.with_notice(notice.clone());
         }
+        // Attribution is outside every checksum, so setting it never moves the digest.
+        entry.speaks_for = facts.speaks_for.clone();
         entry.completed_at =
             project_completion(message, messages.get(position + 1), facts.completed_at);
         entry.usage = facts.usage;

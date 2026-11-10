@@ -78,6 +78,7 @@ fn one_of_each() -> Vec<Record> {
             notice: None,
             written_at_ms: None,
             ride: Some(RideEnvelope {
+                named_speaker: None,
                 call_key: "lineage:4".into(),
                 sender: "reminders".into(),
                 forms: vec!["tool_result".into(), "turn_system".into()],
@@ -96,6 +97,7 @@ fn one_of_each() -> Vec<Record> {
             body: serde_json::json!({"first_kept_ordinal": 12}),
         }),
         Record::RunStart(Box::new(RunStart {
+            named_speaker: None,
             imported_ids: None,
             message_marks: None,
             run_id: "run-1".into(),
@@ -223,6 +225,7 @@ fn one_of_each() -> Vec<Record> {
             call_key: None,
         }),
         Record::QueuedSend(QueuedSend {
+            named_speaker: None,
             media: Vec::new(),
             submission_id: "sub".into(),
             send_id: Some("s2".into()),

@@ -2,7 +2,8 @@
 //! today's actor and the store actor, compared reply by reply and by what each session recorded
 //! about them: each order, each queued send's sender, principal and mode, each ending, each
 //! delivery, and each run's start and end. Admission's refusals, a send expired on arrival, a
-//! dedupe key superseding an undelivered send, an `idle_start` send starting a run, a send that
+//! send whose expiry passes while the session is idle or while its run makes its last model call,
+//! a dedupe key superseding an undelivered send, an `idle_start` send starting a run, a send that
 //! outlives a run's end and rides on a later one, and interrupts (on an idle session, during a
 //! model step, during a tool call, and across a crash before the interrupt's run) are each
 //! answered and recorded alike. Each scenario's sessions then read alike: `session.read` in every
@@ -35,6 +36,7 @@ cipher_tests!(
     an_idle_start_send_starts_a_run_alike,
     ordered_steers_join_the_running_run_alike,
     an_expired_send_waits_on_an_idle_session_alike,
+    an_expired_send_ends_when_its_run_ends_alike,
     a_queued_ordered_sends_retry_is_answered_alike,
     string_sends_from_plan_named_senders_are_admitted_alike,
     an_interrupt_on_an_idle_session_starts_its_run_alike,
@@ -870,33 +872,138 @@ async fn ordered_steers_join_the_running_run_alike(cipher: Cipher) {
     }
 }
 
+/// How far ahead of now a test sets an ordered send's expiry: far enough that both sessions admit
+/// the send before it passes, near enough to wait out.
+const EXPIRY_MS: u64 = 1_000;
+
+/// Waits until the wall clock, which both sessions judge an ordered send's expiry by, is past
+/// `expires`.
+async fn past(expires: u64) {
+    broca_test_support::wait_until("the send's expiry to pass", || async {
+        let now = broca_core::run::epoch_millis().unwrap_or(0);
+        if now > expires {
+            Ok(())
+        } else {
+            Err(format!("{} ms to go", expires - now))
+        }
+    })
+    .await;
+}
+
+/// Waits until both sessions' running run `r1` has its first model step in flight. Its step
+/// boundary, the point before each model step where a run decides its queued ordered sends, has
+/// then passed, and the run reaches no other step boundary before it ends.
+async fn in_first_step(pair: &Pair) {
+    use crate::serve::ServeHandler;
+    use crate::store_reads::{StoreReadOutcome, StoreReadReply, StoreReadRequest};
+    broca_test_support::wait_until("both runs' first model step in flight", || async {
+        let old = serde_json::to_value(
+            pair.today
+                .registry
+                .run_status_reply(&pair.today.key, RunId("r1".into()))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let (reply, answer) = oneshot::channel();
+        pair.commands
+            .send(LineageCmd::StoreRead {
+                request: Box::new(StoreReadRequest::RunStatusReply(RunId("r1".into()))),
+                reply,
+            })
+            .unwrap();
+        let StoreReadOutcome::Served(answer) = answer.await.unwrap() else {
+            return Err("the read wasn't answered in memory".into());
+        };
+        let StoreReadReply::RunStatusReply(Ok(answer)) = *answer else {
+            return Err("the run's status was refused".into());
+        };
+        let new = serde_json::to_value(answer).unwrap();
+        if old["step"]["step_id"] == 1 && new["step"]["step_id"] == 1 {
+            Ok(())
+        } else {
+            Err(format!("today {old}, store {new}"))
+        }
+    })
+    .await;
+}
+
+/// Where the ledger records `sub-q1` ending expired, the first run's end, and the run `r2`
+/// starting.
+fn expiry_story(ledger: &[Value]) -> (Option<usize>, Option<usize>, Option<usize>) {
+    let ended = ledger
+        .iter()
+        .position(|entry| entry["ended"] == "sub-q1" && entry["reason"]["kind"] == "expired");
+    let first_end = ledger
+        .iter()
+        .position(|entry| entry["run_ended"].is_string());
+    let second_run = ledger.iter().position(|entry| entry["run"] == "r2");
+    (ended, first_end, second_run)
+}
+
 /// A queued ordered send whose expiry passes while the session is idle stays queued, as today's
-/// actor leaves it, until the next run's first boundary ends it. Alike.
+/// actor leaves it, until the next run's first step boundary (where a run decides its queued
+/// ordered sends, before its first model step) ends it. The send is queued once the session is
+/// idle, so no run's end can come after its expiry. Alike.
 async fn an_expired_send_waits_on_an_idle_session_alike(cipher: Cipher) {
     let pair = Pair::new(hello(), true, cipher).await;
     pair.first("r1").await;
-    let expires = broca_core::run::epoch_millis().unwrap() + 400;
-    pair.alike(
-        "q1",
-        from(module(AFT), "soon stale"),
-        Some(json!({"modes": ["tool_result"], "expires_at_ms": expires})),
-        None,
-    )
-    .await;
     pair.release();
     pair.idle().await;
-    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    let expires = broca_core::run::epoch_millis().unwrap() + EXPIRY_MS;
+    // Its list names no `idle_start`, so it starts no run on the idle session.
+    let queued = pair
+        .alike(
+            "q1",
+            from(module(AFT), "soon stale"),
+            Some(json!({"modes": ["tool_result"], "expires_at_ms": expires})),
+            None,
+        )
+        .await;
+    assert!(matches!(queued, SendOutcome::Pending { .. }), "{queued:?}");
+    past(expires).await;
     pair.alike("r2", from(core(), "next"), None, None).await;
     pair.release();
     pair.idle().await;
     let (ledger, queue, _) = pair.assert_alike().await;
     assert!(queue.is_empty(), "the expired send ended: {queue:?}");
     // Nothing ended it while the session sat idle: it ended after the next run started.
-    let ended = ledger
-        .iter()
-        .position(|entry| entry["ended"] == "sub-q1" && entry["reason"]["kind"] == "expired");
-    let second_run = ledger.iter().position(|entry| entry["run"] == "r2");
+    let (ended, _, second_run) = expiry_story(&ledger);
     assert!(ended.is_some() && ended > second_run, "{ledger:#?}");
+}
+
+/// A queued ordered send whose expiry passes while the run it waits on is in its last model call
+/// ends when that run ends, before the next run starts. Today's actor ends it at the queue drain
+/// that follows the run's end (`expire_ordered_sends`), and the store actor at its own drain
+/// (`expire_ordered`): the run makes no further model step, so no step boundary, where a run
+/// decides its queued ordered sends, can end it first. Alike.
+async fn an_expired_send_ends_when_its_run_ends_alike(cipher: Cipher) {
+    let pair = Pair::new(hello(), true, cipher).await;
+    pair.first("r1").await;
+    in_first_step(&pair).await;
+    let expires = broca_core::run::epoch_millis().unwrap() + EXPIRY_MS;
+    let queued = pair
+        .alike(
+            "q1",
+            from(module(AFT), "soon stale"),
+            Some(json!({"modes": ["tool_result"], "expires_at_ms": expires})),
+            None,
+        )
+        .await;
+    assert!(matches!(queued, SendOutcome::Pending { .. }), "{queued:?}");
+    past(expires).await;
+    pair.release();
+    pair.idle().await;
+    pair.alike("r2", from(core(), "next"), None, None).await;
+    pair.release();
+    pair.idle().await;
+    let (ledger, queue, _) = pair.assert_alike().await;
+    assert!(queue.is_empty(), "the expired send ended: {queue:?}");
+    let (ended, first_end, second_run) = expiry_story(&ledger);
+    assert!(
+        first_end.is_some() && ended > first_end && second_run > ended,
+        "{ledger:#?}"
+    );
 }
 
 /// A keyed ordered send's retry is answered from the queue while it waits; a retry asking for

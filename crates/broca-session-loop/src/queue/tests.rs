@@ -39,10 +39,27 @@ fn marks() -> broca_protocol::MessageMarks {
     marks
 }
 
+/// [`marks`], and the same marks with the speaker's display name, each with whether the record
+/// must set its must-understand `named_speaker` field.
+fn both_marks() -> [(broca_protocol::MessageMarks, Option<bool>); 2] {
+    let mut named = marks();
+    named.speaks_for = Some(broca_protocol::SpeaksFor::new("agent-1").with_name("Ada"));
+    [(marks(), None), (named, Some(true))]
+}
+
 /// The record the store actor writes for a queued send is the record the converter makes of
 /// today's `Queued` record for the same send, tool part and display marks included.
 #[test]
 fn a_queued_send_is_the_record_the_converter_makes_of_todays() {
+    for (marks, named_speaker) in both_marks() {
+        queued_send_matches_the_converter(marks, named_speaker);
+    }
+}
+
+fn queued_send_matches_the_converter(
+    marks: broca_protocol::MessageMarks,
+    named_speaker: Option<bool>,
+) {
     let mut parts = MemoryParts::default();
     let at = Queued {
         written_at_ms: Some(1_000),
@@ -55,10 +72,11 @@ fn a_queued_send_is_the_record_the_converter_makes_of_todays() {
         &request(),
         &receipt(),
         at,
-        Some(&marks()),
+        Some(&marks),
         &mut parts,
     )
     .unwrap();
+    assert_eq!(built.named_speaker, named_speaker);
     let receipt = receipt();
     let today = WalRecord::Queued {
         sent_by: receipt.sent_by,
@@ -75,7 +93,7 @@ fn a_queued_send_is_the_record_the_converter_makes_of_todays() {
         title: receipt.title,
         delivery: at.delivery,
         hooks: None,
-        message_marks: Some(marks()),
+        message_marks: Some(marks),
     };
     let converted = broca_session_convert::convert(
         &[FramedRecord {
@@ -129,6 +147,12 @@ fn a_queued_send_rebuilds_its_request() {
 /// `Steered` record for the same steer, display marks included.
 #[test]
 fn a_steer_is_the_record_the_converter_makes_of_todays() {
+    for (marks, named_speaker) in both_marks() {
+        steer_matches_the_converter(marks, named_speaker);
+    }
+}
+
+fn steer_matches_the_converter(marks: broca_protocol::MessageMarks, named_speaker: Option<bool>) {
     let input = request().input;
     let receipt = SteerReceipt {
         sent_by: Some(BindPrincipal::Reserved {
@@ -140,7 +164,8 @@ fn a_steer_is_the_record_the_converter_makes_of_todays() {
         delivery: Some(broca_protocol::Delivery::Steer),
         ..SteerReceipt::default()
     };
-    let built = steer(input.clone(), Some(1_000), &receipt, Some(&marks())).unwrap();
+    let built = steer(input.clone(), Some(1_000), &receipt, Some(&marks)).unwrap();
+    assert_eq!(built.named_speaker, named_speaker);
     let today = WalRecord::Steered {
         sent_by: receipt.sent_by.clone(),
         written_at_ms: Some(1_000),
@@ -153,7 +178,7 @@ fn a_steer_is_the_record_the_converter_makes_of_todays() {
         delivery: receipt.delivery,
         input: std::sync::Arc::new(input),
         hooks: None,
-        message_marks: Some(marks()),
+        message_marks: Some(marks),
     };
     let converted = broca_session_convert::convert(
         &[FramedRecord {

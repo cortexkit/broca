@@ -1,4 +1,4 @@
-use crate::{SqliteStore, StoreError};
+use crate::{SessionInventory, StoreError};
 use broca_core::{agent_session_ref, session_addr, SessionRefIndex};
 use broca_protocol::BindIdentity;
 use rusqlite::{params, Connection};
@@ -38,7 +38,7 @@ thread_local! {
     pub(crate) static REF_WAIT_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
-impl SessionRefIndex for SqliteStore {
+impl SessionRefIndex for SessionInventory {
     fn record_session(&self, address: &str, session: &BindIdentity) -> Result<(), String> {
         let deadline = std::time::Instant::now() + crate::STORE_BUSY_TIMEOUT;
         let conn = loop {

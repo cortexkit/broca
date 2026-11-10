@@ -395,16 +395,20 @@ impl StoreRuntime {
             return Ok(None);
         };
         // A read resolves setup parts in the root and mode of the session it reads.
-        let context =
-            |view: &SessionView<LocalBackend>, held: bool, open: bool, live_step| ReadContext {
-                parts: self.parts_for(class, view.head().cipher()),
-                held,
-                open,
-                settled: Some((self.settled_runs(), &addr)),
-                session_name: &key.session,
-                live_step,
-                stream_head: None,
-            };
+        let context = |view: &SessionView<LocalBackend>,
+                       held: bool,
+                       open: bool,
+                       live_step,
+                       entry_speaks_for| ReadContext {
+            parts: self.parts_for(class, view.head().cipher()),
+            held,
+            open,
+            settled: Some((self.settled_runs(), &addr)),
+            session_name: &key.session,
+            live_step,
+            stream_head: None,
+            entry_speaks_for,
+        };
         for _ in 0..POSITION_TRIES {
             let Some(handle) = registry.open_handle(key) else {
                 break;
@@ -424,9 +428,11 @@ impl StoreRuntime {
                 Some(StoreReadOutcome::Stored {
                     position,
                     live_step,
+                    entry_speaks_for,
                 }) => match self.view_at(key, class, position).await {
                     Ok(view) => {
-                        let context = context(&view, true, true, live_step.as_ref());
+                        let context =
+                            context(&view, true, true, live_step.as_ref(), entry_speaks_for);
                         return Ok(Some(execute(&view, &context, &request).await));
                     }
                     // The actor sealed since it answered: ask it again.
@@ -441,7 +447,16 @@ impl StoreRuntime {
             return Ok(None);
         };
         let slot = registry.slot_state(key);
-        let context = context(&view, slot.is_some(), slot == Some("open"), None);
+        // No actor answered, so none holds a Setup: a compaction read asks the catalog.
+        let attribution =
+            crate::store_entries::EntryAttribution::Catalog(self.executor.compaction_plane());
+        let context = context(
+            &view,
+            slot.is_some(),
+            slot == Some("open"),
+            None,
+            attribution,
+        );
         Ok(Some(execute(&view, &context, &request).await))
     }
 

@@ -666,6 +666,133 @@ async fn compaction_v2_setup_unknown_answer_fails_and_next_setup_restarts_notice
     );
 }
 
+/// A plane whose provider answers each catalog read from a script, so a test can change the
+/// provider's declaration between Setups.
+struct DeclaringPlane {
+    inner: RecordingPlane,
+    declares: std::sync::Mutex<std::collections::VecDeque<bool>>,
+    asked: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl runtime::Plane for DeclaringPlane {
+    async fn call(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<Box<serde_json::value::RawValue>, runtime::CallError> {
+        self.inner.call(method, params).await
+    }
+
+    async fn provides_entry_speaks_for(&self) -> bool {
+        self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.declares
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("scripted declaration")
+    }
+}
+
+/// The provider's attribution declaration is read from its catalog at every Setup and holds until
+/// the next one: notices carry `speaks_for` only while the latest Setup found it declared.
+#[tokio::test]
+async fn compaction_v2_notices_carry_speakers_only_while_the_latest_setup_found_them_declared() {
+    let plane = DeclaringPlane {
+        inner: RecordingPlane::default(),
+        declares: std::sync::Mutex::new([true, false].into()),
+        asked: Default::default(),
+    };
+    plane.inner.answers.lock().unwrap().extend([
+        json!({"answer":"ready"}),
+        json!({"answer":"received"}),
+        json!({"answer":"ready"}),
+        json!({"answer":"received"}),
+    ]);
+    let speaker: broca_protocol::SpeaksFor =
+        serde_json::from_value(json!({"agent_id":"agent-a","name":"Ada"})).unwrap();
+    let marked = |count: usize| {
+        let mut facts = facts(count);
+        for fact in &mut facts {
+            fact.speaks_for = Some(speaker.clone());
+        }
+        let messages: Vec<_> = (0..count)
+            .map(|_| text(Role::User, "agent words"))
+            .collect();
+        project(&messages, &facts, &Deliveries::new(), true)
+    };
+    let runtime = runtime::Runtime::default();
+    assert_eq!(
+        runtime.entry_speaks_for(),
+        None,
+        "no Setup has been sent yet"
+    );
+    runtime.observe(&marked(1));
+    runtime.flush(&plane, &setup(), &conditions(), None).await;
+    assert_eq!(runtime.entry_speaks_for(), Some(true));
+    // A catalog answer learned outside a Setup never overrides the latest Setup's.
+    runtime.learn_entry_speaks_for(false);
+    assert_eq!(runtime.entry_speaks_for(), Some(true));
+    // The provider withdraws its declaration; the next Setup reads the catalog again.
+    runtime.require_setup().await;
+    runtime.observe(&marked(2));
+    runtime.flush(&plane, &setup(), &conditions(), None).await;
+    assert_eq!(runtime.entry_speaks_for(), Some(false));
+    assert_eq!(plane.asked.load(std::sync::atomic::Ordering::SeqCst), 2);
+    let calls = plane.inner.calls.lock().unwrap();
+    let notices: Vec<_> = calls
+        .iter()
+        .filter(|(method, _)| method == "compaction.notice")
+        .map(|(_, params)| params["entries"].as_array().unwrap().clone())
+        .collect();
+    assert_eq!(notices.len(), 2);
+    assert_eq!(
+        notices[0][0]["speaks_for"],
+        json!({"agent_id":"agent-a","name":"Ada"})
+    );
+    assert!(
+        notices[1][0].get("speaks_for").is_none(),
+        "{:?}",
+        notices[1]
+    );
+    // Attribution never reaches the content-free Setup.
+    assert!(calls
+        .iter()
+        .filter(|(method, _)| method == "compaction.setup")
+        .all(|(_, params)| !params.to_string().contains("speaks_for")));
+}
+
+/// A runtime that has sent no Setup, such as an actor reopened after its provider was set up,
+/// reads the declaration from the catalog once and keeps it; the next Setup reads it again.
+#[tokio::test]
+async fn compaction_v2_a_runtime_without_setup_reads_the_declaration_once_until_the_next_setup() {
+    let plane = DeclaringPlane {
+        inner: RecordingPlane::default(),
+        declares: std::sync::Mutex::new([true, false].into()),
+        asked: Default::default(),
+    };
+    plane
+        .inner
+        .answers
+        .lock()
+        .unwrap()
+        .extend([json!({"answer":"ready"})]);
+    let runtime = runtime::Runtime::default();
+    assert!(runtime.entry_speaks_for_or_read(&plane).await);
+    assert!(
+        runtime.entry_speaks_for_or_read(&plane).await,
+        "kept, not read again"
+    );
+    assert_eq!(plane.asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(runtime.setup(&plane, &setup()).await);
+    assert_eq!(
+        runtime.entry_speaks_for(),
+        Some(false),
+        "the Setup's own reading"
+    );
+    assert_eq!(plane.asked.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
 #[tokio::test]
 async fn compaction_v2_ride_flushes_changed_entries_and_completion_alone_is_silent() {
     use cortexkit_role_compaction::ride::{RideCause, RideRequest};
@@ -1677,6 +1804,7 @@ fn request_at<'a>(
         chain_reset: false,
         now: 1,
         next_mid: "m12345678.1",
+        render: None,
     }
 }
 

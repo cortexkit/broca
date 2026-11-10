@@ -18,11 +18,13 @@
 //! name store the same bytes.
 
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+
+use broca_owner_only::OpenOptions;
 
 use crate::codec::{hex, Id128};
 
@@ -643,6 +645,8 @@ impl SessionBackend for MemoryBackend {
 ///   `setup::PLAIN_PREFIX`), written the same way. A folder of their own, so a build that knows
 ///   no plain sessions never lists them among the encrypted parts.
 ///
+/// Files and folders are created owner-only, including temporary files before their rename.
+///
 /// Only one process may write a session: the caller holds the session's lease (an OS file
 /// lock) for as long as it writes. So the head version the fences compare against is kept in
 /// memory, loaded from the head file the first time a session is touched.
@@ -901,10 +905,20 @@ fn write_head_file(
     version: Version,
     head: &[u8],
 ) -> io::Result<()> {
+    write_file(dir, temp, name, &[&version.to_le_bytes(), head])
+}
+
+/// Writes complete parts to a temporary file before publishing them with a durable rename.
+fn write_file(dir: &Path, temp: &str, name: &str, parts: &[&[u8]]) -> io::Result<()> {
     let temp = dir.join(temp);
-    let mut file = File::create(&temp)?;
-    file.write_all(&version.to_le_bytes())?;
-    file.write_all(head)?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&temp)?;
+    for part in parts {
+        file.write_all(part)?;
+    }
     file.sync_all()?;
     drop(file);
     std::fs::rename(&temp, dir.join(name))?;
@@ -977,7 +991,7 @@ impl SessionBackend for LocalBackend {
         }
         let dir = self.head_dir(s);
         let versions = dir.join(VERSIONS_DIR);
-        std::fs::create_dir_all(&versions)?;
+        broca_owner_only::create_dir_all(&versions)?;
         // The version's own file first, so `head` never names a version that isn't kept.
         write_head_file(
             &versions,
@@ -1002,7 +1016,7 @@ impl SessionBackend for LocalBackend {
     ) -> Result<(), BackendError> {
         self.fence(s, at)?;
         let dir = self.log_dir(s);
-        std::fs::create_dir_all(&dir)?;
+        broca_owner_only::create_dir_all(&dir)?;
         let file = OpenOptions::new()
             .create(true)
             .truncate(true)
@@ -1106,8 +1120,12 @@ impl SessionBackend for LocalBackend {
         let dir = path
             .parent()
             .expect("an object lives in its change's folder");
-        std::fs::create_dir_all(dir)?;
-        let mut file = File::create(&path)?;
+        broca_owner_only::create_dir_all(dir)?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)?;
         file.write_all(bytes)?;
         file.sync_all()?;
         Ok(())
@@ -1212,22 +1230,14 @@ impl SessionBackend for LocalBackend {
         let dir = path
             .parent()
             .expect("a setup part lives in the setup folder");
-        std::fs::create_dir_all(dir)?;
+        broca_owner_only::create_dir_all(dir)?;
         let file_name = path
             .file_name()
             .and_then(|name| name.to_str())
             .expect("a setup part's path ends in its hex name");
         // A unique temporary name, so two writers storing the same part never share a file.
-        let temp = dir.join(format!(
-            ".{file_name}.{}.tmp",
-            hex(&crate::keys::random_id().0)
-        ));
-        let mut file = File::create(&temp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        drop(file);
-        std::fs::rename(&temp, &path)?;
-        sync_dir(dir)?;
+        let temp = format!(".{file_name}.{}.tmp", hex(&crate::keys::random_id().0));
+        write_file(dir, &temp, file_name, &[bytes])?;
         Ok(())
     }
 

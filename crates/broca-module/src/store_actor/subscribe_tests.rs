@@ -436,6 +436,7 @@ async fn ridden_session() -> (&'static MemoryBackend, u64, Session<&'static Memo
                 forms: vec!["tool_result".into()],
                 form: RideForm::Append,
                 speaks_for: None,
+                named_speaker: None,
             }),
         })
     };
@@ -581,6 +582,7 @@ async fn an_actor_served_reads_head_is_the_head_a_fresh_view_computes() {
         session_name: "s",
         live_step: None,
         stream_head: None,
+        entry_speaks_for: crate::store_entries::EntryAttribution::Known(false),
     };
     let answer = match crate::store_reads::execute(&at, &context, &page()).await {
         StoreReadReply::Page(Ok(answer)) => answer,

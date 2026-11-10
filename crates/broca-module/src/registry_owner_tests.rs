@@ -2091,10 +2091,7 @@ fn log_state_inventory_io_keeps_proven_transient_class_and_cause() {
             std::io::Error::new(std::io::ErrorKind::Interrupted, "temporary inventory read"),
         )),
         broca_store::session_log_evidence::SessionLogError::Inventory(Box::new(
-            broca_store::db::DbError::Io(std::io::Error::new(
-                std::io::ErrorKind::WouldBlock,
-                "temporary inventory read",
-            )),
+            std::io::Error::new(std::io::ErrorKind::WouldBlock, "temporary inventory read"),
         )),
     ] {
         let result = OpenError::from_log_state(error);

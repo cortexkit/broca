@@ -22,17 +22,17 @@ use crate::actor::{SendKey, SendOutcome};
 use crate::executor::{RunExecutor, RunKind};
 use crate::registry::{LineageRegistry, OpenError, HEAD_SESSION_CLASS};
 
-const IDLE: Duration = Duration::from_millis(100);
+pub(super) const IDLE: Duration = Duration::from_millis(100);
 
 /// A module over a scratch state root, configured as production configures one: its registry
 /// creates no session in the new storage but a head. Its opener serves the new storage when
 /// `store`, and serves today's storage alone otherwise.
-struct Module {
+pub(super) struct Module {
     dir: PathBuf,
-    registry: LineageRegistry,
+    pub(super) registry: LineageRegistry,
     wal: Arc<FileWalStore>,
     inventory: Inventory,
-    key: BindIdentity,
+    pub(super) key: BindIdentity,
 }
 
 impl Drop for Module {
@@ -41,7 +41,7 @@ impl Drop for Module {
     }
 }
 
-async fn module(
+pub(super) async fn module(
     store: bool,
     steps: Vec<Vec<NormalizedEvent>>,
     reservation: Option<&ScopeReservation>,
@@ -108,7 +108,7 @@ async fn module(
 /// A `session.send` with no delivery list and no conversation key, routed as the serve layer
 /// routes one, with the label `class`, the retention policy `retention` and the ordered delivery
 /// `order` when given.
-async fn send(
+pub(super) async fn send(
     module: &Module,
     run_id: &str,
     request: broca_protocol::SubmissionRequest,
@@ -139,7 +139,7 @@ async fn send(
 
 impl Module {
     /// Waits until the session's actor has closed and left the registry.
-    async fn closed(&self) {
+    pub(super) async fn closed(&self) {
         for _ in 0..1000 {
             if self.registry.slot_state(&self.key).is_none() {
                 return;

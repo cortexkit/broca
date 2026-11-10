@@ -319,6 +319,7 @@ fn a_ride_envelope_converts_onto_the_append_and_round_trips() {
             forms: vec!["tool_result".into(), "turn_system".into()],
             form: RideForm::Append,
             speaks_for: None,
+            named_speaker: None,
         })
     );
     assert_round_trip(&old);
