@@ -123,6 +123,7 @@ impl Rig {
                 std::fs::write(wal.wal_path(&session), &bytes).unwrap();
             }
             plans.push(PlannedSession {
+                store_prefix: None,
                 reference: broca_wire::agent_data::session_ref("runner", "/p", name),
                 session,
                 end_offset: bytes.len() as u64,
@@ -327,6 +328,7 @@ async fn actor_critical_section_holds_dispatch_until_completion_and_then_refuses
         &root,
         &path,
         &Freeze {
+            store_head_version: None,
             cut_id: CUT.into(),
             end_offset: before.len() as u64,
             lineage_id: "lineage".into(),

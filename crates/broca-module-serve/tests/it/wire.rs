@@ -7031,6 +7031,7 @@ async fn moving_sidecar_serves_reads_and_refuses_sends_with_the_real_wire_golden
         &route.dir,
         &route.wal_path,
         &broca_wal::migration::Freeze {
+            store_head_version: None,
             cut_id: "cut-a".into(),
             end_offset: before.len() as u64,
             lineage_id: "lineage".into(),

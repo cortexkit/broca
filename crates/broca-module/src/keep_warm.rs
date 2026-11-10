@@ -897,6 +897,7 @@ mod retention_tests {
             &root,
             &path,
             &broca_wal::migration::Freeze {
+                store_head_version: None,
                 cut_id: "cut".into(),
                 end_offset: before.len() as u64,
                 lineage_id: "lineage".into(),

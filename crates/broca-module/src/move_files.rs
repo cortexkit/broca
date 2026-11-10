@@ -18,6 +18,9 @@ use std::{
 
 #[derive(Clone)]
 pub struct PlannedSession {
+    /// Where a source cut appends its newest export in the device-local stream copy.
+    /// Receiver plans already name a sealed prefix and leave this absent.
+    pub store_prefix: Option<u64>,
     pub reference: String,
     pub session: BindIdentity,
     pub bytes: Vec<u8>,
@@ -83,6 +86,20 @@ pub struct MoveObservation {
 /// because they have no local bytes that the incoming cut could overwrite.
 #[async_trait::async_trait]
 pub trait MoveDriver: Send + Sync {
+    async fn cache_store_stream(
+        &self,
+        _cut: &str,
+        _plan: &PlannedSession,
+    ) -> Result<(), ErrorBody> {
+        Err(unavailable("store stream cache unavailable"))
+    }
+    async fn verify_store(
+        &self,
+        _plan: &PlannedSession,
+        _staged: &std::path::Path,
+    ) -> Result<(), ErrorBody> {
+        Err(unavailable("store move verifier is unavailable"))
+    }
     /// Media needs a transport carrying objects as well as WAL bytes. Until the
     /// bridge supplies that transport, refuse before any cut intent or freeze.
     fn prepare_media(
@@ -140,6 +157,8 @@ pub struct FileCutArtifacts {
     driver: Arc<dyn MoveDriver>,
     plans: Arc<Mutex<HashMap<String, LockedPlans>>>,
 }
+
+pub mod store;
 
 struct LegacyExclusions(Arc<dyn ExportIndex>);
 impl broca_core::ImportedRunExclusions for LegacyExclusions {
@@ -474,7 +493,7 @@ impl FileCutArtifacts {
         op: Op,
         step: broca_wire::agent_data::step::Step,
     ) -> Result<(), ErrorBody> {
-        let live = self.wal.wal_path(&plan.session);
+        let live = self.move_sidecar(plan);
         if let Some(moved) =
             migration::read_json::<Moved>(&live.with_extension("moved")).map_err(unavailable)?
         {
@@ -586,7 +605,7 @@ impl CutArtifacts for FileCutArtifacts {
         let mut leases = Vec::new();
         let mut observations = Vec::new();
         for plan in &plans {
-            let live = self.wal.wal_path(&plan.session);
+            let live = self.move_sidecar(plan);
             let moving = migration::read_json::<Freeze>(&live.with_extension("moving"))
                 .map_err(unavailable)?;
             let moved = migration::read_json::<Moved>(&live.with_extension("moved"))
@@ -604,6 +623,12 @@ impl CutArtifacts for FileCutArtifacts {
                 moved_holder: moved.map(|m| m.holder),
                 open_actor: actor_open(&plan.session),
             };
+            if store::is_store(plan) && observation.busy_reason.is_none() {
+                observation.busy_reason = plan.divergence_reason.clone();
+                if busy.is_none() {
+                    busy = observation.busy_reason.clone();
+                }
+            }
             // A session whose lease this guard already holds (handed over by its closed
             // actor) must not be acquired again; one with an open actor keeps its lease
             // with that actor while it is paused.
@@ -647,6 +672,9 @@ impl CutArtifacts for FileCutArtifacts {
         // today's to hand over: its WAL is the copy being moved, or the retired one.
         if op == Op::Prepare {
             for plan in &locked.plans {
+                if store::is_store(plan) {
+                    continue;
+                }
                 match self
                     .wal
                     .store_owner_refusal(&plan.session)
@@ -670,6 +698,9 @@ impl CutArtifacts for FileCutArtifacts {
         }
         if matches!(op, Op::Prepare | Op::Import | Op::Activate) {
             for plan in &locked.plans {
+                if store::is_store(plan) {
+                    continue;
+                }
                 if retained_move_copy(self.wal.as_ref(), &plan.session)? {
                     if op == Op::Prepare {
                         return Err(refusal(
@@ -728,6 +759,10 @@ impl CutArtifacts for FileCutArtifacts {
             ));
         }
         for plan in &locked.plans {
+            if store::is_store(plan) {
+                self.store_check(&cut_id, plan, op, state, request).await?;
+                continue;
+            }
             let live = self.wal.wal_path(&plan.session);
             if let Some(other) =
                 migration::cut_fence(self.wal.root(), &plan.reference).map_err(unavailable)?
@@ -885,7 +920,13 @@ impl CutArtifacts for FileCutArtifacts {
             }
         }
         if op == Op::Activate {
-            let paths = self.paths(&cut_id, &locked.plans)?;
+            let plans: Vec<_> = locked
+                .plans
+                .iter()
+                .filter(|plan| !store::is_store(plan))
+                .cloned()
+                .collect();
+            let paths = self.paths(&cut_id, &plans)?;
             if state.intent.as_ref().is_none_or(|i| i.op != "activate")
                 && paths.iter().any(|(staged, _)| !staged.exists())
             {
@@ -893,7 +934,7 @@ impl CutArtifacts for FileCutArtifacts {
                     "activation staging is missing without a pending activate intent",
                 ));
             }
-            move_install::check_installations(&self.installations(&locked.plans, &paths))
+            move_install::check_installations(&self.installations(&plans, &paths))
                 .map_err(|e| self.install_error(&cut_id, state, &locked, e))?;
         }
         Ok(())
@@ -945,13 +986,26 @@ impl CutArtifacts for FileCutArtifacts {
         let locked = self.locked(&cut_id)?;
         let op = request.op();
         let mut offsets = Vec::new();
+        for plan in locked.plans.iter().filter(|plan| store::is_store(plan)) {
+            self.store_apply(&cut_id, plan, op, request).await?;
+            if op == Op::Prepare {
+                offsets.push(self.driver.cover(&plan.reference).await?);
+            }
+        }
+        let wal_plans: Vec<_> = locked
+            .plans
+            .iter()
+            .filter(|plan| !store::is_store(plan))
+            .cloned()
+            .collect();
         match op {
             Op::Prepare => {
-                for plan in &locked.plans {
+                for plan in &wal_plans {
                     migration::freeze(
                         &self.state_root,
                         &self.wal.wal_path(&plan.session),
                         &Freeze {
+                            store_head_version: None,
                             cut_id: cut_id.clone(),
                             end_offset: plan.end_offset,
                             lineage_id: plan.lineage_id.clone(),
@@ -965,6 +1019,9 @@ impl CutArtifacts for FileCutArtifacts {
             Op::Export => {
                 for plan in &locked.plans {
                     self.driver.export(&plan.reference, &plan.bytes).await?;
+                    if store::is_store(plan) {
+                        self.driver.cover(&plan.reference).await?;
+                    }
                 }
             }
             Op::Release => {
@@ -972,7 +1029,7 @@ impl CutArtifacts for FileCutArtifacts {
                 let holder = params["holder"]
                     .as_str()
                     .ok_or_else(|| unavailable("release holder missing"))?;
-                for plan in &locked.plans {
+                for plan in &wal_plans {
                     migration::release(
                         &self.state_root,
                         &self.wal.wal_path(&plan.session),
@@ -984,7 +1041,7 @@ impl CutArtifacts for FileCutArtifacts {
                 }
             }
             Op::Import => {
-                for plan in &locked.plans {
+                for plan in &wal_plans {
                     migration::stage(
                         &self.state_root,
                         &self.staged(&cut_id, plan)?,
@@ -995,11 +1052,11 @@ impl CutArtifacts for FileCutArtifacts {
                 }
             }
             Op::Activate => {
-                let paths = self.paths(&cut_id, &locked.plans)?;
+                let paths = self.paths(&cut_id, &wal_plans)?;
                 let mut projection_admissions = Vec::new();
                 // Keep failed-projection guards through installation so a census
                 // cannot clear their durable marker before the WAL is published.
-                for plan in &locked.plans {
+                for plan in &wal_plans {
                     let range =
                         broca_wal::file_wal::read_verified_member_range(&plan.bytes, 0, 0, None)
                             .map_err(unavailable)?;
@@ -1031,7 +1088,7 @@ impl CutArtifacts for FileCutArtifacts {
                 move_install::install_verified(
                     &self.state_root,
                     &cut_id,
-                    &self.installations(&locked.plans, &paths),
+                    &self.installations(&wal_plans, &paths),
                     self.export.as_ref(),
                     |session| {
                         self.registry.handle().invalidate_history_caches(session);
@@ -1107,8 +1164,22 @@ impl CutArtifacts for FileCutArtifacts {
         let cut_id = cut_id(request)?;
         let locked = self.locked(&cut_id)?;
         for plan in &locked.plans {
-            migration::abort_freeze(&self.wal.wal_path(&plan.session), &cut_id)
+            if store::is_store(plan) {
+                self.store_apply(&cut_id, plan, Op::Abort, request).await?;
+                migration::unlink(
+                    &self
+                        .state_root
+                        .join("session-store-moves/streams")
+                        .join(broca_core::session_addr(&plan.session))
+                        .with_extension(&cut_id),
+                )
                 .map_err(unavailable)?;
+                let staged = self.store_staged(&cut_id, plan);
+                if staged.exists() {
+                    std::fs::remove_dir_all(&staged).map_err(unavailable)?;
+                }
+            }
+            migration::abort_freeze(&self.move_sidecar(plan), &cut_id).map_err(unavailable)?;
             migration::unlink(&self.staged(&cut_id, plan)?).map_err(unavailable)?;
         }
         // A damaged staged WAL may no longer reveal a bind triple. Staging is
@@ -1163,6 +1234,11 @@ impl CutArtifacts for FileCutArtifacts {
         if op == Op::Import {
             let mut complete = true;
             for plan in &locked.plans {
+                if store::is_store(plan) {
+                    self.store_apply(&cut_id, plan, Op::Import, &request)
+                        .await?;
+                    continue;
+                }
                 let staged = self.staged(&cut_id, plan)?;
                 match std::fs::read(&staged) {
                     Ok(bytes)

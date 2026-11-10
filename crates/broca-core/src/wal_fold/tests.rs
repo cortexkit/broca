@@ -2435,6 +2435,7 @@ fn move_sidecars_survive_fold_and_never_enter_archives() {
                 &f.root,
                 &path,
                 &broca_wal::migration::Freeze {
+                    store_head_version: None,
                     cut_id: "cut".into(),
                     end_offset: bytes.len() as u64,
                     lineage_id: "lineage".into(),

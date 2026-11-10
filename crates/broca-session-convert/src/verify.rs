@@ -30,6 +30,9 @@ use broca_wal::{FramedRecord, WalLineageId, WalRecord};
 use serde::Serialize;
 use serde_json::{json, Value};
 
+mod store;
+pub use store::store_snapshot;
+
 /// What to check.
 pub struct Verify<'a> {
     /// The frozen WAL prefix the session was staged from.

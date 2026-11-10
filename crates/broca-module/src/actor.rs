@@ -109,16 +109,23 @@ pub struct RetiredForCut {
 }
 
 /// The session lease a retired actor hands to a cut. Only the actor builds one, once its
-/// writer was joined and its WAL closed, so holding one proves no writer of the session is
+/// writer stopped and its descriptors closed, so holding one proves no writer of the session is
 /// live. It can only keep the session locked: dropping it releases the lease.
 pub struct CutTenure(#[allow(dead_code)] CutLease);
 
 enum CutLease {
+    Store(#[allow(dead_code)] Box<dyn std::any::Any + Send>),
     /// The lease the writer task owned, which its close handed back.
     Writer(#[allow(dead_code)] broca_core::wal_writer::ClosedWriterTenure),
     /// The lease the actor held itself, beside its writer: an actor opened without an owned
     /// writer tenure, as a legacy state root opens every actor.
     Actor(#[allow(dead_code)] Box<dyn LeaseHandle>),
+}
+
+impl CutTenure {
+    pub(crate) fn store(lease: Box<dyn std::any::Any + Send>) -> Self {
+        Self(CutLease::Store(lease))
+    }
 }
 
 /// Who holds the session lease while an actor serves its session.
@@ -16378,6 +16385,7 @@ mod owned_cut_tests {
             &rig.root,
             &path,
             &Freeze {
+                store_head_version: None,
                 cut_id: CUT.into(),
                 end_offset: before.len() as u64,
                 lineage_id: "lineage".into(),
@@ -16469,6 +16477,7 @@ mod owned_cut_tests {
             &rig.root,
             &path,
             &Freeze {
+                store_head_version: None,
                 cut_id: CUT.into(),
                 end_offset: before.len() as u64,
                 lineage_id: "lineage".into(),

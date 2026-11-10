@@ -94,8 +94,8 @@ crate::message! {
 }
 
 crate::oneof! {
-    /// Where the session stands. A head in any state but `Local` names an operation that
-    /// crashed before its commit, which the next load finishes.
+    /// Where the session stands. Creation and recovery states name unfinished operations;
+    /// move states keep the session fenced until the named cut is aborted or released.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub enum Residence {
         1 Local(()),
@@ -105,6 +105,21 @@ crate::oneof! {
         /// Only a recovery opens the session in this state: it deletes what that change created
         /// and recovers again from the unchanged damaged log.
         3 Recovering(Id128),
+        /// The move owns the session; readers may open it, but no writer may do so.
+        /// Move writers only run after a second computer shares the deployment key, so readers
+        /// ship before any move can write these variants; older readers refuse them closed.
+        4 Moving(String),
+        /// The session is held on another computer and refuses reads as well as writes.
+        5 Moved(MoveResidence),
+    }
+}
+
+crate::message! {
+    /// The completed move that fences a retained source copy.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct MoveResidence {
+        1 req holder: String,
+        2 req cut_id: String,
     }
 }
 
@@ -218,6 +233,13 @@ pub fn stored_triple(bytes: &[u8]) -> Result<SessionTriple, HeadError> {
 pub fn stored_pending(bytes: &[u8]) -> Result<Vec<PendingDeletion>, HeadError> {
     let body = bytes.get(TAG_LEN..).ok_or(HeadError::Malformed)?;
     Ok(Head::decode(body).map_err(HeadError::Decode)?.pending)
+}
+
+/// The unverified residence, used only to conservatively retain old version files. Serving a
+/// session always authenticates the whole head with [`open`].
+pub(crate) fn stored_residence(bytes: &[u8]) -> Result<Residence, HeadError> {
+    let body = bytes.get(TAG_LEN..).ok_or(HeadError::Malformed)?;
+    Ok(Head::decode(body).map_err(HeadError::Decode)?.residence)
 }
 
 /// Opens a stored head: decodes it, then checks it in the mode it names. An encrypted head's data

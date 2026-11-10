@@ -1,6 +1,6 @@
 use super::{
-    open, seal, stored_cipher, Head, HeadError, OpenLog, Residence, SessionTriple, WrappedKey,
-    HEAD_FORMAT,
+    open, seal, stored_cipher, Head, HeadError, MoveResidence, OpenLog, Residence, SessionTriple,
+    WrappedKey, HEAD_FORMAT,
 };
 use crate::codec::{ByteBuf, Message as _};
 use crate::keys::{random_id, wrap, Cipher, DataKey, DeploymentKey};
@@ -55,6 +55,41 @@ fn head(deployment: &DeploymentKey, cipher: Cipher) -> (Head, DataKey) {
         cipher: field,
     };
     (head, key)
+}
+
+#[test]
+fn move_residences_roundtrip_and_older_readers_refuse_by_name() {
+    crate::oneof! {
+        #[derive(Debug)]
+        enum OlderResidence {
+            1 Local(()),
+            2 Creating(crate::codec::Id128),
+            3 Recovering(crate::codec::Id128),
+        }
+    }
+    let deployment = DeploymentKey::new(1, &[9; 32]);
+    for cipher in [Cipher::None, Cipher::XChaCha20Poly1305] {
+        for (tag, residence) in [
+            (4, Residence::Moving("cut".into())),
+            (
+                5,
+                Residence::Moved(MoveResidence {
+                    holder: "receiver".into(),
+                    cut_id: "cut".into(),
+                }),
+            ),
+        ] {
+            let (mut head, key) = head(&deployment, cipher);
+            let error = OlderResidence::decode(&residence.encode()).unwrap_err();
+            assert_eq!(error.at, "OlderResidence");
+            assert_eq!(
+                error.kind,
+                crate::codec::DecodeErrorKind::UnknownVariant(tag)
+            );
+            head.residence = residence;
+            assert_eq!(open(&seal(&head, &key), &deployment).unwrap().0, head);
+        }
+    }
 }
 
 /// A head opens in its own mode, which its stored bytes name. A plain head opens without the

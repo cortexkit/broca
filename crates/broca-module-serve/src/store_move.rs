@@ -666,6 +666,7 @@ impl StoreMove {
         let end_offset =
             before!(sync_len(&paths.wal).map_err(io_failed("the WAL couldn't be synced")));
         let wanted = Freeze {
+            store_head_version: None,
             cut_id: journal.move_id.clone(),
             end_offset,
             lineage_id: journal.lineage_id.clone().unwrap_or_default(),

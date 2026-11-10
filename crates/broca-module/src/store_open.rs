@@ -305,6 +305,66 @@ impl StoreRuntime {
         Ok(self.class_of(key)?.is_some())
     }
 
+    pub fn check_move(&self, key: &BindIdentity, write: bool) -> Result<(), OpenError> {
+        let reference = broca_wire::agent_data::session_ref(
+            &key.harness,
+            &key.project_root.to_string_lossy(),
+            &key.session,
+        );
+        let sidecar = self
+            .state_root
+            .join("session-store-moves/fences")
+            .join(broca_core::session_addr(key));
+        let read = |error: std::io::Error| OpenError::Open(error.to_string());
+        if let Some(moved) = broca_wal::migration::read_json::<broca_wal::migration::Moved>(
+            &sidecar.with_extension("moved"),
+        )
+        .map_err(read)?
+        {
+            return Err(OpenError::SessionMoved {
+                holder: moved.holder,
+            });
+        }
+        if write {
+            if let Some(freeze) = broca_wal::migration::read_json::<broca_wal::migration::Freeze>(
+                &sidecar.with_extension("moving"),
+            )
+            .map_err(read)?
+            {
+                return Err(OpenError::SessionMoving {
+                    cut_id: freeze.cut_id,
+                });
+            }
+            if let Some(cut_id) =
+                broca_wal::migration::cut_fence(&self.state_root.join("wal"), &reference)
+                    .map_err(read)?
+            {
+                return Err(OpenError::SessionMoving { cut_id });
+            }
+        }
+        let Some(class) = self.class_of(key)? else {
+            return Ok(());
+        };
+        let backend = self.backend(class);
+        let Some((stored, _)) = backend
+            .read_stored_head(&SessionAddr(broca_core::session_addr(key)))
+            .map_err(|error| OpenError::Open(format!("{error:?}")))?
+        else {
+            return Ok(());
+        };
+        let (head, _) = broca_session_store::head::open(&stored, self.deployment())
+            .map_err(|error| open_error(SessionError::Head(error), false))?;
+        match head.residence {
+            broca_session_store::head::Residence::Moving(cut_id) if write => {
+                Err(OpenError::SessionMoving { cut_id })
+            }
+            broca_session_store::head::Residence::Moved(moved) => Err(OpenError::SessionMoved {
+                holder: moved.holder,
+            }),
+            _ => Ok(()),
+        }
+    }
+
     /// The class of the root holding the session `key`'s head, `None` when no root holds it.
     /// Errors as [`holds`](Self::holds).
     pub fn class_of(&self, key: &BindIdentity) -> Result<Option<StorageClass>, OpenError> {
@@ -862,6 +922,8 @@ const POSITION_TRIES: usize = 3;
 /// A view that couldn't be loaded, as the opener reports it.
 fn view_error(error: SessionError) -> OpenError {
     match error {
+        SessionError::SessionMoving { cut_id } => OpenError::SessionMoving { cut_id },
+        SessionError::SessionMoved { holder } => OpenError::SessionMoved { holder },
         SessionError::NeedsRecovery => OpenError::Classified {
             reason: "session_needs_recovery: the session's log must be repaired before it can be \
                      read; its next send repairs it"
@@ -909,6 +971,11 @@ pub(crate) fn triple(key: &BindIdentity) -> SessionTriple {
 }
 
 fn open_error(error: SessionError, create: bool) -> OpenError {
+    match error {
+        SessionError::SessionMoving { cut_id } => return OpenError::SessionMoving { cut_id },
+        SessionError::SessionMoved { holder } => return OpenError::SessionMoved { holder },
+        _ => {}
+    }
     let action = if create { "created" } else { "opened" };
     OpenError::Open(format!(
         "the session could not be {action} in the new storage: {error:?}"

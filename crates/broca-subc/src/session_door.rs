@@ -182,6 +182,53 @@ impl SessionDoorClient {
         Ok(coverage)
     }
 
+    /// Admit a device-local ciphertext stream without allocating its older snapshots.
+    /// The caller must keep the file unchanged throughout this call.
+    pub async fn admit_file(
+        &self,
+        session_ref: &str,
+        path: &std::path::Path,
+        deadline: Instant,
+    ) -> Result<DoorCoverage, SessionDoorError> {
+        use std::io::{Read as _, Seek as _};
+        let mut file = std::fs::File::open(path).map_err(|error| unavailable(error.to_string()))?;
+        let len = file
+            .metadata()
+            .map_err(|error| unavailable(error.to_string()))?
+            .len();
+        let mut coverage = self.cover(session_ref, deadline).await?;
+        let mut offset = coverage.durable_offset;
+        let mut mismatch_backoff = FIRST_BACKOFF;
+        loop {
+            if offset > len {
+                return Err(unavailable("durable stream end exceeds local stream copy"));
+            }
+            if offset == len {
+                return Ok(coverage);
+            }
+            let end = offset.saturating_add(MAX_CALL_BYTES as u64).min(len);
+            let mut bytes = vec![0; (end - offset) as usize];
+            file.seek(std::io::SeekFrom::Start(offset))
+                .and_then(|_| file.read_exact(&mut bytes))
+                .map_err(|error| unavailable(error.to_string()))?;
+            match self.call("session.admit", json!({"sessionRef":session_ref,"fromOffset":offset,"bytes":encode_hex(&bytes)}), deadline).await? {
+                Ok(value) => {
+                    coverage = decode_coverage(value)?;
+                    if coverage.durable_offset != end { return Err(unavailable("session.admit returned an unexpected durableOffset")); }
+                    offset = end; mismatch_backoff = FIRST_BACKOFF;
+                }
+                Err(error) if error.code == "offset_mismatch" => {
+                    let expected = error.detail.as_ref().and_then(|detail| detail.get("expectedOffset")).and_then(Value::as_u64).ok_or_else(|| refused(&error))?;
+                    coverage = self.cover(session_ref, deadline).await?;
+                    if coverage.durable_offset < expected { return Err(refused(&error)); }
+                    if coverage.durable_offset == offset { backoff(deadline, &mut mismatch_backoff, &error).await?; }
+                    offset = coverage.durable_offset;
+                }
+                Err(error) => return Err(refused(&error)),
+            }
+        }
+    }
+
     /// Read one page of a sealed cut. An unbound read or a missing sealed digest is never accepted.
     pub async fn read(
         &self,

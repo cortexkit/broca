@@ -196,6 +196,78 @@ impl Rig {
     }
 }
 
+#[tokio::test]
+async fn migrated_store_session_agent_move_leaves_its_retained_wal_sentinel_untouched() {
+    struct Door;
+    #[async_trait]
+    impl crate::agent_data::SessionDoor for Door {
+        async fn cover(&self, _: &str) -> Result<u64, broca_subc::session_door::SessionDoorError> {
+            Ok(0)
+        }
+        async fn export(
+            &self,
+            _: &str,
+            _: &[u8],
+        ) -> Result<(), broca_subc::session_door::SessionDoorError> {
+            Ok(())
+        }
+        async fn read(
+            &self,
+            _: &str,
+            _: u64,
+            _: &str,
+        ) -> Result<broca_subc::session_door::DoorRead, broca_subc::session_door::SessionDoorError>
+        {
+            unreachable!()
+        }
+    }
+    let rig = Rig::start("agent-after-migrate").await;
+    rig.write_session();
+    rig.mover()
+        .move_to_store(&key(), Some(StorageClass::Durable))
+        .await
+        .unwrap();
+    let sentinel = rig.wal().with_extension("moved");
+    let before = std::fs::read(&sentinel).unwrap();
+    let index = Arc::new(broca_store::SqliteStore::open(rig.dir.join("agent-index.db")).unwrap());
+    broca_store::session_refs::migrate(
+        &rig.dir.join("agent-index.db"),
+        &broca_core::ReadOnlyWalReader::new(&rig.dir),
+    )
+    .unwrap();
+    let service = crate::agent_data::AgentDataService::new(
+        rig.dir.clone(),
+        rig.registry.clone(),
+        rig.wal_store.clone(),
+        index,
+        Arc::new(Door),
+    );
+    let cut = "ffffffffffffffffffffffffffffffff";
+    let refs = json!([broca_wire::agent_data::session_reference(
+        &key().harness,
+        &key().project_root.to_string_lossy(),
+        &key().session
+    )]);
+    for method in ["prepare", "export", "release"] {
+        let mut params = json!({"cutId":cut,"refs":refs});
+        if method == "release" {
+            params["holder"] = json!("receiver");
+        }
+        crate::agent_data::dispatch(
+            Some(&service),
+            "reserved:entorhinal",
+            &serde_json::to_vec(&json!({"method":format!("agent_data.{method}"),"params":params}))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(std::fs::read(sentinel).unwrap(), before);
+    assert!(
+        matches!(rig.registry.check_move(&key(), false), Err(broca_module::registry::OpenError::SessionMoved { holder }) if holder == "receiver")
+    );
+}
+
 fn settled_row(session: &BindIdentity, run: &str) -> RunIndexRow {
     RunIndexRow {
         run_id: run.into(),

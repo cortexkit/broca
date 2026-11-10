@@ -1943,6 +1943,7 @@ async fn move_fenced_ownership_never_reuses_a_corrupt_cached_prefix() {
                     &fixture.root,
                     &path.with_extension("moving"),
                     &broca_wal::migration::Freeze {
+                        store_head_version: None,
                         cut_id: "cut-a".into(),
                         end_offset: 0,
                         lineage_id: "lineage".into(),

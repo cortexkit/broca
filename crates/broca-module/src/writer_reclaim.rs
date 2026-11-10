@@ -918,6 +918,7 @@ mod tests {
                     &root.path,
                     &wal,
                     &Freeze {
+                        store_head_version: None,
                         cut_id: "move-reclaim".into(),
                         end_offset: std::fs::metadata(&wal).unwrap().len(),
                         lineage_id: "lineage".into(),
@@ -995,6 +996,7 @@ mod tests {
             &root.identity.session,
         );
         let plan = PlannedSession {
+            store_prefix: None,
             reference: reference.clone(),
             session: root.identity.clone(),
             end_offset: bytes.len() as u64,

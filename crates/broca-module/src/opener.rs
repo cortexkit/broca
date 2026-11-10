@@ -297,8 +297,8 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> LineageOpener for DefaultOp
         self.executor.media_profile(request).await
     }
     fn check_move(&self, key: &LineageKey, write: bool) -> Result<(), OpenError> {
-        if self.serves_from_store(key)? {
-            return Ok(());
+        if let Some(store) = self.store_holding(key)? {
+            return store.check_move(key, write);
         }
         self.wal_store
             .check_move(key, write)
@@ -1173,6 +1173,7 @@ mod tests {
             state_root,
             wal,
             &broca_wal::migration::Freeze {
+                store_head_version: None,
                 cut_id: CUT.into(),
                 end_offset: 0,
                 lineage_id: "lineage".into(),
