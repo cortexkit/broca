@@ -1863,6 +1863,8 @@ fn ride_envelope(
 }
 
 #[cfg(test)]
+mod enrolled_entries_tests;
+#[cfg(test)]
 mod inverse_tests;
 #[cfg(test)]
 mod marks_tests;

@@ -54,8 +54,8 @@ struct Kept {
     seen: ChangeMark,
     /// Each window message projected so far, in window order.
     states: Vec<KeptMessage>,
-    /// The transcript: `sealed` sealed entries in front, then the served window messages'
-    /// entries, then the held assistant message's entry when `open` is set.
+    /// The transcript: `sealed` sealed entries in front, then one entry per window message, then
+    /// the held assistant message's entry when `open` is set.
     entries: Arc<Vec<Entry>>,
     sealed: usize,
     open: Option<OpenRides>,
@@ -69,13 +69,12 @@ struct Kept {
     rides_stale: bool,
 }
 
-/// One projected window message: its entry state as it was when projected, whether it was
-/// served (an enrollment leaves out the global system messages it suppressed), and how many
-/// window messages before it were.
+/// One projected window message: its entry state as it was when projected, and whether it is a
+/// global system message the session's enrollment suppressed, whose entry has no parts and
+/// carries no rides.
 struct KeptMessage {
     state: EntryState,
-    served: bool,
-    served_before: usize,
+    suppressed: bool,
 }
 
 /// The held assistant message's id and delivered texts, whose rides a transcript adds.
@@ -96,25 +95,19 @@ impl Kept {
         self.rides_stale = true;
     }
 
-    /// How many of the kept window messages were served.
-    fn served(&self) -> usize {
-        self.states
-            .last()
-            .map_or(0, |last| last.served_before + usize::from(last.served))
-    }
-
     /// Forgets the entries of the window messages from position `from` on, and their rides.
     fn truncate_window(&mut self, from: usize) {
         #[cfg(test)]
         CHECKED.with(|count| count.set(count.get() + self.states.len().saturating_sub(from)));
-        let Some(first) = self.states.get(from) else {
+        if from >= self.states.len() {
             return;
-        };
-        let keep = self.sealed + first.served_before;
+        }
+        // Every window message has an entry, so the window's entries before `from` are `from`.
+        let keep = self.sealed + from;
         if !self.rides_stale {
             let rides = Arc::make_mut(&mut self.rides);
             for kept in &self.states[from..] {
-                if let (true, Some(facts)) = (kept.served, &kept.state.facts) {
+                if let (false, Some(facts)) = (kept.suppressed, &kept.state.facts) {
                     crate::entries::forget_rides(rides, &facts.mid, &kept.state.delivered);
                 }
             }
@@ -145,7 +138,7 @@ impl Kept {
             crate::entries::push_rides(&mut rides, mid, delivered);
         }
         for kept in &self.states {
-            if let (true, Some(facts)) = (kept.served, &kept.state.facts) {
+            if let (false, Some(facts)) = (kept.suppressed, &kept.state.facts) {
                 crate::entries::push_rides(&mut rides, &facts.mid, &kept.state.delivered);
             }
         }
@@ -155,11 +148,11 @@ impl Kept {
 }
 
 /// `stored` as the transcript serves it: as the session's enrollment decided for a message placed
-/// before it, `None` for one it suppressed.
-fn served(enrollment: Option<&EnrollmentOverlay>, stored: StoredEntry) -> Option<StoredEntry> {
+/// before it, with no content for one it suppressed.
+fn served(enrollment: Option<&EnrollmentOverlay>, stored: StoredEntry) -> StoredEntry {
     match enrollment {
         Some(overlay) => overlay.apply(stored),
-        None => Some(stored),
+        None => stored,
     }
 }
 
@@ -209,51 +202,42 @@ impl WindowTranscript {
         let from = conversation.window_start() + kept.states.len() as u64;
         for stored in broca_session_store::session::window_entries(conversation, from, usize::MAX) {
             let state = stored.state.clone();
-            let served_before = kept.served();
-            let Some(stored) = served(enrollment, stored) else {
-                kept.states.push(KeptMessage {
-                    state,
-                    served: false,
-                    served_before,
-                });
-                continue;
-            };
+            let suppressed = enrollment.is_some_and(|overlay| overlay.suppressed(stored.ordinal));
+            let stored = served(enrollment, stored);
             let entry = project(&stored)?;
             Arc::make_mut(&mut kept.entries).push(entry);
-            if let (false, Some(facts)) = (kept.rides_stale, &stored.state.facts) {
+            if let (false, false, Some(facts)) = (kept.rides_stale, suppressed, &stored.state.facts)
+            {
                 crate::entries::push_rides(
                     Arc::make_mut(&mut kept.rides),
                     &facts.mid,
                     &stored.state.delivered,
                 );
             }
-            kept.states.push(KeptMessage {
-                state,
-                served: true,
-                served_before,
-            });
+            kept.states.push(KeptMessage { state, suppressed });
         }
         if let Some((ordinal, message, state)) = conversation.open_entry() {
-            let stored = StoredEntry {
-                ordinal,
-                message: message.clone(),
-                next: None,
-                state: state.clone(),
-                open: true,
-            };
-            if let Some(stored) = served(enrollment, stored) {
-                let entry = project(&stored)?;
-                Arc::make_mut(&mut kept.entries).push(entry);
-                kept.open = Some(OpenRides {
-                    mid: stored
-                        .state
-                        .facts
-                        .as_ref()
-                        .map(|facts| facts.mid.clone())
-                        .unwrap_or_default(),
-                    delivered: stored.state.delivered,
-                });
-            }
+            let stored = served(
+                enrollment,
+                StoredEntry {
+                    ordinal,
+                    message: message.clone(),
+                    next: None,
+                    state: state.clone(),
+                    open: true,
+                },
+            );
+            let entry = project(&stored)?;
+            Arc::make_mut(&mut kept.entries).push(entry);
+            kept.open = Some(OpenRides {
+                mid: stored
+                    .state
+                    .facts
+                    .as_ref()
+                    .map(|facts| facts.mid.clone())
+                    .unwrap_or_default(),
+                delivered: stored.state.delivered,
+            });
         }
         Ok(())
     }

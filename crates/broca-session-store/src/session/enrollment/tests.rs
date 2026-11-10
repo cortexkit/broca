@@ -299,6 +299,7 @@ fn served(entries: &[crate::session::StoredEntry]) -> Vec<(u64, u64, Option<u64>
 
 fn expected() -> Vec<(u64, u64, Option<u64>, Option<String>)> {
     vec![
+        (1, 7, Some(100), None),
         (2, 7, Some(100), None),
         (3, 8, Some(100), None),
         (4, 9, Some(300), Some("occipital".into())),
@@ -307,9 +308,10 @@ fn expected() -> Vec<(u64, u64, Option<u64>, Option<String>)> {
     ]
 }
 
-/// Compaction reads every earlier message through the enrollment's decisions, without the
-/// suppressed system message, on every read path: a page, a page split anywhere, and by id. What
-/// `session.read` reads (`Session::entries`) is every message as stored.
+/// Compaction reads every earlier message through the enrollment's decisions on every read path:
+/// a page, a page split anywhere, and by id. The suppressed system message keeps its ordinal and
+/// id, served with no content, so the ordinals have no gaps. What `session.read` reads
+/// (`Session::entries`) is every message as stored.
 fn compaction_reads_the_earlier_messages_through_the_enrollment_and_reads_serve_them_as_stored(
     cipher: Cipher,
 ) {
@@ -336,22 +338,47 @@ fn compaction_reads_the_earlier_messages_through_the_enrollment_and_reads_serve_
 
         let all = session.compaction_entries(1, usize::MAX).await.unwrap();
         assert_eq!(served(&all), expected());
-        // Pages skip the suppressed message without counting it.
+        // The suppressed system message: a system message with nothing in it, under its own id.
+        assert_eq!(all[0].message.role, Role::System);
+        assert!(!all[0].message.turn_system);
+        assert!(all[0].message.content.is_empty());
+        assert_eq!(all[0].state.facts.as_ref().unwrap().mid, mids[0]);
+        // Pages count every message, the suppressed one included, wherever they split.
+        for limit in 1..=all.len() {
+            let mut paged = Vec::new();
+            let mut from = 1;
+            loop {
+                let page = session.compaction_entries(from, limit).await.unwrap();
+                let Some(last) = page.last() else {
+                    break;
+                };
+                from = last.ordinal + 1;
+                paged.extend(page);
+            }
+            assert_eq!(paged, all, "pages of {limit}");
+        }
         let first = session.compaction_entries(1, 1).await.unwrap();
         assert_eq!(served(&first), expected()[..1]);
         let next = session.compaction_entries(3, 2).await.unwrap();
-        assert_eq!(served(&next), expected()[1..3]);
-        // By id: the suppressed message has no entry, the others are served as above.
-        assert_eq!(session.entry_by_mid(&mids[0]).await.unwrap(), None);
+        assert_eq!(served(&next), expected()[2..4]);
+        // By id: the suppressed message is found as it's served, the others too.
+        assert_eq!(
+            session.entry_by_mid(&mids[0]).await.unwrap().as_ref(),
+            Some(&all[0])
+        );
         let by_id = session.entry_by_mid(&mids[3]).await.unwrap().unwrap();
-        assert_eq!(served(&[by_id]), expected()[2..3]);
+        assert_eq!(served(&[by_id]), expected()[3..4]);
         let named = session
             .entries_by_mid(&[mids[0].clone(), mids[1].clone(), mids[4].clone()])
             .await
             .unwrap();
         assert_eq!(
             served(&named),
-            vec![expected()[0].clone(), expected()[3].clone()]
+            vec![
+                expected()[0].clone(),
+                expected()[1].clone(),
+                expected()[4].clone()
+            ]
         );
 
         // What reads serve is untouched: every earlier message, with its own facts.

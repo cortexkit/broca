@@ -344,8 +344,8 @@ async fn sealed_transcript<W: Writer>(writer: &W) -> Result<Arc<SealedTranscript
 /// check refuses a view naming it, by that id.
 pub async fn transcript<W: Writer>(writer: &W, ctx: &Ctx) -> Result<Transcript, LoopError> {
     let conversation = writer.conversation();
-    // A session that enrolled serves its earlier messages as its enrollment decided, leaving
-    // out the global system messages it suppressed, as the request's prompt leaves them out.
+    // A session that enrolled serves its earlier messages as its enrollment decided, the global
+    // system messages it suppressed as entries with no parts, which render nothing.
     let enrollment = writer.enrollment().await?;
     ctx.window
         .update(writer.session_id(), conversation, enrollment.as_ref())
@@ -364,8 +364,7 @@ pub async fn transcript<W: Writer>(writer: &W, ctx: &Ctx) -> Result<Transcript, 
             }
         };
         if ctx.window.sealed_for().as_ref() != Some(&key) {
-            let (entries, messages, delivered) =
-                sealed_entries(writer, ctx, enrollment.as_ref()).await?;
+            let (entries, messages, delivered) = sealed_entries(writer, ctx).await?;
             ctx.window
                 .set_sealed(Some(key), entries, messages, delivered);
         }
@@ -382,7 +381,6 @@ pub async fn transcript<W: Writer>(writer: &W, ctx: &Ctx) -> Result<Transcript, 
 async fn sealed_entries<W: Writer>(
     writer: &W,
     ctx: &Ctx,
-    enrollment: Option<&broca_session_store::session::EnrollmentOverlay>,
 ) -> Result<
     (
         Vec<cortexkit_role_compaction::read::Entry>,
@@ -421,20 +419,11 @@ async fn sealed_entries<W: Writer>(
         }
         (cuts, named)
     };
-    // The ids of the window's served entries, the held assistant message's included.
-    let suppressed = |ordinal: u64| enrollment.is_some_and(|overlay| overlay.suppressed(ordinal));
+    // The ids of the window's entries, the held assistant message's included.
     let in_window: std::collections::HashSet<&str> = conversation
         .entries
         .iter()
-        .enumerate()
-        .filter(|(at, _)| !suppressed(window_start + *at as u64))
-        .map(|(_, state)| state)
-        .chain(
-            conversation
-                .open_entry()
-                .filter(|(ordinal, _, _)| !suppressed(*ordinal))
-                .map(|(_, _, state)| state),
-        )
+        .chain(conversation.open_entry().map(|(_, _, state)| state))
         .filter_map(|state| state.facts.as_ref())
         .map(|facts| facts.mid.as_str())
         .collect();

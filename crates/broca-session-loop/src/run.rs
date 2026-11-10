@@ -2989,7 +2989,8 @@ fn call_options<W: Writer>(
             prompt
         }
     };
-    // A session that enrolled leaves out the global system messages it carried before (see
+    // A session that enrolled sends none of the global system messages it carried before (its
+    // stored prompt holds an empty placeholder for each, see
     // `compaction::prompt::contract_prompt`), and each run's place moves past them. Otherwise
     // the request shares the run's episode list rather than copying it, as a compacted run
     // shares the one its stored prompt keeps.
@@ -3059,7 +3060,9 @@ fn call_options<W: Writer>(
     }
     // On the current compaction contract a request renders from the entries, as today's loop
     // renders one: text delivered with a tool result is added to the result's copy, and the
-    // system text goes above the conversation.
+    // system text goes above the conversation. This render copies the stored prompt rather than
+    // rendering through a view's plan, so the placeholders the prompt holds for the global system
+    // messages an enrollment suppressed (`compaction::prompt::contract_prompt`) come out of it.
     let conversation = writer.conversation();
     let entries = broca_session_store::session::EnrollmentOverlay::serve(
         enrollment,
@@ -3070,12 +3073,15 @@ fn call_options<W: Writer>(
     .collect::<Result<Vec<_>, _>>()
     .map_err(LoopError::Parts)?;
     let rides = crate::entries::ride_envelopes(conversation);
-    let prompt = broca_core::compaction_v2::render::deliveries_only_with_rides(
+    let mut prompt = broca_core::compaction_v2::render::deliveries_only_with_rides(
         &opts.prompt,
         &entries,
         &rides,
     )
     .map_err(LoopError::Parts)?;
+    if let Some(enrollment) = enrollment {
+        crate::enroll::without_suppressed(&mut prompt, enrollment);
+    }
     let opts = broca_core::compaction_v2::render::options(&opts, prompt);
     Ok(
         broca_core::compaction_v2::systems::view(&opts, &admission.global_system)

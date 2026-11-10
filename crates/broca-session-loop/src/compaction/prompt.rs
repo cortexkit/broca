@@ -4,8 +4,8 @@
 //! which reads the stored prompt message by message beside the transcript's entries
 //! (`compaction::prepare`). The stored prompt is the window's messages as today's loop holds
 //! them: each with the repetition warnings its run's steps earn, its position in the session and
-//! its part numbers, without the global system messages an enrollment suppressed
-//! ([`contract_prompt`]). Deriving it copies every window message, so a compacted run keeps it
+//! its part numbers, with an empty placeholder in place of each global system message an
+//! enrollment suppressed ([`contract_prompt`]). Deriving it copies every window message, so a compacted run keeps it
 //! and at each step takes in only the messages placed since the last one. A placed message
 //! changes only when delivered text is joined into it, which the conversation fold records
 //! (`Conversation::changes`); that, a new window start, a new enrollment or a new list of the
@@ -105,8 +105,8 @@ fn overflow(_: broca_protocol::tags::NumberingOverflow) -> LoopError {
 
 /// The stored prompt of a request on the current compaction contract, derived whole from the
 /// window: its messages with each run's repetition warnings, each stamped with its 0-based
-/// position in the session, without the global system messages `enrollment` suppressed, and
-/// numbered in order.
+/// position in the session, with a placeholder in place of each global system message
+/// `enrollment` suppressed (see [`suppressed_placeholder`]), and numbered in order.
 pub(crate) fn contract_prompt(
     conversation: &Conversation,
     episodes: &[EpisodeRenderInput],
@@ -123,18 +123,29 @@ pub(crate) fn contract_prompt(
     // Each message keeps its place in the session, which the window starts after once history
     // is sealed: the window's first message has the 0-based position `window_start - 1`.
     for (index, message) in prompt.iter_mut().enumerate() {
-        message.ordinal = Some(first + index as u64);
-    }
-    // The global system messages a session that enrolled carried in its transcript before are
-    // left out, as a session on the contract never holds them: the run's system text takes
-    // their place above the conversation, and the entries leave them out alike.
-    if let Some(enrollment) = enrollment {
-        crate::enroll::without_suppressed(&mut prompt, enrollment);
+        let position = first + index as u64;
+        if enrollment.is_some_and(|overlay| overlay.suppressed(position + 1)) {
+            *message = suppressed_placeholder(position);
+        } else {
+            message.ordinal = Some(position);
+        }
     }
     contract_numbering()
         .number_new(&mut prompt)
         .map_err(overflow)?;
     Ok(prompt)
+}
+
+/// What the stored prompt holds at 0-based session position `position` in place of a global
+/// system message the session's enrollment suppressed: a system message with nothing in it. A
+/// session on the contract never holds such a message, since the run's system text takes its
+/// place above the conversation, but the entries serve it at its own ordinal with no parts, and a
+/// view's render plan renders an entry with no parts as nothing. So the stored prompt keeps one
+/// message per entry, as rendering lines them up, and nothing of the message is sent.
+fn suppressed_placeholder(position: u64) -> Message {
+    let mut placeholder = Message::new(Role::System, Vec::new());
+    placeholder.ordinal = Some(position);
+    placeholder
 }
 
 #[cfg(test)]
@@ -230,9 +241,10 @@ impl KeptPrompt {
             let position = first + index as u64;
             message.ordinal = Some(position);
             kept.taken = index + 1;
-            if !enrollment.is_some_and(|overlay| overlay.suppressed(position + 1)) {
-                kept.prompt.push(message);
+            if enrollment.is_some_and(|overlay| overlay.suppressed(position + 1)) {
+                message = suppressed_placeholder(position);
             }
+            kept.prompt.push(message);
         }
         taken(kept.taken - from);
         let front = kept.front;
