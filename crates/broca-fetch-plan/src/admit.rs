@@ -416,6 +416,11 @@ pub trait Fetcher: Send + Sync {
     async fn call_keepalive_supported(&self, _provider: &str) -> Result<bool, FetchError> {
         Ok(false)
     }
+    /// The provider's `call-yield/v1` promise from the admission catalog snapshot. Missing
+    /// discovery freezes no yield permission; dispatch must never fill it from a live catalog.
+    async fn call_yield_supported(&self, _provider: &str) -> Result<bool, FetchError> {
+        Ok(false)
+    }
     /// A declaration from the provider's daemon catalog entry, never guessed from
     /// a version or learned by forwarding a request an older provider cannot read.
     async fn system_text_default_supported(&self, _provider: &str) -> Result<bool, FetchError> {
@@ -715,27 +720,37 @@ async fn catalog_with_optional_keepalive(
     provider: &str,
     request: &CatalogRequest,
     deadline: Instant,
-) -> Result<(Value, bool), FetchMiss> {
+) -> Result<(Value, bool, bool), FetchMiss> {
     use crate::keepalive_discovery::{observe, Outcome};
     let started = std::time::Instant::now();
     let promise = fetcher.call_keepalive_supported(provider);
+    let yield_promise = fetcher.call_yield_supported(provider);
     let catalog = within_deadline(deadline, || fetcher.catalog(provider, request));
-    tokio::pin!(promise, catalog);
-    tokio::select! {
-        biased;
-        promise = &mut promise => {
-            let (supported, outcome) = match promise {
-                Ok(supported) => (supported, Outcome::Finished),
-                Err(_) => (false, Outcome::Failed),
-            };
-            observe(provider, outcome, started.elapsed());
-            catalog.await.map(|answer| (answer, supported)).map_err(FetchMiss::from_error)
-        }
-        answer = &mut catalog => {
-            // Discovery is optional. Never extend a successful required fetch's wait, or
-            // spend its remaining admission budget retrying a failed liveness lookup.
-            observe(provider, Outcome::Unfinished, started.elapsed());
-            answer.map(|answer| (answer, false)).map_err(FetchMiss::from_error)
+    tokio::pin!(promise, yield_promise, catalog);
+    let mut keepalive = None;
+    let mut call_yield = None;
+    loop {
+        tokio::select! {
+            biased;
+            promise = &mut promise, if keepalive.is_none() => {
+                let (supported, outcome) = match promise {
+                    Ok(supported) => (supported, Outcome::Finished),
+                    Err(_) => (false, Outcome::Failed),
+                };
+                observe(provider, outcome, started.elapsed());
+                keepalive = Some(supported);
+            }
+            promise = &mut yield_promise, if call_yield.is_none() => {
+                call_yield = Some(promise.unwrap_or(false));
+            }
+            answer = &mut catalog => {
+                // Optional discovery never extends the required catalog fetch's wait.
+                if keepalive.is_none() {
+                    observe(provider, Outcome::Unfinished, started.elapsed());
+                }
+                return answer.map(|answer| (answer, keepalive.unwrap_or(false), call_yield.unwrap_or(false)))
+                    .map_err(FetchMiss::from_error);
+            }
         }
     }
 }
@@ -838,7 +853,7 @@ pub fn decode_tool_catalog(provider: &str, value: Value) -> Result<ToolCatalog, 
             false,
         )
     })?;
-    let schema_pins = frozen_provider_declarations(&fetched.answer, false)
+    let schema_pins = frozen_provider_declarations(&fetched.answer, false, false)
         .and_then(|declarations| declarations.schema_pins)
         .unwrap_or_default();
     Ok(ToolCatalog {
@@ -932,7 +947,8 @@ fn freeze_reply(reply: &cortexkit_role_tool_provider::catalog::Reply) -> broca_w
 fn frozen_provider_declarations(
     answer: &cortexkit_role_tool_provider::catalog::CatalogAnswer,
     call_keepalive: bool,
-) -> Option<FrozenProviderDeclarations> {
+    call_yield: bool,
+) -> Option<Box<FrozenProviderDeclarations>> {
     let result_formats: BTreeMap<String, FrozenResultFormat> = answer
         .tools
         .iter()
@@ -946,6 +962,27 @@ fn frozen_provider_declarations(
         })
         .collect();
     let declarations = FrozenProviderDeclarations {
+        yield_tools: (call_yield
+            && answer.declares(
+                cortexkit_role_tool_provider::catalog::session_capabilities::LATE_RESULTS,
+            ))
+        .then(|| {
+            answer
+                .tools
+                .iter()
+                .filter(|tool| {
+                    tool.capabilities
+                        .iter()
+                        .any(|tag| tag == cortexkit_role_tool_provider::CALL_YIELD_TOOL_TAG)
+                        && tool
+                            .result_format
+                            .as_ref()
+                            .is_some_and(|format| format.as_str() == "tool-result/v1")
+                })
+                .map(|tool| tool.name.clone())
+                .collect()
+        })
+        .filter(|tools: &BTreeSet<String>| !tools.is_empty()),
         call_keepalive: call_keepalive.then_some(true),
         schema_pins: (!answer.tools.is_empty()).then(|| {
             answer
@@ -967,7 +1004,7 @@ fn frozen_provider_declarations(
             .declares(cortexkit_role_tool_provider::catalog::session_capabilities::LATE_RESULTS)
             .then_some(true),
     };
-    (!declarations.is_empty()).then_some(declarations)
+    (!declarations.is_empty()).then_some(Box::new(declarations))
 }
 
 /// The declarations one provider froze into `manifest`. These are the only declarations a run
@@ -984,7 +1021,7 @@ pub fn frozen_provider_declarations_of<'a>(
             FetchOutcome::Answered {
                 declarations_frozen,
                 ..
-            } => declarations_frozen.as_ref(),
+            } => declarations_frozen.as_deref(),
             _ => None,
         })
 }
@@ -1216,18 +1253,22 @@ pub async fn admit(
     let (catalogs, declarations) = futures::join!(catalogs, declarations);
     let mut raw_answers = BTreeMap::new();
     let mut keepalive_promises = BTreeSet::new();
+    let mut yield_promises = BTreeSet::new();
     let mut outcomes: BTreeMap<&str, Result<Fetched, FetchMiss>> = BTreeMap::new();
     let mut absent_tools = BTreeSet::new();
     for (fetch, outcome) in catalog_fetches.iter().zip(&catalogs) {
         let mut decoded = match outcome {
-            Ok((answer, _)) => decode_answer(answer.clone(), fetch.text_item.is_some())
+            Ok((answer, _, _)) => decode_answer(answer.clone(), fetch.text_item.is_some())
                 .and_then(|fetched| check_opted_in_slots(fetched, fetch.tool_item)),
             Err(_) => continue,
         };
-        if let Ok((answer, keepalive)) = outcome {
+        if let Ok((answer, keepalive, call_yield)) = outcome {
             raw_answers.insert(fetch.provider, answer.clone());
             if *keepalive {
                 keepalive_promises.insert(fetch.provider);
+            }
+            if *call_yield {
+                yield_promises.insert(fetch.provider);
             }
         }
         if fetch.tool_item.is_some_and(|item| item.optional)
@@ -1577,6 +1618,7 @@ pub async fn admit(
                     declarations_frozen: frozen_provider_declarations(
                         &fetched.answer,
                         keepalive_promises.contains(provider),
+                        yield_promises.contains(provider),
                     ),
                 },
                 Err(missed) => FetchOutcome::Absent {
@@ -2003,6 +2045,44 @@ mod tests {
     }
 
     #[test]
+    fn yield_tools_freezes_all_provider_and_tool_opt_ins_without_aliases() {
+        for provider in [false, true] {
+            for late in [false, true] {
+                for tagged in [false, true] {
+                    for format in ["content/v1", "tool-result/v1"] {
+                        let answer: CatalogAnswer = serde_json::from_value(json!({
+                            "generation":"one", "catalog_digest":"one", "capabilities":{"late_results":late},
+                            "tools":[{"name":"work.native", "input_schema":{"type":"object"},
+                                "schema_digest":"634bdb1fe768fce0974f9c89e6f15f889470a8288277c6433e4711ab6a5b9335",
+                                "semantics":1, "capabilities": if tagged { vec!["call.yield/v1"] } else { vec![] },
+                                "result_format":format}]
+                        })).unwrap();
+                        let frozen =
+                            frozen_provider_declarations(&answer, false, provider).unwrap();
+                        let expected = provider && late && tagged && format == "tool-result/v1";
+                        assert_eq!(frozen.yield_tools.is_some(), expected);
+                        if let Some(tools) = frozen.yield_tools {
+                            assert_eq!(tools, BTreeSet::from(["work.native".to_owned()]));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn empty_yield_tools_cost_no_frozen_bytes() {
+        for tools in [None, Some(BTreeSet::new())] {
+            let declarations = FrozenProviderDeclarations {
+                yield_tools: tools,
+                ..Default::default()
+            };
+            assert!(declarations.is_empty());
+            assert_eq!(serde_json::to_string(&declarations).unwrap(), "{}");
+        }
+    }
+
+    #[test]
     fn catalog_schema_pin_is_frozen_instead_of_recomputed_from_a_later_catalog() {
         let digest = "634bdb1fe768fce0974f9c89e6f15f889470a8288277c6433e4711ab6a5b9335";
         let mut answer: cortexkit_role_tool_provider::catalog::CatalogAnswer = serde_json::from_value(json!({
@@ -2010,7 +2090,7 @@ mod tests {
                 "name":"work", "input_schema":{"type":"object"}, "schema_digest":digest, "semantics":7, "capabilities":[]
             }]
         })).unwrap();
-        let frozen = frozen_provider_declarations(&answer, false).unwrap();
+        let frozen = frozen_provider_declarations(&answer, false, false).unwrap();
         answer.tools[0].schema_digest = "0".repeat(64);
         answer.tools[0].semantics = 99;
         let round_trip: FrozenProviderDeclarations =

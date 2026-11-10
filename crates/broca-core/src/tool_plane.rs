@@ -311,6 +311,14 @@ impl DispatchSignals {
             None => std::future::pending().await,
         }
     }
+
+    /// A graceful runner stop, distinct from the person's decision to cancel the call.
+    pub async fn stopping(&self) {
+        match &self.stop {
+            Some(token) => token.cancelled().await,
+            None => std::future::pending().await,
+        }
+    }
 }
 
 impl From<&DispatchSignals> for ToolOpenGuard {

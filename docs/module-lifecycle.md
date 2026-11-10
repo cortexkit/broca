@@ -11,6 +11,9 @@ Shutdown must therefore count actors' work, not just the daemon's forwarded RPCs
    module's registered connection. Broca calls `LineageRegistry::begin_stop`:
    new runs are refused, durable queued work stays queued, and active runs finish
    their current step. It keeps serving health probes and receiving tool results.
+   Yieldable tool calls are asked immediately to hand back through `tool.yield` on their
+   own routes. A held final frame parks its run `tool_held`; shutdown leaves that obligation
+   open for the late result after restart, rather than writing an Interrupted terminal.
 2. At the next clean step-entry boundary, `on_restart: "resume"` runs durably
    write `RunPaused{Restart}`; other runs write `RunFinished{Interrupted}`. No
    cancellation or final seal is triggered by the drain notice. The wall-clock

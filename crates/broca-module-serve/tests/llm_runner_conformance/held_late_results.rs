@@ -25,6 +25,11 @@ const INTERIM: &str = "HELD INTERIM: the answer comes later";
 /// The scripted provider's held calls and its `late_results` feed.
 #[derive(Default)]
 pub(super) struct FeedState {
+    yield_sessions: BTreeSet<String>,
+    yield_arguments: BTreeSet<String>,
+    yield_routes: BTreeSet<(u16, u32)>,
+    waiting_yields: HashMap<String, ((u16, u32), tokio::sync::oneshot::Sender<()>)>,
+    yield_requests: Vec<Value>,
     withdrawals: Vec<Value>,
     /// The catalog declares `late_results` and `tool-result/v1`, and calls in `hold` are held.
     enabled: bool,
@@ -95,13 +100,28 @@ pub(super) fn declare_in_catalog(shared: &Shared, session: &str, answer: &mut Va
     if let Some(tools) = answer["tools"].as_array_mut() {
         for tool in tools {
             tool["result_format"] = json!("tool-result/v1");
+            if yields_session(shared, session) {
+                tool["capabilities"] = json!(["call.yield/v1"]);
+            }
         }
     }
+}
+
+pub(super) fn yields_session(shared: &Shared, session: &str) -> bool {
+    shared
+        .held_feed
+        .lock()
+        .unwrap()
+        .yield_sessions
+        .contains(session)
 }
 
 /// Remember whether a route's bind declared both held-reply capabilities: the provider holds a
 /// call only on such a route (contract §4.1).
 pub(super) fn note_bind(shared: &Shared, route: (u16, u32), capabilities: Option<&[String]>) {
+    if capabilities.is_some_and(|caps| caps.iter().any(|cap| cap == "call-yield/v1")) {
+        shared.held_feed.lock().unwrap().yield_routes.insert(route);
+    }
     let declared = capabilities.is_some_and(|capabilities| {
         cortexkit_role_tool_provider::consumer_reads_held_reply_v1(Some(capabilities))
     });
@@ -113,6 +133,72 @@ pub(super) fn note_bind(shared: &Shared, route: (u16, u32), capabilities: Option
             .declared_routes
             .insert(route);
     }
+}
+
+pub(super) fn answer_yield(
+    shared: &Shared,
+    route: (u16, u32),
+    request: &Value,
+) -> Option<subc_client_rs::HandlerOutcome> {
+    if request["name"] != "tool.yield" {
+        return None;
+    }
+    assert_eq!(request["arguments"]["reason"], "runner_restart");
+    assert!(request.get("call_key").is_none());
+    let key = request["arguments"]["call_key"].as_str().unwrap();
+    let mut feed = shared.held_feed.lock().unwrap();
+    feed.yield_requests.push(request.clone());
+    let answer = if feed
+        .waiting_yields
+        .get(key)
+        .is_some_and(|(own_route, _)| *own_route == route)
+    {
+        let (_, sender) = feed.waiting_yields.remove(key).unwrap();
+        sender.send(()).unwrap();
+        "accepted"
+    } else {
+        "unknown_call"
+    };
+    Some(subc_client_rs::HandlerOutcome::Response(
+        serde_json::to_vec(&json!({"answer":answer})).unwrap(),
+    ))
+}
+
+/// The original request stays open until the runner that dispatched it asks it to yield. Only that final
+/// held frame hands custody to the late-results feed; the yield acknowledgement is not a result.
+pub(super) async fn answer_waiting_yield(
+    shared: &Shared,
+    route: (u16, u32),
+    arguments: &str,
+    request: &Value,
+) -> Option<subc_client_rs::HandlerOutcome> {
+    let receiver = {
+        let mut feed = shared.held_feed.lock().unwrap();
+        if !feed.yield_arguments.contains(arguments) || !feed.yield_routes.contains(&route) {
+            return None;
+        }
+        let key = request["call_key"]
+            .as_str()
+            .expect("yieldable call is keyed")
+            .to_owned();
+        feed.held_keys.insert(arguments.to_owned(), key.clone());
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        assert!(feed.waiting_yields.insert(key, (route, sender)).is_none());
+        receiver
+    };
+    *shared
+        .invocations
+        .lock()
+        .unwrap()
+        .entry(arguments.to_owned())
+        .or_default() += 1;
+    receiver.await.expect("runner asked the live call to yield");
+    Some(subc_client_rs::HandlerOutcome::Response(
+        serde_json::to_vec(&json!({
+            "content":[{"type":"text","text":INTERIM}],"held":{"reason":"running","yielded":true}
+        }))
+        .unwrap(),
+    ))
 }
 
 pub(super) fn install_held_reply(shared: &Shared, session: &str, arguments: &Value, reason: &str) {
@@ -1201,6 +1287,113 @@ async fn held_shutdown_and_restart_send_no_real_withdraw() {
         .unwrap()
         .withdrawals
         .is_empty());
+    drop(live);
+    case.finish();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn graceful_restart_yields_running_tool_and_resumes_same_run_once() {
+    if !rig_ready() {
+        return;
+    }
+    let case = HeldCase::new("held-yield-graceful-restart").await;
+    {
+        let mut feed = case.subject.shared.held_feed.lock().unwrap();
+        feed.yield_sessions.insert(case.session.into());
+        feed.yield_arguments.insert(case.call.arguments.to_string());
+    }
+    let live = case.subject.spawn(&case.root).await.unwrap();
+    let route = case.send(&live).await;
+    let key = await_held_reply(&case.subject.shared, &case.call.arguments)
+        .await
+        .unwrap();
+    assert!(!case
+        .subject
+        .records(&live, case.session)
+        .iter()
+        .any(|record| matches!(
+            record,
+            broca_wal::WalRecord::ToolCallProviderHeld { .. }
+                | broca_wal::WalRecord::RunFinished { .. }
+        )));
+    let old_pid = live
+        .children()
+        .into_iter()
+        .find(|(_, name)| name.contains("ck-broca"))
+        .expect("broca child before restart")
+        .0;
+    let cli = sibling_bin("ck-subc", "SUBC_CORE_BIN")
+        .with_file_name(format!("ck{}", std::env::consts::EXE_SUFFIX));
+    assert!(
+        cli.is_file(),
+        "graceful restart requires the ck CLI beside ck-subc: {cli:?}"
+    );
+    let cli = broca_test_support::ckdev_binary(&cli, broca_test_support::scratch_root());
+    let mut command = tokio::process::Command::new(cli);
+    command
+        .env("XDG_CONFIG_HOME", case.root.join("config"))
+        .env("XDG_RUNTIME_DIR", case.root.join("runtime"))
+        .env("XDG_DATA_HOME", case.root.join("data-home"))
+        .env("HOME", case.root.join("home"))
+        .env_remove("BROCA_STATE_ROOT")
+        .args(["module", "restart", "broca"]);
+    let output = broca_test_support::wait_for(
+        "graceful broca restart acknowledgement",
+        command.output(),
+        || "ck module restart broca has not returned".into(),
+    )
+    .await
+    .unwrap();
+    assert!(output.status.success(), "ck restart failed: {output:?}");
+    assert_eq!(case.await_pause(&live).await, key);
+    let paused = case.subject.records(&live, case.session);
+    assert!(
+        !paused
+            .iter()
+            .any(|record| matches!(record, broca_wal::WalRecord::RunFinished { .. })),
+        "a held pause is not an interrupted terminal"
+    );
+    broca_test_support::wait_until("replacement broca child", || async {
+        if live
+            .children()
+            .iter()
+            .any(|(pid, name)| *pid != old_pid && name.contains("ck-broca"))
+        {
+            Ok(())
+        } else {
+            Err("old broca has not been replaced".into())
+        }
+    })
+    .await;
+    drop(route);
+    case.publish(&key);
+    case.assert_delivered_once(&live, true).await;
+    let records = case.subject.records(&live, case.session);
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| matches!(record, broca_wal::WalRecord::RunStarted { .. }))
+            .count(),
+        1,
+        "late result continues the original run"
+    );
+    let resumed = records
+        .iter()
+        .position(|record| matches!(record, broca_wal::WalRecord::ResumeStarted { .. }))
+        .expect("held recovery resumes the run");
+    assert!(!records[..resumed]
+        .iter()
+        .any(|record| matches!(record, broca_wal::WalRecord::RunFinished { .. })));
+    assert_eq!(
+        case.subject
+            .shared
+            .held_feed
+            .lock()
+            .unwrap()
+            .yield_requests
+            .len(),
+        1
+    );
     drop(live);
     case.finish();
 }

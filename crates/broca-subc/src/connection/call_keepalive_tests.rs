@@ -12,7 +12,7 @@ mod call_keepalive {
             route.call_keepalive = keepalive;
             let stop = CancellationToken::new();
             let signals = broca_core::tool_plane::DispatchSignals::new(None, Some(&stop));
-            let call = conn.tool_call_raw_guarded(
+            let call = conn.tool_call_raw_yieldable_guarded(
                 &route,
                 "read",
                 "{}",
@@ -23,6 +23,7 @@ mod call_keepalive {
                 None,
                 None,
                 &signals,
+                None,
             );
             tokio::pin!(call);
             assert!(futures::poll!(&mut call).is_pending());
@@ -92,7 +93,7 @@ mod call_keepalive {
         let abandoned_wakes = Arc::new(WakeCounter::default());
         let waker = futures::task::waker(abandoned_wakes.clone());
         let mut context = std::task::Context::from_waker(&waker);
-        let mut call = Box::pin(conn.tool_call_raw_guarded(
+        let mut call = Box::pin(conn.tool_call_raw_yieldable_guarded(
             &route,
             "read",
             "{}",
@@ -103,6 +104,7 @@ mod call_keepalive {
             None,
             None,
             &signals,
+            None,
         ));
         assert!(std::future::Future::poll(call.as_mut(), &mut context).is_pending());
         let request = writes.try_recv().unwrap();
@@ -196,7 +198,7 @@ mod call_keepalive {
             let route = RouteHandle::new(7, 1, ConnToken(1));
             let signal = CancellationToken::new();
             let signals = broca_core::tool_plane::DispatchSignals::new(Some(&signal), None);
-            let call = conn.tool_call_raw_guarded(
+            let call = conn.tool_call_raw_yieldable_guarded(
                 &route,
                 "read",
                 "{}",
@@ -207,6 +209,7 @@ mod call_keepalive {
                 None,
                 None,
                 &signals,
+                None,
             );
             tokio::pin!(call);
             assert!(futures::poll!(&mut call).is_pending());
@@ -302,7 +305,7 @@ mod call_keepalive {
         for declared in [false, true] {
             let (conn, route, mut provider) = SubcConnection::in_process_for_test(7, 1);
             let signals = broca_core::tool_plane::DispatchSignals::default();
-            let call = conn.tool_call_raw_guarded(
+            let call = conn.tool_call_raw_yieldable_guarded(
                 &route,
                 "read",
                 r#"{"path":"src/lib.rs"}"#,
@@ -313,6 +316,7 @@ mod call_keepalive {
                 None,
                 None,
                 &signals,
+                None,
             );
             let response = async {
                 let request = provider.next_request().await;

@@ -70,6 +70,15 @@ pub struct FrozenProviderDeclarations {
     /// non-plan tools carry none; a later catalog must not fill the missing facts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema_pins: Option<BTreeMap<String, super::DispatchSchemaPin>>,
+    /// Tools whose calls broca may yield, frozen at admission. Present only when the provider
+    /// declared `call-yield/v1` and `late_results`, and only for tools tagged `call.yield/v1`
+    /// using `tool-result/v1`. Missing or empty means no call is yieldable.
+    #[serde(default, skip_serializing_if = "no_yield_tools")]
+    pub yield_tools: Option<std::collections::BTreeSet<String>>,
+}
+
+fn no_yield_tools(tools: &Option<std::collections::BTreeSet<String>>) -> bool {
+    tools.as_ref().is_none_or(|tools| tools.is_empty())
 }
 
 impl FrozenProviderDeclarations {
@@ -79,6 +88,7 @@ impl FrozenProviderDeclarations {
             && self.result_formats.is_none()
             && self.late_results.is_none()
             && self.schema_pins.is_none()
+            && no_yield_tools(&self.yield_tools)
     }
 }
 
@@ -141,7 +151,7 @@ pub enum FetchOutcome {
         /// Result formats and session capabilities the provider declared, frozen only when it
         /// declared some. Absent keeps manifests from providers without declarations
         /// byte-compatible.
-        declarations_frozen: Option<FrozenProviderDeclarations>,
+        declarations_frozen: Option<Box<FrozenProviderDeclarations>>,
         /// The catalog's reference slots by tool name: the top-level string arguments in which
         /// output references are read (llm-runner §9.13). Frozen only when the provider's plan
         /// item opts into output references and one of its tools declares slots; absent
@@ -213,7 +223,7 @@ struct ProviderFetchIn {
     #[serde(default)]
     reply: Option<BTreeMap<String, FrozenReply>>,
     #[serde(default)]
-    declarations_frozen: Option<FrozenProviderDeclarations>,
+    declarations_frozen: Option<Box<FrozenProviderDeclarations>>,
     #[serde(default)]
     reference_slots: Option<BTreeMap<String, Vec<FrozenReferenceSlot>>>,
 }
@@ -246,7 +256,7 @@ impl Serialize for ProviderFetch {
                 out.text = text.as_deref();
                 out.result_ops = result_ops.as_ref();
                 out.reply = reply.as_ref();
-                out.declarations_frozen = declarations_frozen.as_ref();
+                out.declarations_frozen = declarations_frozen.as_deref();
                 out.reference_slots = reference_slots.as_ref();
             }
             FetchOutcome::Absent { reason } => out.absent = Some(reason),

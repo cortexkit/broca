@@ -316,6 +316,7 @@ pub struct RouteHandle {
     conn: ConnToken,
     pub(crate) reads_tool_result: bool,
     pub(crate) reads_held_reply: bool,
+    pub(crate) declares_call_yield: bool,
     pub(crate) call_keepalive: bool,
     /// The route was opened declaring `tool-provider: v1`.
     pub(crate) tool_provider_v1: bool,
@@ -382,10 +383,12 @@ impl ToolProviderRoutePolicy {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct ToolReplyDeadline {
     pub duration: Duration,
     pub declared: bool,
+    /// A frozen yieldable provider, used only after the original request has been enqueued.
+    pub yield_provider: Option<String>,
 }
 
 struct ToolReplyWait {
@@ -418,6 +421,7 @@ impl RouteHandle {
             conn,
             reads_tool_result: false,
             reads_held_reply: false,
+            declares_call_yield: false,
             call_keepalive: false,
             tool_provider_v1: false,
             session_identity: false,
@@ -1494,6 +1498,7 @@ impl SubcConnection {
             Some(vec![
                 cortexkit_role_tool_provider::TOOL_RESULT_V1_CAPABILITY.into(),
                 cortexkit_role_tool_provider::HELD_REPLY_V1.into(),
+                cortexkit_role_tool_provider::CALL_YIELD_V1.into(),
             ])
         } else {
             tool_result_v1
@@ -1889,6 +1894,9 @@ impl SubcConnection {
             caps.iter()
                 .any(|cap| cap == cortexkit_role_tool_provider::CALL_KEEPALIVE_CAPABILITY)
         });
+        let declares_call_yield = cortexkit_role_tool_provider::consumer_reads_call_yield_v1(
+            consumer_capabilities.as_deref(),
+        );
         let tool_provider_v1 = role_versions
             .as_ref()
             .is_some_and(|roles| roles.contains_key("tool-provider"));
@@ -1920,6 +1928,7 @@ impl SubcConnection {
                         let mut handle = RouteHandle::new(route_channel, route_epoch, conn);
                         handle.reads_tool_result = reads_tool_result;
                         handle.reads_held_reply = reads_held_reply;
+                        handle.declares_call_yield = declares_call_yield;
                         handle.call_keepalive = call_keepalive;
                         handle.tool_provider_v1 = tool_provider_v1;
                         Ok(handle)
@@ -2283,7 +2292,7 @@ impl SubcConnection {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn tool_call_raw_guarded(
+    pub(crate) async fn tool_call_raw_yieldable_guarded(
         &self,
         route: &RouteHandle,
         name: &str,
@@ -2295,6 +2304,7 @@ impl SubcConnection {
         call_key: Option<&str>,
         schema_pin: Option<&str>,
         signals: &broca_core::tool_plane::DispatchSignals,
+        yield_provider: Option<&str>,
     ) -> Result<serde_json::Value, ApprovedCallError> {
         // All fallible setup belongs to one pre-push stage. There is no fallible
         // work after enqueue inside this block, so its errors can never mean sent.
@@ -2327,9 +2337,51 @@ impl SubcConnection {
         };
         let (runtime, _registration, mut rx, corr, wait) =
             before_push.await.map_err(ApprovedCallError::BeforePush)?;
-        self.receive_tool_call(runtime, route, corr, &mut rx, wait, Some(signals))
-            .await
-            .map_err(ApprovedCallError::AfterPush)
+        let yielding = yield_provider
+            .zip(call_key)
+            .filter(|_| route.declares_call_yield)
+            .map(|(provider, call_key)| YieldWatch {
+                provider,
+                tool: name,
+                call_key,
+                accepted: false,
+                settled: false,
+            });
+        self.receive_tool_call_yieldable(
+            runtime,
+            route,
+            corr,
+            &mut rx,
+            wait,
+            Some(signals),
+            yielding,
+        )
+        .await
+        .map_err(ApprovedCallError::AfterPush)
+    }
+
+    /// Ask on the call's own route, with the same runner identity and scope. Acknowledgement never
+    /// replaces the original call's terminal frame; its waiter remains the only result path.
+    pub async fn yield_call(
+        &self,
+        route: &RouteHandle,
+        call_key: &str,
+        reason: &str,
+    ) -> ConnResult<cortexkit_role_tool_provider::call_yield::YieldAnswer> {
+        let request =
+            cortexkit_role_tool_provider::call_yield::YieldArguments::new(call_key, reason)
+                .into_request();
+        let body =
+            serde_json::to_vec(&request).map_err(|error| ConnError::Protocol(error.to_string()))?;
+        let response = self
+            .route_request_raw_with_deadline(
+                route,
+                body,
+                Duration::from_millis(cortexkit_role_tool_provider::CALL_YIELD_DEADLINE_MS),
+            )
+            .await?;
+        serde_json::from_slice(&response)
+            .map_err(|error| ConnError::Protocol(format!("decode tool.yield answer: {error}")))
     }
 
     fn raw_tool_call_body(
@@ -2398,6 +2450,21 @@ impl SubcConnection {
         wait: ToolReplyWait,
         signals: Option<&broca_core::tool_plane::DispatchSignals>,
     ) -> ConnResult<serde_json::Value> {
+        self.receive_tool_call_yieldable(runtime, route, corr, rx, wait, signals, None)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn receive_tool_call_yieldable(
+        &self,
+        runtime: Arc<ConnectionRuntime>,
+        route: &RouteHandle,
+        corr: u64,
+        rx: &mut mpsc::UnboundedReceiver<Frame>,
+        wait: ToolReplyWait,
+        signals: Option<&broca_core::tool_plane::DispatchSignals>,
+        mut yielding: Option<YieldWatch<'_>>,
+    ) -> ConnResult<serde_json::Value> {
         // Arm abandonment only after enqueue. A request canceled while reserving
         // writer capacity has no provider work to cancel.
         let mut abandon = CancelOnAbandon::arm(&runtime, route, corr);
@@ -2418,9 +2485,22 @@ impl SubcConnection {
                     self.await_terminal_deadline(&runtime, rx, wait.duration).await
                 }
             } => terminal,
+            _ = async {
+                if let (Some(signals), Some(yielding)) = (signals, yielding.as_mut()) {
+                    signals.stopping().await;
+                    let answer = self.yield_call(route, yielding.call_key, "runner_restart").await;
+                    yielding.accepted = matches!(answer, Ok(cortexkit_role_tool_provider::call_yield::YieldAnswer::Accepted));
+                    tracing::debug!(provider = yielding.provider, tool = yielding.tool,
+                        call_key = yielding.call_key, ?answer, "tool yield requested for runner stop");
+                }
+                std::future::pending::<()>().await;
+            } => unreachable!(),
         };
         if terminal.is_ok() {
             abandon.disarm();
+            if let Some(yielding) = &mut yielding {
+                yielding.settled = true;
+            }
         }
         let terminal = terminal?;
         match terminal.header.ty {
@@ -2659,6 +2739,27 @@ impl Drop for SubscribeStream {
 /// like any late terminal. The `Cancel` resends nothing, so the call is still sent at most once,
 /// and it says nothing about whether the tool ran, so callers record the outcome exactly as
 /// they would without it.
+struct YieldWatch<'a> {
+    provider: &'a str,
+    tool: &'a str,
+    call_key: &'a str,
+    accepted: bool,
+    settled: bool,
+}
+
+impl Drop for YieldWatch<'_> {
+    fn drop(&mut self) {
+        if self.accepted && !self.settled {
+            tracing::warn!(
+                provider = self.provider,
+                tool = self.tool,
+                call_key = self.call_key,
+                "accepted tool yield abandoned without a final frame"
+            );
+        }
+    }
+}
+
 struct CancelOnAbandon {
     write_tx: mpsc::Sender<Frame>,
     route_epochs: RouteEpochs,
@@ -4782,6 +4883,9 @@ impl SubcConnection {
 
 #[cfg(test)]
 impl InProcessModuleEnd {
+    pub(crate) fn try_frame(&mut self) -> Option<Frame> {
+        self.write_rx.try_recv().ok()
+    }
     pub(crate) fn push(&self, request: &Frame, body: Vec<u8>) -> bool {
         self.terminal(request, FrameType::Push, body)
     }
@@ -4904,7 +5008,7 @@ mod tests {
                 tokio::spawn(async move {
                     if guarded {
                         matches!(
-                            conn.tool_call_raw_guarded(
+                            conn.tool_call_raw_yieldable_guarded(
                                 &route,
                                 "echo",
                                 "{}",
@@ -4914,7 +5018,8 @@ mod tests {
                                 None,
                                 None,
                                 None,
-                                &broca_core::tool_plane::DispatchSignals::default()
+                                &broca_core::tool_plane::DispatchSignals::default(),
+                                None,
                             )
                             .await,
                             Err(ApprovedCallError::BeforePush(
@@ -5239,7 +5344,7 @@ mod tests {
             if installed {
                 assert_eq!(
                     raw["consumer_capabilities"],
-                    serde_json::json!(["tool-result/v1", "held-reply/v1"])
+                    serde_json::json!(["tool-result/v1", "held-reply/v1", "call-yield/v1"])
                 );
             } else if result_v1 {
                 assert_eq!(
@@ -5329,7 +5434,7 @@ mod tests {
         let signals = broca_core::tool_plane::DispatchSignals::default();
         let pin = format!("tp1:work:{}:7", "0".repeat(64));
         let arguments = r#"{ "value" : 1 }"#;
-        let dispatch = conn.tool_call_raw_guarded(
+        let dispatch = conn.tool_call_raw_yieldable_guarded(
             &route,
             "work",
             arguments,
@@ -5340,6 +5445,7 @@ mod tests {
             Some("lineage:7"),
             Some(&pin),
             &signals,
+            None,
         );
         let receive = async {
             let request = provider.next_request().await;
@@ -6468,7 +6574,7 @@ mod tests {
         let (conn, route, mut module) = SubcConnection::in_process_for_test(5, 3);
         let capture = broca_test_support::LogCapture::new();
         let signals = broca_core::tool_plane::DispatchSignals::default();
-        let dispatch = capture.scope_future(conn.tool_call_raw_guarded(
+        let dispatch = capture.scope_future(conn.tool_call_raw_yieldable_guarded(
             &route,
             "lookup",
             r#"{"secret":"argument content"}"#,
@@ -6479,6 +6585,7 @@ mod tests {
             None,
             None,
             &signals,
+            None,
         ));
         let receive = async {
             let request = module.next_request().await;

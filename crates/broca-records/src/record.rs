@@ -1951,7 +1951,8 @@ pub enum WalRecord {
     /// A tool provider accepted the call and answered with a `held` marker (tool-provider
     /// contract §4.1, `held-reply/v1`): the real result arrives later as a `late_results` entry
     /// for `call_key` (§7). The writer must append and sync it before acting on anything else
-    /// in the reply. No production path writes it yet (see `framing::PROVIDER_HELD_FEATURE`).
+    /// in the reply. The daemon declares held replies in every build and recovers these
+    /// obligations through its late-results runtime.
     ///
     /// The call's `ToolDispatchIntent` precedes this record, and no terminal does: the call is
     /// open but not indeterminate, because the provider confirmed it holds the call. Its later

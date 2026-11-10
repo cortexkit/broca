@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[derive(Default)]
-struct HoldingTools(AtomicUsize);
+struct HoldingTools(AtomicUsize, std::sync::atomic::AtomicBool);
 
 #[async_trait]
 impl ToolPlane for HoldingTools {
@@ -55,6 +55,22 @@ impl ToolPlane for HoldingTools {
             .await
             .unwrap();
         std::future::pending().await
+    }
+
+    async fn dispatch_guarded(
+        &self,
+        ctx: &BatchCtx,
+        call: &broca_protocol::ToolCall,
+        key: Option<DispatchKey<'_>>,
+        guard: &broca_core::tool_plane::ToolOpenGuard,
+    ) -> DispatchResult {
+        if self.1.load(Ordering::SeqCst) {
+            // Stand in for a provider that returns its held final only after runner stop.
+            self.0.fetch_add(1, Ordering::SeqCst);
+            guard.signals().stopping().await;
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+        self.dispatch_keyed(ctx, call, key.unwrap()).await
     }
 }
 
@@ -131,7 +147,7 @@ impl RunExecutor for HeldExecutor {
                 bind: req.session.clone(),
                 out: Some(&out),
                 cancel: control.cancel.clone().unwrap_or_default(),
-                stop: Default::default(),
+                stop: control.stop_requested.clone().unwrap_or_default(),
                 held: Some(self.slots.as_ref()),
                 approval: &AllowAll,
                 hook_plane: None,
@@ -451,6 +467,7 @@ fn comparable(mut value: Value) -> Value {
 
 cipher_tests!(
     held_status_and_late_continuation_match_after_restart,
+    a_stop_yielded_hold_survives_the_seal_and_restart,
     boot_sweep_seals_store_orphans_without_a_run_index,
     a_held_pause_keeps_a_queued_interrupt_parked_after_restart
 );
@@ -500,10 +517,30 @@ async fn a_held_pause_keeps_a_queued_interrupt_parked_after_restart(cipher: Ciph
 }
 
 async fn held_status_and_late_continuation_match_after_restart(cipher: Cipher) {
+    held_restart(cipher, false).await;
+}
+
+async fn a_stop_yielded_hold_survives_the_seal_and_restart(cipher: Cipher) {
+    held_restart(cipher, true).await;
+}
+
+async fn held_restart(cipher: Cipher, yield_at_stop: bool) {
     let mut initial = Vec::new();
     for store in [false, true] {
         let side = Side::new(store, cipher, vec![super::super::tests::read_step("m1")]).await;
+        side.executor.tools.1.store(yield_at_stop, Ordering::SeqCst);
         side.send().await;
+        if yield_at_stop {
+            broca_test_support::wait_until("tool waiting for stop", || async {
+                if side.executor.tools.0.load(Ordering::SeqCst) == 1 {
+                    Ok(())
+                } else {
+                    Err("not dispatched".into())
+                }
+            })
+            .await;
+            side.registry.begin_stop();
+        }
         side.idle().await;
         initial.push(side);
     }
@@ -517,6 +554,37 @@ async fn held_status_and_late_continuation_match_after_restart(cipher: Cipher) {
     );
     let mut restarted = Vec::new();
     for side in &initial {
+        if yield_at_stop {
+            assert!(side.registry.stop_and_seal().await);
+            if side.store {
+                let runtime = side.registry.store_runtime().unwrap();
+                let class = runtime.class_of(&side.key).unwrap().unwrap();
+                let session = Session::load(
+                    broca_session_store::backend::LocalBackend::new(class.store_root(&side.dir)),
+                    broca_session_store::backend::SessionAddr(broca_core::session_addr(&side.key)),
+                    &crate::store_open::triple(&side.key),
+                    runtime.deployment(),
+                )
+                .await
+                .unwrap();
+                let run = session.operations.run.as_ref().unwrap();
+                assert!(run.finished.is_none(), "shutdown must not end the held run");
+                assert_eq!(run.paused, Some(broca_protocol::PauseReason::ToolHeld));
+            } else {
+                let records = side.executor.wal.read_records(&side.key).unwrap();
+                assert!(records.iter().any(|frame| matches!(
+                    frame.record,
+                    broca_wal::WalRecord::ToolCallProviderHeld { .. }
+                )));
+                assert!(
+                    !records.iter().any(|frame| matches!(
+                        frame.record,
+                        broca_wal::WalRecord::RunFinished { .. }
+                    )),
+                    "no terminal before same-run resume"
+                );
+            }
+        }
         restarted.push(side.restarted().await);
     }
     for side in &restarted {

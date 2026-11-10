@@ -1776,6 +1776,10 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         let control = RunControl {
             conversation_key,
             cancel: Some(cancel.clone()),
+            stop_requested: self
+                .registry
+                .as_ref()
+                .map(|registry| registry.stopping_signal()),
             step_progress: Some(Arc::clone(&step)),
             hook_plane: self.executor.hook_plane(),
             provider_held_lifecycle: self.executor.provider_held_lifecycle(),
