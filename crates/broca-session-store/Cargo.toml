@@ -24,8 +24,10 @@ getrandom = "0.2"
 # will need a pure-Rust codec for WebAssembly, chosen when that backend is built.
 zstd = "0.14"
 sha2.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
+broca-test-support = { path = "../broca-test-support" }
 proptest = { version = "1.11", default-features = false, features = ["std"] }
 futures = { workspace = true, features = ["executor"] }
 

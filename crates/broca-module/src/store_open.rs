@@ -472,6 +472,9 @@ impl StoreRuntime {
         create: Option<StorageClass>,
         step_events: Option<&crate::step_events::StepEvents>,
     ) -> Result<ActorHandle, OpenError> {
+        let timing = broca_session_store::metrics::Phase::Open
+            .start()
+            .with_session(|| Some(broca_core::session_addr(key)));
         let addr = SessionAddr(broca_core::session_addr(key));
         let triple = triple(key);
         let class = match create {
@@ -503,6 +506,7 @@ impl StoreRuntime {
             Session::load(backend, addr, &triple, self.deployment()).await
         }
         .map_err(|error| open_error(error, create.is_some()))?;
+        drop(timing);
         // The session reads and stores its setup parts in its own root and mode.
         let cipher = session.head().cipher();
         let setup_key = self

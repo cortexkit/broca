@@ -348,6 +348,9 @@ pub async fn serve_read(
     store: &crate::store_open::StoreRuntime,
     req: crate::serve::SessionReadRequest,
 ) -> Result<broca_wire::SessionReadResponse, crate::serve::ServeError> {
+    let _timing = broca_session_store::metrics::Phase::Read
+        .start()
+        .with_session(|| Some(broca_core::session_addr(&req.session)));
     use crate::serve::ServeError;
     use crate::store_reads::{PageRequest, StoreReadReply, StoreReadRequest};
     if let Some(cursor) = req.late_after.as_deref() {

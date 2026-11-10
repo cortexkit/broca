@@ -1915,6 +1915,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         #[cfg(test)]
         let gate = self.media_build_gate.clone();
         self.media_build = Some(tokio::task::spawn_blocking(move || {
+            let timing = broca_session_store::metrics::Phase::MediaFold.start();
+            let addr = broca_core::session_addr(&key);
+            let _timing = timing.with_session(move || Some(addr));
             #[cfg(test)]
             if let Some(gate) = gate {
                 futures::executor::block_on(gate.notified());

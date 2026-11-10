@@ -69,6 +69,7 @@ pub mod head;
 pub mod idindex;
 pub mod keys;
 pub mod log;
+pub mod metrics;
 pub mod prune;
 pub mod record;
 pub mod segment;

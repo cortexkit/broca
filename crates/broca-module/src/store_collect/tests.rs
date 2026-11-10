@@ -109,6 +109,36 @@ fn sweep(
     .with_clock(Arc::new(move || now_ms))
 }
 
+#[tokio::test]
+async fn a_real_collection_pass_publishes_phase_timings() {
+    if !crate::phase_metrics_tests::isolated(
+        "store_collect::tests::a_real_collection_pass_publishes_phase_timings",
+    ) {
+        return;
+    }
+    let root = state_root("phase-timings");
+    let key = key(&root, "finished");
+    let replaced = finished(&root, StorageClass::Ordinary, &key, SEALED_AT).await;
+    let sweep = sweep(
+        &root,
+        slot(&root).await,
+        Arc::new(FileLeaseStore::new(root.join("leases"))),
+        &[],
+        SEALED_AT + GRACE_MS,
+    );
+    let before = broca_session_store::metrics::snapshot();
+    let pass = sweep.sweep_once(&CancellationToken::new());
+    assert_eq!(pass.collected, 1);
+    assert!(!holds(&root, StorageClass::Ordinary, &key, &replaced));
+    let after = broca_session_store::metrics::snapshot();
+    for phase in ["collection", "collection_sweep"] {
+        assert_eq!(after[phase].count, before[phase].count + 1, "{phase}");
+        assert!(after[phase].total_us > before[phase].total_us, "{phase}");
+        assert!(after[phase].last_us > 0, "{phase}");
+    }
+    let _ = std::fs::remove_dir_all(root);
+}
+
 /// Finished sessions nobody opens again are collected by the sweep once their seal's grace
 /// period is over, at most the bound a pass, each pass going on where the last one stopped. A
 /// session still inside its grace period keeps its files. A session an actor serves, or whose
