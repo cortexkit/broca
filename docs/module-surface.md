@@ -2562,6 +2562,14 @@ view. Notices are serialized, coalesced in memory, and flushed completely before
 they create neither `CompactionNotice` records nor bus outbox work. An over-limit ride is
 followed by a fresh estimate and `context_ceiling` if the request still does not fit.
 
+While the materialized compaction entry projection is incomplete, `session.entries` refuses
+with `projection_not_ready` and `detail.class: "transient"`, for ordinal, message-id and tag
+selections alike. The caller may retry; this refusal does not mean an empty transcript or
+missing ids/tags. `session.apply_view` returns the same refusal if its entry read is not ready.
+Other projection faults remain `internal_error`.
+If a delivery template needs a part's number before the projection is ready, `session.send`
+uses its existing `transient` admission refusal without writing the send.
+
 Numbered parts follow the latest host marker's checkpoint. A marker naming another harness or
 session refuses the log on load. Tool-result deliveries are a separate `delivered` list, with
 sender and template attributed by submission id; the render plan edits the stored output before

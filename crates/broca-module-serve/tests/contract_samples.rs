@@ -1995,6 +1995,202 @@ async fn envelope_ride_entries_share_native_coordinates_with_materialized_read()
     rig.finish().await;
 }
 
+fn projection_part_tag_template() -> cortexkit_role_llm_runner::delivery_order::Template {
+    serde_json::from_value(json!({
+        "id":"pointer", "text":"see {part}", "slots":{"part":{"type":"part_tag"}}
+    }))
+    .unwrap()
+}
+
+async fn rig_with_compaction_projection(tag: &str) -> (Rig, serde_json::Value) {
+    use broca_core::{FileWalStore, WalStore};
+
+    let mut rig = Rig::start(tag).await;
+    let mut start: serde_json::Value = serde_json::from_str(
+        include_str!("../../broca-wal/tests/fixtures/before_message_times.jsonl")
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    let input = json!([{"role":"user","content":[{"type":"text","text":"hello"}]}]);
+    start["run_id"] = json!("projection-run");
+    start["submission_id"] = json!("projection-send");
+    start["session"] = json!(rig.session);
+    start["input"] = input.clone();
+    start["written_at_ms"] = json!(10);
+    start["ts_ms"] = json!(10);
+    start["compaction_plan_version"] = json!(3);
+    start["manifest"] = json!({
+        "plan":json!({"compaction_item":{"provider":"provider","preset":"head","params":{}},"composition":{},"render_tags":false,"senders":[{"module":"sender","idle_start":true,"templates":[projection_part_tag_template()]}]}).to_string(),
+        "plan_identity":"plan", "composition_digest":"digest", "tools":[],
+        "system_text":"", "system_digest":"", "join_version":1,
+        "role_versions":{}, "fetches":[], "declarations":[]
+    });
+    let wal_store = FileWalStore::new(rig.dir.join("wal"));
+    {
+        let mut wal = wal_store.open(&rig.session).unwrap();
+        for value in [
+            json!({"type":"delivery_ordered","submission_id":"projection-send","order":{"modes":["idle_start"]}}),
+            json!({"type":"queued","submission_id":"projection-send","request":{"model":{"provider_module_id":"fake","model_id":"fake"},"input":input}}),
+            start,
+            json!({"type":"step_started","step_id":1}),
+            json!({"type":"model_step_finished","step_id":1,"written_at_ms":11,"assistant_message":{"message_id":"answer","content":[{"type":"text","text":"answer"}]},"usage":{},"finish_reason":"stop","retries_used":0}),
+            json!({"type":"turn_finished","step_id":1}),
+            json!({"type":"run_finished","reason":"completed","ts_ms":12,"usage":{},"retries_used":0}),
+        ] {
+            wal.append(1, &serde_json::from_value(value).unwrap(), true)
+                .unwrap();
+        }
+    }
+    rig.bind_compaction(9, "provider").await;
+    let request =
+        json!({"method":"session.entries","params":{"select":{"by":"after"},"detail":"full"}});
+    let ready = rig.request(9, request.clone()).await;
+    assert_eq!(
+        ready.header.ty,
+        subc_protocol::FrameType::Response,
+        "{ready:?}"
+    );
+    let page: serde_json::Value = serde_json::from_slice(&ready.body).unwrap();
+    assert!(!page["entries"].as_array().unwrap().is_empty());
+    (rig, page)
+}
+
+#[tokio::test]
+async fn compaction_part_tag_template_refuses_retryably_while_projection_is_not_ready() {
+    let (mut rig, page) = rig_with_compaction_projection("template-projection-not-ready").await;
+    rig.bind_as(
+        13,
+        Some(subc_protocol::Principal::Reserved {
+            module_id: "sender".into(),
+        }),
+    )
+    .await;
+    let conn = rusqlite::Connection::open(rig.dir.join("store.db")).unwrap();
+    assert!(
+        conn.execute(
+            "UPDATE message SET compaction_json=NULL,compaction_compact_json=NULL",
+            []
+        )
+        .unwrap()
+            > 0
+    );
+    let template = projection_part_tag_template();
+    let wal_before = rig.wal_bytes();
+    let reply = rig.request(13, json!({"method":"session.send","params":{
+        "send_id":"template", "model":{"provider":"fake","model":"fake"}, "delivery":["idle_start"],
+        "template":{"id":template.id,"digest":cortexkit_role_llm_runner::delivery_order::template_digest(&template),
+            "slots":{"part":{"mid":page["entries"][0]["mid"],"part":page["entries"][0]["parts"][0]["id"]}}}
+    }})).await;
+    assert_eq!(
+        reply.header.ty,
+        subc_protocol::FrameType::Error,
+        "{reply:?}"
+    );
+    let refusal: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+    assert_eq!(refusal["code"], "transient", "{refusal}");
+    assert!(
+        refusal["message"]
+            .as_str()
+            .unwrap()
+            .contains("compaction entry projection is not ready"),
+        "{refusal}"
+    );
+    assert_eq!(
+        rig.wal_bytes(),
+        wal_before,
+        "refused template sends write nothing"
+    );
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn compaction_entries_refuse_retryably_while_projection_is_not_ready() {
+    let (mut rig, page) = rig_with_compaction_projection("compaction-projection-not-ready").await;
+    let request =
+        json!({"method":"session.entries","params":{"select":{"by":"after"},"detail":"full"}});
+
+    // Keep the committed watermark so the read cannot repair these deliberately
+    // incomplete cached entries by projecting a newer WAL suffix.
+    let conn = rusqlite::Connection::open(rig.dir.join("store.db")).unwrap();
+    conn.execute_batch("CREATE TEMP TABLE saved_entries AS SELECT session,ord,compaction_json,compaction_compact_json FROM message; CREATE TEMP TABLE saved_tags AS SELECT * FROM message_tag;").unwrap();
+    assert!(
+        conn.execute(
+            "UPDATE message SET compaction_json=NULL,compaction_compact_json=NULL",
+            []
+        )
+        .unwrap()
+            > 0
+    );
+    conn.execute("DELETE FROM message_tag", []).unwrap();
+    for detail in ["full", "compact"] {
+        for select in [
+            json!({"by":"after"}),
+            json!({"by":"mids","mids":[page["entries"][0]["mid"].clone()]}),
+            json!({"by":"tags","tags":[1]}),
+        ] {
+            let reply = rig
+                .request(
+                    9,
+                    json!({"method":"session.entries","params":{"select":select,"detail":detail}}),
+                )
+                .await;
+            assert_eq!(
+                reply.header.ty,
+                subc_protocol::FrameType::Error,
+                "{reply:?}"
+            );
+            let refusal: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+            assert_eq!(refusal["code"], "projection_not_ready", "{refusal}");
+            assert_eq!(refusal["detail"]["class"], "transient", "{refusal}");
+        }
+    }
+    let view = broca_core::compaction_v2::protocol::view::View::seal_with_policy(
+        1,
+        vec![],
+        Some(page["entries"][0]["mid"].as_str().unwrap().into()),
+        None,
+    );
+    let reply = rig
+        .request(
+            9,
+            json!({"method":"session.apply_view","params":{"view":view}}),
+        )
+        .await;
+    assert_eq!(
+        reply.header.ty,
+        subc_protocol::FrameType::Error,
+        "{reply:?}"
+    );
+    let refusal: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+    assert_eq!(refusal["code"], "projection_not_ready", "{refusal}");
+    assert_eq!(refusal["detail"]["class"], "transient", "{refusal}");
+
+    conn.execute_batch("UPDATE message SET compaction_json=(SELECT compaction_json FROM saved_entries WHERE saved_entries.session=message.session AND saved_entries.ord=message.ord), compaction_compact_json=(SELECT compaction_compact_json FROM saved_entries WHERE saved_entries.session=message.session AND saved_entries.ord=message.ord); INSERT INTO message_tag SELECT * FROM saved_tags;").unwrap();
+    let restored = rig.request(9, request.clone()).await;
+    assert_eq!(
+        restored.header.ty,
+        subc_protocol::FrameType::Response,
+        "{restored:?}"
+    );
+    let restored_page: serde_json::Value = serde_json::from_slice(&restored.body).unwrap();
+    assert_eq!(restored_page, page);
+
+    conn.execute("UPDATE message SET compaction_json='not-json'", [])
+        .unwrap();
+    let corrupt = rig.request(9, request).await;
+    assert_eq!(
+        corrupt.header.ty,
+        subc_protocol::FrameType::Error,
+        "{corrupt:?}"
+    );
+    let refusal: serde_json::Value = serde_json::from_slice(&corrupt.body).unwrap();
+    assert_eq!(refusal["code"], "internal_error", "{refusal}");
+    assert!(refusal["detail"].is_null(), "{refusal}");
+    rig.finish().await;
+}
+
 #[tokio::test]
 async fn recorded_owner_marks_are_projected_on_the_real_compaction_entries_route() {
     use broca_core::compaction_v2::protocol::read::{Detail, ReadRequest, Select};

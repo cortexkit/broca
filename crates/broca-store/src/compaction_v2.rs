@@ -8,6 +8,7 @@ use broca_core::{
         entries::compact,
         metadata::{apply_delivery, DeliveryUpdate},
         protocol::read::{Detail, Entry, ReadRequest, Select},
+        read::ReadError,
     },
     context::CompactionStorePage,
 };
@@ -47,7 +48,7 @@ pub(super) fn read_page(
     store: &SqliteStore,
     session: &BindIdentity,
     request: &ReadRequest,
-) -> Result<CompactionStorePage, String> {
+) -> Result<CompactionStorePage, ReadError> {
     let key = SqliteStore::key(session);
     let conn = store.conn.lock().unwrap();
     let tx = conn
@@ -86,6 +87,20 @@ pub(super) fn read_page(
     } else {
         "compaction_json"
     };
+    if matches!(request.select, Select::Mids { .. } | Select::Tags { .. }) {
+        // Missing envelopes can also mean missing mids and tag-index rows. Check
+        // before selecting so an incomplete projection cannot look like no matches.
+        let incomplete: bool = tx
+            .query_row(
+                &format!("SELECT EXISTS(SELECT 1 FROM message WHERE session=?1 AND ord<?2 AND ({column} IS NULL OR compaction_compact_json IS NULL))"),
+                params![key, i64::try_from(prefix_len).map_err(|error| error.to_string())?],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if incomplete {
+            return Err(ReadError::ProjectionNotReady);
+        }
+    }
     let sql = format!("SELECT ord,octet_length({column}),written_at_ms FROM message WHERE session=?1 AND ord<?3 AND {predicate} ORDER BY ord ASC");
     let mut statement = tx.prepare(&sql).map_err(|error| error.to_string())?;
     let rows = statement
@@ -109,7 +124,7 @@ pub(super) fn read_page(
     let mut has_more = false;
     for row in rows {
         let (ordinal, size, written_at) = row.map_err(|error| error.to_string())?;
-        let size = size.ok_or("compaction entry projection is not ready")?;
+        let size = size.ok_or(ReadError::ProjectionNotReady)?;
         let written_at =
             written_at.ok_or("compaction entry is missing its projected written_at_ms")?;
         let size = size + written_at.to_string().len() as u64 - 1;
@@ -288,6 +303,83 @@ mod tests {
         assert_eq!(page.entries.len(), 1);
         assert_eq!(page.entries[0].ordinal, 1);
         assert!(page.has_more);
+    }
+
+    #[test]
+    fn entry_reads_refuse_retryably_until_projection_is_ready() {
+        let (store, session) = fixture(2);
+        let key = SqliteStore::key(&session);
+        let requests: Vec<_> = [Detail::Full, Detail::Compact]
+            .into_iter()
+            .flat_map(|detail| {
+                [
+                    Select::After {
+                        after_ordinal: None,
+                        limit: None,
+                    },
+                    Select::Mids {
+                        mids: vec!["m12345678.0".into(), "m12345678.1".into()],
+                    },
+                    Select::Tags { tags: vec![1, 2] },
+                ]
+                .map(|select| ReadRequest::new(select, detail))
+            })
+            .collect();
+        let before: Vec<_> = requests
+            .iter()
+            .map(|request| store.read_compaction_page(&session, request).unwrap())
+            .collect();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute("UPDATE message SET compaction_json=NULL,compaction_compact_json=NULL WHERE session=?1 AND ord=0", [&key]).unwrap();
+            conn.execute("DELETE FROM message_tag WHERE session=?1 AND ord=0", [&key])
+                .unwrap();
+        }
+        for request in &requests {
+            assert_eq!(
+                store.read_compaction_page(&session, request),
+                Err(ReadError::ProjectionNotReady),
+                "{request:?}"
+            );
+        }
+        {
+            let conn = store.conn.lock().unwrap();
+            let entry = entry(0);
+            conn.execute("UPDATE message SET compaction_json=?2,compaction_compact_json=?3 WHERE session=?1 AND ord=0", params![key, serde_json::to_string(&entry).unwrap(), serde_json::to_string(&compact(&entry)).unwrap()]).unwrap();
+            conn.execute(
+                "INSERT INTO message_tag(session,tag,ord,part) VALUES(?1,1,0,0)",
+                [&key],
+            )
+            .unwrap();
+        }
+        for (request, expected) in requests.iter().zip(before) {
+            assert_eq!(
+                store.read_compaction_page(&session, request).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn entry_projection_faults_are_not_readiness_refusals() {
+        let (store, session) = fixture(1);
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE message SET compaction_json='not-json'", [])
+            .unwrap();
+        let request = ReadRequest::new(
+            Select::After {
+                after_ordinal: None,
+                limit: None,
+            },
+            Detail::Full,
+        );
+        assert!(matches!(
+            store.read_compaction_page(&session, &request),
+            Err(ReadError::Failure(_))
+        ));
     }
 
     #[test]

@@ -7,6 +7,38 @@ use super::protocol::{
 use broca_protocol::BindIdentity;
 use std::sync::Arc;
 
+/// Distinguishes an incomplete compaction projection from ordinary store or WAL faults.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadError {
+    /// Entry envelopes or their selection indexes have not been materialized yet.
+    ProjectionNotReady,
+    /// A store or WAL fault, retaining its diagnostic text.
+    Failure(String),
+}
+
+impl std::fmt::Display for ReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ProjectionNotReady => f.write_str("compaction entry projection is not ready"),
+            Self::Failure(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for ReadError {}
+
+impl From<String> for ReadError {
+    fn from(message: String) -> Self {
+        Self::Failure(message)
+    }
+}
+
+impl From<&str> for ReadError {
+    fn from(message: &str) -> Self {
+        Self::Failure(message.into())
+    }
+}
+
 pub async fn entries<W: crate::WalStore>(
     wal: &W,
     store: Option<Arc<dyn crate::SessionStore>>,
@@ -14,7 +46,7 @@ pub async fn entries<W: crate::WalStore>(
     writer: &crate::WalHandle,
     request: &ReadRequest,
     applied: Option<AppliedView>,
-) -> Result<ReadPage, String> {
+) -> Result<ReadPage, ReadError> {
     let safe = writer.sync().await.map_err(|error| error.to_string())?;
     let lineage = writer
         .lineage_id()
@@ -27,7 +59,8 @@ pub async fn entries<W: crate::WalStore>(
                 if page.prefix_len != 0 {
                     return Err("compaction projection has no checkpoint".into());
                 }
-                return wal_page(wal, session, request, applied, safe, &lineage);
+                return wal_page(wal, session, request, applied, safe, &lineage)
+                    .map_err(Into::into);
             };
             if seed.prefix_len == 0
                 && seed
@@ -37,7 +70,8 @@ pub async fn entries<W: crate::WalStore>(
                     .and_then(|head| head.compaction_metadata.as_ref())
                     .is_none()
             {
-                return wal_page(wal, session, request, applied, safe, &lineage);
+                return wal_page(wal, session, request, applied, safe, &lineage)
+                    .map_err(Into::into);
             }
             if seed.watermark_seq != page.watermark_seq {
                 return Err("compaction projection changed while reading the page".into());
@@ -75,7 +109,7 @@ pub async fn entries<W: crate::WalStore>(
     }
     // Retained lineages and dormant stores have no materialized compaction
     // protocol Entry pages, so they replay the native transcript from the WAL.
-    wal_page(wal, session, request, applied, safe, &lineage)
+    wal_page(wal, session, request, applied, safe, &lineage).map_err(Into::into)
 }
 
 // The first native turn may not have reached a projectable boundary yet. Its

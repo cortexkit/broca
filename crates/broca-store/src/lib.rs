@@ -2249,7 +2249,10 @@ impl MaterializedStore for SqliteStore {
         &self,
         session: &BindIdentity,
         request: &broca_core::compaction_v2::protocol::read::ReadRequest,
-    ) -> Result<Option<broca_core::context::CompactionStorePage>, String> {
+    ) -> Result<
+        Option<broca_core::context::CompactionStorePage>,
+        broca_core::compaction_v2::read::ReadError,
+    > {
         compaction_v2::read_page(self, session, request).map(Some)
     }
 
