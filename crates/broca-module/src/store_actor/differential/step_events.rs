@@ -1,5 +1,5 @@
 use super::*;
-use crate::step_events::{Config, StepEventPublisher, StepEvents};
+use crate::step_events::{StepEventPublisher, StepEvents};
 use broca_protocol::ProviderControl;
 use broca_session_store::keys::Cipher;
 use serde_json::{json, Value};
@@ -22,6 +22,10 @@ pub(super) struct Capture {
 
 #[async_trait]
 impl StepEventPublisher for Capture {
+    async fn live_subject(&self, runner: &str) -> Result<String, String> {
+        Ok(format!("ck.fixture.live.{runner}.step.finished.v1"))
+    }
+
     async fn publish(&self, subject: &str, body: Vec<u8>) -> Result<(), String> {
         self.calls.send((subject.into(), body)).unwrap();
         if self.fail {
@@ -72,20 +76,12 @@ pub(super) fn sample(name: &str, body: &[u8]) {
     }
 }
 
-async fn scenario(cipher: Cipher, enabled: bool, fail: bool, interrupted: bool) {
+async fn scenario(cipher: Cipher, with_bus: bool, fail: bool, interrupted: bool) {
     let mut bodies = Vec::new();
     for new_storage in [false, true] {
         let (calls, mut inbox) = mpsc::unbounded_channel();
-        let events = StepEvents::start(
-            Config {
-                step_events_enabled: enabled,
-            },
-            "fixture",
-            "broca",
-            Arc::new(Capture { calls, fail }),
-        )
-        .unwrap()
-        .map(Arc::new);
+        let events =
+            with_bus.then(|| Arc::new(StepEvents::start_on_bus(Arc::new(Capture { calls, fail }))));
         let module = module_step_events(
             new_storage,
             script(interrupted),
@@ -93,7 +89,6 @@ async fn scenario(cipher: Cipher, enabled: bool, fail: bool, interrupted: bool) 
             events.clone(),
         )
         .await;
-        assert_eq!(module.registry.step_events_enabled(), enabled);
         let outcome = module.send("step-run", "hello", None).await;
         assert!(matches!(outcome, SendOutcome::Active { .. }), "{outcome:?}");
         broca_test_support::wait_until("the scripted run is idle", || async {
@@ -104,7 +99,7 @@ async fn scenario(cipher: Cipher, enabled: bool, fail: bool, interrupted: bool) 
         })
         .await;
         assert!(module.registry.stop_and_seal().await);
-        if !enabled {
+        if !with_bus {
             assert!(inbox.try_recv().is_err());
             continue;
         }
@@ -228,7 +223,7 @@ async fn scenario(cipher: Cipher, enabled: bool, fail: bool, interrupted: bool) 
         sample(&format!("{status}-{storage}-{mode}.json"), &body);
         bodies.push(body);
     }
-    if enabled {
+    if with_bus {
         let mut expected = normalized(&bodies[0]);
         // Only today's reservation measures physical bytes. The new attempt's canonical
         // length cannot stand in for it, so pin this documented evidence gap explicitly.
@@ -249,8 +244,12 @@ async fn durable_step_events_match(cipher: Cipher) {
     scenario(cipher, true, false, true).await;
 }
 
-async fn step_events_off_publishes_nothing(cipher: Cipher) {
+async fn no_bus_publishes_no_step_events(cipher: Cipher) {
     scenario(cipher, false, false, false).await;
+}
+
+async fn run_publishes_step_events_without_configuration(cipher: Cipher) {
+    scenario(cipher, true, false, false).await;
 }
 
 async fn failing_step_publisher_does_not_fail_runs(cipher: Cipher) {
@@ -260,16 +259,7 @@ async fn failing_step_publisher_does_not_fail_runs(cipher: Cipher) {
 async fn a_model_attempt_without_send_time_emits_no_step_event(cipher: Cipher) {
     let (calls, mut inbox) = mpsc::unbounded_channel();
     let events = Arc::new(
-        StepEvents::start(
-            Config {
-                step_events_enabled: true,
-            },
-            "fixture",
-            "broca",
-            Arc::new(Capture { calls, fail: false }),
-        )
-        .unwrap()
-        .unwrap(),
+        StepEvents::start("fixture", "broca", Arc::new(Capture { calls, fail: false })).unwrap(),
     );
     let mut script = script(false);
     let NormalizedEvent::Control(ProviderControl::AttemptFinished { attempt }) = &mut script[0][0]
@@ -294,4 +284,4 @@ async fn a_model_attempt_without_send_time_emits_no_step_event(cipher: Cipher) {
     assert!(inbox.try_recv().is_err());
 }
 
-cipher_tests! { durable_step_events_match, step_events_off_publishes_nothing, failing_step_publisher_does_not_fail_runs, a_model_attempt_without_send_time_emits_no_step_event }
+cipher_tests! { durable_step_events_match, no_bus_publishes_no_step_events, run_publishes_step_events_without_configuration, failing_step_publisher_does_not_fail_runs, a_model_attempt_without_send_time_emits_no_step_event }

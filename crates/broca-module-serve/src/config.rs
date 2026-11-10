@@ -719,9 +719,16 @@ mod anthropic_fallback_config_tests {
 
     #[test]
     fn other_root_keys_are_ignored() {
-        let switches = AnthropicFallbackConfig::parse(r#"{"cache": {}, "providers": {}}"#).unwrap();
-        assert!(!switches.server_side);
-        assert!(!switches.refusal_resend.is_enabled());
+        for text in [
+            r#"{"cache": {}, "providers": {}}"#,
+            r#"{"step_events_enabled": false}"#,
+            r#"{"step_events_enabled": true}"#,
+            r#"{"step_events_enabled": "ignored"}"#,
+        ] {
+            let switches = AnthropicFallbackConfig::parse(text).unwrap();
+            assert!(!switches.server_side);
+            assert!(!switches.refusal_resend.is_enabled());
+        }
     }
 
     #[test]

@@ -173,7 +173,6 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(ServeIoError)?;
     let bus_event_config =
         broca_module_serve::bus_events::Config::load_default_path().map_err(ServeIoError)?;
-    let step_event_config = broca_module_serve::step_events::load_config().map_err(ServeIoError)?;
     let compaction_signals = broca_module_serve::config::CompactionSignalsConfig::load_default()
         .map_err(ServeIoError)?;
     let backup_classes = broca_module_serve::session_class::BackupClasses::load_default_path()
@@ -847,17 +846,13 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     let bus_connector = Arc::new(broca_module_serve::bus_events_nats::NatsConnector::new(
         broca_module_serve::bus_events_nats::CredentialHolder::new(plan_conn.clone()),
     ));
-    let step_events = broca_module_serve::step_events::StepEvents::start_on_bus(
-        step_event_config,
+    let step_events = Arc::new(broca_module_serve::step_events::StepEvents::start_on_bus(
         bus_connector.clone(),
-    )
-    .map(Arc::new);
+    ));
     let mut opener_builder = broca_module::DefaultOpener::new(lease_store, wal_store, executor)
         .with_charge_basis_resolver(charge_basis_table.clone())
-        .with_store_slot(Arc::clone(&store_slot));
-    if let Some(events) = &step_events {
-        opener_builder = opener_builder.with_step_events(events.clone());
-    }
+        .with_store_slot(Arc::clone(&store_slot))
+        .with_step_events(step_events.clone());
     if let Some(legacy) = &run_index {
         opener_builder = opener_builder
             .with_run_index(legacy.clone())

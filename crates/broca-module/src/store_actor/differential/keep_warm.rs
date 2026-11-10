@@ -415,21 +415,13 @@ async fn a_keep_warm_resends_the_last_request_and_records_it_alike(cipher: Ciphe
 
 async fn keep_warm_step_events_match(cipher: Cipher) {
     use super::step_events::{normalized, sample, Capture};
-    use crate::step_events::{Config, StepEvents};
+    use crate::step_events::StepEvents;
     let mut bodies = Vec::new();
     for new_storage in [false, true] {
         let (calls, mut inbox) = mpsc::unbounded_channel();
         let events = Arc::new(
-            StepEvents::start(
-                Config {
-                    step_events_enabled: true,
-                },
-                "fixture",
-                "broca",
-                Arc::new(Capture { calls, fail: false }),
-            )
-            .unwrap()
-            .unwrap(),
+            StepEvents::start("fixture", "broca", Arc::new(Capture { calls, fail: false }))
+                .unwrap(),
         );
         let side = side_events(new_storage, cipher, Some(events)).await;
         side.keep_warm_once().await;

@@ -17,11 +17,6 @@ use std::sync::{
 
 const QUEUE_CAPACITY: usize = 128;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Config {
-    pub step_events_enabled: bool,
-}
-
 /// A plain live publish, never a stream, durable outbox or billing acknowledgement.
 #[async_trait]
 pub trait StepEventPublisher: Send + Sync + 'static {
@@ -41,16 +36,11 @@ pub struct StepEvents {
 }
 
 impl StepEvents {
-    /// With the switch off, do not allocate a queue, spawn a task or touch the bus.
     pub fn start(
-        config: Config,
         account: &str,
         runner: &str,
         publisher: Arc<dyn StepEventPublisher>,
-    ) -> Result<Option<Self>, String> {
-        if !config.step_events_enabled {
-            return Ok(None);
-        }
+    ) -> Result<Self, String> {
         let concrete = |token: &str| {
             !token.is_empty()
                 && !token
@@ -61,14 +51,12 @@ impl StepEvents {
             return Err("step event account and runner must be concrete bus tokens".into());
         }
         let subject = format!("ck.{account}.live.{runner}.step.finished.v1");
-        Ok(Some(Self::spawn(Some(subject), runner, publisher)))
+        Ok(Self::spawn(Some(subject), runner, publisher))
     }
 
     /// Bus credentials are resolved only by the publisher task, never by a session open.
-    pub fn start_on_bus(config: Config, publisher: Arc<dyn StepEventPublisher>) -> Option<Self> {
-        config
-            .step_events_enabled
-            .then(|| Self::spawn(None, "broca", publisher))
+    pub fn start_on_bus(publisher: Arc<dyn StepEventPublisher>) -> Self {
+        Self::spawn(None, "broca", publisher)
     }
 
     fn spawn(
@@ -451,38 +439,22 @@ mod tests {
     }
 
     #[test]
-    fn shipping_build_is_off_by_default_and_wired_when_enabled() {
-        let (calls, mut inbox) = tokio::sync::mpsc::unbounded_channel();
-        let publisher = Arc::new(Publisher { calls, fail: false });
-        // No runtime exists here: an accidental task spawn with defaults would panic.
-        assert!(!Config::default().step_events_enabled);
-        assert!(
-            StepEvents::start(Config::default(), "account", "broca", publisher)
-                .unwrap()
-                .is_none()
-        );
-        assert!(inbox.try_recv().is_err());
+    fn shipping_build_wires_the_bus_publisher_on_both_storages() {
         let main = include_str!("../../broca-module-serve/src/main.rs");
-        assert!(main.contains("step_events::load_config()"));
         assert!(main.contains("StepEvents::start_on_bus"));
         assert!(main.contains(".with_step_events("));
-        assert!(include_str!("../../broca-module-serve/src/serve.rs")
-            .contains(".with_step_events(handler.step_events_enabled())"));
         assert!(include_str!("opener.rs").contains("events.observe(observer)"));
+        assert!(include_str!("opener.rs").contains("self.step_events.as_deref()"));
     }
 
     #[tokio::test]
-    async fn enabled_publisher_uses_plain_live_subject_and_counts_failures_without_retry() {
+    async fn publisher_uses_plain_live_subject_and_counts_failures_without_retry() {
         let (calls, mut inbox) = tokio::sync::mpsc::unbounded_channel();
         let events = StepEvents::start(
-            Config {
-                step_events_enabled: true,
-            },
             "account_a",
             "runner_a",
             Arc::new(Publisher { calls, fail: true }),
         )
-        .unwrap()
         .unwrap();
         events.tx.try_send(fixture(false)).unwrap();
         let (subject, body) = inbox.recv().await.unwrap();
@@ -490,5 +462,21 @@ mod tests {
         cortexkit_role_llm_runner::step_events::decode_step_finished(&subject, &body).unwrap();
         assert_eq!(events.dropped(), 1);
         assert!(inbox.try_recv().is_err(), "failed hint was retried");
+    }
+
+    #[tokio::test]
+    async fn unavailable_bus_drops_hints_without_publishing() {
+        let (calls, mut inbox) = tokio::sync::mpsc::unbounded_channel();
+        let events = StepEvents::start_on_bus(Arc::new(Publisher { calls, fail: false }));
+        events.tx.try_send(fixture(false)).unwrap();
+        broca_test_support::wait_until("the hint without a bus account is dropped", || async {
+            if events.dropped() == 1 {
+                Ok(())
+            } else {
+                Err(format!("dropped={}", events.dropped()))
+            }
+        })
+        .await;
+        assert!(inbox.try_recv().is_err());
     }
 }
