@@ -69,6 +69,9 @@ async fn classed_sends_route_freeze_and_keep_placement_after_restart() {
     }
     let scratch = scratch("session-class");
     let mut subject = BrocaSubject::new(&scratch).await;
+    // This rig has no deployment-key vault. Class placement does not depend on encryption,
+    // so use plain storage to keep sidekick sessions available across restarts without a key.
+    subject.plain_session_storage = true;
     let root = scratch.join("rig");
     let mut live = subject.start(&root).await.unwrap();
     for (session, class, retention, tree) in [

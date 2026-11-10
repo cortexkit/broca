@@ -1485,6 +1485,7 @@ struct BrocaSubject {
     dump_dir: Option<PathBuf>,
     binary: Option<PathBuf>,
     backup_classes: Option<Vec<String>>,
+    plain_session_storage: bool,
     bus_events_enabled: bool,
     process_kills_disabled: bool,
     service_tier_enabled: bool,
@@ -1508,6 +1509,7 @@ impl BrocaSubject {
             dump_dir: None,
             binary: None,
             backup_classes: None,
+            plain_session_storage: false,
             bus_events_enabled: true,
             process_kills_disabled: false,
             service_tier_enabled: std::env::var_os("BROCA_CONFORMANCE_SERVICE_TIER").is_some(),
@@ -1678,6 +1680,9 @@ impl BrocaSubject {
             "service_tier":{"enabled":self.service_tier_enabled}});
         if let Some(classes) = &self.backup_classes {
             settings["backup_classes"] = json!(classes);
+        }
+        if self.plain_session_storage {
+            settings["session_storage"] = json!({"encryption": "off"});
         }
         if routed {
             routed_accounts::configure(root, &self.model_url, &mut config, &mut settings)?;
@@ -2967,6 +2972,7 @@ impl LlmRunnerSubject for BrocaSubject {
             Capability::DeliveryOrder,
             Capability::SenderSuccession,
             Capability::ReadDisplayFacts,
+            Capability::SendIds,
             Capability::ClientMessageId,
             // The adapter implements the three session_change subject hooks (a tool-free
             // refresh plan, model request observations and holdable tool calls), so the kit
@@ -7016,6 +7022,7 @@ mod held_call_tests {
             dump_dir: None,
             binary: None,
             backup_classes: None,
+            plain_session_storage: false,
             bus_events_enabled: false,
             process_kills_disabled: true,
             service_tier_enabled: false,
@@ -7949,6 +7956,18 @@ async fn conformance_subject_declares_the_served_admission_reports_group() {
             .capabilities()
             .contains(&Capability::AdmissionReports));
     }
+}
+
+#[tokio::test]
+async fn conformance_subject_declares_the_served_send_ids_group() {
+    let scratch = broca_test_support::scratch_root().join("send-ids-declaration");
+    let subject = BrocaSubject::new(&scratch).await;
+    let describe = broca_wire::broca_role_describe_with_writers("test", false, false, false);
+    assert!(describe
+        .capabilities
+        .iter()
+        .any(|group| group == cortexkit_role_llm_runner::capabilities::SEND_IDS));
+    assert!(subject.capabilities().contains(&Capability::SendIds));
 }
 
 #[tokio::test]
