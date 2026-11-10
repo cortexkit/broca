@@ -236,21 +236,96 @@ fn run_started(run: &str, at: u64) -> WalRecord {
 /// request today's renderer builds for them. The WAL at `path` must not exist yet: its lineage
 /// is read from the file the first append creates.
 fn session_records(path: &Path) -> Vec<WalRecord> {
+    session_records_with(path, false)
+}
+
+/// A run start of [`run_started`] on the current compaction contract, under a plan naming a
+/// compaction provider.
+fn compacting_run_started(run: &str, at: u64) -> WalRecord {
+    let mut start = run_started(run, at);
+    if let WalRecord::RunStarted {
+        config,
+        compaction_plan_version,
+        manifest,
+        ..
+    } = &mut start
+    {
+        config.context_limit = Some(100_000);
+        *compaction_plan_version = Some(broca_core::compaction_v2::PLAN_VERSION);
+        *manifest = Some(Box::new(broca_wal::PlanManifest {
+            rich_ui: None,
+            plan: broca_wal::OpaqueJson::from_json_text(
+                json!({"compaction_item": {"provider": "compactor", "preset": "summary",
+                    "params": {}}, "composition": {}})
+                .to_string(),
+            )
+            .unwrap(),
+            plan_identity: "compacting-plan".into(),
+            composition_digest: "composition".into(),
+            fetches: Vec::new(),
+            tools: Arc::new(Vec::new()),
+            system_text: String::new(),
+            system_digest: String::new(),
+            join_version: 1,
+            role_versions: [("compaction-provider".into(), "v2".into())].into(),
+            declarations: Vec::new(),
+        }));
+    }
+    start
+}
+
+/// [`session_records`], on the current compaction contract when `compacted`: then the second
+/// run's step applies a view cutting through the session's first message before its request, as
+/// today's loop records it (the view accepted, the step applying it, and the cut's marker), so
+/// that request leaves the first message out.
+fn session_records_with(path: &Path, compacted: bool) -> Vec<WalRecord> {
+    use broca_core::compaction_v2::protocol::view::{Edit, EditOp, View};
     let lineage = {
         let wal = broca_wal::FileWal::open(path).unwrap();
         wal.lineage_id().map(|id| id.to_string())
     };
+    let mid = |position| broca_core::message_mid(true, lineage.as_deref(), position).unwrap();
+    let view =
+        compacted.then(|| View::seal(1, vec![Edit::new(1, EditOp::Cut { through: mid(0) })]));
     let mut written: Vec<WalRecord> = Vec::new();
     for (index, run) in RUNS.iter().enumerate() {
         let step = index as u64 + 1;
         let at = 1_000 * step;
-        let start = run_started(run, at);
+        let start = if compacted {
+            compacting_run_started(run, at)
+        } else {
+            run_started(run, at)
+        };
         let WalRecord::RunStarted { config, .. } = &start else {
             unreachable!()
         };
         let config = (**config).clone();
         written.push(start);
         written.push(record(json!({"type": "step_started", "step_id": step})));
+        if let Some(view) = view.as_ref().filter(|_| step == 2) {
+            let received = broca_core::compaction_v2::received::ReceivedView::from(view.clone());
+            written.push(WalRecord::CompactionViewV2(broca_wal::CompactionViewV2 {
+                version: view.version,
+                checksum: view.checksum.clone(),
+                edits: broca_core::compaction_v2::storage::encode(None, &received),
+                built_through: view.built_through.clone(),
+                new_signed: view.new_signed.clone(),
+                applied_by: None,
+            }));
+            written.push(WalRecord::CompactionViewAppliedV2 {
+                step_id: step,
+                version: view.version,
+                checksum: view.checksum.clone(),
+            });
+            written.push(WalRecord::CompactionMarker {
+                harness: "runner".into(),
+                session: "s".into(),
+                view_version: view.version,
+                first_kept_mid: mid(1),
+                first_kept_ordinal: 2,
+                checkpoint: 0,
+            });
+        }
         let (_, _, body) = broca_module::wal_render::render_step_with_lineage(
             lineage.as_deref(),
             &written,
@@ -490,6 +565,85 @@ async fn a_moved_session_is_the_new_storages_alone() {
     assert_eq!(again.detail.unwrap()["reason"], "in_new_storage");
 }
 
+/// A session that compacted on the current contract moves with its compaction views. The move
+/// verifies before it publishes, so it moves only because the copy rendered the session's last
+/// recorded request, whose step applied a view, and its next request as today's storage renders
+/// them. The moved session's first seal, at its view's cut as the run loop seals, moves the stored
+/// views out of the open log; carrying the loop's copies of them, it keeps them: the session
+/// reloaded after the seal restores the same views.
+#[tokio::test]
+async fn a_compacted_session_moves_with_its_views() {
+    use broca_session_store::backend::{LocalBackend, SessionAddr};
+    use broca_session_store::session::{Carry, Session};
+    let rig = Rig::start("compacted").await;
+    let records = session_records_with(&rig.wal(), true);
+    rig.write(&records);
+    let reply = rig.mover().move_to_store(&key(), None).await.unwrap();
+    assert_eq!(reply["moved"], true, "{reply}");
+    let checks = reply["checks"].as_array().unwrap();
+    for check in ["last_step", "next_request"] {
+        assert!(checks.iter().any(|ran| ran == check), "{reply}");
+    }
+    assert_moved(&rig).await;
+
+    let root = StorageClass::Ordinary.store_root(&rig.dir);
+    let triple = broca_session_convert::stage::triple(&key());
+    let deployment = deployment();
+    let load = || {
+        Session::load(
+            LocalBackend::new(&root),
+            SessionAddr(broca_core::session_addr(&key())),
+            &triple,
+            &deployment,
+        )
+    };
+    let restored =
+        |records: &[(u64, broca_session_store::record::Record)],
+         operations: &broca_session_store::fold::operations::Operations| {
+            broca_session_loop::compaction::restore(records, &key(), operations).unwrap()
+        };
+    let mut session = load().await.unwrap();
+    let state = restored(
+        &session.open_log_records().await.unwrap(),
+        &session.operations,
+    );
+    let applied = state
+        .applied()
+        .cloned()
+        .expect("the moved session holds the applied view");
+    assert_eq!(applied.version, 1);
+    let carry = broca_session_loop::compaction::carried_views(&state, &session.operations).unwrap();
+    let cut = session
+        .conversation
+        .marker
+        .as_ref()
+        .expect("the moved session holds the cut's marker")
+        .first_kept_ordinal;
+    session
+        .seal_at_entry(
+            cut,
+            &Carry {
+                records: &carry,
+                window_repetition: None,
+            },
+            1,
+        )
+        .await
+        .unwrap();
+    session.close().await.unwrap();
+    let session = load().await.unwrap();
+    assert!(
+        session.conversation.window_start() > 1,
+        "the history before the cut is sealed"
+    );
+    let after = restored(
+        &session.open_log_records().await.unwrap(),
+        &session.operations,
+    );
+    assert_eq!(after.applied(), Some(&applied));
+    assert_eq!(after.latest(), Some(&applied));
+}
+
 /// Refuses with `reason` and writes nothing.
 async fn assert_refused(rig: &Rig, mover: StoreMove, bytes: &[u8], reason: &str) {
     let refused = mover.move_to_store(&key(), None).await.unwrap_err();
@@ -542,26 +696,6 @@ async fn each_precondition_refuses_by_name_and_writes_nothing() {
     rig.write(&records);
     let bytes = std::fs::read(rig.wal()).unwrap();
     assert_refused(&rig, rig.mover(), &bytes, "unsupported_feature").await;
-    drop(rig);
-
-    // A compaction view the session accepted, which a seal of the new storage can't carry
-    // yet.
-    let rig = Rig::start("refuse-views").await;
-    let mut records = session_records(&rig.wal());
-    let first_run_end = records
-        .iter()
-        .position(|record| matches!(record, WalRecord::RunFinished { .. }))
-        .unwrap();
-    records.insert(
-        first_run_end + 1,
-        record(
-            json!({"type": "compaction_view_v2", "version": 1, "checksum": "c1",
-            "edits": []}),
-        ),
-    );
-    rig.write(&records);
-    let bytes = std::fs::read(rig.wal()).unwrap();
-    assert_refused(&rig, rig.mover(), &bytes, "compaction_views").await;
     drop(rig);
 
     // A run-index row still owed reconciliation.
