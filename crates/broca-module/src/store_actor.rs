@@ -301,6 +301,8 @@ enum Event {
     Warmed(
         Result<Result<broca_core::WarmSent, crate::executor::WarmError>, tokio::task::JoinError>,
     ),
+    /// The session's idle deadline passed with no run active and no warm being sent.
+    IdleDeadline,
 }
 
 /// The media fold build's end, or never when none is building.
@@ -425,6 +427,29 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         };
         fanout.attach(&self.session, from, sink);
         crate::actor::SubscribeOutcome::Attached
+    }
+
+    /// What keeps the session from closing idle, under the names today's actor gives the
+    /// registry: a run, a warm being sent, or a subscriber still attached. A subscriber keeps a
+    /// session open for as long as it holds its stream, as on today's storage, so a caller
+    /// watching an idle session isn't cut off at its idle deadline; the first idle tick after
+    /// the last one has gone closes it. Empty when the session may close.
+    fn idle_holds(&mut self) -> Vec<&'static str> {
+        let mut holds = Vec::new();
+        if self.run.is_some() {
+            holds.push("active_run");
+        }
+        if self.warm.is_some() {
+            holds.push("manual_warm");
+        }
+        if self
+            .fanout
+            .as_mut()
+            .is_some_and(crate::store_fanout::StoreFanout::has_live_subscribers)
+        {
+            holds.push("live_subscriber");
+        }
+        holds
     }
 
     /// The actor serves finished runs' facts from `settled`, and keeps the ones it reads there,
@@ -563,20 +588,23 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         Ok(appended)
     }
 
-    /// Serves `commands` until the session goes away: when the channel closes, or when it is
-    /// idle at an idle tick. Returns the session, for whoever closes it. A run still running
-    /// when the channel closes is ended as a module stop ends it.
+    /// Serves `commands` until the session goes away: when the channel closes, or at an idle
+    /// tick that finds it idle with no subscriber attached. Returns the session, for whoever
+    /// closes it. A run still running when the channel closes is ended as a module stop ends it.
     pub async fn serve(mut self, commands: mpsc::UnboundedReceiver<LineageCmd>) -> Session<B> {
         let mut commands = Commands::from(commands);
-        self.serve_until_exit(&mut commands, None, None, None).await;
+        self.serve_until_exit(&mut commands, None, None, None, None)
+            .await;
         self.stop_for_shutdown().await;
         self.session
     }
 
     /// Serves the session as the module's actor for it, until it closes idle or the module
-    /// stops, then gives its registry slot up. The order matches today's actor: the session is
-    /// closed and the executor told before the lease goes, and only then does the slot read
-    /// closed, so a reopen never finds another writer still on the session.
+    /// stops, then gives its registry slot up. A subscriber attached to the session keeps it from
+    /// closing idle, as in today's actor; a module stop still closes it, ending every
+    /// subscription. The order matches today's actor: the session is closed and the executor
+    /// told before the lease goes, and only then does the slot read closed, so a reopen never
+    /// finds another writer still on the session.
     pub async fn serve_in_registry(mut self, commands: impl Into<Commands>, life: Lifecycle) {
         let mut commands = commands.into();
         let seal = life.registry.seal_signal();
@@ -587,6 +615,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 Some(&seal),
                 Some(life.idle_ttl),
                 Some(&life.run_in_flight),
+                Some((&life.registry, life.gen)),
             )
             .await;
         let close = match exit {
@@ -633,13 +662,17 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     }
 
     /// The command loop. With `seal`, the module's stop ends it; with `idle_ttl`, the session's
-    /// idle deadline does; `gauge` reads whether a run is running.
+    /// idle deadline does, unless something holds the session open then (see
+    /// [`StoreActor::idle_holds`]), and the deadline is set again; `gauge` reads whether a run
+    /// is running. `slot`, the registry and the generation of the slot this actor serves, is
+    /// told what holds the session open whenever that changes.
     async fn serve_until_exit(
         &mut self,
         commands: &mut Commands,
         seal: Option<&CancellationToken>,
         idle_ttl: Option<std::time::Duration>,
         gauge: Option<&Arc<std::sync::atomic::AtomicU64>>,
+        slot: Option<(&crate::registry::RegistryHandle, u64)>,
     ) -> Exit {
         let never = CancellationToken::new();
         let seal = seal.unwrap_or(&never);
@@ -647,12 +680,23 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         self.recover().await;
         let idle_after = |now: tokio::time::Instant| idle_ttl.map(|ttl| now + ttl);
         let mut idle_deadline = idle_after(tokio::time::Instant::now());
+        // What the registry was last told holds the session open; `None` until it took a note,
+        // which it refuses until this actor's slot reads open.
+        let mut noted: Option<Vec<&'static str>> = None;
         loop {
             if let Some(gauge) = gauge {
                 gauge.store(
                     u64::from(self.run.is_some()),
                     std::sync::atomic::Ordering::SeqCst,
                 );
+            }
+            if let Some((registry, gen)) = slot {
+                let holds = self.idle_holds();
+                if noted.as_ref() != Some(&holds)
+                    && registry.note_idle_holds(&self.key, gen, holds.clone())
+                {
+                    noted = Some(holds);
+                }
             }
             let built = media_built(&mut self.media_build);
             // A warm the executor is sending ends whatever else the actor waits on.
@@ -688,10 +732,18 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                             Some(deadline) => tokio::time::sleep_until(deadline).await,
                             None => std::future::pending().await,
                         }
-                    }, if !has_warm => return Exit::Idle,
+                    }, if !has_warm => Event::IdleDeadline,
                 },
             };
             match event {
+                // A subscriber still attached keeps the session open: the next deadline closes
+                // it once every subscriber has gone.
+                Event::IdleDeadline => {
+                    if self.idle_holds().is_empty() {
+                        return Exit::Idle;
+                    }
+                    idle_deadline = idle_after(tokio::time::Instant::now());
+                }
                 Event::Request(Some(request)) => self.serve_request(request).await,
                 Event::Request(None) => {
                     if let Some(active) = self.run.as_mut() {
@@ -766,7 +818,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 }
                 Event::Done(end) => return self.finish_run(end).await,
                 Event::MediaBuilt(built) => self.media_built(built).await,
-                Event::Command(_) | Event::Warmed(_) => unreachable!("no command is read here"),
+                Event::Command(_) | Event::Warmed(_) | Event::IdleDeadline => {
+                    unreachable!("no command is read here, and no idle deadline is waited on")
+                }
             }
         }
     }
@@ -1419,7 +1473,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 let _ = reply.send(Ok(None));
                 false
             }
-            LineageCmd::IdleTick => self.run.is_none() && self.warm.is_none(),
+            LineageCmd::IdleTick => self.idle_holds().is_empty(),
             LineageCmd::Warm { lineage_id, reply } => {
                 if self.stopping {
                     let _ = reply.send(crate::actor::WarmOutcome::Reopen);
@@ -3578,6 +3632,8 @@ mod reads_tests;
 mod status_tests;
 #[cfg(test)]
 mod subscribe_tests;
+#[cfg(test)]
+mod subscribed_heads_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

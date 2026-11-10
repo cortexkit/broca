@@ -125,8 +125,15 @@ impl StoreRestore {
             Err(error) => return report.error(error),
         }
         // An actor serving the session refuses to be held, and asking it would only keep it
-        // from going idle, so restore waits for it to close by itself.
+        // from going idle, so restore waits for it to close by itself. A subscriber still
+        // attached keeps it from ever doing so, which the operator is told.
         if let Some(state) = self.registry.slot_state(&bind) {
+            if self.registry.idle_holds(&bind).contains(&"live_subscriber") {
+                return report.busy(
+                    "the session has live subscribers, which keep its actor open; stop the \
+                     subscriber or restart broca first",
+                );
+            }
             return report.busy(&format!("an actor serves it ({state})"));
         }
         let fence = match self

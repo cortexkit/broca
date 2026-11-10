@@ -953,7 +953,9 @@ async fn each_wal_folder_moves_into_its_class_root() {
 /// the setup parts its runs name, so a restore of that root needs nothing outside it.
 #[tokio::test]
 async fn an_operator_moves_an_ordinary_session_into_the_durable_root() {
-    let rig = Rig::start("class-durable").await;
+    // Not `class-durable`: `each_wal_folder_moves_into_its_class_root` names its durable rig
+    // that, and the rig's folder is named by process and tag, so the two would share a folder.
+    let rig = Rig::start("operator-durable").await;
     rig.write_session();
     let reply = rig
         .mover()
