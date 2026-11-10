@@ -1,7 +1,8 @@
 //! Additive, durable agent-data discovery projection. No WAL payload is cached.
-use crate::{SqliteStore, StoreError};
+use crate::{SessionInventory, SqliteStore, StoreError};
+use broca_core::SessionRefIndex;
 #[cfg(test)]
-use broca_core::{agent_session_ref, session_addr, SessionRefIndex};
+use broca_core::{agent_session_ref, session_addr};
 use broca_protocol::BindIdentity;
 #[cfg(test)]
 use rusqlite::params;
@@ -147,7 +148,7 @@ pub(crate) fn projection_complete(conn: &Connection) -> Result<bool, StoreError>
     )?)
 }
 
-impl SqliteStore {
+impl SessionInventory {
     /// Missing refs are absent only in a complete projection snapshot. Pending
     /// legacy writes, an unfinished backfill, and database failures never prove absence.
     pub fn session_refs<'a>(
@@ -221,6 +222,25 @@ impl SqliteStore {
             sessions,
             complete: complete && !was_incomplete && !gap()?,
         })
+    }
+}
+
+impl SqliteStore {
+    pub fn session_refs<'a>(
+        &self,
+        refs: impl Iterator<Item = &'a str>,
+    ) -> Result<SessionRefs, StoreError> {
+        SessionInventory::shared(&self.conn).session_refs(refs)
+    }
+
+    pub fn session_refs_named(&self, name: &str, limit: u32) -> Result<SessionRefs, StoreError> {
+        SessionInventory::shared(&self.conn).session_refs_named(name, limit)
+    }
+}
+
+impl SessionRefIndex for SqliteStore {
+    fn record_session(&self, address: &str, session: &BindIdentity) -> Result<(), String> {
+        SessionInventory::shared(&self.conn).record_session(address, session)
     }
 }
 

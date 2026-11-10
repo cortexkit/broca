@@ -12,8 +12,7 @@
 #![forbid(unsafe_code)]
 
 use std::path::Path;
-use std::sync::atomic::AtomicU64;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use broca_core::projection_plan::ProjectionSnapshot;
 #[cfg(test)]
@@ -45,6 +44,9 @@ pub mod db;
 pub mod diagnostics;
 mod display_facts;
 pub mod export_index;
+mod keeper_connection;
+pub use export_index::ExportStore;
+pub use keeper_connection::KeeperOpenError;
 mod fold_identities;
 pub mod grants;
 pub mod late_results_store;
@@ -54,6 +56,8 @@ mod retained_head;
 pub mod retention;
 pub mod retention_withdrawals;
 pub mod session_address;
+pub mod session_inventory;
+pub use session_inventory::SessionInventory;
 pub mod session_log_evidence;
 pub mod session_ref_audit;
 pub mod session_refs;
@@ -475,12 +479,10 @@ impl From<broca_core::ReplayError> for StoreError {
 /// checkpoint folding, and JSON serialization outside that mutex so unrelated sessions wait
 /// only for the short snapshot and commit phases.
 pub struct SqliteStore {
-    conn: Mutex<Connection>,
+    conn: Arc<Mutex<Connection>>,
     wal_config: broca_wal::WalConfig,
     bus_events: bus_events::State,
-    pub(crate) export_high_water: AtomicU64,
-    pub(crate) export_source_instance_id: String,
-    pub(crate) export_source_epoch: u64,
+    export: ExportStore,
 }
 
 struct SchemaUpgradeLog {
@@ -701,7 +703,7 @@ fn sqlite_open_observed() {
 /// SQLite's sidecars retain the token's default owner field (possibly Administrators when
 /// elevated), but their DACL grants only the account SID and SYSTEM inherited from the parent.
 #[cfg(windows)]
-fn prepare_private_sqlite(path: &Path) -> std::io::Result<()> {
+fn validate_private_sqlite(path: &Path) -> std::io::Result<()> {
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -713,6 +715,12 @@ fn prepare_private_sqlite(path: &Path) -> std::io::Result<()> {
         sidecar.push(suffix);
         broca_owner_only::validate_if_exists(std::path::PathBuf::from(sidecar))?;
     }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn prepare_private_sqlite(path: &Path) -> std::io::Result<()> {
+    validate_private_sqlite(path)?;
     match broca_owner_only::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -801,13 +809,12 @@ impl SqliteStore {
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
+        let conn = Arc::new(Mutex::new(conn));
         Ok(Self {
-            conn: Mutex::new(conn),
+            conn: Arc::clone(&conn),
             wal_config: broca_wal::WalConfig::LEGACY,
             bus_events: bus_events::State::default(),
-            export_source_instance_id: source_instance_id,
-            export_source_epoch: source_epoch,
-            export_high_water: AtomicU64::new(high_water),
+            export: ExportStore::from_shared(conn, (source_instance_id, source_epoch, high_water)),
         })
     }
 
@@ -847,13 +854,12 @@ impl SqliteStore {
         let conn = Connection::open(path)?;
         let (source_instance_id, source_epoch, high_water) = Self::init(&conn)?;
         restrict_to_owner(path);
+        let conn = Arc::new(Mutex::new(conn));
         Ok(Self {
-            conn: Mutex::new(conn),
+            conn: Arc::clone(&conn),
             wal_config: broca_wal::WalConfig::LEGACY,
             bus_events: crate::bus_events::State::default(),
-            export_high_water: AtomicU64::new(high_water),
-            export_source_instance_id: source_instance_id,
-            export_source_epoch: source_epoch,
+            export: ExportStore::from_shared(conn, (source_instance_id, source_epoch, high_water)),
         })
     }
 
@@ -861,13 +867,12 @@ impl SqliteStore {
     pub fn open_in_memory() -> Result<Self, StoreError> {
         let conn = Connection::open_in_memory()?;
         let (source_instance_id, source_epoch, high_water) = Self::init(&conn)?;
+        let conn = Arc::new(Mutex::new(conn));
         Ok(Self {
-            conn: Mutex::new(conn),
+            conn: Arc::clone(&conn),
             wal_config: broca_wal::WalConfig::LEGACY,
             bus_events: crate::bus_events::State::default(),
-            export_high_water: AtomicU64::new(high_water),
-            export_source_instance_id: source_instance_id,
-            export_source_epoch: source_epoch,
+            export: ExportStore::from_shared(conn, (source_instance_id, source_epoch, high_water)),
         })
     }
 
@@ -4558,7 +4563,10 @@ mod tests {
                 let barrier = barrier.clone();
                 std::thread::spawn(move || {
                     barrier.wait();
-                    SqliteStore::open(path).unwrap().export_source_instance_id
+                    SqliteStore::open(path)
+                        .unwrap()
+                        .source_instance_id()
+                        .to_owned()
                 })
             })
             .collect();
@@ -4643,12 +4651,15 @@ mod tests {
         );
     }
 
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    };
 
     use broca_core::{MaterializedStore, Persister, RunIndex, WalStore};
     use broca_wal::{Wal, WalError, WalRangeRead};
 
-    use super::{replay, ProjectionCommit, SqliteStore};
+    use super::{replay, ExportStore, ProjectionCommit, SqliteStore};
 
     #[test]
     fn model_pages_return_atomic_compaction_and_rows() {
@@ -5248,13 +5259,12 @@ mod tests {
 
         let (source_instance_id, source_epoch, high_water) =
             SqliteStore::init(&conn).expect("migrate legacy store");
+        let conn = Arc::new(Mutex::new(conn));
         let store = SqliteStore {
             wal_config: broca_wal::WalConfig::LEGACY,
             bus_events: crate::bus_events::State::default(),
-            conn: std::sync::Mutex::new(conn),
-            export_high_water: AtomicU64::new(high_water),
-            export_source_instance_id: source_instance_id,
-            export_source_epoch: source_epoch,
+            conn: Arc::clone(&conn),
+            export: ExportStore::from_shared(conn, (source_instance_id, source_epoch, high_water)),
         };
         let row = store
             .lookup_run("legacy-run")
@@ -5307,13 +5317,12 @@ mod tests {
                 .unwrap();
             assert_eq!(present, 1, "{table}.{column} is added");
         }
+        let conn = Arc::new(Mutex::new(conn));
         let store = SqliteStore {
             wal_config: broca_wal::WalConfig::LEGACY,
             bus_events: crate::bus_events::State::default(),
-            conn: std::sync::Mutex::new(conn),
-            export_high_water: AtomicU64::new(high_water),
-            export_source_instance_id: source_instance_id,
-            export_source_epoch: source_epoch,
+            conn: Arc::clone(&conn),
+            export: ExportStore::from_shared(conn, (source_instance_id, source_epoch, high_water)),
         };
         let row = store.lookup_run("legacy-run").unwrap().unwrap();
         assert_eq!(row.title, None);
@@ -6132,13 +6141,12 @@ mod tests {
             rusqlite::params![key, serde_json::to_string(&message).unwrap()],
         )
         .unwrap();
+        let conn = Arc::new(Mutex::new(conn));
         let store = SqliteStore {
             wal_config: broca_wal::WalConfig::LEGACY,
             bus_events: crate::bus_events::State::default(),
-            conn: std::sync::Mutex::new(conn),
-            export_high_water: AtomicU64::new(high_water),
-            export_source_instance_id: source_instance_id,
-            export_source_epoch: source_epoch,
+            conn: Arc::clone(&conn),
+            export: ExportStore::from_shared(conn, (source_instance_id, source_epoch, high_water)),
         };
 
         assert_eq!(store.projection_snapshot(&key).unwrap().next_ord, 1);
