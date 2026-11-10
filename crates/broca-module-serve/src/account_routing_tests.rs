@@ -1868,7 +1868,7 @@ fn the_removed_break_glass_and_any_unknown_key_are_refused() {
             "providers": {} }"#,
     )
     .unwrap();
-    assert_eq!(named.routing_module, "routing-b");
+    assert_eq!(named.routing_module.as_deref(), Some("routing-b"));
     for leftover in [
         r#"{"account_selection":{"legacy_static":true}}"#,
         r#"{"account_selection":{"legacy_static":false,"routing_module":"routing-b"}}"#,
@@ -1879,6 +1879,26 @@ fn the_removed_break_glass_and_any_unknown_key_are_refused() {
     let error = AccountSelectionConfig::parse(r#"{"account_selection":{"legacy_statc":true}}"#)
         .unwrap_err();
     assert!(error.contains("unknown field"), "{error}");
+}
+
+#[test]
+fn routing_config_preserves_explicit_ids_including_the_legacy_default() {
+    for text in ["{}", r#"{"account_selection":{}}"#] {
+        let config = AccountSelectionConfig::parse(text).unwrap();
+        assert_eq!(config.routing_module, None);
+        assert_eq!(
+            config.routing_modules(),
+            vec!["prefrontal-routing", "striatum"]
+        );
+    }
+    for id in ["prefrontal-routing", "striatum", "routing-b", " routing-b "] {
+        let config = AccountSelectionConfig::parse(
+            &json!({"account_selection":{"routing_module":id}}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(config.routing_module.as_deref(), Some(id));
+        assert_eq!(config.routing_modules(), vec![id]);
+    }
 }
 
 // ---- report bodies --------------------------------------------------------------------------

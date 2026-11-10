@@ -284,7 +284,7 @@ pub fn start(conn: Arc<broca_subc::SubcConnection>, identity: broca_protocol::Bi
     if PUBLISHED.set(Arc::clone(&queue)).is_err() {
         return;
     }
-    let transport = SubcRoutingTransport::new(conn, "insula".into(), identity);
+    let transport = SubcRoutingTransport::new(conn, Some("insula".into()), identity);
     spawn_sender(queue, Arc::new(transport));
 }
 fn spawn_sender(queue: Arc<Queue>, transport: Arc<dyn RoutingTransport>) {
