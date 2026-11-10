@@ -1433,6 +1433,17 @@ async fn module_step_events(
     cipher: Option<broca_session_store::keys::Cipher>,
     step_events: Option<Arc<crate::step_events::StepEvents>>,
 ) -> Module {
+    module_options(on, steps, cipher, step_events, IDLE, None).await
+}
+
+async fn module_options(
+    on: bool,
+    steps: Vec<Vec<NormalizedEvent>>,
+    cipher: Option<broca_session_store::keys::Cipher>,
+    step_events: Option<Arc<crate::step_events::StepEvents>>,
+    idle_ttl: Duration,
+    gate: Option<Arc<Notify>>,
+) -> Module {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let dir = broca_test_support::scratch_root().join(format!(
@@ -1452,19 +1463,19 @@ async fn module_step_events(
                 render_config: None,
                 notes_sends: false,
                 inner: broca_core::provider::StubProvider::new(steps.clone()),
-                gate: None,
+                gate: gate.clone(),
             },
             wal: Arc::clone(&wal),
             planes: Default::default(),
         },
-        store: executor(steps, None),
+        store: executor(steps, gate),
     });
     let runtime = crate::store_open::StoreRuntime::open(
         &dir,
         broca_session_store::keys::DeploymentKey::new(1, &[7; 32])
             .creating(cipher.unwrap_or(broca_session_store::keys::Cipher::XChaCha20Poly1305)),
         Arc::clone(&executor),
-        IDLE,
+        idle_ttl,
     )
     .await
     .unwrap();
@@ -1473,7 +1484,7 @@ async fn module_step_events(
         wal.clone(),
         executor,
     )
-    .with_idle_ttl(IDLE)
+    .with_idle_ttl(idle_ttl)
     .with_store_runtime(Arc::new(runtime));
     if let Some(events) = step_events {
         opener = opener.with_step_events(events);
@@ -1828,6 +1839,7 @@ mod keep_warm;
 mod media;
 mod media_ready;
 mod media_render;
+mod one_shot;
 mod ordered;
 mod pauses;
 mod photo_sends;
