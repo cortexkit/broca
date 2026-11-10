@@ -122,8 +122,11 @@ tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev 
 
 [patch.crates-io]
 # JetStream's retry dependency must not enable Tokio's production test clock.
-# See commons third_party/tryhard/CORTEXKIT.md; remove once upstream drops test-util.
-tryhard = { git = "https://github.com/cortexkit/commons", rev = "fe59258998db48975f43cb892b71a9952db4eb86" }
+# third_party/tryhard is a vendored copy of commons' fork at fe59258998db (see its
+# CORTEXKIT.md). It is vendored rather than a git source so builds never clone
+# commons; a crates.io patch can't replace a crates.io crate. Remove once upstream
+# drops test-util.
+tryhard = { path = "third_party/tryhard" }
 
 # Cargo already defaults to unwinding; pinning it makes that a decision rather
 # than an inherited property. broca serves each run on its own task, so an
