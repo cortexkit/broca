@@ -54,12 +54,17 @@ pub trait Plane: Send + Sync {
     async fn provides_signed_floor(&self) -> bool {
         false
     }
-    /// Both declarations, read together when the runner sends Setup. A plane that reads the
-    /// catalog answers both from one read.
+    /// Whether the provider can receive a separate count of persistent runner notes.
+    async fn provides_notes_tokens(&self) -> bool {
+        false
+    }
+    /// Declarations read together when the runner sends Setup. A catalog-backed plane answers
+    /// them from one read.
     async fn declarations(&self) -> Declarations {
         Declarations {
             entry_speaks_for: self.provides_entry_speaks_for().await,
             signed_floor: self.provides_signed_floor().await,
+            notes_tokens: self.provides_notes_tokens().await,
         }
     }
 }
@@ -72,6 +77,8 @@ pub struct Declarations {
     pub entry_speaks_for: bool,
     /// `compaction-signed-floor/v1`: Setup and conditions carry the signed floor.
     pub signed_floor: bool,
+    /// `compaction-notes-tokens/v1`: notice conditions separate persistent note counts.
+    pub notes_tokens: bool,
 }
 
 impl Declarations {
@@ -79,6 +86,7 @@ impl Declarations {
         Self {
             entry_speaks_for: cortexkit_role_compaction::provides_entry_speaks_for(provides),
             signed_floor: cortexkit_role_compaction::provides_signed_floor(provides),
+            notes_tokens: cortexkit_role_compaction::provides_notes_tokens(provides),
         }
     }
 }
@@ -129,6 +137,10 @@ impl Plane for BoundPlane<'_> {
         self.declarations().await.signed_floor
     }
 
+    async fn provides_notes_tokens(&self) -> bool {
+        self.declarations().await.notes_tokens
+    }
+
     async fn declarations(&self) -> Declarations {
         let Some(plane) = self.plane else {
             return Declarations::default();
@@ -145,6 +157,7 @@ impl Plane for BoundPlane<'_> {
 #[derive(Default)]
 #[cfg_attr(debug_assertions, derive(Clone, PartialEq))]
 struct Pending {
+    token_family: Option<String>,
     entries: BTreeMap<u64, (Entry, u64)>,
     entry_bytes: u64,
     entries_omitted: bool,
@@ -170,6 +183,7 @@ struct Lane {
     /// Setup was sent. Setup, notices and rides carry the session's signed floor only then
     /// (compaction contract W3.5); the declaration holds until the next Setup.
     signed_floor_declared: bool,
+    notes_tokens_declared: bool,
 }
 
 impl Default for Lane {
@@ -180,6 +194,7 @@ impl Default for Lane {
             setup_due: true,
             detects_cache_expired: false,
             signed_floor_declared: false,
+            notes_tokens_declared: false,
         }
     }
 }
@@ -192,6 +207,9 @@ impl Lane {
         if !self.signed_floor_declared {
             conditions.signed_floor = None;
         }
+        if !self.notes_tokens_declared {
+            conditions.notes_tokens = None;
+        }
         conditions
     }
 }
@@ -200,6 +218,7 @@ impl Lane {
 /// producers only take `pending`, so a slow notice cannot accumulate a queue.
 #[derive(Default)]
 pub struct Runtime {
+    pub tokens: Mutex<super::tokens::Counts>,
     pending: Mutex<Pending>,
     lane: tokio::sync::Mutex<Lane>,
     /// Whether the provider declared `compaction-entry-speaks-for/v1` in its catalog entry when
@@ -242,13 +261,18 @@ impl Runtime {
             }
             None => 0,
         };
+        let mut counts = self
+            .tokens
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        refresh_pending_counts(&mut pending, entries, &mut counts);
         #[cfg(debug_assertions)]
         let whole = {
             let mut whole = pending.clone();
-            observe_from(&mut whole, entries, 0);
+            observe_from(&mut whole, entries, 0, &mut counts);
             whole
         };
-        observe_from(&mut pending, entries, from);
+        observe_from(&mut pending, entries, from, &mut counts);
         #[cfg(test)]
         OBSERVED.with(|count| count.set(count.get() + entries.len().saturating_sub(from)));
         #[cfg(debug_assertions)]
@@ -401,6 +425,14 @@ impl Runtime {
                 if !pending.changed && pending.events.is_empty() {
                     return;
                 }
+                refresh_pending_counts(
+                    &mut pending,
+                    &[],
+                    &mut self
+                        .tokens
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner()),
+                );
                 lane.seq += 1;
                 let mut notice = NoticeRequest::new(lane.seq, lane.conditions(conditions));
                 notice.newest = pending.newest.clone();
@@ -422,8 +454,21 @@ impl Runtime {
                     .len()
                     > 1_048_576
                 {
-                    notice.entries.clear();
+                    // Counts are expendable before entries; surface counts remain useful even
+                    // when the provider has to read the omitted transcript entries separately.
+                    super::tokens::strip_counts(&mut notice.entries);
+                    if serde_json::to_vec(&notice.entries)
+                        .expect("entries serialize")
+                        .len()
+                        > 1_048_576
+                    {
+                        notice.entries.clear();
+                    }
                 }
+                self.tokens
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .notice(&mut notice, lane.notes_tokens_declared);
                 notice
             };
             let answer: Result<NoticeAnswer, _> =
@@ -472,6 +517,9 @@ impl Runtime {
         }
         let mut request = request.clone();
         request.conditions = lane.conditions(&request.conditions);
+        request.conditions.system_tokens = None;
+        request.conditions.tools_tokens = None;
+        request.conditions.notes_tokens = None;
         let answer: Result<RawRideAnswer, _> = call(
             plane,
             "compaction.ride",
@@ -524,6 +572,7 @@ async fn setup(
         .unwrap_or_default();
     entry_speaks_for.store(attribution(declared.entry_speaks_for), Ordering::Release);
     lane.signed_floor_declared = declared.signed_floor;
+    lane.notes_tokens_declared = declared.notes_tokens;
     let mut request = request.clone();
     if !lane.signed_floor_declared {
         request.signed_floor = None;
@@ -589,8 +638,40 @@ thread_local! {
     static OBSERVED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// Recount queued entries under a new family when full content is available; otherwise drop
+/// their old metadata rather than label an earlier family's counts with the new family.
+fn refresh_pending_counts(
+    pending: &mut Pending,
+    entries: &[Entry],
+    counts: &mut super::tokens::Counts,
+) {
+    if pending.token_family.as_deref() == counts.family_id() {
+        return;
+    }
+    pending.token_family = counts.family_id().map(str::to_owned);
+    pending.entry_bytes = 0;
+    // The pending batch is bounded by the notice budget. Refresh only that batch, not the
+    // history, when the model's counting rules change before a coalesced notice is flushed.
+    for (ordinal, (entry, bytes)) in &mut pending.entries {
+        if let Ok(index) = entries.binary_search_by_key(ordinal, |entry| entry.ordinal) {
+            let mut full = entries[index].clone();
+            counts.annotate(std::slice::from_mut(&mut full));
+            *entry = super::entries::compact(&full);
+        } else {
+            super::tokens::strip_counts(std::slice::from_mut(entry));
+        }
+        *bytes = broca_protocol::serialized_json_bytes(entry);
+        pending.entry_bytes += *bytes;
+    }
+}
+
 /// [`Runtime::observe`] of `entries[from..]`, with the newest of all `entries`.
-fn observe_from(pending: &mut Pending, entries: &[Entry], from: usize) {
+fn observe_from(
+    pending: &mut Pending,
+    entries: &[Entry],
+    from: usize,
+    counts: &mut super::tokens::Counts,
+) {
     if let Some(newest) = views::newest(entries) {
         if pending
             .newest
@@ -610,7 +691,9 @@ fn observe_from(pending: &mut Pending, entries: &[Entry], from: usize) {
         if changed {
             pending.changed = true;
             if !pending.entries_omitted {
-                let compact = super::entries::compact(entry);
+                let mut counted = entry.clone();
+                counts.annotate(std::slice::from_mut(&mut counted));
+                let compact = super::entries::compact(&counted);
                 let bytes = broca_protocol::serialized_json_bytes(&compact);
                 if let Some((_, old_bytes)) =
                     pending.entries.insert(entry.ordinal, (compact, bytes))
@@ -621,9 +704,19 @@ fn observe_from(pending: &mut Pending, entries: &[Entry], from: usize) {
                 if pending.entry_bytes + 2 + pending.entries.len().saturating_sub(1) as u64
                     > 1_048_576
                 {
-                    pending.entries.clear();
                     pending.entry_bytes = 0;
-                    pending.entries_omitted = true;
+                    for (entry, bytes) in pending.entries.values_mut() {
+                        super::tokens::strip_counts(std::slice::from_mut(entry));
+                        *bytes = broca_protocol::serialized_json_bytes(entry);
+                        pending.entry_bytes += *bytes;
+                    }
+                    if pending.entry_bytes + 2 + pending.entries.len().saturating_sub(1) as u64
+                        > 1_048_576
+                    {
+                        pending.entries.clear();
+                        pending.entry_bytes = 0;
+                        pending.entries_omitted = true;
+                    }
                 }
             }
         }

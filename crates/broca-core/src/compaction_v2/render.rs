@@ -673,6 +673,40 @@ fn numbered_reply(original: &str, neutral: &str, tag: u64, assistant: bool) -> S
     format!("{}{neutral}", tags::tag_prefix(tag))
 }
 
+/// Full-content render input for counting, before provider-specific message framing.
+pub(super) fn counted_content(
+    entry: &Entry,
+    part: &cortexkit_role_compaction::part::Part,
+) -> Option<String> {
+    match &part.body {
+        PartBody::Text { text } => Some(match part.tag {
+            // The entry's original tag spelling has been normalized. Count the canonical
+            // spelling here; a reply that originally omitted the space may differ by a token.
+            Some(tag) => numbered_reply(text, text, tag, entry.role == Role::Assistant),
+            None => text.clone(),
+        }),
+        PartBody::Tool(tool) => {
+            let mut output = ToolOutput::Text {
+                text: tool.output.clone()?,
+            };
+            let plan = PlanPart {
+                id: part.id.clone(),
+                tag: part.tag,
+                prefix: part.tag.is_some(),
+                empty_result_label: tags::empty_result_label(tool).map(str::to_owned),
+                replace: Vec::new(),
+                rides: Vec::new(),
+            };
+            render_result(&mut output, tool, &plan, &entry.mid, &Default::default());
+            let ToolOutput::Text { text } = output else {
+                return None;
+            };
+            Some(text)
+        }
+        _ => None,
+    }
+}
+
 fn render_result(
     output: &mut ToolOutput,
     tool: &ToolPart,
@@ -804,9 +838,11 @@ fn append_delivery(
             crate::delivery_order::append_ride_output(output, &[ride]);
         }
         None => {
-            let mut rendered = super::entries::tool_output(output).1;
-            rendered.push_str("\n\n");
-            rendered.push_str(text);
+            let ride = cortexkit_role_llm_runner::rides::Ride::new("", &delivery.sender, "", text);
+            let rendered = cortexkit_role_llm_runner::rides::append(
+                &super::entries::tool_output(output).1,
+                &[ride],
+            );
             set_result_text(output, rendered, None);
         }
     }

@@ -19,6 +19,7 @@ broca-protocol = { path = "../broca-protocol" }
 broca-wal = { path = "../broca-wal" }
 cortexkit-role-compaction-provider = { workspace = true }
 cortexkit-role-compaction.workspace = true
+cortexkit-tokens.workspace = true
 cortexkit-compaction-view.workspace = true
 cortexkit-role-step-transform-provider.workspace = true
 cortexkit-role-tool-provider.workspace = true

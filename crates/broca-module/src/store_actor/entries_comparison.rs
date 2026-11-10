@@ -1165,10 +1165,36 @@ async fn session_entries_pages_as_todays_paging_of_the_whole_transcript() {
         .unwrap();
     let all = crate::store_entries::all_entries(&session).await.unwrap();
     assert!(all.len() >= 6, "{} entries", all.len());
+    let runtime = store.registry.store_runtime().unwrap();
+    let parts = runtime.parts_for(broca_wal::StorageClass::Ordinary, session.head().cipher());
+    let admission = broca_session_loop::run::admission_of_start(
+        session
+            .operations
+            .run
+            .as_ref()
+            .unwrap()
+            .start
+            .as_ref()
+            .unwrap(),
+        parts,
+    )
+    .unwrap();
+    let counts = std::cell::RefCell::new(broca_core::compaction_v2::tokens::Counts::default());
+    counts.borrow_mut().configure(
+        &broca_session_loop::compaction::frozen(&admission),
+        admission.manifest.as_deref(),
+    );
     let today = |request: &ReadRequest| {
         let mut head = broca_core::compaction_v2::protocol::read::Head::new();
         head.newest = broca_core::compaction_v2::views::newest(&all);
-        serde_json::to_value(broca_core::compaction_v2::views::page(&all, request, head)).unwrap()
+        // Derive metadata before selecting and compacting, so the byte caps still compare the
+        // bounded route with paging the whole transcript, including its new count metadata.
+        serde_json::to_value(
+            counts
+                .borrow_mut()
+                .finish_page(ReadPage::new(all.clone(), head), request),
+        )
+        .unwrap()
     };
     let len = all.len() as u64;
     let tags: Vec<u64> = all

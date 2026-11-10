@@ -295,6 +295,8 @@ pub(crate) fn run(args: &Args) {
             Ok(item) => item.flatten().map(|item| item.0),
             Err(e) => return report.fail("today's compaction item", e, &name),
         };
+        let store_counts =
+            std::sync::Mutex::new(broca_core::compaction_v2::tokens::Counts::default());
         let serve = |caller: &str, method: &str, params: Value| -> Value {
             let params = serde_json::value::to_raw_value(&params).expect("params encode");
             outcome(
@@ -307,6 +309,7 @@ pub(crate) fn run(args: &Args) {
                     &params,
                     // Compared with today's projection, which keeps every entry's attribution.
                     &broca_module::store_entries::EntryAttribution::Known(true),
+                    Some(&store_counts),
                 ))
                 .map(|reply| serde_json::from_str::<Value>(reply.get()).expect("a reply is JSON")),
             )
@@ -345,6 +348,15 @@ pub(crate) fn run(args: &Args) {
             Ok(transcript) => transcript.entries,
             Err(e) => return report.fail("today's entries", e, &name),
         };
+        let (config, frozen_manifest) = match broca_core::compaction_v2::host::frozen(&framed) {
+            Ok(frozen) => frozen,
+            Err(error) => return report.fail("today's count configuration", error, &name),
+        };
+        let counts = std::cell::RefCell::new(broca_core::compaction_v2::tokens::Counts::default());
+        counts.borrow_mut().configure(
+            &broca_core::compaction_v2::host::Frozen::of(&config),
+            frozen_manifest,
+        );
         let state = match broca_core::compaction_v2::session::load(&bind, &framed) {
             Ok(state) => state,
             Err(e) => return report.fail("today's compaction state", e, &name),
@@ -367,7 +379,9 @@ pub(crate) fn run(args: &Args) {
             let mut head = Head::new();
             head.newest = broca_core::compaction_v2::views::newest(&entries);
             head.applied_view = state.applied_identity();
-            json!({ "ok": broca_core::compaction_v2::views::page(&entries, request, head) })
+            json!({ "ok": counts.borrow_mut().finish_page(
+                broca_core::compaction_v2::protocol::read::ReadPage::new(entries.clone(), head), request,
+            ) })
         };
         let mut requests: Vec<ReadRequest> = Vec::new();
         for detail in [Detail::Full, Detail::Compact] {

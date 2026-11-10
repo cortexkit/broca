@@ -544,6 +544,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             });
         let entry_speaks_for = self.entry_attribution(request).await;
         let context = crate::store_reads::ReadContext {
+            token_counts: Some(&self.compaction_session.runtime.tokens),
             parts: &self.parts,
             held: true,
             open: true,

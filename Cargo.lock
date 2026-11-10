@@ -332,9 +332,10 @@ dependencies = [
  "cortexkit-lease",
  "cortexkit-role-compaction",
  "cortexkit-role-compaction-provider",
- "cortexkit-role-llm-runner 0.8.35",
+ "cortexkit-role-llm-runner 0.8.36",
  "cortexkit-role-step-transform-provider",
  "cortexkit-role-tool-provider",
+ "cortexkit-tokens",
  "futures",
  "getrandom 0.3.4",
  "serde",
@@ -357,7 +358,7 @@ dependencies = [
  "broca-store",
  "broca-test-support",
  "broca-wal",
- "cortexkit-role-llm-runner 0.8.35",
+ "cortexkit-role-llm-runner 0.8.36",
  "serde_json",
  "tokio",
  "tokio-util",
@@ -380,7 +381,7 @@ dependencies = [
  "broca-test-support",
  "broca-wal",
  "cortexkit-role-compaction-provider",
- "cortexkit-role-llm-runner 0.8.35",
+ "cortexkit-role-llm-runner 0.8.36",
  "cortexkit-role-step-transform-provider",
  "cortexkit-role-tool-provider",
  "futures",
@@ -430,7 +431,7 @@ dependencies = [
  "cortexkit-bus-trait",
  "cortexkit-compaction-view",
  "cortexkit-role-llm-runner 0.7.48",
- "cortexkit-role-llm-runner 0.8.35",
+ "cortexkit-role-llm-runner 0.8.36",
  "cortexkit-role-step-transform-provider",
  "cortexkit-role-tool-provider",
  "futures",
@@ -484,7 +485,7 @@ dependencies = [
  "cortexkit-role-classifier",
  "cortexkit-role-classifier-conformance",
  "cortexkit-role-harness",
- "cortexkit-role-llm-runner 0.8.35",
+ "cortexkit-role-llm-runner 0.8.36",
  "cortexkit-role-llm-runner-conformance",
  "cortexkit-role-routing",
  "cortexkit-role-step-transform-provider",
@@ -531,7 +532,7 @@ dependencies = [
  "cortexkit-bus-naming",
  "cortexkit-compaction-view",
  "cortexkit-role-llm-runner 0.7.48",
- "cortexkit-role-llm-runner 0.8.35",
+ "cortexkit-role-llm-runner 0.8.36",
  "jsonschema",
  "serde",
  "serde_jcs",
@@ -644,7 +645,7 @@ dependencies = [
  "broca-test-support",
  "broca-wal",
  "cortexkit-role-compaction",
- "cortexkit-role-llm-runner 0.8.35",
+ "cortexkit-role-llm-runner 0.8.36",
  "futures",
  "serde",
  "serde_jcs",
@@ -669,7 +670,7 @@ dependencies = [
  "broca-wal",
  "cortexkit-compaction-view",
  "cortexkit-role-compaction",
- "cortexkit-role-llm-runner 0.8.35",
+ "cortexkit-role-llm-runner 0.8.36",
  "cortexkit-role-step-transform-provider",
  "cortexkit-role-tool-provider",
  "futures",
@@ -749,7 +750,7 @@ dependencies = [
  "broca-test-support",
  "broca-wal",
  "cortexkit-model-batch",
- "cortexkit-role-llm-runner 0.8.35",
+ "cortexkit-role-llm-runner 0.8.36",
  "cortexkit-role-step-transform-provider",
  "cortexkit-role-tool-provider",
  "cortexkit-role-tool-provider-conformance",
@@ -819,7 +820,7 @@ dependencies = [
  "broca-protocol",
  "cortexkit-bus-naming",
  "cortexkit-role-agent-data",
- "cortexkit-role-llm-runner 0.8.35",
+ "cortexkit-role-llm-runner 0.8.36",
  "serde",
  "serde_jcs",
  "serde_json",
@@ -983,7 +984,7 @@ dependencies = [
  "broca-protocol",
  "broca-provider",
  "broca-test-support",
- "cortexkit-role-llm-runner 0.8.35",
+ "cortexkit-role-llm-runner 0.8.36",
  "rusqlite",
  "serde_json",
  "sha2",
@@ -1279,11 +1280,11 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-compaction"
-version = "0.3.4"
+version = "0.3.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "991a0ae3d5e84adebdc416e35a43c4d464affd109e7ac365e1f825d1b13a825b"
+checksum = "a4a179858835f4c665720d35190a001edea41f9bff1ab7aa4dc76ac6ddc7a188"
 dependencies = [
- "cortexkit-role-llm-runner 0.8.35",
+ "cortexkit-role-llm-runner 0.8.36",
  "serde",
  "serde_json",
  "serde_path_to_error",
@@ -1338,9 +1339,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-llm-runner"
-version = "0.8.35"
+version = "0.8.36"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e97b488db80688638f1f603c7f838585a497ceeae2121e3de817e8849ffe563a"
+checksum = "ec3dd82662de68fc128ae405d914a639435e5522069a3778bd0576171bfaea64"
 dependencies = [
  "cortexkit-rich-ui-syntax",
  "cortexkit-role-tool-provider",
@@ -1352,15 +1353,15 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-llm-runner-conformance"
-version = "0.17.43"
+version = "0.17.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7438e2c7073c46f411bd2a665e18eb644ebd3baecabeb015f034e9785f37b037"
+checksum = "d250c85a803e7c7dc625e817abda6d1e8d835036ce4f51a69b4c2a22682a424b"
 dependencies = [
  "async-trait",
  "base64",
  "cortexkit-rich-ui-syntax",
  "cortexkit-role-harness",
- "cortexkit-role-llm-runner 0.8.35",
+ "cortexkit-role-llm-runner 0.8.36",
  "futures-util",
  "serde",
  "serde_jcs",
@@ -1398,7 +1399,7 @@ version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f5b7e30ac9b2ed17eddc93876f71cd5b6ebd5c6af415ef58aa679f017ed5d3f0"
 dependencies = [
- "cortexkit-role-llm-runner 0.8.35",
+ "cortexkit-role-llm-runner 0.8.36",
  "serde",
  "serde_json",
 ]
@@ -1465,6 +1466,19 @@ dependencies = [
  "sha2",
  "subc-os",
  "tokio",
+]
+
+[[package]]
+name = "cortexkit-tokens"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "693c3ba104e0895712e1705f22ef5255ba5ad83bde86d611395f864dede2e4b7"
+dependencies = [
+ "ruzstd",
+ "serde",
+ "unicode-normalization",
+ "unicode-properties",
+ "unicode-script",
 ]
 
 [[package]]
@@ -3316,6 +3330,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
+name = "ruzstd"
+version = "0.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7c1c839d570d835527c9a5e4db7cb2198683a988cb9d7293fc8674e6bd58fc8"
+dependencies = [
+ "twox-hash",
+]
+
+[[package]]
 name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4088,6 +4111,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "twox-hash"
+version = "2.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "86a801b3cea342a06d468c8710662aa29e5e05e4f5c0d62f00bbb7f2ad7941c2"
+
+[[package]]
 name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4116,6 +4145,27 @@ name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+
+[[package]]
+name = "unicode-normalization"
+version = "0.1.24"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5033c97c4262335cded6d6fc3e5c18ab755e1a3dc96376350f3d8e9f009ad956"
+dependencies = [
+ "tinyvec",
+]
+
+[[package]]
+name = "unicode-properties"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e70f2a8b45122e719eb623c01822704c4e0907e7e426a05927e1a1cfff5b75d0"
+
+[[package]]
+name = "unicode-script"
+version = "0.5.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9fb421b350c9aff471779e262955939f565ec18b86c15364e6bdf0d662ca7c1f"
 
 [[package]]
 name = "universal-hash"

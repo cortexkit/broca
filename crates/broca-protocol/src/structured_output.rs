@@ -21,6 +21,27 @@ pub const SUBMIT_RESULT_DESCRIPTION: &str = "Submit the final result of the task
      tool ends the task: call it exactly once, when the work is done, with the result as its \
      input.";
 
+/// The runner-owned declaration shared by admission, rendering and reply-name restoration.
+pub fn submit_tool(schema: Value) -> crate::request::Tool {
+    crate::request::Tool {
+        name: SUBMIT_RESULT_TOOL.to_owned(),
+        description: SUBMIT_RESULT_DESCRIPTION.to_owned(),
+        input_schema: schema,
+        module: None,
+        execution_mode: Default::default(),
+        reply: None,
+    }
+}
+
+/// The instructions an unconstrained `final_text` run carries in its system prompt.
+pub fn instructions(frozen: &FrozenStructuredOutput) -> String {
+    format!(
+        "Your final answer must be a single JSON value, with no other text before or after \
+         it, that validates against this JSON Schema (draft 2020-12) named \"{}\":\n{}",
+        frozen.name, frozen.schema_jcs
+    )
+}
+
 /// The tool result the runner records for the counted `submit_result` call, so the call never
 /// dangles in the transcript. The run has ended by the time it is written.
 pub const SUBMIT_RESULT_RECORDED: &str = "submit_result recorded; the task has ended.";

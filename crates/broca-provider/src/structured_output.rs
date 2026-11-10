@@ -17,10 +17,10 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use broca_protocol::content::{ContentBlock, Message, Role};
-use broca_protocol::request::{CallOptions, Tool};
+use broca_protocol::request::CallOptions;
 use broca_protocol::structured_output::{
     enforcement, reasons, schema_jcs_text, FrozenStructuredOutput, Mode, SchemaDelivery,
-    StructuredOutput, SUBMIT_RESULT_DESCRIPTION, SUBMIT_RESULT_TOOL,
+    StructuredOutput,
 };
 use serde_json::{json, Map, Value};
 
@@ -684,15 +684,7 @@ thread_local! {
     pub(crate) static PREPARED_COPIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// The instructions a `final_text` run without a provider-side schema constraint carries in
-/// its system prompt.
-fn instructions(frozen: &FrozenStructuredOutput) -> String {
-    format!(
-        "Your final answer must be a single JSON value, with no other text before or after \
-         it, that validates against this JSON Schema (draft 2020-12) named \"{}\":\n{}",
-        frozen.name, frozen.schema_jcs
-    )
-}
+use broca_protocol::structured_output::instructions;
 
 /// The request a family shapes for a run with structured output: the `submit_result` tool
 /// appended to the run's tools, or for an unconstrained `final_text` run, the schema
@@ -759,17 +751,7 @@ pub fn prepare<'a>(frozen: &FrozenRenderConfig, opts: &'a CallOptions) -> Cow<'a
     }
 }
 
-/// The runner-owned declaration shared by admission, rendering and reply-name restoration.
-pub fn submit_tool(schema: Value) -> Tool {
-    Tool {
-        name: SUBMIT_RESULT_TOOL.to_owned(),
-        description: SUBMIT_RESULT_DESCRIPTION.to_owned(),
-        input_schema: schema,
-        module: None,
-        execution_mode: Default::default(),
-        reply: None,
-    }
-}
+pub use broca_protocol::structured_output::submit_tool;
 
 /// Add the family's schema encoding to a shaped body, and mark the submit tool strict or not.
 /// `body` is the family's own request body: for Code Assist, the inner Gemini body.

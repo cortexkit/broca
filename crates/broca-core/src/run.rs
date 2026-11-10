@@ -6401,6 +6401,12 @@ where
                 bind: &req.session,
                 scope: req.scope.as_ref(),
             };
+            session
+                .runtime
+                .tokens
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .configure(&crate::compaction_v2::host::Frozen::of(&config), manifest);
             let prepared = crate::compaction_v2::request::prepare(
                 &session.state,
                 &session.runtime,

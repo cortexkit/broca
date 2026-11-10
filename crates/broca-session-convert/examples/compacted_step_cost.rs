@@ -44,6 +44,8 @@
 //!     [--seal-every 2000] [--opens 3] [--open-log-warmup N] [--open-log-steps N] \
 //!     [--unbilled true] [--interleave true]
 //! ```
+//! `--token-counts true` instead measures cold 100-entry full-detail pages, incremental notices,
+//! and a 150k-message paged indexing walk, reporting time spent inside the tokenizer separately.
 //!
 //! `--open-log-warmup` and `--open-log-steps` set the warm-up and measured steps of the
 //! `open-log` case at every size but the smallest. The ratios compare each size with the
@@ -100,6 +102,9 @@ use broca_session_store::record::Record;
 use broca_session_store::session::{Session, SessionError};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
+
+#[path = "compacted_step_cost/token_counts.rs"]
+mod token_counts;
 
 /// The address every session of the bench is written at.
 const ADDR: &str = "0123456789abcdef";
@@ -871,6 +876,7 @@ impl Compactor {
                     "session.entries",
                     &params,
                     &entry_speaks_for,
+                    None,
                 )
                 .await;
                 (page, "handed back, read from a view")
@@ -1752,6 +1758,7 @@ fn durations_ns(samples: &[Duration]) -> Vec<u64> {
 
 /// What the bench was asked to measure.
 struct Args {
+    token_counts: bool,
     out: PathBuf,
     store: PathBuf,
     sizes: Vec<u64>,
@@ -1780,6 +1787,7 @@ const CASES: [&str; 4] = ["sealed-once", "sealed-often", "open-log", "no-cut"];
 impl Args {
     fn parse() -> Self {
         let mut args = Self {
+            token_counts: false,
             out: PathBuf::from("target/scratch/compacted-step-cost/results"),
             store: PathBuf::from("target/scratch/compacted-step-cost/store"),
             sizes: vec![1_000, 150_000, 500_000],
@@ -1806,6 +1814,7 @@ impl Args {
                 .next()
                 .unwrap_or_else(|| panic!("{flag} needs a value"));
             match flag.as_str() {
+                "--token-counts" => args.token_counts = value.parse().unwrap(),
                 "--out" => args.out = PathBuf::from(value),
                 "--store" => args.store = PathBuf::from(value),
                 "--sizes" => args.sizes = list(&value).iter().map(|s| s.parse().unwrap()).collect(),
@@ -2563,6 +2572,10 @@ fn main() {
         let mut templates = Vec::new();
         for (turns, kb) in [(1, 2), (3, 1), (2, 6), (4, 3)] {
             templates.push(template(turns, kb * 1024, &parts).await);
+        }
+        if args.token_counts {
+            token_counts::measure(&args, &templates, &parts).await;
+            return;
         }
         header.push_str(&format!(
             "Session shape: runs built from {} template runs the new loop wrote on the \

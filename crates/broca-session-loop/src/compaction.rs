@@ -761,7 +761,7 @@ fn spanning_repetition(
 /// The run's frozen choices in the shape today's compaction conditions read. Its model
 /// variant, service tier and account choice aren't in the new loop's admission yet, so they read
 /// as none.
-fn frozen(admission: &Admission) -> v2::host::Frozen<'_> {
+pub fn frozen(admission: &Admission) -> v2::host::Frozen<'_> {
     v2::host::Frozen {
         model: &admission.model,
         variant: admission.variant.as_deref(),
@@ -922,6 +922,12 @@ pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
     let rides = Arc::clone(&transcript_rides);
     #[cfg(test)]
     let rendered_before = rendered.rendered();
+    ctx.session
+        .runtime
+        .tokens
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .configure(&frozen(admission), admission.manifest.as_deref());
     let prepared = v2::request::prepare(
         &ctx.session.state,
         &ctx.session.runtime,
@@ -1008,6 +1014,12 @@ pub async fn notice<W: Writer, P, T>(
         return Ok(());
     }
     let entries = transcript(writer, ctx).await?.entries;
+    ctx.session
+        .runtime
+        .tokens
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .configure(&frozen(admission), admission.manifest.as_deref());
     let conditions = conditions_for(writer, admission, &entries, false, signed_floor)
         .map_err(LoopError::Parts)?;
     let applied = ctx.session.state.lock().await.applied_identity();
