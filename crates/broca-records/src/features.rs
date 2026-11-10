@@ -278,3 +278,6 @@ pub const RIDES_V2_FEATURE: &str = "rides-v2/v1";
 
 /// Turn-scoped system entries must not be hoisted into legacy global instructions.
 pub const TURN_SYSTEM_FEATURE: &str = "turn-system/v1";
+
+/// Writer lifecycle records fence recovery against an earlier writer's unfinished suffix.
+pub const WRITER_ID_FEATURE: &str = "writer-id/v1";

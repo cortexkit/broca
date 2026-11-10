@@ -155,6 +155,7 @@ pub struct StoreActor<B: SessionBackend> {
     /// after each seal. They run at the actor's next idle moment, or as it closes (see
     /// [`StoreActor::collect_unreferenced`]).
     collect_due: bool,
+    admission: admission::Admission,
     /// The wall clock the session's deletions come due by, in milliseconds since the epoch: the
     /// clock its runs stamp their seals with.
     now_ms: Arc<dyn Fn() -> u64 + Send + Sync>,
@@ -391,6 +392,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             ordered_scope: None,
             created: None,
             collect_due: false,
+            admission: Default::default(),
             now_ms: Arc::new(|| broca_core::run::epoch_millis().unwrap_or(0)),
         }
     }
@@ -2685,6 +2687,23 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         if started {
             active.started = true;
             if let Some(reply) = active.admitting.take() {
+                // The run's start is durable, so this send was admitted whatever happens here:
+                // a failure to read the first run's settings only leaves the answer without its
+                // baseline. Answering "transient" would tell the caller to retry a run that is
+                // already running.
+                if let Err(error) = self.admission.learn(
+                    &self.session,
+                    &self.parts,
+                    &self.key,
+                    self.registry.as_ref(),
+                ) {
+                    tracing::warn!(
+                        target: "broca.store_actor",
+                        run_id = %active.run_id.0,
+                        %error,
+                        "admitted send answered without its baseline"
+                    );
+                }
                 let _ = reply.send(SendOutcome::Active {
                     run_id: active.run_id.clone(),
                     delivered: None,
@@ -3885,6 +3904,7 @@ fn refuse(command: LineageCmd) {
     }
 }
 
+mod admission;
 mod apply_view;
 mod held;
 mod import;

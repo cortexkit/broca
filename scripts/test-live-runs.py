@@ -10,6 +10,7 @@ import io
 import json
 import os
 import pathlib
+import re
 import struct
 import sys
 import tempfile
@@ -26,7 +27,7 @@ live_runs = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = live_runs
 SPEC.loader.exec_module(live_runs)
 
-EXPECTED_SUITE_ANCHORS = 22
+EXPECTED_SUITE_ANCHORS = 23
 
 # Session logs written by the real runner for a resume close-out: two dispatched calls with no
 # result, the resume's `resume_started` record, an `outcome_unknown` result for each, and the
@@ -348,6 +349,25 @@ class LiveRunsGateTests(unittest.TestCase):
 
 class KnownFeatureTableTests(unittest.TestCase):
     """The scripts' feature table is broca's, read from framing.rs, never a copy."""
+
+    def test_every_written_feature_is_known(self) -> None:
+        # Include inline record requirements as well as named features: a literal in the
+        # Rust table used to disappear silently from the scripts' constant-only reader.
+        wal = live_runs.wal_gate.FRAMING_RS.parent
+        records = wal.parent.parent / "broca-records" / "src"
+        sources = [records / "features.rs", records / "recovery.rs",
+                   records / "head_proof.rs", wal / "framing.rs"]
+        written = set()
+        for path in sources:
+            written.update(re.findall(
+                r'pub const (?!TEST_)[A-Z][A-Z0-9_]*: &str = "([a-z][a-z0-9-]*/v[0-9]+)";',
+                path.read_text().split("#[cfg(test)]", 1)[0],
+            ))
+        written.update(re.findall(
+            r'"([a-z][a-z0-9-]*/v[0-9]+)"', (records / "record.rs").read_text(),
+        ))
+        self.assertIn("writer-id/v1", written)
+        self.assertEqual(written - live_runs.wal_gate.KNOWN_FEATURES, set())
 
     def test_table_is_brocas_and_covers_a_feature_every_tool_call_writes(self) -> None:
         # Positive control: `dispatch-module/v1` gates every dispatched tool call since broca

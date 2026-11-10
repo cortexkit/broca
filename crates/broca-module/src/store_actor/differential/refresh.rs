@@ -363,7 +363,7 @@ async fn compared(
     (today, store, store_answers, runs)
 }
 
-fn first_plan() -> broca_wal::PlanManifest {
+pub(super) fn first_plan() -> broca_wal::PlanManifest {
     manifest(&plan("you are a worker", &["read"], None, None), "plan-1")
 }
 
