@@ -24,8 +24,15 @@ use broca_wal::WalRecord;
 use crate::run::{Admission, LoopError, Seams};
 use crate::writer::Writer;
 
+pub(crate) mod prompt;
 mod window;
 pub use window::WindowTranscript;
+
+#[cfg(test)]
+thread_local! {
+    /// How many entries this thread's compacted requests rendered rather than reused.
+    pub(crate) static RENDERED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// What a run whose plan names a compaction provider needs for its calls to that provider.
 pub struct Ctx {
@@ -869,7 +876,10 @@ pub async fn apply_boundary<W: Writer, P, T>(
 
 /// Prepares step `step`'s request through today's compaction code: Setup when the provider
 /// needs it, a ride when something changed, the notices owed, and the prompt the applied view
-/// renders.
+/// renders from the run's stored prompt, `stored`, brought up to date for the step. `opts`
+/// carries the request's settings; its own prompt is left empty. `rendered` keeps what the
+/// run's renders rendered of each entry, for the next to reuse.
+#[allow(clippy::too_many_arguments)]
 pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
     writer: &mut W,
     admission: &Admission,
@@ -877,9 +887,11 @@ pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
     ctx: &Ctx,
     step: u64,
     opts: broca_protocol::request::CallOptions,
+    stored: &mut prompt::KeptPrompt,
+    rendered: &v2::render::RenderCache,
 ) -> Result<Send, LoopError> {
     let transcript = transcript(writer, ctx).await?;
-    let opts = with_sealed(opts, &transcript);
+    let stored = stored.stored(&transcript.sealed);
     let entries = transcript.entries;
     let transcript_rides = transcript.rides;
     let now = (seams.now_ms)();
@@ -908,6 +920,8 @@ pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
     // A ride renders by its envelope, as today's loop renders a ride recorded with one; text
     // delivered before envelopes existed renders the way it always did.
     let rides = Arc::clone(&transcript_rides);
+    #[cfg(test)]
+    let rendered_before = rendered.rendered();
     let prepared = v2::request::prepare(
         &ctx.session.state,
         &ctx.session.runtime,
@@ -918,7 +932,7 @@ pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
             preset: &ctx.preset,
             entries: &entries,
             rides: &rides,
-            stored: &opts.prompt,
+            stored,
             conditions: &conditions,
             previous: previous.as_ref(),
             current: &current,
@@ -934,6 +948,7 @@ pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
             chain_reset: chained && seams.provider.prepare_chain_reset(),
             now,
             next_mid: NEXT_MID,
+            render: Some(rendered),
         },
         |_| Err("a compaction view's inserted images aren't stored yet".into()),
         |prompt| {
@@ -947,6 +962,9 @@ pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
     )
     .await
     .map_err(LoopError::Parts)?;
+    #[cfg(test)]
+    RENDERED
+        .with(|count| count.set(count.get() + (rendered.rendered() - rendered_before) as usize));
     match prepared {
         v2::request::Prepared::Ready {
             prompt, applied, ..

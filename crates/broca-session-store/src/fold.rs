@@ -49,6 +49,11 @@ pub struct FieldSpec {
 /// `<number> <cardinality> name: Type => { owner: "...", reset: "...", bound: Bound::... },`,
 /// where the number and cardinality mean what they mean in the codec's `message!`: `req` holds
 /// `Type`, `opt` an `Option<Type>`, `rep` a `Vec<Type>`.
+///
+/// A `runtime { ... }` block after the struct declares fields the fold keeps only in memory, each
+/// written as `name: Type => { owner, reset, bound },` without a number. A checkpoint never
+/// carries them, and a state read from one starts them at `Type::default()`. They are in
+/// `SCHEMA` after the stored fields, bound like any other.
 macro_rules! state {
     (
         $(#[$meta:meta])*
@@ -62,6 +67,18 @@ macro_rules! state {
                 },
             )*
         }
+        $(
+            runtime {
+                $(
+                    $(#[$runtime_meta:meta])*
+                    $runtime_vis:vis $runtime:ident: $runtime_ty:ty => {
+                        owner: $runtime_owner:literal,
+                        reset: $runtime_reset:literal,
+                        bound: $runtime_bound:expr $(,)?
+                    },
+                )*
+            }
+        )?
     ) => {
         $(#[$meta])*
         $vis struct $name {
@@ -69,6 +86,10 @@ macro_rules! state {
                 $(#[$field_meta])*
                 $field_vis $field: $crate::__codec_field_ty!($card $ty),
             )*
+            $($(
+                $(#[$runtime_meta])*
+                $runtime_vis $runtime: $runtime_ty,
+            )*)?
         }
 
         const _: () = assert!(
@@ -117,6 +138,9 @@ macro_rules! state {
                             concat!(stringify!($name), ".", stringify!($field))
                         ),
                     )*
+                    $($(
+                        $runtime: ::std::default::Default::default(),
+                    )*)?
                 })
             }
         }
@@ -133,6 +157,14 @@ macro_rules! state {
                         bound: $bound,
                     },
                 )*
+                $($(
+                    $crate::fold::FieldSpec {
+                        name: stringify!($runtime),
+                        owner: $runtime_owner,
+                        reset: $runtime_reset,
+                        bound: $runtime_bound,
+                    },
+                )*)?
             ];
         }
     };
