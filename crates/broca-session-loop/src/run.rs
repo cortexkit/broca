@@ -1686,7 +1686,15 @@ where
     // Each window run's frozen part numbering, read from its start once for the whole run.
     let mut tag_rules = TagRulesCache::default();
     let tools = Arc::new(admission.tools.clone());
-    let manifest = ToolManifest::from_tools(admission.tools.clone());
+    // The run's frozen plan says which preset each tool provider's calls carry, which providers
+    // were fetched and what they declared, as today's loop reads it from the same plan. A call
+    // without its preset is refused by a provider whose route is bound under a scope.
+    let mut manifest = ToolManifest::from_tools(admission.tools.clone());
+    if let Some(plan) = admission.manifest.as_deref() {
+        manifest = manifest
+            .with_plan_manifest(plan)
+            .map_err(|error| LoopError::Parts(format!("the run's frozen plan: {error}")))?;
+    }
     // As today's loop asks once per run: a provider whose media renderer tags its own copy of
     // each request takes the run's tag choice here, and the loop leaves media-holding messages
     // untagged, since preparing their media needs the parts where the model put them.
