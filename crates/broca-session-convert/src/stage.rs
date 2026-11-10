@@ -410,7 +410,7 @@ pub async fn write_with_progress(
     progress: broca_session_store::backend::unpublished::Progress<'_>,
 ) -> Result<Staged, StageError> {
     let Prepared {
-        converted,
+        mut converted,
         appends_in_conversation,
         media,
     } = prepared;
@@ -445,6 +445,7 @@ pub async fn write_with_progress(
     )
     .await
     .map_err(failed("create the staged session"))?;
+    converted.start_at(session.next_seq());
     // Keep exactly the live encoder's batch boundaries and generation/sequence allocation.
     // Only physical barriers are deferred: this tree is never served, and a failed attempt
     // is discarded in full. Shared setup parts still use the ordinary durable backend.

@@ -1142,12 +1142,31 @@ impl Engine {
             if interrupted.load(std::sync::atomic::Ordering::Relaxed) {
                 return Err(Failure::failed("crash", "verification interrupted"));
             }
-            verified.map_err(|error| Failure::failed("verification_failed", error))?;
+            let verified =
+                verified.map_err(|error| Failure::failed("verification_failed", error))?;
+            // A converted session whose requests match today's offline replay, where that replay
+            // can't reproduce a historical request digest, still converts. The ledger keeps the
+            // affected steps so the limit stays visible after the conversion.
+            let replay_limit = (verified.legacy_replay_limit > 0).then(|| {
+                let steps: Vec<String> = verified
+                    .legacy_replay_limit_examples
+                    .iter()
+                    .map(|limit| format!("{} step {}", limit.run_id, limit.step))
+                    .collect();
+                format!(
+                    "legacy_replay_limit: {} step(s) match today's offline replay but not their recorded request digest ({})",
+                    verified.legacy_replay_limit,
+                    steps.join(", ")
+                )
+            });
+            if let Some(detail) = &replay_limit {
+                tracing::warn!(target: "session_conversion", source = %source.id, "{detail}");
+            }
             if let Some(runtime) = runtime {
                 crate::store_move::StoreMove::hold_parts(runtime, source_class, &staged.converted)
                     .map_err(|error| io(error.message))?;
             }
-            self.step(source, "verified", None, None)?;
+            self.step_with_detail(source, "verified", None, None, replay_limit.as_deref())?;
             if let Some(inventory) = &self.inventory {
                 use broca_core::SessionRefIndex;
                 inventory.record_session(&address, &session).map_err(io)?;
@@ -1191,7 +1210,20 @@ impl Engine {
         }
         // The published head now owns all requests; source backup cannot affect its writer.
         drop(_idle_fence);
-        self.step(source, "awaiting_backup", Some("converted"), None)?;
+        // The steps since verification carried its note (a replay limit) forward, also across a
+        // restart that resumed at publication; it stays on the converted row.
+        let note = self
+            .ledger
+            .row(&source.id)
+            .map_err(io)?
+            .and_then(|row| row.detail);
+        self.step_with_detail(
+            source,
+            "awaiting_backup",
+            Some("converted"),
+            None,
+            note.as_deref(),
+        )?;
         self.backup_ready(source)?;
         self.health
             .write()

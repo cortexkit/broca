@@ -917,18 +917,33 @@ fn write_verified_media_session(rig: &Rig) -> Vec<u8> {
     std::fs::read(rig.wal()).unwrap()
 }
 
-/// A session whose media today's store holds is staged with them, and the staged copy is checked
-/// against the request each step sent. Here the WAL's recorded requests predate the image its
-/// input was given, so the check of its last step differs: the move aborts naming that check,
-/// and leaves today's storage as it was, with no staged object behind.
+/// A session whose media today's store holds is staged with them. A changed answer in the
+/// WAL records given to the verifier then aborts and leaves today's storage as it was, with no
+/// staged object behind. A historical request digest alone need not reproduce today's replay,
+/// so the abort requires a genuine difference between the converted session and today's WAL.
 #[tokio::test]
 async fn a_session_holding_media_is_staged_and_its_abort_leaves_nothing() {
     let rig = Rig::start("media-abort").await;
     with_media(&rig, Some(IMAGE));
     let bytes = std::fs::read(rig.wal()).unwrap();
-    let refused = rig.mover().move_to_store(&key(), None).await.unwrap_err();
+    let mover = rig.mover();
+    *mover.faults.plant.lock().unwrap() = Some(Box::new(|records: &mut Vec<FramedRecord>| {
+        for frame in records {
+            if let WalRecord::ModelStepFinished {
+                assistant_message, ..
+            } = &mut frame.record
+            {
+                std::sync::Arc::make_mut(assistant_message).content =
+                    vec![
+                        serde_json::from_value(json!({"type": "text", "text": "Changed."}))
+                            .unwrap(),
+                    ];
+            }
+        }
+    }));
+    let refused = mover.move_to_store(&key(), None).await.unwrap_err();
     assert_eq!(refused.code, "move_verification_failed", "{refused:?}");
-    assert_eq!(refused.detail.unwrap()["check"], "last_step");
+    assert_eq!(refused.detail.unwrap()["check"], "run_result");
     assert_today(&rig, &bytes);
 }
 

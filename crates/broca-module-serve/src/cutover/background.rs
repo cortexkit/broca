@@ -558,6 +558,47 @@ async fn cutover_verification_failure_retains_check_and_first_difference_in_ledg
     );
 }
 
+/// A session whose recorded request digest today's offline replay can't reproduce still
+/// converts, because its converted requests equal today's replay; the converted row keeps the
+/// affected step, also after the ledger is reopened.
+#[tokio::test]
+async fn cutover_keeps_a_legacy_replay_limit_on_the_converted_row() {
+    let rig = Rig::start("cutover-replay-limit").await;
+    // The log records a request digest no render of its records produces.
+    let mut records = session_records(&rig.wal());
+    for record in &mut records {
+        if let WalRecord::ModelAttemptFinished {
+            request_body_sha256,
+            ..
+        } = record
+        {
+            *request_body_sha256 = "0".repeat(64);
+        }
+    }
+    rig.write(&records);
+    let engine = super::engine(&rig, false, true);
+    engine
+        .run_live(&deployment(), Some(&rig.runtime), Some(&rig.registry))
+        .await
+        .unwrap();
+    let row = engine.ledger.rows().unwrap().remove(0);
+    assert_eq!(row.outcome.as_deref(), Some("converted"), "{row:?}");
+    let detail = row
+        .detail
+        .as_deref()
+        .expect("the replay limit must stay on the converted row");
+    assert!(
+        detail.starts_with("legacy_replay_limit: 1 step(s)"),
+        "{detail}"
+    );
+    drop(engine);
+    let ledger = crate::conversion_ledger::Ledger::open(&rig.dir).unwrap();
+    assert_eq!(
+        ledger.row(&row.source.id).unwrap().unwrap().detail,
+        row.detail
+    );
+}
+
 #[tokio::test]
 async fn background_live_takes_oldest_last_write_first_and_stops_next_conversion_on_drain() {
     let rig = Rig::start("background-oldest").await;

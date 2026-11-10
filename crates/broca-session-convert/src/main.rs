@@ -282,6 +282,10 @@ fn parse_args() -> Args {
             "--plain" => {
                 let _ = PLAIN.set(true);
             }
+            _ if arg.starts_with("--") => {
+                eprintln!("unknown option {arg}");
+                std::process::exit(2);
+            }
             _ => paths.push(PathBuf::from(arg)),
         }
     }
