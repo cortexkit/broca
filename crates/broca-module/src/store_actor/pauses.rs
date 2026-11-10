@@ -144,6 +144,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             return SendOutcome::PreUserUnavailable { provider };
         }
         let receipt = queue::SteerReceipt {
+            ts_ms: self.retention_timestamp(),
             sent_by: start.sent_by,
             send_id: start.send_id,
             request_identity_digest: start.identity,

@@ -40,6 +40,9 @@ use crate::store_actor::{Lifecycle, StoreActor};
 /// The capacity of a store session's command channel, the same as today's actor's.
 const COMMANDS: usize = 64;
 
+#[path = "store_expiry.rs"]
+mod expiry;
+
 /// What the module needs to serve sessions kept in the new storage. Opened without the
 /// deployment key it serves plain sessions only; the key is installed into it once it loads
 /// (see [`StoreSlot::load`]), and from then on it serves every session.
@@ -388,6 +391,13 @@ impl StoreRuntime {
         request: crate::store_reads::StoreReadRequest,
     ) -> Result<Option<crate::store_reads::StoreReadReply>, crate::serve::ServeError> {
         use crate::store_reads::{execute, ReadContext, StoreReadOutcome};
+        let run = match &request {
+            crate::store_reads::StoreReadRequest::RunStatus(run)
+            | crate::store_reads::StoreReadRequest::RunStatusReply(run)
+            | crate::store_reads::StoreReadRequest::RunResult(run) => Some(run.0.as_str()),
+            _ => None,
+        };
+        registry.check_expired(key, run).await?;
         let addr = broca_core::session_addr(key);
         // The root the session is kept in. A session never changes roots, so a read that finds
         // none finds no session.
@@ -484,7 +494,8 @@ impl StoreRuntime {
                 .ok_or_else(|| open_error(SessionError::Missing, false))?,
         };
         let backend = self.backend(class);
-        let session = if create.is_some() {
+        let floors = self.expiry_markers(key)?;
+        let mut session = if create.is_some() {
             // The feature floor lists what this state root's logs need a build to understand.
             // Release placement (`scripts/place-release.sh`) refuses to install a build that
             // doesn't know a listed feature, and builds older than the one that refuses
@@ -506,6 +517,13 @@ impl StoreRuntime {
             Session::load(backend, addr, &triple, self.deployment()).await
         }
         .map_err(|error| open_error(error, create.is_some()))?;
+        session.raise_retired_tag_floor(
+            floors
+                .iter()
+                .map(|marker| marker.next_tag)
+                .max()
+                .unwrap_or(1),
+        );
         drop(timing);
         // The session reads and stores its setup parts in its own root and mode.
         let cipher = session.head().cipher();
@@ -530,6 +548,11 @@ impl StoreRuntime {
         .with_uploads(broca_core::media_uploads::Uploads::at(&self.state_root));
         if let Some(events) = step_events {
             actor = actor.with_step_events(events);
+        }
+        if let Some(service) = registry.retention_service() {
+            if !service.defer_overhaul() {
+                actor = actor.with_retention_clock(service.clock.clone());
+            }
         }
         if create.is_some() {
             actor = actor.created_here();

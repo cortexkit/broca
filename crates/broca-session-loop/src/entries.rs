@@ -360,6 +360,10 @@ impl<W: Writer> Writer for Placed<'_, W> {
         self.inner.next_seq()
     }
 
+    fn retired_tag_floor(&self) -> u64 {
+        self.inner.retired_tag_floor()
+    }
+
     fn message_id_prefix(&self) -> String {
         self.inner.message_id_prefix()
     }

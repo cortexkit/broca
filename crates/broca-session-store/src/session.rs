@@ -268,6 +268,7 @@ pub struct Session<B: SessionBackend> {
     memory_only: std::sync::atomic::AtomicBool,
     /// Set when a read refused for needing storage while reads came from memory only.
     memory_refused: std::sync::atomic::AtomicBool,
+    retired_tag_floor: u64,
 }
 
 /// Where a session stood when it was read: the head version, the open log, and how many of the
@@ -459,6 +460,7 @@ impl<B: SessionBackend> Session<B> {
             kept: kept::KeptRecords::from_next(head_next_seq, true),
             memory_only: Default::default(),
             memory_refused: Default::default(),
+            retired_tag_floor: 1,
         })
     }
 
@@ -683,6 +685,7 @@ impl<B: SessionBackend> Session<B> {
             kept: kept::KeptRecords::default(),
             memory_only: Default::default(),
             memory_refused: Default::default(),
+            retired_tag_floor: 1,
         };
         Ok(Loaded::Open {
             session: Box::new(session),
@@ -944,6 +947,16 @@ impl<B: SessionBackend> Session<B> {
     /// harness name or session name it was computed from.
     pub fn address(&self) -> &SessionAddr {
         &self.addr
+    }
+
+    /// Carries the legacy ledger floor across deletion, without changing the projection's
+    /// high-water mark. The address's expiry markers supply it again on every load.
+    pub fn raise_retired_tag_floor(&mut self, next_tag: u64) {
+        self.retired_tag_floor = self.retired_tag_floor.max(next_tag);
+    }
+
+    pub fn retired_tag_floor(&self) -> u64 {
+        self.retired_tag_floor
     }
 
     /// The key this session's subscribe cursors are digested under.

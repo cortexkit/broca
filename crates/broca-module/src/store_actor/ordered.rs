@@ -460,6 +460,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             identity,
             manifest,
             message_marks,
+            prepared: run_prepared,
             ..
         } = start;
         let submission_id = SubmissionId(format!("sub-{}", run_id.0));
@@ -532,10 +533,12 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             request_identity_digest: identity,
             title,
             hooks: prepared.queued_hooks(),
+            retention: run_prepared.retention,
             ..queue::Receipt::default()
         };
         let at = queue::Queued {
             written_at_ms: prepared.at_ms,
+            ts_ms: run_prepared.retention.map(|_| (self.now_ms)()),
             ..queue::Queued::default()
         };
         let queued = queue::queued_send(

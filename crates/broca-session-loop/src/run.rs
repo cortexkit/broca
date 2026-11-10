@@ -2897,6 +2897,14 @@ async fn shown_high<W: Writer>(writer: &W, parts: &dyn Parts) -> Result<u64, Loo
     }
     let mut high = sealed_high;
     for (index, message) in conversation.messages.iter().enumerate() {
+        if let Some(base) = conversation
+            .entries
+            .get(index)
+            .and_then(|entry| entry.facts.as_ref())
+            .and_then(|facts| facts.runner_tag_base)
+        {
+            high = high.max(base);
+        }
         let index = index + (start - 1) as usize;
         // The run that placed this message is the last one starting at or before it.
         let (render, clean) = runs
@@ -2912,7 +2920,7 @@ async fn shown_high<W: Writer>(writer: &W, parts: &dyn Parts) -> Result<u64, Loo
         )
         .map_err(|_| LoopError::Unsupported("part numbers past the numbering limit"))?;
     }
-    Ok(high)
+    Ok(high.max(writer.retired_tag_floor().saturating_sub(1)))
 }
 
 /// Every window run's place in the prompt (its first message's index, and its first user

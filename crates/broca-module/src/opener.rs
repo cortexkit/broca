@@ -520,6 +520,11 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> DefaultOpener<L, W> {
             }
         }
         if let Some(slot) = &self.store {
+            if let Some(runtime) = slot.runtime() {
+                // Deletion leaves an encrypted identity even after the last head is gone.
+                // A missing key cannot turn that identity into a new legacy session.
+                runtime.expiry_markers(key)?;
+            }
             // Decided under the lease, so no other open of this session decides beside it. A
             // session in the new storage is served from there, and refused while it is encrypted
             // and its key hasn't loaded; one that exists in neither storage starts there when the
@@ -530,7 +535,22 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> DefaultOpener<L, W> {
             // nowhere else: one the new storage can't start now is refused here, before anything
             // is created in either storage. The actor keeps the lease until its session is
             // closed.
-            let held = slot.holding(key)?;
+            let mut held = slot.holding(key)?;
+            if let (Some(store), Some(service)) = (&held, registry.retention_service()) {
+                let now_ms = service.clock.now_ms();
+                if let Some(expired_at_ms) = store.expired_at(key, None, now_ms).await? {
+                    if status {
+                        return Err(OpenError::Expired { expired_at_ms });
+                    }
+                    if service
+                        .delete_store_under_lease(store, key, now_ms)
+                        .await
+                        .map_err(OpenError::Open)?
+                    {
+                        held = None;
+                    }
+                }
+            }
             let mark = if held.is_none() && !status {
                 registry.take_store_eligible(key)
             } else {
@@ -540,6 +560,9 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> DefaultOpener<L, W> {
                 Some(creation) => self.creates_in_store(key, creation)?,
                 None => None,
             };
+            // While unserved creating sends can still fall back to legacy storage, that path
+            // cannot consume the encrypted floors of a store-expired address; it is
+            // a cross-format recreation limitation, not a reason to discard those markers.
             if let Some(StoreCreation::Head {
                 unserved: Some(feature),
             }) = creating
@@ -558,6 +581,11 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> DefaultOpener<L, W> {
                 (None, None) => None,
             };
             if let Some(store) = store {
+                if retention.is_some() && registry.retention_service().is_none() {
+                    return Err(OpenError::Open(
+                        "retention service is not configured".into(),
+                    ));
+                }
                 let class = creating.map(|creation| {
                     let durable = match creation {
                         StoreCreation::Send | StoreCreation::Head { .. } => {

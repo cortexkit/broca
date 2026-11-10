@@ -525,11 +525,11 @@ async fn an_expired_session_in_the_new_storage_is_deleted_with_everything_it_own
     assert!(view.operations.owner.first_start.is_none(), "a new session");
 }
 
-/// A session whose policy hasn't expired is kept until its deadline; one whose actor is open is
-/// kept past it, since the open actor holds its lease; one with a run still going, or whose first
+/// A session whose policy hasn't expired is kept until its deadline; one whose lease is held is
+/// kept by the sweep past it; one with a run still going, or whose first
 /// run set no retention, has no deadline at all. Only the expired session nobody uses is deleted.
 #[tokio::test]
-async fn unexpired_and_open_sessions_in_the_new_storage_are_kept() {
+async fn unexpired_and_leased_sessions_in_the_new_storage_are_kept() {
     let rig = Rig::new("kept", Duration::from_secs(600)).await;
     let finished = [
         store_start("r1", Some(SECONDS), STARTED_MS),
@@ -556,7 +556,9 @@ async fn unexpired_and_open_sessions_in_the_new_storage_are_kept() {
         false,
     )
     .await;
-    rig.registry.actor_for(&open).await.unwrap();
+    let leases = FileLeaseStore::new(rig.root.join("leases"));
+    let _lease =
+        broca_core::LeaseStore::acquire(&leases, &broca_core::lease_key_for(&open)).unwrap();
 
     assert_eq!(rig.registry.sweep_once(DEADLINE_MS - 1).await.unwrap(), 0);
     for key in [&idle, &open, &running, &forever] {

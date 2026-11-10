@@ -246,6 +246,9 @@ impl<W: Writer> Writer for Before<'_, W> {
     fn message_id_prefix(&self) -> String {
         self.writer.message_id_prefix()
     }
+    fn retired_tag_floor(&self) -> u64 {
+        self.writer.retired_tag_floor()
+    }
     async fn open_log_records(&self) -> Result<Vec<(u64, Record)>, SessionError> {
         self.writer.open_log_records().await
     }

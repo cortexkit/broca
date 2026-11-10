@@ -2472,7 +2472,7 @@ fn frames(read: &broca_wal::WalRangeRead) -> &[FramedRecord] {
 mod tests;
 
 #[path = "retention_store.rs"]
-mod store;
+pub(crate) mod store;
 
 /// Count file bytes through the actor's highest fsynced sequence, including the lineage-ID
 /// metadata between records but excluding later records appended by a concurrent run.
