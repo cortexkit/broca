@@ -49,6 +49,7 @@ pub struct DefaultOpener<L: LeaseStore, W: WalStore> {
     /// Serves sessions kept in the new storage, and starts new ones there when the registry
     /// marks their creating send. `None` keeps every session on today's storage.
     store: Option<Arc<crate::store_open::StoreSlot>>,
+    step_events: Option<Arc<crate::step_events::StepEvents>>,
     #[cfg(feature = "test-clock")]
     test_fs: Option<Arc<dyn broca_wal::fs_ops::FsOps>>,
     #[cfg(any(test, feature = "test-clock"))]
@@ -144,11 +145,18 @@ impl<L: LeaseStore, W: WalStore> DefaultOpener<L, W> {
             lease_domain: None,
             lease_root: None,
             store: None,
+            step_events: None,
             #[cfg(feature = "test-clock")]
             test_fs: None,
             #[cfg(any(test, feature = "test-clock"))]
             ride_writer_for_test: false,
         }
+    }
+
+    /// Install the independent, lossy attempt publisher on both storage paths.
+    pub fn with_step_events(mut self, events: Arc<crate::step_events::StepEvents>) -> Self {
+        self.step_events = Some(events);
+        self
     }
 
     /// Serves sessions kept in the new storage through `store`.
@@ -347,6 +355,10 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> LineageOpener for DefaultOp
     }
     fn hook_plane_available(&self) -> bool {
         self.executor.hook_plane().is_some()
+    }
+
+    fn step_events_enabled(&self) -> bool {
+        self.step_events.is_some()
     }
 
     fn compaction_supported(&self) -> bool {
@@ -559,7 +571,14 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> DefaultOpener<L, W> {
                     broca_wal::placement(retention.is_some(), durable)
                 });
                 return store
-                    .open_actor(key, gen, registry, Box::new(authority), class)
+                    .open_actor(
+                        key,
+                        gen,
+                        registry,
+                        Box::new(authority),
+                        class,
+                        self.step_events.as_deref(),
+                    )
                     .await;
             }
         }
@@ -727,6 +746,10 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> DefaultOpener<L, W> {
             key.clone(),
             self.executor.source_warm_enabled(),
         );
+        let observer = match &self.step_events {
+            Some(events) => events.observe(observer),
+            None => observer,
+        };
 
         // 3. Open + recover + prove the SESSION WAL away from the async runtime, then spawn its
         //    writer with the fan-out observer. The lease moves through that blocking operation so

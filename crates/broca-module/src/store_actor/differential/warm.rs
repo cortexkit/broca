@@ -110,6 +110,7 @@ impl broca_core::provider::Provider for Probe {
     async fn warm(&self, base: &[u8]) -> Result<broca_core::WarmSent, broca_core::WarmFailure> {
         self.sent.lock().unwrap().push(base.to_vec());
         Ok(broca_core::WarmSent {
+            request_body_bytes: None,
             warm_body_sha256: broca_core::render::request_digest_hex(base),
             sent_at_ms: crate::actor::epoch_ms(),
             usage: broca_protocol::Usage {

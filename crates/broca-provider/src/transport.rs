@@ -1820,6 +1820,7 @@ async fn send_warm_legacy(
             );
         }
         Ok(broca_core::WarmSent {
+            request_body_bytes: Some(gzip.as_ref().unwrap_or(&identity).len() as u64),
             warm_body_sha256,
             sent_at_ms,
             usage,
@@ -2052,6 +2053,7 @@ async fn send_warm_journaled(
         }
         envelope.outcome = Outcome::Complete;
         Ok(broca_core::WarmSent {
+            request_body_bytes: Some(gzip.as_ref().unwrap_or(&identity).len() as u64),
             warm_body_sha256: warm_body_sha256.clone(),
             sent_at_ms,
             usage,
@@ -7925,6 +7927,10 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(sent.usage.cached_input_tokens, Some(4000));
+        assert_eq!(
+            sent.request_body_bytes,
+            Some(warm_request(String::new(), true).body.len() as u64)
+        );
         Arc::try_unwrap(writer)
             .ok()
             .expect("warm journal released writer")

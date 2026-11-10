@@ -247,6 +247,7 @@ fn command(mutation: Mutation, slot: &crate::keep_warm::WarmSlot) -> (LineageCmd
                     warm: Box::new((
                         pending,
                         Ok(broca_core::WarmSent {
+                            request_body_bytes: None,
                             warm_body_sha256: "b".repeat(64),
                             sent_at_ms: 1,
                             usage: Default::default(),

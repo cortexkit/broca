@@ -2581,6 +2581,10 @@ pub trait ServeHandler: Send + Sync {
         false
     }
 
+    fn step_events_enabled(&self) -> bool {
+        false
+    }
+
     /// Serve one `compaction-runner/v1` operation (`bind`, `session.entries`,
     /// `session.apply_view`, `session.applied_view`) for the session a route is bound to.
     /// `caller` is the daemon-attested module id, never a body field. Handlers without
@@ -3307,6 +3311,10 @@ impl ServeHandler for crate::LineageRegistry {
     }
     fn compaction_supported(&self) -> bool {
         crate::LineageRegistry::compaction_supported(self)
+    }
+
+    fn step_events_enabled(&self) -> bool {
+        crate::LineageRegistry::step_events_enabled(self)
     }
 
     async fn compaction_runner(

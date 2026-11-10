@@ -1424,6 +1424,15 @@ impl Drop for Module {
 pub(super) const IDLE: Duration = Duration::from_millis(100);
 
 async fn module(on: bool, steps: Vec<Vec<NormalizedEvent>>) -> Module {
+    module_step_events(on, steps, None, None).await
+}
+
+async fn module_step_events(
+    on: bool,
+    steps: Vec<Vec<NormalizedEvent>>,
+    cipher: Option<broca_session_store::keys::Cipher>,
+    step_events: Option<Arc<crate::step_events::StepEvents>>,
+) -> Module {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let dir = broca_test_support::scratch_root().join(format!(
@@ -1433,7 +1442,10 @@ async fn module(on: bool, steps: Vec<Vec<NormalizedEvent>>) -> Module {
     ));
     let _ = std::fs::remove_dir_all(&dir);
     // Today's WAL store finds the new storage beside its own folder: its state root is `dir`.
-    let wal = Arc::new(FileWalStore::new(dir.join("wal")));
+    let wal = Arc::new(match cipher {
+        Some(_) => FileWalStore::with_config(dir.join("wal"), broca_wal::WalConfig::OVERHAUL),
+        None => FileWalStore::new(dir.join("wal")),
+    });
     let executor: Arc<dyn RunExecutor> = Arc::new(BothLoops {
         today: TodayLoop {
             provider: Gated {
@@ -1449,25 +1461,24 @@ async fn module(on: bool, steps: Vec<Vec<NormalizedEvent>>) -> Module {
     });
     let runtime = crate::store_open::StoreRuntime::open(
         &dir,
-        broca_session_store::keys::DeploymentKey::new(1, &[7; 32]),
+        broca_session_store::keys::DeploymentKey::new(1, &[7; 32])
+            .creating(cipher.unwrap_or(broca_session_store::keys::Cipher::XChaCha20Poly1305)),
         Arc::clone(&executor),
         IDLE,
     )
     .await
     .unwrap();
-    let registry = LineageRegistry::new_with_reader(
-        Arc::new(
-            crate::opener::DefaultOpener::new(
-                Arc::new(FileLeaseStore::new(dir.join("leases"))),
-                wal.clone(),
-                executor,
-            )
-            .with_idle_ttl(IDLE)
-            .with_store_runtime(Arc::new(runtime)),
-        ),
+    let mut opener = crate::opener::DefaultOpener::new(
+        Arc::new(FileLeaseStore::new(dir.join("leases"))),
         wal.clone(),
-        None,
-    );
+        executor,
+    )
+    .with_idle_ttl(IDLE)
+    .with_store_runtime(Arc::new(runtime));
+    if let Some(events) = step_events {
+        opener = opener.with_step_events(events);
+    }
+    let registry = LineageRegistry::new_with_reader(Arc::new(opener), wal.clone(), None);
     let registry = if on {
         registry.with_store_new_sessions()
     } else {
@@ -1822,6 +1833,7 @@ mod pauses;
 mod photo_sends;
 mod refresh;
 mod scopes;
+mod step_events;
 mod streams;
 mod warm;
 

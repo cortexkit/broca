@@ -600,6 +600,7 @@ mod retention_tests {
                 let sent =
                     (e.outcome == broca_wal::record::BillingAttemptOutcome::Complete).then(|| {
                         broca_core::WarmSent {
+                            request_body_bytes: None,
                             warm_body_sha256: "warm".into(),
                             sent_at_ms: epoch_ms(),
                             usage: e.usage.unwrap_or_default(),

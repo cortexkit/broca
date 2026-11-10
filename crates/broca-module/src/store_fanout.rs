@@ -388,7 +388,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreFanout<B> {
             identity: CursorIdentity::of(session),
         }));
         let hook = Arc::clone(&publisher);
-        session.observe_appends(Box::new(move |appended| {
+        session.add_append_observer(Box::new(move |appended| {
             hook.lock().unwrap().appended(appended);
         }));
         Self {

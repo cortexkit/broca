@@ -306,7 +306,7 @@ pub struct RoleDescribeResponse {
 
 impl RoleDescribeResponse {
     /// Advertise live attempt hints only when their publisher is installed. Decoding the
-    /// event type does not promise publication; shipping routes leave this switched off.
+    /// event type does not promise publication; the switch defaults off.
     pub fn with_step_events(mut self, step_events_enabled: bool) -> Self {
         use cortexkit_role_llm_runner::{capabilities::STEP_EVENTS, step_events::StepEvents};
         self.role.capabilities.retain(|name| name != STEP_EVENTS);

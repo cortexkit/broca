@@ -32,6 +32,8 @@ use crate::CacheDeclaration;
 /// A warm's record on its way to the actor, and where the actor answers once it is durable.
 pub(super) struct WarmRecord {
     pub(super) record: Record,
+    pub(super) finished_at_ms: u64,
+    pub(super) request_body_bytes: Option<u64>,
     pub(super) durable: oneshot::Sender<Result<(), String>>,
 }
 
@@ -324,6 +326,7 @@ impl StoreWarmer {
                 return stop("unsupported", format!("{error:?}"));
             }
         };
+        let finished_at_ms = crate::actor::epoch_ms();
         self.slot.note_headers(
             sent.sent_at_ms,
             sent.ratelimit_headers.iter().cloned().collect(),
@@ -346,6 +349,8 @@ impl StoreWarmer {
             .records
             .send(WarmRecord {
                 record: Record::Warmed(record),
+                finished_at_ms,
+                request_body_bytes: sent.request_body_bytes,
                 durable,
             })
             .is_err()
@@ -477,8 +482,25 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> su
 
     /// Appends the record of a warm the active run's keep-warm sent, durable before the driver
     /// hears of it.
-    pub(super) async fn record_kept_warm(&mut self, kept: WarmRecord) {
-        let result = self.append_own(kept.record).await;
+    pub(super) async fn record_kept_warm(&mut self, mut kept: WarmRecord) {
+        let result = async {
+            if let Record::Warmed(warmed) = &mut kept.record {
+                let id = broca_core::attempt_id::mint_attempt_id()
+                    .map_err(|e| format!("warm attempt identity: {e}"))?;
+                warmed.attempt_id = Some(id.as_str().to_owned());
+                let mut facts = serde_json::Map::new();
+                facts.insert(
+                    "finished_at_ms".into(),
+                    serde_json::json!(kept.finished_at_ms),
+                );
+                if let Some(bytes) = kept.request_body_bytes {
+                    facts.insert("request_body_bytes".into(), serde_json::json!(bytes));
+                }
+                warmed.billing = Some(serde_json::Value::Object(facts));
+            }
+            self.append_own(kept.record).await
+        }
+        .await;
         if let Err(error) = &result {
             // The provider answered (and billed) the warm; only its record failed.
             tracing::warn!(
@@ -552,6 +574,7 @@ mod tests {
             };
             self.sent.lock().unwrap().push(sent.bytes().to_vec());
             Ok(broca_core::WarmSent {
+                request_body_bytes: None,
                 warm_body_sha256: sent.sha256.clone(),
                 sent_at_ms: crate::actor::epoch_ms(),
                 usage: broca_protocol::Usage {

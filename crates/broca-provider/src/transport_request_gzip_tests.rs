@@ -694,5 +694,6 @@ async fn a_refused_compressed_warm_is_resent_once_uncompressed() {
     assert_eq!(requests[1].header("content-encoding"), None);
     assert_eq!(requests[1].body, body.as_bytes());
     assert_eq!(sent.warm_body_sha256, sha256_hex(body.as_bytes()));
+    assert_eq!(sent.request_body_bytes, Some(body.len() as u64));
     assert!(client.request_gzip.is_latched());
 }
