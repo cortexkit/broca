@@ -2534,6 +2534,18 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             .as_ref()
             .and_then(|run| run.start.as_ref())
             .is_some_and(|start| start.run_id == active.run_id.0);
+        // A run whose loop failed after its start wrote no end. Left so, the session would hold
+        // a run nothing runs: no queued send drains behind it, and a new send's run is refused.
+        // It ends here with the error instead, unless it paused, which a later retry resumes.
+        let loop_failed = match &result {
+            Err(StoreRunError::Loop(error)) if started => {
+                let unfinished = self.session.operations().run.as_ref().is_some_and(|run| {
+                    run.run_id == active.run_id.0 && run.finished.is_none() && run.paused.is_none()
+                });
+                unfinished.then(|| format!("{error:?}"))
+            }
+            _ => None,
+        };
         if let (Some(submission), false, Err(error)) = (&active.submission, started, &result) {
             let error = match error {
                 StoreRunError::Admission(error) => error.clone(),
@@ -2578,10 +2590,54 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 "a run on the new storage stopped without a recorded end",
             );
         }
+        if let Some(message) = loop_failed {
+            self.end_failed_run(&active.run_id, message).await;
+        }
         // The run's end, if it wrote one, is durable now: a run's last batch ends with a
         // barrier, and the run's task has returned.
         self.bill_owed().await;
         self.drain().await;
+    }
+
+    /// Ends the session's latest run `run_id`, whose loop stopped with `message` without writing
+    /// an end, as the loop ends a run with an error: a permanent error coded `runner_error`,
+    /// since sending the run again would meet the same fault. An end that can't be written leaves
+    /// the run as it was, logged.
+    async fn end_failed_run(&mut self, run_id: &RunId, message: String) {
+        let error = broca_protocol::ProviderError {
+            class: broca_protocol::ErrorClass::Permanent,
+            message,
+            provider_code: Some("runner_error".into()),
+            provider_details: None,
+            provider_subcode: None,
+            refusal: None,
+            status: None,
+            retry_after_secs: None,
+            resets_at_ms: None,
+            resets_at_source: None,
+            limit_window: None,
+            account_ref: None,
+            credential_id: None,
+            affordable_max_tokens: None,
+        };
+        let now = broca_core::run::epoch_millis().unwrap_or(0);
+        if let Err(error) = broca_session_loop::run::end_run_with_error(
+            &mut self.durable(),
+            &run_id.0,
+            broca_protocol::RunFinishReason::Error,
+            &error,
+            now,
+        )
+        .await
+        {
+            tracing::error!(
+                target: "broca.store_actor",
+                session = %self.key.session,
+                run_id = %run_id.0,
+                error = ?error,
+                "the end of a run whose loop failed could not be written",
+            );
+        }
     }
 
     /// Ends a queued send whose run was refused at admission: its retraction carries the
@@ -3679,6 +3735,8 @@ mod entries_comparison;
 mod import_tests;
 #[cfg(test)]
 mod key_tests;
+#[cfg(test)]
+mod loop_error_tests;
 #[cfg(test)]
 mod media_wait_tests;
 #[cfg(test)]

@@ -4511,7 +4511,21 @@ async fn end_with_error<W: Writer, P, T>(
     reason: RunFinishReason,
     error: &ProviderError,
 ) -> Result<Finished, LoopError> {
-    let mut record = run_end(writer, run_id, reason, (seams.now_ms)());
+    end_run_with_error(writer, run_id, reason, error, (seams.now_ms)()).await
+}
+
+/// Ends the session's unfinished latest run `run_id` as `reason`, with `error` on its end and
+/// `now_ms` as its time: the end the loop writes for a run that can't go on, durable before it
+/// returns, with the messages steered or delivered since the run's last step boundary. For the
+/// session's owner, when a run's loop stopped without writing an end.
+pub async fn end_run_with_error<W: Writer>(
+    writer: &mut W,
+    run_id: &str,
+    reason: RunFinishReason,
+    error: &ProviderError,
+    now_ms: u64,
+) -> Result<Finished, LoopError> {
+    let mut record = run_end(writer, run_id, reason, now_ms);
     if let Record::RunEnd(end) = &mut record {
         end.error = Some(serde_json::to_value(error).map_err(|e| LoopError::Parts(e.to_string()))?);
     }
