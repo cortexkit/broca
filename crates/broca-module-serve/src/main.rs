@@ -50,9 +50,7 @@ const OPENAI_DECISIONS_SERVED: bool = false;
 /// asks only for what it serves (other sends still start on today's storage). New sessions move
 /// over one class at a time; heads always start there. Sidekicks go first: they are short-lived,
 /// carry a retention policy, and a failure surfaces as one answer the asking agent retries.
-/// Empty until the converter's media-fold verification failure is shown not to affect sessions
-/// created on the new storage.
-const NEW_STORAGE_SESSION_CLASSES: &[&str] = &[];
+const NEW_STORAGE_SESSION_CLASSES: &[&str] = &["sidekick"];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     broca_module::diagnostics::initialize();
