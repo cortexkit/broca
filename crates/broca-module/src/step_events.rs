@@ -17,6 +17,8 @@ use std::sync::{
 
 const QUEUE_CAPACITY: usize = 128;
 
+pub(crate) type WarmStops = Arc<std::sync::Mutex<std::collections::BTreeMap<String, String>>>;
+
 /// A plain live publish, never a stream, durable outbox or billing acknowledgement.
 #[async_trait]
 pub trait StepEventPublisher: Send + Sync + 'static {
@@ -118,6 +120,8 @@ impl StepEvents {
         bind: broca_protocol::BindIdentity,
         incarnation: [u8; 16],
         first_live_seq: u64,
+        parts: broca_session_loop::parts::SharedParts,
+        warm_stops: WarmStops,
     ) -> store::Observer {
         store::Observer::new(
             bind,
@@ -125,6 +129,8 @@ impl StepEvents {
             first_live_seq,
             self.store_tx.clone(),
             self.dropped.clone(),
+            parts,
+            warm_stops,
         )
     }
 
@@ -228,8 +234,57 @@ fn event(runner: &str, attempt: &DurableAttempt) -> Option<StepFinished> {
         .clone_from(&attempt.route_decision_id);
     event.sent_to_last_content_ms = attempt.sent_to_last_content_ms;
     event.first_to_last_content_ms = attempt.first_to_last_content_ms;
+    if let Some(cache) = &attempt.cache {
+        event.cache = cache_report(
+            &cache.frozen_render_config,
+            &event.provider,
+            cache.keep_warm,
+            cache.stop_reason.as_deref(),
+        );
+    }
     event.check().ok()?;
     Some(event)
+}
+
+fn cache_report(
+    frozen: &serde_json::Value,
+    provider: &str,
+    keep_warm: Option<broca_protocol::request::KeepWarm>,
+    stop: Option<&str>,
+) -> Option<cortexkit_role_llm_runner::cache::Report> {
+    use broca_provider::wire::{cache_lifetime, CacheLifetime};
+    use cortexkit_role_llm_runner::cache::{Report, Warming};
+    let lifetime = (|| {
+        let family = serde_json::from_value(frozen.get("family_id")?.clone()).ok()?;
+        let policy = frozen
+            .get("cache")
+            .filter(|v| !v.is_null())
+            .map(|v| serde_json::from_value(v.clone()))
+            .transpose()
+            .ok()?;
+        cache_lifetime(policy.as_ref(), family, provider)
+    })();
+    let mut report = match lifetime {
+        Some(CacheLifetime::Explicit(ttl)) => Report::explicit(ttl),
+        Some(CacheLifetime::Implicit) => Report::implicit(),
+        None => Report::default(),
+    };
+    report.warming = match keep_warm {
+        Some(broca_protocol::request::KeepWarm::Off) => Some(Warming::new(false)),
+        Some(broca_protocol::request::KeepWarm::Auto) => match stop {
+            None | Some("tools_done" | "cancelled") => Some(Warming::new(true)),
+            Some("budget") => Some(Warming::stopped("cost-cap")),
+            Some("count_cap") => Some(Warming::stopped("count-cap")),
+            Some("outside_hours") => Some(Warming::stopped("outside-hours")),
+            Some("unsupported" | "warm_missed" | "quota") => Some(Warming::stopped("unsupported")),
+            Some("session_close" | "session_moving" | "session_moved") => {
+                Some(Warming::stopped("session-ended"))
+            }
+            Some(_) => None,
+        },
+        None => None,
+    };
+    (report != Report::default()).then_some(report)
 }
 
 /// Both storages use the same usage projection. Missing or interrupted evidence stays absent.
@@ -244,15 +299,26 @@ fn finish(
         let mut split_1h = envelope.cache_write_1h_tokens;
         if let Some(models) = &envelope.usage_by_model {
             usage = Default::default();
-            split_5m = None;
-            split_1h = None;
+            split_5m = Some(0u64);
+            split_1h = Some(0u64);
             for model in models {
                 usage += model.usage;
-                split_5m =
-                    broca_protocol::usage::sum_reported(split_5m, model.cache_write_5m_tokens);
-                split_1h =
-                    broca_protocol::usage::sum_reported(split_1h, model.cache_write_1h_tokens);
+                split_5m = split_5m
+                    .zip(model.cache_write_5m_tokens)
+                    .and_then(|(sum, n)| sum.checked_add(n));
+                split_1h = split_1h
+                    .zip(model.cache_write_1h_tokens)
+                    .and_then(|(sum, n)| sum.checked_add(n));
             }
+        }
+        // A partial split is not a breakdown of the total; keep both lifetimes unknown.
+        if split_5m
+            .zip(split_1h)
+            .and_then(|(a, b)| a.checked_add(b))
+            .is_none_or(|sum| Some(sum) != usage.cache_write_tokens)
+        {
+            split_5m = None;
+            split_1h = None;
         }
         event.input_tokens = usage.input_tokens;
         event.cached_input_tokens = usage.cached_input_tokens;
@@ -329,6 +395,170 @@ mod tests {
             route_decision_id: None,
             sent_to_last_content_ms: None,
             first_to_last_content_ms: None,
+            cache: None,
+        }
+    }
+
+    #[test]
+    fn synthetic_step_cache_samples() {
+        use broca_protocol::request::KeepWarm::{Auto, Off};
+        use broca_provider::{
+            spec::WireFamilyId,
+            wire::{CacheClass, CachePolicy, CacheTtl, MarkerSyntax},
+        };
+        let dir = std::env::var_os("BROCA_STEP_CACHE_SAMPLES_DIR").map(std::path::PathBuf::from);
+        if let Some(dir) = &dir {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        for (name, provider, model) in [
+            ("anthropic-5m-off", "anthropic", "claude-synthetic"),
+            ("anthropic-1h-off", "anthropic", "claude-synthetic"),
+            ("chatgpt-implicit-off", "openai-chatgpt", "gpt-synthetic"),
+            ("anthropic-5m-auto-on", "anthropic", "claude-synthetic"),
+            ("anthropic-5m-auto-stopped", "anthropic", "claude-synthetic"),
+        ] {
+            let mut attempt = fixture(true);
+            attempt.reservation.provider = provider.into();
+            attempt.reservation.model_sent = model.into();
+            let chatgpt = provider == "openai-chatgpt";
+            let ttl = if name.contains("1h") {
+                CacheTtl::OneHour
+            } else {
+                CacheTtl::FiveMinutes
+            };
+            let policy = CachePolicy {
+                version: 1,
+                class: CacheClass::Markers {
+                    syntax: MarkerSyntax::AnthropicCacheControl,
+                    ttl,
+                    max_breakpoints: 4,
+                    lookback_blocks: 20,
+                    tail: None,
+                    omit_ttl: ttl == CacheTtl::FiveMinutes,
+                },
+            };
+            let family = if chatgpt {
+                WireFamilyId::OpenAiResponsesChatgpt
+            } else {
+                WireFamilyId::AnthropicMessages
+            };
+            let stopped = name.ends_with("stopped");
+            attempt.cache = Some(broca_core::wal_writer::StepEventCache {
+                frozen_render_config: json!({"family_id":family, "cache":if chatgpt { Value::Null } else { serde_json::to_value(policy).unwrap() }}),
+                keep_warm: Some(if name.contains("auto") { Auto } else { Off }),
+                stop_reason: stopped.then(|| "budget".into()),
+            });
+            let event = event("runner_a", &attempt).unwrap();
+            let value = serde_json::to_value(&event).unwrap();
+            if chatgpt {
+                assert_eq!(value["cache"]["implicit"], true);
+                assert!(value["cache"].get("ttl_ms").is_none());
+            } else {
+                assert_eq!(
+                    value["cache"]["ttl_ms"],
+                    if ttl == CacheTtl::OneHour {
+                        3_600_000
+                    } else {
+                        300_000
+                    }
+                );
+            }
+            assert_eq!(
+                value["cache"]["warming"]["on"],
+                name.contains("auto") && !stopped
+            );
+            assert_eq!(
+                value["cache"]["warming"].get("stop_reason"),
+                stopped.then_some(&json!("cost-cap"))
+            );
+            let body = serde_json::to_vec_pretty(&event).unwrap();
+            if let Some(dir) = &dir {
+                std::fs::write(dir.join(format!("{name}.json")), body).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn warming_report_preserves_unknown_and_maps_only_session_stops() {
+        use broca_protocol::request::KeepWarm::{Auto, Off};
+        use cortexkit_role_llm_runner::cache::Warming;
+        for (stop, reason) in [
+            ("budget", "cost-cap"),
+            ("count_cap", "count-cap"),
+            ("outside_hours", "outside-hours"),
+            ("unsupported", "unsupported"),
+            ("warm_missed", "unsupported"),
+            ("quota", "unsupported"),
+            ("session_close", "session-ended"),
+            ("session_moving", "session-ended"),
+            ("session_moved", "session-ended"),
+        ] {
+            let report = cache_report(&Value::Null, "synthetic", Some(Auto), Some(stop)).unwrap();
+            assert_eq!(report.warming, Some(Warming::stopped(reason)));
+            assert_eq!(report.ttl_ms, None);
+            assert_eq!(report.implicit, None);
+            report.check().unwrap();
+        }
+        for stop in [None, Some("tools_done"), Some("cancelled")] {
+            assert_eq!(
+                cache_report(&Value::Null, "synthetic", Some(Auto), stop)
+                    .unwrap()
+                    .warming,
+                Some(Warming::new(true))
+            );
+        }
+        assert_eq!(
+            cache_report(&Value::Null, "synthetic", Some(Off), Some("budget"))
+                .unwrap()
+                .warming,
+            Some(Warming::new(false))
+        );
+        assert_eq!(cache_report(&Value::Null, "synthetic", None, None), None);
+        assert_eq!(
+            cache_report(&Value::Null, "synthetic", Some(Auto), Some("future-stop")),
+            None
+        );
+    }
+
+    #[test]
+    fn multi_model_cache_write_split_requires_every_model_and_exact_total() {
+        let mut attempt = fixture(true);
+        for (second, total, expected) in [
+            (
+                json!({"model_used":"b", "usage":{"cache_write_tokens":7}}),
+                37,
+                None,
+            ),
+            (
+                json!({"model_used":"b", "usage":{"cache_write_tokens":7}, "cache_write_5m_tokens":3, "cache_write_1h_tokens":4}),
+                37,
+                Some((13, 24)),
+            ),
+            (
+                json!({"model_used":"b", "usage":{"cache_write_tokens":8}, "cache_write_5m_tokens":3, "cache_write_1h_tokens":4}),
+                38,
+                None,
+            ),
+            (
+                json!({"model_used":"b", "usage":{"cache_write_tokens":7}, "cache_write_5m_tokens":3}),
+                37,
+                None,
+            ),
+        ] {
+            attempt.envelope.usage_by_model = Some(serde_json::from_value(json!([
+                {"model_used":"a", "usage":{"cache_write_tokens":30}, "cache_write_5m_tokens":10, "cache_write_1h_tokens":20}, second
+            ])).unwrap());
+            let event = event("runner_a", &attempt).unwrap();
+            assert_eq!(event.cache_write_tokens, Some(total));
+            assert_eq!(
+                event.cache_write_5m_tokens.zip(event.cache_write_1h_tokens),
+                expected
+            );
+            if expected.is_none() {
+                let body = serde_json::to_value(event).unwrap();
+                assert!(body.get("cache_write_5m_tokens").is_none());
+                assert!(body.get("cache_write_1h_tokens").is_none());
+            }
         }
     }
 

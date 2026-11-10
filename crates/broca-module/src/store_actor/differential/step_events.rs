@@ -284,4 +284,57 @@ async fn a_model_attempt_without_send_time_emits_no_step_event(cipher: Cipher) {
     assert!(inbox.try_recv().is_err());
 }
 
-cipher_tests! { durable_step_events_match, no_bus_publishes_no_step_events, run_publishes_step_events_without_configuration, failing_step_publisher_does_not_fail_runs, a_model_attempt_without_send_time_emits_no_step_event }
+async fn cached_anthropic_auto_step_events_match(cipher: Cipher) {
+    let mut bodies = Vec::new();
+    for new_storage in [false, true] {
+        let (calls, mut inbox) = mpsc::unbounded_channel();
+        let events = Arc::new(StepEvents::start_on_bus(Arc::new(Capture {
+            calls,
+            fail: false,
+        })));
+        let module = module_options_with_render(
+            new_storage,
+            script(false),
+            Some(cipher),
+            Some(events),
+            IDLE,
+            None,
+            Some(serde_json::to_value(super::warm::warmable()).unwrap()),
+        )
+        .await;
+        let mut request = request("hello");
+        request.model.provider_module_id = "anthropic".into();
+        request.model.model_id = "claude-opus-4-8".into();
+        request.keep_warm = Some(broca_protocol::request::KeepWarm::Auto);
+        assert!(matches!(
+            module.send_request("cached-step", request, None).await,
+            SendOutcome::Active { .. }
+        ));
+        broca_test_support::wait_until("the cached run is idle", || async {
+            match module.registry.route_status(&module.key).await {
+                Ok(LineageStatus::Idle) => Ok(()),
+                other => Err(format!("{other:?}")),
+            }
+        })
+        .await;
+        assert!(module.registry.stop_and_seal().await);
+        let (subject, body) =
+            broca_test_support::wait_for("cached step publication", inbox.recv(), || {
+                format!("new={new_storage}")
+            })
+            .await
+            .unwrap();
+        let event =
+            cortexkit_role_llm_runner::step_events::decode_step_finished(&subject, &body).unwrap();
+        assert_eq!(
+            serde_json::to_value(event.cache).unwrap(),
+            json!({"ttl_ms":3_600_000, "warming":{"on":true}})
+        );
+        let mut body = normalized(&body);
+        body.as_object_mut().unwrap().remove("request_body_bytes");
+        bodies.push(body);
+    }
+    assert_eq!(bodies[0], bodies[1]);
+}
+
+cipher_tests! { durable_step_events_match, no_bus_publishes_no_step_events, run_publishes_step_events_without_configuration, failing_step_publisher_does_not_fail_runs, a_model_attempt_without_send_time_emits_no_step_event, cached_anthropic_auto_step_events_match }

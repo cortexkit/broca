@@ -75,6 +75,80 @@ pub enum CacheClass {
     None,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheLifetime {
+    Explicit(u64),
+    Implicit,
+}
+
+/// Project the frozen request's lifetime without changing its provider hints.
+pub fn cache_lifetime(
+    policy: Option<&CachePolicy>,
+    family: WireFamilyId,
+    provider: &str,
+) -> Option<CacheLifetime> {
+    if policy.is_some_and(|policy| policy.version != 1) {
+        return None;
+    }
+    match policy.map(|policy| &policy.class) {
+        // Disabling explicit cache does not prove either a zero lifetime or implicit caching.
+        Some(CacheClass::None) => None,
+        Some(CacheClass::Markers { syntax, ttl, .. })
+            if matches!(
+                (family, syntax),
+                (
+                    WireFamilyId::AnthropicMessages,
+                    MarkerSyntax::AnthropicCacheControl
+                ) | (
+                    WireFamilyId::BedrockConverse,
+                    MarkerSyntax::BedrockCachePoint
+                )
+            ) =>
+        {
+            Some(CacheLifetime::Explicit(match ttl {
+                CacheTtl::FiveMinutes => 300_000,
+                CacheTtl::OneHour => 3_600_000,
+            }))
+        }
+        Some(CacheClass::Hints { retention, .. })
+            if provider == "openai"
+                && matches!(
+                    family,
+                    WireFamilyId::OpenAiChat | WireFamilyId::OpenAiResponses
+                ) =>
+        {
+            match retention.as_deref() {
+                // GPT-5.6 and later treat today's 24h request as 30m; report the frozen request for now.
+                Some("24h") => Some(CacheLifetime::Explicit(86_400_000)),
+                None | Some("in_memory") => Some(CacheLifetime::Implicit),
+                _ => None,
+            }
+        }
+        _ if matches!(
+            family,
+            WireFamilyId::OpenAiResponsesChatgpt
+                | WireFamilyId::Gemini
+                | WireFamilyId::GoogleCodeAssist
+        ) || (provider != "openai"
+            && matches!(
+                family,
+                WireFamilyId::OpenAiChat | WireFamilyId::OpenAiResponses
+            )) =>
+        {
+            Some(CacheLifetime::Implicit)
+        }
+        None if provider == "openai"
+            && matches!(
+                family,
+                WireFamilyId::OpenAiChat | WireFamilyId::OpenAiResponses
+            ) =>
+        {
+            Some(CacheLifetime::Implicit)
+        }
+        _ => None,
+    }
+}
+
 fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -1118,6 +1192,70 @@ impl std::error::Error for NormalizeError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn step_cache_lifetime_uses_frozen_policy_and_route() {
+        use CacheLifetime::{Explicit, Implicit};
+        use WireFamilyId::*;
+        for (family, syntax) in [
+            (AnthropicMessages, MarkerSyntax::AnthropicCacheControl),
+            (BedrockConverse, MarkerSyntax::BedrockCachePoint),
+        ] {
+            for (ttl, expected) in [
+                (CacheTtl::FiveMinutes, 300_000),
+                (CacheTtl::OneHour, 3_600_000),
+            ] {
+                for omit_ttl in [false, true] {
+                    let policy = CachePolicy {
+                        version: 1,
+                        class: CacheClass::Markers {
+                            syntax,
+                            ttl,
+                            max_breakpoints: 4,
+                            lookback_blocks: 20,
+                            tail: None,
+                            omit_ttl,
+                        },
+                    };
+                    assert_eq!(
+                        cache_lifetime(Some(&policy), family, "anthropic"),
+                        Some(Explicit(expected))
+                    );
+                }
+            }
+        }
+        for family in [OpenAiChat, OpenAiResponses] {
+            for (retention, expected) in [
+                (Some("24h"), Some(Explicit(86_400_000))),
+                (Some("in_memory"), Some(Implicit)),
+                (None, Some(Implicit)),
+                (Some("future"), None),
+            ] {
+                let policy = CachePolicy {
+                    version: 1,
+                    class: CacheClass::Hints {
+                        cache_key: "synthetic".into(),
+                        retention: retention.map(str::to_owned),
+                    },
+                };
+                assert_eq!(cache_lifetime(Some(&policy), family, "openai"), expected);
+                assert_eq!(
+                    cache_lifetime(Some(&policy), family, "gateway"),
+                    Some(Implicit)
+                );
+            }
+        }
+        for family in [OpenAiResponsesChatgpt, Gemini, GoogleCodeAssist] {
+            assert_eq!(cache_lifetime(None, family, "synthetic"), Some(Implicit));
+        }
+        let none = CachePolicy {
+            version: 1,
+            class: CacheClass::None,
+        };
+        assert_eq!(cache_lifetime(Some(&none), Gemini, "google"), None);
+        assert_eq!(cache_lifetime(None, AnthropicMessages, "anthropic"), None);
+        assert_eq!(cache_lifetime(None, BedrockConverse, "bedrock"), None);
+    }
 
     #[test]
     fn auth_handle_debug_redacts_every_credential_value() {

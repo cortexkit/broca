@@ -97,6 +97,7 @@ pub(super) struct StoreWarmer {
     config: ConfigSlot,
     records: mpsc::UnboundedSender<WarmRecord>,
     recorded: Option<RecordedBase>,
+    warm_stops: crate::step_events::WarmStops,
 }
 
 impl StoreWarmer {
@@ -109,6 +110,7 @@ impl StoreWarmer {
         declare: Declare,
         last_send: Option<(u64, Option<u64>, broca_protocol::Usage)>,
         recorded: Option<RecordedBase>,
+        warm_stops: crate::step_events::WarmStops,
     ) -> (Arc<Self>, RunWarming) {
         let clock = CacheClock::default();
         if let Some((sent_at_ms, ttl_ms, usage)) = last_send {
@@ -127,6 +129,7 @@ impl StoreWarmer {
             config: Arc::clone(&config),
             records,
             recorded,
+            warm_stops,
         });
         (
             warmer,
@@ -186,6 +189,16 @@ fn responses(config: &RunConfig) -> bool {
 
 #[async_trait::async_trait]
 impl KeepWarmDriver<Admission> for StoreWarmer {
+    fn note_stop(&self, run_id: &RunId, reason: &str) {
+        if matches!(reason, "tools_done" | "cancelled") {
+            return;
+        }
+        self.warm_stops
+            .lock()
+            .unwrap()
+            .entry(run_id.0.clone())
+            .or_insert_with(|| reason.into());
+    }
     fn timing(&self, _admission: &Admission) -> Result<WarmTiming, String> {
         self.timing_of(&self.config()?)
     }
@@ -476,6 +489,7 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> su
             Arc::new(move |config| registry.cache_declaration(config)),
             last_send,
             recorded,
+            self.step_event_warm_stops.clone(),
         );
         Some((driver, warming))
     }
@@ -644,9 +658,31 @@ mod tests {
                 },
             )),
             None,
+            Default::default(),
         );
         *warming.config.lock().unwrap() = Some(((None, None), config()));
         (warmer, warming)
+    }
+
+    #[test]
+    fn live_step_report_retains_the_first_warming_stop_not_tool_completion() {
+        let executor = Arc::new(Counting::default());
+        let (driver, _) = driver(&executor);
+        let run = RunId("synthetic".into());
+        driver.note_stop(&run, "tools_done");
+        driver.note_stop(&run, "cancelled");
+        assert!(driver.warm_stops.lock().unwrap().is_empty());
+        driver.note_stop(&run, "budget");
+        driver.note_stop(&run, "quota");
+        assert_eq!(
+            driver
+                .warm_stops
+                .lock()
+                .unwrap()
+                .get(&run.0)
+                .map(String::as_str),
+            Some("budget")
+        );
     }
 
     /// With neither an in-process send nor a recorded request, a warm stops before rendering or

@@ -504,6 +504,9 @@ impl tracing::Subscriber for WarmStops {
 
 #[async_trait::async_trait]
 impl broca_core::keep_warm_wait::KeepWarmDriver for ObservedWarmer {
+    fn note_stop(&self, run_id: &RunId, reason: &str) {
+        self.inner.note_stop(run_id, reason);
+    }
     fn timing(
         &self,
         config: &broca_wal::RunConfig,
