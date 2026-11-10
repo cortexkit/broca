@@ -1949,71 +1949,134 @@ async fn failed_enrollment_and_active_write_are_repaired_without_a_read_or_resta
         .unwrap(),
     );
     let registry = rig.registry(Some(index.clone()));
-    assert_eq!(registry.retention_repairs_pending(), 0);
-    registry
+    assert_eq!(
+        registry.retention_repairs_pending(),
+        0,
+        "no retention repair should be pending before the send"
+    );
+    let outcome = registry
         .route_send(
             &rig.key,
             request(&rig.key, "r1"),
             crate::executor::RunKind::FreshOrResume,
         )
         .await
-        .unwrap();
+        .expect("route the retained run r1 despite the injected index failures");
+    assert!(
+        matches!(outcome, crate::actor::SendOutcome::Active { .. }),
+        "r1 should be admitted despite the injected index failures; observed {outcome:?}"
+    );
     // Wait for the session actor to clear the lineage registry's in-flight count,
-    // without a read that could itself repair the missing run-index row.
+    // so the later sweep repairs a completed run, without a read that could itself
+    // repair the missing run-index row.
     broca_test_support::event_timeout(
-        "failed_enrollment_and_active_write_are_repaired_without_a_read_or_restart",
+        "r1 to finish and clear the registry's in-flight count before retention repair",
         async {
             while registry.slot_counts().runs_in_flight > 0 {
                 tokio::task::yield_now().await;
             }
         },
         || {
-            broca_test_support::record_kinds(
-                rig.service
-                    .wal
-                    .read_records(&rig.key)
-                    .unwrap()
-                    .iter()
-                    .map(|f| &f.record),
+            format!(
+                "in_flight={}; {}",
+                registry.slot_counts().runs_in_flight,
+                broca_test_support::record_kinds(
+                    rig.service
+                        .wal
+                        .read_records(&rig.key)
+                        .expect("read r1's WAL for the completion-timeout diagnostic")
+                        .iter()
+                        .map(|f| &f.record),
+                ),
             )
         },
     )
     .await
-    .unwrap();
-    assert!(rig.store.lookup_run("r1").unwrap().is_none());
-    assert_eq!(registry.retention_repairs_pending(), 1);
+    .expect("r1 should finish before the retention repair sweep");
+    broca_test_support::event_timeout(
+        "one pending retention repair after r1's failed index writes",
+        async {
+            while registry.retention_repairs_pending() != 1 {
+                tokio::task::yield_now().await;
+            }
+        },
+        || {
+            format!(
+                "pending_repairs={}; {}",
+                registry.retention_repairs_pending(),
+                broca_test_support::record_kinds(
+                    rig.service
+                        .wal
+                        .read_records(&rig.key)
+                        .expect("read r1's WAL for the pending-repair timeout diagnostic")
+                        .iter()
+                        .map(|f| &f.record),
+                ),
+            )
+        },
+    )
+    .await
+    .expect("r1's failed index writes should enroll one pending retention repair");
+    let run = rig.store.lookup_run("r1").expect("look up unrepaired r1");
+    assert!(
+        run.is_none(),
+        "r1 should have no run-index row before the repair sweep; observed {run:?}"
+    );
+    assert_eq!(
+        registry.retention_repairs_pending(),
+        1,
+        "r1's failed index writes should leave one pending retention repair"
+    );
     index.fail.store(false, Ordering::Relaxed);
     registry
         .sweep_once(rig.service.clock.now_ms())
         .await
-        .unwrap();
+        .expect("repair r1 after restoring index writes");
+    let run = rig.store.lookup_run("r1").expect("look up repaired r1");
     assert_eq!(
-        rig.store.lookup_run("r1").unwrap().unwrap().state,
-        RunIndexState::Completed
+        run.as_ref().map(|row| &row.state),
+        Some(&RunIndexState::Completed),
+        "the repair sweep should index r1 as completed; observed {run:?}"
     );
-    assert_eq!(registry.retention_repairs_pending(), 0);
-    assert!(rig
+    assert_eq!(
+        registry.retention_repairs_pending(),
+        0,
+        "the successful repair sweep should clear r1's pending retention repair"
+    );
+    let retained = rig
         .store
         .lookup_run_retention("r1")
-        .unwrap()
-        .unwrap()
-        .lineage_id
-        .is_some());
-    assert!(registry.stop_and_seal().await);
+        .expect("look up r1's repaired retention row");
+    assert!(
+        retained
+            .as_ref()
+            .is_some_and(|row| row.lineage_id.is_some()),
+        "the repair sweep should index r1's retention lineage; observed {retained:?}"
+    );
+    let sealed = registry.stop_and_seal().await;
+    assert!(
+        sealed,
+        "the registry should stop and seal before the expiry sweep; observed {sealed}"
+    );
     registry
         .sweep_once(rig.service.clock.now_ms() + RETAINED_SECONDS * 1000 + 1000)
         .await
-        .unwrap();
-    let expiry = rig
+        .expect("expire r1 after sealing and advancing beyond its retention deadline");
+    let retained = rig
         .store
         .lookup_run_retention("r1")
-        .unwrap()
-        .unwrap()
-        .expired_at_ms
-        .unwrap();
+        .expect("look up r1's expired retention row");
+    let expiry = retained.as_ref().and_then(|row| row.expired_at_ms);
+    assert!(
+        expiry.is_some(),
+        "the expiry sweep should tombstone r1's retention row; observed {retained:?}"
+    );
     assert_eq!(
-        rig.service.expired(&rig.key, Some("r1")).unwrap(),
-        Some(expiry)
+        rig.service
+            .expired(&rig.key, Some("r1"))
+            .expect("check r1's expiry through the retention service"),
+        expiry,
+        "the retention service should report r1's indexed expiry after deletion"
     );
 }
 
