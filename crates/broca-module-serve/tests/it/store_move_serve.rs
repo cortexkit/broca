@@ -325,6 +325,79 @@ async fn a_live_session_moves_to_the_new_storage_and_keeps_serving() {
     rig.finish().await;
 }
 
+#[tokio::test]
+async fn a_store_subscription_keeps_converted_message_and_tool_ids() {
+    let mut rig = Rig::start_movable("store-subscribe-ids").await;
+    *rig.script.media_frozen.lock().unwrap() = Some(image_config());
+    broca_core::media_store::create_media_directories(&rig.dir).unwrap();
+    rig.script
+        .push(&[Step::Call("converted-call"), Step::Text("answer")]);
+    result(&rig.send("turn", "read a file", None).await);
+    rig.wait_for_finished(1).await;
+    rig.wait_idle().await;
+
+    let page = result(&call(&mut rig, "session.read", json!({})).await);
+    let mids: Vec<_> = page["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|message| message["mid"].as_str().unwrap())
+        .collect();
+    assert_eq!(mids, ["m0", "m1", "m2", "m3"]);
+
+    rig.bind_as(2, Some(subc_protocol::Principal::Direct)).await;
+    let moved = rig
+        .request(2, json!({"method": "session.move_to_store", "params": {}}))
+        .await;
+    assert_eq!(result(&moved)["moved"], true);
+    assert!(rig.wal_path.with_extension("moved").exists());
+    let stored = result(&call(&mut rig, "session.read", json!({})).await);
+    let stored_mids: Vec<_> = stored["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|message| message["mid"].as_str().unwrap())
+        .collect();
+    assert_eq!(stored_mids, mids);
+
+    // Wait for the terminal replay frame rather than treating a quiet transport as complete.
+    let frames = rig
+        .subscribe_collect_until(
+            9,
+            json!({"from": "start"}),
+            Duration::from_millis(100),
+            |frame| {
+                serde_json::from_slice::<Value>(&frame.body)
+                    .is_ok_and(|body| body["event"]["type"] == "run_finished")
+            },
+        )
+        .await;
+    let mut started = Vec::new();
+    let mut tools = Vec::new();
+    for frame in &frames {
+        assert_ne!(
+            frame.header.ty,
+            FrameType::Error,
+            "{}",
+            String::from_utf8_lossy(&frame.body)
+        );
+        let body: Value = serde_json::from_slice(&frame.body).unwrap();
+        let event = &body["event"];
+        if event["type"] == "message_started" {
+            started.push(event["mid"].as_str().unwrap().to_owned());
+        } else if event["type"] == "tool_started" {
+            tools.push(event["mid"].as_str().unwrap().to_owned());
+        }
+    }
+    assert_eq!(started, mids, "message starts keep their stored public ids");
+    assert_eq!(
+        tools,
+        ["m1"],
+        "the call stays joined to its assistant message"
+    );
+    rig.finish().await;
+}
+
 /// The session's send params for `send_id` with `prompt`, as [`Rig::send`] sends them.
 fn send_params(send_id: &str, prompt: &str) -> Value {
     json!({"method": "session.send", "params": {
