@@ -6607,6 +6607,24 @@ impl LineageRegistry {
         })
     }
 
+    /// What the open actor serving `key` last said keeps it from closing idle, under the
+    /// reasons [`Self::tool_routes_health`] counts (`live_subscriber` for a subscriber still
+    /// attached). Empty when no actor holds the session open or it named nothing.
+    pub fn idle_holds(&self, key: &LineageKey) -> Vec<&'static str> {
+        let slots = self.inner.slots.lock().unwrap();
+        let Some(Entry::Open { gen, .. }) = slots.get(key) else {
+            return Vec::new();
+        };
+        self.inner
+            .actor_idle_holds
+            .lock()
+            .unwrap()
+            .get(key)
+            .filter(|(owner, _)| owner == gen)
+            .map(|(_, holds)| holds.clone())
+            .unwrap_or_default()
+    }
+
     // Only the test-clock expiry tests close a slot by advancing time.
     #[cfg(all(test, feature = "test-clock"))]
     pub(crate) async fn wait_for_slot_closed(&self, key: &LineageKey) {
@@ -7181,7 +7199,14 @@ impl RegistryHandle {
         }
     }
 
-    pub(crate) fn note_idle_holds(&self, key: &LineageKey, gen: u64, reasons: Vec<&'static str>) {
+    /// Records what keeps generation `gen`'s actor for `key` from closing idle. Returns false,
+    /// recording nothing, unless that generation holds the slot open.
+    pub(crate) fn note_idle_holds(
+        &self,
+        key: &LineageKey,
+        gen: u64,
+        reasons: Vec<&'static str>,
+    ) -> bool {
         let slots = self.inner.slots.lock().unwrap();
         if matches!(slots.get(key), Some(Entry::Open { gen: owner, .. }) if *owner == gen) {
             self.inner
@@ -7189,7 +7214,9 @@ impl RegistryHandle {
                 .lock()
                 .unwrap()
                 .insert(key.clone(), (gen, reasons));
+            return true;
         }
+        false
     }
 }
 
