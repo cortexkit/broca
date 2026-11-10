@@ -832,6 +832,7 @@ fn capability_flag(entry: &Value, key: &str) -> CapabilityFlag {
 
 fn map_limits(limit: Option<&Value>) -> Limits {
     Limits {
+        images_per_request: None,
         context: limit.and_then(|l| l.get("context")).and_then(Value::as_u64),
         max_input: limit.and_then(|l| l.get("input")).and_then(Value::as_u64),
         max_output: limit.and_then(|l| l.get("output")).and_then(Value::as_u64),

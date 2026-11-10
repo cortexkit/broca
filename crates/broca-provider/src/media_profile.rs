@@ -847,8 +847,8 @@ fn build_profile(
 /// family's profile.
 ///
 /// The provider's media quirk comes from its spec when set, otherwise from its catalog provider
-/// id. The model's catalog modalities and context window are read once, here; a later catalog
-/// change leaves the frozen profile as it is.
+/// id. The model's catalog modalities, context window and image count are read once, here; a
+/// later catalog change leaves the frozen profile as it is.
 pub fn freeze_media_profile(
     frozen: &mut FrozenRenderConfig,
     provider: &ProviderSpec,
@@ -858,13 +858,33 @@ pub fn freeze_media_profile(
         .quirks
         .media
         .or_else(|| media_quirk_for_catalog_provider(&provider.id));
-    frozen.media = Some(select_media_profile(
+    frozen.media = Some(select_model_media_profile(
         frozen.family_id,
         quirk,
         &frozen.wire_model_id,
+        model,
+    ));
+}
+
+/// Select a fresh episode's profile from catalog facts and the final routed family/model.
+/// Only the published image count overrides the table; unknown counts keep its fallback.
+pub fn select_model_media_profile(
+    family: WireFamilyId,
+    quirk: Option<MediaQuirk>,
+    wire_model_id: &str,
+    model: &ModelSpec,
+) -> MediaProfile {
+    let mut profile = select_media_profile(
+        family,
+        quirk,
+        wire_model_id,
         model.input_modalities,
         model.limits.context,
-    ));
+    );
+    if let Some(count) = model.limits.images_per_request {
+        profile.image.max_count = Some(count);
+    }
+    profile
 }
 
 #[cfg(test)]
@@ -1197,6 +1217,50 @@ mod tests {
         // The modalities are the catalog's, as they stood at freeze.
         assert!(!profile.accepts_modality(MediaKind::Image));
         assert_eq!(profile.modalities.text, Some(true));
+    }
+
+    #[test]
+    fn catalog_image_count_overrides_only_the_table_count() {
+        let provider = provider("google", WireFamilyId::Gemini, Some(MediaQuirk::Google));
+        let mut model = model(
+            "gemini-4-argon",
+            serde_json::json!(["text", "image"]),
+            Some(1_000_000),
+        );
+        let mut frozen = crate::families::gemini_frozen_config(&model.id);
+        freeze_media_profile(&mut frozen, &provider, &model);
+        let fallback = frozen.media.clone().unwrap();
+        assert_eq!(fallback.image.max_count, Some(3_000));
+
+        model.limits.images_per_request = Some(3_600);
+        freeze_media_profile(&mut frozen, &provider, &model);
+        let mut expected = fallback;
+        expected.image.max_count = Some(3_600);
+        assert_eq!(frozen.media.as_ref().unwrap(), &expected);
+        assert_eq!(
+            select_model_media_profile(
+                WireFamilyId::Gemini,
+                Some(MediaQuirk::Google),
+                &model.id,
+                &model
+            ),
+            expected,
+        );
+    }
+
+    #[test]
+    fn absent_catalog_image_count_keeps_anthropic_window_rule() {
+        let provider = provider("anthropic", WireFamilyId::AnthropicMessages, None);
+        for (window, expected) in [(None, 100), (Some(200_000), 100), (Some(200_001), 600)] {
+            let model = model("claude", serde_json::json!(["text", "image"]), window);
+            let mut frozen = crate::families::anthropic_frozen_config(&model.id);
+            freeze_media_profile(&mut frozen, &provider, &model);
+            assert_eq!(
+                frozen.media.unwrap().image.max_count,
+                Some(expected),
+                "{window:?}"
+            );
+        }
     }
 
     #[test]

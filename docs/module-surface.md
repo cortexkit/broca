@@ -2189,6 +2189,10 @@ freezes its adapter media profile, even for text-only input: a tool may return a
 after the first model request. Requests without media retain their ordinary rendered bytes.
 Resume never adds a profile to an older recorded configuration; those runs keep their media
 markers until a fresh episode is admitted. Existing per-family carrier gates remain in force.
+The profile freezes the catalog's `limit.images_per_request` when stated; absent or null counts
+keep the adapter's existing per-family count (including Anthropic's context-window rule).
+Malformed counts exclude the catalog row rather than becoming zero or unlimited. A later
+catalog change affects fresh admissions only, never a resumed episode's frozen count.
 
 `role.describe` always declares the llm-runner `attachments` and `media_only_send` groups and its upload
 and `session.media_read` operations. A non-template send with committed media may omit `prompt` or send it empty, storing media parts alone without an empty text part; a send with neither text nor media is refused as `invalid_params` naming `template`. Upload staging is available independently of the model;
