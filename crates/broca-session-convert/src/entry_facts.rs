@@ -56,6 +56,7 @@ pub struct Legacy {
 /// or delivered send.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SendDisplay {
+    pub send_id: Option<String>,
     pub sender: Option<String>,
     pub client_message_id: Option<String>,
     /// llm-runner's `MessageMarks` JSON.
@@ -75,6 +76,7 @@ fn send_display(old: &[FramedRecord], lineage: Option<&str>) -> BTreeMap<u64, Se
     let mut display = BTreeMap::new();
     for version in versions {
         let row = SendDisplay {
+            send_id: version.facts.send_id,
             sender: version.facts.sender,
             client_message_id: version.facts.client_message_id,
             marks: version
@@ -364,6 +366,7 @@ pub fn record(
         }
     });
     EntryFacts {
+        send_id: display.and_then(|display| display.send_id.clone()),
         client_message_id: display.and_then(|display| display.client_message_id.clone()),
         sender: display.and_then(|display| display.sender.clone()),
         marks: display.and_then(|display| display.marks.clone()),

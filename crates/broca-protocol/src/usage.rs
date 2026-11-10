@@ -17,6 +17,12 @@ pub struct Usage {
     /// Cache-CREATION (write) input tokens. Counts toward fill.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_write_tokens: Option<u64>,
+    /// Reported 5-minute cache writes, a subset of `cache_write_tokens`, not extra input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_5m_tokens: Option<u64>,
+    /// Reported 1-hour cache writes. Absent means unknown, not a 5-minute default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_1h_tokens: Option<u64>,
     /// Output tokens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<u64>,
@@ -118,6 +124,24 @@ pub struct GenerationUsage {
 }
 
 impl Usage {
+    /// Keep cache-write lifetimes only as a complete breakdown of the reported total.
+    /// Billing readers price the breakdown instead of the total when it is present.
+    pub fn with_complete_cache_write_lifetimes(mut self) -> Self {
+        let complete = match (
+            self.cache_write_tokens,
+            self.cache_write_5m_tokens,
+            self.cache_write_1h_tokens,
+        ) {
+            (Some(total), Some(five), Some(hour)) => five.checked_add(hour) == Some(total),
+            _ => false,
+        };
+        if !complete {
+            self.cache_write_5m_tokens = None;
+            self.cache_write_1h_tokens = None;
+        }
+        self
+    }
+
     /// Context-fill metric: fresh request input + cache reads + cache writes.
     /// All three occupy the model's context window for the measured request.
     ///
@@ -149,6 +173,10 @@ impl Usage {
         self.cached_input_tokens =
             sum_reported(self.cached_input_tokens, other.cached_input_tokens);
         self.cache_write_tokens = sum_reported(self.cache_write_tokens, other.cache_write_tokens);
+        self.cache_write_5m_tokens =
+            sum_reported(self.cache_write_5m_tokens, other.cache_write_5m_tokens);
+        self.cache_write_1h_tokens =
+            sum_reported(self.cache_write_1h_tokens, other.cache_write_1h_tokens);
         self.output_tokens = sum_reported(self.output_tokens, other.output_tokens);
         self.reasoning_tokens = sum_reported(self.reasoning_tokens, other.reasoning_tokens);
     }
@@ -212,7 +240,7 @@ pub fn model_usage<'a>(
     usage: Usage,
     iterations: Option<&'a [UsageIteration]>,
 ) -> Vec<(&'a str, Usage)> {
-    match iterations {
+    let entries = match iterations {
         Some(iterations) => iterations
             .iter()
             .map(|iteration| {
@@ -225,6 +253,16 @@ pub fn model_usage<'a>(
                         input_tokens: iteration.input_tokens,
                         cached_input_tokens: iteration.cache_read_input_tokens,
                         cache_write_tokens: iteration.cache_creation_input_tokens,
+                        cache_write_5m_tokens: iteration
+                            .other
+                            .get("cache_creation")
+                            .and_then(|v| v.get("ephemeral_5m_input_tokens"))
+                            .and_then(serde_json::Value::as_u64),
+                        cache_write_1h_tokens: iteration
+                            .other
+                            .get("cache_creation")
+                            .and_then(|v| v.get("ephemeral_1h_input_tokens"))
+                            .and_then(serde_json::Value::as_u64),
                         output_tokens: iteration.output_tokens,
                         reasoning_tokens: iteration
                             .other
@@ -236,7 +274,11 @@ pub fn model_usage<'a>(
             })
             .collect(),
         None => vec![(served_or_requested_model, usage)],
-    }
+    };
+    entries
+        .into_iter()
+        .map(|(model, usage)| (model, usage.with_complete_cache_write_lifetimes()))
+        .collect()
 }
 
 /// A step's counters sum its iterations, preserving unreported fields as absent.
@@ -244,6 +286,7 @@ pub fn step_usage(usage: Usage, iterations: Option<&[UsageIteration]>) -> Usage 
     model_usage("", usage, iterations)
         .into_iter()
         .fold(Usage::default(), |total, (_, usage)| total + usage)
+        .with_complete_cache_write_lifetimes()
 }
 
 #[cfg(test)]
@@ -275,6 +318,7 @@ mod tests {
                 cached_input_tokens: Some(40136),
                 cache_write_tokens: Some(4),
                 reasoning_tokens: None,
+                ..Usage::default()
             }
         );
         assert_eq!(
@@ -295,6 +339,7 @@ mod tests {
                 cached_input_tokens: Some(0),
                 cache_write_tokens: None,
                 reasoning_tokens: Some(7),
+                ..Usage::default()
             }
         );
     }
@@ -348,6 +393,61 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn cache_write_lifetimes_omit_partial_iterations_without_inflating_fill() {
+        let iterations = serde_json::from_value::<Vec<UsageIteration>>(json!([
+            {"model":"synthetic", "input_tokens":12, "cache_creation_input_tokens":30,
+             "cache_creation":{"ephemeral_5m_input_tokens":10,"ephemeral_1h_input_tokens":20}},
+            {"model":"synthetic", "input_tokens":3, "cache_creation_input_tokens":5,
+             "cache_creation":{"ephemeral_1h_input_tokens":5}},
+            {"model":"synthetic", "cache_creation_input_tokens":2}
+        ]))
+        .unwrap();
+        let usage = step_usage(Usage::default(), Some(&iterations));
+        assert_eq!(usage.cache_write_tokens, Some(37));
+        assert_eq!(usage.cache_write_5m_tokens, None);
+        assert_eq!(usage.cache_write_1h_tokens, None);
+        assert_eq!(usage.fill_tokens(), Some(52));
+        let mut total = usage;
+        total += Usage::default();
+        assert_eq!(total, usage);
+        total += Usage {
+            cache_write_5m_tokens: Some(0),
+            ..Usage::default()
+        };
+        assert_eq!(total.with_complete_cache_write_lifetimes(), usage);
+    }
+
+    #[test]
+    fn cache_write_lifetime_split_requires_a_complete_non_overflowing_total() {
+        for (total, five, hour, complete) in [
+            (Some(30), Some(10), Some(20), true),
+            (Some(0), Some(0), Some(0), true),
+            (Some(31), Some(10), Some(20), false),
+            (None, Some(10), Some(20), false),
+            (Some(30), None, Some(20), false),
+            (Some(30), Some(10), None, false),
+            (Some(u64::MAX), Some(u64::MAX), Some(1), false),
+        ] {
+            let usage = Usage {
+                cache_write_tokens: total,
+                cache_write_5m_tokens: five,
+                cache_write_1h_tokens: hour,
+                ..Usage::default()
+            }
+            .with_complete_cache_write_lifetimes();
+            assert_eq!(usage.cache_write_tokens, total);
+            assert_eq!(
+                usage.cache_write_5m_tokens,
+                if complete { five } else { None }
+            );
+            assert_eq!(
+                usage.cache_write_1h_tokens,
+                if complete { hour } else { None }
+            );
+        }
+    }
+
+    #[test]
     fn fill_counts_cache_writes_and_saturates() {
         let usage = Usage {
             input_tokens: Some(3),
@@ -381,10 +481,12 @@ mod tests {
             input_tokens: Some(0),
             cached_input_tokens: Some(0),
             cache_write_tokens: Some(0),
+            cache_write_5m_tokens: Some(0),
+            cache_write_1h_tokens: Some(0),
             output_tokens: Some(0),
             reasoning_tokens: Some(0),
         };
-        let wire = json!({"input_tokens":0,"cached_input_tokens":0,"cache_write_tokens":0,"output_tokens":0,"reasoning_tokens":0});
+        let wire = json!({"input_tokens":0,"cached_input_tokens":0,"cache_write_tokens":0,"cache_write_5m_tokens":0,"cache_write_1h_tokens":0,"output_tokens":0,"reasoning_tokens":0});
         assert_eq!(serde_json::to_value(zero).unwrap(), wire);
         assert_eq!(serde_json::from_value::<Usage>(wire).unwrap(), zero);
         assert_eq!(

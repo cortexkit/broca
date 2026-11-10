@@ -92,6 +92,11 @@ pub struct StoreActor<B: SessionBackend> {
     /// setup store. `None` keeps them in memory only, as tests do.
     storage: Option<broca_session_loop::durable::SetupParts<B>>,
     run: Option<ActiveRun>,
+    /// Non-durable one-shot hints, retained for queued sends and same-process pause resumes.
+    /// Reopening loses the hints, as it does in the WAL actor.
+    one_shot_runs: std::collections::HashSet<RunId>,
+    one_shot_submissions: std::collections::HashSet<broca_protocol::SubmissionId>,
+    close_after_one_shot: bool,
     /// A late result raced the task's held pause; resume after its terminal is processed.
     held_resume_owed: bool,
     /// Set once the module stops the session: no queued send starts after it.
@@ -226,6 +231,7 @@ enum Exit {
 /// The run the session is running.
 struct ActiveRun {
     run_id: RunId,
+    one_shot: bool,
     /// The actor's end of the run's writer.
     link: RunLink,
     /// Set once the run dropped its writer: it appends nothing more, and its end follows.
@@ -253,6 +259,7 @@ struct ActiveRun {
 struct Start {
     conversation_key: Option<String>,
     run_id: RunId,
+    one_shot: bool,
     request: SubmissionRequest,
     title: Option<String>,
     /// A keyed send's key and identity digest, which the run's start records so a retry can be
@@ -375,6 +382,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             parts: SharedParts::new(parts),
             storage: None,
             run: None,
+            one_shot_runs: Default::default(),
+            one_shot_submissions: Default::default(),
+            close_after_one_shot: false,
             held_resume_owed: false,
             stopping: false,
             billing: None,
@@ -933,7 +943,21 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 }
             }
             self.retry_views().await;
+            if self.close_finished_one_shot().await {
+                return Exit::Idle;
+            }
         }
+    }
+
+    /// Match the WAL actor's `close_finished_one_shot`/`try_close`: only a durable terminal,
+    /// never a pause, can skip the TTL; an active run, live subscriber, warm or run-starting
+    /// queued send still holds the actor open. Billing and cancel finalization are awaited
+    /// inline here, before this check, rather than held in background tasks as in the WAL actor.
+    /// A blocked attempt is consumed, so losing the holder later waits for ordinary idle close.
+    async fn close_finished_one_shot(&mut self) -> bool {
+        std::mem::take(&mut self.close_after_one_shot)
+            && self.idle_holds().is_empty()
+            && matches!(self.queue_starts_runs().await, Ok(false))
     }
 
     /// Serves one write the active run asks for.
@@ -1119,7 +1143,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 request,
                 kind,
                 key,
-                skip_materialization: _,
+                skip_materialization,
                 delivery,
                 plan,
                 order,
@@ -1391,6 +1415,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                             let start = Start {
                                 conversation_key,
                                 run_id: run_id.clone(),
+                                one_shot: skip_materialization,
                                 sent_by: request.principal.clone(),
                                 request: *request,
                                 title,
@@ -1595,6 +1620,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 let start = Start {
                     conversation_key,
                     run_id,
+                    one_shot: skip_materialization,
                     // A plan sender's interrupt shows its sender, as today's actor records it,
                     // though it runs under the session's principal.
                     sent_by: ordered_by.clone().or_else(|| request.principal.clone()),
@@ -1840,6 +1866,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         };
         let Start {
             run_id,
+            one_shot,
             mut request,
             title,
             send_id,
@@ -1962,6 +1989,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         }
         let done = tokio::spawn(async move { executor.execute_on_store(job, out).await });
         self.run = Some(ActiveRun {
+            one_shot: one_shot || self.one_shot_runs.contains(&run_id),
             run_id,
             link,
             writer_gone: false,
@@ -2194,6 +2222,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         Ok(Start {
             conversation_key: None,
             run_id: RunId(run.run_id.clone()),
+            one_shot: false,
             request,
             title: None,
             send_id: None,
@@ -2814,6 +2843,12 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             .is_some_and(|start| start.run_id == active.run_id.0);
         if started {
             active.started = true;
+            if active.one_shot {
+                self.one_shot_runs.insert(active.run_id.clone());
+            }
+            if let Some(submission) = &active.submission {
+                self.one_shot_submissions.remove(submission);
+            }
             if let Some(reply) = active.admitting.take() {
                 // The run's start is durable, so this send was admitted whatever happens here:
                 // a failure to read the first run's settings only leaves the answer without its
@@ -2866,6 +2901,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 format!("the run's task ended without finishing: {error}"),
             ))),
         };
+        let completed = result.is_ok();
         let started = self
             .session
             .operations()
@@ -2935,6 +2971,14 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         // The run's end, if it wrote one, is durable now: a run's last batch ends with a
         // barrier, and the run's task has returned.
         self.bill_owed().await;
+        self.close_after_one_shot = active.one_shot
+            && completed
+            && self
+                .session
+                .operations()
+                .run
+                .as_ref()
+                .is_some_and(|run| run.run_id == active.run_id.0 && run.finished.is_some());
         if std::mem::take(&mut self.held_resume_owed) {
             if let Err(error) = self.resume_held().await {
                 tracing::error!(target: "broca.store_actor", %error, "could not resume a held run after its task parked");
@@ -3177,6 +3221,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         let submission = broca_protocol::SubmissionId(submission_id.to_owned());
         let start = Start {
             run_id: crate::actor::run_id_of_queued(&submission),
+            one_shot: self.one_shot_submissions.contains(&submission),
             conversation_key: queue::receipt_field(&send, "conversation_key")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned),
@@ -3567,6 +3612,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     ) -> SendOutcome {
         let Start {
             run_id,
+            one_shot,
             mut request,
             title,
             send_id,
@@ -3665,6 +3711,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         };
         if let Err(error) = self.append_own_with_media(record, &staged).await {
             return SendOutcome::Error(format!("{error:?}"));
+        }
+        if one_shot {
+            self.one_shot_submissions.insert(submission_id.clone());
         }
         SendOutcome::Pending { submission_id }
     }

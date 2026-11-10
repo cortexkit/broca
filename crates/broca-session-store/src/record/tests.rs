@@ -14,6 +14,26 @@ fn model() -> ModelHandle {
     }
 }
 
+#[test]
+fn cache_write_lifetimes_roundtrip_in_step_end_record() {
+    let mut record = one_of_each()
+        .into_iter()
+        .find(|record| matches!(record, Record::StepEnd(_)))
+        .unwrap();
+    let Record::StepEnd(end) = &mut record else {
+        unreachable!()
+    };
+    end.usage = Some(Usage {
+        cache_write_tokens: Some(30),
+        cache_write_5m_tokens: Some(10),
+        cache_write_1h_tokens: Some(20),
+        ..Usage::default()
+    });
+    end.total_usage = end.usage;
+    let bytes = record.encode_body();
+    assert_eq!(Record::decode(record.kind(), &bytes).unwrap(), record);
+}
+
 /// One record of every kind, with optional members set, so a kind that fails to round-trip or
 /// is missing from this list shows up here.
 fn one_of_each() -> Vec<Record> {

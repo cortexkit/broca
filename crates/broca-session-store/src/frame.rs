@@ -188,7 +188,7 @@ impl FrameKey {
             return out;
         };
         let mut nonce = [0u8; NONCE_LEN];
-        getrandom::getrandom(&mut nonce).expect("the OS random source is available");
+        crate::keys::random_bytes(&mut nonce);
         let mut buffer = plaintext.to_vec();
         let tag = cipher
             .encrypt_in_place_detached(XNonce::from_slice(&nonce), aad, &mut buffer)

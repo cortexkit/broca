@@ -31,6 +31,8 @@ use crate::segment::Segment;
 
 use super::{Session, SessionError};
 
+mod send_ids;
+
 /// One message as `session.entries` reads it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StoredEntry {
@@ -117,6 +119,8 @@ pub(super) struct SealedCaches {
     /// A value a reader derived from sealed history and asked the session to keep (see
     /// `keep_sealed_derived`).
     derived: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+    /// Exact send ids derived from records written before entry facts carried them.
+    send_ids: Option<Box<send_ids::SendIdIndex>>,
 }
 
 pub(super) type SealedEntries = std::sync::Mutex<SealedCaches>;

@@ -70,6 +70,10 @@ fn tally(map: &mut BTreeMap<String, Tally>, name: impl Into<String>, bytes: usiz
 /// One converted log.
 #[derive(Debug, Default)]
 pub struct Converted {
+    /// The origin after aligning records with their destination. Before storage, receipts count
+    /// from 1 when `inverse::invert` reconstructs the original WAL; legacy-view pointers already
+    /// count from `FIRST_SEQ`, the destination's first converted record.
+    first_seq: Option<u64>,
     pub records: Vec<Record>,
     /// Every setup part this log's runs named, by digest, with its canonical bytes.
     pub parts: BTreeMap<Digest, Vec<u8>>,
@@ -80,6 +84,32 @@ pub struct Converted {
     /// The session class of the log's first run.
     pub session_class: Option<String>,
     pub runs: u64,
+}
+
+impl Converted {
+    /// Places the converted records after any bookkeeping the destination already wrote.
+    /// References within the conversion must move with their targets, not keep naming the
+    /// in-memory positions they had before a session's initial writer record was appended.
+    pub(crate) fn start_at(&mut self, first: u64) {
+        let receipt_origin = self.first_seq.unwrap_or(1);
+        let view_origin = self.first_seq.unwrap_or(FIRST_SEQ);
+        for record in &mut self.records {
+            match record {
+                Record::Input(input) => {
+                    if let Some(seq) = &mut input.receipt_seq {
+                        *seq = *seq - receipt_origin + first;
+                    }
+                }
+                Record::EntryFacts(facts) => {
+                    if let Some(seq) = &mut facts.legacy_view_seq {
+                        *seq = *seq - view_origin + first;
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.first_seq = Some(first);
+    }
 }
 
 #[derive(Debug)]
@@ -1868,8 +1898,11 @@ mod enrolled_entries_tests;
 mod inverse_tests;
 #[cfg(test)]
 mod marks_tests;
+
 #[cfg(test)]
 mod read_cost_tests;
+#[cfg(test)]
+mod send_ids_tests;
 #[cfg(test)]
 mod stage_tests;
 #[cfg(test)]

@@ -50,6 +50,7 @@ static ALLOCATOR: TrackingAllocator = TrackingAllocator;
 #[test]
 fn stateful_caller_message_serializer_uses_borrowed_content() {
     let response = SessionReadMessage {
+        send_id: None,
         speaks_for: None,
         notice: false,
         sender: None,

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::placement::{AppendKind, Placement, PlacementAction};
 
-pub const DISPLAY_FACTS_VERSION: u32 = 6;
+pub const DISPLAY_FACTS_VERSION: u32 = 7;
 
 /// Exact response-only outputs by zero-based message ordinal and content part.
 pub type NativeToolOutputs = BTreeMap<u64, BTreeMap<u32, broca_protocol::ToolOutput>>;
@@ -22,6 +22,8 @@ fn module_sender(principal: Option<&broca_protocol::BindPrincipal>) -> Option<St
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DisplayFacts {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message_marks: Option<broca_protocol::MessageMarks>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -64,6 +66,8 @@ impl DisplayFacts {
 pub struct DisplayFactsSeed {
     pub version: u32,
     pub through_seq: u64,
+    #[serde(default)]
+    pending_send_ids: VecDeque<Option<String>>,
     pub anchor: Option<(u64, u64, u64)>,
     placement: Placement,
     budget: Option<broca_protocol::BudgetConfig>,
@@ -96,6 +100,7 @@ impl Default for DisplayFactsSeed {
         Self {
             version: DISPLAY_FACTS_VERSION,
             through_seq: 0,
+            pending_send_ids: VecDeque::new(),
             anchor: None,
             placement: Placement::default(),
             budget: None,
@@ -151,6 +156,7 @@ impl DisplayFactsSeed {
             let current_call = self.call_anchors.observe(record, frame.seq);
             let mut client = None;
             let mut input_sender = None;
+            let mut input_send_id = None;
             let mut input_marks = None;
             match record {
                 WalRecord::Queued {
@@ -175,6 +181,7 @@ impl DisplayFactsSeed {
                     );
                 }
                 WalRecord::RunStarted {
+                    send_id,
                     message_marks,
                     config,
                     request_identity_digest,
@@ -186,6 +193,7 @@ impl DisplayFactsSeed {
                 } => {
                     self.budget = config.budget.clone();
                     self.pending.clear();
+                    self.pending_send_ids.clear();
                     self.pending_senders.clear();
                     self.pending_marks.clear();
                     self.tool_row = None;
@@ -194,6 +202,12 @@ impl DisplayFactsSeed {
                     self.assistant = None;
                     self.tool_names.clear();
                     if matches!(origin, broca_wal::RunOrigin::Fresh) {
+                        input_send_id = send_id.clone().or_else(|| {
+                            submission_id
+                                .as_ref()
+                                .and_then(|id| self.send_keys.origin(&id.0))
+                                .map(|(id, _)| id)
+                        });
                         let queued_marks = submission_id
                             .as_ref()
                             .and_then(|id| self.queued_marks.remove(&id.0))
@@ -216,6 +230,7 @@ impl DisplayFactsSeed {
                     }
                 }
                 WalRecord::Steered {
+                    send_id,
                     message_marks,
                     request_identity_digest,
                     input,
@@ -226,6 +241,8 @@ impl DisplayFactsSeed {
                         .as_deref()
                         .and_then(crate::digest_client_message_id);
                     self.pending.extend(std::iter::repeat_n(id, input.len()));
+                    self.pending_send_ids
+                        .extend(std::iter::repeat_n(send_id.clone(), input.len()));
                     self.pending_marks
                         .extend(std::iter::repeat_n(message_marks.clone(), input.len()));
                     self.pending_senders.extend(std::iter::repeat_n(
@@ -239,6 +256,9 @@ impl DisplayFactsSeed {
                     ..
                 } => {
                     let id = self.queued.remove(&submission_id.0).flatten();
+                    let send_id = self.send_keys.origin(&submission_id.0).map(|(id, _)| id);
+                    self.pending_send_ids
+                        .extend(std::iter::repeat_n(send_id, input.len()));
                     self.pending.extend(std::iter::repeat_n(id, input.len()));
                     let sender = self.queued_senders.remove(&submission_id.0).flatten();
                     let marks = self.queued_marks.remove(&submission_id.0).flatten();
@@ -265,6 +285,7 @@ impl DisplayFactsSeed {
                         for ordinal in first..first + count {
                             let facts = if kind == AppendKind::Input {
                                 DisplayFacts {
+                                    send_id: input_send_id.clone(),
                                     message_marks: input_marks.clone(),
                                     sender: input_sender.clone(),
                                     client_message_id: client.clone(),
@@ -293,6 +314,7 @@ impl DisplayFactsSeed {
                                 ordinal,
                                 seq: frame.seq,
                                 facts: DisplayFacts {
+                                    send_id: self.pending_send_ids.pop_front().flatten(),
                                     message_marks: self.pending_marks.pop_front().flatten(),
                                     sender: self.pending_senders.pop_front().flatten(),
                                     client_message_id: id,
@@ -706,17 +728,20 @@ mod tests {
         ))
         .unwrap();
         start["message_marks"] = json!({"speaks_for":{"agent_id":"Ada"}});
+        start["send_id"] = json!("run-own-send");
         let mut queued: serde_json::Value = serde_json::from_str(include_str!(
             "../../broca-wal/tests/golden/pre_step_transforms/queued.json"
         ))
         .unwrap();
         queued["message_marks"] = json!({"notice":true});
+        queued["send_id"] = serde_json::Value::Null;
         let id = queued["submission_id"].clone();
         let mut steer: serde_json::Value = serde_json::from_str(include_str!(
             "../../broca-wal/tests/golden/pre_step_transforms/steered.json"
         ))
         .unwrap();
         steer["message_marks"] = json!({"speaks_for":{"agent_id":"Grace"}});
+        steer["send_id"] = json!("steer-own-send");
         let frames = [
             frame(1, start),
             frame(2, queued),
@@ -742,6 +767,15 @@ mod tests {
             assert!(marks[1].notice);
             assert!(marks[1].speaks_for.is_none());
             assert_eq!(marks[2].speaks_for.as_ref().unwrap().agent_id, "Grace");
+            let ids: Vec<_> = versions
+                .iter()
+                .filter_map(|version| version.facts.send_id.as_deref())
+                .collect();
+            assert_eq!(
+                ids,
+                ["run-own-send", id.as_str().unwrap(), "steer-own-send"],
+                "cut {cut}"
+            );
         }
     }
 

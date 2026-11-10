@@ -400,8 +400,17 @@ pub(crate) async fn append_batch<B: SessionBackend>(
 /// Writes the prepared session `stage` names into its staging folder. The folder must not hold
 /// the session yet: the head is created there, as for any new session.
 pub async fn write(stage: &Stage<'_>, prepared: Prepared) -> Result<Staged, StageError> {
+    write_with_progress(stage, prepared, None).await
+}
+
+/// As `write`, with fallible progress notifications for construction of the unpublished tree.
+pub async fn write_with_progress(
+    stage: &Stage<'_>,
+    prepared: Prepared,
+    progress: broca_session_store::backend::unpublished::Progress<'_>,
+) -> Result<Staged, StageError> {
     let Prepared {
-        converted,
+        mut converted,
         appends_in_conversation,
         media,
     } = prepared;
@@ -422,8 +431,12 @@ pub async fn write(stage: &Stage<'_>, prepared: Prepared) -> Result<Staged, Stag
             )
         })?;
     let setup = SetupStore::new(&setup_backend, &setup_key);
+    let backend = broca_session_store::backend::unpublished::UnpublishedBackend::staging(
+        stage.staging,
+        progress,
+    );
     let mut session = Session::create_with_history_version(
-        LocalBackend::new(stage.staging),
+        &backend,
         SessionAddr(broca_core::session_addr(stage.session)),
         triple(stage.session),
         stage.deployment,
@@ -432,9 +445,10 @@ pub async fn write(stage: &Stage<'_>, prepared: Prepared) -> Result<Staged, Stag
     )
     .await
     .map_err(failed("create the staged session"))?;
-    // The records are appended as the run loop appends them: each group up to a barrier as one
-    // synced batch, after the setup parts it names are stored. The move's own record goes in
-    // the last batch.
+    converted.start_at(session.next_seq());
+    // Keep exactly the live encoder's batch boundaries and generation/sequence allocation.
+    // Only physical barriers are deferred: this tree is never served, and a failed attempt
+    // is discarded in full. Shared setup parts still use the ordinary durable backend.
     let records = &converted.records;
     let mut moved = stage.moved.clone();
     moved.source_lineage = stage.lineage.map(str::to_owned);
@@ -479,6 +493,9 @@ pub async fn write(stage: &Stage<'_>, prepared: Prepared) -> Result<Staged, Stag
         .close()
         .await
         .map_err(failed("close the staged session"))?;
+    backend
+        .finish()
+        .map_err(|error| StageError::Failed(format!("persist the staged session: {error:?}")))?;
     Ok(Staged {
         appends_in_conversation,
         runs: converted.runs,

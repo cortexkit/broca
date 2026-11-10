@@ -686,6 +686,7 @@ pub fn apply_display_facts(
                 entry.notice = marks.notice;
             }
             entry.sender = facts.sender.clone();
+            entry.send_id = facts.send_id.clone().filter(|_| entry.sender.is_some());
             entry.notices = facts
                 .notices
                 .iter()
@@ -769,6 +770,7 @@ pub fn session_read_response(
             .messages
             .into_iter()
             .map(|message| SessionReadMessage {
+                send_id: None,
                 speaks_for: None,
                 notice: false,
                 sender: None,
@@ -2253,6 +2255,7 @@ pub enum ServeError {
     SessionMoving {
         cut_id: String,
     },
+    SessionConverting,
     SessionMoved {
         holder: String,
     },
@@ -2410,6 +2413,7 @@ impl From<OpenError> for ServeError {
                 session, harness, ..
             } => Self::SessionLogMissing { session, harness },
             OpenError::SessionMoving { cut_id } => Self::SessionMoving { cut_id },
+            OpenError::SessionConverting => Self::SessionConverting,
             OpenError::SessionMoved { holder } => Self::SessionMoved { holder },
             OpenError::Expired { expired_at_ms } => ServeError::Expired { expired_at_ms },
             OpenError::RetentionInvalid(detail) => ServeError::RetentionInvalid(detail),
@@ -2450,6 +2454,7 @@ impl std::fmt::Display for ServeError {
             Self::MediaTooLarge(_) => f.write_str("committed image exceeds a reported image limit"),
             ServeError::UnknownSend => write!(f, "send_id is not recorded for this caller"),
             ServeError::SessionMoving { cut_id } => write!(f, "session is moving under cut {cut_id}"),
+            ServeError::SessionConverting => write!(f, "session is converting in the background"),
             ServeError::SessionMoved { holder } => write!(f, "session moved to {holder}"),
             ServeError::Expired { expired_at_ms } => write!(f, "lineage expired at {expired_at_ms}"),
             ServeError::RetentionInvalid(_) => write!(f, "invalid retention"),

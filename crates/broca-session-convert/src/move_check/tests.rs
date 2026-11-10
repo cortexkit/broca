@@ -12,6 +12,25 @@ use serde_json::json;
 use super::{check, MoveCheckReport};
 use crate::Args;
 
+#[test]
+fn mismatch_examples_keep_the_complete_error() {
+    let mut report = MoveCheckReport::default();
+    let detail = format!(
+        "{}: a placed message names a record that didn't accept it",
+        "prefix ".repeat(30)
+    );
+    MoveCheckReport::count(&mut report.mismatches, &detail);
+    report.example(&detail, "synthetic.wal");
+    assert_eq!(
+        report.mismatches.keys().next().unwrap().chars().count(),
+        120
+    );
+    assert_eq!(
+        report.examples.get(&detail),
+        Some(&vec!["synthetic.wal".into()])
+    );
+}
+
 /// A 1x1 PNG.
 const PNG: &str = "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de0000000c49444154789c63f8cfc0000003010100c9fe92ef0000000049454e44ae426082";
 
@@ -97,6 +116,8 @@ struct Holds {
     image: bool,
     /// Its run has an input-token budget, which the new run loop refuses.
     input_budget: bool,
+    /// Its historical request cannot be reproduced by today's offline renderer.
+    legacy_replay_limit: bool,
 }
 
 /// Writes at `path` a log of one run answering in text, whose attempt recorded the digest of the
@@ -157,7 +178,7 @@ fn write_log(path: &Path, holds: Holds, state_root: &Path, class: MediaStoreClas
         [
             json!({"type": "model_attempt_finished", "step_id": 1, "attempt": 0,
                 "outcome": "complete", "ts_ms": 1_001,
-                "request_body_len": body.len(), "request_body_sha256": sha256(&body),
+                "request_body_len": body.len(), "request_body_sha256": if holds.legacy_replay_limit { sha256(b"historical request") } else { sha256(&body) },
                 "response_body_len": 0, "response_body_sha256": sha256(b"")}),
             json!({"type": "model_step_finished", "step_id": 1,
                 "assistant_message": {"message_id": "m1",
@@ -237,6 +258,31 @@ fn a_session_holding_media_is_checked_with_todays_media() {
     assert_eq!((report.logs, report.verified), (1, 1));
     assert_eq!(report.verified_media, 1);
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn legacy_replay_limits_are_visible_beside_verified_sessions() {
+    let root = scratch("legacy-replay-limit");
+    let state = state_root(&root, &[]);
+    let log = log_in(&state, "wal");
+    write_log(
+        &log,
+        Holds {
+            legacy_replay_limit: true,
+            ..Holds::default()
+        },
+        &state,
+        MediaStoreClass::NonDurable,
+    );
+    let report = checked(&root, vec![log]);
+    assert_eq!(
+        (report.logs, report.verified, report.legacy_replay_limit),
+        (1, 1, 1)
+    );
+    assert!(report.refused.is_empty(), "{:?}", report.examples);
+    assert_eq!(report.legacy_replay_limit_examples.len(), 1);
+    assert!(report.legacy_replay_limit_examples[0].ends_with(": step 1 of r1"));
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 /// The media store a session's bytes are read from is the one of the class its log's folder

@@ -71,10 +71,51 @@ pub fn published_key() -> [u8; 32] {
     Sha256::digest(PUBLISHED_KEY_CONTEXT).into()
 }
 
+pub(crate) fn random_bytes(bytes: &mut [u8]) {
+    #[cfg(test)]
+    if test_entropy::fill(bytes) {
+        return;
+    }
+    getrandom::getrandom(bytes).expect("the OS random source is available");
+}
+
+#[cfg(test)]
+pub(crate) mod test_entropy {
+    use sha2::{Digest, Sha256};
+    use std::cell::RefCell;
+    thread_local! { static COUNTER: RefCell<Option<u64>> = const { RefCell::new(None) }; }
+
+    pub(super) fn fill(bytes: &mut [u8]) -> bool {
+        COUNTER.with_borrow_mut(|counter| {
+            let Some(counter) = counter else {
+                return false;
+            };
+            for chunk in bytes.chunks_mut(32) {
+                let digest = Sha256::digest(counter.to_le_bytes());
+                chunk.copy_from_slice(&digest[..chunk.len()]);
+                *counter += 1;
+            }
+            true
+        })
+    }
+
+    pub(crate) fn replay<T>(build: impl FnOnce() -> T) -> T {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                COUNTER.set(None);
+            }
+        }
+        COUNTER.set(Some(1));
+        let _reset = Reset;
+        build()
+    }
+}
+
 /// A random 128-bit id from the OS random source.
 pub fn random_id() -> Id128 {
     let mut id = [0u8; 16];
-    getrandom::getrandom(&mut id).expect("the OS random source is available");
+    random_bytes(&mut id);
     Id128(id)
 }
 
@@ -195,7 +236,7 @@ impl DataKey {
     /// Mints a new random data key under key id `id`.
     pub fn generate(id: u16) -> Self {
         let mut bytes = [0u8; 32];
-        getrandom::getrandom(&mut bytes).expect("the OS random source is available");
+        random_bytes(&mut bytes);
         Self {
             id,
             bytes,
@@ -297,7 +338,7 @@ fn wrap_aad(deployment: &DeploymentKey, session: &Id128, key_id: u16) -> Vec<u8>
 pub fn wrap(deployment: &DeploymentKey, session: &Id128, key: &DataKey) -> Option<Vec<u8>> {
     let loaded = deployment.loaded.as_ref()?;
     let mut nonce = [0u8; NONCE_LEN];
-    getrandom::getrandom(&mut nonce).expect("the OS random source is available");
+    random_bytes(&mut nonce);
     let mut buffer = key.bytes.to_vec();
     let tag = loaded
         .cipher
@@ -350,7 +391,7 @@ pub fn unwrap(
 pub fn authenticate(key: &DataKey, context: &[u8], data: &[u8]) -> Vec<u8> {
     let cipher = XChaCha20Poly1305::new(Key::from_slice(&key.bytes));
     let mut nonce = [0u8; NONCE_LEN];
-    getrandom::getrandom(&mut nonce).expect("the OS random source is available");
+    random_bytes(&mut nonce);
     let mut aad = context.to_vec();
     aad.extend_from_slice(data);
     let tag = cipher

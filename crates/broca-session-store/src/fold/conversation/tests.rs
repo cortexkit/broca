@@ -259,6 +259,7 @@ fn a_ride_is_kept_beside_its_call_in_both_layouts() {
 
 fn facts(ordinal: u64, tag_base: u64) -> Record {
     Record::EntryFacts(EntryFacts {
+        send_id: None,
         named_speaker: None,
         client_message_id: None,
         sender: None,

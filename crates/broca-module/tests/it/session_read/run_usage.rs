@@ -31,6 +31,8 @@ fn reported() -> Usage {
         input_tokens: Some(400),
         cached_input_tokens: Some(16000),
         cache_write_tokens: Some(1000),
+        cache_write_5m_tokens: None,
+        cache_write_1h_tokens: None,
         output_tokens: Some(220),
         reasoning_tokens: None,
     }

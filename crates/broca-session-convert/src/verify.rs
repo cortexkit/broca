@@ -105,6 +105,17 @@ pub struct Verified {
     pub media: u64,
     /// The checks that ran and agreed, in order.
     pub checks: Vec<&'static str>,
+    /// Checked steps whose historical request digest today's offline replay cannot reproduce.
+    /// Their converted requests still equal today's offline requests byte for byte.
+    pub legacy_replay_limit: u64,
+    /// Up to five affected steps, without request content.
+    pub legacy_replay_limit_examples: Vec<ReplayLimit>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReplayLimit {
+    pub run_id: String,
+    pub step: u64,
 }
 
 /// The first difference found, under the check that found it.
@@ -146,6 +157,14 @@ fn reply<T: Serialize, E: std::fmt::Debug>(reply: Result<T, E>) -> Value {
 
 /// Checks the staged session. `Ok` lists every check that ran.
 pub async fn verify(verify: Verify<'_>) -> Result<Verified, Mismatch> {
+    verify_with_progress(verify, None).await
+}
+
+/// Performs every semantic comparison, with optional fallible scratch progress notifications.
+pub async fn verify_with_progress(
+    verify: Verify<'_>,
+    progress: broca_session_store::backend::unpublished::Progress<'_>,
+) -> Result<Verified, Mismatch> {
     let addr = SessionAddr(broca_core::session_addr(verify.session));
     let triple = crate::stage::triple(verify.session);
     let view = Session::view(
@@ -202,16 +221,30 @@ pub async fn verify(verify: Verify<'_>) -> Result<Verified, Mismatch> {
     let media = staged_media(&verify, staged).await?;
     checks.push(MEDIA);
     let steps = recorded_steps(verify.records);
+    let mut replay_limits = Vec::new();
     if let Some(last) = steps.last() {
-        step(&verify, lineage.as_deref(), last, LAST_STEP).await?;
+        if step(&verify, lineage.as_deref(), last, LAST_STEP, progress).await? {
+            replay_limits.push(last);
+        }
         checks.push(LAST_STEP);
     }
-    next_request(&verify, lineage.as_deref(), staged, &addr, &triple).await?;
+    next_request(
+        &verify,
+        lineage.as_deref(),
+        staged,
+        &addr,
+        &triple,
+        progress,
+    )
+    .await?;
     checks.push(FIRST_OPEN);
     checks.push(NEXT_REQUEST);
     if verify.mode == Mode::Offline {
-        for recorded in &steps {
-            step(&verify, lineage.as_deref(), recorded, ALL_STEPS).await?;
+        // The last step already ran above; count each historical replay limit only once.
+        for recorded in steps.iter().take(steps.len().saturating_sub(1)) {
+            if step(&verify, lineage.as_deref(), recorded, ALL_STEPS, progress).await? {
+                replay_limits.push(recorded);
+            }
         }
         checks.push(ALL_STEPS);
     }
@@ -220,6 +253,15 @@ pub async fn verify(verify: Verify<'_>) -> Result<Verified, Mismatch> {
         messages: broca_module::store_read::transcript_len(staged),
         media,
         checks,
+        legacy_replay_limit: replay_limits.len() as u64,
+        legacy_replay_limit_examples: replay_limits
+            .iter()
+            .take(5)
+            .map(|step| ReplayLimit {
+                run_id: step.run.clone(),
+                step: step.step,
+            })
+            .collect(),
     })
 }
 
@@ -1093,14 +1135,15 @@ async fn store_request<B: SessionBackend>(
 }
 
 /// The recorded step `recorded`, rebuilt by the new run loop from the converted WAL up to its
-/// start, must render to the bytes today's renderer builds for it, and those to the bytes the
-/// provider was sent.
+/// start, must render to the bytes today's renderer builds for it. A historical digest today's
+/// offline replay cannot reproduce is reported separately, not blamed on the conversion.
 async fn step(
     verify: &Verify<'_>,
     lineage: Option<&str>,
     recorded: &RecordedStep,
     check: &'static str,
-) -> Result<(), Mismatch> {
+    progress: broca_session_store::backend::unpublished::Progress<'_>,
+) -> Result<bool, Mismatch> {
     let records = verify.records;
     let wal: Vec<WalRecord> = records.iter().map(|frame| frame.record.clone()).collect();
     let contract = broca_core::is_mode3_log(&wal);
@@ -1127,7 +1170,7 @@ async fn step(
     let cap =
         broca_core::output_reservation::recorded_cap(prefix, broca_protocol::StepId(recorded.step));
     let holds_media = !crate::stage::media_digests(&records[..=end]).is_empty();
-    let converted = crate::convert(&records[..=end], lineage)
+    let mut converted = crate::convert(&records[..=end], lineage)
         .map_err(|error| at(format!("the conversion: {}", error.0)))?;
     let parts = MemoryParts {
         parts: converted.parts.clone(),
@@ -1139,38 +1182,35 @@ async fn step(
         // the rebuild is written to a folder, with the bytes of every medium it names.
         let scratch = verify.staging.join("step-rebuild");
         let _ = std::fs::remove_dir_all(&scratch);
-        let rebuilt = async {
-            let media =
-                crate::stage::read_media(&records[..=end], &converted.records, verify.media)
-                    .map_err(|error| format!("the media: {error}"))?;
-            let mut session = Session::create(
-                LocalBackend::new(&scratch),
-                addr,
-                triple,
-                verify.deployment,
-                !contract,
-            )
-            .await
-            .map_err(|error| format!("a session for the rebuild: {error:?}"))?;
-            crate::stage::append_batch(&mut session, &converted.records, &media)
-                .await
-                .map_err(|error| format!("a session for the rebuild: {error}"))?;
-            let rebuilt = store_request(
-                &session,
-                &scratch,
-                &parts,
-                verify.session,
-                recorded.step,
-                &recorded.config,
-                cap,
-                true,
-            )
-            .await;
-            let _ = session.close().await;
-            rebuilt
-        }
+        let rebuilt = media_rebuild_on(
+            verify,
+            recorded,
+            &records[..=end],
+            &mut converted,
+            cap,
+            broca_session_store::backend::unpublished::UnpublishedBackend::scratch(
+                &scratch, progress,
+            ),
+        )
         .await;
         let _ = std::fs::remove_dir_all(&scratch);
+        #[cfg(test)]
+        {
+            let durable = media_rebuild_on(
+                verify,
+                recorded,
+                &records[..=end],
+                &mut converted,
+                cap,
+                LocalBackend::new(&scratch),
+            )
+            .await;
+            let _ = std::fs::remove_dir_all(&scratch);
+            assert_eq!(
+                rebuilt, durable,
+                "disposable and durable media reconstruction differ"
+            );
+        }
         rebuilt
     } else {
         let backend = MemoryBackend::default();
@@ -1178,6 +1218,7 @@ async fn step(
             let mut session = Session::create(&backend, addr, triple, verify.deployment, !contract)
                 .await
                 .map_err(|error| format!("a session for the rebuild: {error:?}"))?;
+            converted.start_at(session.next_seq());
             session
                 .append(&converted.records, false)
                 .await
@@ -1197,11 +1238,6 @@ async fn step(
         .await
     }
     .map_err(|error| at(format!("the new run loop's rebuild: {error}")))?;
-    if sha256_hex(&rebuilt) != recorded.digest {
-        return Err(at(
-            "the request differs from the one the provider was sent".into()
-        ));
-    }
     let today = todays_request(
         verify,
         lineage,
@@ -1213,10 +1249,64 @@ async fn step(
         holds_media,
     )
     .map_err(|error| at(format!("today's renderer: {error}")))?;
+    compare_request(&rebuilt, &today, &recorded.digest).map_err(|error| at(error.into()))
+}
+
+pub(crate) fn compare_request(
+    rebuilt: &[u8],
+    today: &[u8],
+    recorded_digest: &str,
+) -> Result<bool, &'static str> {
     if rebuilt != today {
-        return Err(at("the rebuilt request differs from today's render".into()));
+        return Err("the rebuilt request differs from today's render");
     }
-    Ok(())
+    let legacy_replay_limit = sha256_hex(today) != recorded_digest;
+    if !legacy_replay_limit && sha256_hex(rebuilt) != recorded_digest {
+        return Err("the request differs from the one the provider was sent");
+    }
+    Ok(legacy_replay_limit)
+}
+
+async fn media_rebuild_on<B: SessionBackend>(
+    verify: &Verify<'_>,
+    recorded: &RecordedStep,
+    records: &[FramedRecord],
+    converted: &mut crate::Converted,
+    cap: Option<u32>,
+    backend: B,
+) -> Result<Vec<u8>, String> {
+    let media = crate::stage::read_media(records, &converted.records, verify.media)
+        .map_err(|error| format!("the media: {error}"))?;
+    let contract = broca_core::is_mode3_log(records.iter().map(|frame| &frame.record));
+    let mut session = Session::create(
+        backend,
+        SessionAddr(broca_core::session_addr(verify.session)),
+        crate::stage::triple(verify.session),
+        verify.deployment,
+        !contract,
+    )
+    .await
+    .map_err(|error| format!("a session for the rebuild: {error:?}"))?;
+    converted.start_at(session.next_seq());
+    crate::stage::append_batch(&mut session, &converted.records, &media)
+        .await
+        .map_err(|error| format!("a session for the rebuild: {error}"))?;
+    let parts = MemoryParts {
+        parts: converted.parts.clone(),
+    };
+    let rebuilt = store_request(
+        &session,
+        &verify.staging.join("step-rebuild"),
+        &parts,
+        verify.session,
+        recorded.step,
+        &recorded.config,
+        cap,
+        true,
+    )
+    .await;
+    let _ = session.close().await;
+    rebuilt
 }
 
 /// The run id the synthetic next send starts. No real run carries it: the copy that receives it
@@ -1318,20 +1408,60 @@ async fn next_request(
     view: &Session<LocalBackend>,
     addr: &SessionAddr,
     triple: &broca_session_store::head::SessionTriple,
+    progress: broca_session_store::backend::unpublished::Progress<'_>,
+) -> Result<(), Mismatch> {
+    let scratch = verify.staging.join("next-request");
+    let result = next_request_on(
+        verify,
+        lineage,
+        view,
+        addr,
+        triple,
+        broca_session_store::backend::unpublished::UnpublishedBackend::scratch(&scratch, progress),
+        progress,
+    )
+    .await;
+    #[cfg(test)]
+    {
+        let durable = next_request_on(
+            verify,
+            lineage,
+            view,
+            addr,
+            triple,
+            LocalBackend::new(&scratch),
+            None,
+        )
+        .await;
+        assert_eq!(
+            result, durable,
+            "disposable and durable next-request verification differ"
+        );
+    }
+    result
+}
+
+async fn next_request_on<B: broca_session_store::backend::SessionBackend>(
+    verify: &Verify<'_>,
+    lineage: Option<&str>,
+    view: &Session<LocalBackend>,
+    addr: &SessionAddr,
+    triple: &broca_session_store::head::SessionTriple,
+    backend: B,
+    progress: broca_session_store::backend::unpublished::Progress<'_>,
 ) -> Result<(), Mismatch> {
     let scratch = verify.staging.join("next-request");
     let _ = std::fs::remove_dir_all(&scratch);
     let result = async {
         copy_session(verify.staging, &scratch, &addr.0)
             .map_err(|error| mismatch(FIRST_OPEN, format!("copy the staged session: {error}")))?;
-        let mut session = Session::load(
-            LocalBackend::new(&scratch),
-            addr.clone(),
-            triple,
-            verify.deployment,
-        )
-        .await
-        .map_err(|error| mismatch(FIRST_OPEN, format!("open: {error:?}")))?;
+        let mut session = Session::load(backend, addr.clone(), triple, verify.deployment)
+            .await
+            .map_err(|error| mismatch(FIRST_OPEN, format!("open: {error:?}")))?;
+        scratch_progress(
+            progress,
+            broca_session_store::backend::unpublished::Step::ScratchLoaded,
+        )?;
         if session.conversation.encode() != view.conversation.encode()
             || session.operations.encode() != view.operations.encode()
         {
@@ -1362,8 +1492,11 @@ async fn next_request(
             holds_media,
         )
         .map_err(|error| mismatch(NEXT_REQUEST, format!("today's renderer: {error}")))?;
-        let converted = crate::convert(&extended, lineage)
+        let mut converted = crate::convert(&extended, lineage)
             .map_err(|error| mismatch(NEXT_REQUEST, format!("the conversion: {}", error.0)))?;
+        // Reproduce the staged prefix at its stored origin. The synthetic next send adds only
+        // a run input and step boundary, with no Input.receipt_seq naming a new Steer or Delivery.
+        converted.start_at(verify.converted.first_seq.unwrap_or(crate::FIRST_SEQ));
         let staged = &verify.converted.records;
         if !converted.records.starts_with(staged) {
             return Err(mismatch(
@@ -1375,6 +1508,10 @@ async fn next_request(
             .append(&converted.records[staged.len()..], true)
             .await
             .map_err(|error| mismatch(NEXT_REQUEST, format!("append the next send: {error:?}")))?;
+        scratch_progress(
+            progress,
+            broca_session_store::backend::unpublished::Step::ScratchAppended,
+        )?;
         let parts = MemoryParts {
             parts: converted.parts.clone(),
         };
@@ -1400,11 +1537,23 @@ async fn next_request(
                 "the next request differs from the one today's renderer builds",
             ));
         }
+        scratch_progress(
+            progress,
+            broca_session_store::backend::unpublished::Step::ScratchCompared,
+        )?;
         Ok(())
     }
     .await;
     let _ = std::fs::remove_dir_all(&scratch);
     result
+}
+
+fn scratch_progress(
+    callback: broca_session_store::backend::unpublished::Progress<'_>,
+    step: broca_session_store::backend::unpublished::Step,
+) -> Result<(), Mismatch> {
+    broca_session_store::backend::unpublished::progress(callback, step)
+        .map_err(|error| mismatch(NEXT_REQUEST, format!("verification interrupted: {error}")))
 }
 
 /// The walks `session.history` is read by: each form, from the newest page by `older` cursors

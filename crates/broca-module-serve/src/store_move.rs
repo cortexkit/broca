@@ -51,6 +51,11 @@ use broca_wal::{
 };
 use serde_json::json;
 
+mod directories;
+pub(crate) use directories::PublicationDirs;
+#[cfg(test)]
+pub(crate) use tests::Faults;
+
 /// Who holds a moved session's WAL, as the `moved` marker names it.
 pub const HOLDER: &str = "session-store/v1";
 
@@ -129,6 +134,7 @@ pub struct StoreMove {
     pub(crate) forget_projection: Option<ForgetProjection>,
     pub(crate) late_results: Option<Arc<broca_module::late_results_store::LateResultsStore>>,
     pub(crate) held_slots: Option<Arc<broca_module::held_slots::HeldSlots>>,
+    directories: std::sync::Mutex<PublicationDirs>,
     #[cfg(test)]
     pub(crate) faults: tests::Faults,
 }
@@ -183,6 +189,7 @@ impl StoreMove {
             forget_projection: None,
             late_results: None,
             held_slots: None,
+            directories: Default::default(),
             #[cfg(test)]
             faults: Default::default(),
         }
@@ -728,6 +735,18 @@ impl StoreMove {
         before!(write_journal(&state_root, &journal)
             .map_err(io_failed("the move's journal couldn't be written")));
         before!(self.step("journal_layout"));
+        {
+            let mut directories = self.directories.lock().unwrap_or_else(|p| p.into_inner());
+            before!(directories
+                .ensure(&state_root, &paths.store)
+                .map_err(io_failed("the class store couldn't be initialized")));
+            before!(directories
+                .ensure_parent(
+                    &state_root,
+                    paths.staging.parent().expect("staging has a parent")
+                )
+                .map_err(io_failed("the staging parent couldn't be initialized")));
+        }
         // Stage. The moved session goes on serving the last update today's head serves for it.
         let lineage_text = lineage.map(|id| id.to_string());
         let observed = before!(self
@@ -762,31 +781,57 @@ impl StoreMove {
             media: media_bytes(&media),
             moved: &moved,
         };
-        let staged = before!(broca_session_convert::stage::write(&stage, prepared)
-            .await
-            .map_err(|error| unavailable("the session couldn't be staged", error)));
+        #[cfg(test)]
+        let interrupted = std::sync::atomic::AtomicBool::new(false);
+        #[cfg(test)]
+        let callback = |step: broca_session_store::backend::unpublished::Step| {
+            if self.faults.crash_here(step.name()) {
+                interrupted.store(true, std::sync::atomic::Ordering::Relaxed);
+                return Err(std::io::Error::other("move interrupted"));
+            }
+            Ok(())
+        };
+        #[cfg(test)]
+        let progress: broca_session_store::backend::unpublished::Progress<'_> = Some(&callback);
+        #[cfg(not(test))]
+        let progress = None;
+        let staged =
+            broca_session_convert::stage::write_with_progress(&stage, prepared, progress).await;
+        #[cfg(test)]
+        if interrupted.load(std::sync::atomic::Ordering::Relaxed) {
+            before!(Err::<(), _>(Stop::Crashed));
+        }
+        let staged =
+            before!(staged.map_err(|error| unavailable("the session couldn't be staged", error)));
         before!(self.step("stage"));
         // Verify.
         #[cfg(test)]
         let records = self.faults.planted(records);
-        let verified = before!(broca_session_convert::verify::verify(Verify {
-            records: &records,
-            lineage,
-            session: key,
-            deployment: new_session_cipher(runtime),
-            store_root: &store,
-            staging: &paths.staging,
-            converted: &staged.converted,
-            mode: Mode::Move,
-            media: media_bytes(&media),
-            media_root: media.as_ref().map(|media| MediaRoot {
-                state_root: &state_root,
-                class: media.class,
-            }),
-            todays_updated_at,
-        })
-        .await
-        .map_err(|mismatch| {
+        let verified = broca_session_convert::verify::verify_with_progress(
+            Verify {
+                records: &records,
+                lineage,
+                session: key,
+                deployment: new_session_cipher(runtime),
+                store_root: &store,
+                staging: &paths.staging,
+                converted: &staged.converted,
+                mode: Mode::Move,
+                media: media_bytes(&media),
+                media_root: media.as_ref().map(|media| MediaRoot {
+                    state_root: &state_root,
+                    class: media.class,
+                }),
+                todays_updated_at,
+            },
+            progress,
+        )
+        .await;
+        #[cfg(test)]
+        if interrupted.load(std::sync::atomic::Ordering::Relaxed) {
+            before!(Err::<(), _>(Stop::Crashed));
+        }
+        let verified = before!(verified.map_err(|mismatch| {
             MoveRefusal::new(
                 "move_verification_failed",
                 format!("the staged session differs from today's: {mismatch}"),
@@ -794,6 +839,12 @@ impl StoreMove {
             .with_detail(json!({ "check": mismatch.check, "detail": mismatch.detail }))
         }));
         before!(self.step("verify"));
+        if verified.legacy_replay_limit > 0 {
+            tracing::warn!(target: "store_move", session = %key.session,
+                legacy_replay_limit = verified.legacy_replay_limit,
+                examples = ?verified.legacy_replay_limit_examples,
+                "converted requests match today's offline replay, which cannot reproduce every historical request digest");
+        }
         // The runtime serving the session reads its setup parts from memory: hold the staged
         // ones there, already stored in the destination root.
         before!(Self::hold_parts(
@@ -887,6 +938,7 @@ impl StoreMove {
             &paths.staging,
             &paths.store,
             &journal.address,
+            &mut self.directories.lock().unwrap_or_else(|p| p.into_inner()),
             |step| self.step(step),
         )
     }
@@ -904,8 +956,12 @@ pub(crate) fn publish_data_at(
     staging: &Path,
     store: &Path,
     address: &str,
+    directories: &mut PublicationDirs,
     mut step: impl FnMut(&'static str) -> Result<(), Stop>,
 ) -> Result<(), Stop> {
+    directories
+        .ensure(state_root, store)
+        .map_err(io_failed("the class store couldn't be initialized"))?;
     let live_logs = store.join("logs").join(address);
     let live_objects = store.join("objects").join(address);
     for (folder, live, boundary) in [
@@ -930,23 +986,43 @@ pub(crate) fn publish_data_at(
             }
             continue;
         }
-        let parent = live.parent().expect("a live folder has a parent");
-        migration::durable_dir(state_root, parent)
-            .map_err(io_failed("the new storage's folders couldn't be made"))?;
         std::fs::rename(&staged, live)
             .map_err(io_failed("the staged session couldn't be published"))?;
         // The online move's fault boundary remains immediately after the rename.
         // Cutover recovery uses the same boundary before it publishes the head.
         step(boundary)?;
     }
-    for folder in [
-        store.join("logs"),
-        store.join("objects"),
-        store.to_path_buf(),
-    ] {
-        match migration::sync_dir(&folder) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            other => other.map_err(io_failed("the new storage's folders couldn't be synced"))?,
+    for folder in ["logs", "objects"] {
+        // A visible destination on restart is not proof that its rename was synced. Replay
+        // both changed-parent barriers even when the session directory already left staging.
+        if store
+            .join(folder)
+            .join(address)
+            .try_exists()
+            .map_err(io_failed("the published data couldn't be checked"))?
+        {
+            for (parent, boundary) in [
+                (
+                    staging.join(folder),
+                    if folder == "logs" {
+                        "sync_logs_source_parent"
+                    } else {
+                        "sync_objects_source_parent"
+                    },
+                ),
+                (
+                    store.join(folder),
+                    if folder == "logs" {
+                        "sync_logs_destination_parent"
+                    } else {
+                        "sync_objects_destination_parent"
+                    },
+                ),
+            ] {
+                migration::sync_dir(&parent)
+                    .map_err(io_failed("a data rename's parent couldn't be synced"))?;
+                step(boundary)?;
+            }
         }
     }
     step("sync_data")?;

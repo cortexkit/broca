@@ -5143,6 +5143,7 @@ fn refused_send_code(error: &ServeError) -> String {
         ServeError::ContextCeiling(_) => cortexkit_role_llm_runner::errors::CONTEXT_CEILING.into(),
         ServeError::UnknownSend => cortexkit_role_llm_runner::errors::UNKNOWN_SEND.into(),
         ServeError::SessionMoving { .. } => "session_moving".into(),
+        ServeError::SessionConverting => "session_converting".into(),
         ServeError::SessionMoved { .. } => "session_moved".into(),
         ServeError::Expired { .. } => broca_module::retention::EXPIRED.into(),
         ServeError::RetentionInvalid(_) | ServeError::InvalidParams { .. } => {
@@ -5215,6 +5216,7 @@ fn refused_send_class(error: &ServeError) -> &'static str {
         | ServeError::Transient(_)
         | ServeError::TagsAwaitSetup
         | ServeError::SessionMoving { .. }
+        | ServeError::SessionConverting
         | ServeError::SessionMoved { .. }
         | ServeError::SessionHeld(_)
         | ServeError::ScopeFreezeBusy { .. }
@@ -5461,6 +5463,11 @@ async fn send_serve_error(
         ServeError::SessionMoving { cut_id } => {
             let body = ErrorBody::new("session_moving", err.to_string())
                 .with_detail(serde_json::json!({"cutId":cut_id}));
+            return send_error_body(writer, ver, channel, epoch, corr, body).await;
+        }
+        ServeError::SessionConverting => {
+            let body = ErrorBody::new("session_converting", err.to_string())
+                .with_detail(serde_json::json!({"class":"transient", "retryable":true}));
             return send_error_body(writer, ver, channel, epoch, corr, body).await;
         }
         ServeError::SessionMoved { holder } => {
@@ -7283,6 +7290,7 @@ mod tests {
             lineage_id: None,
             messages: vec![
                 SessionReadMessage {
+                    send_id: None,
                     speaks_for: None,
                     notice: false,
                     sender: None,
@@ -7311,6 +7319,7 @@ mod tests {
                     part_digests: None,
                 },
                 SessionReadMessage {
+                    send_id: None,
                     speaks_for: None,
                     notice: false,
                     sender: None,
@@ -11129,3 +11138,26 @@ mod classifier_route_tests;
 #[cfg(test)]
 #[path = "serve_flow_compat_tests.rs"]
 mod flow_management_compat_tests;
+
+#[cfg(test)]
+mod background_conversion_errors {
+    use super::*;
+
+    #[tokio::test]
+    async fn background_live_registry_refusal_is_retryable_session_converting_on_wire() {
+        let error = ServeError::from(broca_module::registry::OpenError::SessionConverting);
+        assert_eq!(refused_send_code(&error), "session_converting");
+        assert_eq!(refused_send_class(&error), "transient");
+        let (writer, mut reader) = broca_diagnostics::channel(1, std::sync::Arc::default());
+        send_serve_error(&writer, PROTOCOL_VERSION, 7, 3, 11, &error)
+            .await
+            .unwrap();
+        let frame = reader.recv().await.unwrap();
+        assert_eq!(frame.header.ty, FrameType::Error);
+        let body: ErrorBody = serde_json::from_slice(&frame.body).unwrap();
+        assert_eq!(body.code, "session_converting");
+        let detail = body.detail.unwrap();
+        assert_eq!(detail["class"], "transient");
+        assert_eq!(detail["retryable"], true);
+    }
+}

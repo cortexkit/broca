@@ -422,6 +422,7 @@ pub fn broca_role_describe_with_writers(
         // Client identity belongs to the display envelope, never to a model-visible message.
         cortexkit_role_llm_runner::capabilities::CLIENT_MESSAGE_ID,
         cortexkit_role_llm_runner::capabilities::MESSAGE_SENDERS,
+        cortexkit_role_llm_runner::capabilities::SEND_IDS,
         cortexkit_role_llm_runner::capabilities::STEP_EVENTS,
     ]
     .map(String::from)
@@ -1211,7 +1212,7 @@ mod pinned_reply_bytes {
     #[test]
     fn adopted_runner_groups_leave_other_optional_groups_undeclared() {
         use cortexkit_role_llm_runner::capabilities::{
-            ADMISSION_REPORTS, MEDIA_REFS, MESSAGE_MARKS, NOTICE_WITH_SPEAKS_FOR,
+            ADMISSION_REPORTS, MEDIA_REFS, MESSAGE_MARKS, NOTICE_WITH_SPEAKS_FOR, SEND_IDS,
         };
         for writer in [false, true] {
             let actual = broca_role_describe_with_writers("test", writer, writer, writer);
@@ -1222,6 +1223,7 @@ mod pinned_reply_bytes {
                 NOTICE_WITH_SPEAKS_FOR,
                 MEDIA_REFS,
                 ADMISSION_REPORTS,
+                SEND_IDS,
             ] {
                 assert!(checked.declares(group), "{group}");
             }
@@ -1231,7 +1233,6 @@ mod pinned_reply_bytes {
                 "call_yield",
                 "stop_all",
                 "cache_policy",
-                "send_ids",
                 "history_intake",
                 "plan_notes",
                 "restart_survival",
@@ -1292,7 +1293,7 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "29f250c49a0197d08636dc98d6d07da3feb875300078d7c8b0efbc69c2a862ef",
+            "a28c31f6716acf758955f1d88afefe2c208fe1ed83a1b1428829ef1bc6c40e51",
         );
     }
 
@@ -1487,11 +1488,25 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "2b0c12edf930a42f049665f1ab6f3c84d1c913a5a7beb5e5247a5f798107df85";
+        "0e1ba9cb6405b6e3cce519225578ff8a166cdfd4f84f5a2def903140c60532bd";
     const RUN_TOOL_CALLS_PAGE_SHA256: &str =
         "6978763bd48c30edffbf61a4b4a0966d7efdfc146b94023f4a36cca4bda0881d";
     const DELIVERED_STEP_SHA256: &str =
         "8dac9b0a27f22fd515c117b54d844f88b2a51947de5e4b7ac1b9eab626237aed";
     const DELIVERED_TURN_SHA256: &str =
         "e78ee6901194a60f3081074ad295982e08d64b11b574e7c837bc7dd4a15846c2";
+}
+
+#[test]
+#[ignore = "requires BROCA_SEND_ID_SAMPLES output directory"]
+fn send_id_describe_serializer_sample() {
+    let root = std::env::var_os("BROCA_SEND_ID_SAMPLES").expect("sample output directory");
+    let root = std::path::PathBuf::from(root);
+    std::fs::create_dir_all(&root).unwrap();
+    let describe = broca_role_describe(env!("CARGO_PKG_VERSION"));
+    std::fs::write(
+        root.join("role.describe.json"),
+        serde_json::to_vec_pretty(&describe).unwrap(),
+    )
+    .unwrap();
 }

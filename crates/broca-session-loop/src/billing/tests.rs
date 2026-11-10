@@ -100,6 +100,104 @@ fn bind() -> BindIdentity {
     BindIdentity::new("/project", "runner", "s")
 }
 
+#[test]
+fn stored_cache_write_lifetimes_reach_the_shared_billing_builder() {
+    block_on(async {
+        let mut records = log();
+        let WalRecord::ModelStepFinished {
+            usage,
+            service_tier_used,
+            ..
+        } = &mut records[2].record
+        else {
+            unreachable!()
+        };
+        *usage = broca_protocol::Usage {
+            input_tokens: Some(3),
+            cache_write_tokens: Some(30),
+            cache_write_5m_tokens: Some(10),
+            cache_write_1h_tokens: Some(20),
+            ..Default::default()
+        };
+        *service_tier_used = Some("priority".into());
+        let converted = broca_session_convert::convert(&records, None).unwrap();
+        let backend = MemoryBackend::default();
+        let mut session = Session::create(
+            &backend,
+            SessionAddr("cache-write-split".into()),
+            SessionTriple {
+                project_root: "/project".into(),
+                harness: "runner".into(),
+                session: "s".into(),
+            },
+            &DeploymentKey::new(1, &[1; 32]),
+            false,
+        )
+        .await
+        .unwrap();
+        session.append(&converted.records, true).await.unwrap();
+        let parts = MemoryParts {
+            parts: converted.parts,
+        };
+        let rebuilt = run_records(&session, "r1", &bind(), &parts).await.unwrap();
+        let usage = rebuilt
+            .iter()
+            .find_map(|framed| match &framed.record {
+                WalRecord::ModelStepFinished { usage, .. } => Some(usage),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(usage.cache_write_tokens, Some(30));
+        assert_eq!(usage.cache_write_5m_tokens, Some(10));
+        assert_eq!(usage.cache_write_1h_tokens, Some(20));
+        let resolver = |_: &str, _: &str| (broca_core::billing::ChargeBasis::Unknown, 1);
+        let facts = broca_core::billing::compute_segments_for_run(
+            &rebuilt,
+            &broca_protocol::RunId("r1".into()),
+            "synthetic-source",
+            &resolver,
+        );
+        let mut without_splits = rebuilt.clone();
+        for framed in &mut without_splits {
+            if let WalRecord::ModelStepFinished { usage, .. } = &mut framed.record {
+                usage.cache_write_5m_tokens = None;
+                usage.cache_write_1h_tokens = None;
+            }
+        }
+        let old_facts = broca_core::billing::compute_segments_for_run(
+            &without_splits,
+            &broca_protocol::RunId("r1".into()),
+            "synthetic-source",
+            &resolver,
+        );
+        for (fact, old) in facts.iter().zip(&old_facts) {
+            assert_eq!(fact.fact_id, old.fact_id);
+        }
+        assert_eq!(facts[0].usage.cache_write_tokens, Some(30));
+        assert_eq!(facts[0].usage.cache_write_5m_tokens, Some(10));
+        assert_eq!(facts[0].usage.cache_write_1h_tokens, Some(20));
+        assert_eq!(
+            facts[0].usage_by_service_tier.as_ref().unwrap()["priority"],
+            facts[0].usage
+        );
+        let mut comparable = facts.clone();
+        for fact in &mut comparable {
+            fact.usage.cache_write_5m_tokens = None;
+            fact.usage.cache_write_1h_tokens = None;
+            if let Some(tiers) = &mut fact.usage_by_service_tier {
+                for usage in tiers.values_mut() {
+                    usage.cache_write_5m_tokens = None;
+                    usage.cache_write_1h_tokens = None;
+                }
+            }
+        }
+        assert_eq!(
+            serde_json::to_vec(&comparable).unwrap(),
+            serde_json::to_vec(&old_facts).unwrap()
+        );
+    });
+}
+
 /// Each fed record's type, and the run it names when it names one.
 fn kinds(records: &[FramedRecord]) -> Vec<String> {
     records

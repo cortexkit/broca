@@ -709,6 +709,8 @@ fn openai_chat_captured_cache_write_is_split_out_of_fresh_input() {
             input_tokens: Some(3),
             cached_input_tokens: Some(0),
             cache_write_tokens: Some(3170),
+            cache_write_5m_tokens: None,
+            cache_write_1h_tokens: None,
             output_tokens: Some(4),
             reasoning_tokens: Some(0),
         }
@@ -727,6 +729,8 @@ fn openai_chat_captured_cache_read_after_write_splits_the_same_prompt() {
             input_tokens: Some(3),
             cached_input_tokens: Some(3170),
             cache_write_tokens: Some(0),
+            cache_write_5m_tokens: None,
+            cache_write_1h_tokens: None,
             output_tokens: Some(4),
             reasoning_tokens: Some(0),
         }

@@ -158,6 +158,47 @@ fn usage_keeps_reported_zero_apart_from_unreported() {
 }
 
 #[test]
+fn usage_before_cache_write_lifetimes_keeps_exact_bytes() {
+    // These bytes predate cache-write lifetime counters; absent additions must cost no bytes.
+    let pinned = [0x10, 10, 0x20, 20, 0x30, 30, 0x40, 4, 0x50, 2];
+    let usage = Usage::decode(&pinned).unwrap();
+    assert_eq!(usage.input_tokens, Some(10));
+    assert_eq!(usage.cache_write_tokens, Some(30));
+    assert_eq!(usage.encode(), pinned);
+
+    // The same decoder used by old builds skips unrecognized optional usage members.
+    let mut newer = pinned.to_vec();
+    put_req(&mut newer, 99, false, &20u64);
+    assert_eq!(Usage::decode(&newer).unwrap(), usage);
+    assert_eq!(Usage::decode(&newer).unwrap().encode(), pinned);
+}
+
+#[test]
+fn cache_write_lifetimes_are_optional_in_the_usage_codec() {
+    let pinned = [0x30, 30, 0x60, 0, 0x70, 30];
+    let usage = Usage::decode(&pinned).unwrap();
+    assert_eq!(usage.cache_write_tokens, Some(30));
+    assert_eq!(usage.cache_write_5m_tokens, Some(0));
+    assert_eq!(usage.cache_write_1h_tokens, Some(30));
+    assert_eq!(usage.encode(), pinned);
+
+    // Freeze the old Usage reader's field dispatch: ids 6 and 7 are optional unknown fields.
+    let mut old = Usage::default();
+    crate::codec::read_fields(Raw::Len(&pinned), "old Usage", |field| match field.number {
+        1 => crate::codec::take_one(&mut old.input_tokens, field, "old Usage"),
+        2 => crate::codec::take_one(&mut old.cached_input_tokens, field, "old Usage"),
+        3 => crate::codec::take_one(&mut old.cache_write_tokens, field, "old Usage"),
+        4 => crate::codec::take_one(&mut old.output_tokens, field, "old Usage"),
+        5 => crate::codec::take_one(&mut old.reasoning_tokens, field, "old Usage"),
+        _ => crate::codec::skip_unknown(field, "old Usage"),
+    })
+    .unwrap();
+    assert_eq!(old.cache_write_tokens, Some(30));
+    assert_eq!(old.cache_write_5m_tokens, None);
+    assert_eq!(old.cache_write_1h_tokens, None);
+}
+
+#[test]
 fn opaque_text_is_stored_as_bytes_only_when_it_re_encodes_exactly() {
     let standard = |t| canonical_base64(t, Alphabet::Standard);
     let url_safe = |t| canonical_base64(t, Alphabet::UrlSafe);

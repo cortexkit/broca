@@ -586,6 +586,138 @@ fn a_planted_difference_fails_the_check_that_compares_it() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+fn delivered_messages_rebuild_after_staging(mode: &str) {
+    let root = scratch(&format!("delivery-receipt-{mode}"));
+    let records = framed(vec![
+        run_started("r1", 1_000, "Start."),
+        record(
+            json!({"type": "send_delivered", "submission_id": "q1", "run_id": "r1",
+            "mode": mode, "input": [{"role": if mode == "turn_system" { "system" } else { "user" },
+                "content": [{"type": "text", "text": "Continue."}]}]}),
+        ),
+        record(json!({"type": "step_started", "step_id": 1})),
+        record(json!({"type": "model_step_finished", "step_id": 1,
+            "assistant_message": {"message_id": "m1", "content": [{"type": "text", "text": "Done."}]},
+            "usage": {}, "retries_used": 0})),
+        record(
+            json!({"type": "run_finished", "reason": "completed", "usage": {}, "retries_used": 0}),
+        ),
+    ]);
+    let staged = staged(&root, &records, None);
+    let staging = root.join("session-store/staging/store-move-test");
+    let view = block_on(Session::view(
+        LocalBackend::new(&staging),
+        SessionAddr(broca_core::session_addr(&session())),
+        &crate::stage::triple(&session()),
+        &deployment(),
+    ))
+    .unwrap();
+    let parts = broca_session_loop::parts::MemoryParts {
+        parts: staged.converted.parts,
+    };
+    let mut fold = broca_module::store_media::MediaFold::new(session());
+    block_on(fold.catch_up(&view, &parts));
+    assert_eq!(
+        fold.broken(),
+        None,
+        "the stored receipt must name its delivery"
+    );
+    drop(view);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_delivered_steers_receipt_survives_staging_and_the_media_fold() {
+    delivered_messages_rebuild_after_staging("steer");
+}
+
+#[test]
+fn a_turn_system_deliverys_receipt_survives_staging_and_the_media_fold() {
+    delivered_messages_rebuild_after_staging("turn_system");
+}
+
+#[test]
+fn conversion_rebasing_keeps_legacy_views_at_their_storage_sequences() {
+    let root = scratch("legacy-view-origin");
+    let (records, lineage) = written(&root);
+    let lineage = lineage.map(|id| id.to_string());
+    let mut converted = crate::convert(&records, lineage.as_deref()).unwrap();
+    // Legacy-view pointers already account for the destination's initial WriterOpened record.
+    // Receipts instead count from 1 when inverse::invert reconstructs the original WAL before
+    // storage. Keep the legacy-view pointers' existing origin when storing.
+    let view_seq = crate::FIRST_SEQ + 3;
+    let Record::EntryFacts(facts) = converted
+        .records
+        .iter_mut()
+        .find(|record| matches!(record, Record::EntryFacts(_)))
+        .unwrap()
+    else {
+        unreachable!()
+    };
+    facts.legacy_view_seq = Some(view_seq);
+    for (first, expected) in [
+        (crate::FIRST_SEQ, view_seq),
+        (crate::FIRST_SEQ + 7, view_seq + 7),
+        (crate::FIRST_SEQ, view_seq),
+    ] {
+        converted.start_at(first);
+        let recorded = converted.records.iter().find_map(|record| match record {
+            Record::EntryFacts(facts) => facts.legacy_view_seq,
+            _ => None,
+        });
+        assert_eq!(recorded, Some(expected));
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_legacy_request_replay_limit_is_verified_and_counted_once() {
+    let root = scratch("legacy-replay-limit");
+    let (mut records, lineage) = written(&root);
+    let attempt = records
+        .iter_mut()
+        .rev()
+        .find_map(|frame| match &mut frame.record {
+            WalRecord::ModelAttemptFinished {
+                request_body_sha256,
+                ..
+            } => Some(request_body_sha256),
+            _ => None,
+        })
+        .unwrap();
+    *attempt =
+        crate::verify::sha256_hex(b"a historical request that offline replay cannot reproduce");
+    let staged = staged(&root, &records, lineage);
+    let summary = verified(&root, &records, lineage, &staged.converted, Mode::Offline).unwrap();
+    let summary = serde_json::to_value(summary).unwrap();
+    assert_eq!(summary["legacy_replay_limit"], 1);
+    assert_eq!(
+        summary["legacy_replay_limit_examples"],
+        json!([{"run_id": "r2", "step": 2}])
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn request_comparison_never_accepts_conversion_drift() {
+    let today = b"today's independently rendered request";
+    let digest = crate::verify::sha256_hex(today);
+    assert_eq!(
+        crate::verify::compare_request(today, today, &digest),
+        Ok(false)
+    );
+    assert_eq!(
+        crate::verify::compare_request(today, today, "historical"),
+        Ok(true)
+    );
+    for recorded in [digest.as_str(), "historical"] {
+        assert_eq!(
+            crate::verify::compare_request(b"different request", today, recorded),
+            Err("the rebuilt request differs from today's render")
+        );
+    }
+}
+
 /// Media bytes by digest, as today's media store would give them back: a medium it holds whole,
 /// one whose bytes no longer match their digest, or none.
 #[derive(Debug, Default)]
@@ -750,8 +882,8 @@ fn a_session_holding_media_is_staged_with_its_bytes() {
         }))
         .unwrap_err()
     };
-    // The media agree, so the checks past them run. The WAL's recorded requests were rendered
-    // before its input held the images, so its last step is the first check to differ.
+    // The media agree, so the checks past them run. Without today's media root, the last step
+    // cannot compare its converted request with today's offline media render.
     let past = check(&media);
     assert_eq!(past.check, crate::verify::LAST_STEP, "{past}");
     let mut changed = media;

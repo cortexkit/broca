@@ -752,6 +752,14 @@ fn compute_segments_matching<R: ChargeBasisResolver>(
         output.extend(current.finish(resolver));
     }
 
+    for segment in &mut output {
+        segment.usage = segment.usage.with_complete_cache_write_lifetimes();
+        if let Some(tiers) = &mut segment.usage_by_service_tier {
+            for usage in tiers.values_mut() {
+                *usage = usage.with_complete_cache_write_lifetimes();
+            }
+        }
+    }
     output
 }
 
@@ -1074,6 +1082,7 @@ mod tests {
                 cached_input_tokens: Some(20068),
                 cache_write_tokens: Some(4),
                 reasoning_tokens: Some(23621),
+                ..Usage::default()
             },
             retries,
         );
@@ -1119,6 +1128,78 @@ mod tests {
     }
 
     #[test]
+    fn cache_write_lifetime_facts_preserve_total_only_bytes_and_identity() {
+        let mut records = synthetic_iteration_records(["claude-opus-5-5", "claude-opus-4-8"], 0);
+        let WalRecord::ModelStepFinished {
+            usage,
+            fallback,
+            service_tier_used,
+            ..
+        } = &mut records[1].record
+        else {
+            unreachable!()
+        };
+        fallback.usage_iterations = None;
+        *service_tier_used = Some("priority".into());
+        *usage = Usage {
+            input_tokens: Some(12),
+            cached_input_tokens: Some(100),
+            cache_write_tokens: Some(30),
+            output_tokens: Some(7),
+            ..Usage::default()
+        };
+        const TOTAL_ONLY: &str = r#"{"run_id":"synthetic-run","session":{"project_root":"/synthetic","harness":"capture","session":"l3"},"segment_ordinal":0,"fact_id":"fc07bbda7b53f37e36b57c65d801576d13a50b3fb38dd39b868dba2e857f9a37","provider":"anthropic","model":"claude-opus-4-8","auth_selection":"oauth:anthropic:synthetic","charge_basis":"subscription_included","charge_basis_mapping_version":1,"charge_basis_overrides":"none","usage":{"input_tokens":12,"cached_input_tokens":100,"cache_write_tokens":30,"output_tokens":7},"usage_by_service_tier":{"priority":{"input_tokens":12,"cached_input_tokens":100,"cache_write_tokens":30,"output_tokens":7}},"retries_used":0,"pricing_at_ms":100,"pricing_at_precision":"exact","occurred_at_ms":200,"occurred_at_precision":"terminal","terminal_reason":"completed"}"#;
+        let total_only = compute_segments(&records, "synthetic-source", &resolver);
+        assert_eq!(serde_json::to_string(&total_only[0]).unwrap(), TOTAL_ONLY);
+        let WalRecord::ModelStepFinished { usage, .. } = &mut records[1].record else {
+            unreachable!()
+        };
+        usage.cache_write_5m_tokens = Some(10);
+        usage.cache_write_1h_tokens = Some(20);
+        let facts = compute_segments_for_run(
+            &records,
+            &RunId("synthetic-run".into()),
+            "synthetic-source",
+            &resolver,
+        );
+        assert_eq!(
+            compute_segments(&records, "synthetic-source", &resolver),
+            facts
+        );
+        assert_eq!(facts[0].fact_id, total_only[0].fact_id);
+        assert_eq!(facts[0].usage.cache_write_tokens, Some(30));
+        assert_eq!(facts[0].usage.cache_write_5m_tokens, Some(10));
+        assert_eq!(facts[0].usage.cache_write_1h_tokens, Some(20));
+        let tiers = facts[0].usage_by_service_tier.as_ref().unwrap();
+        assert_eq!(tiers["priority"], facts[0].usage);
+        let mut expected: serde_json::Value = serde_json::from_str(TOTAL_ONLY).unwrap();
+        for value in ["usage", "usage_by_service_tier"] {
+            let target = if value == "usage" {
+                &mut expected[value]
+            } else {
+                &mut expected[value]["priority"]
+            };
+            target["cache_write_5m_tokens"] = json!(10);
+            target["cache_write_1h_tokens"] = json!(20);
+        }
+        assert_eq!(serde_json::to_value(&facts[0]).unwrap(), expected);
+        // A sample is the serialized builder result, not a hand-assembled fact.
+        if let Ok(directory) = std::env::var("BROCA_CACHE_WRITE_FACT_SAMPLES") {
+            std::fs::create_dir_all(&directory).unwrap();
+            for (name, fact) in [
+                ("anthropic-both-lifetimes.json", &facts[0]),
+                ("anthropic-total-only.json", &total_only[0]),
+            ] {
+                std::fs::write(
+                    std::path::Path::new(&directory).join(name),
+                    serde_json::to_vec(fact).unwrap(),
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    #[test]
     fn same_model_iterations_coalesce_and_count_retries_once() {
         let mut records = synthetic_iteration_records(["claude-opus-5-5", "claude-opus-5-5"], 3);
         if let WalRecord::ModelStepFinished {
@@ -1143,12 +1224,112 @@ mod tests {
                 cached_input_tokens: Some(40136),
                 cache_write_tokens: Some(4),
                 reasoning_tokens: None,
+                ..Usage::default()
             }
         );
         assert_eq!(segments[0].retries_used, 3);
         let tiers = segments[0].usage_by_service_tier.as_ref().unwrap();
         assert_eq!(tiers["priority"].output_tokens, Some(2124));
         assert_eq!(tiers["default"].output_tokens, Some(29287));
+    }
+
+    #[test]
+    fn cache_write_lifetime_segments_require_complete_total_and_tier_breakdowns() {
+        for (second_has_split, separate_tiers) in [(false, false), (true, false), (false, true)] {
+            let mut records = vec![
+                started(1, "synthetic-run", Some(100)),
+                step(
+                    2,
+                    1,
+                    Usage {
+                        cache_write_tokens: Some(30),
+                        cache_write_5m_tokens: Some(10),
+                        cache_write_1h_tokens: Some(20),
+                        ..Usage::default()
+                    },
+                    0,
+                ),
+                step(
+                    3,
+                    2,
+                    Usage {
+                        cache_write_tokens: Some(12),
+                        cache_write_5m_tokens: second_has_split.then_some(2),
+                        cache_write_1h_tokens: second_has_split.then_some(10),
+                        ..Usage::default()
+                    },
+                    0,
+                ),
+                terminal(4, Some(200), Usage::default()),
+            ];
+            for (index, tier) in [
+                (1, "priority"),
+                (
+                    2,
+                    if separate_tiers {
+                        "standard"
+                    } else {
+                        "priority"
+                    },
+                ),
+            ] {
+                let WalRecord::ModelStepFinished {
+                    service_tier_used, ..
+                } = &mut records[index].record
+                else {
+                    unreachable!()
+                };
+                *service_tier_used = Some(tier.into());
+            }
+            let facts = compute_segments(&records, "synthetic-source", &resolver);
+            assert_eq!(facts.len(), 1);
+            assert_eq!(facts[0].usage.cache_write_tokens, Some(42));
+            let expected_split = if second_has_split {
+                (Some(12), Some(30))
+            } else {
+                (None, None)
+            };
+            assert_eq!(
+                (
+                    facts[0].usage.cache_write_5m_tokens,
+                    facts[0].usage.cache_write_1h_tokens
+                ),
+                expected_split
+            );
+            let tiers = facts[0].usage_by_service_tier.as_ref().unwrap();
+            let priority_split = if separate_tiers {
+                (Some(10), Some(20))
+            } else {
+                expected_split
+            };
+            assert_eq!(
+                (
+                    tiers["priority"].cache_write_5m_tokens,
+                    tiers["priority"].cache_write_1h_tokens
+                ),
+                priority_split
+            );
+            assert_eq!(
+                tiers["priority"].cache_write_tokens,
+                Some(if separate_tiers { 30 } else { 42 })
+            );
+            if separate_tiers {
+                assert_eq!(tiers["standard"].cache_write_tokens, Some(12));
+                assert_eq!(tiers["standard"].cache_write_5m_tokens, None);
+                assert_eq!(tiers["standard"].cache_write_1h_tokens, None);
+            }
+            let mut without_splits = records.clone();
+            for record in &mut without_splits {
+                if let WalRecord::ModelStepFinished { usage, .. } = &mut record.record {
+                    usage.cache_write_5m_tokens = None;
+                    usage.cache_write_1h_tokens = None;
+                }
+            }
+            let old = compute_segments(&without_splits, "synthetic-source", &resolver);
+            for (fact, old) in facts.iter().zip(old) {
+                assert_eq!(fact.fact_id, old.fact_id);
+            }
+        }
     }
 
     #[test]

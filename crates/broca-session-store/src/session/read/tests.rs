@@ -8,6 +8,22 @@ use crate::keys::{Cipher, DeploymentKey};
 use crate::record::{Assistant, EntryFacts, Input, Placement, Record, StepStart, ToolReply};
 use crate::session::Session;
 
+#[test]
+fn sealed_read_cache_keeps_provenance_state_on_the_heap() {
+    let cache_bytes = std::mem::size_of::<super::SealedCaches>();
+    let session_bytes = std::mem::size_of::<Session<MemoryBackend>>();
+    println!("sealed caches: {cache_bytes} bytes; session: {session_bytes} bytes");
+    // Every session embeds its sealed cache, and read futures retain sessions across awaits.
+    assert!(
+        cache_bytes <= 128,
+        "sealed caches carry {cache_bytes} bytes; keep provenance folds on the heap"
+    );
+    assert!(
+        session_bytes <= 7 * 1024,
+        "session carries {session_bytes} bytes; keep read caches small"
+    );
+}
+
 cipher_tests!(
     every_message_reads_back_by_ordinal_after_two_cuts,
     message_ids_resolve_in_the_window_and_sealed_history,
@@ -93,6 +109,7 @@ fn reply(id: &str, text: String) -> Record {
 /// returns another message's facts shows it.
 fn facts(ordinal: u64) -> Record {
     Record::EntryFacts(EntryFacts {
+        send_id: None,
         named_speaker: None,
         client_message_id: None,
         sender: None,

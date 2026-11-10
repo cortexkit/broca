@@ -35,6 +35,7 @@ fn ride() -> RideEnvelope {
 
 fn entry_facts(marks: serde_json::Value) -> EntryFacts {
     EntryFacts {
+        send_id: None,
         named_speaker: None,
         ordinal: 3,
         written_at_ms: Some(10),
@@ -182,6 +183,7 @@ fn marked_fold_entries() -> (
     let marks = json!({"speaks_for": speaker()});
     (
         crate::fold::operations::PendingInput {
+            send_id: None,
             named_speaker: None,
             seq: Some(4),
             placement: Placement::Steer,
@@ -195,6 +197,7 @@ fn marked_fold_entries() -> (
             message_marks: Some(marks.clone()),
         },
         crate::fold::operations::Pending {
+            send_id: None,
             named_speaker: None,
             submission_id: "sub".into(),
             interrupt: false,
@@ -257,6 +260,33 @@ fn send_metadata_before_send_ids_keeps_its_bytes() {
         crate::fold::operations::Pending::decode(&pending.encode()).unwrap(),
         pending
     );
+}
+
+#[test]
+fn send_id_metadata_is_optional_and_old_decoders_can_skip_it() {
+    use crate::codec::{put_opt, skip_unknown, Fields, Message as _};
+
+    let mut facts = entry_facts(json!({"speaks_for": speaker()}));
+    let (mut input, mut pending) = marked_fold_entries();
+    let old = [facts.encode(), input.encode(), pending.encode()];
+    facts.send_id = Some("send-1".into());
+    input.send_id = facts.send_id.clone();
+    pending.send_id = facts.send_id.clone();
+    for ((old, actual), number) in old
+        .into_iter()
+        .zip([facts.encode(), input.encode(), pending.encode()])
+        .zip([25, 12, 8])
+    {
+        let mut expected = old;
+        put_opt(&mut expected, number, false, &Some("send-1".to_owned()));
+        assert_eq!(actual, expected);
+        let field = Fields::new(&actual, "send metadata")
+            .map(Result::unwrap)
+            .find(|field| field.number == number)
+            .unwrap();
+        assert!(!field.must);
+        skip_unknown(field, "old send metadata decoder").unwrap();
+    }
 }
 
 #[test]

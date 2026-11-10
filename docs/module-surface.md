@@ -537,7 +537,15 @@ This is the exception to ordinary startup's nonblocking deployment-key load. The
 crash-orphan seal and usage-export backfill finish before conversion starts. An unexpected
 conversion failure blocks only its session: `session_unconverted`, `detail.class: "permanent"`,
 with the ledger's class in `detail.refusal_class`. Other sessions resume service after the live
-pass. Archived members convert one at a time while serving, with a pause between sessions.
+pass. With `archives` enabled, the background job converts archived members one at a time, then
+idle live logs oldest last-write first, with a pause between sessions. The registry
+selects a live session only with no opening, open or closing actor and no durable active or
+paused run, queued send or held call, under the session's admission fence. Busy sessions are
+skipped and revisited on later passes, never waited on. During conversion that session's
+operations refuse retryable `session_converting`; other sessions continue serving. The fence
+is released on publication or refusal, including task cancellation. Live files without a
+decodable session identity remain untouched until a `live_at_startup` pass can classify them
+without racing a serving writer.
 
 Conversion reuses the online move's staging, media copy and verification. It keeps storage
 class, compaction views and the legacy WAL lineage id, so previously issued output-reference
@@ -558,13 +566,20 @@ run a week without a conversion finding.
 
 The owner-only `conversion-ledger.db` in the state root uses SQLite WAL journaling with
 `synchronous=FULL`. Each source's identity, path, class, current intent, outcome/refusal class,
-destination, backup, source SHA-256 and timestamps are recorded independently, with each intent committed before
+destination, backup, source SHA-256, failure detail and timestamps are recorded independently, with each intent committed before
 its filesystem operation. The source fingerprint is bound under the session fence before staging;
 resume through publication or backup refuses `source_changed` without changing the source if its
 bytes no longer match. Restart resumes incomplete publication and backup steps. This ledger
 is temporary and is removed with the converter after its final counts enter the release notes.
 `health.check.metrics.session_conversion` reports cached ledger counts by step, outcome and
-refusal class, the live barrier, and any job-level error, without probing source files.
+refusal class, the live barrier, and any job-level error, without probing source files. It also
+reports `live_background_converted` and `live_skipped_busy` since process start,
+`live_remaining` as of the latest pass (including deferred or failed live sources), and
+`deferred_no_identity` counting identity-less live files deferred across passes. Failed and
+refused ledger rows retain the error message; verification details name the mismatched check
+and first differing response field or message ordinal. Each failed attempt logs a WARN with source path, class
+and detail. The standalone `--convert-clone` command, which tests conversion on an
+operator-supplied state-root copy without starting the daemon, writes these warnings to stderr.
 
 For an operator-supplied **clone only**, `ck-broca --convert-clone ROOT --converted-sources BACKUP`
 runs the same conversion in plain mode without starting a daemon or reading the vault. It prints
@@ -1006,6 +1021,15 @@ Neither fact enters a checksum or changes `history_version`. Default reads omit 
 With `include_display_facts`, `sender` is served beside `mid` when recorded send attribution
 names a module; raw history also serves that field. Absence does not identify a human
 or disprove a sender.
+Broca also declares `send_ids`: those module-send entries carry their caller's `send_id`
+beside `sender`, or the returned `submission_id` for an unkeyed queued send. A direct
+unkeyed send or steer that returned no submission id has none. These facts never enter
+message bodies, content digests or `history_version`, and default reads omit them.
+Historical ids are recovered only from exact stored send receipts. Older imports that
+discarded the source id, and converted steers without a stored send id, remain unknown
+and omit the field. Builds before `dabddee12` wrote converted steer receipts one record
+early; even an apparently valid reference can name an adjacent steer, so reads cannot
+prove those ids from the receipts alone.
 Broca does not declare `sender_attribution` and serves no `provider_executed` flags:
 it stores no tools that a model provider executed internally.
 
