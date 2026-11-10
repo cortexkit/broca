@@ -302,7 +302,11 @@ async fn retention_chunk_error_logs_only_safe_error_metadata() {
     let logs = logs.0.lock().unwrap();
     assert_eq!(logs.len(), 1);
     let keys: Vec<_> = logs[0].keys().map(String::as_str).collect();
-    assert_eq!(keys, ["class", "message", "provider_code"]);
+    assert_eq!(
+        keys,
+        ["class", "max_gap_after_event", "message", "provider_code"]
+    );
+    assert_eq!(logs[0]["max_gap_after_event"], "private");
     assert_eq!(logs[0]["provider_code"], "none");
     assert!(!format!("{logs:?}").contains(MARKER));
 }
@@ -314,7 +318,9 @@ fn retention_error_log_filters_backend_codes_and_preserves_status() {
         error.status = Some(429);
         error.provider_code = Some(code.into());
         let capture = broca_test_support::LogCapture::new();
-        capture.in_scope(|| warn_private_failure(&error, "provider failure"));
+        capture.in_scope(|| {
+            warn_private_failure(&error, &AttemptTrace::default(), "provider failure")
+        });
         let logs: Vec<_> = capture
             .events()
             .into_iter()
@@ -323,7 +329,17 @@ fn retention_error_log_filters_backend_codes_and_preserves_status() {
             .collect();
         assert_eq!(logs.len(), 1);
         let keys: Vec<_> = logs[0].keys().map(String::as_str).collect();
-        assert_eq!(keys, ["class", "message", "provider_code", "status"]);
+        assert_eq!(
+            keys,
+            [
+                "class",
+                "max_gap_after_event",
+                "message",
+                "provider_code",
+                "status"
+            ]
+        );
+        assert_eq!(logs[0]["max_gap_after_event"], "private");
         assert_eq!(logs[0]["status"], "429");
         assert_eq!(
             logs[0]["provider_code"],

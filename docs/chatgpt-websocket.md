@@ -250,6 +250,24 @@ generation, reuse, age at send, numeric close code, and only the allowlisted
 `websocket_connection_limit_reached` wrapped error code (`other` for unknown codes).
 No message, payload, header, token, or raw identifier is included.
 
+Both transports log `max_content_gap_ms`, `first_content_ms`, `tail_gap_ms`, and
+`max_gap_after_event` in their attempt summaries and failure diagnostics. For these
+log-only timings, content means any decoded data-bearing response event, including
+lifecycle and metadata events, but not WebSocket Ping/Pong or SSE keepalive comments.
+The clock starts when the request is handed to the transport. The maximum includes
+the wait for the first event and the tail through attempt end, including cancellation;
+`first_content_ms` is absent if no event arrived. `max_gap_after_event` names the event
+preceding the longest gap, or `request_sent` for the initial wait. Event names use the
+same bounded safe-name policy as chunk-error diagnostics and are withheld for ephemeral
+sessions. An unsent attempt has absent timings. This is separate from the narrower
+real-output content classification recorded in the write-ahead log (WAL).
+
+The SSE summary uses the `provider.sse.attempt` target, at INFO for failed attempts or
+attempts longer than 120 seconds and DEBUG for shorter successes, like the WebSocket
+summary. A compression-refused send is summarized before its uncompressed resend. A
+WebSocket upgrade that falls back to SSE has no WebSocket content timings; the SSE
+summary measures the request that was actually sent.
+
 Raw Text observations before normalization count sequence numbers, their range,
 and numbers at or below the previous high-water mark (repeats or backwards
 movement). They also count distinct response/item IDs and record the maximum
