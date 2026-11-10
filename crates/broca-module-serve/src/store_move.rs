@@ -793,6 +793,12 @@ impl StoreMove {
             .with_detail(json!({ "check": mismatch.check, "detail": mismatch.detail }))
         }));
         before!(self.step("verify"));
+        if verified.legacy_replay_limit > 0 {
+            tracing::warn!(target: "store_move", session = %key.session,
+                legacy_replay_limit = verified.legacy_replay_limit,
+                examples = ?verified.legacy_replay_limit_examples,
+                "converted requests match today's offline replay, which cannot reproduce every historical request digest");
+        }
         // The runtime serving the session reads its setup parts from memory: hold the staged
         // ones there, already stored in the destination root.
         before!(Self::hold_parts(

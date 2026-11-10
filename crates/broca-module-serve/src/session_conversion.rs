@@ -858,7 +858,7 @@ impl Engine {
             .await
             .map_err(stage_failure)?;
             self.step(source, "verifying", None, None)?;
-            broca_session_convert::verify::verify(Verify {
+            let verified = broca_session_convert::verify::verify(Verify {
                 records: &records,
                 lineage,
                 session: &session,
@@ -876,6 +876,12 @@ impl Engine {
             })
             .await
             .map_err(|error| Failure::failed("verification_failed", error))?;
+            if verified.legacy_replay_limit > 0 {
+                tracing::warn!(target: "session_conversion", source = %source.id,
+                    legacy_replay_limit = verified.legacy_replay_limit,
+                    examples = ?verified.legacy_replay_limit_examples,
+                    "converted requests match today's offline replay, which cannot reproduce every historical request digest");
+            }
             if let Some(runtime) = runtime {
                 crate::store_move::StoreMove::hold_parts(runtime, source_class, &staged.converted)
                     .map_err(|error| io(error.message))?;

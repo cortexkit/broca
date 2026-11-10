@@ -51,6 +51,9 @@ struct MoveCheckReport {
     verified_messages: u64,
     /// The media objects the verified sessions were staged with.
     verified_media: u64,
+    /// Checked steps that agree with today's offline replay but not the historical digest.
+    legacy_replay_limit: u64,
+    legacy_replay_limit_examples: Vec<String>,
     /// Refusals before anything is written, by reason (`not_movable {reason}`).
     not_movable: BTreeMap<String, u64>,
     /// Conversions that would not be exact, by what was lost.
@@ -67,7 +70,7 @@ struct MoveCheckReport {
     /// `input_token_budget` or `first_protocol_compaction`.
     unsupported_features: BTreeMap<String, u64>,
     timing: Timing,
-    /// Up to five log names for each refusal or mismatch above.
+    /// Up to five log names for each full refusal or mismatch, without truncating its error text.
     examples: BTreeMap<String, Vec<String>>,
 }
 
@@ -97,10 +100,7 @@ impl MoveCheckReport {
     }
 
     fn example(&mut self, key: &str, name: &str) {
-        let examples = self
-            .examples
-            .entry(key.chars().take(120).collect())
-            .or_default();
+        let examples = self.examples.entry(key.to_owned()).or_default();
         if examples.len() < 5 {
             examples.push(name.to_owned());
         }
@@ -135,7 +135,7 @@ fn refused(report: &mut MoveCheckReport, name: &str, error: StageError) {
     };
     MoveCheckReport::count(map, &key);
     report.refuse(class);
-    report.example(&key, name);
+    report.example(&error.to_string(), name);
 }
 
 /// Today's media store of one class, opened read only, so a check never creates one.
@@ -387,13 +387,24 @@ fn check(args: &Args) -> MoveCheckReport {
                 report.verified_runs += verified.runs;
                 report.verified_messages += verified.messages;
                 report.verified_media += verified.media;
+                report.legacy_replay_limit += verified.legacy_replay_limit;
+                if verified.legacy_replay_limit > 0 {
+                    eprintln!("WARN legacy_replay_limit: {name}: {} checked step(s); converted requests equal today's offline render", verified.legacy_replay_limit);
+                    for step in &verified.legacy_replay_limit_examples {
+                        if report.legacy_replay_limit_examples.len() < 5 {
+                            report
+                                .legacy_replay_limit_examples
+                                .push(format!("{name}: step {} of {}", step.step, step.run_id));
+                        }
+                    }
+                }
                 per_session.push(read_us + stage_us + verify_us);
             }
             Err(mismatch) => {
                 let reason = reason(&mismatch);
                 MoveCheckReport::count(&mut report.mismatches, &reason);
                 report.refuse("verification_failed");
-                report.example(&reason, &name);
+                report.example(&mismatch.to_string(), &name);
             }
         }
         let _ = std::fs::remove_dir_all(&staging);

@@ -401,7 +401,7 @@ pub(crate) async fn append_batch<B: SessionBackend>(
 /// the session yet: the head is created there, as for any new session.
 pub async fn write(stage: &Stage<'_>, prepared: Prepared) -> Result<Staged, StageError> {
     let Prepared {
-        converted,
+        mut converted,
         appends_in_conversation,
         media,
     } = prepared;
@@ -432,6 +432,7 @@ pub async fn write(stage: &Stage<'_>, prepared: Prepared) -> Result<Staged, Stag
     )
     .await
     .map_err(failed("create the staged session"))?;
+    converted.start_at(session.next_seq());
     // The records are appended as the run loop appends them: each group up to a barrier as one
     // synced batch, after the setup parts it names are stored. The move's own record goes in
     // the last batch.

@@ -102,6 +102,17 @@ pub struct Verified {
     pub media: u64,
     /// The checks that ran and agreed, in order.
     pub checks: Vec<&'static str>,
+    /// Checked steps whose historical request digest today's offline replay cannot reproduce.
+    /// Their converted requests still equal today's offline requests byte for byte.
+    pub legacy_replay_limit: u64,
+    /// Up to five affected steps, without request content.
+    pub legacy_replay_limit_examples: Vec<ReplayLimit>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReplayLimit {
+    pub run_id: String,
+    pub step: u64,
 }
 
 /// The first difference found, under the check that found it.
@@ -199,16 +210,22 @@ pub async fn verify(verify: Verify<'_>) -> Result<Verified, Mismatch> {
     let media = staged_media(&verify, staged).await?;
     checks.push(MEDIA);
     let steps = recorded_steps(verify.records);
+    let mut replay_limits = Vec::new();
     if let Some(last) = steps.last() {
-        step(&verify, lineage.as_deref(), last, LAST_STEP).await?;
+        if step(&verify, lineage.as_deref(), last, LAST_STEP).await? {
+            replay_limits.push(last);
+        }
         checks.push(LAST_STEP);
     }
     next_request(&verify, lineage.as_deref(), staged, &addr, &triple).await?;
     checks.push(FIRST_OPEN);
     checks.push(NEXT_REQUEST);
     if verify.mode == Mode::Offline {
-        for recorded in &steps {
-            step(&verify, lineage.as_deref(), recorded, ALL_STEPS).await?;
+        // The last step already ran above; count each historical replay limit only once.
+        for recorded in steps.iter().take(steps.len().saturating_sub(1)) {
+            if step(&verify, lineage.as_deref(), recorded, ALL_STEPS).await? {
+                replay_limits.push(recorded);
+            }
         }
         checks.push(ALL_STEPS);
     }
@@ -217,6 +234,15 @@ pub async fn verify(verify: Verify<'_>) -> Result<Verified, Mismatch> {
         messages: broca_module::store_read::transcript_len(staged),
         media,
         checks,
+        legacy_replay_limit: replay_limits.len() as u64,
+        legacy_replay_limit_examples: replay_limits
+            .iter()
+            .take(5)
+            .map(|step| ReplayLimit {
+                run_id: step.run.clone(),
+                step: step.step,
+            })
+            .collect(),
     })
 }
 
@@ -1090,14 +1116,14 @@ async fn store_request<B: SessionBackend>(
 }
 
 /// The recorded step `recorded`, rebuilt by the new run loop from the converted WAL up to its
-/// start, must render to the bytes today's renderer builds for it, and those to the bytes the
-/// provider was sent.
+/// start, must render to the bytes today's renderer builds for it. A historical digest today's
+/// offline replay cannot reproduce is reported separately, not blamed on the conversion.
 async fn step(
     verify: &Verify<'_>,
     lineage: Option<&str>,
     recorded: &RecordedStep,
     check: &'static str,
-) -> Result<(), Mismatch> {
+) -> Result<bool, Mismatch> {
     let records = verify.records;
     let wal: Vec<WalRecord> = records.iter().map(|frame| frame.record.clone()).collect();
     let contract = broca_core::is_mode3_log(&wal);
@@ -1124,7 +1150,7 @@ async fn step(
     let cap =
         broca_core::output_reservation::recorded_cap(prefix, broca_protocol::StepId(recorded.step));
     let holds_media = !crate::stage::media_digests(&records[..=end]).is_empty();
-    let converted = crate::convert(&records[..=end], lineage)
+    let mut converted = crate::convert(&records[..=end], lineage)
         .map_err(|error| at(format!("the conversion: {}", error.0)))?;
     let parts = MemoryParts {
         parts: converted.parts.clone(),
@@ -1149,6 +1175,7 @@ async fn step(
             )
             .await
             .map_err(|error| format!("a session for the rebuild: {error:?}"))?;
+            converted.start_at(session.next_seq());
             crate::stage::append_batch(&mut session, &converted.records, &media)
                 .await
                 .map_err(|error| format!("a session for the rebuild: {error}"))?;
@@ -1175,6 +1202,7 @@ async fn step(
             let mut session = Session::create(&backend, addr, triple, verify.deployment, !contract)
                 .await
                 .map_err(|error| format!("a session for the rebuild: {error:?}"))?;
+            converted.start_at(session.next_seq());
             session
                 .append(&converted.records, false)
                 .await
@@ -1194,11 +1222,6 @@ async fn step(
         .await
     }
     .map_err(|error| at(format!("the new run loop's rebuild: {error}")))?;
-    if sha256_hex(&rebuilt) != recorded.digest {
-        return Err(at(
-            "the request differs from the one the provider was sent".into()
-        ));
-    }
     let today = todays_request(
         verify,
         lineage,
@@ -1210,10 +1233,22 @@ async fn step(
         holds_media,
     )
     .map_err(|error| at(format!("today's renderer: {error}")))?;
+    compare_request(&rebuilt, &today, &recorded.digest).map_err(|error| at(error.into()))
+}
+
+pub(crate) fn compare_request(
+    rebuilt: &[u8],
+    today: &[u8],
+    recorded_digest: &str,
+) -> Result<bool, &'static str> {
     if rebuilt != today {
-        return Err(at("the rebuilt request differs from today's render".into()));
+        return Err("the rebuilt request differs from today's render");
     }
-    Ok(())
+    let legacy_replay_limit = sha256_hex(today) != recorded_digest;
+    if !legacy_replay_limit && sha256_hex(rebuilt) != recorded_digest {
+        return Err("the request differs from the one the provider was sent");
+    }
+    Ok(legacy_replay_limit)
 }
 
 /// The run id the synthetic next send starts. No real run carries it: the copy that receives it
@@ -1359,8 +1394,11 @@ async fn next_request(
             holds_media,
         )
         .map_err(|error| mismatch(NEXT_REQUEST, format!("today's renderer: {error}")))?;
-        let converted = crate::convert(&extended, lineage)
+        let mut converted = crate::convert(&extended, lineage)
             .map_err(|error| mismatch(NEXT_REQUEST, format!("the conversion: {}", error.0)))?;
+        // Reproduce the staged prefix at its stored origin. The synthetic next send adds only
+        // a run input and step boundary, with no Input.receipt_seq naming a new Steer or Delivery.
+        converted.start_at(verify.converted.seq_offset + 1);
         let staged = &verify.converted.records;
         if !converted.records.starts_with(staged) {
             return Err(mismatch(

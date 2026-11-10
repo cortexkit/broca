@@ -107,6 +107,16 @@ fn retention_writes_are_limited_to_the_core_and_actor() {
                 "Steered.ts_ms".to_owned(),
             ],
         ),
+        // The new session storage's actor queues sends with the same retention-clock timestamp:
+        // a plain queued send and one with an ordered `delivery` list.
+        (
+            "crates/broca-module/src/store_actor.rs".to_owned(),
+            vec!["Queued.ts_ms".to_owned()],
+        ),
+        (
+            "crates/broca-module/src/store_actor/ordered.rs".to_owned(),
+            vec!["Queued.ts_ms".to_owned()],
+        ),
     ]);
     assert_eq!(inventory, expected, "retention writer inventory changed");
 }

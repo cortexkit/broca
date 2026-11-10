@@ -70,6 +70,8 @@ fn tally(map: &mut BTreeMap<String, Tally>, name: impl Into<String>, bytes: usiz
 /// One converted log.
 #[derive(Debug, Default)]
 pub struct Converted {
+    /// Offset of this conversion's record sequences from the in-memory origin at seq 1.
+    seq_offset: u64,
     pub records: Vec<Record>,
     /// Every setup part this log's runs named, by digest, with its canonical bytes.
     pub parts: BTreeMap<Digest, Vec<u8>>,
@@ -80,6 +82,32 @@ pub struct Converted {
     /// The session class of the log's first run.
     pub session_class: Option<String>,
     pub runs: u64,
+}
+
+impl Converted {
+    /// Places the converted records after any bookkeeping the destination already wrote.
+    /// References within the conversion must move with their targets, not keep naming the
+    /// in-memory positions they had before a session's initial writer record was appended.
+    pub(crate) fn start_at(&mut self, first: u64) {
+        let offset = first - 1;
+        let move_seq = |seq: &mut u64| *seq = *seq - self.seq_offset + offset;
+        for record in &mut self.records {
+            match record {
+                Record::Input(input) => {
+                    if let Some(seq) = &mut input.receipt_seq {
+                        move_seq(seq);
+                    }
+                }
+                Record::EntryFacts(facts) => {
+                    if let Some(seq) = &mut facts.legacy_view_seq {
+                        move_seq(seq);
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.seq_offset = offset;
+    }
 }
 
 #[derive(Debug)]
