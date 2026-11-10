@@ -94,10 +94,19 @@ def rustdoc():
     subprocess.run([os.environ["BROCA_ATTEST_RUSTDOC"], *args], check=True)
 
 
+def available_cpus():
+    """The CPUs this process may run on, at least 1."""
+    if hasattr(os, "sched_getaffinity"):
+        return max(1, len(os.sched_getaffinity(0)))
+    return max(1, os.cpu_count() or 1)
+
+
 def prepare():
     os.chdir(ROOT)
     os.environ["PATH"] = str(Path.home() / ".cargo/bin") + os.pathsep + os.environ["PATH"]
-    os.environ.setdefault("CARGO_BUILD_JOBS", "2")
+    # A remote job sees exactly the CPUs it asked for, so build on all of them. A fixed 2 left
+    # an 8-CPU job compiling the workspace on a quarter of its machine, past its time limit.
+    os.environ.setdefault("CARGO_BUILD_JOBS", str(available_cpus()))
     os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
 
 
