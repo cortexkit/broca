@@ -1267,12 +1267,22 @@ fn speaking_for_unscoped(request: &mut SubmissionRequest) {
     request.scope = broca_protocol::SendScope::Unstamped;
 }
 
-/// Core under its own head scope, carrying both marks, which a send may not.
+/// Core under its own head scope, carrying both marks: an agent's automatic message, which a
+/// runner declaring `notice_with_speaks_for` admits.
 fn noticed_and_speaking_for(request: &mut SubmissionRequest) {
     speaking_for(request);
     request
         .message_marks
         .insert("notice".to_owned(), serde_json::json!(true));
+}
+
+/// [`noticed_and_speaking_for`], with the speaker's display name.
+fn noticed_and_speaking_for_by_name(request: &mut SubmissionRequest) {
+    noticed_and_speaking_for(request);
+    request.message_marks.insert(
+        "speaks_for".to_owned(),
+        serde_json::json!({"agent_id": "agent-1", "name": "Ada"}),
+    );
 }
 
 /// A send's display marks, a notice and the agent the scope's owner speaks for, are kept for a
@@ -1323,8 +1333,8 @@ async fn a_steers_marks_are_kept_alike() {
 }
 
 /// Marks a send may not carry are refused naming the member, before the send's owner is
-/// checked, alike: another module speaking for the scope owner's agent, a send with no scope
-/// speaking for one, and both marks at once. A send whose marks are admitted then runs.
+/// checked, alike: another module speaking for the scope owner's agent, and a send with no
+/// scope speaking for one. A send whose marks are admitted then runs.
 #[tokio::test]
 async fn marks_a_send_may_not_carry_are_refused_alike() {
     compare(
@@ -1333,8 +1343,34 @@ async fn marks_a_send_may_not_carry_are_refused_alike() {
         vec![
             tweaked(send("r1", "another's"), speaking_for_by_another),
             tweaked(send("r2", "unscoped"), speaking_for_unscoped),
-            tweaked(send("r3", "both"), noticed_and_speaking_for),
             tweaked(send("r4", "first"), noticed),
+            Step::Idle,
+        ],
+    )
+    .await;
+}
+
+/// An agent's automatic message, a notice speaking for the head's agent, is kept with both
+/// marks and the speaker's display name for a send that starts a run, a queued send and a
+/// steer, and `session.read` serves them, alike.
+#[tokio::test]
+async fn an_agents_named_notice_is_kept_alike() {
+    compare(
+        four_turns(),
+        true,
+        vec![
+            tweaked(send("r1", "first"), noticed_and_speaking_for_by_name),
+            tweaked(
+                steered(send("s1", "steered")),
+                noticed_and_speaking_for_by_name,
+            ),
+            Step::Release,
+            Step::Release,
+            Step::Idle,
+            tweaked(send("r2", "second"), noticed_and_speaking_for),
+            tweaked(send("r3", "queued"), noticed_and_speaking_for_by_name),
+            Step::Release,
+            Step::Release,
             Step::Idle,
         ],
     )

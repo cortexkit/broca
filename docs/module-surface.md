@@ -1866,9 +1866,11 @@ rows and fold the bounded WAL suffix since that continuation. No boot-time sweep
 historical sessions. Retention expiry removes the cache and prevents a racing reader
 from repopulating an expired lineage.
 
-**Message marks.** Broca declares `message_marks`. A scoped session's attested owner can
-send `speaks_for: {agent_id}`; any admitted sender can send `notice: true` for its own
-automatic message. The two marks cannot be combined. Invalid marks refuse before opening
+**Message marks.** Broca declares `message_marks` and `notice_with_speaks_for`. A scoped
+session's attested owner can send `speaks_for: {agent_id, name?}`, where `name` is a
+display-only 1–64 printable ASCII byte string and never an identity. Any admitted sender can
+send `notice: true` for its own automatic message. The owner may combine both marks on one
+send, an agent's automatic message. Invalid marks refuse before opening
 a writer. Flow- and run-stamped routes are senders, never owners. Marks are durable
 metadata beside the entry: opted-in reads, raw history and display rows expose them;
 default message bodies, content digests and `history_version` do not change. A send delivered
@@ -1876,17 +1878,18 @@ alongside a tool result is represented by `notices` facts and `notice_delivered`
 these carry `speaks_for`, never a redundant `notice` flag.
 An identical `send_id` retry compares normalized marks as well as the request: changed
 marks refuse `send_id_reuse` with `detail.field` naming `speaks_for` or `notice`, while
-absent and `notice: false` compare equal and retain the original answer. The WAL's
+absent and `notice: false` compare equal and retain the original answer. `speaks_for` is
+compared whole, so a changed, added or removed `name` refuses naming `speaks_for`. The WAL's
 `message-marks/v1` reader shipped before the writer. After marked sends have been written,
 rolling back the daemon requires a build retaining that reader; older builds refuse the
 must-understand WAL feature rather than silently lose the attribution.
-Without `notice_with_speaks_for`, the describe group that admits a speaker's display name and
-a notice with a speaker together, a send carrying `speaks_for.name` refuses `invalid_params`
-naming `speaks_for.name`. Reads already decode a stored name, a display-only 1–64 printable
-ASCII byte string. On today's storage, a record with a named speaker (on its marks, its ride
-or its retry identity) requires the must-understand WAL feature `speaks-for-name/v1`. On the
-new storage, every stored speaker with a name has a must-understand `named_speaker` field
-beside it. Builds without the reader refuse such a record rather than drop the name.
+A runner without `notice_with_speaks_for` refuses a combined notice naming `notice`, and a
+speaker's `name` naming `speaks_for.name`. The reader of names shipped one release before
+the writer. In WAL storage, a record with a named speaker (on its marks, its tool-result
+delivery or its retry identity) requires the must-understand WAL feature `speaks-for-name/v1`.
+In `broca-session-store` storage, every stored speaker with a name has a must-understand
+`named_speaker` field beside it. After named speakers have been written, rolling back requires
+a build with that reader; older builds refuse such a record rather than drop the name.
 
 **Compaction entry attribution.** A marked send's user entries carry `speaks_for`
 (`agent_id` and, when sent, `name`) in `session.entries` pages and `compaction.notice`
