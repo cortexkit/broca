@@ -85,24 +85,24 @@ pub fn raise_floor(path: &Path, names: &[&str]) -> std::io::Result<()> {
     }
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     if !dir.as_os_str().is_empty() {
-        #[cfg(test)]
-        io_tests::observe(io_tests::Io::CreateDir)?;
+        #[cfg(any(test, feature = "test-io-trace"))]
+        io_trace::observe(io_trace::Io::CreateDir)?;
         fs_ops::create_dir_all(dir)?;
     }
     // Lock a stable sibling, never the floor inode that rename replaces. Different
     // session leases do not serialize updates to this shared machine-wide file.
     let mut options = fs_ops::OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
-    #[cfg(test)]
-    io_tests::observe(io_tests::Io::Open)?;
+    #[cfg(any(test, feature = "test-io-trace"))]
+    io_trace::observe(io_trace::Io::Open)?;
     let lock = options.open(lock_path(path))?;
     #[cfg(test)]
     process_tests::before_lock(&lock);
-    #[cfg(test)]
-    io_tests::observe(io_tests::Io::Lock)?;
+    #[cfg(any(test, feature = "test-io-trace"))]
+    io_trace::observe(io_trace::Io::Lock)?;
     lock.lock()?;
-    #[cfg(test)]
-    io_tests::observe(io_tests::Io::Read)?;
+    #[cfg(any(test, feature = "test-io-trace"))]
+    io_trace::observe(io_trace::Io::Read)?;
     let mut floor = read_floor(path)?;
     #[cfg(test)]
     process_tests::after_read();
@@ -114,15 +114,15 @@ pub fn raise_floor(path: &Path, names: &[&str]) -> std::io::Result<()> {
         // Sync through a writable handle: Windows `FlushFileBuffers` refuses a read-only one
         // with "Access is denied", while unix accepts either.
         if fs_ops::try_exists(path)? {
-            #[cfg(test)]
-            io_tests::observe(io_tests::Io::Open)?;
+            #[cfg(any(test, feature = "test-io-trace"))]
+            io_trace::observe(io_trace::Io::Open)?;
             let file = fs_ops::OpenOptions::ordinary().write(true).open(path)?;
-            #[cfg(test)]
-            io_tests::observe(io_tests::Io::FileSync)?;
+            #[cfg(any(test, feature = "test-io-trace"))]
+            io_trace::observe(io_trace::Io::FileSync)?;
             file.sync_all()?;
         }
-        #[cfg(test)]
-        io_tests::observe(io_tests::Io::DirSync)?;
+        #[cfg(any(test, feature = "test-io-trace"))]
+        io_trace::observe(io_trace::Io::DirSync)?;
         crate::directory_sync::sync_dir(dir)?;
         remember_durable_floor(memo_path, floor);
         return Ok(());
@@ -132,23 +132,23 @@ pub fn raise_floor(path: &Path, names: &[&str]) -> std::io::Result<()> {
     let written = (|| {
         let mut options = fs_ops::OpenOptions::new();
         options.write(true).create_new(true);
-        #[cfg(test)]
-        io_tests::observe(io_tests::Io::Open)?;
+        #[cfg(any(test, feature = "test-io-trace"))]
+        io_trace::observe(io_trace::Io::Open)?;
         let mut file = options.open(&temp)?;
         file.write_all(contents.as_bytes())?;
-        #[cfg(test)]
-        io_tests::observe(io_tests::Io::FileSync)?;
+        #[cfg(any(test, feature = "test-io-trace"))]
+        io_trace::observe(io_trace::Io::FileSync)?;
         file.sync_all()?;
-        #[cfg(test)]
-        io_tests::observe(io_tests::Io::Rename)?;
+        #[cfg(any(test, feature = "test-io-trace"))]
+        io_trace::observe(io_trace::Io::Rename)?;
         fs_ops::rename(&temp, path)
     })();
     if let Err(error) = written {
         let _ = fs_ops::remove_file(&temp);
         return Err(error);
     }
-    #[cfg(test)]
-    io_tests::observe(io_tests::Io::DirSync)?;
+    #[cfg(any(test, feature = "test-io-trace"))]
+    io_trace::observe(io_trace::Io::DirSync)?;
     crate::directory_sync::sync_dir(dir)?;
     remember_durable_floor(memo_path, floor);
     Ok(())
@@ -312,5 +312,6 @@ mod windows_acl_tests {
 #[cfg(test)]
 mod process_tests;
 
-#[cfg(test)]
-mod io_tests;
+#[cfg(any(test, feature = "test-io-trace"))]
+#[doc(hidden)]
+pub mod io_trace;

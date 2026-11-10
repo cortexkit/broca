@@ -15,36 +15,40 @@ struct Golden {
 
 const GOLDENS: &[(&str, &str)] = &[
     (
-        include_str!("../../tests/golden/step_transforms/run_started.json"),
-        include_str!("../../tests/golden/step_transforms/run_started.frame.hex"),
+        include_str!("../../../broca-wal/tests/golden/step_transforms/run_started.json"),
+        include_str!("../../../broca-wal/tests/golden/step_transforms/run_started.frame.hex"),
     ),
     (
-        include_str!("../../tests/golden/step_transforms/queued.json"),
-        include_str!("../../tests/golden/step_transforms/queued.frame.hex"),
+        include_str!("../../../broca-wal/tests/golden/step_transforms/queued.json"),
+        include_str!("../../../broca-wal/tests/golden/step_transforms/queued.frame.hex"),
     ),
     (
-        include_str!("../../tests/golden/step_transforms/steered.json"),
-        include_str!("../../tests/golden/step_transforms/steered.frame.hex"),
+        include_str!("../../../broca-wal/tests/golden/step_transforms/steered.json"),
+        include_str!("../../../broca-wal/tests/golden/step_transforms/steered.frame.hex"),
     ),
     (
-        include_str!("../../tests/golden/step_transforms/model_step_finished.json"),
-        include_str!("../../tests/golden/step_transforms/model_step_finished.frame.hex"),
+        include_str!("../../../broca-wal/tests/golden/step_transforms/model_step_finished.json"),
+        include_str!(
+            "../../../broca-wal/tests/golden/step_transforms/model_step_finished.frame.hex"
+        ),
     ),
     (
-        include_str!("../../tests/golden/step_transforms/tool_dispatch_intent.json"),
-        include_str!("../../tests/golden/step_transforms/tool_dispatch_intent.frame.hex"),
+        include_str!("../../../broca-wal/tests/golden/step_transforms/tool_dispatch_intent.json"),
+        include_str!(
+            "../../../broca-wal/tests/golden/step_transforms/tool_dispatch_intent.frame.hex"
+        ),
     ),
     (
-        include_str!("../../tests/golden/step_transforms/tool_no_dispatch.json"),
-        include_str!("../../tests/golden/step_transforms/tool_no_dispatch.frame.hex"),
+        include_str!("../../../broca-wal/tests/golden/step_transforms/tool_no_dispatch.json"),
+        include_str!("../../../broca-wal/tests/golden/step_transforms/tool_no_dispatch.frame.hex"),
     ),
     (
-        include_str!("../../tests/golden/step_transforms/tool_result.json"),
-        include_str!("../../tests/golden/step_transforms/tool_result.frame.hex"),
+        include_str!("../../../broca-wal/tests/golden/step_transforms/tool_result.json"),
+        include_str!("../../../broca-wal/tests/golden/step_transforms/tool_result.frame.hex"),
     ),
     (
-        include_str!("../../tests/golden/step_transforms/tool_result_deny.json"),
-        include_str!("../../tests/golden/step_transforms/tool_result_deny.frame.hex"),
+        include_str!("../../../broca-wal/tests/golden/step_transforms/tool_result_deny.json"),
+        include_str!("../../../broca-wal/tests/golden/step_transforms/tool_result_deny.frame.hex"),
     ),
 ];
 
@@ -325,7 +329,8 @@ fn every_hooks_member_requires_transforms_even_without_ops() {
 #[test]
 fn absent_and_empty_declarations_write_no_bytes() {
     let bytes =
-        include_str!("../../tests/golden/pre_step_transforms/plan_manifest.json").trim_end();
+        include_str!("../../../broca-wal/tests/golden/pre_step_transforms/plan_manifest.json")
+            .trim_end();
     let record: WalRecord = serde_json::from_str(bytes).unwrap();
     let WalRecord::RunStarted {
         manifest: Some(manifest),

@@ -308,7 +308,7 @@ fn recovery_completion_rejects_native_media_instead_of_restoring_content() {
 fn media_carrier_inventory_covers_every_content_field() {
     // Audit field types, not just today's hand-written feature match. A newly added carrier
     // requires a test case even when a wildcard in the production scan would silently skip it.
-    let source = include_str!("../record.rs");
+    let source = include_str!("../../../broca-records/src/record.rs");
     let body = source
         .split("pub enum WalRecord {")
         .nth(1)

@@ -75,7 +75,9 @@ fn pre_message_times_records_keep_exact_bytes() {
     use crate::framing::{
         encode, FRAMING_VERSION, GATED_FRAMING_VERSION, HEADER_LEN, STEER_QUEUE_FEATURE,
     };
-    for pinned in include_str!("../../tests/fixtures/before_message_times.jsonl").lines() {
+    for pinned in
+        include_str!("../../../broca-wal/tests/fixtures/before_message_times.jsonl").lines()
+    {
         let record: WalRecord = serde_json::from_str(pinned).unwrap();
         assert_ne!(record, WalRecord::Unknown);
         assert_eq!(serde_json::to_string(&record).unwrap(), pinned);
@@ -118,7 +120,9 @@ fn pre_interrupt_reason_terminal_bytes_and_features_are_pinned() {
 #[test]
 fn pre_openrouter_reasoning_records_keep_their_bytes_and_frame_requirements() {
     use crate::framing::{encode, FRAMING_VERSION, HEADER_LEN};
-    for pinned in include_str!("../../tests/fixtures/before_openrouter_reasoning.jsonl").lines() {
+    for pinned in
+        include_str!("../../../broca-wal/tests/fixtures/before_openrouter_reasoning.jsonl").lines()
+    {
         let record: WalRecord = serde_json::from_str(pinned).unwrap();
         assert_ne!(record, WalRecord::Unknown);
         assert_eq!(serde_json::to_string(&record).unwrap(), pinned);
@@ -177,7 +181,9 @@ fn auth_selections_without_a_frozen_method_keep_their_bytes_and_frame_requiremen
 
 #[test]
 fn attempt_bytes_before_content_progress_stay_identical() {
-    let pinned = include_str!("../../tests/fixtures/model_attempt_before_progress.json").trim_end();
+    let pinned =
+        include_str!("../../../broca-wal/tests/fixtures/model_attempt_before_progress.json")
+            .trim_end();
     let record: WalRecord = serde_json::from_str(pinned).unwrap();
     assert!(matches!(record, WalRecord::ModelAttemptFinished { .. }));
     assert!(record.required_features().is_empty());
@@ -186,7 +192,8 @@ fn attempt_bytes_before_content_progress_stay_identical() {
 
 #[test]
 fn attempt_progress_fields_roundtrip_without_a_reader_feature() {
-    let pinned = include_str!("../../tests/fixtures/model_attempt_with_progress.json").trim_end();
+    let pinned = include_str!("../../../broca-wal/tests/fixtures/model_attempt_with_progress.json")
+        .trim_end();
     let record: WalRecord = serde_json::from_str(pinned).unwrap();
     let WalRecord::ModelAttemptFinished {
         content_progress, ..
@@ -554,7 +561,7 @@ fn cancellation_records_are_must_understand_and_round_trip() {
 fn pre_compaction_records_keep_their_bytes_and_frame_requirements() {
     use crate::framing::{encode, FRAMING_VERSION, GATED_FRAMING_VERSION, HEADER_LEN};
 
-    let additional = include_str!("../../tests/fixtures/pre_compaction_records.jsonl");
+    let additional = include_str!("../../../broca-wal/tests/fixtures/pre_compaction_records.jsonl");
     for pinned in PINNED.iter().copied().chain(additional.lines()) {
         let record: WalRecord = serde_json::from_str(pinned).unwrap();
         assert_ne!(record, WalRecord::Unknown);
@@ -793,8 +800,10 @@ fn the_pinned_bytes_cover_every_record_kind() {
     let pinned: std::collections::BTreeSet<&str> = PINNED
         .iter()
         .copied()
-        .chain(include_str!("../../tests/fixtures/compaction_records.jsonl").lines())
-        .chain(include_str!("../../tests/fixtures/compaction_v2_records.jsonl").lines())
+        .chain(include_str!("../../../broca-wal/tests/fixtures/compaction_records.jsonl").lines())
+        .chain(
+            include_str!("../../../broca-wal/tests/fixtures/compaction_v2_records.jsonl").lines(),
+        )
         .chain(DEFERRED_CALL_PINNED.iter().copied())
         .chain(CANCEL_AT_PINNED.iter().copied())
         .chain(PROVIDER_HELD_PINNED.iter().copied())
@@ -949,15 +958,15 @@ fn keep_warm_record_metadata_matches_goldens() {
     let bases = [
         (
             PINNED[1],
-            include_str!("../../tests/golden/run_started.keep_warm.json"),
+            include_str!("../../../broca-wal/tests/golden/run_started.keep_warm.json"),
         ),
         (
             PINNED[40],
-            include_str!("../../tests/golden/queued.keep_warm.json"),
+            include_str!("../../../broca-wal/tests/golden/queued.keep_warm.json"),
         ),
         (
             PINNED[PINNED.len() - 1],
-            include_str!("../../tests/golden/cache_warmed.keep_warm.json"),
+            include_str!("../../../broca-wal/tests/golden/cache_warmed.keep_warm.json"),
         ),
     ];
     for (base, golden) in bases {
@@ -1206,7 +1215,8 @@ fn a_client_message_id_in_the_identity_digest_requires_its_reader_feature() {
     const FEATURE: &str = "client-message-id/v1";
     let with_id = r#"{"version":1,"model":"m","input":"i","tools":"t","policy_allowed":"p","tool_choice":"c","generation":"g","cache":"k","budget":"b","stop_when":"s","client_message_id":"msg-1"}"#;
     let without_id = r#"{"version":1,"model":"m","input":"i","tools":"t","policy_allowed":"p","tool_choice":"c","generation":"g","cache":"k","budget":"b","stop_when":"s"}"#;
-    let old = include_str!("../../tests/golden/pre_step_transforms/run_started.json").trim_end();
+    let old = include_str!("../../../broca-wal/tests/golden/pre_step_transforms/run_started.json")
+        .trim_end();
     let steered = serde_json::json!({"type":"steered","input":[{"role":"user","content":[{"type":"text","text":"more"}]}]});
     let queued = serde_json::json!({"type":"queued", "submission_id":"sub", "request": {
         "model":{"provider_module_id":"p","model_id":"m"}, "input":[]}});
@@ -1246,7 +1256,8 @@ fn interrupt_reason_and_directives_require_named_reader_features_only_when_prese
         assert_eq!(frame[4], GATED_FRAMING_VERSION);
         assert!(matches!(decode_next(&frame), DecodeStep::Record { .. }));
     }
-    let old = include_str!("../../tests/golden/pre_step_transforms/run_started.json").trim_end();
+    let old = include_str!("../../../broca-wal/tests/golden/pre_step_transforms/run_started.json")
+        .trim_end();
     let mut raw: serde_json::Value = serde_json::from_str(old).unwrap();
     let record: WalRecord = serde_json::from_value(raw.clone()).unwrap();
     let prior = record.required_features();
@@ -1264,7 +1275,8 @@ fn interrupt_reason_and_directives_require_named_reader_features_only_when_prese
     let old: WalRecord = serde_json::from_str(old).unwrap();
     assert_eq!(
         serde_json::to_string(&old).unwrap(),
-        include_str!("../../tests/golden/pre_step_transforms/run_started.json").trim_end()
+        include_str!("../../../broca-wal/tests/golden/pre_step_transforms/run_started.json")
+            .trim_end()
     );
 }
 
@@ -1303,7 +1315,7 @@ fn pre_tool_reply_send_declared_tools_keep_their_bytes_and_frame_requirements() 
 /// path freezes for the `send_params.tool_reply.json` send.
 #[test]
 fn tool_reply_run_started_matches_golden() {
-    let golden = include_str!("../../tests/golden/run_started.tool_reply.json");
+    let golden = include_str!("../../../broca-wal/tests/golden/run_started.tool_reply.json");
     let mut record: WalRecord = serde_json::from_str(PRE_TOOL_REPLY_RUN_STARTED).unwrap();
     let WalRecord::RunStarted { config, .. } = &mut record else {
         panic!("expected a run start");

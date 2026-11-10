@@ -12,15 +12,12 @@
 
 pub mod access_counter;
 pub mod archive;
-mod directory_sync;
+use broca_records::directory_sync;
 pub mod file_wal;
-pub mod floor;
 pub mod framing;
-pub mod fs_ops;
 pub mod head_proof;
-pub mod record;
 pub mod recovery;
-pub mod session_storage;
+pub use broca_records::{floor, fs_ops, record, session_storage};
 pub mod state_format;
 
 pub use file_wal::{

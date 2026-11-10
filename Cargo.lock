@@ -581,6 +581,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "broca-records"
+version = "0.4.6"
+dependencies = [
+ "broca-owner-only",
+ "broca-protocol",
+ "broca-test-support",
+ "broca-wal",
+ "broca-wal-reader",
+ "serde",
+ "serde_jcs",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "broca-replay"
 version = "0.4.6"
 dependencies = [
@@ -771,6 +786,7 @@ version = "0.4.6"
 dependencies = [
  "broca-owner-only",
  "broca-protocol",
+ "broca-records",
  "broca-test-support",
  "broca-wal-reader",
  "getrandom 0.3.4",
