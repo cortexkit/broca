@@ -876,6 +876,8 @@ fn open_error(error: SessionError, create: bool) -> OpenError {
     ))
 }
 
+pub mod recovery;
+
 #[cfg(test)]
 #[path = "store_open_tests.rs"]
 mod tests;
