@@ -16,8 +16,9 @@ use std::sync::Arc;
 use broca_core::capability::ApprovalPolicy;
 use broca_core::capability::ToolManifest;
 use broca_core::delivery_order::{appended_text, choose_mode, Boundary};
+use broca_core::output_events::OutputEvent;
 use broca_core::provider::{Provider, StepRuntime};
-use broca_core::run::{limiting_stop_satisfied, stop_satisfied, OutputEvent};
+use broca_core::stop_conditions::{limiting_stop_satisfied, stop_satisfied};
 use broca_core::tags::TagNumbering;
 use broca_core::tool_plane::{
     BatchCtx, DispatchKey, DispatchRegistration, DispatchResult, ProviderHeldLifecycle,
@@ -563,7 +564,7 @@ where
     // bust the prompt cache, or make the conversation invalid for the provider.
     let drift = match resolution {
         Resolution::Resume | Resolution::ProviderHeld(_) | Resolution::Paused(_) => {
-            broca_core::run::render_identity_error(
+            broca_core::provider_errors::render_identity_error(
                 seams.provider,
                 admission.renderer_version,
                 &admission.render_config,
@@ -779,7 +780,7 @@ fn open_batch_close_out<W: Writer>(
                     None,
                 ),
                 Some(CallState::ProviderHeld) => {
-                    let (result, _, code) = broca_core::resume::provider_held_close_result(
+                    let (result, _, code) = broca_core::tool_results::provider_held_close_result(
                         id,
                         RunFinishReason::Interrupted,
                     );
@@ -834,14 +835,14 @@ pub async fn seal<W, P, T>(
     writer: &mut W,
     parts: &dyn Parts,
     seams: &Seams<'_, P, T>,
-    cause: broca_core::resume::SealCause,
+    cause: broca_core::seal::SealCause,
 ) -> Result<Finished, LoopError>
 where
     W: Writer,
     P: Provider,
     T: ToolPlane,
 {
-    use broca_core::resume::SealCause;
+    use broca_core::seal::SealCause;
     let run = writer
         .operations()
         .run
@@ -901,7 +902,7 @@ where
         );
         if cause == SealCause::CrashOrphan {
             end.error = Some(
-                serde_json::to_value(broca_core::resume::crash_orphan_error())
+                serde_json::to_value(broca_core::seal::crash_orphan_error())
                     .map_err(|e| LoopError::Parts(e.to_string()))?,
             );
         }
@@ -959,7 +960,7 @@ fn never_dispatched_close_out<W: Writer>(writer: &W, run_id: &str, now: u64) -> 
             &mut records,
             run_id,
             &batch_id,
-            broca_core::resume::not_dispatched_result(id),
+            broca_core::tool_results::not_dispatched_result(id),
             CallOutcome::Interrupted,
             now,
         );
@@ -2330,7 +2331,7 @@ where
                 // The error names the run's account or credential where it is scoped to one, as
                 // today's does before deciding anything on it.
                 let selection = run_selection(seams, admission);
-                let error = Box::new(broca_core::run::stamp_credential(
+                let error = Box::new(broca_core::provider_errors::stamp_credential(
                     *error,
                     selection.and_then(|selection| selection.account_ref.as_deref()),
                     selection.map(|selection| selection.credential_id.as_str()),
@@ -2529,7 +2530,7 @@ where
             // `submit_result` nothing.
             let mut produced = structured.as_ref().map(|frozen| {
                 let text = (frozen.mode == broca_protocol::structured_output::Mode::FinalText)
-                    .then(|| broca_core::run::joined_text(&step.message));
+                    .then(|| broca_core::structured_output::joined_text(&step.message));
                 structured_result(
                     &run_id,
                     broca_protocol::structured_output::result(
@@ -2568,7 +2569,9 @@ where
         // A `submit_tool` run ends at the step that calls `submit_result`, before anything is
         // dispatched or a stop condition is weighed, as today's loop ends it.
         if let Some(frozen) = structured.as_ref() {
-            if let Some(submit) = broca_core::run::counted_submit(frozen, &step.message, &[]) {
+            if let Some(submit) =
+                broca_core::structured_output::counted_submit(frozen, &step.message, &[])
+            {
                 let pending = PendingSubmit {
                     step_id,
                     calls: calls.clone(),
@@ -3222,7 +3225,7 @@ pub(crate) fn repetition_guidance(
                 let seed = serde_json::from_value(seed.clone()).map_err(|error| {
                     LoopError::Parts(format!("stored repetition counters: {error}"))
                 })?;
-                if !broca_core::run::restore_repetition_guidance_seeded(
+                if !broca_core::repetition::restore_repetition_guidance_seeded(
                     &mut prompt[start..end],
                     &seed,
                 ) {
@@ -3236,7 +3239,7 @@ pub(crate) fn repetition_guidance(
         let first_step = (start..end)
             .find(|position| prompt[*position].role == broca_protocol::content::Role::Assistant);
         if let Some(first_step) = first_step {
-            broca_core::run::restore_repetition_guidance(&mut prompt[first_step..end]);
+            broca_core::repetition::restore_repetition_guidance(&mut prompt[first_step..end]);
         }
     }
     Ok(())
@@ -3551,26 +3554,27 @@ async fn model_step<W: Writer, P: Provider, T>(
     // run ends, as broca-core's run loop does. Only attempt records are taken: nothing else of
     // a step that no longer counts is.
     if matches!(outcome, Err(StepFailure::Cancelled)) && seams.provider.reports_attempt_evidence() {
-        let drained = tokio::time::timeout(broca_core::run::CANCELLED_STEP_ATTEMPT_DRAIN, async {
-            while let Some(event) = events.recv().await {
-                if let NormalizedEvent::Control(ProviderControl::AttemptFinished { attempt }) =
-                    event
-                {
-                    record_attempt(
-                        writer,
-                        seams,
-                        run_id,
-                        step_id,
-                        attempt,
-                        requested_ttl_ms,
-                        account_limit_pause,
-                    )
-                    .await?;
+        let drained =
+            tokio::time::timeout(broca_core::provider::CANCELLED_STEP_ATTEMPT_DRAIN, async {
+                while let Some(event) = events.recv().await {
+                    if let NormalizedEvent::Control(ProviderControl::AttemptFinished { attempt }) =
+                        event
+                    {
+                        record_attempt(
+                            writer,
+                            seams,
+                            run_id,
+                            step_id,
+                            attempt,
+                            requested_ttl_ms,
+                            account_limit_pause,
+                        )
+                        .await?;
+                    }
                 }
-            }
-            Ok::<(), LoopError>(())
-        })
-        .await;
+                Ok::<(), LoopError>(())
+            })
+            .await;
         if let Ok(result) = drained {
             result?;
         }
@@ -3596,7 +3600,7 @@ async fn record_attempt<W: Writer, P: Provider, T>(
     if let Some(warm) = &seams.keep_warm {
         warm.note_attempt(&attempt);
     }
-    broca_core::run::report_input_transformations(
+    broca_core::input_transformations::report_input_transformations(
         &seams.bind,
         &broca_protocol::RunId(run_id.into()),
         StepId(step_id),
@@ -4138,7 +4142,7 @@ async fn gate_hooked(
     if let Some(runtime) = hooks {
         let output = runtime
             .chain(
-                broca_core::run::pre_tool_subject(StepId(step_id), call, Phase::Mutate),
+                broca_core::tool_results::pre_tool_subject(StepId(step_id), call, Phase::Mutate),
                 trace,
                 |_| true,
             )
@@ -4184,7 +4188,7 @@ async fn gate_hooked(
     if let Some(runtime) = hooks {
         let output = runtime
             .chain(
-                broca_core::run::pre_tool_subject(StepId(step_id), call, Phase::Validate),
+                broca_core::tool_results::pre_tool_subject(StepId(step_id), call, Phase::Validate),
                 trace,
                 |_| true,
             )
@@ -4218,7 +4222,8 @@ fn hook_refused(
     unavailable: bool,
     metadata: &dyn Fn(&broca_core::hooks::Trace, &Value, bool) -> Option<Value>,
 ) -> CallPlan {
-    let (result, reason) = broca_core::run::pre_tool_refusal(call, provider, text, unavailable);
+    let (result, reason) =
+        broca_core::tool_results::pre_tool_refusal(call, provider, text, unavailable);
     CallPlan::HookTerminal {
         result,
         reason: reason.into(),
@@ -4320,7 +4325,7 @@ fn gate_call(
         }
         Some(ToolPlaneError::ScopeDrained { reason }) => {
             return Some(CallPlan::Synthetic {
-                result: broca_core::run::route_drained_result(&call.tool_call_id, reason),
+                result: broca_core::tool_results::route_drained_result(&call.tool_call_id, reason),
                 reason: Some(reason.clone()),
             });
         }
@@ -4347,7 +4352,7 @@ fn no_dispatch(
     hooks: Option<Value>,
     now: u64,
 ) {
-    let result = broca_core::replay::no_dispatch_result(id, reason);
+    let result = broca_core::tool_results::no_dispatch_result(id, reason);
     let digest = Digest(Sha256::digest(result.encode()).into());
     let is_error = result.is_error;
     records.push(Record::ToolReply(ToolReply {
@@ -4742,7 +4747,7 @@ fn pending_submit<W: Writer>(
             .collect()
     });
     let existing: Vec<ToolResult> = answered.iter().map(|id| error_result(id, "")).collect();
-    let submit = broca_core::run::counted_submit(frozen, &message, &existing)?;
+    let submit = broca_core::structured_output::counted_submit(frozen, &message, &existing)?;
     Some(PendingSubmit {
         step_id: run.completed_steps,
         calls,
@@ -5642,7 +5647,7 @@ async fn withdraw<P, T>(seams: &Seams<'_, P, T>, closed: &[ProviderHeldReply]) {
 /// closes one.
 fn held_close_result(id: &ToolCallId) -> (ToolResult, CallOutcome, &'static str) {
     let (result, _, code) =
-        broca_core::resume::provider_held_close_result(id, RunFinishReason::Cancelled);
+        broca_core::tool_results::provider_held_close_result(id, RunFinishReason::Cancelled);
     (result, CallOutcome::Interrupted, code)
 }
 
@@ -5790,14 +5795,15 @@ async fn post_tool(
                 tool: call.tool_name.clone(),
                 tool_call_id: result.tool_call_id.0.clone(),
                 call_key: Some(call_key.to_owned()),
-                blocks: vec![broca_core::run::post_tool_text(&result)],
+                blocks: vec![broca_core::tool_results::post_tool_text(&result)],
                 is_error: result.is_error,
             },
             broca_core::hooks::Trace::default(),
             |_| true,
         )
         .await;
-    let (result, reason, hooks) = broca_core::run::transformed_tool_result(&result, &output);
+    let (result, reason, hooks) =
+        broca_core::tool_results::transformed_tool_result(&result, &output);
     Resolved {
         result,
         outcome: CallOutcome::Completed,

@@ -17,7 +17,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             let record = Record::Pause(broca_session_store::record::Pause {
                 run_id: run.run_id.clone(),
                 reason: broca_protocol::PauseReason::ToolHeld,
-                ts_ms: broca_core::run::epoch_millis(),
+                ts_ms: broca_core::clock::epoch_millis(),
                 error: None,
                 account_limit: None,
             });

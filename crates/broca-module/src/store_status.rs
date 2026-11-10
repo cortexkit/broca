@@ -260,7 +260,7 @@ struct Walk<'a> {
     parts: &'a dyn Parts,
     /// The usage of the run's completed steps, over every start bearing its id.
     usage: broca_protocol::usage::RunUsage,
-    steps: broca_core::replay::RunUsageSteps,
+    steps: broca_core::step_usage::RunUsageSteps,
     /// Whether the records walked now belong to one of this run's starts.
     usage_active: bool,
     active_run: Option<String>,
@@ -369,7 +369,7 @@ impl<'a> Walk<'a> {
                         .and_then(|fallback| fallback.get("raw_finish_reason"))
                         .and_then(Value::as_str);
                     if let Some(state) = &mut self.found {
-                        state.finish = broca_core::replay::step_finish(
+                        state.finish = broca_core::step_usage::step_finish(
                             &self.frozen_finish_config,
                             refusal_fallback,
                             raw,
@@ -382,7 +382,7 @@ impl<'a> Walk<'a> {
                     let shares = shares(&end.by_model);
                     self.steps.step_ended(
                         &mut self.usage,
-                        Some(broca_core::replay::StepServed {
+                        Some(broca_core::step_usage::StepServed {
                             step_id: broca_protocol::StepId(end.step_id),
                             service_tier_used: end.service_tier_used.as_deref(),
                             speed_used: end.speed_used.as_deref(),
@@ -637,7 +637,7 @@ impl<'a> Walk<'a> {
 
     /// The run ended, as its end states.
     fn end(&mut self, end: End) {
-        let structured_output = broca_core::replay::ended_structured_output(
+        let structured_output = broca_core::structured_output::ended_structured_output(
             self.structured_output_result.clone(),
             self.frozen_structured_output.as_ref(),
         );
@@ -700,7 +700,7 @@ struct WalkRest {
 /// A step's usage by model as the shared usage arithmetic takes it.
 fn shares(
     by_model: &[broca_session_store::record::ModelStepUsage],
-) -> Vec<broca_core::replay::ModelShare<'_>> {
+) -> Vec<broca_core::step_usage::ModelShare<'_>> {
     by_model
         .iter()
         .map(|share| {
@@ -875,7 +875,7 @@ fn predicted_end<B: SessionBackend>(
     walk: &mut Walk<'_>,
 ) -> Result<Option<End>, StatusError> {
     use crate::executor::StoreRunMode;
-    use broca_core::resume::SealCause;
+    use broca_core::seal::SealCause;
     let unrecorded = || StatusError::EndUnrecorded {
         run_id: run.run_id.clone(),
     };
@@ -904,7 +904,7 @@ fn predicted_end<B: SessionBackend>(
             Ok(Some(end(
                 RunFinishReason::Interrupted,
                 Some("runner_crash".into()),
-                Some(broca_core::resume::crash_orphan_error()),
+                Some(broca_core::seal::crash_orphan_error()),
             )))
         }
         Some(StoreRunMode::Resume) => match run.resolution() {

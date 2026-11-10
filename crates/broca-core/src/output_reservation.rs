@@ -22,7 +22,7 @@
 //! so the clamp never depends on state a rebuild cannot see. A step that keeps the frozen cap
 //! writes nothing and renders exactly as before.
 
-use broca_protocol::{ModelHandle, StepId};
+use broca_protocol::{ErrorClass, ModelHandle, ProviderError, StepId};
 use broca_wal::WalRecord;
 
 /// The smallest output cap the loop lowers a request to when the request did not ask for less.
@@ -284,6 +284,40 @@ pub fn recorded_cap(records: &[WalRecord], step_id: StepId) -> Option<u32> {
     }
     None
 }
+
+/// The `context_overflow` refusal of a request whose estimated input leaves less room for output
+/// than the provider's floor. Nothing was sent; compacting the conversation is what helps.
+pub fn output_reservation_overflow(
+    estimate: u64,
+    available: u64,
+    floor: u32,
+    context_limit: u64,
+) -> ProviderError {
+    ProviderError {
+        provider_details: None,
+        provider_subcode: None,
+        refusal: None,
+        class: ErrorClass::ContextOverflow,
+        message: format!(
+            "request not sent: its estimated {estimate} input tokens leave {available} tokens of \
+             the {context_limit}-token context limit for output (after a safety margin of {} \
+             tokens), below the minimum output reservation of {floor} tokens",
+            crate::output_reservation::margin(context_limit)
+        ),
+        status: None,
+        retry_after_secs: None,
+        provider_code: Some(OUTPUT_RESERVATION_OVERFLOW_CODE.into()),
+        resets_at_ms: None,
+        resets_at_source: None,
+        limit_window: None,
+        account_ref: None,
+        credential_id: None,
+        affordable_max_tokens: None,
+    }
+}
+
+/// The `provider_code` of [`output_reservation_overflow`].
+pub const OUTPUT_RESERVATION_OVERFLOW_CODE: &str = "output_reservation_exceeds_context";
 
 #[cfg(test)]
 mod tests {

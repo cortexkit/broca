@@ -35,13 +35,13 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use broca_core::held_calls::HeldCallsProjection;
 use broca_core::projection::{
     boundary_unit, deferred_tool_started_event, input_units, message_lifecycle_event,
     message_shape_finish_reason, no_dispatch_outcome, notice_delivered_event, paused_unit,
     run_finished_unit, run_started_unit, schema_pin_text, tool_finished_event_at, tool_outcome,
     tool_started_event_at, IndeterminateToolCalls, RunEndFacts,
 };
-use broca_core::replay::HeldCallsProjection;
 use broca_protocol::caller::{ControlUnit, RunFinishReason};
 use broca_protocol::content::{AssistantMessage, FinishReason, Message, ToolCall, ToolResult};
 use broca_protocol::{BatchId, RunId, StepId, ToolCallId};

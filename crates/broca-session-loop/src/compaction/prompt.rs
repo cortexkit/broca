@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use broca_core::run::RepetitionGuidance;
+use broca_core::repetition::RepetitionGuidance;
 use broca_core::tags::TagNumbering;
 use broca_protocol::content::{Message, Role};
 use broca_protocol::request::{EpisodeRenderInput, RenderHistory};

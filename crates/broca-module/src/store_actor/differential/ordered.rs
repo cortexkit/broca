@@ -880,7 +880,7 @@ const EXPIRY_MS: u64 = 1_000;
 /// `expires`.
 async fn past(expires: u64) {
     broca_test_support::wait_until("the send's expiry to pass", || async {
-        let now = broca_core::run::epoch_millis().unwrap_or(0);
+        let now = broca_core::clock::epoch_millis().unwrap_or(0);
         if now > expires {
             Ok(())
         } else {
@@ -950,7 +950,7 @@ async fn an_expired_send_waits_on_an_idle_session_alike(cipher: Cipher) {
     pair.first("r1").await;
     pair.release();
     pair.idle().await;
-    let expires = broca_core::run::epoch_millis().unwrap() + EXPIRY_MS;
+    let expires = broca_core::clock::epoch_millis().unwrap() + EXPIRY_MS;
     // Its list names no `idle_start`, so it starts no run on the idle session.
     let queued = pair
         .alike(
@@ -981,7 +981,7 @@ async fn an_expired_send_ends_when_its_run_ends_alike(cipher: Cipher) {
     let pair = Pair::new(hello(), true, cipher).await;
     pair.first("r1").await;
     in_first_step(&pair).await;
-    let expires = broca_core::run::epoch_millis().unwrap() + EXPIRY_MS;
+    let expires = broca_core::clock::epoch_millis().unwrap() + EXPIRY_MS;
     let queued = pair
         .alike(
             "q1",

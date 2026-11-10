@@ -59,21 +59,6 @@ pub(super) async fn restream_message(
     }
 }
 
-/// The subject a pre-tool hook sees for `call` in `phase`.
-pub fn pre_tool_subject(
-    step_id: StepId,
-    call: &ToolCall,
-    phase: cortexkit_role_step_transform_provider::subscription::Phase,
-) -> crate::hooks::Subject {
-    crate::hooks::Subject::PreTool {
-        step_id: step_id.0.to_string(),
-        phase,
-        tool: call.tool_name.clone(),
-        tool_call_id: call.tool_call_id.0.clone(),
-        call_key: None,
-        input: call.input.clone(),
-    }
-}
 pub(super) fn pre_tool_terminal(
     call: &ToolCall,
     original: &serde_json::Value,
@@ -88,63 +73,6 @@ pub(super) fn pre_tool_terminal(
         reason: reason.into(),
         hooks: trace.metadata(original.clone(), call.input.clone(), true),
     }
-}
-
-/// The result a call gets when a pre-tool hook refuses it, and the outcome's reason code. A
-/// provider that denied the call gives the model its own text; one that was unavailable gives
-/// a fixed message naming it.
-pub fn pre_tool_refusal(
-    call: &ToolCall,
-    provider: &str,
-    text: &str,
-    unavailable: bool,
-) -> (ToolResult, &'static str) {
-    let reason = if unavailable {
-        "pre_tool_unavailable"
-    } else {
-        "pre_tool_denied"
-    };
-    let message = if unavailable {
-        format!("{reason}: {provider}; the tool was not executed")
-    } else {
-        text.into()
-    };
-    (error_result(call, &message), reason)
-}
-
-/// A tool result after its post-tool hooks: the edited text in the original output's form, or
-/// a withheld result when a hook the plan requires was unavailable. Also returns the outcome's
-/// reason code and the hook trace.
-pub fn transformed_tool_result(
-    original: &ToolResult,
-    output: &crate::hooks::ChainOutput,
-) -> (ToolResult, Option<String>, Option<Box<broca_wal::Hooks>>) {
-    let mut result = original.clone();
-    let mut reason = None;
-    if let Some((provider, _, _)) = &output.refusal {
-        reason = Some("post_tool_unavailable".into());
-        result.output = ToolOutput::error(format!(
-            "post_tool_unavailable: {provider}; the call executed, but its result is withheld"
-        ));
-        result.is_error = true;
-    } else if let crate::hooks::Subject::PostTool { blocks, .. } = &output.subject {
-        if !output.operations.is_empty() {
-            let text = blocks[0].clone();
-            result.output = match &original.output {
-                ToolOutput::Error { .. } => ToolOutput::error(text),
-                ToolOutput::Denied { .. } if text.starts_with("denied: ") => ToolOutput::Denied {
-                    reason: text[8..].into(),
-                },
-                _ => ToolOutput::Text { text },
-            };
-        }
-    }
-    let metadata = output.trace.metadata(
-        serde_json::to_value(original).unwrap(),
-        serde_json::to_value(&result).unwrap(),
-        false,
-    );
-    (result, reason, metadata)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -227,36 +155,5 @@ pub(super) async fn record_hook_stage(
 ) {
     if !seal.record_hook(stage, writer, record) {
         std::future::pending::<()>().await;
-    }
-}
-
-/// The text a post-tool hook sees for a result: the model's text for it, with media as markers
-/// (provenance permits only captured references). Never called for a JSON result, which stays
-/// hookless.
-pub fn post_tool_text(result: &ToolResult) -> String {
-    match &result.output {
-        ToolOutput::Parts { parts } => broca_protocol::content::media_parts_text(
-            parts,
-            broca_protocol::MediaMarkerReason::Carrier,
-        ),
-        ToolOutput::Text { text } => text.clone(),
-        ToolOutput::Error {
-            message,
-            module,
-            code,
-            detail,
-            nothing_sent,
-            retry,
-            ..
-        } => ToolOutput::error_model_text(
-            message,
-            module.as_deref(),
-            code.as_deref(),
-            detail.as_deref(),
-            *nothing_sent,
-            retry.as_deref(),
-        ),
-        ToolOutput::Denied { reason } => format!("denied: {reason}"),
-        ToolOutput::Json { .. } => unreachable!("a JSON result has no post-tool hooks"),
     }
 }

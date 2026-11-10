@@ -89,7 +89,7 @@ impl RunExecutor for FailingExecutor {
         };
         let result = async {
             let tools = broca_core::StubToolPlane::new().with_canned_text("read", "file contents");
-            let now = || broca_core::run::epoch_millis().unwrap_or(0);
+            let now = || broca_core::clock::epoch_millis().unwrap_or(0);
             let seams = broca_session_loop::Seams {
                 provider: &provider,
                 tools: &tools,

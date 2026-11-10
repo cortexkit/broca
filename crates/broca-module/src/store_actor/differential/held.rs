@@ -124,7 +124,7 @@ impl RunExecutor for HeldExecutor {
             } else {
                 None
             };
-            let now = || broca_core::run::epoch_millis().unwrap_or(0);
+            let now = || broca_core::clock::epoch_millis().unwrap_or(0);
             let seams = broca_session_loop::run::Seams {
                 provider: &self.provider,
                 tools: self.tools.as_ref(),

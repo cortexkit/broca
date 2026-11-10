@@ -17,12 +17,15 @@
 //! Both the run loop and the module's crash-orphan pass resume through these functions, so the
 //! close-out has one shape however the resume is reached.
 
+pub use crate::seal::{crash_orphan_error, SealCause};
+pub use crate::tool_results::{
+    not_dispatched_result, outcome_unknown_result, provider_held_close_result,
+    provider_held_interrupted_result, NOT_DISPATCHED_TEXT, OUTCOME_UNKNOWN_TEXT,
+};
+
 use std::sync::Arc;
 
-use broca_protocol::{
-    content::{ToolOutput, ToolResult},
-    ToolCallId,
-};
+use broca_protocol::ToolCallId;
 use broca_wal::{DispatchOutcome, ResumeRedo, ResumeReplayed, WalRecord, WithdrawElicitation};
 
 use crate::replay::{OpenCallState, ReplayResolution, ReplayState};
@@ -1155,75 +1158,6 @@ mod offset_resume_tests {
     }
 }
 
-/// The text of the result a resume writes for an indeterminate call. It says plainly that no
-/// result was recorded, because that is all the runner knows: the call may have run.
-pub const OUTCOME_UNKNOWN_TEXT: &str = "outcome_unknown: this tool call was sent, but no result \
-     was recorded before the run stopped, so it may or may not have run. It will not be sent \
-     again.";
-
-/// The text of the result a resume writes for a planned call of the same batch that never left
-/// the process. It definitely did not run.
-pub const NOT_DISPATCHED_TEXT: &str =
-    "tool not run: the run was interrupted before this call was dispatched";
-
-/// The result a resume records for an indeterminate call: an error whose text says the call has
-/// no recorded result. Written with outcome [`DispatchOutcome::Unknown`], which every reader
-/// already treats as indeterminate, so the call stays marked as possibly run.
-pub fn outcome_unknown_result(tool_call_id: &ToolCallId) -> ToolResult {
-    ToolResult {
-        tool_call_id: tool_call_id.clone(),
-        output: ToolOutput::error(OUTCOME_UNKNOWN_TEXT),
-        is_error: true,
-    }
-}
-
-/// The result for a planned call that never left the process because the run stopped first. A
-/// resume writes it for such a call of an open batch, and a run asked to stop writes it for each
-/// call it no longer sends. Recorded with outcome [`DispatchOutcome::Interrupted`]: the call
-/// definitely did not run and is never sent later.
-pub fn not_dispatched_result(tool_call_id: &ToolCallId) -> ToolResult {
-    ToolResult {
-        tool_call_id: tool_call_id.clone(),
-        output: ToolOutput::error(NOT_DISPATCHED_TEXT),
-        is_error: true,
-    }
-}
-
-/// A provider-held call has a known owner, so crash close-out must not claim an unknown outcome.
-pub fn provider_held_interrupted_result(tool_call_id: &ToolCallId) -> ToolResult {
-    provider_held_close_result(tool_call_id, broca_protocol::RunFinishReason::Interrupted).0
-}
-
-/// Close a provider's known obligation without pretending that its outcome is unknown.
-pub fn provider_held_close_result(
-    tool_call_id: &ToolCallId,
-    reason: broca_protocol::RunFinishReason,
-) -> (ToolResult, DispatchOutcome, &'static str) {
-    let (code, text, outcome) = match reason {
-        broca_protocol::RunFinishReason::Cancelled => (
-            "provider_held_cancelled",
-            "cancelled",
-            DispatchOutcome::Interrupted,
-        ),
-        _ => (
-            "provider_held_interrupted",
-            "interrupted",
-            DispatchOutcome::Interrupted,
-        ),
-    };
-    (
-        ToolResult {
-            tool_call_id: tool_call_id.clone(),
-            output: ToolOutput::error(format!(
-                "{code}: the run was {text} while the provider held the call"
-            )),
-            is_error: true,
-        },
-        outcome,
-        code,
-    )
-}
-
 /// Closing is episode-wide, even after the last held call has its terminal. Only outcomes,
 /// not provider-controlled result text, identify a close-out. Ignore earlier episodes.
 pub fn provider_held_closing_reason<'a>(
@@ -1650,37 +1584,6 @@ pub fn close_out_pending_turn(prior: &ReplayState) -> Vec<WalRecord> {
     records
 }
 
-/// Why a broca process ends a run it didn't finish: it is stopping while the run runs, or it
-/// found, on opening the session, a run that a crashed process left running.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SealCause {
-    Shutdown,
-    CrashOrphan,
-}
-
-/// The diagnostic a crash-orphan seal records on its `RunFinished`. The run's reason stays
-/// `Interrupted`: recovery knows the old process left the run unsealed, not how it ended.
-pub fn crash_orphan_error() -> broca_protocol::ProviderError {
-    broca_protocol::ProviderError {
-        provider_details: None,
-        provider_subcode: None,
-        class: broca_protocol::ErrorClass::Transient,
-        message: "the previous broca process ended without sealing this run: host crash, kill, \
-                  or power loss"
-            .into(),
-        provider_code: Some("previous_process_ended_unsealed".into()),
-        status: None,
-        retry_after_secs: None,
-        refusal: None,
-        resets_at_ms: None,
-        resets_at_source: None,
-        limit_window: None,
-        account_ref: None,
-        credential_id: None,
-        affordable_max_tokens: None,
-    }
-}
-
 /// What an interrupted seal writes, after any provider attempt a stopping run handed over, in
 /// this order. Built from the replayed log, so every log that ends a run this way ends it the
 /// same: today's actor writes it, and a run loop over other storage writes the same records in
@@ -1784,6 +1687,7 @@ mod tests {
         deferred_tests::{approval, batch, finished, prepared, terminal},
         replay,
     };
+    use broca_protocol::ToolOutput;
     use broca_protocol::{BatchId, PauseReason, RunFinishReason, RunId};
     use broca_wal::DeferredDecision;
 
