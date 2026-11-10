@@ -391,6 +391,8 @@ impl Value for Usage {
             input_tokens,
             cached_input_tokens,
             cache_write_tokens,
+            cache_write_5m_tokens,
+            cache_write_1h_tokens,
             output_tokens,
             reasoning_tokens,
         } = self;
@@ -399,6 +401,8 @@ impl Value for Usage {
         put_opt(out, 3, false, cache_write_tokens);
         put_opt(out, 4, false, output_tokens);
         put_opt(out, 5, false, reasoning_tokens);
+        put_opt(out, 6, false, cache_write_5m_tokens);
+        put_opt(out, 7, false, cache_write_1h_tokens);
     }
     fn read(raw: Raw<'_>) -> Result<Self, DecodeError> {
         const AT: &str = "Usage";
@@ -409,6 +413,8 @@ impl Value for Usage {
             3 => take_one(&mut usage.cache_write_tokens, field, AT),
             4 => take_one(&mut usage.output_tokens, field, AT),
             5 => take_one(&mut usage.reasoning_tokens, field, AT),
+            6 => take_one(&mut usage.cache_write_5m_tokens, field, AT),
+            7 => take_one(&mut usage.cache_write_1h_tokens, field, AT),
             _ => skip_unknown(field, AT),
         })?;
         Ok(usage)

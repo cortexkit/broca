@@ -315,6 +315,8 @@ impl Gen for Usage {
             input_tokens: gen(g),
             cached_input_tokens: gen(g),
             cache_write_tokens: gen(g),
+            cache_write_5m_tokens: gen(g),
+            cache_write_1h_tokens: gen(g),
             output_tokens: gen(g),
             reasoning_tokens: gen(g),
         }

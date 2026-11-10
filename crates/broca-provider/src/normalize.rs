@@ -721,10 +721,22 @@ impl AnthropicNormalizer {
         if let Some(x) = g("cache_read_input_tokens") {
             self.usage.cached_input_tokens = Some(x);
         }
-        // Replay usage keeps its flat total. Journaled attempts separately retain the
-        // provider's TTL split and raw usage without changing the legacy step record.
         if let Some(x) = g("cache_creation_input_tokens") {
             self.usage.cache_write_tokens = Some(x);
+        }
+        if let Some(creation) = u.get("cache_creation") {
+            if let Some(x) = creation
+                .get("ephemeral_5m_input_tokens")
+                .and_then(Value::as_u64)
+            {
+                self.usage.cache_write_5m_tokens = Some(x);
+            }
+            if let Some(x) = creation
+                .get("ephemeral_1h_input_tokens")
+                .and_then(Value::as_u64)
+            {
+                self.usage.cache_write_1h_tokens = Some(x);
+            }
         }
         // MERGING ACROSS EVENTS IS LOAD-BEARING, NOT INCIDENTAL. Anthropic reports usage
         // TWICE per response, and the two are not the same measurement: `message_start`
@@ -1061,6 +1073,48 @@ fn status_default_class(status: u16) -> ErrorClass {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn anthropic_cache_write_lifetimes_preserve_presence_and_last_reported_value() {
+        let mut normalizer = AnthropicNormalizer::new(StepId(1));
+        normalizer.push_json(r#"{"type":"message_start","message":{"id":"synthetic-cache-write","usage":{"input_tokens":12,"cache_read_input_tokens":100,"cache_creation_input_tokens":30,"cache_creation":{"ephemeral_5m_input_tokens":10,"ephemeral_1h_input_tokens":20},"output_tokens":1}}}"#).unwrap();
+        normalizer.push_json(r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"cache_creation":{"ephemeral_5m_input_tokens":0},"output_tokens":7}}"#).unwrap();
+        let events = normalizer.push_json(r#"{"type":"message_stop"}"#).unwrap();
+        let usage = events
+            .iter()
+            .find_map(|event| match event {
+                NormalizedEvent::Control(ProviderControl::StepFinished { usage, .. }) => {
+                    Some(usage)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(usage.cache_write_tokens, Some(30));
+        assert_eq!(usage.cache_write_5m_tokens, Some(0));
+        assert_eq!(usage.cache_write_1h_tokens, Some(20));
+        assert_eq!(usage.output_tokens, Some(7));
+        assert_eq!(usage.fill_tokens(), Some(142));
+    }
+
+    #[test]
+    fn anthropic_cache_write_lifetimes_are_unknown_without_reported_split() {
+        for usage in [
+            serde_json::json!({"input_tokens":12,"output_tokens":7}),
+            serde_json::json!({"cache_creation_input_tokens":30}),
+            serde_json::json!({"cache_creation_input_tokens":0,"cache_creation":{}}),
+        ] {
+            let mut normalizer = AnthropicNormalizer::new(StepId(1));
+            normalizer.merge_usage(&usage);
+            assert_eq!(
+                normalizer.usage.cache_write_tokens,
+                usage
+                    .get("cache_creation_input_tokens")
+                    .and_then(Value::as_u64)
+            );
+            assert_eq!(normalizer.usage.cache_write_5m_tokens, None);
+            assert_eq!(normalizer.usage.cache_write_1h_tokens, None);
+        }
+    }
 
     /// A retired model answers 410 with the generic `api_error` type and a null code. Retrying
     /// cannot help, so the status has to outrank the catch-all type.

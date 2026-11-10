@@ -175,6 +175,8 @@ fn maximum_width_terminal() -> WalRecord {
             input_tokens: Some(u64::MAX),
             cached_input_tokens: Some(u64::MAX),
             cache_write_tokens: Some(u64::MAX),
+            cache_write_5m_tokens: Some(u64::MAX),
+            cache_write_1h_tokens: Some(u64::MAX),
             output_tokens: Some(u64::MAX),
             reasoning_tokens: Some(u64::MAX),
         },

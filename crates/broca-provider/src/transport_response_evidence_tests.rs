@@ -178,6 +178,8 @@ async fn real_metered_capture_openai_chat_write_and_read_response_evidence() {
                 input_tokens: Some(3),
                 cached_input_tokens: Some(read),
                 cache_write_tokens: Some(write),
+                cache_write_5m_tokens: None,
+                cache_write_1h_tokens: None,
                 output_tokens: Some(4),
                 reasoning_tokens: Some(0)
             })
@@ -294,6 +296,8 @@ async fn synthetic_anthropic_response_evidence_merges_ttl_split_and_unknown_keys
         Some(Usage {
             input_tokens: Some(3),
             cache_write_tokens: Some(12),
+            cache_write_5m_tokens: Some(5),
+            cache_write_1h_tokens: Some(7),
             output_tokens: Some(9),
             reasoning_tokens: Some(0),
             ..Default::default()

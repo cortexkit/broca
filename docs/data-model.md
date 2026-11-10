@@ -642,13 +642,15 @@ not know. broca never writes the placeholder back.
 
 ### 2.5 Usage
 
-`Usage` is an object with five optional `u64` keys:
+`Usage` is an object with seven optional `u64` keys:
 
 | Key | Meaning |
 |---|---|
 | `input_tokens` | Fresh, **non-cached** input tokens. Disjoint from `cached_input_tokens`; do not subtract. |
 | `cached_input_tokens` | Cache-read input tokens. |
 | `cache_write_tokens` | Cache-creation tokens. |
+| `cache_write_5m_tokens` | Provider-reported 5-minute cache writes, a subset of `cache_write_tokens`. |
+| `cache_write_1h_tokens` | Provider-reported 1-hour cache writes, a subset of `cache_write_tokens`. |
 | `output_tokens` | Output tokens, **including** reasoning. |
 | `reasoning_tokens` | A **subset** of `output_tokens`; never add the two. |
 
@@ -656,6 +658,15 @@ not know. broca never writes the placeholder back.
 key with value `0` is a reported zero. `{}` means nothing was reported. When usages are
 summed (a run total), a key stays absent only if no step reported it; if some steps
 reported it, the sum covers those steps only, a lower bound.
+
+**Cache-write lifetimes.** Anthropic Messages reports these subsets in
+`usage.cache_creation.ephemeral_5m_input_tokens` and `ephemeral_1h_input_tokens`.
+The total is retained independently; an absent lifetime is unknown and is never inferred from
+the total or the requested cache TTL. Bedrock Converse reads the subsets only when its usage
+carries the same `cache_creation` object. The subsets do not add to context fill. Both storage
+formats retain reported subsets, but usage-export facts omit them until the billing reader
+rollout enables `CACHE_WRITE_LIFETIMES_WRITER_ENABLED` in `broca-core::billing`; that switch also
+covers `usage_by_service_tier` and facts rebuilt from session storage.
 
 **Which records carry usage:**
 

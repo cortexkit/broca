@@ -17,6 +17,12 @@ pub struct Usage {
     /// Cache-CREATION (write) input tokens. Counts toward fill.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_write_tokens: Option<u64>,
+    /// Reported 5-minute cache writes, a subset of `cache_write_tokens`, not extra input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_5m_tokens: Option<u64>,
+    /// Reported 1-hour cache writes. Absent means unknown, not a 5-minute default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_1h_tokens: Option<u64>,
     /// Output tokens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<u64>,
@@ -149,6 +155,10 @@ impl Usage {
         self.cached_input_tokens =
             sum_reported(self.cached_input_tokens, other.cached_input_tokens);
         self.cache_write_tokens = sum_reported(self.cache_write_tokens, other.cache_write_tokens);
+        self.cache_write_5m_tokens =
+            sum_reported(self.cache_write_5m_tokens, other.cache_write_5m_tokens);
+        self.cache_write_1h_tokens =
+            sum_reported(self.cache_write_1h_tokens, other.cache_write_1h_tokens);
         self.output_tokens = sum_reported(self.output_tokens, other.output_tokens);
         self.reasoning_tokens = sum_reported(self.reasoning_tokens, other.reasoning_tokens);
     }
@@ -225,6 +235,16 @@ pub fn model_usage<'a>(
                         input_tokens: iteration.input_tokens,
                         cached_input_tokens: iteration.cache_read_input_tokens,
                         cache_write_tokens: iteration.cache_creation_input_tokens,
+                        cache_write_5m_tokens: iteration
+                            .other
+                            .get("cache_creation")
+                            .and_then(|v| v.get("ephemeral_5m_input_tokens"))
+                            .and_then(serde_json::Value::as_u64),
+                        cache_write_1h_tokens: iteration
+                            .other
+                            .get("cache_creation")
+                            .and_then(|v| v.get("ephemeral_1h_input_tokens"))
+                            .and_then(serde_json::Value::as_u64),
                         output_tokens: iteration.output_tokens,
                         reasoning_tokens: iteration
                             .other
@@ -275,6 +295,7 @@ mod tests {
                 cached_input_tokens: Some(40136),
                 cache_write_tokens: Some(4),
                 reasoning_tokens: None,
+                ..Usage::default()
             }
         );
         assert_eq!(
@@ -295,6 +316,7 @@ mod tests {
                 cached_input_tokens: Some(0),
                 cache_write_tokens: None,
                 reasoning_tokens: Some(7),
+                ..Usage::default()
             }
         );
     }
@@ -348,6 +370,31 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn cache_write_lifetimes_sum_reported_iterations_without_inflating_fill() {
+        let iterations = serde_json::from_value::<Vec<UsageIteration>>(json!([
+            {"model":"synthetic", "input_tokens":12, "cache_creation_input_tokens":30,
+             "cache_creation":{"ephemeral_5m_input_tokens":10,"ephemeral_1h_input_tokens":20}},
+            {"model":"synthetic", "input_tokens":3, "cache_creation_input_tokens":5,
+             "cache_creation":{"ephemeral_1h_input_tokens":5}},
+            {"model":"synthetic", "cache_creation_input_tokens":2}
+        ]))
+        .unwrap();
+        let usage = step_usage(Usage::default(), Some(&iterations));
+        assert_eq!(usage.cache_write_tokens, Some(37));
+        assert_eq!(usage.cache_write_5m_tokens, Some(10));
+        assert_eq!(usage.cache_write_1h_tokens, Some(25));
+        assert_eq!(usage.fill_tokens(), Some(52));
+        let mut total = usage;
+        total += Usage::default();
+        assert_eq!(total, usage);
+        total += Usage {
+            cache_write_5m_tokens: Some(0),
+            ..Usage::default()
+        };
+        assert_eq!(total, usage);
+    }
+
+    #[test]
     fn fill_counts_cache_writes_and_saturates() {
         let usage = Usage {
             input_tokens: Some(3),
@@ -381,10 +428,12 @@ mod tests {
             input_tokens: Some(0),
             cached_input_tokens: Some(0),
             cache_write_tokens: Some(0),
+            cache_write_5m_tokens: Some(0),
+            cache_write_1h_tokens: Some(0),
             output_tokens: Some(0),
             reasoning_tokens: Some(0),
         };
-        let wire = json!({"input_tokens":0,"cached_input_tokens":0,"cache_write_tokens":0,"output_tokens":0,"reasoning_tokens":0});
+        let wire = json!({"input_tokens":0,"cached_input_tokens":0,"cache_write_tokens":0,"cache_write_5m_tokens":0,"cache_write_1h_tokens":0,"output_tokens":0,"reasoning_tokens":0});
         assert_eq!(serde_json::to_value(zero).unwrap(), wire);
         assert_eq!(serde_json::from_value::<Usage>(wire).unwrap(), zero);
         assert_eq!(

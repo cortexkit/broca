@@ -17,6 +17,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 mod fact_session;
 
+/// Enable only after the billing reader can decode cache-write lifetimes. Facts are read once,
+/// so emitting these optional measurements before that rollout would permanently lose them.
+pub const CACHE_WRITE_LIFETIMES_WRITER_ENABLED: bool = false;
+
 /// When installing a session WAL received from another machine, select its
 /// `RunStarted` ids that are absent from this machine's current session WAL.
 /// `incoming` contains the verified source WAL prefix through the move's frozen
@@ -517,7 +521,13 @@ pub fn compute_segments<R: ChargeBasisResolver>(
     source_instance_id: &str,
     resolver: &R,
 ) -> Vec<SpendSegment> {
-    compute_segments_matching(records, None, source_instance_id, resolver)
+    compute_segments_matching(
+        records,
+        None,
+        source_instance_id,
+        resolver,
+        CACHE_WRITE_LIFETIMES_WRITER_ENABLED,
+    )
 }
 
 /// Compute billing-homogeneous segments for one target run without constructing
@@ -528,7 +538,13 @@ pub fn compute_segments_for_run<R: ChargeBasisResolver>(
     source_instance_id: &str,
     resolver: &R,
 ) -> Vec<SpendSegment> {
-    compute_segments_matching(records, Some(run_id), source_instance_id, resolver)
+    compute_segments_matching(
+        records,
+        Some(run_id),
+        source_instance_id,
+        resolver,
+        CACHE_WRITE_LIFETIMES_WRITER_ENABLED,
+    )
 }
 
 fn compute_segments_matching<R: ChargeBasisResolver>(
@@ -536,6 +552,7 @@ fn compute_segments_matching<R: ChargeBasisResolver>(
     target_run: Option<&RunId>,
     source_instance_id: &str,
     resolver: &R,
+    cache_write_lifetimes_enabled: bool,
 ) -> Vec<SpendSegment> {
     let mut output = Vec::new();
     let mut open: Option<OpenRun> = None;
@@ -752,6 +769,20 @@ fn compute_segments_matching<R: ChargeBasisResolver>(
         output.extend(current.finish(resolver));
     }
 
+    if !cache_write_lifetimes_enabled {
+        for segment in &mut output {
+            let omit = |usage: &mut Usage| {
+                usage.cache_write_5m_tokens = None;
+                usage.cache_write_1h_tokens = None;
+            };
+            omit(&mut segment.usage);
+            if let Some(tiers) = &mut segment.usage_by_service_tier {
+                for usage in tiers.values_mut() {
+                    omit(usage);
+                }
+            }
+        }
+    }
     output
 }
 
@@ -1074,6 +1105,7 @@ mod tests {
                 cached_input_tokens: Some(20068),
                 cache_write_tokens: Some(4),
                 reasoning_tokens: Some(23621),
+                ..Usage::default()
             },
             retries,
         );
@@ -1119,6 +1151,97 @@ mod tests {
     }
 
     #[test]
+    fn cache_write_lifetime_fact_switch_preserves_old_bytes_and_identity() {
+        const { assert!(!CACHE_WRITE_LIFETIMES_WRITER_ENABLED) };
+        let mut records = synthetic_iteration_records(["claude-opus-5-5", "claude-opus-4-8"], 0);
+        let WalRecord::ModelStepFinished {
+            usage,
+            fallback,
+            service_tier_used,
+            ..
+        } = &mut records[1].record
+        else {
+            unreachable!()
+        };
+        fallback.usage_iterations = None;
+        *service_tier_used = Some("priority".into());
+        *usage = Usage {
+            input_tokens: Some(12),
+            cached_input_tokens: Some(100),
+            cache_write_tokens: Some(30),
+            output_tokens: Some(7),
+            ..Usage::default()
+        };
+        const TOTAL_ONLY: &str = r#"{"run_id":"synthetic-run","session":{"project_root":"/synthetic","harness":"capture","session":"l3"},"segment_ordinal":0,"fact_id":"fc07bbda7b53f37e36b57c65d801576d13a50b3fb38dd39b868dba2e857f9a37","provider":"anthropic","model":"claude-opus-4-8","auth_selection":"oauth:anthropic:synthetic","charge_basis":"subscription_included","charge_basis_mapping_version":1,"charge_basis_overrides":"none","usage":{"input_tokens":12,"cached_input_tokens":100,"cache_write_tokens":30,"output_tokens":7},"usage_by_service_tier":{"priority":{"input_tokens":12,"cached_input_tokens":100,"cache_write_tokens":30,"output_tokens":7}},"retries_used":0,"pricing_at_ms":100,"pricing_at_precision":"exact","occurred_at_ms":200,"occurred_at_precision":"terminal","terminal_reason":"completed"}"#;
+        for enabled in [false, true] {
+            let facts =
+                compute_segments_matching(&records, None, "synthetic-source", &resolver, enabled);
+            assert_eq!(serde_json::to_string(&facts[0]).unwrap(), TOTAL_ONLY);
+        }
+        let total_only_enabled =
+            compute_segments_matching(&records, None, "synthetic-source", &resolver, true);
+        let WalRecord::ModelStepFinished { usage, .. } = &mut records[1].record else {
+            unreachable!()
+        };
+        usage.cache_write_5m_tokens = Some(10);
+        usage.cache_write_1h_tokens = Some(20);
+        let disabled =
+            compute_segments_matching(&records, None, "synthetic-source", &resolver, false);
+        let enabled = compute_segments_matching(
+            &records,
+            Some(&RunId("synthetic-run".into())),
+            "synthetic-source",
+            &resolver,
+            true,
+        );
+        assert_eq!(serde_json::to_string(&disabled[0]).unwrap(), TOTAL_ONLY);
+        assert_eq!(
+            compute_segments(&records, "synthetic-source", &resolver),
+            disabled
+        );
+        assert_eq!(
+            compute_segments_for_run(
+                &records,
+                &RunId("synthetic-run".into()),
+                "synthetic-source",
+                &resolver
+            ),
+            disabled
+        );
+        assert_eq!(enabled[0].fact_id, disabled[0].fact_id);
+        assert_eq!(enabled[0].usage.cache_write_tokens, Some(30));
+        assert_eq!(enabled[0].usage.cache_write_5m_tokens, Some(10));
+        assert_eq!(enabled[0].usage.cache_write_1h_tokens, Some(20));
+        let tiers = enabled[0].usage_by_service_tier.as_ref().unwrap();
+        assert_eq!(tiers["priority"], enabled[0].usage);
+        let mut expected: serde_json::Value = serde_json::from_str(TOTAL_ONLY).unwrap();
+        for value in ["usage", "usage_by_service_tier"] {
+            let target = if value == "usage" {
+                &mut expected[value]
+            } else {
+                &mut expected[value]["priority"]
+            };
+            target["cache_write_5m_tokens"] = json!(10);
+            target["cache_write_1h_tokens"] = json!(20);
+        }
+        assert_eq!(serde_json::to_value(&enabled[0]).unwrap(), expected);
+        // A sample is the serialized builder result, not a hand-assembled fact.
+        if let Ok(directory) = std::env::var("BROCA_CACHE_WRITE_FACT_SAMPLES") {
+            std::fs::create_dir_all(&directory).unwrap();
+            for (name, fact) in [
+                ("anthropic-both-lifetimes.json", &enabled[0]),
+                ("anthropic-total-only.json", &total_only_enabled[0]),
+            ] {
+                std::fs::write(
+                    std::path::Path::new(&directory).join(name),
+                    serde_json::to_vec(fact).unwrap(),
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    #[test]
     fn same_model_iterations_coalesce_and_count_retries_once() {
         let mut records = synthetic_iteration_records(["claude-opus-5-5", "claude-opus-5-5"], 3);
         if let WalRecord::ModelStepFinished {
@@ -1143,6 +1266,7 @@ mod tests {
                 cached_input_tokens: Some(40136),
                 cache_write_tokens: Some(4),
                 reasoning_tokens: None,
+                ..Usage::default()
             }
         );
         assert_eq!(segments[0].retries_used, 3);

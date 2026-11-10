@@ -1462,6 +1462,20 @@ impl BedrockStreamNormalizer {
         ) {
             self.usage.cache_write_tokens = Some(value);
         }
+        if let Some(creation) = usage.get("cache_creation") {
+            if let Some(value) = creation
+                .get("ephemeral_5m_input_tokens")
+                .and_then(Value::as_u64)
+            {
+                self.usage.cache_write_5m_tokens = Some(value);
+            }
+            if let Some(value) = creation
+                .get("ephemeral_1h_input_tokens")
+                .and_then(Value::as_u64)
+            {
+                self.usage.cache_write_1h_tokens = Some(value);
+            }
+        }
         if let Some(evidence) = &self.response_evidence {
             evidence.lock().unwrap().observe_usage(usage, self.usage);
         }
@@ -2222,6 +2236,18 @@ mod tests {
 #[cfg(test)]
 mod usage_presence_tests {
     use super::*;
+
+    #[test]
+    fn bedrock_cache_write_lifetimes_require_the_anthropic_object() {
+        let mut normalizer = BedrockStreamNormalizer::new(StepId(1));
+        normalizer.merge_usage(&serde_json::json!({"cacheWriteInputTokens":30}));
+        assert_eq!(normalizer.usage.cache_write_tokens, Some(30));
+        assert_eq!(normalizer.usage.cache_write_5m_tokens, None);
+        assert_eq!(normalizer.usage.cache_write_1h_tokens, None);
+        normalizer.merge_usage(&serde_json::json!({"cache_creation":{"ephemeral_5m_input_tokens":10,"ephemeral_1h_input_tokens":20}}));
+        assert_eq!(normalizer.usage.cache_write_5m_tokens, Some(10));
+        assert_eq!(normalizer.usage.cache_write_1h_tokens, Some(20));
+    }
 
     #[test]
     fn bedrock_reports_zero_and_positive_cache_write_but_no_reasoning_split() {

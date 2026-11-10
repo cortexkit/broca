@@ -4497,6 +4497,8 @@ fn response_envelope(
                     input_tokens: counters("input_tokens"),
                     cached_input_tokens: counters("cache_read_input_tokens"),
                     cache_write_tokens: counters("cache_creation_input_tokens"),
+                    cache_write_5m_tokens: split(entry, "ephemeral_5m_input_tokens"),
+                    cache_write_1h_tokens: split(entry, "ephemeral_1h_input_tokens"),
                     output_tokens: counters("output_tokens"),
                     reasoning_tokens: entry
                         .get("output_tokens_details")
