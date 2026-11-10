@@ -394,6 +394,236 @@ async fn an_owner_imports_a_head_and_installs_its_first_view_through_serve() {
     );
 }
 
+/// Published Thalamus exports keep call identities and notices through `session.read`
+/// (default and display facts) and display `session.history`. Optional recording writes
+/// the response frame bodies without re-encoding them.
+#[tokio::test]
+async fn thalamus_imported_heads_keep_calls_and_notices_in_wire_reads() {
+    let fixtures = std::env::var_os("BROCA_THALAMUS_EXPORT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../ck-session-import/tests/fixtures/thalamus-export-v1")
+        });
+    let record = std::env::var_os("BROCA_IMPORTED_READ_RECORD_DIR").map(PathBuf::from);
+    for (host, journal, carrier) in [
+        ("opencode2", "export.json", "thalamus-harness"),
+        ("pi", "export.jsonl", "thalamus-pi"),
+    ] {
+        let expected_calls = if host == "pi" { 1 } else { 2 };
+        let source = fixtures.join(host);
+        let bytes = std::fs::read(source.join(journal)).unwrap();
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(source.join("reply.json")).unwrap()).unwrap();
+        assert_eq!(
+            format!("{:x}", sha2::Sha256::digest(&bytes)),
+            metadata["sha256"].as_str().unwrap()
+        );
+        let header: serde_json::Value = serde_json::from_slice(if host == "pi" {
+            bytes.split(|byte| *byte == b'\n').next().unwrap()
+        } else {
+            &bytes
+        })
+        .unwrap();
+        let session = if host == "pi" {
+            &header["id"]
+        } else {
+            &header["info"]["id"]
+        };
+        let sends = std::fs::read(source.join("export.sends.json")).unwrap();
+        let side: serde_json::Value = serde_json::from_slice(&sends).unwrap();
+        let ride = side
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|send| send["call_key"].is_string())
+            .unwrap();
+        let note = side
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|send| send["template"] == "note")
+            .unwrap();
+        let mut rig = Rig::start(host, true).await;
+        rig.bind(1, core(), Some(stamp(core()))).await;
+        let folder = rig.import_folder();
+        std::fs::create_dir_all(&folder).unwrap();
+        let path = folder.join("head.json");
+        std::fs::write(&path, bytes).unwrap();
+        std::fs::write(folder.join("head.sends.json"), sends).unwrap();
+        let imported = rig
+            .result(
+                1,
+                "session.import",
+                serde_json::json!({
+                    "import_id": "real-thalamus-export",
+                    "source": {"harness": host, "path": path, "session": session,
+                               "sha256": metadata["sha256"]},
+                    "origin": {"kind": "import", "source_ref": "thalamus:sample-head"},
+                    "tag_floor": metadata["tag_floor"],
+                }),
+            )
+            .await;
+        let count = imported["moves"]["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|row| row["entry"].as_u64())
+            .max()
+            .unwrap();
+        for (name, params) in [
+            ("read-default-1.json", serde_json::json!({})),
+            (
+                "read-display-facts-1.json",
+                serde_json::json!({"include_display_facts": true}),
+            ),
+        ] {
+            let response = rig
+                .request(
+                    1,
+                    serde_json::json!({"method": "session.read", "params": params}),
+                )
+                .await;
+            assert_eq!(
+                response.header.ty,
+                FrameType::Response,
+                "{}",
+                String::from_utf8_lossy(&response.body)
+            );
+            let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+            let page = &body["result"];
+            let messages = page["messages"].as_array().unwrap();
+            assert_eq!(
+                messages.len() as u64,
+                count,
+                "the default page covers the whole imported transcript"
+            );
+            assert_eq!(messages[0]["ordinal"], 1);
+            assert!(page.get("next_from_ordinal").is_none());
+            let mut calls = 0;
+            for message in messages {
+                for call in message["tool_calls"].as_array().into_iter().flatten() {
+                    calls += 1;
+                    assert_eq!(call["call_carrier"], carrier);
+                    assert_eq!(
+                        call["call_key"],
+                        format!(
+                            "{}/{}",
+                            message["mid"].as_str().unwrap(),
+                            call["tool_call_id"].as_str().unwrap()
+                        )
+                    );
+                }
+            }
+            assert_eq!(calls, expected_calls);
+            if params["include_display_facts"] == true {
+                let call = messages
+                    .iter()
+                    .flat_map(|message| message["tool_times"].as_array().into_iter().flatten())
+                    .find(|call| call["call_key"] == ride["call_key"])
+                    .expect("the original runner call key");
+                assert_eq!(call["call_carrier"], carrier);
+                for message in messages {
+                    for time in message["tool_times"].as_array().into_iter().flatten() {
+                        let call = message["tool_calls"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .find(|call| call["tool_call_id"] == time["tool_call_id"])
+                            .unwrap();
+                        assert_eq!(time["call_key"], call["call_key"]);
+                        assert_eq!(time["call_carrier"], carrier);
+                    }
+                }
+                let notice = messages
+                    .iter()
+                    .flat_map(|message| message["notices"].as_array().into_iter().flatten())
+                    .find(|notice| notice["call_key"] == ride["call_key"])
+                    .expect("the delivered ride notice");
+                assert_eq!(notice["text"], ride["text"]);
+                assert_eq!(notice["send_id"], ride["send_id"]);
+                assert_eq!(notice["sender"], ride["sender"]);
+                assert_eq!(notice["call_carrier"], carrier);
+                let result_page = rig
+                    .result(
+                        1,
+                        "session.read",
+                        serde_json::json!({
+                            "from_ordinal": 3, "limit": 1, "include_display_facts": true,
+                        }),
+                    )
+                    .await;
+                assert_eq!(
+                    result_page["messages"][0]["notices"][0], *notice,
+                    "a page starting at the results keeps the notice"
+                );
+                let note_row = messages
+                    .iter()
+                    .find(|message| message["mid"] == note["mid"])
+                    .unwrap();
+                assert_eq!(note_row["notice"], true);
+                assert_eq!(note_row["sender"], note["sender"]);
+            } else {
+                assert!(messages
+                    .iter()
+                    .all(|message| message.get("tool_times").is_none()
+                        && message.get("notices").is_none()
+                        && message.get("notice").is_none()));
+            }
+            if let Some(record) = &record {
+                let out = record.join(host);
+                std::fs::create_dir_all(&out).unwrap();
+                std::fs::write(out.join(name), &response.body).unwrap();
+            }
+        }
+        let response = rig
+            .request(
+                1,
+                serde_json::json!({
+                    "method": "session.history", "params": {"form": "display"},
+                }),
+            )
+            .await;
+        assert_eq!(
+            response.header.ty,
+            FrameType::Response,
+            "{}",
+            String::from_utf8_lossy(&response.body)
+        );
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        let rows = body["result"]["messages"].as_array().unwrap();
+        assert_eq!(rows.len() as u64, count);
+        let mut display_calls = 0;
+        let mut notices = 0;
+        for row in rows {
+            for part in row["row"]["parts"].as_array().into_iter().flatten() {
+                if part["type"] == "tool_call" {
+                    display_calls += 1;
+                    assert_eq!(part["call_carrier"], carrier);
+                    assert!(part["call_key"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with(row["mid"].as_str().unwrap()));
+                }
+            }
+            for notice in row["row"]["notices"].as_array().into_iter().flatten() {
+                notices += 1;
+                assert_eq!(notice["call_key"], ride["call_key"]);
+                assert_eq!(notice["call_carrier"], carrier);
+            }
+        }
+        assert_eq!(display_calls, expected_calls);
+        assert_eq!(notices, 1);
+        if let Some(record) = &record {
+            std::fs::write(
+                record.join(host).join("history-display-1.json"),
+                &response.body,
+            )
+            .unwrap();
+        }
+    }
+}
+
 /// An import naming a file outside broca's import folder is refused under the store's own code,
 /// and the file is left alone.
 #[tokio::test]
