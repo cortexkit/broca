@@ -920,7 +920,7 @@ tokio::task_local! {
 
 tokio::task_local! {
     /// When set, the new side ends the cut log's run with this seal instead of resuming it.
-    static SEALING: broca_core::resume::SealCause;
+    static SEALING: broca_core::seal::SealCause;
 }
 
 tokio::task_local! {
@@ -3266,7 +3266,9 @@ async fn compare_seal_every_cut(scenario: Scenario) {
 }
 
 async fn compare_seal_every_cut_in(scenario: Scenario) {
-    use broca_core::resume::{crash_orphan_error, interrupted_seal, DeferredCloseKind, SealCause};
+    use broca_core::resume::interrupted_seal;
+    use broca_core::resume::DeferredCloseKind;
+    use broca_core::seal::{crash_orphan_error, SealCause};
     let (_, full, _) = today_from(&scenario, None, scenario.steps.clone()).await;
     let records = full.framed().len();
     let mut sealed = 0;

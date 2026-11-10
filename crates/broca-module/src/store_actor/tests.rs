@@ -333,7 +333,7 @@ impl RunExecutor for LoopExecutor {
             let tools = GatedTools::new(&self.tool_text, self.planes.tool_gate.clone());
             // The wall clock, as the module's executor reads it: a queued ordered send's expiry
             // is judged at a run's boundaries by the same clock today's loop reads.
-            let now = || broca_core::run::epoch_millis().unwrap_or(0);
+            let now = || broca_core::clock::epoch_millis().unwrap_or(0);
             let approval = GatedApproval(self.approval_gate.clone());
             let seams = Seams {
                 provider: &self.provider,

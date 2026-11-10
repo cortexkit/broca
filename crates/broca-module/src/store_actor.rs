@@ -391,7 +391,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             ordered_scope: None,
             created: None,
             collect_due: false,
-            now_ms: Arc::new(|| broca_core::run::epoch_millis().unwrap_or(0)),
+            now_ms: Arc::new(|| broca_core::clock::epoch_millis().unwrap_or(0)),
         }
     }
 
@@ -936,7 +936,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
 
     /// Stops the session for a module stop, or for a close with nobody left to send commands.
     /// A running run is stopped where it is and its unfinished run ended `Interrupted` by
-    /// today's shutdown seal (`broca_core::resume::SealCause::Shutdown`): never cancelled, which
+    /// today's shutdown seal (`broca_core::seal::SealCause::Shutdown`): never cancelled, which
     /// would record a caller's decision nobody made. A run paused or held by a provider is left
     /// as it is, as today's actor leaves one. Nothing queued starts afterwards.
     async fn stop_for_shutdown(&mut self) {
@@ -978,7 +978,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             start,
             None,
             None,
-            StoreRunMode::Seal(broca_core::resume::SealCause::Shutdown),
+            StoreRunMode::Seal(broca_core::seal::SealCause::Shutdown),
         )
         .await;
         if tokio::time::timeout(crate::actor::SHUTDOWN_SEAL_BOUND, self.run_to_end())
@@ -1764,7 +1764,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             // was accepted, now unless its transforms were told another time.
             None => {
                 req.submission_id = None;
-                req.input_written_at_ms = prepared.at_ms.or_else(broca_core::run::epoch_millis);
+                req.input_written_at_ms = prepared.at_ms.or_else(broca_core::clock::epoch_millis);
             }
         }
         req.title = title;
@@ -2312,7 +2312,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         delivery: broca_protocol::Delivery,
         reply: &mut oneshot::Sender<SendOutcome>,
     ) -> Result<(), SendOutcome> {
-        let at_ms = broca_core::run::epoch_millis();
+        let at_ms = broca_core::clock::epoch_millis();
         let prepared = self
             .transform_input(
                 start.request.input.clone(),
@@ -2817,7 +2817,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             credential_id: None,
             affordable_max_tokens: None,
         };
-        let now = broca_core::run::epoch_millis().unwrap_or(0);
+        let now = broca_core::clock::epoch_millis().unwrap_or(0);
         if let Err(error) = broca_session_loop::run::end_run_with_error(
             &mut self.durable(),
             &run_id.0,
@@ -3361,7 +3361,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 broca_protocol::Delivery::Steer,
                 manifest.as_deref(),
                 None,
-                broca_core::run::epoch_millis(),
+                broca_core::clock::epoch_millis(),
                 reply,
             )
             .await
@@ -3470,7 +3470,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 delivery,
                 manifest.as_deref(),
                 None,
-                broca_core::run::epoch_millis(),
+                broca_core::clock::epoch_millis(),
                 reply,
             )
             .await
@@ -3658,7 +3658,7 @@ pub(crate) fn recovery_mode(
     use broca_session_store::fold::operations::Resolution;
     match run.resolution() {
         Resolution::Resume | Resolution::Interrupted(_) => Some(match run.cancel {
-            None => StoreRunMode::Seal(broca_core::resume::SealCause::CrashOrphan),
+            None => StoreRunMode::Seal(broca_core::seal::SealCause::CrashOrphan),
             Some(_) => StoreRunMode::Resume,
         }),
         Resolution::Idle(_) => Some(StoreRunMode::Resume),

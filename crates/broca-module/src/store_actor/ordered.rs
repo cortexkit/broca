@@ -41,7 +41,7 @@ pub(super) struct QueuedOrder {
 
 /// The wall clock an ordered send's expiry is compared against.
 fn now_ms() -> u64 {
-    broca_core::run::epoch_millis().unwrap_or(0)
+    broca_core::clock::epoch_millis().unwrap_or(0)
 }
 
 /// The `SendEnded` record ending `submission_id` undelivered for `reason`.
@@ -497,7 +497,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 broca_protocol::Delivery::Queue,
                 manifest.as_deref(),
                 None,
-                broca_core::run::epoch_millis(),
+                broca_core::clock::epoch_millis(),
                 reply,
             )
             .await?;

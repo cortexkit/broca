@@ -183,6 +183,15 @@ impl Clock {
     }
 }
 
+/// Return the wall-clock metadata used by durable billing observability fields. A clock failure
+/// leaves the field absent rather than introducing a non-durable or fabricated timestamp.
+pub fn epoch_millis() -> Option<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_millis() as u64)
+}
+
 #[cfg(test)]
 mod tests {
     /// The poller's refresh and admission's refresh run concurrently. A poller read taken

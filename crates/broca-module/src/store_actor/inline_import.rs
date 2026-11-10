@@ -77,7 +77,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         }
         let floor = self.session.operations().tag_high_water;
         let config = broca_core::import::import_marker_config(&digest, floor);
-        let now = broca_core::run::epoch_millis();
+        let now = broca_core::clock::epoch_millis();
         let run_id = request.run_id.0;
         let start = RunStart {
             run_id: run_id.clone(),

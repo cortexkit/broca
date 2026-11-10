@@ -744,8 +744,8 @@ fn spanning_repetition(
             None => return Ok(None),
         },
     };
-    use broca_core::run::RepetitionCheckpointTaken as Taken;
-    match broca_core::run::repetition_checkpoint(steps, seed.as_ref()) {
+    use broca_core::repetition::RepetitionCheckpointTaken as Taken;
+    match broca_core::repetition::repetition_checkpoint(steps, seed.as_ref()) {
         Taken::Taken(checkpoint) => serde_json::to_value(checkpoint)
             .map(Some)
             .map_err(|error| LoopError::Parts(error.to_string())),

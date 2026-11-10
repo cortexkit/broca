@@ -33,9 +33,11 @@ pub mod durability_counters;
 pub mod fresh_start;
 pub mod head;
 pub use head::{is_mode3_log, mode3_log_from_wal};
+pub mod held_calls;
 pub mod hooks;
 pub mod import;
 pub mod input_budget;
+pub mod input_transformations;
 pub mod lease;
 pub mod media_provenance;
 pub mod media_request;
@@ -46,6 +48,7 @@ pub mod message_id;
 pub mod message_times;
 pub mod notice_keys;
 pub use message_id::{message_mid, position_of_mid};
+pub mod output_events;
 pub mod output_reservation;
 pub mod placement;
 pub mod projection;
@@ -54,11 +57,14 @@ pub mod projection_plan;
 #[cfg(test)]
 mod projection_plan_tests;
 pub mod provider;
+pub mod provider_errors;
 pub mod queue;
 pub mod recovery_close_out;
 pub mod refusal_fallback;
 pub mod render;
+pub mod repetition;
 pub mod replay;
+pub mod seal;
 pub mod served_history;
 pub use served_history::ServedHistory;
 
@@ -72,12 +78,16 @@ pub mod scope_admission;
 pub mod shutdown_seal;
 pub mod signed_floor;
 pub mod steer;
+pub mod step_usage;
+pub mod stop_conditions;
+pub mod structured_output;
 pub mod stub_plane;
 pub mod system_one_fact;
 pub mod tags;
 pub mod tool_media;
 pub mod tool_plane;
 pub mod tool_repetition;
+pub mod tool_results;
 pub mod wal_fold;
 pub mod wal_writer;
 
@@ -139,15 +149,14 @@ pub use render::{
 };
 pub use replay::{
     budget_replay_seed_is_valid, deferred_call_obligations, held_call_facts,
-    latest_projection_boundary, no_dispatch_result, reconcile_run_state, replay,
-    replay_projection_tail, DeferredCallObligations, DeferredCallProjection, HeldCallFacts,
-    LateApprovalView, OpenCallState, OpenToolBatch, OwedWithdrawal, PendingTurn, PreparedCall,
-    ProjectedDeferredCall, ProjectionDelta, ProjectionSeed, ReconciledRunState, ReplayError,
-    ReplayResolution, ReplayState, RunUsageProjection,
+    latest_projection_boundary, reconcile_run_state, replay, replay_projection_tail,
+    DeferredCallObligations, DeferredCallProjection, HeldCallFacts, LateApprovalView,
+    OpenCallState, OpenToolBatch, OwedWithdrawal, PendingTurn, PreparedCall, ProjectedDeferredCall,
+    ProjectionDelta, ProjectionSeed, ReconciledRunState, ReplayError, ReplayResolution,
+    ReplayState,
 };
 pub use resume::{
-    close_out_open_batch, close_out_pending_turn, not_dispatched_result, outcome_unknown_result,
-    resume_started_record, DeferredCloseKind,
+    close_out_open_batch, close_out_pending_turn, resume_started_record, DeferredCloseKind,
 };
 pub use retention::{is_retention_lineage, LineageRetention};
 pub use scope_admission::{
@@ -163,21 +172,26 @@ pub use cache_warm::{
     CacheClock, CacheClockReading, RecordedRequest, RecordedRequestError, SentRequest, WarmFailure,
     WarmSent,
 };
-pub use run::{
+pub use input_transformations::{
     input_transformations_reported, input_transformations_unmeasured_attempts,
+};
+pub use output_events::OutputEvent;
+pub use run::{
     load_prior_wal_snapshot, read_prior_run_config, recover_prior_run_config, run_loop,
     run_loop_append_episode, run_loop_append_episode_with_control, run_loop_on_writer,
     run_loop_on_writer_admitted, run_loop_on_writer_admitted_with_prior_snapshot,
     run_loop_resume_after_auth, run_loop_resume_after_auth_with_control, run_loop_under_lease,
-    run_loop_with_control, run_loop_with_store, AccountSelectionRefusal, OutputEvent,
-    PriorWalSnapshot, RoutingUnavailable, RoutingUnavailableReason, RunControl, RunError,
-    RunRequest, RunSummary, StartMode,
+    run_loop_with_control, run_loop_with_store, AccountSelectionRefusal, PriorWalSnapshot,
+    RoutingUnavailable, RoutingUnavailableReason, RunControl, RunError, RunRequest, RunSummary,
+    StartMode,
 };
 pub use shutdown_seal::{SealedAttempt, ShutdownSeal};
 pub use steer::{OrderedAcceptance, SteerInbox};
+pub use step_usage::RunUsageProjection;
 pub use stub_plane::{StubEvent, StubReply, StubToolPlane};
 pub use tags::LineageTags;
 pub use tool_plane::{BatchCtx, DispatchResult, ToolPlane, ToolPlaneError};
+pub use tool_results::{no_dispatch_result, not_dispatched_result, outcome_unknown_result};
 pub use wal_writer::{
     agent_session_ref, is_session_storage_refusal, session_addr, session_storage_refusal,
     FileWalStore, ObservedRecord, ReadOnlyWalReader, RecordObserver, RecordOutcome,

@@ -13,11 +13,38 @@
 //! Every mutation is recorded in a write-ahead log at fsync barriers so a crashed
 //! run resumes deterministically; the barrier points are commented inline.
 
+pub use crate::clock::epoch_millis;
+pub use crate::input_transformations::{
+    input_transformations_reported, input_transformations_unmeasured_attempts,
+    report_input_transformations,
+};
+pub use crate::output_events::OutputEvent;
+pub use crate::output_reservation::{
+    output_reservation_overflow, OUTPUT_RESERVATION_OVERFLOW_CODE,
+};
+pub use crate::provider::CANCELLED_STEP_ATTEMPT_DRAIN;
+pub use crate::provider_errors::{render_identity_error, stamp_credential};
+pub use crate::repetition::store_guidance as repetition_guidance;
+use crate::repetition::{
+    append_repetition_guidance, attach_repetition_guidance, repetition_guidance_fires,
+    restore_guidance_with_originals,
+};
+pub use crate::repetition::{
+    repetition_checkpoint, restore_repetition_guidance, restore_repetition_guidance_seeded,
+    RepetitionCheckpointTaken, RepetitionGuidance,
+};
+pub use crate::stop_conditions::{limiting_stop_satisfied, stop_satisfied};
+pub use crate::structured_output::{counted_submit, joined_text};
+use crate::tool_results::error_result;
+pub use crate::tool_results::{
+    post_tool_text, pre_tool_refusal, pre_tool_subject, route_drained_result,
+    transformed_tool_result,
+};
+
 use broca_diagnostics::{spawn_blocking, JobKind};
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use broca_protocol::structured_output::FrozenStructuredOutput;
 use broca_protocol::BindIdentity;
@@ -45,14 +72,13 @@ use crate::{
     provider::Provider,
     replay::{replay, PendingTurn, ReplayResolution, ReplayState},
     tool_plane::{BatchCtx, DispatchResult, ToolOpenGuard, ToolPlane, ToolPlaneError},
-    tool_repetition::{result_bytes, RepetitionFold, RepetitionObserver},
+    tool_repetition::{RepetitionFold, RepetitionObserver},
     wal_writer::{session_addr, WalHandle, WalStore, WalWriteError},
 };
 
 pub(crate) mod held_prompt;
 mod held_resume;
 pub(crate) mod released_history;
-pub mod repetition_guidance;
 use held_prompt::PromptPosition;
 
 /// Default safety cap when the caller supplies no `stop_when`.
@@ -73,27 +99,6 @@ use held_prompt::PromptPosition;
 /// one in force when it was admitted. That is deliberate (the record comments the same rule) and
 /// safe in the widening direction only.
 const DEFAULT_MAX_STEPS: u64 = 100;
-
-/// Return the wall-clock metadata used by durable billing observability fields. A clock failure
-/// leaves the field absent rather than introducing a non-durable or fabricated timestamp.
-pub fn epoch_millis() -> Option<u64> {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .map(|duration| duration.as_millis() as u64)
-}
-
-/// One event on the runner→caller OutputStream. Display = lossy passthrough;
-/// Control = the reliable assembled units.
-#[derive(Debug, Clone, PartialEq)]
-pub enum OutputEvent {
-    /// Queue-ordered transcript position for the following step's advisory display output.
-    DisplayContext {
-        ordinal: Option<u64>,
-    },
-    Display(DisplayEvent),
-    Control(ControlUnit),
-}
 
 /// The caller's request to start a run.
 #[derive(Clone, Debug, PartialEq)]
@@ -3269,56 +3274,6 @@ fn render_config_error<P: Provider>(provider: &P, recorded: &RunConfig) -> Optio
         recorded.renderer_version,
         &recorded.frozen_render_config,
     )
-}
-
-/// Why `provider` can't resume a run frozen with `renderer_version` and `frozen_render_config`
-/// byte for byte, if it can't: either config is null, the provider doesn't reproduce that
-/// renderer version, or it renders that version with another config. `None` when it can.
-pub fn render_identity_error<P: Provider + ?Sized>(
-    provider: &P,
-    renderer_version: u32,
-    frozen_render_config: &serde_json::Value,
-) -> Option<ProviderError> {
-    let current = provider.render_config_blob();
-    let (message, provider_code) = if current.is_null() || frozen_render_config.is_null() {
-        (
-            "resume refused: the current provider or the recorded WAL has a null frozen render \
-             config, so render identity cannot be verified; old WALs with a null frozen config \
-             were never resume-safe and must be discarded",
-            "frozen_render_config_unverifiable",
-        )
-    } else if !provider.reproduces_renderer_version(renderer_version) {
-        (
-            "resume refused: the provider renderer version differs from the version recorded at \
-             run start, and the provider does not reproduce the recorded version's bytes",
-            "renderer_version_drift",
-        )
-    } else if provider.render_config_blob_for_version(renderer_version) != *frozen_render_config {
-        (
-            "resume refused: the provider frozen render config differs from the config recorded \
-             at run start",
-            "frozen_render_config_drift",
-        )
-    } else {
-        return None;
-    };
-
-    Some(ProviderError {
-        provider_details: None,
-        provider_subcode: None,
-        refusal: None,
-        class: ErrorClass::Permanent,
-        message: message.into(),
-        status: None,
-        retry_after_secs: None,
-        provider_code: Some(provider_code.into()),
-        resets_at_ms: None,
-        resets_at_source: None,
-        limit_window: None,
-        account_ref: None,
-        credential_id: None,
-        affordable_max_tokens: None,
-    })
 }
 
 const PROJECTOR_WRITE_WARNING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -8740,36 +8695,6 @@ pub(crate) async fn project_committed<W: WalStore>(
     }
 }
 
-/// Name the credential behind a credential-scoped terminal, so every surface that reports the
-/// terminal error (the durable `RunFinished`, the control lane's `Error` unit, `run.status`,
-/// `session.read`) says WHICH key or account to stop using:
-///
-/// - an account-limit or billing refusal gets the run's provider account in `account_ref`
-///   (`None` when the run recorded none, falling back to provider-wide treatment);
-/// - every error [`ProviderError::is_credential_scoped`] accepts gets the run's frozen
-///   credential id in `credential_id` (`None` when the run froze no selection);
-/// - a rate limit gets the typed [`broca_protocol::error::RATE_LIMITED`] code in place of the
-///   provider's own echo. This runs once, at the terminal, after the transport's in-step retries,
-///   so it never changes a retry decision.
-///
-/// Every other error is returned unchanged.
-pub fn stamp_credential(
-    mut error: ProviderError,
-    account_ref: Option<&str>,
-    credential_id: Option<&str>,
-) -> ProviderError {
-    if error.is_account_limit_exhausted() || error.is_billing_exhausted() {
-        error.account_ref = account_ref.map(str::to_owned);
-    }
-    if error.is_credential_scoped() {
-        error.credential_id = credential_id.map(str::to_owned);
-    }
-    if error.is_rate_limited() {
-        error.provider_code = Some(broca_protocol::error::RATE_LIMITED.into());
-    }
-    error
-}
-
 /// The sequence number of the last record in the log as this writer knows it: the record a
 /// resume that has written nothing yet is resuming from.
 fn last_record_seq(writer: &WalHandle) -> u64 {
@@ -9032,54 +8957,6 @@ fn episode_history_start(prompt: &[Message], committed_steps: u64) -> usize {
     0
 }
 
-/// Provider-reported input transformations seen by this process since it started.
-static INPUT_TRANSFORMATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Provider attempts this process sent without asking for the report, since it started.
-static INPUT_TRANSFORMATIONS_UNMEASURED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-/// How many entries providers have listed in `input_transformations` since this process started.
-/// Every entry means the provider changed what the model saw, for Anthropic by dropping (or
-/// letting through) a signed thinking block whose earlier context no longer matched: the
-/// rendered conversation was not append-only. Zero is the healthy reading only for the attempts
-/// that asked for the report: see [`input_transformations_unmeasured_attempts`].
-pub fn input_transformations_reported() -> u64 {
-    INPUT_TRANSFORMATIONS.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// How many provider attempts this process sent without asking for the
-/// `input_transformations` report (every Claude Code persona request, which carries no
-/// thinking-binding beta). Their transformations are unknown, not zero, and are never counted in
-/// [`input_transformations_reported`].
-pub fn input_transformations_unmeasured_attempts() -> u64 {
-    INPUT_TRANSFORMATIONS_UNMEASURED.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// What one attempt's record says about provider input transformations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TransformationReading {
-    /// The request did not ask for the report, so nothing is known.
-    NotMeasured,
-    /// The response carried no report although the request may have asked (or the record
-    /// predates the report).
-    Absent,
-    /// The response reported this many transformations.
-    Reported(usize),
-}
-
-impl TransformationReading {
-    pub(crate) fn of(attempt: &broca_protocol::ModelAttempt) -> Self {
-        if attempt.input_transformations_unmeasured {
-            return Self::NotMeasured;
-        }
-        match &attempt.input_transformations {
-            Some(entries) => Self::Reported(entries.len()),
-            None => Self::Absent,
-        }
-    }
-}
-
 /// One INFO line about the client-side refusal fallback, with the schedule's fields.
 /// `thinking_dropped` is how many earlier thinking blocks the provider dropped from the
 /// request, when the response reported its input transformations: a fallback model does not
@@ -9187,51 +9064,6 @@ fn log_step_transition(
     }
 }
 
-/// Count and warn about every entry of an attempt's `input_transformations`, whatever its reason:
-/// on an account that is not enforced, a mismatched thinking block is dropped silently, so this
-/// log line and the counter are the only place the loss shows up.
-pub fn report_input_transformations(
-    session: &BindIdentity,
-    run_id: &RunId,
-    step_id: StepId,
-    attempt: &broca_protocol::ModelAttempt,
-) {
-    let entries = match TransformationReading::of(attempt) {
-        TransformationReading::NotMeasured => {
-            // Not measured is not "none": counted apart, so the reported total never reads a
-            // persona run's silence as a healthy zero.
-            INPUT_TRANSFORMATIONS_UNMEASURED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return;
-        }
-        TransformationReading::Absent | TransformationReading::Reported(0) => return,
-        TransformationReading::Reported(_) => {
-            attempt.input_transformations.as_deref().unwrap_or_default()
-        }
-    };
-    INPUT_TRANSFORMATIONS.fetch_add(entries.len() as u64, std::sync::atomic::Ordering::Relaxed);
-    let reasons: Vec<String> = entries
-        .iter()
-        .map(|entry| {
-            format!(
-                "{}:{}@{}",
-                entry.kind.as_deref().unwrap_or("?"),
-                entry.reason.as_deref().unwrap_or("?"),
-                entry.path.as_deref().unwrap_or("?"),
-            )
-        })
-        .collect();
-    tracing::warn!(
-        target: "provider",
-        session = %session.session,
-        run_id = %run_id.0,
-        step = step_id.0,
-        attempt = attempt.attempt,
-        count = entries.len(),
-        transformations = ?reasons,
-        "provider transformed the request input: an earlier part of the conversation changed"
-    );
-}
-
 /// Re-apply repetition guidance to every episode that finished before `current_start`.
 ///
 /// `spans` are the replayed episodes' model-step ranges. A span reaching past `current_start` is
@@ -9296,183 +9128,6 @@ fn store_prior_needs_episode_spans(prior: &ReplayState) -> bool {
         ReplayResolution::Interrupted { .. } => return false,
     };
     repetition_guidance_fires(&prior.prompt[..current_start.min(prior.prompt.len())])
-}
-
-/// Whether folding `prompt` with a single observer produces guidance for any tool result.
-fn repetition_guidance_fires(prompt: &[Message]) -> bool {
-    let mut fold = RepetitionFold::default();
-    prompt.iter().any(|message| {
-        fold.push(message)
-            .iter()
-            .any(|(_, verdict)| verdict.guidance().is_some())
-    })
-}
-
-fn append_repetition_guidance(result: &mut ToolResult, guidance: &str) {
-    const LABEL: &str = "Tool repetition guidance: ";
-    let suffix = format!("\n\n{LABEL}{guidance}");
-
-    match &mut result.output {
-        ToolOutput::Parts { parts } => {
-            parts.push(broca_protocol::ToolOutputPart::Text { text: suffix })
-        }
-        ToolOutput::Text { text } => text.push_str(&suffix),
-        ToolOutput::Denied { reason } => reason.push_str(&suffix),
-        ToolOutput::Error { message, .. } => message.push_str(&suffix),
-        ToolOutput::Json { value } => {
-            // Structured outputs have no metadata slot. Preserve their JSON text before the note;
-            // this copy is provider-facing only, while the durable result remains structured.
-            let text = format!("{value}{suffix}");
-            result.output = ToolOutput::Text { text };
-        }
-    }
-}
-
-fn attach_repetition_guidance_to_result(
-    observer: &mut RepetitionObserver,
-    call: &ToolCall,
-    result: &mut ToolResult,
-) {
-    let bytes = result_bytes(&result.output);
-    let verdict = observer.observe(call, bytes.as_ref(), result.is_error);
-    if let Some(guidance) = verdict.guidance() {
-        append_repetition_guidance(result, &guidance);
-    }
-}
-
-fn attach_repetition_guidance<'a>(
-    observer: &mut RepetitionObserver,
-    calls: impl Iterator<Item = &'a ToolCall>,
-    results: &mut [ToolResult],
-) {
-    for (call, result) in calls.zip(results) {
-        attach_repetition_guidance_to_result(observer, call, result);
-    }
-}
-
-/// Recreate guidance that an uninterrupted run retained in its in-memory prompt. Replay deliberately
-/// reconstructs only the tool-owned output from the WAL, so this folds raw result copies in source
-/// order and decorates those copies without changing durable history.
-///
-/// Pass one episode's model-step messages, excluding other episodes' messages and the
-/// episode's initial input. Each call starts fresh repetition counters. The slice must
-/// contain raw, undecorated tool outputs: applying this fold twice would duplicate warnings.
-/// Offline renderers use this same fold so their reconstructed inputs receive exactly the
-/// decoration the run loop sends to the provider.
-pub fn restore_repetition_guidance(prompt: &mut [Message]) {
-    restore_guidance_with_originals(prompt, 0, None);
-}
-
-/// [`restore_repetition_guidance`] for a run whose earlier steps aren't in `prompt`: counting
-/// starts from `seed`, the run's [`repetition_checkpoint`] just before `prompt`'s first message,
-/// so the warnings are the ones the whole run would get. False, with nothing changed, when the
-/// checkpoint was taken under other warning rules or doesn't read as one.
-pub fn restore_repetition_guidance_seeded(
-    prompt: &mut [Message],
-    seed: &crate::tool_repetition::RepetitionCheckpoint,
-) -> bool {
-    let Some(mut guidance) = RepetitionGuidance::seeded(seed) else {
-        return false;
-    };
-    for message in prompt.iter_mut() {
-        guidance.guide(message);
-    }
-    true
-}
-
-/// [`restore_repetition_guidance`] one message at a time, for a caller that keeps a run's
-/// guided prompt and adds each new message as it comes: guiding a run's model-step messages
-/// one by one, in order, gives each the warnings the whole-slice fold gives it.
-pub struct RepetitionGuidance(RepetitionFold);
-
-impl Default for RepetitionGuidance {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl RepetitionGuidance {
-    /// Fresh counters, for a run's first model-step message.
-    pub fn new() -> Self {
-        Self(RepetitionFold::default())
-    }
-
-    /// Counters continuing from `seed`, as [`restore_repetition_guidance_seeded`] starts. `None`
-    /// when the checkpoint was taken under other warning rules or doesn't read as one.
-    pub fn seeded(seed: &crate::tool_repetition::RepetitionCheckpoint) -> Option<Self> {
-        RepetitionFold::seeded(seed).map(Self)
-    }
-
-    /// Counts `message`, raw, then adds to its tool results the warnings due.
-    pub fn guide(&mut self, message: &mut Message) {
-        for (index, verdict) in self.0.push(message) {
-            if let Some(guidance) = verdict.guidance() {
-                if let ContentBlock::ToolResult(result) = &mut message.content[index] {
-                    append_repetition_guidance(result, &guidance);
-                }
-            }
-        }
-    }
-}
-
-/// What [`repetition_checkpoint`] found.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RepetitionCheckpointTaken {
-    /// The counters after the steps given.
-    Taken(crate::tool_repetition::RepetitionCheckpoint),
-    /// An assistant's calls among the steps still wait for their results. A checkpoint keeps no
-    /// call text to pair them with, so none can be taken there.
-    CallsWaiting,
-    /// The seed doesn't read as a checkpoint under today's warning rules.
-    SeedRejected,
-}
-
-/// The repetition counters after a run's raw, undecorated steps `prompt`, from its first step,
-/// continuing from `seed` when the run's steps before `prompt` were counted already.
-pub fn repetition_checkpoint(
-    prompt: &[Message],
-    seed: Option<&crate::tool_repetition::RepetitionCheckpoint>,
-) -> RepetitionCheckpointTaken {
-    let mut fold = match seed {
-        Some(seed) => match RepetitionFold::seeded(seed) {
-            Some(fold) => fold,
-            None => return RepetitionCheckpointTaken::SeedRejected,
-        },
-        None => RepetitionFold::default(),
-    };
-    for message in prompt {
-        fold.push(message);
-    }
-    match fold.checkpoint() {
-        Some(checkpoint) => RepetitionCheckpointTaken::Taken(checkpoint),
-        None => RepetitionCheckpointTaken::CallsWaiting,
-    }
-}
-
-fn restore_guidance_with_originals(
-    prompt: &mut [Message],
-    base: usize,
-    mut originals: Option<&mut crate::compaction::OriginalMessages>,
-) -> RepetitionObserver {
-    let mut fold = RepetitionFold::default();
-    for (index, message) in prompt.iter_mut().enumerate() {
-        let verdicts = fold.push(message);
-        let original = originals
-            .as_ref()
-            .filter(|_| !verdicts.is_empty())
-            .map(|_| message.clone());
-        for (block_index, verdict) in verdicts {
-            if let Some(guidance) = verdict.guidance() {
-                if let ContentBlock::ToolResult(result) = &mut message.content[block_index] {
-                    append_repetition_guidance(result, &guidance);
-                }
-            }
-        }
-        if let (Some(originals), Some(original)) = (originals.as_deref_mut(), original) {
-            originals.retain_change(base + index, original, message);
-        }
-    }
-    fold.into_observer()
 }
 
 /// Recreate the same warnings across gaps in a held prompt. Every gap needs the full,
@@ -9792,42 +9447,6 @@ async fn complete_pending_turn<T: ToolPlane, A: ApprovalPolicy>(
         false,
     ))
 }
-
-/// The `context_overflow` refusal of a request whose estimated input leaves less room for output
-/// than the provider's floor. Nothing was sent; compacting the conversation is what helps.
-/// The error a run ends with when not even the provider's smallest output cap fits beside a
-/// step's estimated input: the request is not sent.
-pub fn output_reservation_overflow(
-    estimate: u64,
-    available: u64,
-    floor: u32,
-    context_limit: u64,
-) -> ProviderError {
-    ProviderError {
-        provider_details: None,
-        provider_subcode: None,
-        refusal: None,
-        class: ErrorClass::ContextOverflow,
-        message: format!(
-            "request not sent: its estimated {estimate} input tokens leave {available} tokens of \
-             the {context_limit}-token context limit for output (after a safety margin of {} \
-             tokens), below the minimum output reservation of {floor} tokens",
-            crate::output_reservation::margin(context_limit)
-        ),
-        status: None,
-        retry_after_secs: None,
-        provider_code: Some(OUTPUT_RESERVATION_OVERFLOW_CODE.into()),
-        resets_at_ms: None,
-        resets_at_source: None,
-        limit_window: None,
-        account_ref: None,
-        credential_id: None,
-        affordable_max_tokens: None,
-    }
-}
-
-/// The `provider_code` of [`output_reservation_overflow`].
-pub const OUTPUT_RESERVATION_OVERFLOW_CODE: &str = "output_reservation_exceeds_context";
 
 /// Return the durable request only when no blocking renderer can still hold its snapshot.
 /// This intentionally uses `Arc::get_mut`, never `Arc::make_mut`: copying a multi-megabyte
@@ -10531,11 +10150,6 @@ struct AttemptCallbacks<'a> {
     record: &'a AttemptSink<'a>,
     before_send: Option<Arc<dyn AttemptHook>>,
 }
-
-/// How long a cancelled step's stream is read for its last attempt record. The transport sends
-/// that record and closes the stream without any network wait, so this bound is only reached
-/// if the provider task is starved; the record is then lost rather than the cancel delayed.
-pub const CANCELLED_STEP_ATTEMPT_DRAIN: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Drive ONE model step: forward display deltas, capture the assembled message +
 /// usage, end on the provider's terminal `Finished`/`Error`.
@@ -12510,26 +12124,6 @@ fn tool_open_guard(
     ToolOpenGuard::new(cancel, stop).with_deadline(None)
 }
 
-/// The `route_drained` result for a call a scope drain stopped before it was sent. The text
-/// leads with the name so the model, and anyone reading the transcript, sees why.
-pub fn route_drained_result(id: &ToolCallId, reason: &str) -> ToolResult {
-    ToolResult {
-        tool_call_id: id.clone(),
-        output: ToolOutput::error(format!(
-            "route_drained: the tool was not run because its route was closed ({reason})"
-        )),
-        is_error: true,
-    }
-}
-
-fn error_result(call: &ToolCall, message: &str) -> ToolResult {
-    ToolResult {
-        tool_call_id: call.tool_call_id.clone(),
-        output: ToolOutput::error(message),
-        is_error: true,
-    }
-}
-
 /// A provider-valid synthetic result for an ambiguous dispatch (sent but no result
 /// came back). The conversation stays valid; the run stops for review rather than
 /// feeding the unknown outcome back to the model.
@@ -12912,46 +12506,6 @@ async fn finalize_hard_stop(
     })
 }
 
-/// The text parts of `message` joined exactly as `run.result` joins them: in order, with
-/// nothing inserted.
-/// A message's text parts joined as one answer: what a `final_text` run validates.
-pub fn joined_text(message: &AssistantMessage) -> String {
-    message
-        .content
-        .iter()
-        .filter_map(|block| match block {
-            ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } => {
-                Some(text.as_str())
-            }
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join(cortexkit_role_llm_runner::run::TEXT_SEPARATOR)
-}
-
-/// The `submit_result` call that ends a `submit_tool` run at this step: the first one the
-/// model emitted whose arguments parsed. `None` for a `final_text` run or a step without one.
-/// The `submit_result` call that ends a `submit_tool` run: the step's first one that wasn't
-/// refused for unparseable arguments. `None` in any other mode.
-pub fn counted_submit(
-    frozen: &FrozenStructuredOutput,
-    message: &AssistantMessage,
-    rejected: &[ToolResult],
-) -> Option<ToolCall> {
-    if frozen.mode != broca_protocol::structured_output::Mode::SubmitTool {
-        return None;
-    }
-    message
-        .tool_calls()
-        .find(|call| {
-            call.tool_name == broca_protocol::structured_output::SUBMIT_RESULT_TOOL
-                && !rejected
-                    .iter()
-                    .any(|result| result.tool_call_id == call.tool_call_id)
-        })
-        .cloned()
-}
-
 /// The structured result of a run that ended by calling `submit_result`: the counted call's
 /// input validated against the frozen schema, and every other call of the step, in the order
 /// the model emitted them, listed as a skipped sibling.
@@ -13004,34 +12558,6 @@ fn message_finish_reason(m: &AssistantMessage) -> FinishReason {
     }
 }
 
-/// The first satisfied stop condition, or None.
-pub fn stop_satisfied<'a>(
-    conds: &'a [StopCondition],
-    completed_steps: u64,
-    last: &AssistantMessage,
-) -> Option<&'a StopCondition> {
-    conds.iter().find(|c| match c {
-        StopCondition::StepCount { n } => completed_steps >= *n,
-        StopCondition::HasToolCall { name } => last
-            .tool_calls()
-            .any(|tc| name.as_ref().is_none_or(|n| &tc.tool_name == n)),
-        StopCondition::LoopFinished => last.tool_calls().next().is_none(),
-    })
-}
-
-/// Whether any satisfied stop other than LoopFinished forbids adding a model step
-/// to process a queued steer. Check every condition, even after a matching LoopFinished.
-pub fn limiting_stop_satisfied(
-    conds: &[StopCondition],
-    completed_steps: u64,
-    last: &AssistantMessage,
-) -> bool {
-    conds.iter().any(|condition| {
-        !matches!(condition, StopCondition::LoopFinished)
-            && stop_satisfied(std::slice::from_ref(condition), completed_steps, last).is_some()
-    })
-}
-
 async fn send(out: &mpsc::Sender<OutputEvent>, ev: OutputEvent) -> bool {
     out.send(ev).await.is_ok()
 }
@@ -13051,15 +12577,13 @@ mod display_text;
 mod future_size_tests;
 #[path = "run/hook_dispatch.rs"]
 mod hook_dispatch;
-pub use hook_dispatch::{
-    post_tool_text, pre_tool_refusal, pre_tool_subject, transformed_tool_result,
-};
 use hook_dispatch::{
     pre_tool_terminal, record_hook_stage, record_model_hook, resolve_hooked, restream_message,
 };
 
 #[cfg(test)]
 mod tests {
+    use crate::input_transformations::tests::transformation_attempt;
     use std::{
         sync::atomic::{AtomicBool, AtomicU64, Ordering},
         time::Duration,
@@ -14091,198 +13615,6 @@ mod tests {
                 .any(|record| matches!(record, WalRecord::AttemptFinished { .. })),
             "refused start must remain provably unsent"
         );
-    }
-
-    fn transformation_attempt(
-        report: Option<Vec<broca_protocol::InputTransformation>>,
-        unmeasured: bool,
-    ) -> broca_protocol::ModelAttempt {
-        broca_protocol::ModelAttempt {
-            content_progress: Default::default(),
-            attempt: 0,
-            request_body_len: 1,
-            request_body_sha256: "aa".into(),
-            http_status: Some(200),
-            content_type: None,
-            response_body_len: 0,
-            response_body_sha256: "bb".into(),
-            response_body_cap: None,
-            outcome: broca_protocol::provider::AttemptOutcome::Complete,
-            ts_ms: 0,
-            sent_at_ms: None,
-            transport: None,
-            websocket_request: None,
-            cache_evidence: None,
-            websocket_close_code: None,
-            input_transformations: report,
-            input_transformations_unmeasured: unmeasured,
-            credential_refresh: None,
-            served_account_ref: None,
-            account_observation: Default::default(),
-        }
-    }
-
-    /// An attempt whose request did not ask for the report (a Claude Code persona request) is
-    /// "not measured", never "no transformations", even if a report field were present.
-    #[test]
-    fn an_unmeasured_attempt_never_reads_as_no_transformations() {
-        assert_eq!(
-            TransformationReading::of(&transformation_attempt(None, true)),
-            TransformationReading::NotMeasured
-        );
-        assert_eq!(
-            TransformationReading::of(&transformation_attempt(Some(Vec::new()), true)),
-            TransformationReading::NotMeasured
-        );
-        assert_eq!(
-            TransformationReading::of(&transformation_attempt(Some(Vec::new()), false)),
-            TransformationReading::Reported(0)
-        );
-        assert_eq!(
-            TransformationReading::of(&transformation_attempt(None, false)),
-            TransformationReading::Absent
-        );
-    }
-
-    /// `stamp_credential` sets `credential_id` only on credential-scoped terminals (a billing
-    /// refusal, an exhausted account window, a rate limit) and on no other error. It rewrites
-    /// only rate limits to the `rate_limited` code, and sets `account_ref` only on the billing
-    /// and account-limit refusals.
-    #[test]
-    fn stamp_credential_names_the_credential_only_on_credential_scoped_errors() {
-        let error = |class, status: Option<u16>, code: Option<&str>| ProviderError {
-            provider_details: None,
-            provider_subcode: None,
-            refusal: None,
-            class,
-            message: "m".into(),
-            status,
-            retry_after_secs: None,
-            provider_code: code.map(str::to_owned),
-            resets_at_ms: None,
-            resets_at_source: None,
-            limit_window: None,
-            account_ref: None,
-            credential_id: None,
-            affordable_max_tokens: None,
-        };
-        use broca_protocol::error::{ACCOUNT_LIMIT_EXHAUSTED, BILLING_EXHAUSTED, RATE_LIMITED};
-        use ErrorClass::*;
-        // (case, error, expected provider_code after stamping, expected account_ref stamped)
-        let scoped = [
-            (
-                "billing",
-                error(Permanent, Some(403), Some(BILLING_EXHAUSTED)),
-                Some(BILLING_EXHAUSTED),
-                true,
-            ),
-            (
-                "billing on 400",
-                error(Permanent, Some(400), Some(BILLING_EXHAUSTED)),
-                Some(BILLING_EXHAUSTED),
-                true,
-            ),
-            (
-                "account limit",
-                error(Transient, Some(429), Some(ACCOUNT_LIMIT_EXHAUSTED)),
-                Some(ACCOUNT_LIMIT_EXHAUSTED),
-                true,
-            ),
-            (
-                "anthropic 429",
-                error(Transient, Some(429), Some("rate_limit_error")),
-                Some(RATE_LIMITED),
-                false,
-            ),
-            (
-                "openai 429",
-                error(Transient, Some(429), Some("rate_limit_exceeded")),
-                Some(RATE_LIMITED),
-                false,
-            ),
-            (
-                "google 429",
-                error(Transient, Some(429), Some("RESOURCE_EXHAUSTED")),
-                Some(RATE_LIMITED),
-                false,
-            ),
-            (
-                "bare 429",
-                error(Transient, Some(429), None),
-                Some(RATE_LIMITED),
-                false,
-            ),
-            (
-                "in-band rate limit",
-                error(Transient, None, Some("rate_limit_error")),
-                Some(RATE_LIMITED),
-                false,
-            ),
-        ];
-        for (case, raw, code, names_account) in scoped {
-            let stamped =
-                stamp_credential(raw.clone(), Some("acct-1"), Some("apikey:anthropic:work"));
-            assert_eq!(
-                stamped.credential_id.as_deref(),
-                Some("apikey:anthropic:work"),
-                "{case}"
-            );
-            assert_eq!(stamped.provider_code.as_deref(), code, "{case}");
-            assert_eq!(
-                stamped.account_ref.as_deref(),
-                names_account.then_some("acct-1"),
-                "{case}"
-            );
-            // A run that froze no credential selection names none.
-            let bare = stamp_credential(raw, None, None);
-            assert_eq!(bare.credential_id, None, "{case} without a selection");
-        }
-        let unscoped = [
-            (
-                "context overflow",
-                error(ContextOverflow, Some(400), Some("context_length_exceeded")),
-            ),
-            (
-                "bad request",
-                error(Permanent, Some(400), Some("invalid_request_error")),
-            ),
-            (
-                "policy refusal",
-                error(Permanent, None, Some("cyber_policy")),
-            ),
-            (
-                "content filter",
-                error(Permanent, None, Some("content_filter")),
-            ),
-            (
-                "tier refusal on 429",
-                error(Permanent, Some(429), Some("service_tier_unavailable")),
-            ),
-            (
-                "response deadline",
-                error(Transient, None, Some("response_deadline")),
-            ),
-            (
-                "server error",
-                error(Transient, Some(500), Some("api_error")),
-            ),
-            (
-                "overloaded",
-                error(Transient, Some(529), Some("overloaded_error")),
-            ),
-            ("timeout", error(Transient, Some(408), None)),
-            ("stream cut", error(ProviderUnavailable, None, None)),
-            ("auth", error(Auth, Some(401), Some("authentication_error"))),
-            (
-                "crash orphan",
-                error(Transient, None, Some("previous_process_ended_unsealed")),
-            ),
-        ];
-        for (case, raw) in unscoped {
-            let stamped =
-                stamp_credential(raw.clone(), Some("acct-1"), Some("apikey:anthropic:work"));
-            assert_eq!(stamped, raw, "{case} is returned unchanged");
-        }
     }
 
     #[test]

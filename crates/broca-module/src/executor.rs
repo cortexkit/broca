@@ -379,7 +379,7 @@ pub enum StoreRunMode {
     Resume,
     /// End the session's unfinished run `Interrupted` without calling the model, writing what
     /// today's seal writes (`broca_core::resume::interrupted_seal`): `broca_session_loop::seal`.
-    Seal(broca_core::resume::SealCause),
+    Seal(broca_core::seal::SealCause),
 }
 
 /// How a store run ended, with the parts store its job lent.

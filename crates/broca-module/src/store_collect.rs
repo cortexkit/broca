@@ -97,7 +97,7 @@ impl StoreCollectSweep {
             slot,
             leases,
             served,
-            now_ms: Arc::new(|| broca_core::run::epoch_millis().unwrap_or(0)),
+            now_ms: Arc::new(|| broca_core::clock::epoch_millis().unwrap_or(0)),
             heads_per_pass: HEADS_PER_PASS,
             collects_per_pass: COLLECTS_PER_PASS,
             cursor: Mutex::new(None),

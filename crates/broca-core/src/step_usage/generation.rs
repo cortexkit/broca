@@ -152,7 +152,7 @@ mod tests {
 
     fn projection() -> RunUsageProjection {
         let mut projection = RunUsageProjection::new(RunId("run".into()));
-        projection.observe(&super::super::projection_boundary_tests::run_started(1, "run").record);
+        projection.observe(&crate::replay::projection_boundary_tests::run_started(1, "run").record);
         projection
     }
 

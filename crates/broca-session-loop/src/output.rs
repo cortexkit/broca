@@ -63,7 +63,7 @@ pub async fn reserve<W: Writer, P: Provider>(
             match broca_core::output_reservation::decide(limits, context_limit, estimate) {
                 Reservation::Overflow { available, floor } => {
                     return Ok(Reserved::Overflow(Box::new(
-                        broca_core::run::output_reservation_overflow(
+                        broca_core::output_reservation::output_reservation_overflow(
                             estimate,
                             available,
                             floor,
