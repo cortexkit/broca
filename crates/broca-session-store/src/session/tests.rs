@@ -87,6 +87,145 @@ fn create_and_write<B: SessionBackend>(backend: &B, cipher: Cipher) -> (Vec<u8>,
     })
 }
 
+#[test]
+fn unpublished_staging_has_byte_identical_final_artifacts() {
+    use crate::backend::unpublished::UnpublishedBackend;
+    use crate::codec::hex;
+    use sha2::{Digest, Sha256};
+
+    fn tree(root: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+        fn walk(
+            root: &std::path::Path,
+            dir: &std::path::Path,
+            files: &mut std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>,
+        ) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(root, &path, files);
+                } else {
+                    files.insert(
+                        path.strip_prefix(root).unwrap().to_owned(),
+                        std::fs::read(path).unwrap(),
+                    );
+                }
+            }
+        }
+        let mut files = std::collections::BTreeMap::new();
+        walk(root, root, &mut files);
+        files
+    }
+
+    fn build<B: SessionBackend>(backend: &B, cipher: Cipher) {
+        crate::keys::test_entropy::replay(|| {
+            block_on(async {
+                let deployment = deployment(cipher);
+                let mut session = Session::create_with_history_version(
+                    backend,
+                    addr(),
+                    triple(),
+                    &deployment,
+                    true,
+                    519,
+                )
+                .await
+                .unwrap();
+                let setup_key = deployment.setup_key_for(cipher).unwrap();
+                crate::setup::SetupStore::new(backend, &setup_key)
+                    .put(crate::record::PartKind::Tools, b"[]")
+                    .await
+                    .unwrap();
+                let bytes = b"native image bytes";
+                let reference = serde_json::from_value(serde_json::json!({"kind":"image", "mime":"image/png", "byte_size":bytes.len(), "sha256":hex(&Sha256::digest(bytes)), "width":1,"height":1})).unwrap();
+                let Record::Input(mut photo) = input("look") else {
+                    unreachable!()
+                };
+                photo.message.content.push(ContentBlock::Media(reference));
+                session
+                    .append_input_media(
+                        &[Record::Input(photo)],
+                        vec![super::NewInputMedia {
+                            record: 0,
+                            message: 0,
+                            block: 1,
+                            part: None,
+                            bytes: bytes.to_vec(),
+                        }],
+                        true,
+                    )
+                    .await
+                    .unwrap();
+                session.append(&[event("complete")], true).await.unwrap();
+                assert_eq!(session.head().history_version, 519);
+                assert_eq!(session.version, 3);
+                session.close().await.unwrap();
+            })
+        });
+    }
+
+    for cipher in Cipher::ALL {
+        let root = broca_test_support::scratch_root().join(format!(
+            "staging-bytes-{}-{}",
+            cipher.label(),
+            hex(&crate::keys::random_id().0)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let live = root.join("live");
+        let staged = root.join("staged");
+        build(&LocalBackend::new(&live), cipher);
+        let backend = UnpublishedBackend::staging(&staged, None);
+        build(&backend, cipher);
+        backend.finish().unwrap();
+        let mut expected = tree(&live);
+        for version in [1, 2] {
+            expected
+                .remove(&std::path::PathBuf::from(format!(
+                    "heads/{}/v/{version}",
+                    addr().0
+                )))
+                .unwrap();
+        }
+        let actual = tree(&staged);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for path in actual.keys() {
+                assert_eq!(
+                    std::fs::metadata(staged.join(path))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o600,
+                    "{}",
+                    path.display()
+                );
+            }
+        }
+        assert!(actual.keys().any(|path| path.starts_with("objects")));
+        assert!(actual
+            .keys()
+            .any(|path| path.starts_with(if cipher == Cipher::None {
+                "setup-plain"
+            } else {
+                "setup"
+            })));
+        assert_eq!(actual, expected, "{}", cipher.label());
+        block_on(async {
+            let view = Session::view(
+                LocalBackend::new(&staged),
+                addr(),
+                &triple(),
+                &deployment(cipher),
+            )
+            .await
+            .unwrap();
+            assert_eq!(texts(&view.conversation.messages), ["look"]);
+        });
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
 /// A byte 23 bytes into the claim-only frame `close` writes last, which is inside that frame's
 /// header, in a log `len` bytes long whose frames are sealed in mode `cipher`. A claim frame
 /// has an empty body, so it is exactly the mode's frame overhead long.

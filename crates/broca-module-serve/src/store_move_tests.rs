@@ -887,6 +887,19 @@ fn with_media(rig: &Rig, object: Option<&[u8]>) -> String {
     digest
 }
 
+fn write_verified_media_session(rig: &Rig) -> Vec<u8> {
+    broca_core::media_store::create_media_directories(&rig.dir).unwrap();
+    let digest = broca_wal::migration::digest(IMAGE);
+    std::fs::write(rig.dir.join("media/objects").join(&digest), IMAGE).unwrap();
+    let input = Arc::new(vec![serde_json::from_value(json!({
+        "role":"user", "content":[{"type":"media","kind":"image","mime":"image/png",
+            "sha256":digest,"byte_size":IMAGE.len(),"width":1,"height":1}]
+    }))
+    .unwrap()]);
+    rig.write(&session_records_with_input(&rig.wal(), false, Some(input)));
+    std::fs::read(rig.wal()).unwrap()
+}
+
 /// A session whose media today's store holds is staged with them, and the staged copy is checked
 /// against the request each step sent. Here the WAL's recorded requests predate the image its
 /// input was given, so the check of its last step differs: the move aborts naming that check,
@@ -1033,6 +1046,24 @@ async fn startup_after_a_crash_at_every_step_leaves_one_owner() {
         steps.contains(&"rename_logs") && steps.contains(&"head"),
         "{steps:?}"
     );
+    for required in [
+        "staged_log_created",
+        "staged_log_appended",
+        "staged_version_written",
+        "staged_head_written",
+        "staged_file_synced",
+        "staged_directory_synced",
+        "scratch_loaded",
+        "scratch_appended",
+        "scratch_compared",
+        "sync_logs_source_parent",
+        "sync_logs_destination_parent",
+    ] {
+        assert!(
+            steps.contains(&required),
+            "missing cut {required}: {steps:?}"
+        );
+    }
     let published = steps.iter().position(|step| *step == "head").unwrap() + 1;
     for at in 1..=steps.len() {
         let rig = Rig::start(&format!("crash-{at}")).await;
@@ -1061,6 +1092,48 @@ async fn startup_after_a_crash_at_every_step_leaves_one_owner() {
             assert_moved(&rig).await;
         } else {
             assert_today(&rig, &bytes);
+        }
+    }
+}
+
+#[tokio::test]
+async fn online_move_unpublished_media_crash_cuts_leave_one_owner() {
+    let steps = {
+        let rig = Rig::start("media-crash-count").await;
+        write_verified_media_session(&rig);
+        let mover = rig.mover();
+        mover.move_to_store(&key(), None).await.unwrap();
+        let seen = mover.faults.seen.lock().unwrap().clone();
+        seen
+    };
+    for required in [
+        "staged_object_written",
+        "rename_objects",
+        "sync_objects_source_parent",
+        "sync_objects_destination_parent",
+    ] {
+        assert!(
+            steps.contains(&required),
+            "missing cut {required}: {steps:?}"
+        );
+    }
+    let published = steps.iter().position(|step| *step == "head").unwrap() + 1;
+    for at in 1..=steps.len() {
+        let rig = Rig::start(&format!("media-crash-{at}")).await;
+        let before = write_verified_media_session(&rig);
+        let mover = rig.mover();
+        *mover.faults.crash_at.lock().unwrap() = Some(at);
+        let error = mover.move_to_store(&key(), None).await.unwrap_err();
+        assert_eq!(error.code, "crashed", "cut {at}: {}", steps[at - 1]);
+        drop(mover);
+        let first = recover_at_startup(&rig.dir);
+        assert!(first.refused.is_empty(), "cut {at}: {first:?}");
+        let second = finish_at_startup(&rig.dir, None, None);
+        assert!(second.refused.is_empty(), "cut {at}: {second:?}");
+        if at >= published {
+            assert_moved(&rig).await;
+        } else {
+            assert_today(&rig, &before);
         }
     }
 }
@@ -1879,6 +1952,8 @@ mod cutover {
             "verified",
             "publishing",
             "rename_logs",
+            "sync_logs_source_parent",
+            "sync_logs_destination_parent",
             "sync_data",
             "publish_head",
             "awaiting_backup",
@@ -1922,6 +1997,144 @@ mod cutover {
             assert_eq!(std::fs::read(&rows[0].source.backup).unwrap(), before);
             assert!(rig.registry.kept_in_new_storage(&key()).unwrap());
             assert!(!rig.wal().exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn cutover_unpublished_media_writes_and_verification_crashes_rebuild() {
+        let steps = {
+            let rig = Rig::start("cutover-write-count").await;
+            write_verified_media_session(&rig);
+            let engine = engine(&rig, false, true);
+            engine
+                .run_live(
+                    &deployment(),
+                    Some(rig.runtime.as_ref()),
+                    Some(&rig.registry),
+                )
+                .await
+                .unwrap();
+            let seen = engine.faults.seen.lock().unwrap().clone();
+            seen
+        };
+        for required in [
+            "staged_object_written",
+            "staged_version_written",
+            "staged_head_written",
+            "staged_file_synced",
+            "staged_directory_synced",
+            "scratch_loaded",
+            "scratch_appended",
+            "scratch_compared",
+        ] {
+            assert!(
+                steps.contains(&required),
+                "missing cut {required}: {steps:?}"
+            );
+        }
+        // Each ordinal is a distinct physical write or verification boundary, including the
+        // repeated appends and media reconstruction, not merely the end of a staging phase.
+        for at in 1..=steps.len() {
+            let rig = Rig::start(&format!("cutover-write-crash-{at}")).await;
+            let before = write_verified_media_session(&rig);
+            let first = engine(&rig, false, true);
+            *first.faults.crash_at.lock().unwrap() = Some(at);
+            assert!(
+                first
+                    .run_live(
+                        &deployment(),
+                        Some(rig.runtime.as_ref()),
+                        Some(&rig.registry)
+                    )
+                    .await
+                    .is_err(),
+                "cut {at}: {}",
+                steps[at - 1]
+            );
+            let row = &first.ledger.rows().unwrap()[0];
+            assert!(matches!(row.step.as_str(), "staging" | "verifying"));
+            assert!(!broca_wal::session_storage_head(
+                &rig.dir,
+                StorageClass::Ordinary,
+                &broca_core::session_addr(&key())
+            )
+            .exists());
+            drop(first);
+            let restarted = Engine::configured(
+                &rig.dir,
+                Config {
+                    archives: false,
+                    live_at_startup: true,
+                    backup_root: Some(rig.dir.with_extension("converted-sources")),
+                },
+            )
+            .unwrap()
+            .unwrap();
+            restarted
+                .run_live(
+                    &deployment(),
+                    Some(rig.runtime.as_ref()),
+                    Some(&rig.registry),
+                )
+                .await
+                .unwrap();
+            let row = &restarted.ledger.rows().unwrap()[0];
+            assert_eq!(row.step, "done", "cut {at}: {}", steps[at - 1]);
+            assert_eq!(row.outcome.as_deref(), Some("converted"));
+            assert_eq!(std::fs::read(&row.source.backup).unwrap(), before);
+            assert!(rig.registry.kept_in_new_storage(&key()).unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn cutover_media_publication_parent_crashes_replay_barriers() {
+        for boundary in [
+            "rename_objects",
+            "sync_logs_source_parent",
+            "sync_logs_destination_parent",
+            "sync_objects_source_parent",
+            "sync_objects_destination_parent",
+            "sync_data",
+            "publish_head",
+        ] {
+            let rig = Rig::start(&format!("cutover-media-parent-{boundary}")).await;
+            let before = write_verified_media_session(&rig);
+            let mut first = engine(&rig, false, true);
+            first.crash = Some(boundary);
+            assert!(
+                first
+                    .run_live(
+                        &deployment(),
+                        Some(rig.runtime.as_ref()),
+                        Some(&rig.registry)
+                    )
+                    .await
+                    .is_err(),
+                "{boundary}"
+            );
+            drop(first);
+            let restarted = Engine::configured(
+                &rig.dir,
+                Config {
+                    archives: false,
+                    live_at_startup: true,
+                    backup_root: Some(rig.dir.with_extension("converted-sources")),
+                },
+            )
+            .unwrap()
+            .unwrap();
+            restarted
+                .run_live(
+                    &deployment(),
+                    Some(rig.runtime.as_ref()),
+                    Some(&rig.registry),
+                )
+                .await
+                .unwrap();
+            let row = &restarted.ledger.rows().unwrap()[0];
+            assert_eq!(row.step, "done", "{boundary}");
+            assert_eq!(row.outcome.as_deref(), Some("converted"));
+            assert_eq!(std::fs::read(&row.source.backup).unwrap(), before);
         }
     }
 }

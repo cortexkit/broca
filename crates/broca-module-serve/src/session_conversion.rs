@@ -111,8 +111,11 @@ pub struct Engine {
     inventory: Option<broca_store::session_inventory::SessionInventory>,
     mover: OnceLock<Arc<crate::store_move::StoreMove>>,
     archive_inventory: Mutex<ArchiveInventory>,
+    directories: Mutex<crate::store_move::PublicationDirs>,
     #[cfg(test)]
     pub(crate) crash: Option<&'static str>,
+    #[cfg(test)]
+    pub(crate) faults: crate::store_move::Faults,
 }
 
 #[derive(Default)]
@@ -227,9 +230,12 @@ impl Engine {
             source_index,
             mover: OnceLock::new(),
             archive_inventory: Mutex::default(),
+            directories: Mutex::default(),
             inventory,
             #[cfg(test)]
             crash: None,
+            #[cfg(test)]
+            faults: Default::default(),
         }))
     }
 
@@ -491,6 +497,18 @@ fn change_count(counts: &mut BTreeMap<String, u64>, name: &str, delta: i8) {
 }
 
 impl Engine {
+    fn initialize_directories(&self) -> Result<(), String> {
+        let mut directories = self.directories.lock().unwrap_or_else(|p| p.into_inner());
+        for class in StorageClass::ALL {
+            directories
+                .ensure(&self.root, &class.store_root(&self.root))
+                .map_err(|error| error.to_string())?;
+        }
+        directories
+            .ensure_parent(&self.root, &self.root.join("conversion-staging"))
+            .map_err(|error| error.to_string())
+    }
+
     pub async fn run_live(
         &self,
         deployment: &DeploymentKey,
@@ -500,6 +518,7 @@ impl Engine {
         if !self.config.live_at_startup {
             return Ok(());
         }
+        self.initialize_directories()?;
         let sources = self.enumerate_live()?;
         for source in sources {
             self.process(&source, deployment, runtime, registry).await?;
@@ -523,6 +542,7 @@ impl Engine {
         if !self.config.archives {
             return Ok(());
         }
+        self.initialize_directories()?;
         let sources = self.enumerate_archives()?;
         for source in sources {
             self.process(&source, deployment, runtime, registry).await?;
@@ -829,6 +849,11 @@ impl Engine {
                 .map_err(io)?;
             self.step(source, "staging", None, None)?;
             remove_staging(&staging)?;
+            self.directories
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .ensure_parent(&self.root, staging.parent().expect("staging has a parent"))
+                .map_err(io)?;
             let history_version = source_history(
                 self.source_index.as_ref(),
                 &session,
@@ -841,7 +866,21 @@ impl Engine {
                 move_id: format!("cutover:{address}"),
                 source_activity_ms: todays_updated_at,
             };
-            let staged = broca_session_convert::stage::write(
+            #[cfg(test)]
+            let interrupted = std::sync::atomic::AtomicBool::new(false);
+            #[cfg(test)]
+            let callback = |step: broca_session_store::backend::unpublished::Step| {
+                if self.crash == Some(step.name()) || self.faults.crash_here(step.name()) {
+                    interrupted.store(true, std::sync::atomic::Ordering::Relaxed);
+                    return Err(std::io::Error::other("conversion interrupted"));
+                }
+                Ok(())
+            };
+            #[cfg(test)]
+            let progress: broca_session_store::backend::unpublished::Progress<'_> = Some(&callback);
+            #[cfg(not(test))]
+            let progress = None;
+            let staged = broca_session_convert::stage::write_with_progress(
                 &Stage {
                     records: &records,
                     lineage: lineage_text.as_deref(),
@@ -854,28 +893,40 @@ impl Engine {
                     moved: &moved,
                 },
                 prepared,
+                progress,
             )
-            .await
-            .map_err(stage_failure)?;
+            .await;
+            #[cfg(test)]
+            if interrupted.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(Failure::failed("crash", "staging interrupted"));
+            }
+            let staged = staged.map_err(stage_failure)?;
             self.step(source, "verifying", None, None)?;
-            broca_session_convert::verify::verify(Verify {
-                records: &records,
-                lineage,
-                session: &session,
-                deployment,
-                store_root: &destination,
-                staging: &staging,
-                converted: &staged.converted,
-                mode: Mode::Move,
-                media: media_bytes,
-                media_root: media.as_ref().map(|media| MediaRoot {
-                    state_root: &self.root,
-                    class: media.class,
-                }),
-                todays_updated_at,
-            })
-            .await
-            .map_err(|error| Failure::failed("verification_failed", error))?;
+            let verified = broca_session_convert::verify::verify_with_progress(
+                Verify {
+                    records: &records,
+                    lineage,
+                    session: &session,
+                    deployment,
+                    store_root: &destination,
+                    staging: &staging,
+                    converted: &staged.converted,
+                    mode: Mode::Move,
+                    media: media_bytes,
+                    media_root: media.as_ref().map(|media| MediaRoot {
+                        state_root: &self.root,
+                        class: media.class,
+                    }),
+                    todays_updated_at,
+                },
+                progress,
+            )
+            .await;
+            #[cfg(test)]
+            if interrupted.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(Failure::failed("crash", "verification interrupted"));
+            }
+            verified.map_err(|error| Failure::failed("verification_failed", error))?;
             if let Some(runtime) = runtime {
                 crate::store_move::StoreMove::hold_parts(runtime, source_class, &staged.converted)
                     .map_err(|error| io(error.message))?;
@@ -897,6 +948,7 @@ impl Engine {
             &staging,
             &destination,
             &address,
+            &mut self.directories.lock().unwrap_or_else(|p| p.into_inner()),
             |_boundary| {
                 #[cfg(test)]
                 if self.crash == Some(_boundary) {
