@@ -4497,12 +4497,15 @@ fn response_envelope(
                     input_tokens: counters("input_tokens"),
                     cached_input_tokens: counters("cache_read_input_tokens"),
                     cache_write_tokens: counters("cache_creation_input_tokens"),
+                    cache_write_5m_tokens: split(entry, "ephemeral_5m_input_tokens"),
+                    cache_write_1h_tokens: split(entry, "ephemeral_1h_input_tokens"),
                     output_tokens: counters("output_tokens"),
                     reasoning_tokens: entry
                         .get("output_tokens_details")
                         .and_then(|details| details.get("thinking_tokens"))
                         .and_then(Value::as_u64),
-                };
+                }
+                .with_complete_cache_write_lifetimes();
                 let model = model_row(&mut models, model);
                 model.usage += usage;
                 model.cache_write_5m_tokens = broca_protocol::usage::sum_reported(

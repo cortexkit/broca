@@ -113,6 +113,8 @@ fn expected_metered_write() -> Usage {
         input_tokens: Some(3),
         cached_input_tokens: Some(0),
         cache_write_tokens: Some(3170),
+        cache_write_5m_tokens: None,
+        cache_write_1h_tokens: None,
         output_tokens: Some(5),
         reasoning_tokens: Some(0),
     }
@@ -123,6 +125,8 @@ fn expected_codex_zero_write() -> Usage {
         input_tokens: Some(14),
         cached_input_tokens: Some(0),
         cache_write_tokens: Some(0),
+        cache_write_5m_tokens: None,
+        cache_write_1h_tokens: None,
         output_tokens: Some(6),
         reasoning_tokens: Some(0),
     }
@@ -133,6 +137,8 @@ fn expected_codex_no_write_key() -> Usage {
         input_tokens: Some(4_267),
         cached_input_tokens: Some(9_600),
         cache_write_tokens: None,
+        cache_write_5m_tokens: None,
+        cache_write_1h_tokens: None,
         output_tokens: Some(178),
         reasoning_tokens: Some(98),
     }

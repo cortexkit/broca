@@ -13,6 +13,31 @@
 use super::*;
 
 #[test]
+fn usage_before_cache_write_lifetimes_keeps_exact_bytes() {
+    for pinned in [
+        r#"{"type":"model_step_finished","step_id":1,"assistant_message":{"message_id":"m","content":[]},"usage":{"input_tokens":10,"cached_input_tokens":20,"cache_write_tokens":30,"output_tokens":4,"reasoning_tokens":2},"retries_used":0}"#,
+        r#"{"type":"run_finished","reason":"completed","usage":{"input_tokens":10,"cached_input_tokens":20,"cache_write_tokens":30,"output_tokens":4,"reasoning_tokens":2},"retries_used":0}"#,
+    ] {
+        let record: WalRecord = serde_json::from_str(pinned).unwrap();
+        assert_eq!(serde_json::to_string(&record).unwrap(), pinned);
+        assert!(record.required_features().is_empty());
+        let frame = crate::framing::encode(7, 3, &record).unwrap();
+        assert_eq!(frame[4], crate::framing::FRAMING_VERSION);
+        assert_eq!(&frame[crate::framing::HEADER_LEN..], pinned.as_bytes());
+    }
+}
+
+// Optional measurements do not alter replay, so older builds may skip them.
+#[test]
+fn usage_reader_accepts_unknown_measurements() {
+    let pinned = r#"{"type":"model_step_finished","step_id":1,"assistant_message":{"message_id":"m","content":[]},"usage":{"cache_write_tokens":30},"retries_used":0}"#;
+    let mut newer: serde_json::Value = serde_json::from_str(pinned).unwrap();
+    newer["usage"]["future_cache_write_measurement"] = serde_json::json!(20);
+    let record: WalRecord = serde_json::from_value(newer).unwrap();
+    assert_eq!(serde_json::to_string(&record).unwrap(), pinned);
+}
+
+#[test]
 fn run_started_before_yield_tools_keeps_provider_declaration_bytes() {
     let pinned = r#"{"type":"run_started","run_id":"r","session":{"project_root":"/project","harness":"runner","session":"s"},"config":{"model":{"provider_module_id":"p","model_id":"m"},"tools":[],"tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},"context_epoch":0,"renderer_version":1},"input":[],"origin":{"kind":"fresh"},"manifest":{"plan":"{}","plan_identity":"plan","composition_digest":"composition","fetches":[{"provider":"tools","catalog_digest":"catalog","tools":[],"declarations_frozen":{"call_keepalive":true,"result_formats":{"work":"tool-result/v1"},"late_results":true}}],"tools":[],"system_text":"","system_digest":"system","join_version":1,"role_versions":{}}}"#;
     let record: WalRecord = serde_json::from_str(pinned).unwrap();

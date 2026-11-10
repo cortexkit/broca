@@ -56,6 +56,8 @@ mod schema_tests {
                 input_tokens: Some(0),
                 cached_input_tokens: Some(0),
                 cache_write_tokens: Some(0),
+                cache_write_5m_tokens: None,
+                cache_write_1h_tokens: None,
                 output_tokens: Some(0),
                 reasoning_tokens: Some(0),
             },
@@ -465,6 +467,8 @@ mod schema_tests {
                 input_tokens: Some(120),
                 cached_input_tokens: Some(0),
                 cache_write_tokens: Some(40),
+                cache_write_5m_tokens: None,
+                cache_write_1h_tokens: None,
                 output_tokens: Some(9),
                 reasoning_tokens: Some(2),
             },
@@ -502,6 +506,20 @@ mod schema_tests {
             assert_eq!(decoded, record);
             assert_eq!(serde_json::to_vec(&decoded).unwrap(), pinned.as_bytes());
         }
+    }
+
+    #[test]
+    fn cache_write_lifetimes_roundtrip_in_step_wal_frame() {
+        let bytes = r#"{"type":"model_step_finished","step_id":1,"assistant_message":{"message_id":"synthetic","content":[]},"usage":{"cache_write_tokens":30,"cache_write_5m_tokens":10,"cache_write_1h_tokens":20},"retries_used":0}"#;
+        let record: WalRecord = serde_json::from_str(bytes).unwrap();
+        let encoded = crate::framing::encode(7, 3, &record).unwrap();
+        assert_eq!(encoded[4], crate::framing::FRAMING_VERSION);
+        let crate::framing::DecodeStep::Record { framed, .. } =
+            crate::framing::decode_next(&encoded)
+        else {
+            panic!("usage frame must decode");
+        };
+        assert_eq!(serde_json::to_string(&framed.record).unwrap(), bytes);
     }
 
     #[test]

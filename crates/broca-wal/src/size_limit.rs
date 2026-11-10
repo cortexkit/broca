@@ -73,6 +73,8 @@ pub fn terminal_reserve_bytes(overhead: u64, config: crate::WalConfig) -> u64 {
         input_tokens: Some(u64::MAX),
         cached_input_tokens: Some(u64::MAX),
         cache_write_tokens: Some(u64::MAX),
+        cache_write_5m_tokens: Some(u64::MAX),
+        cache_write_1h_tokens: Some(u64::MAX),
         output_tokens: Some(u64::MAX),
         reasoning_tokens: Some(u64::MAX),
     };
@@ -164,8 +166,10 @@ mod tests {
     }
 
     #[test]
-    fn legacy_terminal_reserve_is_unchanged_and_has_no_reopen_reserve() {
-        assert_eq!(reserve_bytes(crate::framing::LINEAGE_FRAME_LEN as u64), 580);
+    fn legacy_terminal_reserve_includes_cache_write_lifetimes_and_has_no_reopen_reserve() {
+        // Terminal usage can carry both optional cache-write lifetimes at their widest u64
+        // values, so the bound reserves 90 more bytes than the five-counter usage shape.
+        assert_eq!(reserve_bytes(crate::framing::LINEAGE_FRAME_LEN as u64), 670);
         assert_eq!(reopen_reserve_bytes(crate::WalConfig::LEGACY), 0);
     }
 }
