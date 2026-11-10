@@ -2762,8 +2762,8 @@ mod executor {
             bind: req.session.clone(),
             out: Some(out),
             cancel: control.cancel.clone().unwrap_or_default(),
-            // A module stop aborts a store run and seals it from the actor.
-            stop: Default::default(),
+            // Keep tool waits alive during grace so eligible calls can hand back a held reply.
+            stop: control.stop_requested.clone().unwrap_or_default(),
             held,
             approval: &AllowAll,
             hook_plane: control.hook_plane.clone(),

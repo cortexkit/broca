@@ -18,6 +18,61 @@ fn log(lines: &[&str]) -> Vec<FramedRecord> {
         .collect()
 }
 
+#[test]
+fn frozen_yield_tools_survives_conversion_into_provider_answer_parts() {
+    let mut run: serde_json::Value = serde_json::from_str(RUN).unwrap();
+    run["manifest"] = serde_json::json!({
+        "plan":"{}", "plan_identity":"plan", "composition_digest":"composition",
+        "fetches":[{"provider":"tools", "catalog_digest":"catalog", "tools":[],
+            "declarations_frozen":{"late_results":true,"result_formats":{"work":"tool-result/v1"},"yield_tools":["work"]}}],
+        "tools":[],"system_text":"","system_digest":"system","join_version":1,"role_versions":{}
+    });
+    let original = log(&[&run.to_string()]);
+    let converted = convert(&original, None).unwrap();
+    let start = converted
+        .records
+        .iter()
+        .find_map(|record| match record {
+            Record::RunStart(start) => Some(start),
+            _ => None,
+        })
+        .unwrap();
+    let answer = start
+        .setup
+        .iter()
+        .find(|part| part.kind == broca_session_store::record::PartKind::ProviderAnswer)
+        .unwrap();
+    let stored: serde_json::Value =
+        serde_json::from_slice(&converted.parts[&answer.digest]).unwrap();
+    assert_eq!(
+        stored["declarations_frozen"]["yield_tools"],
+        serde_json::json!(["work"])
+    );
+    let parts = broca_session_loop::MemoryParts {
+        parts: converted.parts,
+    };
+    let restored = broca_session_loop::run::frozen_manifest(start, &parts)
+        .unwrap()
+        .unwrap();
+    let broca_wal::FetchOutcome::Answered {
+        declarations_frozen: Some(declarations),
+        ..
+    } = &restored.fetches[0].outcome
+    else {
+        panic!("frozen provider answer")
+    };
+    assert_eq!(
+        declarations
+            .yield_tools
+            .as_ref()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>(),
+        ["work"]
+    );
+}
+
 fn names(records: &[Record]) -> Vec<&'static str> {
     records.iter().map(Record::name).collect()
 }

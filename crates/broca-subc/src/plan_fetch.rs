@@ -333,6 +333,18 @@ impl broca_fetch_plan::PlanAdmitter for SubcPlanAdmitter {
 
 #[async_trait]
 impl Fetcher for SubcPlanFetcher {
+    async fn call_yield_supported(&self, provider: &str) -> Result<bool, FetchError> {
+        let entries = self.catalog_snapshot().await?;
+        Ok(entries
+            .iter()
+            .find(|entry| entry.module_id == provider)
+            .and_then(|entry| entry.capabilities.as_ref())
+            .is_some_and(|caps| {
+                caps.provides
+                    .iter()
+                    .any(|capability| capability == cortexkit_role_tool_provider::CALL_YIELD_V1)
+            }))
+    }
     async fn call_keepalive_supported(&self, provider: &str) -> Result<bool, FetchError> {
         let entries = self.catalog_snapshot().await?;
         Ok(entries

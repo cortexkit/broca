@@ -150,12 +150,13 @@ mod tests {
                 kind: "token".into(),
             }],
         )]));
-        *declarations_frozen = Some(FrozenProviderDeclarations {
+        *declarations_frozen = Some(Box::new(FrozenProviderDeclarations {
+            yield_tools: None,
             call_keepalive: None,
             result_formats: None,
             late_results: Some(true),
             schema_pins: None,
-        });
+        }));
         let bytes = serde_json::to_string(&record).unwrap();
         assert!(bytes.contains(
             r#""declarations_frozen":{"late_results":true},"reference_slots":{"read":[{"name":"data","kind":"token"}]}"#
@@ -460,7 +461,8 @@ mod tests {
                 text: None,
                 result_ops: None,
                 reply: None,
-                declarations_frozen: Some(FrozenProviderDeclarations {
+                declarations_frozen: Some(Box::new(FrozenProviderDeclarations {
+                    yield_tools: None,
                     call_keepalive: None,
                     result_formats: Some(BTreeMap::from([(
                         "ask".to_owned(),
@@ -468,7 +470,7 @@ mod tests {
                     )])),
                     late_results: Some(true),
                     schema_pins: None,
-                }),
+                })),
                 reference_slots: None,
             },
         };
@@ -513,12 +515,13 @@ mod tests {
                 ..
             } = &mut fetch.outcome
             {
-                *declarations_frozen = Some(FrozenProviderDeclarations {
+                *declarations_frozen = Some(Box::new(FrozenProviderDeclarations {
+                    yield_tools: None,
                     call_keepalive: None,
                     result_formats: None,
                     late_results: Some(true),
                     schema_pins: None,
-                });
+                }));
             }
         }
         assert!(declared
@@ -556,7 +559,8 @@ mod tests {
                 ..
             } = &mut fetch.outcome
             {
-                *declarations_frozen = Some(FrozenProviderDeclarations {
+                *declarations_frozen = Some(Box::new(FrozenProviderDeclarations {
+                    yield_tools: None,
                     schema_pins: Some(
                         [(
                             "work".into(),
@@ -568,7 +572,7 @@ mod tests {
                         .into(),
                     ),
                     ..Default::default()
-                });
+                }));
             }
         }
         assert!(pinned

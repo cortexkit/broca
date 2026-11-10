@@ -13,6 +13,23 @@
 use super::*;
 
 #[test]
+fn run_started_before_yield_tools_keeps_provider_declaration_bytes() {
+    let pinned = r#"{"type":"run_started","run_id":"r","session":{"project_root":"/project","harness":"runner","session":"s"},"config":{"model":{"provider_module_id":"p","model_id":"m"},"tools":[],"tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},"context_epoch":0,"renderer_version":1},"input":[],"origin":{"kind":"fresh"},"manifest":{"plan":"{}","plan_identity":"plan","composition_digest":"composition","fetches":[{"provider":"tools","catalog_digest":"catalog","tools":[],"declarations_frozen":{"call_keepalive":true,"result_formats":{"work":"tool-result/v1"},"late_results":true}}],"tools":[],"system_text":"","system_digest":"system","join_version":1,"role_versions":{}}}"#;
+    let record: WalRecord = serde_json::from_str(pinned).unwrap();
+    assert_eq!(serde_json::to_string(&record).unwrap(), pinned);
+    let frame = crate::framing::encode(7, 3, &record).unwrap();
+    assert!(
+        matches!(crate::framing::decode_next(&frame), crate::framing::DecodeStep::Record { framed, .. } if framed.record == record)
+    );
+
+    // A rollback reader must accept a newer declaration without understanding it.
+    let mut newer: serde_json::Value = serde_json::from_str(pinned).unwrap();
+    newer["manifest"]["fetches"][0]["declarations_frozen"]["yield_tools"] =
+        serde_json::json!(["work"]);
+    serde_json::from_value::<WalRecord>(newer).unwrap();
+}
+
+#[test]
 fn compaction_view_before_metadata_keeps_exact_bytes() {
     let pinned = r#"{"type":"compaction_view_v2","version":1,"checksum":"provider-checksum","edits":[{"kind":"full","edit":{"since":1,"op":"drop","mid":"m1","part":"0"}}]}"#;
     let record: WalRecord = serde_json::from_str(pinned).unwrap();

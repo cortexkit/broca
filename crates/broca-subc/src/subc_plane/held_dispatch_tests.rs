@@ -13,6 +13,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 #[path = "tests/dropped_media_tests.rs"]
 mod dropped_media_tests;
 
+#[path = "tests/call_yield_tests.rs"]
+mod call_yield_tests;
+
 struct Rig {
     identity: bool,
     declared_route: bool,
@@ -256,7 +259,12 @@ fn manifest_declaring(opt_in: bool, late_results: bool) -> ToolManifest {
 }
 
 fn manifest_format(format: Option<&str>, late_results: bool) -> ToolManifest {
+    manifest_with_yield(format, late_results, false)
+}
+
+fn manifest_with_yield(format: Option<&str>, late_results: bool, yieldable: bool) -> ToolManifest {
     let declarations = FrozenProviderDeclarations {
+        yield_tools: yieldable.then(|| std::collections::BTreeSet::from(["tool".into()])),
         call_keepalive: None,
         result_formats: format.map(|format| {
             std::collections::BTreeMap::from([(
@@ -284,7 +292,7 @@ fn manifest_format(format: Option<&str>, late_results: bool) -> ToolManifest {
                 text: None,
                 result_ops: None,
                 reply: None,
-                declarations_frozen: Some(declarations),
+                declarations_frozen: Some(Box::new(declarations)),
                 reference_slots: None,
             },
         }],
@@ -808,6 +816,7 @@ async fn staged_plain_key_reaches_the_real_guarded_wire_envelope() {
         crate::connection::ToolReplyDeadline {
             duration: Duration::from_secs(2),
             declared: false,
+            yield_provider: None,
         },
         Some("preset"),
         Some("lineage:1"),
@@ -962,9 +971,12 @@ fn manifest_pinning(
                 text: None,
                 result_ops: None,
                 reply: None,
-                declarations_frozen: schema_pins.map(|schema_pins| FrozenProviderDeclarations {
-                    schema_pins: Some(schema_pins),
-                    ..Default::default()
+                declarations_frozen: schema_pins.map(|schema_pins| {
+                    Box::new(FrozenProviderDeclarations {
+                        yield_tools: None,
+                        schema_pins: Some(schema_pins),
+                        ..Default::default()
+                    })
                 }),
                 reference_slots: None,
             },

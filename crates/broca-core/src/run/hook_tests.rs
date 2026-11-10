@@ -2796,12 +2796,14 @@ fn declaring(late_results: bool) -> broca_wal::PlanManifest {
         ..
     } = &mut manifest.fetches[0].outcome
     {
-        *declarations_frozen = late_results.then_some(broca_wal::FrozenProviderDeclarations {
-            call_keepalive: Some(true),
-            result_formats: None,
-            late_results: Some(true),
-            schema_pins: None,
-        });
+        *declarations_frozen =
+            late_results.then_some(Box::new(broca_wal::FrozenProviderDeclarations {
+                yield_tools: None,
+                call_keepalive: Some(true),
+                result_formats: None,
+                late_results: Some(true),
+                schema_pins: None,
+            }));
     }
     manifest
 }

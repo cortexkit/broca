@@ -135,7 +135,7 @@ impl ToolManifest {
             {
                 if !declarations.is_empty() {
                     self.provider_declarations
-                        .insert(fetch.provider.clone(), declarations.clone());
+                        .insert(fetch.provider.clone(), declarations.as_ref().clone());
                 }
             }
         }

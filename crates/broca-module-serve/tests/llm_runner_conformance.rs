@@ -1171,6 +1171,21 @@ impl subc_client_rs::ModuleHandler for ToolProvider {
         }
         let arguments = request["arguments"].to_string();
         let handle = ctx.route_handle();
+        if let Some(outcome) =
+            held_late_results::answer_yield(&self.shared, (handle.channel, handle.epoch), &request)
+        {
+            return outcome;
+        }
+        if let Some(outcome) = held_late_results::answer_waiting_yield(
+            &self.shared,
+            (handle.channel, handle.epoch),
+            &arguments,
+            &request,
+        )
+        .await
+        {
+            return outcome;
+        }
         if let Some(outcome) = held_late_results::answer_held(
             &self.shared,
             (handle.channel, handle.epoch),
@@ -1280,6 +1295,11 @@ impl subc_client_rs::ModuleHandler for ToolProvider {
 fn tool_manifest() -> subc_protocol::manifest::ModuleManifest {
     use subc_protocol::manifest::{Concurrency, ExecutionMode, IdentityScope, ProviderRole, Tool};
     subc_protocol::manifest::ModuleManifest::builder(TOOL_MODULE, env!("CARGO_PKG_VERSION"))
+        .capabilities(Some(subc_protocol::manifest::CapabilityDeclarations {
+            provides: vec!["call-yield/v1".into()],
+            requires: vec![],
+            must_never_reach: vec![],
+        }))
         .provides(vec![ProviderRole::ToolProvider {
             tools: vec![Tool {
                 name: SCRIPTED_TOOL.to_string(),
@@ -3294,7 +3314,7 @@ impl LlmRunnerSubject for BrocaSubject {
             let providers = if flow {
                 json!([])
             } else {
-                json!([{"provider":TOOL_MODULE,"tools":[{"name":SCRIPTED_TOOL,"capabilities":[]}]}])
+                json!([{"provider":TOOL_MODULE,"tools":[{"name":SCRIPTED_TOOL,"capabilities":if held_late_results::yields_session(&self.shared, session) { vec!["call.yield/v1"] } else { vec![] }}]}])
             };
             let composition = json!({"providers":providers,"step_transform_items":[]});
             let mut plan = json!({

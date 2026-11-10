@@ -2059,7 +2059,7 @@ consumer SDK sends. It never reaches a pending call, even one with the same corr
 refusal is counted in `health.check` as `reverse_requests_refused`.
 
 **Tool result formats and provider-held calls.** The daemon's dispatch routes declare
-`consumer_capabilities: ["tool-result/v1", "held-reply/v1"]` in every build. Typed result
+`consumer_capabilities: ["tool-result/v1", "held-reply/v1", "call-yield/v1"]` in every build. Typed result
 decoding still requires the result-format opt-in in the provider's frozen catalog. Negotiating
 `tool-result/v1` does not change the stored text or error payload bytes. Dispatch captures images
 and PDFs through the session's
@@ -2118,6 +2118,17 @@ and excludes temporary, retained and ephemeral media stores; model-based admissi
 descriptor change.
 
 ### Provider-held calls
+
+At graceful stop begin, a running call may be handed back through `tool.yield` on its original
+route, with `reason: "runner_restart"`. Admission freezes `yield_tools` in each provider's
+declarations only when its catalog snapshot declares `call-yield/v1` and its tool catalog
+declares `late_results`; the set contains only canonical tool names tagged `call.yield/v1`
+using `tool-result/v1`. Dispatch also requires a call key and a route declaring `call-yield/v1`.
+Older manifests without the set never yield. The yield answer does not settle the call: its
+original terminal frame does. A result is recorded normally; a held final frame follows the
+same durable hold and recovery path below. Refusals and accepted yields without a final frame
+within grace keep the existing abort, CANCEL and unknown-outcome seal. An accepted yield
+abandoned without its final frame logs the provider, tool and call key.
 
 The daemon installs the provider-held runtime (`broca-module-serve/src/held_runtime.rs`) on
 its tool plane: the waiting slots a held call's batch waits in, a late-results intake store

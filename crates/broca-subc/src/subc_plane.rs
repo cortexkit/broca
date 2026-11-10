@@ -571,7 +571,7 @@ impl ToolPlaneConnection for SubcConnection {
         // The run's signals guard the enqueue itself: a cancel or stop observed before the
         // request enters the writer queue leaves it unsent, and one after it never turns the
         // enqueued request into an unsent one.
-        self.tool_call_raw_guarded(
+        self.tool_call_raw_yieldable_guarded(
             route,
             &call.tool_name,
             &args,
@@ -582,6 +582,7 @@ impl ToolPlaneConnection for SubcConnection {
             call_key,
             schema_pin,
             signals,
+            deadline.yield_provider.as_deref(),
         )
         .await
     }
@@ -610,7 +611,7 @@ impl ToolPlaneConnection for SubcConnection {
         args: &ApprovedArgs,
         schema_pin: Option<&str>,
     ) -> Result<serde_json::Value, crate::connection::ApprovedCallError> {
-        self.tool_call_raw_guarded(
+        self.tool_call_raw_yieldable_guarded(
             route,
             &call.tool_name,
             &args.bytes,
@@ -621,6 +622,7 @@ impl ToolPlaneConnection for SubcConnection {
             Some(&args.key),
             schema_pin,
             &args.signals,
+            deadline.yield_provider.as_deref(),
         )
         .await
     }
@@ -924,10 +926,6 @@ impl SubcToolPlane {
                 .ok()
             });
         let late_results = self.frozen_contract(ctx, module).late_results;
-        let deadline = crate::connection::ToolReplyDeadline {
-            duration: deadline,
-            declared: self.declared_reply(ctx, module, call).is_some(),
-        };
         let plain_key = key.filter(|_| {
             self.held_reply_declared() && late_results && self.conn.consumer_module_id().is_some()
         });
@@ -935,6 +933,31 @@ impl SubcToolPlane {
             .as_ref()
             .map(|args| args.key.as_str())
             .or(plain_key.map(|key| key.call_key));
+        let yieldable = sent_key.is_some()
+            && late_results
+            && self.held_reply_declared()
+            && self
+                .batch_manifests
+                .lock()
+                .unwrap()
+                .get(&Self::batch_route_key(ctx))
+                .and_then(|manifest| manifest.provider_declarations(module))
+                .is_some_and(|declarations| {
+                    declarations
+                        .yield_tools
+                        .as_ref()
+                        .is_some_and(|tools| tools.contains(&call.tool_name))
+                        && declarations
+                            .result_formats
+                            .as_ref()
+                            .and_then(|formats| formats.get(&call.tool_name))
+                            .is_some_and(|format| format.0 == "tool-result/v1")
+                });
+        let deadline = crate::connection::ToolReplyDeadline {
+            duration: deadline,
+            declared: self.declared_reply(ctx, module, call).is_some(),
+            yield_provider: yieldable.then(|| module.to_owned()),
+        };
         if self.held_reply_declared()
             && late_results
             && sent_key.is_some_and(|key| {
@@ -9002,7 +9025,8 @@ mod approval_digest_contract_tests {
                 &call,
                 crate::connection::ToolReplyDeadline {
                     duration: Duration::from_secs(1),
-                    declared: false
+                    declared: false,
+                    yield_provider: None,
                 },
                 Some("head"),
                 &args,
@@ -9112,7 +9136,7 @@ mod approved_queue_contract_tests {
             };
             let args = if setup == "raw-body" { "{" } else { "{}" };
             let result = conn
-                .tool_call_raw_guarded(
+                .tool_call_raw_yieldable_guarded(
                     &route,
                     &oversized,
                     args,
@@ -9123,6 +9147,7 @@ mod approved_queue_contract_tests {
                     Some("call-key"),
                     None,
                     &Default::default(),
+                    None,
                 )
                 .await;
             assert!(
