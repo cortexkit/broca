@@ -7471,20 +7471,26 @@ async fn a_compacted_step_whose_cap_would_pass_the_context_limit_is_lowered() {
 
 /// A new-loop run whose requests can't be rendered until it waited for something (as a store
 /// run's media renderer renders nothing until its run waited for the session's media) waits
-/// before its compaction estimate and its output cap's estimate render the step's request, and
-/// makes the same run as today's loop.
+/// before its first step's compaction estimate renders the step's request, and makes the same
+/// run as today's loop.
 #[tokio::test]
 async fn a_compacted_step_waits_for_its_request_to_be_ready_before_estimating_it() {
-    let script = CompactionScript {
-        context_limit: lowering().context_limit,
-        rides: Vec::new(),
-    };
     READY
         .scope(
             Some(ReadyScript::Ready),
-            OUTPUT.scope(
-                Some(lowering()),
-                compare_compacted(measured_scenario(), script),
+            compare_compacted(
+                compacted_scenario(vec![
+                    answer(
+                        "a1",
+                        vec![call("c1", "read", json!({"path": "a"}))],
+                        FinishReason::ToolCalls,
+                    ),
+                    text_step("a2", "done"),
+                ]),
+                CompactionScript {
+                    context_limit: 100_000,
+                    rides: Vec::new(),
+                },
             ),
         )
         .await;

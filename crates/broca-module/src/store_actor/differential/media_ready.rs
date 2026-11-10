@@ -427,6 +427,17 @@ async fn ends(session: &Session<&'static MemoryBackend>) -> Vec<(String, Value, 
         .collect()
 }
 
+/// Lets the session's media fold build once dropped. A test that holds the build and fails
+/// before letting it through would otherwise leave the build's thread blocked, and the test's
+/// runtime waiting on it instead of reporting the failure.
+struct Released(Arc<Notify>);
+
+impl Drop for Released {
+    fn drop(&mut self) {
+        self.0.notify_one();
+    }
+}
+
 /// Waits until a run is waiting for its media.
 async fn until_waiting(log: &Log) {
     broca_test_support::wait_until("a run waits for its media", || async {
@@ -449,6 +460,7 @@ async fn until_waiting(log: &Log) {
 #[tokio::test]
 async fn a_compacting_run_renders_and_sends_only_once_its_media_are_ready() {
     let build = Arc::new(Notify::new());
+    let _released = Released(Arc::clone(&build));
     let executor = ReadyExecutor::new(vec![text_step("a1", "hello")]);
     let log = Arc::clone(&executor.log);
     let (commands, served) = actor(executor, Some(Arc::clone(&build))).await;
@@ -509,6 +521,7 @@ async fn a_compacting_run_whose_media_cant_be_had_ends_with_the_error_and_sends_
 #[tokio::test]
 async fn a_cancel_while_a_compacting_run_waits_for_its_media_ends_it_cancelled() {
     let build = Arc::new(Notify::new());
+    let _released = Released(Arc::clone(&build));
     let executor = ReadyExecutor::new(vec![text_step("a1", "never sent")]);
     let log = Arc::clone(&executor.log);
     let (commands, served) = actor(executor, Some(Arc::clone(&build))).await;
