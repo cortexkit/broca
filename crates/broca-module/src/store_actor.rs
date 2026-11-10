@@ -36,7 +36,9 @@
 //! - a send's attachments, staged from its uploads and stored as the session's own objects
 //!   before the record that names them: a send's run start, its queued record or its steer;
 //! - `session.warm` on an idle session, re-sending the request its loop would send next (see
-//!   `warm`).
+//!   `warm`);
+//! - a send's service tier level, admitted by today's rule and sent at the level it was admitted
+//!   at (see `service_tier`).
 //!
 //! Every other command, and every send that needs an admission rule not built here yet, is
 //! refused by name with nothing written. Today's actor is the reference for each rule still to
@@ -1217,6 +1219,12 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                         },
                     }
                 }
+                // As in today's actor, the send's service tier level is admitted once its model is
+                // known, before the plan's model-bearing items are checked.
+                if let Err(outcome) = self.admit_service_tier(&mut request, manifest.as_deref()) {
+                    let _ = reply.send(outcome);
+                    return false;
+                }
                 // A send that left its model to the session checks its plan's model-bearing
                 // items against the model it now runs on, as today's actor does once the model
                 // is resolved. A steer that left it would be checked against the joined run's
@@ -1496,6 +1504,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         } = start;
         // The executor resolves the send's credential selection; only the result is frozen.
         let auth = request.auth.take();
+        // As today's actor hands it over: the level its admission settled, which a fresh run's
+        // admission applies.
+        let queued_service_tier = request.service_tier_level.take();
         let mut req = RunRequest::from_submission(
             request,
             run_id.clone(),
@@ -1573,6 +1584,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             parts,
             mode,
             media,
+            queued_service_tier,
         };
         let resume = mode != StoreRunMode::Fresh;
         if resume {
@@ -3376,8 +3388,6 @@ fn unserved_request(
 fn refuse_unbuilt_request(request: &SubmissionRequest) -> Option<&'static str> {
     if request.keep_warm.is_some() {
         Some("keep-warm")
-    } else if request.service_tier_level.is_some() {
-        Some("a service tier level")
     } else {
         None
     }
@@ -3544,6 +3554,7 @@ fn refuse(command: LineageCmd) {
 mod apply_view;
 mod import;
 mod ordered;
+mod service_tier;
 mod warm;
 
 #[cfg(test)]

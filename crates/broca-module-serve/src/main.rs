@@ -4583,6 +4583,7 @@ mod executor {
             parts: &mut dyn broca_session_loop::parts::Parts,
             mode: broca_module::executor::StoreRunMode,
             media: Option<broca_module::store_media::StoreRunMediaWait>,
+            mut queued_service_tier: Option<String>,
             out: &mpsc::Sender<OutputEvent>,
         ) -> Result<broca_session_loop::Finished, broca_module::executor::StoreRunError> {
             use broca_module::executor::{StoreRunError, StoreRunMode};
@@ -4620,7 +4621,6 @@ mod executor {
                 head_seq: stored.head_seq,
                 persona: stored.persona,
             };
-            let mut queued_service_tier = None;
             let admitted = self
                 .admit_episode(
                     EpisodeJob {
@@ -6171,6 +6171,7 @@ mod executor {
                 mut parts,
                 mode,
                 media,
+                queued_service_tier,
             } = job;
             let result = self
                 .run_on_store(
@@ -6181,6 +6182,7 @@ mod executor {
                     parts.as_mut(),
                     mode,
                     media,
+                    queued_service_tier,
                     &out,
                 )
                 .await;

@@ -360,6 +360,9 @@ pub struct StoreRunJob {
     /// What the run renders media from, as today's runs render it (see `store_media`), sent
     /// once the session's media fold is ready. `None` for a seal, which calls no model.
     pub media: Option<crate::store_media::StoreRunMediaWait>,
+    /// The service tier level the send admitted, as [`RunJob::queued_service_tier`]: routing may
+    /// choose another, and a fresh run's admission applies it to the request it freezes.
+    pub queued_service_tier: Option<String>,
 }
 
 /// What a store run does: admit a new run, or carry on or end the session's unfinished one.

@@ -140,18 +140,7 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> St
                 "the session's latest run start: {error:?}"
             )))
         };
-        let mut config =
-            broca_session_loop::run::run_config_of_start(start, &self.parts).map_err(error)?;
-        // A refreeze before the run's first provider call renders and bills under what it froze.
-        if let Some(refrozen) = &run.refrozen_render {
-            config.frozen_render_config = refrozen["render_config"].clone();
-            if let Some(version) = refrozen["renderer_version"].as_u64() {
-                config.renderer_version = version as u32;
-            }
-        }
-        if let Some(selection) = &run.refrozen_auth {
-            config.auth_selection = serde_json::from_value(selection.clone()).ok();
-        }
+        let config = run_config(run, start, &self.parts).map_err(error)?;
 
         // What the session's frozen config allows, before its clock is read.
         let declaration = self
@@ -339,6 +328,27 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> St
                 expiry_basis: broca_wire::EXPIRY_BASIS_ESTIMATED.into(),
             }));
     }
+}
+
+/// The config `run` runs under: the one its start `start` froze, with the refreezes it recorded
+/// since applied, as today's `latest_episode_config` reads an episode's config from its log.
+pub(super) fn run_config(
+    run: &broca_session_store::fold::operations::Run,
+    start: &broca_session_store::record::RunStart,
+    parts: &dyn broca_session_loop::parts::Parts,
+) -> Result<broca_wal::RunConfig, broca_session_loop::run::LoopError> {
+    let mut config = broca_session_loop::run::run_config_of_start(start, parts)?;
+    // A refreeze before the run's first provider call renders and bills under what it froze.
+    if let Some(refrozen) = &run.refrozen_render {
+        config.frozen_render_config = refrozen["render_config"].clone();
+        if let Some(version) = refrozen["renderer_version"].as_u64() {
+            config.renderer_version = version as u32;
+        }
+    }
+    if let Some(selection) = &run.refrozen_auth {
+        config.auth_selection = serde_json::from_value(selection.clone()).ok();
+    }
+    Ok(config)
 }
 
 /// When the latest run ended or paused on an exhausted provider account whose reset is still in
