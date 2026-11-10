@@ -2515,13 +2515,19 @@ async fn vault_dependency_is_resolved_after_registering() {
     .expect("the bounded per-call vault readiness wait must terminate");
 
     assert_ne!(run.exit_code, 0);
+    // With no credentials module, the vault listing never loads, so admission refuses
+    // `credentials_unavailable` before any credential is fetched. That code is always transient
+    // (`detail.class`, pinned in broca-module's admission_refusal tests); the client prints only
+    // the code and message.
     assert!(
-        run.saw("transient"),
-        "admission returns the typed transient error"
+        run.saw("credentials_unavailable"),
+        "admission returns the typed transient refusal: {:?}",
+        run.lines
     );
     assert!(
-        run.saw("credentials service unreachable"),
-        "the admission error names the unavailable credential service"
+        run.saw("vault credential listing"),
+        "the admission error names the unavailable vault listing: {:?}",
+        run.lines
     );
     assert!(
         !run.saw("SEND state=active"),
