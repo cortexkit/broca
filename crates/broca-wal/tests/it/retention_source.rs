@@ -107,6 +107,15 @@ fn retention_writes_are_limited_to_the_core_and_actor() {
                 "Steered.ts_ms".to_owned(),
             ],
         ),
+        // The session-storage actor writes the same retention-sourced timestamps for queued sends.
+        (
+            "crates/broca-module/src/store_actor.rs".to_owned(),
+            vec!["Queued.ts_ms".to_owned()],
+        ),
+        (
+            "crates/broca-module/src/store_actor/ordered.rs".to_owned(),
+            vec!["Queued.ts_ms".to_owned()],
+        ),
     ]);
     assert_eq!(inventory, expected, "retention writer inventory changed");
 }
