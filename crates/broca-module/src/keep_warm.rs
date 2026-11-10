@@ -42,7 +42,7 @@ impl WarmSlot {
             *headers = Some((sent_at_ms, values));
         }
     }
-    fn latest_headers(&self) -> BTreeMap<String, String> {
+    pub(crate) fn latest_headers(&self) -> BTreeMap<String, String> {
         self.headers
             .lock()
             .unwrap()

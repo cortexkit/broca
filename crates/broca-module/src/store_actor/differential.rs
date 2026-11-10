@@ -205,6 +205,7 @@ fn today_at(
     let executor = Arc::new(TodayLoop {
         provider: Gated {
             render_config: None,
+            notes_sends: false,
             inner: broca_core::provider::StubProvider::new(steps),
             gate,
         },
@@ -1394,6 +1395,7 @@ async fn module(on: bool, steps: Vec<Vec<NormalizedEvent>>) -> Module {
         today: TodayLoop {
             provider: Gated {
                 render_config: None,
+                notes_sends: false,
                 inner: broca_core::provider::StubProvider::new(steps.clone()),
                 gate: None,
             },
@@ -1776,6 +1778,7 @@ async fn a_store_session_reads_as_the_same_history_on_todays_storage() {
 
 mod controls;
 mod head;
+mod keep_warm;
 mod media;
 mod media_ready;
 mod media_render;

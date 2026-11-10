@@ -2995,7 +2995,8 @@ mod executor {
             // session's changes outside its steps (`RunControl::compaction_changes`); a store
             // run does the same.
             compaction_changes: true,
-            // No run of a store session warms yet: keep-warm needs its scheduler in the actor.
+            // A run's keep-warm, which the session's actor builds for a run whose keep-warm is
+            // `auto`, is set by the caller.
             keep_warm: None,
             account_reports,
             max_same_account_wait,
@@ -4584,6 +4585,13 @@ mod executor {
             mode: broca_module::executor::StoreRunMode,
             media: Option<broca_module::store_media::StoreRunMediaWait>,
             mut queued_service_tier: Option<String>,
+            keep_warm: Option<
+                Arc<
+                    dyn broca_core::keep_warm_wait::KeepWarmDriver<
+                        broca_session_loop::run::Admission,
+                    >,
+                >,
+            >,
             out: &mpsc::Sender<OutputEvent>,
         ) -> Result<broca_session_loop::Finished, broca_module::executor::StoreRunError> {
             use broca_module::executor::{StoreRunError, StoreRunMode};
@@ -4785,6 +4793,7 @@ mod executor {
                 self.max_same_account_wait,
             );
             seams.model_call_ready = model_call_ready;
+            seams.keep_warm = keep_warm;
             let finished = if fresh_episode {
                 match broca_session_loop::admit::admission(
                     req,
@@ -6172,6 +6181,7 @@ mod executor {
                 mode,
                 media,
                 queued_service_tier,
+                keep_warm,
             } = job;
             let result = self
                 .run_on_store(
@@ -6183,6 +6193,7 @@ mod executor {
                     mode,
                     media,
                     queued_service_tier,
+                    keep_warm,
                     &out,
                 )
                 .await;

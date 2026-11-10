@@ -52,6 +52,13 @@ pub trait KeepWarmDriver<C: ?Sized + Sync = RunConfig>: Send + Sync {
     }
     fn last_sent_at_ms(&self) -> Option<u64>;
     fn note_attempt(&self, _attempt: &broca_protocol::ModelAttempt) {}
+    /// The seal a run's model calls note each request on as their transport starts sending it,
+    /// for a run loop that gives its calls no seal of its own: a warm re-sends those bytes, and
+    /// their send and usage date the cache. `None` when the loop's own seal already does, as
+    /// today's run loop's shutdown seal does.
+    fn step_seal(&self) -> Option<crate::ShutdownSeal> {
+        None
+    }
     fn costs(&self, config: &C) -> Result<crate::keep_warm::WarmCosts, String>;
     /// Price a durable warm exactly as the live driver did. Responses drivers must
     /// override this with usage pricing, not the fixed output-token quote.

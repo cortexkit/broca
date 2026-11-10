@@ -24,6 +24,7 @@ async fn serve_store_run(
         mode,
         media: None,
         queued_service_tier: None,
+        keep_warm: None,
     };
     let (out, mut events) = mpsc::channel(256);
     tokio::spawn(async move { while events.recv().await.is_some() {} });

@@ -363,6 +363,11 @@ pub struct StoreRunJob {
     /// The service tier level the send admitted, as [`RunJob::queued_service_tier`]: routing may
     /// choose another, and a fresh run's admission applies it to the request it freezes.
     pub queued_service_tier: Option<String>,
+    /// What warms the prompt cache while the run waits on tool calls, for a run whose keep-warm
+    /// is `auto` (`broca_session_loop::run::Seams::keep_warm`). `None` warms nothing.
+    pub keep_warm: Option<
+        Arc<dyn broca_core::keep_warm_wait::KeepWarmDriver<broca_session_loop::run::Admission>>,
+    >,
 }
 
 /// What a store run does: admit a new run, or carry on or end the session's unfinished one.

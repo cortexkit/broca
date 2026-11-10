@@ -86,6 +86,7 @@ async fn side_at(
         today: TodayLoop {
             provider: Gated {
                 render_config: None,
+                notes_sends: false,
                 inner: broca_core::provider::StubProvider::new(steps),
                 gate: None,
             },

@@ -367,7 +367,7 @@ fn account_wall(run: &broca_session_store::fold::operations::Run, now_ms: u64) -
 }
 
 /// The digest a lowercase hex SHA-256 spells.
-fn sha256_digest(hex: &str) -> Option<broca_session_store::codec::Digest> {
+pub(super) fn sha256_digest(hex: &str) -> Option<broca_session_store::codec::Digest> {
     if hex.len() != 64 {
         return None;
     }
