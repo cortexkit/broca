@@ -25,7 +25,14 @@
 //!   `--seal-every` messages, each sealing the history before its cut, as a head's history is
 //!   sealed over its life; the measured run's first step seals the rest up to its cut;
 //! - `open-log`: the session never seals, so the whole history stays in the open log behind the
-//!   cut (the run's writer skips the loop's seal).
+//!   cut (the run's writer skips the loop's seal);
+//! - `no-cut`, a worker's shape: the view cuts nothing, so every request carries the whole
+//!   session, but replaces the output of every tool call before the newest `--keep` messages
+//!   with a short marker, as a worker's view drops old tool results. A worker's session stays
+//!   within its context window, so this case is run at smaller sizes (`--sizes
+//!   1000,5000,20000 --cases no-cut`). The summary splits its request build into the renders of
+//!   the request's bytes and the rest, with each one's slope per message, and times the view's
+//!   planning over the window offline.
 //!
 //! Run it on a release build (it writes a few gigabytes under the store directory and takes
 //! minutes; `open-log` takes tens of seconds a step at the larger sizes):
@@ -33,9 +40,9 @@
 //! ```text
 //! cargo run --release -p broca-session-convert --example compacted_step_cost -- \
 //!     --out <results dir> [--store <scratch dir>] [--sizes 1000,150000,500000] \
-//!     [--cases sealed-once,sealed-often,open-log] [--warmup 10] [--steps 60] [--keep 300] \
+//!     [--cases sealed-once,sealed-often,open-log,no-cut] [--warmup 10] [--steps 60] [--keep 300] \
 //!     [--seal-every 2000] [--opens 3] [--open-log-warmup N] [--open-log-steps N] \
-//!     [--unbilled true]
+//!     [--unbilled true] [--interleave true]
 //! ```
 //!
 //! `--open-log-warmup` and `--open-log-steps` set the warm-up and measured steps of the
@@ -43,13 +50,26 @@
 //! smallest size given. By default every history run is billed, as on a module that keeps the
 //! usage export; `--unbilled true` leaves them all owed to billing, as on a module without one.
 //!
+//! By default each size and case is measured alone, one after another. `--interleave true`
+//! measures the sizes of each case side by side instead, so whatever else loads the machine (the
+//! disk's flushes above all) falls on every size alike: every size's session is built first, and
+//! then their measured runs run at the same time, their model calls taking turns round-robin in
+//! the order the sizes are given (the first size's step, the second's, the first's again, and
+//! so on). The turn is kept in the scripted model's seam: a run waiting for its turn is timed as
+//! the `model: turnstile wait` item, which counts with the test doubles, outside every part and
+//! the total. The actors' opening costs are measured before any run starts and after all end.
+//!
 //! It writes `summary.md` (tables per part and size, with ratios to the smallest size),
 //! `steps-<size>-<case>.jsonl` (every step's timed calls and gaps, in order, warm-up included)
 //! and `labels-<size>-<case>.tsv` (each label's samples over the measured steps) under `--out`.
+//! Each step's line has `model_call_at_ns`, when the model call ending its cycle began, in
+//! nanoseconds from one origin the whole bench shares, so the step files of sizes measured side
+//! by side can be merged in time order.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -139,6 +159,9 @@ fn manifest() -> Arc<broca_wal::PlanManifest> {
     })
 }
 
+/// The context window the `no-cut` case's measured run is admitted with (see `run_measured`).
+const NO_CUT_CONTEXT_LIMIT: u64 = 20_000_000;
+
 /// A send naming no tools of its own (the plan's apply), on model `model`, with a context window
 /// a head's model has.
 fn request(text: &str, model: &str, max_steps: u32) -> SubmissionRequest {
@@ -220,11 +243,14 @@ fn tool_text(bytes: usize) -> String {
     "fn example(reader: &Reader) -> u64 { reader.view().len() }\n".repeat(bytes / 59 + 1)
 }
 
+/// The instant every timeline counts from, so the events of runs measured side by side compare.
+static ORIGIN: OnceLock<Instant> = OnceLock::new();
+
 /// One timed call, or the loop's own work between two of them.
 #[derive(Clone, Debug)]
 struct Event {
     label: String,
-    /// Nanoseconds from the timeline's start.
+    /// Nanoseconds from the bench's [`ORIGIN`].
     start: u64,
     end: u64,
     /// Nested inside another event (an entries read inside the notice that prompted it), so
@@ -241,7 +267,7 @@ struct Timeline {
 impl Timeline {
     fn new() -> Arc<Self> {
         Arc::new(Self {
-            origin: Instant::now(),
+            origin: *ORIGIN.get_or_init(Instant::now),
             events: Mutex::new(Vec::new()),
         })
     }
@@ -490,21 +516,110 @@ impl<W: Writer> Writer for TimedWriter<W> {
     }
 }
 
+/// Keeps the measured runs of an interleaved bench (`--interleave true`) taking their model
+/// calls in turn. Each run has a seat; the seats make one model call each, round-robin in seat
+/// order, and a seat leaves once its run makes its last call, or ends.
+struct Turnstile {
+    turns: Mutex<Turns>,
+    turned: tokio::sync::Notify,
+}
+
+struct Turns {
+    /// Whether each seat's run still makes model calls.
+    seated: Vec<bool>,
+    /// The seat whose call is next.
+    next: usize,
+}
+
+impl Turns {
+    /// Gives the turn to the next seat after `from`, in seat order, whose run still makes calls.
+    fn pass(&mut self, from: usize) {
+        let count = self.seated.len();
+        if let Some(next) = (1..=count)
+            .map(|step| (from + step) % count)
+            .find(|seat| self.seated[*seat])
+        {
+            self.next = next;
+        }
+    }
+}
+
+impl Turnstile {
+    fn new(seats: usize) -> Arc<Self> {
+        Arc::new(Self {
+            turns: Mutex::new(Turns {
+                seated: vec![true; seats],
+                next: 0,
+            }),
+            turned: tokio::sync::Notify::new(),
+        })
+    }
+
+    /// Waits for `seat`'s turn, then reads `clock` and passes the turn on, in that order, so the
+    /// calls' clock readings follow their turns. With `last`, the seat leaves as it passes.
+    async fn enter(&self, seat: usize, last: bool, clock: impl Fn() -> u64) -> u64 {
+        loop {
+            let turned = self.turned.notified();
+            tokio::pin!(turned);
+            // Registered before the turn is read, so a pass after the read still wakes it.
+            turned.as_mut().enable();
+            {
+                let mut turns = self.turns.lock().unwrap();
+                if turns.next == seat {
+                    let at = clock();
+                    if last {
+                        turns.seated[seat] = false;
+                    }
+                    turns.pass(seat);
+                    drop(turns);
+                    self.turned.notify_waiters();
+                    return at;
+                }
+            }
+            turned.await;
+        }
+    }
+
+    /// `seat`'s run ended: it makes no more calls, so the others never wait for it.
+    fn leave(&self, seat: usize) {
+        let mut turns = self.turns.lock().unwrap();
+        turns.seated[seat] = false;
+        if turns.next == seat {
+            turns.pass(seat);
+        }
+        drop(turns);
+        self.turned.notify_waiters();
+    }
+}
+
+/// A run's seat at a [`Turnstile`].
+#[derive(Clone)]
+struct Seat {
+    turnstile: Arc<Turnstile>,
+    index: usize,
+}
+
 /// The scripted model, timing when the loop reaches it and each render the loop asks of it.
 /// At each step it also renders the request as the Anthropic Messages provider would send it,
 /// timed apart: the scripted model's own rendering is the canonical one, which the loop uses for
-/// its size estimates.
+/// its size estimates. With a seat at a [`Turnstile`], each call waits for its turn after that
+/// render, timed as the `model: turnstile wait` item.
 struct BenchProvider {
     inner: StubProvider,
     wire: broca_provider::LiveProvider<broca_provider::families::AnthropicMessages>,
     timeline: Arc<Timeline>,
     /// The size of the newest request the Anthropic renderer gave, in bytes.
     wire_bytes: Mutex<Vec<usize>>,
+    seat: Option<Seat>,
+    /// How many steps the model is scripted with, and how many calls it had so far.
+    scripted: usize,
+    called: AtomicUsize,
 }
 
 impl BenchProvider {
     fn new(steps: Vec<Vec<NormalizedEvent>>, timeline: Arc<Timeline>) -> Self {
         Self {
+            scripted: steps.len(),
             inner: StubProvider::new(steps),
             wire: broca_provider::LiveProvider::new(
                 broca_provider::families::AnthropicMessages,
@@ -513,7 +628,15 @@ impl BenchProvider {
             ),
             timeline,
             wire_bytes: Mutex::new(Vec::new()),
+            seat: None,
+            called: AtomicUsize::new(0),
         }
+    }
+
+    /// This model, taking its calls in turn at `seat`.
+    fn seated(mut self, seat: Option<Seat>) -> Self {
+        self.seat = seat;
+        self
     }
 }
 
@@ -579,7 +702,22 @@ impl broca_core::provider::Provider for BenchProvider {
                 );
             }
         }
-        let at = self.timeline.now();
+        let at = match &self.seat {
+            Some(seat) => {
+                let call = self.called.fetch_add(1, Ordering::SeqCst);
+                let waiting = self.timeline.now();
+                let at = seat
+                    .turnstile
+                    .enter(seat.index, call + 1 >= self.scripted, || {
+                        self.timeline.now()
+                    })
+                    .await;
+                self.timeline
+                    .push("model: turnstile wait".into(), waiting, at, false);
+                at
+            }
+            None => self.timeline.now(),
+        };
         self.timeline.push("model step".into(), at, at, false);
         self.inner.step(step_id, opts).await
     }
@@ -657,6 +795,8 @@ struct Compactor {
     outcomes: Mutex<BTreeMap<&'static str, usize>>,
     /// Each method the provider was called with, in order.
     methods: Mutex<Vec<String>>,
+    /// The provider rules the newest call stated, as the loop stated them.
+    rules: Mutex<Option<Value>>,
 }
 
 impl Compactor {
@@ -668,6 +808,7 @@ impl Compactor {
             cursor: Mutex::new(0),
             outcomes: Mutex::new(BTreeMap::new()),
             methods: Mutex::new(Vec::new()),
+            rules: Mutex::new(None),
         })
     }
 
@@ -703,7 +844,11 @@ impl Compactor {
                 StoreReadReply::Compaction(page) => (page, "served by the actor"),
                 _ => panic!("an entries read answered with another read's reply"),
             },
-            StoreReadOutcome::Stored { position, .. } => {
+            StoreReadOutcome::Stored {
+                position,
+                entry_speaks_for,
+                ..
+            } => {
                 // The actor needed storage: the module reads the session as it stood there.
                 let view = Session::view_at(
                     LocalBackend::new(reader.root.clone()),
@@ -721,6 +866,7 @@ impl Compactor {
                     Some(COMPACTOR),
                     "session.entries",
                     &params,
+                    &entry_speaks_for,
                 )
                 .await;
                 (page, "handed back, read from a view")
@@ -772,6 +918,9 @@ impl broca_core::CompactionPlane for Compactor {
     {
         let start = self.timeline.now();
         self.methods.lock().unwrap().push(method.to_owned());
+        if let Some(rules) = params.pointer("/conditions/rules") {
+            *self.rules.lock().unwrap() = Some(rules.clone());
+        }
         // A real plane sends the call's parameters over the daemon's bus as JSON.
         let encoded = serde_json::to_vec(&params).unwrap();
         let entries = params
@@ -819,24 +968,10 @@ fn bucket(count: usize) -> String {
 /// The summarising view of version `version`: a summary inserted at the start, and a cut through
 /// `through`.
 fn summary_view(version: u64, through: &str) -> View {
-    let summary = "Summary of the session so far: the team moved the reader onto kept views, \
-                   fixed the seal at a cut, and reviewed three deliveries. Open threads: the \
-                   entries page cost, the actor's open cost, and the view cache bound. "
-        .repeat(40);
     View::seal(
         version,
         vec![
-            Edit::new(
-                version,
-                EditOp::Insert {
-                    at: InsertAt::Start,
-                    message: InsertedMessage::new(
-                        format!("summary-{version}"),
-                        broca_core::compaction_v2::protocol::read::Role::User,
-                        vec![summary],
-                    ),
-                },
-            ),
+            summary_insert(version),
             Edit::new(
                 version,
                 EditOp::Cut {
@@ -845,6 +980,65 @@ fn summary_view(version: u64, through: &str) -> View {
             ),
         ],
     )
+}
+
+/// The summary a view of version `version` inserts at the start.
+fn summary_insert(version: u64) -> Edit {
+    let summary = "Summary of the session so far: the team moved the reader onto kept views, \
+                   fixed the seal at a cut, and reviewed three deliveries. Open threads: the \
+                   entries page cost, the actor's open cost, and the view cache bound. "
+        .repeat(40);
+    Edit::new(
+        version,
+        EditOp::Insert {
+            at: InsertAt::Start,
+            message: InsertedMessage::new(
+                format!("summary-{version}"),
+                broca_core::compaction_v2::protocol::read::Role::User,
+                vec![summary],
+            ),
+        },
+    )
+}
+
+/// The window entries of `conversation`, projected as the compaction provider reads them.
+fn window_entries(
+    conversation: &Conversation,
+) -> Vec<broca_core::compaction_v2::protocol::read::Entry> {
+    broca_session_store::session::window_entries(conversation, 1, usize::MAX)
+        .iter()
+        .map(|stored| broca_session_loop::entries::project(stored).unwrap())
+        .collect()
+}
+
+/// The worker's view of version `version` (`no-cut`): a summary inserted at the start, no cut,
+/// and the output of every finished tool call in an entry up to ordinal `through` replaced by a
+/// short marker, as a worker's view drops old tool results.
+fn dropping_view(version: u64, conversation: &Conversation, through: u64) -> View {
+    use broca_core::compaction_v2::protocol::part::PartBody;
+    let mut edits = vec![summary_insert(version)];
+    for entry in window_entries(conversation) {
+        if entry.ordinal > through {
+            break;
+        }
+        for part in &entry.parts {
+            if let PartBody::Tool(tool) = &part.body {
+                if tool.output.is_some() && !tool.provider_executed {
+                    edits.push(Edit::new(
+                        version,
+                        EditOp::Replace {
+                            mid: entry.mid.clone(),
+                            part: part.id.clone(),
+                            field: "output".into(),
+                            value: json!("[output dropped]"),
+                            expect: part.digest.clone(),
+                        },
+                    ));
+                }
+            }
+        }
+    }
+    View::seal(version, edits)
 }
 
 /// Runs each store job through the new loop's admission and run, as the module's executor does,
@@ -1224,6 +1418,40 @@ async fn build(
     }
 }
 
+/// The history of `size` messages a case measures, written under the store directory: sealed
+/// at a new cut every `--seal-every` messages when `often` (`sealed-often`), else kept in the
+/// open log.
+async fn build_base(
+    args: &Args,
+    size: u64,
+    often: bool,
+    templates: &[Template],
+    parts: &SharedParts,
+) -> Built {
+    let base = args.store.join(format!(
+        "{size}-{}",
+        if often { "sealed-often-base" } else { "base" }
+    ));
+    let built = build(
+        &base,
+        size,
+        args.keep,
+        often.then_some(args.seal_every),
+        !args.unbilled,
+        templates,
+        parts,
+    )
+    .await;
+    println!(
+        "built {} messages in {:.1} s ({:.1} MB, {} cuts sealed)",
+        built.messages,
+        built.written.as_secs_f64(),
+        built.bytes as f64 / 1e6,
+        built.views
+    );
+    built
+}
+
 /// Runs one run of one answering step on `session` under the compacting plan, on another model
 /// than the history's runs, so its step rides the compaction provider, which hands over the
 /// summarising view of version `version` cutting through the message `through`. The step
@@ -1380,6 +1608,8 @@ struct Cycle {
     step: usize,
     items: Vec<(String, u64, &'static str)>,
     parts: BTreeMap<&'static str, u64>,
+    /// When the model call that ends the cycle began, in nanoseconds from the bench's origin.
+    model_call_at: u64,
 }
 
 /// Splits a run's events into step cycles, one per model call that has a next one.
@@ -1467,7 +1697,7 @@ fn cycles(events: &[Event]) -> Vec<Cycle> {
             }
             let part = if is_append(&event.label) {
                 PARTS[1]
-            } else if event.label.starts_with("tools:") {
+            } else if event.label.starts_with("tools:") || event.label.starts_with("model:") {
                 "test doubles"
             } else {
                 phase(index).part()
@@ -1488,7 +1718,12 @@ fn cycles(events: &[Event]) -> Vec<Cycle> {
                 *parts.entry(PARTS[6]).or_insert(0) += ns;
             }
         }
-        out.push(Cycle { step, items, parts });
+        out.push(Cycle {
+            step,
+            items,
+            parts,
+            model_call_at: span[span.len() - 1].start,
+        });
     }
     out
 }
@@ -1528,11 +1763,15 @@ struct Args {
     seal_every: u64,
     /// Whether the history's runs stay owed to billing, as on a module with no usage export.
     unbilled: bool,
+    /// Whether each case's sizes are measured side by side, their model calls taking turns.
+    interleave: bool,
     opens: usize,
 }
 
-/// The cases the bench knows: how the history behind the view's cut is kept.
-const CASES: [&str; 3] = ["sealed-once", "sealed-often", "open-log"];
+/// The cases the bench knows: how the history behind the view's cut is kept, or, in `no-cut`,
+/// a view that never cuts but leaves out the output of every tool call but the newest, as a
+/// worker's view does.
+const CASES: [&str; 4] = ["sealed-once", "sealed-often", "open-log", "no-cut"];
 
 impl Args {
     fn parse() -> Self {
@@ -1548,6 +1787,7 @@ impl Args {
             keep: 300,
             seal_every: 2_000,
             unbilled: false,
+            interleave: false,
             opens: 3,
         };
         let list = |value: &str| -> Vec<String> {
@@ -1573,6 +1813,7 @@ impl Args {
                 "--keep" => args.keep = value.parse().unwrap(),
                 "--seal-every" => args.seal_every = value.parse().unwrap(),
                 "--unbilled" => args.unbilled = value.parse().unwrap(),
+                "--interleave" => args.interleave = value.parse().unwrap(),
                 "--opens" => args.opens = value.parse().unwrap(),
                 other => panic!("unknown flag {other}"),
             }
@@ -1671,22 +1912,144 @@ struct Measured {
     after: OpenCosts,
     notes: Vec<String>,
     wire_bytes: Vec<usize>,
+    /// The view the run applied, and the provider rules its calls stated.
+    view: View,
+    rules: Option<Value>,
+    /// What planning that view over the session's window costs (see [`planner_costs`]).
+    planner: Vec<Duration>,
 }
 
 /// Sends a run of `warmup + steps` tool steps and an answer to the session under `root` and
-/// measures each step cycle: `warmup` steps, then `steps` steps measured.
+/// measures each step cycle: `warmup` steps, then `steps` steps measured. The actor's opening
+/// costs are measured before the run and after it.
 async fn measure(
     args: &Args,
     built: &Built,
     case: &str,
-    (warmup, steps): (usize, usize),
+    steps: (usize, usize),
     parts: &SharedParts,
 ) -> Measured {
+    let before = open_costs(&built.root, parts, args.opens).await;
+    let mut measured = run_measured(built, case, steps, parts, None).await;
+    measured.before = before;
+    measured.after = open_costs(&built.root, parts, args.opens).await;
+    measured.planner = planner_costs(&built.root, &measured, args.opens).await;
+    measured
+}
+
+/// [`measure`] for each of `runs` (a session and its warm-up and measured steps) side by side:
+/// every actor's opening costs first, then the runs at the same time, their model calls taking
+/// turns in the order given, then every actor's opening costs again.
+async fn measure_interleaved(
+    args: &Args,
+    runs: &[(Built, (usize, usize))],
+    case: &str,
+    parts: &SharedParts,
+) -> Vec<Measured> {
+    let mut before = Vec::new();
+    for (built, _) in runs {
+        before.push(open_costs(&built.root, parts, args.opens).await);
+    }
+    let turnstile = Turnstile::new(runs.len());
+    let mut measured =
+        futures::future::join_all(runs.iter().enumerate().map(|(index, (built, steps))| {
+            let seat = Seat {
+                turnstile: Arc::clone(&turnstile),
+                index,
+            };
+            run_measured(built, case, *steps, parts, Some(seat))
+        }))
+        .await;
+    for ((one, before), (built, _)) in measured.iter_mut().zip(before).zip(runs) {
+        one.before = before;
+        one.after = open_costs(&built.root, parts, args.opens).await;
+        one.planner = planner_costs(&built.root, one, args.opens).await;
+    }
+    let check = turn_check(&measured);
+    println!("{case}: {check}");
+    for one in &mut measured {
+        one.notes.push(check.clone());
+    }
+    measured
+}
+
+/// Whether the model calls of runs measured side by side took turns: merged in time order from
+/// their step cycles, as the step files record them, each call should be the next run's in
+/// round-robin order among the runs that still make calls.
+fn turn_check(runs: &[Measured]) -> String {
+    let calls: Vec<Vec<u64>> = runs
+        .iter()
+        .map(|run| {
+            run.warmup_cycles
+                .iter()
+                .chain(&run.cycles)
+                .map(|cycle| cycle.model_call_at)
+                .collect()
+        })
+        .collect();
+    let sizes: Vec<String> = runs.iter().map(|run| run.size.to_string()).collect();
+    format!(
+        "Interleaved with the {} messages runs: of the {} model calls their step cycles end at, \
+         merged in time order, {} fell out of round-robin turn.",
+        sizes.join(" and "),
+        calls.iter().map(Vec::len).sum::<usize>(),
+        out_of_turn(&calls)
+    )
+}
+
+/// How many of the calls in `runs` (each run's call times), merged in time order, aren't the
+/// call of the run whose turn it is, round-robin in run order among the runs with calls left.
+fn out_of_turn(runs: &[Vec<u64>]) -> usize {
+    let mut calls: Vec<(u64, usize)> = runs
+        .iter()
+        .enumerate()
+        .flat_map(|(seat, times)| times.iter().map(move |at| (*at, seat)))
+        .collect();
+    calls.sort_unstable();
+    let mut left: Vec<usize> = runs.iter().map(Vec::len).collect();
+    let (mut expected, mut out_of_turn) = (0, 0);
+    for &(_, seat) in &calls {
+        if seat != expected {
+            out_of_turn += 1;
+        }
+        left[seat] -= 1;
+        if let Some(next) = (1..=left.len())
+            .map(|step| (seat + step) % left.len())
+            .find(|next| left[*next] > 0)
+        {
+            expected = next;
+        }
+    }
+    out_of_turn
+}
+
+/// Sends a run of `warmup + steps` tool steps and an answer to the session under `root` and
+/// measures each step cycle: `warmup` steps, then `steps` steps measured. With `seat`, the run's
+/// model calls take their turns at its turnstile. The opening costs are left for the caller.
+async fn run_measured(
+    built: &Built,
+    case: &str,
+    (warmup, steps): (usize, usize),
+    parts: &SharedParts,
+    seat: Option<Seat>,
+) -> Measured {
     let root = &built.root;
-    let before = open_costs(root, parts, args.opens).await;
     let timeline = Timeline::new();
     let compactor = Compactor::new(Arc::clone(&timeline));
-    *compactor.view.lock().unwrap() = Some(summary_view(built.views + 1, &built.cut.0));
+    let session = Session::load(
+        LocalBackend::new(root.clone()),
+        SessionAddr(ADDR.into()),
+        &triple(),
+        &deployment(),
+    )
+    .await
+    .unwrap();
+    let view = if case == "no-cut" {
+        dropping_view(built.views + 1, &session.conversation, built.cut.1)
+    } else {
+        summary_view(built.views + 1, &built.cut.0)
+    };
+    *compactor.view.lock().unwrap() = Some(view.clone());
     // The provider starts with every entry the session held before the run already read, so
     // each read after a notice asks only for the run's new entries.
     *compactor.cursor.lock().unwrap() = built.messages;
@@ -1696,43 +2059,40 @@ async fn measure(
         .collect();
     script.push(answer_step("done"));
     let executor = Arc::new(BenchExecutor {
-        provider: BenchProvider::new(script, Arc::clone(&timeline)),
+        provider: BenchProvider::new(script, Arc::clone(&timeline)).seated(seat.clone()),
         tool_text: tool_text(2_048),
         compactor: Arc::clone(&compactor),
         timeline: Arc::clone(&timeline),
-        seals: case != "open-log",
+        seals: case.starts_with("sealed"),
     });
-    let session = Session::load(
-        LocalBackend::new(root.clone()),
-        SessionAddr(ADDR.into()),
-        &triple(),
-        &deployment(),
-    )
-    .await
-    .unwrap();
     let (commands, served) = serve(root, session, Arc::clone(&executor), parts);
     *compactor.reader.lock().unwrap() = Some(EntriesReader {
         commands: commands.clone(),
         root: root.clone(),
         parts: parts.clone(),
     });
+    let mut submission = request(
+        "Carry on with the review: read each file the plan names and report what changed.",
+        // Another model than the history's runs, so the first step rides the compaction
+        // provider, which hands the view over there.
+        "m2",
+        (total + 5) as u32,
+    );
+    if case == "no-cut" {
+        // The history's runs are copies of small template runs, so the first request's size
+        // estimate counts the whole uncut request as growth since the last request measured;
+        // past a few thousand messages that passes a 1,000,000-token window and the run would
+        // end at the context ceiling before its first model call.
+        submission.context_limit = Some(NO_CUT_CONTEXT_LIMIT);
+    }
     idle(&commands).await;
     timeline.take();
-    let outcome = send(
-        &commands,
-        "measure001",
-        request(
-            "Carry on with the review: read each file the plan names and report what changed.",
-            // Another model than the history's runs, so the first step rides the compaction
-            // provider, which hands the view over there.
-            "m2",
-            (total + 5) as u32,
-        ),
-        None,
-    )
-    .await;
+    let outcome = send(&commands, "measure001", submission, None).await;
     assert!(matches!(outcome, SendOutcome::Active { .. }), "{outcome:?}");
     idle(&commands).await;
+    if let Some(seat) = &seat {
+        seat.turnstile.leave(seat.index);
+    }
     let events = timeline.take();
     *compactor.reader.lock().unwrap() = None;
     drop(commands);
@@ -1793,23 +2153,68 @@ async fn measure(
         session.conversation.placed
     ));
     session.close().await.unwrap();
-    let after = open_costs(root, parts, args.opens).await;
 
     let all = cycles(&events);
     let (warmup_cycles, cycles): (Vec<Cycle>, Vec<Cycle>) =
         all.into_iter().partition(|cycle| cycle.step <= warmup);
     let wire_bytes = executor.provider.wire_bytes.lock().unwrap().clone();
+    let rules = compactor.rules.lock().unwrap().clone();
     Measured {
         size: built.messages,
         case: case.to_owned(),
         built: built.clone(),
         cycles,
         warmup_cycles,
-        before,
-        after,
+        before: OpenCosts::default(),
+        after: OpenCosts::default(),
         notes,
         wire_bytes,
+        view,
+        rules,
+        planner: Vec::new(),
     }
+}
+
+/// What planning the run's view over the session's window costs, at least `samples` times,
+/// after the run: `render::plan_for_render`, the part of every render of a request that runs
+/// before any message is rendered (the view's checksum, and the shared view crate's
+/// `edits_for_transcript`, `seal_with_policy` and `plan_view`, each over every window entry or
+/// every edit). Measured only where the view's targets are all in the window (`open-log`,
+/// `no-cut`): after a seal the transcript holds sealed entries the window doesn't.
+async fn planner_costs(root: &Path, measured: &Measured, samples: usize) -> Vec<Duration> {
+    if !matches!(measured.case.as_str(), "open-log" | "no-cut") {
+        return Vec::new();
+    }
+    let Some(rules) = measured
+        .rules
+        .clone()
+        .and_then(|rules| serde_json::from_value(rules).ok())
+    else {
+        return Vec::new();
+    };
+    let session = Session::load(
+        LocalBackend::new(root.to_path_buf()),
+        SessionAddr(ADDR.into()),
+        &triple(),
+        &deployment(),
+    )
+    .await
+    .unwrap();
+    let entries = window_entries(&session.conversation);
+    session.close().await.unwrap();
+    (0..samples.max(5))
+        .map(|_| {
+            let started = Instant::now();
+            broca_core::compaction_v2::render::plan_for_render(
+                &entries,
+                Some(&measured.view),
+                &rules,
+                broca_core::compaction_v2::Floor::none(),
+            )
+            .expect("the run's view plans over the window");
+            started.elapsed()
+        })
+        .collect()
 }
 
 /// The output of `command` with `args`, trimmed, or what failed.
@@ -1872,6 +2277,7 @@ fn write_raw(out: &Path, nominal: u64, measured: &Measured) {
             "case": measured.case,
             "step": cycle.step,
             "warmup": warmup,
+            "model_call_at_ns": cycle.model_call_at,
             "parts_ns": cycle.parts,
             "items": cycle.items.iter().map(|(label, ns, part)| json!([label, ns, part])).collect::<Vec<_>>(),
         });
@@ -1896,6 +2302,81 @@ fn write_raw(out: &Path, nominal: u64, measured: &Measured) {
         ));
     }
     std::fs::write(out.join(format!("labels-{name}.tsv")), tsv).unwrap();
+    if !measured.planner.is_empty() {
+        std::fs::write(
+            out.join(format!("planner-{name}.json")),
+            json!({"planner_ns": durations_ns(&measured.planner)}).to_string(),
+        )
+        .unwrap();
+    }
+}
+
+/// Request build's median (p50) split, per size: the renders of the request's bytes (the size
+/// estimate's canonical render and the provider's wire render, the `render (...)` items) and
+/// the rest, with each one's slope per message against the size before, and what planning the
+/// view costs offline (see [`planner_costs`]).
+fn request_split(measured: &[(u64, Measured)]) -> String {
+    let mut out = String::from(
+        "\nRequest build, split: byte assembly is the `render (...)` items (the size estimate's \
+         canonical render and the provider's wire render); the rest is everything else request \
+         build holds. A slope is the p50's change per message against the size before, in µs. \
+         The planner column is one plan of the run's view over the session's window after the \
+         run, timed offline (`render::plan_for_render`: the view's checksum and the shared view \
+         crate's `edits_for_transcript`, `seal_with_policy` and `plan_view`); each render of a \
+         request runs it once, before rendering any message.\n\n| size | request build p50 ms | byte assembly p50 ms | rest p50 ms | \
+         assembly slope µs/msg | rest slope µs/msg | planner p50 ms (offline) |\n\
+         |---|---|---|---|---|---|---|\n",
+    );
+    let mut previous: Option<(u64, f64, f64)> = None;
+    for (size, one) in measured {
+        let assembly: Vec<u64> = one
+            .cycles
+            .iter()
+            .map(|cycle| {
+                cycle
+                    .items
+                    .iter()
+                    .filter(|(label, _, part)| *part == PARTS[0] && label.starts_with("render ("))
+                    .map(|(_, ns, _)| ns)
+                    .sum()
+            })
+            .collect();
+        let rest: Vec<u64> = one
+            .cycles
+            .iter()
+            .zip(&assembly)
+            .map(|(cycle, assembly)| {
+                cycle
+                    .parts
+                    .get(PARTS[0])
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_sub(*assembly)
+            })
+            .collect();
+        let (assembly50, rest50) = (stats(&assembly).0, stats(&rest).0);
+        let slope = |now: f64, before: f64, from: u64| {
+            format!("{:.3}", (now - before) * 1000.0 / (*size - from) as f64)
+        };
+        let (assembly_slope, rest_slope) = match previous {
+            Some((from, assembly, rest)) if *size > from => {
+                (slope(assembly50, assembly, from), slope(rest50, rest, from))
+            }
+            _ => ("-".into(), "-".into()),
+        };
+        let planner = if one.planner.is_empty() {
+            "-".into()
+        } else {
+            format!("{:.3}", stats(&durations_ns(&one.planner)).0)
+        };
+        out.push_str(&format!(
+            "| {size} | {:.3} | {assembly50:.3} | {rest50:.3} | {assembly_slope} | {rest_slope} | \
+             {planner} |\n",
+            stats(&part_samples(&one.cycles, PARTS[0])).0,
+        ));
+        previous = Some((*size, assembly50, rest50));
+    }
+    out
 }
 
 /// The summary of every size of one case.
@@ -1949,6 +2430,7 @@ fn case_summary(case: &str, measured: &[(u64, Measured)]) -> String {
         }
         out.push('\n');
     }
+    out.push_str(&request_split(measured));
     out.push_str("\nNot per step: opening the session's actor, and seeding subscriptions.\n\n");
     out.push_str(
         "| size | when | open log records | window starts at | Session::load ms p50 / p95 / max | \
@@ -1958,7 +2440,7 @@ fn case_summary(case: &str, measured: &[(u64, Measured)]) -> String {
         for (when, costs) in [
             ("before the run", &one.before),
             (
-                if case == "open-log" {
+                if matches!(case, "open-log" | "no-cut") {
                     "after the run (still unsealed)"
                 } else {
                     "after the run (sealed at the cut)"
@@ -1980,12 +2462,17 @@ fn case_summary(case: &str, measured: &[(u64, Measured)]) -> String {
         out.push_str(&format!("\n### {size} messages, `{case}`\n\n"));
         out.push_str(&format!(
             "Built {} messages in {:.1} s, {:.1} MB on disk, sealed at {} cuts as it was written; \
-             the view cuts through ordinal {}. {} measured steps after {} warm-up steps. \
+             the view {} through ordinal {}. {} measured steps after {} warm-up steps. \
              Anthropic request body p50 {} KB.\n\n",
             one.built.messages,
             one.built.written.as_secs_f64(),
             one.built.bytes as f64 / 1e6,
             one.built.views,
+            if case == "no-cut" {
+                "drops tool outputs"
+            } else {
+                "cuts"
+            },
             one.built.cut.1,
             one.cycles.len(),
             one.warmup_cycles.len(),
@@ -2080,8 +2567,11 @@ fn main() {
              {:.1} messages per run on average; encrypted, on local files; {}. The run measured \
              takes {} tool steps (2 KB results) and an answer (`open-log` above the smallest \
              size: {} warm-up and {} measured steps); the view inserts a summary and cuts \
-             through all but about the newest {} messages. `sealed-often` seals at a new cut \
-             about every {} messages.\n",
+             through all but about the newest {} messages (`no-cut`: cuts nothing, and replaces \
+             the output of every tool call before those messages; its run is admitted with a \
+             20,000,000-token window, since the first request's size estimate counts the whole \
+             uncut request as growth over the copied history's small requests). `sealed-often` seals at a new \
+             cut about every {} messages.\n",
             templates.len(),
             templates.iter().map(|t| t.messages).sum::<u64>() as f64 / templates.len() as f64,
             if args.unbilled {
@@ -2095,71 +2585,106 @@ fn main() {
             args.keep,
             args.seal_every,
         ));
+        if args.interleave {
+            header.push_str(
+                "\nInterleaved (`--interleave true`): every size's session was built first; then, \
+                 case by case, the sizes' measured runs ran at the same time, their model calls \
+                 taking turns round-robin in the order the sizes are given, so whatever else \
+                 loaded the machine fell on every size alike. A run waiting for its turn is the \
+                 `model: turnstile wait` item, counted with the test doubles, outside every part \
+                 and the total. The actors' opening costs were measured before the runs started \
+                 and after they all ended. Each size's notes say whether the calls kept their \
+                 turns.\n",
+            );
+        }
         let mut by_case: BTreeMap<String, Vec<(u64, Measured)>> = BTreeMap::new();
         let smallest = args.sizes.iter().copied().min().unwrap_or(0);
-        for &size in &args.sizes {
-            // One build per way of keeping the history, copied for each case that measures it.
-            let mut bases: BTreeMap<bool, Built> = BTreeMap::new();
-            for case in &args.cases {
-                let often = case == "sealed-often";
-                if bases.contains_key(&often) {
-                    continue;
+        // The warm-up and measured steps of `case` at `size`.
+        let steps_of = |case: &str, size: u64| match (args.open_log_warmup, args.open_log_steps) {
+            (warmup, steps) if case == "open-log" && size > smallest => {
+                (warmup.unwrap_or(args.warmup), steps.unwrap_or(args.steps))
+            }
+            _ => (args.warmup, args.steps),
+        };
+        // `base`, copied to where `case` measures it at `size`.
+        let copied = |base: &Built, case: &str, size: u64| {
+            let root = args.store.join(format!("{size}-{case}"));
+            copy_dir(&base.root, &root);
+            let mut copy = base.clone();
+            copy.root = root;
+            copy
+        };
+        // Records `measured` and rewrites the summary with every case measured so far.
+        let mut record = |case: &str, size: u64, measured: Measured, load: &str| {
+            println!(
+                "{size} {case}: total p50 / p95 / max {} ms (load before: {load})",
+                ms3(stats(&part_samples(&measured.cycles, "total")))
+            );
+            write_raw(&args.out, size, &measured);
+            let mut measured = measured;
+            measured.notes.push(format!("Load before this case: `{load}`."));
+            let _ = std::fs::remove_dir_all(&measured.built.root);
+            by_case
+                .entry(case.to_owned())
+                .or_default()
+                .push((size, measured));
+            let mut summary = header.clone();
+            for (case, measured) in &by_case {
+                summary.push_str(&case_summary(case, measured));
+            }
+            std::fs::write(args.out.join("summary.md"), &summary).unwrap();
+        };
+        if args.interleave {
+            // Every size's history, built before any run is measured.
+            let mut bases: BTreeMap<(u64, bool), Built> = BTreeMap::new();
+            for &size in &args.sizes {
+                for case in &args.cases {
+                    let often = case == "sealed-often";
+                    if let std::collections::btree_map::Entry::Vacant(slot) =
+                        bases.entry((size, often))
+                    {
+                        slot.insert(build_base(&args, size, often, &templates, &parts).await);
+                    }
                 }
-                let base = args
-                    .store
-                    .join(format!("{size}-{}", if often { "sealed-often-base" } else { "base" }));
-                let seal_every = often.then_some(args.seal_every);
-                let built = build(
-                    &base,
-                    size,
-                    args.keep,
-                    seal_every,
-                    !args.unbilled,
-                    &templates,
-                    &parts,
-                )
-                .await;
-                println!(
-                    "built {} messages in {:.1} s ({:.1} MB, {} cuts sealed)",
-                    built.messages,
-                    built.written.as_secs_f64(),
-                    built.bytes as f64 / 1e6,
-                    built.views
-                );
-                bases.insert(often, built);
             }
             for case in &args.cases {
-                let base = &bases[&(case == "sealed-often")];
-                let root = args.store.join(format!("{size}-{case}"));
-                copy_dir(&base.root, &root);
-                let mut copy = base.clone();
-                copy.root = root.clone();
-                let reduced = case == "open-log" && size > smallest;
-                let steps = match (args.open_log_warmup, args.open_log_steps) {
-                    (warmup, steps) if reduced => {
-                        (warmup.unwrap_or(args.warmup), steps.unwrap_or(args.steps))
-                    }
-                    _ => (args.warmup, args.steps),
-                };
+                let runs: Vec<(Built, (usize, usize))> = args
+                    .sizes
+                    .iter()
+                    .map(|&size| {
+                        let base = &bases[&(size, case == "sealed-often")];
+                        (copied(base, case, size), steps_of(case, size))
+                    })
+                    .collect();
                 let load = command_output("uptime", &[]);
-                let measured = measure(&args, &copy, case, steps, &parts).await;
-                println!(
-                    "{size} {case}: total p50 / p95 / max {} ms (load before: {load})",
-                    ms3(stats(&part_samples(&measured.cycles, "total")))
-                );
-                write_raw(&args.out, size, &measured);
-                let mut measured = measured;
-                measured.notes.push(format!("Load before this case: `{load}`."));
-                by_case.entry(case.clone()).or_default().push((size, measured));
-                let _ = std::fs::remove_dir_all(&root);
-                let mut summary = header.clone();
-                for (case, measured) in &by_case {
-                    summary.push_str(&case_summary(case, measured));
+                let measured = measure_interleaved(&args, &runs, case, &parts).await;
+                for (&size, measured) in args.sizes.iter().zip(measured) {
+                    record(case, size, measured, &load);
                 }
-                std::fs::write(args.out.join("summary.md"), &summary).unwrap();
             }
             for base in bases.values() {
                 let _ = std::fs::remove_dir_all(&base.root);
+            }
+        } else {
+            for &size in &args.sizes {
+                // One build per way of keeping the history, copied for each case that measures
+                // it.
+                let mut bases: BTreeMap<bool, Built> = BTreeMap::new();
+                for case in &args.cases {
+                    let often = case == "sealed-often";
+                    if let std::collections::btree_map::Entry::Vacant(slot) = bases.entry(often) {
+                        slot.insert(build_base(&args, size, often, &templates, &parts).await);
+                    }
+                }
+                for case in &args.cases {
+                    let copy = copied(&bases[&(case == "sealed-often")], case, size);
+                    let load = command_output("uptime", &[]);
+                    let measured = measure(&args, &copy, case, steps_of(case, size), &parts).await;
+                    record(case, size, measured, &load);
+                }
+                for base in bases.values() {
+                    let _ = std::fs::remove_dir_all(&base.root);
+                }
             }
         }
         println!(
@@ -2168,4 +2693,63 @@ fn main() {
             command_output("uptime", &[])
         );
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Three seats making 3, 1 and 2 calls, each from its own task, the later seats arriving
+    /// first: the turnstile lets the calls in round-robin in seat order, and passes over a seat
+    /// once it made its last call.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_turnstile_lets_calls_in_round_robin() {
+        let turnstile = Turnstile::new(3);
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let mut tasks = Vec::new();
+        for (seat, calls) in [3usize, 1, 2].into_iter().enumerate() {
+            let (turnstile, order) = (Arc::clone(&turnstile), Arc::clone(&order));
+            tasks.push(tokio::spawn(async move {
+                for call in 0..calls {
+                    tokio::time::sleep(Duration::from_millis(3 - seat as u64)).await;
+                    turnstile
+                        .enter(seat, call + 1 == calls, || {
+                            order.lock().unwrap().push(seat);
+                            0
+                        })
+                        .await;
+                }
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        assert_eq!(*order.lock().unwrap(), [0, 1, 2, 0, 2, 0]);
+    }
+
+    /// A seat whose run ends without its last call leaves, and the others' calls go on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_seat_that_leaves_holds_up_no_one() {
+        let turnstile = Turnstile::new(2);
+        turnstile.enter(0, false, || 0).await;
+        turnstile.leave(0);
+        let second = Arc::clone(&turnstile);
+        let calls = tokio::spawn(async move {
+            second.enter(1, false, || 0).await;
+            second.enter(1, true, || 0).await;
+        });
+        tokio::time::timeout(Duration::from_secs(5), calls)
+            .await
+            .expect("the remaining seat's calls went in")
+            .unwrap();
+    }
+
+    /// The check of the step files' call times: calls that alternate are all in turn, a run
+    /// left alone once the other ran out is in turn, and two calls of one run in a row aren't.
+    #[test]
+    fn calls_out_of_turn_are_counted() {
+        assert_eq!(out_of_turn(&[vec![1, 3, 5], vec![2, 4, 6]]), 0);
+        assert_eq!(out_of_turn(&[vec![1, 3], vec![2, 4, 5, 6]]), 0);
+        assert_eq!(out_of_turn(&[vec![1, 2, 5], vec![3, 4, 6]]), 2);
+    }
 }

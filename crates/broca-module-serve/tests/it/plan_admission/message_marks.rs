@@ -134,10 +134,24 @@ async fn marked_sends_are_display_only_and_survive_reopen() {
 async fn invalid_or_unauthorized_marks_refuse_before_any_write() {
     let (mut rig, _) = scoped_plan_rig("message-marks-refuse", false).await;
     let plan = vector("plans/broca-head-no-compaction.json");
+    // Broca declares notice_with_speaks_for, so a notice may carry a speaker and the speaker a
+    // name; a name outside its grammar still refuses.
     for (index, (marks, field)) in [
         (
-            json!({"speaks_for":{"agent_id":"Ada"},"notice":true}),
-            "notice",
+            json!({"speaks_for":{"agent_id":"Ada","name":""}}),
+            "speaks_for.name",
+        ),
+        (
+            json!({"speaks_for":{"agent_id":"Ada","name":"x".repeat(65)},"notice":true}),
+            "speaks_for.name",
+        ),
+        (
+            json!({"speaks_for":{"agent_id":"Ada","name":"a\nb"}}),
+            "speaks_for.name",
+        ),
+        (
+            json!({"speaks_for":{"agent_id":"Ada","name":7}}),
+            "speaks_for.name",
         ),
         (json!({"speaks_for":{"agent_id":""}}), "speaks_for.agent_id"),
         (
@@ -174,7 +188,7 @@ async fn invalid_or_unauthorized_marks_refuse_before_any_write() {
         .await;
         let error = error_body(&reply);
         if index == 0 {
-            sample("marks-conflict.json", &reply);
+            sample("marks-invalid-name.json", &reply);
         }
         assert_eq!(error["code"], "invalid_params", "{error}");
         assert_eq!(error["detail"]["field"], field, "{error}");
@@ -261,6 +275,112 @@ async fn changed_speaks_for_retry_refuses_speaks_for_first_without_writing() {
         assert_eq!(rig.wal_bytes(), before);
         sample("marks-speaks-for-reuse.json", &reply);
     }
+    rig.finish().await;
+}
+
+/// A speaker's name is part of the send's retry identity: a retry that changes or drops it
+/// refuses naming `speaks_for` and writes nothing, and the same name replays.
+#[tokio::test]
+async fn a_changed_speaker_name_refuses_the_retry_naming_speaks_for() {
+    let named = json!({"speaks_for":{"agent_id":"Ada","name":"Ada Lovelace"},"notice":true});
+    let (mut rig, plan, sent) = retry_fixture("named-mark-retry", named.clone(), true).await;
+    for marks in [
+        json!({"speaks_for":{"agent_id":"Ada","name":"Ada King"},"notice":true}),
+        json!({"speaks_for":{"agent_id":"Ada"},"notice":true}),
+    ] {
+        let before = rig.wal_bytes();
+        let reply = send_plan(&mut rig, 8, "marked-key", "same words", Some(&plan), marks).await;
+        let error = error_body(&reply);
+        assert_eq!(error["code"], "send_id_reuse", "{error}");
+        assert_eq!(error["detail"]["field"], "speaks_for", "{error}");
+        assert_eq!(rig.wal_bytes(), before);
+        sample("named-marks-reuse.json", &reply);
+    }
+    let before = rig.wal_bytes();
+    let reply = send_plan(&mut rig, 8, "marked-key", "same words", Some(&plan), named).await;
+    assert_eq!(reply.body, sent.body);
+    assert_eq!(rig.wal_bytes(), before);
+    rig.script.hold_model(false);
+    rig.wait_for_finished(1).await;
+    rig.wait_idle().await;
+    rig.finish().await;
+}
+
+/// The owner's automatic message carrying an agent's words under a display name is stored with
+/// both marks and the name, served to opted-in reads before and after a restart, and written
+/// only in records that require the name reader.
+#[tokio::test]
+async fn a_named_agent_notice_is_stored_and_served_with_both_marks() {
+    let (mut rig, _) = scoped_plan_rig("named-agent-notice", false).await;
+    let marks = json!({"speaks_for":{"agent_id":"agent-a","name":"Ada"},"notice":true});
+    rig.script.push(&[Step::Text("answer")]);
+    let sent = send_plan(
+        &mut rig,
+        8,
+        "named-notice",
+        "words of another agent",
+        Some(&vector("plans/broca-head-no-compaction.json")),
+        marks.clone(),
+    )
+    .await;
+    sample("named-marks-send.json", &sent);
+    assert_eq!(
+        sent.header.ty,
+        subc_protocol::FrameType::Response,
+        "{}",
+        String::from_utf8_lossy(&sent.body)
+    );
+    let run_id = result(&sent)["run_id"].as_str().unwrap().to_owned();
+    rig.wait_for_finished(1).await;
+    rig.wait_idle().await;
+    let status = rig
+        .request(8, json!({"method":"run.status","params":{"run_id":run_id}}))
+        .await;
+    sample("named-marks-run-status.json", &status);
+    assert_eq!(status.header.ty, subc_protocol::FrameType::Response);
+    let read = rig
+        .request(
+            8,
+            json!({"method":"session.read","params":{"include_display_facts":true}}),
+        )
+        .await;
+    sample("named-marks-read.json", &read);
+    let entry = &result(&read)["messages"][0];
+    assert_eq!(entry["speaks_for"], marks["speaks_for"], "{entry}");
+    assert_eq!(entry["notice"], true, "{entry}");
+    let records = broca_core::WalStore::read_records(
+        &broca_core::FileWalStore::new(rig.dir.join("wal")),
+        &rig.session,
+    )
+    .unwrap();
+    let named: Vec<_> = records
+        .iter()
+        .filter(|frame| {
+            frame
+                .record
+                .required_features()
+                .contains(&broca_wal::framing::SPEAKS_FOR_NAME_FEATURE)
+        })
+        .collect();
+    assert!(
+        named
+            .iter()
+            .any(|frame| matches!(frame.record, broca_wal::WalRecord::RunStarted { .. })),
+        "the run's start records the named speaker behind the name reader: {records:?}"
+    );
+    assert!(rig.registry().stop_and_seal().await);
+    let mut rig = rig.restart().await;
+    rig.bind_with_scope(8, Some(scope_owner()), Some(scope_stamp(false)))
+        .await;
+    let read = result(
+        &rig.request(
+            8,
+            json!({"method":"session.read","params":{"include_display_facts":true}}),
+        )
+        .await,
+    );
+    assert_eq!(read["messages"][0]["speaks_for"], marks["speaks_for"]);
+    assert_eq!(read["messages"][0]["notice"], true);
     rig.finish().await;
 }
 

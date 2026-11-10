@@ -314,6 +314,27 @@ impl<B: SessionBackend> Session<B> {
         deployment: &DeploymentKey,
         appends_in_conversation: bool,
     ) -> Result<Self, SessionError> {
+        Self::create_with_history_version(
+            backend,
+            addr,
+            triple,
+            deployment,
+            appends_in_conversation,
+            0,
+        )
+        .await
+    }
+
+    /// Creates a converted session whose served-history counter continues from the source.
+    /// The initial checkpoint and head carry the same version, including after creation recovery.
+    pub async fn create_with_history_version(
+        backend: B,
+        addr: SessionAddr,
+        triple: SessionTriple,
+        deployment: &DeploymentKey,
+        appends_in_conversation: bool,
+        history_version: u64,
+    ) -> Result<Self, SessionError> {
         let session_id = random_id();
         let (key, wrapped, cipher) = match deployment.new_sessions() {
             Cipher::XChaCha20Poly1305 => {
@@ -336,7 +357,7 @@ impl<B: SessionBackend> Session<B> {
             session_id,
             triple,
             incarnation: random_id(),
-            history_version: 0,
+            history_version,
             residence: Residence::Creating(log),
             features: Vec::new(),
             keys: wrapped,
@@ -389,7 +410,10 @@ impl<B: SessionBackend> Session<B> {
             ChainBase::default(),
         );
         let conversation = Conversation::new(appends_in_conversation);
-        let operations = Operations::default();
+        let operations = Operations {
+            history_version: head.history_version,
+            ..Operations::default()
+        };
         let checkpoint = Checkpoint {
             covers_through: 0,
             next_seq: head.next_seq,
@@ -879,6 +903,17 @@ impl<B: SessionBackend> Session<B> {
         Ok(())
     }
 
+    /// Deletes the stored session at `addr` whole, as [`Session::discard`] does: its head first,
+    /// so the address reads as having no session, then its kept head versions, logs and objects,
+    /// which hold its media and its id index. This is for a caller that holds the session's lease
+    /// without having opened a writer: retention deleting a session whose policy has expired.
+    /// `at` is the head version the caller read when it decided, so a head that has moved since
+    /// refuses `Fenced` and nothing is deleted.
+    pub async fn delete(backend: B, addr: &SessionAddr, at: Version) -> Result<(), SessionError> {
+        backend.delete_session(addr, at).await?;
+        Ok(())
+    }
+
     /// The backend the session reads and writes through.
     pub fn backend(&self) -> &B {
         &self.backend
@@ -955,6 +990,8 @@ mod revert;
 pub use revert::{RevertRefusal, Reverted};
 mod seal;
 pub use seal::{Carry, Sealed, GRACE_MS};
+mod collect;
+pub use collect::{collect_stored, stored_due};
 pub mod restore;
 
 #[cfg(test)]

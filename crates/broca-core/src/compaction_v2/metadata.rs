@@ -8,7 +8,7 @@ use broca_protocol::{BindPrincipal, ContentBlock, DeliveryMode, Message, Role as
 use broca_wal::{FramedRecord, WalRecord};
 use cortexkit_role_compaction::{
     part::{Delivered, PartBody, ToolPart, ToolStatus},
-    read::{NoticeOrigin, Role, StepUsage},
+    read::{NoticeOrigin, Role, SpeaksFor, StepUsage},
     view::AppliedView,
 };
 
@@ -61,6 +61,11 @@ pub struct Metadata {
     pub source_input: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notice: Option<NoticeOrigin>,
+    /// The agent whose words a marked send carried, on each of its user messages. Absent on
+    /// every other row, so an unmarked row keeps its earlier bytes. Rows projected by a build
+    /// before this field lack it even for a marked send.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speaks_for: Option<SpeaksFor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<StepUsage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -120,6 +125,10 @@ impl Origin {
             self.template.as_deref(),
             self.marks.as_ref(),
         )
+    }
+
+    fn speaks_for(&self) -> Option<SpeaksFor> {
+        super::entries::recorded_speaks_for(self.marks.as_ref())
     }
 }
 
@@ -411,6 +420,9 @@ impl Fold {
                             notice: (notice_input && message.role == HostRole::User)
                                 .then(|| origin.notice())
                                 .flatten(),
+                            speaks_for: (notice_input && message.role == HostRole::User)
+                                .then(|| origin.speaks_for())
+                                .flatten(),
                             ..Metadata::default()
                         },
                         count: numbered_parts(message),
@@ -491,6 +503,9 @@ impl Fold {
                             notice: (message.role == HostRole::User)
                                 .then(|| origin.notice())
                                 .flatten(),
+                            speaks_for: (message.role == HostRole::User)
+                                .then(|| origin.speaks_for())
+                                .flatten(),
                             ..Metadata::default()
                         },
                         count: numbered_parts(message),
@@ -511,6 +526,9 @@ impl Fold {
                             source_input: Some(index as u64),
                             notice: (message.role == HostRole::User)
                                 .then(|| origin.notice())
+                                .flatten(),
+                            speaks_for: (message.role == HostRole::User)
+                                .then(|| origin.speaks_for())
                                 .flatten(),
                             ..Metadata::default()
                         },
@@ -747,6 +765,7 @@ pub fn project_entry(
         completed_at: (message.role == HostRole::Assistant && metadata.source_input.is_none())
             .then_some(written_at),
         notice: metadata.notice.clone(),
+        speaks_for: metadata.speaks_for.clone(),
         usage: metadata.usage,
         generated_under: metadata.generated_under.clone(),
     };

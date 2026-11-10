@@ -78,6 +78,7 @@ fn one_of_each() -> Vec<Record> {
             notice: None,
             written_at_ms: None,
             ride: Some(RideEnvelope {
+                named_speaker: None,
                 call_key: "lineage:4".into(),
                 sender: "reminders".into(),
                 forms: vec!["tool_result".into(), "turn_system".into()],
@@ -96,6 +97,7 @@ fn one_of_each() -> Vec<Record> {
             body: serde_json::json!({"first_kept_ordinal": 12}),
         }),
         Record::RunStart(Box::new(RunStart {
+            named_speaker: None,
             imported_ids: None,
             message_marks: None,
             run_id: "run-1".into(),
@@ -223,6 +225,7 @@ fn one_of_each() -> Vec<Record> {
             call_key: None,
         }),
         Record::QueuedSend(QueuedSend {
+            named_speaker: None,
             media: Vec::new(),
             submission_id: "sub".into(),
             send_id: Some("s2".into()),
@@ -275,6 +278,39 @@ fn one_of_each() -> Vec<Record> {
             body: Some(serde_json::json!({"reason": "restart"})),
         }),
     ]
+}
+
+#[test]
+fn source_lineage_round_trips_with_a_must_understand_bit() {
+    let moved = Moved {
+        move_id: "move".into(),
+        source_activity_ms: 9,
+        source_lineage: Some("0190a6b2-0000-7000-8000-000000000001".into()),
+    };
+    let record = Record::Moved(moved);
+    let body = record.encode_body();
+    assert_eq!(Record::decode(record.kind(), &body).unwrap(), record);
+    let field = crate::codec::Fields::new(&body, "old reader")
+        .map(Result::unwrap)
+        .find(|field| field.number == 3)
+        .unwrap();
+    assert!(field.must);
+    assert!(matches!(
+        crate::codec::skip_unknown(field, "old reader")
+            .unwrap_err()
+            .kind,
+        crate::codec::DecodeErrorKind::MustUnderstand { field: 3 }
+    ));
+    let old_move = Record::Moved(Moved {
+        move_id: "move".into(),
+        source_activity_ms: 9,
+        source_lineage: None,
+    });
+    let body = old_move.encode_body();
+    assert_eq!(Record::decode(old_move.kind(), &body).unwrap(), old_move);
+    assert!(!crate::codec::Fields::new(&body, "old move")
+        .map(Result::unwrap)
+        .any(|field| field.number == 3));
 }
 
 #[test]

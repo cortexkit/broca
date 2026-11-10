@@ -511,6 +511,15 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreFanout<B> {
         self.subscribers.push((cancel, tokio::spawn(task)));
     }
 
+    /// Whether any subscriber is still attached. A subscriber's task is all there is of it: the
+    /// task ends when its stream is dropped, when the stream ends it (a lost continuity, a lag,
+    /// read access ending) or when this fanout is dropped. Finished tasks are let go of here, so
+    /// a session held open for its subscribers keeps no entry for the ones that left.
+    pub(crate) fn has_live_subscribers(&mut self) -> bool {
+        self.subscribers.retain(|(_, task)| !task.is_finished());
+        !self.subscribers.is_empty()
+    }
+
     /// The display lane's sender and the step its deltas belong to, for a run's output drain.
     pub(crate) fn display(&self) -> (DisplaySender, Arc<Mutex<Option<String>>>) {
         (self.display.clone(), Arc::clone(&self.display_mid))

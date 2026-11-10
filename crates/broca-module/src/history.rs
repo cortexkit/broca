@@ -305,17 +305,21 @@ pub fn project(entry: &SessionReadMessage, limits: Option<&Limits>) -> DisplayRo
                         &call.input,
                         limits,
                     );
-                    part.call_key = entry
+                    if let Some(fact) = entry
                         .tool_calls
                         .iter()
                         .find(|fact| fact.tool_call_id == call.tool_call_id.0)
-                        .and_then(|fact| fact.call_key.clone());
+                    {
+                        part.call_key = fact.call_key.clone();
+                        part.call_carrier = fact.call_carrier.clone();
+                    }
                     if let Some(time) = entry
                         .tool_times
                         .iter()
                         .find(|time| time.tool_call_id == call.tool_call_id.0)
                     {
                         part.call_key = time.call_key.clone();
+                        part.call_carrier = time.call_carrier.clone();
                         part.schema_pin = time.schema_pin.clone();
                         part.started_at = time.started_at;
                         part.finished_at = time.finished_at;

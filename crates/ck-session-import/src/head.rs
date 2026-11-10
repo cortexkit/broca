@@ -20,10 +20,12 @@ use std::fmt;
 
 use broca_protocol::{ContentBlock, MediaRef, Message, Role, ToolCallId};
 
+mod calls;
 pub mod opencode2;
 pub mod pi;
 mod sends;
 
+pub use calls::{apply_calls, calls_path, read_calls, CallRow};
 pub use sends::{apply_sends, read_sends, sends_path, SendRow, SendTarget};
 
 /// The module that minted an OpenCode 2 head's call keys.
@@ -104,15 +106,22 @@ pub struct HeadMedium {
     pub bytes: Vec<u8>,
 }
 
-/// One imported tool call's identity.
+/// One imported tool call's identity and recorded facts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallIdentity {
     /// The call id as the message holds it, after a reused id was made unique.
     pub tool_call_id: String,
+    /// The id as the source wrote it, before reused ids were made unique for broca.
+    pub source_tool_call_id: String,
     /// The key the source runner gave the call, verbatim.
     pub call_key: String,
     /// The module that minted the key.
     pub carrier: String,
+    /// Facts recorded by the minting runner, never supplied by the importing runner.
+    pub schema_pin: Option<String>,
+    pub started_at: Option<u64>,
+    pub finished_at: Option<u64>,
+    pub unanswered: Option<String>,
 }
 
 pub type HeadCall = CallIdentity;
@@ -159,6 +168,8 @@ pub enum HeadError {
     Media { mid: String, reason: String },
     /// The side file can't be applied.
     Sends(String),
+    /// The call facts side file can't be applied.
+    Calls(String),
 }
 
 impl HeadError {
@@ -171,6 +182,7 @@ impl HeadError {
             Self::OrphanResult { .. } => "import_orphan_result",
             Self::Media { .. } => "import_media_refused",
             Self::Sends(_) => "import_sends_unreadable",
+            Self::Calls(_) => "import_calls_unreadable",
         }
     }
 
@@ -212,6 +224,7 @@ impl fmt::Display for HeadError {
                 write!(f, "source row {mid}: a medium can't be stored: {reason}")
             }
             Self::Sends(reason) => write!(f, "the side file can't be applied: {reason}"),
+            Self::Calls(reason) => write!(f, "the calls side file can't be applied: {reason}"),
         }
     }
 }
@@ -336,8 +349,13 @@ pub(crate) fn pair_calls(
                     match keys.next().flatten() {
                         Some(key) => calls.push(CallIdentity {
                             tool_call_id: assigned.clone(),
+                            source_tool_call_id: source.clone(),
                             call_key: key,
                             carrier: carrier.to_owned(),
+                            schema_pin: None,
+                            started_at: None,
+                            finished_at: None,
+                            unanswered: None,
                         }),
                         None => keyless.push(assigned.clone()),
                     }

@@ -10,8 +10,8 @@
 //!   whether or not a provider holds it, as today's rule reads (an intent and no result). Its
 //!   module is the one its intent recorded, found through the session's id lookup.
 //! - **A turn no recorded step produced:** an imported turn's facts name keys another runner
-//!   minted (`CallFacts::carrier`), so, as today's read does for a message no step of its log
-//!   produced, each call is served with no dispatch fact.
+//!   minted (`CallFacts::carrier`), so each call retains its original key and carrier, without
+//!   inventing a broca dispatch.
 //!
 //! A call without an intent never left: it isn't indeterminate and has no module. Answered (denied,
 //! invalid, synthetic, or refused with its batch), it has the key its outcome recorded, as
@@ -49,12 +49,7 @@ impl TurnOf {
 
 /// A call with no dispatch fact: never sent, or produced by no recorded step.
 fn unattributed(tool_call_id: &str) -> SessionReadToolCall {
-    SessionReadToolCall {
-        tool_call_id: tool_call_id.to_owned(),
-        call_key: None,
-        dispatched_to: None,
-        indeterminate: false,
-    }
+    SessionReadToolCall::new(tool_call_id)
 }
 
 /// The ids of the tool calls `message` makes, in its order.
@@ -92,15 +87,13 @@ fn served_call(
     call: Option<&broca_session_store::record::CallFacts>,
     id: &str,
 ) -> SessionReadToolCall {
-    match call {
-        Some(call) if call.carrier.is_none() => SessionReadToolCall {
-            tool_call_id: id.to_owned(),
-            call_key: Some(call.call_key.clone()),
-            dispatched_to: call.dispatched_to.clone(),
-            indeterminate: false,
-        },
-        _ => unattributed(id),
+    let mut served = unattributed(id);
+    if let Some(call) = call {
+        served.call_key = Some(call.call_key.clone());
+        served.call_carrier = call.carrier.clone();
+        served.dispatched_to = call.dispatched_to.clone();
     }
+    served
 }
 
 /// The facts of copy `copy` (counting from 0) of the open turn's call `id`, from the open
@@ -137,10 +130,9 @@ async fn open_call<B: SessionBackend>(
     if !dispatched {
         // A copy answered without an intent has the key its outcome recorded, and nothing
         // else; one not answered yet, or a later copy of a dispatched id, has neither.
-        return Ok(SessionReadToolCall {
-            call_key: call.key.clone().filter(|_| !call.intent),
-            ..unattributed(id)
-        });
+        let mut served = unattributed(id);
+        served.call_key = call.key.clone().filter(|_| !call.intent);
+        return Ok(served);
     }
     let Some(key) = call.key.clone() else {
         return Ok(unattributed(id));
@@ -156,12 +148,10 @@ async fn open_call<B: SessionBackend>(
         .ok_or_else(|| {
             SessionError::Fold(format!("no dispatch intent records the call key {key}"))
         })?;
-    Ok(SessionReadToolCall {
-        tool_call_id: id.to_owned(),
-        call_key: Some(key),
-        dispatched_to: intent.module_id,
-        indeterminate: !answered,
-    })
+    let mut served = SessionReadToolCall::new(id).with_call_key(key);
+    served.dispatched_to = intent.module_id;
+    served.indeterminate = !answered;
+    Ok(served)
 }
 
 /// Fills each message's `tool_calls`, and the carrier call's key of a tool result delivered as a
@@ -240,9 +230,10 @@ pub async fn attribute_tool_calls<B: SessionBackend>(
                 .find(|entry| entry.ordinal == assistant && !entry.open)
                 .and_then(|entry| entry.state.turn),
         };
-        let key = placed_call(turn.as_ref(), &carrier).call_key;
+        let call = placed_call(turn.as_ref(), &carrier);
         if let Some(receipt) = &mut response.messages[index].delivered_as {
-            receipt.call_key = key;
+            receipt.call_key = call.call_key;
+            receipt.call_carrier = call.call_carrier;
         }
     }
     Ok(())

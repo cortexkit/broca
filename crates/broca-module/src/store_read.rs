@@ -99,8 +99,8 @@ pub async fn served_entries<B: SessionBackend>(
 
 /// [`served_entries`] as compaction reads them (`Session::compaction_entries`): a session that
 /// enrolled in the current compaction contract serves the messages placed before it as the
-/// enrollment decided, and not the global system messages it suppressed, which don't count
-/// toward `limit`. What `session.entries` serves and a view is checked against.
+/// enrollment decided, the global system messages it suppressed as entries with no parts, at
+/// their own ordinals. What `session.entries` serves and a view is checked against.
 pub async fn served_compaction_entries<B: SessionBackend>(
     session: &Session<B>,
     from: u64,
@@ -189,6 +189,19 @@ pub async fn read_page<B: SessionBackend>(
         messages.push(page_message(entry, next, latest)?);
         turns.push(crate::store_calls::TurnOf::of(entry));
         let mut served = display_facts(entry).served();
+        served.notices.extend(
+            imported_notices(
+                session,
+                entry,
+                index.checked_sub(1).and_then(|at| entries.get(at)),
+            )
+            .await?
+            .into_iter()
+            .map(|fact| broca_core::projection::ProjectedNotice {
+                fact,
+                submission_id: String::new(),
+            }),
+        );
         // A turn whose results are placed has its facts, though reads still serve it as running
         // until its batch closes (`results_await_close`).
         if entry.open && entry.state.turn.is_none() {
@@ -259,6 +272,70 @@ pub async fn read_page<B: SessionBackend>(
         stamps,
         numbering,
     })
+}
+
+/// Imports keep riding sends beside the assistant call. Readers attach those notices to
+/// the corresponding result part, including when a page starts at the results message.
+async fn imported_notices<B: SessionBackend>(
+    session: &Session<B>,
+    entry: &StoredEntry,
+    previous: Option<&StoredEntry>,
+) -> Result<Vec<cortexkit_role_llm_runner::read::NoticeFact>, SessionError> {
+    if entry.message.role != Role::Tool
+        || entry
+            .state
+            .facts
+            .as_ref()
+            .is_some_and(|facts| facts.run_id.is_some())
+        || entry.ordinal <= 1
+    {
+        return Ok(Vec::new());
+    }
+    let loaded;
+    let previous = match previous {
+        Some(previous) => previous,
+        None => {
+            loaded = session.entries(entry.ordinal - 1, 1).await?;
+            let Some(previous) = loaded.first() else {
+                return Ok(Vec::new());
+            };
+            previous
+        }
+    };
+    let mut notices = Vec::new();
+    for delivered in &previous.state.delivered {
+        let Some(broca_protocol::ContentBlock::ToolCall(tool)) =
+            previous.message.content.get(delivered.part as usize)
+        else {
+            continue;
+        };
+        let Some(call) = previous
+            .state
+            .turn
+            .iter()
+            .flat_map(|turn| &turn.calls)
+            .find(|call| call.tool_call_id == tool.tool_call_id && call.carrier.is_some())
+        else {
+            continue;
+        };
+        let Some(part) = entry.message.content.iter().position(|block| {
+            matches!(block, broca_protocol::ContentBlock::ToolResult(result) if result.tool_call_id == tool.tool_call_id)
+        }) else {
+            continue;
+        };
+        if let (Some(send_id), Some(notice)) = (&delivered.send_id, &delivered.notice) {
+            let mut fact = cortexkit_role_llm_runner::read::NoticeFact::new(
+                part as u32,
+                send_id,
+                &notice.sender,
+                &delivered.text,
+            )
+            .with_call_key(&call.call_key);
+            fact.call_carrier = call.carrier.clone();
+            notices.push(fact);
+        }
+    }
+    Ok(notices)
 }
 
 /// Serves `session.read` for a session kept in the new storage. The reply is today's for the
@@ -888,9 +965,8 @@ pub fn display_facts(entry: &StoredEntry) -> DisplayFacts {
 /// What an `include_display_facts` read serves about each tool call of `message`, whose tool
 /// turn recorded `turn`: one per call, in the order the message made them, with its key, schema
 /// pin, dispatch and finish times and why it has no answer, as the turn recorded them (see
-/// [`facts_by_call`]); a call the turn has no facts for is named with none. A call imported
-/// from another runner (`CallFacts::carrier`) is named with none too, as today's read names a
-/// call no step of its log made.
+/// [`facts_by_call`]); a call the turn has no facts for is named with none. Imported calls
+/// retain the key and carrier of the runner that recorded them.
 pub fn turn_times(
     message: &broca_protocol::Message,
     turn: &broca_session_store::record::TurnFacts,
@@ -907,10 +983,11 @@ pub fn turn_times(
     ids.iter()
         .zip(facts_by_call(&ids, turn))
         .map(|(id, call)| {
-            let Some(call) = call.filter(|call| call.carrier.is_none()) else {
+            let Some(call) = call else {
                 return ToolTime::new(*id);
             };
             let mut time = ToolTime::new(*id).with_call_key(&call.call_key);
+            time.call_carrier = call.carrier.clone();
             time.started_at = call.dispatched_at_ms;
             time.finished_at = call.finished_at_ms;
             time.unanswered = call.unanswered.map(|why| why.as_str().to_owned());

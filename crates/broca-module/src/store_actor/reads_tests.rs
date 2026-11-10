@@ -559,6 +559,7 @@ impl Module {
             session_name: &self.key.session,
             live_step: None,
             stream_head: None,
+            entry_speaks_for: crate::store_entries::EntryAttribution::Known(false),
         };
         execute(&view, &context, request).await
     }
@@ -727,6 +728,7 @@ fn shape(reply: StoreReadReply) -> String {
         StoreReadReply::Media(media) => format!("{media:?}"),
         StoreReadReply::TagLocation(location) => format!("{location:?}"),
         StoreReadReply::WritingView(view) => format!("{view:?}"),
+        StoreReadReply::OutputRefNamespace(namespace) => namespace,
         StoreReadReply::PlanChange(read) => format!("{:?}", read.map(|read| read.0)),
         StoreReadReply::PlanIdentities(identities) => format!("{identities:?}"),
         StoreReadReply::Baseline(facts) => format!("{facts:?}"),

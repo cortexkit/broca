@@ -586,29 +586,25 @@ pub fn apply_tool_call_dispatches(
             // The step that produced this message holds exactly these calls: report them.
             Some(found) if found.iter().map(|d| &d.tool_call_id).eq(ids.iter()) => found
                 .iter()
-                .map(|dispatch| broca_wire::SessionReadToolCall {
-                    tool_call_id: dispatch.tool_call_id.clone(),
-                    call_key: dispatch.key_seq.or(dispatch.intent_seq).and_then(|seq| {
+                .map(|dispatch| {
+                    let mut call = broca_wire::SessionReadToolCall::new(&dispatch.tool_call_id);
+                    call.call_key = dispatch.key_seq.or(dispatch.intent_seq).and_then(|seq| {
                         broca_core::tool_call_key(
                             Some(lineage_id),
                             seq,
                             dispatch.recorded_call_key.as_deref(),
                         )
-                    }),
-                    dispatched_to: dispatch.dispatched_to.clone(),
-                    indeterminate: dispatch.indeterminate,
+                    });
+                    call.dispatched_to = dispatch.dispatched_to.clone();
+                    call.indeterminate = dispatch.indeterminate;
+                    call
                 })
                 .collect(),
             // No recorded step produced this message (an imported one, say): report each
             // call with no dispatch fact rather than guess one.
             _ => ids
                 .into_iter()
-                .map(|tool_call_id| broca_wire::SessionReadToolCall {
-                    tool_call_id,
-                    call_key: None,
-                    dispatched_to: None,
-                    indeterminate: false,
-                })
+                .map(broca_wire::SessionReadToolCall::new)
                 .collect(),
         };
     }
@@ -2821,6 +2817,16 @@ pub trait ServeHandler: Send + Sync {
         Ok(None)
     }
 
+    /// The namespace output references use. A converted session retains its source WAL's
+    /// lineage even though its history cursors use the new store incarnation.
+    async fn output_ref_namespace(
+        &self,
+        _session: &LineageKey,
+        incarnation: &str,
+    ) -> Result<String, ServeError> {
+        Ok(incarnation.to_owned())
+    }
+
     /// `session.output_refs` (llm-runner §9.13): one page of an output-reference set, derived
     /// from the session log on every read (see [`crate::output_refs`]).
     async fn output_refs(
@@ -3255,12 +3261,7 @@ impl crate::LineageRegistry {
             for message in &mut response.messages {
                 message.tool_calls = calls_of(&message.message)
                     .into_iter()
-                    .map(|tool_call_id| broca_wire::SessionReadToolCall {
-                        tool_call_id,
-                        call_key: None,
-                        dispatched_to: None,
-                        indeterminate: false,
-                    })
+                    .map(broca_wire::SessionReadToolCall::new)
                     .collect();
             }
             return Ok(());
@@ -3343,6 +3344,25 @@ impl ServeHandler for crate::LineageRegistry {
         self.route_tag_location(session, tag)
             .await
             .map_err(ServeError::from)
+    }
+
+    async fn output_ref_namespace(
+        &self,
+        session: &LineageKey,
+        incarnation: &str,
+    ) -> Result<String, ServeError> {
+        use crate::store_reads::{StoreReadReply, StoreReadRequest};
+        let Some(store) = self.store_holding(session)? else {
+            return Ok(incarnation.to_owned());
+        };
+        match store
+            .read(self, session, StoreReadRequest::OutputRefNamespace)
+            .await?
+        {
+            Some(StoreReadReply::OutputRefNamespace(namespace)) => Ok(namespace),
+            Some(_) => Err(crate::store_reads::mismatched()),
+            None => Ok(incarnation.to_owned()),
+        }
     }
 
     async fn store_writing_view(
@@ -4344,6 +4364,11 @@ impl ServeHandler for crate::LineageRegistry {
         &self,
         session: &LineageKey,
     ) -> Result<(bool, Option<String>), ServeError> {
+        // The new storage keeps each message's public id as it was minted or converted, so its
+        // stream's ids need no translation; reading today's log for them would be refused.
+        if self.store_holding(session)?.is_some() {
+            return Ok((false, None));
+        }
         if let Some(identity) = self.message_identity_from_log(session).await? {
             return Ok(identity);
         }
@@ -4376,7 +4401,6 @@ impl ServeHandler for crate::LineageRegistry {
                 page,
                 at_seq,
                 head_facts,
-                head_media,
                 head_facts_complete,
                 newest_record_ms,
                 retention_activity_ms,
@@ -4437,7 +4461,6 @@ impl ServeHandler for crate::LineageRegistry {
                             run_id: page.lineage_state.last_run_id.as_ref(),
                             state: page.lineage_state.state.as_str(),
                             model: selected_model.as_ref(),
-                            stored: head_media.as_ref(),
                         },
                     )
                     .await?,
@@ -4574,32 +4597,9 @@ impl ServeHandler for crate::LineageRegistry {
         // As `read`: a head published meanwhile serves the answer once more, from there.
         let again = run_id.clone();
         let today: Result<broca_wire::RunResultResponse, ServeError> = async move {
-            let row_read = self.read_run_row_state(session, &run_id).await?;
-            let (state, mut records, preserve_pause) = match &row_read {
-                Some(read) => {
-                    let policy = self
-                        .read_only_run_state(
-                            session,
-                            read.lineage_id.map(|id| id.to_string()),
-                            Some(&run_id.0),
-                            read.state.state == broca_core::RunIndexState::Paused,
-                            None,
-                        )
-                        .await?;
-                    (
-                        Some(read.state.clone()),
-                        Some(read.records.clone()),
-                        matches!(
-                            policy,
-                            Some(crate::registry::ReadOnlyRunState::Paused { .. })
-                        ),
-                    )
-                }
-                None => {
-                    self.route_run_state_with_reader_policy(session, run_id.clone())
-                        .await?
-                }
-            };
+            let (state, mut records, preserve_pause) = self
+                .route_run_state_with_reader_policy(session, run_id.clone())
+                .await?;
             let auth_selection = state.as_ref().and_then(frozen_auth_selection);
             let mut detail = state.as_ref().and_then(|state| state.budget_detail.clone());
             let mut context_ceiling = state
@@ -4666,49 +4666,14 @@ impl ServeHandler for crate::LineageRegistry {
                     None => self.read_durable_wal(session).await?.0,
                 };
                 let clean_reply = clean_reply_of(&records, &run_id);
-                let mut message = match &row_read {
-                    Some(read) => {
-                        final_message_from_prompt(&read.replayed.prompt, &run_id, clean_reply)?
-                    }
-                    None => final_message_of(&records, &run_id, clean_reply)?,
-                };
+                let mut message = final_message_of(&records, &run_id, clean_reply)?;
                 // A complete legacy snapshot already proves its original m<position> vocabulary.
                 // Re-reading head would read the log again even though this snapshot already proves it.
-                let complete_legacy = row_read.is_none()
-                    && records.first().is_some_and(|frame| frame.seq == 1)
+                let complete_legacy = records.first().is_some_and(|frame| frame.seq == 1)
                     && !broca_core::is_mode3_log(records.iter().map(|frame| &frame.record));
                 if !complete_legacy {
-                    // An indexed run row already carries its lineage, validated against the log
-                    // when it was read, and its own records start at its RunStarted, whose plan
-                    // version says whether the log is mode 3. Only a row without its start reads
-                    // the head.
-                    let row_identity = row_read.as_ref().and_then(|read| {
-                        read.records
-                            .iter()
-                            .any(|frame| {
-                                matches!(frame.record, broca_wal::WalRecord::RunStarted { .. })
-                            })
-                            .then(|| {
-                                (
-                                    broca_core::is_mode3_log(
-                                        read.records.iter().map(|frame| &frame.record),
-                                    ),
-                                    read.lineage_id.map(|id| id.to_string()),
-                                )
-                            })
-                    });
-                    let (mode3, lineage) = match row_identity {
-                        Some(identity) => identity,
-                        None => {
-                            let head = self.head(session).await?;
-                            if row_read.as_ref().is_some_and(|read| {
-                                read.lineage_id.map(|id| id.to_string()) != head.lineage_id
-                            }) {
-                                return Err(ServeError::UnknownRun(run_id.0));
-                            }
-                            (head.mode3, head.lineage_id)
-                        }
-                    };
+                    let head = self.head(session).await?;
+                    let (mode3, lineage) = (head.mode3, head.lineage_id);
                     message.mid =
                         broca_core::message_mid(mode3, lineage.as_deref(), message.ordinal - 1)
                             .map_err(|error| {
@@ -4775,9 +4740,6 @@ impl ServeHandler for crate::LineageRegistry {
         let today: Result<cortexkit_role_llm_runner::tool_calls::ToolCallsPage, ServeError> =
             async move {
                 let run_id = request.run_id.clone();
-                let row_read = self
-                    .read_run_row(session, &broca_protocol::RunId(run_id.clone()))
-                    .await?;
                 let limit = tool_calls_limit(&request);
                 let (
                     range,
@@ -4789,22 +4751,10 @@ impl ServeHandler for crate::LineageRegistry {
                     fallback,
                 ) = match request.after.as_deref() {
                     None => {
-                        let range = match &row_read {
-                            Some(read) => {
-                                let mut range =
-                                    broca_wal::WalRangeRead::without_anchors(read.records.clone());
-                                range.lineage_id = read.lineage_id;
-                                range
-                            }
-                            None => {
-                                self.read_run_tool_calls_range(session, &run_id, 0, None, None)
-                                    .await?
-                            }
-                        };
-                        let records = match &row_read {
-                            Some(read) => read.records.as_slice(),
-                            None => run_tool_call_records(&range)?,
-                        };
+                        let range = self
+                            .read_run_tool_calls_range(session, &run_id, 0, None, None)
+                            .await?;
+                        let records = run_tool_call_records(&range)?;
                         let Some((start, end)) = run_tool_call_bounds(records, &run_id) else {
                             return Err(ServeError::UnknownRun(run_id));
                         };
@@ -4815,31 +4765,15 @@ impl ServeHandler for crate::LineageRegistry {
                     Some(token) => {
                         let cursor = checked_tool_calls_cursor(token, &run_id)?;
                         let lineage_id = cursor.lineage_id.clone();
-                        let range = match &row_read {
-                            Some(read) => {
-                                let records = read
-                                    .records
-                                    .iter()
-                                    .filter(|f| {
-                                        f.seq >= cursor.step_seq && f.seq <= cursor.batch_end_seq
-                                    })
-                                    .cloned()
-                                    .collect();
-                                let mut range = broca_wal::WalRangeRead::without_anchors(records);
-                                range.lineage_id = read.lineage_id;
-                                range
-                            }
-                            None => {
-                                self.read_run_tool_calls_range(
-                                    session,
-                                    &run_id,
-                                    cursor.step_seq - 1,
-                                    cursor.anchor_before.map(Into::into),
-                                    Some(cursor.batch_end_seq),
-                                )
-                                .await?
-                            }
-                        };
+                        let range = self
+                            .read_run_tool_calls_range(
+                                session,
+                                &run_id,
+                                cursor.step_seq - 1,
+                                cursor.anchor_before.map(Into::into),
+                                Some(cursor.batch_end_seq),
+                            )
+                            .await?;
                         let observed_lineage =
                             range.lineage_id.as_ref().map(|lineage| lineage.to_string());
                         if observed_lineage
@@ -4861,35 +4795,9 @@ impl ServeHandler for crate::LineageRegistry {
                         )
                     }
                 };
-                let row_records = row_read.as_ref().map(|read| {
-                    read.records
-                        .iter()
-                        .filter(|f| {
-                            seed.as_ref().is_none_or(|cursor| {
-                                f.seq >= cursor.step_seq && f.seq <= cursor.batch_end_seq
-                            })
-                        })
-                        .cloned()
-                        .collect::<Vec<_>>()
-                });
-                let records = match &row_records {
-                    Some(records) => records.as_slice(),
-                    None => run_tool_call_records(&range)?,
-                };
+                let records = run_tool_call_records(&range)?;
                 let step_ordinals = if seed.is_none() {
-                    match &row_read {
-                        Some(read) => read
-                            .replayed
-                            .committed_tool_turns
-                            .iter()
-                            .filter_map(|(index, record_index)| {
-                                let message = read.replayed.prompt.get(*index)?;
-                                let seq = read.records.get(*record_index)?.seq;
-                                Some((seq, message.ordinal.unwrap_or(*index as u64)))
-                            })
-                            .collect(),
-                        None => committed_tool_step_ordinals(records),
-                    }
+                    committed_tool_step_ordinals(records)
                 } else {
                     std::collections::HashMap::new()
                 };
@@ -5445,33 +5353,9 @@ impl ServeHandler for crate::LineageRegistry {
         // As `read`: a head published meanwhile serves the answer once more, from there.
         let again = run_id.clone();
         let today: Result<RunStatusResponse, ServeError> = async move {
-            let row_read = self.read_run_row_state(session, &run_id).await?;
-            let (state, preserve_pause) = match &row_read {
-                Some(read) => {
-                    let policy = self
-                        .read_only_run_state(
-                            session,
-                            read.lineage_id.map(|id| id.to_string()),
-                            Some(&run_id.0),
-                            read.state.state == broca_core::RunIndexState::Paused,
-                            None,
-                        )
-                        .await?;
-                    (
-                        Some(read.state.clone()),
-                        matches!(
-                            policy,
-                            Some(crate::registry::ReadOnlyRunState::Paused { .. })
-                        ),
-                    )
-                }
-                None => {
-                    let (state, _, preserve_pause) = self
-                        .route_run_state_with_reader_policy(session, run_id.clone())
-                        .await?;
-                    (state, preserve_pause)
-                }
-            };
+            let (state, _, preserve_pause) = self
+                .route_run_state_with_reader_policy(session, run_id.clone())
+                .await?;
             let mut response = run_status_response_with_reader_policy(state, preserve_pause);
             // Lifecycle resolution above remains authoritative when its transcript reader or
             // final text is unavailable. Enrich the answer only with readable durable metadata.
@@ -5479,10 +5363,7 @@ impl ServeHandler for crate::LineageRegistry {
                 response,
                 RunStatusResponse::Interrupted { .. } | RunStatusResponse::Completed { .. }
             ) {
-                match &row_read {
-                    Some(read) => Some(read.records.clone()),
-                    None => self.read_durable_wal(session).await.ok().map(|read| read.0),
-                }
+                self.read_durable_wal(session).await.ok().map(|read| read.0)
             } else {
                 None
             };
@@ -5493,14 +5374,9 @@ impl ServeHandler for crate::LineageRegistry {
                 (RunStatusResponse::Completed { directives, .. }, Some(records))
                     if wake_directive_requested(records, &run_id) =>
                 {
-                    *directives = match &row_read {
-                        Some(read) => {
-                            final_message_from_prompt(&read.replayed.prompt, &run_id, None)
-                        }
-                        None => final_message_of(records, &run_id, None),
-                    }
-                    .ok()
-                    .and_then(|message| completed_directives(records, &run_id, &message.text));
+                    *directives = final_message_of(records, &run_id, None)
+                        .ok()
+                        .and_then(|message| completed_directives(records, &run_id, &message.text));
                 }
                 _ => {}
             }
@@ -5870,458 +5746,5 @@ fn media_preflight_error(error: broca_core::RunError) -> ServeError {
             field: "content".into(),
             message: error.to_string(),
         },
-    }
-}
-
-/// Offset-based head for overhaul roots only (not yet serving production).
-///
-/// Today's `head_for` serves the newest page of one message through the store and the
-/// WAL past its watermark. The offset index serves the same head from the session row
-/// and the newest message row's byte range: the head decodes only those frames, never
-/// the whole log. A Setup in the tail renumbers indexed tags, so the caller advances
-/// the index before serving when [`head_tail_needs_index_up`] is true. Production offset reads
-/// wire `broca.db` into `head_for`; this helper already pins the decode bound the head
-/// must keep.
-///
-/// The head's byte range is the newest message row's `[lo_off, hi_off)`: one frame for a
-/// single-message turn, the turn's span for a tool turn whose two messages share it.
-/// With frame-decode counting on, serving the head decodes only that range.
-#[allow(dead_code, reason = "used once broca.db opens on overhaul state roots")]
-pub(crate) fn head_byte_range_for_offsets(
-    newest: Option<&crate::registry::OffsetPageRow>,
-) -> Option<(u64, u64)> {
-    newest.map(|row| (row.lo_off, row.hi_off))
-}
-
-/// Whether a head whose tail holds a durable Setup may be served from the current index.
-///
-/// Delegates to the replay crate's detector so head, page and tail checks cannot drift
-/// apart. A durable Setup before its index commit (durable tail, stale index) forces a
-/// catch-up: recovery replays the Setup into the index before the head is served.
-#[allow(dead_code, reason = "used once broca.db opens on overhaul state roots")]
-pub(crate) fn head_tail_needs_index_up(tail: &[broca_wal::FramedRecord]) -> bool {
-    broca_core::replay::tail_contains_compaction_setup(tail)
-}
-
-/// Offset head decode-bounding and Setup catch-up tests.
-///
-/// Pins that the head decodes only its own row range and that a Setup in the tail
-/// forces an index catch-up before serving, including the crash-cut where the Setup is
-/// durable but its index commit has not happened.
-#[cfg(test)]
-mod offset_head_tests {
-    use std::cell::Cell;
-    use std::sync::Arc;
-
-    use broca_protocol::{
-        caller::RunFinishReason,
-        content::{AssistantMessage, ContentBlock, Message, Role},
-        request::ModelHandle,
-        BindIdentity, MessageId, RunId, StepId, Usage,
-    };
-    use broca_wal::{
-        CompactionMessageKind, FramedRecord, RunConfig, RunOrigin, SetupTagCheckpoint, WalRecord,
-    };
-
-    use super::{head_byte_range_for_offsets, head_tail_needs_index_up};
-    use crate::registry::{decode_frames_at_offsets, OffsetPageRow};
-
-    fn user(text: &str) -> Message {
-        Message::new(Role::User, vec![ContentBlock::Text { text: text.into() }])
-    }
-
-    fn run_started() -> WalRecord {
-        WalRecord::RunStarted {
-            message_marks: None,
-            compaction_plan_version: None,
-            sent_by: None,
-            written_at_ms: None,
-            tags: None,
-            session_class: None,
-            retention: None,
-            hooks: None,
-            title: None,
-            on_restart: None,
-            keep_warm: None,
-            marker_order_version: None,
-            manifest: None,
-            scope: None,
-            send_id: None,
-            request_identity_digest: None,
-            project_id: None,
-            principal: None,
-            ts_ms: None,
-            run_id: RunId("r1".into()),
-            session: BindIdentity::new("/tmp/project", "runner", "session"),
-            config: Box::new(RunConfig {
-                global_system: None,
-                account_route: None,
-                route_decision_id: None,
-                account_limit_pause: false,
-                turn_directives_v1: None,
-                render_tags: false,
-                computed_tags: None,
-                model: ModelHandle::new("stub", "m"),
-                tools: vec![].into(),
-                tool_choice: Default::default(),
-                generation: Default::default(),
-                response_format: Default::default(),
-                provider_options: serde_json::Value::Null,
-                cache_tiers: serde_json::Value::Null,
-                context_epoch: 0,
-                renderer_version: 1,
-                frozen_render_config: serde_json::Value::Null,
-                auth_selection: None,
-                tools_were_omitted: false,
-                budget: None,
-                context_limit: None,
-                work_class: None,
-                variant: None,
-                service_tier: None,
-                stop_when: Vec::new(),
-                context_management: None,
-            }),
-            input: vec![user("task")].into(),
-            origin: RunOrigin::Fresh,
-            submission_id: None,
-        }
-    }
-
-    fn text_step() -> WalRecord {
-        WalRecord::ModelStepFinished {
-            raw_finish_reason: None,
-            fallback: Default::default(),
-            written_at_ms: None,
-            tags: None,
-            hooks: None,
-            step_id: StepId(1),
-            assistant_message: Arc::new(AssistantMessage {
-                message_id: MessageId("m1".into()),
-                content: vec![ContentBlock::Text {
-                    text: "answer".into(),
-                }],
-            }),
-            usage: Usage::default(),
-            finish_reason: None,
-            retries_used: 0,
-            service_tier_used: None,
-            speed_used: None,
-        }
-    }
-
-    fn run_finished() -> WalRecord {
-        WalRecord::RunFinished {
-            interrupt_reason: None,
-            ts_ms: None,
-            reason: RunFinishReason::Completed,
-            usage: Usage::default(),
-            error: None,
-            retries_used: 0,
-        }
-    }
-
-    fn encode_log(records: &[WalRecord]) -> (Vec<u8>, Vec<(u64, u64)>) {
-        let mut bytes = Vec::new();
-        let mut offsets = Vec::new();
-        for (i, record) in records.iter().enumerate() {
-            let start = bytes.len() as u64;
-            bytes.extend(broca_wal::framing::encode(i as u64 + 1, 1, record).expect("encode"));
-            offsets.push((start, bytes.len() as u64));
-        }
-        (bytes, offsets)
-    }
-
-    #[test]
-    fn head_decodes_only_its_range_and_catches_setup_in_tail() {
-        let records = vec![
-            run_started(),
-            WalRecord::StepStarted { step_id: StepId(1) },
-            text_step(),
-            run_finished(),
-        ];
-        let (bytes, offsets) = encode_log(&records);
-        // The head is the newest message's row: here the single answer frame.
-        let newest = OffsetPageRow {
-            ord: 1,
-            lo_off: offsets[2].0,
-            hi_off: offsets[2].1,
-        };
-        let range = head_byte_range_for_offsets(Some(&newest)).expect("head range");
-        assert_eq!(range, (offsets[2].0, offsets[2].1));
-        assert!(head_byte_range_for_offsets(None).is_none());
-        // With counting on, the head decodes one frame, not the whole log.
-        let counter = Cell::new(0u64);
-        let head = decode_frames_at_offsets(&bytes, &[range], Some(&counter)).expect("head decode");
-        assert_eq!(head.len(), 1);
-        assert_eq!(counter.get(), 1);
-        assert!(counter.get() < records.len() as u64);
-        assert!(matches!(
-            head[0].record,
-            WalRecord::ModelStepFinished { .. }
-        ));
-        // No Setup in this tail: no catch-up.
-        let tail: Vec<FramedRecord> = head;
-        assert!(!head_tail_needs_index_up(&tail));
-        // A durable Setup in the tail forces a catch-up before the head is served.
-        // Crash-cut: these Setup bytes are durable while its index commit has not happened;
-        // the reader sees the Setup past the indexed end and advances the index first.
-        let mut with_setup = tail.clone();
-        with_setup.push(FramedRecord {
-            seq: with_setup.len() as u64 + 10,
-            fence: 1,
-            record: WalRecord::CompactionMessage {
-                provider: "test".into(),
-                kind: CompactionMessageKind::Setup,
-                compaction_id: "cmp-1".into(),
-                version: 1,
-                range: broca_wal::CompactionRange { from: 0, to: 0 },
-                replacement: Arc::new(Vec::new()),
-                sha256: "0".repeat(64),
-                request_id: None,
-                cursor: None,
-                call_when: None,
-                stability: None,
-                ceiling: None,
-                tag_checkpoint: Some(SetupTagCheckpoint {
-                    tag_checkpoint: 3,
-                    cut: "m1".into(),
-                }),
-                ride_wait_ms: None,
-                view_features: None,
-                view_due: None,
-            },
-        });
-        assert!(head_tail_needs_index_up(&with_setup));
-    }
-}
-
-#[cfg(test)]
-mod raw_database_composition_tests {
-    use super::*;
-    use broca_core::FileWalStore;
-    use broca_wal::{Wal, WalRecord};
-    use std::sync::{Arc, Mutex};
-
-    struct NoActor;
-    #[async_trait]
-    impl crate::registry::LineageOpener for NoActor {
-        async fn open(
-            &self,
-            _: &LineageKey,
-            _: u64,
-            _: crate::registry::RegistryHandle,
-        ) -> Result<crate::registry::ActorHandle, crate::registry::OpenError> {
-            panic!("read-only composition must not open an actor")
-        }
-    }
-
-    #[tokio::test]
-    async fn raw_database_test_bundle_preserves_legacy_head_page_and_cursor_bytes() {
-        let root = broca_test_support::scratch_root()
-            .join(format!("raw-composition-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("state-format"), "broca-state/2\n").unwrap();
-        let key = LineageKey::new(root.join("project"), "runner", "session");
-        let wal_store = Arc::new(FileWalStore::with_config(
-            root.join("wal"),
-            broca_wal::WalConfig::OVERHAUL,
-        ));
-        std::fs::create_dir_all(root.join("wal")).unwrap();
-        let mut wal = broca_wal::FileWal::open(wal_store.wal_path(&key))
-            .unwrap()
-            .with_feature_floor(root.join("wal-floor"));
-        let mut start: WalRecord = serde_json::from_str(
-            include_str!("../../broca-wal/tests/fixtures/before_message_times.jsonl")
-                .lines()
-                .next()
-                .unwrap(),
-        )
-        .unwrap();
-        if let WalRecord::RunStarted { session, title, .. } = &mut start {
-            *session = key.clone();
-            *title = Some("WAL-only title".into());
-        }
-        let step: WalRecord = serde_json::from_value(serde_json::json!({"type":"model_step_finished","written_at_ms":1234,"step_id":1,"assistant_message":{"message_id":"m","content":[{"type":"text","text":"answer"}]},"usage":{"input_tokens":7,"output_tokens":3},"retries_used":0})).unwrap();
-        let terminal: WalRecord = serde_json::from_value(serde_json::json!({"type":"run_finished","reason":"completed","usage":{"input_tokens":7,"output_tokens":3},"completed_steps":1,"retries_used":0})).unwrap();
-        for record in [
-            start,
-            WalRecord::StepStarted {
-                step_id: broca_protocol::StepId(1),
-            },
-            step,
-            terminal,
-        ] {
-            wal.append(1, &record, false).unwrap();
-        }
-        wal.sync().unwrap();
-        let publication = wal.durable_publication().unwrap();
-        let db = Arc::new(broca_store::db::OverhaulDb::open(&root).unwrap());
-        db.publish(
-            &key,
-            &broca_core::agent_session_ref(&key),
-            broca_store::db::LogLocation::Live,
-            &publication,
-        )
-        .unwrap();
-        let bundle = Arc::new(crate::registry::RawPageTestBundle {
-            db,
-            publications: Mutex::new(std::collections::HashMap::from([(
-                key.clone(),
-                publication,
-            )])),
-        });
-        let legacy = crate::registry::LineageRegistry::new_with_reader(
-            Arc::new(NoActor),
-            wal_store.clone(),
-            None,
-        );
-        let raw =
-            crate::registry::LineageRegistry::new_with_reader(Arc::new(NoActor), wal_store, None)
-                .with_raw_pages_for_test(bundle.clone())
-                .with_episode_source(Arc::new(crate::registry::EpisodeReadSource::new(
-                    bundle.db.clone(),
-                    Arc::new({
-                        let bundle = bundle.clone();
-                        move |key, _| {
-                            bundle
-                                .publications
-                                .lock()
-                                .unwrap()
-                                .get(key)
-                                .cloned()
-                                .ok_or_else(|| "episode publication missing".into())
-                        }
-                    }),
-                )));
-        let counter = broca_wal::access_counter::WalAccessCounter::default();
-        let raw_head = counter
-            .operation("composed raw head")
-            .run_future(raw.head(&key))
-            .await
-            .unwrap();
-        // Each store allocates its own history version when it first serves the session; every
-        // other byte must match.
-        let mut legacy_head = legacy.head(&key).await.unwrap();
-        assert!(raw_head.history_version > 0 && legacy_head.history_version > 0);
-        legacy_head.history_version = raw_head.history_version;
-        assert_eq!(
-            serde_json::to_vec(&raw_head).unwrap(),
-            serde_json::to_vec(&legacy_head).unwrap()
-        );
-        for from in [None, Some(0), Some(1), Some(500)] {
-            let request = SessionReadRequest::new(key.clone(), from, Some(1));
-            let actual = counter
-                .operation(format!("composed raw page {from:?}"))
-                .run_future(raw.read(request.clone()))
-                .await
-                .unwrap();
-            let mut expected = legacy.read(request).await.unwrap();
-            expected.history_version = actual.history_version;
-            assert_eq!(
-                String::from_utf8(serde_json::to_vec(&actual).unwrap()).unwrap(),
-                String::from_utf8(serde_json::to_vec(&expected).unwrap()).unwrap()
-            );
-        }
-        let mut request = SessionReadRequest::new(key.clone(), None, Some(1));
-        request.history_version = Some(u64::MAX);
-        assert!(matches!(
-            raw.read(request).await,
-            Err(ServeError::HistoryChanged)
-        ));
-        let mut legacy_argument = SessionReadRequest::new(key.clone(), None, Some(1));
-        legacy_argument.lineage_id = Some("ignored-legacy-lineage".into());
-        assert!(raw.read(legacy_argument).await.is_ok());
-        let head = raw.head(&key).await.unwrap();
-        let mut request = SessionReadRequest::new(key.clone(), None, Some(1));
-        request.history_version = Some(head.history_version);
-        request.after_mid = Some("m0".into());
-        let next = raw.read(request).await.unwrap();
-        assert_eq!(next.messages[0].mid, "m1");
-        let fixture = std::fs::read(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../scripts/fixtures/resume-close-out-sealed.wal"),
-        )
-        .unwrap();
-        let mut at = 0;
-        while at < fixture.len() {
-            match broca_wal::framing::decode_next(&fixture[at..]) {
-                broca_wal::framing::DecodeStep::Record { framed, consumed } => {
-                    let mut record = framed.record;
-                    if let WalRecord::RunStarted {
-                        session,
-                        run_id,
-                        written_at_ms,
-                        ..
-                    } = &mut record
-                    {
-                        *session = key.clone();
-                        run_id.0.push_str("-composed");
-                        *written_at_ms = Some(2000);
-                    }
-                    if let WalRecord::ModelStepFinished { written_at_ms, .. } = &mut record {
-                        *written_at_ms = Some(3000);
-                    }
-                    wal.append(1, &record, false).unwrap();
-                    at += consumed;
-                }
-                broca_wal::framing::DecodeStep::Lineage { consumed, .. } => at += consumed,
-                _ => panic!("invalid tool corpus"),
-            }
-        }
-        wal.sync().unwrap();
-        let publication = wal.durable_publication().unwrap();
-        bundle
-            .db
-            .publish(
-                &key,
-                &broca_core::agent_session_ref(&key),
-                broca_store::db::LogLocation::Live,
-                &publication,
-            )
-            .unwrap();
-        bundle
-            .publications
-            .lock()
-            .unwrap()
-            .insert(key.clone(), publication);
-        for from in [None, Some(2), Some(3), Some(4)] {
-            let request = SessionReadRequest::new(key.clone(), from, Some(2));
-            let actual = counter
-                .operation(format!("composed raw tool page {from:?}"))
-                .run_future(raw.read(request.clone()))
-                .await
-                .unwrap();
-            let mut expected = legacy.read(request).await.unwrap();
-            expected.history_version = actual.history_version;
-            assert_eq!(
-                String::from_utf8(serde_json::to_vec(&actual).unwrap()).unwrap(),
-                String::from_utf8(serde_json::to_vec(&expected).unwrap()).unwrap()
-            );
-        }
-        assert!(!root.join("run-index.db").exists());
-        for op in counter.snapshot() {
-            assert!(
-                op.seed_fallbacks.is_empty(),
-                "{}: {:?}",
-                op.name,
-                op.seed_fallbacks
-            );
-            assert!(
-                op.reads
-                    .iter()
-                    .all(|r| r.class != broca_wal::access_counter::ReadClass::Origin),
-                "{}: {:?}",
-                op.name,
-                op.reads
-            );
-        }
-        // Close every handle into the root before deleting it: the registries
-        // and the bundle keep broca.db and the log open, and Windows refuses to
-        // delete an open file (OS error 32).
-        drop(raw);
-        drop(legacy);
-        drop(bundle);
-        drop(wal);
-        std::fs::remove_dir_all(root).unwrap();
     }
 }

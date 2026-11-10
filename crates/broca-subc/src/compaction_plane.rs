@@ -44,20 +44,20 @@ fn current_reference(bind: &BindIdentity, supplied: &str) -> Result<String, Comp
 pub struct SubcCompactionPlane {
     route: RoleRoute,
     v2_route: RoleRoute,
-    /// Reads the catalog, where a mode-3 provider declares the capabilities it reads.
+    /// Asks the daemon's catalog what a provider declares; no route is opened for it.
     conn: Arc<SubcConnection>,
 }
 
 impl SubcCompactionPlane {
     pub fn new(conn: Arc<SubcConnection>) -> Self {
         Self {
+            conn: conn.clone(),
             v2_route: RoleRoute::without_discovery(conn.clone(), "compaction-provider", "v2"),
-            route: RoleRoute::new(conn.clone(), ROLE, VERSION, |describe| {
+            route: RoleRoute::new(conn, ROLE, VERSION, |describe| {
                 check_describe(describe)
                     .map(|_| ())
                     .map_err(|problems| format!("{problems:?}"))
             }),
-            conn,
         }
     }
 
@@ -161,6 +161,18 @@ fn bounded(deadline: Instant) -> Instant {
 
 #[async_trait]
 impl CompactionPlane for SubcCompactionPlane {
+    /// The provider's `provides` from the daemon's `catalog.list`, read fresh on every call: a
+    /// provider declares compaction capabilities there, and Setup reads them each time it is
+    /// sent. A catalog that can't be read, or has no entry for the provider, answers `None`.
+    async fn provider_capabilities(&self, provider: &str) -> Option<Vec<String>> {
+        let entries = self.conn.catalog_list().await.ok()?;
+        entries
+            .into_iter()
+            .find(|entry| entry.module_id == provider)
+            .and_then(|entry| entry.capabilities)
+            .map(|capabilities| capabilities.provides)
+    }
+
     async fn call_v2(
         &self,
         provider: &str,
@@ -191,33 +203,6 @@ impl CompactionPlane for SubcCompactionPlane {
                 } => CallError::Refused(Refusal::new(&code, message, detail)),
                 _ => CallError::Unavailable,
             })
-    }
-
-    /// The provider's catalog entry's `provides`, within the call budget. A catalog that can't
-    /// be read, or a provider missing from it, declares nothing: the provider is then sent only
-    /// what every provider reads.
-    async fn v2_provides(&self, provider: &str) -> Vec<String> {
-        let listed = tokio::time::timeout(
-            Duration::from_millis(COMPACTION_CALL_BUDGET_MS),
-            self.conn.catalog_list(),
-        )
-        .await;
-        match listed {
-            Ok(Ok(entries)) => entries
-                .into_iter()
-                .find(|entry| entry.module_id == provider)
-                .and_then(|entry| entry.capabilities)
-                .map(|caps| caps.provides)
-                .unwrap_or_default(),
-            Ok(Err(error)) => {
-                tracing::warn!(%error, provider, "compaction provider catalog read failed");
-                Vec::new()
-            }
-            Err(_) => {
-                tracing::warn!(provider, "compaction provider catalog read timed out");
-                Vec::new()
-            }
-        }
     }
 
     async fn setup(

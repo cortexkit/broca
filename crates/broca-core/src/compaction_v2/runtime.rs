@@ -1,7 +1,14 @@
 //! Per-session, in-memory call lane. Notices are serialized and coalesced, not
 //! written to the log or published on a bus.
 
-use std::{collections::BTreeMap, sync::Mutex, time::Duration};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        atomic::{AtomicU8, Ordering},
+        Mutex,
+    },
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use cortexkit_role_compaction::{
@@ -35,10 +42,44 @@ pub trait Plane: Send + Sync {
         method: &str,
         params: serde_json::Value,
     ) -> Result<Box<RawValue>, CallError>;
-    /// The manifest capabilities the provider's catalog entry declares (`provides`), read at
-    /// every Setup (compaction contract W1.4). The default declares none.
-    async fn provides(&self) -> Vec<String> {
-        Vec::new()
+    /// Whether the provider's catalog entry lists `compaction-entry-speaks-for/v1`, asked when
+    /// the runner sends Setup. A plane that can't read the catalog answers false, so the
+    /// provider is sent no attribution it may not understand.
+    async fn provides_entry_speaks_for(&self) -> bool {
+        false
+    }
+    /// Whether the provider's catalog entry lists `compaction-signed-floor/v1` (compaction
+    /// contract W3.5). A plane that can't read the catalog answers false, so the provider is
+    /// sent no floor it may not understand.
+    async fn provides_signed_floor(&self) -> bool {
+        false
+    }
+    /// Both declarations, read together when the runner sends Setup. A plane that reads the
+    /// catalog answers both from one read.
+    async fn declarations(&self) -> Declarations {
+        Declarations {
+            entry_speaks_for: self.provides_entry_speaks_for().await,
+            signed_floor: self.provides_signed_floor().await,
+        }
+    }
+}
+
+/// What the provider's catalog entry declares that changes what the runner sends it, as the
+/// latest Setup read it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Declarations {
+    /// `compaction-entry-speaks-for/v1`: entries carry stored speaker marks.
+    pub entry_speaks_for: bool,
+    /// `compaction-signed-floor/v1`: Setup and conditions carry the signed floor.
+    pub signed_floor: bool,
+}
+
+impl Declarations {
+    fn of(provides: &[String]) -> Self {
+        Self {
+            entry_speaks_for: cortexkit_role_compaction::provides_entry_speaks_for(provides),
+            signed_floor: cortexkit_role_compaction::provides_signed_floor(provides),
+        }
     }
 }
 
@@ -80,15 +121,29 @@ impl Plane for BoundPlane<'_> {
             .await
     }
 
-    async fn provides(&self) -> Vec<String> {
-        match self.plane {
-            Some(plane) => plane.v2_provides(self.provider).await,
-            None => Vec::new(),
-        }
+    async fn provides_entry_speaks_for(&self) -> bool {
+        self.declarations().await.entry_speaks_for
+    }
+
+    async fn provides_signed_floor(&self) -> bool {
+        self.declarations().await.signed_floor
+    }
+
+    async fn declarations(&self) -> Declarations {
+        let Some(plane) = self.plane else {
+            return Declarations::default();
+        };
+        plane
+            .provider_capabilities(self.provider)
+            .await
+            .map_or_else(Declarations::default, |provides| {
+                Declarations::of(&provides)
+            })
     }
 }
 
 #[derive(Default)]
+#[cfg_attr(debug_assertions, derive(Clone, PartialEq))]
 struct Pending {
     entries: BTreeMap<u64, (Entry, u64)>,
     entry_bytes: u64,
@@ -147,63 +202,60 @@ impl Lane {
 pub struct Runtime {
     pending: Mutex<Pending>,
     lane: tokio::sync::Mutex<Lane>,
+    /// Whether the provider declared `compaction-entry-speaks-for/v1` in its catalog entry when
+    /// the latest Setup was sent, kept until the next Setup: one of the `ATTRIBUTION_` values.
+    /// Kept apart from the lane, so a `session.entries` read the provider makes while a notice
+    /// holds the lane never waits for that notice's answer.
+    entry_speaks_for: AtomicU8,
+}
+
+/// No Setup was sent in this runtime's life, and no read has asked the catalog since.
+const ATTRIBUTION_UNKNOWN: u8 = 0;
+const ATTRIBUTION_UNDECLARED: u8 = 1;
+const ATTRIBUTION_DECLARED: u8 = 2;
+
+fn attribution(declared: bool) -> u8 {
+    if declared {
+        ATTRIBUTION_DECLARED
+    } else {
+        ATTRIBUTION_UNDECLARED
+    }
 }
 
 impl Runtime {
     /// Observe durable entries. Completion metadata alone changes no digest and
     /// does not emit a notice, whereas final tool results and deliveries do.
+    ///
+    /// `entries` come in ordinal order, and only two kinds can change anything here: those past
+    /// the newest ordinal observed, and the newest assistant entry with parts, which can still
+    /// gain results or deliveries. So once an assistant entry has been observed, only the entries
+    /// from the lower of those two ordinals on are looked at; until then, all of them.
     pub fn observe(&self, entries: &[Entry]) {
         let mut pending = self
             .pending
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if let Some(newest) = views::newest(entries) {
-            if pending
-                .newest
-                .as_ref()
-                .is_none_or(|previous| previous.ordinal <= newest.ordinal)
-            {
-                pending.newest = Some(newest);
+        let from = match &pending.assistant {
+            Some((assistant, _)) => {
+                let first = pending.observed_through.saturating_add(1).min(*assistant);
+                entries.partition_point(|entry| entry.ordinal < first)
             }
-        }
-        let through = pending.observed_through;
-        let assistant = pending.assistant.clone();
-        for entry in entries {
-            let changed = entry.ordinal > through
-                || assistant.as_ref().is_some_and(|(ordinal, digest)| {
-                    *ordinal == entry.ordinal && digest != &entry.digest
-                });
-            if changed {
-                pending.changed = true;
-                if !pending.entries_omitted {
-                    let compact = super::entries::compact(entry);
-                    let bytes = broca_protocol::serialized_json_bytes(&compact);
-                    if let Some((_, old_bytes)) =
-                        pending.entries.insert(entry.ordinal, (compact, bytes))
-                    {
-                        pending.entry_bytes = pending.entry_bytes.saturating_sub(old_bytes);
-                    }
-                    pending.entry_bytes += bytes;
-                    if pending.entry_bytes + 2 + pending.entries.len().saturating_sub(1) as u64
-                        > 1_048_576
-                    {
-                        pending.entries.clear();
-                        pending.entry_bytes = 0;
-                        pending.entries_omitted = true;
-                    }
-                }
-            }
-            pending.observed_through = pending.observed_through.max(entry.ordinal);
-            if entry.role == cortexkit_role_compaction::read::Role::Assistant
-                && !entry.parts.is_empty()
-                && pending
-                    .assistant
-                    .as_ref()
-                    .is_none_or(|(ordinal, _)| *ordinal <= entry.ordinal)
-            {
-                pending.assistant = Some((entry.ordinal, entry.digest.clone()));
-            }
-        }
+            None => 0,
+        };
+        #[cfg(debug_assertions)]
+        let whole = {
+            let mut whole = pending.clone();
+            observe_from(&mut whole, entries, 0);
+            whole
+        };
+        observe_from(&mut pending, entries, from);
+        #[cfg(test)]
+        OBSERVED.with(|count| count.set(count.get() + entries.len().saturating_sub(from)));
+        #[cfg(debug_assertions)]
+        assert!(
+            *pending == whole,
+            "observing the entries from position {from} differs from observing them all"
+        );
     }
 
     pub fn event(&self, event: Event) {
@@ -240,7 +292,45 @@ impl Runtime {
     /// before any model I/O.
     pub async fn setup(&self, plane: &dyn Plane, request: &SetupRequest) -> bool {
         let mut lane = self.lane.lock().await;
-        setup(&mut lane, plane, request).await
+        setup(&mut lane, plane, request, &self.entry_speaks_for).await
+    }
+
+    /// Whether entries handed to the provider may carry `speaks_for`: its catalog entry declared
+    /// `compaction-entry-speaks-for/v1` when the session's latest Setup was sent. `None` when this
+    /// runtime has sent no Setup and learned nothing since (see [`Self::learn_entry_speaks_for`]).
+    pub fn entry_speaks_for(&self) -> Option<bool> {
+        match self.entry_speaks_for.load(Ordering::Acquire) {
+            ATTRIBUTION_DECLARED => Some(true),
+            ATTRIBUTION_UNDECLARED => Some(false),
+            _ => None,
+        }
+    }
+
+    /// Keeps a declaration read from the provider's catalog outside a Setup, for a session whose
+    /// provider was set up before this runtime existed (an actor reopened after closing idle, or
+    /// a restarted daemon). A provider can't withdraw the declaration without restarting, and a
+    /// restarted provider is sent Setup again, so the catalog answers what the latest Setup found.
+    /// A Setup sent meanwhile wins: this only fills a runtime that still knows nothing.
+    pub fn learn_entry_speaks_for(&self, declared: bool) {
+        let _ = self.entry_speaks_for.compare_exchange(
+            ATTRIBUTION_UNKNOWN,
+            attribution(declared),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    /// [`Self::entry_speaks_for`], reading the provider's catalog through `plane` and keeping the
+    /// answer when no Setup has told this runtime yet.
+    pub async fn entry_speaks_for_or_read(&self, plane: &dyn Plane) -> bool {
+        if let Some(declared) = self.entry_speaks_for() {
+            return declared;
+        }
+        let declared = tokio::time::timeout(CALL_DEADLINE, plane.provides_entry_speaks_for())
+            .await
+            .unwrap_or(false);
+        self.learn_entry_speaks_for(declared);
+        self.entry_speaks_for().unwrap_or(declared)
     }
 
     /// A failed Setup without an applied view is retried before the next send,
@@ -267,7 +357,7 @@ impl Runtime {
     pub async fn ensure_setup(&self, plane: &dyn Plane, request: &SetupRequest) -> bool {
         let mut lane = self.lane.lock().await;
         if !lane.ready && lane.setup_due {
-            setup(&mut lane, plane, request).await
+            setup(&mut lane, plane, request, &self.entry_speaks_for).await
         } else {
             lane.ready
         }
@@ -297,7 +387,10 @@ impl Runtime {
     ) {
         let mut restarted = false;
         loop {
-            if !lane.ready && (!lane.setup_due || !setup(lane, plane, setup_request).await) {
+            if !lane.ready
+                && (!lane.setup_due
+                    || !setup(lane, plane, setup_request, &self.entry_speaks_for).await)
+            {
                 return;
             }
             let batch = {
@@ -316,6 +409,10 @@ impl Runtime {
                     .into_values()
                     .map(|(entry, _)| entry)
                     .collect();
+                super::entries::gate_speaks_for(
+                    &mut notice.entries,
+                    self.entry_speaks_for().unwrap_or(false),
+                );
                 pending.entry_bytes = 0;
                 pending.entries_omitted = false;
                 pending.changed = false;
@@ -411,12 +508,22 @@ impl Runtime {
     }
 }
 
-async fn setup(lane: &mut Lane, plane: &dyn Plane, request: &SetupRequest) -> bool {
+async fn setup(
+    lane: &mut Lane,
+    plane: &dyn Plane,
+    request: &SetupRequest,
+    entry_speaks_for: &AtomicU8,
+) -> bool {
     lane.seq = 0;
-    // The provider's declaration is read again at every Setup, and what it says holds for every
-    // call until the next one.
-    lane.signed_floor_declared =
-        cortexkit_role_compaction::provides_signed_floor(&plane.provides().await);
+    // The provider's declarations are read from the catalog at every Setup, before the Setup is
+    // sent, so a provider that reads entries as soon as it is ready already sees them as
+    // declared, and what they say holds for every call until the next Setup. A catalog that
+    // can't be read in time counts as no declaration.
+    let declared = tokio::time::timeout(CALL_DEADLINE, plane.declarations())
+        .await
+        .unwrap_or_default();
+    entry_speaks_for.store(attribution(declared.entry_speaks_for), Ordering::Release);
+    lane.signed_floor_declared = declared.signed_floor;
     let mut request = request.clone();
     if !lane.signed_floor_declared {
         request.signed_floor = None;
@@ -477,6 +584,63 @@ pub fn detects(cache_expired: bool) -> Vec<RideCause> {
 }
 
 #[cfg(test)]
+thread_local! {
+    /// How many entries this thread's observations looked at.
+    static OBSERVED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// [`Runtime::observe`] of `entries[from..]`, with the newest of all `entries`.
+fn observe_from(pending: &mut Pending, entries: &[Entry], from: usize) {
+    if let Some(newest) = views::newest(entries) {
+        if pending
+            .newest
+            .as_ref()
+            .is_none_or(|previous| previous.ordinal <= newest.ordinal)
+        {
+            pending.newest = Some(newest);
+        }
+    }
+    let through = pending.observed_through;
+    let assistant = pending.assistant.clone();
+    for entry in &entries[from..] {
+        let changed = entry.ordinal > through
+            || assistant.as_ref().is_some_and(|(ordinal, digest)| {
+                *ordinal == entry.ordinal && digest != &entry.digest
+            });
+        if changed {
+            pending.changed = true;
+            if !pending.entries_omitted {
+                let compact = super::entries::compact(entry);
+                let bytes = broca_protocol::serialized_json_bytes(&compact);
+                if let Some((_, old_bytes)) =
+                    pending.entries.insert(entry.ordinal, (compact, bytes))
+                {
+                    pending.entry_bytes = pending.entry_bytes.saturating_sub(old_bytes);
+                }
+                pending.entry_bytes += bytes;
+                if pending.entry_bytes + 2 + pending.entries.len().saturating_sub(1) as u64
+                    > 1_048_576
+                {
+                    pending.entries.clear();
+                    pending.entry_bytes = 0;
+                    pending.entries_omitted = true;
+                }
+            }
+        }
+        pending.observed_through = pending.observed_through.max(entry.ordinal);
+        if entry.role == cortexkit_role_compaction::read::Role::Assistant
+            && !entry.parts.is_empty()
+            && pending
+                .assistant
+                .as_ref()
+                .is_none_or(|(ordinal, _)| *ordinal <= entry.ordinal)
+        {
+            pending.assistant = Some((entry.ordinal, entry.digest.clone()));
+        }
+    }
+}
+
+#[cfg(test)]
 mod pending_tests {
     use super::*;
     use cortexkit_role_compaction::{
@@ -505,5 +669,43 @@ mod pending_tests {
         assert!(pending.entries_omitted);
         assert!(pending.entries.is_empty());
         assert_eq!(pending.newest.as_ref().unwrap().ordinal, 1);
+    }
+
+    /// Once an assistant entry has been observed, an observation looks only at the entries past
+    /// the newest observed and at that assistant entry, so its cost doesn't grow with how many
+    /// entries it's handed.
+    #[test]
+    fn an_observation_looks_only_at_what_can_have_changed() {
+        let entry = |ordinal: u64| {
+            let role = if ordinal.is_multiple_of(2) {
+                Role::Assistant
+            } else {
+                Role::User
+            };
+            Entry::new(
+                ordinal,
+                format!("m{ordinal}"),
+                role,
+                1,
+                vec![Part::new("0", PartBody::Text { text: "x".into() })],
+            )
+        };
+        let looked_at = |window: u64| {
+            let runtime = Runtime::default();
+            let mut entries: Vec<Entry> = (1..=window).map(entry).collect();
+            runtime.observe(&entries);
+            entries.push(entry(window + 1));
+            let before = OBSERVED.with(std::cell::Cell::get);
+            runtime.observe(&entries);
+            let looked = OBSERVED.with(std::cell::Cell::get) - before;
+            // The new entry was noticed.
+            let pending = runtime.pending.lock().unwrap();
+            assert_eq!(pending.observed_through, window + 1);
+            assert!(pending.entries.contains_key(&(window + 1)));
+            looked
+        };
+        // The newest assistant entry (the window's last) and the new one.
+        assert_eq!(looked_at(10), 2);
+        assert_eq!(looked_at(1_000), 2);
     }
 }

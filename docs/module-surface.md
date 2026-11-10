@@ -820,7 +820,7 @@ what it cost.
   `session.read` and projection skip it; it is never a transcript message. Billing turns it into
   its own export fact marked `warm: true`, priced from its own usage, whose id is taken over the
   record's WAL sequence so the run's ordinary facts keep their ids. Absent usage stays absent.
-  On opted-in `broca-state/2` roots, every physical warm send is durably reserved before sending
+  The retained version-4 WAL compatibility path reserves every physical warm send before sending
   and normally gets a `cache_warmed` terminal with its reservation and outcome envelope even
   when it fails;
   those records require the `bill-attempts/v1` WAL feature. A compression refusal and
@@ -829,6 +829,8 @@ what it cost.
   the outcome or a full WAL refuses its terminal, reclaim lets the billing reader report the
   reserved attempt as possibly billed,
   without inventing usage, deduplicated by its random `attempt_id`.
+  These low-level compatibility records do not enable daemon service on roots marked
+  `broca-state/2`: startup refuses those roots and requires a fresh state root.
 - **Head and declaration.** `session.head.cache` reports the clock from memory, with no WAL
   scan. The admitting send's `baseline` and `session.baseline` carry `cache {ttl_ms,
   ttl_options_ms, read_refreshes_ttl, warm: "supported" | "unsupported", basis}`, every member
@@ -1650,10 +1652,11 @@ synchronous client recorded and a crash left open is sealed on recovery with its
 exit, without calling the provider or the model.
 
 The provider-call watchdog is separate from caller cancellation. A timed-out provider attempt
-ends `Interrupted`, not `Cancelled`, and releases the lease on legacy-format roots. On an overhaul
-root, a billing-reservation durability failure takes precedence: the step fails with a WAL
+ends `Interrupted`, not `Cancelled`, and releases the lease on legacy-format roots. In the retained
+version-4 WAL compatibility path, a billing-reservation durability failure takes precedence: the step fails with a WAL
 durability error instead of `Interrupted`. A writer whose sync never returns remains a
 process-level failure for the supervisor, not a bounded close-out; ownership is not released early.
+Roots marked `broca-state/2` are not served by the daemon.
 
 ## 14. run.status enum + durable run index + busy-vs-stale
 
@@ -1863,9 +1866,11 @@ rows and fold the bounded WAL suffix since that continuation. No boot-time sweep
 historical sessions. Retention expiry removes the cache and prevents a racing reader
 from repopulating an expired lineage.
 
-**Message marks.** Broca declares `message_marks`. A scoped session's attested owner can
-send `speaks_for: {agent_id}`; any admitted sender can send `notice: true` for its own
-automatic message. The two marks cannot be combined. Invalid marks refuse before opening
+**Message marks.** Broca declares `message_marks` and `notice_with_speaks_for`. A scoped
+session's attested owner can send `speaks_for: {agent_id, name?}`, where `name` is a
+display-only 1–64 printable ASCII byte string and never an identity. Any admitted sender can
+send `notice: true` for its own automatic message. The owner may combine both marks on one
+send, an agent's automatic message. Invalid marks refuse before opening
 a writer. Flow- and run-stamped routes are senders, never owners. Marks are durable
 metadata beside the entry: opted-in reads, raw history and display rows expose them;
 default message bodies, content digests and `history_version` do not change. A send delivered
@@ -1873,10 +1878,28 @@ alongside a tool result is represented by `notices` facts and `notice_delivered`
 these carry `speaks_for`, never a redundant `notice` flag.
 An identical `send_id` retry compares normalized marks as well as the request: changed
 marks refuse `send_id_reuse` with `detail.field` naming `speaks_for` or `notice`, while
-absent and `notice: false` compare equal and retain the original answer. The WAL's
+absent and `notice: false` compare equal and retain the original answer. `speaks_for` is
+compared whole, so a changed, added or removed `name` refuses naming `speaks_for`. The WAL's
 `message-marks/v1` reader shipped before the writer. After marked sends have been written,
 rolling back the daemon requires a build retaining that reader; older builds refuse the
 must-understand WAL feature rather than silently lose the attribution.
+A runner without `notice_with_speaks_for` refuses a combined notice naming `notice`, and a
+speaker's `name` naming `speaks_for.name`. The reader of names shipped one release before
+the writer. In WAL storage, a record with a named speaker (on its marks, its tool-result
+delivery or its retry identity) requires the must-understand WAL feature `speaks-for-name/v1`.
+In `broca-session-store` storage, every stored speaker with a name has a must-understand
+`named_speaker` field beside it. After named speakers have been written, rolling back requires
+a build with that reader; older builds refuse such a record rather than drop the name.
+
+**Compaction entry attribution.** A marked send's user entries carry `speaks_for`
+(`agent_id` and, when sent, `name`) in `session.entries` pages and `compaction.notice`
+entries. This applies only when the session's compaction provider lists
+`compaction-entry-speaks-for/v1` in its catalog entry. Broca reads that declaration from the
+catalog at every Setup and keeps it until the next Setup. An actor that has not sent Setup
+yet reads the catalog once for the provider the plan names. Every other provider gets
+entries without the member. Attribution is outside every checksum, so it never changes entry
+digests, `history_version` or views. On today's storage, entries projected before this
+release keep no attribution until their projection is rebuilt.
 
 **Media-only references.** Broca declares `media_refs`. `media: "media_refs"` on
 `session.read` or raw `session.history` replaces byte-backed media outside tool results with exactly

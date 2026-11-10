@@ -303,7 +303,6 @@ impl ModelPin {
 
 /// The System One service: the batch store, the routing pins, and the concurrency caps.
 pub struct SystemOne {
-    routing_content_retention: bool,
     routing: Option<Routing>,
     image_resolver: Option<Arc<dyn ImageResolver>>,
     store: Arc<SystemOneStore>,
@@ -372,7 +371,6 @@ impl SystemOne {
         in_flight: Arc<AtomicUsize>,
     ) -> Self {
         Self {
-            routing_content_retention: true,
             routing: None,
             image_resolver: None,
             store,
@@ -488,7 +486,6 @@ impl SystemOne {
         service.export = self.export.clone();
         service.charge_basis = self.charge_basis.clone();
         service.image_resolver = self.image_resolver.clone();
-        service.routing_content_retention = self.routing_content_retention;
         service
     }
 
@@ -586,12 +583,6 @@ impl SystemOne {
             .map_err(|error| error.to_string())
     }
 
-    /// Routing debt is drained on every root; only the existing retention policy permits deletion.
-    pub fn with_routing_content_retention(mut self, enabled: bool) -> Self {
-        self.routing_content_retention = enabled;
-        self
-    }
-
     /// Replace the clock; tests drive retention with it.
     pub fn with_clock(mut self, clock: Arc<dyn Fn() -> i64 + Send + Sync>) -> Self {
         self.clock = clock;
@@ -606,9 +597,6 @@ impl SystemOne {
 
     /// Delete batches past retention. Returns how many batches went.
     pub async fn sweep(&self) -> Result<usize, String> {
-        if !self.routing_content_retention {
-            return Ok(0);
-        }
         let store = Arc::clone(&self.store);
         let now = (self.clock)();
         tokio::task::spawn_blocking(move || store.sweep(now))

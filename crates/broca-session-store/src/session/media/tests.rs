@@ -66,6 +66,7 @@ fn image(bytes: &[u8]) -> MediaRef {
 
 fn start(run: &str, send: &str) -> Record {
     Record::RunStart(Box::new(RunStart {
+        named_speaker: None,
         imported_ids: None,
         message_marks: None,
         run_id: run.into(),
@@ -148,6 +149,7 @@ fn call(id: &str) -> ContentBlock {
 
 fn facts(ordinal: u64, mid: String) -> Record {
     Record::EntryFacts(EntryFacts {
+        named_speaker: None,
         client_message_id: None,
         sender: None,
         marks: None,
@@ -558,6 +560,7 @@ fn photo_message(text: &str, images: &[&[u8]]) -> Message {
 /// A queued send whose one message holds `images` after its text.
 fn queued(submission: &str, images: &[&[u8]]) -> Record {
     Record::QueuedSend(QueuedSend {
+        named_speaker: None,
         media: Vec::new(),
         submission_id: submission.into(),
         send_id: None,
@@ -620,6 +623,7 @@ fn a_sends_media_are_stored_under_its_record_and_its_copies_point_at_them(cipher
         assert_eq!(media_objects(&backend).len(), 1);
 
         let steer = Record::Steer(Steer {
+            named_speaker: None,
             media: Vec::new(),
             input: vec![photo_message("steer look", &[b])],
             written_at_ms: None,

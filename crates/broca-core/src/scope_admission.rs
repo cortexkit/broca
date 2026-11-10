@@ -136,12 +136,30 @@ pub fn decide_owner_access(
     )))
 }
 
+/// Whether broca declares llm-runner's `notice_with_speaks_for` group: a send may combine
+/// `notice: true` with `speaks_for`, and a speaker may carry a display `name`. `role.describe`
+/// and send admission both read this, so admission accepts exactly what describe declares.
+pub const NOTICE_WITH_SPEAKS_FOR: bool = true;
+
 /// Validate display attribution against the frozen owner before any session write.
 pub fn admit_message_marks(
     params: &serde_json::Map<String, serde_json::Value>,
     ownership: &SessionOwnershipV1,
     principal: Option<&BindPrincipal>,
     send: &SendScope,
+) -> Result<Option<broca_protocol::MessageMarks>, &'static str> {
+    admit_message_marks_declaring(params, ownership, principal, send, NOTICE_WITH_SPEAKS_FOR)
+}
+
+/// [`admit_message_marks`] for a runner that declares `notice_with_speaks_for` or not. Without
+/// it, a notice combined with a speaker refuses naming `notice`, and a speaker's name refuses
+/// naming `speaks_for.name`.
+pub fn admit_message_marks_declaring(
+    params: &serde_json::Map<String, serde_json::Value>,
+    ownership: &SessionOwnershipV1,
+    principal: Option<&BindPrincipal>,
+    send: &SendScope,
+    notice_with_speaks_for: bool,
 ) -> Result<Option<broca_protocol::MessageMarks>, &'static str> {
     let automated = matches!(send, SendScope::Stamped(bind)
         if bind.scope.flow_id.is_some() || bind.scope.run_id.is_some());
@@ -155,8 +173,13 @@ pub fn admit_message_marks(
     let sender = principal
         .map(BindPrincipal::as_owner_string)
         .unwrap_or_default();
-    let marks =
-        cortexkit_role_llm_runner::message_marks::check(params, true, owner.as_deref(), &sender)?;
+    let marks = cortexkit_role_llm_runner::message_marks::check_with_notice_speaks_for(
+        params,
+        true,
+        notice_with_speaks_for,
+        owner.as_deref(),
+        &sender,
+    )?;
     Ok((marks.speaks_for.is_some() || marks.notice).then_some(marks))
 }
 
@@ -735,6 +758,53 @@ mod tests {
         BindPrincipal::Reserved {
             module_id: FLOW_ONLY_MODULE.into(),
         }
+    }
+
+    /// With `notice_with_speaks_for` the owner may combine a notice with a speaker and name the
+    /// speaker; without it, both refuse exactly as before the group existed.
+    #[test]
+    fn notice_with_speaks_for_admits_combined_and_named_marks_only_when_declared() {
+        let frozen = scope(core(), 3);
+        let session = history(&[(Some(core()), Some(frozen.clone()))]);
+        let send = stamped(frozen);
+        let admit = |marks: serde_json::Value, declared: bool| {
+            admit_message_marks_declaring(
+                marks.as_object().unwrap(),
+                &session,
+                Some(&core()),
+                &send,
+                declared,
+            )
+            .map(|marks| serde_json::to_value(marks).unwrap())
+        };
+        let combined = serde_json::json!({"notice": true, "speaks_for": {"agent_id": "agent-a"}});
+        let named = serde_json::json!({"speaks_for": {"agent_id": "agent-a", "name": "Ada"}});
+        let both = serde_json::json!({
+            "notice": true,
+            "speaks_for": {"agent_id": "agent-a", "name": "Ada"}
+        });
+        for marks in [&combined, &named, &both] {
+            assert_eq!(admit(marks.clone(), true), Ok(marks.clone()));
+        }
+        assert_eq!(admit(combined, false), Err("notice"));
+        assert_eq!(admit(named, false), Err("speaks_for.name"));
+        assert_eq!(admit(both.clone(), false), Err("notice"));
+        let unnamed = serde_json::json!({"speaks_for": {"agent_id": "agent-a"}});
+        assert_eq!(admit(unnamed.clone(), false), Ok(unnamed));
+        assert_eq!(
+            admit(
+                serde_json::json!({"speaks_for": {"agent_id": "agent-a", "name": ""}}),
+                true
+            ),
+            Err("speaks_for.name"),
+            "a name keeps its 1-64 printable ASCII bytes"
+        );
+        // Broca declares the group, so the admission it serves takes combined and named marks.
+        assert_eq!(
+            admit_message_marks(both.as_object().unwrap(), &session, Some(&core()), &send)
+                .map(|marks| serde_json::to_value(marks).unwrap()),
+            Ok(both.clone())
+        );
     }
 
     #[test]

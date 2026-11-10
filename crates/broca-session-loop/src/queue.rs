@@ -82,6 +82,12 @@ pub fn queued_send(
         },
         None => None,
     };
+    // Stored as today's `Queued` record stores them, so the drained run's start, a ride's notice
+    // and the reads serve them alike.
+    let message_marks = message_marks
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(json)?;
     Ok(QueuedSend {
         // Filled as the record is appended, by the append that stores the media's bytes
         // (`Session::append_input_media`).
@@ -95,12 +101,8 @@ pub fn queued_send(
         request: (!rest.is_empty()).then_some(Value::Object(rest)),
         receipt,
         delivery,
-        // Stored as today's `Queued` record stores them, so the drained run's start, a ride's
-        // notice and the reads serve them alike.
-        message_marks: message_marks
-            .map(serde_json::to_value)
-            .transpose()
-            .map_err(json)?,
+        named_speaker: broca_session_store::record::marks_name_speaker(message_marks.as_ref()),
+        message_marks,
     })
 }
 
@@ -162,6 +164,11 @@ pub fn steer(
         Value::Object(receipt) if receipt.is_empty() => None,
         receipt => Some(receipt),
     };
+    // Stored as today's `Steered` record stores them.
+    let message_marks = message_marks
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(|e| format!("a steer's marks: {e}"))?;
     Ok(Steer {
         // Filled as the record is appended, by the append that stores the media's bytes.
         media: Vec::new(),
@@ -169,11 +176,8 @@ pub fn steer(
         written_at_ms,
         tags_v1: None,
         receipt,
-        // Stored as today's `Steered` record stores them.
-        message_marks: message_marks
-            .map(serde_json::to_value)
-            .transpose()
-            .map_err(|e| format!("a steer's marks: {e}"))?,
+        named_speaker: broca_session_store::record::marks_name_speaker(message_marks.as_ref()),
+        message_marks,
     })
 }
 

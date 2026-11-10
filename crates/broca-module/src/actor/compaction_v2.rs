@@ -246,7 +246,7 @@ impl<W: WalStore + 'static> super::LineageActor<W> {
                     .lock()
                     .await
                     .applied_identity();
-                let page = v2::read::entries(
+                let mut page = v2::read::entries(
                     self.wal_store.as_ref(),
                     store,
                     &self.key,
@@ -256,6 +256,26 @@ impl<W: WalStore + 'static> super::LineageActor<W> {
                 )
                 .await
                 .map_err(internal)?;
+                let plane = self.executor.compaction_plane();
+                let declared = match item.as_ref() {
+                    Some((provider, ..)) => {
+                        let scope = checkpoint
+                            .ownership
+                            .as_ref()
+                            .and_then(|ownership| ownership.scope.as_ref());
+                        self.compaction_session
+                            .runtime
+                            .entry_speaks_for_or_read(&v2::runtime::BoundPlane {
+                                plane: plane.as_deref(),
+                                provider,
+                                bind: &self.key,
+                                scope,
+                            })
+                            .await
+                    }
+                    None => false,
+                };
+                v2::entries::gate_speaks_for(&mut page.entries, declared);
                 to_raw_value(&page).map_err(|error| internal(error.to_string()))
             }
             "session.applied_view" => {

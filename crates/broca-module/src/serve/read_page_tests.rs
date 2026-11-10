@@ -33,12 +33,9 @@ fn message(ordinal: u64, len: usize) -> SessionReadMessage {
             episode: "producing-run".into(),
             is_final: false,
         }),
-        tool_calls: vec![SessionReadToolCall {
-            tool_call_id: "call".into(),
-            call_key: Some("lineage:42".into()),
-            dispatched_to: Some("tool-provider".into()),
-            indeterminate: false,
-        }],
+        tool_calls: vec![SessionReadToolCall::new("call")
+            .with_call_key("lineage:42")
+            .with_dispatched_to("tool-provider")],
         described: None,
         digest: None,
         part_digests: None,

@@ -142,3 +142,49 @@ pub fn check_plan_version(recorded: u32) -> Result<(), String> {
         "compaction_plan_version {recorded} cannot resume; supported compaction plan version 2 or version {supported}"
     ))
 }
+
+#[cfg(test)]
+mod bound_signed_tests {
+    use super::*;
+    use cortexkit_role_compaction::rules::SignedParts;
+
+    fn signed_parts(model: &str) -> SignedParts {
+        conditions(ModelRef::new("anthropic", model), 200_000, 8_000, false)
+            .rules
+            .signed_parts
+    }
+
+    /// Fable 5.2 and Mythos 5.1 and 5.2 enforce the thinking prefix check on every account, so
+    /// a compacting session on them declares its signed parts bound, on every route's id form.
+    /// The pinned view library lists them itself.
+    #[test]
+    fn fable_5_2_and_mythos_declare_bound_signed_parts() {
+        for model in [
+            "claude-fable-5-2",
+            "anthropic/claude-fable-5.2",
+            "anthropic.claude-fable-5-2-v1:0",
+            "claude-fable-5-2@20261109",
+            "CLAUDE-FABLE-5-2",
+            "claude-mythos-5-1",
+            "claude-mythos-5-2",
+        ] {
+            assert_eq!(signed_parts(model), SignedParts::Bound, "{model}");
+        }
+    }
+
+    /// The library's boundaries hold: a longer version, a bare major, another family's name
+    /// inside a word, and models it decides are unbound.
+    #[test]
+    fn near_misses_and_listed_models_keep_the_librarys_answer() {
+        for model in [
+            "claude-fable-5-20",
+            "claude-fable-5",
+            "claude-notfable-5-2",
+            "claude-mythos-5-3",
+            "claude-opus-4-8",
+        ] {
+            assert_eq!(signed_parts(model), SignedParts::None, "{model}");
+        }
+        assert_eq!(signed_parts("claude-opus-5-5"), SignedParts::Bound);
+    }
+}

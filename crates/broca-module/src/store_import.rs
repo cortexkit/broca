@@ -116,12 +116,13 @@ impl ImportRoots {
 }
 
 /// Deletes what fed an import once its session is durable: an OpenCode 2 export and its side
-/// file, or for Pi only the side file, never the journal, wherever it lies. Each only when
+/// files, or for Pi only the side files, never the journal, wherever it lies. Each only when
 /// [`ImportRoots::deletable`] allows it. A failed delete is logged: the session is durable, so
 /// the import stands.
 pub fn delete_sources(roots: &ImportRoots, harness: ImportHarness, source: &Path) {
     let sends = ck_session_import::head::sends_path(source);
-    let mut doomed = vec![sends];
+    let calls = ck_session_import::head::calls_path(source);
+    let mut doomed = vec![sends, calls];
     if harness != ImportHarness::Pi {
         doomed.push(source.to_path_buf());
     }
@@ -266,6 +267,19 @@ pub fn read_source(
             ))
         }
     };
+    let calls = ck_session_import::head::calls_path(&path);
+    if calls.exists() {
+        let calls = roots.admit(&calls)?;
+        let bytes = std::fs::read(&calls).map_err(|error| {
+            ImportRefusal::new(
+                "import_calls_unreadable",
+                format!("the calls side file could not be read: {error}"),
+            )
+        })?;
+        let rows = ck_session_import::head::read_calls(&bytes)?;
+        ck_session_import::head::apply_calls(&mut history, &rows)?;
+    }
+    // A send delivered with a tool result names the opaque key supplied by the calls file.
     let sends = ck_session_import::head::sends_path(&path);
     if sends.exists() {
         let sends = roots.admit(&sends)?;
@@ -383,12 +397,15 @@ pub fn seed(history: HeadHistory, at: &SeedFacts<'_>) -> Result<Seed, ImportRefu
                     .map(|call| CallFacts {
                         tool_call_id: broca_protocol::ToolCallId(call.tool_call_id.clone()),
                         call_key: call.call_key.clone(),
-                        schema_pin: None,
+                        schema_pin: call.schema_pin.clone().map(serde_json::Value::String),
                         carrier: Some(call.carrier.clone()),
                         dispatched_to: None,
-                        dispatched_at_ms: None,
-                        finished_at_ms: None,
-                        unanswered: None,
+                        dispatched_at_ms: call.started_at,
+                        finished_at_ms: call.finished_at,
+                        unanswered: call
+                            .unanswered
+                            .as_deref()
+                            .and_then(broca_session_store::record::Unanswered::from_name),
                     })
                     .collect(),
             }));
@@ -456,6 +473,9 @@ pub fn seed(history: HeadHistory, at: &SeedFacts<'_>) -> Result<Seed, ImportRefu
             client_message_id: send.and_then(|send| send.client_message_id.clone()),
             sender: send.map(|send| send.sender.clone()),
             marks: send.and_then(|send| send.marks.clone()),
+            named_speaker: broca_session_store::record::marks_name_speaker(
+                send.and_then(|send| send.marks.as_ref()),
+            ),
             no_display_facts: None,
             reasoning_summaries: broca_session_loop::entries::reasoning_summaries(&message.message),
             rich_ui: None,
@@ -630,6 +650,7 @@ fn seed_start(
         refusal_schedule: None,
         imported_ids: None,
         message_marks: None,
+        named_speaker: None,
     })
 }
 

@@ -68,9 +68,7 @@ pub fn view(opts: &CallOptions, global: &[Message]) -> Result<Option<CallOptions
     prompt.extend(global.iter().cloned());
     prompt.extend(opts.prompt.iter().cloned());
     let mut view = opts.with_prompt(prompt);
-    let mut history = opts.render_episodes.as_ref().clone();
-    history.raw_ordinals = true;
-    view.render_episodes = std::sync::Arc::new(history);
+    view.render_episodes = super::render::raw_ordinals(&opts.render_episodes);
     for marker in &mut view.declared_markers {
         marker.message_index += global.len();
     }

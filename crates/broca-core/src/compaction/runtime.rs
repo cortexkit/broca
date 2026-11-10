@@ -116,12 +116,10 @@ pub trait CompactionPlane: Send + Sync {
         Err(crate::compaction_v2::runtime::CallError::Unavailable)
     }
 
-    /// The manifest capabilities (`provides`) the catalog entry of the mode-3 compaction
-    /// provider `provider` declares, read before each Setup (compaction contract W1.4). The
-    /// default, for a plane that can't read the catalog, declares none, so the provider is sent
-    /// only what every provider reads.
-    async fn v2_provides(&self, _provider: &str) -> Vec<String> {
-        Vec::new()
+    /// The capabilities `provider`'s catalog entry lists (`provides`), read from the daemon's
+    /// catalog when asked. `None` when the catalog can't be read or names no such module.
+    async fn provider_capabilities(&self, _provider: &str) -> Option<Vec<String>> {
+        None
     }
 
     async fn setup(

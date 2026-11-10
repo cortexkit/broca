@@ -604,6 +604,7 @@ mod records {
         forms,
         form,
         speaks_for,
+        named_speaker,
     });
     crate::fuzzing::gen::fields!(StepUsage {
         prompt_tokens,
@@ -637,6 +638,7 @@ mod records {
         notices,
         runner_tag_base,
         legacy_view_seq,
+        named_speaker,
     });
     crate::fuzzing::gen::fields!(RideNotice {
         part,
@@ -645,6 +647,7 @@ mod records {
         call_key,
         text,
         speaks_for,
+        named_speaker,
     });
     crate::fuzzing::gen::fields!(ReasoningSummary { part, text });
     crate::fuzzing::gen::fields!(RichUi {
@@ -687,6 +690,7 @@ mod records {
         refusal_schedule,
         imported_ids,
         message_marks,
+        named_speaker,
     });
     crate::fuzzing::gen::fields!(RunEnd {
         run_id,
@@ -817,6 +821,7 @@ mod records {
         delivery,
         media,
         message_marks,
+        named_speaker,
     });
     crate::fuzzing::gen::fields!(SessionRefresh {
         generation,
@@ -874,6 +879,7 @@ mod records {
         receipt,
         media,
         message_marks,
+        named_speaker,
     });
     crate::fuzzing::gen::fields!(Delivery {
         submission_id,
@@ -998,6 +1004,7 @@ mod records {
     crate::fuzzing::gen::fields!(Moved {
         move_id,
         source_activity_ms,
+        source_lineage,
     });
     crate::fuzzing::gen::fields!(EnrollmentOverlayRef {
         log,
@@ -1121,6 +1128,7 @@ mod operations {
         request_identity_digest,
         media,
         message_marks,
+        named_speaker,
     });
     crate::fuzzing::gen::fields!(NaturalEnd { stop, extendable });
     crate::fuzzing::gen::fields!(Budget {
@@ -1187,6 +1195,7 @@ mod operations {
         sender,
         request_identity_digest,
         message_marks,
+        named_speaker,
     });
     crate::fuzzing::gen::fields!(Operations {
         run,
@@ -1214,7 +1223,8 @@ mod operations {
         title,
         plan,
         enrolled,
-        tag_high_water
+        tag_high_water,
+        source_lineage
     });
     crate::fuzzing::gen::fields!(Enrollment {
         through_ordinal,

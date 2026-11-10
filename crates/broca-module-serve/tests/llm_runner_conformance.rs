@@ -2971,6 +2971,10 @@ impl LlmRunnerSubject for BrocaSubject {
         if self.service_tier_enabled {
             capabilities.insert(Capability::ServiceTier);
         }
+        // Admission and role.describe read the same switch for combined and named marks.
+        if broca_core::scope_admission::NOTICE_WITH_SPEAKS_FOR {
+            capabilities.insert(Capability::NoticeWithSpeaksFor);
+        }
         capabilities.extend([
             Capability::Attachments,
             Capability::MediaOnlySend,
@@ -4516,62 +4520,104 @@ fn check_0811_cases(
     check_0811_cases_for_writer(cases, broca_core::delivery_order::RIDES_V2_WRITER_ENABLED)
 }
 
-const MESSAGE_MARK_CASES: [&str; 4] = [
-    "message_marks_served",
-    "message_marks_both_refused",
-    "message_marks_speaks_for_owner_only",
-    "message_marks_retry_changed",
-];
+/// Every message-mark case and the outcome it must have for a runner that declares
+/// `notice_with_speaks_for` or not. Declaring the group turns the two undeclared-group refusal
+/// cases inapplicable, by the kit's own reason, and its own cases into required passes.
+fn message_mark_cases(notice_with_speaks_for: bool) -> Vec<(&'static str, CaseOutcome)> {
+    let declared_by_subject = || CaseOutcome::Inapplicable {
+        reason:
+            "the subject declares every one of notice_with_speaks_for, so none is left to refuse"
+                .into(),
+    };
+    let group_case = || {
+        if notice_with_speaks_for {
+            CaseOutcome::Passed
+        } else {
+            CaseOutcome::Inapplicable {
+                reason: "notice_with_speaks_for is not declared".into(),
+            }
+        }
+    };
+    let undeclared_case = || {
+        if notice_with_speaks_for {
+            declared_by_subject()
+        } else {
+            CaseOutcome::Passed
+        }
+    };
+    vec![
+        ("message_marks_served", CaseOutcome::Passed),
+        ("message_marks_both_refused", undeclared_case()),
+        ("message_marks_speaks_for_owner_only", CaseOutcome::Passed),
+        ("message_marks_retry_changed", CaseOutcome::Passed),
+        ("notice_with_speaks_for_served", group_case()),
+        ("notice_with_speaks_for_retry", group_case()),
+        ("notice_with_speaks_for_name_undeclared", undeclared_case()),
+    ]
+}
 
-fn check_message_marks_cases(
+fn check_message_marks_cases_declaring(
     cases: &[cortexkit_role_llm_runner_conformance::CaseReport],
+    notice_with_speaks_for: bool,
 ) -> Result<(), String> {
-    for name in MESSAGE_MARK_CASES {
+    for (name, expected) in message_mark_cases(notice_with_speaks_for) {
         let case = cases
             .iter()
             .find(|case| case.case == name)
             .ok_or_else(|| format!("the suite has no case {name}"))?;
-        if case.outcome != CaseOutcome::Passed {
-            return Err(format!("{name}: {:?}", case.outcome));
+        if case.outcome != expected {
+            return Err(format!("{name}: {:?}, expected {expected:?}", case.outcome));
         }
     }
     Ok(())
 }
 
+fn check_message_marks_cases(
+    cases: &[cortexkit_role_llm_runner_conformance::CaseReport],
+) -> Result<(), String> {
+    check_message_marks_cases_declaring(cases, broca_core::scope_admission::NOTICE_WITH_SPEAKS_FOR)
+}
+
 #[test]
-fn message_marks_cases_require_exact_passes_and_reject_missing_cases() {
+fn message_marks_cases_require_exact_outcomes_and_reject_missing_cases() {
     use cortexkit_role_llm_runner_conformance::{CaseReport, CASES};
-    let cases: Vec<_> = MESSAGE_MARK_CASES
-        .into_iter()
-        .map(|name| {
-            let spec = CASES.iter().find(|spec| spec.name == name).unwrap();
-            CaseReport {
-                case: spec.name,
-                requires: spec.requires.to_vec(),
-                outcome: CaseOutcome::Passed,
+    for declared in [false, true] {
+        let cases: Vec<_> = message_mark_cases(declared)
+            .into_iter()
+            .map(|(name, outcome)| {
+                let spec = CASES.iter().find(|spec| spec.name == name).unwrap();
+                CaseReport {
+                    case: spec.name,
+                    requires: spec.requires.to_vec(),
+                    outcome,
+                }
+            })
+            .collect();
+        check_message_marks_cases_declaring(&cases, declared).unwrap();
+        for index in 0..cases.len() {
+            for outcome in [
+                CaseOutcome::Passed,
+                CaseOutcome::Failed {
+                    reason: "failed".into(),
+                },
+                CaseOutcome::Skipped {
+                    missing: vec![Capability::MessageMarks],
+                },
+                CaseOutcome::Inapplicable {
+                    reason: "message_marks is not declared".into(),
+                },
+            ] {
+                if outcome == cases[index].outcome {
+                    continue;
+                }
+                let mut changed = cases.clone();
+                changed[index].outcome = outcome;
+                assert!(check_message_marks_cases_declaring(&changed, declared).is_err());
             }
-        })
-        .collect();
-    check_message_marks_cases(&cases).unwrap();
-    for index in 0..cases.len() {
-        for outcome in [
-            CaseOutcome::Failed {
-                reason: "failed".into(),
-            },
-            CaseOutcome::Skipped {
-                missing: vec![Capability::MessageMarks],
-            },
-            CaseOutcome::Inapplicable {
-                reason: "message_marks is not declared".into(),
-            },
-        ] {
-            let mut changed = cases.clone();
-            changed[index].outcome = outcome;
-            assert!(check_message_marks_cases(&changed).is_err());
+            let mut missing = cases.clone();
+            missing.remove(index);
+            assert!(check_message_marks_cases_declaring(&missing, declared).is_err());
         }
-        let mut missing = cases.clone();
-        missing.remove(index);
-        assert!(check_message_marks_cases(&missing).is_err());
     }
 }
 
@@ -7625,6 +7671,25 @@ async fn scripted_model_failure_ends_one_turn_and_preserves_fractional_retry_hin
     assert_eq!(shared.failure_turns.lock().unwrap()[session], 2);
 }
 
+/// The adapter claims `notice_with_speaks_for` exactly when broca's role.describe declares it,
+/// so the kit grades that group's cases by what broca serves.
+#[tokio::test]
+async fn conformance_subject_declares_notice_with_speaks_for_as_described() {
+    let root = broca_test_support::scratch_root().join("subject-notice-with-speaks-for");
+    let subject = BrocaSubject::new(&root).await;
+    let described = broca_wire::broca_role_describe_with_writers("test", true, true, true)
+        .capabilities
+        .iter()
+        .any(|name| name == cortexkit_role_llm_runner::capabilities::NOTICE_WITH_SPEAKS_FOR);
+    assert!(described);
+    assert_eq!(
+        subject
+            .capabilities()
+            .contains(&Capability::NoticeWithSpeaksFor),
+        described
+    );
+}
+
 #[tokio::test]
 async fn conformance_subject_always_declares_attachments() {
     let root = broca_test_support::scratch_root().join("subject-attachments");
@@ -7879,16 +7944,12 @@ async fn conformance_subject_declares_the_served_finish_reason_group() {
 
 #[test]
 fn assertion_address_lookup_does_not_contend_with_a_held_writer() {
-    for overhaul in [false, true] {
-        let root = broca_test_support::scratch_root()
-            .join(format!("assertion-address-held-writer-{overhaul}"));
+    {
+        let root = broca_test_support::scratch_root().join("assertion-address-held-writer-legacy");
         std::fs::create_dir_all(&root).unwrap();
-        if overhaul {
-            std::fs::write(root.join("state-format"), b"broca-state/2\n").unwrap();
-        }
         let seed = broca_protocol::BindIdentity::new(root.join("legacy"), "harness", "session");
         broca_test_support::register_legacy_session(&root, &seed).unwrap();
-        let database = root.join(if overhaul { "broca.db" } else { "run-index.db" });
+        let database = root.join("run-index.db");
         let blocker = rusqlite::Connection::open(database).unwrap();
         blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
         let claim = broca_protocol::BindIdentity::new(root.join("route"), "harness", "session");

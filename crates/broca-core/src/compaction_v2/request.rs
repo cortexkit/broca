@@ -34,6 +34,10 @@ pub struct At<'a> {
     pub chain_reset: bool,
     pub now: u64,
     pub next_mid: &'a str,
+    /// What the run's earlier renders kept of the entries they rendered, for this request's
+    /// renders to reuse and bring up to date (see `render::RenderCache`); `None` renders every
+    /// entry.
+    pub render: Option<&'a render::RenderCache>,
 }
 
 #[derive(Debug)]
@@ -101,7 +105,7 @@ pub async fn prepare(
     let frozen = frozen && view.is_some();
     // Claimed only where the accepted Setup listed it.
     let cache_expired = at.cache_expired && runtime.detects_cache_expired().await;
-    let mut prompt = render::prompt_view_with_rides(
+    let mut prompt = render::prompt_view_kept(
         at.stored,
         at.entries,
         at.rides,
@@ -109,6 +113,7 @@ pub async fn prepare(
         &at.conditions.rules,
         super::host::view_floor(at.conditions),
         &mut image,
+        at.render,
     )?;
     let mut tokens = estimate(&prompt)?;
     let causes = if frozen {
@@ -137,7 +142,7 @@ pub async fn prepare(
         )
         .await?;
         view = state.lock().await.view_for_step(at.step).cloned();
-        prompt = render::prompt_view_with_rides(
+        prompt = render::prompt_view_kept(
             at.stored,
             at.entries,
             at.rides,
@@ -145,6 +150,7 @@ pub async fn prepare(
             &at.conditions.rules,
             super::host::view_floor(at.conditions),
             &mut image,
+            at.render,
         )?;
         tokens = estimate(&prompt)?;
     }
@@ -163,7 +169,7 @@ pub async fn prepare(
         .await?;
         rode_over_limit = true;
         view = state.lock().await.view_for_step(at.step).cloned();
-        prompt = render::prompt_view_with_rides(
+        prompt = render::prompt_view_kept(
             at.stored,
             at.entries,
             at.rides,
@@ -171,6 +177,7 @@ pub async fn prepare(
             &at.conditions.rules,
             super::host::view_floor(at.conditions),
             &mut image,
+            at.render,
         )?;
         tokens = estimate(&prompt)?;
     }

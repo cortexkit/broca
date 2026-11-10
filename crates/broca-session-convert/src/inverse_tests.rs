@@ -18,6 +18,36 @@ fn log(lines: &[&str]) -> Vec<FramedRecord> {
 
 const RUN: &str = r#"{"type":"run_started","run_id":"RUN","session":{"project_root":"/project","harness":"runner","session":"s"},"config":{"model":{"provider_module_id":"p","model_id":"m"},"tools":[{"name":"bash","description":"run","input_schema":{"type":"object"},"execution_mode":"parallel"}],"tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},"context_epoch":0,"renderer_version":1},"input":[{"role":"user","content":[{"type":"text","text":"hi"}]}],"origin":{"kind":"fresh"}}"#;
 
+#[test]
+fn a_runs_recorded_conversation_key_converts_and_round_trips_exactly() {
+    let mut value: serde_json::Value = serde_json::from_str(RUN).unwrap();
+    value["config"]["auth_selection"] = serde_json::json!({
+        "credential_id": "apikey:p:work", "account_ref": "acct-1",
+        "account_decision": {
+            "path": "routed", "conversation_key": "shared-conversation",
+            "conversation_key_source": "caller",
+        },
+    });
+    let old = log(&[
+        &value.to_string(),
+        r#"{"type":"run_finished","reason":"completed","usage":{},"retries_used":0}"#,
+    ]);
+    let converted = convert(&old, Some("source-lineage")).unwrap();
+    let start = converted
+        .records
+        .iter()
+        .find_map(|record| match record {
+            broca_session_store::record::Record::RunStart(start) => Some(start),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        start.auth_selection.as_ref().unwrap()["account_decision"]["conversation_key"],
+        "shared-conversation"
+    );
+    assert_round_trip(&old);
+}
+
 fn assert_round_trip(old: &[FramedRecord]) {
     let converted = convert(old, None).unwrap();
     assert!(converted.lost.is_empty(), "{:?}", converted.lost);
@@ -319,6 +349,7 @@ fn a_ride_envelope_converts_onto_the_append_and_round_trips() {
             forms: vec!["tool_result".into(), "turn_system".into()],
             form: RideForm::Append,
             speaks_for: None,
+            named_speaker: None,
         })
     );
     assert_round_trip(&old);
@@ -538,6 +569,7 @@ fn a_moved_session_converts_back_to_its_log() {
     let mut records = converted.records.clone();
     records.push(broca_session_store::record::Record::Moved(
         broca_session_store::record::Moved {
+            source_lineage: Some("source-lineage".into()),
             move_id: "store-move:test".into(),
             source_activity_ms: 5,
         },

@@ -149,6 +149,8 @@ pub async fn compaction_runner(
                 caller.as_deref(),
                 &method,
                 &params,
+                // No root holds the session, so it has no entries to attribute.
+                &EntryAttribution::Known(false),
             )
             .await
         }
@@ -156,8 +158,56 @@ pub async fn compaction_runner(
     }
 }
 
+/// What a `session.entries` read knows of whether the session's compaction provider declared
+/// entry attribution (`compaction-entry-speaks-for/v1`), which decides whether the entries it
+/// serves keep `speaks_for`.
+#[derive(Clone)]
+pub enum EntryAttribution {
+    /// What the session's actor found in the provider's catalog entry at the latest Setup it
+    /// sent, or learned since.
+    Known(bool),
+    /// Nothing is known here, as for a session no actor holds: the provider's catalog entry is
+    /// read through this plane when the read is served. A provider can't withdraw the
+    /// declaration without restarting, and a restarted provider is sent Setup again, so the
+    /// catalog answers what the latest Setup found. Without a plane, nothing is declared.
+    Catalog(Option<std::sync::Arc<dyn broca_core::CompactionPlane>>),
+}
+
+impl std::fmt::Debug for EntryAttribution {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Known(declared) => f.debug_tuple("Known").field(declared).finish(),
+            Self::Catalog(plane) => f
+                .debug_tuple("Catalog")
+                .field(&plane.as_ref().map(|_| "plane"))
+                .finish(),
+        }
+    }
+}
+
+impl EntryAttribution {
+    /// Whether `provider` declared entry attribution.
+    pub async fn declared(&self, provider: &str) -> bool {
+        match self {
+            Self::Known(declared) => *declared,
+            Self::Catalog(Some(plane)) => tokio::time::timeout(
+                broca_core::compaction_v2::runtime::CALL_DEADLINE,
+                plane.provider_capabilities(provider),
+            )
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|provides| {
+                broca_core::compaction_v2::protocol::provides_entry_speaks_for(&provides)
+            }),
+            Self::Catalog(None) => false,
+        }
+    }
+}
+
 /// [`compaction_runner`] over a loaded `session`, whose runs name their setup parts in `parts`.
-/// `None` is a session whose creation never committed.
+/// `None` is a session whose creation never committed. `attribution` decides whether the
+/// entries served keep `speaks_for`.
 pub async fn serve_compaction<B: SessionBackend>(
     parts: &dyn Parts,
     session: Option<&Session<B>>,
@@ -165,6 +215,7 @@ pub async fn serve_compaction<B: SessionBackend>(
     caller: Option<&str>,
     method: &str,
     params: &RawValue,
+    attribution: &EntryAttribution,
 ) -> Result<Box<RawValue>, Refusal> {
     let session = admit(parts, session, caller)?;
     match method {
@@ -178,7 +229,14 @@ pub async fn serve_compaction<B: SessionBackend>(
                     "compaction entries limit must be at least 1",
                 ));
             }
-            let page = entries_page(session, &request).await.map_err(internal)?;
+            let mut page = entries_page(session, &request).await.map_err(internal)?;
+            // Admission let only the provider the plan in force names through, so the caller
+            // is that provider.
+            let declared = match caller {
+                Some(provider) => attribution.declared(provider).await,
+                None => false,
+            };
+            broca_core::compaction_v2::entries::gate_speaks_for(&mut page.entries, declared);
             to_raw_value(&page).map_err(|error| internal(error.to_string()))
         }
         "session.applied_view" => {

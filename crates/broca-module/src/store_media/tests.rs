@@ -154,6 +154,7 @@ async fn an_append_feeds_the_media_fold_without_reading_the_open_log() {
         .append(
             &[Record::RunStart(Box::new(
                 broca_session_store::record::RunStart {
+                    named_speaker: None,
                     imported_ids: None,
                     message_marks: None,
                     run_id: "r2".into(),

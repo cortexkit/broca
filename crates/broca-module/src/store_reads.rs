@@ -81,6 +81,9 @@ pub enum StoreReadRequest {
     /// The compaction view the model step that wrote message `ordinal` (counting from 0) was
     /// rendered under, for output references (see `store_output_refs::writing_view`).
     WritingView { ordinal: u64 },
+    /// The namespace of output references: the source WAL's lineage after conversion, otherwise
+    /// the store incarnation. It is independent of the public history cursor's incarnation.
+    OutputRefNamespace,
     /// What a plan-change op's preflight reads about the session, for a request naming
     /// `generation` and `send_id` (see `store_plan_change::change_read`).
     PlanChange {
@@ -167,6 +170,7 @@ pub enum StoreReadReply {
     Media(Result<Option<StoredMedia>, ServeError>),
     TagLocation(Result<broca_core::TagLocation, ServeError>),
     WritingView(Result<Option<broca_core::compaction_provider::view::CompactionView>, ServeError>),
+    OutputRefNamespace(String),
     PlanChange(Result<PlanChangeRead, String>),
     PlanIdentities(Result<RefreshedIdentities, String>),
     /// `None` before the session's first run.
@@ -198,6 +202,8 @@ pub enum StoreReadOutcome {
     Stored {
         position: Position,
         live_step: Option<LiveStep>,
+        /// The actor's `ReadContext::entry_speaks_for`, which the read keeps.
+        entry_speaks_for: crate::store_entries::EntryAttribution,
     },
     /// The read can't be answered now. Transient.
     Refused(ServeError),
@@ -232,6 +238,9 @@ pub struct ReadContext<'a> {
     /// (`Some(None)` for a stream with no unit yet), or `None` when no seeded projection knows
     /// it, so a page projects it from storage.
     pub stream_head: Option<Option<broca_core::Cursor>>,
+    /// Whether compaction entries the read serves keep `speaks_for`: whether the session's
+    /// compaction provider declared `compaction-entry-speaks-for/v1`.
+    pub entry_speaks_for: crate::store_entries::EntryAttribution,
 }
 
 impl ReadContext<'_> {
@@ -332,6 +341,7 @@ pub async fn execute<B: SessionBackend>(
                 caller.as_deref(),
                 method,
                 params,
+                &ctx.entry_speaks_for,
             )
             .await,
         ),
@@ -345,6 +355,13 @@ pub async fn execute<B: SessionBackend>(
             crate::store_output_refs::tag_location(session, ctx.parts, *tag)
                 .await
                 .map_err(output_refs_failed),
+        ),
+        StoreReadRequest::OutputRefNamespace => StoreReadReply::OutputRefNamespace(
+            session
+                .operations
+                .source_lineage
+                .clone()
+                .unwrap_or_else(|| broca_session_store::codec::hex(&session.head().incarnation.0)),
         ),
         StoreReadRequest::WritingView { ordinal } => StoreReadReply::WritingView(
             crate::store_output_refs::writing_view(session, *ordinal)
@@ -454,6 +471,7 @@ pub async fn answer_in_memory<B: SessionBackend>(
         _ => StoreReadOutcome::Stored {
             position: session.position(),
             live_step: ctx.live_step.cloned(),
+            entry_speaks_for: ctx.entry_speaks_for.clone(),
         },
     }
 }

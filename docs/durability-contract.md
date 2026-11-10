@@ -3,6 +3,10 @@
 This document defines the authoritative record set and replay semantics.
 See `docs/wal-and-resume-design.md` for on-disk encoding and task mechanics.
 
+Roots marked `broca-state/2` are no longer served: startup names the removed
+staging format and requires a fresh state root. The version-4/overhaul WAL rules
+below remain low-level compatibility contracts; they do not enable that daemon mode.
+
 ## 1. The one invariant + the v1 policy
 
 Side-effecting tools are **at-most-once across a crash**, via an **intent-log +

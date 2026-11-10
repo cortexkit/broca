@@ -152,7 +152,7 @@ impl<B: SessionBackend> Session<B> {
     /// [`Session::find_message`] finds it, so an import's source id is found too. An entry read
     /// from sealed history is kept while the session is open, so asking for it again reads
     /// nothing. Entries are served as compaction reads them ([`Session::compaction_entries`]): a
-    /// message an enrollment suppressed has none.
+    /// message an enrollment suppressed is served with no content.
     pub async fn entry_by_mid(&self, mid: &str) -> Result<Option<StoredEntry>, SessionError> {
         if let Some(entry) = self.sealed_caches().entries.get(mid) {
             return Ok(Some(entry.clone()));

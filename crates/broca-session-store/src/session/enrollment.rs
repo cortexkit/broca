@@ -67,21 +67,37 @@ impl EnrollmentOverlay {
 
     /// `stored` as `session.entries` serves it on the contract: an earlier message takes the
     /// enrollment's part number base, time and notice in place of its own facts' (recorded off
-    /// the contract, where nothing served them); a suppressed one isn't served at all. A message
-    /// placed since is unchanged.
-    pub fn apply(&self, mut stored: StoredEntry) -> Option<StoredEntry> {
+    /// the contract, where nothing served them). A message placed since is unchanged.
+    ///
+    /// A suppressed global system message is still served, at its own ordinal and under its own
+    /// id, but as a system message with no content, so its entry has no parts. The contract
+    /// counts every message of a host that keeps its own log, so ordinals have no gaps; the
+    /// run's system text took the message's place above the conversation, so its entry shows
+    /// nothing, and a view's render plan renders an entry with no parts as nothing at all. With
+    /// no parts and no notice, the entry's digest is the same at every read.
+    pub fn apply(&self, mut stored: StoredEntry) -> StoredEntry {
         let Some(decided) = self.entry(stored.ordinal) else {
-            return Some(stored);
+            return stored;
         };
-        if decided.suppressed {
-            return None;
-        }
         if let Some(facts) = stored.state.facts.as_mut() {
             facts.tag_base = decided.tag_base;
             facts.written_at_ms = Some(decided.written_at_ms);
             facts.notice.clone_from(&decided.notice);
+            if decided.suppressed {
+                // Nothing that could give the empty entry a notice origin, a speaker or usage.
+                facts.sender = None;
+                facts.marks = None;
+                facts.usage = None;
+                facts.generated_under = None;
+            }
         }
-        Some(stored)
+        if decided.suppressed {
+            stored.message.content.clear();
+            stored.next = None;
+            stored.state.delivered.clear();
+            stored.state.turn = None;
+        }
+        stored
     }
 
     /// `entries` as `session.entries` serves them (see [`EnrollmentOverlay::apply`]); `overlay`
@@ -90,7 +106,7 @@ impl EnrollmentOverlay {
         match overlay {
             Some(overlay) => entries
                 .into_iter()
-                .filter_map(|entry| overlay.apply(entry))
+                .map(|entry| overlay.apply(entry))
                 .collect(),
             None => entries,
         }
@@ -204,33 +220,17 @@ impl<B: SessionBackend> Session<B> {
     /// Up to `limit` entries from ordinal `from` on, as `session.entries` serves them: as
     /// [`Session::entries`] reads them, with what the session's enrollment in the current
     /// compaction contract decided about the messages placed before it (see
-    /// [`EnrollmentOverlay::apply`]). A suppressed message isn't served and doesn't count toward
-    /// `limit`. Every reader that projects entries for compaction reads them here, so they all
-    /// see the same entries; `session.read` reads [`Session::entries`].
+    /// [`EnrollmentOverlay::apply`]). Every message has an entry, a suppressed one included, so
+    /// the ordinals have no gaps. Every reader that projects entries for compaction reads them
+    /// here, so they all see the same entries; `session.read` reads [`Session::entries`].
     pub async fn compaction_entries(
         &self,
         from: u64,
         limit: usize,
     ) -> Result<Vec<StoredEntry>, SessionError> {
-        let Some(overlay) = self.enrollment().await? else {
-            return self.entries(from, limit).await;
-        };
-        let mut out = Vec::new();
-        let mut next = from.max(1);
-        while out.len() < limit {
-            let wanted = limit - out.len();
-            let read = self.entries(next, wanted).await?;
-            let Some(last) = read.last() else {
-                break;
-            };
-            next = last.ordinal + 1;
-            let ended = read.len() < wanted;
-            out.extend(read.into_iter().filter_map(|entry| overlay.apply(entry)));
-            if ended {
-                break;
-            }
-        }
-        Ok(out)
+        let overlay = self.enrollment().await?;
+        let entries = self.entries(from, limit).await?;
+        Ok(EnrollmentOverlay::serve(overlay.as_ref(), entries))
     }
 }
 

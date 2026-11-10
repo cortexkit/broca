@@ -49,8 +49,12 @@ use crate::segment::{self, SegmentMeta};
 use super::{log_bind, Session, SessionError};
 
 /// How long what a change stopped naming is kept, so a reader that read the head just before
-/// the commit can finish reading.
-pub const GRACE_MS: u64 = 10 * 60 * 1000;
+/// the commit can finish reading, and a backup's walk of the store that began before the commit
+/// still finds every file of the head version current when it began, which restore may choose.
+/// It is the period head versions are kept for (`backend::HEAD_VERSION_KEEP_MS`), and both count
+/// from the change: the head versions from before it, which name its deletions, come due for
+/// pruning when its deletions come due, and the head write that ends a collection prunes them.
+pub const GRACE_MS: u64 = crate::backend::HEAD_VERSION_KEEP_MS;
 
 const PRUNE_CONTEXT: &[u8] = b"broca-prune-v1";
 
@@ -763,7 +767,8 @@ impl<B: SessionBackend> Session<B> {
     }
 
     /// Deletes what committed changes stopped naming, once it is `GRACE_MS` old, and drops
-    /// those entries from the head. Returns how many changes' deletions ran.
+    /// those entries from the head. Returns how many changes' deletions ran; 0, with nothing
+    /// read or written, when none is due.
     pub async fn collect(&mut self, now_ms: u64) -> Result<usize, SessionError> {
         if self.poisoned {
             return Err(SessionError::Poisoned);
@@ -771,69 +776,19 @@ impl<B: SessionBackend> Session<B> {
         if self.operations.open_change.is_some() {
             return Err(SessionError::ChangeOpen);
         }
-        let due: Vec<PendingDeletion> = self
-            .head
-            .pending
-            .iter()
-            .filter(|pending| pending.unreferenced_at_ms.saturating_add(GRACE_MS) <= now_ms)
-            .cloned()
-            .collect();
+        let due = super::collect::due(&self.head, now_ms);
         if due.is_empty() {
             return Ok(0);
         }
-        let key = self.key.frame_key();
-        let index = IndexPages {
-            backend: &self.backend,
-            addr: &self.addr,
-            session: self.head.session_id,
-            key: &key,
-        };
-        for pending in &due {
-            // A retired-runs list is read before anything it names is deleted, and deleted
-            // last, so a collection that stops halfway runs again from the list.
-            if let Some(list) = &pending.retired_index {
-                match index.read::<Retired>(list).await {
-                    Ok(retired) => {
-                        index
-                            .delete_retired(&retired.refs, self.version)
-                            .await
-                            .map_err(SessionError::Index)?;
-                        self.backend
-                            .delete_object(&self.addr, list, self.version)
-                            .await?;
-                    }
-                    Err(idindex::IndexError::Missing(_)) => {}
-                    Err(error) => return Err(SessionError::Index(error)),
-                }
-            }
-            // A revert's list of abandoned objects, likewise read first and deleted last.
-            if let Some(list) = &pending.abandoned {
-                match index.read::<Retired>(list).await {
-                    Ok(abandoned) => {
-                        for object in &abandoned.refs {
-                            self.backend
-                                .delete_object(&self.addr, object, self.version)
-                                .await?;
-                        }
-                        self.backend
-                            .delete_object(&self.addr, list, self.version)
-                            .await?;
-                    }
-                    Err(idindex::IndexError::Missing(_)) => {}
-                    Err(error) => return Err(SessionError::Index(error)),
-                }
-            }
-            for log in &pending.logs {
-                self.backend
-                    .delete_log(&self.addr, log, self.version)
-                    .await?;
-            }
-            for object in &pending.objects {
-                self.backend
-                    .delete_object(&self.addr, object, self.version)
-                    .await?;
-            }
-        }
+        super::collect::delete(
+            &self.backend,
+            &self.addr,
+            self.head.session_id,
+            &self.key,
+            self.version,
+            &due,
+        )
+        .await?;
         let done: BTreeSet<Id128> = due.iter().map(|pending| pending.change).collect();
         let mut head = self.head.clone();
         head.pending

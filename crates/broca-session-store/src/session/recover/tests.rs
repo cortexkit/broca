@@ -51,6 +51,7 @@ fn model() -> ModelHandle {
 
 fn start(run: &str) -> Record {
     Record::RunStart(Box::new(RunStart {
+        named_speaker: None,
         imported_ids: None,
         message_marks: None,
         run_id: run.into(),
@@ -653,6 +654,7 @@ fn a_rebuilt_checkpoint_keeps_frozen_and_post_move_activity(cipher: Cipher) {
                     session
                         .append(
                             &[Record::Moved(crate::record::Moved {
+                                source_lineage: None,
                                 move_id: "store-move:test".into(),
                                 source_activity_ms: 2_002,
                             })],

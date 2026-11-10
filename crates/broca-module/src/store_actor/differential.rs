@@ -424,8 +424,12 @@ fn tweaked(mut step: Step, change: fn(&mut SubmissionRequest)) -> Step {
 
 /// Runs `steps` on both sides over the same provider script, the first model step gated when
 /// `gated`. Every reply is compared as its step says; when every step is served alike, the two
-/// sessions' conversations must also be the same.
-async fn compare(script: Vec<Vec<NormalizedEvent>>, gated: bool, steps: Vec<Step>) {
+/// sessions' conversations must also be the same. Returns today's reply to each send, in order.
+async fn compare(
+    script: Vec<Vec<NormalizedEvent>>,
+    gated: bool,
+    steps: Vec<Step>,
+) -> Vec<SendOutcome> {
     let today_gate = gated.then(|| Arc::new(Notify::new()));
     let store_gate = gated.then(|| Arc::new(Notify::new()));
     let today = today(script.clone(), today_gate.clone());
@@ -438,6 +442,7 @@ async fn compare(script: Vec<Vec<NormalizedEvent>>, gated: bool, steps: Vec<Step
         super::tests::actor_with(executor(script, store_gate.clone()), parts.clone()).await;
     // Both sides get the request one caller shapes.
     let caller = super::tests::Caller::default();
+    let mut answers = Vec::new();
     for (index, step) in steps.into_iter().enumerate() {
         match step {
             Step::Send {
@@ -471,6 +476,7 @@ async fn compare(script: Vec<Vec<NormalizedEvent>>, gated: bool, steps: Vec<Step
                 )
                 .await;
                 assert_eq!(new, old, "step {index}: replies differ");
+                answers.push(old);
             }
             Step::Retract(submission_id) => {
                 let old = today
@@ -513,6 +519,7 @@ async fn compare(script: Vec<Vec<NormalizedEvent>>, gated: bool, steps: Vec<Step
     );
     display_reads_alike(&today, &session, &parts).await;
     assert!(today.registry.stop_and_seal().await);
+    answers
 }
 
 /// The read modes that add to a reply: display facts, tools, Rich UI stamps, each alone and all
@@ -1260,12 +1267,22 @@ fn speaking_for_unscoped(request: &mut SubmissionRequest) {
     request.scope = broca_protocol::SendScope::Unstamped;
 }
 
-/// Core under its own head scope, carrying both marks, which a send may not.
+/// Core under its own head scope, carrying both marks: an agent's automatic message, which a
+/// runner declaring `notice_with_speaks_for` admits.
 fn noticed_and_speaking_for(request: &mut SubmissionRequest) {
     speaking_for(request);
     request
         .message_marks
         .insert("notice".to_owned(), serde_json::json!(true));
+}
+
+/// [`noticed_and_speaking_for`], with the speaker's display name.
+fn noticed_and_speaking_for_by_name(request: &mut SubmissionRequest) {
+    noticed_and_speaking_for(request);
+    request.message_marks.insert(
+        "speaks_for".to_owned(),
+        serde_json::json!({"agent_id": "agent-1", "name": "Ada"}),
+    );
 }
 
 /// A send's display marks, a notice and the agent the scope's owner speaks for, are kept for a
@@ -1316,8 +1333,8 @@ async fn a_steers_marks_are_kept_alike() {
 }
 
 /// Marks a send may not carry are refused naming the member, before the send's owner is
-/// checked, alike: another module speaking for the scope owner's agent, a send with no scope
-/// speaking for one, and both marks at once. A send whose marks are admitted then runs.
+/// checked, alike: another module speaking for the scope owner's agent, and a send with no
+/// scope speaking for one. A send whose marks are admitted then runs.
 #[tokio::test]
 async fn marks_a_send_may_not_carry_are_refused_alike() {
     compare(
@@ -1326,8 +1343,34 @@ async fn marks_a_send_may_not_carry_are_refused_alike() {
         vec![
             tweaked(send("r1", "another's"), speaking_for_by_another),
             tweaked(send("r2", "unscoped"), speaking_for_unscoped),
-            tweaked(send("r3", "both"), noticed_and_speaking_for),
             tweaked(send("r4", "first"), noticed),
+            Step::Idle,
+        ],
+    )
+    .await;
+}
+
+/// An agent's automatic message, a notice speaking for the head's agent, is kept with both
+/// marks and the speaker's display name for a send that starts a run, a queued send and a
+/// steer, and `session.read` serves them, alike.
+#[tokio::test]
+async fn an_agents_named_notice_is_kept_alike() {
+    compare(
+        four_turns(),
+        true,
+        vec![
+            tweaked(send("r1", "first"), noticed_and_speaking_for_by_name),
+            tweaked(
+                steered(send("s1", "steered")),
+                noticed_and_speaking_for_by_name,
+            ),
+            Step::Release,
+            Step::Release,
+            Step::Idle,
+            tweaked(send("r2", "second"), noticed_and_speaking_for),
+            tweaked(send("r3", "queued"), noticed_and_speaking_for_by_name),
+            Step::Release,
+            Step::Release,
             Step::Idle,
         ],
     )
@@ -1590,28 +1633,18 @@ async fn the_switch_starts_a_new_session_in_the_new_storage_and_reopens_it() {
     );
 }
 
-/// With the switch off, and with it on for a creating send the store actor doesn't serve, the
-/// session starts on today's storage and the new storage holds nothing.
+/// With the switch off, a session starts on today's storage and the new storage holds nothing.
 #[tokio::test]
-async fn sessions_stay_on_todays_storage_unless_the_switch_and_the_send_allow() {
-    for (on, conversation_key) in [(false, None), (true, Some("conversation"))] {
-        let module = module(on, vec![super::tests::text_step("a1", "hello")]).await;
-        assert!(
-            matches!(
-                module.send("r1", "first", conversation_key).await,
-                SendOutcome::Active { .. }
-            ),
-            "switch {on}, conversation key {conversation_key:?}"
-        );
-        module.closed().await;
-        assert!(!module.head().exists(), "switch {on}");
-        assert_eq!(
-            module.wal.wal_present(&module.key),
-            Some(true),
-            "switch {on}"
-        );
-        assert!(!module.floor().contains(broca_wal::SESSION_STORAGE_FEATURE));
-    }
+async fn sessions_stay_on_todays_storage_when_the_switch_is_off() {
+    let module = module(false, vec![super::tests::text_step("a1", "hello")]).await;
+    assert!(matches!(
+        module.send("r1", "first", None).await,
+        SendOutcome::Active { .. }
+    ));
+    module.closed().await;
+    assert!(!module.head().exists());
+    assert_eq!(module.wal.wal_present(&module.key), Some(true));
+    assert!(!module.floor().contains(broca_wal::SESSION_STORAGE_FEATURE));
 }
 
 /// One `session.read` reply as JSON, with what legitimately differs between the two storages
@@ -1776,10 +1809,16 @@ async fn a_store_session_reads_as_the_same_history_on_todays_storage() {
 
 mod controls;
 mod head;
+mod inline_refs;
 mod media;
+mod media_ready;
 mod media_render;
 mod ordered;
+mod pauses;
 mod photo_sends;
 mod refresh;
+mod scopes;
 mod streams;
 mod warm;
+
+mod held;

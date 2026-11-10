@@ -100,7 +100,7 @@ class RetryMarkerStaging(unittest.TestCase):
                 self.assertIn("artifact contains the test-harness override marker", admission.stderr)
 
     def test_fs_override_path_carries_the_marker(self):
-        source = (ROOT / "crates/broca-wal/src/fs_ops.rs").read_text()
+        source = (ROOT / "crates/broca-records/src/fs_ops.rs").read_text()
         override = source.split('#[cfg(feature = "fs-override")]\nfn current()', 1)[1].split('\n}', 1)[0]
         self.assertIn('std::hint::black_box("' + FS_OVERRIDE_MARKER + '");', override)
         real = source.split('#[cfg(not(feature = "fs-override"))]\nfn current()', 1)[1].split('\n}', 1)[0]

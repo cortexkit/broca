@@ -713,16 +713,29 @@ impl StoreMove {
         before!(self.step("journal_layout"));
         // Stage. The moved session goes on serving the last update today's head serves for it.
         let lineage_text = lineage.map(|id| id.to_string());
+        let observed = before!(self
+            .registry
+            .history_read_version(key)
+            .await
+            .map_err(|error| unavailable("the source's served-history version", error)));
+        let source_history_version = before!(self
+            .registry
+            .served_snapshot(key, lineage_text.clone(), !records.is_empty(), observed)
+            .await
+            .map_err(|error| unavailable("the source's served-history snapshot", error)))
+        .history_version;
         let store = paths.store.clone();
         let todays_updated_at = broca_module::head_time::updated_at_of_wal(
             &records,
             broca_module::head_time::file_written_ms(&paths.wal),
         );
         let moved = broca_session_store::record::Moved {
+            source_lineage: None,
             move_id: journal.move_id.clone(),
             source_activity_ms: todays_updated_at,
         };
         let stage = Stage {
+            source_history_version,
             records: &records,
             lineage: lineage_text.as_deref(),
             session: key,

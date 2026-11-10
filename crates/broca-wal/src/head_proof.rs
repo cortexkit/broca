@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use crate::{framing, fs_ops, Wal, WalError};
 pub use broca_wal_reader::proof::{HeadProof, PublishedLog};
 
-pub const VISIBILITY_LATE_FEATURE: &str = "visibility-late/v1";
+pub use broca_records::head_proof::VISIBILITY_LATE_FEATURE;
 pub const MAX_PROOF_AGE_MS: u64 = 59_000;
 
 /// A completed barrier borrowing the actual WAL, not a stored watermark.
