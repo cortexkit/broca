@@ -218,8 +218,37 @@ struct CallScan {
     index: usize,
     tool_call_id: String,
     call_key: Option<String>,
+    call_carrier: Option<String>,
     arguments: serde_json::Value,
     slots: Vec<ReferenceSlot>,
+}
+
+impl CallScan {
+    fn resolve(
+        self,
+        lineage: &str,
+        ordinal: u64,
+        mid: &str,
+        request: &BTreeMap<u64, Target>,
+    ) -> (String, OutputRefSet) {
+        let mut set = resolve_set(
+            set_id(
+                lineage,
+                SetKey {
+                    ordinal,
+                    call: Some(self.index),
+                },
+            ),
+            mid,
+            self.call_key.as_deref(),
+            request,
+            |resolution, request, mut mint| {
+                resolution.call(&self.arguments, &self.slots, true, request, &mut mint)
+            },
+        );
+        set.descriptor.call_carrier = self.call_carrier;
+        (self.tool_call_id, set)
+    }
 }
 
 /// The stored bytes a tool result holds, never its rendering: `format`, `mime` and content.
@@ -742,24 +771,7 @@ async fn derive_message<H: ServeHandler + ?Sized>(
     );
     let calls = calls
         .into_iter()
-        .map(|call| {
-            let set = resolve_set(
-                set_id(
-                    &lineage,
-                    SetKey {
-                        ordinal,
-                        call: Some(call.index),
-                    },
-                ),
-                mid,
-                call.call_key.as_deref(),
-                &request,
-                |resolution, request, mut mint| {
-                    resolution.call(&call.arguments, &call.slots, true, request, &mut mint)
-                },
-            );
-            (call.tool_call_id, set)
-        })
+        .map(|call| call.resolve(&lineage, ordinal, mid, &request))
         .collect();
     Ok(MessageOutputRefs { reply, calls })
 }
@@ -924,6 +936,8 @@ fn call_scans(
                 index,
                 call_key: call_attribution(entry, &id, occurrence)
                     .and_then(|dispatch| dispatch.call_key.clone()),
+                call_carrier: call_attribution(entry, &id, occurrence)
+                    .and_then(|dispatch| dispatch.call_carrier.clone()),
                 tool_call_id: id,
                 arguments: call.input.clone(),
                 slots,
@@ -938,6 +952,27 @@ mod tests {
     use broca_core::compaction_provider::view::CompactionView;
     use cortexkit_role_llm_runner::display::{TextPart, ToolCallPart};
     use serde_json::json;
+
+    #[test]
+    fn imported_output_descriptors_keep_the_call_carrier() {
+        for carrier in [None, Some("thalamus-pi")] {
+            let call = CallScan {
+                index: 0,
+                tool_call_id: "call_probe_1".into(),
+                call_key: Some("5b9fb962/call_probe_1".into()),
+                call_carrier: carrier.map(str::to_owned),
+                arguments: json!({"path": "plain"}),
+                slots: vec![],
+            };
+            let (_, set) = call.resolve("lineage", 2, "5b9fb962", &BTreeMap::new());
+            let wire = serde_json::to_value(set.descriptor).unwrap();
+            assert_eq!(wire["call_key"], "5b9fb962/call_probe_1");
+            match carrier {
+                Some(carrier) => assert_eq!(wire["call_carrier"], carrier),
+                None => assert!(wire.get("call_carrier").is_none()),
+            }
+        }
+    }
 
     fn view(covers_through: u64, ranges: serde_json::Value) -> CompactionView {
         serde_json::from_value(json!({
