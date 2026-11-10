@@ -1919,6 +1919,22 @@ impl Reader<'_> {
         crate::serve::send_status_reply(outcome, &own_run, || baseline)
     }
 
+    /// What became of the send `send_id` whose own run id is `own_run`, as a keyed retry of it
+    /// is answered: the outcome `send.status` reads for it, from the same records. `None` when
+    /// the session holds no such send. With `legacy_steers`, a steer sent under `send_id`
+    /// answers for it.
+    pub(crate) async fn recorded_send_outcome<B: SessionBackend>(
+        &self,
+        session: &Session<B>,
+        own_run: &RunId,
+        send_id: &str,
+        legacy_steers: bool,
+    ) -> Result<Option<crate::actor::SendOutcome>, StatusError> {
+        let lookup = SendLookup { session };
+        self.send_outcome(session, &lookup, own_run, send_id, legacy_steers)
+            .await
+    }
+
     /// The recorded fate of the send `send_id` whose own run id is `own_run`, as
     /// `send_fate::recorded_send_outcome` reads it from today's records. `None` when the session
     /// holds no such send.
