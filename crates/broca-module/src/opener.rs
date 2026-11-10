@@ -24,7 +24,6 @@ use crate::registry::{
 
 /// Opens a lineage with a real lease + session WAL writer + the configured executor.
 pub struct DefaultOpener<L: LeaseStore, W: WalStore> {
-    readers: Option<Arc<ActorReadSources>>,
     projection_fences: std::sync::Mutex<
         std::collections::HashMap<LineageKey, std::sync::Weak<tokio::sync::Mutex<()>>>,
     >,
@@ -54,13 +53,6 @@ pub struct DefaultOpener<L: LeaseStore, W: WalStore> {
     test_fs: Option<Arc<dyn broca_wal::fs_ops::FsOps>>,
     #[cfg(feature = "test-clock")]
     ride_writer_for_test: bool,
-}
-
-/// Boot-selected read capabilities. Recovery still opens the writer and syncs
-/// the recovered WAL prefix once, before attaching readers to its actor and fanout.
-pub struct ActorReadSources {
-    pub admission: Arc<dyn broca_core::context::AdmissionReader>,
-    pub episodes: Arc<crate::registry::EpisodeReadSource>,
 }
 
 /// [`DefaultOpener::with_lease_domain`] refused a domain that does not acquire in the
@@ -140,7 +132,6 @@ impl<W: WalStore> DefaultOpener<FileLeaseStore, W> {
 impl<L: LeaseStore, W: WalStore> DefaultOpener<L, W> {
     pub fn new(lease_store: Arc<L>, wal_store: Arc<W>, executor: Arc<dyn RunExecutor>) -> Self {
         Self {
-            readers: None,
             projection_fences: Default::default(),
             lease_store,
             wal_store,
@@ -170,11 +161,6 @@ impl<L: LeaseStore, W: WalStore> DefaultOpener<L, W> {
     /// the deployment key loads. Until then those sessions are refused `key_unavailable`.
     pub fn with_store_slot(mut self, slot: Arc<crate::store_open::StoreSlot>) -> Self {
         self.store = Some(slot);
-        self
-    }
-
-    pub fn with_readers(mut self, readers: Arc<ActorReadSources>) -> Self {
-        self.readers = Some(readers);
         self
     }
 
@@ -480,12 +466,20 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> DefaultOpener<L, W> {
                         return Err(OpenError::LeaseHeld(key.session.clone()));
                     }
                     let deleting = if let Some(service) = registry.retention_service() {
-                        let session = key.clone();
-                        tokio::task::spawn_blocking(move || service.expired_typed(&session, None))
+                        // Retention deleting this session's expired copy in the new storage
+                        // holds the lease as today's deletion does; the open waits for it alike.
+                        if service.store_deletion_in_flight(key) {
+                            true
+                        } else {
+                            let session = key.clone();
+                            tokio::task::spawn_blocking(move || {
+                                service.expired_typed(&session, None)
+                            })
                             .await
                             .map_err(|error| OpenError::Open(error.to_string()))?
                             .map_err(OpenError::from_retention)?
                             .is_some()
+                        }
                     } else {
                         false
                     };
@@ -733,11 +727,6 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> DefaultOpener<L, W> {
             key.clone(),
             self.executor.source_warm_enabled(),
         );
-        let fanout = if let Some(readers) = &self.readers {
-            fanout.with_episode_source(readers.episodes.clone())
-        } else {
-            fanout
-        };
 
         // 3. Open + recover + prove the SESSION WAL away from the async runtime, then spawn its
         //    writer with the fan-out observer. The lease moves through that blocking operation so
@@ -841,25 +830,6 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> DefaultOpener<L, W> {
             }
         }
         let writer = Arc::new(writer);
-
-        if let Some(readers) = &self.readers {
-            return Ok(LineageActor::spawn_with_readers(
-                key.clone(),
-                gen,
-                lease,
-                writer,
-                self.executor.clone(),
-                self.wal_store.clone(),
-                registry,
-                self.idle_ttl,
-                fanout,
-                self.run_index.clone(),
-                self.materialized_store.clone(),
-                self.export_index.clone(),
-                self.charge_basis_resolver.clone(),
-                Some(readers.admission.clone()),
-            ));
-        }
 
         // 4. Start the actor, which owns the writer + fan-out (and a bare lease, if any)
         //    until close.

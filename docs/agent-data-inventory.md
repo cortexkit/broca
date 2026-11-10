@@ -58,13 +58,10 @@ route's current folder. Expired reads keep `expired`; move fences keep
 `session_moving` and `session_moved`. A send after completed expiry can still
 start a fresh lineage.
 
-The format-selected `SessionAddressResolver` must implement this log-state check;
-there is no default that can silently bypass it. Both stores use one shared
-filesystem-first classifier. A content-bearing live log returns before any
-inventory database access. Legacy SqliteStore evidence is unchanged. On format-2
-roots, OverhaulDb loads its own indexed session/run observations and independent
-retention, removal and imported-run evidence from `broca.db`; its identity-only
-`session_identity` rows remain reservations, not content. SQL or schema failures,
+The `SessionAddressResolver` must implement this log-state check;
+there is no default that can silently bypass it. The filesystem-first classifier
+returns for a content-bearing live log before any inventory database access.
+SqliteStore's identity-only rows remain reservations, not content. SQL or schema failures,
 or content hints without a usable run/lineage proof, return errors rather than
 certifying an available or new session. A fallible presence probe retains typed
 WAL errors, so temporary I/O keeps its original cause and transient class rather

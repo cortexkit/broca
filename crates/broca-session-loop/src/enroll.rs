@@ -273,11 +273,12 @@ async fn run_sender<W: Writer>(
     Ok(sender)
 }
 
-/// `prompt`, each of whose messages is stamped with its 0-based position in the session,
-/// without the global system messages an enrollment suppressed, as a session on the contract
-/// never holds them in its transcript. Done before the prompt is lined up with the entries, which
-/// serve each such message with no parts: a render either leaves those entries out too or puts
-/// an empty message back in the prompt's copy at each one's place, which renders nothing.
+/// `prompt`, each of whose messages is stamped with its 0-based position in the session, without
+/// the messages at the positions of the global system messages an enrollment suppressed, as a
+/// session on the contract never sends them. A request's stored prompt holds an empty placeholder
+/// at each, lined up with the entries, which serve each such message with no parts
+/// (`compaction::prompt::contract_prompt`); a render through a view's plan renders those as
+/// nothing, while a render that copies the stored prompt takes them out with this.
 pub fn without_suppressed(prompt: &mut Vec<Message>, overlay: &EnrollmentOverlay) {
     prompt.retain(|message| {
         !message

@@ -111,24 +111,6 @@ impl EnrollmentOverlay {
             None => entries,
         }
     }
-
-    /// `entries` as [`EnrollmentOverlay::serve`] serves them, without the suppressed global
-    /// system messages: the entries of a request's prompt that leaves those messages out and
-    /// puts the run's system text above the conversation in their place, one entry per prompt
-    /// message.
-    pub fn serve_unsuppressed(
-        overlay: Option<&Self>,
-        entries: Vec<StoredEntry>,
-    ) -> Vec<StoredEntry> {
-        match overlay {
-            Some(overlay) => entries
-                .into_iter()
-                .filter(|entry| !overlay.suppressed(entry.ordinal))
-                .map(|entry| overlay.apply(entry))
-                .collect(),
-            None => entries,
-        }
-    }
 }
 
 /// The name of the enrollment object `overlay` points at.

@@ -14,12 +14,13 @@ description = "broca WAL: the intent-log source of truth — framed records (len
 test-known-feature = []
 # Test-only hooks for dependent crates to observe file/directory syncs during
 # session moves and inject I/O failures at those filesystem boundaries.
-test-io-trace = []
+test-io-trace = ["broca-records/test-io-trace"]
 # Test-only filesystem backend override for the power-loss harness. Artifacts built
 # with this feature carry a marker that staging and placement refuse.
-fs-override = []
+fs-override = ["broca-records/fs-override"]
 
 [dependencies]
+broca-records = { path = "../broca-records" }
 broca-owner-only.workspace = true
 broca-protocol = { path = "../broca-protocol" }
 broca-wal-reader = { path = "../broca-wal-reader", version = "0.1.0" }
@@ -30,6 +31,7 @@ sha2.workspace = true
 getrandom = "0.3"
 
 [dev-dependencies]
+broca-records = { path = "../broca-records", features = ["test-io-trace"] }
 broca-owner-only = { workspace = true, features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util"] }
 # Test scratch paths live under one owned, self-reclaiming root; see that crate.

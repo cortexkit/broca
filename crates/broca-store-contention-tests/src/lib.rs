@@ -15,6 +15,7 @@ mod vfs;
 struct SqliteStore {
     conn: std::sync::Mutex<rusqlite::Connection>,
 }
+use SqliteStore as SessionInventory;
 type StoreError = Box<dyn std::error::Error + Send + Sync>;
 const STORE_BUSY_TIMEOUT: std::time::Duration = busy::STORE_BUSY_TIMEOUT;
 #[path = "../../broca-store/src/session_refs/write.rs"]

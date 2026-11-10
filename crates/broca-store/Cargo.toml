@@ -10,8 +10,6 @@ description = "broca materialized store: SqliteStore (the MaterializedStore impl
 [features]
 default = []
 test-conformance = []
-# Non-shipping process-kill seam after descriptor sync, before database commit.
-publication-faults = []
 
 [dependencies]
 getrandom = "0.3"

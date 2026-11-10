@@ -159,10 +159,9 @@ then releases every requested or answered admission id. An unknown outcome keeps
 debt owed. A held, content-free row is removed atomically with release, so an old hold
 cannot free a new same-id incarnation. Settled routing debt never extends content TTL.
 
-Overhaul (`broca-state/2`) roots keep the existing destructive-retention fence: routing cleanup still
-drains reports, releases, pending admissions and tombstones, but it does not scrub
-content or run the ordinary sweep. Live snapshots and claims refuse expired routed
-rows on **every** root, so cleanup timing never exposes content past retention.
+The daemon refuses roots marked `broca-state/2`; the removed staging format has no
+System One service. Live snapshots and claims on supported roots refuse expired
+routed rows, so cleanup timing never exposes content past retention.
 
 `llm.classify/v1` results include the model used, as required by llm-tools 0.3.0.
 That tool still requires a pin to identify the provider before checking consent

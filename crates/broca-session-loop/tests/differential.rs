@@ -426,6 +426,7 @@ fn tool(name: &str, mode: ExecutionMode) -> Tool {
 struct Spy {
     inner: StubToolPlane,
     log: Arc<Mutex<Vec<String>>>,
+    manifest: Mutex<Option<ToolManifest>>,
     keys: Mutex<Vec<(ToolCallId, String)>>,
     held: Arc<HeldScript>,
     /// The caller's cancel, which the `hold_cancel` tool's call triggers once its provider holds
@@ -536,6 +537,7 @@ impl Spy {
                 ended: Mutex::new(None),
             }),
             log,
+            manifest: Mutex::new(None),
             keys: Mutex::new(Vec::new()),
             cancel_on_hold: Mutex::new(None),
         }
@@ -562,6 +564,24 @@ impl Spy {
 
     fn note(&self, entry: String) {
         self.log.lock().unwrap().push(entry);
+    }
+
+    // Observe the provider and preset at dispatch from the ToolManifest received at batch start.
+    // Reading Scenario.manifest instead would hide a loop that omitted the plan's presets.
+    fn note_route(&self, call: &ToolCall) {
+        let manifest = self.manifest.lock().unwrap();
+        if let Some(manifest) = manifest.as_ref() {
+            if let Some(provider) = manifest
+                .get(&call.tool_name)
+                .and_then(|tool| tool.module.as_deref())
+            {
+                self.note(format!(
+                    "dispatch_route {} provider={provider:?} preset={:?}",
+                    call.tool_call_id.0,
+                    manifest.provider_preset(provider)
+                ));
+            }
+        }
     }
 
     /// `key#n` for `key`, numbered by first use; remembers it for `call`.
@@ -600,6 +620,7 @@ impl ToolPlane for Spy {
         calls: &[ToolCall],
         manifest: &ToolManifest,
     ) -> Result<(), ToolPlaneError> {
+        *self.manifest.lock().unwrap() = Some(manifest.clone());
         self.note(format!(
             "batch_started {:?}{}",
             ids(calls),
@@ -615,6 +636,7 @@ impl ToolPlane for Spy {
         manifest: &ToolManifest,
         guard: &ToolOpenGuard,
     ) -> Result<(), ToolPlaneError> {
+        *self.manifest.lock().unwrap() = Some(manifest.clone());
         self.note(format!(
             "batch_started_guarded {:?}{}",
             ids(calls),
@@ -650,6 +672,7 @@ impl ToolPlane for Spy {
     }
 
     async fn dispatch(&self, ctx: &BatchCtx, call: &ToolCall) -> DispatchResult {
+        self.note_route(call);
         self.note(format!("dispatch {} {}", call.tool_call_id.0, call.input));
         self.inner.dispatch(ctx, call).await
     }
@@ -660,6 +683,7 @@ impl ToolPlane for Spy {
         call: &ToolCall,
         key: DispatchKey<'_>,
     ) -> DispatchResult {
+        self.note_route(call);
         let token = self.key(&call.tool_call_id, key.call_key);
         self.note(format!(
             "dispatch_keyed {} {} {token} recorder={}",
@@ -677,6 +701,7 @@ impl ToolPlane for Spy {
         key: Option<DispatchKey<'_>>,
         guard: &ToolOpenGuard,
     ) -> DispatchResult {
+        self.note_route(call);
         let keyed = key.map(|key| {
             format!(
                 "{} recorder={}",
@@ -6323,6 +6348,63 @@ async fn every_cut_of_a_run_admitted_with_a_fetch_plan_resumes_alike() {
     compare_every_cut(planned_scenario()).await;
 }
 
+async fn assert_store_dispatch_preset(plan: Option<Value>, expected: Option<&str>) {
+    let route = format!("dispatch_route c1 provider=\"provider\" preset={expected:?}");
+    let expected_route = format!("{route:?}");
+    let mut scenario = planned_scenario();
+    scenario.tools[0].module = Some("provider".into());
+    scenario.manifest = plan.map(|plan| {
+        let mut manifest = planned_manifest(&scenario.tools);
+        Arc::make_mut(&mut manifest).plan =
+            broca_wal::OpaqueJson::from_json_text(plan.to_string()).unwrap();
+        manifest
+    });
+    for layout in LAYOUTS {
+        LAYOUT
+            .scope(
+                layout,
+                Box::pin(async {
+                    with_each_writer(|| {
+                        Box::pin(async {
+                            let outcome = new_loop(&scenario).await;
+                            let routes: Vec<_> = outcome
+                                .calls
+                                .iter()
+                                .filter(|entry| entry.contains("dispatch_route "))
+                                .collect();
+                            assert_eq!(routes, [&expected_route]);
+                        })
+                    })
+                    .await;
+                }),
+            )
+            .await;
+    }
+}
+
+#[tokio::test]
+async fn store_dispatch_uses_the_frozen_provider_preset() {
+    assert_store_dispatch_preset(
+        Some(json!({"tool_items": [{"provider": "provider", "preset": "head"}]})),
+        Some("head"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn store_dispatch_without_a_plan_preset_stays_presetless() {
+    assert_store_dispatch_preset(
+        Some(json!({"tool_items": [{"provider": "provider"}]})),
+        None,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn store_dispatch_without_a_plan_stays_presetless() {
+    assert_store_dispatch_preset(None, None).await;
+}
+
 /// The hook provider both loops call, keyed by the tool a call names: the mutate hook rewrites
 /// a `mutated` call's input to `{"path":"mutated"}`, the validate hook denies a `vetoed` call,
 /// the provider is unavailable for a `hook_down` call, and every other call passes.
@@ -7491,20 +7573,26 @@ async fn a_compacted_step_whose_cap_would_pass_the_context_limit_is_lowered() {
 
 /// A new-loop run whose requests can't be rendered until it waited for something (as a store
 /// run's media renderer renders nothing until its run waited for the session's media) waits
-/// before its compaction estimate and its output cap's estimate render the step's request, and
-/// makes the same run as today's loop.
+/// before its first step's compaction estimate renders the step's request, and makes the same
+/// run as today's loop.
 #[tokio::test]
 async fn a_compacted_step_waits_for_its_request_to_be_ready_before_estimating_it() {
-    let script = CompactionScript {
-        context_limit: lowering().context_limit,
-        rides: Vec::new(),
-    };
     READY
         .scope(
             Some(ReadyScript::Ready),
-            OUTPUT.scope(
-                Some(lowering()),
-                compare_compacted(measured_scenario(), script),
+            compare_compacted(
+                compacted_scenario(vec![
+                    answer(
+                        "a1",
+                        vec![call("c1", "read", json!({"path": "a"}))],
+                        FinishReason::ToolCalls,
+                    ),
+                    text_step("a2", "done"),
+                ]),
+                CompactionScript {
+                    context_limit: 100_000,
+                    rides: Vec::new(),
+                },
             ),
         )
         .await;

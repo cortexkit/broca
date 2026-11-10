@@ -130,7 +130,15 @@ impl SqliteStore {
         let mut store = Self::open_read_only(path)?;
         let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
         crate::busy::configure_writer_connection(&conn)?;
-        store.conn = std::sync::Mutex::new(conn);
+        store.conn = std::sync::Arc::new(std::sync::Mutex::new(conn));
+        store.export = crate::ExportStore::from_shared(
+            std::sync::Arc::clone(&store.conn),
+            (
+                store.source_instance_id().to_owned(),
+                store.source_epoch(),
+                store.high_water(),
+            ),
+        );
         Ok(store)
     }
 

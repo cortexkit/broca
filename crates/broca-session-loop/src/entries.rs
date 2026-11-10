@@ -1875,6 +1875,17 @@ pub fn push_rides(
     }
 }
 
+/// Takes out of `rides` what [`push_rides`] added for message `mid`'s delivered texts.
+pub fn forget_rides(
+    rides: &mut broca_core::compaction_v2::entries::RideEnvelopes,
+    mid: &str,
+    delivered: &[Delivered],
+) {
+    for delivered in delivered {
+        rides.forget(mid, &delivered.part.to_string());
+    }
+}
+
 /// Renders each ride of the window after the result that carries it, as today's loop renders a
 /// ride recorded with its envelope: through the runner's own ride rules
 /// (`broca_core::delivery_order::append_ride`), never joined here. `prompt` holds the window's

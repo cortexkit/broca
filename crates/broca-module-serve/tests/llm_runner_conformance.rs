@@ -7879,16 +7879,12 @@ async fn conformance_subject_declares_the_served_finish_reason_group() {
 
 #[test]
 fn assertion_address_lookup_does_not_contend_with_a_held_writer() {
-    for overhaul in [false, true] {
-        let root = broca_test_support::scratch_root()
-            .join(format!("assertion-address-held-writer-{overhaul}"));
+    {
+        let root = broca_test_support::scratch_root().join("assertion-address-held-writer-legacy");
         std::fs::create_dir_all(&root).unwrap();
-        if overhaul {
-            std::fs::write(root.join("state-format"), b"broca-state/2\n").unwrap();
-        }
         let seed = broca_protocol::BindIdentity::new(root.join("legacy"), "harness", "session");
         broca_test_support::register_legacy_session(&root, &seed).unwrap();
-        let database = root.join(if overhaul { "broca.db" } else { "run-index.db" });
+        let database = root.join("run-index.db");
         let blocker = rusqlite::Connection::open(database).unwrap();
         blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
         let claim = broca_protocol::BindIdentity::new(root.join("route"), "harness", "session");

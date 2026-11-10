@@ -17,7 +17,8 @@
 //! - retracting a queued send before it runs;
 //! - a run paused for sign-in, resumed by a retry of its own send;
 //! - the session's status;
-//! - cancelling the active run, now or at its next step boundary;
+//! - cancelling the active run, now or at its next step boundary, by its owner, and at once by a
+//!   module the session's plan grants `interrupt` (see `scopes`);
 //! - on opening the session, its unfinished run: a running one is ended `Interrupted`, since
 //!   only a process that ended without stopping it leaves one, and with no unfinished run the
 //!   queue drains;
@@ -36,7 +37,11 @@
 //! - a send's attachments, staged from its uploads and stored as the session's own objects
 //!   before the record that names them: a send's run start, its queued record or its steer;
 //! - `session.warm` on an idle session, re-sending the request its loop would send next (see
-//!   `warm`).
+//!   `warm`);
+//! - a send under an agent-run scope, and a send reopening the session's scope at a later epoch,
+//!   admitted by today's scope rules (see `scopes`);
+//! - deleting what the session's seals replaced once the grace period is over, at the first
+//!   idle moment after it opens the session and after each seal (see `collect_unreferenced`).
 //!
 //! Every other command, and every send that needs an admission rule not built here yet, is
 //! refused by name with nothing written. Today's actor is the reference for each rule still to
@@ -133,10 +138,20 @@ pub struct StoreActor<B: SessionBackend> {
     registry: Option<crate::registry::RegistryHandle>,
     /// The warm the executor is sending, if any.
     warm: Option<warm::PendingStoreWarm>,
+    /// The scope the ordered send being admitted was admitted under, set only while it is: the
+    /// run it starts at once, if it does, records it (see `drained_start`).
+    ordered_scope: Option<broca_protocol::SessionScope>,
     /// The seq the next record would have taken when this actor created the session, set only
     /// when it did. A session it created that still has it when the actor closes holds nothing
     /// anyone sent, and is deleted (see [`StoreActor::created_here`]).
     created: Option<u64>,
+    /// Set when the session may hold deletions that have come due: when the actor opens it and
+    /// after each seal. They run at the actor's next idle moment, or as it closes (see
+    /// [`StoreActor::collect_unreferenced`]).
+    collect_due: bool,
+    /// The wall clock the session's deletions come due by, in milliseconds since the epoch: the
+    /// clock its runs stamp their seals with.
+    now_ms: Arc<dyn Fn() -> u64 + Send + Sync>,
 }
 
 /// How an actor lives in the module's registry. Tests serve an actor without one.
@@ -301,6 +316,10 @@ enum Event {
     Warmed(
         Result<Result<broca_core::WarmSent, crate::executor::WarmError>, tokio::task::JoinError>,
     ),
+    /// The session's idle deadline passed with no run active and no warm being sent.
+    IdleDeadline,
+    /// The session is idle and may hold deletions that have come due.
+    Collect,
 }
 
 /// The media fold build's end, or never when none is building.
@@ -344,8 +363,19 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             media_build_gate: None,
             registry: None,
             warm: None,
+            ordered_scope: None,
             created: None,
+            collect_due: false,
+            now_ms: Arc::new(|| broca_core::run::epoch_millis().unwrap_or(0)),
         }
+    }
+
+    /// Reads the time the session's deletions come due by from `now_ms`, in place of the wall
+    /// clock.
+    #[cfg(test)]
+    pub(crate) fn with_clock(mut self, now_ms: Arc<dyn Fn() -> u64 + Send + Sync>) -> Self {
+        self.now_ms = now_ms;
+        self
     }
 
     /// Marks the session as one this actor created. If the actor closes with nothing appended
@@ -425,6 +455,29 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         };
         fanout.attach(&self.session, from, sink);
         crate::actor::SubscribeOutcome::Attached
+    }
+
+    /// What keeps the session from closing idle, under the names today's actor gives the
+    /// registry: a run, a warm being sent, or a subscriber still attached. A subscriber keeps a
+    /// session open for as long as it holds its stream, as on today's storage, so a caller
+    /// watching an idle session isn't cut off at its idle deadline; the first idle tick after
+    /// the last one has gone closes it. Empty when the session may close.
+    fn idle_holds(&mut self) -> Vec<&'static str> {
+        let mut holds = Vec::new();
+        if self.run.is_some() {
+            holds.push("active_run");
+        }
+        if self.warm.is_some() {
+            holds.push("manual_warm");
+        }
+        if self
+            .fanout
+            .as_mut()
+            .is_some_and(crate::store_fanout::StoreFanout::has_live_subscribers)
+        {
+            holds.push("live_subscriber");
+        }
+        holds
     }
 
     /// The actor serves finished runs' facts from `settled`, and keeps the ones it reads there,
@@ -563,20 +616,25 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         Ok(appended)
     }
 
-    /// Serves `commands` until the session goes away: when the channel closes, or when it is
-    /// idle at an idle tick. Returns the session, for whoever closes it. A run still running
-    /// when the channel closes is ended as a module stop ends it.
+    /// Serves `commands` until the session goes away: when the channel closes, or at an idle
+    /// tick that finds it idle with no subscriber attached. Returns the session, for whoever
+    /// closes it. A run still running when the channel closes is ended as a module stop ends it.
     pub async fn serve(mut self, commands: mpsc::UnboundedReceiver<LineageCmd>) -> Session<B> {
         let mut commands = Commands::from(commands);
-        self.serve_until_exit(&mut commands, None, None, None).await;
+        let exit = self
+            .serve_until_exit(&mut commands, None, None, None, None)
+            .await;
         self.stop_for_shutdown().await;
+        self.collect_on_exit(&exit).await;
         self.session
     }
 
     /// Serves the session as the module's actor for it, until it closes idle or the module
-    /// stops, then gives its registry slot up. The order matches today's actor: the session is
-    /// closed and the executor told before the lease goes, and only then does the slot read
-    /// closed, so a reopen never finds another writer still on the session.
+    /// stops, then gives its registry slot up. A subscriber attached to the session keeps it from
+    /// closing idle, as in today's actor; a module stop still closes it, ending every
+    /// subscription. The order matches today's actor: the session is closed and the executor
+    /// told before the lease goes, and only then does the slot read closed, so a reopen never
+    /// finds another writer still on the session.
     pub async fn serve_in_registry(mut self, commands: impl Into<Commands>, life: Lifecycle) {
         let mut commands = commands.into();
         let seal = life.registry.seal_signal();
@@ -587,6 +645,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 Some(&seal),
                 Some(life.idle_ttl),
                 Some(&life.run_in_flight),
+                Some((&life.registry, life.gen)),
             )
             .await;
         let close = match exit {
@@ -601,6 +660,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             }
         }
         self.stop_for_shutdown().await;
+        self.collect_on_exit(&exit).await;
         life.run_in_flight
             .store(0, std::sync::atomic::Ordering::SeqCst);
         let _ = tokio::time::timeout(
@@ -633,20 +693,30 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     }
 
     /// The command loop. With `seal`, the module's stop ends it; with `idle_ttl`, the session's
-    /// idle deadline does; `gauge` reads whether a run is running.
+    /// idle deadline does, unless something holds the session open then (see
+    /// [`StoreActor::idle_holds`]), and the deadline is set again; `gauge` reads whether a run
+    /// is running. `slot`, the registry and the generation of the slot this actor serves, is
+    /// told what holds the session open whenever that changes.
     async fn serve_until_exit(
         &mut self,
         commands: &mut Commands,
         seal: Option<&CancellationToken>,
         idle_ttl: Option<std::time::Duration>,
         gauge: Option<&Arc<std::sync::atomic::AtomicU64>>,
+        slot: Option<(&crate::registry::RegistryHandle, u64)>,
     ) -> Exit {
         let never = CancellationToken::new();
         let seal = seal.unwrap_or(&never);
         self.seal = seal.clone();
         self.recover().await;
+        // Deletions that came due while the session was closed run once the actor is idle, so
+        // they never hold up a command or a run.
+        self.collect_due = true;
         let idle_after = |now: tokio::time::Instant| idle_ttl.map(|ttl| now + ttl);
         let mut idle_deadline = idle_after(tokio::time::Instant::now());
+        // What the registry was last told holds the session open; `None` until it took a note,
+        // which it refuses until this actor's slot reads open.
+        let mut noted: Option<Vec<&'static str>> = None;
         loop {
             if let Some(gauge) = gauge {
                 gauge.store(
@@ -654,7 +724,16 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                     std::sync::atomic::Ordering::SeqCst,
                 );
             }
+            if let Some((registry, gen)) = slot {
+                let holds = self.idle_holds();
+                if noted.as_ref() != Some(&holds)
+                    && registry.note_idle_holds(&self.key, gen, holds.clone())
+                {
+                    noted = Some(holds);
+                }
+            }
             let built = media_built(&mut self.media_build);
+            let collect_due = self.collect_due;
             // A warm the executor is sending ends whatever else the actor waits on.
             let has_warm = self.warm.is_some();
             let warm_task = self.warm.as_mut().map(|pending| &mut pending.task);
@@ -683,15 +762,25 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                     result = warmed, if has_warm => Event::Warmed(result),
                     built = built => Event::MediaBuilt(built),
                     command = commands.recv() => Event::Command(command),
+                    // Only once no command is waiting: the session is idle.
+                    () = std::future::ready(()), if collect_due => Event::Collect,
                     _ = async {
                         match idle_deadline {
                             Some(deadline) => tokio::time::sleep_until(deadline).await,
                             None => std::future::pending().await,
                         }
-                    }, if !has_warm => return Exit::Idle,
+                    }, if !has_warm => Event::IdleDeadline,
                 },
             };
             match event {
+                // A subscriber still attached keeps the session open: the next deadline closes
+                // it once every subscriber has gone.
+                Event::IdleDeadline => {
+                    if self.idle_holds().is_empty() {
+                        return Exit::Idle;
+                    }
+                    idle_deadline = idle_after(tokio::time::Instant::now());
+                }
                 Event::Request(Some(request)) => self.serve_request(request).await,
                 Event::Request(None) => {
                     if let Some(active) = self.run.as_mut() {
@@ -701,6 +790,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 Event::Done(end) => self.finish_run(end).await,
                 Event::MediaBuilt(built) => self.media_built(built).await,
                 Event::Warmed(result) => self.finish_warm(result).await,
+                Event::Collect => self.collect_unreferenced().await,
                 Event::Command(None) => return Exit::Closed,
                 Event::Command(Some(command)) => {
                     idle_deadline = idle_after(tokio::time::Instant::now());
@@ -715,6 +805,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
 
     /// Serves one write the active run asks for.
     async fn serve_request(&mut self, request: broca_session_loop::shared::Request) {
+        // A seal's own deletions come due a grace period after it, but earlier ones may be due.
+        let seals = matches!(request, broca_session_loop::shared::Request::Seal { .. });
         let active = self
             .run
             .as_mut()
@@ -736,6 +828,42 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         };
         active.link.serve(&mut writer, request).await;
         self.answer_admission();
+        if seals {
+            self.collect_due = true;
+        }
+    }
+
+    /// Deletes what the session's committed changes stopped naming, once it has gone unnamed for
+    /// the grace period (see `broca_session_store::session::collect`). With nothing due, which
+    /// is usual since a change's deletions come due a day after it, nothing is read or written.
+    /// The actor is the session's only writer, so no append or seal runs meanwhile.
+    async fn collect_unreferenced(&mut self) {
+        self.collect_due = false;
+        let now_ms = (self.now_ms)();
+        match self.session.collect(now_ms).await {
+            Ok(0) => {}
+            Ok(changes) => tracing::info!(
+                target: "broca.store_actor",
+                session = %self.key.session,
+                changes,
+                "deleted what the session's changes stopped naming",
+            ),
+            Err(error) => tracing::warn!(
+                target: "broca.store_actor",
+                session = %self.key.session,
+                error = ?error,
+                "what the session's changes stopped naming could not be deleted; the next open \
+                 or the store's collection sweep retries",
+            ),
+        }
+    }
+
+    /// Runs deletions still due when the actor stops serving, unless the module is stopping or
+    /// the session is about to be deleted whole.
+    async fn collect_on_exit(&mut self, exit: &Exit) {
+        if self.collect_due && !matches!(exit, Exit::Stop) && !self.created_and_untouched() {
+            self.collect_unreferenced().await;
+        }
     }
 
     /// Serves the active run, and nothing else, until no run is active.
@@ -766,7 +894,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 }
                 Event::Done(end) => return self.finish_run(end).await,
                 Event::MediaBuilt(built) => self.media_built(built).await,
-                Event::Command(_) | Event::Warmed(_) => unreachable!("no command is read here"),
+                Event::Command(_) | Event::Warmed(_) | Event::IdleDeadline | Event::Collect => {
+                    unreachable!("no command is read here, and no idle deadline is waited on")
+                }
             }
         }
     }
@@ -989,7 +1119,20 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 };
                 // As in today's actor, the owner and scope check comes first: a send the session's
                 // history refuses is refused before any retry is answered.
-                let scope = match self.send_scope(&run_id, &request, queue_starts_runs).await {
+                let planned_tools = plan
+                    .as_ref()
+                    .and_then(|plan| plan.manifest.as_ref())
+                    .is_some_and(|manifest| !manifest.tools.is_empty());
+                let scope = match self
+                    .send_scope(
+                        &run_id,
+                        &request,
+                        delivery,
+                        planned_tools,
+                        queue_starts_runs,
+                    )
+                    .await
+                {
                     Ok(scope) => scope,
                     Err(outcome) => {
                         let _ = reply.send(outcome);
@@ -1301,7 +1444,12 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                     message_marks,
                 };
                 if let Some(order) = order {
+                    // A run the ordered send starts at once records the scope the send was
+                    // admitted under, as today's actor starts that run under the send's own route,
+                    // so a scope the send freezes or reopens is recorded on its start.
+                    self.ordered_scope.clone_from(&start.scope);
                     self.queue_ordered(start, order, ordered_by, reply).await;
+                    self.ordered_scope = None;
                 } else if steering && self.run.is_some() {
                     let outcome = self.steer(start, stop_sequences_named, &mut reply).await;
                     let _ = reply.send(outcome);
@@ -1379,6 +1527,19 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 let _ = reply.send(self.cancel(&run_id, at).await);
                 false
             }
+            LineageCmd::CancelFrom {
+                run_id,
+                at,
+                principal,
+                scope,
+                reply,
+            } => {
+                let _ = reply.send(
+                    self.cancel_from(&run_id, at, principal.as_ref(), &scope)
+                        .await,
+                );
+                false
+            }
             LineageCmd::Retract {
                 submission_id,
                 reply,
@@ -1419,7 +1580,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 let _ = reply.send(Ok(None));
                 false
             }
-            LineageCmd::IdleTick => self.run.is_none() && self.warm.is_none(),
+            LineageCmd::IdleTick => self.idle_holds().is_empty(),
             LineageCmd::Warm { lineage_id, reply } => {
                 if self.stopping {
                     let _ = reply.send(crate::actor::WarmOutcome::Reopen);
@@ -2146,15 +2307,28 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     /// caller's send meets the scope reservation too, so only the scope that reserved the
     /// session's address may start it; an unreadable reservation refuses the send as transient.
     ///
-    /// Reopening a scope at a later epoch, and agent-run scopes, are refused by name: today's
-    /// actor checks more for each (whether the run can start now; for an agent run, that the
-    /// send declares no tools of its own).
+    /// Before any of that, a send under an agent-run scope that declares tools, of its own or
+    /// through its plan (`planned_tools`), is refused, since an agent run is model-only. A send
+    /// that reopens the session's scope at a later epoch records that epoch, and is admitted only
+    /// when its run starts at once (see `scopes`).
     async fn send_scope(
         &self,
         run_id: &RunId,
         request: &SubmissionRequest,
+        delivery: broca_protocol::Delivery,
+        planned_tools: bool,
         queue_starts_runs: bool,
     ) -> Result<Option<broca_protocol::SessionScope>, SendOutcome> {
+        if let Some(refused) = scopes::agent_run_tools(
+            &request.scope,
+            request
+                .tools
+                .as_ref()
+                .is_some_and(|tools| !tools.is_empty()),
+            planned_tools,
+        ) {
+            return Err(refused);
+        }
         let mut ownership = self.ownership().map_err(SendOutcome::Transient)?;
         if request.scope != broca_protocol::SendScope::Internal {
             ownership.reservation = self
@@ -2162,18 +2336,24 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 .await
                 .map_err(SendOutcome::Transient)?;
         }
-        if let broca_protocol::SendScope::Stamped(bind) = &request.scope {
-            if bind.scope.run_id.is_some() {
-                return Err(SendOutcome::Error(unserved(
-                    "a send under an agent-run scope",
-                )));
-            }
-        }
         match broca_core::decide_scope(&ownership, request.principal.as_ref(), &request.scope) {
             Err(refusal) => Err(SendOutcome::ScopeRefused(refusal)),
-            Ok(broca_core::ScopeDecision::Reopen(_)) => Err(SendOutcome::Error(unserved(
-                "reopening the session's scope at a later epoch",
-            ))),
+            Ok(broca_core::ScopeDecision::Reopen(reopened)) => {
+                let frozen = ownership
+                    .scope
+                    .as_ref()
+                    .expect("only a scoped session can be reopened");
+                match self.reopen_cannot_start_now(
+                    run_id,
+                    delivery,
+                    frozen,
+                    request,
+                    queue_starts_runs,
+                ) {
+                    Some(refused) => Err(refused),
+                    None => Ok(Some(reopened)),
+                }
+            }
             Ok(decision @ broca_core::ScopeDecision::Freeze(_)) => {
                 if let Some(active) = self.run.as_ref().filter(|active| active.run_id != *run_id) {
                     return Err(SendOutcome::ScopeFreezeBusy {
@@ -2423,6 +2603,18 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             .as_ref()
             .and_then(|run| run.start.as_ref())
             .is_some_and(|start| start.run_id == active.run_id.0);
+        // A run whose loop failed after its start wrote no end. Left so, the session would hold
+        // a run nothing runs: no queued send drains behind it, and a new send's run is refused.
+        // It ends here with the error instead, unless it paused, which a later retry resumes.
+        let loop_failed = match &result {
+            Err(StoreRunError::Loop(error)) if started => {
+                let unfinished = self.session.operations().run.as_ref().is_some_and(|run| {
+                    run.run_id == active.run_id.0 && run.finished.is_none() && run.paused.is_none()
+                });
+                unfinished.then(|| format!("{error:?}"))
+            }
+            _ => None,
+        };
         if let (Some(submission), false, Err(error)) = (&active.submission, started, &result) {
             let error = match error {
                 StoreRunError::Admission(error) => error.clone(),
@@ -2467,10 +2659,54 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 "a run on the new storage stopped without a recorded end",
             );
         }
+        if let Some(message) = loop_failed {
+            self.end_failed_run(&active.run_id, message).await;
+        }
         // The run's end, if it wrote one, is durable now: a run's last batch ends with a
         // barrier, and the run's task has returned.
         self.bill_owed().await;
         self.drain().await;
+    }
+
+    /// Ends the session's latest run `run_id`, whose loop stopped with `message` without writing
+    /// an end, as the loop ends a run with an error: a permanent error coded `runner_error`,
+    /// since sending the run again would meet the same fault. An end that can't be written leaves
+    /// the run as it was, logged.
+    async fn end_failed_run(&mut self, run_id: &RunId, message: String) {
+        let error = broca_protocol::ProviderError {
+            class: broca_protocol::ErrorClass::Permanent,
+            message,
+            provider_code: Some("runner_error".into()),
+            provider_details: None,
+            provider_subcode: None,
+            refusal: None,
+            status: None,
+            retry_after_secs: None,
+            resets_at_ms: None,
+            resets_at_source: None,
+            limit_window: None,
+            account_ref: None,
+            credential_id: None,
+            affordable_max_tokens: None,
+        };
+        let now = broca_core::run::epoch_millis().unwrap_or(0);
+        if let Err(error) = broca_session_loop::run::end_run_with_error(
+            &mut self.durable(),
+            &run_id.0,
+            broca_protocol::RunFinishReason::Error,
+            &error,
+            now,
+        )
+        .await
+        {
+            tracing::error!(
+                target: "broca.store_actor",
+                session = %self.key.session,
+                run_id = %run_id.0,
+                error = ?error,
+                "the end of a run whose loop failed could not be written",
+            );
+        }
     }
 
     /// Ends a queued send whose run was refused at admission: its retraction carries the
@@ -2674,8 +2910,13 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             sent_by: principal("sent_by")?,
             request,
             // A drained send is broca's own, so it carries the scope the session already froze,
-            // as today's drain (`SendScope::Internal`) carries it.
-            scope: self.ownership()?.scope,
+            // as today's drain (`SendScope::Internal`) carries it. An ordered send its own
+            // admission drains carries the scope it was admitted under (`ordered_scope`).
+            scope: if own_admission {
+                self.ordered_scope.clone()
+            } else {
+                self.ownership()?.scope
+            },
             manifest: self.frozen_manifest()?,
             session_class: self.frozen_session_class(),
             prepared: Prepared::default(),
@@ -3502,11 +3743,6 @@ fn refuse(command: LineageCmd) {
                 broca_core::ImportError::Wal(unserved("an import")),
             ));
         }
-        LineageCmd::CancelFrom { reply, .. } => {
-            let _ = reply.send(CancelOutcome::Error(unserved(
-                "a cancel from a scoped route",
-            )));
-        }
         LineageCmd::RunState { reply, .. } => {
             let _ = reply.send(Err(unserved("run.status")));
         }
@@ -3542,6 +3778,7 @@ fn refuse(command: LineageCmd) {
         LineageCmd::Send { .. }
         | LineageCmd::Status { .. }
         | LineageCmd::Cancel { .. }
+        | LineageCmd::CancelFrom { .. }
         | LineageCmd::Retract { .. }
         | LineageCmd::SenderPolicy { .. }
         | LineageCmd::SessionRefresh { .. }
@@ -3554,10 +3791,13 @@ fn refuse(command: LineageCmd) {
 mod apply_view;
 mod import;
 mod ordered;
+mod scopes;
 mod warm;
 
 #[cfg(test)]
 mod billing_tests;
+#[cfg(test)]
+mod collect_tests;
 #[cfg(test)]
 mod differential;
 #[cfg(test)]
@@ -3566,6 +3806,8 @@ mod entries_comparison;
 mod import_tests;
 #[cfg(test)]
 mod key_tests;
+#[cfg(test)]
+mod loop_error_tests;
 #[cfg(test)]
 mod media_wait_tests;
 #[cfg(test)]
@@ -3578,6 +3820,8 @@ mod reads_tests;
 mod status_tests;
 #[cfg(test)]
 mod subscribe_tests;
+#[cfg(test)]
+mod subscribed_heads_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

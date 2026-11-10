@@ -24,8 +24,15 @@ use broca_wal::WalRecord;
 use crate::run::{Admission, LoopError, Seams};
 use crate::writer::Writer;
 
+pub(crate) mod prompt;
 mod window;
 pub use window::WindowTranscript;
+
+#[cfg(test)]
+thread_local! {
+    /// How many entries this thread's compacted requests rendered rather than reused.
+    pub(crate) static RENDERED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// What a run whose plan names a compaction provider needs for its calls to that provider.
 pub struct Ctx {
@@ -281,10 +288,6 @@ pub struct Transcript {
     pub entries: Arc<Vec<cortexkit_role_compaction::read::Entry>>,
     /// The sealed messages put in front of the window's, for the stored prompt, with ordinals.
     pub sealed: Arc<Vec<(u64, broca_protocol::Message)>>,
-    /// Where, among `entries`, the window's global system messages that the session's
-    /// enrollment suppressed sit, in order. Each has an entry with no parts, while the request's
-    /// stored prompt leaves the message out (see [`with_suppressed`]).
-    pub suppressed: Vec<usize>,
     /// The ride envelopes of the entries' delivered texts, for rendering each ride.
     pub rides: Arc<v2::entries::RideEnvelopes>,
 }
@@ -549,30 +552,6 @@ fn with_sealed(
     opts
 }
 
-/// `prompt`, a request's stored prompt as [`with_sealed`] completes it, lined up with the
-/// transcript's entries for rendering: an empty global system message put back at each position
-/// where the transcript serves a message the session's enrollment suppressed. The prompt leaves
-/// those messages out, since the run's system text takes their place above the conversation,
-/// while the entries keep each at its ordinal with no parts. The render plan renders an entry
-/// with no parts as nothing, so what goes in its place is never rendered: the request's bytes are
-/// those of the prompt without it.
-fn with_suppressed<'p>(
-    prompt: &'p [broca_protocol::Message],
-    transcript: &Transcript,
-) -> std::borrow::Cow<'p, [broca_protocol::Message]> {
-    if transcript.suppressed.is_empty() {
-        return std::borrow::Cow::Borrowed(prompt);
-    }
-    let mut lined_up = prompt.to_vec();
-    for &position in &transcript.suppressed {
-        let mut placeholder =
-            broca_protocol::Message::new(broca_protocol::content::Role::System, Vec::new());
-        placeholder.ordinal = Some(transcript.entries[position].ordinal - 1);
-        lined_up.insert(position.min(lined_up.len()), placeholder);
-    }
-    std::borrow::Cow::Owned(lined_up)
-}
-
 /// Seals the session's history before a cut the step just applied, and starts the new open log
 /// with full copies of both view slots: a seal moves the ledger out, and a stored view is a
 /// change against the views before it. The copies go applied view first, then the step that
@@ -629,9 +608,8 @@ pub async fn offline_prompt<W: Writer>(
     };
     let transcript = transcript(writer, &ctx).await?;
     let opts = with_sealed(opts, &transcript);
-    let stored = with_suppressed(&opts.prompt, &transcript);
     let prompt = v2::render::prompt_with_rides(
-        &stored,
+        &opts.prompt,
         &transcript.entries,
         &transcript.rides,
         view.as_ref().map_or(&[][..], |view| view.edits.as_slice()),
@@ -887,7 +865,10 @@ pub async fn apply_boundary<W: Writer, P, T>(
 
 /// Prepares step `step`'s request through today's compaction code: Setup when the provider
 /// needs it, a ride when something changed, the notices owed, and the prompt the applied view
-/// renders.
+/// renders from the run's stored prompt, `stored`, brought up to date for the step. `opts`
+/// carries the request's settings; its own prompt is left empty. `rendered` keeps what the
+/// run's renders rendered of each entry, for the next to reuse.
+#[allow(clippy::too_many_arguments)]
 pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
     writer: &mut W,
     admission: &Admission,
@@ -895,10 +876,11 @@ pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
     ctx: &Ctx,
     step: u64,
     opts: broca_protocol::request::CallOptions,
+    stored: &mut prompt::KeptPrompt,
+    rendered: &v2::render::RenderCache,
 ) -> Result<Send, LoopError> {
     let transcript = transcript(writer, ctx).await?;
-    let opts = with_sealed(opts, &transcript);
-    let stored = with_suppressed(&opts.prompt, &transcript);
+    let stored = stored.stored(&transcript.sealed);
     let entries = transcript.entries;
     let transcript_rides = transcript.rides;
     let now = (seams.now_ms)();
@@ -927,6 +909,8 @@ pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
     // A ride renders by its envelope, as today's loop renders a ride recorded with one; text
     // delivered before envelopes existed renders the way it always did.
     let rides = Arc::clone(&transcript_rides);
+    #[cfg(test)]
+    let rendered_before = rendered.rendered();
     let prepared = v2::request::prepare(
         &ctx.session.state,
         &ctx.session.runtime,
@@ -937,7 +921,7 @@ pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
             preset: &ctx.preset,
             entries: &entries,
             rides: &rides,
-            stored: &stored,
+            stored,
             conditions: &conditions,
             previous: previous.as_ref(),
             current: &current,
@@ -953,6 +937,7 @@ pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
             chain_reset: chained && seams.provider.prepare_chain_reset(),
             now,
             next_mid: NEXT_MID,
+            render: Some(rendered),
         },
         |_| Err("a compaction view's inserted images aren't stored yet".into()),
         |prompt| {
@@ -966,6 +951,9 @@ pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
     )
     .await
     .map_err(LoopError::Parts)?;
+    #[cfg(test)]
+    RENDERED
+        .with(|count| count.set(count.get() + (rendered.rendered() - rendered_before) as usize));
     match prepared {
         v2::request::Prepared::Ready {
             prompt, applied, ..
