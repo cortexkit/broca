@@ -59,6 +59,23 @@ async fn module(name: &str, billing: Option<StoreBilling>) -> Module {
 /// [`module`] whose new storage creates sessions in mode `new_sessions` and takes every new
 /// session a creating send opens.
 async fn module_with(name: &str, billing: Option<StoreBilling>, new_sessions: Cipher) -> Module {
+    module_placing(
+        name,
+        billing,
+        new_sessions,
+        LineageRegistry::with_store_new_sessions,
+    )
+    .await
+}
+
+/// [`module_with`], with `place` choosing which new sessions the registry starts in the new
+/// storage.
+async fn module_placing(
+    name: &str,
+    billing: Option<StoreBilling>,
+    new_sessions: Cipher,
+    place: impl FnOnce(LineageRegistry) -> LineageRegistry,
+) -> Module {
     let dir =
         broca_test_support::scratch_root().join(format!("store-key-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -77,7 +94,7 @@ async fn module_with(name: &str, billing: Option<StoreBilling>, new_sessions: Ci
     let wal = Arc::new(FileWalStore::new(dir.join("wal")));
     let executor: Arc<dyn RunExecutor> = Arc::new(executor(vec![text_step("a1", "hello")], None));
     let slot = Arc::new(StoreSlot::awaiting_key(&dir, 1).creating(new_sessions));
-    let registry = LineageRegistry::new_with_reader(
+    let registry = place(LineageRegistry::new_with_reader(
         Arc::new(
             DefaultOpener::new(
                 Arc::new(FileLeaseStore::new(dir.join("leases"))),
@@ -89,8 +106,7 @@ async fn module_with(name: &str, billing: Option<StoreBilling>, new_sessions: Ci
         ),
         wal,
         None,
-    )
-    .with_store_new_sessions();
+    ));
     let setup = StoreRuntimeSetup {
         state_root: dir.clone(),
         executor,
@@ -367,6 +383,64 @@ async fn a_head_is_refused_transient_until_the_new_storage_can_create_it() {
     );
     for class in broca_wal::StorageClass::ALL {
         assert!(!wal.class_wal_path(class, &head).exists(), "{class:?}");
+    }
+}
+
+/// Production starts new sessions in the new storage one class at a time: a creating send naming
+/// a listed class starts there, and one naming another class, or none, starts on today's storage.
+#[tokio::test]
+async fn only_listed_classes_start_new_sessions_in_the_new_storage() {
+    let module = module_placing("classes", None, Cipher::XChaCha20Poly1305, |registry| {
+        registry.with_store_new_session_classes(["sidekick"])
+    })
+    .await;
+    module.load_key().await;
+    let wal = FileWalStore::new(module.dir.join("wal"));
+    for (name, class, in_store) in [
+        ("a-sidekick", Some("sidekick"), true),
+        ("a-mason", Some("mason"), false),
+        ("no-class", None, false),
+    ] {
+        let session = BindIdentity::new(module.dir.join("project"), "store-actor", name);
+        let outcome = module
+            .registry
+            .route_submission_with_class(
+                &session,
+                RunId(format!("r-{name}")),
+                request("first"),
+                RunKind::FreshOrResume,
+                SendKey::Minted,
+                false,
+                broca_protocol::Delivery::Queue,
+                None,
+                None,
+                None,
+                None,
+                class.map(str::to_owned),
+                false,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+        // This module's executor runs only store sessions, so only that row's run is checked;
+        // a session on today's storage is checked by where its log was written.
+        if in_store {
+            assert!(
+                matches!(outcome, SendOutcome::Active { .. }),
+                "{name}: {outcome:?}"
+            );
+        }
+        let stored =
+            broca_wal::session_storage_class(&module.dir, &broca_core::session_addr(&session))
+                .unwrap();
+        let has_wal = broca_wal::StorageClass::ALL
+            .into_iter()
+            .any(|storage| wal.class_wal_path(storage, &session).exists());
+        assert_eq!(
+            stored.is_some(),
+            in_store,
+            "{name}: kept in the new storage"
+        );
+        assert_eq!(has_wal, !in_store, "{name}: has a log on today's storage");
     }
 }
 

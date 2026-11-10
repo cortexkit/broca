@@ -1047,6 +1047,9 @@ struct Inner {
     /// Whether a session that exists in neither storage may start in the new storage, when the
     /// send creating it asks only for what the store actor serves. Off unless a builder sets it.
     store_new_sessions: std::sync::atomic::AtomicBool,
+    /// Session classes whose sessions start in the new storage under the same condition, while
+    /// `store_new_sessions` is off: how production moves new sessions over one class at a time.
+    store_new_classes: std::sync::OnceLock<std::collections::BTreeSet<String>>,
     /// Sessions whose creating send or import the store actor serves, marked by it with how the
     /// session it creates is placed, and taken by the opener, which starts such a session in the
     /// new storage when it exists nowhere yet.
@@ -2097,11 +2100,37 @@ impl LineageRegistry {
     /// Lets a session that exists in neither storage start in the new storage when the send
     /// creating it asks only for what the store actor serves. The opener must have a store
     /// runtime (`DefaultOpener::with_store_runtime`); without one every session stays on today's
-    /// storage. Off by default, and in production. A head ([`HEAD_SESSION_CLASS`]) starts in the
+    /// storage. Off by default; production enables it per class instead
+    /// ([`Self::with_store_new_session_classes`]). A head ([`HEAD_SESSION_CLASS`]) starts in the
     /// new storage whenever the opener has one, whether or not this is set.
     pub fn with_store_new_sessions(self) -> Self {
         self.inner.store_new_sessions.store(true, Ordering::SeqCst);
         self
+    }
+
+    /// Like [`Self::with_store_new_sessions`], but only for sessions whose creating send names one
+    /// of `classes` as its session class. A send naming no class, or another class, starts on
+    /// today's storage. Imports are unaffected.
+    pub fn with_store_new_session_classes<'a>(
+        self,
+        classes: impl IntoIterator<Item = &'a str>,
+    ) -> Self {
+        let _ = self
+            .inner
+            .store_new_classes
+            .set(classes.into_iter().map(str::to_owned).collect());
+        self
+    }
+
+    /// Whether a send creating a session of `class` may start it in the new storage.
+    fn starts_new_sessions_in_store(&self, class: Option<&str>) -> bool {
+        self.inner.store_new_sessions.load(Ordering::SeqCst)
+            || class.is_some_and(|class| {
+                self.inner
+                    .store_new_classes
+                    .get()
+                    .is_some_and(|classes| classes.contains(class))
+            })
     }
 
     pub fn new(opener: Arc<dyn LineageOpener>) -> Self {
@@ -2154,6 +2183,7 @@ impl LineageRegistry {
                 change_gates: Mutex::new(HashMap::new()),
                 next_gen: AtomicU64::new(1),
                 store_new_sessions: std::sync::atomic::AtomicBool::new(false),
+                store_new_classes: std::sync::OnceLock::new(),
                 store_eligible: Mutex::new(HashMap::new()),
                 opener,
                 reader: wal_store.map(|wal_store| ReadSources { wal_store, store }),
@@ -3739,7 +3769,8 @@ impl LineageRegistry {
         // only when the registry creates sessions there and the store actor serves the send.
         let creation = if session_class.as_deref() == Some(HEAD_SESSION_CLASS) {
             Some(StoreCreation::Head { unserved })
-        } else if self.inner.store_new_sessions.load(Ordering::SeqCst) && unserved.is_none() {
+        } else if unserved.is_none() && self.starts_new_sessions_in_store(session_class.as_deref())
+        {
             Some(StoreCreation::Send)
         } else {
             None
