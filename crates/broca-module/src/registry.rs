@@ -2038,7 +2038,7 @@ impl LineageRegistry {
         Ok(guard)
     }
     pub fn check_move(&self, key: &LineageKey, write: bool) -> Result<(), OpenError> {
-        if write && self.background_conversion_held(key) {
+        if self.background_conversion_held(key) {
             return Err(OpenError::SessionConverting);
         }
         // A session in the new storage has no WAL, so no WAL move fence applies to it, and

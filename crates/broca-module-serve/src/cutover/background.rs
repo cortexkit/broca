@@ -222,6 +222,12 @@ async fn background_live_send_is_refused_under_fence_and_retry_succeeds_after_pu
     };
     wait_background_probe(&probe).await;
     assert!(rig.registry.conversion_refusal(&key()).unwrap().0);
+    // Authorization reads can start after the request's initial admission check. They must
+    // report SessionConverting too, so an already-dispatched send is not refused as moving.
+    assert!(matches!(
+        rig.registry.check_move(&key(), false),
+        Err(broca_module::registry::OpenError::SessionConverting)
+    ));
     let refused = rig
         .registry
         .route_send(
