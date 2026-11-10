@@ -33,6 +33,17 @@ fn unavailable(error: impl std::fmt::Display) -> ErrorBody {
 /// the participant checks the complete stream's size, metadata and sealed digest.
 #[async_trait::async_trait]
 pub trait SessionDoor: Send + Sync {
+    async fn export_file(
+        &self,
+        reference: &str,
+        path: &std::path::Path,
+    ) -> Result<(), SessionDoorError> {
+        let bytes = std::fs::read(path).map_err(|error| SessionDoorError {
+            message: error.to_string(),
+            door_code: None,
+        })?;
+        self.export(reference, &bytes).await
+    }
     async fn cover(&self, reference: &str) -> Result<u64, SessionDoorError>;
     async fn export(&self, reference: &str, bytes: &[u8]) -> Result<(), SessionDoorError>;
     async fn read(
@@ -44,6 +55,15 @@ pub trait SessionDoor: Send + Sync {
 }
 #[async_trait::async_trait]
 impl SessionDoor for SessionDoorClient {
+    async fn export_file(
+        &self,
+        reference: &str,
+        path: &std::path::Path,
+    ) -> Result<(), SessionDoorError> {
+        self.admit_file(reference, path, Instant::now() + Duration::from_secs(120))
+            .await
+            .map(|_| ())
+    }
     async fn cover(&self, reference: &str) -> Result<u64, SessionDoorError> {
         self.cover(reference, Instant::now() + Duration::from_secs(60))
             .await
@@ -88,6 +108,7 @@ impl AgentDataService {
     ) -> Self {
         wal.set_session_ref_index(index.clone());
         let driver = Arc::new(Driver {
+            store: registry.store_runtime(),
             root: root.clone(),
             wal: wal.clone(),
             index: index.clone(),
@@ -124,6 +145,7 @@ impl AgentDataService {
     ) -> Self {
         wal.set_session_ref_index(index.clone());
         let driver = Arc::new(Driver {
+            store: registry.store_runtime(),
             root: root.clone(),
             wal: wal.clone(),
             index: index.clone(),
@@ -263,10 +285,20 @@ pub(crate) async fn dispatch(
 }
 
 struct Driver {
+    store: Option<Arc<broca_module::store_open::StoreRuntime>>,
     root: PathBuf,
     wal: Arc<FileWalStore>,
     index: Arc<dyn broca_core::SessionInventory>,
     door: Arc<dyn SessionDoor>,
+}
+
+mod store;
+mod stream;
+struct Incoming {
+    bytes: Vec<u8>,
+    end: u64,
+    digest: String,
+    store: bool,
 }
 
 #[derive(Default)]
@@ -411,7 +443,7 @@ impl Driver {
         )?;
         Ok(bytes)
     }
-    async fn incoming(&self, reference: &str, cut_id: &str) -> Result<Vec<u8>, CutReadFailure> {
+    async fn incoming(&self, reference: &str, cut_id: &str) -> Result<Incoming, CutReadFailure> {
         let mut bytes = Vec::new();
         let mut metadata = None;
         loop {
@@ -427,6 +459,9 @@ impl Driver {
                         verification_cause,
                     }
                 })?;
+            if bytes.is_empty() && page.bytes.starts_with(b"broca-store-export/") {
+                return self.incoming_store(reference, cut_id, page).await;
+            }
             if page.stream_end > self.wal.max_read_bytes() {
                 return Err(unavailable("sealed cut exceeds the session WAL size limit").into());
             }
@@ -451,12 +486,17 @@ impl Driver {
                         verification_cause: Some("sealed SHA mismatch"),
                     });
                 }
-                return Ok(bytes);
+                return Ok(Incoming {
+                    bytes,
+                    end: page.stream_end,
+                    digest: page.digest,
+                    store: false,
+                });
             }
         }
     }
     fn local_sessions(&self, refs: &Refs) -> SessionInventory {
-        match self
+        let mut inventory = match self
             .index
             .resolve_refs(&refs.iter().map(|r| r.r#ref.as_str()).collect::<Vec<_>>())
         {
@@ -476,12 +516,94 @@ impl Driver {
                 sessions: BTreeMap::new(),
                 unreadable: vec![error.to_string()],
             },
+        };
+        if let Some(store) = &self.store {
+            for class in broca_wal::StorageClass::ALL {
+                let backend =
+                    broca_session_store::backend::LocalBackend::new(class.store_root(&self.root));
+                let found = (|| -> Result<(), String> {
+                    for addr in backend.stored_sessions().map_err(|e| format!("{e:?}"))? {
+                        let (bytes, _) = backend
+                            .read_stored_head(&addr)
+                            .map_err(|e| format!("{e:?}"))?
+                            .ok_or("head vanished")?;
+                        let triple = broca_session_store::head::stored_triple(&bytes)
+                            .map_err(|e| format!("{e:?}"))?;
+                        let reference = contract::session_ref(
+                            &triple.harness,
+                            &triple.project_root,
+                            &triple.session,
+                        );
+                        if refs.iter().any(|wanted| wanted.r#ref == reference) {
+                            inventory.sessions.insert(
+                                reference,
+                                BindIdentity {
+                                    project_root: triple.project_root.into(),
+                                    harness: triple.harness,
+                                    session: triple.session,
+                                },
+                            );
+                        }
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = found {
+                    inventory.unreadable.push(error);
+                }
+            }
+            let _ = store;
         }
+        inventory
     }
 }
 
 #[async_trait::async_trait]
 impl MoveDriver for Driver {
+    async fn cache_store_stream(&self, cut: &str, plan: &PlannedSession) -> Result<(), ErrorBody> {
+        self.cache_stream(cut, plan).await
+    }
+    async fn verify_store(
+        &self,
+        plan: &PlannedSession,
+        staged: &std::path::Path,
+    ) -> Result<(), ErrorBody> {
+        let runtime = self
+            .store
+            .as_ref()
+            .ok_or_else(|| unavailable("store runtime unavailable"))?;
+        let addr =
+            broca_session_store::backend::SessionAddr(broca_core::session_addr(&plan.session));
+        let export = broca_session_store::session::moves::Export::decode(
+            broca_session_store::session::moves::last_export(&plan.bytes)
+                .map_err(broca_module::move_files::store::failure)?,
+            &addr,
+            runtime.deployment(),
+        )
+        .map_err(broca_module::move_files::store::failure)?;
+        let (_, version) = export
+            .head(&addr, runtime.deployment())
+            .map_err(broca_module::move_files::store::failure)?;
+        let actual = broca_session_store::session::moves::Export::pinned(
+            &broca_session_store::backend::LocalBackend::new(staged),
+            &addr,
+            version,
+            &export.header.class,
+            runtime.deployment(),
+        )
+        .await
+        .map_err(broca_module::move_files::store::failure)?;
+        let checks = broca_session_convert::verify::store_snapshot(&actual, runtime.deployment())
+            .await
+            .map_err(unavailable)?;
+        if export.checks != checks {
+            return Err(refusal(
+                "digest_mismatch",
+                "staged store move-check snapshot differs from source",
+                json!({"checks":checks.keys().collect::<Vec<_>>()}),
+            ));
+        }
+        Ok(())
+    }
     async fn plan(&self, cut_id: &str, refs: &Refs, op: Op) -> Result<MovePlans, ErrorBody> {
         // Empty move probes must not depend on the projection or touch WALs.
         if refs.iter().next().is_none() {
@@ -536,6 +658,15 @@ impl MoveDriver for Driver {
         let mut plans = Vec::new();
         for reference in refs.iter() {
             let session = sessions.get(&reference.r#ref);
+            if let Some(session) = session {
+                if let Some(plan) = self
+                    .store_plan(&reference.r#ref, session, cut_id, op)
+                    .await?
+                {
+                    plans.push(plan);
+                    continue;
+                }
+            }
             if reference.ref_kind == contract::BROCA_SESSION_REF_KIND
                 && session.is_none()
                 && (bound || !unreadable.is_empty())
@@ -626,7 +757,8 @@ impl MoveDriver for Driver {
                     }
                     Ok(false) => {
                         match self.incoming(&reference.r#ref, cut_id).await {
-                            Ok(bytes) => {
+                            Ok(incoming) => {
+                                let bytes = incoming.bytes;
                                 divergence = Some(if bytes.starts_with(&local) {
                                     broca_module::move_files::LocalDivergence::AtCut
                                 } else {
@@ -652,17 +784,38 @@ impl MoveDriver for Driver {
                     }
                 }
             } else if op == Op::Activate {
-                self.activation_bytes(
-                    &reference.r#ref,
-                    cut_id,
-                    session.expect("recorded activation address checked"),
-                )?
+                if session.is_some_and(|session| {
+                    self.root
+                        .join("session-store-moves/staging")
+                        .join(cut_id)
+                        .join(broca_core::session_addr(session))
+                        .exists()
+                }) {
+                    let incoming = self
+                        .incoming(&reference.r#ref, cut_id)
+                        .await
+                        .map_err(|error| error.refusal)?;
+                    plans.push(self.incoming_store_plan(&reference.r#ref, incoming).await?);
+                    continue;
+                } else {
+                    self.activation_bytes(
+                        &reference.r#ref,
+                        cut_id,
+                        session.expect("recorded activation address checked"),
+                    )?
+                }
             } else if op == Op::Abort {
                 Vec::new()
             } else if receiver {
-                self.incoming(&reference.r#ref, cut_id)
+                let incoming = self
+                    .incoming(&reference.r#ref, cut_id)
                     .await
-                    .map_err(|error| error.refusal)?
+                    .map_err(|error| error.refusal)?;
+                if incoming.store {
+                    plans.push(self.incoming_store_plan(&reference.r#ref, incoming).await?);
+                    continue;
+                }
+                incoming.bytes
             } else {
                 let session = session.expect("source ref resolved");
                 match self.wal.bytes_for_move(session).map_err(unavailable)? {
@@ -709,6 +862,7 @@ impl MoveDriver for Driver {
                 None
             };
             plans.push(PlannedSession {
+                store_prefix: None,
                 reference: reference.r#ref.clone(),
                 session,
                 end_offset: bytes.len() as u64,
@@ -731,6 +885,28 @@ impl MoveDriver for Driver {
         self.door.cover(reference).await.map_err(unavailable)
     }
     async fn export(&self, reference: &str, frozen: &[u8]) -> Result<(), ErrorBody> {
+        if frozen.starts_with(b"broca-store-export/") {
+            let frame = broca_session_store::session::moves::last_export(frozen)
+                .map_err(broca_module::move_files::store::failure)?;
+            let header = broca_session_store::session::moves::header(frame)
+                .map_err(broca_module::move_files::store::failure)?;
+            let session = BindIdentity {
+                project_root: header.triple.project_root.into(),
+                harness: header.triple.harness,
+                session: header.triple.session,
+            };
+            return self
+                .door
+                .export_file(
+                    reference,
+                    &self
+                        .root
+                        .join("session-store-moves/streams")
+                        .join(broca_core::session_addr(&session)),
+                )
+                .await
+                .map_err(unavailable);
+        }
         self.door
             .export(reference, frozen)
             .await
@@ -781,6 +957,7 @@ impl MoveDriver for Driver {
                 if let Some(reason) = &observation.busy_reason {
                     return json!({"state":"busy","reason_code":reason,"reason":format!("session has pending {reason}")});
                 }
+                if plan.format.starts_with(broca_session_store::session::moves::FORMAT) { return json!({"state":"idle"}); }
                 match source_busy_reason(&plan.bytes) {
                     Ok(Some(reason)) => json!({"state":"busy","reason_code":reason,"reason":format!("session has pending {reason}")}),
                     Ok(None) => json!({"state":"idle"}),
@@ -1014,6 +1191,7 @@ mod operational_port_tests {
                     )]))
                     .unwrap();
                 let driver = Driver {
+                    store: None,
                     root: root.clone(),
                     wal,
                     index: index.clone(),

@@ -303,6 +303,58 @@ async fn admit_chunks_at_the_broca_cap_and_resumes_from_cover() {
 }
 
 #[tokio::test]
+async fn admit_file_streams_one_mib_chunks_and_reuses_the_durable_prefix() {
+    let bytes: Vec<u8> = (0..1_048_581).map(|index| (index % 251) as u8).collect();
+    let door = FakeDoor::start(vec![
+        cover(2, 1),
+        cover(1_048_578, 5),
+        cover(1_048_581, 5),
+        cover(1_048_581, 5),
+    ])
+    .await;
+    let client = door.client(true).await;
+    let path = broca_test_support::scratch_root().join(format!(
+        "door-export-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(&path, &bytes).unwrap();
+    let coverage = client
+        .admit_file(SESSION_REF, &path, deadline())
+        .await
+        .unwrap();
+    assert_eq!(coverage.durable_offset, 1_048_581);
+    client
+        .admit_file(SESSION_REF, &path, deadline())
+        .await
+        .unwrap();
+    let sent = door.sent();
+    assert_eq!(sent.len(), 4);
+    for (request, expected) in [
+        (&sent[1], &bytes[2..1_048_578]),
+        (&sent[2], &bytes[1_048_578..]),
+    ] {
+        assert_eq!(request["method"], "session.admit");
+        let hex = request["params"]["bytes"].as_str().unwrap();
+        assert!(hex.len() <= 2 * 1_048_576);
+        let decoded: Vec<_> = hex
+            .as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect();
+        assert_eq!(decoded, expected);
+    }
+    assert_eq!(sent[1]["params"]["fromOffset"], 2);
+    assert_eq!(sent[2]["params"]["fromOffset"], 1_048_578);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
 async fn offset_mismatch_uses_expected_offset_and_a_fresh_cover() {
     let door = FakeDoor::start(vec![
         cover(0, 0),

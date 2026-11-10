@@ -5281,6 +5281,7 @@ fn migration_sidecars_prevent_retention_deletion_and_boot_enrollment() {
         &rig.root,
         &portable,
         &broca_wal::migration::Freeze {
+            store_head_version: None,
             cut_id: "cut".into(),
             end_offset: before.len() as u64,
             lineage_id: "lineage".into(),

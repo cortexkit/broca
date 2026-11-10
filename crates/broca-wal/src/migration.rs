@@ -23,6 +23,8 @@ pub struct Freeze {
     #[serde(rename = "endOffset")]
     pub end_offset: u64,
     pub lineage_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_head_version: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

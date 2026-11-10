@@ -493,6 +493,12 @@ async fn an_expired_session_in_the_new_storage_is_deleted_with_everything_it_own
     for path in &owned {
         assert!(path.exists(), "{} before the sweep", path.display());
     }
+    let stream = rig
+        .root
+        .join("session-store-moves/streams")
+        .join(addr(&key).0);
+    std::fs::create_dir_all(stream.parent().unwrap()).unwrap();
+    std::fs::write(&stream, b"ciphertext stream fixture").unwrap();
     assert!(
         LocalBackend::new(rig.ephemeral())
             .head_versions(&addr(&key))
@@ -503,6 +509,7 @@ async fn an_expired_session_in_the_new_storage_is_deleted_with_everything_it_own
     );
 
     assert_eq!(rig.registry.sweep_once(DEADLINE_MS).await.unwrap(), 1);
+    assert!(!stream.exists());
     for path in &owned {
         assert!(!path.exists(), "{} is left", path.display());
     }

@@ -212,6 +212,7 @@ impl From<mpsc::UnboundedReceiver<LineageCmd>> for Commands {
 
 /// Why the actor stopped serving commands.
 enum Exit {
+    Cut(oneshot::Sender<crate::actor::CutLockReply>),
     /// Every sender is gone.
     Closed,
     /// The session went idle: at its idle deadline, or on an idle tick.
@@ -675,8 +676,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 Some((&life.registry, life.gen)),
             )
             .await;
-        let close = match exit {
-            Exit::Idle => life.registry.begin_close(&self.key, life.gen),
+        let close = match &exit {
+            Exit::Idle | Exit::Cut(_) => life.registry.begin_close(&self.key, life.gen),
             Exit::Closed | Exit::Stop => None,
         };
         if close.is_some() {
@@ -696,7 +697,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         )
         .await;
         let key = self.key.clone();
-        let untouched = self.created_and_untouched();
+        let untouched = self.created_and_untouched() && !matches!(exit, Exit::Cut(_));
         // Everything but the session is dropped here, before the lease, as the whole actor was.
         let session = self.into_session();
         if untouched {
@@ -711,6 +712,20 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             }
         } else {
             drop(session);
+        }
+        if let Exit::Cut(reply) = exit {
+            if let Some(close) = close {
+                let (release, _) = oneshot::channel();
+                let _ = reply.send(crate::actor::CutLockReply {
+                    busy: None,
+                    release,
+                    retired: Some(crate::actor::RetiredForCut {
+                        tenure: Some(crate::actor::CutTenure::store(life.lease)),
+                        close,
+                    }),
+                });
+                return;
+            }
         }
         drop(life.lease);
         match close {
@@ -825,6 +840,38 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 Event::Command(None) => return Exit::Closed,
                 Event::Command(Some(command)) => {
                     idle_deadline = idle_after(tokio::time::Instant::now());
+                    if let LineageCmd::CutLock { reply, mode } = command {
+                        let mut busy = if self.run.is_some() {
+                            Some("run_active")
+                        } else if self.warm.is_some() {
+                            Some("cache_warm")
+                        } else if self.media_build.is_some() || self.media_waiting.is_some() {
+                            Some("send_queued")
+                        } else {
+                            crate::move_files::store::store_busy(&self.session)
+                        };
+                        if busy.is_none()
+                            && matches!(mode, crate::registry::CutLockMode::Mutate)
+                            && slot.is_some()
+                        {
+                            if self.session.sync().await.is_ok() {
+                                return Exit::Cut(reply);
+                            }
+                            busy = Some("unknown");
+                        }
+                        let (release, released) = oneshot::channel();
+                        if reply
+                            .send(crate::actor::CutLockReply {
+                                busy: busy.map(str::to_owned),
+                                release,
+                                retired: None,
+                            })
+                            .is_ok()
+                        {
+                            let _ = released.await;
+                        }
+                        continue;
+                    }
                     if self.handle(command).await {
                         return Exit::Idle;
                     }
@@ -893,7 +940,10 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     /// Runs deletions still due when the actor stops serving, unless the module is stopping or
     /// the session is about to be deleted whole.
     async fn collect_on_exit(&mut self, exit: &Exit) {
-        if self.collect_due && !matches!(exit, Exit::Stop) && !self.created_and_untouched() {
+        if self.collect_due
+            && !matches!(exit, Exit::Stop | Exit::Cut(_))
+            && !self.created_and_untouched()
+        {
             self.collect_unreferenced().await;
         }
     }

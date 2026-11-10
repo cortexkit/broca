@@ -260,6 +260,34 @@ fn missing_deployment_key_refuses_before_staging_and_checksums_refuse_damage() {
 }
 
 #[test]
+fn export_header_names_the_loaded_deployment_wrapper_not_the_first_wrapper() {
+    block_on(async {
+        let source = Root::new();
+        let store = LocalBackend::new(&source.0);
+        let deployment = DeploymentKey::new(7, &[4; 32]);
+        drop(history(&store, &deployment).await);
+        let (stored, version) = store.read_head(&addr()).await.unwrap().unwrap();
+        let (mut head, key) = head::open(&stored, &deployment).unwrap();
+        let mut other = head.keys[0].clone();
+        other.deployment = 8;
+        head.keys.insert(0, other);
+        store
+            .write_head(
+                &addr(),
+                &head::seal(&head, &key),
+                Some(version),
+                version + 1,
+            )
+            .await
+            .unwrap();
+        let export = Export::pinned(&store, &addr(), version + 1, "durable", &deployment)
+            .await
+            .unwrap();
+        assert_eq!(export.header.deployment_key, Some(7));
+    });
+}
+
+#[test]
 fn frozen_reads_work_writers_refuse_release_fences_both_and_abort_is_cut_owned() {
     block_on(async {
         let source = Root::new();
@@ -364,5 +392,54 @@ fn activation_resumes_after_each_file_rename_and_rejects_unreachable_files_befor
         assert!(!staging.0.exists());
         export.files.insert("../escaped".into(), vec![]);
         assert!(Export::decode(&export.encode(), &addr(), &deployment).is_err());
+    });
+}
+
+#[test]
+fn stream_frames_skip_old_exports_and_preserve_partial_admission_tails() {
+    block_on(async {
+        let source = Root::new();
+        let store = LocalBackend::new(&source.0);
+        let deployment = DeploymentKey::new(7, &[4; 32]);
+        drop(history(&store, &deployment).await);
+        let (_, version) = store.read_head(&addr()).await.unwrap().unwrap();
+        let mut export = Export::pinned(&store, &addr(), version, "durable", &deployment)
+            .await
+            .unwrap();
+        let first = append_stream(&[], &export);
+        export.checks.insert("head".into(), "newest".into());
+        let second = append_stream(&first, &export);
+        assert_eq!(last_export(&second).unwrap(), export.encode());
+        assert_eq!(covered_stream(&second, first.len() as u64).unwrap(), first);
+        let partial = first.len() + (second.len() - first.len()) / 2;
+        assert_eq!(covered_stream(&second, partial as u64).unwrap(), second);
+        let path = source.0.join("stream");
+        std::fs::write(&path, &second).unwrap();
+        assert_eq!(
+            stream_prefix(&path, partial as u64).unwrap(),
+            second.len() as u64
+        );
+        let (latest, end, digest) = stream_file(&path, u64::MAX).unwrap();
+        assert_eq!(latest, append_stream(&[], &export));
+        assert_eq!(end, second.len() as u64);
+        assert_eq!(digest, hex(&Sha256::digest(&second)));
+        let planned = planned_stream(&path, first.len() as u64, &latest).unwrap();
+        let written = append_stream_file(&path, first.len() as u64, &latest).unwrap();
+        assert_eq!(planned, written);
+        assert_eq!(std::fs::read(&path).unwrap(), second);
+        std::fs::write(&path, &second[..partial]).unwrap();
+        assert!(stream_prefix(&path, partial as u64).is_err());
+        assert!(covered_stream(&second[..partial], partial as u64).is_err());
+        assert!(covered_stream(&first, partial as u64).is_err());
+        assert!(last_export(&second[..second.len() - 1]).is_err());
+        let mut corrupted = second.clone();
+        *corrupted.last_mut().unwrap() ^= 1;
+        assert!(covered_stream(&corrupted, partial as u64).is_err());
+        assert!(last_export(&corrupted).is_err());
+        assert_eq!(
+            covered_stream(&corrupted, first.len() as u64).unwrap(),
+            first
+        );
+        assert!(last_export(&[second.as_slice(), b"trailing"].concat()).is_err());
     });
 }

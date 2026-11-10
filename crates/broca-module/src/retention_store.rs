@@ -348,6 +348,8 @@ impl RetentionService {
         Session::delete(backend, addr, position.version)
             .await
             .map_err(described)?;
+        broca_wal::migration::unlink(&state_root.join("session-store-moves/streams").join(&addr.0))
+            .map_err(|error| error.to_string())?;
         self.store
             .deadlines
             .lock()

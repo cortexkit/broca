@@ -1131,6 +1131,7 @@ async fn status_keeps_a_partial_prepare_intent_byte_identical_until_repeat() {
         &rig.root,
         &rig.wal.wal_path(&sessions[0]),
         &broca_wal::migration::Freeze {
+            store_head_version: None,
             cut_id: CUT.into(),
             end_offset: rig.bytes(&sessions[0]).len() as u64,
             lineage_id: range.lineage_id.unwrap().to_string(),
@@ -1391,6 +1392,9 @@ mod real_daemon;
 #[path = "agent_data/inventory.rs"]
 mod inventory;
 
+#[path = "agent_data/store_moves.rs"]
+mod store_moves;
+
 #[tokio::test]
 async fn closed_session_with_question_withdrawal_debt_is_busy_before_prepare() {
     let rig = Rig::new("approval-debt", Arc::new(FakeDoor::default()));
@@ -1497,6 +1501,7 @@ async fn contradictory_owner_case(op: contract::Op) {
         &rig.root,
         &sidecar,
         &broca_wal::migration::Freeze {
+            store_head_version: None,
             cut_id: BACK.into(),
             end_offset: rig.bytes(&session).len() as u64,
             lineage_id: "foreign-lineage".into(),
@@ -1978,6 +1983,7 @@ async fn activation_busy_freeze_has_typed_refs_and_preserves_staging() {
         &rig.root,
         &rig.wal.wal_path(&session),
         &broca_wal::migration::Freeze {
+            store_head_version: None,
             cut_id: BACK.into(),
             end_offset: bytes.len() as u64,
             lineage_id: range.lineage_id.unwrap().to_string(),

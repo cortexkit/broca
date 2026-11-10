@@ -14,6 +14,7 @@ use crate::{
 
 pub const FORMAT: &str = "broca-store-export/1";
 const MAGIC: &[u8] = b"broca-store-export/1\0";
+pub const STREAM: &[u8] = b"broca-store-export/1\n";
 
 crate::message! {
     /// Catalog information needed before a receiver writes any files.
@@ -50,6 +51,7 @@ fn invalid(reason: impl std::fmt::Debug) -> Error {
 /// A fully checked framing; the values are stored bytes, never decrypted payloads.
 pub struct Export {
     pub header: Header,
+    pub checks: BTreeMap<String, String>,
     pub files: BTreeMap<String, Vec<u8>>,
 }
 
@@ -86,9 +88,17 @@ impl Export {
             triple: head.triple,
             class: class.into(),
             cipher: head.cipher.unwrap_or(Cipher::XChaCha20Poly1305),
-            deployment_key: head.keys.first().map(|key| key.deployment),
+            deployment_key: head
+                .keys
+                .iter()
+                .find(|key| key.deployment == deployment.id())
+                .map(|key| key.deployment),
         };
-        let export = Self { header, files };
+        let export = Self {
+            header,
+            checks: BTreeMap::new(),
+            files,
+        };
         export.check(addr, deployment)?;
         Ok(export)
     }
@@ -96,6 +106,10 @@ impl Export {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = MAGIC.to_vec();
         put_string(&mut out, &self.header.encode());
+        put_string(
+            &mut out,
+            &serde_json::to_vec(&self.checks).expect("digests encode"),
+        );
         out.extend_from_slice(&(self.files.len() as u32).to_le_bytes());
         for (path, bytes) in &self.files {
             put_string(&mut out, path.as_bytes());
@@ -118,6 +132,7 @@ impl Export {
         }
         let header = Header::decode(string(&mut bytes)?).map_err(invalid)?;
         preflight(&header, deployment)?;
+        let checks = serde_json::from_slice(string(&mut bytes)?).map_err(invalid)?;
         let count = u32::from_le_bytes(take(&mut bytes, 4)?.try_into().unwrap());
         let mut files = BTreeMap::new();
         for _ in 0..count {
@@ -137,7 +152,11 @@ impl Export {
         if !bytes.is_empty() {
             return Err(invalid("trailing export bytes"));
         }
-        let export = Self { header, files };
+        let export = Self {
+            header,
+            checks,
+            files,
+        };
         export.check(addr, deployment)?;
         Ok(export)
     }
@@ -200,6 +219,71 @@ impl Export {
     }
 }
 
+pub fn header(bytes: &[u8]) -> Result<Header, Error> {
+    let mut bytes = bytes;
+    if take(&mut bytes, MAGIC.len())? != MAGIC {
+        return Err(invalid("export format"));
+    }
+    Header::decode(string(&mut bytes)?).map_err(invalid)
+}
+
+/// Append one complete ciphertext snapshot to the session's append-only door stream.
+pub fn append_stream(prefix: &[u8], export: &Export) -> Vec<u8> {
+    let mut bytes = if prefix.is_empty() {
+        STREAM.to_vec()
+    } else {
+        prefix.to_vec()
+    };
+    let frame = export.encode();
+    bytes.extend_from_slice(&(frame.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(&Sha256::digest(&frame));
+    bytes.extend_from_slice(&frame);
+    bytes
+}
+
+/// Check frame boundaries and digests; only the last complete export is imported.
+pub fn last_export(bytes: &[u8]) -> Result<&[u8], Error> {
+    if !bytes.starts_with(STREAM) {
+        return Err(invalid("export stream format"));
+    }
+    let mut cursor = &bytes[STREAM.len()..];
+    let mut last = None;
+    while !cursor.is_empty() {
+        let len = u64::from_le_bytes(take(&mut cursor, 8)?.try_into().unwrap());
+        let digest = take(&mut cursor, 32)?;
+        let frame = take(&mut cursor, usize::try_from(len).map_err(invalid)?)?;
+        if Sha256::digest(frame).as_slice() != digest {
+            return Err(invalid("export stream frame SHA-256 mismatch"));
+        }
+        last = Some(frame);
+    }
+    last.ok_or_else(|| invalid("empty export stream"))
+}
+
+/// The cached prefix to keep for an observed door end. A partially admitted frame keeps its
+/// authenticated tail so it can finish before another snapshot is appended.
+pub fn covered_stream(bytes: &[u8], covered: u64) -> Result<&[u8], Error> {
+    let covered = usize::try_from(covered).map_err(invalid)?;
+    if covered == 0 {
+        return Ok(&[]);
+    }
+    if covered > bytes.len() || !bytes.starts_with(STREAM) {
+        return Err(invalid("move stream cached prefix missing"));
+    }
+    let mut cursor = &bytes[STREAM.len()..];
+    let mut end = STREAM.len();
+    while end < covered {
+        let len = u64::from_le_bytes(take(&mut cursor, 8)?.try_into().unwrap());
+        let digest = take(&mut cursor, 32)?;
+        let frame = take(&mut cursor, usize::try_from(len).map_err(invalid)?)?;
+        if Sha256::digest(frame).as_slice() != digest {
+            return Err(invalid("move stream cached frame digest"));
+        }
+        end = bytes.len() - cursor.len();
+    }
+    Ok(&bytes[..end])
+}
+
 fn preflight(header: &Header, deployment: &DeploymentKey) -> Result<(), Error> {
     match (header.cipher, header.deployment_key) {
         (Cipher::None, None) => Ok(()),
@@ -230,7 +314,9 @@ fn string<'a>(bytes: &mut &'a [u8]) -> Result<&'a [u8], Error> {
 }
 
 mod files;
-pub use files::{abort, freeze, release};
+pub use files::{abort, freeze, release, save_stream};
+mod stream;
+pub use stream::{append_stream_file, planned_stream, stream_file, stream_prefix};
 
 #[cfg(test)]
 mod tests;

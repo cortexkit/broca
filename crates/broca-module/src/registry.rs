@@ -2006,10 +2006,8 @@ impl LineageRegistry {
         Ok(guard)
     }
     pub fn check_move(&self, key: &LineageKey, write: bool) -> Result<(), OpenError> {
-        // A session in the new storage has no WAL, so no WAL move fence applies to it, and
-        // today's store would refuse it by name. Moving such a session isn't built.
         if self.inner.opener.serves_from_store(key)? {
-            return Ok(());
+            return self.inner.opener.check_move(key, write);
         }
         // A move into the new storage holding the session in this process, or one startup
         // couldn't settle, keeps today's storage from serving it. Both are known in memory, so
@@ -2061,7 +2059,7 @@ impl LineageRegistry {
     }
 
     /// The runtime serving sessions kept in the new storage, for reads that take no lease.
-    pub(crate) fn store_runtime(&self) -> Option<Arc<crate::store_open::StoreRuntime>> {
+    pub fn store_runtime(&self) -> Option<Arc<crate::store_open::StoreRuntime>> {
         self.inner.opener.store_runtime()
     }
     pub fn backup_classes(&self) -> Vec<String> {

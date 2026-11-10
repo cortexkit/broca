@@ -70,6 +70,7 @@ impl CutArtifacts for Artifacts {
                         &self.root,
                         &self.path(&name),
                         &broca_wal::migration::Freeze {
+                            store_head_version: None,
                             cut_id: CUT.into(),
                             end_offset: 0,
                             lineage_id: name.clone(),
@@ -192,6 +193,7 @@ async fn status_keeps_prepare_intent_byte_identical_and_repeat_rolls_forward_all
         &root,
         &artifacts.path("a"),
         &broca_wal::migration::Freeze {
+            store_head_version: None,
             cut_id: CUT.into(),
             end_offset: 0,
             lineage_id: "a".into(),

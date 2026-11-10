@@ -606,6 +606,7 @@ mod move_reader_tests {
             &root,
             &live,
             &broca_wal::migration::Freeze {
+                store_head_version: None,
                 cut_id: "cut".into(),
                 end_offset: bytes.len() as u64,
                 lineage_id: "lineage".into(),

@@ -11,6 +11,30 @@ impl Export {
         addr: &SessionAddr,
         deployment: &DeploymentKey,
     ) -> Result<(), Error> {
+        let memory = self.memory(addr, deployment).await?;
+        let (_, version) = self.head(addr, deployment)?;
+        let head_path = format!("heads/{}/head", addr.0);
+        let stored = &self.files[&head_path];
+        let (mut reached, finding) =
+            super::super::restore::reachable(&memory, addr, deployment, &stored[8..], version)
+                .await
+                .map_err(invalid)?;
+        if let Some(finding) = finding {
+            return Err(invalid(finding));
+        }
+        reached.insert(head_path, stored.clone());
+        reached.insert(format!("heads/{}/v/{version}", addr.0), stored.clone());
+        if reached != self.files {
+            return Err(invalid("export has unreachable files"));
+        }
+        Ok(())
+    }
+
+    pub async fn memory(
+        &self,
+        addr: &SessionAddr,
+        deployment: &DeploymentKey,
+    ) -> Result<MemoryBackend, Error> {
         self.check(addr, deployment)?;
         let memory = MemoryBackend::default();
         let (_, version) = self.head(addr, deployment)?;
@@ -29,19 +53,7 @@ impl Export {
                 memory.set_setup(&format!("plain/{name}"), bytes.clone());
             }
         }
-        let (mut reached, finding) =
-            super::super::restore::reachable(&memory, addr, deployment, &stored[8..], version)
-                .await
-                .map_err(invalid)?;
-        if let Some(finding) = finding {
-            return Err(invalid(finding));
-        }
-        reached.insert(head_path, stored.clone());
-        reached.insert(format!("heads/{}/v/{version}", addr.0), stored.clone());
-        if reached != self.files {
-            return Err(invalid("export has unreachable files"));
-        }
-        Ok(())
+        Ok(memory)
     }
 
     /// Writes only authenticated stored bytes, under owner-only directories. The caller keeps
@@ -140,7 +152,7 @@ fn checked_path(root: &Path, path: &str) -> Result<std::path::PathBuf, Error> {
     Ok(full)
 }
 
-fn sync(path: &Path) -> Result<(), Error> {
+pub(super) fn sync(path: &Path) -> Result<(), Error> {
     #[cfg(unix)]
     std::fs::File::open(path)?.sync_all()?;
     #[cfg(not(unix))]
@@ -148,7 +160,7 @@ fn sync(path: &Path) -> Result<(), Error> {
     Ok(())
 }
 
-fn create_dirs(path: &Path) -> Result<(), Error> {
+pub(super) fn create_dirs(path: &Path) -> Result<(), Error> {
     let mut directories = Vec::new();
     let mut at = Some(path);
     while let Some(path) = at {
@@ -182,6 +194,14 @@ fn publish(root: &Path, path: &str, bytes: &[u8]) -> Result<(), Error> {
     std::fs::rename(&temp, &path)?;
     sync(parent)?;
     Ok(())
+}
+
+pub fn save_stream(state_root: &Path, addr: &SessionAddr, bytes: &[u8]) -> Result<(), Error> {
+    publish(
+        state_root,
+        &format!("session-store-moves/streams/{}", addr.0),
+        bytes,
+    )
 }
 
 /// Fences the live source while preserving the immutable head version exported by the cut.

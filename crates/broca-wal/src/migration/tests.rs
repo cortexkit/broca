@@ -9,6 +9,7 @@ fn root(tag: &str) -> PathBuf {
 }
 fn owner(cut: &str) -> Freeze {
     Freeze {
+        store_head_version: None,
         cut_id: cut.into(),
         end_offset: 17,
         lineage_id: "lineage".into(),
