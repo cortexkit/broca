@@ -430,6 +430,63 @@ async fn a_head_created_by_an_ordered_send_an_interrupt_or_a_sign_in_resume_answ
     }
 }
 
+/// A later `session.send` from another module to a head its reserving owner already started is
+/// answered by the session's history, through the serve layer, exactly as today's storage
+/// answers it, and never with the reservation's "nobody started this yet" refusal. A head in the
+/// new storage has no WAL however many runs it has, so the serve layer's first-send precheck must
+/// not read the missing WAL as "no run yet".
+#[tokio::test]
+async fn a_started_head_answers_later_sends_from_its_history_not_its_reservation() {
+    use crate::serve::{SendRequest, ServeError, ServeHandler};
+    let reservation = ScopeReservation {
+        owner: core(),
+        scope_ref: "head-1".into(),
+    };
+    let steps = || vec![text_step("a1", "hello"), text_step("a2", "again")];
+    let today = module(false, steps(), Some(&reservation)).await;
+    let store = module(true, steps(), Some(&reservation)).await;
+    let mut answers = Vec::new();
+    for module in [&today, &store] {
+        let sent = sent_by("owner", core(), stamped(core(), "head-1", 1));
+        let first = send(module, "r1", sent, Some(HEAD_SESSION_CLASS), None, None)
+            .await
+            .unwrap();
+        assert!(matches!(first, SendOutcome::Active { .. }), "{first:?}");
+        module.closed().await;
+        let later = SendRequest {
+            session_class: None,
+            retention: None,
+            conversation_key: None,
+            session: module.key.clone(),
+            run_id: RunId("r2".into()),
+            send_id: None,
+            title: None,
+            request: Box::new(sent_by("from the app", other(), SendScope::Unstamped)),
+            skip_materialization: false,
+            kind: RunKind::FreshOrResume,
+            delivery: broca_protocol::Delivery::Queue,
+            stop_sequences_named: false,
+            plan: None,
+            order: None,
+        };
+        answers.push(match ServeHandler::send(&module.registry, later).await {
+            Ok(_) => "admitted".to_owned(),
+            Err(ServeError::ScopeRefused(ScopeRefusal::OwnerMismatch(mismatch))) => {
+                assert!(
+                    !matches!(&*mismatch, OwnerMismatch::Reserved { .. }),
+                    "a started head was refused as if no one had started it: {mismatch:?}"
+                );
+                format!("{mismatch:?}")
+            }
+            Err(other) => format!("{other:?}"),
+        });
+        module.closed().await;
+    }
+    assert_eq!(answers[1], answers[0], "today's storage answers alike");
+    assert_eq!(store.store_class(), Some(StorageClass::Durable));
+    assert_eq!(store.wal.wal_present(&store.key), Some(false));
+}
+
 /// The refusal a reserved session gives a send from any scope but the one that reserved it.
 fn assert_reserved_for_core(outcome: &SendOutcome, label: &str) {
     match outcome {

@@ -3543,8 +3543,11 @@ impl ServeHandler for crate::LineageRegistry {
         // A session with no WAL yet has no episode, and an owner's scoped bind may have reserved
         // its address. Refuse anyone else's first send here, before staging media or opening the
         // session's actor, which writes the WAL's first frame. The actor makes the same decision
-        // for a session whose WAL already exists.
+        // for a session whose WAL already exists. A session the new storage holds never has a
+        // WAL, however many runs it has, so a missing WAL says nothing about it: its own actor
+        // applies the reservation while it has no run (`StoreActor::send_scope`).
         if req.request.scope != broca_protocol::SendScope::Internal
+            && self.store_holding(&req.session)?.is_none()
             && self.wal_written(&req.session) == Some(false)
         {
             // A reservation that cannot be read refuses the send as transient, never as "not
