@@ -4561,12 +4561,14 @@ mod executor {
                     Some(now()),
                 ) {
                     Ok(admission) => {
-                        broca_session_loop::run(writer, parts, admission, &seams).await
+                        // Keep the loop body off the executor's poll frame, as the legacy
+                        // loop does, even though async_trait already boxes the outer executor.
+                        Box::pin(broca_session_loop::run(writer, parts, admission, &seams)).await
                     }
                     Err(error) => return Err(StoreRunError::Admission(error)),
                 }
             } else {
-                broca_session_loop::resume(writer, parts, &seams).await
+                Box::pin(broca_session_loop::resume(writer, parts, &seams)).await
             };
             // The run's end, for routing and the vault, as `execute` reports it. The reports
             // read only how the run ended or paused.

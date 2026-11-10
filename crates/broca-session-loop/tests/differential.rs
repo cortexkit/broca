@@ -2596,14 +2596,16 @@ async fn new_from(
         model_call_ready: provider.model_call_ready(),
     };
     let sealing = SEALING.try_with(|cause| *cause).ok();
+    // A crash-cut comparison nests this driver several frames deep. Heap-own the loop bodies,
+    // as the production executor does for run and resume, rather than copying them there.
     through!(
         writer,
         |w| if let (true, Some(cause)) = (resuming, sealing) {
             seal(w, &parts, &seams, cause).await
         } else if resuming {
-            resume(w, &parts, &seams).await
+            Box::pin(resume(w, &parts, &seams)).await
         } else {
-            run(w, &mut parts, scenario.admission(&provider), &seams).await
+            Box::pin(run(w, &mut parts, scenario.admission(&provider), &seams)).await
         }
     )
     .expect("the new loop runs");
