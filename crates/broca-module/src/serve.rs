@@ -586,29 +586,25 @@ pub fn apply_tool_call_dispatches(
             // The step that produced this message holds exactly these calls: report them.
             Some(found) if found.iter().map(|d| &d.tool_call_id).eq(ids.iter()) => found
                 .iter()
-                .map(|dispatch| broca_wire::SessionReadToolCall {
-                    tool_call_id: dispatch.tool_call_id.clone(),
-                    call_key: dispatch.key_seq.or(dispatch.intent_seq).and_then(|seq| {
+                .map(|dispatch| {
+                    let mut call = broca_wire::SessionReadToolCall::new(&dispatch.tool_call_id);
+                    call.call_key = dispatch.key_seq.or(dispatch.intent_seq).and_then(|seq| {
                         broca_core::tool_call_key(
                             Some(lineage_id),
                             seq,
                             dispatch.recorded_call_key.as_deref(),
                         )
-                    }),
-                    dispatched_to: dispatch.dispatched_to.clone(),
-                    indeterminate: dispatch.indeterminate,
+                    });
+                    call.dispatched_to = dispatch.dispatched_to.clone();
+                    call.indeterminate = dispatch.indeterminate;
+                    call
                 })
                 .collect(),
             // No recorded step produced this message (an imported one, say): report each
             // call with no dispatch fact rather than guess one.
             _ => ids
                 .into_iter()
-                .map(|tool_call_id| broca_wire::SessionReadToolCall {
-                    tool_call_id,
-                    call_key: None,
-                    dispatched_to: None,
-                    indeterminate: false,
-                })
+                .map(broca_wire::SessionReadToolCall::new)
                 .collect(),
         };
     }
@@ -3255,12 +3251,7 @@ impl crate::LineageRegistry {
             for message in &mut response.messages {
                 message.tool_calls = calls_of(&message.message)
                     .into_iter()
-                    .map(|tool_call_id| broca_wire::SessionReadToolCall {
-                        tool_call_id,
-                        call_key: None,
-                        dispatched_to: None,
-                        indeterminate: false,
-                    })
+                    .map(broca_wire::SessionReadToolCall::new)
                     .collect();
             }
             return Ok(());
