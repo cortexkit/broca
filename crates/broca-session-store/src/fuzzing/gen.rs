@@ -617,6 +617,7 @@ mod records {
     });
     crate::fuzzing::gen::fields!(ViewRef { version, checksum });
     crate::fuzzing::gen::fields!(EntryFacts {
+        send_id,
         ordinal,
         written_at_ms,
         tag_base,
@@ -1120,6 +1121,7 @@ mod operations {
         results_mid
     });
     crate::fuzzing::gen::fields!(PendingInput {
+        send_id,
         seq,
         placement,
         messages,
@@ -1191,6 +1193,7 @@ mod operations {
     crate::fuzzing::gen::fields!(ViewSlot { version, checksum });
     crate::fuzzing::gen::fields!(AppliedView { step_id, view });
     crate::fuzzing::gen::fields!(Pending {
+        send_id,
         submission_id,
         interrupt,
         ordered,

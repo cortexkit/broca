@@ -1852,3 +1852,105 @@ mod streams;
 mod warm;
 
 mod held;
+
+#[tokio::test]
+async fn send_ids_equal_the_admitted_keys_and_unkeyed_submission_on_both_storages() {
+    use crate::serve::ServeHandler;
+
+    for delivery in [
+        broca_protocol::Delivery::Queue,
+        broca_protocol::Delivery::Steer,
+    ] {
+        let old_gate = Arc::new(Notify::new());
+        let new_gate = Arc::new(Notify::new());
+        let today = today(hello(), Some(old_gate.clone()));
+        let old_calls = today.executor.provider.inner.clone();
+        let parts = broca_session_loop::parts::SharedParts::new(Box::new(
+            broca_session_loop::parts::MemoryParts::default(),
+        ));
+        let executor = executor(hello(), Some(new_gate.clone()));
+        let new_calls = executor.provider.inner.clone();
+        let (commands, served, _) = super::tests::actor_with(executor, parts.clone()).await;
+        let caller = super::tests::Caller::default();
+        let second_key = if delivery == broca_protocol::Delivery::Queue {
+            SendKey::Minted
+        } else {
+            SendKey::SendId("steer-key".into())
+        };
+        let mut second_id = "steer-key".to_owned();
+        for (run, text, key, mode) in [
+            (
+                "native-first",
+                "native keyed send",
+                SendKey::SendId("start-key".into()),
+                broca_protocol::Delivery::Queue,
+            ),
+            ("native-second", "native second send", second_key, delivery),
+        ] {
+            let mut request = caller.shape(run, &key, request(text));
+            from_core(&mut request);
+            let old = today
+                .send(run, request.clone(), key.clone(), mode, None)
+                .await;
+            let new = super::tests::send_exactly(&commands, run, request, key, mode, None).await;
+            assert_eq!(new, old);
+            if run == "native-second" && delivery == broca_protocol::Delivery::Queue {
+                let SendOutcome::Pending { submission_id } = old else {
+                    panic!("queue returned {old:?}")
+                };
+                second_id = submission_id.0;
+            }
+        }
+        old_gate.notify_one();
+        new_gate.notify_one();
+        // Each scripted model call consumes one permit. Wait for the first permit to be
+        // consumed before releasing the second, so Notify cannot coalesce the releases.
+        broca_test_support::wait_until(
+            "both first calls to consume their gate permits",
+            || async {
+                if !old_calls.calls().is_empty() && !new_calls.calls().is_empty() {
+                    Ok(())
+                } else {
+                    Err("a first model call is still gated".to_owned())
+                }
+            },
+        )
+        .await;
+        old_gate.notify_one();
+        new_gate.notify_one();
+        today.idle().await;
+        super::tests::idle(&commands).await;
+        drop(commands);
+        let session = served.await.unwrap();
+        let request = opted_request(&today.key, (Some(1), Some(100)), (true, false, false));
+        let old = today.registry.read(request.clone()).await.unwrap();
+        let new = crate::store_read::serve_view(&session, &parts, &request)
+            .await
+            .unwrap();
+        for read in [&old, &new] {
+            for (text, id) in [
+                ("native keyed send", "start-key"),
+                ("native second send", second_id.as_str()),
+            ] {
+                let entry = read.messages.iter().find(|entry| entry.message.content.iter().any(|part|
+                    matches!(part, broca_protocol::ContentBlock::Text {text: actual} if actual == text)
+                )).unwrap();
+                assert_eq!(entry.sender.as_deref(), Some("prefrontal-core"));
+                assert_eq!(entry.send_id.as_deref(), Some(id), "{text}");
+            }
+        }
+        let mut entries = session.entries(1, 100).await.unwrap();
+        for entry in &mut entries {
+            if let Some(facts) = &mut entry.state.facts {
+                facts.send_id = None;
+            }
+        }
+        let recovered = session.older_entry_send_ids(&entries).await.unwrap();
+        for entry in &new.messages {
+            if let Some(id) = &entry.send_id {
+                assert_eq!(recovered.get(&entry.ordinal), Some(id));
+            }
+        }
+        assert!(today.registry.stop_and_seal().await);
+    }
+}

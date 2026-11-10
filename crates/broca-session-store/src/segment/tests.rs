@@ -106,6 +106,7 @@ fn a_group_never_splits_across_blocks(cipher: Cipher) {
 /// Facts for `ordinal`, as a writer places them after its messages.
 fn facts(ordinal: u64) -> Record {
     Record::EntryFacts(crate::record::EntryFacts {
+        send_id: None,
         named_speaker: None,
         client_message_id: None,
         sender: None,

@@ -1228,6 +1228,8 @@ fn serialize_read_message<S: serde::Serializer>(
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct SessionReadMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speaks_for: Option<broca_protocol::SpeaksFor>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub notice: bool,
@@ -1306,6 +1308,8 @@ impl Serialize for SessionReadMessage {
         #[derive(Serialize)]
         struct Wire<'a> {
             #[serde(skip_serializing_if = "Option::is_none")]
+            send_id: &'a Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
             speaks_for: &'a Option<broca_protocol::SpeaksFor>,
             #[serde(skip_serializing_if = "std::ops::Not::not")]
             notice: bool,
@@ -1348,6 +1352,7 @@ impl Serialize for SessionReadMessage {
             role: broca_protocol::Role,
         }
         Wire {
+            send_id: &self.send_id,
             speaks_for: &self.speaks_for,
             notice: self.notice,
             sender: &self.sender,
@@ -6281,6 +6286,7 @@ mod caller_message_tests {
 
     fn read_message(content: Vec<ContentBlock>) -> SessionReadMessage {
         SessionReadMessage {
+            send_id: None,
             speaks_for: None,
             notice: false,
             sender: None,
@@ -6792,6 +6798,7 @@ mod caller_message_tests {
         );
         message.cache_prefix_blocks = Some(1);
         let response = SessionReadMessage {
+            send_id: None,
             speaks_for: None,
             notice: false,
             sender: None,

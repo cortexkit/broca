@@ -686,6 +686,7 @@ pub fn apply_display_facts(
                 entry.notice = marks.notice;
             }
             entry.sender = facts.sender.clone();
+            entry.send_id = facts.send_id.clone().filter(|_| entry.sender.is_some());
             entry.notices = facts
                 .notices
                 .iter()
@@ -769,6 +770,7 @@ pub fn session_read_response(
             .messages
             .into_iter()
             .map(|message| SessionReadMessage {
+                send_id: None,
                 speaks_for: None,
                 notice: false,
                 sender: None,

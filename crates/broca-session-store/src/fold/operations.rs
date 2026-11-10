@@ -238,6 +238,8 @@ crate::message! {
         /// record rather than serve the speaker without its name. Absent otherwise, so a record
         /// without a name keeps the bytes it had before names existed.
         11 opt [must] named_speaker: bool,
+        /// The caller-visible id of the send whose messages wait here. Unknown on older checkpoints.
+        12 opt send_id: String,
     }
 }
 
@@ -717,6 +719,8 @@ crate::message! {
         /// record rather than serve the speaker without its name. Absent otherwise, so a record
         /// without a name keeps the bytes it had before names existed.
         7 opt [must] named_speaker: bool,
+        /// The caller's send id, or the returned submission id for an unkeyed queued send.
+        8 opt send_id: String,
     }
 }
 
@@ -1508,6 +1512,11 @@ impl Operations {
                 let ordered =
                     self.ordered_next.take().as_deref() == Some(send.submission_id.as_str());
                 let pending = Pending {
+                    send_id: Some(
+                        send.send_id
+                            .clone()
+                            .unwrap_or_else(|| send.submission_id.clone()),
+                    ),
                     submission_id: send.submission_id.clone(),
                     interrupt: send.delivery.as_deref() == Some("interrupt"),
                     ordered,
@@ -1751,6 +1760,7 @@ impl Operations {
                         pending.sender.clone(),
                         pending.request_identity_digest.clone(),
                         pending.message_marks.clone(),
+                        pending.send_id.clone(),
                     )
                 }),
             _ => None,
@@ -2079,6 +2089,7 @@ impl Operations {
                 }
             }
             Record::Steer(steer) => run.pending_steers.push(PendingInput {
+                send_id: receipt_string(steer.receipt.as_ref(), "send_id"),
                 seq,
                 placement: crate::record::Placement::Steer,
                 messages: steer.input.clone(),
@@ -2100,9 +2111,10 @@ impl Operations {
                 named_speaker: crate::record::marks_name_speaker(steer.message_marks.as_ref()),
             }),
             Record::Delivery(delivery) if !delivery.input.is_empty() => {
-                let (sender, request_identity_digest, message_marks) =
+                let (sender, request_identity_digest, message_marks, send_id) =
                     delivered_send.unwrap_or_default();
                 run.pending_steers.push(PendingInput {
+                    send_id,
                     seq,
                     placement: if delivery.mode == "turn_system" {
                         crate::record::Placement::DeliveredTurnSystem

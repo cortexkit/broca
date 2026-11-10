@@ -1898,8 +1898,11 @@ mod enrolled_entries_tests;
 mod inverse_tests;
 #[cfg(test)]
 mod marks_tests;
+
 #[cfg(test)]
 mod read_cost_tests;
+#[cfg(test)]
+mod send_ids_tests;
 #[cfg(test)]
 mod stage_tests;
 #[cfg(test)]

@@ -158,6 +158,15 @@ pub async fn read_page<B: SessionBackend>(
     from_ordinal: Option<u64>,
     limit: Option<u64>,
 ) -> Result<StorePage, StoreReadError> {
+    read_page_with_facts(session, from_ordinal, limit, true).await
+}
+
+async fn read_page_with_facts<B: SessionBackend>(
+    session: &Session<B>,
+    from_ordinal: Option<u64>,
+    limit: Option<u64>,
+    include_display_facts: bool,
+) -> Result<StorePage, StoreReadError> {
     let capped_limit = limit
         .unwrap_or(broca_core::SESSION_READ_DEFAULT_LIMIT)
         .clamp(1, broca_core::SESSION_READ_MAX_LIMIT);
@@ -176,6 +185,11 @@ pub async fn read_page<B: SessionBackend>(
         .then(|| entries.pop())
         .flatten();
     let latest = session.operations.run.as_ref();
+    let older_send_ids = if include_display_facts {
+        session.older_entry_send_ids(&entries).await?
+    } else {
+        BTreeMap::new()
+    };
     let mut messages = Vec::with_capacity(entries.len());
     let mut mids = Vec::with_capacity(entries.len());
     let mut turns = Vec::with_capacity(entries.len());
@@ -189,6 +203,9 @@ pub async fn read_page<B: SessionBackend>(
         messages.push(page_message(entry, next, latest)?);
         turns.push(crate::store_calls::TurnOf::of(entry));
         let mut served = display_facts(entry).served();
+        served.send_id = served
+            .send_id
+            .or_else(|| older_send_ids.get(&entry.ordinal).cloned());
         served.notices.extend(
             imported_notices(
                 session,
@@ -453,9 +470,14 @@ pub(crate) async fn page<B: SessionBackend>(
         summaries,
         stamps,
         numbering,
-    } = read_page(session, from_ordinal, request.limit)
-        .await
-        .map_err(refused)?;
+    } = read_page_with_facts(
+        session,
+        from_ordinal,
+        request.limit,
+        request.include_display_facts,
+    )
+    .await
+    .map_err(refused)?;
     crate::store_entries::attach_part_tags(session, parts, &mut page.messages, &numbering)
         .await
         .map_err(|error| {
@@ -844,6 +866,8 @@ fn lineage_state<B: SessionBackend>(session: &Session<B>) -> SessionReadLineageS
 /// delivered with the message's tool calls.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DisplayFacts {
+    /// The caller-visible id of the send that placed this message, when known.
+    pub send_id: Option<String>,
     /// For a user message: the `client_message_id` of the send that placed it.
     pub client_message_id: Option<String>,
     /// The attested module id of the sender of the send that placed the message: every message
@@ -931,6 +955,7 @@ pub fn display_facts(entry: &StoredEntry) -> DisplayFacts {
         })
         .collect();
     DisplayFacts {
+        send_id: facts.and_then(|facts| facts.send_id.clone()),
         client_message_id: facts
             .and_then(|facts| facts.client_message_id.clone())
             .filter(|_| user),
@@ -1023,6 +1048,7 @@ impl DisplayFacts {
     /// tool results message the notices of the sends that rode on its results.
     pub fn served(&self) -> broca_core::display_facts::DisplayFacts {
         broca_core::display_facts::DisplayFacts {
+            send_id: self.send_id.clone(),
             message_marks: self.message_marks(),
             sender: self.sender.clone(),
             client_message_id: self.client_message_id.clone(),

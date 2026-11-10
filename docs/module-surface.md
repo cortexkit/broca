@@ -1021,6 +1021,15 @@ Neither fact enters a checksum or changes `history_version`. Default reads omit 
 With `include_display_facts`, `sender` is served beside `mid` when recorded send attribution
 names a module; raw history also serves that field. Absence does not identify a human
 or disprove a sender.
+Broca also declares `send_ids`: those module-send entries carry their caller's `send_id`
+beside `sender`, or the returned `submission_id` for an unkeyed queued send. A direct
+unkeyed send or steer that returned no submission id has none. These facts never enter
+message bodies, content digests or `history_version`, and default reads omit them.
+Historical ids are recovered only from exact stored send receipts. Older imports that
+discarded the source id, and converted steers without a stored send id, remain unknown
+and omit the field. Builds before `dabddee12` wrote converted steer receipts one record
+early; even an apparently valid reference can name an adjacent steer, so reads cannot
+prove those ids from the receipts alone.
 Broca does not declare `sender_attribution` and serves no `provider_executed` flags:
 it stores no tools that a model provider executed internally.
 

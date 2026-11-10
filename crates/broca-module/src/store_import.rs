@@ -446,6 +446,7 @@ pub fn seed(history: HeadHistory, at: &SeedFacts<'_>) -> Result<Seed, ImportRefu
             .filter(|_| message.message.role == Role::User);
         let ride = message.rides.last();
         records.push(Record::EntryFacts(EntryFacts {
+            send_id: send.map(|send| send.send_id.clone()),
             ordinal,
             written_at_ms: Some(written),
             tag_base: high,

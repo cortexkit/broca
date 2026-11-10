@@ -149,6 +149,7 @@ fn call(id: &str) -> ContentBlock {
 
 fn facts(ordinal: u64, mid: String) -> Record {
     Record::EntryFacts(EntryFacts {
+        send_id: None,
         named_speaker: None,
         client_message_id: None,
         sender: None,

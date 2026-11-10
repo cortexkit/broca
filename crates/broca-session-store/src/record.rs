@@ -442,6 +442,9 @@ message! {
         /// record rather than serve the speaker without its name. Absent otherwise, so a record
         /// without a name keeps the bytes it had before names existed.
         24 opt [must] named_speaker: bool,
+        /// The caller's send id, or the returned submission id of an unkeyed send. Display
+        /// metadata only: absent when unknown, and never part of a message's content identity.
+        25 opt send_id: String,
     }
 }
 

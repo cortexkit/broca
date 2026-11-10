@@ -124,6 +124,7 @@ fn text(text: &str) -> ContentBlock {
 
 fn facts(ordinal: u64, mid: &str) -> Record {
     Record::EntryFacts(EntryFacts {
+        send_id: None,
         named_speaker: None,
         ordinal,
         written_at_ms: Some(ordinal),

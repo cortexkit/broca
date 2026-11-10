@@ -124,6 +124,7 @@ fn answer(run: &str, text: &str) -> Record {
 
 fn facts(ordinal: u64, mid: String) -> Record {
     Record::EntryFacts(EntryFacts {
+        send_id: None,
         named_speaker: None,
         client_message_id: None,
         sender: None,

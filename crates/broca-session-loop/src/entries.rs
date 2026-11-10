@@ -839,6 +839,7 @@ pub fn with_facts(batch: Vec<Record>, at: &Placing<'_>) -> Result<Vec<Record>, S
                     .filter(|message| message.role == Role::Assistant && facts.run_id.is_some())
                     .and(at.rich_ui.cloned());
                 pending.push(EntryFacts {
+                    send_id: facts.send.send_id,
                     client_message_id: facts.send.client_message_id,
                     sender: facts.send.sender,
                     named_speaker: broca_session_store::record::marks_name_speaker(
@@ -1137,6 +1138,7 @@ fn cancelled(mut turn: TurnFacts) -> Option<TurnFacts> {
 /// or delivered send.
 #[derive(Debug, Clone, Default)]
 struct SendFacts {
+    send_id: Option<String>,
     sender: Option<String>,
     client_message_id: Option<String>,
     /// llm-runner's `MessageMarks` JSON.
@@ -1185,6 +1187,11 @@ fn run_send_facts(
         _ => None,
     };
     SendFacts {
+        send_id: start
+            .send_id
+            .clone()
+            .or_else(|| queued.and_then(|send| send.send_id.clone()))
+            .or_else(|| start.submission_id.clone()),
         sender: queued.and_then(|send| send.sender.clone()).or(module),
         client_message_id: queued
             .and_then(|send| send.request_identity_digest.as_deref())
@@ -1212,11 +1219,12 @@ fn held_send_facts(input: &broca_session_store::record::Input, at: &Placing<'_>)
             .iter()
             .find(|pending| pending.seq.is_some() && pending.seq == input.receipt_seq)
     });
-    let (sender, digest, marks) = match pending {
+    let (sender, digest, marks, send_id) = match pending {
         Some(pending) => (
             pending.sender.clone(),
             pending.request_identity_digest.as_deref(),
             pending.message_marks.clone(),
+            pending.send_id.clone(),
         ),
         None => match at
             .operations
@@ -1228,11 +1236,13 @@ fn held_send_facts(input: &broca_session_store::record::Input, at: &Placing<'_>)
                 queued.sender.clone(),
                 queued.request_identity_digest.as_deref(),
                 queued.message_marks.clone(),
+                queued.send_id.clone(),
             ),
             None => return SendFacts::default(),
         },
     };
     SendFacts {
+        send_id,
         sender,
         client_message_id: digest.and_then(broca_core::digest_client_message_id),
         marks,
@@ -1955,6 +1965,7 @@ mod lifetime_tag_high_tests {
             ));
             conversation.entries.push(EntryState {
                 facts: Some(EntryFacts {
+                    send_id: None,
                     named_speaker: None,
                     ordinal,
                     written_at_ms: None,
@@ -2019,5 +2030,82 @@ mod lifetime_tag_high_tests {
         // A message placed since numbers from its own facts.
         operations.enrolled.as_mut().unwrap().through_ordinal = 1;
         assert_eq!(lifetime_tag_high(&two_messages(12), &operations), Ok(13));
+    }
+}
+
+#[cfg(test)]
+mod send_id_tests {
+    use super::*;
+    use broca_session_store::fold::operations::Pending;
+    use broca_session_store::record::{Input, Placement};
+
+    #[test]
+    fn ordered_inputs_keep_their_own_send_id_in_every_placement() {
+        for placement in [Placement::Delivered, Placement::DeliveredTurnSystem] {
+            for id in ["caller-send", "sub-native"] {
+                let mut operations = Operations::default();
+                operations.queue.push(Pending {
+                    submission_id: "sub-native".into(),
+                    interrupt: false,
+                    ordered: true,
+                    sender: Some("sample-sender".into()),
+                    request_identity_digest: None,
+                    message_marks: None,
+                    named_speaker: None,
+                    send_id: Some(id.into()),
+                });
+                let mut message = Message::new(
+                    if placement == Placement::DeliveredTurnSystem {
+                        Role::System
+                    } else {
+                        Role::User
+                    },
+                    vec![ContentBlock::Text {
+                        text: "synthetic delivery".into(),
+                    }],
+                );
+                message.turn_system = placement == Placement::DeliveredTurnSystem;
+                let batch = vec![Record::Input(Input {
+                    run_id: "native-run".into(),
+                    placement,
+                    message,
+                    written_at_ms: Some(10),
+                    submission_id: Some("sub-native".into()),
+                    notice: None,
+                    tags_v1: None,
+                    receipt_seq: Some(3),
+                    media: Vec::new(),
+                    pruned: Vec::new(),
+                })];
+                let conversation = Conversation::new(false);
+                let calls = OpenCalls::default();
+                let out = with_facts(
+                    batch,
+                    &Placing {
+                        conversation: &conversation,
+                        operations: &operations,
+                        calls: &calls,
+                        first_seq: 10,
+                        prefix: "gnative",
+                        session: "synthetic",
+                        tags: Tags::default(),
+                        view: None,
+                        rich_ui: None,
+                        runner: None,
+                    },
+                )
+                .unwrap();
+                let facts = out
+                    .iter()
+                    .find_map(|record| match record {
+                        Record::EntryFacts(facts) => Some(facts),
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(facts.send_id.as_deref(), Some(id));
+                assert_eq!(facts.sender.as_deref(), Some("sample-sender"));
+                assert_eq!(facts.mid, "gnative.11");
+            }
+        }
     }
 }

@@ -35,6 +35,7 @@ fn ride() -> RideEnvelope {
 
 fn entry_facts(marks: serde_json::Value) -> EntryFacts {
     EntryFacts {
+        send_id: None,
         named_speaker: None,
         ordinal: 3,
         written_at_ms: Some(10),
@@ -182,6 +183,7 @@ fn marked_fold_entries() -> (
     let marks = json!({"speaks_for": speaker()});
     (
         crate::fold::operations::PendingInput {
+            send_id: None,
             named_speaker: None,
             seq: Some(4),
             placement: Placement::Steer,
@@ -195,6 +197,7 @@ fn marked_fold_entries() -> (
             message_marks: Some(marks.clone()),
         },
         crate::fold::operations::Pending {
+            send_id: None,
             named_speaker: None,
             submission_id: "sub".into(),
             interrupt: false,
@@ -226,6 +229,64 @@ fn marked_fold_entries_before_speaker_names_keep_their_bytes() {
         crate::fold::operations::Pending::decode(&pending.encode()).unwrap(),
         pending
     );
+}
+
+/// Freeze the three message shapes to which an optional send id may be added. These bytes were
+/// written without a send id and must remain readable and byte-identical when it is unknown.
+#[test]
+fn send_metadata_before_send_ids_keeps_its_bytes() {
+    use crate::codec::Message as _;
+
+    let facts = entry_facts(json!({"speaks_for": speaker()}));
+    assert_eq!(
+        hex(&facts.encode()),
+        "1003200a3002800101a20106676162632e33b2010572756e2d31c00109d201057374656572820204636f72659202217b22737065616b735f666f72223a7b226167656e745f6964223a22416461227d7df2023822027331320972656d696e6465727342096c696e656167653a34520872656d696e6465726a127b226167656e745f6964223a22416461227d"
+    );
+    let (input, pending) = marked_fold_entries();
+    assert_eq!(
+        hex(&input.encode()),
+        "10042002320d10022209220712057374656572400562037375627204636f7265aa01217b22737065616b735f666f72223a7b226167656e745f6964223a22416461227d7d"
+    );
+    assert_eq!(
+        hex(&pending.encode()),
+        "120373756230014204636f72656a217b22737065616b735f666f72223a7b226167656e745f6964223a22416461227d7d"
+    );
+    assert_eq!(EntryFacts::decode(&facts.encode()).unwrap(), facts);
+    assert_eq!(
+        crate::fold::operations::PendingInput::decode(&input.encode()).unwrap(),
+        input
+    );
+    assert_eq!(
+        crate::fold::operations::Pending::decode(&pending.encode()).unwrap(),
+        pending
+    );
+}
+
+#[test]
+fn send_id_metadata_is_optional_and_old_decoders_can_skip_it() {
+    use crate::codec::{put_opt, skip_unknown, Fields, Message as _};
+
+    let mut facts = entry_facts(json!({"speaks_for": speaker()}));
+    let (mut input, mut pending) = marked_fold_entries();
+    let old = [facts.encode(), input.encode(), pending.encode()];
+    facts.send_id = Some("send-1".into());
+    input.send_id = facts.send_id.clone();
+    pending.send_id = facts.send_id.clone();
+    for ((old, actual), number) in old
+        .into_iter()
+        .zip([facts.encode(), input.encode(), pending.encode()])
+        .zip([25, 12, 8])
+    {
+        let mut expected = old;
+        put_opt(&mut expected, number, false, &Some("send-1".to_owned()));
+        assert_eq!(actual, expected);
+        let field = Fields::new(&actual, "send metadata")
+            .map(Result::unwrap)
+            .find(|field| field.number == number)
+            .unwrap();
+        assert!(!field.must);
+        skip_unknown(field, "old send metadata decoder").unwrap();
+    }
 }
 
 #[test]

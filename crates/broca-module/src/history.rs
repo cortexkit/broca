@@ -399,7 +399,7 @@ pub fn project(entry: &SessionReadMessage, limits: Option<&Limits>) -> DisplayRo
 
 /// One entry of the raw form: the message as `session.read` serves it, with the time it was
 /// written, which the raw form always carries. Of the facts a display-facts read adds, the raw
-/// form keeps only the sender.
+/// form keeps the sender and the send's caller-visible id.
 pub fn raw_entry(entry: &SessionReadMessage, written_at: u64) -> Value {
     let mut value = serde_json::to_value(entry).expect("history entry JSON");
     for field in [

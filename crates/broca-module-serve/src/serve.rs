@@ -7290,6 +7290,7 @@ mod tests {
             lineage_id: None,
             messages: vec![
                 SessionReadMessage {
+                    send_id: None,
                     speaks_for: None,
                     notice: false,
                     sender: None,
@@ -7318,6 +7319,7 @@ mod tests {
                     part_digests: None,
                 },
                 SessionReadMessage {
+                    send_id: None,
                     speaks_for: None,
                     notice: false,
                     sender: None,
