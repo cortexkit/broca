@@ -257,6 +257,7 @@ async fn registry_gated(
             inner: broca_core::provider::StubProvider::new(steps),
             gate,
             render_config: None,
+            notes_sends: false,
         }),
         wal: Arc::clone(&wal),
         store: store_executor,

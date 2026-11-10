@@ -479,6 +479,7 @@ async fn registry(
             inner: broca_core::provider::StubProvider::new(steps),
             gate,
             render_config: Some(image_render_config()),
+            notes_sends: false,
         }),
         wal: Arc::clone(&wal),
         sent: Arc::clone(sent),

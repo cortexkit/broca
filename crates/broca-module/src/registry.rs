@@ -3705,14 +3705,8 @@ impl LineageRegistry {
         }
         crate::retention::validate_retention(retention, None, false)
             .map_err(OpenError::RetentionInvalid)?;
-        let unserved = crate::store_actor::unserved_creating_send(
-            &request,
-            kind,
-            delivery,
-            conversation_key.is_some(),
-            retention.is_some(),
-            order.is_some(),
-        );
+        let unserved =
+            crate::store_actor::unserved_creating_send(&request, kind, retention.is_some());
         // How the session starts if this send creates it. A head starts only in the new
         // storage, and the opener refuses one it can't start there; any other send starts there
         // only when the registry creates sessions there and the store actor serves the send.

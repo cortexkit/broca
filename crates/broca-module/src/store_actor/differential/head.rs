@@ -57,6 +57,7 @@ async fn gated_module_in(
         today: TodayLoop {
             provider: Gated {
                 render_config: None,
+                notes_sends: false,
                 inner: broca_core::provider::StubProvider::new(steps.clone()),
                 gate: gate.clone(),
             },

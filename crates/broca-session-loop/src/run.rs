@@ -3290,6 +3290,12 @@ async fn model_step<W: Writer, P: Provider, T>(
         }
     }
     let _in_flight = InFlight(seams.step_progress.as_ref());
+    // A run's keep-warm may ask its calls to note each request their transport sends on its
+    // seal, so a warm re-sends those bytes, as today's loop notes them on its shutdown seal.
+    let send_seal = seams
+        .keep_warm
+        .as_ref()
+        .and_then(|driver| driver.step_seal());
     if let Some(progress) = &seams.step_progress {
         let now = (seams.now_ms)();
         *progress.lock().unwrap() = Some(broca_protocol::provider::InFlightStep {
@@ -3315,7 +3321,7 @@ async fn model_step<W: Writer, P: Provider, T>(
     let runtime = StepRuntime {
         cancel: seams.cancel.clone(),
         deadline: None,
-        seal: None,
+        seal: send_seal.clone(),
         progress: seams.step_progress.clone(),
         first_attempt: 0,
         attempt_hook: None,
@@ -3390,6 +3396,11 @@ async fn model_step<W: Writer, P: Provider, T>(
                         limited,
                     ));
                 };
+                // The request's measured input labels its send, which a warm's price reads, as
+                // today's loop labels it once its step ends.
+                if let Some(seal) = &send_seal {
+                    seal.note_usage(StepId(step_id), usage);
+                }
                 break Ok(Step {
                     message,
                     usage,

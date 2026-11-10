@@ -60,6 +60,7 @@ pub(super) async fn module(
         today: TodayLoop {
             provider: Gated {
                 render_config: None,
+                notes_sends: false,
                 inner: broca_core::provider::StubProvider::new(steps.clone()),
                 gate: None,
             },
@@ -292,9 +293,9 @@ async fn every_other_creating_send_still_starts_on_todays_storage() {
 }
 
 /// A head whose creating send asks for what the new storage doesn't serve on such a send (media,
-/// an ordered delivery, a retention policy) is refused `not_served_on_new_storage`, permanently,
-/// naming that feature. Nothing is created in either storage: no head, log or object in any of the
-/// new storage's roots, no WAL, no feature floor, and no actor.
+/// a retention policy) is refused `not_served_on_new_storage`, permanently, naming that feature.
+/// Nothing is created in either storage: no head, log or object in any of the new storage's roots,
+/// no WAL, no feature floor, and no actor.
 #[tokio::test]
 async fn a_head_the_new_storage_does_not_serve_is_refused_and_creates_nothing() {
     let mut media = request("look");
@@ -302,12 +303,6 @@ async fn a_head_the_new_storage_does_not_serve_is_refused_and_creates_nothing() 
         serde_json::from_value(json!([{"type": "upload", "upload_id": "up-1"}])).unwrap();
     let cases = [
         ("a send carrying media", media, None, None),
-        (
-            "an ordered delivery",
-            request("first"),
-            None,
-            Some(json!({"modes": ["idle_start"]})),
-        ),
         (
             "a send setting retention",
             request("first"),
@@ -357,6 +352,89 @@ async fn a_head_the_new_storage_does_not_serve_is_refused_and_creates_nothing() 
         );
         assert!(!module.floor().contains(broca_wal::SESSION_STORAGE_FEATURE));
         assert_eq!(module.registry.slot_state(&module.key), None, "{feature}");
+    }
+}
+
+/// [`send`] of a head's creating send, asking to be delivered as `delivery`, with the run kind
+/// `kind` and the ordered delivery `order` when given.
+async fn head_send(
+    module: &Module,
+    request: broca_protocol::SubmissionRequest,
+    delivery: broca_protocol::Delivery,
+    kind: RunKind,
+    order: Option<serde_json::Value>,
+) -> SendOutcome {
+    module
+        .registry
+        .route_submission_with_order(
+            &module.key,
+            RunId("r1".into()),
+            request,
+            kind,
+            SendKey::Minted,
+            false,
+            delivery,
+            None,
+            None,
+            None,
+            None,
+            Some(HEAD_SESSION_CLASS.into()),
+            false,
+            order.map(|order| serde_json::from_value(order).expect("an order decodes")),
+        )
+        .await
+        .expect("the head opens")
+}
+
+/// A head created by a send that the new storage served only on a session it already held (an
+/// ordered delivery list, starting a run or waiting for one, and an interrupt) or not at all (a
+/// send resuming after sign-in, which has no paused run to resume on a new session) starts in the
+/// new storage, and is answered as today's storage answers the same send.
+#[tokio::test]
+async fn a_head_created_by_an_ordered_send_an_interrupt_or_a_sign_in_resume_answers_alike() {
+    use broca_protocol::Delivery;
+    let cases = [
+        (
+            "an ordered send starting a run",
+            Delivery::Queue,
+            RunKind::FreshOrResume,
+            Some(json!({"modes": ["idle_start"]})),
+        ),
+        (
+            "an ordered send waiting for a run",
+            Delivery::Queue,
+            RunKind::FreshOrResume,
+            Some(json!({"modes": ["steer"]})),
+        ),
+        (
+            "an interrupt",
+            Delivery::Interrupt,
+            RunKind::FreshOrResume,
+            None,
+        ),
+        (
+            "a send resuming after sign-in",
+            Delivery::Queue,
+            RunKind::ResumeAfterAuth,
+            None,
+        ),
+    ];
+    for (label, delivery, kind, order) in cases {
+        let today = module(false, vec![text_step("a1", "hello")], None).await;
+        let store = module(true, vec![text_step("a1", "hello")], None).await;
+        let old = head_send(&today, request("first"), delivery, kind, order.clone()).await;
+        let new = head_send(&store, request("first"), delivery, kind, order).await;
+        assert!(
+            matches!(
+                old,
+                SendOutcome::Active { .. } | SendOutcome::Pending { .. }
+            ),
+            "{label}: {old:?}"
+        );
+        assert_eq!(new, old, "{label}: today's storage answers alike");
+        store.closed().await;
+        assert_eq!(store.store_class(), Some(StorageClass::Durable), "{label}");
+        assert_eq!(store.wal.wal_present(&store.key), Some(false), "{label}");
     }
 }
 

@@ -77,11 +77,14 @@ pub(super) fn bind() -> BindIdentity {
 
 /// A scripted provider whose first step waits for `gate`, so a test can act while a run's start
 /// is durable and its first model call is in flight. With `render_config`, it freezes that render
-/// config into its runs, as a provider whose model takes media freezes its media profile.
+/// config into its runs, as a provider whose model takes media freezes its media profile. With
+/// `notes_sends`, each step notes the request it sends on the seal its run gives it, as a
+/// transport does, so a keep-warm can re-send those bytes.
 pub(super) struct Gated {
     pub(super) inner: StubProvider,
     pub(super) gate: Option<Arc<Notify>>,
     pub(super) render_config: Option<serde_json::Value>,
+    pub(super) notes_sends: bool,
 }
 
 #[async_trait]
@@ -112,6 +115,33 @@ impl broca_core::provider::Provider for Gated {
             gate.notified().await;
         }
         self.inner.step(step_id, opts).await
+    }
+
+    async fn step_with_shutdown_seal(
+        &self,
+        step_id: broca_protocol::StepId,
+        opts: Arc<broca_protocol::request::CallOptions>,
+        cancel: tokio_util::sync::CancellationToken,
+        deadline: Option<tokio::time::Instant>,
+        seal: broca_core::ShutdownSeal,
+    ) -> mpsc::Receiver<NormalizedEvent> {
+        if self.notes_sends {
+            let body = broca_core::provider::Provider::render_request(self, &opts);
+            seal.note_sent(
+                broca_core::SentRequest {
+                    step_id,
+                    sha256: broca_core::render::request_digest_hex(&body),
+                    body: Arc::new(body),
+                    sent_at_ms: crate::actor::epoch_ms(),
+                    route: broca_core::refusal_fallback::StepRoute::Source,
+                },
+                None,
+            );
+        }
+        broca_core::provider::Provider::step_with_shared_cancel(
+            self, step_id, opts, cancel, deadline,
+        )
+        .await
     }
 }
 
@@ -231,6 +261,7 @@ pub(super) fn executor(
             inner: StubProvider::new(steps),
             gate,
             render_config: None,
+            notes_sends: false,
         },
         drain_gate: None,
         planes: Planes::default(),
@@ -270,6 +301,7 @@ impl RunExecutor for LoopExecutor {
             mut parts,
             mode,
             media,
+            keep_warm,
             ..
         } = job;
         let media_wait = media.filter(|_| self.waits_for_media).map(|media| {
@@ -322,7 +354,7 @@ impl RunExecutor for LoopExecutor {
                 // The module's executor has every store run tell the compaction provider of
                 // the session's changes outside its steps (`Seams::compaction_changes`).
                 compaction_changes: true,
-                keep_warm: None,
+                keep_warm,
                 account_reports: None,
                 max_same_account_wait: Default::default(),
                 auth_selection: None,
@@ -770,17 +802,15 @@ async fn a_refused_send_writes_nothing() {
 async fn an_unserved_send_is_refused_by_name() {
     let (commands, served, _) = actor(executor(vec![], None)).await;
     let (reply, answer) = oneshot::channel();
-    let mut keyed = request("first");
-    keyed.keep_warm = Some(broca_protocol::request::KeepWarm::Auto);
     commands
         .send(LineageCmd::Send {
             session_class: None,
-            retention: None,
+            retention: Some(3_600),
             stop_sequences_named: false,
             conversation_key: None,
             title: None,
             run_id: RunId("r1".into()),
-            request: Box::new(keyed),
+            request: Box::new(request("first")),
             kind: RunKind::FreshOrResume,
             key: SendKey::Minted,
             skip_materialization: false,
@@ -793,7 +823,8 @@ async fn an_unserved_send_is_refused_by_name() {
     assert_eq!(
         answer.await.unwrap(),
         SendOutcome::Error(
-            "keep-warm is not served yet for a session kept in the new storage".into()
+            "a send setting retention is not served yet for a session kept in the new storage"
+                .into()
         )
     );
     drop(commands);

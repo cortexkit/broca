@@ -150,6 +150,7 @@ fn today_stopping(steps: Vec<Vec<NormalizedEvent>>) -> Today {
     let executor = Arc::new(TodayLoop {
         provider: Gated {
             render_config: None,
+            notes_sends: false,
             inner: broca_core::provider::StubProvider::new(steps),
             gate: None,
         },

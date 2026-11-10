@@ -10,6 +10,9 @@ struct TierServeRig {
     session: BindIdentity,
     corr: u64,
     subc: Option<tokio::task::JoinHandle<()>>,
+    /// Whether the rig's module creates new sessions in the new session storage, which keeps no
+    /// WAL.
+    on_store: bool,
 }
 
 impl TierServeRig {
@@ -30,8 +33,25 @@ impl TierServeRig {
         root: &std::path::Path,
         url: Option<&str>,
         plane: Option<Arc<TierCompaction>>,
+        live: LiveLoopExecutor,
+        subc: Option<tokio::task::JoinHandle<()>>,
+    ) -> Self {
+        Self::start_in(root, url, plane, live, subc, false).await
+    }
+
+    /// [`Self::start`], with the rig's module creating new sessions in the new session storage.
+    async fn start_on_store(root: &std::path::Path, url: &str) -> Self {
+        let (live, subc) = stand_in_executor(root).await;
+        Self::start_in(root, Some(url), None, live, Some(subc), true).await
+    }
+
+    async fn start_in(
+        root: &std::path::Path,
+        url: Option<&str>,
+        plane: Option<Arc<TierCompaction>>,
         mut live: LiveLoopExecutor,
         subc: Option<tokio::task::JoinHandle<()>>,
+        on_store: bool,
     ) -> Self {
         use broca_module::{DefaultOpener, LineageRegistry};
         use subc_protocol::{
@@ -52,15 +72,33 @@ impl TierServeRig {
         let opener = DefaultOpener::new(
             Arc::new(broca_core::FileLeaseStore::new(root.join("leases"))),
             wal.clone(),
-            executor,
+            Arc::clone(&executor),
         )
         .with_run_index(store.clone())
         .with_materialized_store(store.clone());
-        let registry = Arc::new(LineageRegistry::new_with_reader(
+        let opener = if on_store {
+            let runtime = broca_module::store_open::StoreRuntime::open(
+                root,
+                broca_session_store::keys::DeploymentKey::new(1, &[7; 32]),
+                executor,
+                std::time::Duration::from_millis(100),
+            )
+            .await
+            .unwrap();
+            opener.with_store_runtime(Arc::new(runtime))
+        } else {
+            opener
+        };
+        let registry = LineageRegistry::new_with_reader(
             Arc::new(opener),
             wal.clone(),
             Some(store.clone()),
-        ));
+        );
+        let registry = Arc::new(if on_store {
+            registry.with_store_new_sessions()
+        } else {
+            registry
+        });
         registry.set_session_address_inventory(store);
         let (client, server) = tokio::io::duplex(1024 * 1024);
         let (mut reader, mut writer) = tokio::io::split(client);
@@ -117,6 +155,7 @@ impl TierServeRig {
             session,
             corr: 0,
             subc,
+            on_store,
         };
         let bind = subc_protocol::session::ModuleControlRequest::RouteBind {
             route_channel: 7,
@@ -181,8 +220,14 @@ impl TierServeRig {
 
     async fn ended(&mut self, run: &str) -> (subc_protocol::Frame, subc_protocol::Frame) {
         use broca_core::WalStore as _;
+        // A session in the new storage keeps no WAL; its run's end is read from `run.status`
+        // below alone.
+        let wal = (!self.on_store).then_some(&self.wal);
         broca_test_support::wait_until("tier run durable terminal", || {
-            let frames = self.wal.read_records(&self.session).unwrap();
+            let Some(wal) = wal else {
+                return std::future::ready(Ok(()));
+            };
+            let frames = wal.read_records(&self.session).unwrap();
             let mut active = false;
             let mut ended = false;
             for frame in &frames {
@@ -1433,4 +1478,88 @@ async fn service_tier_writer_admits_maps_refuses_and_describes_through_serve() {
     assert_eq!(http.requests.lock().unwrap().len(), before);
     rig.close().await;
     std::fs::remove_dir_all(root).unwrap();
+}
+
+/// What a rig's session made of three service tier sends: a creating send whose plan's model
+/// selection names `fast`, a later send naming `fast` itself, and a later send naming `fast` for
+/// a model with no price at that tier. For each send, its answer, its run's end, and the model
+/// and tier the provider was sent, with the run ids left out, since each side mints its own.
+async fn tier_story(store: bool) -> Vec<serde_json::Value> {
+    use broca_core::WalStore as _;
+    let root = fresh_vault_root(if store { "tier-store" } else { "tier-today" });
+    let http = resume_http_fixture().await;
+    let mut rig = if store {
+        TierServeRig::start_on_store(&root, &http.url).await
+    } else {
+        TierServeRig::start(&root, &http.url).await
+    };
+    rig.registry.set_plan_admitter(Arc::new(HeadSelectionAdmitter));
+    let mut story = Vec::new();
+    let sends = [
+        serde_json::json!({"send_id":"first","prompt":"hello",
+            "plan":selection_plan(Some(fast_selection()))}),
+        serde_json::json!({"send_id":"second","prompt":"again",
+            "model":{"provider":"openai","model":"test-ultrafast"},"service_tier":"fast"}),
+        serde_json::json!({"send_id":"third","prompt":"once more",
+            "model":{"provider":"openai","model":"test-standard-only"},"service_tier":"fast"}),
+    ];
+    for params in sends {
+        let sent = rig.call("session.send", params).await;
+        let mut answer = tier_reply(&sent);
+        if sent.header.ty != subc_protocol::FrameType::Response {
+            story.push(answer);
+            continue;
+        }
+        let run = tier_run(&sent);
+        let (_, result) = rig.ended(&run).await;
+        // On today's storage a planned send's answer also carries the plan's baseline, which a
+        // session in the new storage doesn't answer a send with yet. That isn't a service tier
+        // fact, so it is left out of the comparison.
+        if let Some(result) = answer["result"].as_object_mut() {
+            result.retain(|key, _| key != "run_id" && key != "submission_id" && key != "baseline");
+        }
+        let body: serde_json::Value =
+            serde_json::from_slice(&http.requests.lock().unwrap().last().unwrap().body).unwrap();
+        story.push(serde_json::json!({
+            "answer": answer,
+            "state": tier_reply(&result)["result"]["state"],
+            "sent": {"model": body["model"], "service_tier": body["service_tier"]},
+        }));
+    }
+    if store {
+        assert_eq!(
+            rig.wal.wal_present(&rig.session),
+            Some(false),
+            "the session is kept in the new storage"
+        );
+    }
+    rig.close().await;
+    std::fs::remove_dir_all(root).unwrap();
+    story
+}
+
+/// A session kept in the new storage admits and sends service tiers as today's storage does: a
+/// creating send whose plan's model selection names `fast`, and a later send naming `fast`, are
+/// both sent at the provider's priority tier, and a level the send's model has no price for is
+/// refused with today's answer, before anything is sent.
+#[tokio::test]
+async fn a_store_session_admits_and_sends_service_tiers_as_today() {
+    if !run_catalog_drift_child("a_store_session_admits_and_sends_service_tiers_as_today") {
+        return;
+    }
+    broca_protocol::configure_service_tier(true).unwrap();
+    install_queued_ultrafast_catalog();
+    let today = tier_story(false).await;
+    assert_eq!(
+        today[0]["sent"],
+        serde_json::json!({"model": "test-ultrafast", "service_tier": "priority"}),
+        "{today:?}"
+    );
+    assert_eq!(today[1]["sent"], today[0]["sent"], "{today:?}");
+    assert_eq!(
+        today[2]["detail"],
+        serde_json::json!({"field":"service_tier","reason":"unsupported_tier"}),
+        "{today:?}"
+    );
+    assert_eq!(tier_story(true).await, today);
 }

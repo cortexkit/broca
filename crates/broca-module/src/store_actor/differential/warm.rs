@@ -35,7 +35,7 @@ cipher_tests!(
 
 /// A first-party Anthropic config frozen with one-hour markers and adaptive thinking, which a
 /// warm may refresh.
-fn warmable() -> FrozenRenderConfig {
+pub(super) fn warmable() -> FrozenRenderConfig {
     let mut frozen = anthropic_frozen_config("claude-opus-4-8");
     frozen.cache = Some(CachePolicy {
         version: 1,
@@ -60,7 +60,7 @@ fn warmable() -> FrozenRenderConfig {
 }
 
 /// Declares a session's cache with the provider families' own rules, as the serving layer does.
-struct FamilyDeclarer;
+pub(super) struct FamilyDeclarer;
 
 impl CacheDeclarer for FamilyDeclarer {
     fn declare(&self, config: &broca_wal::RunConfig) -> Option<CacheDeclaration> {
@@ -206,6 +206,7 @@ async fn registry_at(
                 inner: broca_core::provider::StubProvider::new(steps),
                 gate: None,
                 render_config,
+                notes_sends: false,
             },
             wal: Arc::clone(&wal),
             planes: Default::default(),

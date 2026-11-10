@@ -38,6 +38,10 @@
 //!   before the record that names them: a send's run start, its queued record or its steer;
 //! - `session.warm` on an idle session, re-sending the request its loop would send next (see
 //!   `warm`);
+//! - a send's service tier level, admitted by today's rule and sent at the level it was admitted
+//!   at (see `service_tier`);
+//! - keep-warm while a run waits on tool calls, re-sending the request its transport last sent
+//!   (see `keep_warm`);
 //! - a send under an agent-run scope, and a send reopening the session's scope at a later epoch,
 //!   admitted by today's scope rules (see `scopes`);
 //! - deleting what the session's seals replaced once the grace period is over, at the first
@@ -237,6 +241,8 @@ struct ActiveRun {
     step: broca_core::provider::LiveStepProgress,
     /// The media the run's tool calls captured, held until the record naming them is appended.
     tool_media: Arc<broca_session_loop::PendingMedia>,
+    /// The actor's end of the run's keep-warm, for a run that keeps its cache warm.
+    warming: Option<keep_warm::RunWarming>,
 }
 
 /// A run to start: the send's request and what the run's start records about the send.
@@ -319,10 +325,25 @@ enum Event {
     Warmed(
         Result<Result<broca_core::WarmSent, crate::executor::WarmError>, tokio::task::JoinError>,
     ),
+    /// The active run's keep-warm sent a warm, whose record the actor appends.
+    KeptWarm(Box<keep_warm::WarmRecord>),
     /// The session's idle deadline passed with no run active and no warm being sent.
     IdleDeadline,
     /// The session is idle and may hold deletions that have come due.
     Collect,
+}
+
+/// The next record of a warm the active run's keep-warm sent, or never when it keeps none.
+async fn kept_warm(warming: &mut Option<keep_warm::RunWarming>) -> Box<keep_warm::WarmRecord> {
+    match warming.as_mut() {
+        Some(warming) => match warming.records.recv().await {
+            Some(record) => Box::new(record),
+            // The driver lives as long as the run's task; a run whose driver is gone sends no
+            // more warms.
+            None => std::future::pending().await,
+        },
+        None => std::future::pending().await,
+    }
 }
 
 /// The media fold build's end, or never when none is building.
@@ -754,6 +775,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 Some(active) => tokio::select! {
                     biased;
                     _ = seal.cancelled() => return Exit::Stop,
+                    // A warm's record is taken before the run's next write, which the warm's
+                    // tool wait came before.
+                    record = kept_warm(&mut active.warming) => Event::KeptWarm(record),
                     request = active.link.next(), if !active.writer_gone => Event::Request(request),
                     end = &mut active.done => Event::Done(end),
                     result = warmed, if has_warm => Event::Warmed(result),
@@ -794,6 +818,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 Event::Done(end) => self.finish_run(end).await,
                 Event::MediaBuilt(built) => self.media_built(built).await,
                 Event::Warmed(result) => self.finish_warm(result).await,
+                Event::KeptWarm(record) => self.record_kept_warm(*record).await,
                 Event::Collect => self.collect_unreferenced().await,
                 Event::Command(None) => return Exit::Closed,
                 Event::Command(Some(command)) => {
@@ -832,6 +857,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         };
         active.link.serve(&mut writer, request).await;
         self.answer_admission();
+        self.refresh_warm_config();
         if seals {
             self.collect_due = true;
         }
@@ -885,6 +911,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 return;
             };
             let event = tokio::select! {
+                biased;
+                record = kept_warm(&mut active.warming) => Event::KeptWarm(record),
                 request = active.link.next(), if !active.writer_gone => Event::Request(request),
                 end = &mut active.done => Event::Done(end),
                 built = media_built(&mut self.media_build) => Event::MediaBuilt(built),
@@ -898,6 +926,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 }
                 Event::Done(end) => return self.finish_run(end).await,
                 Event::MediaBuilt(built) => self.media_built(built).await,
+                Event::KeptWarm(record) => self.record_kept_warm(*record).await,
                 Event::Command(_) | Event::Warmed(_) | Event::IdleDeadline | Event::Collect => {
                     unreachable!("no command is read here, and no idle deadline is waited on")
                 }
@@ -1270,7 +1299,11 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                         }
                     }
                 }
-                if let Some(what) = unserved_request(&request, kind, retention.is_some()) {
+                if let Some(what) = unserved_request(
+                    kind,
+                    retention.is_some(),
+                    self.session.operations().owner.episodes > 0,
+                ) {
                     let _ = reply.send(SendOutcome::Error(unserved(what)));
                     return false;
                 }
@@ -1363,6 +1396,12 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                             }
                         },
                     }
+                }
+                // As in today's actor, the send's service tier level is admitted once its model is
+                // known, before the plan's model-bearing items are checked.
+                if let Err(outcome) = self.admit_service_tier(&mut request, manifest.as_deref()) {
+                    let _ = reply.send(outcome);
+                    return false;
                 }
                 // A send that left its model to the session checks its plan's model-bearing
                 // items against the model it now runs on, as today's actor does once the model
@@ -1698,6 +1737,17 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         } = start;
         // The executor resolves the send's credential selection; only the result is frozen.
         let auth = request.auth.take();
+        // A run whose keep-warm is `auto` warms the prompt cache while it waits on tool calls.
+        let (keep_warm, warming) = match self.keep_warm_for(&request, mode) {
+            Some((driver, warming)) => (
+                Some(driver as Arc<dyn broca_core::keep_warm_wait::KeepWarmDriver<_>>),
+                Some(warming),
+            ),
+            None => (None, None),
+        };
+        // As today's actor hands it over: the level its admission settled, which a fresh run's
+        // admission applies.
+        let queued_service_tier = request.service_tier_level.take();
         let mut req = RunRequest::from_submission(
             request,
             run_id.clone(),
@@ -1775,6 +1825,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             parts,
             mode,
             media,
+            queued_service_tier,
+            keep_warm,
         };
         let resume = mode != StoreRunMode::Fresh;
         if resume {
@@ -1797,6 +1849,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             done,
             step,
             tool_media,
+            warming,
         });
     }
 
@@ -2644,6 +2697,16 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     /// the next queued send. A drained run refused at admission ends its queued send with the
     /// refusal, as today's actor ends it, and the next one is tried.
     async fn finish_run(&mut self, end: Result<StoreRunEnd, tokio::task::JoinError>) {
+        // A warm the run's keep-warm sent before the run ended is recorded, even when its record
+        // arrived with the run's end.
+        while let Some(record) = self
+            .run
+            .as_mut()
+            .and_then(|active| active.warming.as_mut())
+            .and_then(|warming| warming.records.try_recv().ok())
+        {
+            self.record_kept_warm(record).await;
+        }
         let Some(active) = self.run.take() else {
             return;
         };
@@ -3620,13 +3683,9 @@ fn finished(run_id: &RunId, reason: broca_protocol::RunFinishReason) -> SendOutc
 pub fn unserved_creating_send(
     request: &SubmissionRequest,
     kind: RunKind,
-    delivery: broca_protocol::Delivery,
-    conversation_key: bool,
     retention: bool,
-    ordered: bool,
 ) -> Option<&'static str> {
-    unserved_delivery(ordered, delivery, conversation_key)
-        .or_else(|| unserved_request(request, kind, retention))
+    unserved_request(kind, retention, false)
         .or_else(|| carries_media(request).then_some("a send carrying media"))
 }
 
@@ -3659,45 +3718,14 @@ fn frozen_media(
     (profile, model)
 }
 
-/// The delivery a send creating a session asks for that keeps the new session out of the new
-/// storage, which then starts on today's: an ordered list or an interrupt. This actor serves both
-/// only on a session it already holds.
-fn unserved_delivery(
-    ordered: bool,
-    delivery: broca_protocol::Delivery,
-    _conversation_key: bool,
-) -> Option<&'static str> {
-    if ordered {
-        Some("an ordered delivery")
-    } else if delivery == broca_protocol::Delivery::Interrupt {
-        Some("an interrupt")
-    } else {
-        None
-    }
-}
-
-/// What a send's request asks for, where this actor doesn't serve it yet.
-fn unserved_request(
-    request: &SubmissionRequest,
-    kind: RunKind,
-    retention: bool,
-) -> Option<&'static str> {
+/// What a send asks for, where this actor doesn't serve it yet. On a session that never ran (`ran`
+/// false), as on a send creating one, a send resuming after sign-in has no paused run to resume:
+/// today's loop starts its run fresh, as it starts any other send's, and so does this actor.
+fn unserved_request(kind: RunKind, retention: bool, ran: bool) -> Option<&'static str> {
     if retention {
         Some("a send setting retention")
-    } else if kind == RunKind::ResumeAfterAuth {
+    } else if kind == RunKind::ResumeAfterAuth && ran {
         Some("resuming after sign-in")
-    } else {
-        refuse_unbuilt_request(request)
-    }
-}
-
-/// The request fields a store session doesn't take yet, refused by name before anything is
-/// written.
-fn refuse_unbuilt_request(request: &SubmissionRequest) -> Option<&'static str> {
-    if request.keep_warm.is_some() {
-        Some("keep-warm")
-    } else if request.service_tier_level.is_some() {
-        Some("a service tier level")
     } else {
         None
     }
@@ -3861,10 +3889,12 @@ mod apply_view;
 mod held;
 mod import;
 mod inline_import;
+mod keep_warm;
 mod ordered;
 mod pauses;
 mod retries;
 mod scopes;
+mod service_tier;
 mod warm;
 
 #[cfg(test)]

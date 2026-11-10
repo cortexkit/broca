@@ -326,6 +326,7 @@ async fn side_with(
     let provider = broca_core::provider::StubProvider::new(steps.clone());
     let scripted = || Gated {
         render_config: None,
+        notes_sends: false,
         inner: provider.clone(),
         gate: gate.clone(),
     };
