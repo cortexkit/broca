@@ -296,6 +296,7 @@ fn compacted(root: &Path) -> (Vec<FramedRecord>, Option<WalLineageId>, Vec<u8>) 
 
 fn moved(records: &[FramedRecord]) -> broca_session_store::record::Moved {
     broca_session_store::record::Moved {
+        source_lineage: None,
         move_id: "store-move:test".into(),
         source_activity_ms: broca_module::head_time::updated_at_of_wal(records, None),
     }
@@ -324,6 +325,7 @@ fn staged(root: &Path) -> Compacted {
     );
     let staging = root.join("session-store/staging/store-move-test");
     let stage = Stage {
+        source_history_version: 1,
         records: &records,
         lineage: lineage_text.as_deref(),
         session: &session(),

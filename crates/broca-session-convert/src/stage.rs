@@ -27,8 +27,14 @@ use crate::Converted;
 pub struct Stage<'a> {
     /// The WAL prefix to copy: every record of the session up to its frozen end.
     pub records: &'a [FramedRecord],
-    /// The WAL's lineage, which today's message ids and call keys are made of.
+    /// The WAL's lineage, which the source message ids and call keys are made of. Offline
+    /// conversion must publish through `stage` too, so its move records this reference namespace.
     pub lineage: Option<&'a str>,
+    /// The version `session.read` serves for the source session. Publishing conversions obtain it through
+    /// `ServedHistory::served_snapshot`, including allocation when no row exists. The read-only
+    /// move-check rehearsal uses an existing row, otherwise the registry's no-source fallback
+    /// (`u64::from(has_log)`), which can differ from a row allocation's wall-clock floor.
+    pub source_history_version: u64,
     pub session: &'a BindIdentity,
     pub deployment: &'a DeploymentKey,
     /// The new storage's root (`<state root>/session-store`), whose setup store takes the
@@ -416,12 +422,13 @@ pub async fn write(stage: &Stage<'_>, prepared: Prepared) -> Result<Staged, Stag
             )
         })?;
     let setup = SetupStore::new(&setup_backend, &setup_key);
-    let mut session = Session::create(
+    let mut session = Session::create_with_history_version(
         LocalBackend::new(stage.staging),
         SessionAddr(broca_core::session_addr(stage.session)),
         triple(stage.session),
         stage.deployment,
         appends_in_conversation,
+        stage.source_history_version,
     )
     .await
     .map_err(failed("create the staged session"))?;
@@ -429,7 +436,9 @@ pub async fn write(stage: &Stage<'_>, prepared: Prepared) -> Result<Staged, Stag
     // synced batch, after the setup parts it names are stored. The move's own record goes in
     // the last batch.
     let records = &converted.records;
-    let moved = Record::Moved(stage.moved.clone());
+    let mut moved = stage.moved.clone();
+    moved.source_lineage = stage.lineage.map(str::to_owned);
+    let moved = Record::Moved(moved);
     if records.is_empty() {
         append_batch(&mut session, std::slice::from_ref(&moved), &media).await?;
     }

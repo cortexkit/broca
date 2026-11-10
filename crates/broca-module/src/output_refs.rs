@@ -624,7 +624,10 @@ pub async fn message_output_refs<H: ServeHandler + ?Sized>(
     if page.incarnation == "unwritten" {
         return Ok(None);
     }
-    let current = snapshot_scope(&page.incarnation, page.history_version);
+    let namespace = handler
+        .output_ref_namespace(session, &page.incarnation)
+        .await?;
+    let current = snapshot_scope(&namespace, page.history_version);
     if lineage.is_some_and(|lineage| lineage != current) {
         return Ok(None);
     }
@@ -665,10 +668,11 @@ pub async fn page_output_refs<H: ServeHandler + ?Sized>(
     entries: &[SessionReadMessage],
     records: Option<Vec<broca_wal::WalRecord>>,
 ) -> Result<BTreeMap<u64, MessageOutputDescriptors>, ServeError> {
+    let namespace = handler.output_ref_namespace(session, lineage).await?;
     let mut messages = Messages {
         handler,
         session,
-        lineage: snapshot_scope(lineage, history_version),
+        lineage: snapshot_scope(&namespace, history_version),
         history_version,
         cache: entries
             .iter()

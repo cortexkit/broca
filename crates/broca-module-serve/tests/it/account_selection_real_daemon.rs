@@ -2743,6 +2743,121 @@ async fn caller_conversation_key_reaches_routing_and_retry_identity() {
     assert_eq!(rig.routing.account_for_count(id), 1);
 }
 
+/// Both executors freeze the same account selection for caller affinity, its inheritance and
+/// the session-derived fallback. The store is plain only so the fixture needs no deployment key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn store_and_wal_freeze_the_same_auth_selection_for_conversation_keys() {
+    let Some(today) = Rig::start().await else {
+        return;
+    };
+    let Some(store) = Rig::start_with(json!({"session_storage":{"encryption":"off"}})).await else {
+        return;
+    };
+    let plain = broca_session_store::keys::DeploymentKey::unloaded(1);
+    for rig in [&today, &store] {
+        rig.routing.set(RoutingMode::Choose {
+            account_id: "acct-b",
+            credential_id: "oauth:anthropic:acct-b",
+        });
+    }
+    for name in ["affinity-differential", "derived-differential"] {
+        let identity = store.served_identity(name).await;
+        assert_eq!(identity, today.served_identity(name).await);
+        store.create_held(&identity, &plain).await;
+    }
+    for (name, send_id, extra, source) in [
+        (
+            "affinity-differential",
+            "caller",
+            json!({"conversation_key":"consult:differential"}),
+            "caller",
+        ),
+        ("affinity-differential", "inherited", json!({}), "inherited"),
+        ("derived-differential", "derived", json!({}), "session"),
+    ] {
+        let mut frozen = Vec::new();
+        for (on_store, rig) in [(false, &today), (true, &store)] {
+            let client = rig.client(name).await;
+            broca_test_support::wait_until(&format!("idle before {name}/{send_id}"), || async {
+                let status = client.status().await;
+                if matches!(status, Ok(broca_module::serve::StatusResponse::Idle)) {
+                    Ok(())
+                } else {
+                    Err(format!("{status:?}"))
+                }
+            })
+            .await;
+            let sent = rig.raw_send(name, send_id, extra.clone()).await.unwrap();
+            let id = sent["run_id"].as_str().unwrap();
+            broca_test_support::wait_until(&format!("finished {name}/{send_id}"), || async {
+                let status = client.status().await;
+                if matches!(status, Ok(broca_module::serve::StatusResponse::Idle)) {
+                    Ok(())
+                } else {
+                    Err(format!("{status:?}"))
+                }
+            })
+            .await;
+            let identity = rig.served_identity(name).await;
+            let mut selection = if on_store {
+                let session = broca_session_store::session::Session::view(
+                    broca_session_store::backend::LocalBackend::new(
+                        rig.state_root.join(broca_wal::SESSION_STORAGE_DIR),
+                    ),
+                    broca_session_store::backend::SessionAddr(broca_core::session_addr(&identity)),
+                    &broca_session_store::head::SessionTriple {
+                        project_root: identity.project_root.display().to_string(),
+                        harness: identity.harness.clone(),
+                        session: identity.session.clone(),
+                    },
+                    &plain,
+                )
+                .await
+                .unwrap();
+                assert!(!rig.has_todays_wal(&identity));
+                session
+                    .find_run_start(id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .auth_selection
+                    .unwrap()
+            } else {
+                rig.finished_run(name, id)
+                    .await
+                    .iter()
+                    .find_map(|frame| match &frame.record {
+                        WalRecord::RunStarted { run_id, config, .. } if run_id.0 == id => Some(
+                            serde_json::to_value(config.auth_selection.as_ref().unwrap()).unwrap(),
+                        ),
+                        _ => None,
+                    })
+                    .unwrap()
+            };
+            let expected = if source == "session" {
+                broca_module_serve::account_routing::conversation_key(&identity)
+            } else {
+                "consult:differential".into()
+            };
+            rig.assert_affinity(id, &expected);
+            assert_eq!(selection["account_decision"]["conversation_key"], expected);
+            assert_eq!(
+                selection["account_decision"]["conversation_key_source"],
+                source
+            );
+            // Admission ids belong to individual runs. Check that binding before normalizing
+            // only this field; credential, vault request and the rest of the decision must agree.
+            assert_eq!(selection["account_decision"]["admission_id"], id);
+            selection["account_decision"]["admission_id"] = json!("@RUN@");
+            frozen.push(selection);
+        }
+        assert_eq!(
+            frozen[1], frozen[0],
+            "{name}/{send_id}: frozen auth selections differ"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn malformed_conversation_keys_are_refused_without_wal_writes() {
     let Some(rig) = Rig::start().await else {

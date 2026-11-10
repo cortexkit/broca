@@ -1004,6 +1004,7 @@ mod records {
     crate::fuzzing::gen::fields!(Moved {
         move_id,
         source_activity_ms,
+        source_lineage,
     });
     crate::fuzzing::gen::fields!(EnrollmentOverlayRef {
         log,
@@ -1222,7 +1223,8 @@ mod operations {
         title,
         plan,
         enrolled,
-        tag_high_water
+        tag_high_water,
+        source_lineage
     });
     crate::fuzzing::gen::fields!(Enrollment {
         through_ordinal,

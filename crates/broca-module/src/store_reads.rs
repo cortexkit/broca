@@ -81,6 +81,9 @@ pub enum StoreReadRequest {
     /// The compaction view the model step that wrote message `ordinal` (counting from 0) was
     /// rendered under, for output references (see `store_output_refs::writing_view`).
     WritingView { ordinal: u64 },
+    /// The namespace of output references: the source WAL's lineage after conversion, otherwise
+    /// the store incarnation. It is independent of the public history cursor's incarnation.
+    OutputRefNamespace,
     /// What a plan-change op's preflight reads about the session, for a request naming
     /// `generation` and `send_id` (see `store_plan_change::change_read`).
     PlanChange {
@@ -167,6 +170,7 @@ pub enum StoreReadReply {
     Media(Result<Option<StoredMedia>, ServeError>),
     TagLocation(Result<broca_core::TagLocation, ServeError>),
     WritingView(Result<Option<broca_core::compaction_provider::view::CompactionView>, ServeError>),
+    OutputRefNamespace(String),
     PlanChange(Result<PlanChangeRead, String>),
     PlanIdentities(Result<RefreshedIdentities, String>),
     /// `None` before the session's first run.
@@ -351,6 +355,13 @@ pub async fn execute<B: SessionBackend>(
             crate::store_output_refs::tag_location(session, ctx.parts, *tag)
                 .await
                 .map_err(output_refs_failed),
+        ),
+        StoreReadRequest::OutputRefNamespace => StoreReadReply::OutputRefNamespace(
+            session
+                .operations
+                .source_lineage
+                .clone()
+                .unwrap_or_else(|| broca_session_store::codec::hex(&session.head().incarnation.0)),
         ),
         StoreReadRequest::WritingView { ordinal } => StoreReadReply::WritingView(
             crate::store_output_refs::writing_view(session, *ordinal)

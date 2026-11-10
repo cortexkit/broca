@@ -2821,6 +2821,16 @@ pub trait ServeHandler: Send + Sync {
         Ok(None)
     }
 
+    /// The namespace output references use. A converted session retains its source WAL's
+    /// lineage even though its history cursors use the new store incarnation.
+    async fn output_ref_namespace(
+        &self,
+        _session: &LineageKey,
+        incarnation: &str,
+    ) -> Result<String, ServeError> {
+        Ok(incarnation.to_owned())
+    }
+
     /// `session.output_refs` (llm-runner §9.13): one page of an output-reference set, derived
     /// from the session log on every read (see [`crate::output_refs`]).
     async fn output_refs(
@@ -3343,6 +3353,25 @@ impl ServeHandler for crate::LineageRegistry {
         self.route_tag_location(session, tag)
             .await
             .map_err(ServeError::from)
+    }
+
+    async fn output_ref_namespace(
+        &self,
+        session: &LineageKey,
+        incarnation: &str,
+    ) -> Result<String, ServeError> {
+        use crate::store_reads::{StoreReadReply, StoreReadRequest};
+        let Some(store) = self.store_holding(session)? else {
+            return Ok(incarnation.to_owned());
+        };
+        match store
+            .read(self, session, StoreReadRequest::OutputRefNamespace)
+            .await?
+        {
+            Some(StoreReadReply::OutputRefNamespace(namespace)) => Ok(namespace),
+            Some(_) => Err(crate::store_reads::mismatched()),
+            None => Ok(incarnation.to_owned()),
+        }
     }
 
     async fn store_writing_view(
