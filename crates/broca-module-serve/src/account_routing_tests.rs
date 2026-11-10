@@ -938,20 +938,24 @@ async fn apikey_routing_refuses_wrong_method_or_unloadable_pick() {
 }
 
 #[tokio::test]
-async fn apikey_legacy_unhinted_and_pinned_keep_the_configured_vault_record() {
+async fn apikey_unhinted_and_pinned_keep_the_exact_listed_vault_record() {
     use crate::auth_routing::{resolve_credential_id, MethodConfig};
-    use crate::vault_config::{VaultAddressing, VaultCredentialIds};
-    let root = broca_test_support::scratch_root().join("apikey-static-mapping");
-    std::fs::create_dir_all(&root).unwrap();
-    let path = root.join("auth-methods.json");
-    std::fs::write(&path, br#"{"defaults":{"anthropic":"apikey"}}"#).unwrap();
-    let methods = MethodConfig::load(&path).unwrap();
-    let addressing = VaultAddressing::new(VaultCredentialIds::from_pairs([
-        ("apikey:anthropic", "operator-default"),
-        ("apikey:anthropic:work", "operator-work"),
-    ]));
-    for (account, expected) in [(None, "operator-default"), (Some("work"), "operator-work")] {
-        let key = resolve_credential_id("anthropic", None, account, &methods, AuthMethod::Oauth);
+    use crate::vault_config::VaultAddressing;
+    let cache = Arc::new(ListingCache::default());
+    cache.store(crate::auth_routing::row_listing());
+    let methods = MethodConfig::from_listing(cache.clone());
+    let addressing = VaultAddressing::new(cache);
+    for (account, expected) in [
+        (None, "apikey:openai"),
+        (Some("acct1"), "apikey:openai:acct1"),
+    ] {
+        let key = resolve_credential_id(
+            "openai",
+            Some(AuthMethod::ApiKey),
+            account,
+            &methods,
+            AuthMethod::Oauth,
+        );
         let routing = FakeRouting::refusing(SELECTION_DISABLED, json!({}));
         let choice = choose_account(
             &client(&routing),
@@ -978,7 +982,10 @@ async fn apikey_legacy_unhinted_and_pinned_keep_the_configured_vault_record() {
         .await
         .unwrap();
         assert!(!matches!(choice, AccountChoice::Routed { .. }));
-        assert_eq!(addressing.vault_id_for(&key), expected);
+        assert_eq!(
+            addressing.vault_id_for(&key).unwrap().as_deref(),
+            Some(expected)
+        );
         assert!(routing.methods().is_empty());
     }
 }

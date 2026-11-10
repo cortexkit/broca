@@ -150,6 +150,20 @@ and the supervised module's read grant. A missing vault configuration or refused
 credential read never falls back to another application's credential store. Mock
 providers selected with `BROCA_PROVIDER_BASE_URL` need no credential route.
 
+Credential keys resolve from the daemon's cached `credential.list_scoped` rows, never from
+`auth-methods.json` or `vault.credential_ids`. Those obsolete settings are ignored with one
+boot warning each and can be deleted. Active exact ids win; otherwise one row must name both
+the method and the catalog provider in `provider_ids` (not the vendor `provider` field).
+Retired rows and rows without `provider_ids` are not eligible. Without an explicit method,
+the default order is `chatgpt`, `oauth`, `antigravity`, then `apikey` among eligible methods.
+Frozen vault ids are reused on resume; older selections without a resolved id look up their
+frozen key by the same row rule, without changing their method.
+
+New sends refuse `credentials_unavailable` while no listing has loaded, with
+`detail.class: "transient"`. An ambiguous fixed key refuses `credential_ambiguous` with
+`detail: {class: "permanent", credential: <broca key>, candidate_ids: [<vault ids>]}`;
+it never chooses a row silently. Existing missing-credential refusals are unchanged.
+
 Foreground developer tools use a separately provisioned capability handle:
 `broca-run` resolves a catalog model's provider and configured auth method, loads
 its handle through `vault_config::load_devtools_handle`, and reads it through subc.
@@ -1331,7 +1345,7 @@ The manifest lists `classifier/v1` in `capabilities.provides`.
   beside the token; their answers are read from the `result` member of Cloudflare's
   reply envelope. OpenAI Decisions uses `POST https://api.openai.com/v1/decisions`
   with `gpt-6-luna` and the vault credential `apikey:openai`, resolved through
-  `vault.credential_ids` aliases like the other System One credentials.
+  row-based credential lookup like the other System One credentials.
   `providers.<id>.base_url` (`typesafe`, `cloudflare-workers-ai`, `openai`)
   replaces the corresponding base. The OpenAI override also applies to chat calls
   using that provider id. Decisions requests disable prompt caching with explicit

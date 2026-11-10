@@ -1054,6 +1054,13 @@ pub enum RunError {
     /// error and writes NOTHING durable (no ghost run). Distinct from a mid-run failure
     /// (which is a normal short terminal run).
     Config(String),
+    /// The cached vault listing has not arrived; admission must not guess a credential.
+    CredentialsUnavailable,
+    /// More than one active vault row serves the requested key.
+    CredentialAmbiguous {
+        credential: String,
+        candidate_ids: Vec<String>,
+    },
     /// V2 Setup requires the model's real frozen context window.
     CompactionContextLimitMissing,
     /// Person media failed admission before a record could name it.
@@ -1186,6 +1193,7 @@ impl RunError {
         match self {
             Self::Upload(error) => error.error_class(),
             Self::Config(_)
+            | Self::CredentialAmbiguous { .. }
             | Self::CompactionContextLimitMissing
             | Self::MediaUnsupported(_)
             | Self::MediaTooLarge(_)
@@ -1200,6 +1208,7 @@ impl RunError {
             | Self::NewerWriter { .. }
             | Self::TagNumbering(_) => ErrorClass::Permanent,
             Self::LeaseHeld(_)
+            | Self::CredentialsUnavailable
             | Self::Lease(_)
             | Self::Wal(_)
             | Self::Panicked
@@ -1214,6 +1223,8 @@ impl std::fmt::Display for RunError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             RunError::LeaseHeld(s) => write!(f, "session '{s}' held by a live writer"),
+            RunError::CredentialsUnavailable => write!(f, "the vault credential listing has not loaded yet"),
+            RunError::CredentialAmbiguous { credential, candidate_ids } => write!(f, "credential {credential} is ambiguous: {}", candidate_ids.join(", ")),
             RunError::Lease(s) => write!(f, "lease error: {s}"),
             RunError::RetainedSessionTooLarge { max_bytes } => write!(f, "{}", crate::wal_writer::retained_size::error(*max_bytes).message),
             RunError::SessionTooLarge { max_bytes } => write!(f, "{}", crate::wal_writer::retained_size::scoped_error(*max_bytes, broca_wal::size_limit::SizeScope::Session).message),

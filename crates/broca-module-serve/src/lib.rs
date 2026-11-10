@@ -86,7 +86,7 @@ pub use serve::{
     ServeIoError,
 };
 pub use vault_config::{
-    scoped_not_found_message, VaultAddressing, VaultCredentialIds, VaultHandles, VaultHandlesError,
+    scoped_not_found_message, VaultAddressing, VaultHandles, VaultHandlesError,
 };
 
 pub mod devtools;

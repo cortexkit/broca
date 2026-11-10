@@ -98,9 +98,14 @@ async fn account_route_refuses_unlisted_default_method_before_any_write() {
     let http = resume_http_fixture().await;
     let routing = Arc::new(AuthHintRouting::default());
     let mut live = auth_hint_executor(&root, &daemon, routing.clone(), &http.url).await;
-    let config_path = root.join("methods.json");
-    std::fs::write(&config_path, r#"{"defaults":{"openai":"antigravity"}}"#).unwrap();
-    Arc::get_mut(live.vault.as_mut().unwrap()).unwrap().methods = broca_module_serve::MethodConfig::load(&config_path).unwrap();
+    let cache = listed_credentials([("antigravity:openai", "antigravity:openai")]);
+    let (mut rows, _) = cache.get().unwrap();
+    Arc::make_mut(&mut rows).credentials.retain(|row| row.provider_ids != ["openai"] || row.auth_method.as_deref() == Some("antigravity"));
+    cache.store((*rows).clone());
+    let vault = Arc::get_mut(live.vault.as_mut().unwrap()).unwrap();
+    vault.methods = broca_module_serve::MethodConfig::from_listing(cache.clone());
+    vault.addressing = broca_module_serve::VaultAddressing::new(cache.clone());
+    vault.listing = cache;
     let store = live.wal_store.clone();
     let mut rig = TierServeRig::start_with_executor(&root, None, None, live, None).await;
     let reply = rig.call("session.send", serde_json::json!({"send_id":"unsupported-route","prompt":"hello",

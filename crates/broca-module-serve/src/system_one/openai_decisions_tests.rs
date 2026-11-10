@@ -565,7 +565,7 @@ fn retry_after_dates_and_seconds_are_preserved_without_guessing() {
 }
 
 #[test]
-fn openai_uses_existing_boot_url_and_vault_id_configuration() {
+fn openai_uses_boot_url_and_row_based_vault_addressing() {
     let overrides = crate::provider_overrides::ProviderOverrides::parse(
         r#"{"providers":{"openai":{"base_url":"http://proxy.example/v1"}}}"#,
     )
@@ -579,11 +579,12 @@ fn openai_uses_existing_boot_url_and_vault_id_configuration() {
     assert_eq!(client.egress_host(), "proxy.example");
     let default = OpenAiDecisions::new(None, Arc::new(Token), Duration::from_secs(1)).unwrap();
     assert_eq!(default.egress_host(), "api.openai.com");
-    let aliases = crate::VaultCredentialIds::parse(
-        r#"{"vault":{"credential_ids":{"apikey:openai":"apikey:openai:decisions"}}}"#,
-    )
-    .unwrap();
-    let addressing = crate::VaultAddressing::new(aliases);
+    let cache = Arc::new(crate::account_routing::ListingCache::default());
+    cache.store(crate::auth_routing::row_listing());
+    let addressing = crate::VaultAddressing::new(cache);
     let key = crate::CredentialId::parse(CREDENTIAL_ID).unwrap();
-    assert_eq!(addressing.vault_id_for(&key), "apikey:openai:decisions");
+    assert_eq!(
+        addressing.vault_id_for(&key).unwrap().as_deref(),
+        Some("apikey:openai")
+    );
 }

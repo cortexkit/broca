@@ -252,7 +252,8 @@ async fn runtime_override_preserves_auth_billing_and_cache_predicates() {
         .unwrap()
         .is_some());
     assert_resume_replays_the_admitted_cache_policy(&executor, req.clone());
-    assert_eq!(auth.selection.as_ref().unwrap().resolved_credential_id, None);
+    // Admission without account routing freezes the listed vault id even when the token reply omits it.
+    assert_eq!(auth.selection.as_ref().unwrap().resolved_credential_id.as_deref(), Some("apikey:deepseek"));
     executor.provider_base_url = Some("http://127.0.0.1:4010/v1".into());
     let mock = executor.decide_auth("deepseek", None, true, Some(AuthMethod::ApiKey), None).await.unwrap();
     assert!(mock.selection.is_none(), "mock auth has no vault witness, vault request, or selection");

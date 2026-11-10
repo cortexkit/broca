@@ -4,7 +4,7 @@
 /// credential id `work-claude` with `auth_method: "oauth"` beside it. It is framed and decoded
 /// as replay reads it, folded into the admission checkpoint, and resumed through the same
 /// prior-run view `execute` uses. The resume reads `work-claude` verbatim and authenticates as
-/// OAuth. An alias exists for the broca key `oauth:anthropic`, so a build that turned the id
+/// OAuth. A different row serves the broca key `oauth:anthropic`, so a build that turned the id
 /// into a broca key, or ignored the method and fell back to configuration, would read
 /// something else. The selection re-frozen on resume keeps the method, so a later resume of the
 /// same run, here or on the writing build, reads it the same way.
@@ -39,7 +39,7 @@ async fn a_run_started_with_a_frozen_auth_method_resumes_on_its_vault_id_verbati
         &root,
         &daemon,
         Duration::from_secs(2),
-        broca_module_serve::VaultCredentialIds::from_pairs([("oauth:anthropic", "aliased-key")]),
+        listed_credentials([("oauth:anthropic", "aliased-key")]),
         supervised_broca_identity(),
     )
     .await;
@@ -50,20 +50,10 @@ async fn a_run_started_with_a_frozen_auth_method_resumes_on_its_vault_id_verbati
             .unwrap()
             .addressing
             .vault_id_for_selection(&frozen)
-            .as_deref(),
+            .unwrap().as_deref(),
         Some("work-claude")
     );
-    let resolved = executor
-        .decide_auth_with_account(
-            prior.config.model.provider_module_id.as_str(),
-            Some(frozen.credential_id.as_str()),
-            frozen.auth_method.as_deref(),
-            false,
-            None,
-            None,
-            &AccountChoice::NotApplicable,
-            frozen.account_decision.as_ref(),
-        )
+    let resolved = executor.decide_auth_with_account(prior.config.model.provider_module_id.as_str(), Some(frozen.credential_id.as_str()), frozen.auth_method.as_deref(), None, false, None, None, &AccountChoice::NotApplicable, frozen.account_decision.as_ref())
         .await
         .unwrap_or_else(|error| {
             daemon.assert_healthy();
@@ -93,7 +83,7 @@ async fn a_run_started_with_a_frozen_auth_method_resumes_on_its_vault_id_verbati
 
 /// ONLY A ROUTED ADMISSION FREEZES AN AUTH METHOD.
 ///
-/// A fresh admission resolved from configuration freezes a broca key with no `auth_method`, so
+/// A fresh fixed admission resolved from rows freezes a broca key with no `auth_method`, so
 /// the `RunStarted` it writes needs no reader feature and any older build can still read and
 /// resume it. A fresh admission routed to an account freezes the vault's own credential id with
 /// the method the vault's metadata named, so its `RunStarted` requires
@@ -111,30 +101,10 @@ async fn only_a_routed_admission_freezes_its_auth_method_and_requires_the_featur
     )
     .await;
     let executor = executor_with_capturing_vault(&root, &daemon).await;
-    let configured = executor
-        .decide_auth_with_account(
-            "anthropic",
-            None,
-            None,
-            true,
-            Some(AuthMethod::Oauth),
-            None,
-            &AccountChoice::NotApplicable,
-            None,
-        )
+    let configured = executor.decide_auth_with_account("anthropic", None, None, None, true, Some(AuthMethod::Oauth), None, &AccountChoice::NotApplicable, None)
         .await
         .unwrap();
-    let routed = executor
-        .decide_auth_with_account(
-            "openai",
-            None,
-            None,
-            true,
-            Some(AuthMethod::Chatgpt),
-            None,
-            &routed_chatgpt_choice().await,
-            None,
-        )
+    let routed = executor.decide_auth_with_account("openai", None, None, None, true, Some(AuthMethod::Chatgpt), None, &routed_chatgpt_choice().await, None)
         .await
         .unwrap();
     let run_started = |selection: broca_wal::AuthSelection| {
@@ -190,4 +160,67 @@ fn resume_preserves_the_frozen_billing_snapshot_without_backfilling() {
     frozen.billing_vault_facts = None;
     preserve_billing_vault_snapshot(&mut selection, Some(&frozen));
     assert!(selection.unwrap().billing_vault_facts.is_none());
+}
+
+#[tokio::test]
+async fn older_frozen_kimi_key_resolves_once_then_resume_keeps_the_frozen_vault_id() {
+    let root = fresh_vault_root("frozen-kimi-rows");
+    let daemon = CapturingVaultDaemon::start(&root).await;
+    let executor = executor_with_vault_addressing(&root, &daemon, Duration::from_secs(2),
+        listed_credentials([("apikey:kimi-code-plan-global", "apikey:kimi-for-coding")]),
+        supervised_broca_identity()).await;
+    let key = "apikey:kimi-code-plan-global";
+    let resumed = executor.decide_auth_with_account("kimi-code-plan-global", Some(key), None, None,
+        false, None, None, &AccountChoice::NotApplicable, None).await.unwrap();
+    let selection = resumed.selection.unwrap();
+    assert_eq!(selection.credential_id, key);
+    assert_eq!(selection.resolved_credential_id.as_deref(), Some("apikey:kimi-for-coding"));
+    assert_eq!(resumed.method, Some(AuthMethod::ApiKey));
+    executor.vault.as_ref().unwrap().listing.store(broca_subc::vault::ScopedList {
+        credentials:vec![], grants:0, grant_tuples:vec![], view:"changed".into(),
+    });
+    let again = executor.decide_auth_with_account("kimi-code-plan-global", Some(key), None,
+        selection.resolved_credential_id.as_deref(), false, None, None, &AccountChoice::NotApplicable, None).await.unwrap();
+    assert_eq!(again.selection.unwrap().resolved_credential_id, selection.resolved_credential_id);
+    assert_eq!(methods(&daemon.requests()), ["credential.get_scoped", "credential.get_scoped"]);
+    for (_, request) in daemon.requests() { assert_eq!(request["credential_id"], "apikey:kimi-for-coding"); }
+    daemon.assert_healthy();
+    drop(executor);
+    drop(daemon);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn admission_without_a_cached_listing_refuses_transiently_before_a_credential_read() {
+    let root = fresh_vault_root("no-listing-admission");
+    let daemon = CapturingVaultDaemon::start(&root).await;
+    let executor = executor_with_vault_addressing(&root, &daemon, Duration::from_secs(2),
+        Arc::new(broca_module_serve::account_routing::ListingCache::default()), supervised_broca_identity()).await;
+    let result = executor.decide_auth("deepseek", None, true, Some(AuthMethod::ApiKey), None).await;
+    assert!(matches!(result, Err(RunError::CredentialsUnavailable)));
+    assert!(daemon.requests().iter().all(|(method, _)| method != "credential.get_scoped"));
+    drop(executor);
+    drop(daemon);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn older_frozen_keys_refuse_ambiguous_or_missing_rows_without_reading_a_credential() {
+    let root = fresh_vault_root("frozen-key-refusals");
+    let daemon = CapturingVaultDaemon::start(&root).await;
+    let executor = executor_with_vault_addressing(&root, &daemon, Duration::from_secs(2),
+        listed_credentials([("apikey:kimi-code-plan-global:acct1", "kimi-row1"),
+            ("apikey:kimi-code-plan-global:acct2", "kimi-row2")]), supervised_broca_identity()).await;
+    let result = executor.decide_auth_with_account("kimi-code-plan-global", Some("apikey:kimi-code-plan-global"),
+        None, None, false, None, None, &AccountChoice::NotApplicable, None).await;
+    assert!(matches!(result, Err(RunError::CredentialAmbiguous { ref credential, ref candidate_ids })
+        if credential == "apikey:kimi-code-plan-global" && candidate_ids == &["kimi-row1", "kimi-row2"]));
+    let result = executor.decide_auth_with_account("missing", Some("apikey:missing"),
+        None, None, false, None, None, &AccountChoice::NotApplicable, None).await;
+    assert!(matches!(result, Err(RunError::Config(ref message)) if message.contains("not_found")));
+    assert!(daemon.requests().is_empty());
+    daemon.assert_healthy();
+    drop(executor);
+    drop(daemon);
+    std::fs::remove_dir_all(root).unwrap();
 }

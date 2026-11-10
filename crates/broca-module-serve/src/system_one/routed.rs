@@ -72,7 +72,7 @@ impl RoutingCredentials for VaultRoutingCredentials {
         Arc::new(VaultCredential {
             client: self.0.clone(),
             credential_id: credential_id.into(),
-            vault_id: credential_id.into(),
+            addressing: None,
         })
     }
 }

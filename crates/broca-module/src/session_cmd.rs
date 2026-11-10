@@ -287,6 +287,11 @@ pub enum ImportOutcome {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SendOutcome {
+    CredentialsUnavailable,
+    CredentialAmbiguous {
+        credential: String,
+        candidate_ids: Vec<String>,
+    },
     RouteDecisionFixed,
     AccountRouteFixed,
     SessionMoving {

@@ -18,7 +18,7 @@ use broca_subc::vault::ScopedList;
 use broca_subc::VaultError;
 use broca_wire::{VaultAuditMissing, VaultAuditResponse, VaultAuditRow};
 
-use crate::{CredentialId, MethodConfig, VaultAddressing};
+use crate::CredentialId;
 
 /// The daemon-owned capability the `vault.audit` op calls. Implemented by the process that
 /// holds the vault client; the serve layer only forwards the answer.
@@ -26,36 +26,35 @@ pub trait VaultAuditor: Send + Sync {
     fn audit(&self) -> Pin<Box<dyn Future<Output = VaultAuditResponse> + Send + '_>>;
 }
 
-/// The credentials broca's configuration routes to, as vault credential id -> the broca
-/// routing keys that resolve to it.
-///
-/// Two sources name a credential: each provider's configured default method
-/// (`auth-methods.json`, giving `<method>:<provider>`), and each `vault.credential_ids` alias.
-/// A routing key reached only by a per-request method or account pin is not configuration,
-/// so it is not listed; give it an alias to have the audit watch it.
-pub fn referenced_credentials(
-    methods: &MethodConfig,
-    addressing: &VaultAddressing,
-) -> BTreeMap<String, Vec<String>> {
-    let mut referenced: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let mut add = |key: String, vault_id: String| {
-        let keys = referenced.entry(vault_id).or_default();
-        if !keys.contains(&key) {
-            keys.push(key);
+/// Public routing keys that resolve to each vault row. Ambiguous keys reference no row:
+/// the audit must not claim a credential that fixed admission would refuse to choose.
+pub fn referenced_credentials(listing: &ScopedList) -> BTreeMap<String, Vec<String>> {
+    let mut keys = std::collections::BTreeSet::new();
+    for row in &listing.credentials {
+        if row.state != "active" || row.provider_ids.is_empty() {
+            continue;
         }
-    };
-    for (provider, method) in methods.defaults() {
-        let key = CredentialId::new(method, provider, None);
-        add(
-            key.to_id_string(),
-            addressing.vault_id_for(&key).into_owned(),
-        );
+        let Some(method) = row
+            .auth_method
+            .as_deref()
+            .and_then(crate::AuthMethod::from_token)
+        else {
+            continue;
+        };
+        for provider in &row.provider_ids {
+            keys.insert(CredentialId::new(method, provider, None).to_id_string());
+        }
+        if CredentialId::parse(&row.id).is_some() {
+            keys.insert(row.id.clone());
+        }
     }
-    for (key, vault_id) in addressing.aliases() {
-        add(key.to_string(), vault_id.to_string());
-    }
-    for keys in referenced.values_mut() {
-        keys.sort_unstable();
+    let mut referenced: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for key in keys {
+        if let Ok(Some(row)) =
+            crate::auth_routing::credential_row(listing, &CredentialId::parse(&key).unwrap())
+        {
+            referenced.entry(row.id.clone()).or_default().push(key);
+        }
     }
     referenced
 }
@@ -135,7 +134,6 @@ pub fn vault_error_label(error: &VaultError) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::VaultCredentialIds;
     use broca_subc::vault::{ScopedCredential, ScopedList};
 
     fn row(id: &str, credential_type: &str, state: &str) -> ScopedCredential {
@@ -165,43 +163,20 @@ mod tests {
         }
     }
 
-    fn methods(json: &str) -> MethodConfig {
-        let path = broca_test_support::scratch_root().join(format!(
-            "broca-vault-audit-methods-{}-{}.json",
-            std::process::id(),
-            json.len()
-        ));
-        std::fs::write(&path, json).unwrap();
-        let config = MethodConfig::load(&path).unwrap();
-        let _ = std::fs::remove_file(&path);
-        config
-    }
-
     #[test]
-    fn configuration_references_method_defaults_and_aliases_by_vault_id() {
-        let methods = methods(r#"{"defaults":{"anthropic":"oauth","openai":"chatgpt"}}"#);
-        let addressing = VaultAddressing::new(VaultCredentialIds::from_pairs([
-            ("apikey:opencode", "apikey:opencode-go"),
-            ("chatgpt:openai", "chatgpt:openai:gmail"),
-        ]));
-        let referenced = referenced_credentials(&methods, &addressing);
-        assert_eq!(
-            referenced,
-            BTreeMap::from([
-                (
-                    "apikey:opencode-go".to_string(),
-                    vec!["apikey:opencode".to_string()]
-                ),
-                (
-                    "chatgpt:openai:gmail".to_string(),
-                    vec!["chatgpt:openai".to_string()]
-                ),
-                (
-                    "oauth:anthropic".to_string(),
-                    vec!["oauth:anthropic".to_string()]
-                ),
-            ])
+    fn audit_references_only_keys_that_the_shared_row_rule_resolves() {
+        let referenced = referenced_credentials(&crate::auth_routing::row_listing());
+        assert!(
+            referenced["apikey:kimi-for-coding"].contains(&"apikey:kimi-code-plan-global".into())
         );
+        assert!(referenced["apikey:opencode-zen"].contains(&"apikey:opencode".into()));
+        assert_eq!(referenced["apikey:openai"], ["apikey:openai"]);
+        assert!(!referenced
+            .values()
+            .flatten()
+            .any(|key| key == "apikey:anthropic-platform" || key == "apikey:anthropic"));
+        assert!(!referenced.contains_key("apikey:inception"));
+        assert!(!referenced.contains_key("apikey:cline-pass"));
     }
 
     /// THE FINDING THE AUDIT EXISTS FOR: a credential broca routes to that the vault did not

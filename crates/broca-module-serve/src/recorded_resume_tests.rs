@@ -160,9 +160,11 @@ async fn execute_recorded_fixture(
     let _ = std::fs::remove_dir_all(root);
     std::fs::create_dir_all(root).unwrap();
     // The resume reads its credential from the vault, as production does; the stand-in serves
-    // `stand-in-token` for the recorded credential id.
+    // `stand-in-token` for the recorded credential id. Include `apikey:anthropic` in the
+    // vault listing so the resume reaches the check for its recorded renderer.
     let vault = CapturingVaultDaemon::start(root).await;
-    let executor = executor_with_capturing_vault(root, &vault).await;
+    let executor = executor_with_vault_addressing(root, &vault, Duration::from_secs(2),
+        listed_credentials([("apikey:anthropic", "apikey:anthropic")]), supervised_broca_identity()).await;
     let mut req = drift_request(root);
     req.model.model_id = "opaque-resume".into();
     req.generation.max_output_tokens = Some(2048);
