@@ -86,6 +86,8 @@ pub struct StoreActor<B: SessionBackend> {
     /// setup store. `None` keeps them in memory only, as tests do.
     storage: Option<broca_session_loop::durable::SetupParts<B>>,
     run: Option<ActiveRun>,
+    /// A late result raced the task's held pause; resume after its terminal is processed.
+    held_resume_owed: bool,
     /// Set once the module stops the session: no queued send starts after it.
     stopping: bool,
     /// Where the session's spend facts are written. Without it, a run that ends stays owed
@@ -335,6 +337,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             parts: SharedParts::new(parts),
             storage: None,
             run: None,
+            held_resume_owed: false,
             stopping: false,
             billing: None,
             compaction_session: Arc::default(),
@@ -1454,6 +1457,11 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 let _ = reply.send(status);
                 false
             }
+            LineageCmd::ResumeHeld { reply } => {
+                let result = self.resume_held().await;
+                let _ = reply.send(result);
+                false
+            }
             LineageCmd::Cancel { run_id, at, reply } => {
                 let _ = reply.send(self.cancel(&run_id, at).await);
                 false
@@ -1782,11 +1790,14 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     ///   writes just that end;
     /// - with no unfinished run, the first queued send drains.
     ///
-    /// A paused run stays paused: a sign-in pause waits for its retry. Resuming after a
-    /// restart, the account-limit pause's timer, and calls a provider holds aren't recovered on
-    /// this storage yet, so nothing is written for them.
+    /// A held run parks until a late result resumes its original batch. A sign-in pause waits
+    /// for its retry. Resuming after a restart and the account-limit pause's timer aren't
+    /// recovered on this storage yet, so nothing is written for them.
     async fn recover(&mut self) {
         self.bill_owed().await;
+        if self.park_held().await {
+            return;
+        }
         let operations = self.session.operations();
         let Some(run) = operations.run.as_ref().filter(|run| run.finished.is_none()) else {
             return self.drain().await;
@@ -2581,6 +2592,11 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         // The run's end, if it wrote one, is durable now: a run's last batch ends with a
         // barrier, and the run's task has returned.
         self.bill_owed().await;
+        if std::mem::take(&mut self.held_resume_owed) {
+            if let Err(error) = self.resume_held().await {
+                tracing::error!(target: "broca.store_actor", %error, "could not resume a held run after its task parked");
+            }
+        }
         self.drain().await;
     }
 
@@ -3386,8 +3402,9 @@ fn retry_of_queued(
 
 /// What opening the session does with its unfinished latest run `run` before it takes any
 /// command: seal it as a crash's orphan, or resume it to its end. `None` leaves it as it is: a
-/// run paused, or waiting on calls a provider holds, whose recovery isn't built for this storage
-/// yet. A read of the session that no actor holds predicts the run's end from this same decision
+/// paused run, or one waiting on calls a provider holds. A held batch with every result already
+/// durable resumes to finish its barrier. A read of the session that no actor holds predicts
+/// the run's end from this same decision
 /// (`store_status`), so what it serves is what the next open records.
 pub(crate) fn recovery_mode(
     run: &broca_session_store::fold::operations::Run,
@@ -3399,6 +3416,7 @@ pub(crate) fn recovery_mode(
             Some(_) => StoreRunMode::Resume,
         }),
         Resolution::Idle(_) => Some(StoreRunMode::Resume),
+        Resolution::ProviderHeld(waiting) if waiting.is_empty() => Some(StoreRunMode::Resume),
         Resolution::ProviderHeld(_) | Resolution::Paused(_) => None,
     }
 }
@@ -3664,6 +3682,7 @@ fn refuse(command: LineageCmd) {
 }
 
 mod apply_view;
+mod held;
 mod import;
 mod ordered;
 mod scopes;

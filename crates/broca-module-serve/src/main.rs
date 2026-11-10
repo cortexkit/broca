@@ -1095,6 +1095,11 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         broca_module_serve::cache_warm::ProviderCacheDeclarer,
     ));
     let recovery: Arc<dyn broca_core::RecoveryDiscovery> = run_index.as_ref().unwrap().clone();
+    let store_recovery = registry
+        .recover_store_crash_orphans()
+        .await
+        .map_err(|error| ServeIoError(format!("store crash-orphan recovery: {error}")))?;
+    tracing::warn!(target: "lifecycle", ?store_recovery, "store crash-orphan recovery complete");
     let crash_orphans = mark_crash_orphans(
         &registry,
         recovery.clone(),
