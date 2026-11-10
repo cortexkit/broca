@@ -176,6 +176,7 @@ pub(crate) fn warm_journal(
     let step_id = match &job.base {
         WarmBase::InFlight(sent) => sent.step_id,
         WarmBase::Recorded(recorded) => recorded.step_id,
+        WarmBase::RecordedMedia { request, .. } => request.step_id,
     };
     let auth = job.config.auth_selection.clone();
     let template = AttemptReservation {
@@ -230,6 +231,38 @@ pub(crate) struct AutomaticWarmer {
     pub(crate) slot: WarmSlot,
     pub(crate) declare: Declare,
     pub(crate) recorded: Mutex<Option<RecordedRequest>>,
+}
+
+#[cfg(test)]
+pub(crate) fn recorded_for_test(
+    writer: Arc<WalHandle>,
+    executor: Arc<dyn RunExecutor>,
+    session: BindIdentity,
+    request: RecordedRequest,
+) -> Arc<dyn KeepWarmDriver> {
+    let clock = CacheClock::default();
+    clock.note_sent(epoch_ms(), Some(3_600_000));
+    Arc::new(AutomaticWarmer {
+        trigger: "keep_warm",
+        retention: false,
+        session,
+        writer,
+        executor,
+        clock,
+        seal: ShutdownSeal::new(),
+        slot: WarmSlot::default(),
+        declare: Arc::new(|_| {
+            Some(CacheDeclaration {
+                ttl_ms: Some(3_600_000),
+                ttl_options_ms: vec![],
+                read_refreshes_ttl: Some(true),
+                warm: Ok(()),
+                basis: None,
+                requested_ttl_ms: Some(3_600_000),
+            })
+        }),
+        recorded: Mutex::new(Some(request)),
+    })
 }
 
 #[async_trait::async_trait]
@@ -361,6 +394,7 @@ impl KeepWarmDriver for AutomaticWarmer {
         let step_id = match &base {
             WarmBase::InFlight(sent) => sent.step_id,
             WarmBase::Recorded(recorded) => recorded.step_id,
+            WarmBase::RecordedMedia { request, .. } => request.step_id,
         };
         let digest = base.request_body_sha256().to_owned();
         let mut job = WarmJob {

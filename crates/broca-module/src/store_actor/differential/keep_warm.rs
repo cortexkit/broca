@@ -25,6 +25,8 @@ use crate::registry::LineageRegistry;
 
 cipher_tests!(a_keep_warm_resends_the_last_request_and_records_it_alike);
 
+mod resumed;
+
 /// How long after a request a warm of its cache is sent: short, so the tool wait sees one.
 const WARM_AFTER_MS: u64 = 200;
 

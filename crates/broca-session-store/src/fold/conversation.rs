@@ -586,6 +586,26 @@ impl Conversation {
         self.open.as_ref().map(|turn| &turn.assistant)
     }
 
+    /// A render-only view before an entry in the window. A held tool turn and everything after
+    /// the cut are omitted, so rebuilding the request that produced that turn cannot include
+    /// its own answer or results. The original conversation is unchanged.
+    pub fn before_entry(&self, ordinal: u64) -> Option<Self> {
+        let start = self.window_start();
+        if ordinal < start || ordinal > self.placed + 1 {
+            return None;
+        }
+        let mut before = self.clone();
+        let keep = (ordinal - start) as usize;
+        before.messages.truncate(keep);
+        before.entries.truncate(keep);
+        before.placed = ordinal - 1;
+        before.open = None;
+        before.open_entry = None;
+        before.episodes.retain(|episode| episode.start < ordinal);
+        before.changes.everything();
+        Some(before)
+    }
+
     pub fn apply(&mut self, record: &Record) -> Result<(), FoldError> {
         if record.stream() != Stream::Transcript {
             return Err(FoldError::LedgerRecord(record.name()));

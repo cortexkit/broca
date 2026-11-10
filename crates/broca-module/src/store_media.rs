@@ -42,7 +42,7 @@ use broca_session_store::session::{MediaError, MediaObjects, Session, SessionErr
 use broca_wal::{FramedRecord, WalRecord};
 
 /// What the actor and its running run share.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Shared {
     /// Today's records rebuilt since the running run's seed, oldest first, from the seed's
     /// position + 1. The run drops each once it has read past it.
@@ -381,6 +381,16 @@ pub type ReadTail = dyn Fn(u64) -> Result<Vec<FramedRecord>, String> + Send + Sy
 pub type RendererInputs = (Arc<dyn MediaBytes>, MediaCheckpoint, Box<ReadTail>);
 
 impl StoreRunMedia {
+    /// A fixed view for rebuilding a recorded request. Its tail reader must not discard records
+    /// the live run's independent renderer still needs.
+    pub(crate) fn snapshot(&self) -> Self {
+        Self {
+            seed: self.seed.clone(),
+            shared: Arc::new(Mutex::new(self.shared.lock().unwrap().clone())),
+            bytes: self.bytes.clone(),
+        }
+    }
+
     /// The byte source, the seed and the tail reader a run's `LiveMedia` is built from, or why
     /// the run can't render media.
     pub fn renderer_inputs(self) -> Result<RendererInputs, String> {
