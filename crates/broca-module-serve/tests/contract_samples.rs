@@ -2125,6 +2125,119 @@ async fn recorded_owner_marks_are_projected_on_the_real_compaction_entries_route
     }
 }
 
+/// A compaction provider whose catalog entry declares entry attribution
+/// (`compaction-entry-speaks-for/v1`). It is never sent Setup here: the entries read asks the
+/// catalog.
+struct AttributingCompactor;
+
+#[async_trait::async_trait]
+impl broca_core::CompactionPlane for AttributingCompactor {
+    async fn setup(
+        &self,
+        _: &str,
+        _: &broca_protocol::BindIdentity,
+        _: Option<&broca_protocol::SessionScope>,
+        _: broca_core::compaction_provider::setup::SetupRequest,
+    ) -> Result<
+        broca_core::compaction_provider::setup::SetupAnswer,
+        broca_core::CompactionUnavailable,
+    > {
+        Err(broca_core::CompactionUnavailable)
+    }
+
+    async fn provider_capabilities(&self, provider: &str) -> Option<Vec<String>> {
+        assert_eq!(provider, "provider");
+        Some(vec![
+            "compaction-provider/v2".into(),
+            broca_core::compaction_v2::protocol::COMPACTION_ENTRY_SPEAKS_FOR_PROVIDES.into(),
+        ])
+    }
+}
+
+/// An owner's automatic message carrying another agent's words under a display name reaches a
+/// declaring compaction provider's `session.entries` as a notice with that speaker.
+#[tokio::test]
+async fn a_named_speaker_reaches_a_declaring_compactors_entries() {
+    use broca_core::compaction_v2::protocol::read::{Detail, ReadRequest, Select};
+    use broca_core::{FileWalStore, WalStore};
+    let mut rig = Rig::start("recorded-named-speaker").await;
+    rig.set_compaction_plane(std::sync::Arc::new(AttributingCompactor));
+    let principal = broca_protocol::BindPrincipal::Reserved {
+        module_id: "core".into(),
+    };
+    let marks = json!({"speaks_for":{"agent_id":"agent-a","name":"Ada"},"notice":true});
+    let mut start: serde_json::Value = serde_json::from_str(
+        include_str!("../../broca-wal/tests/fixtures/before_message_times.jsonl")
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    let input = vec![broca_protocol::Message::new(
+        broca_protocol::Role::User,
+        vec![broca_protocol::ContentBlock::Text {
+            text: "synthetic words of another agent".into(),
+        }],
+    )];
+    start["run_id"] = json!("named-run");
+    start["submission_id"] = json!("named-send");
+    start["session"] = serde_json::to_value(&rig.session).unwrap();
+    start["input"] = json!(input);
+    start["principal"] = json!(principal);
+    start["sent_by"] = json!(principal);
+    start["written_at_ms"] = json!(10);
+    start["ts_ms"] = json!(10);
+    start["compaction_plan_version"] = json!(3);
+    start["manifest"] = json!({
+        "plan":json!({"compaction_item":{"provider":"provider","preset":"head","params":{}},"composition":{},"render_tags":false}).to_string(),
+        "plan_identity":"plan", "composition_digest":"digest", "tools":[],
+        "system_text":"", "system_digest":"", "join_version":1,
+        "role_versions":{}, "fetches":[], "declarations":[]
+    });
+    start["message_marks"] = marks.clone();
+    let store = FileWalStore::new(rig.dir.join("wal"));
+    {
+        let mut wal = store.open(&rig.session).unwrap();
+        for value in [
+            json!({"type":"delivery_ordered","submission_id":"named-send","order":{"modes":["idle_start"]}}),
+            json!({"type":"queued","submission_id":"named-send","principal":principal,"sent_by":principal,"message_marks":marks,
+                "request":{"model":{"provider_module_id":"fake","model_id":"fake"},"input":input}}),
+            start,
+            json!({"type":"step_started","step_id":1}),
+            json!({"type":"model_step_finished","step_id":1,"written_at_ms":11,"assistant_message":{"message_id":"answer","content":[{"type":"text","text":"synthetic answer"}]},"usage":{},"finish_reason":"stop","retries_used":0}),
+            json!({"type":"turn_finished","step_id":1}),
+            json!({"type":"run_finished","reason":"completed","ts_ms":12,"usage":{},"retries_used":0}),
+        ] {
+            wal.append(1, &serde_json::from_value(value).unwrap(), true)
+                .unwrap();
+        }
+    }
+    rig.bind_compaction(9, "provider").await;
+    let params = serde_json::to_value(ReadRequest::new(
+        Select::After {
+            after_ordinal: None,
+            limit: Some(100),
+        },
+        Detail::Full,
+    ))
+    .unwrap();
+    let reply = rig
+        .request(9, json!({"method":"session.entries","params":params}))
+        .await;
+    assert_eq!(
+        reply.header.ty,
+        subc_protocol::FrameType::Response,
+        "{reply:?}"
+    );
+    capture("compaction-named-speaker.json", &reply.body);
+    let page: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+    let entry = &page["entries"][0];
+    assert_eq!(entry["role"], "user", "{entry}");
+    assert_eq!(entry["speaks_for"], marks["speaks_for"], "{entry}");
+    assert_eq!(entry["notice"], json!({"sender":"core"}), "{entry}");
+    rig.finish().await;
+}
+
 #[tokio::test]
 async fn recorded_rides_keep_native_output_on_the_compaction_entries_serve_path() {
     use broca_core::compaction_v2::protocol::read::{Detail, ReadRequest, Select};
