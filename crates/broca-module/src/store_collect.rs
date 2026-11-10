@@ -176,6 +176,9 @@ impl StoreCollectSweep {
     /// collects those with deletions due, at most [`COLLECTS_PER_PASS`] of them. Blocks on file
     /// reads and writes.
     pub fn sweep_once(&self, stopping: &CancellationToken) -> SweepPass {
+        let _timing = broca_session_store::metrics::Phase::CollectionSweep
+            .start()
+            .with_session(|| None);
         let mut pass = SweepPass::default();
         // Until the new storage's runtime opens, no session there is served or collected.
         let Some(runtime) = self.slot.runtime() else {
@@ -261,6 +264,9 @@ impl StoreCollectSweep {
         deployment: &DeploymentKey,
         now_ms: u64,
     ) -> Outcome {
+        let _timing = broca_session_store::metrics::Phase::Collection
+            .start()
+            .with_session(|| Some(addr.0.clone()));
         let store = LocalBackend::new(class.store_root(&self.state_root));
         let bytes = match store.read_stored_head(addr) {
             Ok(Some((bytes, _))) => bytes,

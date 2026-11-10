@@ -484,8 +484,27 @@ storage is refused `open_failed`, class `transient`, its reason starting `key_un
 broca reads the record again with backoff and serves those sessions once it loads, without a
 restart. A deployment with encryption off and no encrypted sessions never needs the key. The
 key is kept in memory only; logs name only its id, with one WARN while it is missing and one
-INFO when it loads. `health.check.metrics.store` reports `{key_id, loaded, new_sessions}`,
+INFO when it loads. `health.check.metrics.store` reports `{key_id, loaded, new_sessions, phases}`,
 `new_sessions` being `"encrypted"` or `"plain"`.
+
+`phases` reports process-lifetime monotonic timings for `open`, `append`, `sync`, `seal`,
+`media_wait`, `request_prepare`, `media_fold`, `read`, `entries_page`, `collection` and
+`collection_sweep`. Each has `{count, total_us, max_us, last_us}`, initially zero. An elapsed
+duration smaller than one microsecond is reported as one; snapshots read independent relaxed
+atomics, so concurrent completions can be partially reflected. Counts include failed operations
+that entered a measured phase. `sync` measures the local log's disk barrier separately from
+append; memory backends have no disk barrier. `request_prepare` ends at the run loop's final
+`CallOptions` handoff, excludes its media wait, and does not include provider rendering or
+transport. `seal` also sums `transcript_records`, `ledger_records`, `kept_records`,
+`transcript_bytes`, `ledger_bytes`, `index_entries`, `merged_entries` and `forced_merges` from
+successful seals. These metrics are never stored and reset on restart. Without a published
+new-storage slot, `metrics.store` remains null.
+
+A phase exceeding its budget emits one WARN on `session_storage`, with `phase`, `elapsed_us`,
+`elapsed_ms` and the hashed session address (absent for a whole sweep). Budgets are open/seal
+500 ms, sync 100 ms, request preparation 50 ms, media fold 1 s, read/entries page 200 ms and
+collection/sweep 1 s. Append and media wait have counters but no slow-line policy. Normal phases
+emit no lines.
 
 To see one debug record per served operation, add a `CK_LOG` value to broca's module environment
 in `subc.jsonc`:

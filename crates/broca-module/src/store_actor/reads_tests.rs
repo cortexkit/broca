@@ -436,6 +436,10 @@ impl Drop for Module {
 }
 
 async fn module(steps: Vec<Vec<NormalizedEvent>>) -> Module {
+    module_with(|gate| Arc::new(executor(steps, Some(gate)))).await
+}
+
+async fn module_with(make_executor: impl FnOnce(Arc<Notify>) -> Arc<dyn RunExecutor>) -> Module {
     use std::sync::atomic::AtomicU64;
     static N: AtomicU64 = AtomicU64::new(0);
     let dir = broca_test_support::scratch_root().join(format!(
@@ -446,7 +450,7 @@ async fn module(steps: Vec<Vec<NormalizedEvent>>) -> Module {
     let _ = std::fs::remove_dir_all(&dir);
     let gate = Arc::new(Notify::new());
     let wal = Arc::new(FileWalStore::new(dir.join("wal")));
-    let executor: Arc<dyn RunExecutor> = Arc::new(executor(steps, Some(Arc::clone(&gate))));
+    let executor = make_executor(Arc::clone(&gate));
     let runtime = crate::store_open::StoreRuntime::open(
         &dir,
         broca_session_store::keys::DeploymentKey::new(1, &[7; 32]),
@@ -685,6 +689,91 @@ impl Module {
 
 fn deployment_key() -> broca_session_store::keys::DeploymentKey {
     broca_session_store::keys::DeploymentKey::new(1, &[7; 32])
+}
+
+#[tokio::test]
+async fn real_actor_work_publishes_nonzero_phase_timings() {
+    if !crate::phase_metrics_tests::isolated(
+        "store_actor::reads_tests::real_actor_work_publishes_nonzero_phase_timings",
+    ) {
+        return;
+    }
+    use broca_session_store::metrics::snapshot;
+    use std::sync::atomic::AtomicU64;
+
+    let before = snapshot();
+    let m = module_with(|gate| {
+        Arc::new(super::collect_tests::SealingExecutor {
+            inner: executor(
+                vec![text_step("a1", "one"), text_step("b1", "two")],
+                Some(gate),
+            ),
+            now: Arc::new(AtomicU64::new(1_000)),
+        })
+    })
+    .await;
+    for run in ["r1", "r2"] {
+        active(m.send(run, "hello").await);
+        m.in_step(run, 1).await;
+        crate::store_read::serve_read(
+            &m.registry,
+            &m.runtime(),
+            crate::serve::SessionReadRequest::new(m.key.clone(), Some(1), Some(20)),
+        )
+        .await
+        .expect("the open actor serves a real read");
+        m.gate.notify_one();
+        m.ended(run, "completed").await;
+        m.close().await;
+    }
+
+    let session = m.writer().await;
+    let request = serde_json::from_value(serde_json::json!({
+        "select": {"by": "after"}, "detail": "full"
+    }))
+    .unwrap();
+    let page = crate::store_entries::entries_page(&session, &request)
+        .await
+        .unwrap();
+    assert!(!page.entries.is_empty());
+    session.close().await.unwrap();
+
+    let after = snapshot();
+    for phase in [
+        "open",
+        "append",
+        "sync",
+        "seal",
+        "media_wait",
+        "request_prepare",
+        "media_fold",
+        "read",
+        "entries_page",
+        "collection",
+    ] {
+        let old = &before[phase];
+        let new = &after[phase];
+        assert!(new.count > old.count, "{phase}: no completed work");
+        assert!(new.total_us > old.total_us, "{phase}: no measured time");
+        assert!(
+            new.last_us > 0 && new.max_us >= new.last_us,
+            "{phase}: invalid timings"
+        );
+    }
+    assert_eq!(
+        after["open"].count - before["open"].count,
+        2,
+        "create and reload"
+    );
+    assert_eq!(
+        after["seal"].count - before["seal"].count,
+        2,
+        "both seals run through the actor"
+    );
+    let sealed = after["seal"].sealed.as_ref().unwrap();
+    assert!(sealed.ledger_records > 0);
+    assert!(sealed.ledger_bytes > 0);
+    assert!(sealed.index_entries > 0);
 }
 
 /// A reply as text both paths can be compared by. An active run's `step` is left out: it is the

@@ -1067,7 +1067,10 @@ impl SessionBackend for LocalBackend {
             file.seek(SeekFrom::Start(expected_end))?;
             file.write_all(bytes)?;
             if barrier {
-                file.sync_all()?;
+                let timing = crate::metrics::Phase::Sync.start();
+                let synced = file.sync_all();
+                timing.finish(Some(&s.0));
+                synced?;
             }
             Ok(expected_end + bytes.len() as u64)
         })

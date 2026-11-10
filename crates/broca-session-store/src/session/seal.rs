@@ -245,6 +245,10 @@ impl<B: SessionBackend> Session<B> {
         now_ms: u64,
     ) -> Result<Sealed, SessionError> {
         let (records, batches, checkpoint) = open;
+        let addr = self.addr.clone();
+        let _timing = crate::metrics::Phase::Seal
+            .start()
+            .with_session(|| Some(addr.0));
         let change = random_id();
         let intent = Record::ChangeIntent(ChangeIntent { change, kind, cut });
         let intent_seq = self.append(std::slice::from_ref(&intent), true).await?;
@@ -286,6 +290,7 @@ impl<B: SessionBackend> Session<B> {
                 durable: true,
             });
         }
+        crate::metrics::sealed(&sealed);
         Ok(sealed)
     }
 
@@ -770,6 +775,9 @@ impl<B: SessionBackend> Session<B> {
     /// those entries from the head. Returns how many changes' deletions ran; 0, with nothing
     /// read or written, when none is due.
     pub async fn collect(&mut self, now_ms: u64) -> Result<usize, SessionError> {
+        let _timing = crate::metrics::Phase::Collection
+            .start()
+            .with_session(|| Some(self.addr.0.clone()));
         if self.poisoned {
             return Err(SessionError::Poisoned);
         }

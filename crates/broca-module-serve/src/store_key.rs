@@ -243,9 +243,10 @@ pub fn publish(slot: Arc<StoreSlot>) {
         .unwrap_or_else(|e| e.into_inner()) = Some(slot);
 }
 
-/// `{key_id, loaded, new_sessions}` for the published slot: which deployment key the new storage
+/// `{key_id, loaded, new_sessions, phases}` for the published slot: which deployment key the new storage
 /// opens encrypted sessions with, whether it has loaded, and the mode the sessions it creates
-/// take (`"encrypted"` or `"plain"`). Null in a process that published none.
+/// take (`"encrypted"` or `"plain"`), and process-lifetime storage/run-loop timings and seal
+/// statistics. Null in a process that published none.
 pub fn health() -> serde_json::Value {
     PUBLISHED
         .get()
@@ -253,13 +254,46 @@ pub fn health() -> serde_json::Value {
         .map_or(serde_json::Value::Null, |slot| health_of(&slot))
 }
 
-/// `{key_id, loaded, new_sessions}` for `slot`.
+/// Deployment-key state and process-lifetime storage/run-loop timings and seal statistics.
 pub fn health_of(slot: &StoreSlot) -> serde_json::Value {
     serde_json::json!({
         "key_id": slot.key_id(),
         "loaded": slot.key_loaded(),
         "new_sessions": slot.new_sessions().label(),
+        "phases": broca_session_store::metrics::snapshot(),
     })
+}
+
+/// The zero-work phase shape pinned by both key-state and served-health goldens.
+#[cfg(test)]
+pub(crate) fn empty_phases_golden() -> serde_json::Value {
+    let mut phases = serde_json::json!({});
+    for phase in [
+        "open",
+        "append",
+        "sync",
+        "seal",
+        "media_wait",
+        "request_prepare",
+        "media_fold",
+        "read",
+        "entries_page",
+        "collection",
+        "collection_sweep",
+    ] {
+        phases[phase] = serde_json::json!({"count": 0, "total_us": 0, "max_us": 0, "last_us": 0});
+    }
+    phases["seal"].as_object_mut().unwrap().extend(
+        serde_json::json!({
+            "transcript_records": 0, "ledger_records": 0, "kept_records": 0,
+            "transcript_bytes": 0, "ledger_bytes": 0, "index_entries": 0,
+            "merged_entries": 0, "forced_merges": 0,
+        })
+        .as_object()
+        .unwrap()
+        .clone(),
+    );
+    phases
 }
 
 #[cfg(test)]
@@ -297,15 +331,40 @@ mod tests {
     /// Health names the mode new sessions take, as the slot was configured.
     #[test]
     fn health_names_the_mode_of_new_sessions() {
+        const CHILD_TEST: &str = "BROCA_ISOLATED_STORE_HEALTH_TEST";
+        const TEST: &str = "store_key::tests::health_names_the_mode_of_new_sessions";
+        if std::env::var(CHILD_TEST).as_deref() != Ok(TEST) {
+            // Other tests can finish real storage work before this golden reads lifetime metrics.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+                .env(CHILD_TEST, TEST)
+                .stdin(std::process::Stdio::null())
+                .output()
+                .expect("spawn the isolated store health test");
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "store health golden failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
         use broca_session_store::keys::Cipher;
         let root = std::path::Path::new("/unused");
+        let phases = empty_phases_golden();
         assert_eq!(
             health_of(&StoreSlot::awaiting_key(root, 2)),
-            serde_json::json!({"key_id": 2, "loaded": false, "new_sessions": "encrypted"})
+            serde_json::json!({"key_id": 2, "loaded": false, "new_sessions": "encrypted", "phases": phases})
         );
         assert_eq!(
             health_of(&StoreSlot::awaiting_key(root, 2).creating(Cipher::None)),
-            serde_json::json!({"key_id": 2, "loaded": false, "new_sessions": "plain"})
+            serde_json::json!({"key_id": 2, "loaded": false, "new_sessions": "plain", "phases": phases})
+        );
+        publish(Arc::new(StoreSlot::awaiting_key(root, 2)));
+        assert_eq!(
+            health(),
+            serde_json::json!({"key_id": 2, "loaded": false, "new_sessions": "encrypted", "phases": phases})
         );
     }
 }

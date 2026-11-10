@@ -2020,6 +2020,9 @@ where
             }
             _ => {}
         }
+        let mut request_timing = broca_session_store::metrics::Phase::RequestPrepare
+            .start()
+            .with_session(|| Some(broca_core::session_addr(&seams.bind)));
         let run_rules = if contract && tag_rules_read {
             Vec::new()
         } else {
@@ -2056,6 +2059,10 @@ where
         // check of a request an account-limit pause refused. When the wait fails, none of those
         // renders: the model call's own wait then fails the step with that error before anything
         // is sent, so the run still ends with its end record.
+        request_timing.pause();
+        let media_timing = broca_session_store::metrics::Phase::MediaWait
+            .start()
+            .with_session(|| Some(broca_core::session_addr(&seams.bind)));
         let call_ready = match &seams.model_call_ready {
             Some(ready) => tokio::select! {
                 ready = ready.ready() => ready.is_ok(),
@@ -2066,6 +2073,8 @@ where
             },
             None => true,
         };
+        drop(media_timing);
+        request_timing.resume();
         if let Some(ctx) = compaction.filter(|_| call_ready) {
             let marked = writer.conversation().marker.clone();
             match crate::compaction::prepare(
@@ -2210,6 +2219,7 @@ where
         let mut prior_retries = 0;
         // The retries of an attempt the run's own model refused, which the re-sent step's count.
         let mut refusal_retries = 0u32;
+        drop(request_timing);
         let outcome = loop {
             let outcome = model_step(
                 writer,

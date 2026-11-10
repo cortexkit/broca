@@ -370,6 +370,9 @@ pub async fn entries_page<B: SessionBackend>(
     session: &Session<B>,
     request: &ReadRequest,
 ) -> Result<ReadPage, String> {
+    let _timing = broca_session_store::metrics::Phase::EntriesPage
+        .start()
+        .with_session(|| Some(session.address().0.clone()));
     let len = transcript_len(session);
     let (from, count) = match &request.select {
         Select::After {

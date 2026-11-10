@@ -125,9 +125,9 @@ async fn an_actor_opening_a_session_past_the_grace_deletes_what_its_seal_replace
 
 /// Runs each store job through the test loop, after sealing the session's ledger through the
 /// run's writer, as a run whose compaction cuts the session seals it, at the time `now` holds.
-struct SealingExecutor {
-    inner: LoopExecutor,
-    now: Arc<AtomicU64>,
+pub(super) struct SealingExecutor {
+    pub(super) inner: LoopExecutor,
+    pub(super) now: Arc<AtomicU64>,
 }
 
 #[async_trait]

@@ -245,8 +245,14 @@ async fn a_vault_serving_the_deployment_key_loads_it_and_a_held_session_opens() 
     let rig = key_rig("served").await;
     let daemon = CapturingVaultDaemon::start(&rig.root).await;
     daemon.serve_deployment_key(DEPLOYMENT_KEY_RECORD, Some(deployment_key_hex().into_bytes()));
+    let mut health = broca_module_serve::store_key::health_of(&rig.slot);
+    let phases = health.as_object_mut().unwrap().remove("phases").unwrap();
+    assert!(
+        phases.is_object(),
+        "health includes phase counters before the key loads"
+    );
     assert_eq!(
-        broca_module_serve::store_key::health_of(&rig.slot),
+        health,
         serde_json::json!({"key_id": 1, "loaded": false, "new_sessions": "encrypted"})
     );
     let loading = tokio::spawn(rig.loader(&daemon).await.run(rig.registry.clone()));
@@ -262,8 +268,14 @@ async fn a_vault_serving_the_deployment_key_loads_it_and_a_held_session_opens() 
     rig.open_held()
         .await
         .expect("the held session opens under the vault's key");
+    let mut health = broca_module_serve::store_key::health_of(&rig.slot);
+    let phases = health.as_object_mut().unwrap().remove("phases").unwrap();
+    assert!(
+        phases["open"]["count"].as_u64().is_some_and(|count| count > 0),
+        "health includes the held session's real open"
+    );
     assert_eq!(
-        broca_module_serve::store_key::health_of(&rig.slot),
+        health,
         serde_json::json!({"key_id": 1, "loaded": true, "new_sessions": "encrypted"})
     );
     assert_eq!(

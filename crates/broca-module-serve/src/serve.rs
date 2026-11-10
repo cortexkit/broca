@@ -10605,9 +10605,10 @@ mod tests {
         let health: serde_json::Value = serde_json::from_slice(&health.body).unwrap();
         assert_eq!(
             health["metrics"]["store"],
-            serde_json::json!({"key_id": 7, "loaded": false, "new_sessions": "encrypted"}),
+            serde_json::json!({"key_id": 7, "loaded": false, "new_sessions": "encrypted",
+                "phases": crate::store_key::empty_phases_golden()}),
             "health.check reports the deployment key's id, that it hasn't loaded, and the mode \
-             new sessions take"
+             new sessions take, with zero-work phase counters"
         );
         assert!(
             health["metrics"]["scoped_role_route_refusals"].is_object(),

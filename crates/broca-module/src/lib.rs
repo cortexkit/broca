@@ -24,6 +24,8 @@ pub mod late_results_store;
 pub mod opener;
 pub mod output_refs;
 pub mod person_media;
+#[cfg(test)]
+mod phase_metrics_tests;
 mod plan_change;
 mod plan_episode;
 pub mod registry;

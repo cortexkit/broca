@@ -792,6 +792,9 @@ impl<B: SessionBackend> Session<B> {
     /// Folds `records` into the state, then appends them as one batch, synced if `barrier`.
     /// Returns the seq of the first record.
     pub async fn append(&mut self, records: &[Record], barrier: bool) -> Result<u64, SessionError> {
+        let timing = crate::metrics::Phase::Append
+            .start()
+            .with_session(|| Some(self.addr.0.clone()));
         if self.poisoned {
             return Err(SessionError::Poisoned);
         }
@@ -837,6 +840,7 @@ impl<B: SessionBackend> Session<B> {
             self.kept.note(first + position as u64, record);
         }
         self.poisoned = false;
+        drop(timing);
         self.observed(Appended::Records {
             first,
             records,
@@ -921,6 +925,12 @@ impl<B: SessionBackend> Session<B> {
 
     pub fn head(&self) -> &Head {
         &self.head
+    }
+
+    /// The hashed storage address, suitable for diagnostics without exposing the project root,
+    /// harness name or session name it was computed from.
+    pub fn address(&self) -> &SessionAddr {
+        &self.addr
     }
 
     /// The key this session's subscribe cursors are digested under.
