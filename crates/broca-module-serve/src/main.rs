@@ -4410,7 +4410,15 @@ mod executor {
                      otherwise"
                 ))));
             }
-            if routing_decision_error.is_none() && resolution.pause.is_some() {
+            // A resume whose cancel is already tripped only ends its paused run, with no model
+            // call (`broca_session_loop::resume`), so a credential still waiting for sign-in
+            // doesn't stop it: an interrupt ends a run paused for sign-in this way.
+            let ends_paused_run = mode == StoreRunMode::Resume
+                && control
+                    .cancel
+                    .as_ref()
+                    .is_some_and(tokio_util::sync::CancellationToken::is_cancelled);
+            if routing_decision_error.is_none() && resolution.pause.is_some() && !ends_paused_run {
                 return Err(StoreRunError::Admission(RunError::Config(
                     "a run that starts paused for sign-in isn't served on the new session \
                      storage yet"

@@ -1221,14 +1221,17 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 let mut identity = None;
                 if key.is_keyed() {
                     match self
-                        .keyed(
-                            &run_id,
-                            &key,
-                            &request,
+                        .keyed(retries::KeyedSend {
+                            run_id: &run_id,
+                            key: &key,
+                            request: &request,
                             delivery,
-                            conversation_key.as_deref(),
-                            order.as_ref(),
-                        )
+                            conversation_key: conversation_key.as_deref(),
+                            order: order.as_ref(),
+                            // A plan-named sender's key isn't answered by an owner's steer, as
+                            // in today's actor.
+                            legacy_steers: ordered_by.is_none(),
+                        })
                         .await
                     {
                         Ok(Keyed::Answered(outcome)) => {
@@ -1357,36 +1360,44 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 }
                 // A send that left its model to the session checks its plan's model-bearing
                 // items against the model it now runs on, as today's actor does once the model
-                // is resolved. A steer that left it would be checked against the joined run's
-                // frozen model and variant, which this actor doesn't read back yet.
-                if model_check.is_some()
-                    && request
+                // is resolved. One that still leaves it, as a steer does, runs on the run it
+                // joins, so it is checked against the latest run's frozen model and variant.
+                // Before any run there is no model to inherit, and today's actor skips the
+                // check; admission refuses such a send for its missing model.
+                if let Some(plan) = &model_check {
+                    let checked = if request
                         .inherit_frozen
                         .contains(&broca_protocol::request::InheritedParam::Model)
-                {
-                    let _ = reply.send(SendOutcome::Error(unserved(
-                        "a steer leaving its model to the session with a plan to check",
-                    )));
-                    return false;
-                }
-                if let Some(plan) = &model_check {
-                    if let Err(refusal) = broca_fetch_plan::admit::check_plan_model(
-                        plan,
-                        request.model.provider_module_id.as_str(),
-                        &request.model.model_id,
-                        request.variant.as_deref(),
-                    ) {
-                        let _ = reply.send(SendOutcome::PlanRefused(refusal));
-                        return false;
+                    {
+                        match self.latest_admission() {
+                            Ok(latest) => latest.map(|latest| (latest.model, latest.variant)),
+                            Err(error) => {
+                                let _ = reply.send(SendOutcome::Transient(error));
+                                return false;
+                            }
+                        }
+                    } else {
+                        Some((request.model.clone(), request.variant.clone()))
+                    };
+                    if let Some((model, variant)) = checked {
+                        if let Err(refusal) = broca_fetch_plan::admit::check_plan_model(
+                            plan,
+                            model.provider_module_id.as_str(),
+                            &model.model_id,
+                            variant.as_deref(),
+                        ) {
+                            let _ = reply.send(SendOutcome::PlanRefused(refusal));
+                            return false;
+                        }
                     }
                 }
                 // A run paused for sign-in or an account limit still owns the session: today's
                 // actor neither queues another send behind it nor drives it again for one. A
-                // steer can join no paused run but one paused for a restart, which today's actor
-                // steers into; this actor doesn't resume such a run, so it refuses that steer. An
-                // ordered send waits behind any paused run, unless its list could start one. An
-                // interrupt can't end a run waiting on calls a provider holds, as today; today's
-                // actor ends any other paused run for it, which this actor doesn't do yet.
+                // steer can join no paused run but one paused for a restart, which keeps the steer
+                // for its resume (`steer_restart_paused`). An ordered send waits behind any paused
+                // run, unless its list could start one. An interrupt can't end a run waiting on
+                // calls a provider holds, as today; it ends any other paused run
+                // (`interrupt_paused`).
                 if self.run.is_none() {
                     if let Some((paused, reason)) = self.paused() {
                         let starts_runs = order
@@ -1399,14 +1410,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                                     reason,
                                 })
                             }
-                            _ if interrupting => Some(SendOutcome::Error(unserved(
-                                "an interrupt ending a paused run",
-                            ))),
-                            broca_protocol::PauseReason::Restart if steering => {
-                                Some(SendOutcome::Error(unserved(
-                                    "a steer into a run paused for a restart",
-                                )))
-                            }
+                            _ if interrupting => None,
+                            broca_protocol::PauseReason::Restart if steering => None,
                             broca_protocol::PauseReason::AuthRequired
                             | broca_protocol::PauseReason::AccountLimit
                                 if starts_runs =>
@@ -1466,16 +1471,30 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                         }
                     }
                     let _ = reply.send(outcome);
+                } else if let Some((paused, _)) = self.paused().filter(|_| interrupting || steering)
+                {
+                    // Only what the pause check above lets through gets here: an interrupt behind
+                    // any pause but calls a provider holds, and a steer behind a restart.
+                    let outcome = if interrupting {
+                        self.interrupt_paused(start, &mut reply).await
+                    } else {
+                        self.steer_restart_paused(start, paused, &mut reply).await
+                    };
+                    let _ = reply.send(outcome);
                 } else if self.running().is_some() {
                     let outcome = self.queue(start, delivery, &mut reply).await;
                     let _ = reply.send(outcome);
                 } else if queue_starts_runs {
-                    // The queue drains at a run's end, so an idle session with sends still queued
-                    // that start runs holds sends this actor doesn't drain yet (see `drain`);
-                    // today's actor would start them first.
-                    let _ = reply.send(SendOutcome::Error(unserved(
-                        "a send while sends are queued on an idle session",
-                    )));
+                    // As today's actor does, a send arriving while sends that start runs wait in
+                    // an idle session's queue is queued behind them and answered `pending`. The
+                    // queue drains at a run's end and when the session opens; work still waiting
+                    // here drains now, oldest first.
+                    let outcome = self.queue(start, delivery, &mut reply).await;
+                    let queued = matches!(outcome, SendOutcome::Pending { .. });
+                    let _ = reply.send(outcome);
+                    if queued {
+                        self.drain().await;
+                    }
                 } else {
                     let mut start = start;
                     let admitted = match self.freeze_plan(&mut start) {
@@ -1630,8 +1649,22 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         &mut self,
         start: Start,
         drained: Option<Drained>,
+        reply: Option<oneshot::Sender<SendOutcome>>,
+        mode: StoreRunMode,
+    ) {
+        self.start_run_under(start, drained, reply, mode, CancellationToken::new())
+            .await;
+    }
+
+    /// [`Self::start_run`], under `cancel`, which a caller's cancel trips. A token tripped before
+    /// the run starts ends a resumed paused run `Cancelled` at once (`end_paused`).
+    async fn start_run_under(
+        &mut self,
+        start: Start,
+        drained: Option<Drained>,
         mut reply: Option<oneshot::Sender<SendOutcome>>,
         mode: StoreRunMode,
+        cancel: CancellationToken,
     ) {
         let media = match mode {
             StoreRunMode::Seal(_) => None,
@@ -1676,7 +1709,6 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         req.request_identity_digest = identity;
         req.scope = scope;
         req.session_class = session_class;
-        let cancel = CancellationToken::new();
         let step: broca_core::provider::LiveStepProgress = Arc::default();
         let control = RunControl {
             cancel: Some(cancel.clone()),
@@ -1851,9 +1883,11 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     ///   writes just that end;
     /// - with no unfinished run, the first queued send drains.
     ///
-    /// A paused run stays paused: a sign-in pause waits for its retry. Resuming after a
-    /// restart, the account-limit pause's timer, and calls a provider holds aren't recovered on
-    /// this storage yet, so nothing is written for them.
+    /// A paused run stays paused: a sign-in pause waits for its retry. An interrupt queued
+    /// behind a paused run by a process that stopped before ending that run ends it now, as
+    /// today's drain does (`end_paused`). Resuming after a restart, the account-limit pause's
+    /// timer, and calls a provider holds aren't recovered on this storage yet, so nothing is
+    /// written for them.
     async fn recover(&mut self) {
         self.bill_owed().await;
         let operations = self.session.operations();
@@ -1863,6 +1897,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         let mode = match recovery_mode(run) {
             Some(mode) => mode,
             None => {
+                if self.interrupt_waits_on_pause() {
+                    return self.end_paused().await;
+                }
                 if !matches!(run.paused, Some(broca_protocol::PauseReason::AuthRequired)) {
                     tracing::warn!(
                         target: "broca.store_actor",
@@ -2416,23 +2453,27 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
 
     /// A keyed send, looked up by the run id its key names, as today's actor looks it up: a run
     /// started under the key answers the retry from that run's records when the payload is the
-    /// same, and is refused naming what differs when it is not. A key no run used starts a run.
-    async fn keyed(
-        &self,
-        run_id: &RunId,
-        key: &crate::actor::SendKey,
-        request: &SubmissionRequest,
-        delivery: broca_protocol::Delivery,
-        conversation_key: Option<&str>,
-        order: Option<&broca_protocol::DeliveryOrder>,
-    ) -> Result<Keyed, String> {
+    /// same, and is refused naming what differs when it is not. A send that never started, a
+    /// steer, or one queued and since settled, is answered from its records too
+    /// (`unstarted_retry`). A key nothing used starts a run.
+    async fn keyed(&mut self, send: retries::KeyedSend<'_>) -> Result<Keyed, String> {
+        let retries::KeyedSend {
+            run_id,
+            key,
+            request,
+            delivery,
+            conversation_key,
+            order,
+            legacy_steers: _,
+        } = send;
         let digest = broca_core::send_identity_digest_with_conversation_key(
             request,
             delivery,
             conversation_key,
         );
+        let session = &self.session;
         let find = |kind, id: String| async move {
-            self.session
+            session
                 .find_id(kind, &id)
                 .await
                 .map_err(|error| format!("{error:?}"))
@@ -2448,8 +2489,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 holders.extend(find(IdKind::SendId, send_id.to_owned()).await?);
             }
             // A key whose send is still queued is answered by the queue (`queue`), as in today's
-            // actor. Today's actor also answers a key held by a steer, a retraction or an ended
-            // send, from records this actor doesn't read yet.
+            // actor.
             let queued_id = format!("sub-{}", run_id.0);
             let still_queued = !holders.is_empty()
                 && holders.iter().all(|(_, record)| {
@@ -2461,13 +2501,10 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                     .queue
                     .iter()
                     .any(|pending| pending.submission_id == queued_id);
-            return Ok(if holders.is_empty() || still_queued {
-                Keyed::Fresh(digest)
-            } else {
-                Keyed::Answered(SendOutcome::Error(unserved(
-                    "a retry of a steered, retracted or ended send",
-                )))
-            });
+            if holders.is_empty() || still_queued {
+                return Ok(Keyed::Fresh(digest));
+            }
+            return self.unstarted_retry(send, &holders, digest).await;
         };
         // The delivery order is part of a keyed send's identity: a run an ordered send started
         // is answered only to a retry asking for the same order, and a run a plain send started
@@ -2522,8 +2559,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 },
                 // A run paused for sign-in is resumed by its retry, as in today's actor; whether the
                 // credential is ready now is the executor's to decide. Runner-owned pauses are
-                // reported. Today's actor also drives an unfinished run that nothing runs, which
-                // is boot recovery's to do here.
+                // reported.
                 (None, Some(broca_protocol::PauseReason::AuthRequired)) => {
                     return Ok(Keyed::Resume)
                 }
@@ -2539,7 +2575,13 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                     reason,
                     delivered: None,
                 },
-                _ => SendOutcome::Error(unserved("driving an unfinished run again by its retry")),
+                // An unfinished run that nothing here runs, which opening the session didn't
+                // recover: today's actor answers its retry from the run's records, which read it
+                // as active, and drives nothing for it.
+                (None, None) => SendOutcome::Active {
+                    run_id: run_id.clone(),
+                    delivered: None,
+                },
             },
             // An earlier run: a later run started only after this one ended.
             None => match by_run.iter().find_map(|(_, record)| match record {
@@ -2986,20 +3028,20 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         {
             return RetractOutcome::AlreadyStarted;
         }
-        let Some(pending) = self
+        if !self
             .session
             .operations()
             .queue
             .iter()
-            .find(|pending| pending.submission_id == submission_id.0)
-        else {
+            .any(|pending| pending.submission_id == submission_id.0)
+        {
             return RetractOutcome::NotPending;
-        };
-        // Today's actor withdraws an ordered send through the running run, which may be
-        // delivering it at that moment; withdrawing one here isn't built yet.
-        if pending.ordered {
-            return RetractOutcome::Error(unserved("retracting an ordered send"));
         }
+        // An ordered send a running run may deliver at its next boundary is withdrawn the same
+        // way. The run builds each boundary's batch from the session's queue as the batch is
+        // appended, and this actor appends nothing while it does: either the run delivered the
+        // send first, which took it out of the queue and leaves it not pending here, or the run
+        // reads the retraction and leaves the send undelivered.
         let record = Record::Retraction(Retraction {
             submission_id: submission_id.0,
             failure: None,
@@ -3791,6 +3833,8 @@ fn refuse(command: LineageCmd) {
 mod apply_view;
 mod import;
 mod ordered;
+mod pauses;
+mod retries;
 mod scopes;
 mod warm;
 
@@ -3812,6 +3856,8 @@ mod loop_error_tests;
 mod media_wait_tests;
 #[cfg(test)]
 mod new_heads_tests;
+#[cfg(test)]
+mod pauses_tests;
 #[cfg(test)]
 mod read_cost;
 #[cfg(test)]

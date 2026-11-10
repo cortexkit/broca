@@ -1787,6 +1787,7 @@ mod media;
 mod media_ready;
 mod media_render;
 mod ordered;
+mod pauses;
 mod photo_sends;
 mod refresh;
 mod scopes;

@@ -522,6 +522,13 @@ where
         return Ok(finished(writer, reason));
     }
     let resolution = run.resolution();
+    // A cancel tripped before a paused run resumes ends it `Cancelled` before anything else a
+    // resume does, as today's loop lets a cancel while paused win: nothing is refrozen, no
+    // resume is recorded, an account limit isn't waited on, and no model is called. A session's
+    // actor ends a paused run this way for an interrupt queued behind it.
+    if matches!(resolution, Resolution::Paused(_)) && seams.cancel.is_cancelled() {
+        return finish(writer, seams, &admission.run_id, RunFinishReason::Cancelled).await;
+    }
     // A run paused on its account's limit resumes on that same account, and only once the
     // account has reset, as today's resume decides it. Until then nothing is written and the
     // run stays paused; on another account it ends interrupted, saying why.
