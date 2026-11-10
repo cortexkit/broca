@@ -396,15 +396,15 @@ impl Pair {
         self.assert_alike_ids(true).await
     }
 
-    /// [`Self::assert_alike`]; `same_ids` false sets each stream unit's message id aside (see
-    /// [`streams::assert_alike_but_message_ids`]).
+    /// [`Self::assert_alike`]; `same_ids` false permits only today's abandoned positional id
+    /// to be reused after cancellation (see [`streams::assert_alike_after_cancel`]).
     async fn assert_alike_ids(self, same_ids: bool) -> (Vec<Value>, Vec<String>, (usize, usize)) {
         let stream = streams::store(&self.commands).await;
         let today_stream = streams::routed(&self.today.registry, &self.today.key).await;
         if same_ids {
             streams::assert_alike(&stream, &today_stream);
         } else {
-            streams::assert_alike_but_message_ids(&stream, &today_stream);
+            streams::assert_alike_after_cancel(&stream, &today_stream);
         }
         let notices = stream
             .iter()

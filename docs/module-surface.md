@@ -1829,6 +1829,9 @@ callers do not send unsupported fields and check compatibility tests.
 Each entry's `ordinal` is its stored position plus one. Legacy log mids stay `m<position>`;
 logs whose first `RunStarted` has `compaction_plan_version` use `m<lineage-prefix>.<position>`,
 where the prefix is the lineage's first eight hex characters. Never derive a mid from an ordinal.
+Native sessions on the new storage mint unique message ids, including after a cancelled step
+announced an id but placed no message; converted sessions retain their positional ids and may
+reuse that abandoned position for the next message.
 Every head/read/history page, even empty, carries `history_version` and `incarnation`. A durable
 address-keyed high-water row survives log retention and recreation. An absent log reads as
 `unwritten`, without creating a log, lease or history row. Destructive same-lineage recovery

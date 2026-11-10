@@ -103,10 +103,25 @@ pub(super) async fn both(
     steps: Vec<Vec<NormalizedEvent>>,
     gated: bool,
 ) -> (Module, Module, Option<Arc<Notify>>, Option<Arc<Notify>>) {
+    both_with_cipher(
+        steps,
+        gated,
+        broca_session_store::keys::Cipher::XChaCha20Poly1305,
+    )
+    .await
+}
+
+/// [`both`], creating the store session in the selected cipher mode.
+pub(super) async fn both_with_cipher(
+    steps: Vec<Vec<NormalizedEvent>>,
+    gated: bool,
+    cipher: broca_session_store::keys::Cipher,
+) -> (Module, Module, Option<Arc<Notify>>, Option<Arc<Notify>>) {
     let today_gate = gated.then(|| Arc::new(Notify::new()));
     let store_gate = gated.then(|| Arc::new(Notify::new()));
-    let today = gated_module(false, steps.clone(), today_gate.clone()).await;
-    let store = gated_module(true, steps, store_gate.clone()).await;
+    let deployment = || broca_session_store::keys::DeploymentKey::new(1, &[7; 32]).creating(cipher);
+    let today = gated_module_in(false, steps.clone(), today_gate.clone(), deployment()).await;
+    let store = gated_module_in(true, steps, store_gate.clone(), deployment()).await;
     (today, store, today_gate, store_gate)
 }
 

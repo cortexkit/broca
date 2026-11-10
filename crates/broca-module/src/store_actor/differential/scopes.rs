@@ -20,6 +20,7 @@ use super::head::{both, head_json, occipital, send_titled};
 use super::{compare, interrupting, keyed, send, steered, tweaked, Module, Step};
 use crate::actor::{CancelOutcome, ScopeFreezeBusyReason, SendKey, SendOutcome, SendPlan};
 use crate::executor::RunKind;
+use crate::serve::ServeHandler;
 
 /// `n` model steps, each answering with text.
 fn texts(n: usize) -> Vec<Vec<NormalizedEvent>> {
@@ -488,7 +489,15 @@ async fn run_out(module: &Module, gate: &Option<Arc<Notify>>) {
 /// The owner, over its own route, cancels its next run, and both sessions then head alike.
 #[tokio::test]
 async fn a_cancel_from_another_module_is_checked_against_the_plan_alike() {
-    let (today, store, today_gate, store_gate) = both(texts(4), true).await;
+    use broca_session_store::keys::Cipher;
+    for cipher in [Cipher::XChaCha20Poly1305, Cipher::None] {
+        cancel_from_another_module(cipher).await;
+    }
+}
+
+async fn cancel_from_another_module(cipher: broca_session_store::keys::Cipher) {
+    let (today, store, today_gate, store_gate) =
+        super::head::both_with_cipher(texts(4), true, cipher).await;
     for module in [&today, &store] {
         let sent = send_titled(
             module,
@@ -499,6 +508,7 @@ async fn a_cancel_from_another_module_is_checked_against_the_plan_alike() {
         )
         .await;
         assert!(matches!(sent, SendOutcome::Active { .. }), "{sent:?}");
+        in_model_step(module, "r1").await;
     }
     assert!(store.head().exists() && !today.head().exists());
     let stranger = BindPrincipal::Reserved {
@@ -544,10 +554,6 @@ async fn a_cancel_from_another_module_is_checked_against_the_plan_alike() {
     );
     run_out(&today, &today_gate).await;
     run_out(&store, &store_gate).await;
-    // The streams are compared here, after one cancelled run. After a second, the two storages
-    // number the second run's messages differently whoever cancelled the first, since a step
-    // cancelled while in flight takes a message id on one storage only; that is not scope
-    // admission's to settle.
     super::streams::assert_alike(
         &super::streams::routed(&store.registry, &store.key).await,
         &super::streams::routed(&today.registry, &today.key).await,
@@ -560,6 +566,7 @@ async fn a_cancel_from_another_module_is_checked_against_the_plan_alike() {
     for module in [&today, &store] {
         let sent = send_titled(module, "r2", from_core("second"), None, None).await;
         assert!(matches!(sent, SendOutcome::Active { .. }), "{sent:?}");
+        in_model_step(module, "r2").await;
     }
     assert_eq!(
         cancels_alike(
@@ -585,6 +592,30 @@ async fn a_cancel_from_another_module_is_checked_against_the_plan_alike() {
     let head = head_json(&store, None).await;
     assert_eq!(head["last_run_state"]["run_id"], "r2", "{head}");
     assert_eq!(head["last_run_state"]["state"], "cancelled", "{head}");
+    super::streams::assert_alike_after_cancel(
+        &super::streams::routed(&store.registry, &store.key).await,
+        &super::streams::routed(&today.registry, &today.key).await,
+    );
+}
+
+/// A cancel must meet an in-flight model step, not race the run's admission.
+async fn in_model_step(module: &Module, run: &str) {
+    broca_test_support::wait_until("the model step to be in flight", || async {
+        let status = serde_json::to_value(
+            module
+                .registry
+                .run_status_reply(&module.key, RunId(run.into()))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        if status["step"]["step_id"] == 1 {
+            Ok(())
+        } else {
+            Err(format!("{run}: {status}"))
+        }
+    })
+    .await;
 }
 
 /// The scope a stamped route carries.

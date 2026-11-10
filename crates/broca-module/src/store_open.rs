@@ -531,6 +531,9 @@ impl StoreRuntime {
         if let Some(billing) = &self.billing {
             actor = actor.with_billing(billing.clone());
         }
+        let first_episode = actor
+            .first_episode_handle(&registry)
+            .map_err(OpenError::Open)?;
         let (tx, commands) = mpsc::channel(COMMANDS);
         let run_in_flight = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let life = Lifecycle {
@@ -557,7 +560,7 @@ impl StoreRuntime {
             durable_head: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             run_in_flight,
             approvals: Arc::new(crate::approval_state::ApprovalState::default()),
-            first_episode: Arc::new(std::sync::OnceLock::new()),
+            first_episode,
         })
     }
 }

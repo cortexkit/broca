@@ -2243,7 +2243,7 @@ impl WalRecord {
             return &[crate::head_proof::VISIBILITY_LATE_FEATURE];
         }
         if matches!(self, Self::WriterOpened { .. } | Self::WriterClosed { .. }) {
-            return &["writer-id/v1"];
+            return &[crate::features::WRITER_ID_FEATURE];
         }
         let base = self.base_required_features();
         // The agent-run, session-class and input-cap unions below are precomputed tables that

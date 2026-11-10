@@ -75,33 +75,8 @@ pub(super) fn assert_alike(store: &[Value], today: &[Value]) {
     );
 }
 
-/// [`assert_alike`], with every message id set aside. For a session whose run was cancelled
-/// while its step was in flight: the step announced an id it never placed, and today's storage,
-/// whose ids are positions, gives the next message placed there that same id, where a session
-/// begun in the new storage mints it a new one.
-pub(super) fn assert_alike_but_message_ids(store: &[Value], today: &[Value]) {
-    fn without_ids(value: &Value) -> Value {
-        match value {
-            Value::Object(members) => Value::Object(
-                members
-                    .iter()
-                    .map(|(key, member)| {
-                        let member = match key.as_str() {
-                            "mid" => Value::String("<mid>".into()),
-                            _ => without_ids(member),
-                        };
-                        (key.clone(), member)
-                    })
-                    .collect(),
-            ),
-            Value::Array(items) => Value::Array(items.iter().map(without_ids).collect()),
-            other => other.clone(),
-        }
-    }
-    let store: Vec<Value> = store.iter().map(without_ids).collect();
-    let today: Vec<Value> = today.iter().map(without_ids).collect();
-    assert_alike(&store, &today);
-}
+mod cancel_ids;
+pub(super) use cancel_ids::assert_alike_after_cancel;
 
 fn normalized(events: &[Arc<ControlEvent>]) -> Vec<Value> {
     let mut names = HashMap::new();

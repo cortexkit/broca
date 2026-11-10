@@ -1512,11 +1512,8 @@ async fn tier_story(store: bool) -> Vec<serde_json::Value> {
         }
         let run = tier_run(&sent);
         let (_, result) = rig.ended(&run).await;
-        // On today's storage a planned send's answer also carries the plan's baseline, which a
-        // session in the new storage doesn't answer a send with yet. That isn't a service tier
-        // fact, so it is left out of the comparison.
         if let Some(result) = answer["result"].as_object_mut() {
-            result.retain(|key, _| key != "run_id" && key != "submission_id" && key != "baseline");
+            result.retain(|key, _| key != "run_id" && key != "submission_id");
         }
         let body: serde_json::Value =
             serde_json::from_slice(&http.requests.lock().unwrap().last().unwrap().body).unwrap();
