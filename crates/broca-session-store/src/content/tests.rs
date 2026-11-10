@@ -158,6 +158,22 @@ fn usage_keeps_reported_zero_apart_from_unreported() {
 }
 
 #[test]
+fn usage_before_cache_write_lifetimes_keeps_exact_bytes() {
+    // These bytes predate cache-write lifetime counters; absent additions must cost no bytes.
+    let pinned = [0x10, 10, 0x20, 20, 0x30, 30, 0x40, 4, 0x50, 2];
+    let usage = Usage::decode(&pinned).unwrap();
+    assert_eq!(usage.input_tokens, Some(10));
+    assert_eq!(usage.cache_write_tokens, Some(30));
+    assert_eq!(usage.encode(), pinned);
+
+    // The same decoder used by old builds skips unrecognized optional usage members.
+    let mut newer = pinned.to_vec();
+    put_req(&mut newer, 99, false, &20u64);
+    assert_eq!(Usage::decode(&newer).unwrap(), usage);
+    assert_eq!(Usage::decode(&newer).unwrap().encode(), pinned);
+}
+
+#[test]
 fn opaque_text_is_stored_as_bytes_only_when_it_re_encodes_exactly() {
     let standard = |t| canonical_base64(t, Alphabet::Standard);
     let url_safe = |t| canonical_base64(t, Alphabet::UrlSafe);
