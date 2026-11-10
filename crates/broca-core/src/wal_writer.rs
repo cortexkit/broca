@@ -3978,7 +3978,6 @@ pub struct WalHandle {
     fence: u64,
     append_budget: Option<Mutex<AppendBudget>>,
     tx: std_mpsc::Sender<WalCommand>,
-    step_events_enabled: bool,
     /// Reservation order must equal channel-send order because the writer cross-checks
     /// handle-assigned and WAL-assigned seqs and poisons the handle if they drift.
     /// A panic while it is held leaves the reserved-versus-enqueued state unknown, so
@@ -4707,9 +4706,6 @@ impl WalHandle {
         startup: (StampClock, Option<open_writers::WriterContext>),
     ) -> Result<WalHandle, WalWriteError> {
         let (clock, context) = startup;
-        let step_events_enabled = observer
-            .as_ref()
-            .is_some_and(|observer| observer.step_events.is_some());
         // One owner holds the WAL and its lease from here until the writer thread takes
         // them, so a panic while preparing the handle or a failed thread spawn still
         // closes the WAL before the lease is released.
@@ -5008,7 +5004,6 @@ impl WalHandle {
             append_budget,
             v4,
             tx,
-            step_events_enabled,
             enqueue_lock,
             next_seq,
             publication_bytes,
@@ -5046,12 +5041,10 @@ impl WalHandle {
         run_id: &broca_protocol::RunId,
         config: &broca_wal::RunConfig,
     ) {
-        if self.step_events_enabled {
-            let _ = self.tx.send(WalCommand::StepEventRun {
-                run_id: run_id.clone(),
-                route_decision_id: config.route_decision_id.clone(),
-            });
-        }
+        let _ = self.tx.send(WalCommand::StepEventRun {
+            run_id: run_id.clone(),
+            route_decision_id: config.route_decision_id.clone(),
+        });
     }
 
     pub fn needs_display_placement_seed(&self) -> bool {

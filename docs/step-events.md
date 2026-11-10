@@ -1,9 +1,10 @@
 # Live model-step hints
 
-`step_events_enabled` in `broca.jsonc` is a boolean, **false by default**, read at
-daemon startup. When enabled, `role.describe` advertises the llm-runner `STEP_EVENTS`
-capability with the `per_attempt` / `step_ref` policy. Leave it off until the spend
-ledger consuming these hints can decode the emitted bodies.
+Broca always publishes model-step hints when a bus connection is available; there
+is no enable/disable setting. Without a bus connection, no hints are published.
+`role.describe` always advertises the llm-runner `STEP_EVENTS` capability with
+`per_attempt` granularity (a hint for each model attempt) and a `step_ref` history
+key (the durable step reference links the hint to recorded history).
 
 The subject is `ck.{account}.live.broca.step.finished.v1`. The account comes from
 broca's daemon-attested ck-bus credential, never the caller. Hints share broca's

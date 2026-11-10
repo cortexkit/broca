@@ -357,10 +357,6 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> LineageOpener for DefaultOp
         self.executor.hook_plane().is_some()
     }
 
-    fn step_events_enabled(&self) -> bool {
-        self.step_events.is_some()
-    }
-
     fn compaction_supported(&self) -> bool {
         self.executor.compaction_plane().is_some()
     }

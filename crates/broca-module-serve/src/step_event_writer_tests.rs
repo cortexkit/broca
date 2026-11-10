@@ -27,9 +27,8 @@ async fn step_events_publish_frozen_decision_on_every_admitted_step() {
     let session = req.session.clone();
     let (tx, mut published) = tokio::sync::mpsc::unbounded_channel();
     let events = broca_module_serve::step_events::StepEvents::start(
-        broca_module_serve::step_events::Config { step_events_enabled: true },
         "fixture", "broca", Arc::new(StepEventCapture { tx }),
-    ).unwrap().unwrap();
+    ).unwrap();
     let (records, _records_inbox) = tokio::sync::broadcast::channel(16);
     let observer = events.observe(broca_core::RecordObserver::new(records,
         Arc::new(std::sync::atomic::AtomicUsize::new(0))));

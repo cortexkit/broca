@@ -700,10 +700,6 @@ pub trait LineageOpener: Send + Sync {
         false
     }
 
-    fn step_events_enabled(&self) -> bool {
-        false
-    }
-
     /// Whether this opener's executor has a compaction plane. Defaults to false, the same
     /// fail-closed reading as the hook plane, without acquiring a lease or opening a WAL.
     fn compaction_supported(&self) -> bool {
@@ -2083,10 +2079,6 @@ impl LineageRegistry {
 
     pub fn compaction_supported(&self) -> bool {
         self.inner.opener.compaction_supported()
-    }
-
-    pub fn step_events_enabled(&self) -> bool {
-        self.inner.opener.step_events_enabled()
     }
 
     /// The runtime serving sessions kept in the new storage, for reads that take no lease.

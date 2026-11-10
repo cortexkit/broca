@@ -4155,8 +4155,7 @@ where
                 handler.compaction_supported(),
                 crate::RETENTION_WRITER_ENABLED,
                 handler.hook_plane_available(),
-            )
-            .with_step_events(handler.step_events_enabled());
+            );
             describe.session_class.backup_classes = handler.backup_classes();
             trace_describe("response_ready", channel, epoch, corr);
             let sent = send_json_response(writer, ver, channel, epoch, corr, &describe).await;

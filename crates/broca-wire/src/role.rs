@@ -304,21 +304,6 @@ pub struct RoleDescribeResponse {
     pub session_class: SessionClassCapability,
 }
 
-impl RoleDescribeResponse {
-    /// Advertise live attempt hints only when their publisher is installed. Decoding the
-    /// event type does not promise publication; the switch defaults off.
-    pub fn with_step_events(mut self, step_events_enabled: bool) -> Self {
-        use cortexkit_role_llm_runner::{capabilities::STEP_EVENTS, step_events::StepEvents};
-        self.role.capabilities.retain(|name| name != STEP_EVENTS);
-        self.role.step_events = if step_events_enabled {
-            self.role.capabilities.push(STEP_EVENTS.into());
-            Some(StepEvents::new("per_attempt", "step_ref"))
-        } else {
-            None
-        };
-        self
-    }
-}
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionClassCapability {
     pub backup_classes: Vec<String>,
@@ -437,6 +422,7 @@ pub fn broca_role_describe_with_writers(
         // Client identity belongs to the display envelope, never to a model-visible message.
         cortexkit_role_llm_runner::capabilities::CLIENT_MESSAGE_ID,
         cortexkit_role_llm_runner::capabilities::MESSAGE_SENDERS,
+        cortexkit_role_llm_runner::capabilities::STEP_EVENTS,
     ]
     .map(String::from)
     .to_vec();
@@ -493,6 +479,10 @@ pub fn broca_role_describe_with_writers(
     .with_steer_receipt(steer_receipt::GUARANTEED)
     .with_run_cancel(vec!["now".into(), "step_boundary".into()])
     .with_routed_accounts(vec!["oauth".into(), "chatgpt".into(), "apikey".into()]);
+    describe.step_events = Some(cortexkit_role_llm_runner::step_events::StepEvents::new(
+        "per_attempt",
+        "step_ref",
+    ));
     if hook_writer {
         // Once a hook plane is installed the run loop calls every hook the role names:
         // `pre_user` on each user message before it is written, `pre_tool` and `post_tool`
@@ -752,20 +742,10 @@ mod pinned_reply_bytes {
     }
 
     #[test]
-    fn step_events_declaration_follows_only_the_publisher_switch() {
+    fn step_events_are_declared_with_or_without_optional_writers() {
         use cortexkit_role_llm_runner::{capabilities::STEP_EVENTS, describe::check_describe};
-        let shipping = broca_role_describe_with_writers("test", true, true, true);
-        assert!(shipping.role.step_events.is_none());
-        assert!(!shipping
-            .role
-            .capabilities
-            .iter()
-            .any(|name| name == STEP_EVENTS));
-        for enabled in [false, true] {
-            let describe = shipping
-                .clone()
-                .with_step_events(enabled)
-                .with_step_events(enabled);
+        for writers in [false, true] {
+            let describe = broca_role_describe_with_writers("test", writers, writers, writers);
             let raw = serde_json::to_value(&describe).unwrap();
             check_describe(&raw).unwrap();
             assert_eq!(
@@ -775,25 +755,14 @@ mod pinned_reply_bytes {
                     .iter()
                     .filter(|name| *name == STEP_EVENTS)
                     .count(),
-                usize::from(enabled)
+                1
             );
-            if enabled {
-                let vectors: serde_json::Value = serde_json::from_str(
-                    cortexkit_role_llm_runner::vectors::file("step-events.json").unwrap(),
-                )
-                .unwrap();
-                assert_eq!(raw["step_events"], vectors["valid_policies"][0]);
-            } else {
-                assert!(raw.get("step_events").is_none());
-            }
+            let vectors: serde_json::Value = serde_json::from_str(
+                cortexkit_role_llm_runner::vectors::file("step-events.json").unwrap(),
+            )
+            .unwrap();
+            assert_eq!(raw["step_events"], vectors["valid_policies"][0]);
         }
-        assert_eq!(
-            shipping
-                .clone()
-                .with_step_events(true)
-                .with_step_events(false),
-            shipping
-        );
     }
 
     fn golden(file: &str) -> Vec<u8> {
@@ -1323,7 +1292,7 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "c0417b93fd9311ae8f9f00b91c9e7aa769e4e47f93dc07cd91ba1da80174ff5f",
+            "29f250c49a0197d08636dc98d6d07da3feb875300078d7c8b0efbc69c2a862ef",
         );
     }
 
@@ -1518,7 +1487,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "b7ab050d2afb45fd99b94af8d8c9d8ad0b2b409ed37f8703de6f65cf671dd8e8";
+        "2b0c12edf930a42f049665f1ab6f3c84d1c913a5a7beb5e5247a5f798107df85";
     const RUN_TOOL_CALLS_PAGE_SHA256: &str =
         "6978763bd48c30edffbf61a4b4a0966d7efdfc146b94023f4a36cca4bda0881d";
     const DELIVERED_STEP_SHA256: &str =
