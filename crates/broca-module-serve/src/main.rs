@@ -1318,10 +1318,10 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
                         )
                         .await?;
                     engine
-                        .run_archives(
+                        .run_background(
                             runtime.deployment(),
-                            Some(runtime.as_ref()),
-                            Some(registry.as_ref()),
+                            runtime.as_ref(),
+                            registry.as_ref(),
                             Duration::from_millis(250),
                         )
                         .await
