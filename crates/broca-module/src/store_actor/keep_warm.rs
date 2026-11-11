@@ -154,11 +154,10 @@ impl StoreWarmer {
             .ttl_ms
             .filter(|ttl| *ttl > 0)
             .ok_or("cache TTL unavailable")?;
-        Ok(WarmTiming {
+        Ok(WarmTiming::for_ttl(
             ttl_ms,
-            lead_ms: 30_000.min(ttl_ms / 2),
-            after_send_ms: self.executor.warm_after_send_ms(config),
-        })
+            self.executor.warm_after_send_ms(config),
+        ))
     }
 
     fn costs_of(&self, config: &RunConfig) -> Result<broca_core::keep_warm::WarmCosts, String> {
@@ -174,7 +173,7 @@ impl StoreWarmer {
 
 /// Whether requests under `config` go to an OpenAI Responses endpoint, whose warms are priced
 /// from the usage they report.
-fn responses(config: &RunConfig) -> bool {
+pub(super) fn responses(config: &RunConfig) -> bool {
     matches!(
         config
             .frozen_render_config
@@ -386,7 +385,7 @@ impl StoreWarmer {
 /// The record of a keep-warm of step `step_id` of run `run_id`, whose request had the digest
 /// `request_body_sha256`, as today's driver records it on a log that doesn't reserve a warm's
 /// billing before sending it: the provider answered it, so it reached the cache.
-fn warmed(
+pub(super) fn warmed(
     run_id: &RunId,
     step_id: u64,
     request_body_sha256: &str,
