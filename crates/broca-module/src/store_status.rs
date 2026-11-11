@@ -1244,6 +1244,8 @@ impl Reader<'_> {
                 .ok_or_else(|| damaged("the run's start has no timestamp"))?,
             broca_wire::RunAdmissionStorage::Store,
             admission.manifest.as_deref(),
+            admission.send.principal.as_ref(),
+            admission.send.scope.as_ref(),
         )
         .map(Some)
     }

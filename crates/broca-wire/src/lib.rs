@@ -988,6 +988,18 @@ pub struct RunAdmissionFetch {
     pub declarations_frozen: Option<serde_json::Value>,
 }
 
+/// The scope and driving principal recorded on this run's own start, not the current bind.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunAdmissionScope {
+    pub owner: broca_protocol::BindPrincipal,
+    #[serde(rename = "ref")]
+    pub scope_ref: String,
+    pub epoch: u64,
+    /// Older scoped starts may omit this field; absence means no driving principal was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<broca_protocol::BindPrincipal>,
+}
+
 /// Admission metadata only: no messages, tool arguments, system text or credentials.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunAdmissionResponse {
@@ -997,6 +1009,8 @@ pub struct RunAdmissionResponse {
     pub started_at_ms: u64,
     pub storage: RunAdmissionStorage,
     pub fetches: Vec<RunAdmissionFetch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<RunAdmissionScope>,
 }
 
 #[cfg(test)]
@@ -1029,7 +1043,12 @@ mod run_admission_tests {
                 provider: "aft".into(),
                 declarations_frozen: None,
             }],
+            scope: None,
         };
+        assert_eq!(
+            serde_json::to_vec(&response).unwrap().as_slice(),
+            br#"{"run_id":"r","started_at_ms":123,"storage":"store","fetches":[{"provider":"aft"}]}"#,
+        );
         assert_eq!(
             serde_json::to_value(response).unwrap(),
             serde_json::json!({
