@@ -442,6 +442,10 @@ async fn keep_warm_step_events_match(cipher: Cipher) {
         assert_eq!(event.input_tokens, Some(3));
         assert_eq!(event.cached_input_tokens, Some(1_000));
         assert_eq!(
+            serde_json::to_value(&event.cache).unwrap(),
+            serde_json::json!({"ttl_ms":3_600_000,"warming":{"on":true}})
+        );
+        assert_eq!(
             event.request_body_bytes,
             Some(side.sent.lock().unwrap()[0].len() as u64)
         );

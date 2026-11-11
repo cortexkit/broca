@@ -52,6 +52,8 @@ pub trait KeepWarmDriver<C: ?Sized + Sync = RunConfig>: Send + Sync {
     }
     fn last_sent_at_ms(&self) -> Option<u64>;
     fn note_attempt(&self, _attempt: &broca_protocol::ModelAttempt) {}
+    /// Observe a warming stop for live reports, independently of durable usage accounting.
+    fn note_stop(&self, _run_id: &RunId, _reason: &str) {}
     /// The seal a run's model calls note each request on as their transport starts sending it,
     /// for a run loop that gives its calls no seal of its own: a warm re-sends those bytes, and
     /// their send and usage date the cache. `None` when the loop's own seal already does, as
@@ -140,6 +142,7 @@ pub async fn wait_tools_with_spend<F: Future, C: ?Sized + Sync>(
     let timing = match warm.driver.timing(warm.config) {
         Ok(timing) => timing,
         Err(reason) => {
+            warm.driver.note_stop(warm.run_id, "unsupported");
             if warm.log_unsupported() {
                 tracing::info!(target: "cache_warm", stop = "unsupported", detail = %reason, "keep_warm stopped");
             }
@@ -150,12 +153,14 @@ pub async fn wait_tools_with_spend<F: Future, C: ?Sized + Sync>(
         || timing.after_send_ms == Some(0)
         || (timing.after_send_ms.is_none() && timing.lead_ms >= timing.ttl_ms)
     {
+        warm.driver.note_stop(warm.run_id, "unsupported");
         if warm.log_unsupported() {
             tracing::info!(target: "cache_warm", stop = "unsupported", "keep_warm has no positive scheduling interval");
         }
         return tools.await;
     }
     let Some(initial) = delay(warm.driver.as_ref(), timing) else {
+        warm.driver.note_stop(warm.run_id, "unsupported");
         if warm.log_unsupported() {
             tracing::info!(target: "cache_warm", stop = "unsupported", "keep_warm has no cache clock");
         }
@@ -199,6 +204,7 @@ pub async fn wait_tools_with_spend<F: Future, C: ?Sized + Sync>(
                         let missed = usage.cached_input_tokens.zip(usage.input_tokens).map(|(cached, fresh)| (cached, cached.saturating_add(fresh)));
                         if let Some((cached, total)) = missed.filter(|(cached, total)| *cached < total.saturating_sub(*cached)) {
                             warm.warm_missed.store(true, std::sync::atomic::Ordering::Relaxed);
+                            warm.driver.note_stop(warm.run_id, "warm_missed");
                             stopped = true;
                             next = None;
                             tracing::info!(target: "cache_warm", stop = "warm_missed", cached_input_tokens = cached, total_input_tokens = total, run_id = %warm.run_id.0, spent, "keep_warm stopped");
@@ -210,6 +216,7 @@ pub async fn wait_tools_with_spend<F: Future, C: ?Sized + Sync>(
                         next = Some(tokio::time::Instant::now() + Duration::from_millis((timing.lead_ms / 10).clamp(1, 1000)));
                     }
                     WarmTick::Stop { reason, detail } => {
+                        warm.driver.note_stop(warm.run_id, &reason);
                         stopped = true;
                         next = None;
                         if reason != "unsupported" || warm.log_unsupported() {
@@ -217,6 +224,7 @@ pub async fn wait_tools_with_spend<F: Future, C: ?Sized + Sync>(
                         }
                     }
                     WarmTick::StopWithCost { reason, detail, cost } => {
+                        warm.driver.note_stop(warm.run_id, &reason);
                         spent += cost;
                         stopped = true;
                         next = None;
@@ -234,6 +242,7 @@ pub async fn wait_tools_with_spend<F: Future, C: ?Sized + Sync>(
                         tick = Some(warm.driver.warm(warm.config, warm.run_id));
                     }
                     result => {
+                        warm.driver.note_stop(warm.run_id, "budget");
                         stopped = true;
                         let detail = result.err().unwrap_or_else(|| "one cache bust costs no more than the next warm".into());
                         tracing::info!(target: "cache_warm", stop = "budget", detail = %detail, "keep_warm stopped");
@@ -308,9 +317,13 @@ mod tests {
         costs_called: AtomicUsize,
         warms: AtomicUsize,
         next_decision: tokio::sync::Notify,
+        stops: std::sync::Mutex<Vec<String>>,
     }
     #[async_trait::async_trait]
     impl KeepWarmDriver for ChargedDriver {
+        fn note_stop(&self, _: &RunId, reason: &str) {
+            self.stops.lock().unwrap().push(reason.into());
+        }
         fn timing(&self, _: &RunConfig) -> Result<WarmTiming, String> {
             Ok(WarmTiming {
                 ttl_ms: 1000,
@@ -343,6 +356,7 @@ mod tests {
             costs_called: AtomicUsize::new(0),
             warms: AtomicUsize::new(0),
             next_decision: Default::default(),
+            stops: Default::default(),
         });
         let done = CancellationToken::new();
         let task = {
@@ -376,6 +390,7 @@ mod tests {
         driver.next_decision.notified().await;
         done.cancel();
         task.await.unwrap();
+        assert_eq!(*driver.stops.lock().unwrap(), ["budget"]);
         assert_eq!(
             driver.warms.load(Ordering::SeqCst),
             1,

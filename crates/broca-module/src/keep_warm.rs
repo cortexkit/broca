@@ -267,6 +267,9 @@ pub(crate) fn recorded_for_test(
 
 #[async_trait::async_trait]
 impl KeepWarmDriver for AutomaticWarmer {
+    fn note_stop(&self, run_id: &RunId, reason: &str) {
+        self.writer.note_step_event_warm_stop(run_id, reason);
+    }
     fn timing(&self, config: &RunConfig) -> Result<WarmTiming, String> {
         let declaration = (self.declare)(config).ok_or("cache declaration unavailable")?;
         declaration.warm?;
@@ -403,7 +406,7 @@ impl KeepWarmDriver for AutomaticWarmer {
             base,
             attempt_hook: None,
         };
-        self.writer.note_step_event_run_config(run_id, config);
+        self.writer.note_step_event_run_config(run_id, config, None);
         let journal = automatic_warm_hook(&self.writer, &self.seal, &job, run_id, self.trigger);
         job.attempt_hook = journal
             .as_ref()

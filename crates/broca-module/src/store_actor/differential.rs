@@ -1444,6 +1444,18 @@ async fn module_options(
     idle_ttl: Duration,
     gate: Option<Arc<Notify>>,
 ) -> Module {
+    module_options_with_render(on, steps, cipher, step_events, idle_ttl, gate, None).await
+}
+
+async fn module_options_with_render(
+    on: bool,
+    steps: Vec<Vec<NormalizedEvent>>,
+    cipher: Option<broca_session_store::keys::Cipher>,
+    step_events: Option<Arc<crate::step_events::StepEvents>>,
+    idle_ttl: Duration,
+    gate: Option<Arc<Notify>>,
+    render_config: Option<serde_json::Value>,
+) -> Module {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let dir = broca_test_support::scratch_root().join(format!(
@@ -1457,10 +1469,12 @@ async fn module_options(
         Some(_) => FileWalStore::with_config(dir.join("wal"), broca_wal::WalConfig::OVERHAUL),
         None => FileWalStore::new(dir.join("wal")),
     });
+    let mut store_loop = executor(steps.clone(), gate.clone());
+    store_loop.provider.render_config = render_config.clone();
     let executor: Arc<dyn RunExecutor> = Arc::new(BothLoops {
         today: TodayLoop {
             provider: Gated {
-                render_config: None,
+                render_config,
                 notes_sends: false,
                 inner: broca_core::provider::StubProvider::new(steps.clone()),
                 gate: gate.clone(),
@@ -1468,7 +1482,7 @@ async fn module_options(
             wal: Arc::clone(&wal),
             planes: Default::default(),
         },
-        store: executor(steps, gate),
+        store: store_loop,
     });
     let runtime = crate::store_open::StoreRuntime::open(
         &dir,
@@ -1507,11 +1521,21 @@ async fn module_options(
 
 impl Module {
     async fn send(&self, run_id: &str, text: &str, conversation_key: Option<&str>) -> SendOutcome {
+        self.send_request(run_id, request(text), conversation_key)
+            .await
+    }
+
+    async fn send_request(
+        &self,
+        run_id: &str,
+        request: SubmissionRequest,
+        conversation_key: Option<&str>,
+    ) -> SendOutcome {
         self.registry
             .route_submission_with_order(
                 &self.key,
                 RunId(run_id.into()),
-                self.caller.shape(run_id, &SendKey::Minted, request(text)),
+                self.caller.shape(run_id, &SendKey::Minted, request),
                 RunKind::FreshOrResume,
                 SendKey::Minted,
                 false,

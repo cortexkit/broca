@@ -4319,7 +4319,11 @@ where
     };
     if is_resume && !append_episode {
         if let Some(config) = &prior.run_config {
-            writer.note_step_event_run_config(&resolved_run_id, config);
+            writer.note_step_event_run_config(
+                &resolved_run_id,
+                config,
+                Some(req.keep_warm.unwrap_or_default()),
+            );
         }
     }
     // Whether this run shows runner tags to the model, and under which rules: both frozen in
