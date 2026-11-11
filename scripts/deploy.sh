@@ -99,15 +99,13 @@ rollback_command() {
     if [ -n "$backup" ]; then
       printf 'Rollback: '
       printf '%q ' "$ROOT/scripts/place-release.sh" --staged "$backup"
-      for client in broca-session broca-run; do
+      for client in broca-session; do
         client_backup="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["client_backups"][sys.argv[2]])' "$report" "$client")"
         if [ -n "$client_backup" ]; then
-          case "$client" in broca-session) option=--session-staged ;; broca-run) option=--run-staged ;; esac
-          printf '%q ' "$option" "$client_backup"
+          printf '%q ' --session-staged "$client_backup"
         else
           # Rolling back a first installation restores absence, not an incompatible new client.
-          case "$client" in broca-session) option=--remove-session ;; broca-run) option=--remove-run ;; esac
-          printf '%q ' "$option"
+          printf '%q ' --remove-session
         fi
       done
       printf '%q ' --dest "$dest" --restart --live-approved

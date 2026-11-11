@@ -24,7 +24,7 @@ effect.
 | `broca-diagnostics` | Blocking-job and egress instrumentation. |
 | `cortexkit-chatgpt-policy` | Shared ChatGPT/Codex account-id, refusal and quota-header policy. |
 | `ck-session-import`, `ck-import` | Log import readers and CLI. |
-| `broca-run`, `broca-bench`, `broca-replay` | Standalone runner, benchmarks and replay fixtures. |
+| `broca-bench`, `broca-replay` | Benchmarks and replay fixtures. |
 | `broca-test-support`, `broca-crash-harness` | Test support and crash-cut recovery checks. |
 
 See [Architecture](docs/architecture.md) for the data flow and invariants.

@@ -2,11 +2,9 @@
 /target
 **/*.rs.bk
 
-# ENGINE RUNTIME STATE. `broca-run` writes its WAL and single-writer leases under
-# `<project-root>/.broca/`, and --project-root defaults to the CWD -- so running the CLI
-# from a checkout puts session state inside the repo. That is correct behaviour for a
-# harness whose durable log belongs beside the project it drives; what was wrong was
-# tracking the result.
+# ENGINE RUNTIME STATE. Legacy harnesses stored WALs and single-writer leases under
+# `<project-root>/.broca/`. Keep excluding those directories even though supervised
+# deployments use a separate state root: an old checkout can still contain transcripts.
 #
 # A WAL is a TRANSCRIPT: prompts, tool arguments and tool results, verbatim. The two files
 # this rule retired held only a `say pong` acceptance probe, but the same command run

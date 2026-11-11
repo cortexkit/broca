@@ -2321,10 +2321,9 @@ impl CatalogCache {
             // back to present and pass, putting a model the newer catalog withdrew back on the
             // admission path.
             //
-            // Reachable without any fusiform-side fault: the daemon and broca-run share one LKG
-            // path, and persist_lkg is atomic per write but has no cross-process ordering. Two
-            // pollers minutes apart both write and the last one wins, so a CLI invocation that
-            // polled earlier can overwrite the daemon's newer snapshot on disk.
+            // Reachable without any fusiform-side fault: pollers sharing a catalog snapshot
+            // path have no cross-process ordering, even though persist_lkg is atomic per write.
+            // An older poll can finish writing last and overwrite a newer snapshot on disk.
             let missing = current
                 .model_identities
                 .difference(&next.model_identities)

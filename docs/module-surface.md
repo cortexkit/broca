@@ -54,7 +54,7 @@ whether the daemon flag appears before or after the subcommand, without binding.
 composes a tool-only plan from live provider catalogs without creating a session or sending
 a turn. With `--scope`, every provider's catalog is fetched on a scoped `tool-provider: v1`
 route as a Direct carrier. The scope owner must authorize `direct` as a carrier for those
-providers. Like [`broca-run --scope`](broca-run.md), the command reads the private 32-byte
+providers. The command reads the private 32-byte
 bind proof as exactly 64 hex characters on stdin, optionally followed by a newline, and
 requires EOF. A missing or malformed proof is refused before connecting to the daemon;
 the proof never belongs in argv, an environment variable, the items file, or diagnostics.
@@ -67,13 +67,70 @@ are refused rather than silently falling back to unscoped routing. Scope selecto
 are sent only in `route.open`, never in catalog request bodies. Tool presets come
 from the plan's tool items, so there is no `--preset` flag.
 
+### Carry an owner's scope
+
+For `compose-plan --scope <owner>/<ref>/<epoch>`, the owner is a reserved module id,
+not `direct` ownership: a Direct process cannot register or own the scope. The
+explicit epoch prevents a reused scope ref from silently selecting another session.
+
+After the owner has synced and received acceptance for its record, it hands the
+child a **32-byte random bind proof privately**, encoded as exactly 64 hex
+characters on a private piped stdin, optionally followed by a newline, then closes
+the pipe. Never put the proof in argv, an environment variable, a log, or a shell
+command printed by an orchestrator. Missing or malformed input is refused as
+`scope_bind_proof_required` or `scope_bind_proof_invalid` before any daemon connection.
+
+```text
+broca-session --subc <connection-file> compose-plan --items <items-file> \
+  --scope rig-owner/run-42/1
+```
+
+The command deliberately contains no proof argument. The selector sent to subc
+uses base64url without padding over the decoded 32 bytes. The proof hash is
+SHA-256 over those raw bytes, **not** the 64-character hex representation.
+
+For example, the reserved module `rig-owner` syncs this scope record, replacing
+the folder with its canonical absolute rig folder and the hash with its proof's
+lowercase 64-character SHA-256 digest:
+
+```json
+{
+  "ref": "run-42",
+  "scope_epoch": 1,
+  "kind": "head",
+  "workdir": "/absolute/rig-folder",
+  "bind_proof_sha256": "<sha256-of-the-raw-32-byte-proof>",
+  "carriers": [
+    {
+      "principal": {"kind": "direct"},
+      "targets": ["aft"]
+    }
+  ],
+  "attributes": {}
+}
+```
+
+The owner is established by its supervised module connection, not by adding an
+owner field to the record. A wrong proof is refused by subc as
+`scope_bind_proof_mismatch`. Every provider catalog route opened for the plan
+carries the selector and proof; the daemon stamps the record's workdir on that
+route. A local `--project-root` does not override it. Keep `targets` narrow: the
+owner must explicitly authorize every tool provider the plan needs. There is no
+fallback to a folder claimed by the CLI.
+
+The process-level **Fusiform catalog and vault routes stay unscoped and need no
+carrier entry**. The proof lives only in the tool plane, never in the composed
+plan, session identity, model input, or WAL. Composing a plan does not create a
+session or authorize a subsequent session route to carry the scope.
+
 ---
 
 ## 1. What it is
 
 broca is an **orchestration tier**: a subc module that runs agentic LLM loops for
 consumer modules while consuming tools, credentials, and model-routing services.
-Its agentic core is shared with the [`broca-run` CLI](broca-run.md).
+`broca-session` controls and inspects that supervised module rather than running
+an agentic loop in-process.
 
 ### 1a. Runtime precondition: a model catalog must be reachable ONCE
 
@@ -164,11 +221,9 @@ New sends refuse `credentials_unavailable` while no listing has loaded, with
 `detail: {class: "permanent", credential: <broca key>, candidate_ids: [<vault ids>]}`;
 it never chooses a row silently. Existing missing-credential refusals are unchanged.
 
-Foreground developer tools use a separately provisioned capability handle:
-`broca-run` resolves a catalog model's provider and configured auth method, loads
-its handle through `vault_config::load_devtools_handle`, and reads it through subc.
-An explicit `--auth-bearer` overrides this; `--base-url` without a bearer remains
-credential-free for mocks. Live tests require `BROCA_LIVE_TESTS=1` before loading
+Foreground developer probes and live tests use a separately provisioned capability
+handle, loaded through `vault_config::load_devtools_handle` and read through subc.
+Live tests require `BROCA_LIVE_TESTS=1` before loading
 any handle or reading a credential, and use the same dev-tools handle map
 (`BROCA_DEVTOOLS_HANDLES` or `~/.config/cortexkit/broca/dev-tools-handles.json`).
 `BROCA_LIVE_SUBC` or `SUBC_SOCKET` can select their subc connection file.
@@ -2449,10 +2504,11 @@ Additive WAL changes must retain the existing compatibility rules:
 8. **Durable run index** (§14).
 9. **WAL lease-tenure stamps and file-integrity rejection**.
 
-## 22. Standalone CLI coexistence
+## 22. Session CLI
 
-`broca-run` stays as-is; a single-turn CLI run is a lineage with one episode. Shared core,
-two front-ends.
+`broca-session` sends turns to the supervised module; it does not own a separate
+in-process run loop. A single-turn session is a lineage with one episode, using
+the same admission, durability and coordination contracts as other consumers.
 
 ## 23. Thin-core fit (subc)
 

@@ -115,7 +115,10 @@ mod tests {
 
     #[test]
     fn documented_owner_record_uses_the_published_direct_carrier_shape() {
-        let document = include_str!("../../../docs/broca-run.md");
+        let document = include_str!("../../../docs/module-surface.md")
+            .split_once("### Carry an owner's scope\n")
+            .unwrap()
+            .1;
         let record = document
             .split("```json\n")
             .nth(1)
