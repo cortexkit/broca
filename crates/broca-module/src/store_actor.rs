@@ -629,7 +629,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             }
         }
         self.session
-            .add_append_observer(Box::new(move |appended| observer.appended(appended)));
+            .add_positioned_append_observer(Box::new(move |appended, position| {
+                observer.appended(appended, position)
+            }));
         self
     }
 

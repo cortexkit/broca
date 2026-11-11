@@ -50,7 +50,8 @@ pub(super) async fn session_live(
     // The kit names a case's sessions after the case. The routed-account cases' names carry
     // `routed-account` and the account-route cases' (`account_route_*`) carry `account_route`;
     // both route accounts through the vault, so both need this vault-backed runner.
-    if !(session.contains("routed-account") || session.contains("account_route")) {
+    let step_fixture = step_events::fixture_session(session);
+    if !(session.contains("routed-account") || session.contains("account_route") || step_fixture) {
         return Ok(None);
     }
     if !session
@@ -64,6 +65,18 @@ pub(super) async fn session_live(
     let mut instances = subject.routed_instances.lock().await;
     if let Some(live) = instances.get(session).and_then(std::sync::Weak::upgrade) {
         return Ok(Some(live));
+    }
+    // Mock model calls have no billable attempt records. Step-event fixtures use the native
+    // provider and its test vault so their events join to real durable attempt identities.
+    if step_fixture {
+        let peer = RecordingRoutingPeer::new("apikey", fixture("apikey")?)
+            .map_err(|error| HarnessError::new(error.to_string()))?;
+        subject
+            .shared
+            .routed_account_peers
+            .lock()
+            .unwrap()
+            .insert(session.into(), peer);
     }
     // A separate daemon keeps the production vault/routing path real without changing the
     // unrelated mock-provider cases. The session route owns the daemon, not this weak cache.

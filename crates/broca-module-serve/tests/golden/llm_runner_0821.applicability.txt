@@ -4,7 +4,7 @@ N/A cache_policy_plan_refusals: missing groups: cache_policy
 N/A cache_policy_send_refusals: missing groups: cache_policy
 N/A cache_policy_continuation_refused: missing groups: cache_policy
 N/A cache_policy_plan_and_send_refused: missing groups: cache_policy
-N/A cache_policy_step_report: missing groups: cache_policy, step_events
+N/A cache_policy_step_report: missing groups: cache_policy
 N/A restart_survival_model_step: adapter declares host_survives_restart: false
 N/A restart_survival_held_tool_call: adapter declares host_survives_restart: false
 N/A restart_survival_send_handoff: adapter declares host_survives_restart: false
@@ -64,6 +64,6 @@ PASS media_descriptors_pairing
 PASS media_descriptors_part_keys
 PASS media_descriptors_provider_rows
 PASS media_descriptors_stable_across_pages
-N/A read_display_facts_send_id: missing groups: send_ids
-PASS_WITH_INAPPLICABLE_RULE read_display_facts_send_id_when_present: read_display_facts_send_id_unkeyed: runner returned no submission_id; verified absence instead
+PASS read_display_facts_send_id
+N/A read_display_facts_send_id_when_present: send_ids guarantee is checked by read_display_facts_send_id
 N/A call_identity_imported_call_carrier: adapter hook seed_imported_tool_call is unavailable
