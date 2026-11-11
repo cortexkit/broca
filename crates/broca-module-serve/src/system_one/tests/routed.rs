@@ -2186,8 +2186,10 @@ async fn routed_resettable_account_limit_reports_reset_without_reselection() {
         observation["observed_at_ms"].as_u64().unwrap() + 10_000
     );
     assert_eq!(observation["resets_at_source"], "retry_after");
+    assert!(observation.get("limit_window").is_none());
     let report = &rig.router.bodies("route.report")[0];
     assert_eq!(report["reset_at_ms"], reset);
+    assert!(report.get("limit_window").is_none());
     assert!(report.get("refusal_class").is_none());
 }
 

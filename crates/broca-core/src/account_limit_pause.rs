@@ -249,6 +249,10 @@ impl FailedAccountLimitAttempt {
             return None;
         }
         let source = self.attempt.account_observation.limit.as_ref()?;
+        // A spending wall clears by renewal or top-up, not by waiting out a quota window.
+        if source.limit_window == Some(broca_protocol::error::AccountLimitWindow::Credit) {
+            return None;
+        }
         let selection = selection?;
         // A selection without auth_method is a broca lookup key, whose first component is
         // its method. With auth_method present the lookup id is opaque and is never parsed.
@@ -623,6 +627,20 @@ mod tests {
                 expected,
                 "{name}"
             );
+            if expected {
+                let mut credit = FailedAccountLimitAttempt {
+                    seq: evidence.seq,
+                    attempt: evidence.attempt.clone(),
+                };
+                let limit = credit.attempt.account_observation.limit.as_mut().unwrap();
+                limit.limit_window = Some(broca_protocol::error::AccountLimitWindow::Credit);
+                assert!(
+                    credit
+                        .pause(StepId(1), 1000, &error, Some(&selection), &budget)
+                        .is_none(),
+                    "credit wall with quota timing: {name}"
+                );
+            }
             assert!(evidence
                 .pause(StepId(1), 1000, &error, None, &budget)
                 .is_none());
