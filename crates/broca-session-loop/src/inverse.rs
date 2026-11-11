@@ -523,6 +523,17 @@ impl Inverse {
         self.next
     }
 
+    /// What the inverse holds, estimated by walking it when asked (see
+    /// `broca_session_store::held`): the records waiting for their claim, the latest message's
+    /// call inputs, and the steers not yet placed.
+    pub fn held_bytes(&self) -> usize {
+        use broca_session_store::held::HeldBytes;
+        std::mem::size_of::<Self>()
+            + self.pending.heap_bytes()
+            + self.calls.heap_bytes()
+            + self.unplaced.heap_bytes()
+    }
+
     /// Today's record JSON for each old record `records` complete, in order. `records` are the
     /// log's next records, the first at seq `first`, and must start where the last batch ended.
     /// `parts` reads a setup part a record names.

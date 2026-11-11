@@ -282,6 +282,21 @@ pub struct ChangeMark {
 #[derive(Debug, Clone, Default)]
 struct Restated(Vec<(u64, u64)>);
 
+impl crate::held::HeldBytes for WindowChanges {
+    fn heap_bytes(&self) -> usize {
+        crate::held::HeldBytes::heap_bytes(&self.states.0)
+            + crate::held::HeldBytes::heap_bytes(&self.messages.0)
+    }
+}
+
+impl Conversation {
+    /// The heap the assistant message held for its tool results holds, with the replies it has
+    /// so far, for the memory report (see `crate::held`).
+    pub fn open_heap_bytes(&self) -> usize {
+        crate::held::HeldBytes::heap_bytes(&self.open)
+    }
+}
+
 impl Restated {
     fn push(&mut self, count: u64, ordinal: u64) {
         // An earlier change at the same or a later ordinal is never the lowest since any mark

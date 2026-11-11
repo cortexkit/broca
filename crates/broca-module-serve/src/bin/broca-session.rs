@@ -585,6 +585,11 @@ enum Cmd {
         #[arg(long = "vault-ready-timeout-ms", hide = true)]
         vault_ready_timeout_ms: Option<u64>,
     },
+    /// `memory.report`: the daemon's estimate of what each open session and shared cache holds
+    /// in memory, walked when asked. Prints a table of the sessions by holder, the process's
+    /// totals, the setup parts sessions hold decoded and the caches; with `--json-events`, the
+    /// reply as JSON. Operator only; the session identity is only the transport attachment.
+    Memory,
     /// `session.read`: one durable transcript page (lease-free; works on idle and
     /// active sessions). Prints per-message role/ordinal/summary plus page timing.
     Read {
@@ -1147,8 +1152,7 @@ async fn run(args: Args) -> Result<i32, String> {
                         return Ok(1);
                     }
                 };
-                let page: broca_wire::tag_map::TagMapResponse = serde_json::from_slice(&body)
-                    .map_err(|error| format!("tag-map reply doesn't decode: {error}"))?;
+                let page = tag_map_page(&body)?;
                 let next = next_tag_map_page(after_ordinal, &page)?;
                 pages.push(page);
                 match next {
@@ -1171,6 +1175,21 @@ async fn run(args: Args) -> Result<i32, String> {
                 .map_err(|_| "cannot write the tag map")?;
             writeln!(output).map_err(|_| "cannot write the tag map")?;
             output.flush().map_err(|_| "cannot flush the tag map")?;
+            Ok(0)
+        }
+        Cmd::Memory => {
+            let report = client
+                .memory_report()
+                .await
+                .map_err(|error| format!("memory.report: {error}"))?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&report).map_err(|error| error.to_string())?
+                );
+            } else {
+                print!("{}", memory_table(&report));
+            }
             Ok(0)
         }
         Cmd::Raw { op, params } => {
@@ -1577,6 +1596,102 @@ fn audit_events(answer: &Result<VaultAuditResponse, String>) -> Vec<(serde_json:
         ),
     ));
     events
+}
+
+/// Bytes in mebibytes, for the memory table.
+fn mib(bytes: u64) -> String {
+    format!("{:.1}", bytes as f64 / (1024.0 * 1024.0))
+}
+
+/// The `memory.report` reply as a table: one row per session and a row of totals, by holder in
+/// MiB, then the setup parts and the caches.
+fn memory_table(report: &broca_module_serve::wire::MemoryReport) -> String {
+    use broca_module_serve::wire::MemoryHolders;
+    let mut out = String::new();
+    let header =
+        format!(
+        "{:<18} {:>3} {:>7} {:>8} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>8}\n",
+        "session", "run", "msgs", "messages", "facts", "kept", "spare", "ids", "sealed",
+        "entries", "media", "request", "rest", "total MiB"
+    );
+    out.push_str(&header);
+    let row = |name: &str, run: &str, messages: String, h: &MemoryHolders| {
+        format!(
+            "{:<18} {:>3} {:>7} {:>8} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>8}\n",
+            name,
+            run,
+            messages,
+            mib(h.messages),
+            mib(h.entry_facts),
+            mib(h.kept_records),
+            mib(h.kept_records_capacity),
+            mib(h.id_index),
+            mib(h.sealed_entries),
+            mib(h.compaction_entries),
+            mib(h.media_fold),
+            mib(h.request_in_flight),
+            mib(h.rest),
+            mib(h.total),
+        )
+    };
+    for session in &report.sessions {
+        out.push_str(&row(
+            &session.address,
+            if session.run_in_progress { "yes" } else { "" },
+            session.window_messages.to_string(),
+            &session.holders,
+        ));
+    }
+    out.push_str(&row(
+        "total",
+        &report.running_sessions.to_string(),
+        report
+            .sessions
+            .iter()
+            .map(|session| session.window_messages)
+            .sum::<u64>()
+            .to_string(),
+        &report.totals,
+    ));
+    out.push_str(&format!(
+        "{} sessions on the new storage ({} with a run in progress), {} on today's storage, {} \
+         unanswered. Sessions with a run in progress hold their run's entries and request on top \
+         of an idle session's bytes.\n",
+        report.sessions.len(),
+        report.running_sessions,
+        report.legacy_sessions,
+        report.unanswered_sessions
+    ));
+    if !report.setup_parts.is_empty() {
+        out.push_str("\nsetup part      decoded MiB  copies  sessions\n");
+        for part in &report.setup_parts {
+            out.push_str(&format!(
+                "{:<15} {:>11} {:>7} {:>9}\n",
+                part.kind,
+                mib(part.decoded_bytes),
+                part.decoded_copies,
+                part.sessions
+            ));
+        }
+    }
+    out.push_str(
+        "\ncache                  entries  max entries  estimated MiB  counted MiB  max MiB\n",
+    );
+    for (name, cache) in [
+        ("closed-session views", &report.closed_session_views),
+        ("settled runs", &report.settled_runs),
+    ] {
+        out.push_str(&format!(
+            "{:<22} {:>7} {:>12} {:>14} {:>12} {:>8}\n",
+            name,
+            cache.entries,
+            cache.max_entries,
+            mib(cache.estimated_bytes),
+            cache.counted_bytes.map_or_else(|| "-".into(), mib),
+            cache.max_bytes.map_or_else(|| "-".into(), mib),
+        ));
+    }
+    out
 }
 
 /// Ask the daemon for `vault.audit`. A request that got no reply at all (no connection, no
@@ -2580,9 +2695,26 @@ fn tag_map_document(
     serde_json::json!({ "session": session, "rows": rows })
 }
 
+/// The answer inside a management reply. The daemon frames every unary reply as
+/// `{"result": <answer>}`, and `management_raw` hands those bytes back unchanged, so a command
+/// that reads the answer must take it out of that member first.
+fn management_result(body: &[u8], op: &str) -> Result<serde_json::Value, String> {
+    let mut reply: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|error| format!("{op} reply doesn't decode: {error}"))?;
+    reply
+        .get_mut("result")
+        .map(serde_json::Value::take)
+        .ok_or_else(|| format!("{op} reply carries no result"))
+}
+
+/// One `session.tag_map` page, read from the reply bytes the daemon sent.
+fn tag_map_page(body: &[u8]) -> Result<broca_wire::tag_map::TagMapResponse, String> {
+    serde_json::from_value(management_result(body, "tag-map")?)
+        .map_err(|error| format!("tag-map reply doesn't decode: {error}"))
+}
+
 fn restore_report(json: bool, body: &[u8], output: &mut impl FnMut(String)) -> Result<i32, String> {
-    let reply: serde_json::Value = serde_json::from_slice(body)
-        .map_err(|error| format!("restore-from-backup reply doesn't decode: {error}"))?;
+    let reply = management_result(body, "restore-from-backup")?;
     let sessions = reply["sessions"]
         .as_array()
         .ok_or("restore-from-backup reply names no sessions")?;
@@ -3570,13 +3702,17 @@ mod tests {
             &args.cmd,
             Cmd::TagMap { out: Some(out), limit: Some(2) } if out == std::path::Path::new("/tmp/map.json")
         ));
+        // Pages are decoded from bytes framed as the daemon sends them, `{"result": …}`.
         let page = |rows: serde_json::Value, next: Option<u64>| {
             let mut page = serde_json::json!({"numbered": true, "rows": rows});
             if let Some(next) = next {
                 page["next_after_ordinal"] = next.into();
             }
-            serde_json::from_value::<broca_wire::tag_map::TagMapResponse>(page).unwrap()
+            let body = serde_json::json!({ "result": page }).to_string();
+            super::tag_map_page(body.as_bytes()).unwrap()
         };
+        // An answer without the framing is refused, not read as an empty page.
+        assert!(super::tag_map_page(br#"{"numbered":true,"rows":[]}"#).is_err());
         let first = page(
             serde_json::json!([{"tag": 1, "mid": "m1", "ordinal": 1, "part": 0, "role": "user"}]),
             Some(2),
@@ -3613,10 +3749,10 @@ mod tests {
         ])
         .expect("parse restore-from-backup");
         assert!(matches!(args.cmd, Cmd::RestoreFromBackup { all: true }));
-        let reply = serde_json::json!({"sessions": [
+        let reply = serde_json::json!({"result": {"sessions": [
             {"outcome": "kept", "report": "durable a: kept"},
             {"outcome": "log_cut", "report": "durable b: log cut"},
-        ]});
+        ]}});
         let mut lines: Vec<String> = Vec::new();
         let exit = super::restore_report(false, reply.to_string().as_bytes(), &mut |line| {
             lines.push(line)
@@ -3632,10 +3768,10 @@ mod tests {
                 ]
             )
         );
-        let reply = serde_json::json!({"sessions": [
+        let reply = serde_json::json!({"result": {"sessions": [
             {"outcome": "rolled_back", "report": "durable a: rolled back"},
             {"outcome": "unrecoverable", "report": "durable b: unrecoverable"},
-        ]});
+        ]}});
         let mut lines: Vec<String> = Vec::new();
         let exit = super::restore_report(true, reply.to_string().as_bytes(), &mut |line| {
             lines.push(line)

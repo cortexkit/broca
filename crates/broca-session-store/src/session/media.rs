@@ -734,5 +734,11 @@ impl<B: SessionBackend> Session<B> {
     }
 }
 
+impl crate::held::HeldBytes for OpenLogIndex {
+    fn heap_bytes(&self) -> usize {
+        self.facts.heap_bytes() + self.media.heap_bytes()
+    }
+}
+
 #[cfg(test)]
 mod tests;

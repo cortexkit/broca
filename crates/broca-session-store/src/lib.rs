@@ -67,6 +67,7 @@ pub mod frame;
 #[cfg(any(test, fuzzing))]
 pub mod fuzzing;
 pub mod head;
+pub mod held;
 pub mod idindex;
 pub mod keys;
 pub mod log;
@@ -76,9 +77,14 @@ pub mod record;
 pub mod segment;
 pub mod session;
 pub mod setup;
+/// A synthetic session shaped like production ones, for memory budget tests: built for the
+/// crate's tests, and for other crates' tests behind the `synthetic` feature.
+#[cfg(any(test, feature = "synthetic"))]
+pub mod synthetic;
 
 // The crate's tests count what each thread allocates, so the fuzzing checks can hold decoders to
-// allocations proportional to their input.
+// allocations proportional to their input, and the memory budget tests can measure what a loaded
+// session holds.
 #[cfg(test)]
 #[global_allocator]
 static ALLOCATOR: fuzzing::CountingAlloc = fuzzing::CountingAlloc;

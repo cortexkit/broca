@@ -8,6 +8,13 @@
 //! owns the wire mechanics (see `docs/lineage-actor-coordinator.md`).
 #![forbid(unsafe_code)]
 
+// The memory budget tests count what their thread allocates (see `broca_test_support::alloc`).
+// Only the test binary installs the counting allocator.
+#[cfg(test)]
+#[global_allocator]
+static ALLOCATOR: broca_test_support::alloc::CountingAlloc =
+    broca_test_support::alloc::CountingAlloc;
+
 pub mod actor;
 pub mod cache;
 pub mod claude_code_identity;
@@ -21,6 +28,7 @@ pub mod held_withdrawals;
 pub mod history;
 pub mod late_results_puller;
 pub mod late_results_store;
+pub mod memory_report;
 pub mod opener;
 pub mod output_refs;
 pub mod person_media;

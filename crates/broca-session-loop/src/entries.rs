@@ -443,6 +443,10 @@ impl<W: Writer> Writer for Placed<'_, W> {
     fn media(&self) -> Option<std::sync::Arc<dyn broca_core::tool_media::MediaCapture>> {
         self.inner.media()
     }
+
+    fn share_window(&self, window: crate::compaction::WeakWindow) {
+        self.inner.share_window(window)
+    }
 }
 
 /// The run's frozen tag rules, which every message it places records.

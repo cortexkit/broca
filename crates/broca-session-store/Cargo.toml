@@ -31,6 +31,11 @@ broca-test-support = { path = "../broca-test-support" }
 proptest = { version = "1.11", default-features = false, features = ["std"] }
 futures = { workspace = true, features = ["executor"] }
 
+[features]
+# A synthetic session shaped like production ones (`synthetic`), for other crates' memory budget
+# tests. Enabled only as a dev-dependency feature, never in a shipped build.
+synthetic = []
+
 [lints.rust]
 # `cargo fuzz` builds with `--cfg fuzzing`, which exposes the `fuzzing` module to the targets in
 # `fuzz/` (a separate workspace, never built by the normal build).

@@ -47,6 +47,7 @@ use broca_protocol::content::{AssistantMessage, FinishReason, Message, ToolCall,
 use broca_protocol::{BatchId, RunId, StepId, ToolCallId};
 use broca_session_store::fold::conversation::Conversation;
 use broca_session_store::fold::operations::Operations;
+use broca_session_store::held::HeldBytes;
 use broca_session_store::record::{CallOutcome, Placement, Record, Stream};
 use cortexkit_role_llm_runner::live::LiveEvent;
 
@@ -129,6 +130,26 @@ enum Waiting {
     StepEnd(Box<StepEndUnits>),
 }
 
+impl broca_session_store::held::HeldBytes for CallIdentity {
+    fn heap_bytes(&self) -> usize {
+        self.key.heap_bytes() + self.schema_pin.heap_bytes()
+    }
+}
+
+impl broca_session_store::held::HeldBytes for Waiting {
+    fn heap_bytes(&self) -> usize {
+        match self {
+            Waiting::Input(message) => message.heap_bytes(),
+            // A control unit is a wire type of many shapes; its compact JSON stands in for its
+            // heap. A budget firing waits for one record at most.
+            Waiting::Budget(unit) => serde_json::to_vec(unit).map_or(0, |bytes| bytes.len()),
+            Waiting::StepEnd(units) => {
+                std::mem::size_of::<StepEndUnits>() + units.message.heap_bytes()
+            }
+        }
+    }
+}
+
 /// What a step's end yields, kept until its assistant message's id is known.
 #[derive(Debug, Clone)]
 struct StepEndUnits {
@@ -188,27 +209,26 @@ impl Default for StoreControl {
 }
 
 impl StoreControl {
-    /// An estimate of the memory this projection holds: its copies of the folds, as encoded,
-    /// which the store's bound schema bounds, and the facts it keeps of the current run, step and
-    /// batch. It never holds the units it made. Reported by the store actor's read-cost measure
-    /// (`store_actor::read_cost`).
+    /// An estimate of the memory this projection holds, walked when asked (see
+    /// `broca_session_store::held`): its copies of the folds, and the facts it keeps of the
+    /// current run, step and batch. It never holds the units it made. The shared call-state
+    /// projections it keeps from `broca_core` count at their inline size: they hold a few ids of
+    /// the open batch at most. Reported by the memory report and by the store actor's read-cost
+    /// measure (`store_actor::read_cost`).
     pub fn held_bytes(&self) -> usize {
-        use broca_session_store::codec::Message as _;
-        // A rough size for one kept call fact: its id, a key and a message id.
-        const PER_FACT: usize = 128;
-        fn json(value: &impl serde::Serialize) -> usize {
-            serde_json::to_vec(value).map_or(0, |bytes| bytes.len())
-        }
-        self.conversation.encode().len()
-            + self.operations.encode().len()
-            + self.step_message.as_deref().map_or(0, json)
-            + self.assistant_calls.iter().map(json).sum::<usize>()
-            + PER_FACT
-                * (self.started_tools.len()
-                    + self.calls.len()
-                    + self.carriers.len()
-                    + self.input_owners.len()
-                    + self.waiting.len())
+        std::mem::size_of::<Self>()
+            + self.conversation.heap_bytes()
+            + self.operations.heap_bytes()
+            + self.step_message.heap_bytes()
+            + self.assistant_calls.heap_bytes()
+            + self.assistant_mid.heap_bytes()
+            + self.results_mid.heap_bytes()
+            + self.started_tools.heap_bytes()
+            + self.calls.heap_bytes()
+            + self.carriers.heap_bytes()
+            + self.reply.heap_bytes()
+            + self.input_owners.heap_bytes()
+            + self.waiting.heap_bytes()
     }
     /// The projection at the start of a log whose checkpoint holds `conversation` and
     /// `operations`, folded through `covers_through`. At a session's first log they are empty.

@@ -45,6 +45,7 @@ async fn retained(on: bool, cipher: Cipher, idle: Duration, gate: Option<Arc<Not
                 gate: gate.clone(),
                 render_config: None,
                 notes_sends: false,
+                hold: None,
             },
             wal: wal.clone(),
             planes: Default::default(),

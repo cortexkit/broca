@@ -1,12 +1,13 @@
 //! An allocator that counts what each thread holds, so a check can bound the memory one decode
-//! takes. The crate's test binary and every fuzz target install it as the global allocator; in
-//! any other binary the counts stay at zero and `bounded` checks nothing.
+//! takes. Every fuzz target installs it as the global allocator; in any other binary the counts
+//! stay at zero and `bounded` checks nothing. The crate's own tests use the workspace's test
+//! allocator instead.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
 /// The system allocator, counting the bytes each thread has live and the most it has had live
-/// since the last [`reset_peak`].
+/// since a [`Counting`] started.
 pub struct CountingAlloc;
 
 thread_local! {
@@ -63,23 +64,47 @@ unsafe impl GlobalAlloc for CountingAlloc {
 }
 
 /// Bytes this thread has live now.
-pub fn live() -> isize {
+fn live() -> isize {
     LIVE.with(Cell::get)
 }
 
-/// Starts a new peak at what this thread has live now.
-pub fn reset_peak() {
-    let now = live();
-    PEAK.with(|peak| peak.set(now));
-}
-
-/// The most this thread has had live since the last [`reset_peak`].
-pub fn peak() -> isize {
+/// The most this thread has had live since its peak was last reset.
+fn peak() -> isize {
     PEAK.with(Cell::get)
 }
 
-/// Raises the peak to at least `to`, so a measurement nested inside another doesn't hide what
-/// the outer one saw before it.
-pub fn raise_peak(to: isize) {
-    PEAK.with(|peak| peak.set(peak.get().max(to)));
+/// What a [`Counting`] saw.
+pub struct Counts {
+    /// The most this thread held at once beyond what it held when counting started.
+    pub peak: isize,
+}
+
+/// One measurement of what this thread holds, the same interface the crate's tests measure
+/// through (`broca_test_support::alloc::Counting`). This allocator counts always, so starting a
+/// measurement only starts a new peak; dropping it raises the peak back to what an outer
+/// measurement saw before, so a nested one doesn't hide it.
+pub struct Counting {
+    start: isize,
+    outer: isize,
+}
+
+impl Counting {
+    pub fn start() -> Self {
+        let outer = peak();
+        let start = live();
+        PEAK.with(|peak| peak.set(start));
+        Self { start, outer }
+    }
+
+    pub fn read(&self) -> Counts {
+        Counts {
+            peak: peak() - self.start,
+        }
+    }
+}
+
+impl Drop for Counting {
+    fn drop(&mut self) {
+        PEAK.with(|peak| peak.set(peak.get().max(self.outer)));
+    }
 }

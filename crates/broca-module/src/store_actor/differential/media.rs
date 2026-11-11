@@ -258,6 +258,7 @@ async fn registry_gated(
             gate,
             render_config: None,
             notes_sends: false,
+            hold: None,
         }),
         wal: Arc::clone(&wal),
         store: store_executor,

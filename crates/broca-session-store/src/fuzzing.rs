@@ -41,7 +41,14 @@ use crate::log::ChainBase;
 use crate::record::{Event, Marker, Record, StepStart};
 use crate::segment::{self, BlockBody, BlockEntry, SegmentHeader, SegmentIndex, StoredRecord};
 
+// The fuzz targets count with the allocator of this module; the crate's tests count with the
+// workspace's test allocator, which the memory budget tests share, so both measure one way.
+#[cfg(not(test))]
 mod alloc;
+#[cfg(test)]
+mod alloc {
+    pub use broca_test_support::alloc::{Counting, CountingAlloc};
+}
 #[cfg(test)]
 pub(crate) mod gen;
 mod log;
@@ -79,12 +86,10 @@ pub const ALLOC_BASE: usize = 1 << 20;
 /// [`ALLOC_PER_BYTE`] per input byte plus [`ALLOC_BASE`]. `extra` adds bytes the input
 /// legitimately expands to, such as a compressed block's stated size.
 pub fn bounded<T>(input: usize, extra: usize, decode: impl FnOnce() -> T) -> T {
-    let outer = alloc::peak();
-    let start = alloc::live();
-    alloc::reset_peak();
+    let counting = alloc::Counting::start();
     let out = decode();
-    let held = usize::try_from(alloc::peak() - start).unwrap_or(0);
-    alloc::raise_peak(outer);
+    let held = usize::try_from(counting.read().peak).unwrap_or(0);
+    drop(counting);
     let limit = input
         .saturating_add(extra)
         .saturating_mul(ALLOC_PER_BYTE)

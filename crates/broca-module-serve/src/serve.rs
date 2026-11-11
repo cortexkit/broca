@@ -57,10 +57,11 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::manifest::{
-    OP_BASELINE, OP_CANCEL, OP_FLUSH_PREFIX, OP_HEAD, OP_IMPORT, OP_INSTALL_VIEW, OP_MOVE_TO_STORE,
-    OP_READ, OP_REFRESH, OP_REFRESH_POLICY, OP_RESTORE_FROM_BACKUP, OP_RETRACT, OP_ROLE_DESCRIBE,
-    OP_RUN_ADMISSION, OP_RUN_EVENT_GET, OP_RUN_RESULT, OP_RUN_TOOL_CALLS, OP_SEND, OP_SEND_STATUS,
-    OP_SESSION_SEND_STATUS, OP_STATUS, OP_SUBSCRIBE, OP_TAG_MAP, OP_VAULT_AUDIT, OP_WARM,
+    OP_BASELINE, OP_CANCEL, OP_FLUSH_PREFIX, OP_HEAD, OP_IMPORT, OP_INSTALL_VIEW, OP_MEMORY_REPORT,
+    OP_MOVE_TO_STORE, OP_READ, OP_REFRESH, OP_REFRESH_POLICY, OP_RESTORE_FROM_BACKUP, OP_RETRACT,
+    OP_ROLE_DESCRIBE, OP_RUN_ADMISSION, OP_RUN_EVENT_GET, OP_RUN_RESULT, OP_RUN_TOOL_CALLS,
+    OP_SEND, OP_SEND_STATUS, OP_SESSION_SEND_STATUS, OP_STATUS, OP_SUBSCRIBE, OP_TAG_MAP,
+    OP_VAULT_AUDIT, OP_WARM,
 };
 use crate::wire::{
     CancelParams, FromWireExt, ImportParams, ImportResult, RetractParams, RouteRequest, SendParams,
@@ -1828,6 +1829,19 @@ where
                     bind,
                 )
                 .await?;
+            } else if req.method == OP_MEMORY_REPORT && bind.management {
+                spawn_memory_report_request(
+                    req,
+                    writer,
+                    conn_cancel,
+                    request_slots,
+                    request_tasks,
+                    (ver, channel, epoch, corr),
+                    handler.clone(),
+                    session,
+                    bind,
+                )
+                .await?;
             } else {
                 let prepared = prepare_route_request(req, routes, channel, conn_cancel);
                 let dispatch_ticket = routes.reserve_dispatch(&session);
@@ -2677,6 +2691,97 @@ fn subscribe_from(
             .map_err(|e| (Some("from".into()), e))?,
     };
     Ok((from, params.limits))
+}
+
+/// Dispatch `memory.report` without acquiring an actor lease or touching the bound session: the
+/// report is daemon-scoped, and the bound route is only its transport. Only the operator's own
+/// connection is answered, since the report names every open session's address.
+#[allow(clippy::too_many_arguments)]
+async fn spawn_memory_report_request<H: ServeHandler + 'static>(
+    req: RouteRequest,
+    writer: &EgressSender<Frame>,
+    conn_cancel: &CancellationToken,
+    request_slots: &Arc<Semaphore>,
+    request_tasks: &mut JoinSet<Result<(), ServeIoError>>,
+    (ver, channel, epoch, corr): (u8, u16, u32, u64),
+    handler: Arc<H>,
+    session: BrocaBindIdentity,
+    bind: BindObservation,
+) -> Result<(), ServeIoError> {
+    let request_slots = request_slots.clone();
+    let writer = writer.clone();
+    let conn_cancel = conn_cancel.clone();
+    request_tasks.spawn(reply_on_panic(
+        writer.clone(),
+        (ver, channel, epoch, corr),
+        async move {
+            log_served_request(
+                OP_MEMORY_REPORT,
+                &session,
+                caller_module(&bind),
+                "reply",
+                async {
+                    let _permit = request_slots
+                        .acquire_owned()
+                        .await
+                        .map_err(|_| ServeIoError("request concurrency limiter closed".into()))?;
+                    // Every request is counted, a refused one too, as every management operation is.
+                    count_management_operation(OP_MEMORY_REPORT);
+                    if !matches!(bind.principal, Some(broca_protocol::BindPrincipal::Direct)) {
+                        return send_error(
+                            &writer,
+                            ver,
+                            channel,
+                            epoch,
+                            corr,
+                            "operator_required",
+                            "memory.report is for the operator only",
+                        )
+                        .await;
+                    }
+                    if !req.params.is_null() {
+                        if let Err(error) =
+                            serde_json::from_value::<crate::wire::MemoryReportParams>(req.params)
+                        {
+                            return send_error(
+                                &writer,
+                                ver,
+                                channel,
+                                epoch,
+                                corr,
+                                "invalid_params",
+                                &error.to_string(),
+                            )
+                            .await;
+                        }
+                    }
+                    let report = tokio::select! {
+                        _ = conn_cancel.cancelled() => return Ok(()),
+                        report = handler.memory_report() => report,
+                    };
+                    match report {
+                        Some(report) => {
+                            send_json_response(&writer, ver, channel, epoch, corr, &report).await
+                        }
+                        None => {
+                            send_error(
+                                &writer,
+                                ver,
+                                channel,
+                                epoch,
+                                corr,
+                                "unavailable",
+                                "this broca serves no sessions to report",
+                            )
+                            .await
+                        }
+                    }
+                },
+            )
+            .await
+        },
+    ));
+    Ok(())
 }
 
 /// Dispatch `vault.audit` without acquiring an actor lease or touching the bound session.
@@ -6589,6 +6694,7 @@ fn method_code(method: &str) -> u8 {
         OP_WARM => 17,
         OP_RUN_TOOL_CALLS => 19,
         OP_INSTALL_VIEW => 20,
+        OP_MEMORY_REPORT => 21,
         _ => 255,
     }
 }

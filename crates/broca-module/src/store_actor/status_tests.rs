@@ -69,6 +69,7 @@ async fn side_at(
             provider: Gated {
                 render_config: None,
                 notes_sends: false,
+                hold: None,
                 inner: broca_core::provider::StubProvider::new(steps.clone()),
                 gate: gate.clone(),
             },

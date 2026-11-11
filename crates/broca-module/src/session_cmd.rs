@@ -207,6 +207,12 @@ pub enum LineageCmd {
     Status {
         reply: oneshot::Sender<LineageStatus>,
     },
+    /// Estimate what the session holds in memory, by holder, for `memory.report`: a store
+    /// actor answers with its sizes, walked now; an actor of today's storage answers that it is
+    /// one, and is counted only.
+    MemoryReport {
+        reply: oneshot::Sender<crate::memory_report::MemoryAnswer>,
+    },
     /// Resolve a SPECIFIC run_id's lifecycle state: live actor → durable index terminal →
     /// WAL reconciliation when the index still says Active or has no row. `None` means the
     /// run_id is unknown to this session.

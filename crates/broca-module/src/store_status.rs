@@ -192,6 +192,50 @@ impl SettledRuns {
         self.inner.lock().map_or(0, |inner| inner.facts.len())
     }
 
+    /// What the cache holds, estimated by walking it when asked (see
+    /// `broca_session_store::held`), with its cap. A final message counts by its compact JSON,
+    /// which stands in for its heap.
+    pub fn memory(&self) -> broca_wire::MemoryCache {
+        use broca_session_store::held::HeldBytes;
+        let Ok(inner) = self.inner.lock() else {
+            return broca_wire::MemoryCache::default();
+        };
+        let key_heap =
+            |(address, _, _, run_id): &SettledKey| address.heap_bytes() + run_id.heap_bytes();
+        // The table's buckets, each a slot and a control byte.
+        let slot = std::mem::size_of::<SettledKey>() + std::mem::size_of::<RunFacts>();
+        let buckets = match inner.facts.capacity() {
+            0 => 0,
+            capacity => (capacity * 8 / 7).next_power_of_two(),
+        };
+        let facts: usize = inner
+            .facts
+            .iter()
+            .map(|(key, facts)| {
+                key_heap(key)
+                    + facts.interrupt_reason.heap_bytes()
+                    + facts
+                        .final_message
+                        .as_ref()
+                        .map_or(0, |message| match message {
+                            Ok(message) => {
+                                serde_json::to_vec(message).map_or(0, |bytes| bytes.len())
+                            }
+                            Err(_) => 0,
+                        })
+            })
+            .sum();
+        let order = inner.order.capacity() * std::mem::size_of::<SettledKey>()
+            + inner.order.iter().map(key_heap).sum::<usize>();
+        broca_wire::MemoryCache {
+            entries: inner.facts.len() as u64,
+            max_entries: self.capacity as u64,
+            counted_bytes: None,
+            max_bytes: None,
+            estimated_bytes: (buckets * (slot + 1) + facts + order) as u64,
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

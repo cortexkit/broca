@@ -418,6 +418,7 @@ async fn new_roles_are_sessionless_and_answer_only_unknown_method() {
             "session.subscribe",
             "run.status",
             "vault.audit",
+            "memory.report",
             "tool.catalog",
             "tool.call",
             "late_results",

@@ -124,7 +124,15 @@ pub struct ActorWriter {
     /// The seq of the session's last record known durable, as today's WAL writer's durable
     /// head counts it, for reporters that must name only durable records.
     durable_head: Arc<AtomicU64>,
+    /// Where the run's transcript handle goes for the actor's memory report, when it asks for one
+    /// (see [`ActorWriter::sharing_window`]).
+    window: Option<RunWindow>,
 }
+
+/// Where a run leaves its owner a weak handle on the transcript it keeps (see
+/// [`Writer::share_window`]). The owner reads it for its memory report and clears it when the run
+/// ends.
+pub type RunWindow = Arc<std::sync::Mutex<Option<crate::compaction::WeakWindow>>>;
 
 /// The actor's end of a run's writer.
 pub struct RunLink {
@@ -153,12 +161,19 @@ impl ActorWriter {
                 // A run starts after a barrier: the writer's open, a run's end or the actor's
                 // own append, each synced. So every record the session holds is durable.
                 durable_head: Arc::new(AtomicU64::new(session.next_seq().saturating_sub(1))),
+                window: None,
             },
             RunLink {
                 requests: receiver,
                 missed: Vec::new(),
             },
         )
+    }
+
+    /// This writer leaves the run's transcript handle in `window` (see [`RunWindow`]).
+    pub fn sharing_window(mut self, window: RunWindow) -> Self {
+        self.window = Some(window);
+        self
     }
 
     async fn ask<T>(&self, make: impl FnOnce(Reply<T>) -> Request) -> Result<T, SessionError> {
@@ -399,6 +414,14 @@ impl Writer for ActorWriter {
 
     fn media(&self) -> Option<Arc<dyn MediaCapture>> {
         self.media.clone()
+    }
+
+    fn share_window(&self, window: crate::compaction::WeakWindow) {
+        if let Some(slot) = &self.window {
+            if let Ok(mut slot) = slot.lock() {
+                *slot = Some(window);
+            }
+        }
     }
 }
 
