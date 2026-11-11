@@ -641,6 +641,18 @@ class StoreWorkerTrafficTests(WorkerTrafficFixture):
         self.assertIn("no_worker_candidate", output)
         invoke.assert_not_called()
 
+    def test_store_log_written_without_a_new_run_is_not_a_candidate_or_a_failure(self):
+        # A head's idle warm-up appends to its log after the restart but starts no run.
+        self.store()
+        with sqlite3.connect(self.root / "run-index.db") as db:
+            db.execute("UPDATE run_index SET state_changed_ms=99")
+        self.write()
+        with patch.object(self.worker, "invoke") as invoke:
+            status, output = self.wait()
+        self.assertEqual(status, 0, output)
+        self.assertIn("storage_counts=wal:1,store:0", output)
+        invoke.assert_not_called()
+
     def test_missing_store_inventory_is_named_and_is_not_created(self):
         self.store()
         (self.root / "run-index.db").unlink()

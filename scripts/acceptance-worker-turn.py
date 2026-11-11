@@ -216,8 +216,10 @@ def scan_store_workers(state_root, after_ms, session_bin, subc, deadline):
                 runs = db.execute("SELECT run_id FROM run_index WHERE session=? AND "
                                   "(state_changed_ms>=? OR state IN ('active','paused') OR state_changed_ms IS NULL)",
                                   (bind, after_ms)).fetchall()
+                # A log also changes without a new run: idle cache warm-ups, seals and cleanup
+                # write to it. No run after the restart means no candidate here, not a read failure.
                 if not runs:
-                    return summaries, {"unreadable_store_run_inventory"}
+                    continue
                 base = [str(session_bin), "--subc", str(subc), "--project-root", project,
                         "--harness", harness, "--session", session]
                 for (run_id,) in runs:
