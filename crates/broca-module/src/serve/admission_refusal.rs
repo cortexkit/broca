@@ -49,9 +49,12 @@ pub fn upload_refusal(
 /// operation-specific rendering in the serving layer.
 pub fn admission_refusal(error: &ServeError) -> Option<AdmissionRefusal> {
     let (code, detail) = match error {
+        // The vault listing not having loaded clears by itself, so this is answered with the
+        // runner contract's retryable code `transient`; callers decide retries by code alone. The
+        // cause stays in `detail` for diagnostics.
         ServeError::CredentialsUnavailable => (
-            "credentials_unavailable",
-            Some(json!({"class":"transient"})),
+            "transient",
+            Some(json!({"class":"transient", "cause":"credentials_unavailable"})),
         ),
         ServeError::CredentialAmbiguous {
             credential,
@@ -263,12 +266,17 @@ mod tests {
         let body =
             serde_json::to_value(admission_refusal(&ServeError::CredentialsUnavailable).unwrap())
                 .unwrap();
-        assert_eq!(body["code"], "credentials_unavailable");
-        assert_eq!(body["detail"], json!({"class":"transient"}));
+        // A listing that has not loaded yet is the contract's retryable `transient`, with the
+        // cause kept in detail.
+        assert_eq!(body["code"], "transient");
+        assert_eq!(
+            body["detail"],
+            json!({"class":"transient", "cause":"credentials_unavailable"})
+        );
         for (error, code, class) in [
             (
                 RunError::CredentialsUnavailable,
-                "credentials_unavailable",
+                "transient",
                 ErrorClass::Transient,
             ),
             (

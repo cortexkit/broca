@@ -249,8 +249,10 @@ the default order is `chatgpt`, `oauth`, `antigravity`, then `apikey` among elig
 Frozen vault ids are reused on resume; older selections without a resolved id look up their
 frozen key by the same row rule, without changing their method.
 
-New sends refuse `credentials_unavailable` while no listing has loaded, with
-`detail.class: "transient"`. An ambiguous fixed key refuses `credential_ambiguous` with
+New sends refuse with code `transient` and
+`detail: {class: "transient", cause: "credentials_unavailable"}` while no listing has loaded:
+the listing loads by itself, so the same send may be admitted on retry, and `transient` is the
+runner contract's retryable code. An ambiguous fixed key refuses `credential_ambiguous` with
 `detail: {class: "permanent", credential: <broca key>, candidate_ids: [<vault ids>]}`;
 it never chooses a row silently. Existing missing-credential refusals are unchanged.
 

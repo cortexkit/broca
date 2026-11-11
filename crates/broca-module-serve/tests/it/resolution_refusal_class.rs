@@ -414,7 +414,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "credentials_unavailable",
             error: RunError::CredentialsUnavailable,
-            body: r#"{"code":"credentials_unavailable","message":"the vault credential listing has not loaded yet","detail":{"class":"transient"}}"#,
+            body: r#"{"code":"transient","message":"the vault credential listing has not loaded yet","detail":{"cause":"credentials_unavailable","class":"transient"}}"#,
         },
     ]
 }

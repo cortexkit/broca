@@ -183,7 +183,7 @@ broca specifics:
   | `agent_run_scopes_unsupported` | `permanent` | `{<session scope>}` |
   | `session_log_missing` | `detail.class: permanent` | `{class, session, harness}`; a writer would recreate historical content or a read would falsely report empty history; existing named refusals and valid index answers keep precedence; stop broca and inspect `store-maintenance repair-session-root` |
   | `projection_not_ready` | `detail.class: transient` | `{class}`; the compaction entry projection is incomplete, so `session.entries` or the entry read for `session.apply_view` may succeed after the projection is rebuilt |
-  | `transient` | `detail.class: transient` | `{class}`; a dependency the request needs has not answered or loaded yet (for a send: the model catalog, a credential lookup), so the same request may succeed on retry |
+  | `transient` | `detail.class: transient` | `{class, cause?}`; a dependency the request needs has not answered or loaded yet (for a send: the model catalog, a credential lookup), so the same request may succeed on retry. Callers retry by this code alone. `cause` is present only where broca names the dependency: `cause: "credentials_unavailable"` means broca's vault credential listing has not loaded yet |
 
 - Principal-specific admission refusals `flow_scope_required` and `sender_not_owner` carry a
   top-level `class: "permanent"` beside `code`, `message`, and `detail: {kind, principal}`.

@@ -5175,7 +5175,8 @@ async fn send_response_bytes(
 
 fn refused_send_code(error: &ServeError) -> String {
     match error {
-        ServeError::CredentialsUnavailable => "credentials_unavailable".into(),
+        // Answered on the wire as the contract's `transient` code (see `admission_refusal`).
+        ServeError::CredentialsUnavailable => "transient".into(),
         ServeError::CredentialAmbiguous { .. } => "credential_ambiguous".into(),
         ServeError::Upload(error) => error.code.into(),
         ServeError::ContextCeiling(_) => cortexkit_role_llm_runner::errors::CONTEXT_CEILING.into(),
