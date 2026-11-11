@@ -2675,7 +2675,7 @@ session it creates by the same rule, in one complete store per class:
 `session-store-durable/`, `session-store/` (ordinary) and `session-store-ephemeral/`;
 the root holding a session's head is authoritative afterwards, and a head found in
 two roots is refused `session_in_two_classes`. A file import (`session.import` with a
-file source, which brings an OpenCode 2 or Pi agent head onto broca) carries no
+file source, which brings an OpenCode 1, OpenCode 2 or Pi agent head onto broca) carries no
 label and is placed durable by the same rule: ephemeral if it carries a retention
 policy, else `session-store-durable/`, whatever `backup_classes` lists.
 `session.move_to_store` (operator only)
@@ -2688,6 +2688,15 @@ Classed records require the must-understand WAL feature `session-class/v1`.
 A `v0.3.205` reader refuses those records by feature name; unclassed records retain
 their old bytes and remain readable. The reader, writer and capability ship
 together, with no writer switch or second rollout release.
+
+A file import records its attested owner and scope but applies no plan. Its owner's first
+`session.send` must carry `plan` and passes ordinary plan admission, including compaction
+enrollment and model selection; an omitted plan is `invalid_params` naming `plan`. Another
+principal is refused `scope_owner_mismatch`. The imported history precedes that send's prompt.
+`session.install_view` may install the moved head's view before this send, but is refused once
+the session has run. No `session.adopt` is needed or served for this transition. OpenCode 1
+sources are single-session SQLite extracts made by `ck-import opencode1-extract`, not the live
+host database; the source is digest-checked before reading and deleted only after durability.
 
 ### Restoring the new storage from a backup
 

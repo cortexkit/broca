@@ -30,7 +30,7 @@ use sha2::{Digest, Sha256};
     about = "Import a foreign harness transcript into broca"
 )]
 struct Args {
-    /// Source harness (opencode, claude-code, codex, goose, or pi).
+    /// Source harness (opencode, claude-code, codex, goose, pi), or opencode1-extract.
     harness_name: String,
     /// Source session id shown by --list.
     source: Option<String>,
@@ -46,6 +46,12 @@ struct Args {
     /// Override the source container path (database file or sessions root, per harness).
     #[arg(long)]
     source_db: Option<PathBuf>,
+    /// SQLite source for opencode1-extract (required; no live-host default).
+    #[arg(long)]
+    db: Option<PathBuf>,
+    /// Destination folder for opencode1-extract.
+    #[arg(long)]
+    out_dir: Option<PathBuf>,
     /// Target broca session id (defaults to a fresh UUID and is printed).
     #[arg(long)]
     session: Option<String>,
@@ -136,6 +142,28 @@ async fn main() {
 }
 
 async fn run(args: Args, output: &Output) -> Result<(), String> {
+    if args.harness_name == "opencode1-extract" {
+        let db = args
+            .db
+            .as_deref()
+            .ok_or("opencode1-extract requires --db")?;
+        let session = args
+            .session
+            .as_deref()
+            .ok_or("opencode1-extract requires --session")?;
+        let dir = args
+            .out_dir
+            .as_deref()
+            .ok_or("opencode1-extract requires --out-dir")?;
+        let extracted = ck_session_import::opencode_extract::extract(db, session, dir)
+            .map_err(|error| error.to_string())?;
+        println!(
+            "{}",
+            json!({"path": extracted.path, "sha256": extracted.sha256,
+            "messages": extracted.messages, "newest_mid": extracted.newest_mid})
+        );
+        return Ok(());
+    }
     let reader: Box<dyn HarnessReader> = match args.harness_name.as_str() {
         "codex" => Box::new(CodexReader::new(
             args.source_db

@@ -15,6 +15,7 @@ use broca_core::{FileLeaseStore, FileWalStore, OutputEvent, RunError, RunSummary
 use broca_module::executor::{RunExecutor, RunJob};
 use broca_module::{DefaultOpener, LineageRegistry};
 use broca_module_serve::{serve_connection, ServeEnd};
+use broca_session_loop::Writer as _;
 use sha2::Digest;
 use subc_protocol::scope::{ScopeKind, ScopeStamp, CAP_SCOPES_V1};
 use subc_protocol::session::ModuleControlRequest;
@@ -41,11 +42,21 @@ fn stamp(owner: Principal) -> ScopeStamp {
     ScopeStamp::new(owner, "head-1", 1, ScopeKind::Head).with_owner_authorized(true)
 }
 
-/// Nothing in these tests runs a model step: an import and a view install write no run.
-struct NoRuns;
+/// Runs only synthetic provider steps and records the request and compaction Setup.
+#[derive(Clone, Default)]
+struct HeadRunner {
+    calls: Arc<std::sync::Mutex<Vec<broca_protocol::request::CallOptions>>>,
+    setups: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+}
 
 #[async_trait]
-impl RunExecutor for NoRuns {
+impl RunExecutor for HeadRunner {
+    fn head_selection_wire(
+        &self,
+        _: &cortexkit_role_llm_runner::head_selection::PlanModel,
+    ) -> Option<String> {
+        Some("openai".into())
+    }
     async fn execute(
         &self,
         _job: RunJob,
@@ -53,6 +64,152 @@ impl RunExecutor for NoRuns {
     ) -> Result<RunSummary, RunError> {
         unreachable!("an import runs no model step")
     }
+
+    fn compaction_plane(&self) -> Option<Arc<dyn broca_core::CompactionPlane>> {
+        Some(Arc::new(self.clone()))
+    }
+
+    async fn execute_on_store(
+        &self,
+        job: broca_module::executor::StoreRunJob,
+        out: mpsc::Sender<OutputEvent>,
+    ) -> broca_module::executor::StoreRunEnd {
+        use broca_module::executor::{StoreRunEnd, StoreRunError};
+        let broca_module::executor::StoreRunJob {
+            mut req,
+            mut control,
+            mut writer,
+            mut parts,
+            ..
+        } = job;
+        control.admitted_context_limit = Some(200_000);
+        let provider = broca_core::provider::StubProvider::new(vec![vec![
+            broca_protocol::NormalizedEvent::Control(broca_protocol::ProviderControl::Finished {
+                usage: Default::default(),
+                finish_reason: broca_protocol::content::FinishReason::Stop,
+                retries_used: 0,
+            }),
+        ]]);
+        let result = async {
+            let admission = broca_session_loop::admit::admission(
+                &mut req,
+                &control,
+                &provider,
+                writer.operations(),
+                Some(10_000),
+            )
+            .map_err(StoreRunError::Admission)?;
+            let tools = broca_core::stub_plane::StubToolPlane::new();
+            let now = || 10_000;
+            let seams = broca_session_loop::run::Seams {
+                provider: &provider,
+                tools: &tools,
+                bind: req.session.clone(),
+                out: Some(&out),
+                cancel: control.cancel.clone().unwrap_or_default(),
+                stop: Default::default(),
+                held: None,
+                approval: &broca_core::capability::AllowAll,
+                hook_plane: None,
+                now_ms: &now,
+                session_address: None,
+                compaction_plane: Some(self),
+                compaction_session: None,
+                compaction_changes: true,
+                keep_warm: None,
+                account_reports: None,
+                max_same_account_wait: Default::default(),
+                auth_selection: None,
+                step_progress: None,
+                model_call_ready: None,
+            };
+            broca_session_loop::run::run(&mut writer, parts.as_mut(), admission, &seams)
+                .await
+                .map_err(StoreRunError::Loop)
+        }
+        .await;
+        self.calls.lock().unwrap().extend(provider.calls());
+        StoreRunEnd { parts, result }
+    }
+}
+
+#[async_trait]
+impl broca_core::CompactionPlane for HeadRunner {
+    async fn setup(
+        &self,
+        _: &str,
+        _: &broca_protocol::BindIdentity,
+        _: Option<&broca_protocol::SessionScope>,
+        _: broca_core::compaction_provider::setup::SetupRequest,
+    ) -> Result<
+        broca_core::compaction_provider::setup::SetupAnswer,
+        broca_core::CompactionUnavailable,
+    > {
+        panic!("an imported head uses the current compaction protocol")
+    }
+    async fn call_v2(
+        &self,
+        _: &str,
+        _: &broca_protocol::BindIdentity,
+        _: Option<&broca_protocol::SessionScope>,
+        method: &str,
+        params: serde_json::Value,
+        _: u64,
+    ) -> Result<Box<serde_json::value::RawValue>, broca_core::compaction_v2::runtime::CallError>
+    {
+        let answer = match method {
+            "compaction.setup" => {
+                self.setups.lock().unwrap().push(params);
+                serde_json::json!({"answer":"ready"})
+            }
+            "compaction.notice" => serde_json::json!({"answer":"received"}),
+            "compaction.ride" => serde_json::json!({"answer":"nothing"}),
+            _ => panic!("unexpected method {method}"),
+        };
+        Ok(serde_json::value::to_raw_value(&answer).unwrap())
+    }
+    async fn provider_capabilities(&self, _: &str) -> Option<Vec<String>> {
+        Some(vec!["compaction-provider/v2".into()])
+    }
+}
+
+#[derive(Default)]
+struct HeadPlan(std::sync::atomic::AtomicUsize);
+
+#[async_trait]
+impl broca_fetch_plan::PlanAdmitter for HeadPlan {
+    async fn admit(
+        &self,
+        plan: &broca_fetch_plan::Plan,
+        _: &broca_protocol::BindIdentity,
+        _: Option<&broca_protocol::SessionScope>,
+    ) -> Result<broca_fetch_plan::Admitted, broca_fetch_plan::Refusal> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(broca_fetch_plan::Admitted {
+            manifest: broca_wal::PlanManifest {
+                rich_ui: None,
+                plan: broca_wal::OpaqueJson::from_json_text(plan.text.clone()).unwrap(),
+                plan_identity: plan.identity.clone(),
+                composition_digest: plan.composition_digest.clone(),
+                fetches: vec![],
+                tools: Arc::new(vec![]),
+                system_text: "Destination system.".into(),
+                system_digest: "system".into(),
+                join_version: 1,
+                role_versions: Default::default(),
+                declarations: vec![],
+            },
+        })
+    }
+}
+
+fn head_plan() -> serde_json::Value {
+    let composition = serde_json::json!({"providers":[{"provider":"synthetic-compactor","tools":[]}],
+        "step_transform_items":[], "compaction":{"provider":"synthetic-compactor"}});
+    serde_json::json!({"tool_items":[], "system_text_items":[], "step_transform_items":[],
+        "composition_digest": cortexkit_role_tool_provider::catalog::composition_digest(&composition).unwrap(),
+        "composition":composition, "compaction_item":{"provider":"synthetic-compactor","preset":"default","params":{}},
+        "model":{"provider":"stub","model":"m"}})
 }
 
 /// An OpenCode 2 export, as Thalamus's `session.export` writes it: a prompt, a reply that
@@ -82,6 +239,8 @@ struct Rig {
     writer: tokio::io::WriteHalf<tokio::io::DuplexStream>,
     _serve: tokio::task::JoinHandle<Result<ServeEnd, broca_module_serve::serve::ServeIoError>>,
     corr: u64,
+    runner: HeadRunner,
+    admitter: Arc<HeadPlan>,
 }
 
 impl Drop for Rig {
@@ -101,7 +260,8 @@ impl Rig {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let wal = Arc::new(FileWalStore::new(dir.join("wal")));
-        let executor: Arc<dyn RunExecutor> = Arc::new(NoRuns);
+        let runner = HeadRunner::default();
+        let executor: Arc<dyn RunExecutor> = Arc::new(runner.clone());
         let mut opener = DefaultOpener::new(
             Arc::new(FileLeaseStore::new(dir.join("leases"))),
             wal.clone(),
@@ -154,6 +314,8 @@ impl Rig {
         )
         .unwrap();
         registry.set_session_address_inventory(store);
+        let admitter = Arc::new(HeadPlan::default());
+        registry.set_plan_admitter(admitter.clone());
         let registry = Arc::new(registry);
         let (client, server) = tokio::io::duplex(256 * 1024);
         let (mut reader, mut writer) = tokio::io::split(client);
@@ -193,6 +355,8 @@ impl Rig {
             writer,
             _serve: serve,
             corr: 1,
+            runner,
+            admitter,
         }
     }
 
@@ -315,10 +479,278 @@ fn view(version: u64) -> serde_json::Value {
     .unwrap()
 }
 
+fn opencode1_source(rig: &Rig, name: &str, count: Option<usize>) -> serde_json::Value {
+    let db_path = rig.dir.join(format!("{name}-host.db"));
+    let mut db = rusqlite::Connection::open(&db_path).unwrap();
+    db.execute_batch(include_str!(
+        "../../../ck-session-import/tests/fixtures/head/opencode1.sql"
+    ))
+    .unwrap();
+    if let Some(count) = count {
+        db.execute_batch(
+            "DELETE FROM part; DELETE FROM message; DELETE FROM session WHERE id='ses_other';",
+        )
+        .unwrap();
+        let transaction = db.transaction().unwrap();
+        {
+            let mut message = transaction
+                .prepare("INSERT INTO message VALUES (?1,'ses_synthetic',?2,?3,NULL)")
+                .unwrap();
+            let mut part = transaction
+                .prepare("INSERT INTO part VALUES (?1,?1,'ses_synthetic',?2,?3)")
+                .unwrap();
+            let text = "Synthetic history. ".repeat(256);
+            for index in 0..count {
+                let mid = format!("msg_synthetic_{index:06}");
+                message
+                    .execute(rusqlite::params![
+                        mid,
+                        index as u64,
+                        if index % 2 == 0 {
+                            r#"{"role":"user"}"#
+                        } else {
+                            r#"{"role":"assistant"}"#
+                        }
+                    ])
+                    .unwrap();
+                part.execute(rusqlite::params![
+                    mid,
+                    index as u64,
+                    serde_json::json!({"type":"text","text":text}).to_string()
+                ])
+                .unwrap();
+            }
+        }
+        transaction.commit().unwrap();
+    }
+    drop(db);
+    let started = std::time::Instant::now();
+    let source = ck_session_import::opencode_extract::extract(
+        &db_path,
+        "ses_synthetic",
+        &rig.import_folder(),
+    )
+    .unwrap();
+    if count.is_some() {
+        eprintln!(
+            "opencode1 synthetic messages={} bytes={} extract_ms={}",
+            source.messages,
+            std::fs::metadata(&source.path).unwrap().len(),
+            started.elapsed().as_millis()
+        );
+    }
+    serde_json::json!({"import_id":name, "source":{"harness":"opencode1", "path":source.path,
+        "session":"ses_synthetic", "sha256":source.sha256},
+        "origin":{"kind":"import","source_ref":"opencode1:ses_synthetic"}, "tag_floor":40})
+}
+
+#[tokio::test]
+async fn opencode1_extract_import_install_view_and_first_owner_send_keep_history() {
+    let mut rig = Rig::start("opencode1", true).await;
+    rig.bind(1, core(), Some(stamp(core()))).await;
+    let params = opencode1_source(&rig, "extract-head", None);
+    let imported = rig.result(1, "session.import", params.clone()).await;
+    assert_eq!(imported["imported_messages"], 8);
+    assert_eq!(imported["dropped_system_messages"], 1);
+    assert_eq!(imported["moves"]["shape"], "plugin");
+    let rows = imported["moves"]["rows"].as_array().unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|row| row["entry"].as_u64())
+            .collect::<Vec<_>>(),
+        [
+            Some(1),
+            Some(2),
+            Some(3),
+            Some(4),
+            Some(5),
+            Some(6),
+            None,
+            Some(7),
+            Some(8),
+            None,
+            None
+        ]
+    );
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row["finished_summary"] == true)
+            .map(|row| row["mid"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["msg_007", "msg_008"]
+    );
+    assert!(!std::path::Path::new(params["source"]["path"].as_str().unwrap()).exists());
+    let page = rig.result(1, "session.read", serde_json::json!({})).await;
+    let stored = page.to_string();
+    assert!(
+        stored.contains("msg_001") && stored.contains("image/png"),
+        "{page}"
+    );
+    assert!(!stored.contains("never-import-this"));
+    rig.bind(2, stranger(), Some(stamp(core()))).await;
+    let send = serde_json::json!({"prompt":"Continue synthetic history.","send_id":"first-owner", "plan":head_plan()});
+    let non_owner = rig
+        .request(
+            2,
+            serde_json::json!({"method":"session.send", "params":send.clone()}),
+        )
+        .await;
+    let non_owner: serde_json::Value = serde_json::from_slice(&non_owner.body).unwrap();
+    assert_eq!(non_owner["code"], "scope_owner_mismatch", "{non_owner}");
+    let missing = rig.request(1, serde_json::json!({"method":"session.send", "params":{"prompt":"Continue", "send_id":"missing-plan"}})).await;
+    let missing: serde_json::Value = serde_json::from_slice(&missing.body).unwrap();
+    assert_eq!(missing["code"], "invalid_params", "{missing}");
+    assert_eq!(missing["detail"]["field"], "plan", "{missing}");
+    let fetches_before_owner = rig.admitter.0.load(std::sync::atomic::Ordering::SeqCst);
+    rig.result(
+        1,
+        "session.install_view",
+        serde_json::json!({"view":view(1)}),
+    )
+    .await;
+    let sent = rig.result(1, "session.send", send.clone()).await;
+    assert_eq!(sent["state"], "active", "{sent}");
+    broca_test_support::wait_until("the first imported owner run", || async {
+        if rig.runner.calls.lock().unwrap().is_empty() {
+            Err("no provider request yet".into())
+        } else {
+            Ok(())
+        }
+    })
+    .await;
+    let calls = rig.runner.calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1);
+    let request = serde_json::to_string(&calls[0]).unwrap();
+    for expected in [
+        "Look at this synthetic image.",
+        "Synthetic file content",
+        "Synthetic summary.",
+        "Continue synthetic history.",
+        "Destination system.",
+    ] {
+        assert!(request.contains(expected), "missing {expected}: {request}");
+    }
+    use broca_provider::families::{
+        anthropic_frozen_config, gemini_frozen_config, openai_responses_frozen_config,
+        AnthropicMessages, Gemini, OpenAiResponses,
+    };
+    use broca_provider::wire::WireFamily;
+    let families: [(&dyn WireFamily, _); 3] = [
+        (
+            &AnthropicMessages,
+            anthropic_frozen_config("claude-sonnet-4-5"),
+        ),
+        (&OpenAiResponses, openai_responses_frozen_config("gpt-5")),
+        (&Gemini, gemini_frozen_config("gemini-2.5-pro")),
+    ];
+    for (family, frozen) in families {
+        let body = String::from_utf8(family.render(&frozen, &calls[0])).unwrap();
+        assert!(body.contains("Synthetic summary."), "{body}");
+        assert!(
+            !body.contains("Synthetic reasoning") && !body.contains("never-import-this"),
+            "finished-run reasoning is stored but never rendered without its payload: {body}"
+        );
+    }
+    assert!(!request.contains("Source system text"));
+    let setups = rig.runner.setups.lock().unwrap().clone();
+    assert_eq!(setups.len(), 1);
+    assert_eq!(setups[0]["applied_view"]["version"], 1, "{:?}", setups[0]);
+    assert_eq!(
+        rig.result(1, "session.import", params).await,
+        imported,
+        "receipt survives owner admission"
+    );
+    let baseline = rig
+        .result(1, "session.baseline", serde_json::json!({}))
+        .await;
+    assert!(
+        baseline
+            .to_string()
+            .contains(head_plan()["composition_digest"].as_str().unwrap()),
+        "{baseline}"
+    );
+    let head = rig.result(1, "session.head", serde_json::json!({})).await;
+    assert_eq!(head["model"]["provider"], "stub", "{head}");
+    let replay = rig.result(1, "session.send", send.clone()).await;
+    assert_eq!(replay["state"], "finished");
+    assert_eq!(replay["run_id"], sent["run_id"]);
+    let mut changed = send.clone();
+    changed["model"] = serde_json::json!({"provider":"stub", "model":"different"});
+    let refused = rig
+        .request(
+            1,
+            serde_json::json!({"method":"session.send", "params":changed}),
+        )
+        .await;
+    let refused: serde_json::Value = serde_json::from_slice(&refused.body).unwrap();
+    assert_eq!(refused["code"], "send_id_reuse", "{refused}");
+    assert_eq!(refused["detail"]["field"], "model", "{refused}");
+    let mut changed = send;
+    changed["plan"]["model"]["model"] = serde_json::json!("different");
+    assert_eq!(rig.refused(1, "session.send", changed).await, "plan_drift");
+    assert_eq!(
+        rig.runner.calls.lock().unwrap().len(),
+        1,
+        "neither retries nor refusals start another run"
+    );
+    assert_eq!(
+        rig.admitter.0.load(std::sync::atomic::Ordering::SeqCst),
+        fetches_before_owner + 1,
+        "owner admission fetches once; retries never fetch"
+    );
+    assert_eq!(
+        rig.refused(
+            1,
+            "session.install_view",
+            serde_json::json!({"view":view(1)})
+        )
+        .await,
+        "install_view_refused"
+    );
+}
+
+#[tokio::test]
+async fn opencode1_serve_refuses_an_unanswered_call_without_deleting_the_extract() {
+    let mut rig = Rig::start("opencode1-open", true).await;
+    rig.bind(1, core(), Some(stamp(core()))).await;
+    let mut params = opencode1_source(&rig, "open-call", None);
+    let path = PathBuf::from(params["source"]["path"].as_str().unwrap());
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute(
+        "UPDATE part SET data=json_set(data,'$.state.status','running') WHERE id='prt_009'",
+        [],
+    )
+    .unwrap();
+    drop(db);
+    params["source"]["sha256"] =
+        serde_json::json!(ck_session_import::opencode_extract::sha256_file(&path).unwrap());
+    assert_eq!(
+        rig.refused(1, "session.import", params).await,
+        "import_open_call"
+    );
+    assert!(path.exists(), "a refused import never deletes its source");
+    assert!(rig.runner.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+#[ignore = "synthetic 25k-message extract/import timing, run explicitly"]
+async fn opencode1_extract_import_25k_timing() {
+    let mut rig = Rig::start("opencode1-25k", true).await;
+    rig.bind(1, core(), Some(stamp(core()))).await;
+    let params = opencode1_source(&rig, "timing-25k", Some(25_000));
+    let started = std::time::Instant::now();
+    let imported = rig.result(1, "session.import", params).await;
+    eprintln!(
+        "opencode1 synthetic messages=25000 import_ms={}",
+        started.elapsed().as_millis()
+    );
+    assert_eq!(imported["imported_messages"], 25_000);
+}
+
 /// The owner imports a head over a scoped route: the reply is the store's, the source file
 /// leaves broca's import folder, a retry is answered the same, the head reads back from the new
 /// storage under the source's message ids, and the owner installs the first view. Another
-/// principal's install is refused, and a send before adopt is refused.
+/// principal's install is refused.
 #[tokio::test]
 async fn an_owner_imports_a_head_and_installs_its_first_view_through_serve() {
     let mut rig = Rig::start("import", true).await;

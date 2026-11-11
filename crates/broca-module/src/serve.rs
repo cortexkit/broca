@@ -263,7 +263,7 @@ pub struct SendRequest {
 pub enum PlanState {
     /// The history cannot be read without the session's actor; the actor decides.
     Unknown,
-    /// No episode yet: a plan sent now is fetched and frozen.
+    /// No admitting episode yet (possibly only an import seed): a plan is fetched and frozen.
     NotAdmitted,
     /// The session has episodes. `frozen` is its plan's identity, `None` when it was admitted
     /// without a plan.
@@ -3849,7 +3849,9 @@ impl ServeHandler for crate::LineageRegistry {
     async fn plan_state(&self, session: &LineageKey) -> PlanState {
         match self.session_ownership_for_bind(session).await {
             None => PlanState::Unknown,
-            Some(ownership) if ownership.episodes == 0 => PlanState::NotAdmitted,
+            Some(ownership) if ownership.episodes == 0 || ownership.first_episode.is_none() => {
+                PlanState::NotAdmitted
+            }
             Some(ownership) => PlanState::Admitted {
                 frozen: ownership
                     .first_episode

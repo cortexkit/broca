@@ -47,7 +47,11 @@ pub fn ownership_with_first_episode(
     parts: &dyn crate::parts::Parts,
 ) -> Result<SessionOwnershipV1, String> {
     let mut summary = ownership(owner)?;
-    if let Some(first) = &owner.first_start {
+    if let Some(first) = owner
+        .first_start
+        .as_ref()
+        .filter(|_| !owner.awaiting_import_admission())
+    {
         let admission = crate::run::admission_of_start(first, parts)
             .map_err(|error| format!("the first run's start: {error:?}"))?;
         summary.first_episode = Some(broca_core::admission::FirstEpisodeV1 {

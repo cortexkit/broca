@@ -695,6 +695,7 @@ message! {
     pub struct ImportedMove {
         1 req mid: String,
         2 opt ordinal: u64,
+        3 opt finished_summary: bool,
     }
 }
 

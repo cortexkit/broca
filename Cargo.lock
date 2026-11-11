@@ -473,6 +473,7 @@ dependencies = [
  "broca-wal",
  "broca-wire",
  "chrono",
+ "ck-session-import",
  "clap",
  "cortexkit-bus-naming",
  "cortexkit-bus-nats",
@@ -962,8 +963,10 @@ version = "0.4.16"
 dependencies = [
  "base64",
  "broca-module-serve",
+ "broca-owner-only",
  "broca-protocol",
  "broca-provider",
+ "broca-records",
  "broca-test-support",
  "cortexkit-role-llm-runner 0.8.36",
  "rusqlite",

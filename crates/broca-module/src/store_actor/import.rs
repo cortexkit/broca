@@ -87,19 +87,23 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             now_ms,
         } = command;
         let digest = payload_digest(&params);
-        // A retry: the session's seeded run names this key. The same payload is answered from
-        // the receipt, after the source is gone; another payload under the key is refused.
-        let seeded = self
-            .session
-            .operations
-            .owner
-            .first_start
-            .as_ref()
-            .filter(|start| start.seeded == Some(true))
-            .map(|start| (start.send_id.clone(), start.request_identity_digest.clone()));
-        if let Some((key, stored)) = seeded {
-            if key.as_deref() == Some(params.import_id.as_str()) {
-                if stored.as_deref() != Some(digest.as_str()) {
+        // The receipt survives source deletion and the first real owner run, whose start
+        // replaces the seed as the session's admitting episode.
+        if self.session.operations.imported_ids.is_some() {
+            let receipt = match self.session.import_receipt().await {
+                Ok(Some(receipt)) => receipt,
+                other => {
+                    return (
+                        StoreOutcome::Refused(ImportRefusal::new(
+                            "session_needs_recovery",
+                            format!("the import receipt could not be read: {other:?}"),
+                        )),
+                        false,
+                    )
+                }
+            };
+            if receipt.import_id == params.import_id {
+                if receipt.digest != digest {
                     return (
                         StoreOutcome::Refused(ImportRefusal::new(
                             "send_id_reuse",

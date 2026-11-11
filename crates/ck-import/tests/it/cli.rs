@@ -28,6 +28,37 @@ fn command() -> Command {
 }
 
 #[test]
+fn opencode1_extract_prints_a_single_source_descriptor_without_a_daemon() {
+    let dir = broca_test_support::scratch_root()
+        .join(format!("cli-opencode1-extract-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let output = broca_test_support::retry_executable_file_busy(|| {
+        command()
+            .args(["opencode1-extract", "--session", "ses-text", "--db"])
+            .arg(fixture())
+            .arg("--out-dir")
+            .arg(&dir)
+            .output()
+    })
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let descriptor: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(descriptor["messages"], 2);
+    assert!(descriptor["newest_mid"].is_string());
+    let path = std::path::Path::new(descriptor["path"].as_str().unwrap());
+    assert_eq!(
+        descriptor["sha256"],
+        ck_session_import::opencode_extract::sha256_file(path).unwrap()
+    );
+    assert_eq!(descriptor.as_object().unwrap().len(), 4);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn list_human_output_snapshot() {
     let output = broca_test_support::retry_executable_file_busy(|| {
         command()

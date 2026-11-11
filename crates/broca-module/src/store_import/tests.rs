@@ -241,22 +241,27 @@ fn history() -> HeadHistory {
             SourceRow {
                 mid: "u1".into(),
                 message: Some(0),
+                finished_summary: false,
             },
             SourceRow {
                 mid: "sys".into(),
                 message: None,
+                finished_summary: false,
             },
             SourceRow {
                 mid: "u2".into(),
                 message: Some(1),
+                finished_summary: false,
             },
             SourceRow {
                 mid: "u3".into(),
                 message: Some(2),
+                finished_summary: false,
             },
             SourceRow {
                 mid: "a1".into(),
                 message: Some(3),
+                finished_summary: false,
             },
         ],
         dropped_system_messages: 1,
@@ -297,6 +302,23 @@ fn facts(seed: &Seed) -> Vec<&broca_session_store::record::EntryFacts> {
             _ => None,
         })
         .collect()
+}
+
+#[test]
+fn old_plugin_receipt_retries_omit_absent_finished_summary() {
+    use broca_session_store::codec::Message as _;
+    let mut receipt = seeded(history(), None).unwrap().receipt;
+    receipt.shape = "plugin".into();
+    for row in &mut receipt.moves {
+        row.finished_summary = None;
+    }
+    let receipt = broca_session_store::record::ImportReceipt::decode(&receipt.encode()).unwrap();
+    let reply = serde_json::to_value(reply_of(&receipt, 0, "abcd".into()).unwrap()).unwrap();
+    assert!(reply["moves"]["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|row| row.get("finished_summary").is_none()));
 }
 
 /// The source runner's notice rule: the owner's plain prompt has none, the owner's templated

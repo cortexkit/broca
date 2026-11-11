@@ -115,7 +115,7 @@ impl ImportRoots {
     }
 }
 
-/// Deletes what fed an import once its session is durable: an OpenCode 2 export and its side
+/// Deletes what fed an import once its session is durable: an OpenCode extract/export and its side
 /// files, or for Pi only the side files, never the journal, wherever it lies. Each only when
 /// [`ImportRoots::deletable`] allows it. A failed delete is logged: the session is durable, so
 /// the import stands.
@@ -238,13 +238,12 @@ pub fn read_source(
     roots: &ImportRoots,
 ) -> Result<(PathBuf, HeadHistory), ImportRefusal> {
     let path = roots.admit(Path::new(&params.source.path))?;
-    let bytes = std::fs::read(&path).map_err(|error| {
+    let digest = ck_session_import::opencode_extract::sha256_file(&path).map_err(|error| {
         ImportRefusal::new(
             "import_source_unreadable",
             format!("the source file could not be read: {error}"),
         )
     })?;
-    let digest = format!("{:x}", Sha256::digest(&bytes));
     if !digest.eq_ignore_ascii_case(&params.source.sha256) {
         return Err(ImportRefusal::new(
             "import_digest_mismatch",
@@ -256,15 +255,21 @@ pub fn read_source(
             .map_err(|reason| format!("{reason:?}"))
     };
     let mut history = match params.source.harness {
-        ImportHarness::OpenCode2 => ck_session_import::head::opencode2::read(&bytes, &mut check)?,
-        ImportHarness::Pi => {
-            ck_session_import::head::pi::read(&bytes, &params.source.session, &mut check)?
-        }
+        ImportHarness::OpenCode2 => ck_session_import::head::opencode2::read(
+            &std::fs::read(&path).map_err(|error| {
+                ImportRefusal::new("import_source_unreadable", error.to_string())
+            })?,
+            &mut check,
+        )?,
+        ImportHarness::Pi => ck_session_import::head::pi::read(
+            &std::fs::read(&path).map_err(|error| {
+                ImportRefusal::new("import_source_unreadable", error.to_string())
+            })?,
+            &params.source.session,
+            &mut check,
+        )?,
         ImportHarness::OpenCode1 => {
-            return Err(ImportRefusal::new(
-                "import_harness_unsupported",
-                "an OpenCode 1 source is not served yet",
-            ))
+            ck_session_import::head::opencode1::read(&path, &params.source.session, &mut check)?
         }
     };
     let calls = ck_session_import::head::calls_path(&path);
@@ -511,7 +516,11 @@ pub fn seed(history: HeadHistory, at: &SeedFacts<'_>) -> Result<Seed, ImportRefu
         import_id: at.params.import_id.clone(),
         digest,
         shape: shape_name(shape_of(at.params.source.harness)).into(),
-        moves: moves_with_added(&history, added),
+        moves: moves_with_added(
+            &history,
+            added,
+            shape_of(at.params.source.harness) == MoveListShape::Plugin,
+        ),
         imported_messages: history.messages.len() as u64,
         dropped_system_messages: history.dropped_system_messages as u64,
     };
@@ -527,7 +536,11 @@ pub fn seed(history: HeadHistory, at: &SeedFacts<'_>) -> Result<Seed, ImportRefu
 /// messages broca added that belong to it, in ordinal order: the tool results split off an
 /// assistant row, or the results closing a call it left unanswered. An added message belongs to
 /// the nearest source message before it. So every ordinal the import placed appears exactly once.
-fn moves_with_added(history: &HeadHistory, added: Vec<(usize, String)>) -> Vec<ImportedMove> {
+fn moves_with_added(
+    history: &HeadHistory,
+    added: Vec<(usize, String)>,
+    plugin: bool,
+) -> Vec<ImportedMove> {
     // Each added message's owner: the index of the nearest earlier message a source row names.
     let mut after: std::collections::BTreeMap<Option<usize>, Vec<(usize, String)>> =
         Default::default();
@@ -540,6 +553,7 @@ fn moves_with_added(history: &HeadHistory, added: Vec<(usize, String)>) -> Vec<I
     let row = |(index, mid): (usize, String)| ImportedMove {
         mid,
         ordinal: Some(index as u64 + 1),
+        finished_summary: plugin.then_some(false),
     };
     let mut moves: Vec<ImportedMove> = after
         .remove(&None)
@@ -551,6 +565,7 @@ fn moves_with_added(history: &HeadHistory, added: Vec<(usize, String)>) -> Vec<I
         moves.push(ImportedMove {
             mid: source.mid.clone(),
             ordinal: source.message.map(|index| index as u64 + 1),
+            finished_summary: plugin.then_some(source.finished_summary),
         });
         if let Some(owned) = source.message.and_then(|index| after.remove(&Some(index))) {
             moves.extend(owned.into_iter().map(row));
@@ -697,7 +712,9 @@ pub fn reply_of(
                 .map(|row| MoveRow {
                     mid: row.mid.clone(),
                     entry: row.ordinal,
-                    finished_summary: None,
+                    finished_summary: (shape == MoveListShape::Plugin)
+                        .then_some(row.finished_summary)
+                        .flatten(),
                     // No source id has the form of one broca mints (the import refuses one), so
                     // a row under such an id is a message broca added.
                     added: broca_session_store::session::is_broca_id_form(&row.mid),

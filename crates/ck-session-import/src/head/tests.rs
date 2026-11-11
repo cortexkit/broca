@@ -275,7 +275,7 @@ fn fixture(path: &str) -> Vec<u8> {
 
 /// A media check that accepts any bytes under their declared type, as the store's would for
 /// valid media.
-fn accept(bytes: &[u8], mime: &str) -> Result<MediaRef, String> {
+pub(super) fn accept(bytes: &[u8], mime: &str) -> Result<MediaRef, String> {
     Ok(MediaRef {
         kind: if mime.starts_with("image/") {
             MediaKind::Image

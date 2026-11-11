@@ -141,6 +141,7 @@ pub fn read(
         moves.push(SourceRow {
             mid,
             message: (drafts.len() > first).then_some(first),
+            finished_summary: false,
         });
     }
     // Pi closes a call left without a result when the next user or assistant turn arrives, or
