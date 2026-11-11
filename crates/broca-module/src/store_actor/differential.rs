@@ -1875,6 +1875,8 @@ mod step_events;
 mod streams;
 mod warm;
 
+#[cfg(feature = "test-clock")]
+mod account_limit_pause;
 mod held;
 
 #[tokio::test]
