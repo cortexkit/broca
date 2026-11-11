@@ -4727,6 +4727,39 @@ pub async fn end_run_with_error<W: Writer>(
     Ok(finished(writer, reason))
 }
 
+/// Records a refused restart continuation and its interrupted terminal without dispatching
+/// anything. Set `record_resume` when the attempt failed before recording a resume entry;
+/// owners that already recorded it keep the existing entry instead of appending a duplicate.
+pub async fn end_restart_resume_refused<W: Writer>(
+    writer: &mut W,
+    run_id: &str,
+    error: &ProviderError,
+    now_ms: u64,
+    record_resume: bool,
+) -> Result<Finished, LoopError> {
+    if record_resume {
+        let resolution = run_state(writer).resolution();
+        let mut batch = Some(vec![Record::Resumed(resumed_record(writer, &resolution))]);
+        writer
+            .append_with(
+                &mut |_, _, first_seq| {
+                    let mut batch = batch.take().expect("one refused resume entry");
+                    name_resumed_from(&mut batch, first_seq);
+                    batch
+                },
+                false,
+            )
+            .await?;
+    }
+    let mut record = run_end(writer, run_id, RunFinishReason::Interrupted, now_ms);
+    if let Record::RunEnd(end) = &mut record {
+        end.interrupt_reason = Some("runner_crash".into());
+        end.error = Some(serde_json::to_value(error).map_err(|e| LoopError::Parts(e.to_string()))?);
+    }
+    append_end(writer, run_id, vec![record]).await?;
+    Ok(finished(writer, RunFinishReason::Interrupted))
+}
+
 /// The timed pause on the run's own account that `limited`, the step's attempt the provider
 /// refused for the account's limit, allows, as today's loop decides it: only for a transient
 /// error, only when the run consented at admission, and only when the account resets before

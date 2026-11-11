@@ -138,6 +138,15 @@ impl crate::registry::LineageRegistry {
                         response
                             .await
                             .map_err(|_| OpenError::Open("recovery barrier lost".into()))?;
+                        let (reply, response) = tokio::sync::oneshot::channel();
+                        actor
+                            .send(crate::actor::LineageCmd::ResumeRestart { reply })
+                            .await
+                            .map_err(|_| OpenError::Open("restart recovery actor closed".into()))?;
+                        response
+                            .await
+                            .map_err(|_| OpenError::Open("restart recovery reply lost".into()))?
+                            .map_err(OpenError::Open)?;
                         Ok::<_, OpenError>(())
                     }
                     .await;

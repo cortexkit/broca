@@ -953,11 +953,7 @@ fn head_class(state_root: &Path, key: &BindIdentity) -> Result<Option<StorageCla
 const POSITION_TRIES: usize = 3;
 
 fn recovery_changes_reads(view: &SessionView<LocalBackend>) -> bool {
-    view.operations
-        .run
-        .as_ref()
-        .is_some_and(|run| run.finished.is_none())
-        || !view.operations.queue.is_empty()
+    crate::store_actor::recovery_changes_reads(&view.operations)
 }
 
 /// A view that couldn't be loaded, as the opener reports it.

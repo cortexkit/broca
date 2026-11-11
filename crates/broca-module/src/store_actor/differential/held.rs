@@ -85,6 +85,7 @@ struct HeldExecutor {
     // Replace a scripted auth pause with another pause reason, without involving timers or
     // a process restart, so cancellation exercises the same paused actor on both storages.
     pause_as: std::sync::Mutex<Option<broca_protocol::PauseReason>>,
+    refuse_restart: std::sync::atomic::AtomicBool,
 }
 
 #[async_trait]
@@ -99,6 +100,23 @@ impl RunExecutor for HeldExecutor {
         mut job: RunJob,
         out: mpsc::Sender<OutputEvent>,
     ) -> Result<RunSummary, RunError> {
+        if self.refuse_restart.load(Ordering::SeqCst)
+            && job
+                .prior_snapshot
+                .checkpoint_at_head
+                .last_episode
+                .as_ref()
+                .is_some_and(|episode| {
+                    episode.disposition == broca_core::EpisodeDisposition::Paused
+                        && episode.pause_reason == Some(broca_protocol::PauseReason::Restart)
+                })
+        {
+            let error = RunError::Config("restart admission refused".into());
+            if let Some(reply) = job.on_admitted.take() {
+                let _ = reply.send(Err(error.clone()));
+            }
+            return Err(error);
+        }
         job.control.admitted_context_limit =
             job.control.admitted_context_limit.or(job.req.context_limit);
         let writer = job.writer.clone();
@@ -147,6 +165,21 @@ impl RunExecutor for HeldExecutor {
             mode,
             ..
         } = job;
+        if self.refuse_restart.load(Ordering::SeqCst)
+            && mode == StoreRunMode::Resume
+            && writer
+                .operations()
+                .run
+                .as_ref()
+                .is_some_and(|run| run.paused == Some(broca_protocol::PauseReason::Restart))
+        {
+            return StoreRunEnd {
+                parts,
+                result: Err(StoreRunError::Admission(RunError::Config(
+                    "restart admission refused".into(),
+                ))),
+            };
+        }
         control.admitted_context_limit = control.admitted_context_limit.or(req.context_limit);
         let result = async {
             let admission = if mode == StoreRunMode::Fresh {
@@ -263,6 +296,7 @@ impl Side {
             tools,
             slots: HeldSlots::new(),
             pause_as: Default::default(),
+            refuse_restart: false.into(),
         });
         let runtime = crate::store_open::StoreRuntime::open(
             &dir,
@@ -503,6 +537,9 @@ impl Side {
 }
 
 mod cancel;
+#[path = "held/restart.rs"]
+#[cfg(feature = "test-clock")]
+mod restart;
 
 fn comparable(mut value: Value) -> Value {
     if let Some(held) = value.get_mut("held_calls").and_then(Value::as_array_mut) {
@@ -1025,6 +1062,29 @@ async fn startup_read_recovers_its_own_orphan_without_global_sweep() {
     assert!(original.registry.stop_and_seal().await);
 }
 
+#[tokio::test]
+async fn a_parked_held_run_reads_without_opening_an_actor() {
+    let original = Side::new(
+        true,
+        Cipher::None,
+        vec![super::super::tests::read_step("m1")],
+    )
+    .await;
+    original.send().await;
+    original.idle().await;
+    let expected = comparable(original.status().await);
+    let reboot = original.restarted().await;
+    assert!(reboot.registry.slot_state(&reboot.key).is_none());
+    assert_eq!(comparable(reboot.status().await), expected);
+    assert!(
+        reboot.registry.slot_state(&reboot.key).is_none(),
+        "a durable held pause stays read-only"
+    );
+    assert_eq!(reboot.executor.tools.0.load(Ordering::SeqCst), 1);
+    assert!(reboot.registry.stop_and_seal().await);
+    assert!(original.registry.stop_and_seal().await);
+}
+
 cipher_tests!(held_record_boundary_cuts_rejoin_without_redispatch);
 
 async fn held_record_boundary_cuts_rejoin_without_redispatch(cipher: Cipher) {
@@ -1132,6 +1192,7 @@ async fn held_record_boundary_cuts_rejoin_without_redispatch(cipher: Cipher) {
             tools: source.executor.tools.clone(),
             slots: HeldSlots::new(),
             pause_as: Default::default(),
+            refuse_restart: false.into(),
         });
         let actor = super::super::StoreActor::new(
             source.key.clone(),

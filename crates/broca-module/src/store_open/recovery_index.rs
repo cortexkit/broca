@@ -23,11 +23,40 @@ type AfterCheck = Box<dyn Fn(&Path)>;
 #[cfg(all(test, feature = "test-clock"))]
 std::thread_local! {
     static AFTER_CHECK: std::cell::RefCell<Option<AfterCheck>> = const { std::cell::RefCell::new(None) };
+    static SYNC_COUNTS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+fn sync_file(file: &std::fs::File) -> io::Result<()> {
+    #[cfg(all(test, feature = "test-clock"))]
+    SYNC_COUNTS.with(|counts| counts.set((counts.get().0 + 1, counts.get().1)));
+    file.sync_all()
+}
+
+fn sync_dir(path: &Path) -> io::Result<()> {
+    #[cfg(all(test, feature = "test-clock"))]
+    SYNC_COUNTS.with(|counts| counts.set((counts.get().0, counts.get().1 + 1)));
+    broca_wal::fs_ops::sync_dir(path)
+}
+
+#[cfg(all(test, feature = "test-clock"))]
+pub(crate) fn sync_counts_for_test() -> (usize, usize) {
+    SYNC_COUNTS.with(std::cell::Cell::get)
+}
+
+#[cfg(all(test, feature = "test-clock"))]
+pub(crate) fn prepare_complete_for_test(root: &Path) -> io::Result<()> {
+    prepare(root)?;
+    complete(root)
+}
+
+#[cfg(all(test, feature = "test-clock"))]
+pub(crate) fn members_for_test(root: &Path) -> io::Result<Option<Vec<SessionAddr>>> {
+    candidates(root)
 }
 
 pub(super) fn prepare(root: &Path) -> io::Result<()> {
     broca_owner_only::create_dir_all(root.join(DIRECTORY))?;
-    broca_wal::fs_ops::sync_dir(root)
+    sync_dir(root)
 }
 
 pub(crate) fn insert(root: &Path, addr: &SessionAddr) -> io::Result<()> {
@@ -39,14 +68,15 @@ pub(crate) fn insert(root: &Path, addr: &SessionAddr) -> io::Result<()> {
         .create(true)
         .truncate(true)
         .open(dir.join(&addr.0))?;
-    file.sync_all()?;
-    broca_wal::fs_ops::sync_dir(&dir)
+    sync_file(&file)?;
+    sync_dir(&dir)
 }
 
 pub(crate) fn remove(root: &Path, addr: &SessionAddr) -> io::Result<()> {
     let dir = root.join(DIRECTORY);
     match std::fs::remove_file(dir.join(&addr.0)) {
-        Ok(()) => broca_wal::fs_ops::sync_dir(&dir),
+        // A lost unlink leaves a stale candidate, never a missing unfinished run.
+        Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
     }
@@ -117,8 +147,8 @@ pub(super) fn complete(root: &Path) -> io::Result<()> {
         .truncate(true)
         .open(dir.join(COMPLETE))?;
     file.write_all(VERSION)?;
-    file.sync_all()?;
-    broca_wal::fs_ops::sync_dir(&dir)
+    sync_file(&file)?;
+    sync_dir(&dir)
 }
 
 #[cfg(test)]

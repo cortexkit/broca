@@ -6298,6 +6298,12 @@ impl LineageRegistry {
         self.inner
             .restart_resume_ready
             .store(true, Ordering::Release);
+        // Store sessions have no legacy run-index row. Their durable candidate set also
+        // reaches actors opened before readiness, which must receive ResumeRestart now.
+        let store_recovery = self.store_runtime().map(|_| {
+            let registry = self.clone();
+            tokio::spawn(async move { registry.recover_store_crash_orphans().await })
+        });
         let mut seen = HashSet::new();
         let mut resumed = 0;
         let mut sealed = 0;
@@ -6396,6 +6402,16 @@ impl LineageRegistry {
                 Ok(_) => resumed += 1,
                 Err(error) => {
                     tracing::warn!(target: "lifecycle", "restart resume: refused session '{}': {error}", key.session)
+                }
+            }
+        }
+        if let Some(store_recovery) = store_recovery {
+            match store_recovery.await {
+                Ok(Ok(sweep)) => {
+                    tracing::info!(target: "lifecycle", ?sweep, "store restart resume candidate sweep complete")
+                }
+                error => {
+                    tracing::warn!(target: "lifecycle", ?error, "store restart resume recovery failed")
                 }
             }
         }
@@ -6617,6 +6633,13 @@ impl RegistryHandle {
     }
     pub(crate) fn restart_resume_ready(&self) -> bool {
         self.inner.restart_resume_ready.load(Ordering::Acquire)
+    }
+
+    #[cfg(all(test, feature = "test-clock"))]
+    pub(crate) fn enable_restart_resumes_for_test(&self) {
+        self.inner
+            .restart_resume_ready
+            .store(true, Ordering::Release);
     }
 
     /// The session's prompt-cache clock, shared with every run and warm of the session.

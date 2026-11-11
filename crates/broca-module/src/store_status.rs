@@ -1016,9 +1016,8 @@ async fn final_message<B: SessionBackend>(
 }
 
 /// The no-run `status` of a store session that no actor holds asks the actor anyway when its
-/// latest run is unfinished and not paused (or has a cancel pending), or when sends wait in its
-/// queue: opening the actor recovers the run and drains the queue, as today's `status` wakes a
-/// session a crash left so.
+/// latest run has open-time recovery, or when queued work can drain: the same decision as a
+/// caller read. Pauses without recoverable work and already parked held waits need no actor.
 pub async fn status_needs_actor(
     store: &crate::store_open::StoreRuntime,
     key: &broca_protocol::BindIdentity,
@@ -1026,10 +1025,9 @@ pub async fn status_needs_actor(
     let Some(session) = store.current_view(key).await? else {
         return Ok(false);
     };
-    let unfinished = session.operations.run.as_ref().is_some_and(|run| {
-        run.finished.is_none() && (run.paused.is_none() || run.cancel.is_some())
-    });
-    Ok(unfinished || !session.operations.queue.is_empty())
+    Ok(crate::store_actor::recovery_changes_reads(
+        &session.operations,
+    ))
 }
 
 /// A read of a store session's run and send facts, served by its actor when one holds it open,
