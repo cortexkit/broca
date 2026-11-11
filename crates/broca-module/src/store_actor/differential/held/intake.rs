@@ -91,6 +91,10 @@ impl Intake {
             }])
             .await
             .unwrap();
+        Self::with_store(side, key, store)
+    }
+
+    fn with_store(side: &Side, key: String, store: Arc<LateResultsStore>) -> Self {
         let feed = Arc::new(Feed {
             entries: Mutex::new(vec![
                 LateEntry::new(
@@ -152,6 +156,300 @@ impl Intake {
     async fn tick(&self) {
         self.intake.tick_for_test("tools").await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn encrypted_store_hold_survives_lost_late_results_database() {
+    let initial = Side::new(
+        true,
+        Cipher::XChaCha20Poly1305,
+        vec![super::super::super::tests::read_step("m1")],
+    )
+    .await;
+    initial.send().await;
+    initial.idle().await;
+    let original = Intake::new(&initial).await;
+    let registrations = original.store.registrations().unwrap();
+    let key = original.key.clone();
+    drop(original);
+    std::fs::remove_file(initial.dir.join("late-results.db")).unwrap();
+
+    let side = initial.restarted().await;
+    let store = Arc::new(LateResultsStore::open(&side.dir.join("late-results.db")).unwrap());
+    let rig = Intake::with_store(&side, key, store);
+    rig.intake.set_rebuilding(true);
+    rig.tick().await;
+    assert_eq!(rig.delivery.calls.load(Ordering::SeqCst), 0);
+    assert!(rig.feed.acks.lock().unwrap().is_empty());
+    let mut report =
+        crate::late_results_puller::rebuild_store_from_wals(&rig.store, &side.dir).unwrap();
+    crate::late_results_puller::rebuild_store_from_sessions_with_progress(
+        &rig.store,
+        &side.dir,
+        Some(side.registry.store_runtime().unwrap().as_ref()),
+        &mut report,
+        |_| {},
+    )
+    .await
+    .unwrap();
+    assert!(report.unreadable.is_empty());
+    assert_eq!(rig.store.registrations().unwrap(), registrations);
+    rig.tick().await;
+    assert_eq!(rig.delivery.calls.load(Ordering::SeqCst), 0);
+    assert!(rig.feed.acks.lock().unwrap().is_empty());
+    rig.store.finish_rebuild().unwrap();
+    rig.intake.set_rebuilding(false);
+    rig.tick().await;
+    side.idle().await;
+    assert_eq!(rig.delivery.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(side.result().await["state"], "completed");
+    assert_eq!(side.executor.tools.0.load(Ordering::SeqCst), 1);
+    assert_eq!(side.executor.provider.inner.calls().len(), 1);
+    assert_eq!(rig.feed.acks.lock().unwrap().len(), 1);
+    assert!(initial.registry.stop_and_seal().await);
+    assert!(side.registry.stop_and_seal().await);
+}
+
+#[tokio::test]
+async fn store_rebuild_omits_completed_and_cancelled_runs() {
+    for cancel in [false, true] {
+        let side = Side::new(
+            true,
+            Cipher::XChaCha20Poly1305,
+            vec![
+                super::super::super::tests::read_step("m1"),
+                super::super::super::tests::text_step("m2", "done"),
+            ],
+        )
+        .await;
+        side.send().await;
+        side.idle().await;
+        if cancel {
+            assert_eq!(
+                side.registry
+                    .route_cancel(&side.key, RunId("r1".into()))
+                    .await
+                    .unwrap(),
+                CancelOutcome::Ack
+            );
+            cancelled(&side).await;
+        } else {
+            let rig = Intake::new(&side).await;
+            rig.tick().await;
+            side.idle().await;
+            assert_eq!(side.result().await["state"], "completed");
+        }
+        let store = LateResultsStore::open(&side.dir.join("rebuilt.db")).unwrap();
+        let mut report = crate::late_results_puller::RebuildReport::default();
+        crate::late_results_puller::rebuild_store_from_sessions_with_progress(
+            &store,
+            &side.dir,
+            Some(side.registry.store_runtime().unwrap().as_ref()),
+            &mut report,
+            |_| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.sessions, 1);
+        assert!(report.unreadable.is_empty());
+        assert!(store.registrations().unwrap().is_empty());
+        assert!(side.registry.stop_and_seal().await);
+    }
+}
+
+async fn seed_rebuild_inventory(side: &Side, count: usize) -> serde_json::Value {
+    use broca_session_store::{
+        backend::{LocalBackend, SessionAddr},
+        record::Record,
+        session::Session,
+    };
+    let runtime = side.registry.store_runtime().unwrap();
+    let view = runtime.current_view(&side.key).await.unwrap().unwrap();
+    let mut template = view
+        .ledger_tail_until(|record| matches!(record, Record::RunStart(_)))
+        .await
+        .unwrap();
+    template.reverse();
+    let scope = json!({
+        "owner": { "kind": "reserved", "module_id": "owner" },
+        "ref": "original-scope", "scope_epoch": 42,
+        "flow_id": "flow", "agent_id": "agent", "run_id": "agent-run",
+        "sender": { "kind": "reserved", "module_id": "carrier" }, "agent_id_frozen": true
+    });
+    for index in 0..count {
+        let bind = BindIdentity::new(
+            &side.key.project_root,
+            &side.key.harness,
+            format!("synthetic-{index}"),
+        );
+        let address = broca_core::session_addr(&bind);
+        let key = format!("{address}:11");
+        let class = broca_wal::StorageClass::ALL[index % 3];
+        let mut session = Session::create(
+            LocalBackend::new(class.store_root(&side.dir)),
+            SessionAddr(address),
+            crate::store_open::triple(&bind),
+            runtime.deployment(),
+            false,
+        )
+        .await
+        .unwrap();
+        let records: Vec<_> = template
+            .iter()
+            .filter_map(|(_, record)| match record {
+                Record::RunStart(start) => {
+                    let mut start = start.clone();
+                    start.scope = Some(scope.clone());
+                    Some(Record::RunStart(start))
+                }
+                Record::BatchStart(batch) => {
+                    let mut batch = batch.clone();
+                    batch.mid = None;
+                    Some(Record::BatchStart(batch))
+                }
+                Record::ToolIntent(intent) => {
+                    let mut intent = intent.clone();
+                    intent.call_key = Some(key.clone());
+                    Some(Record::ToolIntent(intent))
+                }
+                Record::ToolHeld(held) if index % 2 == 0 => {
+                    let mut held = held.clone();
+                    held.call_key = key.clone();
+                    Some(Record::ToolHeld(held))
+                }
+                _ => None,
+            })
+            .collect();
+        session.append(&records, true).await.unwrap();
+        session.seal(None, 1).await.unwrap();
+        session.close().await.unwrap();
+    }
+    scope
+}
+
+#[tokio::test]
+async fn store_rebuild_covers_every_class_intents_and_frozen_scope() {
+    let side = Side::new(
+        true,
+        Cipher::XChaCha20Poly1305,
+        vec![super::super::super::tests::read_step("m1")],
+    )
+    .await;
+    side.send().await;
+    side.idle().await;
+    let scope = seed_rebuild_inventory(&side, 6).await;
+    let store = LateResultsStore::open(&side.dir.join("rebuilt.db")).unwrap();
+    let mut report = crate::late_results_puller::RebuildReport::default();
+    crate::late_results_puller::rebuild_store_from_sessions_with_progress(
+        &store,
+        &side.dir,
+        Some(side.registry.store_runtime().unwrap().as_ref()),
+        &mut report,
+        |_| {},
+    )
+    .await
+    .unwrap();
+    assert!(report.unreadable.is_empty());
+    assert_eq!(report.sessions, 7);
+    assert_eq!(report.registered, 7);
+    let calls = store.registrations().unwrap();
+    for index in 0..6 {
+        let call = calls
+            .iter()
+            .find(|call| call.bind.session == format!("synthetic-{index}"))
+            .unwrap();
+        assert_eq!(
+            call.call_key,
+            format!("{}:11", broca_core::session_addr(&call.bind))
+        );
+        assert_eq!(call.lineage, broca_core::session_addr(&call.bind));
+        assert_eq!(call.module, "tools");
+        assert_eq!(serde_json::to_value(&call.scope).unwrap(), scope);
+    }
+    assert!(store.feed("tools").unwrap().unwrap().ack_owed);
+    assert!(side.registry.stop_and_seal().await);
+}
+
+#[tokio::test]
+async fn store_rebuild_unreadable_head_or_missing_runtime_keeps_scan_incomplete() {
+    let side = Side::new(
+        true,
+        Cipher::XChaCha20Poly1305,
+        vec![super::super::super::tests::read_step("m1")],
+    )
+    .await;
+    side.send().await;
+    side.idle().await;
+    let store = LateResultsStore::open(&side.dir.join("rebuilt.db")).unwrap();
+    let mut missing_runtime = crate::late_results_puller::RebuildReport::default();
+    crate::late_results_puller::rebuild_store_from_sessions_with_progress(
+        &store,
+        &side.dir,
+        None,
+        &mut missing_runtime,
+        |_| {},
+    )
+    .await
+    .unwrap();
+    assert_eq!(missing_runtime.unreadable.len(), 1);
+    assert!(store.registrations().unwrap().is_empty());
+    let runtime = side.registry.store_runtime().unwrap();
+    let head = broca_wal::session_storage_head(
+        &side.dir,
+        runtime.class_of(&side.key).unwrap().unwrap(),
+        &broca_core::session_addr(&side.key),
+    );
+    std::fs::write(&head, b"unreadable head").unwrap();
+    let mut unreadable = crate::late_results_puller::RebuildReport::default();
+    crate::late_results_puller::rebuild_store_from_sessions_with_progress(
+        &store,
+        &side.dir,
+        Some(&runtime),
+        &mut unreadable,
+        |_| {},
+    )
+    .await
+    .unwrap();
+    assert_eq!(unreadable.unreadable, [head]);
+    assert!(store.registrations().unwrap().is_empty());
+    assert!(side.registry.stop_and_seal().await);
+}
+
+#[tokio::test]
+#[ignore = "synthetic rebuild cost measurement"]
+async fn store_rebuild_cost_on_three_hundred_encrypted_sessions() {
+    let side = Side::new(
+        true,
+        Cipher::XChaCha20Poly1305,
+        vec![super::super::super::tests::read_step("m1")],
+    )
+    .await;
+    side.send().await;
+    side.idle().await;
+    seed_rebuild_inventory(&side, 300).await;
+    let store = LateResultsStore::open(&side.dir.join("rebuilt.db")).unwrap();
+    let mut report = crate::late_results_puller::RebuildReport::default();
+    let started = std::time::Instant::now();
+    crate::late_results_puller::rebuild_store_from_sessions_with_progress(
+        &store,
+        &side.dir,
+        Some(side.registry.store_runtime().unwrap().as_ref()),
+        &mut report,
+        |_| {},
+    )
+    .await
+    .unwrap();
+    eprintln!(
+        "store rebuild: sessions={} registered={} unreadable={} elapsed_ms={}",
+        report.sessions,
+        report.registered,
+        report.unreadable.len(),
+        started.elapsed().as_millis()
+    );
+    assert_eq!(report.sessions, 301);
+    assert_eq!(report.registered, 301);
+    assert!(report.unreadable.is_empty());
+    assert!(side.registry.stop_and_seal().await);
 }
 
 cipher_tests!(

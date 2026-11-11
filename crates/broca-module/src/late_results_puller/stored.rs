@@ -4,6 +4,175 @@ use super::*;
 use broca_session_store::fold::operations::{Resolution, Run};
 use broca_session_store::record::{CallOutcome, Record, ToolHeld, ToolIntent};
 
+/// Extend a lost-database rebuild with every backup class's `broca-session-store` inventory.
+/// Only the latest open batch can still accept an answer; read its durable dispatch records
+/// back to the run's start, which also retains the frozen scope.
+/// The caller must keep intake fenced until both this scan and the WAL scan succeed.
+pub async fn rebuild_store_from_sessions_with_progress(
+    store: &LateResultsStore,
+    state_root: &Path,
+    runtime: Option<&crate::store_open::StoreRuntime>,
+    report: &mut RebuildReport,
+    progress: impl Fn(&RebuildReport),
+) -> Result<(), String> {
+    use broca_session_store::backend::LocalBackend;
+    let inventory = || {
+        let mut sessions = Vec::new();
+        for class in broca_wal::StorageClass::ALL {
+            let backend = LocalBackend::new(class.store_root(state_root));
+            for address in backend
+                .stored_sessions()
+                .map_err(|error| format!("{error:?}"))?
+            {
+                sessions.push((class, address));
+            }
+        }
+        Ok::<_, String>(sessions)
+    };
+    let sessions = inventory()?;
+    for (class, address) in &sessions {
+        let head = class
+            .store_root(state_root)
+            .join("heads")
+            .join(&address.0)
+            .join("head");
+        let scanned = async {
+            let runtime = runtime.ok_or("session store runtime is unavailable")?;
+            let backend = LocalBackend::new(class.store_root(state_root));
+            let (bytes, _) = backend
+                .read_stored_head(address)
+                .map_err(|error| format!("{error:?}"))?
+                .ok_or("session head disappeared")?;
+            let triple = broca_session_store::head::stored_triple(&bytes)
+                .map_err(|error| format!("{error:?}"))?;
+            let bind = BindIdentity::new(triple.project_root, triple.harness, triple.session);
+            if broca_core::session_addr(&bind) != address.0 {
+                return Err("session head identity differs from its address".into());
+            }
+            let view = runtime
+                .current_view(&bind)
+                .await
+                .map_err(|error| format!("{error:?}"))?
+                .ok_or("inventoried session disappeared")?;
+            let calls = rebuild_registrations(&view, &bind).await?;
+            for call in &calls {
+                store.ensure_feed(&call.module, true)?;
+            }
+            store.register_calls(&calls)?;
+            report.registered += calls.len();
+            Ok::<_, String>(())
+        }
+        .await;
+        report.sessions += 1;
+        if let Err(error) = scanned {
+            tracing::warn!(target: "late_results", session_head = %head.display(), "late-results rebuild incomplete: {error}");
+            report.unreadable.push(head);
+        }
+        progress(report);
+    }
+    if inventory()? != sessions {
+        return Err("session store inventory changed during late-results rebuild".into());
+    }
+    Ok(())
+}
+
+async fn rebuild_registrations(
+    view: &broca_session_store::session::SessionView<broca_session_store::backend::LocalBackend>,
+    bind: &BindIdentity,
+) -> Result<Vec<LateResultRegistration>, String> {
+    let Some(run) = view
+        .operations
+        .run
+        .as_ref()
+        .filter(|run| run.finished.is_none() && run.cancel.is_none())
+    else {
+        return Ok(Vec::new());
+    };
+    let Some(batch) = &run.open_batch else {
+        return Ok(Vec::new());
+    };
+    if batch
+        .calls
+        .iter()
+        .any(|call| call.held_reply.is_some() && (!call.intent || call.key.is_none()))
+    {
+        return Err("open held call has no intent or call key".into());
+    }
+    let keys: Vec<_> = batch
+        .calls
+        .iter()
+        .filter(|call| call.intent && call.terminal.is_none())
+        .filter_map(|call| call.key.as_ref())
+        .collect();
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut records = view
+        .ledger_tail_until(
+            |record| matches!(record, Record::RunStart(start) if start.run_id == run.run_id),
+        )
+        .await
+        .map_err(|error| format!("{error:?}"))?;
+    records.reverse();
+    let start = records
+        .iter()
+        .find_map(|(_, record)| match record {
+            Record::RunStart(start) if start.run_id == run.run_id => Some(start),
+            _ => None,
+        })
+        .ok_or("open run has no durable start")?;
+    let scope: Option<broca_protocol::SessionScope> = start
+        .scope
+        .clone()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|error| format!("invalid frozen run scope: {error}"))?;
+    let lineage = StoredLineage::Readable {
+        records,
+        run: Some(Box::new(run.clone())),
+    };
+    let mut registrations = Vec::new();
+    for key in keys {
+        let call = lineage.call(key).ok_or("open call has no durable intent")?;
+        if call.intent.run_id != run.run_id || call.intent.batch_id != batch.batch_id {
+            return Err("open call intent belongs to another run or batch".into());
+        }
+        if call.terminal || call.run_ended || call.closing {
+            continue;
+        }
+        let module = call
+            .held
+            .as_ref()
+            .map(|held| &held.module)
+            .or(call.intent.module_id.as_ref());
+        let Some(module) = module else {
+            continue;
+        };
+        if call.held.is_some()
+            && call
+                .intent
+                .module_id
+                .as_ref()
+                .is_some_and(|target| target != module)
+        {
+            return Err("held call module differs from its intent".into());
+        }
+        cortexkit_role_tool_provider::call::validate_call_key(key)
+            .map_err(|error| error.to_string())?;
+        let (lineage, _) = key
+            .rsplit_once(':')
+            .ok_or("registered call key has no lineage")?;
+        registrations.push(LateResultRegistration {
+            lineage: lineage.into(),
+            call_key: key.clone(),
+            module: module.clone(),
+            bind: bind.clone(),
+            scope: scope.clone(),
+        });
+    }
+    Ok(registrations)
+}
+
 pub(super) enum StoredLineage {
     Readable {
         records: Vec<(u64, Record)>,

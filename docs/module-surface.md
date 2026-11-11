@@ -2384,13 +2384,14 @@ At boot tombstoned lineages are pruned from the intake without opening an actor.
 session with a registration is opened so its open-time recovery runs, then each
 module that still needs its feed gets its puller. A missing or unreadable `late-results.db` is
 rebuilt off the startup path by verifying every live WAL and every published archive member,
-including intent-only calls whose registration may precede their held reply. The rebuild
+and reading operational state and active run records for every session in the session store's
+inventory across all backup classes, including intent-only calls whose registration may precede
+their held reply. The rebuild
 retains each episode's original scope. Until that scan completes no entry is delivered or
 acked. Only roots with neither registration history nor a held feature floor may skip a
 rebuild scan. An existing unheld database starts no scan, reads no WAL and gains no writes;
 boot adds only a read-only probe of the rebuild fence.
-The lost-database rebuild currently scans WAL-backed sessions only; it does not reconstruct
-registrations from new-storage sessions. Their existing registrations must be retained.
+An unreadable session in either storage keeps the rebuild fence pinned until a rescan succeeds.
 
 After a held run's cancel seal is synced, `tool.withdraw` is sent on the original provider's
 tool route with its frozen scope, under broca's carrier identity. The cancellation outcome

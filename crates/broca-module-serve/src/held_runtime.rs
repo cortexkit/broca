@@ -14,7 +14,7 @@
 //!   cursor the provider returned, after the delivered terminal is synced.
 //! - **Boot recovery** ([`HeldRuntime::recover`]): every session with a registration is opened
 //!   so its open-time recovery runs, then a puller starts for every module that still needs its
-//!   feed. A store that is missing or unreadable is rebuilt from live and archived WALs, off the
+//!   feed. A missing or unreadable intake database is rebuilt from WALs and new-storage sessions, off the
 //!   startup path; until that scan completes every pulled entry is Blocked and nothing is acked.
 //!
 //! Installing this runtime declares `tool-result/v1` and `held-reply/v1` on dispatch routes in
@@ -37,8 +37,8 @@ use std::{
 use broca_module::held_slots::{EntryMapper, HeldRunResumer, HeldSlots, SlotDelivery};
 use broca_module::held_withdrawals::{HeldWithdrawals, WithdrawTransport};
 use broca_module::late_results_puller::{
-    rebuild_store_from_wals_with_progress, FeedError, FeedReply, HeldDelivery, LateResultsFeed,
-    LateResultsIntake, RebuildReport,
+    rebuild_store_from_sessions_with_progress, rebuild_store_from_wals_with_progress, FeedError,
+    FeedReply, HeldDelivery, LateResultsFeed, LateResultsIntake, RebuildReport,
 };
 use broca_module::late_results_store::LateResultsStore;
 use broca_protocol::BindIdentity;
@@ -51,7 +51,7 @@ pub const LATE_RESULTS_DB: &str = "late-results.db";
 /// How many registered sessions boot recovery opens at once.
 const RECOVERY_CONCURRENCY: usize = 8;
 
-/// How long a rebuild that met an unreadable WAL waits before scanning again.
+/// How long a rebuild that met unreadable session storage waits before scanning again.
 const REBUILD_RETRY: Duration = Duration::from_secs(30);
 
 /// One route per provider module, opened on the consumer-identity connection.
@@ -289,7 +289,7 @@ impl HeldRuntime {
         self.withdrawals.bind_stopping_signal(stopping);
     }
 
-    /// Boot recovery, run off the startup path: rebuild a lost store from the live WALs, open
+    /// Boot recovery, run off the startup path: rebuild a lost intake from both session storages, open
     /// every registered session so its open-time recovery runs, then start a puller for every
     /// module whose feed is still needed.
     pub async fn recover(self: Arc<Self>, registry: Arc<broca_module::registry::LineageRegistry>) {
@@ -309,44 +309,61 @@ impl HeldRuntime {
                 let store = Arc::clone(&self.store);
                 let root = self.wal_root.clone();
                 let progress = self.progress.clone();
-                let scan_stop = stopping.clone();
                 let started = std::time::Instant::now();
                 let scan = tokio::task::spawn_blocking(move || {
                     let report = rebuild_store_from_wals_with_progress(&store, &root, |report| {
                         *progress.lock().expect("rebuild progress") = report.clone();
                     })?;
-                    if scan_stop.is_cancelled() {
+                    Ok::<_, String>(report)
+                });
+                let scan = async {
+                    let mut report = scan.await.map_err(|error| error.to_string())??;
+                    let runtime = registry.store_runtime();
+                    if let Some(runtime) = &runtime {
+                        self.intake.set_session_store(runtime.clone());
+                        self.withdrawals.with_store_runtime(runtime.clone());
+                    }
+                    rebuild_store_from_sessions_with_progress(
+                        &self.store,
+                        &self.wal_root,
+                        runtime.as_deref(),
+                        &mut report,
+                        |report| {
+                            *self.progress.lock().expect("rebuild progress") = report.clone();
+                        },
+                    )
+                    .await?;
+                    if stopping.is_cancelled() {
                         return Err("late-results recovery is stopping".into());
                     }
                     if report.unreadable.is_empty() {
-                        store.finish_rebuild()?;
+                        self.store.finish_rebuild()?;
                     }
                     Ok::<_, String>(report)
-                });
+                };
                 let report = tokio::select! {
                     biased;
                     _ = stopping.cancelled() => return,
                     report = scan => report,
-                }
-                .map_err(|error| error.to_string())
-                .and_then(|report| report);
+                };
                 match report {
                     Ok(report) if report.unreadable.is_empty() => {
                         tracing::info!(
                             target: "late_results",
                             files = report.files,
                             decoded = report.decoded,
+                            sessions = report.sessions,
                             registered = report.registered,
                             skipped_by_floor = report.skipped_by_floor,
                             elapsed_ms = started.elapsed().as_millis() as u64,
-                            "late-results store rebuilt from the live WALs"
+                            "late-results intake rebuilt from WALs and session storage"
                         );
                         break;
                     }
                     Ok(report) => tracing::warn!(
                         target: "late_results",
                         unreadable = report.unreadable.len(),
-                        "late-results rebuild met unreadable WALs; entries stay blocked until a rescan completes"
+                        "late-results rebuild met unreadable session storage; entries stay blocked until a rescan completes"
                     ),
                     Err(error) => tracing::warn!(
                         target: "late_results",
@@ -521,6 +538,7 @@ mod tests {
         let report = RebuildReport {
             files: 7,
             decoded: 5,
+            sessions: 0,
             registered: 3,
             unreadable: vec![PathBuf::from("unreadable.wal")],
             skipped_by_floor: false,

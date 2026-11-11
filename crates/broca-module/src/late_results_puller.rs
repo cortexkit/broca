@@ -39,6 +39,7 @@ use crate::late_results_store::{
 };
 
 mod stored;
+pub use stored::rebuild_store_from_sessions_with_progress;
 use stored::StoredLineage;
 
 /// How often a started feed is pulled.
@@ -1361,9 +1362,11 @@ pub struct RebuildReport {
     pub files: usize,
     /// WAL files decoded, including logs with no held reply yet.
     pub decoded: usize,
+    /// Session-store inventory entries examined.
+    pub sessions: usize,
     /// Registrations written.
     pub registered: usize,
-    /// WALs that could not be verified or registered; any one keeps the fence tripped.
+    /// WALs or session heads that could not be read or registered; any one keeps the fence tripped.
     pub unreadable: Vec<std::path::PathBuf>,
     /// The state root's WAL feature floor shows no provider-held frame was ever written here,
     /// so no WAL was looked at.
