@@ -138,7 +138,7 @@ fn run_started(
     session: &BindIdentity,
     parts: &dyn Parts,
 ) -> Result<Value, String> {
-    let mut value = today::run_started(start, inputs, |part| parts.get(part))?;
+    let mut value = today::run_started(start, inputs, |part| crate::parts::value(parts, part))?;
     if let Value::Object(object) = &mut value {
         object.insert("session".into(), today::json(session));
     }

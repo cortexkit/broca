@@ -1241,7 +1241,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                         plan.as_deref(),
                         latest
                             .as_ref()
-                            .map(|latest| (&latest.render_config, latest.tools.as_slice())),
+                            .map(|latest| (&*latest.render_config, latest.tools.as_slice())),
                         joins_active_run,
                     ) {
                         let _ = reply.send(SendOutcome::StructuredOutputInvalid { field });
@@ -2333,13 +2333,13 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     }
 
     /// The fetch plan's manifest the session's first run froze, read back from the setup parts
-    /// its start names; `None` for a session admitted without a plan, or with no run yet.
+    /// its start names; `None` for a session admitted without a plan, or with no run yet. Shared
+    /// with every other holder of the same manifest.
     fn frozen_manifest(&self) -> Result<Option<Arc<broca_wal::PlanManifest>>, String> {
         let Some(first) = self.session.operations().owner.first_start.as_ref() else {
             return Ok(None);
         };
-        broca_session_loop::run::admission_of_start(first, &self.parts)
-            .map(|admission| admission.manifest)
+        broca_session_loop::run::frozen_manifest(first, &self.parts)
             .map_err(|error| format!("the session's first run start: {error:?}"))
     }
 
@@ -2474,7 +2474,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 } else {
                     self.latest_admission()
                         .map_err(SendOutcome::Transient)?
-                        .map(|latest| latest.tools)
+                        .map(|latest| Arc::unwrap_or_clone(latest.tools))
                         .unwrap_or_default()
                 };
                 start.request.policy_allowed =
@@ -3986,7 +3986,7 @@ fn frozen_media(
     String,
 ) {
     let profile = serde_json::from_value::<broca_provider::wire::FrozenRenderConfig>(
-        frozen.render_config.clone(),
+        serde_json::Value::clone(&frozen.render_config),
     )
     .ok()
     .and_then(|config| config.media.map(Box::new));

@@ -43,8 +43,8 @@ use broca_session_store::codec::{Digest, Message as _};
 use broca_session_store::fold::operations::{CallState, Operations, Resolution};
 use broca_session_store::record::{
     Assistant, Attempt, BatchEnd, BatchStart, CallOutcome, CeilingDecided, Delivery, Input, Notice,
-    PartKind, Pause, Placement, Record, Redo, ResultAppend, Resumed, RunEnd, RunStart, SendEnded,
-    SetupStub, StepEnd, StepStart, ToolHeld, ToolIntent, ToolOutcome, ToolReply,
+    PartKind, PartRef, Pause, Placement, Record, Redo, ResultAppend, Resumed, RunEnd, RunStart,
+    SendEnded, SetupStub, StepEnd, StepStart, ToolHeld, ToolIntent, ToolOutcome, ToolReply,
 };
 use broca_session_store::session::SessionError;
 use broca_wal::ComputedTagRules;
@@ -73,14 +73,16 @@ pub struct Admission {
     pub model: ModelHandle,
     /// The messages this run adds to the conversation.
     pub input: Vec<Message>,
-    /// The tools the run may call, in the order the model sees them.
-    pub tools: Vec<Tool>,
+    /// The tools the run may call, in the order the model sees them. Shared with every other
+    /// holder of the same setup part (see `crate::parts::shared`).
+    pub tools: Arc<Vec<Tool>>,
     pub tool_choice: ToolChoice,
     pub generation: GenerationConfig,
-    pub response_format: ResponseFormat,
+    pub response_format: Arc<ResponseFormat>,
     pub provider_options: Value,
-    /// The provider's frozen render config, opaque to the loop.
-    pub render_config: Value,
+    /// The provider's frozen render config, opaque to the loop. Shared like `tools`: a run that
+    /// changes its own copies it first.
+    pub render_config: Arc<Value>,
     pub renderer_version: u32,
     /// Termination predicates, OR'd. Empty means a [`DEFAULT_MAX_STEPS`] step limit.
     pub stop_when: Vec<StopCondition>,
@@ -96,8 +98,9 @@ pub struct Admission {
     /// For a session on the current compaction contract, the system text every request renders
     /// above the conversation, which is never part of its transcript: the plan's system text for
     /// a planned run, otherwise the system messages the caller sent, or the previous run's when
-    /// it sent none. [`run`] takes it out of `input`; a caller leaves it empty.
-    pub global_system: Vec<Message>,
+    /// it sent none. [`run`] takes it out of `input`; a caller leaves it empty. Shared like
+    /// `tools`.
+    pub global_system: Arc<Vec<Message>>,
     /// The window the run's model may use, in tokens; compaction states its conditions from it,
     /// and a run on a plan with a compaction provider needs one.
     pub context_limit: Option<u64>,
@@ -336,7 +339,7 @@ where
     admission.compaction_plan_version = contract.then_some(cortexkit_compaction_view::PLAN_VERSION);
     let mut input = std::mem::take(&mut admission.input);
     if contract {
-        admission.global_system = global_system(writer, parts, &mut input, &admission)?;
+        admission.global_system = Arc::new(global_system(writer, parts, &mut input, &admission)?);
     } else if let Some(previous) = writer.operations().run.as_ref() {
         // A later run outside the contract: its system messages must repeat the session's.
         broca_core::fresh_start::append_system_messages(
@@ -362,6 +365,11 @@ where
     } else {
         None
     };
+    // The schedule is read first, so a session whose schedule can't be read stores no part.
+    let refusal_schedule = refusal_schedule(&*writer, &admission)?;
+    // From here the run holds the decoded values of the parts its start names, as its resume
+    // and the session's next run read them, so all of them render the same requests.
+    let setup = store_setup(parts, &mut admission)?;
     let runner = broca_core::tags::rules_for(
         Some(broca_wal::ComputedTagRules { checkpoint }),
         frozen_render_tags(&admission),
@@ -387,7 +395,15 @@ where
         ),
         inner: writer,
     };
-    let start_seq = admit(&mut placed, parts, &admission, checkpoint, enrolled).await?;
+    let start_seq = admit(
+        &mut placed,
+        &admission,
+        setup,
+        refusal_schedule,
+        checkpoint,
+        enrolled,
+    )
+    .await?;
     if let Some(reports) = &seams.account_reports {
         reports.run_started(&event_id(&placed, start_seq), start_seq);
     }
@@ -438,13 +454,15 @@ fn global_system<W: Writer>(
                 .iter()
                 .find(|part| part.kind == PartKind::GlobalSystem)
         }) {
-        Some(part) => decode::<Vec<Message>>(Some(parts.get(part).map_err(LoopError::Parts)?))?,
+        Some(part) => {
+            Some(crate::parts::shared::<Vec<Message>, _>(parts, part).map_err(LoopError::Parts)?)
+        }
         None => None,
     };
     broca_core::fresh_start::new_episode_globals(
         input,
         admission.manifest.as_deref(),
-        previous.as_deref(),
+        previous.as_ref().map(|previous| previous.as_slice()),
     )
     .map_err(LoopError::Refused)
 }
@@ -1204,39 +1222,102 @@ pub fn frozen_manifest(
 }
 
 /// The plan manifest `manifest` references, rebuilt from its setup parts and the rest of its
-/// members.
+/// members. Shared with every other holder of the same manifest (see `crate::parts::shared`),
+/// and its tool list with every holder of its tools part.
 pub fn stored_manifest(
     manifest: &broca_session_store::fold::operations::ManifestRef,
     parts: &dyn Parts,
 ) -> Result<std::sync::Arc<broca_wal::PlanManifest>, LoopError> {
-    let mut members = match &manifest.rest {
-        Some(Value::Object(rest)) => rest.clone(),
-        _ => serde_json::Map::new(),
-    };
-    let mut fetches = Vec::new();
-    for part in &manifest.parts {
-        let value = parts.get(part).map_err(LoopError::Parts)?;
-        match part.kind {
-            PartKind::Plan => {
-                members.insert("plan".into(), value);
+    let rebuild = || -> Result<broca_wal::PlanManifest, String> {
+        let mut members = match &manifest.rest {
+            Some(Value::Object(rest)) => rest.clone(),
+            _ => serde_json::Map::new(),
+        };
+        let mut fetches = Vec::new();
+        let mut tools = None;
+        for part in &manifest.parts {
+            if part.kind == PartKind::Tools {
+                // The tool list is the one every holder of the part shares. The member is
+                // filled in once the rest of the manifest is read.
+                tools = Some(crate::parts::shared_or::<Vec<Tool>, _>(parts, part, |e| {
+                    format!("the frozen manifest: {e}")
+                })?);
+                members.insert("tools".into(), Value::Array(Vec::new()));
+                continue;
             }
-            PartKind::ProviderAnswer => fetches.push(value),
-            PartKind::Tools => {
-                members.insert("tools".into(), value);
+            let value = parts.get(part)?;
+            match part.kind {
+                PartKind::Plan => {
+                    members.insert("plan".into(), value);
+                }
+                PartKind::ProviderAnswer => fetches.push(value),
+                PartKind::SystemText => {
+                    members.insert("system_text".into(), value);
+                }
+                PartKind::Declarations => {
+                    members.insert("declarations".into(), value);
+                }
+                _ => {}
             }
-            PartKind::SystemText => {
-                members.insert("system_text".into(), value);
-            }
-            PartKind::Declarations => {
-                members.insert("declarations".into(), value);
-            }
-            _ => {}
         }
+        members.insert("fetches".into(), Value::Array(fetches));
+        let mut rebuilt: broca_wal::PlanManifest =
+            serde_json::from_value(Value::Object(members))
+                .map_err(|e| format!("the frozen manifest: {e}"))?;
+        if let Some(tools) = tools {
+            rebuilt.tools = tools;
+        }
+        Ok(rebuilt)
+    };
+    match parts.decoded() {
+        Some(decoded) => decoded.get_or_decode(manifest_key(manifest), rebuild),
+        None => rebuild().map(std::sync::Arc::new),
     }
-    members.insert("fetches".into(), Value::Array(fetches));
-    serde_json::from_value(Value::Object(members))
-        .map(std::sync::Arc::new)
-        .map_err(|e| LoopError::Parts(format!("the frozen manifest: {e}")))
+    .map_err(LoopError::Parts)
+}
+
+/// The key the manifest `manifest` references is shared under: its parts, in order, and the
+/// rest of its members exactly as the record spells them.
+fn manifest_key(manifest: &broca_session_store::fold::operations::ManifestRef) -> Digest {
+    let rest = manifest
+        .rest
+        .as_ref()
+        .map(|rest| serde_json::to_vec(rest).expect("a JSON value always serializes"))
+        .unwrap_or_default();
+    crate::parts::derived_key(
+        "plan manifest",
+        manifest.parts.iter().map(|part| (part.kind, &part.digest)),
+        &rest,
+    )
+}
+
+/// The system text a run on the current compaction contract renders from its plan manifest
+/// (`broca_core::compaction_v2::systems::from_manifest`), shared by every run whose manifest
+/// holds the same system text part. `reference` is the manifest's reference, `manifest` the
+/// manifest it references.
+fn manifest_system(
+    reference: &broca_session_store::fold::operations::ManifestRef,
+    manifest: &broca_wal::PlanManifest,
+    parts: &dyn Parts,
+) -> Result<Arc<Vec<Message>>, LoopError> {
+    let derive = || Ok(broca_core::compaction_v2::systems::from_manifest(manifest));
+    let text = reference
+        .parts
+        .iter()
+        .find(|part| part.kind == PartKind::SystemText);
+    match (parts.decoded(), text) {
+        (Some(decoded), Some(text)) => decoded
+            .get_or_decode(
+                crate::parts::derived_key(
+                    "plan manifest system messages",
+                    [(text.kind, &text.digest)],
+                    &[],
+                ),
+                derive,
+            )
+            .map_err(LoopError::Parts),
+        _ => derive().map(Arc::new).map_err(LoopError::Parts),
+    }
 }
 
 /// A run's admission as its start record froze it, read back from the fold and the setup
@@ -1258,7 +1339,8 @@ fn frozen_admission(
     // A resume that refroze the run's render config (before any provider call) or its account
     // (onto the one routing gave it) renders and bills under what it refroze.
     if let Some(refrozen) = &run.refrozen_render {
-        admission.render_config = refrozen["render_config"].clone();
+        // Read from the run's own record, not a setup part, so it is the run's alone.
+        admission.render_config = Arc::new(refrozen["render_config"].clone());
         admission.renderer_version = decode::<u32>(Some(refrozen["renderer_version"].clone()))?
             .unwrap_or(admission.renderer_version);
     }
@@ -1268,11 +1350,20 @@ fn frozen_admission(
     // A run whose strict schema was downgraded renders downgraded from then on, as today's
     // resume rebuilds its provider from the downgraded config.
     if run.structured_downgraded {
-        broca_protocol::structured_output::FrozenStructuredOutput::downgrade_render_config(
-            &mut admission.render_config,
-        );
+        downgrade_render_config(&mut admission.render_config);
     }
     Ok(admission)
+}
+
+/// Downgrades a run's strict schema in its render config
+/// (`FrozenStructuredOutput::downgrade_render_config`). The config may be shared, so `make_mut`
+/// gives the run a value of its own first: a copy while another holder keeps the shared one,
+/// otherwise the value itself, which the decoded-part cache then no longer hands out. Every
+/// other holder keeps the config as decoded.
+pub(crate) fn downgrade_render_config(render_config: &mut Arc<Value>) {
+    broca_protocol::structured_output::FrozenStructuredOutput::downgrade_render_config(
+        Arc::make_mut(render_config),
+    );
 }
 
 /// The cache marker order `start` froze, which its record keeps beside its config; `None` for a
@@ -1369,7 +1460,7 @@ pub fn run_config_of_start(
 ) -> Result<broca_wal::RunConfig, LoopError> {
     let (config, _) = run_config_members(
         start,
-        |part| parts.get(part).map_err(LoopError::Parts),
+        |part| crate::parts::value(parts, part).map_err(LoopError::Parts),
         || LoopError::Parts("a run start's carried config is not an object".into()),
     )?;
     serde_json::from_value(Value::Object(config)).map_err(|e| LoopError::Parts(e.to_string()))
@@ -1381,14 +1472,15 @@ pub fn admission_of_start(
     start: &broca_session_store::record::RunStart,
     parts: &dyn Parts,
 ) -> Result<Admission, LoopError> {
-    let part = |kind: PartKind| -> Result<Option<Value>, LoopError> {
-        start
-            .setup
-            .iter()
-            .find(|part| part.kind == kind)
-            .map(|part| parts.get(part).map_err(LoopError::Parts))
+    // Each part is read as the value every other holder of it shares.
+    fn shared<T>(parts: &dyn Parts, part: Option<&PartRef>) -> Result<Option<Arc<T>>, LoopError>
+    where
+        T: serde::de::DeserializeOwned + Send + Sync + 'static,
+    {
+        part.map(|part| crate::parts::shared(parts, part).map_err(LoopError::Parts))
             .transpose()
-    };
+    }
+    let part = |kind: PartKind| start.setup.iter().find(|part| part.kind == kind);
     let config = start
         .run_choices
         .as_ref()
@@ -1396,16 +1488,19 @@ pub fn admission_of_start(
         .cloned()
         .unwrap_or(Value::Null);
     let member = |key: &str| config.get(key).cloned();
+    // Read once, where the system text first needs it, and then held.
+    let manifest;
     Ok(Admission {
         run_id: start.run_id.clone(),
         model: start.model.clone(),
         input: Vec::new(),
-        tools: decode(part(PartKind::Tools)?)?.unwrap_or_default(),
+        tools: shared(parts, part(PartKind::Tools))?.unwrap_or_default(),
         tool_choice: decode(member("tool_choice"))?.unwrap_or_default(),
         generation: decode(member("generation"))?.unwrap_or_default(),
-        response_format: decode(part(PartKind::ResponseFormat)?)?.unwrap_or_default(),
+        response_format: shared(parts, part(PartKind::ResponseFormat))?.unwrap_or_default(),
         provider_options: member("provider_options").unwrap_or(Value::Null),
-        render_config: decode::<Value>(part(PartKind::RenderConfig)?)?.unwrap_or(Value::Null),
+        render_config: shared(parts, part(PartKind::RenderConfig))?
+            .unwrap_or_else(|| Arc::new(Value::Null)),
         renderer_version: start.renderer_version,
         stop_when: decode(member("stop_when"))?.unwrap_or_default(),
         on_restart: decode(start.on_restart.clone())?,
@@ -1414,19 +1509,23 @@ pub fn admission_of_start(
         account_limit_pause: decode::<bool>(member("account_limit_pause"))?.unwrap_or(false),
         ts_ms: start.ts_ms,
         written_at_ms: start.written_at_ms,
-        global_system: match (
-            start.compaction_plan_version,
-            frozen_manifest(start, parts)?,
-        ) {
-            (None, _) => Vec::new(),
-            (Some(_), Some(manifest)) => {
-                broca_core::compaction_v2::systems::from_manifest(&manifest)
+        global_system: {
+            let reference = broca_session_store::fold::operations::ManifestRef::of_start(start);
+            manifest = reference
+                .as_ref()
+                .map(|reference| stored_manifest(reference, parts))
+                .transpose()?;
+            match (start.compaction_plan_version, &reference, &manifest) {
+                (None, _, _) => Arc::default(),
+                (Some(_), Some(reference), Some(manifest)) => {
+                    manifest_system(reference, manifest, parts)?
+                }
+                (Some(_), _, _) => shared(parts, part(PartKind::GlobalSystem))?.unwrap_or_default(),
             }
-            (Some(_), None) => decode(part(PartKind::GlobalSystem)?)?.unwrap_or_default(),
         },
         compaction_plan_version: start.compaction_plan_version,
         context_limit: start.context_limit,
-        manifest: frozen_manifest(start, parts)?,
+        manifest,
         render_tags: member("render_tags")
             .and_then(|value| value.as_bool())
             .unwrap_or(false),
@@ -1682,7 +1781,7 @@ async fn offline_request_for<W: Writer>(
     };
     let episodes = Arc::new(render_history(writer, parts, &mut ToolSetCache::default()).await?);
     let run_rules = run_tag_rules(writer, &episodes, &mut TagRulesCache::default()).await?;
-    let tools = Arc::new(admission.tools.clone());
+    let tools = Arc::clone(&admission.tools);
     let enrollment = writer.enrollment().await?;
     let mut opts = call_options(
         writer,
@@ -1754,11 +1853,11 @@ where
     // what its renders rendered of each entry, which the next reuses where unchanged.
     let mut kept_prompt = crate::compaction::prompt::KeptPrompt::default();
     let rendered = broca_core::compaction_v2::render::RenderCache::default();
-    let tools = Arc::new(admission.tools.clone());
+    let tools = Arc::clone(&admission.tools);
     // The run's frozen plan says which preset each tool provider's calls carry, which providers
     // were fetched and what they declared, as today's loop reads it from the same plan. A call
     // without its preset is refused by a provider whose route is bound under a scope.
-    let mut manifest = ToolManifest::from_tools(admission.tools.clone());
+    let mut manifest = ToolManifest::from_shared_tools(Arc::clone(&admission.tools));
     if let Some(plan) = admission.manifest.as_deref() {
         manifest = manifest
             .with_plan_manifest(plan)
@@ -2696,27 +2795,36 @@ fn to_value<T: serde::Serialize>(value: Option<&T>) -> Result<Option<Value>, Loo
         .map_err(|e| LoopError::Parts(e.to_string()))
 }
 
-/// Writes the run's start. `checkpoint` is the highest part number the session has shown
-/// ([`shown_high`]), which the run's computed numbering continues after. `enrolled` is the
-/// record of the session's move onto the current compaction contract when this run makes it,
-/// which its start's batch carries.
-async fn admit<W: Writer>(
-    writer: &mut W,
-    parts: &mut dyn Parts,
+/// The session's refusal-fallback schedule the run carries: only under the same model and within
+/// a day of its last change, as today's admission decides it.
+fn refusal_schedule<W: Writer>(
+    writer: &W,
     admission: &Admission,
-    checkpoint: u64,
-    enrolled: Option<broca_session_store::record::CompactionEnrolled>,
-) -> Result<u64, LoopError> {
-    // The session's refusal-fallback schedule carries into the run only under the same model
-    // and within a day of its last change, as today's admission decides it.
-    let refusal_schedule = broca_core::refusal_fallback::on_episode_admitted(
+) -> Result<Option<Value>, LoopError> {
+    broca_core::refusal_fallback::on_episode_admitted(
         crate::refusal::schedule(writer)?,
         &admission.model,
         admission.ts_ms,
     )
     .map(serde_json::to_value)
     .transpose()
-    .map_err(|e| LoopError::Parts(e.to_string()))?;
+    .map_err(|e| LoopError::Parts(e.to_string()))
+}
+
+/// The setup parts a run's start names, as [`store_setup`] stored them, and what remains of its
+/// manifest, which stays with the run's choices.
+struct Setup {
+    parts: Vec<PartRef>,
+    manifest_rest: Option<Value>,
+}
+
+/// Stores the run's setup parts, then has the run hold their shared decoded values in place of
+/// the ones its send gave: its tools, response format, system text, render config and manifest
+/// with its tool list. Its resume and the session's next run (which inherits its tools) read
+/// the same parts, so every request of the session renders the same values, and every run of
+/// the process on the same parts holds one copy of each. A part that doesn't decode refuses the
+/// run.
+fn store_setup(parts: &mut dyn Parts, admission: &mut Admission) -> Result<Setup, LoopError> {
     let mut setup = Vec::new();
     // A planned run's system text is part of its manifest; any other run's is its own part.
     let global_system = (admission.manifest.is_none() && !admission.global_system.is_empty())
@@ -2731,7 +2839,10 @@ async fn admit<W: Writer>(
             serde_json::to_value(&admission.response_format),
         ),
         (PartKind::GlobalSystem, Ok(global_system)),
-        (PartKind::RenderConfig, Ok(admission.render_config.clone())),
+        (
+            PartKind::RenderConfig,
+            Ok(Value::clone(&admission.render_config)),
+        ),
     ] {
         let value = value.map_err(|e| LoopError::Parts(e.to_string()))?;
         if value.is_null() {
@@ -2741,10 +2852,66 @@ async fn admit<W: Writer>(
     }
     // A manifest's shared members are setup parts after the run config's, in the order the
     // resume reads them back; what remains of it stays with the run's choices.
+    let config_parts = setup.len();
     let manifest_rest = match &admission.manifest {
         Some(manifest) => manifest_parts(manifest, parts, &mut setup)?,
         None => None,
     };
+    let parts = &*parts;
+    fn decoded<T>(parts: &dyn Parts, part: &PartRef) -> Result<Arc<T>, LoopError>
+    where
+        T: serde::de::DeserializeOwned + Send + Sync + 'static,
+    {
+        crate::parts::shared(parts, part).map_err(|error| {
+            LoopError::Parts(format!("the run's {:?} setup part: {error}", part.kind))
+        })
+    }
+    for part in &setup[..config_parts] {
+        match part.kind {
+            PartKind::Tools => admission.tools = decoded(parts, part)?,
+            PartKind::ResponseFormat => admission.response_format = decoded(parts, part)?,
+            PartKind::GlobalSystem => admission.global_system = decoded(parts, part)?,
+            PartKind::RenderConfig => admission.render_config = decoded(parts, part)?,
+            _ => {}
+        }
+    }
+    if admission.manifest.is_some() {
+        // The reference the run's start makes to its manifest, as a later read takes it.
+        let reference = broca_session_store::fold::operations::ManifestRef {
+            parts: setup[config_parts..].to_vec(),
+            rest: manifest_rest.clone(),
+        };
+        let manifest = stored_manifest(&reference, parts)?;
+        // On the current compaction contract a planned run renders its manifest's system
+        // text, as `global_system` decided before the manifest was read back.
+        if admission.compaction_plan_version.is_some() {
+            admission.global_system = manifest_system(&reference, &manifest, parts)?;
+        }
+        admission.manifest = Some(manifest);
+    }
+    Ok(Setup {
+        parts: setup,
+        manifest_rest,
+    })
+}
+
+/// Writes the run's start, naming the setup parts [`store_setup`] stored. `refusal_schedule` is
+/// what [`refusal_schedule`] decided. `checkpoint` is the highest part number the session has
+/// shown ([`shown_high`]), which the run's computed numbering continues after. `enrolled` is the
+/// record of the session's move onto the current compaction contract when this run makes it,
+/// which its start's batch carries.
+async fn admit<W: Writer>(
+    writer: &mut W,
+    admission: &Admission,
+    setup: Setup,
+    refusal_schedule: Option<Value>,
+    checkpoint: u64,
+    enrolled: Option<broca_session_store::record::CompactionEnrolled>,
+) -> Result<u64, LoopError> {
+    let Setup {
+        parts: setup,
+        manifest_rest,
+    } = setup;
     let tool_names = admission
         .tools
         .iter()
@@ -2989,7 +3156,7 @@ fn render_episodes<W: Writer>(
                 prompt_start: index(episode.start),
                 first_user: episode.first_user.map(index),
                 frozen_config: match &episode.render_config {
-                    Some(part) => parts.get(part).map_err(LoopError::Parts)?,
+                    Some(part) => crate::parts::value(parts, part).map_err(LoopError::Parts)?,
                     None => Value::Null,
                 },
             })
@@ -3067,19 +3234,18 @@ fn tool_set_of_start(start: &RunStart, parts: &dyn Parts) -> Result<Option<Strin
     if start.seeded == Some(true) {
         return Ok(None);
     }
-    let part = |kind: PartKind| -> Result<Option<Value>, LoopError> {
-        start
-            .setup
-            .iter()
-            .find(|part| part.kind == kind)
-            .map(|part| parts.get(part).map_err(LoopError::Parts))
-            .transpose()
-    };
-    let tools: Vec<Tool> = decode(part(PartKind::Tools)?)?.unwrap_or_default();
-    let render_config = part(PartKind::RenderConfig)?.unwrap_or(Value::Null);
+    let part = |kind: PartKind| start.setup.iter().find(|part| part.kind == kind);
+    let tools = part(PartKind::Tools)
+        .map(|part| crate::parts::shared::<Vec<Tool>, _>(parts, part))
+        .transpose()
+        .map_err(LoopError::Parts)?;
+    let render_config = part(PartKind::RenderConfig)
+        .map(|part| crate::parts::shared::<Value, _>(parts, part))
+        .transpose()
+        .map_err(LoopError::Parts)?;
     Ok(Some(broca_core::signed_floor::tool_set_digest(
-        &tools,
-        &render_config,
+        tools.as_deref().map_or(&[], Vec::as_slice),
+        render_config.as_deref().unwrap_or(&Value::Null),
     )))
 }
 
@@ -3203,7 +3369,7 @@ fn call_options<W: Writer>(
     opts.render_episodes = episodes;
     opts.tools = Arc::clone(tools);
     opts.tool_choice = Arc::new(admission.tool_choice.clone());
-    opts.response_format = Arc::new(admission.response_format.clone());
+    opts.response_format = Arc::clone(&admission.response_format);
     opts.generation = Arc::new(admission.generation.clone());
     opts.provider_options = Arc::new(admission.provider_options.clone());
     opts.target_model = Some(admission.model.clone());
@@ -4764,7 +4930,7 @@ fn account_limit_pause<P: Provider, T>(
 /// this lifetime can prove the cache expired.
 pub(crate) fn requested_cache_ttl(admission: &Admission) -> Option<u64> {
     let frozen: broca_provider::wire::FrozenRenderConfig =
-        serde_json::from_value(admission.render_config.clone()).ok()?;
+        serde_json::from_value(Value::clone(&admission.render_config)).ok()?;
     broca_provider::cache_warm::requested_ttl_ms(&admission.model.provider_module_id, &frozen)
 }
 

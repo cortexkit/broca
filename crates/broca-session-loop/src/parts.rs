@@ -5,7 +5,9 @@
 //! of those bytes, as the converter computes it, so converted and new runs name equal parts
 //! alike.
 
-use std::collections::BTreeMap;
+use std::any::{Any, TypeId};
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Weak};
 
 use broca_session_store::codec::Digest;
 use broca_session_store::record::{PartKind, PartRef};
@@ -30,12 +32,156 @@ pub trait Parts: Send + Sync {
 
     /// Notes that `parts` are durable now.
     fn mark_stored(&mut self, _parts: &[PartRef]) {}
+
+    /// The decoded values of this store's parts that their holders share (see
+    /// [`DecodedParts`]). `None` for a store that keeps none, so every read decodes again.
+    fn decoded(&self) -> Option<DecodedParts> {
+        None
+    }
 }
 
-/// Parts held in memory, for tests and for runs whose parts the caller keeps elsewhere.
+/// Parts held in memory, for tests and for runs whose parts the caller keeps elsewhere. It keeps
+/// no decoded parts of its own: a [`SharedParts`] over it does.
 #[derive(Default)]
 pub struct MemoryParts {
     pub parts: BTreeMap<Digest, Vec<u8>>,
+}
+
+/// Setup parts already decoded, shared by every session and run of the process that uses them.
+///
+/// An entry is keyed by the part's digest and the type it was decoded as, so one part decoded
+/// as two types is two entries. The cache holds each value weakly: the value is freed when its
+/// last holder drops it, and the dead entry goes at the next insert. While any holder keeps a
+/// value, every later read of the same part as the same type gets that value and decodes
+/// nothing. A shared value is never changed: a holder that needs another value makes its own.
+#[derive(Clone, Default)]
+pub struct DecodedParts(Arc<std::sync::Mutex<Entries>>);
+
+/// The decoded-part cache's entries: each value held weakly, by its part's digest and the type
+/// it was decoded as.
+type Entries = HashMap<(Digest, TypeId), Weak<dyn Any + Send + Sync>>;
+
+impl DecodedParts {
+    /// The value held under `key` as a `T` while any holder keeps it, otherwise what `decode`
+    /// gives, which later reads then share. Two threads that miss together both decode, and
+    /// the second to finish takes the first one's value. `decode` may read other entries.
+    pub fn get_or_decode<T: Send + Sync + 'static>(
+        &self,
+        key: Digest,
+        decode: impl FnOnce() -> Result<T, String>,
+    ) -> Result<Arc<T>, String> {
+        let slot = (key, TypeId::of::<T>());
+        if let Some(held) = live::<T>(&self.entries(), &slot) {
+            return Ok(held);
+        }
+        // Decoded without the lock held, so a decode that reads other entries can't deadlock.
+        let decoded = Arc::new(decode()?);
+        let mut entries = self.entries();
+        if let Some(held) = live::<T>(&entries, &slot) {
+            return Ok(held);
+        }
+        entries.retain(|_, entry| entry.strong_count() > 0);
+        let entry: Weak<T> = Arc::downgrade(&decoded);
+        entries.insert(slot, entry);
+        Ok(decoded)
+    }
+
+    /// How many entries the cache holds, live or not yet removed.
+    pub fn len(&self) -> usize {
+        self.entries().len()
+    }
+
+    /// Whether the cache holds no entry.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn entries(&self) -> std::sync::MutexGuard<'_, Entries> {
+        // Every change to the map is a single insert or removal, so a holder that panicked
+        // left it whole.
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// The value `entries` holds under `slot`, while any holder keeps it.
+fn live<T: Send + Sync + 'static>(entries: &Entries, slot: &(Digest, TypeId)) -> Option<Arc<T>> {
+    entries.get(slot)?.upgrade()?.downcast::<T>().ok()
+}
+
+thread_local! {
+    /// How many times this thread decoded a part's stored bytes.
+    static DECODES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times this thread decoded a part's stored bytes, through any store here. Tests and
+/// measurements read it to see which reads decode and which share a decoded value.
+pub fn decodes_on_this_thread() -> u64 {
+    DECODES.with(std::cell::Cell::get)
+}
+
+/// A part's stored bytes decoded, counted for [`decodes_on_this_thread`].
+fn decode_bytes(bytes: &[u8]) -> Result<Value, String> {
+    DECODES.with(|count| count.set(count.get() + 1));
+    serde_json::from_slice(bytes).map_err(|e| e.to_string())
+}
+
+/// `part`'s value decoded as a `T`, shared with every other holder of the same part as a `T`
+/// in the process (see [`DecodedParts`]). It is exactly what decoding the part's value as a `T`
+/// gives; a store that keeps no decoded parts decodes it on every call.
+pub fn shared<T, P>(parts: &P, part: &PartRef) -> Result<Arc<T>, String>
+where
+    T: serde::de::DeserializeOwned + Send + Sync + 'static,
+    P: Parts + ?Sized,
+{
+    shared_or(parts, part, |error| error.to_string())
+}
+
+/// [`shared`], with `invalid` saying why a part's value isn't a `T`.
+pub fn shared_or<T, P>(
+    parts: &P,
+    part: &PartRef,
+    invalid: impl FnOnce(serde_json::Error) -> String,
+) -> Result<Arc<T>, String>
+where
+    T: serde::de::DeserializeOwned + Send + Sync + 'static,
+    P: Parts + ?Sized,
+{
+    let decode = || serde_json::from_value(parts.get(part)?).map_err(invalid);
+    match parts.decoded() {
+        Some(decoded) => decoded.get_or_decode(part.digest, decode),
+        None => decode().map(Arc::new),
+    }
+}
+
+/// `part`'s value as an owned JSON value, for a reader that builds a value of its own from it.
+/// Read through [`shared`]: while another holder keeps the part decoded as a `Value`, this
+/// copies that value instead of decoding the part again.
+pub fn value<P: Parts + ?Sized>(parts: &P, part: &PartRef) -> Result<Value, String> {
+    shared::<Value, P>(parts, part).map(Arc::unwrap_or_clone)
+}
+
+/// The key a value derived from other decoded values is shared under: `what` names the
+/// derivation, `from` the digests it is derived from, `rest` any other input, so no two
+/// derivations and no part share a key.
+pub fn derived_key<'a>(
+    what: &str,
+    from: impl IntoIterator<Item = (PartKind, &'a Digest)>,
+    rest: &[u8],
+) -> Digest {
+    let mut hasher = Sha256::new();
+    hasher.update(b"broca derived setup value\0");
+    hasher.update(what.as_bytes());
+    hasher.update([0]);
+    for (kind, digest) in from {
+        hasher.update(format!("{kind:?}").as_bytes());
+        hasher.update([0]);
+        hasher.update(digest.0);
+    }
+    hasher.update((rest.len() as u64).to_be_bytes());
+    hasher.update(rest);
+    Digest(hasher.finalize().into())
 }
 
 /// A part's stored bytes and their digest.
@@ -67,20 +213,27 @@ impl Parts for MemoryParts {
             .parts
             .get(&part.digest)
             .ok_or_else(|| "setup part missing".to_string())?;
-        serde_json::from_slice(bytes).map_err(|e| e.to_string())
+        decode_bytes(bytes)
     }
 }
 
 /// One parts store shared by several holders: a session's actor and its run both store parts
 /// in it, the actor while the run holds its own handle. Each call takes the lock for that call
 /// only, and parts calls never wait on anything else, so neither holder blocks the other for
-/// long.
+/// long. The holders share decoded parts too: the store's own when it keeps them, otherwise
+/// the ones this handle and its clones keep.
 #[derive(Clone)]
-pub struct SharedParts(pub std::sync::Arc<std::sync::Mutex<Box<dyn Parts>>>);
+pub struct SharedParts(
+    pub std::sync::Arc<std::sync::Mutex<Box<dyn Parts>>>,
+    DecodedParts,
+);
 
 impl SharedParts {
     pub fn new(parts: Box<dyn Parts>) -> Self {
-        Self(std::sync::Arc::new(std::sync::Mutex::new(parts)))
+        Self(
+            std::sync::Arc::new(std::sync::Mutex::new(parts)),
+            DecodedParts::default(),
+        )
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Box<dyn Parts>>, String> {
@@ -110,15 +263,23 @@ impl Parts for SharedParts {
             held.mark_stored(parts);
         }
     }
+
+    fn decoded(&self) -> Option<DecodedParts> {
+        let held = self.lock().ok().and_then(|parts| parts.decoded());
+        Some(held.unwrap_or_else(|| self.1.clone()))
+    }
 }
 
 /// The deployment's setup parts, shared by every session in the process: what its setup store
 /// held when the process loaded it, and what runs have put since. A part put here is held in
 /// memory and listed by [`Parts::unstored`] until a writer stores it. The list is the
 /// deployment's, not a session's: one session may name a part another session put first, so
-/// whichever writer appends first stores it.
+/// whichever writer appends first stores it. Their decoded values are shared the same way.
 #[derive(Clone, Default)]
-pub struct DeploymentParts(std::sync::Arc<std::sync::Mutex<DeploymentState>>);
+pub struct DeploymentParts {
+    state: std::sync::Arc<std::sync::Mutex<DeploymentState>>,
+    decoded: DecodedParts,
+}
 
 #[derive(Default)]
 struct DeploymentState {
@@ -129,16 +290,17 @@ struct DeploymentState {
 impl DeploymentParts {
     /// The parts the deployment's setup store holds, as its `load_all` read them.
     pub fn loaded(parts: impl IntoIterator<Item = (Digest, std::sync::Arc<[u8]>)>) -> Self {
-        Self(std::sync::Arc::new(std::sync::Mutex::new(
-            DeploymentState {
+        Self {
+            state: std::sync::Arc::new(std::sync::Mutex::new(DeploymentState {
                 parts: parts.into_iter().collect(),
                 unstored: BTreeMap::new(),
-            },
-        )))
+            })),
+            decoded: DecodedParts::default(),
+        }
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, DeploymentState>, String> {
-        self.0
+        self.state
             .lock()
             .map_err(|_| "a holder of the deployment's parts panicked while using them".to_owned())
     }
@@ -161,7 +323,7 @@ impl Parts for DeploymentParts {
             .parts
             .get(&part.digest)
             .ok_or_else(|| "setup part missing".to_string())?;
-        serde_json::from_slice(bytes).map_err(|e| e.to_string())
+        decode_bytes(bytes)
     }
 
     fn unstored(&self) -> Vec<(PartRef, Vec<u8>)> {
@@ -191,4 +353,11 @@ impl Parts for DeploymentParts {
             }
         }
     }
+
+    fn decoded(&self) -> Option<DecodedParts> {
+        Some(self.decoded.clone())
+    }
 }
+
+#[cfg(test)]
+mod tests;

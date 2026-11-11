@@ -2315,3 +2315,5 @@ impl Inventory {
         assert_eq!(changed, 1, "the session's address was reserved");
     }
 }
+
+mod decoded_parts;
