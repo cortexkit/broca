@@ -3,6 +3,21 @@ use broca_wal::{FramedRecord, WalRecord};
 
 #[test]
 fn admission_checkpoint_before_message_marks_keeps_exact_bytes() {
+    let pinned = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/golden/admission_before_message_marks.json"
+    ))
+    .unwrap();
+    let restored: AdmissionCheckpointV1 = serde_json::from_str(&pinned).unwrap();
+    assert!(
+        restored.tool_set_history.is_unknown(),
+        "an absent history must remain unknown, never known-empty"
+    );
+    let old_bytes = serde_json::to_string(&restored).unwrap();
+    assert_eq!(old_bytes, pinned.trim_end());
+    assert!(!old_bytes.contains("message_marks"));
+
+    // Rebuilding today knows there were no earlier runs; legacy checkpoint bytes cannot say so.
     let queued: WalRecord = serde_json::from_str(include_str!(
         "../../broca-wal/tests/golden/pre_step_transforms/queued.json"
     ))
@@ -13,16 +28,15 @@ fn admission_checkpoint_before_message_marks_keeps_exact_bytes() {
         record: queued,
     }])
     .unwrap();
+    assert_eq!(
+        checkpoint.tool_set_history,
+        broca_core::signed_floor::ToolSetHistory::Known(Default::default())
+    );
     let bytes = serde_json::to_string(&checkpoint).unwrap();
-    let pinned = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/golden/admission_before_message_marks.json"
-    ))
-    .unwrap();
-    assert_eq!(bytes, pinned.trim_end());
+    assert!(bytes.contains("\"tool_set_history\":{}"));
     assert!(!bytes.contains("message_marks"));
-    let restored: AdmissionCheckpointV1 = serde_json::from_str(&pinned).unwrap();
-    assert_eq!(restored, checkpoint);
+    let rebuilt: AdmissionCheckpointV1 = serde_json::from_str(&bytes).unwrap();
+    assert_eq!(rebuilt, checkpoint);
 }
 
 #[test]
