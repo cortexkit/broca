@@ -284,14 +284,32 @@ async fn an_import_writes_the_history_and_answers_its_retry_from_the_receipt() {
     let outcome = send_exactly(
         &commands,
         "r1",
-        request("next"),
+        {
+            let mut next = request("next");
+            next.principal = Some(core());
+            next.scope = broca_protocol::SendScope::Stamped(broca_protocol::BindScope {
+                scope: scope(),
+                owner_authorized: true,
+                kind: broca_protocol::ScopeKind::Head,
+                parent: None,
+                parent_state: None,
+            });
+            next
+        },
         SendKey::Minted,
         broca_protocol::Delivery::Queue,
         None,
     )
     .await;
     assert!(
-        matches!(&outcome, SendOutcome::Error(message) if message.contains("session.adopt")),
+        matches!(
+            &outcome,
+            SendOutcome::DeliveryRefused {
+                code: "invalid_params",
+                field: "plan",
+                ..
+            }
+        ),
         "{outcome:?}"
     );
     drop(commands);

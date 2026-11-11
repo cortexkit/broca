@@ -1396,9 +1396,9 @@ state! {
             reset: "never",
             bound: Bound::Fixed,
         },
-        /// The session's first run start, kept for what it froze for the session's whole life:
-        /// a fetch plan's manifest, among the setup parts it names, which today's rules read as
-        /// the first episode's. The run fold keeps only the latest run's start.
+        /// The session's admitting run start and its frozen setup. For a file import, the seed
+        /// stands here until the first owner send applies a plan; that run replaces the seed.
+        /// Ownership remains the import's. The run fold keeps only the latest run's start.
         6 opt pub first_start: crate::record::RunStart => {
             owner: "admission",
             reset: "never",
@@ -1416,13 +1416,29 @@ state! {
 }
 
 impl Owner {
+    /// File import records ownership and history, but only a real owner send applies a plan.
+    pub fn awaiting_import_admission(&self) -> bool {
+        self.first_start
+            .as_ref()
+            .is_some_and(|start| start.seeded == Some(true) && start.imported_ids.is_some())
+    }
+
+    /// Whether the next send freezes the session's first applied manifest.
+    pub fn needs_admission(&self) -> bool {
+        self.episodes == 0 || self.awaiting_import_admission()
+    }
+
     /// Folds one run start's principal and scope, as `SessionOwnershipV1::fold_run_started`
-    /// folds them, and keeps the session's first run start.
+    /// folds them, and keeps the session's admitting start (or its pending import seed).
     fn fold_run_start(&mut self, start: &crate::record::RunStart) {
         let principal = start.principal.as_ref();
         let scope = start.scope.as_ref();
         if self.episodes == 0 {
             self.first_principal = principal.cloned();
+            self.first_start = Some(start.clone());
+        } else if self.awaiting_import_admission() && start.seeded != Some(true) {
+            // Keep the import's owner and scope, but future plan/baseline reads must use the
+            // first admitted run rather than the seed's placeholder model and empty setup.
             self.first_start = Some(start.clone());
         }
         if self.adopted_session_class.is_none()

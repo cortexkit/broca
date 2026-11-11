@@ -2690,7 +2690,7 @@ session it creates by the same rule, in one complete store per class:
 `session-store-durable/`, `session-store/` (ordinary) and `session-store-ephemeral/`;
 the root holding a session's head is authoritative afterwards, and a head found in
 two roots is refused `session_in_two_classes`. A file import (`session.import` with a
-file source, which brings an OpenCode 2 or Pi agent head onto broca) carries no
+file source, which brings an OpenCode 1, OpenCode 2 or Pi agent head onto broca) carries no
 label and is placed durable by the same rule: ephemeral if it carries a retention
 policy, else `session-store-durable/`, whatever `backup_classes` lists.
 `session.move_to_store` (operator only)
@@ -2703,6 +2703,57 @@ Classed records require the must-understand WAL feature `session-class/v1`.
 A `v0.3.205` reader refuses those records by feature name; unclassed records retain
 their old bytes and remain readable. The reader, writer and capability ship
 together, with no writer switch or second rollout release.
+
+A file import records its attested owner and scope but applies no plan. Its owner's first
+`session.send` must carry `plan` and passes ordinary plan admission, including compaction
+enrollment and model selection; an omitted plan is `invalid_params` naming `plan`. Another
+principal is refused `scope_owner_mismatch`. The imported history precedes that send's prompt.
+`session.install_view` may install the moved head's view before this send, but is refused once
+the session has run. No `session.adopt` is needed or served for this transition. OpenCode 1
+sources are single-session SQLite extracts made by `ck-import opencode1-extract`, not the live
+host database; the source is digest-checked before reading and deleted only after durability.
+Both import list shapes carry `newest: {ordinal, mid, digest}`, all required: the exact last
+entry the import placed, including the digest `session.entries` serves. It is not the current
+session head. The receipt records the imported message count and move ids; retries reproject
+that original immutable entry and its facts through the same stored-entry code as
+`session.entries`, checking its id against the receipt. Source deletion, views and later owner
+runs do not change it. No extra receipt field is needed; a missing/replaced original entry
+refuses recovery instead of answering with another entry.
+
+OpenCode 1 source rows cover every session message, ordered by `time_created`, then id, even
+when a row projects nothing and has `entry: null`. The extract preserves both ordering columns.
+`finished_summary` is true when summary is true/numeric 1 and finish is `stop`, regardless of
+role or error, exactly `COALESCE(json_extract(data,'$.summary'),0) = 1 AND
+COALESCE(json_extract(data,'$.finish'),'') = 'stop'`. A summary object or another finish is false.
+Move rows have no `source_entry` member, not even null.
+An older OpenCode 1 message's `pending` or `running` tool part is a historical interruption:
+it keeps its recorded input (or `{}`) and the host's error result
+`[Tool execution was interrupted]`. Only such a part in the last source message row refuses
+`import_open_call`, because that row can still be live. Source-row order is `time_created`, then
+message id; a later row that projects no message still makes an earlier unfinished call historical.
+
+Before importing, an operator can run `ck-import opencode1-check --extract FILE --session ID`.
+It uses the import reader and the same media byte/type admission without needing a store. It
+prints one counts-only JSON object: source/imported roles, calls, exclusive result kinds,
+distinct media byte objects and occurrences, dropped systems, rows projecting nothing (including
+systems), and finished summaries (including errored summaries). A refusal prints only its code
+and one-based source message ordinal, or null when no source row is responsible, and exits 1; it prints
+neither source diagnostics nor message ids/content. The check does not exercise import-root,
+digest or idempotency checks, or store-write/encryption/durability admission. Without
+`--moves-out`, it also does not check whether imported part numbers fit above the caller's
+highest already-shown number (`tag_floor`). A successful check is not a promise that a later
+durable import cannot fail.
+
+With `--moves-out FILE` and optional `--tag-floor N` (default 0), the checker also runs the real
+import seeder without a daemon or store. It creates a new owner-only file with wrapper
+`{offline: true, unminted_prefix: "unminted:", moves, newest}`. The `moves` member remains
+wire-decodable: source rows are exact; every added row keeps its exact ordinal and `added: true`
+but its mid is `unminted:<n>` counting added rows from 1. The real store must mint those ids
+from its message-id prefix and next record sequence. `newest.ordinal` is exact; its mid/digest
+are exact for a source newest, or both `unminted:` markers for an added newest. A single stderr
+line reports the count and reason. The wrapper prevents this partial rehearsal list from
+being mistaken for a real import reply, and contains no message content. `--tag-floor` requires
+`--moves-out`; seeding also validates that imported part numbers fit above that floor.
 
 ### Restoring the new storage from a backup
 

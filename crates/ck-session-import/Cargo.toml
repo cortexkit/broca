@@ -10,6 +10,8 @@ description = "Foreign harness session readers that convert transcripts to broca
 [dependencies]
 base64 = "0.22"
 broca-protocol = { path = "../broca-protocol" }
+broca-owner-only = { path = "../broca-owner-only" }
+broca-records = { path = "../broca-records" }
 cortexkit-role-llm-runner.workspace = true
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde_json.workspace = true

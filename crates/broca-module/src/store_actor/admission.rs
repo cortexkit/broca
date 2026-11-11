@@ -23,6 +23,9 @@ impl Admission {
         if self.0.get().is_some() {
             return Ok(());
         }
+        if session.operations().owner.awaiting_import_admission() {
+            return Ok(());
+        }
         let Some(first) = session.operations().owner.first_start.as_ref() else {
             return Ok(());
         };

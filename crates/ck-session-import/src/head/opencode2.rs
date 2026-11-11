@@ -119,6 +119,7 @@ pub fn read(bytes: &[u8], check: &mut MediaCheck<'_>) -> Result<HeadHistory, Hea
         moves.push(SourceRow {
             mid,
             message: (drafts.len() > first).then_some(first),
+            finished_summary: false,
         });
     }
     // OpenCode 2 sends no call without its result, so a call left without one means the head

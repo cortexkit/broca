@@ -570,7 +570,11 @@ mod records {
     });
     crate::fuzzing::gen::fields!(ImportedId { mid, ordinal });
     crate::fuzzing::gen::fields!(ImportedIdMap { ids });
-    crate::fuzzing::gen::fields!(ImportedMove { mid, ordinal });
+    crate::fuzzing::gen::fields!(ImportedMove {
+        mid,
+        ordinal,
+        finished_summary
+    });
     crate::fuzzing::gen::fields!(ImportReceipt {
         import_id,
         digest,

@@ -1311,14 +1311,24 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             } => {
                 // An ordered send is admitted below, by today's rules; how it is delivered is the
                 // order's, not the string `delivery` beside it. So is an interrupt.
-                // An imported session runs only once `session.adopt` gives it the plan its head
-                // ran under, which isn't built yet: without it, a run would start with none.
-                if self.session.operations().imported_ids.is_some() {
-                    let _ = reply.send(SendOutcome::Error(
-                        "an imported session takes no send until session.adopt gives it a plan"
-                            .into(),
-                    ));
-                    return false;
+                // Import already fixed the owner and scope. Its first owner send applies the
+                // plan through ordinary admission, without replacing that recorded ownership.
+                if self.session.operations().owner.awaiting_import_admission() {
+                    if let Err(outcome) = self
+                        .send_scope(&run_id, &request, delivery, false, false)
+                        .await
+                    {
+                        let _ = reply.send(outcome);
+                        return false;
+                    }
+                    if plan.is_none() {
+                        let _ = reply.send(SendOutcome::DeliveryRefused {
+                            code: "invalid_params",
+                            field: "plan",
+                            message: "an imported session's first owner send requires plan".into(),
+                        });
+                        return false;
+                    }
                 }
                 // As in today's actor, a send's display marks are admitted first, against the
                 // session's owner summary and the principal and scope the send came with, before
@@ -1499,7 +1509,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                     if crate::plan_episode::tools_are_frozen(
                         retry,
                         matches!(key, crate::actor::SendKey::RunId),
-                        self.session.operations().owner.episodes > 0,
+                        !self.session.operations().owner.needs_admission(),
                         frozen.is_some(),
                     ) {
                         let _ = reply.send(crate::plan_episode::tools_frozen_refusal());
@@ -1512,7 +1522,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 let mut manifest = frozen.clone();
                 let model_check = plan.as_ref().and_then(|plan| plan.model_check.clone());
                 if let Some(plan) = plan {
-                    if self.session.operations().owner.episodes == 0 {
+                    if self.session.operations().owner.needs_admission() {
                         match plan.manifest {
                             Some(fetched) => manifest = Some(fetched),
                             // The serve layer saw a run when it checked the plan, so it fetched
@@ -1552,6 +1562,36 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 }
                 let mut identity = None;
                 if key.is_keyed() {
+                    // Serve resolved plan.model on the imported head's admitting send, but a
+                    // retry arrives with an inherited-model placeholder. Hash that retry with
+                    // the admitting run's model, not the seed's model or a later selection.
+                    if self.session.operations().imported_ids.is_some()
+                        && request
+                            .inherit_frozen
+                            .contains(&broca_protocol::request::InheritedParam::Model)
+                    {
+                        if let Some(start) = self
+                            .session
+                            .operations()
+                            .owner
+                            .first_start
+                            .as_ref()
+                            .filter(|start| start.seeded != Some(true) && start.run_id == run_id.0)
+                        {
+                            match broca_session_loop::run::admission_of_start(start, &self.parts) {
+                                Ok(admitted) => {
+                                    request.model = admitted.model;
+                                    request.variant = admitted.variant;
+                                }
+                                Err(error) => {
+                                    let _ = reply.send(SendOutcome::Transient(format!(
+                                        "the imported head's admitting run: {error:?}"
+                                    )));
+                                    return false;
+                                }
+                            }
+                        }
+                    }
                     match self
                         .keyed(retries::KeyedSend {
                             run_id: &run_id,
@@ -1639,7 +1679,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 {
                     // A session's first send runs on the plan it fetched; a later one on the
                     // session's choice.
-                    let selection = if self.session.operations().owner.episodes == 0 {
+                    let selection = if self.session.operations().owner.needs_admission() {
                         Ok(manifest
                             .as_deref()
                             .and_then(broca_core::head::manifest_selection))
@@ -2639,7 +2679,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         // plan's tools fill them in.
         let tools_were_omitted = start.request.tools.is_none();
         start.prepared.tools_were_omitted = tools_were_omitted;
-        let first_run = self.session.operations().owner.episodes == 0;
+        let first_run = self.session.operations().owner.needs_admission();
         if !first_run {
             let (manifest, applies) =
                 self.run_plan(&start.request.model, start.request.variant.as_deref())?;

@@ -161,15 +161,33 @@ fn receipt() -> ImportReceipt {
             ImportedMove {
                 mid: "msg_u1".into(),
                 ordinal: Some(1),
+                finished_summary: None,
             },
             ImportedMove {
                 mid: "msg_sys".into(),
                 ordinal: None,
+                finished_summary: None,
             },
         ],
         imported_messages: 3,
         dropped_system_messages: 1,
     }
+}
+
+#[test]
+fn import_receipts_without_finished_summary_remain_readable() {
+    let old = receipt();
+    let decoded = ImportReceipt::decode(&old.encode()).unwrap();
+    assert_eq!(decoded, old);
+    assert!(decoded
+        .moves
+        .iter()
+        .all(|row| row.finished_summary.is_none()));
+    let mut plugin = old.clone();
+    plugin.moves[0].finished_summary = Some(true);
+    plugin.moves[1].finished_summary = Some(false);
+    assert_eq!(ImportReceipt::decode(&plugin.encode()).unwrap(), plugin);
+    assert_ne!(plugin.encode(), old.encode());
 }
 
 /// An imported history of three messages, the first carrying an image, each message followed
