@@ -213,6 +213,9 @@ A consumer can be both. The surface is **session-centric**: consumers address
   unscoped. Neither storage roots nor the namespace are sent as wire bind projects.
   Tool routes to the plan's compaction or step-transform providers bind the session's own
   harness and session; other tool modules bind `runner` with the unchanged session string.
+  AFT (`module_id: aft`) additionally receives the real harness when it is `broca`, so its
+  background-command completion notices can address that session. Other harnesses still
+  become `runner`; this exception changes neither the attested principal nor the frozen scope.
   Keeping one `(harness, session)` bind pair per session at a provider relies on the session
   string being unique per consumer and provider, which every caller today satisfies
   (Core names each session with its own task id).

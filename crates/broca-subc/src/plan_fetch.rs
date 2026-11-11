@@ -440,7 +440,7 @@ mod carrier_catalog_tests {
         .with_compaction_provider(Some("compactor".into()))
         .with_hook_providers(["hook".into()]);
         let fetch = async {
-            for provider in ["compactor", "hook", "aft"] {
+            for provider in ["compactor", "hook", "aft", "other"] {
                 fetcher.call(provider, CATALOG_OP, json!({})).await.unwrap();
             }
         };
@@ -450,14 +450,14 @@ mod carrier_catalog_tests {
                 serde_json::from_slice::<Value>(&request.body).unwrap()["op"],
                 "catalog.list"
             );
-            daemon.reply(&request, inventory(&["compactor", "hook", "aft"]));
-            for provider in ["compactor", "hook", "aft"] {
+            daemon.reply(&request, inventory(&["compactor", "hook", "aft", "other"]));
+            for provider in ["compactor", "hook", "aft", "other"] {
                 let open = daemon.next_request().await;
                 let body: Value = serde_json::from_slice(&open.body).unwrap();
                 assert_eq!(
                     body["identity"],
                     json!({
-                        "harness": if provider == "aft" { "runner" } else { "broca" },
+                        "harness": if provider == "other" { "runner" } else { "broca" },
                         "session": "session",
                     })
                 );
