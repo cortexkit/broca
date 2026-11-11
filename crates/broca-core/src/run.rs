@@ -7928,8 +7928,8 @@ where
                     )
                     .await;
                 }
-                // Surface the error live (direct consumers of `out`, e.g. the broca-run
-                // CLI) AND carry it out of the loop so the durable RunFinished persists
+                // Surface the error live for direct consumers of `out` AND carry it
+                // out of the loop so the durable RunFinished persists
                 // it — module subscribers source control from the WAL projection, not
                 // `out`, so without persisting it the cause would be lost on the stream.
                 let _ = send(

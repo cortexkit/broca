@@ -296,7 +296,7 @@ partition_inventory() {
 }
 
 deploy() {
-  cargo build --release --locked -p broca-module-serve -p broca-run --bin ck-broca --bin broca-session --bin broca-run
+  cargo build --release --locked -p broca-module-serve --bin ck-broca --bin broca-session
   BROCA_DEPLOY_TEST_BIN="$CARGO_TARGET_DIR/release/ck-broca" BROCA_REQUIRE_LINUX_DEPLOY=1 \
     python3 -B scripts/test-place-release-gate.py LinuxDeployTests.test_real_linux_subc_stage_place_restart_verify -v
 }

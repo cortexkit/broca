@@ -141,7 +141,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/release-clients.sh"
 if [ -z "$STAGED" ]; then
   STAGED="$HOME/.local/share/cortexkit/staging/ck-broca.$(git -C "$(dirname "${BASH_SOURCE[0]}")/.." rev-parse --short=8 HEAD)"
 fi
-for client in broca-session broca-run; do
+for client in broca-session; do
   broca_verify_client "$(dirname "$BIN")/$client" "${MODULE_VERSION_LINE#ck-broca }" \
     "$(broca_release_client_path "$STAGED" "$client")" || fail=1
 done

@@ -27,7 +27,7 @@ deploy = load_suite("client_deploy_fixture", "test-deploy.py")
 
 
 class StageClientsTests(unittest.TestCase):
-    def test_stage_builds_and_publishes_all_three_signed_binaries_sidecar_first(self):
+    def test_stage_builds_and_publishes_module_and_session_signed_binaries_sidecar_first(self):
         with tempfile.TemporaryDirectory(prefix="release clients ") as directory:
             root = Path(directory)
             scripts = root / "scripts"
@@ -72,7 +72,7 @@ esac
 printf '%s\n' "$*" > "$CARGO_LOG"
 target="${CARGO_TARGET_DIR:-target}/release"
 mkdir -p "$target"
-for name in ck-broca broca-session broca-run; do
+for name in ck-broca broca-session; do
  case " $* " in *" --bin $name "*) ;; *) continue ;; esac
  printf '#!/bin/sh\necho "%s 0.0.2"\n' "$name" > "$target/$name"
  chmod 755 "$target/$name"
@@ -106,11 +106,12 @@ exec "$REAL_MV" "$@"
                                     capture_output=True, timeout=60)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             args = (root / "cargo.log").read_text()
-            self.assertIn("-p broca-module-serve -p broca-run", args)
+            self.assertIn("-p broca-module-serve", args)
+            self.assertNotIn("broca-run", args)
             self.assertFalse((root / "target/release").exists())
             seam = root / "home/.local/share/cortexkit/staging"
             renames = log.read_text().splitlines()
-            for name in ("ck-broca", "broca-session", "broca-run"):
+            for name in ("ck-broca", "broca-session"):
                 self.assertIn(f"--bin {name}", args)
                 artifact = seam / f"{name}.deadbeef"
                 self.assertTrue(artifact.is_file(), result.stdout)
@@ -128,7 +129,7 @@ class ClientPlacementTests(gate.GateBase):
         super().setUp()
         gate.stub_binary(self.dest, version="0.3.148", features=[], signed="adhoc,runtime")
         gate.stub_binary(self.staged, features=[], signed="adhoc,runtime")
-        for name in ("broca-session", "broca-run"):
+        for name in ("broca-session",):
             gate.stub_client(self.bindir / name, name, "0.3.148")
         self.restart_log = self.tmp / "restart.log"
         ck = self.fake_bin / "ck"
@@ -137,17 +138,17 @@ class ClientPlacementTests(gate.GateBase):
 
     def test_missing_client_refuses_before_any_placement_or_restart(self):
         before = self.dest.read_bytes()
-        (self.tmp / "broca-run.staged").unlink()
+        (self.tmp / "broca-session.staged").unlink()
         result = self.place("--restart")
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("client-missing", result.stderr)
-        self.assertIn("broca-run", result.stderr)
+        self.assertIn("broca-session", result.stderr)
         self.assertEqual(self.dest.read_bytes(), before)
         self.assertFalse(self.restart_log.exists())
 
     def test_client_version_mismatch_refuses_before_restart(self):
         before = self.dest.read_bytes()
-        gate.stub_client(self.tmp / "broca-run.staged", "broca-run", "0.3.198")
+        gate.stub_client(self.tmp / "broca-session.staged", "broca-session", "0.3.198")
         result = self.place("--restart")
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("client-version", result.stderr)
@@ -156,7 +157,7 @@ class ClientPlacementTests(gate.GateBase):
         self.assertFalse(self.restart_log.exists())
 
     def test_clients_rename_before_restart_and_keep_verifiable_backups(self):
-        originals = {name: (self.bindir / name).read_bytes() for name in ("broca-session", "broca-run")}
+        originals = {name: (self.bindir / name).read_bytes() for name in ("broca-session",)}
         # The restart stub observes destination bytes, rather than trusting placement's log.
         ck = self.fake_bin / "ck"
         ck.write_text('#!/bin/sh\nset -e\n' + ''.join(
@@ -168,6 +169,7 @@ class ClientPlacementTests(gate.GateBase):
         self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
         self.assertTrue(self.restart_log.exists(), result.stderr)
         saved = json.loads(report.read_text())
+        self.assertEqual(set(saved["client_backups"]), {"broca-session"})
         for name, original in originals.items():
             self.assertEqual((self.bindir / name).read_bytes(), (self.tmp / f"{name}.staged").read_bytes())
             backup = Path(saved["client_backups"][name])
@@ -180,7 +182,7 @@ class ClientPlacementTests(gate.GateBase):
         before = self.dest.read_bytes()
         mv = self.fake_bin / "mv"
         mv.write_text('#!/bin/sh\nfor target; do :; done\n' +
-                      f'[ "$target" != "{self.bindir / "broca-run"}" ] || exit 17\n' +
+                      f'[ "$target" != "{self.bindir / "broca-session"}" ] || exit 17\n' +
                       f'exec "{shutil.which("mv")}" "$@"\n')
         mv.chmod(0o755)
         result = self.place("--restart")
@@ -189,10 +191,9 @@ class ClientPlacementTests(gate.GateBase):
         self.assertFalse(self.restart_log.exists())
 
     def test_rollback_can_restore_absent_clients(self):
-        result = self.place("--remove-session", "--remove-run")
+        result = self.place("--remove-session")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertFalse((self.bindir / "broca-session").exists())
-        self.assertFalse((self.bindir / "broca-run").exists())
 
 
 class HealthSnapshotTests(gate.GateBase):
@@ -295,10 +296,32 @@ class ClientVerificationTests(gate.GateBase):
         super().setUp()
         gate.stub_binary(self.dest, features=[], signed="adhoc,runtime")
 
+    def test_placement_and_verification_leave_retired_runner_and_rollback_untouched(self):
+        gate.stub_binary(self.staged, features=[], signed="adhoc,runtime")
+        executed = self.tmp / "retired-runner-executed"
+        legacy = [self.bindir / "broca-run", self.bindir / "broca-run.rollback"]
+        for path in legacy:
+            path.write_text(f'#!/bin/sh\ntouch "{executed}"\nexit 42\n')
+            path.chmod(0o700)
+
+        def snapshot(path):
+            stat = path.stat()
+            return path.read_bytes(), stat.st_ino, stat.st_mode, stat.st_mtime_ns
+
+        before = {path: snapshot(path) for path in legacy}
+        placed = self.place()
+        self.assertEqual(placed.returncode, 0, placed.stdout + placed.stderr)
+        verified = self.verify()
+        self.assertEqual(verified.returncode, 0, verified.stdout + verified.stderr)
+        self.assertEqual({path: snapshot(path) for path in legacy}, before)
+        self.assertFalse(executed.exists())
+        self.assertEqual(list(self.rollback.glob("broca-run*")), [])
+        self.assertNotIn("broca-run", placed.stdout + placed.stderr + verified.stdout + verified.stderr)
+
     def test_wrong_client_version_fails_verification_even_with_matching_digest(self):
-        client = self.bindir / "broca-run"
-        gate.stub_client(client, "broca-run", "0.3.198")
-        shutil.copy2(Path(str(client) + ".sha256.postsign"), self.tmp / "broca-run.staged.sha256.postsign")
+        client = self.bindir / "broca-session"
+        gate.stub_client(client, "broca-session", "0.3.198")
+        shutil.copy2(Path(str(client) + ".sha256.postsign"), self.tmp / "broca-session.staged.sha256.postsign")
         result = self.verify()
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("client --version mismatch", result.stderr)
@@ -317,21 +340,22 @@ class ClientVerificationTests(gate.GateBase):
         self.assertIn("client sha256 mismatch", result.stderr)
 
     def test_missing_staged_client_sidecar_fails_verification(self):
-        (self.tmp / "broca-run.staged.sha256.postsign").unlink()
+        (self.tmp / "broca-session.staged.sha256.postsign").unlink()
         result = self.verify()
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("missing staged client sidecar", result.stderr)
 
 
 class ClientRollbackTests(deploy.DeployTests):
-    def test_rollback_command_names_module_and_both_clients(self):
+    def test_rollback_command_names_module_and_session_client(self):
         result = self.deploy(FAIL_STEP="verify")
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         rollback = next(line for line in result.stderr.splitlines() if line.startswith("Rollback: "))
-        for name in ("broca-session.rollback", "broca-run.rollback", "bin/ck-broca"):
+        for name in ("broca-session.rollback", "bin/ck-broca"):
             self.assertIn(name, rollback)
         self.assertIn("--session-staged", rollback)
-        self.assertIn("--run-staged", rollback)
+        self.assertNotIn("broca-run", rollback)
+        self.assertNotIn("--run-staged", rollback)
 
     def test_first_install_rollback_explicitly_restores_absent_clients(self):
         stub = self.scripts / "stub.py"
@@ -341,7 +365,7 @@ class ClientRollbackTests(deploy.DeployTests):
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         rollback = next(line for line in result.stderr.splitlines() if line.startswith("Rollback: "))
         self.assertIn("--remove-session", rollback)
-        self.assertIn("--remove-run", rollback)
+        self.assertNotIn("--remove-run", rollback)
 
 
 if __name__ == "__main__":

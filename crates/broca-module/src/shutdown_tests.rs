@@ -187,8 +187,8 @@ impl Fixture {
     }
 
     /// The production shape: a durable run index beside the WAL. The other constructors omit
-    /// it because most seal arms are about the WAL, and an index-free registry is a legal
-    /// deployment (`broca-run`).
+    /// it because most seal arms are about the WAL, and the registry supports callers
+    /// without a run index.
     fn with_run_index(resolved: bool) -> Self {
         Self::build(resolved, None, true, false, None, true)
     }

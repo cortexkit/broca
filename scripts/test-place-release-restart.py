@@ -60,7 +60,7 @@ class RestartTests(unittest.TestCase):
                 check=True, capture_output=True,
             )
         self.old_inode = self.dest.stat().st_ino
-        for client in ("broca-session", "broca-run"):
+        for client in ("broca-session",):
             src = self.tmp / f"{client}.c"
             src.write_text(f'#include <stdio.h>\nint main(void) {{ puts("{client} 0.0.1"); return 0; }}\n')
             subprocess.run(["cc", "-o", str(self.tmp / f"{client}.staged"), str(src)], check=True)
@@ -151,7 +151,7 @@ printf 'COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\\nck-broca %s user tx
 
     def test_client_resigning_preserves_staged_postsign_hashes(self) -> None:
         expected = {}
-        for client in ("broca-session", "broca-run"):
+        for client in ("broca-session",):
             staged = self.tmp / f"{client}.staged"
             subprocess.run(["codesign", "--force", "--sign", "-", "-o", "runtime",
                             "--identifier", client, str(staged)], check=True, capture_output=True)

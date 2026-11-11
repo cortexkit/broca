@@ -98,7 +98,7 @@ int main(int argc, char **argv) {
         shutil.copy2(self.dest, self.staged)
         with self.staged.open("ab") as output:
             output.write(b"\nnew-release-marker\n")
-        for client in ("broca-session", "broca-run"):
+        for client in ("broca-session",):
             source.write_text(f'#include <stdio.h>\nint main(void) {{ puts("{client} 0.0.1"); return 0; }}\n')
             staged_client = self.tmp / f"{client}.staged"
             subprocess.run(["cc", str(source), "-o", str(staged_client)], check=True, capture_output=True)
@@ -183,7 +183,7 @@ int main(int argc, char **argv) {
         artifact = release / "ck-broca.deadbeef"
         shutil.copy2(self.staged, artifact)
         client_shas = {}
-        for client in ("broca-session", "broca-run"):
+        for client in ("broca-session",):
             staged_client = release / f"{client}.deadbeef"
             shutil.copy2(self.tmp / f"{client}.staged", staged_client)
             # Same version, different bytes: stale fixture sidecars must not verify this release.
@@ -432,7 +432,7 @@ int main(int argc, char **argv) {
             verified = self.verify(sha, staged=artifact, marker="ck-broca", control="broca")
             self.assertEqual(verified.returncode, 0, verified.stdout + verified.stderr)
             self.assertIn("running sha256", verified.stdout)
-            for client in ("broca-session", "broca-run"):
+            for client in ("broca-session",):
                 self.assertIn(f"client   {self.dest.parent / client} -- version ", verified.stdout)
             print(f"real Linux deploy: pid {old_pid} -> {new_pid}; ELF sha256 {sha}; inode/hash MATCH")
         finally:
@@ -629,7 +629,7 @@ class GateBase(unittest.TestCase):
         self.codesign_log = self.tmp / "codesign.log"
         self.fake_bin = self.tmp / "fake-bin"
         self.fake_bin.mkdir()
-        for client in ("broca-session", "broca-run"):
+        for client in ("broca-session",):
             stub_client(self.tmp / f"{client}.staged", client)
             shutil.copy2(self.tmp / f"{client}.staged", self.bindir / client)
         for name, body in (
@@ -980,8 +980,8 @@ print(f"ck-broca 4243 user txt REG 1 1 {{inode}} {self.dest}")
         self.assertEqual(read_flags(self.dest), "adhoc,runtime")
         self.assertIn("signing   flags=adhoc,runtime", result.stdout)
         sign_calls = [l for l in self.codesign_log.read_text().splitlines() if " -s " in f" {l} "]
-        self.assertEqual(len(sign_calls), 3, sign_calls)
-        for call, name in zip(sign_calls, ("ck-broca", "broca-session", "broca-run")):
+        self.assertEqual(len(sign_calls), 2, sign_calls)
+        for call, name in zip(sign_calls, ("ck-broca", "broca-session")):
             self.assertIn("-o runtime", call)
             self.assertIn(f"--identifier {name}", call)
 

@@ -110,7 +110,7 @@ supervisor can respawn it.
 | `cortexkit-chatgpt-policy` | Shared ChatGPT/Codex account-id, refusal and quota-header policy. |
 | `broca-store` | Materialized store, export index and store maintenance. |
 | `ck-session-import`, `ck-import` | Readers for other harnesses' logs and the import CLI. |
-| `broca-run`, `broca-bench`, `broca-replay`, `broca-test-support` | Standalone runner, benchmarks, replay fixtures and test support. |
+| `broca-bench`, `broca-replay`, `broca-test-support` | Benchmarks, replay fixtures and test support. |
 | `broca-crash-harness` | Crash-cut testing and recovery invariant checks. |
 
 ## Invariants

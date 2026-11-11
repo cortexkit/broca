@@ -373,7 +373,7 @@ BUILD_LOG=$(mktemp "${TMPDIR:-/tmp}/broca-release-build.XXXXXX")
 build_status=0
 set +e
 {
-    python3 scripts/lib/cargo-watchdog.py --step "build signed release artifact" -- cargo build --release --locked -p broca-module-serve -p broca-run --bin ck-broca --bin broca-session --bin broca-run --quiet 2>&1 1>&3 3>&- | tee "$BUILD_LOG" >&2
+    python3 scripts/lib/cargo-watchdog.py --step "build signed release artifact" -- cargo build --release --locked -p broca-module-serve --bin ck-broca --bin broca-session --quiet 2>&1 1>&3 3>&- | tee "$BUILD_LOG" >&2
     build_status=${PIPESTATUS[0]}
 } 3>&1
 set -e
@@ -686,7 +686,7 @@ fi
 
 # Clients are signed in private scratch too: publishing a build-tree copy would bypass both
 # the hardened signature and the sidecar-first hand-off used for the module.
-for client in broca-session broca-run; do
+for client in broca-session; do
     client_built="${CARGO_TARGET_DIR:-target}/release/$client"
     client_tmp="$BUILD_SCRATCH/$client.$COMMIT.incoming"
     client_staged="$SEAM/$client.$COMMIT"

@@ -113,7 +113,7 @@ class RetryMarkerStaging(unittest.TestCase):
 class ClientMarkerStaging(unittest.TestCase):
     def test_staging_refuses_test_harness_client(self):
         source = (ROOT / "scripts/stage-release.sh").read_text()
-        start = source.index("for client in broca-session broca-run; do", source.index("# Clients are signed in private scratch too:"))
+        start = source.index("for client in broca-session; do", source.index("# Clients are signed in private scratch too:"))
         block = source[start:source.index("# THE CURRENT-ARTIFACT MANIFEST.", start)]
         with tempfile.TemporaryDirectory(prefix="broca-client-marker-") as tmp:
             root = Path(tmp)
@@ -121,7 +121,7 @@ class ClientMarkerStaging(unittest.TestCase):
             (target / "release").mkdir(parents=True)
             (root / "scratch").mkdir()
             (root / "seam").mkdir()
-            for client in ("broca-session", "broca-run"):
+            for client in ("broca-session",):
                 (target / "release" / client).write_text(RETRY_MARKER + "\n")
             result = subprocess.run(
                 ["bash", "-c", 'set -euo pipefail; source "$ROOT/scripts/nonshipping-markers.sh"; '
@@ -171,11 +171,11 @@ class ReleaseMarkerPlacement(placement.GateBase):
         self.assert_refused(self.place())
 
     def test_client_marker_refuses_before_any_binary_is_placed(self):
-        client = self.tmp / "broca-run.staged"
+        client = self.tmp / "broca-session.staged"
         client.write_bytes(client.read_bytes().replace(
             b"# identity", b"# " + RETRY_MARKER.encode() + b"\n# identity",
         ))
-        self.assert_refused(self.place(), name="broca-run")
+        self.assert_refused(self.place(), name="broca-session")
 
     def test_normal_placement_passes_marker_checks(self):
         result = self.place()

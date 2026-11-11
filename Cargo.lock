@@ -610,26 +610,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "broca-run"
-version = "0.4.12"
-dependencies = [
- "base64",
- "broca-catalog",
- "broca-core",
- "broca-module-serve",
- "broca-protocol",
- "broca-provider",
- "broca-subc",
- "broca-test-support",
- "clap",
- "serde",
- "serde_json",
- "sha2",
- "subc-protocol",
- "tokio",
-]
-
-[[package]]
 name = "broca-session-convert"
 version = "0.4.12"
 dependencies = [
