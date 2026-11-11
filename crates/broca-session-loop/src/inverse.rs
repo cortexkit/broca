@@ -8,6 +8,11 @@
 //! transcript records until the next ledger record claims them, and refuses a log where a
 //! transcript record is left unclaimed or claimed by the wrong anchor.
 //!
+//! An import's seeded run (`session.import`) is laid out its own way: each imported message is
+//! followed by its facts records and the rides on its results, through the run's end. Its start
+//! claims every imported message up to that end, so it inverts to what today's import seed is:
+//! one `run_started` holding the whole imported history, then the run's end.
+//!
 //! Steered and delivered messages are the exception: their ledger record keeps them whole, and
 //! the transcript holds copies where the conversation places them, each naming its record by
 //! seq. The inverse rebuilds those records from the ledger alone and checks each copy against
@@ -22,8 +27,8 @@ use broca_protocol::content::Message;
 use broca_session_store::codec::Digest;
 use broca_session_store::record::{
     Attempt, BudgetFire, BudgetFiring, CallOutcome, CancelPoint, Delivery, Event, Input, PartKind,
-    PartRef, Placement, QueuedSend, Record, ResultAppend, SessionRefresh, Steer, ToolIntent,
-    ToolOutcome, ToolReply,
+    PartRef, Placement, QueuedSend, Record, ResultAppend, RunEnd, RunStart, SessionRefresh, Steer,
+    ToolIntent, ToolOutcome, ToolReply,
 };
 use serde_json::{Map, Value};
 
@@ -394,6 +399,61 @@ fn event(event: &Event, claimed: &[&Record]) -> Result<Value, String> {
     Ok(Value::Object(object))
 }
 
+/// Whether `start`, followed by `next`, starts an import's seeded run: `session.import` writes
+/// a seeded start and, right after it, the first imported message, placed `Imported`.
+fn imports_seed(start: &RunStart, next: Option<&Record>) -> bool {
+    start.seeded == Some(true)
+        && matches!(next, Some(Record::Input(input))
+            if input.placement == Placement::Imported && input.run_id == start.run_id)
+}
+
+/// The imported messages of an import's seeded run, in order, from `rest`, the records after its
+/// start; the run's end; and how many records of `rest` the run takes, its end included.
+/// Today's import seed holds every imported message in its one `run_started`, so they are all
+/// claimed by the start. Between them `session.import` writes each message's facts, a turn's
+/// call facts and the rides on its results: none of them is a record of today's log or moves a
+/// message, so they are passed over. The whole run is written in one batch, so its end must be
+/// in `rest`.
+fn import_seed<'a>(
+    start: &RunStart,
+    rest: &'a [Record],
+) -> Result<(Vec<&'a Input>, &'a RunEnd, usize), InverseError> {
+    let mut inputs = Vec::new();
+    for (at, record) in rest.iter().enumerate() {
+        match record {
+            Record::Input(input)
+                if input.placement == Placement::Imported && input.run_id == start.run_id =>
+            {
+                inputs.push(input);
+            }
+            Record::EntryFacts(_) | Record::TurnFacts(_) => {}
+            Record::ResultAppend(append) if append.run_id == start.run_id => {}
+            Record::RunEnd(end) if end.run_id == start.run_id => return Ok((inputs, end, at + 1)),
+            other => {
+                return Err(InverseError::Layout(format!(
+                    "an import's seeded run holds a {} before its end",
+                    other.name()
+                )))
+            }
+        }
+    }
+    Err(InverseError::Layout(
+        "an import's seeded run doesn't end in the batch that starts it".into(),
+    ))
+}
+
+/// Today's `run_finished` for an import's seeded run. Today's import seed ends with zero usage,
+/// which today's record requires; `session.import` records none, since no model ran.
+fn seed_run_finished(end: &RunEnd) -> Value {
+    let mut finished = today::run_finished(end);
+    if let Some(object) = finished.as_object_mut() {
+        object
+            .entry("usage")
+            .or_insert_with(|| json(broca_protocol::Usage::default()));
+    }
+    finished
+}
+
 /// Why a session's records can't be turned back into today's records.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InverseError {
@@ -582,16 +642,28 @@ impl Inverse {
                 }
                 Record::RunStart(start) => {
                     unclaimed(&self.pending, "a run start")?;
-                    let mut inputs = Vec::new();
-                    while let Some(Record::Input(input)) = records.get(index) {
-                        if input.placement != Placement::RunInput || input.run_id != start.run_id {
-                            break;
+                    let (inputs, seed_end) = if imports_seed(start, records.get(index)) {
+                        let (inputs, end, taken) = import_seed(start, &records[index..])?;
+                        index += taken;
+                        (inputs, Some(end))
+                    } else {
+                        let mut inputs = Vec::new();
+                        while let Some(Record::Input(input)) = records.get(index) {
+                            if input.placement != Placement::RunInput
+                                || input.run_id != start.run_id
+                            {
+                                break;
+                            }
+                            inputs.push(input);
+                            index += 1;
                         }
-                        inputs.push(input);
-                        index += 1;
-                    }
+                        (inputs, None)
+                    };
                     self.calls.clear();
                     out.push(today::run_started(start, &inputs, parts)?);
+                    if let Some(end) = seed_end {
+                        out.push(seed_run_finished(end));
+                    }
                 }
                 Record::StepEnd(end) => {
                     let [Record::Assistant(assistant)] = self.pending.as_slice() else {
