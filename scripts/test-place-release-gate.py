@@ -834,6 +834,81 @@ print(f"ck-broca 4243 user txt REG 1 1 {{inode}} {self.dest}")
         self.assertEqual(data["sessions_cancelled"], ["session.wal"])
         self.assertEqual(data["runs_cancelled"], [{"session": "session.wal", "run_id": "run-cancelled"}])
 
+    def cancelled_restart_report(self, *, before_restart):
+        env = self.restart_fixture()
+        env["HOME"] = str(self.tmp / "home")
+        report = self.tmp / "report.json"
+        wal = self.state / "wal"
+        wal.mkdir()
+        session = wal / "session.wal"
+        session.write_bytes(
+            wal_frame(1, {"type": "run_started", "run_id": "run-held"})
+            + wal_frame(2, {"type": "step_started"})
+            + wal_frame(3, {"type": "run_paused", "reason": "tool_held"})
+        )
+        timing = self.tmp / "timing.json"
+        ck = Path(env["PLACE_RELEASE_CK"])
+        ck.write_text(f'''#!/usr/bin/env python3
+import hashlib, json, pathlib, struct, sys, time
+session = pathlib.Path({str(session)!r})
+timing = pathlib.Path({str(timing)!r})
+before_restart = {before_restart!r}
+
+def cancel():
+    # Use the previous millisecond for the caller cancel, so equal clock ticks cannot race.
+    timestamp = time.time_ns() // 1_000_000 - int(before_restart)
+    record = {{"type": "run_finished", "reason": "cancelled", "ts_ms": timestamp}}
+    payload = json.dumps(record, separators=(",", ":")).encode()
+    header = struct.pack("<BQQ", 1, 4, 1)
+    with session.open("ab") as output:
+        output.write(struct.pack("<I", len(payload)) + header + hashlib.sha256(header + payload).digest() + payload)
+    timing.write_text(json.dumps({{"finished_ms": timestamp}}))
+
+if sys.argv[1:] == ["--json", "health", "broca"]:
+    if before_restart:
+        cancel()
+    print("{{}}")
+elif sys.argv[1:] == ["module", "restart", "broca"]:
+    observed_ms = time.time_ns() // 1_000_000
+    if not before_restart:
+        cancel()
+    data = json.loads(timing.read_text())
+    timing.write_text(json.dumps(dict(data, restart_signal_ms=observed_ms)))
+    pathlib.Path({str(self.tmp / "restarted")!r}).touch()
+else:
+    raise AssertionError(sys.argv)
+''')
+        ck.chmod(0o755)
+        result = self.place(
+            "--restart", "--live-approved", "--report", str(report),
+            PLACE_RELEASE_GATE_CMD='echo "live runs          1"; echo "  live  session.wal  last write 0s ago"; exit 1',
+            **env,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return result, json.loads(report.read_text()), json.loads(timing.read_text())
+
+    def test_a_caller_cancel_between_snapshot_and_restart_is_not_a_drain_failure(self):
+        result, data, timing = self.cancelled_restart_report(before_restart=True)
+        self.assertNotIn("FAILURE", result.stderr)
+        self.assertEqual(data["active_runs_at_restart"], [{"session": "session.wal", "run_id": "run-held"}])
+        self.assertEqual(data["runs_caller_cancelled"], [{"session": "session.wal", "run_id": "run-held"}])
+        self.assertEqual(data["sessions_caller_cancelled"], ["session.wal"])
+        self.assertEqual(data["runs_cancelled"], [])
+        self.assertEqual(data["sessions_cancelled"], [])
+        self.assertEqual(data["seal_error"], "")
+        self.assertLess(timing["finished_ms"], data["drain_started_ms"])
+        self.assertLessEqual(data["drain_started_ms"], timing["restart_signal_ms"])
+
+    def test_a_cancel_after_the_restart_signal_is_still_a_drain_failure(self):
+        result, data, timing = self.cancelled_restart_report(before_restart=False)
+        self.assertIn("FAILURE -- shutdown drain cancelled run run-held", result.stderr)
+        self.assertEqual(data["runs_cancelled"], [{"session": "session.wal", "run_id": "run-held"}])
+        self.assertEqual(data["sessions_cancelled"], ["session.wal"])
+        self.assertEqual(data["runs_caller_cancelled"], [])
+        self.assertEqual(data["seal_error"], "")
+        self.assertLessEqual(data["drain_started_ms"], timing["restart_signal_ms"])
+        self.assertGreaterEqual(timing["finished_ms"], data["drain_started_ms"])
+
     def test_live_approved_accepts_a_run_that_starts_between_placement_and_restart(self):
         env = self.restart_fixture()
         counter = self.tmp / "gate-called"
