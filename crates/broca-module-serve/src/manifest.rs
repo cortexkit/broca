@@ -417,10 +417,6 @@ pub(crate) fn observability_surfaces() -> Vec<ObservabilitySurface> {
     }]
 }
 
-// A runner-wide requirement would exclude credential-owned endpoints, including Code Assist.
-// Keep it off until routing can express the endpoint requirement separately for each pair.
-const RUNNER_REQUIRES_WIRE_API: bool = false;
-
 struct RoutingRunnerPair {
     pair: RunnerPair,
     opens_through_catalog_endpoint: bool,
@@ -472,11 +468,14 @@ fn routing_runner_pairs() -> Vec<RoutingRunnerPair> {
 }
 
 fn routing_declarations() -> ConsumerDeclarations {
-    let pairs = routing_runner_pairs();
-    let requires_wire_api =
-        RUNNER_REQUIRES_WIRE_API && pairs.iter().all(|pair| pair.opens_through_catalog_endpoint);
-    let mut runner = RunnerDeclaration::new(pairs.into_iter().map(|pair| pair.pair).collect())
-        .with_requires_wire_api(requires_wire_api);
+    let pairs = routing_runner_pairs()
+        .into_iter()
+        .map(|pair| {
+            pair.pair
+                .with_requires_wire_api(pair.opens_through_catalog_endpoint)
+        })
+        .collect();
+    let mut runner = RunnerDeclaration::new(pairs);
     runner.follows_account_choice = true;
     let declarations = ConsumerDeclarations::new().with_runner(runner);
     declarations
@@ -787,11 +786,55 @@ mod routing_tests {
         let runner = parsed.runner.as_ref().expect("broca declares its runner");
         assert!(runner.follows_account_choice);
         assert!(!runner.requires_wire_api());
-        assert!(
-            runner.admits_row(false),
-            "credential-owned endpoints stay eligible"
-        );
+        assert!(!slot["runner"]
+            .as_object()
+            .unwrap()
+            .contains_key("requires_wire_api"));
         assert_eq!(runner.pairs.len(), 12);
+        let sources = routing_runner_pairs();
+        for (pair, source) in runner.pairs.iter().zip(&sources) {
+            assert_eq!(pair.wire_api, source.pair.wire_api);
+            assert_eq!(pair.auth_method, source.pair.auth_method);
+            assert_eq!(
+                pair.requires_wire_api,
+                Some(source.opens_through_catalog_endpoint)
+            );
+            assert_eq!(
+                runner.requires_wire_api_for_pair(pair),
+                source.opens_through_catalog_endpoint
+            );
+            assert_eq!(
+                runner.admits_pair_row(pair, false),
+                !source.opens_through_catalog_endpoint
+            );
+            assert!(runner.admits_pair_row(pair, true));
+        }
+        assert_eq!(
+            runner
+                .pairs
+                .iter()
+                .filter(|pair| runner.requires_wire_api_for_pair(pair))
+                .count(),
+            9
+        );
+        // The pair field is Option<bool>: Some(false) is explicit, not omitted like
+        // the runner-level false. Pin the real manifest bytes, including that distinction.
+        let expected = concat!(
+            r#"{"runner":{"follows_account_choice":true,"pairs":["#,
+            r#"{"auth_method":"apikey","requires_wire_api":true,"wire_api":"anthropic.messages"},"#,
+            r#"{"auth_method":"oauth","requires_wire_api":true,"wire_api":"anthropic.messages"},"#,
+            r#"{"auth_method":"apikey","requires_wire_api":true,"wire_api":"aws.bedrock_converse"},"#,
+            r#"{"auth_method":"oauth","requires_wire_api":true,"wire_api":"aws.bedrock_converse"},"#,
+            r#"{"auth_method":"antigravity","requires_wire_api":false,"wire_api":"google.code_assist"},"#,
+            r#"{"auth_method":"apikey","requires_wire_api":true,"wire_api":"google.generate_content"},"#,
+            r#"{"auth_method":"oauth","requires_wire_api":true,"wire_api":"google.generate_content"},"#,
+            r#"{"auth_method":"apikey","requires_wire_api":true,"wire_api":"openai.chat_completions"},"#,
+            r#"{"auth_method":"oauth","requires_wire_api":true,"wire_api":"openai.chat_completions"},"#,
+            r#"{"auth_method":"chatgpt","requires_wire_api":false,"wire_api":"openai.chatgpt_responses"},"#,
+            r#"{"auth_method":"apikey","requires_wire_api":true,"wire_api":"openai.responses"},"#,
+            r#"{"auth_method":"oauth","requires_wire_api":false,"wire_api":"openai.responses"}]}}"#,
+        );
+        assert_eq!(serde_json::to_string(slot).unwrap(), expected);
         assert_eq!(serde_json::to_value(parsed).unwrap(), *slot);
         println!(
             "routing/v1 HELLO slot: {}",

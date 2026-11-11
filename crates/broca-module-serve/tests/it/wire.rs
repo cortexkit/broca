@@ -2940,6 +2940,14 @@ async fn hello_bind_send_status_roundtrip() {
     assert!(runner.follows_account_choice);
     assert!(!runner.requires_wire_api());
     assert_eq!(runner.pairs.len(), 12);
+    assert_eq!(
+        runner
+            .pairs
+            .iter()
+            .filter(|pair| runner.requires_wire_api_for_pair(pair))
+            .count(),
+        9
+    );
     assert!(runner
         .pairs
         .iter()
