@@ -49,9 +49,12 @@ pub fn upload_refusal(
 /// operation-specific rendering in the serving layer.
 pub fn admission_refusal(error: &ServeError) -> Option<AdmissionRefusal> {
     let (code, detail) = match error {
+        // The vault listing not having loaded clears by itself, so this is answered with the
+        // runner contract's retryable code `transient`; callers decide retries by code alone. The
+        // cause stays in `detail` for diagnostics.
         ServeError::CredentialsUnavailable => (
-            "credentials_unavailable",
-            Some(json!({"class":"transient"})),
+            "transient",
+            Some(json!({"class":"transient", "cause":"credentials_unavailable"})),
         ),
         ServeError::CredentialAmbiguous {
             credential,
@@ -88,11 +91,22 @@ pub fn admission_refusal(error: &ServeError) -> Option<AdmissionRefusal> {
             "open_failed",
             class.map(|class| json!({"class": class.shared_class()})),
         ),
-        ServeError::Transient(_) => ("transient", None),
+        // The cause clears by itself (a catalog or credential listing not loaded yet, a
+        // dependency that did not answer), so the same send may be admitted on retry.
+        ServeError::Transient(_) => ("transient", Some(json!({"class": "transient"}))),
+        // broca is stopping: this request did nothing, so repeating it after the restart may
+        // be answered. The cause says nothing about an earlier request with the same send id.
+        ServeError::ModuleStopping(_) => (
+            "transient",
+            Some(json!({"class": "transient", "cause": "module_stopping"})),
+        ),
         ServeError::VariantUnsupported(refusal) => (
             "variant_unsupported",
+            // Resending the same variant to the same model cannot succeed until the catalog
+            // changes, so the refusal states it is permanent.
             Some(json!({
                 "model": refusal.model, "variant": refusal.variant, "defined": refusal.defined,
+                "class": "permanent",
             })),
         ),
         ServeError::ToolAliasInvalid(refusal) => (
@@ -258,12 +272,17 @@ mod tests {
         let body =
             serde_json::to_value(admission_refusal(&ServeError::CredentialsUnavailable).unwrap())
                 .unwrap();
-        assert_eq!(body["code"], "credentials_unavailable");
-        assert_eq!(body["detail"], json!({"class":"transient"}));
+        // A listing that has not loaded yet is the contract's retryable `transient`, with the
+        // cause kept in detail.
+        assert_eq!(body["code"], "transient");
+        assert_eq!(
+            body["detail"],
+            json!({"class":"transient", "cause":"credentials_unavailable"})
+        );
         for (error, code, class) in [
             (
                 RunError::CredentialsUnavailable,
-                "credentials_unavailable",
+                "transient",
                 ErrorClass::Transient,
             ),
             (

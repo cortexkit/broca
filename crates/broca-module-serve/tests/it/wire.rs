@@ -528,7 +528,7 @@ impl RunExecutor for ReauthCoreExec {
     }
 }
 
-fn min_config() -> broca_wal::RunConfig {
+pub(super) fn min_config() -> broca_wal::RunConfig {
     broca_wal::RunConfig {
         account_route: None,
         global_system: None,
