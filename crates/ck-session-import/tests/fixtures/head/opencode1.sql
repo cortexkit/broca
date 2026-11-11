@@ -6,15 +6,15 @@ CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT NOT NULL, session_id TEX
 CREATE INDEX part_session ON part(session_id, message_id);
 INSERT INTO session VALUES ('ses_synthetic', 'Synthetic head', '/synthetic/project', 9000), ('ses_other', 'Not exported', '/synthetic/other', 10000);
 INSERT INTO message VALUES
- ('msg_001', 'ses_synthetic', 1000, '{"role":"user"}', X'0102'),
+ ('msg_001', 'ses_synthetic', 1000, '{"role":"user","summary":{"text":"summary object"},"finish":"stop"}', X'0102'),
  ('msg_002', 'ses_synthetic', 2000, '{"role":"assistant"}', NULL),
- ('msg_003', 'ses_synthetic', 3000, '{"role":"user"}', NULL),
+ ('msg_003', 'ses_synthetic', 3000, '{"role":"user","summary":true,"finish":"length"}', NULL),
  ('msg_004', 'ses_synthetic', 4000, '{"role":"assistant"}', NULL),
  ('msg_005', 'ses_synthetic', 5000, '{"role":"system"}', NULL),
  ('msg_006', 'ses_synthetic', 6000, '{"role":"user"}', NULL),
  ('msg_007', 'ses_synthetic', 7000, '{"role":"assistant","summary":true,"finish":"stop"}', NULL),
+ ('msg_009', 'ses_synthetic', 8000, '{"role":"assistant","error":{"name":"APIError"}}', NULL),
  ('msg_008', 'ses_synthetic', 8000, '{"role":"assistant","summary":true,"finish":"stop","error":{"name":"APIError"}}', NULL),
- ('msg_009', 'ses_synthetic', 9000, '{"role":"assistant","error":{"name":"APIError"}}', NULL),
  ('msg_other', 'ses_other', 10000, '{"role":"user"}', NULL);
 INSERT INTO part VALUES
  ('prt_001', 'msg_001', 'ses_synthetic', 1000, '{"type":"text","text":"Look at this synthetic image."}'),

@@ -6,7 +6,7 @@
 //! The daemon side is played by the test, as in the scope carrier tests: it sends the HELLO_ACK
 //! advertising `scopes/v1` and stamps each bind.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -385,6 +385,15 @@ impl Rig {
     }
 
     async fn request(&mut self, channel: u16, body: serde_json::Value) -> Frame {
+        self.request_captured(channel, body, None).await
+    }
+
+    async fn request_captured(
+        &mut self,
+        channel: u16,
+        body: serde_json::Value,
+        sample: Option<(&Path, &str)>,
+    ) -> Frame {
         self.corr += 1;
         let frame = Frame::build(
             FrameType::Request,
@@ -395,17 +404,55 @@ impl Rig {
             serde_json::to_vec(&body).unwrap(),
         )
         .unwrap();
+        if let Some((folder, case)) = sample {
+            std::fs::write(folder.join(format!("{case}.request.json")), &frame.body).unwrap();
+        }
         write_frame(&mut self.writer, &frame).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(20), read_frame(&mut self.reader))
+        let reply = tokio::time::timeout(Duration::from_secs(20), read_frame(&mut self.reader))
             .await
             .expect("a reply")
             .unwrap()
-            .unwrap()
+            .unwrap();
+        if let Some((folder, case)) = sample {
+            let kind = match reply.header.ty {
+                FrameType::Response => "reply",
+                FrameType::Error => "error",
+                other => panic!("unexpected sample frame {other:?}"),
+            };
+            std::fs::write(folder.join(format!("{case}.{kind}.json")), &reply.body).unwrap();
+        }
+        reply
+    }
+
+    async fn sample(
+        &mut self,
+        folder: &Path,
+        channel: u16,
+        method: &str,
+        case: &str,
+        params: serde_json::Value,
+    ) -> Frame {
+        self.request_captured(
+            channel,
+            serde_json::json!({"method":method,"params":params}),
+            Some((folder, &format!("{method}.{case}"))),
+        )
+        .await
     }
 
     /// Binds `channel` to the head session as the daemon relays it, stamped with `principal`
     /// and, when given, the scope the route was admitted under.
     async fn bind(&mut self, channel: u16, principal: Principal, scope: Option<ScopeStamp>) {
+        self.bind_roles(channel, principal, scope, None).await;
+    }
+
+    async fn bind_roles(
+        &mut self,
+        channel: u16,
+        principal: Principal,
+        scope: Option<ScopeStamp>,
+        role_versions: Option<std::collections::BTreeMap<String, String>>,
+    ) {
         let bind = ModuleControlRequest::RouteBind {
             route_channel: channel,
             epoch: 1,
@@ -417,7 +464,7 @@ impl Rig {
             consumer_capabilities: None,
             admission_facts: None,
             scope,
-            role_versions: None,
+            role_versions,
             call_mode: None,
         };
         let reply = self.request(0, serde_json::to_value(bind).unwrap()).await;
@@ -427,6 +474,18 @@ impl Rig {
             "{}",
             String::from_utf8_lossy(&reply.body)
         );
+    }
+
+    async fn bind_compactor(&mut self, channel: u16) {
+        self.bind_roles(
+            channel,
+            Principal::Reserved {
+                module_id: "synthetic-compactor".into(),
+            },
+            Some(stamp(core())),
+            Some([("compaction-runner".into(), "v1".into())].into()),
+        )
+        .await;
     }
 
     async fn result(
@@ -447,7 +506,12 @@ impl Rig {
             "{method}: {}",
             String::from_utf8_lossy(&reply.body)
         );
-        serde_json::from_slice::<serde_json::Value>(&reply.body).unwrap()["result"].clone()
+        let body = serde_json::from_slice::<serde_json::Value>(&reply.body).unwrap();
+        if method == "session.entries" {
+            body
+        } else {
+            body["result"].clone()
+        }
     }
 
     /// The refusal code `method` answers with.
@@ -477,6 +541,39 @@ fn view(version: u64) -> serde_json::Value {
         Vec::new(),
     ))
     .unwrap()
+}
+
+fn assert_imported_ids(
+    imported: &serde_json::Value,
+    page: &serde_json::Value,
+    collection: &str,
+    surface: &str,
+) {
+    let entries = page[collection]
+        .as_array()
+        .unwrap_or_else(|| panic!("{surface}: {page}"));
+    for moved in imported["moves"]["rows"].as_array().unwrap() {
+        if let Some(ordinal) = moved["entry"].as_u64() {
+            let served = entries
+                .iter()
+                .find(|entry| entry["ordinal"].as_u64() == Some(ordinal))
+                .unwrap_or_else(|| panic!("{surface} omitted ordinal {ordinal}: {page}"));
+            assert_eq!(
+                served["mid"], moved["mid"],
+                "{surface} changed ordinal {ordinal}'s mid (added={}): {page}",
+                moved["added"]
+            );
+        }
+    }
+}
+
+fn assert_imported_newest(imported: &serde_json::Value, page: &serde_json::Value) {
+    let last = page["entries"].as_array().unwrap().last().unwrap();
+    assert_eq!(
+        imported["newest"],
+        serde_json::json!({"ordinal":last["ordinal"],"mid":last["mid"],"digest":last["digest"]}),
+        "import newest must be the exact last imported compaction entry"
+    );
 }
 
 fn opencode1_source(rig: &Rig, name: &str, count: Option<usize>) -> serde_json::Value {
@@ -581,12 +678,18 @@ async fn opencode1_extract_import_install_view_and_first_owner_send_keep_history
     );
     assert!(!std::path::Path::new(params["source"]["path"].as_str().unwrap()).exists());
     let page = rig.result(1, "session.read", serde_json::json!({})).await;
+    assert_imported_ids(&imported, &page, "messages", "session.read");
     let stored = page.to_string();
-    assert!(
-        stored.contains("msg_001") && stored.contains("image/png"),
-        "{page}"
-    );
+    assert!(stored.contains("image/png"), "{page}");
     assert!(!stored.contains("never-import-this"));
+    let raw = rig
+        .result(
+            1,
+            "session.history",
+            serde_json::json!({"from_ordinal":1,"limit":100}),
+        )
+        .await;
+    assert_imported_ids(&imported, &raw, "messages", "raw session.history");
     rig.bind(2, stranger(), Some(stamp(core()))).await;
     let send = serde_json::json!({"prompt":"Continue synthetic history.","send_id":"first-owner", "plan":head_plan()});
     let non_owner = rig
@@ -655,6 +758,16 @@ async fn opencode1_extract_import_install_view_and_first_owner_send_keep_history
     let setups = rig.runner.setups.lock().unwrap().clone();
     assert_eq!(setups.len(), 1);
     assert_eq!(setups[0]["applied_view"]["version"], 1, "{:?}", setups[0]);
+    rig.bind_compactor(3).await;
+    let entries = rig
+        .result(
+            3,
+            "session.entries",
+            serde_json::json!({"select":{"by":"after","limit":8},"detail":"full"}),
+        )
+        .await;
+    assert_imported_ids(&imported, &entries, "entries", "session.entries");
+    assert_imported_newest(&imported, &entries);
     assert_eq!(
         rig.result(1, "session.import", params).await,
         imported,
@@ -710,26 +823,59 @@ async fn opencode1_extract_import_install_view_and_first_owner_send_keep_history
 }
 
 #[tokio::test]
-async fn opencode1_serve_refuses_an_unanswered_call_without_deleting_the_extract() {
-    let mut rig = Rig::start("opencode1-open", true).await;
-    rig.bind(1, core(), Some(stamp(core()))).await;
-    let mut params = opencode1_source(&rig, "open-call", None);
-    let path = PathBuf::from(params["source"]["path"].as_str().unwrap());
-    let db = rusqlite::Connection::open(&path).unwrap();
-    db.execute(
-        "UPDATE part SET data=json_set(data,'$.state.status','running') WHERE id='prt_009'",
+async fn opencode1_old_open_calls_import_but_last_row_open_calls_keep_the_extract() {
+    for last in [false, true] {
+        let mut rig = Rig::start(
+            if last {
+                "opencode1-open-tail"
+            } else {
+                "opencode1-open-old"
+            },
+            true,
+        )
+        .await;
+        rig.bind(1, core(), Some(stamp(core()))).await;
+        let mut params = opencode1_source(&rig, "open-call", None);
+        let path = PathBuf::from(params["source"]["path"].as_str().unwrap());
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute(
+        "UPDATE part SET data=json_set(data,'$.state.status','running','$.state.input',json('{\"path\":\"recorded-input\"}')) WHERE id='prt_009'",
         [],
     )
     .unwrap();
-    drop(db);
-    params["source"]["sha256"] =
-        serde_json::json!(ck_session_import::opencode_extract::sha256_file(&path).unwrap());
-    assert_eq!(
-        rig.refused(1, "session.import", params).await,
-        "import_open_call"
-    );
-    assert!(path.exists(), "a refused import never deletes its source");
-    assert!(rig.runner.calls.lock().unwrap().is_empty());
+        if last {
+            db.execute(
+                "UPDATE part SET message_id='msg_009' WHERE id='prt_009'",
+                [],
+            )
+            .unwrap();
+        }
+        drop(db);
+        params["source"]["sha256"] =
+            serde_json::json!(ck_session_import::opencode_extract::sha256_file(&path).unwrap());
+        if last {
+            assert_eq!(
+                rig.refused(1, "session.import", params).await,
+                "import_open_call"
+            );
+            assert!(path.exists(), "a refused import never deletes its source");
+        } else {
+            let imported = rig.result(1, "session.import", params).await;
+            assert_eq!(imported["imported_messages"], 8);
+            assert!(!path.exists());
+            let page = rig
+                .result(1, "session.read", serde_json::json!({}))
+                .await
+                .to_string();
+            assert!(
+                page.contains("[Tool execution was interrupted]")
+                    && page.contains("recorded-input")
+                    && page.contains("reused-2"),
+                "{page}"
+            );
+        }
+        assert!(rig.runner.calls.lock().unwrap().is_empty());
+    }
 }
 
 #[tokio::test]
@@ -745,6 +891,252 @@ async fn opencode1_extract_import_25k_timing() {
         started.elapsed().as_millis()
     );
     assert_eq!(imported["imported_messages"], 25_000);
+}
+
+/// Save the actual request and terminal frame bodies, not reconstructed typed responses.
+#[tokio::test]
+#[ignore = "writes synthetic wire samples; run explicitly"]
+async fn opencode1_capture_head_import_wire_samples() {
+    let folder = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../.cortexkit/internal-docs/investigations/head-import-samples");
+    std::fs::create_dir_all(&folder).unwrap();
+    let mut rig = Rig::start("opencode1-wire-samples", true).await;
+    rig.bind(1, core(), Some(stamp(core()))).await;
+    let params = opencode1_source(&rig, "wire-synthetic-head", None);
+    let path = PathBuf::from(params["source"]["path"].as_str().unwrap());
+    let mut media = |bytes: &[u8], mime: &str| {
+        broca_core::media_validation::validate_media(bytes, mime)
+            .map_err(|reason| format!("{reason:?}"))
+    };
+    let preview = broca_module::store_import::offline_moves(
+        ck_session_import::head::opencode1::read(&path, "ses_synthetic", &mut media).unwrap(),
+        Some(40),
+    )
+    .unwrap();
+    let original = std::fs::read(&path).unwrap();
+    let error = |frame: &Frame, code: &str| {
+        assert_eq!(
+            frame.header.ty,
+            FrameType::Error,
+            "{}",
+            String::from_utf8_lossy(&frame.body)
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&frame.body).unwrap()["code"],
+            code
+        );
+    };
+    let mut wrong = params.clone();
+    wrong["source"]["sha256"] = serde_json::json!("00");
+    error(
+        &rig.sample(&folder, 1, "session.import", "digest_mismatch", wrong)
+            .await,
+        "import_digest_mismatch",
+    );
+    let outside = rig.dir.join("synthetic-outside.db");
+    std::fs::write(&outside, &original).unwrap();
+    let mut wrong = params.clone();
+    wrong["source"]["path"] = serde_json::json!(outside);
+    error(
+        &rig.sample(&folder, 1, "session.import", "path_refused", wrong)
+            .await,
+        "import_path_refused",
+    );
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute("UPDATE part SET message_id='msg_009',data=json_set(data,'$.state.status','running') WHERE id='prt_009'",[]).unwrap();
+    drop(db);
+    let mut open = params.clone();
+    open["source"]["sha256"] =
+        serde_json::json!(ck_session_import::opencode_extract::sha256_file(&path).unwrap());
+    error(
+        &rig.sample(&folder, 1, "session.import", "open_call", open)
+            .await,
+        "import_open_call",
+    );
+    assert!(path.exists());
+    std::fs::write(&path, original).unwrap();
+    let imported = rig
+        .sample(&folder, 1, "session.import", "success", params.clone())
+        .await;
+    assert_eq!(imported.header.ty, FrameType::Response);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&imported.body).unwrap()["result"]["moves"]
+            ["shape"],
+        "plugin"
+    );
+    let imported_result =
+        serde_json::from_slice::<serde_json::Value>(&imported.body).unwrap()["result"].clone();
+    assert_eq!(
+        serde_json::to_value(preview.newest).unwrap(),
+        imported_result["newest"],
+        "a source newest is exact even in the offline wrapper"
+    );
+    let page = rig
+        .sample(
+            &folder,
+            1,
+            "session.read",
+            "imported",
+            serde_json::json!({}),
+        )
+        .await;
+    assert_eq!(page.header.ty, FrameType::Response);
+    let page = serde_json::from_slice::<serde_json::Value>(&page.body).unwrap();
+    assert_imported_ids(
+        &imported_result,
+        &page["result"],
+        "messages",
+        "sampled session.read",
+    );
+    let raw = rig
+        .result(
+            1,
+            "session.history",
+            serde_json::json!({"from_ordinal":1,"limit":100}),
+        )
+        .await;
+    assert_imported_ids(
+        &imported_result,
+        &raw,
+        "messages",
+        "sampled raw session.history",
+    );
+    let retry = rig
+        .sample(&folder, 1, "session.import", "retry", params.clone())
+        .await;
+    assert_eq!(retry.body, imported.body);
+    let mut reused = params.clone();
+    reused["tag_floor"] = serde_json::json!(41);
+    error(
+        &rig.sample(&folder, 1, "session.import", "send_id_reuse", reused)
+            .await,
+        "send_id_reuse",
+    );
+    let installed = rig
+        .sample(
+            &folder,
+            1,
+            "session.install_view",
+            "success",
+            serde_json::json!({"view":view(1)}),
+        )
+        .await;
+    assert_eq!(installed.header.ty, FrameType::Response);
+    error(
+        &rig.sample(
+            &folder,
+            1,
+            "session.send",
+            "without_plan",
+            serde_json::json!({"send_id":"wire-no-plan","prompt":"Continue synthetic history."}),
+        )
+        .await,
+        "invalid_params",
+    );
+    rig.bind(2, stranger(), Some(stamp(core()))).await;
+    let send = serde_json::json!({"send_id":"wire-first-owner","prompt":"Continue synthetic history.","plan":head_plan()});
+    error(
+        &rig.sample(&folder, 2, "session.send", "non_owner", send.clone())
+            .await,
+        "scope_owner_mismatch",
+    );
+    let sent = rig
+        .sample(&folder, 1, "session.send", "first_owner", send.clone())
+        .await;
+    assert_eq!(sent.header.ty, FrameType::Response);
+    broca_test_support::event_timeout(
+        "the sampled owner run to finish",
+        async {
+            loop {
+                if rig.result(1, "run.status", serde_json::json!({})).await["state"] == "idle" {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        },
+        || "the synthetic provider run is still active".into(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(rig.runner.calls.lock().unwrap().len(), 1);
+    rig.bind_compactor(3).await;
+    let entries = rig
+        .sample(
+            &folder,
+            3,
+            "session.entries",
+            "imported",
+            serde_json::json!({"select":{"by":"after","limit":8},"detail":"full"}),
+        )
+        .await;
+    assert_eq!(entries.header.ty, FrameType::Response);
+    let entries = serde_json::from_slice::<serde_json::Value>(&entries.body).unwrap();
+    assert_imported_ids(
+        &imported_result,
+        &entries,
+        "entries",
+        "sampled session.entries",
+    );
+    assert_imported_newest(&imported_result, &entries);
+    let after_owner = rig
+        .sample(
+            &folder,
+            1,
+            "session.import",
+            "after_owner_retry",
+            params.clone(),
+        )
+        .await;
+    assert_eq!(
+        after_owner.body, imported.body,
+        "import retry remains byte-identical after the first owner run"
+    );
+    let retry = rig.sample(&folder, 1, "session.send", "retry", send).await;
+    assert_eq!(retry.header.ty, FrameType::Response);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&retry.body).unwrap()["result"]["run_id"],
+        serde_json::from_slice::<serde_json::Value>(&sent.body).unwrap()["result"]["run_id"]
+    );
+    error(
+        &rig.sample(
+            &folder,
+            1,
+            "session.install_view",
+            "after_step",
+            serde_json::json!({"view":view(1)}),
+        )
+        .await,
+        "install_view_refused",
+    );
+    let readme = "# Head-import wire samples\n\nCaptured from the real serve handler over synthetic SQLite history. Files contain exact UTF-8 frame bodies, without transport headers or pretty-printing. Requests include method/params; Management successful terminal bodies retain the result wrapper; compaction-runner session.entries returns a bare page. Paths and SHA-256 values name the temporary synthetic extract, deleted on durable success; these are observations, not reusable live requests.\n\nThe owner route is stamped for reserved prefrontal-core; the non-owner route is reserved magic-context under the same scope. The synthetic plan uses a stub model and synthetic compactor. Source message ordinals are one-based.\n\n- session.import.success: initial file-source import and plugin move list.\n- session.import.retry: identical request, byte-identical durable receipt reply after source deletion.\n- session.import.digest_mismatch: wrong source digest, import_digest_mismatch.\n- session.import.open_call: running tool in the last source row, import_open_call; extract retained.\n- session.import.send_id_reuse: same import_id with a different tag_floor, send_id_reuse.\n- session.import.path_refused: source outside import roots, import_path_refused.\n- session.install_view.success: owner installs version 1 before the first send.\n- session.install_view.after_step: install after a real synthetic model step, install_view_refused.\n- session.send.without_plan: owner first send without plan, invalid_params naming plan.\n- session.send.non_owner: another principal's first send, scope_owner_mismatch.\n- session.send.first_owner: owner first send with plan.model and no top-level model, active reply.\n- session.send.retry: identical send_id/request after the step, same run_id and finished reply.\n\nSHA256SUMS covers every JSON body and this README, not itself.\n";
+    let readme = format!("{readme}\n- session.import.after_owner_retry: identical import request after the first owner run; the complete reply, including newest, is byte-identical to success.\n- session.read.imported: all eight imported entries before the first owner send; every move-list id matches by ordinal.\n- session.entries.imported: all eight imported entries on the compaction-runner/v1 role route after plan admission; every source and added id matches. Raw session.history is asserted too, without a sample file.\n");
+    std::fs::write(folder.join("README.md"), readme).unwrap();
+    let mut files = std::fs::read_dir(&folder)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+                || path.file_name().is_some_and(|name| name == "README.md")
+        })
+        .collect::<Vec<_>>();
+    files.sort();
+    assert_eq!(
+        files.len(),
+        31,
+        "fifteen request/terminal pairs and a README"
+    );
+    let sums = files
+        .iter()
+        .map(|path| {
+            format!(
+                "{:x}  {}\n",
+                sha2::Sha256::digest(std::fs::read(path).unwrap()),
+                path.file_name().unwrap().to_str().unwrap()
+            )
+        })
+        .collect::<String>();
+    std::fs::write(folder.join("SHA256SUMS"), sums).unwrap();
 }
 
 /// The owner imports a head over a scoped route: the reply is the store's, the source file
@@ -777,7 +1169,7 @@ async fn an_owner_imports_a_head_and_installs_its_first_view_through_serve() {
         "the import deletes its source from broca's own folder"
     );
     assert_eq!(
-        rig.result(1, "session.import", params).await,
+        rig.result(1, "session.import", params.clone()).await,
         reply,
         "a retry is answered from the stored reply"
     );
@@ -823,6 +1215,30 @@ async fn an_owner_imports_a_head_and_installs_its_first_view_through_serve() {
         .await,
         installed,
         "an install retry is answered the same"
+    );
+    rig.result(1,"session.send",serde_json::json!({"prompt":"Continue runner history.","send_id":"runner-first-owner","plan":head_plan()})).await;
+    broca_test_support::wait_until("the runner-shaped imported owner run", || async {
+        if rig.runner.calls.lock().unwrap().is_empty() {
+            Err("no provider request yet".into())
+        } else {
+            Ok(())
+        }
+    })
+    .await;
+    rig.bind_compactor(3).await;
+    let entries = rig
+        .result(
+            3,
+            "session.entries",
+            serde_json::json!({"select":{"by":"after","limit":4},"detail":"full"}),
+        )
+        .await;
+    assert_imported_ids(&reply, &entries, "entries", "runner session.entries");
+    assert_imported_newest(&reply, &entries);
+    assert_eq!(
+        rig.result(1, "session.import", params).await,
+        reply,
+        "runner import retry after owner admission retains newest"
     );
 }
 

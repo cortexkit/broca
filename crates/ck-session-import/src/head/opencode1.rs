@@ -15,7 +15,8 @@
 //! | completed tool | call and result; compacted output is `[Old tool result content cleared]`, without attachments |
 //! | errored tool | error result, except interrupted metadata's string output is a successful result |
 //! | provider-executed tool | refused: the canonical import cannot represent provider-owned execution |
-//! | pending/running tool | refused: the held head must be idle (stricter than the host's interruption placeholder) |
+//! | pending/running tool in an older row | call with recorded input (or `{}`), and the host's error result `[Tool execution was interrupted]` |
+//! | pending/running tool in the last source message row | refused: the head may still be working |
 //! | system | omitted and counted |
 //! | step markers, snapshots, patches, other non-model parts | omitted |
 //!
@@ -37,11 +38,25 @@ use super::{
     SourceRow,
 };
 
+mod audit;
+pub use audit::{check, check_with_history, Counts, Refusal, ToolResults};
+
+const INTERRUPTED: &str = "[Tool execution was interrupted]";
+
 /// Reads only a digest-checked, standalone extract: immutable mode never follows a host WAL.
 pub fn read(
     path: &Path,
     session: &str,
     check: &mut MediaCheck<'_>,
+) -> Result<HeadHistory, HeadError> {
+    read_audited(path, session, check, &mut audit::Audit::default())
+}
+
+fn read_audited(
+    path: &Path,
+    session: &str,
+    check: &mut MediaCheck<'_>,
+    audit: &mut audit::Audit,
 ) -> Result<HeadHistory, HeadError> {
     let unreadable = |error: &dyn std::fmt::Display| HeadError::Unreadable(error.to_string());
     let connection = Connection::open_with_flags(
@@ -68,9 +83,13 @@ pub fn read(
     let mut drafts = Vec::new();
     let mut moves = Vec::new();
     let mut dropped_system_messages = 0;
-    let mut ids = std::collections::HashSet::new();
-    for (mid, data, time) in rows {
-        if mid.is_empty() || !ids.insert(mid.clone()) {
+    let row_count = rows.len();
+    for (index, (mid, data, time)) in rows.into_iter().enumerate() {
+        let repeated = audit
+            .ordinals
+            .insert(mid.clone(), index as u64 + 1)
+            .is_some();
+        if mid.is_empty() || repeated {
             return Err(HeadError::row(
                 &mid,
                 "message id is empty or repeats an earlier row",
@@ -78,6 +97,13 @@ pub fn read(
         }
         let row: Value =
             serde_json::from_str(&data).map_err(|error| HeadError::row(&mid, error.to_string()))?;
+        let role = match row["role"].as_str() {
+            Some("user") => "user",
+            Some("assistant") => "assistant",
+            Some("system") => "system",
+            _ => "other",
+        };
+        *audit.counts.source_rows_by_role.entry(role).or_default() += 1;
         let items = parts
             .remove(&mid)
             .unwrap_or_default()
@@ -90,11 +116,36 @@ pub fn read(
         let time =
             u64::try_from(time).map_err(|_| HeadError::row(&mid, "time_created is negative"))?;
         let first = drafts.len();
-        let finished_summary =
-            row["role"] == "assistant" && row["summary"] == true && row["finish"] == "stop";
+        // SQLite's json_extract represents true as 1; the consumer's query also accepts a
+        // numeric 1. Objects, strings and every other value are not a finished summary.
+        let finished_summary = (row["summary"] == true || row["summary"].as_f64() == Some(1.0))
+            && row["finish"] == "stop";
+        // A crash can leave old tool parts unfinished forever. Only the last source row can
+        // still be live, even when that row's other parts would project nothing.
+        if index + 1 == row_count {
+            if let Some(item) = items.iter().find(|item| {
+                item["type"] == "tool"
+                    && matches!(
+                        item["state"]["status"].as_str(),
+                        Some("pending" | "running")
+                    )
+            }) {
+                return Err(HeadError::OpenCall {
+                    mid: mid.clone(),
+                    call_id: text(&mid, &item["callID"], "tool callID")?,
+                });
+            }
+        }
         match row["role"].as_str() {
             Some("user") => drafts.extend(user(&mid, time, &items, check)?),
-            Some("assistant") => drafts.extend(assistant(&mid, time, &row, &items, check)?),
+            Some("assistant") => drafts.extend(assistant(
+                &mid,
+                time,
+                &row,
+                &items,
+                check,
+                &mut audit.counts.tool_results,
+            )?),
             Some("system") => dropped_system_messages += 1,
             role => {
                 return Err(HeadError::row(
@@ -225,6 +276,7 @@ fn assistant(
     row: &Value,
     items: &[Value],
     check: &mut MediaCheck<'_>,
+    counts: &mut ToolResults,
 ) -> Result<Vec<Draft>, HeadError> {
     if !row["error"].is_null()
         && !(row["error"]["name"] == "MessageAbortedError"
@@ -272,6 +324,7 @@ fn assistant(
                 let state = &item["state"];
                 let (output, is_error) = match state["status"].as_str() {
                     Some("completed") => {
+                        counts.completed += 1;
                         let compacted = state["time"]["compacted"].as_u64().is_some_and(|n| n > 0);
                         let output = if compacted {
                             "[Old tool result content cleared]".into()
@@ -309,6 +362,7 @@ fn assistant(
                         if state["metadata"]["interrupted"] == true
                             && state["metadata"]["output"].is_string()
                         {
+                            counts.interrupted_as_result += 1;
                             (
                                 ToolOutput::Text {
                                     text: text(
@@ -320,23 +374,34 @@ fn assistant(
                                 false,
                             )
                         } else {
+                            counts.error += 1;
                             (
                                 ToolOutput::error(text(mid, &state["error"], "tool error")?),
                                 true,
                             )
                         }
                     }
-                    _ => {
-                        return Err(HeadError::OpenCall {
-                            mid: mid.into(),
-                            call_id: id,
-                        })
+                    Some("pending" | "running") => {
+                        counts.open_call_placeholders += 1;
+                        (ToolOutput::error(INTERRUPTED), true)
+                    }
+                    other => {
+                        return Err(HeadError::row(
+                            mid,
+                            format!("call {id} has unknown tool status {other:?}"),
+                        ))
                     }
                 };
                 content.push(ContentBlock::ToolCall(ToolCall {
                     tool_call_id: ToolCallId(id.clone()),
                     tool_name: text(mid, &item["tool"], "tool name")?,
-                    input: state["input"].clone(),
+                    input: if matches!(state["status"].as_str(), Some("pending" | "running"))
+                        && state["input"].is_null()
+                    {
+                        serde_json::json!({})
+                    } else {
+                        state["input"].clone()
+                    },
                     thought_signature: None,
                 }));
                 keys.push(Some(format!("{mid}/{id}")));

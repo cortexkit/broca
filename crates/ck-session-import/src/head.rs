@@ -60,7 +60,7 @@ pub struct SourceRow {
     /// host never sends the row to its model. A row that became two messages (an OpenCode 2
     /// assistant row whose calls have results) names the first, the assistant message.
     pub message: Option<usize>,
-    /// The standalone plugin's assistant summary finished with `stop`, even if it errored.
+    /// The standalone plugin's source row has summary equal to true/1 and finish `stop`, even on error.
     pub finished_summary: bool,
 }
 

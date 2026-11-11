@@ -13,6 +13,8 @@ path = "src/main.rs"
 
 [dependencies]
 broca-core = { path = "../broca-core" }
+broca-module = { path = "../broca-module" }
+broca-owner-only.workspace = true
 broca-module-serve = { path = "../broca-module-serve" }
 broca-protocol = { path = "../broca-protocol" }
 broca-subc = { path = "../broca-subc" }
@@ -23,7 +25,7 @@ sha2.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
 # Test scratch paths live under one owned, self-reclaiming root; see that crate.
 broca-test-support = { path = "../broca-test-support" }
-broca-module = { path = "../broca-module" }
 tokio = { workspace = true, features = ["test-util"] }

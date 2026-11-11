@@ -23,8 +23,8 @@ use broca_session_store::record::{
 };
 use broca_session_store::session::NewInputMedia;
 use broca_wire::head_import::{
-    FileImportParams, FileImportReply, ImportHarness, InstallViewReply, MoveList, MoveListShape,
-    MoveRow,
+    FileImportParams, FileImportReply, ImportHarness, ImportNewest, InstallViewReply, MoveList,
+    MoveListShape, MoveRow,
 };
 use ck_session_import::head::{HeadError, HeadHistory, HeadMessage};
 use sha2::{Digest as _, Sha256};
@@ -238,12 +238,25 @@ pub fn read_source(
     roots: &ImportRoots,
 ) -> Result<(PathBuf, HeadHistory), ImportRefusal> {
     let path = roots.admit(Path::new(&params.source.path))?;
-    let digest = ck_session_import::opencode_extract::sha256_file(&path).map_err(|error| {
+    let unreadable = |error| {
         ImportRefusal::new(
             "import_source_unreadable",
             format!("the source file could not be read: {error}"),
         )
-    })?;
+    };
+    // SQLite reads its own extract. JSON/JSONL sources are hashed from the very bytes parsed,
+    // so those readers never observe a second read with different bytes.
+    let sqlite = params.source.harness == ImportHarness::OpenCode1;
+    let bytes = if sqlite {
+        Vec::new()
+    } else {
+        std::fs::read(&path).map_err(unreadable)?
+    };
+    let digest = if sqlite {
+        ck_session_import::opencode_extract::sha256_file(&path).map_err(unreadable)?
+    } else {
+        format!("{:x}", Sha256::digest(&bytes))
+    };
     if !digest.eq_ignore_ascii_case(&params.source.sha256) {
         return Err(ImportRefusal::new(
             "import_digest_mismatch",
@@ -255,19 +268,10 @@ pub fn read_source(
             .map_err(|reason| format!("{reason:?}"))
     };
     let mut history = match params.source.harness {
-        ImportHarness::OpenCode2 => ck_session_import::head::opencode2::read(
-            &std::fs::read(&path).map_err(|error| {
-                ImportRefusal::new("import_source_unreadable", error.to_string())
-            })?,
-            &mut check,
-        )?,
-        ImportHarness::Pi => ck_session_import::head::pi::read(
-            &std::fs::read(&path).map_err(|error| {
-                ImportRefusal::new("import_source_unreadable", error.to_string())
-            })?,
-            &params.source.session,
-            &mut check,
-        )?,
+        ImportHarness::OpenCode2 => ck_session_import::head::opencode2::read(&bytes, &mut check)?,
+        ImportHarness::Pi => {
+            ck_session_import::head::pi::read(&bytes, &params.source.session, &mut check)?
+        }
         ImportHarness::OpenCode1 => {
             ck_session_import::head::opencode1::read(&path, &params.source.session, &mut check)?
         }
@@ -321,6 +325,130 @@ pub struct SeedFacts<'a> {
     /// first record takes, which name a message the import makes itself.
     pub prefix: &'a str,
     pub first_seq: u64,
+}
+
+/// An offline projection of the move list. Store-minted ids are explicitly unminted strings;
+/// source ids, entry ordinals and plugin summary flags are the ordinary seeder's output.
+#[derive(Debug)]
+pub struct OfflineMoves {
+    pub moves: MoveList,
+    pub newest: ImportNewest,
+    pub unminted: u64,
+}
+
+/// A seed refusal without exposing its source-bearing diagnostic to a counts-only caller.
+#[derive(Debug)]
+pub struct OfflineRefusal {
+    pub code: &'static str,
+    pub message_ordinal: Option<u64>,
+}
+
+/// Runs the import seeder without a store. The store's message-id prefix and next record seq
+/// do not exist yet, so every added mid is replaced with `unminted:<n>`, in added-row order.
+pub fn offline_moves(
+    history: HeadHistory,
+    tag_floor: Option<u64>,
+) -> Result<OfflineMoves, OfflineRefusal> {
+    let refused_mid = history
+        .messages
+        .iter()
+        .filter_map(|message| message.mid.as_ref())
+        .find(|mid| broca_session_store::session::is_broca_id_form(mid))
+        .and_then(|mid| history.rows.iter().position(|row| &row.mid == mid))
+        .map(|index| index as u64 + 1);
+    let params: FileImportParams = serde_json::from_value(serde_json::json!({
+        "import_id":"offline-preview", "source":{"harness":"opencode1","path":"","session":"","sha256":""},
+        "origin":{"kind":"import","source_ref":"offline-preview"},"tag_floor":tag_floor,
+    })).map_err(|_| OfflineRefusal { code:"import_source_unmapped",message_ordinal:None })?;
+    let principal = BindPrincipal::Reserved {
+        module_id: "offline-preview".into(),
+    };
+    let seed = seed(
+        history,
+        &SeedFacts {
+            params: &params,
+            principal: &principal,
+            scope: None,
+            now_ms: 0,
+            prefix: "gfeed",
+            first_seq: 0,
+        },
+    )
+    .map_err(|refusal| OfflineRefusal {
+        code: refusal.code,
+        message_ordinal: if refusal.code == "import_id_refused" {
+            refused_mid
+        } else {
+            None
+        },
+    })?;
+    let newest = newest_of_records(&seed.records).map_err(|refusal| OfflineRefusal {
+        code: refusal.code,
+        message_ordinal: None,
+    })?;
+    let mut reply =
+        reply_of(&seed.receipt, 0, String::new(), newest).map_err(|refusal| OfflineRefusal {
+            code: refusal.code,
+            message_ordinal: None,
+        })?;
+    let mut unminted = 0;
+    for row in &mut reply.moves.rows {
+        if row.added {
+            unminted += 1;
+            row.mid = format!("unminted:{unminted}");
+            if row.entry == Some(reply.newest.ordinal) {
+                reply.newest.mid = row.mid.clone();
+                reply.newest.digest = format!("unminted:{unminted}");
+            }
+        }
+    }
+    Ok(OfflineMoves {
+        moves: reply.moves,
+        newest: reply.newest,
+        unminted,
+    })
+}
+
+/// Uses exactly the stored-entry projector behind `session.entries`, including its digest.
+pub(crate) fn newest_of_entry(
+    entry: &broca_session_store::session::StoredEntry,
+) -> Result<ImportNewest, ImportRefusal> {
+    let projected = broca_session_loop::entries::project(entry).map_err(|error| {
+        ImportRefusal::new(
+            "session_needs_recovery",
+            format!("the imported newest entry could not be projected: {error}"),
+        )
+    })?;
+    Ok(ImportNewest {
+        ordinal: projected.ordinal,
+        mid: projected.mid,
+        digest: projected.digest,
+    })
+}
+
+/// Projects an offline seed with the same conversation fold and stored-entry projector the
+/// store uses. An added newest's provisional store id/digest never escape the offline wrapper.
+pub(crate) fn newest_of_records(records: &[Record]) -> Result<ImportNewest, ImportRefusal> {
+    let mut conversation = broca_session_store::fold::conversation::Conversation::new(true);
+    // Only transcript records change messages. Run starts/ends belong to the session's
+    // operational state and cannot be applied to Conversation.
+    for record in records
+        .iter()
+        .filter(|record| record.stream() == broca_session_store::record::Stream::Transcript)
+    {
+        conversation.apply(record).map_err(|error| {
+            ImportRefusal::new(
+                "import_source_unmapped",
+                format!("the import seed could not be projected: {error:?}"),
+            )
+        })?;
+    }
+    let entry = broca_session_store::session::window_entries(&conversation, conversation.placed, 1)
+        .pop()
+        .ok_or_else(|| {
+            ImportRefusal::new("import_empty", "the import seed placed no newest entry")
+        })?;
+    newest_of_entry(&entry)
 }
 
 /// The import's seeded run: a run start, every imported message as an `Input` placed
@@ -692,6 +820,7 @@ pub fn reply_of(
     receipt: &ImportReceipt,
     history_version: u64,
     incarnation: String,
+    newest: ImportNewest,
 ) -> Result<FileImportReply, ImportRefusal> {
     let shape = match receipt.shape.as_str() {
         "plugin" => MoveListShape::Plugin,
@@ -704,6 +833,7 @@ pub fn reply_of(
         }
     };
     Ok(FileImportReply {
+        newest,
         moves: MoveList {
             shape,
             rows: receipt

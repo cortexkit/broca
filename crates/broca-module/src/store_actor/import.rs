@@ -7,8 +7,8 @@ use broca_wire::head_import::InstallViewReply;
 
 use super::StoreActor;
 use crate::store_import::{
-    delete_sources, payload_digest, read_source, reply_of, seed, ImportCommand, ImportRefusal,
-    InstallViewCommand, SeedFacts, StoreCommand, StoreOutcome,
+    delete_sources, newest_of_entry, payload_digest, read_source, reply_of, seed, ImportCommand,
+    ImportRefusal, InstallViewCommand, SeedFacts, StoreCommand, StoreOutcome,
 };
 
 impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
@@ -59,14 +59,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     /// The reply this session's import kept.
     async fn stored_reply(&self) -> StoreOutcome {
         match self.session.import_receipt().await {
-            Ok(Some(receipt)) => match reply_of(
-                &receipt,
-                self.session.operations.history_version,
-                self.incarnation(),
-            ) {
-                Ok(reply) => StoreOutcome::Imported(reply),
-                Err(refusal) => StoreOutcome::Refused(refusal),
-            },
+            Ok(Some(receipt)) => self.reply_from_receipt(&receipt).await,
             Ok(None) => StoreOutcome::Refused(ImportRefusal::new(
                 "session_exists",
                 "the session exists and holds no import",
@@ -75,6 +68,54 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 "session_needs_recovery",
                 format!("the session's import receipt could not be read: {error:?}"),
             )),
+        }
+    }
+
+    /// Imported inputs and their entry facts are immutable. Read the receipt's last imported
+    /// ordinal, never the current session head, so views and later owner runs cannot change the
+    /// import's newest. Reprojection also supports receipts written before newest was served.
+    async fn reply_from_receipt(
+        &self,
+        receipt: &broca_session_store::record::ImportReceipt,
+    ) -> StoreOutcome {
+        let expected = receipt
+            .moves
+            .iter()
+            .find(|row| row.ordinal == Some(receipt.imported_messages));
+        let entries = match self.session.entries(receipt.imported_messages, 1).await {
+            Ok(entries) => entries,
+            Err(error) => {
+                return StoreOutcome::Refused(ImportRefusal::new(
+                    "session_needs_recovery",
+                    format!("the import's newest entry could not be read: {error:?}"),
+                ))
+            }
+        };
+        let Some(entry) = entries.first().filter(|entry| {
+            entry.ordinal == receipt.imported_messages
+                && entry
+                    .state
+                    .facts
+                    .as_ref()
+                    .is_some_and(|facts| expected.is_some_and(|row| row.mid == facts.mid))
+        }) else {
+            return StoreOutcome::Refused(ImportRefusal::new(
+                "session_needs_recovery",
+                "the import's newest entry is no longer retained under its recorded id",
+            ));
+        };
+        let newest = match newest_of_entry(entry) {
+            Ok(newest) => newest,
+            Err(refusal) => return StoreOutcome::Refused(refusal),
+        };
+        match reply_of(
+            receipt,
+            self.session.operations.history_version,
+            self.incarnation(),
+            newest,
+        ) {
+            Ok(reply) => StoreOutcome::Imported(reply),
+            Err(refusal) => StoreOutcome::Refused(refusal),
         }
     }
 
@@ -216,14 +257,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             return (StoreOutcome::Refused(refusal), true);
         }
         delete_sources(&roots, params.source.harness, &path);
-        match reply_of(
-            &seed.receipt,
-            self.session.operations.history_version,
-            self.incarnation(),
-        ) {
-            Ok(reply) => (StoreOutcome::Imported(reply), false),
-            Err(refusal) => (StoreOutcome::Refused(refusal), false),
-        }
+        (self.reply_from_receipt(&seed.receipt).await, false)
     }
 
     /// Records the compaction provider's view of an imported session as the view the session

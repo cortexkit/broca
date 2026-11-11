@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 use std::fmt::Write as _;
+use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -30,7 +31,7 @@ use sha2::{Digest, Sha256};
     about = "Import a foreign harness transcript into broca"
 )]
 struct Args {
-    /// Source harness (opencode, claude-code, codex, goose, pi), or opencode1-extract.
+    /// Source harness, opencode1-extract, or the counts-only opencode1-check.
     harness_name: String,
     /// Source session id shown by --list.
     source: Option<String>,
@@ -52,6 +53,17 @@ struct Args {
     /// Destination folder for opencode1-extract.
     #[arg(long)]
     out_dir: Option<PathBuf>,
+    /// Single-session SQLite file for opencode1-check; never the live host database.
+    #[arg(long)]
+    extract: Option<PathBuf>,
+    /// Write an offline wrapper with the seeded plugin move list. Added mids are unminted:<n>,
+    /// not store ids; source mids and all entry ordinals/summary flags are exact. The wrapper's
+    /// newest also uses unminted: for mid/digest when its last entry is added.
+    #[arg(long)]
+    moves_out: Option<PathBuf>,
+    /// Highest already-shown part number to honor while seeding --moves-out.
+    #[arg(long)]
+    tag_floor: Option<u64>,
     /// Target broca session id (defaults to a fresh UUID and is printed).
     #[arg(long)]
     session: Option<String>,
@@ -135,9 +147,102 @@ async fn main() {
         }
     };
     let output = Output { json: args.json };
+    if args.harness_name == "opencode1-check" {
+        match run_opencode1_check(&args) {
+            Ok(true) => return,
+            Ok(false) => std::process::exit(1),
+            Err(error) => {
+                output.error(&error);
+                std::process::exit(1);
+            }
+        }
+    }
     if let Err(error) = run(args, &output).await {
         output.error(&error);
         std::process::exit(1);
+    }
+}
+
+/// Print only counters or a code/ordinal refusal. Reader diagnostics can contain source ids
+/// and content, so this command never sends them through the ordinary CLI error formatter.
+fn run_opencode1_check(args: &Args) -> Result<bool, String> {
+    let path = args
+        .extract
+        .as_deref()
+        .ok_or("opencode1-check requires --extract")?;
+    let session = args
+        .session
+        .as_deref()
+        .ok_or("opencode1-check requires --session")?;
+    let mut media = |bytes: &[u8], mime: &str| {
+        broca_core::media_validation::validate_media(bytes, mime)
+            .map_err(|reason| format!("{reason:?}"))
+    };
+    if args.tag_floor.is_some() && args.moves_out.is_none() {
+        return Err("--tag-floor requires --moves-out".into());
+    }
+    match ck_session_import::head::opencode1::check_with_history(path, session, &mut media) {
+        Ok((history, counts)) => {
+            if let Some(output) = &args.moves_out {
+                let preview = match broca_module::store_import::offline_moves(
+                    history,
+                    args.tag_floor,
+                ) {
+                    Ok(preview) => preview,
+                    Err(refusal) => {
+                        println!(
+                            "{}",
+                            json!({"ok":false,"refusal":{"code":refusal.code,"message_ordinal":refusal.message_ordinal}})
+                        );
+                        return Ok(false);
+                    }
+                };
+                let newest_unminted = preview
+                    .moves
+                    .rows
+                    .iter()
+                    .any(|row| row.added && row.entry == Some(preview.newest.ordinal));
+                let bytes = serde_json::to_vec(
+                    &json!({"offline":true,"unminted_prefix":"unminted:","moves":preview.moves,"newest":preview.newest}),
+                )
+                .map_err(|_| "offline moves could not be encoded".to_owned())?;
+                let mut file = broca_owner_only::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(output)
+                    .map_err(|_| {
+                        "offline moves file could not be created (it must not already exist)"
+                            .to_owned()
+                    })?;
+                file.write_all(&bytes)
+                    .and_then(|()| file.sync_all())
+                    .map_err(|_| "offline moves file could not be written".to_owned())?;
+                eprintln!("{} added ids are unminted: their real ids require the store's message-id prefix and next record sequence; newest mid/digest are {}",preview.unminted,if newest_unminted {"also unminted"} else {"exact"});
+            }
+            println!(
+                "{}",
+                json!({"ok":true,
+                "source_rows_by_role":counts.source_rows_by_role,
+                "imported_messages_by_role":counts.imported_messages_by_role,
+                "tool_calls":counts.tool_calls,
+                "tool_results":{"completed":counts.tool_results.completed, "error":counts.tool_results.error,
+                    "interrupted_as_result":counts.tool_results.interrupted_as_result,
+                    "open_call_placeholders":counts.tool_results.open_call_placeholders},
+                "media_objects":counts.media_objects, "media_occurrences":counts.media_occurrences,
+                "dropped_system_rows":counts.dropped_system_rows,
+                "rows_projected_nothing":counts.rows_projected_nothing,
+                "finished_summaries":counts.finished_summaries})
+            );
+            Ok(true)
+        }
+        Err(refusal) => {
+            println!(
+                "{}",
+                json!({"ok":false,"refusal":{"code":refusal.code,
+                "message_ordinal":refusal.message_ordinal}})
+            );
+            Ok(false)
+        }
     }
 }
 
