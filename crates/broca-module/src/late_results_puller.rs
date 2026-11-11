@@ -38,6 +38,9 @@ use crate::late_results_store::{
     Disposition, FeedPosition, LateResultsStore, RegistrationRow, RegistrationState,
 };
 
+mod stored;
+use stored::StoredLineage;
+
 /// How often a started feed is pulled.
 pub const PULL_INTERVAL: Duration = Duration::from_secs(3);
 /// The longest wait between attempts after a transport error or a refusal.
@@ -231,6 +234,7 @@ impl Puller {
 pub struct LateResultsIntake {
     store: Arc<LateResultsStore>,
     wal: Arc<FileWalStore>,
+    session_store: Mutex<Option<Arc<crate::store_open::StoreRuntime>>>,
     /// The module id the daemon attests for this process: the feed's custodian. Without one no
     /// plain key is sent and no feed is pulled.
     consumer_module: String,
@@ -242,7 +246,7 @@ pub struct LateResultsIntake {
     /// Set while the store is being rebuilt from the WALs. Until the rebuild completes, no
     /// registration can be trusted to be missing, so every entry is Blocked and nothing is acked.
     rebuilding: std::sync::atomic::AtomicBool,
-    sweep_after: Mutex<Option<(String, String)>>,
+    sweep_after: tokio::sync::Mutex<Option<(String, String)>>,
     delivery_failures: Mutex<HashMap<IntakeKey, DeliveryFailure>>,
 }
 
@@ -263,14 +267,20 @@ impl LateResultsIntake {
         Arc::new(Self {
             store,
             wal,
+            session_store: Mutex::new(None),
             consumer_module: consumer_module.into(),
             delivery,
             feed,
             pullers: Mutex::new(HashMap::new()),
             rebuilding: std::sync::atomic::AtomicBool::new(false),
-            sweep_after: Mutex::new(None),
+            sweep_after: tokio::sync::Mutex::new(None),
             delivery_failures: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Install the reader that owns new-storage sessions before recovering their feeds.
+    pub fn set_session_store(&self, runtime: Arc<crate::store_open::StoreRuntime>) {
+        *self.session_store.lock().expect("session store") = Some(runtime);
     }
 
     /// Mark the store as being rebuilt (or done). See [`Self::rebuild_from_wals`].
@@ -341,22 +351,34 @@ impl LateResultsIntake {
     }
 
     /// Revisit old rows even for providers with no running feed. Each pass reads at most one
-    /// page of registrations' WALs; unreadable and unfinished calls remain for the next cycle.
-    pub fn sweep_registrations(&self) -> Result<usize, String> {
+    /// page of registrations' session records; unreadable and unfinished calls remain for the next cycle.
+    pub async fn sweep_registrations(&self) -> Result<usize, String> {
         if self.is_rebuilding() || !self.store.has_held_history() {
             return Ok(0);
         }
-        let mut after = self.sweep_after.lock().expect("registration sweep");
+        let mut after = self.sweep_after.lock().await;
         let rows = self
             .store
             .registration_page(after.as_ref(), REGISTRATION_SWEEP_LIMIT)?;
         let mut views = HashMap::new();
         let mut settled = Vec::new();
         let mut inline = Vec::new();
+        let mut retired = Vec::new();
         for row in &rows {
-            let view = views
-                .entry(row.call.bind.clone())
-                .or_insert_with(|| self.lineage_view(&row.call));
+            if !views.contains_key(&row.call.bind) {
+                views.insert(
+                    row.call.bind.clone(),
+                    self.lineage_view(&row.call, &rows).await,
+                );
+            }
+            let view = views.get(&row.call.bind).expect("lineage view");
+            if let Some(stored) = &view.stored {
+                if let Some(reason) = stored.retirement_reason(&row.call.call_key) {
+                    settled.push((row.call.module.clone(), row.call.call_key.clone()));
+                    retired.push((&row.call, reason));
+                }
+                continue;
+            }
             // Retention can reuse a bind: the tombstone belongs to this row's lineage,
             // not to every registration sharing the cached WAL snapshot.
             if self.tombstoned(&row.call.bind, &row.call.lineage)
@@ -369,10 +391,21 @@ impl LateResultsIntake {
                 } else {
                     settled.push(key);
                 }
+                retired.push((
+                    &row.call,
+                    if self.tombstoned(&row.call.bind, &row.call.lineage) {
+                        "lineage_tombstoned"
+                    } else {
+                        "terminal_and_batch_committed"
+                    },
+                ));
             }
         }
         self.store.remove_calls(&settled)?;
         self.store.remove_inline_calls(&inline)?;
+        for (call, reason) in retired {
+            log_retirement(call, reason);
+        }
         *after = if rows.len() == REGISTRATION_SWEEP_LIMIT {
             rows.last()
                 .map(|row| (row.call.module.clone(), row.call.call_key.clone()))
@@ -386,14 +419,36 @@ impl LateResultsIntake {
         self.pullers.lock().expect("pullers").get(module).cloned()
     }
 
-    /// Read one registered lineage's whole WAL without the run index.
-    pub fn lineage_view(&self, registration: &LateResultRegistration) -> LineageView {
+    /// Read one registered session's durable records from its own storage, without the run index.
+    pub async fn lineage_view(
+        &self,
+        registration: &LateResultRegistration,
+        rows: &[RegistrationRow],
+    ) -> LineageView {
+        let runtime = self.session_store.lock().expect("session store").clone();
+        if let Some(runtime) = runtime {
+            let keys = rows
+                .iter()
+                .filter(|row| row.call.bind == registration.bind)
+                .map(|row| row.call.call_key.clone())
+                .collect();
+            if let Some(stored) = StoredLineage::read(&runtime, &registration.bind, keys).await {
+                return LineageView {
+                    facts: HeldCallFacts::default(),
+                    records: Vec::new(),
+                    tombstoned: false,
+                    delivered: HashSet::new(),
+                    stored: Some(stored),
+                };
+            }
+        }
         let mut view = match self.readable(&registration.bind) {
             Some(records) => LineageView {
                 facts: broca_core::held_call_facts(&records, None),
                 records,
                 tombstoned: false,
                 delivered: HashSet::new(),
+                stored: None,
             },
             None => LineageView {
                 // A WAL the intake cannot read proves nothing: every entry for it is deferred.
@@ -404,6 +459,7 @@ impl LateResultsIntake {
                 records: Vec::new(),
                 tombstoned: false,
                 delivered: HashSet::new(),
+                stored: None,
             },
         };
         view.tombstoned = self.tombstoned(&registration.bind, &registration.lineage);
@@ -433,16 +489,16 @@ impl LateResultsIntake {
     ///
     /// The same pass prunes the registrations that are settled for good, so a registration
     /// never outlives the commit of the batch that settled its call.
-    pub fn module_needs_feed(&self, module: &str) -> Result<bool, String> {
-        let holds = self.module_holds_calls(module)?;
+    pub async fn module_needs_feed(&self, module: &str) -> Result<bool, String> {
+        let holds = self.module_holds_calls(module).await?;
         Ok(holds || self.store.feed(module)?.is_some_and(|feed| feed.ack_owed))
     }
 
     /// Start the module's puller when its feed is still needed and none runs. The claim lives in
     /// this process only: a puller never outlives its process, so a crash leaves nothing that
     /// could keep the next process from starting one.
-    pub fn ensure_puller(self: &Arc<Self>, module: &str) -> Result<StartOutcome, String> {
-        if !self.module_needs_feed(module)? {
+    pub async fn ensure_puller(self: &Arc<Self>, module: &str) -> Result<StartOutcome, String> {
+        if !self.module_needs_feed(module).await? {
             return Ok(StartOutcome::Idle);
         }
         let puller = Arc::new(Puller::new());
@@ -460,11 +516,11 @@ impl LateResultsIntake {
     }
 
     /// Start a module's puller after boot recovery registered its calls. Same claim, same loop.
-    pub fn ensure_puller_after_recovery(
+    pub async fn ensure_puller_after_recovery(
         self: &Arc<Self>,
         module: &str,
     ) -> Result<StartOutcome, String> {
-        self.ensure_puller(module)
+        self.ensure_puller(module).await
     }
 
     /// Run the module's puller until nothing keeps it, then do one last pull and ack, release the
@@ -476,7 +532,7 @@ impl LateResultsIntake {
                 if puller.is_stopped() {
                     break;
                 }
-                let needed = intake.module_needs_feed(&module).unwrap_or(true);
+                let needed = intake.module_needs_feed(&module).await.unwrap_or(true);
                 if !needed {
                     break;
                 }
@@ -500,6 +556,11 @@ impl LateResultsIntake {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) async fn tick_for_test(&self, module: &str) -> Result<(), FeedError> {
+        self.pull_round(module, &Puller::new()).await
+    }
+
     async fn tick_with(&self, module: &str, puller: &Puller) {
         match self.pull_round(module, puller).await {
             Ok(()) => puller.reset_interval(),
@@ -510,7 +571,7 @@ impl LateResultsIntake {
                 puller.set_pinned(Vec::new());
                 puller.reset_interval();
             }
-            Err(FeedError::Abandoned(reason)) => match self.module_holds_calls(module) {
+            Err(FeedError::Abandoned(reason)) => match self.module_holds_calls(module).await {
                 Ok(true) => {
                     // A module with an open held call or owed barrier keeps its backoff: its
                     // calls stay paused until the feed answers again.
@@ -543,30 +604,56 @@ impl LateResultsIntake {
 
     /// Whether the module still has a held call or an owed barrier: the condition that outranks
     /// an abandoned ack. Prunes every registration whose call is settled for good on the way.
-    pub fn module_holds_calls(&self, module: &str) -> Result<bool, String> {
+    pub async fn module_holds_calls(&self, module: &str) -> Result<bool, String> {
         let mut holds = false;
         let mut views = HashMap::new();
         let mut inline = Vec::new();
         let mut settled = Vec::new();
-        for row in self.store.registrations_for(module)? {
-            let view = views
-                .entry(row.call.bind.clone())
-                .or_insert_with(|| self.lineage_view(&row.call));
+        let mut retired = Vec::new();
+        let rows = self.store.registrations_for(module)?;
+        for row in &rows {
+            if !views.contains_key(&row.call.bind) {
+                views.insert(
+                    row.call.bind.clone(),
+                    self.lineage_view(&row.call, &rows).await,
+                );
+            }
+            let view = views.get(&row.call.bind).expect("lineage view");
+            if let Some(stored) = &view.stored {
+                if let Some(reason) = stored.retirement_reason(&row.call.call_key) {
+                    settled.push((module.to_owned(), row.call.call_key.clone()));
+                    retired.push((&row.call, reason));
+                } else {
+                    holds |= stored.needs_intake(&row.call.call_key);
+                }
+                continue;
+            }
             if view.tombstoned
                 || (!view.facts.unreadable
                     && registration_settled(&row.call.call_key, &view.records, &view.facts))
             {
                 if inline_registration_settled(&row.call.call_key, &view.records, &view.facts) {
-                    inline.push((module.to_owned(), row.call.call_key));
+                    inline.push((module.to_owned(), row.call.call_key.clone()));
                 } else {
-                    settled.push((module.to_owned(), row.call.call_key));
+                    settled.push((module.to_owned(), row.call.call_key.clone()));
                 }
+                retired.push((
+                    &row.call,
+                    if view.tombstoned {
+                        "lineage_tombstoned"
+                    } else {
+                        "terminal_and_batch_committed"
+                    },
+                ));
             } else if view.facts.unreadable || view.facts.needs_intake() {
                 holds = true;
             }
         }
         self.store.remove_inline_calls(&inline)?;
         self.store.remove_calls(&settled)?;
+        for (call, reason) in retired {
+            log_retirement(call, reason);
+        }
         Ok(holds)
     }
 
@@ -759,7 +846,11 @@ impl LateResultsIntake {
                 Disposition::NoOp => Classified::NoOp,
             });
         }
-        let kind = self.classify(module, entry, rows, views)?;
+        let kind = self.classify(module, entry, rows, views).await?;
+        let session_address = rows
+            .iter()
+            .find(|row| row.call.module == module && row.call.call_key == entry.call_key)
+            .map(|row| broca_core::session_addr(&row.call.bind));
         match kind {
             Classified::NoOp => {
                 self.store
@@ -771,6 +862,8 @@ impl LateResultsIntake {
                     module,
                     call_key = entry.call_key,
                     event_id = entry.event_id,
+                    session_address,
+                    reason,
                     "late-results entry deferred: {reason}"
                 );
             }
@@ -780,6 +873,8 @@ impl LateResultsIntake {
                     module,
                     call_key = entry.call_key,
                     event_id = entry.event_id,
+                    session_address,
+                    reason = "held_record_pending",
                     "late-results entry waits for its held record"
                 );
             }
@@ -788,7 +883,7 @@ impl LateResultsIntake {
         Ok(kind)
     }
 
-    fn classify(
+    async fn classify(
         &self,
         module: &str,
         entry: &LateEntry,
@@ -833,19 +928,22 @@ impl LateResultsIntake {
             return Ok(Classified::NoOp);
         }
         if !views.contains_key(&row.call.bind) {
-            let view = self.lineage_view(&row.call);
+            let view = self.lineage_view(&row.call, rows).await;
             views.insert(row.call.bind.clone(), view);
         }
         let view = views.get(&row.call.bind).expect("view was just inserted");
+        if view.delivered.contains(&entry.call_key) {
+            return Ok(Classified::NoOp);
+        }
+        if let Some(stored) = &view.stored {
+            return Ok(stored.classify(module, entry, row));
+        }
         if view.tombstoned {
             // Retention deleted the session; its late entries are no-ops, never Blocked.
             return Ok(Classified::NoOp);
         }
         if view.facts.unreadable {
             return Ok(Classified::Blocked("wal_unreadable".into()));
-        }
-        if view.delivered.contains(&entry.call_key) {
-            return Ok(Classified::NoOp);
         }
         let Some(dispatch) = dispatch_fact(&entry.call_key, &view.records) else {
             // A registration without its intent is not evidence that the call is gone.
@@ -947,9 +1045,13 @@ impl LateResultsIntake {
             };
             let held_call_id = match views
                 .get(&row.call.bind)
-                .and_then(|view| view.facts.held_call(&entry.call_key))
-                .map(|held| held.tool_call_id.clone())
-            {
+                .and_then(|view| match &view.stored {
+                    Some(stored) => stored.held_call_id(&entry.call_key),
+                    None => view
+                        .facts
+                        .held_call(&entry.call_key)
+                        .map(|held| held.tool_call_id.clone()),
+                }) {
                 Some(id) => id,
                 None => {
                     // Nothing to deliver as a tool result: settle the entry as a no-op.
@@ -1077,12 +1179,24 @@ impl LateResultsIntake {
     }
 }
 
-/// One registered lineage's WAL, as the intake reads it.
+/// One registered session's durable records, as the intake reads them.
 pub struct LineageView {
     pub facts: HeldCallFacts,
     pub records: Vec<FramedRecord>,
     pub tombstoned: bool,
     delivered: HashSet<String>,
+    stored: Option<StoredLineage>,
+}
+
+fn log_retirement(call: &LateResultRegistration, reason: &str) {
+    tracing::info!(
+        target: "late_results",
+        module = call.module,
+        call_key = call.call_key,
+        session_address = broca_core::session_addr(&call.bind),
+        reason,
+        "retired late-results registration"
+    );
 }
 
 /// Settles an entry for an open held call without writing it into the run, and says why.
@@ -2225,6 +2339,7 @@ mod tests {
                     &rig.store.registration_rows().unwrap(),
                     &mut HashMap::new()
                 )
+                .await
                 .unwrap(),
             Classified::Pending
         );
@@ -2315,7 +2430,7 @@ mod tests {
             &bind,
             &inline_then_held_records(&bind),
         );
-        assert!(rig.intake.module_holds_calls("basal").unwrap());
+        assert!(rig.intake.module_holds_calls("basal").await.unwrap());
         assert!(rig
             .store
             .registration("basal", "lineage:4")
@@ -2358,12 +2473,12 @@ mod tests {
         register_more(&rig.store, &calls).await;
         assert!(rig.intake.running().is_empty());
         assert_eq!(
-            rig.intake.sweep_registrations().unwrap(),
+            rig.intake.sweep_registrations().await.unwrap(),
             REGISTRATION_SWEEP_LIMIT
         );
         assert_eq!(rig.store.registrations().unwrap().len(), 1);
-        assert_eq!(rig.intake.sweep_registrations().unwrap(), 1);
-        assert_eq!(rig.intake.sweep_registrations().unwrap(), 0);
+        assert_eq!(rig.intake.sweep_registrations().await.unwrap(), 1);
+        assert_eq!(rig.intake.sweep_registrations().await.unwrap(), 0);
         assert!(rig.store.registrations().unwrap().is_empty());
     }
 
@@ -2396,7 +2511,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert_eq!(rig.intake.sweep_registrations().unwrap(), 1);
+        assert_eq!(rig.intake.sweep_registrations().await.unwrap(), 1);
         assert!(rig.store.registration("basal", "zzz:4").unwrap().is_some());
     }
 
@@ -3002,9 +3117,9 @@ mod tests {
         let rig = Rig::new("unheld", None, Vec::new()).await;
         let bind = quiet_bind("quiet", &rig_root("unheld").join("wal"));
         register_more(&rig.store, &[registration("lineage:1", "tools", &bind)]).await;
-        assert!(!rig.intake.module_needs_feed("tools").unwrap());
+        assert!(!rig.intake.module_needs_feed("tools").await.unwrap());
         assert_eq!(
-            rig.intake.ensure_puller("tools").unwrap(),
+            rig.intake.ensure_puller("tools").await.unwrap(),
             StartOutcome::Idle
         );
         assert!(rig.intake.running().is_empty());
@@ -3024,11 +3139,11 @@ mod tests {
         let other = quiet_bind("other-scope", &rig_root("one-puller").join("wal"));
         register_more(&rig.store, &[registration("lineage:5", "tools", &other)]).await;
         assert_eq!(
-            rig.intake.ensure_puller("tools").unwrap(),
+            rig.intake.ensure_puller("tools").await.unwrap(),
             StartOutcome::Started
         );
         assert_eq!(
-            rig.intake.ensure_puller("tools").unwrap(),
+            rig.intake.ensure_puller("tools").await.unwrap(),
             StartOutcome::Held
         );
         assert_eq!(rig.intake.running(), vec!["tools".to_owned()]);
@@ -4292,7 +4407,7 @@ mod tests {
             &done,
             &delivered_records(done_key, "tools", &done),
         );
-        assert!(rig.intake.module_needs_feed("tools").unwrap());
+        assert!(rig.intake.module_needs_feed("tools").await.unwrap());
         let kept: Vec<String> = rig
             .store
             .registrations()
@@ -4734,7 +4849,7 @@ mod tests {
         );
         let start = tokio::time::Instant::now();
         assert_eq!(
-            intake.ensure_puller("tools").unwrap(),
+            intake.ensure_puller("tools").await.unwrap(),
             StartOutcome::Started
         );
         // Both waits run on the paused clock, so the bound costs no real time. It only turns
