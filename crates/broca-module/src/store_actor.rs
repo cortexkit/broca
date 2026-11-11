@@ -2169,7 +2169,13 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         };
         match self.recovery_start(run) {
             Ok(start) => {
-                self.start_run(start, None, None, mode).await;
+                if run.cancel.is_some() && run.paused.is_some() {
+                    let cancel = CancellationToken::new();
+                    cancel.cancel();
+                    self.start_run_under(start, None, None, mode, cancel).await;
+                } else {
+                    self.start_run(start, None, None, mode).await;
+                }
                 // Today's actor seals a crash's orphan before it takes any command, so no caller
                 // sees the orphan as running; the seal sends nothing, so it ends at once.
                 if matches!(mode, StoreRunMode::Seal(_)) {
@@ -3798,6 +3804,38 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         run_id: &RunId,
         at: broca_wal::record::RunCancelAt,
     ) -> CancelOutcome {
+        if self.run.is_none() {
+            let Some(run) = self.session.operations().run.as_ref().filter(|run| {
+                run.run_id == run_id.0 && run.finished.is_none() && run.paused.is_some()
+            }) else {
+                return CancelOutcome::NotActive;
+            };
+            let start = match self.recovery_start(run) {
+                Ok(start) => start,
+                Err(error) => return CancelOutcome::Error(error),
+            };
+            let point = match at {
+                broca_wal::record::RunCancelAt::Now => CancelPoint::Now,
+                broca_wal::record::RunCancelAt::StepBoundary => CancelPoint::StepBoundary,
+            };
+            if let Err(error) = self
+                .append_own(Record::CancelRequest(CancelRequest {
+                    run_id: run_id.0.clone(),
+                    at: point,
+                }))
+                .await
+            {
+                return CancelOutcome::Error(error);
+            }
+            // A parked run has no task to cancel. Resume with cancellation already requested:
+            // ordinary pauses end immediately, and a held batch closes its calls and withdraws
+            // them after its Cancelled end is durable. Neither cancel point waits for a result.
+            let cancel = CancellationToken::new();
+            cancel.cancel();
+            self.start_run_under(start, None, None, StoreRunMode::Resume, cancel)
+                .await;
+            return CancelOutcome::Ack;
+        }
         let Some(active) = self.run.as_mut().filter(|active| &active.run_id == run_id) else {
             return CancelOutcome::NotActive;
         };
@@ -3892,6 +3930,9 @@ pub(crate) fn recovery_mode(
     run: &broca_session_store::fold::operations::Run,
 ) -> Option<StoreRunMode> {
     use broca_session_store::fold::operations::Resolution;
+    if run.finished.is_none() && run.cancel.is_some() {
+        return Some(StoreRunMode::Resume);
+    }
     match run.resolution() {
         Resolution::Resume | Resolution::Interrupted(_) => Some(match run.cancel {
             None => StoreRunMode::Seal(broca_core::seal::SealCause::CrashOrphan),

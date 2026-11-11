@@ -44,11 +44,24 @@ async fn serve_store_run(
     req: broca_core::RunRequest,
     mode: broca_module::executor::StoreRunMode,
 ) -> broca_module::executor::StoreRunEnd {
+    serve_store_run_with_control(executor, session, parts, req, mode, Default::default()).await
+}
+
+async fn serve_store_run_with_control(
+    executor: &LiveLoopExecutor,
+    session: &mut broca_session_store::session::Session<
+        &'static broca_session_store::backend::MemoryBackend,
+    >,
+    parts: &broca_session_loop::parts::SharedParts,
+    req: broca_core::RunRequest,
+    mode: broca_module::executor::StoreRunMode,
+    control: broca_core::run::RunControl,
+) -> broca_module::executor::StoreRunEnd {
     let (writer, mut link) = broca_session_loop::shared::ActorWriter::new(session, None);
     let job = broca_module::executor::StoreRunJob {
         req,
         auth: None,
-        control: Default::default(),
+        control,
         writer,
         parts: Box::new(parts.clone()),
         mode,
