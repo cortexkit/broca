@@ -62,9 +62,36 @@ pub trait Plane: Send + Sync {
     /// them from one read.
     async fn declarations(&self) -> Declarations {
         Declarations {
-            entry_speaks_for: self.provides_entry_speaks_for().await,
+            entry_speaks_for: AttributionDeclaration::known(self.provides_entry_speaks_for().await),
             signed_floor: self.provides_signed_floor().await,
             notes_tokens: self.provides_notes_tokens().await,
+        }
+    }
+}
+
+/// Whether a catalog read established that entries may carry speaker attribution.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AttributionDeclaration {
+    Declared,
+    NotDeclared,
+    #[default]
+    Unknown,
+}
+
+impl AttributionDeclaration {
+    pub fn known(declared: bool) -> Self {
+        if declared {
+            Self::Declared
+        } else {
+            Self::NotDeclared
+        }
+    }
+
+    pub fn value(self) -> Option<bool> {
+        match self {
+            Self::Declared => Some(true),
+            Self::NotDeclared => Some(false),
+            Self::Unknown => None,
         }
     }
 }
@@ -74,7 +101,7 @@ pub trait Plane: Send + Sync {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Declarations {
     /// `compaction-entry-speaks-for/v1`: entries carry stored speaker marks.
-    pub entry_speaks_for: bool,
+    pub entry_speaks_for: AttributionDeclaration,
     /// `compaction-signed-floor/v1`: Setup and conditions carry the signed floor.
     pub signed_floor: bool,
     /// `compaction-notes-tokens/v1`: notice conditions separate persistent note counts.
@@ -84,7 +111,9 @@ pub struct Declarations {
 impl Declarations {
     fn of(provides: &[String]) -> Self {
         Self {
-            entry_speaks_for: cortexkit_role_compaction::provides_entry_speaks_for(provides),
+            entry_speaks_for: AttributionDeclaration::known(
+                cortexkit_role_compaction::provides_entry_speaks_for(provides),
+            ),
             signed_floor: cortexkit_role_compaction::provides_signed_floor(provides),
             notes_tokens: cortexkit_role_compaction::provides_notes_tokens(provides),
         }
@@ -130,7 +159,7 @@ impl Plane for BoundPlane<'_> {
     }
 
     async fn provides_entry_speaks_for(&self) -> bool {
-        self.declarations().await.entry_speaks_for
+        self.declarations().await.entry_speaks_for == AttributionDeclaration::Declared
     }
 
     async fn provides_signed_floor(&self) -> bool {
@@ -145,12 +174,11 @@ impl Plane for BoundPlane<'_> {
         let Some(plane) = self.plane else {
             return Declarations::default();
         };
-        plane
-            .provider_capabilities(self.provider)
-            .await
-            .map_or_else(Declarations::default, |provides| {
-                Declarations::of(&provides)
-            })
+        match plane.provider_capabilities(self.provider).await {
+            crate::ProviderCapabilities::Declared(provides) => Declarations::of(&provides),
+            crate::ProviderCapabilities::NotInCatalog => Declarations::of(&[]),
+            crate::ProviderCapabilities::Unknown => Declarations::default(),
+        }
     }
 }
 
@@ -566,11 +594,18 @@ async fn setup(
     // The provider's declarations are read from the catalog at every Setup, before the Setup is
     // sent, so a provider that reads entries as soon as it is ready already sees them as
     // declared, and what they say holds for every call until the next Setup. A catalog that
-    // can't be read in time counts as no declaration.
+    // can't be read in time sends no optional fields, but leaves attribution unknown so an
+    // entries read cannot mistake the fallback for a provider's declaration.
     let declared = tokio::time::timeout(CALL_DEADLINE, plane.declarations())
         .await
         .unwrap_or_default();
-    entry_speaks_for.store(attribution(declared.entry_speaks_for), Ordering::Release);
+    entry_speaks_for.store(
+        declared
+            .entry_speaks_for
+            .value()
+            .map_or(ATTRIBUTION_UNKNOWN, attribution),
+        Ordering::Release,
+    );
     lane.signed_floor_declared = declared.signed_floor;
     lane.notes_tokens_declared = declared.notes_tokens;
     let mut request = request.clone();

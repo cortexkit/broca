@@ -31,6 +31,8 @@ use crate::store_reads::{
 };
 use crate::store_status::SettledRuns;
 
+mod capability_tests;
+
 /// A memory backend that records how far the session's log is written and how far a barrier
 /// made it durable, and can fail the next barrier.
 #[derive(Default)]
