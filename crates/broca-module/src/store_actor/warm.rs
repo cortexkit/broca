@@ -221,7 +221,6 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> St
             let records = self.idle_warm_records().await.map_err(unavailable)?;
             let headers = records
                 .iter()
-                .rev()
                 .find_map(|(_, record)| match record {
                     Record::Warmed(warm) => warm.ratelimit_headers.clone(),
                     Record::Attempt(attempt) => attempt

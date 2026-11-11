@@ -4,6 +4,8 @@ use super::*;
 use broca_session_loop::writer::Writer as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+mod billing_recovery;
+
 cipher_tests!(
     idle_head_uses_hour_lifetime_and_stops_at_durable_cap,
     idle_warm_rebuilds_after_restart_without_changing_prompt_state,

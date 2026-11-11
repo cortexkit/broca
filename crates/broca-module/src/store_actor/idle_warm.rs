@@ -5,17 +5,12 @@ use broca_session_loop::writer::Writer as _;
 use broca_session_store::record::Record;
 
 impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> super::StoreActor<B> {
+    /// Newest first, no farther back than the last real model attempt.
     pub(super) async fn idle_warm_records(&self) -> Result<Vec<(u64, Record)>, String> {
-        match &self.readers {
-            Some(readers) => {
-                self.session
-                    .stored_records(readers())
-                    .records_between(1, self.session.next_seq().saturating_sub(1))
-                    .await
-            }
-            None => self.session.open_log_records().await,
-        }
-        .map_err(|error| format!("warm_history: {error:?}"))
+        self.session
+            .ledger_tail_until(|record| matches!(record, Record::Attempt(_)))
+            .await
+            .map_err(|error| format!("warm_history: {error:?}"))
     }
 
     pub(super) async fn bill_recorded_idle_warms(&self) {
@@ -23,25 +18,43 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> su
         if self.frozen_session_class().as_deref() != Some("head") {
             return;
         }
-        let Ok(records) = self.idle_warm_records().await else {
+        let Some(run) = self
+            .session
+            .operations()
+            .run
+            .as_ref()
+            .filter(|run| run.finished.is_some())
+        else {
             return;
         };
-        let runs: std::collections::BTreeSet<_> = records
-            .iter()
-            .filter_map(|(_, record)| match record {
-                Record::Warmed(warm) => Some(warm.run_id.as_str()),
-                _ => None,
+        let run_id = run.run_id.as_str();
+        let Ok(records) = self
+            .session
+            .ledger_tail_until(|record| match record {
+                Record::Billed(billed) => billed.run_id == run_id,
+                Record::RunStart(start) => start.run_id == run_id,
+                _ => false,
             })
-            .collect();
-        // A warm can arrive after the run's Billed record. Re-inserting stable fact IDs also
-        // recovers a crash between making that late warm durable and inserting its spend.
-        for run in runs {
-            if let Err(error) = billing
-                .insert(&self.session, &self.key, &self.parts, run)
-                .await
-            {
-                tracing::warn!(target: "cache_warm", session = %broca_core::session_addr(&self.key), %error, "could not recover warm spend facts");
-            }
+            .await
+        else {
+            return;
+        };
+        let after_billed =
+            matches!(records.last(), Some((_, Record::Billed(billed))) if billed.run_id == run_id);
+        let late_warm = records.iter().any(|(_, record)| {
+            matches!(record, Record::Warmed(warm)
+            if warm.run_id == run_id && warm.trigger.as_deref() == Some("keep_warm"))
+        });
+        if !after_billed || !late_warm {
+            return;
+        }
+        // A warm can arrive after the latest run's Billed record. Recover a crash between that
+        // warm's durable write and its spend insert, without touching already-settled older runs.
+        if let Err(error) = billing
+            .insert(&self.session, &self.key, &self.parts, run_id)
+            .await
+        {
+            tracing::warn!(target: "cache_warm", session = %broca_core::session_addr(&self.key), %error, "could not recover warm spend facts");
         }
     }
     pub(super) async fn idle_warm_due(&self) -> Result<u64, String> {
@@ -93,7 +106,7 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> su
         // Sealed history matters too: actor eviction and log rotation must not reset the cap.
         let records = self.idle_warm_records().await?;
         let mut spent = 0.0;
-        for (_, record) in records.iter().rev() {
+        for (_, record) in &records {
             match record {
                 Record::Attempt(_) => break,
                 Record::Warmed(warm) => {

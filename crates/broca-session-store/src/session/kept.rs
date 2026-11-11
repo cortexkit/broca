@@ -119,6 +119,11 @@ impl KeptRecords {
         self.whole.then_some(self.records.as_slice())
     }
 
+    /// The retained suffix, without cloning the rest of the run for a tail lookup.
+    pub(super) fn tail(&self) -> (&[(u64, Record)], bool) {
+        (&self.records, self.whole)
+    }
+
     /// The seq of the run start of the run `run_id`, when it is the latest run start and kept.
     pub(crate) fn start_of(&self, run_id: &str) -> Option<u64> {
         self.latest_start
