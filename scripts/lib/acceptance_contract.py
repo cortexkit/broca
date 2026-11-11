@@ -39,17 +39,22 @@ def bind_no_project(description):
     return int(counts[0]) > 0
 
 
-def tool_results_pass(text, no_project):
+def tool_result_verdict(text):
+    """Return success, a route refusal (3), or failure without treating refusals as success."""
     results = [line for line in text.splitlines() if line.startswith("TOOL_RESULT ")]
     if not results:
-        return False
+        return 1, "TOOL RESULT MISSING"
+    refused = False
     for line in results:
         result = re.fullmatch(r"TOOL_RESULT seq=\d+ id=\S+ is_error=(true|false) text=(.*)", line)
         if result is None:
-            return False
-        if result[1] == "true" and not (no_project and result[2] == PROJECT_REQUIRED):
-            return False
-    return True
+            return 1, "MALFORMED TOOL RESULT"
+        if result[1] == "true":
+            if result[2].startswith("tool/route rejected: project_required"):
+                refused = True
+            else:
+                return 1, "TOOL RESULT ERRORED -- " + result[2]
+    return (3, "") if refused else (0, "")
 
 
 def main():
@@ -59,14 +64,16 @@ def main():
     probe.add_argument("description", type=Path)
     tool = sub.add_parser("tool-result")
     tool.add_argument("transcript", type=Path)
-    tool.add_argument("no_project", choices=("0", "1"))
     args = parser.parse_args()
     try:
         if args.command == "probe":
             description = json.loads(args.description.read_text())["result"]
             print(int(bind_no_project(description)))
             return 0
-        return 0 if tool_results_pass(args.transcript.read_text(), args.no_project == "1") else 1
+        status, detail = tool_result_verdict(args.transcript.read_text())
+        if detail:
+            print("acceptance-turn: " + detail, file=sys.stderr)
+        return status
     except (OSError, ValueError, KeyError, TypeError) as error:
         print(f"acceptance-turn: declaration/result check failed: {error}", file=sys.stderr)
         return 2
