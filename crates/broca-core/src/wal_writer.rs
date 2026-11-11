@@ -3128,6 +3128,7 @@ pub struct RecordObserver {
     subscribers: Arc<AtomicUsize>,
     tap: Option<(Arc<DurableRecordTap>, Arc<std::sync::atomic::AtomicBool>)>,
     step_events: Option<StepEventObserver>,
+    synced_head: Option<Arc<AtomicU64>>,
     publications: Vec<tokio::sync::watch::Sender<Option<broca_wal::file_wal::DurablePublication>>>,
 }
 
@@ -3172,6 +3173,18 @@ struct StepEventObserver {
 }
 
 impl StepEventObserver {
+    fn evidence(attempt: &DurableAttempt, synced_seq: Option<u64>) {
+        if let (Some(synced_seq), Some(lineage), Some(writer)) =
+            (synced_seq, attempt.lineage, attempt.writer_id)
+        {
+            tracing::debug!(target: "step-events.evidence",
+                storage = "wal", session_ref = %attempt.reservation.session.session_ref,
+                log_incarnation = %format!("{lineage}.{}", writer.iter().map(|byte| format!("{byte:02x}")).collect::<String>()),
+                step_seq = attempt.seq, synced_seq, attempt_id = %attempt.attempt_id.as_str(),
+                "step event durable handoff");
+        }
+    }
+
     fn note_cache(&mut self, run_id: &broca_protocol::RunId, mut cache: StepEventCache) {
         if let Some(prior) = self.caches.get(&run_id.0) {
             cache.keep_warm = cache.keep_warm.or(prior.keep_warm);
@@ -3203,6 +3216,7 @@ impl StepEventObserver {
         lineage: Option<broca_wal::WalLineageId>,
         writer_id: Option<[u8; 16]>,
         record: &WalRecord,
+        synced_seq: Option<u64>,
     ) {
         match record {
             WalRecord::RunStarted {
@@ -3288,7 +3302,7 @@ impl StepEventObserver {
                             ),
                             _ => (None, None),
                         };
-                        slot.send(DurableAttempt {
+                        let attempt = DurableAttempt {
                             seq,
                             lineage,
                             writer_id,
@@ -3302,7 +3316,9 @@ impl StepEventObserver {
                             sent_to_last_content_ms,
                             first_to_last_content_ms,
                             cache: self.caches.get(&reservation.run_id.0).cloned(),
-                        })
+                        };
+                        Self::evidence(&attempt, synced_seq);
+                        slot.send(attempt)
                     }
                     Err(_) => {
                         self.dropped.fetch_add(1, Ordering::Relaxed);
@@ -3317,6 +3333,7 @@ impl StepEventObserver {
                 for (_, mut attempt) in std::mem::take(&mut self.open) {
                     attempt.interrupted_at_ms = Some(finished_at_ms);
                     attempt.cache = self.caches.get(&attempt.reservation.run_id.0).cloned();
+                    Self::evidence(&attempt, synced_seq);
                     if self.tx.try_send(attempt).is_err() {
                         self.dropped.fetch_add(1, Ordering::Relaxed);
                     }
@@ -3392,6 +3409,7 @@ impl RecordObserver {
             subscribers,
             tap: None,
             step_events: None,
+            synced_head: None,
             publications: Vec::new(),
         }
     }
@@ -3492,7 +3510,15 @@ impl RecordObserver {
         record: &WalRecord,
     ) {
         if let Some(events) = &mut self.step_events {
-            events.observe(seq, lineage, writer_id, record);
+            events.observe(
+                seq,
+                lineage,
+                writer_id,
+                record,
+                self.synced_head
+                    .as_ref()
+                    .map(|head| head.load(Ordering::Acquire)),
+            );
         }
         let Some((tap, healthy)) = &self.tap else {
             return;
@@ -4898,6 +4924,9 @@ impl WalHandle {
             publication_bytes.clone(),
         );
         let durable_head = Arc::new(AtomicU64::new(last_seq));
+        if let Some(observer) = &mut observer {
+            observer.synced_head = Some(Arc::clone(&durable_head));
+        }
         let writer_durable_head = Arc::clone(&durable_head);
         let poisoned = Arc::new(Mutex::new(None));
         let writer_poisoned = poisoned.clone();

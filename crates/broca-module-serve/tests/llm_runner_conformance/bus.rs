@@ -11,14 +11,26 @@ use cortexkit_bus_testkit::{
     trust::{box_root_id, signer_root_id, unix_now},
     BusOptions, BusServer,
 };
+use futures::StreamExt;
 use nkeys::KeyPair;
 use sha2::{Digest, Sha256};
+
+type CapturedStep = (String, Vec<u8>);
 
 pub(super) struct BusRig {
     server: BusServer,
     pub names: AccountNames,
     user: Arc<KeyPair>,
     jwt: String,
+    _connection: NatsConnection,
+    step_publications: Arc<Mutex<Vec<CapturedStep>>>,
+    step_capture: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for BusRig {
+    fn drop(&mut self) {
+        self.step_capture.abort();
+    }
 }
 
 fn jwt(signer: &KeyPair, subject: &str, nats: Value) -> String {
@@ -99,12 +111,38 @@ impl BusRig {
             })
             .await
             .unwrap();
+        let mut steps = connection
+            .client()
+            .subscribe(format!(
+                "ck.{}.live.broca.step.finished.v1",
+                names.account()
+            ))
+            .await
+            .unwrap();
+        connection.client().flush().await.unwrap();
+        let step_publications = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&step_publications);
+        let step_capture = tokio::spawn(async move {
+            while let Some(message) = steps.next().await {
+                captured
+                    .lock()
+                    .unwrap()
+                    .push((message.subject.to_string(), message.payload.to_vec()));
+            }
+        });
         Some(Self {
             server,
             names,
             user,
             jwt,
+            _connection: connection,
+            step_publications,
+            step_capture,
         })
+    }
+
+    pub fn step_publications(&self) -> Vec<CapturedStep> {
+        self.step_publications.lock().unwrap().clone()
     }
     pub async fn register(self: &Arc<Self>, connection_file: &Path) -> tokio::task::JoinHandle<()> {
         let manifest = subc_protocol::manifest::ModuleManifest::builder("ckbus", "test")

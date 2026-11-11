@@ -244,6 +244,72 @@ async fn durable_step_events_match(cipher: Cipher) {
     scenario(cipher, true, false, true).await;
 }
 
+async fn handoff_evidence(new_storage: bool) {
+    let (calls, mut inbox) = mpsc::unbounded_channel();
+    let events = Arc::new(StepEvents::start_on_bus(Arc::new(Capture {
+        calls,
+        fail: false,
+    })));
+    let module =
+        module_step_events(new_storage, script(false), Some(Cipher::None), Some(events)).await;
+    let session_ref = broca_core::agent_session_ref(&module.key);
+    let capture = broca_test_support::LogCapture::observe(move |event| {
+        event.target == "step-events.evidence"
+            && event.fields.get("session_ref") == Some(&session_ref)
+    });
+    let sent = module.send("evidence-run", "hello", None).await;
+    assert!(matches!(sent, SendOutcome::Active { .. }), "{sent:?}");
+    let (subject, bytes) =
+        broca_test_support::wait_for("step-event evidence publication", inbox.recv(), || {
+            format!("new_storage={new_storage}")
+        })
+        .await
+        .unwrap();
+    let published =
+        cortexkit_role_llm_runner::step_events::decode_step_finished(&subject, &bytes).unwrap();
+    let evidence = capture
+        .events()
+        .into_iter()
+        .find(|event| {
+            event.fields.get("attempt_id").map(String::as_str) == published.attempt_id.as_deref()
+        })
+        .expect("a real publication has writer-side evidence");
+    assert_eq!(evidence.level, tracing::Level::DEBUG);
+    assert_eq!(
+        evidence.fields["log_incarnation"],
+        published.log_incarnation
+    );
+    assert_eq!(
+        evidence.fields["step_seq"].parse::<u64>().unwrap(),
+        published.seq
+    );
+    if new_storage {
+        assert_eq!(evidence.fields["storage"], "store");
+        let record_end = evidence.fields["record_end"].parse::<u64>().unwrap();
+        let synced = evidence.fields["synced_through"].parse::<u64>().unwrap();
+        assert!(record_end > 0);
+        assert!(synced >= record_end, "published before sync: {evidence:?}");
+    } else {
+        assert_eq!(evidence.fields["storage"], "wal");
+        let synced = evidence.fields["synced_seq"].parse::<u64>().unwrap();
+        assert!(
+            synced >= published.seq,
+            "published before sync: {evidence:?}"
+        );
+    }
+    assert!(module.registry.stop_and_seal().await);
+}
+
+#[tokio::test]
+async fn wal_step_event_handoff_logs_the_actual_synced_position() {
+    handoff_evidence(false).await;
+}
+
+#[tokio::test]
+async fn store_step_event_handoff_logs_the_actual_synced_position() {
+    handoff_evidence(true).await;
+}
+
 async fn no_bus_publishes_no_step_events(cipher: Cipher) {
     scenario(cipher, false, false, false).await;
 }

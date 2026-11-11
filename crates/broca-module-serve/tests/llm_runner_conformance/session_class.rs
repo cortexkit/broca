@@ -62,6 +62,50 @@ fn golden(name: &str, value: Value) {
     assert_eq!(bytes, std::fs::read(path).unwrap(), "{name}");
 }
 
+async fn assert_stored_head(
+    subject: &BrocaSubject,
+    live: &Live,
+    session: &str,
+    class: broca_wal::StorageClass,
+    runs: u64,
+) {
+    use broca_session_store::{
+        backend::{LocalBackend, SessionAddr},
+        head::SessionTriple,
+        keys::DeploymentKey,
+        session::Session,
+    };
+    let identity = subject.bind_identity(session);
+    let address = broca_core::session_addr(&identity);
+    assert_eq!(
+        broca_wal::session_storage_class(&live.state_root, &address).unwrap(),
+        Some(class),
+        "the head keeps its backup class"
+    );
+    assert!(broca_wal::session_storage_head(&live.state_root, class, &address).is_file());
+    let stored = Session::view(
+        LocalBackend::new(class.store_root(&live.state_root)),
+        SessionAddr(address),
+        &SessionTriple {
+            project_root: identity.project_root.display().to_string(),
+            harness: identity.harness,
+            session: identity.session,
+        },
+        &DeploymentKey::unloaded(1),
+    )
+    .await
+    .expect("read the plain head without opening a writer");
+    let operations = &stored.operations;
+    assert_eq!(operations.owner.episodes, runs);
+    // With one run, or two runs across restart, the first and latest starts cover every run.
+    for start in [
+        operations.owner.first_start.as_ref().unwrap(),
+        operations.run.as_ref().unwrap().start.as_ref().unwrap(),
+    ] {
+        assert_eq!(start.session_class.as_deref(), Some("head"));
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn classed_sends_route_freeze_and_keep_placement_after_restart() {
     if !rigs_present() {
@@ -75,9 +119,14 @@ async fn classed_sends_route_freeze_and_keep_placement_after_restart() {
     let root = scratch.join("rig");
     let mut live = subject.start(&root).await.unwrap();
     for (session, class, retention, tree) in [
-        ("durable-head", Some("head"), None, "wal-durable"),
+        ("durable-head", Some("head"), None, "session-store-durable"),
         ("ordinary", None, None, "wal"),
-        ("retained-head", Some("head"), Some(3600), "wal-ephemeral"),
+        (
+            "retained-head",
+            Some("head"),
+            Some(3600),
+            "session-store-ephemeral",
+        ),
         ("worker", Some("worker"), None, "wal"),
     ] {
         subject
@@ -132,7 +181,16 @@ async fn classed_sends_route_freeze_and_keep_placement_after_restart() {
                 "{session} in {candidate}"
             );
         }
-        assert!(subject.records(&live, session).iter().any(|record| matches!(record, broca_wal::WalRecord::RunStarted { session_class, .. } if session_class.as_deref() == class)));
+        if class == Some("head") {
+            let storage_class = if retention.is_some() {
+                broca_wal::StorageClass::Ephemeral
+            } else {
+                broca_wal::StorageClass::Durable
+            };
+            assert_stored_head(&subject, &live, session, storage_class, 1).await;
+        } else {
+            assert!(subject.records(&live, session).iter().any(|record| matches!(record, broca_wal::WalRecord::RunStarted { session_class, .. } if session_class.as_deref() == class)));
+        }
         let read = response(route.request("session.read", json!({})).await.unwrap());
         assert!(!read["messages"].as_array().unwrap().is_empty());
     }
@@ -164,7 +222,7 @@ async fn classed_sends_route_freeze_and_keep_placement_after_restart() {
     subject.backup_classes = Some(vec!["worker".into()]);
     let mut live = subject.start(&root).await.unwrap();
     for (session, class, tree) in [
-        ("durable-head", None, "wal-durable"),
+        ("durable-head", None, "session-store-durable"),
         ("worker", Some("worker"), "wal"),
     ] {
         let route = subject
@@ -193,11 +251,49 @@ async fn classed_sends_route_freeze_and_keep_placement_after_restart() {
         );
         finish(&route, &sent["run_id"]).await;
         let addr = broca_core::session_addr(&subject.bind_identity(session));
-        assert!(live
-            .state_root
-            .join(tree)
-            .join(format!("{addr}.wal"))
-            .exists());
+        for candidate in ["wal", "wal-durable", "wal-ephemeral"] {
+            assert_eq!(
+                live.state_root
+                    .join(candidate)
+                    .join(format!("{addr}.wal"))
+                    .exists(),
+                candidate == tree,
+                "{session} in {candidate} after restart"
+            );
+        }
+        if session == "durable-head" {
+            assert_stored_head(
+                &subject,
+                &live,
+                session,
+                broca_wal::StorageClass::Durable,
+                2,
+            )
+            .await;
+            let mut changed = subject.send_fields(session, false);
+            changed.insert("prompt".into(), json!("change class after restart"));
+            changed.insert("session_class".into(), json!("worker"));
+            match route
+                .request("session.send", Value::Object(changed))
+                .await
+                .unwrap()
+            {
+                Reply::Error(error) => {
+                    assert_eq!(error.code, "invalid_params");
+                    assert!(error.message.contains("session_class"));
+                }
+                other => panic!("changed session_class accepted after restart: {other:?}"),
+            }
+            assert_stored_head(
+                &subject,
+                &live,
+                session,
+                broca_wal::StorageClass::Durable,
+                2,
+            )
+            .await;
+            continue;
+        }
         let classes: Vec<_> = subject
             .records(&live, session)
             .iter()

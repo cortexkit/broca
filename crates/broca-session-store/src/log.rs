@@ -364,6 +364,11 @@ impl LogEncoder {
         self.offset
     }
 
+    /// The byte boundary made durable by the writer's most recent successful barrier.
+    pub fn synced_through(&self) -> u64 {
+        self.synced_through
+    }
+
     /// The seq the next record will take.
     pub fn next_seq(&self) -> u64 {
         self.next_seq

@@ -186,7 +186,11 @@ impl Observer {
         )
     }
 
-    pub(crate) fn appended(&mut self, appended: Appended<'_>) {
+    pub(crate) fn appended(
+        &mut self,
+        appended: Appended<'_>,
+        position: broca_session_store::session::AppendPosition,
+    ) {
         match appended {
             Appended::Records {
                 first,
@@ -201,10 +205,10 @@ impl Observer {
                     }
                 }
                 if durable {
-                    self.synced();
+                    self.synced(position);
                 }
             }
-            Appended::Synced => self.synced(),
+            Appended::Synced => self.synced(position),
             Appended::Replaced => {
                 self.unsynced.clear();
                 self.completed.clear();
@@ -364,7 +368,7 @@ impl Observer {
         }
     }
 
-    fn synced(&mut self) {
+    fn synced(&mut self, position: broca_session_store::session::AppendPosition) {
         for event in self.unsynced.drain(..) {
             let Some(id) = event.attempt_id.as_ref() else {
                 continue;
@@ -372,6 +376,13 @@ impl Observer {
             if !self.emitted.insert(id.clone()) {
                 continue;
             }
+            tracing::debug!(target: "step-events.evidence",
+                storage = "store", session_ref = %event.session_ref,
+                log_incarnation = %event.log_incarnation, step_seq = event.seq,
+                attempt_id = %id,
+                log_id = %position.log.0.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+                record_end = position.written_through, synced_through = position.synced_through,
+                "step event durable handoff");
             if event.check().is_err() || self.tx.try_send(event).is_err() {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
             }

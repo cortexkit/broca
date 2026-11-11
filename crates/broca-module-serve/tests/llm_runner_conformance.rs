@@ -355,6 +355,8 @@ mod session_class;
 #[allow(dead_code)]
 #[path = "it/session_client.rs"]
 mod session_client;
+#[path = "llm_runner_conformance/step_events.rs"]
+mod step_events;
 
 fn client_log_dir() -> PathBuf {
     broca_test_support::scratch_root()
@@ -1614,7 +1616,7 @@ impl BrocaSubject {
                         "XDG_DATA_HOME": data_home,
                         "BROCA_PROVIDER_BASE_URL": self.model_url,
                         "BROCA_TOOL_MODULE": TOOL_MODULE,
-                        "CK_LOG": "info,broca.wire.describe=debug,broca.wire.ingress=debug,broca.wire.egress=debug",
+                        "CK_LOG": "info,broca.wire.describe=debug,broca.wire.ingress=debug,broca.wire.egress=debug,broca.step-events.evidence=debug",
                     },
                     "enabled": true
                 },
@@ -1681,7 +1683,7 @@ impl BrocaSubject {
         if let Some(classes) = &self.backup_classes {
             settings["backup_classes"] = json!(classes);
         }
-        if self.plain_session_storage {
+        if self.plain_session_storage || routed_session.is_some_and(step_events::fixture_session) {
             settings["session_storage"] = json!({"encryption": "off"});
         }
         if routed {
@@ -1748,7 +1750,11 @@ impl BrocaSubject {
             None => None,
         };
         #[cfg(feature = "test-clock")]
-        let bus_credentials = match self.bus.as_ref().filter(|_| !routed) {
+        let bus_credentials = match self
+            .bus
+            .as_ref()
+            .filter(|_| !routed || routed_session.is_some_and(step_events::fixture_session))
+        {
             Some(bus) => Some(bus.register(&connection_file).await),
             None => None,
         };
@@ -2497,6 +2503,17 @@ impl RunnerRoute for BrocaRoute {
 
 #[async_trait]
 impl LlmRunnerSubject for BrocaSubject {
+    async fn step_event_observation(
+        &self,
+        handle: &Live,
+        session: &str,
+    ) -> Result<
+        cortexkit_role_llm_runner_conformance::step_events::StepEventObservation,
+        HarnessError,
+    > {
+        step_events::observe(self, handle, session).await
+    }
+
     async fn call_yield_admission_state(
         &self,
         session: &str,
@@ -2973,6 +2990,7 @@ impl LlmRunnerSubject for BrocaSubject {
             Capability::SenderSuccession,
             Capability::ReadDisplayFacts,
             Capability::SendIds,
+            Capability::StepEvents,
             Capability::ClientMessageId,
             // The adapter implements the three session_change subject hooks (a tool-free
             // refresh plan, model request observations and holdable tool calls), so the kit
@@ -3132,7 +3150,13 @@ impl LlmRunnerSubject for BrocaSubject {
             .unwrap()
             .get(session)
         {
-            return routed_accounts::send_fields(session, first, peer);
+            let mut fields = routed_accounts::send_fields(session, first, peer);
+            if first && step_events::fixture_session(session) {
+                // The new-head path records durable attempt identities. The fixture's daemon
+                // uses plain storage because its vault has no deployment key.
+                fields.insert("session_class".into(), json!("head"));
+            }
+            return fields;
         }
         if self
             .shared
@@ -4668,6 +4692,8 @@ fn check_0814_undeclared_cases(
 }
 
 fn expected_0821_cases() -> Vec<(&'static str, CaseOutcome)> {
+    // The Passed send-id pin depends on the product fix that omits internal submission IDs
+    // from unkeyed direct starts, rather than exposing them as caller send IDs.
     include_str!("golden/llm_runner_0821.applicability.txt")
         .lines()
         .chain(include_str!("golden/llm_runner_0828.applicability.txt").lines())
@@ -4723,10 +4749,18 @@ fn check_0821_cases(
 }
 
 #[test]
-fn runner_0821_unkeyed_send_identity_pins_the_exact_optional_rule() {
+fn runner_0821_send_identity_pins_the_exact_replacement_rule() {
     use cortexkit_role_llm_runner_conformance::{CaseReport, CASES};
     const CASE: &str = "read_display_facts_send_id_when_present";
-    const REASON: &str = "read_display_facts_send_id_unkeyed: runner returned no submission_id; verified absence instead";
+    const REASON: &str = "send_ids guarantee is checked by read_display_facts_send_id";
+    assert_eq!(
+        expected_0821_cases()
+            .into_iter()
+            .find(|(name, _)| *name == "read_display_facts_send_id")
+            .unwrap()
+            .1,
+        CaseOutcome::Passed
+    );
     let mut cases: Vec<_> = expected_0821_cases()
         .into_iter()
         .map(|(name, outcome)| {
@@ -4739,24 +4773,24 @@ fn runner_0821_unkeyed_send_identity_pins_the_exact_optional_rule() {
         })
         .collect();
     let index = cases.iter().position(|case| case.case == CASE).unwrap();
-    cases[index].outcome = CaseOutcome::PassedWithInapplicableRule {
+    cases[index].outcome = CaseOutcome::Inapplicable {
         reason: REASON.into(),
     };
     check_0821_cases(&cases).unwrap();
     for reason in [
         "",
         "runner returned no submission_id",
-        "read_display_facts_send_id_unkeyed: runner does not admit unkeyed non-owner sends",
+        "read_display_facts_send_id_unkeyed: runner returned no submission_id; verified absence instead",
     ] {
         let mut changed = cases.clone();
-        changed[index].outcome = CaseOutcome::PassedWithInapplicableRule {
+        changed[index].outcome = CaseOutcome::Inapplicable {
             reason: reason.into(),
         };
         assert!(check_0821_cases(&changed).unwrap_err().contains(CASE));
     }
     for outcome in [
         CaseOutcome::Passed,
-        CaseOutcome::Inapplicable {
+        CaseOutcome::PassedWithInapplicableRule {
             reason: REASON.into(),
         },
     ] {
@@ -7956,6 +7990,18 @@ async fn conformance_subject_declares_the_served_admission_reports_group() {
             .capabilities()
             .contains(&Capability::AdmissionReports));
     }
+}
+
+#[tokio::test]
+async fn conformance_subject_declares_the_served_step_events_group() {
+    let scratch = broca_test_support::scratch_root().join("step-events-declaration");
+    let subject = BrocaSubject::new(&scratch).await;
+    let describe = broca_wire::broca_role_describe_with_writers("test", false, false, false);
+    assert!(describe
+        .capabilities
+        .iter()
+        .any(|group| group == cortexkit_role_llm_runner::capabilities::STEP_EVENTS));
+    assert!(subject.capabilities().contains(&Capability::StepEvents));
 }
 
 #[tokio::test]
