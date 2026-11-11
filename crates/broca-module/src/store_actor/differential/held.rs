@@ -14,6 +14,9 @@ use broca_session_store::keys::{Cipher, DeploymentKey};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+#[path = "held/intake.rs"]
+mod intake;
+
 #[derive(Default)]
 struct HoldingTools(AtomicUsize, std::sync::atomic::AtomicBool);
 
@@ -304,6 +307,10 @@ impl Side {
         .unwrap()
     }
     async fn restarted(&self) -> Self {
+        self.restarted_with_steps(vec![super::super::tests::text_step("m2", "done")])
+            .await
+    }
+    async fn restarted_with_steps(&self, steps: Vec<Vec<NormalizedEvent>>) -> Self {
         fn copy(from: &std::path::Path, to: &std::path::Path) {
             if !from.exists() {
                 return;
@@ -328,7 +335,7 @@ impl Side {
             self.key.clone(),
             self.store,
             self.cipher,
-            vec![super::super::tests::text_step("m2", "done")],
+            steps,
             self.executor.tools.clone(),
             None,
         )

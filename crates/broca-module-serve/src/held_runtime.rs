@@ -259,9 +259,12 @@ impl HeldRuntime {
         let weak = Arc::downgrade(&intake);
         slots.on_hold(move |module| {
             if let Some(intake) = weak.upgrade() {
-                if let Err(error) = intake.ensure_puller(module) {
-                    tracing::warn!(target: "late_results", module, "late-results puller did not start: {error}");
-                }
+                let module = module.to_owned();
+                tokio::spawn(async move {
+                    if let Err(error) = intake.ensure_puller(&module).await {
+                        tracing::warn!(target: "late_results", module, "late-results puller did not start: {error}");
+                    }
+                });
             }
         });
         Ok(Arc::new(Self {
@@ -290,6 +293,9 @@ impl HeldRuntime {
     /// every registered session so its open-time recovery runs, then start a puller for every
     /// module whose feed is still needed.
     pub async fn recover(self: Arc<Self>, registry: Arc<broca_module::registry::LineageRegistry>) {
+        if let Some(runtime) = registry.store_runtime() {
+            self.intake.set_session_store(runtime);
+        }
         let stopping = registry.stopping_signal();
         self.bind_stopping_signal(stopping.clone());
         if stopping.is_cancelled() {
@@ -389,17 +395,13 @@ impl HeldRuntime {
                 _ = stopping.cancelled() => return,
                 _ = tokio::time::sleep(broca_module::late_results_puller::PULL_INTERVAL) => {}
             }
-            let intake = self.intake.clone();
-            match tokio::task::spawn_blocking(move || intake.sweep_registrations()).await {
-                Ok(Ok(settled)) if settled > 0 => {
+            match self.intake.sweep_registrations().await {
+                Ok(settled) if settled > 0 => {
                     tracing::info!(target: "late_results", settled, "retired settled late-results registrations")
                 }
-                Ok(Ok(_)) => {}
-                Ok(Err(error)) => {
-                    tracing::warn!(target: "late_results", "late-results registration sweep failed: {error}")
-                }
+                Ok(_) => {}
                 Err(error) => {
-                    tracing::warn!(target: "late_results", "late-results registration sweep task failed: {error}")
+                    tracing::warn!(target: "late_results", "late-results registration sweep failed: {error}")
                 }
             }
         }
@@ -414,7 +416,7 @@ impl HeldRuntime {
             if stopping.is_cancelled() {
                 return;
             }
-            if let Err(error) = self.intake.ensure_puller(&module) {
+            if let Err(error) = self.intake.ensure_puller(&module).await {
                 tracing::warn!(target: "late_results", module, "late-results puller did not start: {error}");
             }
         }

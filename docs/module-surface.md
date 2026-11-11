@@ -2304,7 +2304,7 @@ abandoned without its final frame logs the provider, tool and call key.
 
 The daemon installs the provider-held runtime (`broca-module-serve/src/held_runtime.rs`) on
 its tool plane: the waiting slots a held call's batch waits in, a late-results intake store
-(`late-results.db` under the state root, a projection of the WAL kept out of the backup
+(`late-results.db` under the state root, a dispatch-registration projection kept out of the backup
 catalog), one puller per provider module, and boot recovery. Installing that runtime enables
 held-reply negotiation without an environment switch, in release and debug builds alike.
 `role.describe` advertises `held_calls` beside `run_status`. Tool planes without the held
@@ -2343,7 +2343,8 @@ delivery of withdrawal packets.
 The puller pulls `late_results` under broca's own principal on one unscoped route per module
 (the custodian is the carrier, tool-provider contract §7), every 3 s while the module needs
 its feed, backing off to 30 s after errors. Each entry is classed from the intake registrations
-and the registered session's own WAL, never from `run-index.db`: an entry for an open held call
+and the registered session's own records (its WAL or new session storage), never from
+`run-index.db`: an entry for an open held call
 is mapped with the same `content/v1` mapper a synchronous reply uses (`not_started` and
 `expired` become error results whose text is pinned by golden), deposited in the call's slot,
 and the session's actor resumes a paused run into its original batch, which writes the result
@@ -2351,7 +2352,7 @@ as the call's `ToolResult` at the call's position and syncs it. Only then is the
 through exactly the cursor the provider returned. An entry whose call already has its terminal
 (including an inline answer), whose dispatching run has ended, whose kind is unknown, or which
 no registration names is acked as a no-op. A durable intent with no terminal or held record is
-pending only while its dispatching run is open; an unreadable WAL remains blocked. An answer
+pending only while its dispatching run is open; unreadable session storage remains blocked. An answer
 for an indeterminate call in a sealed run never changes that call or enters a later run.
 A `not_started` entry with `reason: "scope_ended"` is the same never-run error result,
 not a request to dispatch the call again.
@@ -2366,6 +2367,11 @@ also retires old inline-terminal registrations as it encounters them. A maintena
 checks at most 64 registrations every 3 s, starting after recovery, even for modules without
 a running puller. It lazily retires stale terminal rows without scanning every log at startup;
 held calls that still owe a batch commit keep their registrations for recovery.
+For new-storage sessions the intake reads the durable intent, held and terminal records and
+the operational run state. Delivery uses the same slots and the store actor's `ResumeHeld`
+continuation; a cancelling or ended run cannot take an answer, nor can a later run take an
+earlier run's key. Deferred entries and retired registrations log their session address,
+call key and reason.
 
 At boot tombstoned lineages are pruned from the intake without opening an actor. Every remaining
 session with a registration is opened so its open-time recovery runs, then each
@@ -2376,6 +2382,8 @@ retains each episode's original scope. Until that scan completes no entry is del
 acked. Only roots with neither registration history nor a held feature floor may skip a
 rebuild scan. An existing unheld database starts no scan, reads no WAL and gains no writes;
 boot adds only a read-only probe of the rebuild fence.
+The lost-database rebuild currently scans WAL-backed sessions only; it does not reconstruct
+registrations from new-storage sessions. Their existing registrations must be retained.
 
 After a held run's cancel seal is synced, `tool.withdraw` is sent on the original provider's
 tool route with its frozen scope, under broca's carrier identity. The cancellation outcome
