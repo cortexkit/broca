@@ -6,8 +6,8 @@
 //! not yet written, and a log that needs a recovery refuses until a writer repairs it. Each reply
 //! is built from what the session decided when it placed each message (`EntryFacts`) and from its
 //! operational fold, never from a replay. A reply here equals the reply today's reader builds from
-//! a WAL for the same history, except that it has no WAL lineage and its cursors use the store's
-//! own record seqs.
+//! a WAL for the same history, except that it has no WAL lineage, its cursors use the store's
+//! own record seqs, and the replies and history version are exposed as `store_exposure` says.
 
 use std::collections::BTreeMap;
 
@@ -110,6 +110,40 @@ pub async fn served_compaction_entries<B: SessionBackend>(
     Ok(held_back(session, entries))
 }
 
+/// The zero-based ordinals of every assistant message of `session` whose entry facts say its run
+/// cleans replies (`EntryFacts::clean_reply`): the messages every read serves cleaned of tag
+/// notation (`crate::store_exposure::served_message`). Reads the whole transcript, a page at a
+/// time; for the converter's checks, which compare whole sessions.
+pub async fn clean_reply_ordinals<B: SessionBackend>(
+    session: &Session<B>,
+) -> Result<std::collections::BTreeSet<u64>, SessionError> {
+    const PAGE: usize = 256;
+    let len = transcript_len(session);
+    let mut ordinals = std::collections::BTreeSet::new();
+    let mut from = 1;
+    while from <= len {
+        let entries = served_entries(session, from, PAGE).await?;
+        let Some(last) = entries.last().map(|entry| entry.ordinal) else {
+            break;
+        };
+        ordinals.extend(
+            entries
+                .iter()
+                .filter(|entry| {
+                    entry.message.role == Role::Assistant
+                        && entry
+                            .state
+                            .facts
+                            .as_ref()
+                            .is_some_and(|facts| facts.clean_reply)
+                })
+                .map(|entry| entry.ordinal - 1),
+        );
+        from = last + 1;
+    }
+    Ok(ordinals)
+}
+
 /// `entries` with the results of a batch that hasn't closed held back, and the turn they answer
 /// served as still running (see [`results_await_close`]).
 fn held_back<B: SessionBackend>(
@@ -148,6 +182,10 @@ pub struct StorePage {
     /// ordinal: that run's id and the number before the message's first part
     /// (`EntryFacts::runner_tag_base`).
     pub numbering: BTreeMap<u64, (String, u64)>,
+    /// The zero-based ordinals of the page's assistant messages whose entry facts say their run
+    /// cleans replies (`EntryFacts::clean_reply`), which a served read shows cleaned
+    /// (`crate::store_exposure::served_message`).
+    pub clean_replies: std::collections::BTreeSet<u64>,
 }
 
 /// A `session.read` page: up to `limit` messages from `from_ordinal` (counting from 0, as
@@ -198,6 +236,7 @@ async fn read_page_with_facts<B: SessionBackend>(
     let mut summaries = crate::serve::RecordedSummaries::new();
     let mut stamps = BTreeMap::new();
     let mut numbering = BTreeMap::new();
+    let mut clean_replies = std::collections::BTreeSet::new();
     for (index, entry) in entries.iter().enumerate() {
         let next = entries.get(index + 1).or(after.as_ref());
         messages.push(page_message(entry, next, latest)?);
@@ -231,6 +270,9 @@ async fn read_page_with_facts<B: SessionBackend>(
             }
             if let (Some(run), Some(base)) = (&facts.run_id, facts.runner_tag_base) {
                 numbering.insert(entry.ordinal - 1, (run.clone(), base));
+            }
+            if facts.clean_reply && entry.message.role == Role::Assistant {
+                clean_replies.insert(entry.ordinal - 1);
             }
             if let (Some(run), Role::Assistant) = (&facts.run_id, entry.message.role) {
                 let stamp = facts.rich_ui.as_ref().and_then(|stamp| {
@@ -288,6 +330,7 @@ async fn read_page_with_facts<B: SessionBackend>(
         summaries,
         stamps,
         numbering,
+        clean_replies,
     })
 }
 
@@ -431,10 +474,12 @@ fn finish(
 
 /// The `session.read` reply `request` asks of `session`, as far as the session decides it: the
 /// page, from the message `after_mid` names or the ordinal asked for, refused when the session's
-/// history version isn't the one asked for; each message's part numbers attached as its run's
+/// history version isn't the one asked for (the version the llm-runner surface serves,
+/// `store_exposure::served_history_version`); each message's part numbers attached as its run's
 /// tag rules number it, and each model-written message marked for reply cleaning by them
-/// (`store_entries::attach_part_tags`); each message's tool calls attributed from its turn
-/// facts; and what
+/// (`store_entries::attach_part_tags`); each reply whose entry facts say its run cleans replies
+/// served cleaned (`store_exposure::served_message`); each message's tool calls attributed from
+/// its turn facts; and what
 /// each opt-in adds, from the page's own entry and turn facts and the session's folds. The
 /// session's actor runs this over the session it holds, so all of it reads from memory or none of
 /// it is served there. What doesn't depend on the session (media mode, the byte cap) is the
@@ -447,9 +492,10 @@ pub(crate) async fn page<B: SessionBackend>(
 ) -> Result<crate::store_reads::PageAnswer, crate::serve::ServeError> {
     use crate::serve::ServeError;
     let head = session.head();
+    let served_version = crate::store_exposure::served_history_version(head.history_version);
     if request
         .history_version
-        .is_some_and(|requested| requested != head.history_version)
+        .is_some_and(|requested| requested != served_version)
     {
         return Err(ServeError::HistoryChanged);
     }
@@ -470,6 +516,7 @@ pub(crate) async fn page<B: SessionBackend>(
         summaries,
         stamps,
         numbering,
+        clean_replies,
     } = read_page_with_facts(
         session,
         from_ordinal,
@@ -487,6 +534,15 @@ pub(crate) async fn page<B: SessionBackend>(
                 None,
             )
         })?;
+    // Numbered first, from the stored text, so cleaning changes no part's number.
+    for message in &mut page.messages {
+        if clean_replies.contains(&message.ordinal) {
+            let served = crate::store_exposure::served_message(&message.message, true);
+            if let std::borrow::Cow::Owned(served) = served {
+                message.message = served;
+            }
+        }
+    }
     let times = request
         .include_display_facts
         .then(|| crate::serve::DisplayTimes::of(&page));
@@ -496,7 +552,7 @@ pub(crate) async fn page<B: SessionBackend>(
         None
     };
     let mut response = crate::serve::session_read_response(page, tools);
-    response.history_version = head.history_version;
+    response.history_version = served_version;
     response.incarnation = broca_session_store::codec::hex(&head.incarnation.0);
     // The cursor at the read's durable end, which a subscribe resumes from with nothing missed
     // or repeated: the actor's live projection knows it; otherwise it is projected from the open

@@ -671,13 +671,14 @@ fn shape_name(shape: MoveListShape) -> &'static str {
     }
 }
 
-/// The reply an import's receipt stands for, with the session's history version and
-/// incarnation.
+/// The reply an import's receipt stands for, with the session's history version as the
+/// llm-runner surface serves it (from `stored_history_version`, the head's) and incarnation.
 pub fn reply_of(
     receipt: &ImportReceipt,
-    history_version: u64,
+    stored_history_version: u64,
     incarnation: String,
 ) -> Result<FileImportReply, ImportRefusal> {
+    let history_version = crate::store_exposure::served_history_version(stored_history_version);
     let shape = match receipt.shape.as_str() {
         "plugin" => MoveListShape::Plugin,
         "runner" => MoveListShape::Runner,

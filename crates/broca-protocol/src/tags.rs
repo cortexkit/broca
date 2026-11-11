@@ -543,7 +543,15 @@ pub fn cleans_model_text(message: &Message) -> bool {
 /// cleans ([`cleans_model_text`]), and otherwise unchanged. Never touches reasoning, tool-call
 /// arguments or tool results.
 pub fn exposed_message(message: &Message) -> std::borrow::Cow<'_, Message> {
-    if !cleans_model_text(message) {
+    exposed_reply(message, cleans_model_text(message))
+}
+
+/// `message` with the model's text cleaned of tag notation when `clean` is true and the message
+/// is the model's own (an assistant message), and otherwise unchanged. Only text parts change:
+/// reasoning, tool-call arguments and tool results never do. Cleaning is idempotent, so a reply
+/// already cleaned comes back byte for byte.
+pub fn exposed_reply(message: &Message, clean: bool) -> std::borrow::Cow<'_, Message> {
+    if !clean || message.role != Role::Assistant {
         return std::borrow::Cow::Borrowed(message);
     }
     let mut exposed = message.clone();

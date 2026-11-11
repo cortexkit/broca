@@ -281,7 +281,7 @@ pub async fn build<B: SessionBackend>(
         updated_at: Some(updated_at),
     });
     let head = session.head();
-    reply.history_version = head.history_version;
+    reply.history_version = crate::store_exposure::served_history_version(head.history_version);
     reply.incarnation = broca_session_store::codec::hex(&head.incarnation.0);
     Ok(StoreHead {
         reply,

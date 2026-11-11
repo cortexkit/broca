@@ -2844,6 +2844,18 @@ pub trait ServeHandler: Send + Sync {
         Ok(incarnation.to_owned())
     }
 
+    /// The history version output-reference ids of `session` are scoped to, given `served`, the
+    /// version its reads serve: the stored transcript's own version, which only a rewrite of the
+    /// stored history moves. A reference names stored tool output, so an id stays valid across a
+    /// change in how reads expose stored replies (`crate::store_exposure`).
+    async fn output_ref_history_version(
+        &self,
+        _session: &LineageKey,
+        served: u64,
+    ) -> Result<u64, ServeError> {
+        Ok(served)
+    }
+
     /// `session.output_refs` (llm-runner §9.13): one page of an output-reference set, derived
     /// from the session log on every read (see [`crate::output_refs`]).
     async fn output_refs(
@@ -3370,6 +3382,17 @@ impl ServeHandler for crate::LineageRegistry {
         self.route_tag_location(session, tag)
             .await
             .map_err(ServeError::from)
+    }
+
+    async fn output_ref_history_version(
+        &self,
+        session: &LineageKey,
+        served: u64,
+    ) -> Result<u64, ServeError> {
+        if self.store_holding(session)?.is_none() {
+            return Ok(served);
+        }
+        crate::store_exposure::stored_history_version(served).ok_or(ServeError::HistoryChanged)
     }
 
     async fn output_ref_namespace(

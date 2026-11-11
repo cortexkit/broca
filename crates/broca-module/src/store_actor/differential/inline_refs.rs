@@ -432,6 +432,60 @@ async fn output_reference_list_and_byte_reads_match_today() {
     );
 }
 
+/// An output-reference set id on a session created on the new storage names the history version
+/// the session stores, not the one its reads serve (`store_exposure`): a build from before the
+/// exposure epoch served the stored version and scoped its ids by it, so an id it handed out
+/// still resolves. An id scoped to the served version names nothing.
+#[tokio::test]
+async fn a_set_id_names_the_stored_history_version_and_resolves_across_the_raise() {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    let store = module(true, reference_script()).await;
+    referencing(&store).await;
+    let set = reference_set(&store).await;
+    let stored = store.load().await.head().history_version;
+    let page = store
+        .registry
+        .read(crate::serve::SessionReadRequest::new(
+            store.key.clone(),
+            None,
+            Some(100),
+        ))
+        .await
+        .unwrap();
+    let served = crate::store_exposure::served_history_version(stored);
+    assert_eq!(page.history_version, served);
+    assert_ne!(served, stored);
+    let namespace = store
+        .registry
+        .output_ref_namespace(&store.key, &page.incarnation)
+        .await
+        .unwrap();
+    let scope = |version: u64| {
+        format!(
+            "h1.{}.{version}/",
+            URL_SAFE_NO_PAD.encode(namespace.as_bytes())
+        )
+    };
+    let id = &set.descriptor.set_id;
+    assert!(id.starts_with(&scope(stored)), "{id}");
+    let listed_page = listed(&store, id).await;
+    assert_eq!(listed_page["records"][0]["state"], "resolved");
+    let ref_id = listed_page["records"][0]["ref_id"].as_str().unwrap();
+    assert_eq!(
+        read_ref(&store, ref_id, 0, 131_072).await,
+        serde_json::json!({"data":"ZmlsZSBjb250ZW50cw==","size":13,"format":"text"})
+    );
+    let at_served = id.replacen(&scope(stored), &scope(served), 1);
+    let request = serde_json::from_value(serde_json::json!({"set_id": at_served})).unwrap();
+    assert!(
+        !matches!(
+            store.registry.output_refs(&store.key, &request).await,
+            Ok(Ok(_))
+        ),
+        "an id scoped to the served version names nothing"
+    );
+}
+
 #[tokio::test]
 async fn an_output_reference_handed_out_before_conversion_still_resolves_after_reload() {
     let module = module(false, reference_script()).await;
@@ -514,7 +568,12 @@ async fn an_output_reference_handed_out_before_conversion_still_resolves_after_r
         ))
         .await
         .unwrap();
-    assert_eq!(after.history_version, page.history_version);
+    // The moved session serves the source's version raised by the new storage's exposure epoch:
+    // it serves replies cleaned that today's storage served with their tags.
+    assert_eq!(
+        after.history_version,
+        crate::store_exposure::served_history_version(page.history_version)
+    );
     assert_eq!(listed(&module, &set.descriptor.set_id).await, before);
     assert_eq!(read_ref(&module, id, 0, 131_072).await, content);
 }

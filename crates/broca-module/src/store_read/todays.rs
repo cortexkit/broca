@@ -37,6 +37,9 @@ pub struct Todays<'a> {
     /// a turn's from when the page's own don't hold it.
     whole: OnceCell<Dispatches>,
     facts: OnceCell<Facts>,
+    /// The zero-based ordinals of the replies this build serves cleaned of tag notation when the
+    /// session is kept in the new storage (see [`Todays::with_clean_replies`]).
+    clean_replies: std::collections::BTreeSet<u64>,
 }
 
 impl<'a> Todays<'a> {
@@ -56,7 +59,17 @@ impl<'a> Todays<'a> {
             dispatches: OnceCell::new(),
             whole: OnceCell::new(),
             facts: OnceCell::new(),
+            clean_replies: Default::default(),
         }
+    }
+
+    /// Today's reads with the replies at `ordinals` (zero-based) cleaned of tag notation, as the
+    /// new storage serves the same session (`crate::store_exposure::served_message`): what a
+    /// converted session's reads are compared with. The ordinals are those whose converted entry
+    /// facts say their run cleans replies (`super::clean_reply_ordinals`).
+    pub fn with_clean_replies(mut self, ordinals: std::collections::BTreeSet<u64>) -> Self {
+        self.clean_replies = ordinals;
+        self
     }
 
     /// Today's reply to `req`.
@@ -78,6 +91,14 @@ impl<'a> Todays<'a> {
         };
         let mut response = crate::serve::session_read_response(page, tools);
         response.lineage_id = self.lineage.map(str::to_owned);
+        for entry in &mut response.messages {
+            if self.clean_replies.contains(&(entry.ordinal - 1)) {
+                let served = crate::store_exposure::served_message(&entry.message, true);
+                if let std::borrow::Cow::Owned(served) = served {
+                    entry.message = served;
+                }
+            }
+        }
         // Today's read folds display facts for an opted-in read, and for the tool results of a
         // log whose sends rode on them, whose native outputs it serves instead of the joined
         // ones.

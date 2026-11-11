@@ -254,7 +254,9 @@ fn store_pages<B: SessionBackend>(
         let mut failed = |check: &str| {
             *report.store_checks_failed.entry(check.into()).or_default() += 1;
         };
-        if page.history_version != head.history_version {
+        if page.history_version
+            != broca_module::store_exposure::served_history_version(head.history_version)
+        {
             failed("history_version is not the head's");
         }
         if page.incarnation != incarnation {
@@ -499,7 +501,22 @@ pub(super) fn run(args: &Args) {
         }
         report.mode3_logs += u64::from(mode3);
         report.without_lineage += u64::from(old.lineage.is_none());
-        let todays = Todays::new(&old.records, old.lineage.as_deref());
+        let backend = MemoryBackend::default();
+        let addr = SessionAddr(name.clone());
+        let (session, run_inputs, parts) =
+            match built_session(&old, &name, &backend, &addr, &deployment) {
+                Ok(built) => built,
+                Err(e) => return report.fail("session", e, &name),
+            };
+        // Today's side as this build exposes the converted session: the replies its entry facts
+        // say are cleaned served cleaned.
+        let clean_replies = match block_on(broca_module::store_read::clean_reply_ordinals(&session))
+        {
+            Ok(ordinals) => ordinals,
+            Err(e) => return report.fail("session", format!("{e:?}"), &name),
+        };
+        let todays =
+            Todays::new(&old.records, old.lineage.as_deref()).with_clean_replies(clean_replies);
         let mut today = Vec::new();
         for mode in MODES {
             match walk(|from| {
@@ -514,13 +531,6 @@ pub(super) fn run(args: &Args) {
                 Err(e) => return report.fail(&format!("today's {} pages", mode.0), e, &name),
             }
         }
-        let backend = MemoryBackend::default();
-        let addr = SessionAddr(name.clone());
-        let (session, run_inputs, parts) =
-            match built_session(&old, &name, &backend, &addr, &deployment) {
-                Ok(built) => built,
-                Err(e) => return report.fail("session", e, &name),
-            };
         for (mode, today) in MODES.iter().zip(&today) {
             match store_pages(&session, &parts, &name, limit, *mode, &mut report) {
                 Ok(open) => compare(&mut report, &name, mode.0, false, &open, today),
