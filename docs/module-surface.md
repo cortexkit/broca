@@ -2635,6 +2635,15 @@ sealed `Interrupted` with the refusal reason. An unreadable newer-writer WAL is
 only logged at WARN with its session and missing features: no bytes or metadata
 are changed, and other sessions still resume.
 
+On the session-store backend a restart pause is continued only within one hour of the
+time it records. A restart takes seconds to minutes, so an older pause was left by a long
+outage and its caller has stopped waiting. Such a run, or one whose pause records no time,
+is not continued: when its session is next opened (at startup for every session with an
+unfinished run) the run is sealed `Interrupted` with `restart_resume_expired`, no provider
+request is sent for it, and the session's queue drains. The caller decides whether to send
+again. A paused run with a cancel pending still ends `Cancelled`. The WAL backend has no
+such limit: it resumes every restart pause at its next start.
+
 New episodes freeze image-only labeling for multipart image-notice text; older episodes keep
 their literal text projection on resume, while a new episode adopting the rule may rebuild its
 prompt cache once, like a renderer-version bump.

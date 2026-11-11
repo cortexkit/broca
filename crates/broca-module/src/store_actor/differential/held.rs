@@ -85,7 +85,22 @@ struct HeldExecutor {
     // Replace a scripted auth pause with another pause reason, without involving timers or
     // a process restart, so cancellation exercises the same paused actor on both storages.
     pause_as: std::sync::Mutex<Option<broca_protocol::PauseReason>>,
+    /// How long ago a restart pause written through `pause_as` says it was written. The run
+    /// loop records the time of a restart pause, so the fixture does too; `0` is now.
+    pause_age_ms: std::sync::atomic::AtomicU64,
     refuse_restart: std::sync::atomic::AtomicBool,
+}
+
+impl HeldExecutor {
+    /// The time a pause written through `pause_as` records: a restart pause's time, as the run
+    /// loop records it, and none for the other reasons, which the fixture leaves as they were.
+    fn pause_ts_ms(&self, reason: broca_protocol::PauseReason) -> Option<u64> {
+        (reason == broca_protocol::PauseReason::Restart).then(|| {
+            broca_core::clock::epoch_millis()
+                .unwrap_or(0)
+                .saturating_sub(self.pause_age_ms.load(Ordering::SeqCst))
+        })
+    }
 }
 
 #[async_trait]
@@ -142,7 +157,7 @@ impl RunExecutor for HeldExecutor {
                 writer.record(broca_wal::WalRecord::RunPaused {
                     run_id,
                     reason,
-                    ts_ms: None,
+                    ts_ms: self.pause_ts_ms(reason),
                     error: None,
                     account_limit: None,
                 });
@@ -239,7 +254,7 @@ impl RunExecutor for HeldExecutor {
                             broca_session_store::record::Pause {
                                 run_id: req.run_id.0.clone(),
                                 reason,
-                                ts_ms: None,
+                                ts_ms: self.pause_ts_ms(reason),
                                 error: None,
                                 account_limit: None,
                             },
@@ -296,6 +311,7 @@ impl Side {
             tools,
             slots: HeldSlots::new(),
             pause_as: Default::default(),
+            pause_age_ms: Default::default(),
             refuse_restart: false.into(),
         });
         let runtime = crate::store_open::StoreRuntime::open(
@@ -1192,6 +1208,7 @@ async fn held_record_boundary_cuts_rejoin_without_redispatch(cipher: Cipher) {
             tools: source.executor.tools.clone(),
             slots: HeldSlots::new(),
             pause_as: Default::default(),
+            pause_age_ms: Default::default(),
             refuse_restart: false.into(),
         });
         let actor = super::super::StoreActor::new(

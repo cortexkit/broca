@@ -28,6 +28,11 @@ async fn submit(side: &Side, run: &str, text: &str) -> SendOutcome {
 }
 
 async fn paused(store: bool) -> Side {
+    paused_for(store, 0).await
+}
+
+/// A session whose run paused for a restart `age_ms` ago.
+async fn paused_for(store: bool, age_ms: u64) -> Side {
     let dir = scratch_dir();
     let key = BindIdentity::new(dir.join("project"), "restart-comparison", "s1");
     let side = Side::at(
@@ -43,6 +48,7 @@ async fn paused(store: bool) -> Side {
     // Reuse the recorded-pause fixture so the comparison isolates recovery, not shutdown.
     // Both loops durably record the same restart pause and frozen on_restart preference.
     *side.executor.pause_as.lock().unwrap() = Some(broca_protocol::PauseReason::Restart);
+    side.executor.pause_age_ms.store(age_ms, Ordering::SeqCst);
     assert!(matches!(
         submit(&side, "r1", "first").await,
         SendOutcome::Active { .. }
@@ -336,6 +342,36 @@ async fn background_candidates_resume_an_untouched_restart_paused_store_session(
     ended_without_reading(&side, "r1").await;
     assert_eq!(side.executor.provider.inner.calls().len(), 1);
     assert_eq!(side.status().await["state"], "completed");
+    assert!(side.registry.stop_and_seal().await);
+    assert!(original.registry.stop_and_seal().await);
+}
+
+/// A restart pause older than the continuation window is not continued on the new storage:
+/// the run ends Interrupted without a model call, and the send queued behind it starts. The
+/// old storage is not compared: it resumes every restart pause at its next start, so its
+/// pauses never age, and it gets no such limit.
+#[tokio::test]
+async fn an_old_restart_pause_ends_interrupted_and_the_next_send_starts() {
+    let two_hours_ms = 2 * 60 * 60 * 1000;
+    let original = paused_for(true, two_hours_ms).await;
+    let side = original.restarted().await;
+    seed_queued_send(&side).await;
+    side.registry.handle().enable_restart_resumes_for_test();
+    resume_command(&side).await;
+    ended_without_reading(&side, "r2").await;
+    let status = side.status().await;
+    assert_eq!(status["state"], "interrupted", "{status}");
+    assert_eq!(
+        status["error"]["provider_code"], "restart_resume_expired",
+        "{status}"
+    );
+    // The one model call is the queued send's: the old run sent nothing.
+    assert_eq!(side.executor.provider.inner.calls().len(), 1);
+    let story = story(&side).await;
+    assert!(
+        story.contains(&"end Interrupted Some(\"restart_resume_expired\")".to_owned()),
+        "{story:?}"
+    );
     assert!(side.registry.stop_and_seal().await);
     assert!(original.registry.stop_and_seal().await);
 }
