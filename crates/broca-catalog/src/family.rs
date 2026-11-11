@@ -6,37 +6,97 @@
 
 use broca_provider::spec::WireFamilyId;
 
+const CREDENTIAL_PERSONA_ROUTES: &[(&str, &str, WireFamilyId, &str)] = &[(
+    "meta",
+    "oauth",
+    WireFamilyId::OpenAiResponses,
+    "https://api.meta.ai/v1",
+)];
+
 /// Meta subscription credentials require the Meta Responses client. This endpoint is
 /// credential policy, including for curated rows that have no models.dev wire metadata.
 pub(crate) fn credential_persona_route(
     provider: &str,
     method: &str,
 ) -> Option<(WireFamilyId, &'static str)> {
-    (provider == "meta" && method == "oauth")
-        .then_some((WireFamilyId::OpenAiResponses, "https://api.meta.ai/v1"))
+    CREDENTIAL_PERSONA_ROUTES
+        .iter()
+        .find(|(p, m, _, _)| *p == provider && *m == method)
+        .map(|(_, _, family, endpoint)| (*family, *endpoint))
+}
+
+/// Families with a credential-owned endpoint for this method, independent of catalog facts.
+pub fn credential_persona_families(method: &str) -> impl Iterator<Item = WireFamilyId> + '_ {
+    CREDENTIAL_PERSONA_ROUTES
+        .iter()
+        .filter(move |(_, m, _, _)| *m == method)
+        .map(|(_, _, family, _)| *family)
+}
+
+// Keep admission and capability discovery on the same npm/shape authority. Each entry is
+// an exact accepted tuple; an unknown shape must not fall back to another wire grammar.
+const WIRE_ROUTES: &[(&str, Option<&str>, WireFamilyId)] = &[
+    ("@ai-sdk/openai", None, WireFamilyId::OpenAiResponses),
+    (
+        "@ai-sdk/openai",
+        Some("responses"),
+        WireFamilyId::OpenAiResponses,
+    ),
+    ("@ai-sdk/xai", None, WireFamilyId::OpenAiResponses),
+    (
+        "@ai-sdk/xai",
+        Some("responses"),
+        WireFamilyId::OpenAiResponses,
+    ),
+    (
+        "@ai-sdk/openai",
+        Some("completions"),
+        WireFamilyId::OpenAiChat,
+    ),
+    (
+        "@ai-sdk/openai-compatible",
+        Some("completions"),
+        WireFamilyId::OpenAiChat,
+    ),
+    (
+        "@ai-sdk/openai-compatible",
+        Some("responses"),
+        WireFamilyId::OpenAiResponses,
+    ),
+    (
+        "@ai-sdk/amazon-bedrock/mantle",
+        Some("responses"),
+        WireFamilyId::OpenAiResponses,
+    ),
+    ("@ai-sdk/anthropic", None, WireFamilyId::AnthropicMessages),
+    ("@ai-sdk/google", None, WireFamilyId::Gemini),
+    (
+        "@ai-sdk/amazon-bedrock",
+        None,
+        WireFamilyId::BedrockConverse,
+    ),
+    ("@ai-sdk/openai-compatible", None, WireFamilyId::OpenAiChat),
+    (
+        "@openrouter/ai-sdk-provider",
+        None,
+        WireFamilyId::OpenAiChat,
+    ),
+    ("@ai-sdk/cerebras", None, WireFamilyId::OpenAiChat),
+];
+
+/// Families reachable through catalog npm/shape facts. Several tuples can share a family.
+pub fn catalog_wire_families() -> impl Iterator<Item = WireFamilyId> {
+    WIRE_ROUTES.iter().map(|(_, _, family)| *family)
 }
 
 /// Translate an upstream SDK package and API shape into a renderer Broca implements.
 /// Package names describe the upstream protocol, not an endpoint or a model alias.
 /// Unknown shapes must not silently fall back to a different request grammar.
 pub fn wire_family(npm: &str, shape: Option<&str>) -> Option<WireFamilyId> {
-    use WireFamilyId::*;
-    match (npm, shape) {
-        ("@ai-sdk/openai", None | Some("responses")) => Some(OpenAiResponses),
-        ("@ai-sdk/xai", None | Some("responses")) => Some(OpenAiResponses),
-        ("@ai-sdk/openai" | "@ai-sdk/openai-compatible", Some("completions")) => Some(OpenAiChat),
-        ("@ai-sdk/openai-compatible" | "@ai-sdk/amazon-bedrock/mantle", Some("responses")) => {
-            Some(OpenAiResponses)
-        }
-        ("@ai-sdk/anthropic", None) => Some(AnthropicMessages),
-        ("@ai-sdk/google", None) => Some(Gemini),
-        ("@ai-sdk/amazon-bedrock", None) => Some(BedrockConverse),
-        (
-            "@ai-sdk/openai-compatible" | "@openrouter/ai-sdk-provider" | "@ai-sdk/cerebras",
-            None,
-        ) => Some(OpenAiChat),
-        _ => None,
-    }
+    WIRE_ROUTES
+        .iter()
+        .find(|(package, api_shape, _)| *package == npm && *api_shape == shape)
+        .map(|(_, _, family)| *family)
 }
 
 /// Compatibility metadata for legacy documents with no package field. Published packages
@@ -122,6 +182,71 @@ pub fn resolve_provider_family(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enumerable_wire_routes_preserve_exact_package_and_shape_matching() {
+        let cases = [
+            ("@ai-sdk/openai", None, WireFamilyId::OpenAiResponses),
+            (
+                "@ai-sdk/openai",
+                Some("responses"),
+                WireFamilyId::OpenAiResponses,
+            ),
+            ("@ai-sdk/xai", None, WireFamilyId::OpenAiResponses),
+            (
+                "@ai-sdk/xai",
+                Some("responses"),
+                WireFamilyId::OpenAiResponses,
+            ),
+            (
+                "@ai-sdk/openai",
+                Some("completions"),
+                WireFamilyId::OpenAiChat,
+            ),
+            (
+                "@ai-sdk/openai-compatible",
+                Some("completions"),
+                WireFamilyId::OpenAiChat,
+            ),
+            (
+                "@ai-sdk/openai-compatible",
+                Some("responses"),
+                WireFamilyId::OpenAiResponses,
+            ),
+            (
+                "@ai-sdk/amazon-bedrock/mantle",
+                Some("responses"),
+                WireFamilyId::OpenAiResponses,
+            ),
+            ("@ai-sdk/anthropic", None, WireFamilyId::AnthropicMessages),
+            ("@ai-sdk/google", None, WireFamilyId::Gemini),
+            (
+                "@ai-sdk/amazon-bedrock",
+                None,
+                WireFamilyId::BedrockConverse,
+            ),
+            ("@ai-sdk/openai-compatible", None, WireFamilyId::OpenAiChat),
+            (
+                "@openrouter/ai-sdk-provider",
+                None,
+                WireFamilyId::OpenAiChat,
+            ),
+            ("@ai-sdk/cerebras", None, WireFamilyId::OpenAiChat),
+        ];
+        assert_eq!(WIRE_ROUTES.len(), cases.len());
+        for (npm, shape, family) in cases {
+            assert_eq!(wire_family(npm, shape), Some(family), "{npm} {shape:?}");
+            assert_eq!(wire_family(npm, Some("unknown")), None);
+        }
+        for (npm, shape) in [
+            ("unknown", None),
+            ("@ai-sdk/anthropic", Some("responses")),
+            ("@ai-sdk/google", Some("completions")),
+            ("@ai-sdk/amazon-bedrock/mantle", None),
+        ] {
+            assert_eq!(wire_family(npm, shape), None, "{npm} {shape:?}");
+        }
+    }
 
     fn family(r: &FamilyResolution) -> Option<(WireFamilyId, ResolutionSource)> {
         match r {
