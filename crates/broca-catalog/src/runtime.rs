@@ -58,6 +58,7 @@ pub const FUSIFORM_FACT_PREFIXES: &[&str] = &[
     "limit.context",
     "limit.output",
     "limit.images_per_request",
+    "limit.image_long_edge_px",
     "capability.attachment",
     "capability.input_modalities",
     "capability.mid_conversation_system",
@@ -144,6 +145,8 @@ struct LoadedCatalog {
     carries_output_limits: bool,
     /// An equal-version poll must replace an older LKG that did not request image counts.
     carries_image_counts: bool,
+    /// An equal-version poll must replace an older LKG that did not request pixel bounds.
+    carries_image_dimensions: bool,
     /// Whether any row of the source document carried a mode rate. Same reason as
     /// `carries_output_limits`: an LKG fetched before broca requested mode rates has the same
     /// version as the next poll and none of them, and reusing its index would keep every tier
@@ -254,6 +257,15 @@ fn response_carries_image_counts(response: &FusiformCatalogResponse) -> bool {
         .any(|facts| facts.contains_key("limit.images_per_request"))
 }
 
+fn response_carries_image_dimensions(response: &FusiformCatalogResponse) -> bool {
+    response.models.values().any(|facts| {
+        facts.contains_key("limit.image_long_edge_px")
+            || facts
+                .keys()
+                .any(|key| key.starts_with("limit.image_long_edge_px.above_images."))
+    })
+}
+
 /// The bounded provider facts retained for admission. `raw` is always null, so cloning this spec
 /// for one lookup never copies another model or an ingestion-only catalog field.
 struct ServingProvider {
@@ -285,6 +297,8 @@ struct ServingModel {
     /// served.
     output_limit: Option<u64>,
     images_per_request: Option<u32>,
+    image_long_edge_px: Option<u32>,
+    image_long_edge_px_above_images: BTreeMap<u32, u32>,
     attachment: CapabilityFlag,
     input_modalities: InputModalities,
     reasoning: CapabilityFlag,
@@ -323,6 +337,8 @@ impl Default for ServingModel {
             context_limit: None,
             output_limit: None,
             images_per_request: None,
+            image_long_edge_px: None,
+            image_long_edge_px_above_images: BTreeMap::new(),
             attachment: CapabilityFlag::Absent,
             input_modalities: InputModalities::default(),
             reasoning: CapabilityFlag::Absent,
@@ -353,6 +369,8 @@ impl ServingModel {
             context_limit: model.limits.context,
             output_limit: model.limits.max_output,
             images_per_request: model.limits.images_per_request,
+            image_long_edge_px: model.limits.image_long_edge_px,
+            image_long_edge_px_above_images: model.limits.image_long_edge_px_above_images.clone(),
             attachment: model.capabilities.attachment,
             input_modalities: model.input_modalities,
             reasoning: model.capabilities.reasoning,
@@ -389,6 +407,8 @@ impl ServingModel {
                 max_input: None,
                 max_output: self.output_limit,
                 images_per_request: self.images_per_request,
+                image_long_edge_px: self.image_long_edge_px,
+                image_long_edge_px_above_images: self.image_long_edge_px_above_images.clone(),
             },
             cost: self.cost.clone(),
             reasoning_options: self.reasoning_options.clone(),
@@ -1471,6 +1491,8 @@ fn serving_model_from_facts(
         context_limit: context_fact(identity, facts)?,
         output_limit: output_fact(identity, facts)?,
         images_per_request: images_per_request_fact(identity, facts)?,
+        image_long_edge_px: positive_u32_fact(identity, facts, "limit.image_long_edge_px")?,
+        image_long_edge_px_above_images: image_long_edge_conditionals_fact(identity, facts)?,
         attachment: optional_capability_fact(identity, facts, "capability.attachment")?,
         input_modalities: facts
             .get("capability.input_modalities")
@@ -1765,7 +1787,15 @@ fn images_per_request_fact(
     identity: &str,
     facts: &BTreeMap<String, Value>,
 ) -> Result<Option<u32>, CatalogError> {
-    match facts.get("limit.images_per_request") {
+    positive_u32_fact(identity, facts, "limit.images_per_request")
+}
+
+fn positive_u32_fact(
+    identity: &str,
+    facts: &BTreeMap<String, Value>,
+    key: &str,
+) -> Result<Option<u32>, CatalogError> {
+    match facts.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(value) => value
             .as_u64()
@@ -1774,13 +1804,38 @@ fn images_per_request_fact(
             .map(Some)
             .ok_or_else(|| CatalogError::FusiformFact {
                 model: identity.to_string(),
-                fact: "limit.images_per_request".to_string(),
+                fact: key.to_string(),
                 reason: format!(
                     "expected positive 32-bit unsigned integer or null, found {}",
                     value_kind(value)
                 ),
             }),
     }
+}
+
+/// Conditional bounds count image and document blocks across the request, including history.
+/// Validate even without a base bound so malformed facts follow the other limit readers.
+fn image_long_edge_conditionals_fact(
+    identity: &str,
+    facts: &BTreeMap<String, Value>,
+) -> Result<BTreeMap<u32, u32>, CatalogError> {
+    let mut limits = BTreeMap::new();
+    for key in facts.keys() {
+        let Some(suffix) = key.strip_prefix("limit.image_long_edge_px.above_images.") else {
+            continue;
+        };
+        let above_count = suffix
+            .parse::<u32>()
+            .map_err(|_| CatalogError::FusiformFact {
+                model: identity.to_string(),
+                fact: key.clone(),
+                reason: "expected 32-bit unsigned integer image count suffix".to_string(),
+            })?;
+        if let Some(side) = positive_u32_fact(identity, facts, key)? {
+            limits.insert(above_count, side);
+        }
+    }
+    Ok(limits)
 }
 
 /// A typed admission refusal used only when neither memory nor the configured LKG has a catalog.
@@ -2192,6 +2247,8 @@ impl CatalogCache {
                 // serving its last accepted snapshot.
                 if response_carries_output_limits(&response) != current.carries_output_limits
                     || response_carries_image_counts(&response) != current.carries_image_counts
+                    || response_carries_image_dimensions(&response)
+                        != current.carries_image_dimensions
                     || response_carries_mode_rates(&response) != current.carries_mode_rates
                     || response_carries_warm_rates(&response) != current.carries_warm_rates
                     || response_carries_model_kinds(&response) != current.carries_model_kinds
@@ -2230,6 +2287,7 @@ impl CatalogCache {
                     source: CatalogSource::Fusiform,
                     carries_output_limits: current.carries_output_limits,
                     carries_image_counts: current.carries_image_counts,
+                    carries_image_dimensions: current.carries_image_dimensions,
                     carries_mode_rates: current.carries_mode_rates,
                     carries_warm_rates: current.carries_warm_rates,
                     carries_model_kinds: current.carries_model_kinds,
@@ -2324,6 +2382,7 @@ impl CatalogCache {
             source,
             carries_output_limits: true,
             carries_image_counts: true,
+            carries_image_dimensions: false,
             carries_mode_rates: false,
             carries_warm_rates: true,
             // The vendored snapshot serves no `model.kind`.
@@ -2400,6 +2459,7 @@ fn loaded(
         source,
         carries_output_limits: response_carries_output_limits(response),
         carries_image_counts: response_carries_image_counts(response),
+        carries_image_dimensions: response_carries_image_dimensions(response),
         carries_mode_rates: response_carries_mode_rates(response),
         carries_warm_rates: response_carries_warm_rates(response),
         carries_model_kinds: response_carries_model_kinds(response),
@@ -4732,6 +4792,164 @@ mod tests {
         }
         let malformed = facts(&[("rate.input.mode.fast", serde_json::json!(2.0))]);
         assert!(priced_modes_fact("p/m", &malformed).is_err());
+    }
+
+    #[test]
+    fn catalog_image_dimensions_are_requested_and_survive_equal_version_refresh() {
+        let cache = CatalogCache::empty();
+        let first = response(100);
+        let version = first.catalog_version;
+        cache.refresh(first).unwrap();
+        let before = cache.snapshot().unwrap();
+        let model = |snapshot: &CatalogSnapshot| {
+            snapshot
+                .model_for_serving("anthropic", "claude-sonnet-4-5")
+                .unwrap()
+                .1
+        };
+        assert_eq!(model(&before).limits.image_long_edge_px, None);
+
+        let mut upgraded = response(200);
+        upgraded.catalog_version = version;
+        let facts = upgraded
+            .models
+            .get_mut("anthropic/claude-sonnet-4-5")
+            .unwrap();
+        for (key, value) in [
+            ("limit.image_long_edge_px", 8_000),
+            ("limit.image_long_edge_px.above_images.20", 3_000),
+            ("limit.image_long_edge_px.above_images.2", 5_000),
+        ] {
+            facts.insert(key.into(), serde_json::json!(value));
+        }
+        for facts in upgraded.models.values_mut() {
+            facts.retain(|fact, _| {
+                FUSIFORM_FACT_PREFIXES
+                    .iter()
+                    .any(|prefix| fact.starts_with(prefix))
+            });
+        }
+        cache.refresh(upgraded).unwrap();
+        let after = cache.snapshot().unwrap();
+        assert!(!before.shares_index_with(&after));
+        let model = model(&after);
+        assert_eq!(model.limits.image_long_edge_px, Some(8_000));
+        assert_eq!(
+            model.limits.image_long_edge_px_above_images,
+            BTreeMap::from([(2, 5_000), (20, 3_000)])
+        );
+        let profile = broca_provider::media_profile::select_model_media_profile(
+            WireFamilyId::AnthropicMessages,
+            Some(broca_provider::media_profile::MediaQuirk::Anthropic),
+            &model.id,
+            &model,
+        );
+        assert_eq!(profile.max_image_side(2, 0), Some(8_000));
+        assert_eq!(profile.max_image_side(3, 0), Some(5_000));
+        assert_eq!(profile.max_image_side(20, 0), Some(5_000));
+        assert_eq!(profile.max_image_side(21, 0), Some(3_000));
+        assert_eq!(profile.max_image_side(1, 20), Some(3_000));
+        assert_eq!(
+            before
+                .model_for_serving("anthropic", "claude-sonnet-4-5")
+                .unwrap()
+                .1
+                .limits
+                .image_long_edge_px,
+            None
+        );
+    }
+
+    #[test]
+    fn catalog_image_dimensions_null_is_unknown_and_malformed_facts_exclude_the_row() {
+        let mut response = response(100);
+        for key in [
+            "limit.image_long_edge_px",
+            "limit.image_long_edge_px.above_images.20",
+        ] {
+            response
+                .models
+                .get_mut("anthropic/claude-sonnet-4-5")
+                .unwrap()
+                .insert(key.into(), Value::Null);
+        }
+        let installed = loaded(&response, CatalogSource::Fusiform, None).unwrap();
+        let model = installed
+            .catalog
+            .model_for_serving("anthropic", "claude-sonnet-4-5")
+            .unwrap()
+            .1;
+        assert_eq!(model.limits.image_long_edge_px, None);
+        assert!(model.limits.image_long_edge_px_above_images.is_empty());
+
+        for key in [
+            "limit.image_long_edge_px",
+            "limit.image_long_edge_px.above_images.20",
+        ] {
+            for malformed in [
+                serde_json::json!(0),
+                serde_json::json!(-1),
+                serde_json::json!(1.5),
+                serde_json::json!("3000"),
+                serde_json::json!(true),
+                serde_json::json!([]),
+                serde_json::json!({}),
+                serde_json::json!(u64::from(u32::MAX) + 1),
+            ] {
+                let mut malformed_response = response.clone();
+                malformed_response
+                    .models
+                    .get_mut("anthropic/claude-sonnet-4-5")
+                    .unwrap()
+                    .insert(key.into(), malformed.clone());
+                assert!(
+                    loaded_excludes_for_fact(&malformed_response, key),
+                    "{key}: {malformed}"
+                );
+                assert!(loaded(&malformed_response, CatalogSource::Fusiform, None)
+                    .unwrap()
+                    .catalog
+                    .model_for_serving("anthropic", "claude-sonnet-4-5")
+                    .is_none());
+            }
+        }
+        for suffix in ["", "twenty", "-1", "1.5", "4294967296", "20.extra"] {
+            let key = format!("limit.image_long_edge_px.above_images.{suffix}");
+            let mut malformed_response = response.clone();
+            malformed_response
+                .models
+                .get_mut("anthropic/claude-sonnet-4-5")
+                .unwrap()
+                .insert(key.clone(), serde_json::json!(3_000));
+            assert!(loaded_excludes_for_fact(&malformed_response, &key), "{key}");
+        }
+        let facts = response
+            .models
+            .get_mut("anthropic/claude-sonnet-4-5")
+            .unwrap();
+        facts.insert(
+            "limit.image_long_edge_px".into(),
+            serde_json::json!(u32::MAX),
+        );
+        facts.insert(
+            "limit.image_long_edge_px.above_images.0".into(),
+            serde_json::json!(1),
+        );
+        facts.insert(
+            format!("limit.image_long_edge_px.above_images.{}", u32::MAX),
+            serde_json::json!(2),
+        );
+        let installed = loaded(&response, CatalogSource::Fusiform, None).unwrap();
+        let model = installed
+            .catalog
+            .model_for_serving("anthropic", "claude-sonnet-4-5")
+            .unwrap()
+            .1;
+        assert_eq!(model.limits.image_long_edge_px, Some(u32::MAX));
+        assert_eq!(
+            model.limits.image_long_edge_px_above_images,
+            BTreeMap::from([(0, 1), (u32::MAX, 2)])
+        );
     }
 
     #[test]

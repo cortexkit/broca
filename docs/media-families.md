@@ -261,6 +261,16 @@ provider. Today's frozen quirks cannot do this alone: DeepSeek and Kimi carry id
 A provider on any family with no profile entry gets the conservative profile: a
 person's media is refused (`carrier`) and tool media renders as markers.
 
+At admission, Fusiform's `limit.images_per_request` overrides the table's image
+count when known. A known `limit.image_long_edge_px` replaces the table's image
+dimensions with that unconditional longest-side bound and every known
+`limit.image_long_edge_px.above_images.<n>` bound. A conditional applies when the
+whole request, including history, holds more than `n` image and document blocks.
+The tightest applicable bound wins. Absent or null pixel bounds are unknown;
+without a base bound the profile keeps the table's dimensions unchanged.
+These limits are frozen in the run's media profile, so a catalog refresh does not
+change a resumed run. Catalog pixel bounds do not change byte limits.
+
 ---
 
 ## `anthropic_messages` (Anthropic Messages API)
@@ -286,9 +296,9 @@ https://platform.claude.com/docs/en/api/overview (request size limits)
 | per-item limit | 10 MB base64-encoded; 8000×8000 px | covered by the request cap | — | — |
 | count limit per request | 600 images (100 for models with a 200k-token context window) | 600 PDF pages (100 when the request's context window is under 1M tokens); pages, not documents | — | — |
 
-- **Count-dependent dimension limit:** when a request holds more than 20 `image`
-  blocks, every image must be at most 2000 px on each side. Images from earlier turns
-  and images nested in `tool_result` count toward the 20.
+- **Count-dependent dimension limit:** the catalog states 3000 px above 20 image
+  and document blocks. Without a catalog base bound, the legacy table still uses
+  2000 px above 20 image blocks. Earlier turns and nested `tool_result` blocks count.
 - **Request cap:** 32 MB (Messages endpoint).
 - **Tool results for computer-use and browser-use toolset members** accept only
   `text` and `image` blocks, and the API rejects an oversized `tool_result` image there
