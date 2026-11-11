@@ -455,7 +455,7 @@ async fn runs<B: SessionBackend>(
 }
 
 /// The read modes: whether each asks for display facts, tools and Rich UI.
-const READ_MODES: [(&str, bool, bool, bool); 5] = [
+pub(crate) const READ_MODES: [(&str, bool, bool, bool); 5] = [
     ("default", false, false, false),
     ("display_facts", true, false, false),
     ("tools", false, true, false),
@@ -465,7 +465,7 @@ const READ_MODES: [(&str, bool, bool, bool); 5] = [
 
 /// How many messages a compared page asks for. Small, so a session's pages are many and their
 /// boundaries are compared too.
-const PAGE: u64 = 7;
+pub(crate) const PAGE: u64 = 7;
 
 /// A page's members beside its messages, as compared: all of them but the ones a moved session
 /// changes by design (the log's incarnation and history version, and the subscribe cursor).
@@ -486,6 +486,9 @@ async fn reads<B: SessionBackend>(
     parts: &MemoryParts,
 ) -> Result<(), Mismatch> {
     let todays = Todays::new(verify.records, lineage);
+    let reader = broca_module::store_read::ViewReader::new(view, parts)
+        .await
+        .map_err(|error| mismatch(READ, format!("the stream head can't be read: {error:?}")))?;
     for (mode, display_facts, tools, rich_ui) in READ_MODES {
         let mut from = 1;
         loop {
@@ -495,7 +498,7 @@ async fn reads<B: SessionBackend>(
             request.include_tools = tools;
             request.include_rich_ui = rich_ui;
             let today = todays.read(&request);
-            let store = broca_module::store_read::serve_view(view, parts, &request).await;
+            let store = reader.read(&request).await;
             let at = format!("{mode} page from {from}");
             let (today, store) = match (today, store) {
                 (Ok(today), Ok(store)) => (today, store),

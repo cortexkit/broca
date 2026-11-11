@@ -429,3 +429,105 @@ fn part_numbers_are_found_where_todays_read_numbers_them() {
         );
     }
 }
+
+#[test]
+fn shared_conversion_pages_are_byte_equal_in_every_read_mode() {
+    use broca_module::serve::SessionReadRequest;
+    use broca_module::store_read::{serve_view, ViewReader};
+    use broca_session_store::session::Session;
+    use futures::executor::block_on;
+
+    let old = synthetic_log(4, 12, true, false);
+    let lineage = Some("0b3c3c1e-1f2a-4c1d-9e57-5a0e5f0c0001");
+    for sealed in [false, true] {
+        let stored = if sealed {
+            store_then_seal(&old, lineage, "shared-pages")
+        } else {
+            crate::read_cost::store_unsealed(&old, lineage, "shared-pages")
+        }
+        .unwrap();
+        block_on(async {
+            let view = Session::view(
+                &stored.backend,
+                stored.addr.clone(),
+                &stored.triple,
+                &stored.deployment,
+            )
+            .await
+            .unwrap();
+            let reader = ViewReader::new(&view, &stored.parts).await.unwrap();
+            let key = broca_protocol::BindIdentity::new("/read-cost", "read-cost", "shared-pages");
+            for (mode, display, tools, rich_ui) in crate::verify::READ_MODES {
+                let mut from = 1;
+                let mut pages = 0;
+                loop {
+                    let mut request =
+                        SessionReadRequest::new(key.clone(), Some(from), Some(crate::verify::PAGE));
+                    request.include_display_facts = display;
+                    request.include_tools = tools;
+                    request.include_rich_ui = rich_ui;
+                    stored.backend.take();
+                    let shared = reader.read(&request).await.unwrap();
+                    let reads = stored.backend.take();
+                    if !sealed {
+                        assert_eq!(reads.log_reads, 0, "{mode} page from {from}");
+                    }
+                    let separate = serve_view(&view, &stored.parts, &request).await.unwrap();
+                    assert!(shared.head.is_some());
+                    assert_eq!(
+                        serde_json::to_vec(&shared).unwrap(),
+                        serde_json::to_vec(&separate).unwrap(),
+                        "sealed={sealed}, {mode} page from {from}"
+                    );
+                    pages += 1;
+                    match shared.next_from_ordinal {
+                        Some(next) if next > from => from = next,
+                        _ => break,
+                    }
+                }
+                assert!(pages > 1, "{mode} must exercise several pages");
+            }
+        });
+    }
+}
+
+/// Run explicitly to compare the old per-page projection with the shared reader on synthetic
+/// unsealed conversions. Timing is printed, not asserted: machine load is not a read contract.
+#[test]
+#[ignore = "synthetic conversion page-walk timing"]
+fn conversion_page_walk_timing() {
+    use crate::read_cost::{page_walk_cost, store_unsealed};
+
+    let output = (0..24)
+        .map(|line| {
+            format!("src/component_{line}.rs: changed item; checks passed, 32 cases, no failures\n")
+        })
+        .collect::<String>();
+    for messages in [200, 2_000, 10_000] {
+        let mut old = synthetic(messages / 4, 4);
+        for frame in &mut old {
+            let mut value = serde_json::to_value(&frame.record).unwrap();
+            if value["type"] == "tool_result" {
+                value["result"]["output"]["text"] = serde_json::Value::String(output.clone());
+                frame.record = serde_json::from_value(value).unwrap();
+            }
+        }
+        let stored = store_unsealed(
+            &old,
+            Some("0b3c3c1e-1f2a-4c1d-9e57-5a0e5f0c0001"),
+            "conversion-timing",
+        )
+        .unwrap();
+        assert_eq!(stored.messages, messages as u64);
+        for shared in [false, true] {
+            let (elapsed, pages, reads) = page_walk_cost(&stored, shared).unwrap();
+            eprintln!(
+                "messages={messages} shared={shared} pages={pages} elapsed_ms={:.3} us_per_message={:.3} log_reads={} log_bytes={}",
+                elapsed.as_secs_f64() * 1_000.0,
+                elapsed.as_secs_f64() * 1_000_000.0 / messages as f64,
+                reads.log_reads,
+                reads.log_bytes,
+            );
+        }
+    }
+}
