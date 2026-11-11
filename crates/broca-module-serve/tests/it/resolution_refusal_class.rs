@@ -11,14 +11,19 @@
 //!
 //! Set `BROCA_RESOLUTION_REFUSAL_SAMPLES` to a folder to also write each body there, named
 //! `<case>.<storage>.<plan>.json`, before the bodies are compared.
+//!
+//! A module that is stopping refuses every request with one body too, whichever path refused it,
+//! and a keyed resend it refused is answered from the record after the restart.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use broca_core::{FileLeaseStore, FileWalStore, OutputEvent, RunError, RunSummary};
-use broca_module::executor::{RunExecutor, RunJob, StoreRunEnd, StoreRunError, StoreRunJob};
+use broca_core::{FileLeaseStore, FileWalStore, OutputEvent, RunError, RunSummary, WalStore};
+use broca_module::executor::{
+    RunExecutor, RunJob, StoreRunEnd, StoreRunError, StoreRunJob, StoreRunMode,
+};
 use broca_module::{DefaultOpener, LineageRegistry};
 use broca_module_serve::{serve_connection, ServeEnd};
 use serde_json::{json, Value};
@@ -35,18 +40,16 @@ const CONSULT: &str = "consult";
 
 /// Refuses every run before it starts with the error it holds, on both storages, as the module's
 /// executor refuses a run whose model or variant it can't resolve: on today's storage through the
-/// admission acknowledgement, on the new storage as the run's admission error.
+/// admission acknowledgement, on the new storage as the run's admission error. Holding no error,
+/// it runs a send to completion instead: on today's storage its start (with the send's key) and a
+/// completed end, on the new storage the new loop over a provider answering one text step.
 struct Refusing {
     error: Mutex<Option<RunError>>,
 }
 
 impl Refusing {
-    fn error(&self) -> RunError {
-        self.error
-            .lock()
-            .unwrap()
-            .clone()
-            .expect("each send sets the refusal first")
+    fn error(&self) -> Option<RunError> {
+        self.error.lock().unwrap().clone()
     }
 }
 
@@ -57,28 +60,171 @@ impl RunExecutor for Refusing {
         job: RunJob,
         _out: mpsc::Sender<OutputEvent>,
     ) -> Result<RunSummary, RunError> {
-        let error = self.error();
-        if let Some(ack) = job.on_admitted {
-            let _ = ack.send(Err(error.clone()));
+        if let Some(error) = self.error() {
+            if let Some(ack) = job.on_admitted {
+                let _ = ack.send(Err(error.clone()));
+            }
+            return Err(error);
         }
-        Err(error)
+        job.writer.record(broca_wal::WalRecord::RunStarted {
+            message_marks: None,
+            compaction_plan_version: None,
+            sent_by: None,
+            written_at_ms: None,
+            tags: None,
+            session_class: job.req.session_class.clone(),
+            retention: None,
+            hooks: None,
+            title: None,
+            on_restart: None,
+            keep_warm: None,
+            marker_order_version: None,
+            manifest: job.control.manifest.as_deref().cloned().map(Box::new),
+            scope: job.req.scope.clone(),
+            send_id: job.req.send_id.clone(),
+            request_identity_digest: job.req.request_identity_digest.clone(),
+            project_id: job.req.project_id.clone(),
+            principal: job.req.principal.clone(),
+            ts_ms: None,
+            run_id: job.req.run_id.clone(),
+            session: job.req.session.clone(),
+            config: Box::new(super::wire::min_config()),
+            input: job.req.input.clone().into(),
+            origin: broca_wal::RunOrigin::Fresh,
+            submission_id: job.req.submission_id.clone(),
+        });
+        job.writer
+            .sync()
+            .await
+            .map_err(|error| RunError::Wal(error.to_string()))?;
+        if let Some(ack) = job.on_admitted {
+            let _ = ack.send(Ok(job.req.run_id.clone()));
+        }
+        job.writer.record(broca_wal::WalRecord::RunFinished {
+            interrupt_reason: None,
+            ts_ms: None,
+            reason: broca_protocol::RunFinishReason::Completed,
+            usage: broca_protocol::Usage::default(),
+            error: None,
+            retries_used: 0,
+        });
+        job.writer
+            .sync()
+            .await
+            .map_err(|error| RunError::Wal(error.to_string()))?;
+        Ok(RunSummary {
+            reason: broca_protocol::RunFinishReason::Completed,
+            paused: None,
+            steps: 1,
+            usage: broca_protocol::Usage::default(),
+            retries_used: 0,
+            final_step_finish_reason: None,
+        })
     }
 
     async fn execute_on_store(
         &self,
         job: StoreRunJob,
-        _out: mpsc::Sender<OutputEvent>,
+        out: mpsc::Sender<OutputEvent>,
     ) -> StoreRunEnd {
-        StoreRunEnd {
-            parts: job.parts,
-            result: Err(StoreRunError::Admission(self.error())),
+        if let Some(error) = self.error() {
+            return StoreRunEnd {
+                parts: job.parts,
+                result: Err(StoreRunError::Admission(error)),
+            };
         }
+        // Run the send through the new loop over a scripted provider that answers one text step,
+        // as the module's executor runs a store session's run.
+        use broca_session_loop::writer::Writer;
+        let StoreRunJob {
+            mut req,
+            control,
+            mut writer,
+            mut parts,
+            mode,
+            ..
+        } = job;
+        let provider = broca_core::provider::StubProvider::new(vec![text_step("answered")]);
+        let result = async {
+            let tools = broca_core::StubToolPlane::new();
+            let now = || 1;
+            let seams = broca_session_loop::run::Seams {
+                provider: &provider,
+                tools: &tools,
+                bind: req.session.clone(),
+                out: Some(&out),
+                cancel: control.cancel.clone().unwrap_or_default(),
+                stop: Default::default(),
+                held: None,
+                approval: &broca_core::AllowAll,
+                hook_plane: None,
+                now_ms: &now,
+                session_address: None,
+                compaction_plane: control.compaction_plane.as_deref(),
+                compaction_session: None,
+                compaction_changes: true,
+                keep_warm: None,
+                account_reports: None,
+                max_same_account_wait: Default::default(),
+                auth_selection: None,
+                step_progress: control.step_progress.clone(),
+                model_call_ready: None,
+            };
+            match mode {
+                StoreRunMode::Fresh => {
+                    let admission = broca_session_loop::admit::admission(
+                        &mut req,
+                        &control,
+                        &provider,
+                        writer.operations(),
+                        Some(1),
+                    )
+                    .map_err(StoreRunError::Admission)?;
+                    broca_session_loop::run::run(&mut writer, parts.as_mut(), admission, &seams)
+                        .await
+                }
+                StoreRunMode::Seal(cause) => {
+                    broca_session_loop::seal(&mut writer, parts.as_ref(), &seams, cause).await
+                }
+                _ => broca_session_loop::run::resume(&mut writer, parts.as_ref(), &seams).await,
+            }
+            .map_err(StoreRunError::Loop)
+        }
+        .await;
+        StoreRunEnd { parts, result }
     }
+}
+
+/// One model step that answers `text` and finishes.
+fn text_step(text: &str) -> Vec<broca_protocol::NormalizedEvent> {
+    use broca_protocol::content::{AssistantMessage, ContentBlock, FinishReason};
+    use broca_protocol::{MessageId, ProviderControl, Usage};
+    vec![
+        broca_protocol::NormalizedEvent::Control(ProviderControl::AssistantMessage {
+            message: AssistantMessage {
+                message_id: MessageId("a1".into()),
+                content: vec![ContentBlock::Text { text: text.into() }],
+            },
+        }),
+        broca_protocol::NormalizedEvent::Control(ProviderControl::Finished {
+            usage: Usage {
+                input_tokens: Some(100),
+                output_tokens: Some(20),
+                ..Usage::default()
+            },
+            finish_reason: FinishReason::Stop,
+            retries_used: 0,
+        }),
+    ]
 }
 
 struct Rig {
     dir: PathBuf,
+    /// Whether dropping the rig removes its state root; a rig whose root a later rig reopens
+    /// leaves it.
+    remove_dir: bool,
     executor: Arc<Refusing>,
+    registry: Arc<LineageRegistry>,
     reader: tokio::io::ReadHalf<tokio::io::DuplexStream>,
     writer: tokio::io::WriteHalf<tokio::io::DuplexStream>,
     _serve: tokio::task::JoinHandle<Result<ServeEnd, broca_module_serve::serve::ServeIoError>>,
@@ -88,7 +234,9 @@ struct Rig {
 
 impl Drop for Rig {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
+        if self.remove_dir {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
     }
 }
 
@@ -104,6 +252,11 @@ impl Rig {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         broca_core::media_store::create_media_directories(&dir).unwrap();
+        Self::open(dir, new_storage).await
+    }
+
+    /// A module serving the state root `dir` as it is, as a restarted module does.
+    async fn open(dir: PathBuf, new_storage: bool) -> Self {
         let wal = Arc::new(FileWalStore::new(dir.join("wal")));
         let executor = Arc::new(Refusing {
             error: Mutex::new(None),
@@ -178,7 +331,9 @@ impl Rig {
         write_frame(&mut writer, &ack).await.unwrap();
         Self {
             dir,
+            remove_dir: true,
             executor,
+            registry,
             reader,
             writer,
             _serve: serve,
@@ -239,9 +394,21 @@ impl Rig {
     async fn refused_body(&mut self, session: &str, error: RunError, plan: bool) -> Vec<u8> {
         *self.executor.error.lock().unwrap() = Some(error);
         let channel = self.bind(session).await;
+        let reply = self.send(channel, "turn-1", plan).await;
+        assert_eq!(
+            reply.header.ty,
+            FrameType::Error,
+            "{session}: {}",
+            String::from_utf8_lossy(&reply.body)
+        );
+        reply.body.to_vec()
+    }
+
+    /// Sends `send_id` on `channel` as Core sends it, with a fetch plan when `plan` is set.
+    async fn send(&mut self, channel: u16, send_id: &str, plan: bool) -> Frame {
         let mut params = json!({
             "prompt": "hi",
-            "send_id": "turn-1",
+            "send_id": send_id,
             "session_class": CONSULT,
             "model": {"provider": "google", "model": "antigravity-gemini-4-carbon", "variant": "high"},
         });
@@ -260,16 +427,8 @@ impl Rig {
             }
             params["plan"] = plan;
         }
-        let reply = self
-            .request(channel, json!({"method": "session.send", "params": params}))
-            .await;
-        assert_eq!(
-            reply.header.ty,
-            FrameType::Error,
-            "{session}: {}",
-            String::from_utf8_lossy(&reply.body)
-        );
-        reply.body.to_vec()
+        self.request(channel, json!({"method": "session.send", "params": params}))
+            .await
     }
 }
 
@@ -451,6 +610,181 @@ async fn each_resolution_refusal_has_one_body_on_every_path() {
                 }
             }
         }
+        // Last, because a module that began stopping never serves again: every send is refused
+        // before a session opens. The routes are bound first, as a drain finds them.
+        let plain = rig.bind("module_stopping-plain").await;
+        let planned = rig.bind("module_stopping-plan").await;
+        rig.registry.begin_stop();
+        for (plan_name, channel, plan) in [("plain", plain, false), ("plan", planned, true)] {
+            let reply = rig.send(channel, "turn-1", plan).await;
+            let name = format!("module_stopping.{storage}.{plan_name}.json");
+            check_body(
+                samples.as_deref(),
+                &name,
+                &reply,
+                MODULE_STOPPING,
+                &mut mismatches,
+            );
+        }
     }
     assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+}
+
+/// The body of every request refused because the module is stopping, on the paths that open a
+/// session or start its run.
+const MODULE_STOPPING: &str = r#"{"code":"transient","message":"open failed: module is stopping","detail":{"cause":"module_stopping","class":"transient"}}"#;
+
+/// Writes `reply`'s body to the sample folder as `name`, then notes it when it is not an error
+/// frame carrying exactly `want`.
+fn check_body(
+    samples: Option<&std::path::Path>,
+    name: &str,
+    reply: &Frame,
+    want: &str,
+    mismatches: &mut Vec<String>,
+) {
+    if let Some(samples) = samples {
+        std::fs::write(samples.join(name), &reply.body).unwrap();
+    }
+    if reply.header.ty != FrameType::Error || reply.body.as_slice() != want.as_bytes() {
+        mismatches.push(format!(
+            "{name}: {:?}\n  got  {}\n  want {want}",
+            reply.header.ty,
+            String::from_utf8_lossy(&reply.body)
+        ));
+    }
+}
+
+/// A keyed resend refused because the module is stopping did nothing: after the restart the same
+/// send id is answered from the record with the original run, and the session holds that one run.
+/// On both storages, sent as Core sends it (session class `consult`, a fetch plan, a scope).
+#[tokio::test]
+async fn a_keyed_resend_refused_while_stopping_is_answered_after_the_restart() {
+    let samples = std::env::var_os("BROCA_RESOLUTION_REFUSAL_SAMPLES").map(PathBuf::from);
+    if let Some(samples) = &samples {
+        std::fs::create_dir_all(samples).unwrap();
+    }
+    let mut mismatches = Vec::new();
+    for (storage, new_storage) in [("todays", false), ("new", true)] {
+        let mut rig = Rig::start(&format!("resend-{storage}"), new_storage).await;
+        rig.remove_dir = false;
+        let dir = rig.dir.clone();
+        let channel = rig.bind("resend").await;
+        let first = rig.send(channel, "turn-1", true).await;
+        assert_eq!(
+            first.header.ty,
+            FrameType::Response,
+            "{storage}: {}",
+            String::from_utf8_lossy(&first.body)
+        );
+        let first: Value = serde_json::from_slice(&first.body).unwrap();
+        let run_id = first["result"]["run_id"].as_str().unwrap().to_owned();
+        let key = rig
+            .registry
+            .resolve_session_address(
+                &broca_protocol::BindIdentity::new("", "runner", "resend"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        wait_until_finished(&rig, &key, &run_id).await;
+
+        rig.registry.begin_stop();
+        let resent = rig.send(channel, "turn-1", true).await;
+        let name = format!("module_stopping_resend.{storage}.plan.json");
+        check_body(
+            samples.as_deref(),
+            &name,
+            &resent,
+            MODULE_STOPPING,
+            &mut mismatches,
+        );
+        // Another operation on the session is refused with the same body.
+        let cancel = rig
+            .request(
+                channel,
+                json!({"method": "run.cancel", "params": {"run_id": run_id}}),
+            )
+            .await;
+        let name = format!("module_stopping.{storage}.cancel.json");
+        check_body(
+            samples.as_deref(),
+            &name,
+            &cancel,
+            MODULE_STOPPING,
+            &mut mismatches,
+        );
+        assert!(
+            rig.registry.stop_and_seal().await,
+            "{storage}: the stop is clean"
+        );
+        drop(rig);
+
+        let mut rig = Rig::open(dir, new_storage).await;
+        let channel = rig.bind("resend").await;
+        let again = rig.send(channel, "turn-1", true).await;
+        assert_eq!(
+            again.header.ty,
+            FrameType::Response,
+            "{storage}: {}",
+            String::from_utf8_lossy(&again.body)
+        );
+        let again: Value = serde_json::from_slice(&again.body).unwrap();
+        assert_eq!(
+            again["result"]["run_id"], run_id,
+            "{storage}: the resend is answered with the original run: {again}"
+        );
+        assert_eq!(
+            run_starts(&rig, &key, new_storage).await,
+            1,
+            "{storage}: the session holds one run for the send id"
+        );
+    }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+}
+
+/// Waits until the session's run `run_id` has ended.
+async fn wait_until_finished(rig: &Rig, key: &broca_protocol::BindIdentity, run_id: &str) {
+    use broca_module::serve::{ServeHandler, SessionReadRequest};
+    broca_test_support::wait_until("the first send's run ends", || async {
+        let read = rig
+            .registry
+            .read(SessionReadRequest::new(key.clone(), None, Some(1)))
+            .await
+            .map_err(|error| error.to_string())?;
+        if read.lineage_state.last_run_id.as_deref() == Some(run_id)
+            && read.lineage_state.state != "active"
+        {
+            Ok(())
+        } else {
+            Err(format!("{:?}", read.lineage_state))
+        }
+    })
+    .await;
+}
+
+/// How many runs the session holds: its `RunStarted` records on today's storage; on the new
+/// storage, the distinct runs its messages are attributed to.
+async fn run_starts(rig: &Rig, key: &broca_protocol::BindIdentity, new_storage: bool) -> usize {
+    use broca_module::serve::{ServeHandler, SessionReadRequest};
+    if new_storage {
+        let read = rig
+            .registry
+            .read(SessionReadRequest::new(key.clone(), None, None))
+            .await
+            .expect("the session reads");
+        read.messages
+            .iter()
+            .filter_map(|message| message.run.as_ref().map(|run| run.run_id.clone()))
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+    } else {
+        FileWalStore::new(rig.dir.join("wal"))
+            .read_records(key)
+            .unwrap()
+            .into_iter()
+            .filter(|frame| matches!(frame.record, broca_wal::WalRecord::RunStarted { .. }))
+            .count()
+    }
 }

@@ -94,6 +94,12 @@ pub fn admission_refusal(error: &ServeError) -> Option<AdmissionRefusal> {
         // The cause clears by itself (a catalog or credential listing not loaded yet, a
         // dependency that did not answer), so the same send may be admitted on retry.
         ServeError::Transient(_) => ("transient", Some(json!({"class": "transient"}))),
+        // broca is stopping: this request did nothing, so repeating it after the restart may
+        // be answered. The cause says nothing about an earlier request with the same send id.
+        ServeError::ModuleStopping(_) => (
+            "transient",
+            Some(json!({"class": "transient", "cause": "module_stopping"})),
+        ),
         ServeError::VariantUnsupported(refusal) => (
             "variant_unsupported",
             // Resending the same variant to the same model cannot succeed until the catalog

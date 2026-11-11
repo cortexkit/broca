@@ -5209,6 +5209,8 @@ fn refused_send_code(error: &ServeError) -> String {
         }
         ServeError::SendIdReuse { .. } => "send_id_reuse".into(),
         ServeError::Transient(_) | ServeError::TagsAwaitSetup => "transient".into(),
+        // Answered on the wire as the contract's `transient` code (see `admission_refusal`).
+        ServeError::ModuleStopping(_) => "transient".into(),
         ServeError::Import(_) => "import_rejected".into(),
         ServeError::ImportIdReuse => "import_id_reuse".into(),
         ServeError::ImportBusy => "import_busy".into(),
@@ -5253,6 +5255,7 @@ fn refused_send_class(error: &ServeError) -> &'static str {
         ServeError::RoutingUnavailable(_)
         | ServeError::CredentialsUnavailable
         | ServeError::Transient(_)
+        | ServeError::ModuleStopping(_)
         | ServeError::TagsAwaitSetup
         | ServeError::SessionMoving { .. }
         | ServeError::SessionConverting
@@ -5497,6 +5500,7 @@ async fn send_serve_error(
         | ServeError::MediaTooLarge(_)
         | ServeError::SendIdReuse { .. }
         | ServeError::Transient(_)
+        | ServeError::ModuleStopping(_)
         | ServeError::InvalidParams { .. }
         | ServeError::AccountSelectionRefused(_)
         | ServeError::RoutingUnavailable(_) => unreachable!("admission refusal returned above"),

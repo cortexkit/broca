@@ -2613,7 +2613,10 @@ freezes it for the episode. It is not inherited from an earlier send and is part
 of keyed-send identity.
 
 On the daemon's channel-0 `module.draining` push, broca stops new admission and
-queued dispatch immediately, without starting its final seal timer. A resume-enabled
+queued dispatch immediately, without starting its final seal timer. Requests refused
+because broca is stopping answer code `transient` with
+`detail: {class: "transient", cause: "module_stopping"}` (see
+[module lifecycle and shutdown](module-lifecycle.md)). A resume-enabled
 run finishes its current work and writes
 `RunPaused{Restart}` at the next clean step-entry boundary. The gated frame requires
 `restart-pause/v1`; the writer raises the local WAL feature floor before appending

@@ -218,6 +218,8 @@ pub enum OpenError {
     LeaseHeld(String),
     /// The lease store / WAL / replay failed while opening.
     Open(String),
+    /// broca is stopping, so it opens no session. Nothing was written for the request.
+    ModuleStopping,
     /// A read failure whose typed cause is still available.
     Classified {
         reason: String,
@@ -450,6 +452,7 @@ impl std::fmt::Display for OpenError {
             | OpenError::NewerWriter { reason: s, .. } => {
                 write!(f, "open failed: {s}")
             }
+            OpenError::ModuleStopping => f.write_str("open failed: module is stopping"),
             OpenError::NotServedOnNewStorage { feature } => f.write_str(
                 &crate::store_actor::unserved_on_creation(feature),
             ),
@@ -3401,7 +3404,7 @@ impl LineageRegistry {
         let mut close_retries = 0;
         loop {
             if self.inner.stopping.is_cancelled() {
-                return Err(OpenError::Open("module is stopping".into()));
+                return Err(OpenError::ModuleStopping);
             }
             // Fast path under the lock: classify the slot + claim a transition. The slow
             // open/await happens AFTER the lock is dropped.
@@ -6514,6 +6517,14 @@ impl LineageRegistry {
                         // Refused only to a send creating a head, never to this pass's open.
                         | OpenError::NotServedOnNewStorage { .. } => sweep.open_failed += 1,
                         OpenError::LeaseHeld(_) => sweep.lease_held += 1,
+                        OpenError::ModuleStopping => {
+                            tracing::warn!(
+                                target: "lifecycle",
+                                "crash-orphan pass could not open session '{}': module is stopping",
+                                key.session
+                            );
+                            sweep.open_failed += 1;
+                        }
                         OpenError::Open(reason)
                         | OpenError::Classified { reason, .. }
                         | OpenError::HistoryUnreachable { reason, .. }

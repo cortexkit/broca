@@ -661,6 +661,9 @@ enum StartRunFailure {
     ContextCeiling(broca_protocol::ContextCeilingDetail),
     Expired,
     Shutdown,
+    /// The module began stopping before the run was handed to its executor, so nothing of it
+    /// was written by this start.
+    ModuleStopping,
     Infrastructure(String),
     Admission(RunError),
     /// The owner check refused the send against the session's history at admission.
@@ -906,7 +909,7 @@ struct AdmittedRequestIdentity {
 impl std::fmt::Display for StartRunFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Shutdown => write!(f, "module is stopping"),
+            Self::Shutdown | Self::ModuleStopping => write!(f, "module is stopping"),
             Self::ContextCeiling(detail) => write!(
                 f,
                 "context_ceiling: size {} in window {} ({})",
@@ -3372,7 +3375,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 };
         }
         if self.registry.is_stopping() {
-            return SendOutcome::Transient("module is stopping".into());
+            return SendOutcome::ModuleStopping(crate::serve::StoppingAt::Admission);
         }
         let send_id = key.send_id().map(str::to_owned);
         let skip_materialization =
@@ -4528,6 +4531,9 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 Err(StartRunFailure::ContextCeiling(detail)) => SendOutcome::ContextCeiling(detail),
                 Err(StartRunFailure::Scope(refusal)) => SendOutcome::ScopeRefused(refusal),
                 Err(StartRunFailure::Admission(error)) => admission_refusal_outcome(error),
+                Err(StartRunFailure::ModuleStopping) => {
+                    SendOutcome::ModuleStopping(crate::serve::StoppingAt::Open)
+                }
                 // Infrastructure strings include replay failures, so retryability is unknown.
                 Err(error) => SendOutcome::Error(error.to_string()),
             },
@@ -5496,7 +5502,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         req.scope = episode_scope;
 
         if self.registry.is_stopping() {
-            return Err(StartRunFailure::Infrastructure("module is stopping".into()));
+            return Err(StartRunFailure::ModuleStopping);
         }
         let cancel = CancellationToken::new();
         if cancel_before_execute {
@@ -6002,7 +6008,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         prepared: Option<pre_user::PreparedInput>,
     ) -> SendOutcome {
         if self.registry.is_stopping() {
-            return SendOutcome::Transient("module is stopping".into());
+            return SendOutcome::ModuleStopping(crate::serve::StoppingAt::Admission);
         }
         let SendIdentity {
             display_sent_by,
@@ -6529,7 +6535,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         order: broca_protocol::DeliveryOrder,
     ) -> SendOutcome {
         if self.registry.is_stopping() {
-            return SendOutcome::Transient("module is stopping".into());
+            return SendOutcome::ModuleStopping(crate::serve::StoppingAt::Admission);
         }
         let submission_id = broca_protocol::SubmissionId(format!("sub-{}", run_id.0));
         let request_scope = request.scope.clone();

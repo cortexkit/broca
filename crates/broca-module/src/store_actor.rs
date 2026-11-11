@@ -2586,7 +2586,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         let abandon = async move {
             tokio::select! {
                 biased;
-                _ = seal.cancelled() => SendOutcome::Transient("module is stopping".into()),
+                _ = seal.cancelled() => SendOutcome::ModuleStopping(crate::serve::StoppingAt::Admission),
                 _ = reply.closed() => SendOutcome::Transient("send cancelled".into()),
             }
         };

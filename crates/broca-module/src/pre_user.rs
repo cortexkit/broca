@@ -39,7 +39,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         let abandon = async move {
             tokio::select! {
                 biased;
-                _ = seal.cancelled() => SendOutcome::Transient("module is stopping".into()),
+                _ = seal.cancelled() => SendOutcome::ModuleStopping(crate::serve::StoppingAt::Admission),
                 _ = async {
                     match send_reply.as_mut() {
                         Some(reply) => reply.closed().await,
