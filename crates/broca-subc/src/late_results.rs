@@ -44,7 +44,7 @@ pub async fn withdraw_held_call(
         Err(message) => return withdraw_error(ConnError::Protocol(message)),
     };
     let catalog = match conn.catalog_list().await {
-        Ok(catalog) => catalog,
+        Ok(catalog) => crate::provider_catalog::ProviderCatalog::from(catalog),
         Err(error) => return withdraw_error(error),
     };
     let policy = crate::connection::ToolProviderRoutePolicy::for_provider(
@@ -228,7 +228,7 @@ impl LateResultsFeed {
                 detail: None,
             });
         }
-        let catalog = conn.catalog_list().await?;
+        let catalog = crate::provider_catalog::ProviderCatalog::from(conn.catalog_list().await?);
         // The feed aggregates the custodian's calls across conversations; its dedicated
         // maintenance identity must never become a conversation's compaction identity.
         let policy =

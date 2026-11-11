@@ -261,7 +261,8 @@ mod call_keepalive {
                             ..Default::default()
                         },
                         held,
-                    );
+                                            None,
+);
                     tokio::pin!(open);
                     let request = tokio::select! {
                         result = &mut open => panic!("premature result: {result:?}"),

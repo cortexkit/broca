@@ -30,7 +30,10 @@ const TRANSIENT: &str = "transient";
 const FETCH_REPLY_TIMEOUT: Duration = broca_fetch_plan::ADMISSION_DEADLINE;
 
 type CatalogSnapshot = futures::future::Shared<
-    futures::future::BoxFuture<'static, Result<Arc<Vec<subc_control::CatalogEntry>>, FetchError>>,
+    futures::future::BoxFuture<
+        'static,
+        Result<Arc<crate::provider_catalog::ProviderCatalog>, FetchError>,
+    >,
 >;
 
 /// Fetches one session's plan over a subc consumer connection.
@@ -99,7 +102,9 @@ impl SubcPlanFetcher {
         }
     }
 
-    async fn catalog_snapshot(&self) -> Result<Arc<Vec<subc_control::CatalogEntry>>, FetchError> {
+    async fn catalog_snapshot(
+        &self,
+    ) -> Result<Arc<crate::provider_catalog::ProviderCatalog>, FetchError> {
         use futures::FutureExt;
         let snapshot = self
             .catalog_snapshot
@@ -112,7 +117,7 @@ impl SubcPlanFetcher {
                 async move {
                     conn.catalog_list()
                         .await
-                        .map(Arc::new)
+                        .map(|entries| Arc::new(entries.into()))
                         .map_err(|error| FetchError::Lost(error.to_string()))
                 }
                 .boxed()
@@ -172,7 +177,11 @@ impl SubcPlanFetcher {
 
     async fn call(&self, provider: &str, op: &str, arguments: Value) -> Result<Value, FetchError> {
         let selector = self.selector().await?;
-        let catalog = self.catalog_snapshot().await?;
+        let catalog = match self.catalog_snapshot().await {
+            Ok(catalog) => catalog,
+            Err(_) if provider == "aft" => Arc::new(Vec::new().into()),
+            Err(error) => return Err(error),
+        };
         let policy = crate::connection::ToolProviderRoutePolicy::for_provider(
             &catalog,
             provider,
@@ -415,8 +424,13 @@ mod carrier_catalog_tests {
             .iter()
             .map(|provider| {
                 let mut entry = subc_control::CatalogEntry::new(*provider, Vec::new(), Vec::new());
+                let provides = if *provider == "aft" {
+                    vec!["tool-provider/v1", "scope-background-tasks/v1"]
+                } else {
+                    vec!["tool-provider/v1"]
+                };
                 entry.capabilities =
-                    Some(serde_json::from_value(json!({"provides":["tool-provider/v1"]})).unwrap());
+                    Some(serde_json::from_value(json!({"provides": provides})).unwrap());
                 entry
             })
             .collect();

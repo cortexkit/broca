@@ -438,6 +438,7 @@ trait ToolPlaneConnection: Send + Sync {
         scope: Option<&ScopeSelector>,
         _shape: RouteShape,
         _provider_held_installed: bool,
+        _aft_harness: Option<Arc<crate::provider_catalog::AftHarness>>,
     ) -> Result<RouteHandle, ConnError> {
         self.route_open(module_id, identity, scope).await
     }
@@ -542,6 +543,7 @@ impl ToolPlaneConnection for SubcConnection {
         scope: Option<&ScopeSelector>,
         shape: RouteShape,
         provider_held_installed: bool,
+        aft_harness: Option<Arc<crate::provider_catalog::AftHarness>>,
     ) -> Result<RouteHandle, ConnError> {
         self.route_open_dispatch_single_attempt(
             module_id,
@@ -549,6 +551,7 @@ impl ToolPlaneConnection for SubcConnection {
             scope,
             shape,
             provider_held_installed,
+            aft_harness,
         )
         .await
     }
@@ -754,7 +757,7 @@ pub struct SubcToolPlane {
     /// provider is restarted. A missing provider triggers one fresh resolution fetch, and any
     /// learned-dead route clears this snapshot, covering the catalog changes that can affect a
     /// later batch without polling per batch.
-    catalog_memo: Mutex<Option<Arc<Vec<CatalogEntry>>>>,
+    catalog_memo: Mutex<Option<Arc<crate::provider_catalog::ProviderCatalog>>>,
     /// The at-most-once fence (keyed by (session, tool_call_id), evicted at batch terminal).
     fence: Mutex<Fence>,
     /// Per-PROVIDER concurrency window, resolved from that provider's catalog entry at
@@ -1242,21 +1245,45 @@ impl SubcToolPlane {
         self.conn.catalog_list().await.map_err(conn_to_plane)
     }
 
-    async fn catalog_snapshot(&self) -> Result<Arc<Vec<CatalogEntry>>, ToolPlaneError> {
+    async fn catalog_snapshot(
+        &self,
+    ) -> Result<Arc<crate::provider_catalog::ProviderCatalog>, ToolPlaneError> {
         if let Some(catalog) = self.catalog_memo.lock().unwrap().as_ref().cloned() {
             return Ok(catalog);
         }
 
-        let fetched = Arc::new(self.conn.catalog_list().await.map_err(conn_to_plane)?);
+        let fetched: Arc<crate::provider_catalog::ProviderCatalog> = Arc::new(
+            self.conn
+                .catalog_list()
+                .await
+                .map_err(conn_to_plane)?
+                .into(),
+        );
         let mut memo = self.catalog_memo.lock().unwrap();
         Ok(Arc::clone(memo.get_or_insert(fetched)))
     }
 
-    async fn refresh_catalog_snapshot(&self) -> Result<Arc<Vec<CatalogEntry>>, ToolPlaneError> {
+    async fn refresh_catalog_snapshot(
+        &self,
+    ) -> Result<Arc<crate::provider_catalog::ProviderCatalog>, ToolPlaneError> {
         self.clear_catalog_memo();
-        let fetched = Arc::new(self.conn.catalog_list().await.map_err(conn_to_plane)?);
+        let fetched: Arc<crate::provider_catalog::ProviderCatalog> = Arc::new(
+            self.conn
+                .catalog_list()
+                .await
+                .map_err(conn_to_plane)?
+                .into(),
+        );
         *self.catalog_memo.lock().unwrap() = Some(Arc::clone(&fetched));
         Ok(fetched)
+    }
+
+    fn aft_harness(&self) -> Option<Arc<crate::provider_catalog::AftHarness>> {
+        self.catalog_memo
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|catalog| Arc::clone(&catalog.aft_harness))
     }
 
     fn clear_catalog_memo(&self) {
@@ -2325,7 +2352,13 @@ impl SubcToolPlane {
         if let Some(w) = self.windows.lock().unwrap().get(module_id).copied() {
             return Ok(w);
         }
-        let catalog = Arc::new(self.conn.catalog_list().await.map_err(conn_to_plane)?);
+        let catalog: Arc<crate::provider_catalog::ProviderCatalog> = Arc::new(
+            self.conn
+                .catalog_list()
+                .await
+                .map_err(conn_to_plane)?
+                .into(),
+        );
         self.catalog_memo
             .lock()
             .unwrap()
@@ -2455,6 +2488,7 @@ impl SubcToolPlane {
                     selector.as_ref(),
                     shape,
                     self.held_reply_declared(),
+                    self.aft_harness(),
                 )
             };
             return match outage {
@@ -2546,6 +2580,7 @@ impl SubcToolPlane {
                     Some(&selector),
                     shape,
                     self.held_reply_declared(),
+                    self.aft_harness(),
                 )
             };
             let opened = match outage {
@@ -3759,6 +3794,7 @@ impl SubcToolPlane {
                     Some(&selector),
                     self.frozen_contract(ctx, &module).route_shape(),
                     self.held_reply_declared(),
+                    self.aft_harness(),
                 )
             },
         )
@@ -4444,6 +4480,9 @@ fn legacy_non_text_tool_content_placeholder(block: &serde_json::Value) -> String
 
 #[cfg(test)]
 mod tests {
+    mod aft_harness {
+        include!("subc_plane/tests/aft_harness_tests.rs");
+    }
     include!("subc_plane/direct_carrier_tests.rs");
     include!("subc_plane/route_close_followup_tests.rs");
     include!("subc_plane/call_keepalive_tests.rs");
@@ -5184,7 +5223,7 @@ mod tests {
         );
         let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
         plane.windows.lock().unwrap().insert("aft".into(), 1);
-        *plane.catalog_memo.lock().unwrap() = Some(Arc::new(Vec::new()));
+        *plane.catalog_memo.lock().unwrap() = Some(Arc::new(Vec::new().into()));
         let bind = BindIdentity::new("/tmp/route-open-retry", "test", "session");
         let lifecycle = CancellationToken::new();
         tokio::time::pause();
@@ -5221,7 +5260,7 @@ mod tests {
         );
         let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
         plane.windows.lock().unwrap().insert("aft".into(), 1);
-        *plane.catalog_memo.lock().unwrap() = Some(Arc::new(Vec::new()));
+        *plane.catalog_memo.lock().unwrap() = Some(Arc::new(Vec::new().into()));
         let bind = BindIdentity::new("/tmp/route-open-retry-deadline", "test", "session");
         let lifecycle = CancellationToken::new();
         tokio::time::pause();
@@ -5260,7 +5299,7 @@ mod tests {
         );
         let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
         plane.windows.lock().unwrap().insert("aft".into(), 1);
-        *plane.catalog_memo.lock().unwrap() = Some(Arc::new(Vec::new()));
+        *plane.catalog_memo.lock().unwrap() = Some(Arc::new(Vec::new().into()));
         let bind = BindIdentity::new("/tmp/warm-short-timeout", "test", "session");
         let lifecycle = CancellationToken::new();
 
@@ -5292,7 +5331,7 @@ mod tests {
         );
         let plane = Arc::new(SubcToolPlane::with_connection(conn.clone(), "aft"));
         plane.windows.lock().unwrap().insert("aft".into(), 1);
-        *plane.catalog_memo.lock().unwrap() = Some(Arc::new(Vec::new()));
+        *plane.catalog_memo.lock().unwrap() = Some(Arc::new(Vec::new().into()));
         let bind = BindIdentity::new("/tmp/warm-cap", "test", "session");
         let lifecycle = CancellationToken::new();
 
@@ -5345,7 +5384,7 @@ mod tests {
         );
         let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
         plane.windows.lock().unwrap().insert("aft".into(), 1);
-        *plane.catalog_memo.lock().unwrap() = Some(Arc::new(Vec::new()));
+        *plane.catalog_memo.lock().unwrap() = Some(Arc::new(Vec::new().into()));
         let bind = BindIdentity::new("/tmp/route-open-terminal", "test", "session");
         let lifecycle = CancellationToken::new();
         let started = Instant::now();
@@ -5379,7 +5418,7 @@ mod tests {
         );
         let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
         plane.windows.lock().unwrap().insert("aft".into(), 1);
-        *plane.catalog_memo.lock().unwrap() = Some(Arc::new(Vec::new()));
+        *plane.catalog_memo.lock().unwrap() = Some(Arc::new(Vec::new().into()));
         let bind = BindIdentity::new("/tmp/route-open-unknown", "test", "session");
         let lifecycle = CancellationToken::new();
         let started = Instant::now();
@@ -5410,7 +5449,7 @@ mod tests {
         conn.script_route_open_sequence("aft", vec![RouteOpenScript::transport("socket lost")]);
         let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
         plane.windows.lock().unwrap().insert("aft".into(), 1);
-        *plane.catalog_memo.lock().unwrap() = Some(Arc::new(Vec::new()));
+        *plane.catalog_memo.lock().unwrap() = Some(Arc::new(Vec::new().into()));
         let bind = BindIdentity::new("/tmp/route-open-transport", "test", "session");
         let lifecycle = CancellationToken::new();
         let started = Instant::now();
@@ -5444,7 +5483,7 @@ mod tests {
         );
         let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
         plane.windows.lock().unwrap().insert("aft".into(), 1);
-        *plane.catalog_memo.lock().unwrap() = Some(Arc::new(Vec::new()));
+        *plane.catalog_memo.lock().unwrap() = Some(Arc::new(Vec::new().into()));
         let bind = BindIdentity::new("/tmp/warm-terminal", "test", "session");
         let lifecycle = CancellationToken::new();
         let started = Instant::now();
@@ -5474,7 +5513,7 @@ mod tests {
         conn.script_route_open_sequence("aft", vec![RouteOpenScript::rejected_body(&body)]);
         let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
         plane.windows.lock().unwrap().insert("aft".into(), 1);
-        *plane.catalog_memo.lock().unwrap() = Some(Arc::new(Vec::new()));
+        *plane.catalog_memo.lock().unwrap() = Some(Arc::new(Vec::new().into()));
         let bind = BindIdentity::new("/tmp/warm-structured-terminal", "test", "session");
         let started = Instant::now();
 
@@ -5508,7 +5547,7 @@ mod tests {
         );
         let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
         plane.windows.lock().unwrap().insert("aft".into(), 1);
-        *plane.catalog_memo.lock().unwrap() = Some(Arc::new(Vec::new()));
+        *plane.catalog_memo.lock().unwrap() = Some(Arc::new(Vec::new().into()));
         let bind = BindIdentity::new("/tmp/warm-structured-retry", "test", "session");
 
         let result = plane
@@ -5530,7 +5569,7 @@ mod tests {
         conn.script_route_open_sequence("aft", vec![RouteOpenScript::transport("socket lost")]);
         let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
         plane.windows.lock().unwrap().insert("aft".into(), 1);
-        *plane.catalog_memo.lock().unwrap() = Some(Arc::new(Vec::new()));
+        *plane.catalog_memo.lock().unwrap() = Some(Arc::new(Vec::new().into()));
         let bind = BindIdentity::new("/tmp/warm-transport", "test", "session");
         let lifecycle = CancellationToken::new();
         let started = Instant::now();
@@ -7819,6 +7858,7 @@ mod tests {
             scope: Option<&ScopeSelector>,
             shape: RouteShape,
             provider_held_installed: bool,
+            aft_harness: Option<Arc<crate::provider_catalog::AftHarness>>,
         ) -> Result<RouteHandle, ConnError> {
             self.conn
                 .route_open_dispatch_single_attempt(
@@ -7827,6 +7867,7 @@ mod tests {
                     scope,
                     shape,
                     provider_held_installed,
+                    aft_harness,
                 )
                 .await
         }
@@ -9056,7 +9097,7 @@ mod approved_queue_contract_tests {
     // snapshot too, so only the enqueue boundary can consume the scripted transport.
     fn cached_plane(conn: SubcConnection) -> SubcToolPlane {
         let plane = SubcToolPlane::new(conn, "aft");
-        *plane.catalog_memo.lock().unwrap() = Some(Arc::new(Vec::new()));
+        *plane.catalog_memo.lock().unwrap() = Some(Arc::new(Vec::new().into()));
         plane
     }
     #[tokio::test]
