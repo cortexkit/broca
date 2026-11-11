@@ -79,7 +79,7 @@ impl ToolManifest {
     }
 
     /// Index a shared ordered tool set without cloning its declarations.
-    pub(crate) fn from_shared_tools(tools: Arc<Vec<Tool>>) -> Self {
+    pub fn from_shared_tools(tools: Arc<Vec<Tool>>) -> Self {
         // When names repeat, get() and execution-mode dispatch use the final declaration.
         let name_to_index = tools
             .iter()

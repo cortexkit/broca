@@ -130,7 +130,9 @@ impl MediaFold {
         let batch: Vec<Record> = fresh.iter().map(|(_, record)| record.clone()).collect();
         let rebuilt = self
             .inverse
-            .push(*first, &batch, &|part| parts.get(part))
+            .push(*first, &batch, &|part| {
+                broca_session_loop::parts::value(parts, part)
+            })
             .map_err(|error| {
                 format!("the session's media fold can't rebuild today's records: {error}")
             })?;

@@ -685,7 +685,7 @@ pub fn latest_tools<B: SessionBackend>(
         .ok_or_else(|| StoreReadError::Setup(format!("run {} has no start", run.run_id)))?;
     let (config, _) = broca_session_loop::run::run_config_members(
         start,
-        |part| parts.get(part).map_err(StoreReadError::Setup),
+        |part| broca_session_loop::parts::value(parts, part).map_err(StoreReadError::Setup),
         || StoreReadError::Setup("a run's frozen choices aren't an object".into()),
     )?;
     let tools: Vec<broca_protocol::request::Tool> = match config.get("tools") {

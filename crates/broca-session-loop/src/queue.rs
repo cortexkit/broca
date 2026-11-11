@@ -124,7 +124,7 @@ pub fn request_of(send: &QueuedSend, parts: &dyn Parts) -> Result<SubmissionRequ
     for part in &send.setup {
         match part.kind {
             PartKind::Tools => {
-                request.insert("tools".into(), parts.get(part)?);
+                request.insert("tools".into(), crate::parts::value(parts, part)?);
             }
             other => return Err(format!("a queued send names a {other:?} part")),
         }
