@@ -7,6 +7,9 @@
 
 use crate::catalog_refresh::CATALOG_POLL_INTERVAL;
 use crate::consumer_routes::ConsumerRoutes;
+use broca_catalog::live::WireFamilyId;
+use cortexkit_role_routing::declarations::{ConsumerDeclarations, RunnerDeclaration, RunnerPair};
+use std::collections::BTreeMap;
 use subc_protocol::manifest::Concurrency;
 use subc_protocol::manifest::{
     Bindings, CapabilityDeclarations, IdentityBinding, IdentityScope, LaunchNonceSource,
@@ -414,6 +417,74 @@ pub(crate) fn observability_surfaces() -> Vec<ObservabilitySurface> {
     }]
 }
 
+// A runner-wide requirement would exclude credential-owned endpoints, including Code Assist.
+// Keep it off until routing can express the endpoint requirement separately for each pair.
+const RUNNER_REQUIRES_WIRE_API: bool = false;
+
+struct RoutingRunnerPair {
+    pair: RunnerPair,
+    opens_through_catalog_endpoint: bool,
+}
+
+fn routing_wire_api(family: WireFamilyId) -> &'static str {
+    match family {
+        WireFamilyId::AnthropicMessages => "anthropic.messages",
+        WireFamilyId::OpenAiResponses => "openai.responses",
+        WireFamilyId::OpenAiChat => "openai.chat_completions",
+        WireFamilyId::OpenAiResponsesChatgpt => "openai.chatgpt_responses",
+        WireFamilyId::Gemini => "google.generate_content",
+        WireFamilyId::GoogleCodeAssist => "google.code_assist",
+        WireFamilyId::BedrockConverse => "aws.bedrock_converse",
+    }
+}
+
+fn routing_runner_pairs() -> Vec<RoutingRunnerPair> {
+    let mut pairs = BTreeMap::new();
+    for method in crate::auth_routing::DEFAULT_METHOD_ORDER {
+        let mut insert = |family, catalog_endpoint| {
+            pairs
+                .entry((routing_wire_api(family), method.as_token()))
+                .and_modify(|all_catalog: &mut bool| *all_catalog &= catalog_endpoint)
+                .or_insert(catalog_endpoint);
+        };
+        if let Some(family) = crate::auth_routing::family_for_method(method) {
+            insert(family, false);
+        } else {
+            for family in broca_catalog::family::catalog_wire_families() {
+                insert(family, true);
+            }
+        }
+        // A family shared with a credential persona cannot require a catalog endpoint:
+        // routing's pair union must admit every provider broca can open through that pair.
+        for family in broca_catalog::family::credential_persona_families(method.as_token()) {
+            insert(family, false);
+        }
+    }
+    pairs
+        .into_iter()
+        .map(
+            |((wire_api, auth_method), opens_through_catalog_endpoint)| RoutingRunnerPair {
+                pair: RunnerPair::new(wire_api, auth_method),
+                opens_through_catalog_endpoint,
+            },
+        )
+        .collect()
+}
+
+fn routing_declarations() -> ConsumerDeclarations {
+    let pairs = routing_runner_pairs();
+    let requires_wire_api =
+        RUNNER_REQUIRES_WIRE_API && pairs.iter().all(|pair| pair.opens_through_catalog_endpoint);
+    let mut runner = RunnerDeclaration::new(pairs.into_iter().map(|pair| pair.pair).collect())
+        .with_requires_wire_api(requires_wire_api);
+    runner.follows_account_choice = true;
+    let declarations = ConsumerDeclarations::new().with_runner(runner);
+    declarations
+        .validate()
+        .expect("broca's routing declaration is valid");
+    declarations
+}
+
 /// The manifest for a fully configured process: the archive timer's configuration shapes
 /// `self_signals`, and the resolved consumer routes shape `consumes`.
 pub fn manifest_configured(
@@ -630,7 +701,103 @@ pub fn manifest_configured(
     // this list does not name, and the list cannot enumerate them, because callers choose
     // them at request time.
     .consumes(consumer_routes.consumer_roles())
+    .role_declarations(BTreeMap::from([(
+        cortexkit_role_routing::ROLE_DECLARATIONS_KEY.to_string(),
+        serde_json::to_value(routing_declarations())
+            .expect("routing declaration serializes")
+            .as_object()
+            .expect("routing declaration is an object")
+            .clone(),
+    )]))
     .build()
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+    use cortexkit_role_routing::declarations::parse_consumer_declarations;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn runner_pairs_and_endpoint_sources_follow_admission_authorities() {
+        let pairs = routing_runner_pairs();
+        let actual: BTreeSet<_> = pairs
+            .iter()
+            .map(|pair| {
+                (
+                    pair.pair.wire_api.as_str(),
+                    pair.pair.auth_method.as_str(),
+                    pair.opens_through_catalog_endpoint,
+                )
+            })
+            .collect();
+        // auth_routing::family_for_method preserves catalog families for API key/OAuth;
+        // live.rs:1348-1406 opens those through catalog.resolve_route's wire.api, except
+        // credential_persona_route in family.rs, which gives OAuth/Responses its own base.
+        // live.rs:1167-1214 builds BOTH method overrides from family defaults instead:
+        // neither ChatGPT nor Code Assist requires a catalog endpoint.
+        let expected = BTreeSet::from([
+            ("anthropic.messages", "apikey", true),
+            ("anthropic.messages", "oauth", true),
+            ("aws.bedrock_converse", "apikey", true),
+            ("aws.bedrock_converse", "oauth", true),
+            ("google.code_assist", "antigravity", false),
+            ("google.generate_content", "apikey", true),
+            ("google.generate_content", "oauth", true),
+            ("openai.chat_completions", "apikey", true),
+            ("openai.chat_completions", "oauth", true),
+            ("openai.chatgpt_responses", "chatgpt", false),
+            ("openai.responses", "apikey", true),
+            ("openai.responses", "oauth", false),
+        ]);
+        assert_eq!(actual, expected);
+        assert_eq!(pairs.len(), expected.len(), "no duplicate pairs");
+        assert!(actual.contains(&("google.code_assist", "antigravity", false)));
+
+        // The contract vocabulary pins the external tokens; WireFamilyId's serde names
+        // are not routing's wire_api spellings.
+        assert_eq!(
+            actual
+                .iter()
+                .map(|(wire, _, _)| *wire)
+                .collect::<BTreeSet<_>>(),
+            cortexkit_role_routing::spellings::WIRE_APIS
+                .iter()
+                .copied()
+                .collect()
+        );
+        assert_eq!(
+            crate::auth_routing::DEFAULT_METHOD_ORDER
+                .iter()
+                .map(|method| method.as_token())
+                .collect::<BTreeSet<_>>(),
+            cortexkit_role_routing::spellings::AUTH_METHODS
+                .iter()
+                .copied()
+                .collect()
+        );
+    }
+
+    #[test]
+    fn hello_routing_slot_passes_the_whole_slot_parser() {
+        let manifest = serde_json::to_value(manifest("broca")).unwrap();
+        let slot = &manifest["role_declarations"][cortexkit_role_routing::ROLE_DECLARATIONS_KEY];
+        let parsed = parse_consumer_declarations(slot).expect("the entire routing slot validates");
+        assert!(parsed.consumers.is_empty());
+        let runner = parsed.runner.as_ref().expect("broca declares its runner");
+        assert!(runner.follows_account_choice);
+        assert!(!runner.requires_wire_api());
+        assert!(
+            runner.admits_row(false),
+            "credential-owned endpoints stay eligible"
+        );
+        assert_eq!(runner.pairs.len(), 12);
+        assert_eq!(serde_json::to_value(parsed).unwrap(), *slot);
+        println!(
+            "routing/v1 HELLO slot: {}",
+            serde_json::to_string(slot).unwrap()
+        );
+    }
 }
 
 #[cfg(test)]
@@ -668,6 +835,7 @@ mod provenance_tests {
                 "module_version",
                 "protocol_ver",
                 "provides",
+                "role_declarations",
                 "self_signals",
                 "trust_tier",
             ],

@@ -2925,6 +2925,25 @@ async fn hello_bind_send_status_roundtrip() {
     assert_eq!(hello.header.ty, FrameType::Hello);
     let body: ModuleHelloBody = serde_json::from_slice(&hello.body).unwrap();
     assert_eq!(body.manifest.module_id, "broca");
+    let slot = body
+        .manifest
+        .role_declarations
+        .get(cortexkit_role_routing::ROLE_DECLARATIONS_KEY)
+        .expect("HELLO publishes the routing runner declaration");
+    let declarations = cortexkit_role_routing::declarations::parse_consumer_declarations(
+        &serde_json::Value::Object(slot.clone()),
+    )
+    .expect("the HELLO routing slot validates as a whole");
+    let runner = declarations
+        .runner
+        .expect("HELLO declares broca as a runner");
+    assert!(runner.follows_account_choice);
+    assert!(!runner.requires_wire_api());
+    assert_eq!(runner.pairs.len(), 12);
+    assert!(runner
+        .pairs
+        .iter()
+        .any(|pair| pair.wire_api == "google.code_assist" && pair.auth_method == "antigravity"));
     assert_eq!(
         body.control_ops,
         Some(vec![MODULE_CONTROL_OP_HEALTH_CHECK.to_string()])
