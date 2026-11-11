@@ -731,19 +731,33 @@ impl SqliteStore {
         self
     }
 
+    /// The query behind [`Self::session_runs`].
+    ///
+    /// It must be answered from the identity index, because it runs once for every session a
+    /// conversion or a move handles, under the store's one connection. That index covers only
+    /// rows whose session is valid JSON, so SQLite uses it only when the query states
+    /// `json_valid(session)` too; without that condition it reads every row of the table on
+    /// each call. `INDEXED BY` turns any later wording the index can't answer into a prepare
+    /// error, so it can't become a silent full read again.
+    fn session_runs_sql() -> String {
+        format!(
+            "SELECT run_id FROM run_index INDEXED BY {} \
+              WHERE json_valid(session) \
+                AND json_extract(session, '$.project_root') = ?1 \
+                AND json_extract(session, '$.harness') = ?2 \
+                AND json_extract(session, '$.session') = ?3 \
+              ORDER BY run_id",
+            session_log_evidence::indexes::RUNS
+        )
+    }
+
     /// Every run-index row of `session`, in run-id order. The index keeps a row's session as
     /// its bind identity's JSON, so rows are matched on its three members.
     pub fn session_runs(&self, session: &BindIdentity) -> Result<Vec<RunIndexRow>, String> {
         let run_ids = {
             let conn = self.conn.lock().map_err(|e| e.to_string())?;
             let mut statement = conn
-                .prepare(
-                    "SELECT run_id FROM run_index \
-                      WHERE json_extract(session, '$.project_root') = ?1 \
-                        AND json_extract(session, '$.harness') = ?2 \
-                        AND json_extract(session, '$.session') = ?3 \
-                      ORDER BY run_id",
-                )
+                .prepare(&Self::session_runs_sql())
                 .map_err(|e| e.to_string())?;
             let rows = statement
                 .query_map(
@@ -4755,6 +4769,58 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_sessions_runs_are_found_through_the_identity_index() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        // Each call of the helper names a new session, so both are made once.
+        let wanted = crate::conformance::session("wanted");
+        let other = crate::conformance::session("other");
+        for (run_id, session) in [("run-b", &wanted), ("run-x", &other), ("run-a", &wanted)] {
+            store
+                .index_run_active(&broca_core::RunIndexRow {
+                    withdrawals_owed: false,
+                    title: None,
+                    run_id: run_id.into(),
+                    session: session.clone(),
+                    submission_id: None,
+                    request_identity_digest: None,
+                    state: broca_core::RunIndexState::Active,
+                    usage: None,
+                    final_step_finish_reason: None,
+                    retries_used: 0,
+                })
+                .expect("index active");
+        }
+
+        let runs = store.session_runs(&wanted).unwrap();
+        let run_ids: Vec<&str> = runs.iter().map(|row| row.run_id.as_str()).collect();
+        assert_eq!(run_ids, ["run-a", "run-b"]);
+
+        // The rows alone don't show how they were found: a read of the whole table returns
+        // the same two. On a real run index that read took 0.8 s for each session.
+        let conn = store.conn.lock().unwrap();
+        let plan: Vec<String> = conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {}",
+                SqliteStore::session_runs_sql()
+            ))
+            .unwrap()
+            .query_map(["", "", ""], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|step| step
+                    .starts_with("SEARCH run_index USING INDEX session_log_evidence_runs")),
+            "the query must search the identity index, plan: {plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|step| step.starts_with("SCAN")),
+            "the query must not read the whole table, plan: {plan:?}"
+        );
     }
 
     #[test]
