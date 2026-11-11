@@ -715,7 +715,14 @@ async fn entries<B: SessionBackend>(
     let state = broca_core::compaction_v2::session::load(bind, records)
         .map_err(|error| mismatch(ENTRIES, format!("today's compaction state: {error}")))?;
     let applied = match state.applied_received() {
-        Some(view) => json!({ "ok": { "view": view } }),
+        Some(view) => {
+            let mut answer = json!({ "ok": { "view": view } });
+            // The WAL-backed session.applied_view returns the provider recorded for this view.
+            if let Some(module) = state.applied_by() {
+                answer["ok"]["applied_by"] = json!(module);
+            }
+            answer
+        }
         None => json!({ "ok": {} }),
     };
     same(
