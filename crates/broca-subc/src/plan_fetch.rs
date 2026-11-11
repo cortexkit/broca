@@ -177,11 +177,7 @@ impl SubcPlanFetcher {
 
     async fn call(&self, provider: &str, op: &str, arguments: Value) -> Result<Value, FetchError> {
         let selector = self.selector().await?;
-        let catalog = match self.catalog_snapshot().await {
-            Ok(catalog) => catalog,
-            Err(_) if provider == "aft" => Arc::new(Vec::new().into()),
-            Err(error) => return Err(error),
-        };
+        let catalog = self.catalog_snapshot().await?;
         let policy = crate::connection::ToolProviderRoutePolicy::for_provider(
             &catalog,
             provider,
@@ -418,6 +414,45 @@ impl Fetcher for SubcPlanFetcher {
 mod carrier_catalog_tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn failed_catalog_read_loses_aft_and_other_fetches_without_opening_routes() {
+        let mut errors = Vec::new();
+        for provider in ["aft", "other"] {
+            let (conn, _, mut daemon) = SubcConnection::in_process_for_test(1, 1);
+            let fetcher = SubcPlanFetcher::new(
+                Arc::new(conn),
+                BindIdentity::new("/project", "broca", "catalog-failure"),
+                None,
+            );
+            let call = fetcher.call(provider, CATALOG_OP, json!({}));
+            tokio::pin!(call);
+            let request = tokio::select! {
+                result = &mut call => panic!("fetch finished before catalog read: {result:?}"),
+                request = daemon.next_request() => request,
+            };
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(body["op"], "catalog.list");
+            assert!(daemon.refuse(&request, "module_timeout"));
+            let error = tokio::select! {
+                result = &mut call => result.unwrap_err(),
+                request = daemon.next_request() => panic!(
+                    "{provider} sent a request after its catalog read failed: {}",
+                    String::from_utf8_lossy(&request.body),
+                ),
+            };
+            assert!(
+                matches!(&error, FetchError::Lost(_)),
+                "{provider}: {error:?}"
+            );
+            assert!(daemon.take_written_for_test().is_empty());
+            errors.push(error);
+        }
+        assert_eq!(
+            errors[0], errors[1],
+            "AFT must preserve the same lost-fetch error as other providers"
+        );
+    }
 
     fn inventory(providers: &[&str]) -> Vec<u8> {
         let modules: Vec<_> = providers
