@@ -7,6 +7,9 @@ use cortexkit_role_compaction::{
 };
 use serde_json::json;
 
+#[path = "statement_seq_tests.rs"]
+mod statement_seq;
+
 use super::{
     conditions as session_conditions,
     entries::{project, Deliveries, EntryFacts},

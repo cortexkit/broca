@@ -51,6 +51,9 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+#[path = "compaction/statement_seq.rs"]
+mod statement_seq;
+
 /// Serves scripted steps in order and records every request it was asked to send.
 #[derive(Clone)]
 struct ScriptedProvider {
@@ -1950,9 +1953,11 @@ impl broca_core::CompactionPlane for CompactionSpy {
 
     /// The provider reads the signed floor, so both loops must report the same one.
     async fn provider_capabilities(&self, _: &str) -> broca_core::ProviderCapabilities {
-        broca_core::ProviderCapabilities::Declared(vec![
-            cortexkit_role_compaction::COMPACTION_SIGNED_FLOOR_PROVIDES.into(),
-        ])
+        let mut provides = vec![cortexkit_role_compaction::COMPACTION_SIGNED_FLOOR_PROVIDES.into()];
+        if statement_seq::declared() {
+            provides.push(cortexkit_role_compaction::COMPACTION_STATEMENT_SEQ_PROVIDES.into());
+        }
+        broca_core::ProviderCapabilities::Declared(provides)
     }
 
     async fn call_v2(

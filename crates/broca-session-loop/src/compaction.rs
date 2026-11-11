@@ -824,6 +824,11 @@ fn conditions_for<W: Writer>(
         None,
         signed_floor,
         &|entry| prompt_view(conversation, operations, entry),
+        // Appended positions distinguish even unsynced states, unlike a durability frontier.
+        // Seal/revert/recovery preserve their high-water (session/{seal,revert,recover}.rs).
+        // A torn tail may rewind on reopen, but a fresh Runtime lane always sends Setup first,
+        // replacing the provider's held stamp before any notice or ride (runtime::Lane::default).
+        Some(writer.next_seq().saturating_sub(1)),
     )?;
     if conditions.last_prompt_tokens.is_none() && operations.enrolled.is_some() {
         conditions.last_prompt_tokens = crate::enroll::last_prompt_tokens(operations);

@@ -168,8 +168,8 @@ impl broca_core::CompactionPlane for HeadRunner {
         };
         Ok(serde_json::value::to_raw_value(&answer).unwrap())
     }
-    async fn provider_capabilities(&self, _: &str) -> Option<Vec<String>> {
-        Some(vec!["compaction-provider/v2".into()])
+    async fn provider_capabilities(&self, _: &str) -> broca_core::ProviderCapabilities {
+        broca_core::ProviderCapabilities::Declared(vec!["compaction-provider/v2".into()])
     }
 }
 

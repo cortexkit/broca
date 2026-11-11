@@ -94,6 +94,7 @@ pub fn conditions(
         newest_step_fill,
         signed_floor,
         &|_| None,
+        None,
     )
 }
 
@@ -136,7 +137,8 @@ pub fn view_floor(conditions: &Conditions) -> Floor<'_> {
 /// [`conditions`] from a run's frozen choices in any shape. `prompt_view` names, for the entry
 /// whose usage gives the session's fill ([`last_prompt`]), the version of the view the request
 /// that produced it was rendered under: `Some(0)` for no view, `None` when the caller can't tie
-/// that request to a view.
+/// that request to a view. `statement_seq` is the newest log record the statement reflects;
+/// rule-only checks may omit it. The runtime gates the stamp on the provider's declaration.
 pub fn conditions_of(
     config: &Frozen<'_>,
     entries: &[Entry],
@@ -144,6 +146,7 @@ pub fn conditions_of(
     newest_step_fill: Option<(&str, u64)>,
     signed_floor: Option<u64>,
     prompt_view: &dyn Fn(&Entry) -> Option<u64>,
+    statement_seq: Option<u64>,
 ) -> Result<Conditions, String> {
     let window = config
         .context_limit
@@ -167,6 +170,10 @@ pub fn conditions_of(
     }
     let mut conditions =
         conditions::conditions(context_of(config, None).model, window, reserve, chained);
+    if statement_seq.is_some_and(|seq| seq > 9_007_199_254_740_991) {
+        return Err("compaction statement_seq exceeds the protocol integer range".into());
+    }
+    conditions.statement_seq = statement_seq;
     conditions.accepts_images = config
         .frozen_render_config
         .pointer("/media/modalities/image")
@@ -363,12 +370,16 @@ pub async fn notice(
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .configure(&Frozen::of(&config), manifest);
-    let conditions = conditions(
-        &config,
+    // This synced snapshot's WAL position survives reopen: FileWal resumes at last_seq + 1
+    // (file_wal.rs). Run close-out appends records; it never rewinds the log.
+    let conditions = conditions_of(
+        &Frozen::of(&config),
         &transcript.entries,
         false,
         transcript.newest_step_fill(),
         transcript.signed_floor,
+        &|_| None,
+        frames.last().map(|frame| frame.seq),
     )?;
     let applied = session.state.lock().await.applied_identity();
     let mut setup = conditions::setup_request(
