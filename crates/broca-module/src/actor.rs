@@ -2352,7 +2352,17 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 attempt_id,
                 result,
             } => self.on_run_finished(run_id, attempt_id, *result).await,
-            LineageCmd::Warm { lineage_id, reply } => {
+            LineageCmd::Warm {
+                lineage_id,
+                reply,
+                idle_auto,
+            } => {
+                if idle_auto {
+                    let _ = reply.send(WarmOutcome::Error(
+                        "idle warming requires session storage".into(),
+                    ));
+                    return false;
+                }
                 if self.registry.is_stopping() {
                     let _ = reply.send(WarmOutcome::Reopen);
                 } else {

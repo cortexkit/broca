@@ -14,6 +14,9 @@ use broca_session_store::keys::{Cipher, DeploymentKey};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+#[path = "held/intake.rs"]
+mod intake;
+
 #[derive(Default)]
 struct HoldingTools(AtomicUsize, std::sync::atomic::AtomicBool);
 
@@ -79,6 +82,9 @@ struct HeldExecutor {
     wal: Arc<FileWalStore>,
     tools: Arc<HoldingTools>,
     slots: Arc<HeldSlots>,
+    // Replace a scripted auth pause with another pause reason, without involving timers or
+    // a process restart, so cancellation exercises the same paused actor on both storages.
+    pause_as: std::sync::Mutex<Option<broca_protocol::PauseReason>>,
 }
 
 #[async_trait]
@@ -95,7 +101,9 @@ impl RunExecutor for HeldExecutor {
     ) -> Result<RunSummary, RunError> {
         job.control.admitted_context_limit =
             job.control.admitted_context_limit.or(job.req.context_limit);
-        run_loop_on_writer_admitted_with_prior_snapshot(
+        let writer = job.writer.clone();
+        let run_id = job.req.run_id.clone();
+        let mut result = run_loop_on_writer_admitted_with_prior_snapshot(
             job.req,
             &job.writer,
             StartMode::FreshOrResume,
@@ -109,7 +117,22 @@ impl RunExecutor for HeldExecutor {
             job.on_admitted,
             Some(&job.prior_snapshot),
         )
-        .await
+        .await?;
+        let pause_as = *self.pause_as.lock().unwrap();
+        if let Some(reason) = pause_as {
+            if result.paused == Some(broca_protocol::PauseReason::AuthRequired) {
+                writer.record(broca_wal::WalRecord::RunPaused {
+                    run_id,
+                    reason,
+                    ts_ms: None,
+                    error: None,
+                    account_limit: None,
+                });
+                writer.sync().await?;
+                result.paused = Some(reason);
+            }
+        }
+        Ok(result)
     }
     async fn execute_on_store(
         &self,
@@ -163,7 +186,7 @@ impl RunExecutor for HeldExecutor {
                 step_progress: control.step_progress,
                 model_call_ready: None,
             };
-            match (admission, mode) {
+            let mut finished = match (admission, mode) {
                 (Some(admission), _) => {
                     broca_session_loop::run::run(&mut writer, parts.as_mut(), admission, &seams)
                         .await
@@ -173,7 +196,30 @@ impl RunExecutor for HeldExecutor {
                 }
                 _ => broca_session_loop::run::resume(&mut writer, parts.as_ref(), &seams).await,
             }
-            .map_err(StoreRunError::Loop)
+            .map_err(StoreRunError::Loop)?;
+            let pause_as = *self.pause_as.lock().unwrap();
+            if let Some(reason) = pause_as {
+                if finished.paused == Some(broca_protocol::PauseReason::AuthRequired) {
+                    Writer::append(
+                        &mut writer,
+                        &[broca_session_store::record::Record::Pause(
+                            broca_session_store::record::Pause {
+                                run_id: req.run_id.0.clone(),
+                                reason,
+                                ts_ms: None,
+                                error: None,
+                                account_limit: None,
+                            },
+                        )],
+                        true,
+                    )
+                    .await
+                    .map_err(broca_session_loop::LoopError::from)
+                    .map_err(StoreRunError::Loop)?;
+                    finished.paused = Some(reason);
+                }
+            }
+            Ok(finished)
         }
         .await;
         StoreRunEnd { parts, result }
@@ -216,6 +262,7 @@ impl Side {
             wal: wal.clone(),
             tools,
             slots: HeldSlots::new(),
+            pause_as: Default::default(),
         });
         let runtime = crate::store_open::StoreRuntime::open(
             &dir,
@@ -304,6 +351,10 @@ impl Side {
         .unwrap()
     }
     async fn restarted(&self) -> Self {
+        self.restarted_with_steps(vec![super::super::tests::text_step("m2", "done")])
+            .await
+    }
+    async fn restarted_with_steps(&self, steps: Vec<Vec<NormalizedEvent>>) -> Self {
         fn copy(from: &std::path::Path, to: &std::path::Path) {
             if !from.exists() {
                 return;
@@ -328,7 +379,7 @@ impl Side {
             self.key.clone(),
             self.store,
             self.cipher,
-            vec![super::super::tests::text_step("m2", "done")],
+            steps,
             self.executor.tools.clone(),
             None,
         )
@@ -450,6 +501,8 @@ impl Side {
         }
     }
 }
+
+mod cancel;
 
 fn comparable(mut value: Value) -> Value {
     if let Some(held) = value.get_mut("held_calls").and_then(Value::as_array_mut) {
@@ -806,6 +859,7 @@ async fn held_record_boundary_cuts_rejoin_without_redispatch(cipher: Cipher) {
             wal: source.executor.wal.clone(),
             tools: source.executor.tools.clone(),
             slots: HeldSlots::new(),
+            pause_as: Default::default(),
         });
         let actor = super::super::StoreActor::new(
             source.key.clone(),

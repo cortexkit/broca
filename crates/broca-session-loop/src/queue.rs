@@ -19,6 +19,9 @@ use crate::parts::Parts;
 /// names. Each is left out when absent, as today's record leaves it out.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Receipt {
+    /// A class an unlabelled session may adopt when this queued send starts its run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_class: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sent_by: Option<broca_protocol::BindPrincipal>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -121,7 +124,7 @@ pub fn request_of(send: &QueuedSend, parts: &dyn Parts) -> Result<SubmissionRequ
     for part in &send.setup {
         match part.kind {
             PartKind::Tools => {
-                request.insert("tools".into(), parts.get(part)?);
+                request.insert("tools".into(), crate::parts::value(parts, part)?);
             }
             other => return Err(format!("a queued send names a {other:?} part")),
         }

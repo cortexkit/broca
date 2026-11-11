@@ -15,7 +15,6 @@ members = [
     "crates/broca-store",
     "crates/broca-store-contention-tests",
     "crates/broca-catalog",
-    "crates/broca-run",
     "crates/broca-module",
     "crates/broca-wire",
     "crates/broca-module-serve",
@@ -53,7 +52,7 @@ exclude = ["crates/broca-session-store/fuzz"]
 # checkouts are used only to build integration-test rig binaries.
 
 [workspace.package]
-version = "0.4.12"
+version = "0.4.16"
 edition = "2021"
 rust-version = "1.96"
 license = "MIT"
@@ -107,7 +106,7 @@ cortexkit-compaction-view = "=0.3.0"
 # System One: the one-pass decision-model role and the batch rules it shares with extraction.
 cortexkit-role-classifier = "=0.6.3"
 cortexkit-role-classifier-conformance = "=0.8.3"
-cortexkit-role-routing = "=0.7.6"
+cortexkit-role-routing = "=0.7.14"
 cortexkit-model-batch = "=0.3.4"
 
 # The logging facade every crate here emits through. The records are formatted and

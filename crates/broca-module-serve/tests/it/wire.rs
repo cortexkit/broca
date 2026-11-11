@@ -2177,6 +2177,8 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         // This library-only rig publishes no new-storage slot or deployment key. The metric
         // remains present as null, without degrading the healthy process.
         "store",
+        // No converter engine is published by this rig; its health remains present and idle.
+        "session_conversion",
         "catalog_age_ms",
         "catalog_source",
         // Runs executing right now, as opposed to open session slots. Shipped in v0.3.27 for
@@ -2338,6 +2340,19 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         metrics["store"],
         serde_json::Value::Null,
         "a process without a published new-storage slot reports no deployment-key state"
+    );
+    assert_eq!(
+        metrics["session_conversion"],
+        serde_json::json!({
+            "live_converting": false,
+            "live_background_converted": 0,
+            "live_skipped_busy": 0,
+            "live_remaining": 0,
+            "deferred_no_identity": 0,
+            "progress": {"sources": 0, "steps": {}, "outcomes": {}, "refusals": {}},
+            "error": null
+        }),
+        "a process without a converter engine reports idle conversion health"
     );
     assert_eq!(
         metrics["usage_observe"],
@@ -2925,6 +2940,33 @@ async fn hello_bind_send_status_roundtrip() {
     assert_eq!(hello.header.ty, FrameType::Hello);
     let body: ModuleHelloBody = serde_json::from_slice(&hello.body).unwrap();
     assert_eq!(body.manifest.module_id, "broca");
+    let slot = body
+        .manifest
+        .role_declarations
+        .get(cortexkit_role_routing::ROLE_DECLARATIONS_KEY)
+        .expect("HELLO publishes the routing runner declaration");
+    let declarations = cortexkit_role_routing::declarations::parse_consumer_declarations(
+        &serde_json::Value::Object(slot.clone()),
+    )
+    .expect("the HELLO routing slot validates as a whole");
+    let runner = declarations
+        .runner
+        .expect("HELLO declares broca as a runner");
+    assert!(runner.follows_account_choice);
+    assert!(!runner.requires_wire_api());
+    assert_eq!(runner.pairs.len(), 12);
+    assert_eq!(
+        runner
+            .pairs
+            .iter()
+            .filter(|pair| runner.requires_wire_api_for_pair(pair))
+            .count(),
+        9
+    );
+    assert!(runner
+        .pairs
+        .iter()
+        .any(|pair| pair.wire_api == "google.code_assist" && pair.auth_method == "antigravity"));
     assert_eq!(
         body.control_ops,
         Some(vec![MODULE_CONTROL_OP_HEALTH_CHECK.to_string()])

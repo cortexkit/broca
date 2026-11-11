@@ -225,6 +225,14 @@ fn log_in(state: &Path, folder: &str) -> PathBuf {
 
 /// `move-check` over `files`, with its scratch folder under `root`.
 fn checked(root: &Path, files: Vec<PathBuf>) -> MoveCheckReport {
+    checked_with_inventory(root, files, None)
+}
+
+fn checked_with_inventory(
+    root: &Path,
+    files: Vec<PathBuf>,
+    inventory_root: Option<PathBuf>,
+) -> MoveCheckReport {
     check(&Args {
         command: "move-check".into(),
         out_file: None,
@@ -235,9 +243,69 @@ fn checked(root: &Path, files: Vec<PathBuf>) -> MoveCheckReport {
         max_records: None,
         every: 1,
         all_steps: false,
+        inventory_root,
         dir: Some(root.join("scratch")),
         files,
     })
+}
+
+#[test]
+fn inventory_rekeys_are_checked_read_only_and_unresolved_identities_are_named() {
+    use broca_core::SessionRefIndex;
+    let root = scratch("inventory-rekeys");
+    let state = state_root(&root, &[]);
+    let effective = BindIdentity::new("/renamed-project", "broca", "s");
+    let address = broca_core::session_addr(&effective);
+    let log = root.join("set-aside").join(format!("{address}.wal"));
+    write_log(&log, Holds::default(), &state, MediaStoreClass::NonDurable);
+    let index = state.join("run-index.db");
+    let store = broca_store::SqliteStore::open(&index).unwrap();
+    store.record_session(&address, &effective).unwrap();
+    let connection = rusqlite::Connection::open(&index).unwrap();
+    connection
+        .execute_batch(
+            "INSERT OR REPLACE INTO agent_data_projection VALUES(1,1);
+         INSERT OR IGNORE INTO agent_data_census_done VALUES(1);
+         UPDATE agent_data_census SET covered=1;",
+        )
+        .unwrap();
+    drop(connection);
+    drop(store);
+    let before = std::fs::read(&index).unwrap();
+    let original = std::fs::read(&log).unwrap();
+    let report = checked_with_inventory(&root, vec![log.clone()], Some(state.clone()));
+    assert_eq!(
+        report.verified,
+        1,
+        "{}",
+        serde_json::to_string(&report).unwrap()
+    );
+    assert!(report.refused.is_empty());
+    assert_eq!(std::fs::read(&index).unwrap(), before);
+    assert_eq!(std::fs::read(&log).unwrap(), original);
+
+    let different = root.join("set-aside/different-address.wal");
+    std::fs::rename(&log, &different).unwrap();
+    let report = checked_with_inventory(&root, vec![different.clone()], Some(state.clone()));
+    assert_eq!(report.refused.get("identity_unresolved"), Some(&1));
+    assert!(report
+        .examples
+        .keys()
+        .any(|key| key.contains("differs from source address")));
+    // Without an inventory the historical first-run identity remains the rehearsal default.
+    assert_eq!(checked(&root, vec![different.clone()]).verified, 1);
+    let connection = rusqlite::Connection::open(&index).unwrap();
+    connection
+        .execute("DELETE FROM agent_data_session_ref", [])
+        .unwrap();
+    let report = checked_with_inventory(&root, vec![different], Some(state.clone()));
+    assert_eq!(report.refused.get("identity_unresolved"), Some(&1));
+    assert!(report
+        .examples
+        .keys()
+        .any(|key| key.contains("no inventory row")));
+    drop(connection);
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 /// A session holding media is staged with the bytes today's media store holds for it, and

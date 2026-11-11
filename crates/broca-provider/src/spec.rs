@@ -8,7 +8,7 @@
 //! them. The unbounded `raw` passthrough is INGESTION-ONLY and is never read on the
 //! render/normalize path (so the frozen subset stays bounded and complete).
 
-use std::fmt;
+use std::{collections::BTreeMap, fmt};
 
 use serde::de::{self, Deserializer, Visitor};
 use serde::{Deserialize, Serialize, Serializer};
@@ -463,12 +463,19 @@ pub struct Capabilities {
 /// eight such models sit under providers we serve. A row-level rule ("this model has no
 /// token model, ignore its limits") looks tidier and is wrong for those: it would discard
 /// a real context window alongside an inapplicable output cap.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Limits {
     /// Published per-request image count, frozen into the media profile at admission.
     /// Absent means unknown, so the adapter's table remains the fallback.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub images_per_request: Option<u32>,
+    /// Published unconditional longest image side, in pixels. Unknown keeps the adapter table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_long_edge_px: Option<u32>,
+    /// Stricter longest-side bounds above each image-and-document count. These override the
+    /// adapter table only when the unconditional catalog bound is known.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub image_long_edge_px_above_images: BTreeMap<u32, u32>,
     /// Consumed: surfaced as the run's `context_limit`, which is the prompt-reduction
     /// transform's pressure signal.
     #[serde(default, skip_serializing_if = "Option::is_none")]

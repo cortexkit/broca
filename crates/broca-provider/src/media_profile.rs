@@ -123,7 +123,7 @@ pub struct DimensionLimit {
     pub above_count: u32,
     /// The longest side, in pixels, each image may have while the limit applies.
     pub max_side_px: u32,
-    /// Whether documents count toward `above_count` alongside images (Claude on Bedrock).
+    /// Whether documents count toward `above_count` alongside images.
     #[serde(default, skip_serializing_if = "is_false")]
     pub counts_documents: bool,
 }
@@ -847,7 +847,7 @@ fn build_profile(
 /// family's profile.
 ///
 /// The provider's media quirk comes from its spec when set, otherwise from its catalog provider
-/// id. The model's catalog modalities, context window and image count are read once, here; a
+/// id. The model's catalog modalities, context window and image bounds are read once, here; a
 /// later catalog change leaves the frozen profile as it is.
 pub fn freeze_media_profile(
     frozen: &mut FrozenRenderConfig,
@@ -867,7 +867,7 @@ pub fn freeze_media_profile(
 }
 
 /// Select a fresh episode's profile from catalog facts and the final routed family/model.
-/// Only the published image count overrides the table; unknown counts keep its fallback.
+/// Published image counts and dimensions override the table; unknown bounds keep its fallback.
 pub fn select_model_media_profile(
     family: WireFamilyId,
     quirk: Option<MediaQuirk>,
@@ -883,6 +883,19 @@ pub fn select_model_media_profile(
     );
     if let Some(count) = model.limits.images_per_request {
         profile.image.max_count = Some(count);
+    }
+    if let Some(side) = model.limits.image_long_edge_px {
+        profile.dimension_limits = vec![DimensionLimit::new(0, side)];
+        profile
+            .dimension_limits
+            .extend(model.limits.image_long_edge_px_above_images.iter().map(
+                |(&above_count, &max_side_px)| DimensionLimit {
+                    // Both the catalog and the profile use a strict "more than" threshold.
+                    above_count,
+                    max_side_px,
+                    counts_documents: true,
+                },
+            ));
     }
     profile
 }
@@ -1217,6 +1230,80 @@ mod tests {
         // The modalities are the catalog's, as they stood at freeze.
         assert!(!profile.accepts_modality(MediaKind::Image));
         assert_eq!(profile.modalities.text, Some(true));
+    }
+
+    #[test]
+    fn catalog_image_dimensions_replace_only_table_dimensions() {
+        for (family, quirk, wire_model, base, threshold, conditional) in [
+            (
+                WireFamilyId::AnthropicMessages,
+                MediaQuirk::Anthropic,
+                "claude-sonnet-4-5",
+                8_000,
+                20,
+                3_000,
+            ),
+            (
+                WireFamilyId::OpenAiChat,
+                MediaQuirk::Deepseek,
+                "deepseek-chat",
+                8_192,
+                14,
+                4_096,
+            ),
+        ] {
+            let mut model = model(
+                wire_model,
+                serde_json::json!(["text", "image", "pdf"]),
+                None,
+            );
+            let fallback = select_model_media_profile(family, Some(quirk), wire_model, &model);
+            assert_eq!(
+                fallback,
+                select_media_profile(
+                    family,
+                    Some(quirk),
+                    wire_model,
+                    model.input_modalities,
+                    None
+                ),
+                "absent catalog dimensions must keep the whole table profile"
+            );
+            model
+                .limits
+                .image_long_edge_px_above_images
+                .insert(threshold, conditional);
+            assert_eq!(
+                select_model_media_profile(family, Some(quirk), wire_model, &model),
+                fallback,
+                "conditionals without a base must not override the table"
+            );
+            model.limits.image_long_edge_px = Some(base);
+            let profile = select_model_media_profile(family, Some(quirk), wire_model, &model);
+            assert_eq!(profile.max_image_side(1, 0), Some(base));
+            assert_eq!(profile.max_image_side(threshold, 0), Some(base));
+            assert_eq!(profile.max_image_side(threshold + 1, 0), Some(conditional));
+            assert_eq!(profile.max_image_side(1, threshold - 1), Some(base));
+            assert_eq!(profile.max_image_side(1, threshold), Some(conditional));
+            let mut expected = fallback;
+            expected.dimension_limits = vec![
+                DimensionLimit::new(0, base),
+                DimensionLimit {
+                    above_count: threshold,
+                    max_side_px: conditional,
+                    counts_documents: true,
+                },
+            ];
+            assert_eq!(profile, expected, "byte and other limits must not change");
+
+            model.limits.image_long_edge_px_above_images.clear();
+            assert_eq!(
+                select_model_media_profile(family, Some(quirk), wire_model, &model)
+                    .dimension_limits,
+                vec![DimensionLimit::new(0, base)],
+                "a known base must replace, not augment, table conditionals"
+            );
+        }
     }
 
     #[test]

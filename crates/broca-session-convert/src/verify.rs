@@ -715,7 +715,14 @@ async fn entries<B: SessionBackend>(
     let state = broca_core::compaction_v2::session::load(bind, records)
         .map_err(|error| mismatch(ENTRIES, format!("today's compaction state: {error}")))?;
     let applied = match state.applied_received() {
-        Some(view) => json!({ "ok": { "view": view } }),
+        Some(view) => {
+            let mut answer = json!({ "ok": { "view": view } });
+            // The WAL-backed session.applied_view returns the provider recorded for this view.
+            if let Some(module) = state.applied_by() {
+                answer["ok"]["applied_by"] = json!(module);
+            }
+            answer
+        }
         None => json!({ "ok": {} }),
     };
     same(
@@ -1314,8 +1321,12 @@ async fn media_rebuild_on<B: SessionBackend>(
 const NEXT_RUN: &str = "store-move-next-request";
 
 /// The WAL with one more send after it: the session's last run start again, under a new run id
-/// with a fixed input, and its first step's start, as the next send to the session would begin.
-fn with_next_send(records: &[FramedRecord]) -> Result<Vec<FramedRecord>, String> {
+/// with a fixed input and the effective serving identity, and its first step's start, as the
+/// next send to the session would begin.
+fn with_next_send(
+    records: &[FramedRecord],
+    effective: &BindIdentity,
+) -> Result<Vec<FramedRecord>, String> {
     let last = records.last().ok_or("the WAL is empty")?;
     let mut start = records
         .iter()
@@ -1339,10 +1350,12 @@ fn with_next_send(records: &[FramedRecord]) -> Result<Vec<FramedRecord>, String>
         send_id,
         request_identity_digest,
         written_at_ms,
+        session,
         ..
     } = &mut start
     {
         *run_id = RunId(NEXT_RUN.into());
+        *session = effective.clone();
         *ts_ms = at;
         *written_at_ms = at;
         *origin = broca_wal::RunOrigin::Fresh;
@@ -1473,8 +1486,8 @@ async fn next_request_on<B: broca_session_store::backend::SessionBackend>(
         if !session.operations.billing_owed.is_empty() {
             return Err(mismatch(FIRST_OPEN, "opening the session owes billing"));
         }
-        let extended =
-            with_next_send(verify.records).map_err(|error| mismatch(NEXT_REQUEST, error))?;
+        let extended = with_next_send(verify.records, verify.session)
+            .map_err(|error| mismatch(NEXT_REQUEST, error))?;
         let wal: Vec<WalRecord> = extended.iter().map(|frame| frame.record.clone()).collect();
         let config = match &wal[wal.len() - 2] {
             WalRecord::RunStarted { config, .. } => config,
@@ -1494,6 +1507,8 @@ async fn next_request_on<B: broca_session_store::backend::SessionBackend>(
         .map_err(|error| mismatch(NEXT_REQUEST, format!("today's renderer: {error}")))?;
         let mut converted = crate::convert(&extended, lineage)
             .map_err(|error| mismatch(NEXT_REQUEST, format!("the conversion: {}", error.0)))?;
+        crate::stage::retain_run_identities(&mut converted, &extended, verify.session)
+            .map_err(|error| mismatch(NEXT_REQUEST, error.to_string()))?;
         // Reproduce the staged prefix at its stored origin. The synthetic next send adds only
         // a run input and step boundary, with no Input.receipt_seq naming a new Steer or Delivery.
         converted.start_at(verify.converted.first_seq.unwrap_or(crate::FIRST_SEQ));

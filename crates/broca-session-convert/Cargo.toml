@@ -42,4 +42,5 @@ futures = { workspace = true, features = ["executor"] }
 
 [dev-dependencies]
 broca-test-support = { path = "../broca-test-support" }
+rusqlite = { version = "0.32", features = ["bundled"] }
 tokio = { workspace = true, features = ["test-util"] }

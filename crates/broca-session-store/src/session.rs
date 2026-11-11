@@ -269,7 +269,7 @@ pub struct Session<B: SessionBackend> {
     /// `keep_sealed_derived`).
     sealed_entries: read::SealedEntries,
     /// Told of every batch this writer appends (see [`Session::observe_appends`]).
-    observer: Option<AppendObserver>,
+    observer: Option<PositionedAppendObserver>,
     /// The open log's records kept in memory (see `kept`).
     kept: kept::KeptRecords,
     /// Set while reads come from memory only (see [`Session::in_memory`]).
@@ -310,6 +310,17 @@ pub enum Appended<'a> {
 /// The observer of a session's appends: it runs on the writer's task, right after each append
 /// returns, so it sees the records in seq order and only once they're written.
 pub type AppendObserver = Box<dyn FnMut(Appended<'_>) + Send + Sync>;
+
+/// Writer-owned byte boundaries sampled when an append observer is called. `written_through`
+/// bounds every record told by that callback; only `synced_through` is crash-durable.
+#[derive(Clone, Copy)]
+pub struct AppendPosition {
+    pub log: Id128,
+    pub written_through: u64,
+    pub synced_through: u64,
+}
+
+pub type PositionedAppendObserver = Box<dyn FnMut(Appended<'_>, AppendPosition) + Send + Sync>;
 
 impl<B: SessionBackend> Session<B> {
     /// Creates a session at `addr`, in the cipher mode `deployment` creates sessions in (see
@@ -878,17 +889,23 @@ impl<B: SessionBackend> Session<B> {
     /// returns: the session's own appends, a seal's change records and the records it carries
     /// into the new log, and a revert's replacing the history. One observer at a time; a new one
     /// replaces the last.
-    pub fn observe_appends(&mut self, observer: AppendObserver) {
-        self.observer = Some(observer);
+    pub fn observe_appends(&mut self, mut observer: AppendObserver) {
+        self.observer = Some(Box::new(move |appended, _| observer(appended)));
     }
 
     /// Observe appends alongside the existing observer, without changing its records or order.
     pub fn add_append_observer(&mut self, mut observer: AppendObserver) {
+        self.add_positioned_append_observer(Box::new(move |appended, _| observer(appended)));
+    }
+
+    /// Observe appends with the writer's actual written and synced byte boundaries. The
+    /// snapshot is taken on the writer task, before any observer can hand off a live hint.
+    pub fn add_positioned_append_observer(&mut self, mut observer: PositionedAppendObserver) {
         let prior = self.observer.take();
         self.observer = Some(match prior {
-            Some(mut prior) => Box::new(move |appended| {
-                prior(appended);
-                observer(appended);
+            Some(mut prior) => Box::new(move |appended, position| {
+                prior(appended, position);
+                observer(appended, position);
             }),
             None => observer,
         });
@@ -896,7 +913,14 @@ impl<B: SessionBackend> Session<B> {
 
     fn observed(&mut self, appended: Appended<'_>) {
         if let Some(observer) = self.observer.as_mut() {
-            observer(appended);
+            observer(
+                appended,
+                AppendPosition {
+                    log: self.log,
+                    written_through: self.encoder.offset(),
+                    synced_through: self.encoder.synced_through(),
+                },
+            );
         }
     }
 
@@ -1037,6 +1061,7 @@ mod enrollment;
 pub use enrollment::EnrollmentOverlay;
 
 mod read;
+mod tail;
 pub use read::{served_window, window_entries, StoredEntry};
 mod stored;
 pub use stored::{LogFrom, StoredRecords};

@@ -5413,6 +5413,7 @@ fn classify_account_limit_exhausted_with_auth(
                     provider_code: Some(ACCOUNT_LIMIT_EXHAUSTED.to_owned()),
                     resets_at_ms,
                     resets_at_source: resets_at_ms.map(|_| "retry_after".to_owned()),
+                    limit_window: Some(broca_protocol::error::AccountLimitWindow::Credit),
                     ..exhausted
                 };
             }
@@ -5442,7 +5443,9 @@ fn classify_account_limit_exhausted_with_auth(
                 provider_code: Some(ACCOUNT_LIMIT_EXHAUSTED.to_owned()),
                 resets_at_ms,
                 resets_at_source: resets_at_ms.map(|_| "retry_after".to_owned()),
-                limit_window: Some(limit_window),
+                limit_window: Some(broca_protocol::error::AccountLimitWindow::Quota(
+                    limit_window,
+                )),
                 account_ref: None,
                 ..error
             };
@@ -5472,7 +5475,9 @@ fn classify_account_limit_exhausted_with_auth(
                     resets_at_source: limit
                         .resets_at_source
                         .map(|source| source.as_str().to_owned()),
-                    limit_window: limit.limit_window,
+                    limit_window: limit
+                        .limit_window
+                        .map(broca_protocol::error::AccountLimitWindow::Quota),
                     account_ref: None,
                     ..error
                 },
@@ -10384,7 +10389,12 @@ mod tests {
         assert_eq!(error.retry_after_secs, Some(352_835.0));
         assert_eq!(error.resets_at_ms, Some(1_790_740_800_000));
         assert_eq!(error.resets_at_source.as_deref(), Some("header"));
-        assert_eq!(error.limit_window.as_deref(), Some("seven_day"));
+        assert_eq!(
+            error.limit_window,
+            Some(broca_protocol::error::AccountLimitWindow::Quota(
+                "seven_day".into()
+            ))
+        );
         assert_eq!(
             error.account_ref, None,
             "the provider does not know the account; the run stamps it"
@@ -11271,7 +11281,11 @@ mod tests {
                     assert_eq!(error.status, Some(status));
                     assert_eq!(error.resets_at_ms, None);
                     assert_eq!(error.resets_at_source, None);
-                    assert_eq!(error.limit_window, None);
+                    assert_eq!(
+                        error.limit_window,
+                        (expected_code == ACCOUNT_LIMIT_EXHAUSTED)
+                            .then_some(broca_protocol::error::AccountLimitWindow::Credit)
+                    );
                 }
             }
         }
@@ -11426,6 +11440,86 @@ mod tests {
     /// Matches six captured Anthropic credit refusals from 2026-10-16 through 2026-10-27.
     /// The fixed type and complete message are preserved; varying request ids are omitted.
     const ANTHROPIC_CREDIT_BALANCE_BODY: &str = r#"{"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits."}}"#;
+
+    #[tokio::test]
+    async fn captured_xai_subscription_spending_reports_credit_window() {
+        for retry_hint in [false, true] {
+            let server = ScriptedServer::start(vec![ScriptResponse::Http {
+                status: 403,
+                headers: if retry_hint {
+                    vec![("retry-after", "60")]
+                } else {
+                    Vec::new()
+                },
+                body: XAI_SPENDING_LIMIT_BODY.as_bytes(),
+            }])
+            .await;
+            let mut provider = retry_test_provider(&server, 0).with_auth_method(Some("oauth"));
+            let mut frozen = (*provider.frozen).clone();
+            frozen.family_id = WireFamilyId::OpenAiChat;
+            provider.frozen = Arc::new(frozen);
+            let events = collect_step_events(&provider, CancellationToken::new(), None).await;
+            let error = terminal_error(&events);
+            assert!(error.is_account_limit_exhausted());
+            assert_eq!(
+                error.limit_window,
+                Some(broca_protocol::error::AccountLimitWindow::Credit)
+            );
+            let attempt = events
+                .iter()
+                .find_map(|event| match event {
+                    NormalizedEvent::Control(ProviderControl::AttemptFinished { attempt }) => {
+                        Some(attempt)
+                    }
+                    _ => None,
+                })
+                .expect("a refused HTTP attempt is reported");
+            let report = broca_module_serve::account_routing::attempt_body(
+                "credit-event",
+                "admitted-run",
+                attempt,
+                None,
+            );
+            let observed = attempt
+                .account_observation
+                .limit
+                .as_ref()
+                .unwrap()
+                .observed_at_ms;
+            let mut expected = serde_json::json!({
+                "event_id":"credit-event", "caller":{"runner":"broca"},
+                "kind":"account_limit_exhausted", "admission_id":"admitted-run",
+                "limit_window":"credit", "observed_at_ms":observed,
+            });
+            if retry_hint {
+                expected["resets_at_ms"] = serde_json::json!(observed + 60_000);
+                expected["resets_at_source"] = serde_json::json!("retry_after");
+            }
+            assert_eq!(report, expected);
+            assert_eq!(server.request_bodies().len(), 1);
+        }
+    }
+
+    #[test]
+    fn anthropic_subscription_credit_balance_keeps_permanent_billing_refusal() {
+        let headers = crate::wire::ResponseHeaders::new(std::iter::empty::<(&str, &str)>());
+        let raw = classify_http_error(400, ANTHROPIC_CREDIT_BALANCE_BODY, None, None);
+        let classified = super::classify_account_limit_exhausted_with_auth(
+            super::AccountLimitContext {
+                family: WireFamilyId::AnthropicMessages,
+                subscription_auth: true,
+            },
+            400,
+            &headers,
+            ANTHROPIC_CREDIT_BALANCE_BODY,
+            UNIX_EPOCH,
+            raw.clone(),
+        );
+        assert_eq!(classified, raw);
+        assert_eq!(classified.class, ErrorClass::Permanent);
+        assert!(classified.is_billing_exhausted());
+        assert_eq!(classified.limit_window, None);
+    }
 
     #[test]
     fn anthropic_credit_balance_400_is_billing_exhausted() {

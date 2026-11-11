@@ -452,7 +452,8 @@ impl StoreRuntime {
     ) -> Result<Option<crate::store_reads::StoreReadReply>, crate::serve::ServeError> {
         use crate::store_reads::{execute, ReadContext, StoreReadOutcome};
         let run = match &request {
-            crate::store_reads::StoreReadRequest::RunStatus(run)
+            crate::store_reads::StoreReadRequest::RunAdmission(run)
+            | crate::store_reads::StoreReadRequest::RunStatus(run)
             | crate::store_reads::StoreReadRequest::RunStatusReply(run)
             | crate::store_reads::StoreReadRequest::RunResult(run) => Some(run.0.as_str()),
             _ => None,
@@ -607,6 +608,7 @@ impl StoreRuntime {
             Box::new(self.parts_for(class, cipher).clone()),
         )
         .with_storage(storage)
+        .with_class_placement(class, registry.backup_classes())
         .with_settled(Arc::clone(&self.settled))
         // A send's attachments are uploaded beside the session, under the state root, whichever
         // storage keeps it.

@@ -5,6 +5,39 @@ model, and coordinator invariants.
 
 ## Session inspection CLI
 
+`broca-session --subc CONNECTION --project-root ROOT --harness HARNESS --session NAME
+admission --run-id RUN` prints the daemon's `run.admission` JSON reply without reading
+encrypted session files in the client. It uses the same session authorization as
+`run.status`. This is a read-only management query; it does not admit a turn.
+
+### Frozen run admission
+
+`run.admission {"run_id":"…"}` reads the requested run's own start, on either storage,
+not the latest baseline of its session. A known run returns:
+
+```json
+{"run_id":"…","session_class":"sidekick","started_at_ms":123,"storage":"store","fetches":[{"provider":"aft","declarations_frozen":{"late_results":true}}]}
+```
+
+`storage` is `wal` or `store`. `session_class` and each fetch's
+`declarations_frozen` are omitted when absent in the recorded admission; absence
+is not replaced by an empty value. `fetches` contains only provider names and
+their frozen declarations, not tools, messages, system text or credentials. A
+run admitted without a fetch plan has an empty `fetches` array. An unknown run
+returns `{"state":"unknown"}`, as `run.status` does. The required `run_id` is
+scoped to the bound session; unknown parameter keys are refused.
+An older start without a recorded timestamp is unreadable through this query,
+not assigned a fabricated start time.
+
+On new storage the query uses the run-id index to find `RunStart` and resolves
+the setup parts it froze, without a transcript walk. On WAL storage it reads
+the run's `RunStarted`. WAL envelope feature lists are not exposed by this op;
+the deployment acceptance script still verifies those features directly from
+WAL frames. New storage has a record schema, not a WAL feature list.
+The worker acceptance summary's `storage_counts=wal:N,store:N` counts observed
+post-restart worker runs, including workers without an AFT fetch that are counted
+separately in `ignored_counts`. Only AFT-fetching workers can certify acceptance.
+
 `broca-session trajectory <id> [--transcript] [--out FILE]` exports JSONL directly
 from the recorded WAL, without a daemon connection. Without `--out`, JSONL goes
 to stdout. Output files are created owner-only and must not already exist. It uses
@@ -54,7 +87,7 @@ whether the daemon flag appears before or after the subcommand, without binding.
 composes a tool-only plan from live provider catalogs without creating a session or sending
 a turn. With `--scope`, every provider's catalog is fetched on a scoped `tool-provider: v1`
 route as a Direct carrier. The scope owner must authorize `direct` as a carrier for those
-providers. Like [`broca-run --scope`](broca-run.md), the command reads the private 32-byte
+providers. The command reads the private 32-byte
 bind proof as exactly 64 hex characters on stdin, optionally followed by a newline, and
 requires EOF. A missing or malformed proof is refused before connecting to the daemon;
 the proof never belongs in argv, an environment variable, the items file, or diagnostics.
@@ -67,13 +100,70 @@ are refused rather than silently falling back to unscoped routing. Scope selecto
 are sent only in `route.open`, never in catalog request bodies. Tool presets come
 from the plan's tool items, so there is no `--preset` flag.
 
+### Carry an owner's scope
+
+For `compose-plan --scope <owner>/<ref>/<epoch>`, the owner is a reserved module id,
+not `direct` ownership: a Direct process cannot register or own the scope. The
+explicit epoch prevents a reused scope ref from silently selecting another session.
+
+After the owner has synced and received acceptance for its record, it hands the
+child a **32-byte random bind proof privately**, encoded as exactly 64 hex
+characters on a private piped stdin, optionally followed by a newline, then closes
+the pipe. Never put the proof in argv, an environment variable, a log, or a shell
+command printed by an orchestrator. Missing or malformed input is refused as
+`scope_bind_proof_required` or `scope_bind_proof_invalid` before any daemon connection.
+
+```text
+broca-session --subc <connection-file> compose-plan --items <items-file> \
+  --scope rig-owner/run-42/1
+```
+
+The command deliberately contains no proof argument. The selector sent to subc
+uses base64url without padding over the decoded 32 bytes. The proof hash is
+SHA-256 over those raw bytes, **not** the 64-character hex representation.
+
+For example, the reserved module `rig-owner` syncs this scope record, replacing
+the folder with its canonical absolute rig folder and the hash with its proof's
+lowercase 64-character SHA-256 digest:
+
+```json
+{
+  "ref": "run-42",
+  "scope_epoch": 1,
+  "kind": "head",
+  "workdir": "/absolute/rig-folder",
+  "bind_proof_sha256": "<sha256-of-the-raw-32-byte-proof>",
+  "carriers": [
+    {
+      "principal": {"kind": "direct"},
+      "targets": ["aft"]
+    }
+  ],
+  "attributes": {}
+}
+```
+
+The owner is established by its supervised module connection, not by adding an
+owner field to the record. A wrong proof is refused by subc as
+`scope_bind_proof_mismatch`. Every provider catalog route opened for the plan
+carries the selector and proof; the daemon stamps the record's workdir on that
+route. A local `--project-root` does not override it. Keep `targets` narrow: the
+owner must explicitly authorize every tool provider the plan needs. There is no
+fallback to a folder claimed by the CLI.
+
+The process-level **Fusiform catalog and vault routes stay unscoped and need no
+carrier entry**. The proof lives only in the tool plane, never in the composed
+plan, session identity, model input, or WAL. Composing a plan does not create a
+session or authorize a subsequent session route to carry the scope.
+
 ---
 
 ## 1. What it is
 
 broca is an **orchestration tier**: a subc module that runs agentic LLM loops for
 consumer modules while consuming tools, credentials, and model-routing services.
-Its agentic core is shared with the [`broca-run` CLI](broca-run.md).
+`broca-session` controls and inspects that supervised module rather than running
+an agentic loop in-process.
 
 ### 1a. Runtime precondition: a model catalog must be reachable ONCE
 
@@ -164,14 +254,29 @@ New sends refuse `credentials_unavailable` while no listing has loaded, with
 `detail: {class: "permanent", credential: <broca key>, candidate_ids: [<vault ids>]}`;
 it never chooses a row silently. Existing missing-credential refusals are unchanged.
 
-Foreground developer tools use a separately provisioned capability handle:
-`broca-run` resolves a catalog model's provider and configured auth method, loads
-its handle through `vault_config::load_devtools_handle`, and reads it through subc.
-An explicit `--auth-bearer` overrides this; `--base-url` without a bearer remains
-credential-free for mocks. Live tests require `BROCA_LIVE_TESTS=1` before loading
+Foreground developer probes and live tests use a separately provisioned capability
+handle, loaded through `vault_config::load_devtools_handle` and read through subc.
+Live tests require `BROCA_LIVE_TESTS=1` before loading
 any handle or reading a credential, and use the same dev-tools handle map
 (`BROCA_DEVTOOLS_HANDLES` or `~/.config/cortexkit/broca/dev-tools-handles.json`).
 `BROCA_LIVE_SUBC` or `SUBC_SOCKET` can select their subc connection file.
+
+### 1c. Routing provider discovery
+
+`account_selection.routing_module` in `broca.jsonc` is an optional explicit module id. When
+set, broca opens exactly that id, without catalog discovery or an id fallback. When unset,
+all routing calls use the daemon catalog's sole provider of the `routing/v1` capability.
+Only entries with `nonce_verified: true` count: the daemon sets that field after verifying
+the supervised module's launch nonce, so a self-registered process cannot claim routing.
+
+Broca caches the discovered module id separately from its management route. An open refused
+with `unknown_module`, `target_unavailable` or `module_removed` clears the id and re-reads
+the catalog once; another disappearance refusal ends that open. A warming provider retains
+bounded backoff without another catalog read. A stale route handle alone reopens the cached
+provider, and requests are retried only when the stale handle proves non-delivery.
+No verified provider gives the existing transient `routing_unavailable` admission refusal.
+Multiple verified providers also refuse without opening either, with the distinct logged
+diagnostic `routing_provider_ambiguous` and the same transient `routing_unavailable` refusal.
 
 ## 2. Two consumer roles
 
@@ -467,7 +572,7 @@ wait for the queue lock or insula IO. A failed batch is discarded, not requeued.
 `health.check.metrics.session_readers` is a process-wide, in-memory census of authorized
 read attempts, separate from the legacy numeric `metrics.session_reads`. Its `entries` array
 contains `{principal, op, owner, count, last_ms}` for `session.read`, `session.history`,
-`session.head`, `session.subscribe`, `run.status`, `run.result`, `run.tool_calls`, `send.status`,
+`session.head`, `session.subscribe`, `run.status`, `run.admission`, `run.result`, `run.tool_calls`, `send.status`,
 `session.send_status` and `session.media_read`. Authorization and migration refusals are excluded;
 later parameter or handler errors still count. Subscriptions count once when opened, not once per frame.
 The principal is rendered from the daemon's route stamp (`reserved:<module_id>`, `direct`,
@@ -800,6 +905,13 @@ and never includes `retry_at_ms`. It is sent only when the router declares
 `observe_credential_refused` and its prerequisite `observe_backoff`; resettable account limits
 and transient rate limits keep their existing reports.
 
+An exactly identified subscription spending or credit wall is instead reported through
+`route.account_observe` as `account_limit_exhausted` with `limit_window: "credit"`.
+Broca includes reset timing only when the provider supplied it; no reset is invented for a
+top-up. A credit wall does not start an account-limit continuation, even with a retry hint.
+Prepaid API-key balance refusals retain the `credential_refused` path above. Timed quotas
+keep their existing window and reset evidence, and `route.report` has no `limit_window`.
+
 Broca sends the effective `service_tier` on `route.account_for` only when the router's
 `role.describe` declares `service_tier`. A tier-aware answer's `service_tier_chosen` must be a
 known level, must be present for an explicit request, and cannot upgrade it. An unbound
@@ -1028,6 +1140,9 @@ Broca also declares `send_ids`: those module-send entries carry their caller's `
 beside `sender`, or the returned `submission_id` for an unkeyed queued send. A direct
 unkeyed send or steer that returned no submission id has none. These facts never enter
 message bodies, content digests or `history_version`, and default reads omit them.
+An unkeyed ordered `idle_start` admitted while idle also omits the field; if admission
+failed transiently and answered pending before a later drain, that send serves no `send_id`
+though its reply carried one, because the recorded facts cannot distinguish those replies.
 Historical ids are recovered only from exact stored send receipts. Older imports that
 discarded the source id, and converted steers without a stored send id, remain unknown
 and omit the field. Builds before `dabddee12` wrote converted steer receipts one record
@@ -2249,7 +2364,7 @@ abandoned without its final frame logs the provider, tool and call key.
 
 The daemon installs the provider-held runtime (`broca-module-serve/src/held_runtime.rs`) on
 its tool plane: the waiting slots a held call's batch waits in, a late-results intake store
-(`late-results.db` under the state root, a projection of the WAL kept out of the backup
+(`late-results.db` under the state root, a dispatch-registration projection kept out of the backup
 catalog), one puller per provider module, and boot recovery. Installing that runtime enables
 held-reply negotiation without an environment switch, in release and debug builds alike.
 `role.describe` advertises `held_calls` beside `run_status`. Tool planes without the held
@@ -2288,7 +2403,8 @@ delivery of withdrawal packets.
 The puller pulls `late_results` under broca's own principal on one unscoped route per module
 (the custodian is the carrier, tool-provider contract §7), every 3 s while the module needs
 its feed, backing off to 30 s after errors. Each entry is classed from the intake registrations
-and the registered session's own WAL, never from `run-index.db`: an entry for an open held call
+and the registered session's own records (its WAL or new session storage), never from
+`run-index.db`: an entry for an open held call
 is mapped with the same `content/v1` mapper a synchronous reply uses (`not_started` and
 `expired` become error results whose text is pinned by golden), deposited in the call's slot,
 and the session's actor resumes a paused run into its original batch, which writes the result
@@ -2296,7 +2412,7 @@ as the call's `ToolResult` at the call's position and syncs it. Only then is the
 through exactly the cursor the provider returned. An entry whose call already has its terminal
 (including an inline answer), whose dispatching run has ended, whose kind is unknown, or which
 no registration names is acked as a no-op. A durable intent with no terminal or held record is
-pending only while its dispatching run is open; an unreadable WAL remains blocked. An answer
+pending only while its dispatching run is open; unreadable session storage remains blocked. An answer
 for an indeterminate call in a sealed run never changes that call or enters a later run.
 A `not_started` entry with `reason: "scope_ended"` is the same never-run error result,
 not a request to dispatch the call again.
@@ -2311,16 +2427,24 @@ also retires old inline-terminal registrations as it encounters them. A maintena
 checks at most 64 registrations every 3 s, starting after recovery, even for modules without
 a running puller. It lazily retires stale terminal rows without scanning every log at startup;
 held calls that still owe a batch commit keep their registrations for recovery.
+For new-storage sessions the intake reads the durable intent, held and terminal records and
+the operational run state. Delivery uses the same slots and the store actor's `ResumeHeld`
+continuation; a cancelling or ended run cannot take an answer, nor can a later run take an
+earlier run's key. Deferred entries and retired registrations log their session address,
+call key and reason.
 
 At boot tombstoned lineages are pruned from the intake without opening an actor. Every remaining
 session with a registration is opened so its open-time recovery runs, then each
 module that still needs its feed gets its puller. A missing or unreadable `late-results.db` is
 rebuilt off the startup path by verifying every live WAL and every published archive member,
-including intent-only calls whose registration may precede their held reply. The rebuild
+and reading operational state and active run records for every session in the session store's
+inventory across all backup classes, including intent-only calls whose registration may precede
+their held reply. The rebuild
 retains each episode's original scope. Until that scan completes no entry is delivered or
 acked. Only roots with neither registration history nor a held feature floor may skip a
 rebuild scan. An existing unheld database starts no scan, reads no WAL and gains no writes;
 boot adds only a read-only probe of the rebuild fence.
+An unreadable session in either storage keeps the rebuild fence pinned until a rescan succeeds.
 
 After a held run's cancel seal is synced, `tool.withdraw` is sent on the original provider's
 tool route with its frozen scope, under broca's carrier identity. The cancellation outcome
@@ -2449,10 +2573,11 @@ Additive WAL changes must retain the existing compatibility rules:
 8. **Durable run index** (§14).
 9. **WAL lease-tenure stamps and file-integrity rejection**.
 
-## 22. Standalone CLI coexistence
+## 22. Session CLI
 
-`broca-run` stays as-is; a single-turn CLI run is a lineage with one episode. Shared core,
-two front-ends.
+`broca-session` sends turns to the supervised module; it does not own a separate
+in-process run loop. A single-turn session is a lineage with one episode, using
+the same admission, durability and coordination contracts as other consumers.
 
 ## 23. Thin-core fit (subc)
 
@@ -2531,9 +2656,15 @@ their existing format (`reason: "auth_required"`, without `pause_reason`).
 `session.send.session_class` is an optional top-level opaque label beside `send_id`
 and `retention`. Its grammar is `[a-z0-9_-]{1,32}`; explicit null, non-string values,
 uppercase, whitespace and all other characters are refused as `invalid_params`,
-naming `session_class`. The first send freezes the label, including its absence.
-Later sends may omit it or repeat the same label, but cannot add or change it.
-The label is recorded on `RunStarted`, not sent to model providers.
+naming `session_class`. The first send freezes the label. Later sends may omit it
+or repeat the same label, but cannot change it. On WAL storage, absence on the first
+send stays frozen too. On the session-store backend, an unlabelled session adopts
+the first later run start's label only if that label would place it in the folder
+already holding the session; otherwise the label is ignored. Adoption never moves
+files or changes the class labels recorded for earlier runs. A queued send adopts
+when its run starts.
+The label is recorded on the run's start (`RunStarted` on WAL or `RunStart` on the
+session-store backend), not sent to model providers.
 
 The daemon reads `backup_classes` from `broca.jsonc`, defaulting to `["head"]`.
 `role.describe.capabilities` includes `session_class`, and its

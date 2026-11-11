@@ -769,6 +769,7 @@ pub trait SessionInventoryReadiness: Send + Sync {
     async fn wait(&self) -> Result<(), broca_store::session_address::SessionAddressError>;
 }
 
+mod idle_warm;
 mod media;
 pub(crate) mod media_head;
 pub mod session_conversion;
@@ -1019,6 +1020,8 @@ struct Inner {
     session_inventory_readiness: std::sync::OnceLock<Arc<dyn SessionInventoryReadiness>>,
     tool_route_health: std::sync::OnceLock<Arc<ToolRouteHealth>>,
     actor_idle_holds: Mutex<HashMap<LineageKey, (u64, Vec<&'static str>)>>,
+    idle_warms: Mutex<HashMap<LineageKey, idle_warm::Scheduled>>,
+    idle_warm_stops: Mutex<HashSet<LineageKey>>,
     /// Raised and lowered by the System One batch service; read into `batches_in_flight`.
     batches_in_flight: Arc<AtomicUsize>,
     cut_gates: Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
@@ -1976,6 +1979,9 @@ impl LineageRegistry {
         };
         for key in sorted {
             guard.gates.push(self.cut_gate(&key).lock_owned().await);
+            if matches!(mode, CutLockMode::Mutate) {
+                self.handle().stop_idle_warm(&key, "released_or_moving");
+            }
             let handle = {
                 let slots = self.inner.slots.lock().unwrap();
                 if let Some((bound, _)) = slots.get_key_value(&key) {
@@ -2158,6 +2164,8 @@ impl LineageRegistry {
                 session_inventory_readiness: std::sync::OnceLock::new(),
                 tool_route_health: std::sync::OnceLock::new(),
                 actor_idle_holds: Mutex::new(HashMap::new()),
+                idle_warms: Mutex::new(HashMap::new()),
+                idle_warm_stops: Mutex::new(HashSet::new()),
                 batches_in_flight: Arc::new(AtomicUsize::new(0)),
                 attribution_notices: Mutex::new(BoundedSessionCache::new(SESSION_CACHE_SESSIONS)),
                 unbound_cursor_notices: Mutex::new(BoundedSessionCache::new(
@@ -2249,14 +2257,29 @@ impl LineageRegistry {
         key: &LineageKey,
         lineage_id: Option<String>,
     ) -> Result<crate::actor::WarmOutcome, OpenError> {
+        self.route_warm_mode(key, lineage_id, false).await
+    }
+
+    async fn route_warm_mode(
+        &self,
+        key: &LineageKey,
+        lineage_id: Option<String>,
+        idle_auto: bool,
+    ) -> Result<crate::actor::WarmOutcome, OpenError> {
         use crate::actor::{LineageCmd, WarmOutcome};
         loop {
+            if idle_auto && !self.inner.opener.serves_from_store(key)? {
+                return Err(OpenError::Open(
+                    "idle warming requires session storage".into(),
+                ));
+            }
             self.check_move(key, true)?;
             self.check_expired(key, None).await?;
             let handle = self.actor_for(key).await?;
             let (reply, rx) = tokio::sync::oneshot::channel();
             let cmd = LineageCmd::Warm {
                 lineage_id: lineage_id.clone(),
+                idle_auto,
                 reply,
             };
             if handle.send(cmd).await.is_err() {
@@ -5898,6 +5921,17 @@ impl LineageRegistry {
     /// The daemon's drain command is irreversible; only a replacement process admits work again.
     pub fn begin_stop(&self) {
         self.inner.stopping.cancel();
+        let idle_heads: Vec<_> = self
+            .inner
+            .idle_warms
+            .lock()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        for key in idle_heads {
+            self.handle().stop_idle_warm(&key, "shutdown");
+        }
     }
 
     /// A child token for boot work to stop when the module begins draining.
@@ -8531,6 +8565,7 @@ impl LineageRegistry {
     }
 
     fn evict_retention_caches(&self, key: &LineageKey) -> bool {
+        self.handle().stop_idle_warm(key, "expired");
         // A live WAL, archive member or untombstoned meta row belongs to a newer lineage.
         // Address-keyed caches must survive completion of the older lineage's deletion.
         if self.inner.reader.as_ref().is_some_and(|reader| {
@@ -8591,6 +8626,10 @@ impl RegistryHandle {
 
     pub(crate) fn store_runtime(&self) -> Option<Arc<crate::store_open::StoreRuntime>> {
         self.inner.opener.store_runtime()
+    }
+
+    pub(crate) fn backup_classes(&self) -> Vec<String> {
+        self.inner.opener.backup_classes()
     }
     pub(crate) fn repair_retention(&self, key: &LineageKey) {
         self.inner.repairs.insert(key);

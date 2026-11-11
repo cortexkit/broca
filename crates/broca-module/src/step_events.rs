@@ -264,10 +264,12 @@ fn cache_report(
             .ok()?;
         cache_lifetime(policy.as_ref(), family, provider)
     })();
-    let mut report = match lifetime {
-        Some(CacheLifetime::Explicit(ttl)) => Report::explicit(ttl),
-        Some(CacheLifetime::Implicit) => Report::implicit(),
-        None => Report::default(),
+    // A route whose cache lifetime broca can't tell omits `cache` entirely, warming included:
+    // the contract reads a missing object as unknown, and a present one must carry exactly one
+    // lifetime form.
+    let mut report = match lifetime? {
+        CacheLifetime::Explicit(ttl) => Report::explicit(ttl),
+        CacheLifetime::Implicit => Report::implicit(),
     };
     report.warming = match keep_warm {
         Some(broca_protocol::request::KeepWarm::Off) => Some(Warming::new(false)),
@@ -284,7 +286,7 @@ fn cache_report(
         },
         None => None,
     };
-    (report != Report::default()).then_some(report)
+    Some(report)
 }
 
 /// Both storages use the same usage projection. Missing or interrupted evidence stays absent.
@@ -481,7 +483,10 @@ mod tests {
     #[test]
     fn warming_report_preserves_unknown_and_maps_only_session_stops() {
         use broca_protocol::request::KeepWarm::{Auto, Off};
+        use broca_provider::spec::WireFamilyId;
         use cortexkit_role_llm_runner::cache::Warming;
+        // ChatGPT's cache is implicit, so its steps always have a lifetime to report.
+        let implicit = json!({"family_id": WireFamilyId::OpenAiResponsesChatgpt, "cache": null});
         for (stop, reason) in [
             ("budget", "cost-cap"),
             ("count_cap", "count-cap"),
@@ -493,31 +498,34 @@ mod tests {
             ("session_moving", "session-ended"),
             ("session_moved", "session-ended"),
         ] {
-            let report = cache_report(&Value::Null, "synthetic", Some(Auto), Some(stop)).unwrap();
+            let report = cache_report(&implicit, "openai", Some(Auto), Some(stop)).unwrap();
             assert_eq!(report.warming, Some(Warming::stopped(reason)));
-            assert_eq!(report.ttl_ms, None);
-            assert_eq!(report.implicit, None);
             report.check().unwrap();
         }
         for stop in [None, Some("tools_done"), Some("cancelled")] {
             assert_eq!(
-                cache_report(&Value::Null, "synthetic", Some(Auto), stop)
+                cache_report(&implicit, "openai", Some(Auto), stop)
                     .unwrap()
                     .warming,
                 Some(Warming::new(true))
             );
         }
         assert_eq!(
-            cache_report(&Value::Null, "synthetic", Some(Off), Some("budget"))
+            cache_report(&implicit, "openai", Some(Off), Some("budget"))
                 .unwrap()
                 .warming,
             Some(Warming::new(false))
         );
-        assert_eq!(cache_report(&Value::Null, "synthetic", None, None), None);
-        assert_eq!(
-            cache_report(&Value::Null, "synthetic", Some(Auto), Some("future-stop")),
-            None
-        );
+        let unknown = cache_report(&implicit, "openai", Some(Auto), Some("future-stop")).unwrap();
+        assert_eq!(unknown.implicit, Some(true));
+        assert_eq!(unknown.warming, None);
+        // No lifetime means no cache object, even when warming is known.
+        for keep_warm in [None, Some(Auto), Some(Off)] {
+            assert_eq!(
+                cache_report(&Value::Null, "synthetic", keep_warm, Some("budget")),
+                None
+            );
+        }
     }
 
     #[test]

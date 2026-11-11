@@ -22,8 +22,8 @@
 # --live-approved permits a restart with known live runs, logging the invoking OS user.
 # It never bypasses an unreadable gate or the new-pid/placed-inode wait.
 # --report FILE writes the rollback path, restart pid and pre-restart live WAL names as JSON.
-# Clients default to broca-session and broca-run with the staged module's suffix. Rollback
-# commands use --session-staged/--run-staged, or --remove-session/--remove-run to restore
+# The client defaults to broca-session with the staged module's suffix. Rollback
+# commands use --session-staged, or --remove-session to restore
 # an installation that had no placed client.
 # On Darwin the staged binary needs an adjacent .dSYM; placement renames that bundle beside the
 # destination and saves an existing bundle beside its matching rollback binary.
@@ -69,9 +69,7 @@ set -euo pipefail
 DEST="${HOME}/.local/share/cortexkit/bin/ck-broca"
 STAGED=""
 SESSION_STAGED=""
-RUN_STAGED=""
 REMOVE_SESSION=0
-REMOVE_RUN=0
 SKIP_GATE=0
 RESTART=0
 RESTART_ONLY=0
@@ -81,7 +79,7 @@ REPORT=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --staged|--session-staged|--run-staged|--dest|--report)
+    --staged|--session-staged|--dest|--report)
       if [ "$#" -lt 2 ] || [ -z "${2:-}" ]; then
         echo "place-release: usage error: $1 requires an argument" >&2
         exit 2
@@ -91,9 +89,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --staged) STAGED="${2:-}"; STAGED_PROVIDED=1; shift 2 ;;
     --session-staged) SESSION_STAGED="$2"; shift 2 ;;
-    --run-staged) RUN_STAGED="$2"; shift 2 ;;
     --remove-session) REMOVE_SESSION=1; shift ;;
-    --remove-run) REMOVE_RUN=1; shift ;;
     --dest)   DEST="${2:-}"; shift 2 ;;
     --skip-gate) SKIP_GATE=1; shift ;;
     --restart) RESTART=1; shift ;;
@@ -104,8 +100,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-if { [ "$REMOVE_SESSION" -eq 1 ] && [ -n "$SESSION_STAGED" ]; } ||
-   { [ "$REMOVE_RUN" -eq 1 ] && [ -n "$RUN_STAGED" ]; }; then
+if [ "$REMOVE_SESSION" -eq 1 ] && [ -n "$SESSION_STAGED" ]; then
   echo "place-release: a client cannot be both staged and removed" >&2
   exit 2
 fi
@@ -120,7 +115,7 @@ if [ "$LIVE_APPROVED" -eq 1 ]; then
 fi
 
 if [ "$RESTART_ONLY" -eq 1 ]; then
-  if [ "$STAGED_PROVIDED" -eq 1 ] || [ "$RESTART" -eq 1 ] || [ "$SKIP_GATE" -eq 1 ] || [ -n "$SESSION_STAGED$RUN_STAGED" ] || [ "$REMOVE_SESSION$REMOVE_RUN" != 00 ]; then
+  if [ "$STAGED_PROVIDED" -eq 1 ] || [ "$RESTART" -eq 1 ] || [ "$SKIP_GATE" -eq 1 ] || [ -n "$SESSION_STAGED" ] || [ "$REMOVE_SESSION" -ne 0 ]; then
     echo "place-release: --restart-only cannot be combined with --staged, --restart or --skip-gate" >&2
     exit 2
   fi
@@ -140,6 +135,7 @@ source "$REPO_ROOT/scripts/release-clients.sh"
 source "$REPO_ROOT/scripts/nonshipping-markers.sh"
 GATE_LOG="$(mktemp "${TMPDIR:-/tmp}/place-gate.XXXXXX")"
 ACTIVE_RUNS_FILE="$(mktemp "${TMPDIR:-/tmp}/place-runs.XXXXXX")"
+DRAIN_STARTED_MS=""
 TMP=""
 TMP_DSYM=""
 TMP_DSYM_PARENT=""
@@ -147,7 +143,7 @@ OLD_DSYM_TEMP=""
 DSYM_SWAP_STARTED=0
 PLACEMENT_COMMITTED=0
 CLIENT_TEMPS=()
-CLIENT_BACKUPS=("" "")
+CLIENT_BACKUPS=("")
 cleanup_place() {
   rm -f "${TMP:-}"
   for client_tmp in ${CLIENT_TEMPS[@]+"${CLIENT_TEMPS[@]}"}; do rm -f "$client_tmp"; done
@@ -190,15 +186,16 @@ gate_reason() {
 
 write_report() {
   [ -n "$REPORT" ] || return 0
-  python3 - "$REPORT" "${BACKUP:-}" "${1:-}" "$GATE_LOG" "$REPO_ROOT/scripts" "$ACTIVE_RUNS_FILE" "${CLIENT_BACKUPS[0]}" "${CLIENT_BACKUPS[1]}" <<'PY'
+  python3 - "$REPORT" "${BACKUP:-}" "${1:-}" "$GATE_LOG" "$REPO_ROOT/scripts" "$ACTIVE_RUNS_FILE" "${CLIENT_BACKUPS[0]}" "$DRAIN_STARTED_MS" <<'PY'
 import json, pathlib, sys
-path, backup, pid, gate, scripts, active_runs_file, session_backup, run_backup = sys.argv[1:]
+path, backup, pid, gate, scripts, active_runs_file, session_backup, drain_started_ms = sys.argv[1:]
+drain_started_ms = int(drain_started_ms) if drain_started_ms else None
 snapshot = pathlib.Path(gate).read_text() if pathlib.Path(gate).exists() else ""
 sessions = [line.split()[1] for line in snapshot.splitlines() if line.startswith("  live  ")]
 sys.path.insert(0, scripts)
 from lib import state_root
 from lib.archive_read import logical_wals
-from lib.seal_readback import CANCELLED, PAUSED, SEALED, UNCONFIRMED, active_run_id, classify_run
+from lib.seal_readback import CALLER_CANCELLED, CANCELLED, PAUSED, SEALED, UNCONFIRMED, active_run_id, classify_run
 
 active_path = pathlib.Path(active_runs_file)
 seal_error = ""
@@ -210,7 +207,7 @@ if pid:
     except Exception as error:
         active_runs = [{"session": name, "run_id": None} for name in sessions]
         errors = [f"cannot read pre-restart run snapshot: {error}"]
-    statuses = {SEALED: [], UNCONFIRMED: [], CANCELLED: [], PAUSED: [], "idle": []}
+    statuses = {SEALED: [], UNCONFIRMED: [], CANCELLED: [], CALLER_CANCELLED: [], PAUSED: [], "idle": []}
     try:
         wals = {
             wal.name: wal
@@ -233,7 +230,7 @@ if pid:
             wal = wals.get(name)
             if wal is not None:
                 try:
-                    status = classify_run(wal, run_id)
+                    status = classify_run(wal, run_id, drain_started_ms=drain_started_ms)
                 except Exception as error:
                     errors.append(str(error))
         statuses[status].append({"session": name, "run_id": run_id})
@@ -258,16 +255,18 @@ else:
         errors.append(str(error))
     seal_error = "; ".join(errors)
     active_path.write_text(json.dumps({"runs": active_runs, "error": seal_error}))
-    statuses = {SEALED: [], UNCONFIRMED: [], CANCELLED: [], PAUSED: [], "idle": []}
+    statuses = {SEALED: [], UNCONFIRMED: [], CANCELLED: [], CALLER_CANCELLED: [], PAUSED: [], "idle": []}
 
 runs_sealed = statuses[SEALED]
 sessions_paused = [run["session"] for run in statuses[PAUSED]]
 sessions_idle = [run["session"] for run in statuses["idle"]]
 runs_unconfirmed = statuses[UNCONFIRMED]
 runs_cancelled = statuses[CANCELLED]
+runs_caller_cancelled = statuses[CALLER_CANCELLED]
 sessions_sealed = [run["session"] for run in runs_sealed]
 sessions_unconfirmed = [run["session"] for run in runs_unconfirmed]
 sessions_cancelled = [run["session"] for run in runs_cancelled]
+sessions_caller_cancelled = [run["session"] for run in runs_caller_cancelled]
 for run in runs_cancelled:
     print(
         f"place-release: FAILURE -- shutdown drain cancelled run {run['run_id']} "
@@ -275,15 +274,18 @@ for run in runs_cancelled:
         file=sys.stderr,
     )
 pathlib.Path(path).write_text(json.dumps({"backup": backup, "pid": pid or None,
-                                        "client_backups": {"broca-session": session_backup, "broca-run": run_backup},
+                                        "client_backups": {"broca-session": session_backup},
                                        "sessions_at_restart": sessions,
                                        "active_runs_at_restart": active_runs,
+                                       "drain_started_ms": drain_started_ms,
                                        "runs_sealed": runs_sealed,
                                        "runs_unconfirmed": runs_unconfirmed,
                                        "runs_cancelled": runs_cancelled,
+                                       "runs_caller_cancelled": runs_caller_cancelled,
                                        "sessions_sealed": sessions_sealed,
                                        "sessions_unconfirmed": sessions_unconfirmed,
                                        "sessions_cancelled": sessions_cancelled,
+                                       "sessions_caller_cancelled": sessions_caller_cancelled,
                                        "sessions_idle": sessions_idle,
                                        "sessions_paused": sessions_paused,
                                        "seal_error": seal_error,
@@ -383,6 +385,8 @@ restart_and_wait() {
     return 2
   fi
   save_health_before_restart "$old_pid"
+  # Capture a lower bound before signalling: an uncertain cancel must still blame the drain.
+  DRAIN_STARTED_MS="$(python3 -c 'import time; print(time.time_ns() // 1_000_000)')"
   "${PLACE_RELEASE_CK:-ck}" module restart broca
   wait_seconds="${PLACE_RELEASE_WAIT_SECONDS:-90}"
   poll_seconds="${PLACE_RELEASE_POLL_SECONDS:-1}"
@@ -641,15 +645,14 @@ else
   FLOOR_VERDICT="empty, not checked (the copy predates --wal-known-features)"
 fi
 
-# Prepare both clients before publishing any binary. A missing, wrong-version or unsignable
+# Prepare the client before publishing any binary. A missing, wrong-version or unsignable
 # client must stop placement before the module can be restarted with an incompatible client.
 SESSION_STAGED="${SESSION_STAGED:-$(broca_release_client_path "$STAGED" broca-session)}"
-RUN_STAGED="${RUN_STAGED:-$(broca_release_client_path "$STAGED" broca-run)}"
-CLIENT_NAMES=(broca-session broca-run)
-CLIENT_SOURCES=("$SESSION_STAGED" "$RUN_STAGED")
-CLIENT_REMOVALS=("$REMOVE_SESSION" "$REMOVE_RUN")
+CLIENT_NAMES=(broca-session)
+CLIENT_SOURCES=("$SESSION_STAGED")
+CLIENT_REMOVALS=("$REMOVE_SESSION")
 CLIENT_SHAS=()
-for i in 0 1; do
+for i in "${!CLIENT_NAMES[@]}"; do
   if [ "${CLIENT_REMOVALS[$i]}" -eq 1 ]; then
     CLIENT_TEMPS+=("")
     CLIENT_SHAS+=("")
@@ -741,7 +744,7 @@ fi
 
 # Client snapshots are independent because older installations may have no placed clients.
 # Keep an empty report entry in that case rather than inventing bytes to restore.
-for i in 0 1; do
+for i in "${!CLIENT_NAMES[@]}"; do
   client_dest="$(dirname "$DEST")/${CLIENT_NAMES[$i]}"
   [ -e "$client_dest" ] || continue
   client_backup="$ROLLBACK_DIR/${CLIENT_NAMES[$i]}.rollback-$(date -u +%Y%m%dT%H%M%SZ)"
@@ -765,7 +768,7 @@ BEFORE_INODE="$(broca_file_inode "$DEST")"
 
 # These renames are on the destination filesystem, just like the module rename below.
 # Any copy, signing, rename or readback failure exits before restart_and_wait is reachable.
-for i in 0 1; do
+for i in "${!CLIENT_NAMES[@]}"; do
   client_dest="$(dirname "$DEST")/${CLIENT_NAMES[$i]}"
   if [ "${CLIENT_REMOVALS[$i]}" -eq 1 ]; then
     rm -f "$client_dest"

@@ -11,10 +11,12 @@ use super::{Session, SessionError, StoredEntry};
 pub(super) struct SendIdIndex {
     through: u64,
     conversation: Conversation,
+    running: bool,
+    idle_starts: BTreeSet<String>,
     run: Option<(String, Option<String>)>,
     queued: BTreeMap<String, String>,
     receipts: BTreeMap<u64, Option<String>>,
-    entries: BTreeMap<u64, String>,
+    entries: BTreeMap<u64, Option<String>>,
     steers: BTreeSet<u64>,
 }
 
@@ -23,6 +25,8 @@ impl SendIdIndex {
         Self {
             through: 0,
             conversation: Conversation::new(appends),
+            running: false,
+            idle_starts: BTreeSet::new(),
             run: None,
             queued: BTreeMap::new(),
             receipts: BTreeMap::new(),
@@ -33,7 +37,22 @@ impl SendIdIndex {
 
     fn observe(&mut self, seq: u64, record: &Record) -> Result<(), SessionError> {
         match record {
+            Record::DeliveryOrdered(ordered) => {
+                // As in the WAL send-key index, omit an idle admission's unkeyed id even if
+                // a transient refusal answered Pending before a later drain: the log cannot
+                // distinguish that reply from an immediate start's Active reply.
+                if !self.running
+                    && ordered
+                        .order
+                        .get("modes")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|modes| modes.iter().any(|mode| mode == "idle_start"))
+                {
+                    self.idle_starts.insert(ordered.submission_id.clone());
+                }
+            }
             Record::RunStart(start) => {
+                self.running = true;
                 let fresh = start
                     .origin
                     .as_ref()
@@ -42,28 +61,27 @@ impl SendIdIndex {
                     == Some("fresh");
                 let id = fresh
                     .then(|| {
-                        start
-                            .send_id
-                            .clone()
-                            .or_else(|| {
-                                start
-                                    .submission_id
-                                    .as_ref()
-                                    .and_then(|id| self.queued.get(id).cloned())
-                            })
-                            .or_else(|| start.submission_id.clone())
+                        start.send_id.clone().or_else(|| {
+                            start
+                                .submission_id
+                                .as_ref()
+                                .and_then(|id| self.queued.get(id).cloned())
+                        })
                     })
                     .flatten();
                 self.run = Some((start.run_id.clone(), id));
             }
             Record::QueuedSend(send) => {
-                self.queued.insert(
-                    send.submission_id.clone(),
-                    send.send_id
-                        .clone()
-                        .unwrap_or_else(|| send.submission_id.clone()),
-                );
+                let id = send.send_id.clone().or_else(|| {
+                    (!self.idle_starts.contains(&send.submission_id))
+                        .then(|| send.submission_id.clone())
+                });
+                if let Some(id) = id {
+                    self.queued.insert(send.submission_id.clone(), id);
+                }
             }
+            Record::RunEnd(_) | Record::Pause(_) => self.running = false,
+            Record::Resumed(_) => self.running = true,
             Record::Steer(steer) => {
                 let id = steer
                     .receipt
@@ -105,7 +123,10 @@ impl SendIdIndex {
                 .apply(record)
                 .map_err(|error| SessionError::Fold(format!("send ids: conversation {error:?}")))?;
         }
-        if let Some(id) = id.filter(|_| self.conversation.placed == before + 1) {
+        if self.conversation.placed == before + 1
+            && matches!(record, Record::Input(input) if matches!(input.placement,
+                Placement::RunInput | Placement::Steer | Placement::Delivered | Placement::DeliveredTurnSystem))
+        {
             self.entries.insert(self.conversation.placed, id);
             if matches!(record, Record::Input(input) if input.placement == Placement::Steer) {
                 self.steers.insert(self.conversation.placed);
@@ -135,6 +156,33 @@ impl<B: SessionBackend> Session<B> {
         &self,
         entries: &[StoredEntry],
     ) -> Result<BTreeMap<u64, String>, SessionError> {
+        let missing: BTreeSet<_> = entries
+            .iter()
+            .filter(|entry| {
+                entry
+                    .state
+                    .facts
+                    .as_ref()
+                    .is_some_and(|facts| facts.send_id.is_none())
+            })
+            .map(|entry| entry.ordinal)
+            .collect();
+        Ok(self
+            .entry_send_ids(entries)
+            .await?
+            .into_iter()
+            .filter(|(ordinal, _)| missing.contains(ordinal))
+            .filter_map(|(ordinal, id)| id.map(|id| (ordinal, id)))
+            .collect())
+    }
+
+    /// Admission-derived ids for native input entries, including known absence. Stored facts
+    /// from older writers may have copied an internal submission id, so reads replace them;
+    /// imported entries keep their source facts instead of taking the importing send's id.
+    pub async fn entry_send_ids(
+        &self,
+        entries: &[StoredEntry],
+    ) -> Result<BTreeMap<u64, Option<String>>, SessionError> {
         let needed: Vec<_> = entries
             .iter()
             .filter(|entry| {
@@ -142,7 +190,7 @@ impl<B: SessionBackend> Session<B> {
                     .state
                     .facts
                     .as_ref()
-                    .is_some_and(|facts| facts.sender.is_some() && facts.send_id.is_none())
+                    .is_some_and(|facts| facts.sender.is_some())
             })
             .map(|entry| entry.ordinal)
             .collect();

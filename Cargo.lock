@@ -269,7 +269,7 @@ checksum = "dc0b364ead1874514c8c2855ab558056ebfeb775653e7ae45ff72f28f8f3166c"
 
 [[package]]
 name = "broca-bench"
-version = "0.4.12"
+version = "0.4.16"
 dependencies = [
  "broca-core",
  "broca-protocol",
@@ -286,7 +286,7 @@ dependencies = [
 
 [[package]]
 name = "broca-catalog"
-version = "0.4.12"
+version = "0.4.16"
 dependencies = [
  "base64",
  "broca-catalog",
@@ -307,7 +307,7 @@ dependencies = [
 
 [[package]]
 name = "broca-ck"
-version = "0.4.12"
+version = "0.4.16"
 dependencies = [
  "broca-protocol",
  "serde",
@@ -318,7 +318,7 @@ dependencies = [
 
 [[package]]
 name = "broca-core"
-version = "0.4.12"
+version = "0.4.16"
 dependencies = [
  "async-trait",
  "base64",
@@ -349,7 +349,7 @@ dependencies = [
 
 [[package]]
 name = "broca-crash-harness"
-version = "0.4.12"
+version = "0.4.16"
 dependencies = [
  "async-trait",
  "broca-core",
@@ -366,7 +366,7 @@ dependencies = [
 
 [[package]]
 name = "broca-diagnostics"
-version = "0.4.12"
+version = "0.4.16"
 dependencies = [
  "serde",
  "tokio",
@@ -374,7 +374,7 @@ dependencies = [
 
 [[package]]
 name = "broca-fetch-plan"
-version = "0.4.12"
+version = "0.4.16"
 dependencies = [
  "async-trait",
  "broca-protocol",
@@ -395,7 +395,7 @@ dependencies = [
 
 [[package]]
 name = "broca-heap-profile"
-version = "0.4.12"
+version = "0.4.16"
 dependencies = [
  "serde",
  "serde_json",
@@ -404,11 +404,11 @@ dependencies = [
 
 [[package]]
 name = "broca-memory-relief"
-version = "0.4.12"
+version = "0.4.16"
 
 [[package]]
 name = "broca-module"
-version = "0.4.12"
+version = "0.4.16"
 dependencies = [
  "async-trait",
  "base64",
@@ -448,7 +448,7 @@ dependencies = [
 
 [[package]]
 name = "broca-module-serve"
-version = "0.4.12"
+version = "0.4.16"
 dependencies = [
  "async-nats",
  "async-trait",
@@ -519,14 +519,14 @@ dependencies = [
 
 [[package]]
 name = "broca-owner-only"
-version = "0.4.12"
+version = "0.4.16"
 dependencies = [
  "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "broca-protocol"
-version = "0.4.12"
+version = "0.4.16"
 dependencies = [
  "cortexkit-anthropic-policy",
  "cortexkit-bus-naming",
@@ -542,7 +542,7 @@ dependencies = [
 
 [[package]]
 name = "broca-provider"
-version = "0.4.12"
+version = "0.4.16"
 dependencies = [
  "async-trait",
  "base64",
@@ -584,7 +584,7 @@ dependencies = [
 
 [[package]]
 name = "broca-records"
-version = "0.4.12"
+version = "0.4.16"
 dependencies = [
  "broca-owner-only",
  "broca-protocol",
@@ -599,7 +599,7 @@ dependencies = [
 
 [[package]]
 name = "broca-replay"
-version = "0.4.12"
+version = "0.4.16"
 dependencies = [
  "broca-protocol",
  "rustix",
@@ -610,28 +610,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "broca-run"
-version = "0.4.12"
-dependencies = [
- "base64",
- "broca-catalog",
- "broca-core",
- "broca-module-serve",
- "broca-protocol",
- "broca-provider",
- "broca-subc",
- "broca-test-support",
- "clap",
- "serde",
- "serde_json",
- "sha2",
- "subc-protocol",
- "tokio",
-]
-
-[[package]]
 name = "broca-session-convert"
-version = "0.4.12"
+version = "0.4.16"
 dependencies = [
  "async-trait",
  "broca-core",
@@ -647,6 +627,7 @@ dependencies = [
  "cortexkit-role-compaction",
  "cortexkit-role-llm-runner 0.8.36",
  "futures",
+ "rusqlite",
  "serde",
  "serde_jcs",
  "serde_json",
@@ -657,7 +638,7 @@ dependencies = [
 
 [[package]]
 name = "broca-session-loop"
-version = "0.4.12"
+version = "0.4.16"
 dependencies = [
  "async-trait",
  "broca-core",
@@ -684,7 +665,7 @@ dependencies = [
 
 [[package]]
 name = "broca-session-store"
-version = "0.4.12"
+version = "0.4.16"
 dependencies = [
  "broca-owner-only",
  "broca-protocol",
@@ -703,7 +684,7 @@ dependencies = [
 
 [[package]]
 name = "broca-store"
-version = "0.4.12"
+version = "0.4.16"
 dependencies = [
  "async-trait",
  "broca-core",
@@ -726,7 +707,7 @@ dependencies = [
 
 [[package]]
 name = "broca-store-contention-tests"
-version = "0.4.12"
+version = "0.4.16"
 dependencies = [
  "broca-core",
  "broca-protocol",
@@ -737,7 +718,7 @@ dependencies = [
 
 [[package]]
 name = "broca-subc"
-version = "0.4.12"
+version = "0.4.16"
 dependencies = [
  "async-trait",
  "base64",
@@ -770,7 +751,7 @@ dependencies = [
 
 [[package]]
 name = "broca-test-support"
-version = "0.4.12"
+version = "0.4.16"
 dependencies = [
  "broca-core",
  "broca-owner-only",
@@ -787,7 +768,7 @@ dependencies = [
 
 [[package]]
 name = "broca-wal"
-version = "0.4.12"
+version = "0.4.16"
 dependencies = [
  "broca-owner-only",
  "broca-protocol",
@@ -814,7 +795,7 @@ dependencies = [
 
 [[package]]
 name = "broca-wire"
-version = "0.4.12"
+version = "0.4.16"
 dependencies = [
  "broca-core",
  "broca-protocol",
@@ -960,7 +941,7 @@ dependencies = [
 
 [[package]]
 name = "ck-import"
-version = "0.4.12"
+version = "0.4.16"
 dependencies = [
  "broca-core",
  "broca-module",
@@ -977,7 +958,7 @@ dependencies = [
 
 [[package]]
 name = "ck-session-import"
-version = "0.4.12"
+version = "0.4.16"
 dependencies = [
  "base64",
  "broca-module-serve",
@@ -1372,9 +1353,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-media"
-version = "0.1.0"
+version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "baf764fa40506723c074f032364198a9ae6f15f8ba6ccac2b6a47fe5ddb0cb04"
+checksum = "9cc89e1f492de328aea5413bc349f83647462f9b07ebe22b95cec4dd0936d7c6"
 dependencies = [
  "base64",
  "serde",
@@ -1384,9 +1365,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-routing"
-version = "0.7.6"
+version = "0.7.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d02627558b2b45baaae1f79fdf6acfb2a4ea155f36dbfebc97d1a5b856071f5b"
+checksum = "bb9ff42c21ae2e8e9df615e77cbd3d68aa963b728b13b7d96e13411221037afa"
 dependencies = [
  "cortexkit-role-media",
  "serde",

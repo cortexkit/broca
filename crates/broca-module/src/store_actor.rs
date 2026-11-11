@@ -166,6 +166,9 @@ pub struct StoreActor<B: SessionBackend> {
     /// clock its runs stamp their seals with.
     now_ms: Arc<dyn Fn() -> u64 + Send + Sync>,
     retention_clock: Option<broca_core::clock::Clock>,
+    /// The authoritative folder and the opener's backup selection rule. Without placement
+    /// information an unlabelled session cannot safely adopt a class.
+    class_placement: Option<(broca_wal::StorageClass, Vec<String>)>,
 }
 
 /// How an actor lives in the module's registry. Tests serve an actor without one.
@@ -411,7 +414,17 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             admission: Default::default(),
             now_ms: Arc::new(|| broca_core::clock::epoch_millis().unwrap_or(0)),
             retention_clock: None,
+            class_placement: None,
         }
+    }
+
+    pub(crate) fn with_class_placement(
+        mut self,
+        class: broca_wal::StorageClass,
+        backup_classes: Vec<String>,
+    ) -> Self {
+        self.class_placement = Some((class, backup_classes));
+        self
     }
 
     /// Reads the time the session's deletions come due by from `now_ms`, in place of the wall
@@ -629,7 +642,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             }
         }
         self.session
-            .add_append_observer(Box::new(move |appended| observer.appended(appended)));
+            .add_positioned_append_observer(Box::new(move |appended, position| {
+                observer.appended(appended, position)
+            }));
         self
     }
 
@@ -712,6 +727,16 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 Some((&life.registry, life.gen)),
             )
             .await;
+        let stop_reason = match &exit {
+            Exit::Idle => None,
+            Exit::Expired(_) => Some("expired"),
+            Exit::Cut(_) => Some("released_or_moving"),
+            Exit::Closed => Some("released"),
+            Exit::Stop => Some("shutdown"),
+        };
+        if let Some(reason) = stop_reason {
+            life.registry.stop_idle_warm(&self.key, reason);
+        }
         let close = match &exit {
             Exit::Idle | Exit::Expired(_) | Exit::Cut(_) => {
                 life.registry.begin_close(&self.key, life.gen)
@@ -801,6 +826,13 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         let seal = seal.unwrap_or(&never);
         self.seal = seal.clone();
         self.recover().await;
+        if !self
+            .registry
+            .as_ref()
+            .is_some_and(|registry| registry.has_idle_warm(&self.key))
+        {
+            self.arm_idle_warm().await;
+        }
         // Deletions that came due while the session was closed run once the actor is idle, so
         // they never hold up a command or a run.
         self.collect_due = true;
@@ -1222,7 +1254,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                         plan.as_deref(),
                         latest
                             .as_ref()
-                            .map(|latest| (&latest.render_config, latest.tools.as_slice())),
+                            .map(|latest| (&*latest.render_config, latest.tools.as_slice())),
                         joins_active_run,
                     ) {
                         let _ = reply.send(SendOutcome::StructuredOutputInvalid { field });
@@ -1794,11 +1826,15 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 false
             }
             LineageCmd::IdleTick => self.idle_holds().is_empty(),
-            LineageCmd::Warm { lineage_id, reply } => {
+            LineageCmd::Warm {
+                lineage_id,
+                reply,
+                idle_auto,
+            } => {
                 if self.stopping {
                     let _ = reply.send(crate::actor::WarmOutcome::Reopen);
                 } else {
-                    self.warm(lineage_id, reply).await;
+                    self.warm(lineage_id, reply, idle_auto).await;
                 }
                 false
             }
@@ -1860,6 +1896,15 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         mode: StoreRunMode,
         cancel: CancellationToken,
     ) {
+        if self.warm.as_ref().is_some_and(|warm| warm.idle_auto) {
+            let pending = self.warm.as_mut().expect("idle warm exists");
+            pending.task.abort();
+            let result = (&mut pending.task).await;
+            self.finish_warm(result).await;
+        }
+        if let Some(registry) = &self.registry {
+            registry.stop_idle_warm(&self.key, "real_run");
+        }
         let mut media = match mode {
             StoreRunMode::Seal(_) => None,
             _ => Some(self.run_media().await),
@@ -2111,6 +2156,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     /// timer aren't recovered on this storage yet, so nothing is written for them.
     async fn recover(&mut self) {
         self.bill_owed().await;
+        self.bill_recorded_idle_warms().await;
         if self.park_held().await {
             return;
         }
@@ -2138,7 +2184,13 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         };
         match self.recovery_start(run) {
             Ok(start) => {
-                self.start_run(start, None, None, mode).await;
+                if run.cancel.is_some() && run.paused.is_some() {
+                    let cancel = CancellationToken::new();
+                    cancel.cancel();
+                    self.start_run_under(start, None, None, mode, cancel).await;
+                } else {
+                    self.start_run(start, None, None, mode).await;
+                }
                 // Today's actor seals a crash's orphan before it takes any command, so no caller
                 // sees the orphan as running; the seal sends nothing, so it ends at once.
                 if matches!(mode, StoreRunMode::Seal(_)) {
@@ -2237,38 +2289,45 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         })
     }
 
-    /// The label the session's first run froze; `None` for a session created unlabelled.
+    /// The first class a run recorded, including a later adoption on an unlabelled session.
     fn frozen_session_class(&self) -> Option<String> {
-        self.session
-            .operations()
-            .owner
+        let owner = &self.session.operations().owner;
+        owner
             .first_start
             .as_ref()
             .and_then(|start| start.session_class.clone())
+            .or_else(|| owner.adopted_session_class.clone())
     }
 
-    /// The label a send's run records, by today's rule (`crate::session_class::admit`): the
-    /// session's first run freezes the label its send names, a later send may only repeat it,
-    /// and a session created unlabelled stays unlabelled whatever a later send names.
+    /// An unlabelled session may adopt a class only in its existing folder. Labelled sessions
+    /// use the shared admission rule, without changing their class or placement.
     fn session_class(&self, requested: Option<&str>) -> Result<Option<String>, SendOutcome> {
-        let frozen = self
-            .session
-            .operations()
-            .owner
-            .first_start
-            .as_ref()
-            .map(|start| start.session_class.as_deref());
+        let class = self.frozen_session_class();
+        let first = self.session.operations().owner.first_start.as_ref();
+        let frozen = first.map(|_| class.as_deref());
         let Some(requested) = requested else {
             return Ok(frozen.flatten().map(str::to_owned));
         };
         match crate::session_class::admit(Some(requested), frozen) {
             Ok(crate::session_class::Admitted::Class(class)) => Ok(class),
             Ok(crate::session_class::Admitted::IgnoredOnUnlabelled(label)) => {
+                if self
+                    .class_placement
+                    .as_ref()
+                    .is_some_and(|(folder, backups)| {
+                        broca_wal::placement(
+                            first.is_some_and(|start| start.retention_secs.is_some()),
+                            broca_wal::selected_for_backup(Some(&label), backups),
+                        ) == *folder
+                    })
+                {
+                    return Ok(Some(label));
+                }
                 tracing::info!(
                     target: "broca.session_class",
                     session = %self.key.session,
                     label = %label,
-                    "session_class ignored: the session was created unlabelled"
+                    "session_class ignored: its storage folder differs or is unknown"
                 );
                 Ok(None)
             }
@@ -2294,13 +2353,13 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     }
 
     /// The fetch plan's manifest the session's first run froze, read back from the setup parts
-    /// its start names; `None` for a session admitted without a plan, or with no run yet.
+    /// its start names; `None` for a session admitted without a plan, or with no run yet. Shared
+    /// with every other holder of the same manifest.
     fn frozen_manifest(&self) -> Result<Option<Arc<broca_wal::PlanManifest>>, String> {
         let Some(first) = self.session.operations().owner.first_start.as_ref() else {
             return Ok(None);
         };
-        broca_session_loop::run::admission_of_start(first, &self.parts)
-            .map(|admission| admission.manifest)
+        broca_session_loop::run::frozen_manifest(first, &self.parts)
             .map_err(|error| format!("the session's first run start: {error:?}"))
     }
 
@@ -2435,7 +2494,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 } else {
                     self.latest_admission()
                         .map_err(SendOutcome::Transient)?
-                        .map(|latest| latest.tools)
+                        .map(|latest| Arc::unwrap_or_clone(latest.tools))
                         .unwrap_or_default()
                 };
                 start.request.policy_allowed =
@@ -2985,6 +3044,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             }
         }
         self.drain().await;
+        self.arm_idle_warm().await;
     }
 
     /// Ends the session's latest run `run_id`, whose loop stopped with `message` without writing
@@ -3133,7 +3193,12 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             .drained_start(&first.submission_id, own_admission)
             .await
         {
-            Ok((mut start, mut drained)) => match self.freeze_plan(&mut start) {
+            Ok((mut start, mut drained)) => match self
+                .session_class(start.session_class.as_deref())
+                .and_then(|class| {
+                    start.session_class = class;
+                    self.freeze_plan(&mut start)
+                }) {
                 Ok(()) => {
                     start.prepared.hooks = crate::actor::pre_user::drained_hooks(
                         drained.hooks.take(),
@@ -3148,7 +3213,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                         .await
                 }
                 Err(outcome) => {
-                    // The send can't start under the session's plan: it ends with the refusal,
+                    // The send can't start under the session's class or plan: it ends with the refusal,
                     // as a drained send refused at admission ends, and the next one is tried.
                     let error = broca_core::RunError::Config(format!("{outcome:?}"));
                     match self
@@ -3241,7 +3306,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 self.ownership()?.scope
             },
             manifest: self.frozen_manifest()?,
-            session_class: self.frozen_session_class(),
+            session_class: queue::receipt_field(&send, "session_class")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
             prepared: Prepared {
                 retention: queue::receipt_field(&send, "retention")
                     .and_then(serde_json::Value::as_u64),
@@ -3623,7 +3690,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             // A queued send keeps its request as sent; the plan is frozen into it when it
             // drains, as today's queue freezes it at the episode's start.
             manifest: _,
-            session_class: _,
+            session_class,
             prepared: start_prepared,
             message_marks,
         } = start;
@@ -3683,6 +3750,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         }
         request.staged_uploads = None;
         let receipt = queue::Receipt {
+            session_class: session_class.filter(|_| self.frozen_session_class().is_none()),
             conversation_key,
             sent_by,
             principal: request.principal.clone(),
@@ -3766,6 +3834,38 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         run_id: &RunId,
         at: broca_wal::record::RunCancelAt,
     ) -> CancelOutcome {
+        if self.run.is_none() {
+            let Some(run) = self.session.operations().run.as_ref().filter(|run| {
+                run.run_id == run_id.0 && run.finished.is_none() && run.paused.is_some()
+            }) else {
+                return CancelOutcome::NotActive;
+            };
+            let start = match self.recovery_start(run) {
+                Ok(start) => start,
+                Err(error) => return CancelOutcome::Error(error),
+            };
+            let point = match at {
+                broca_wal::record::RunCancelAt::Now => CancelPoint::Now,
+                broca_wal::record::RunCancelAt::StepBoundary => CancelPoint::StepBoundary,
+            };
+            if let Err(error) = self
+                .append_own(Record::CancelRequest(CancelRequest {
+                    run_id: run_id.0.clone(),
+                    at: point,
+                }))
+                .await
+            {
+                return CancelOutcome::Error(error);
+            }
+            // A parked run has no task to cancel. Resume with cancellation already requested:
+            // ordinary pauses end immediately, and a held batch closes its calls and withdraws
+            // them after its Cancelled end is durable. Neither cancel point waits for a result.
+            let cancel = CancellationToken::new();
+            cancel.cancel();
+            self.start_run_under(start, None, None, StoreRunMode::Resume, cancel)
+                .await;
+            return CancelOutcome::Ack;
+        }
         let Some(active) = self.run.as_mut().filter(|active| &active.run_id == run_id) else {
             return CancelOutcome::NotActive;
         };
@@ -3860,6 +3960,9 @@ pub(crate) fn recovery_mode(
     run: &broca_session_store::fold::operations::Run,
 ) -> Option<StoreRunMode> {
     use broca_session_store::fold::operations::Resolution;
+    if run.finished.is_none() && run.cancel.is_some() {
+        return Some(StoreRunMode::Resume);
+    }
     match run.resolution() {
         Resolution::Resume | Resolution::Interrupted(_) => Some(match run.cancel {
             None => StoreRunMode::Seal(broca_core::seal::SealCause::CrashOrphan),
@@ -3911,7 +4014,7 @@ fn frozen_media(
     String,
 ) {
     let profile = serde_json::from_value::<broca_provider::wire::FrozenRenderConfig>(
-        frozen.render_config.clone(),
+        serde_json::Value::clone(&frozen.render_config),
     )
     .ok()
     .and_then(|config| config.media.map(Box::new));
@@ -4091,6 +4194,7 @@ mod admission;
 mod apply_view;
 mod expiry;
 mod held;
+mod idle_warm;
 mod import;
 mod inline_import;
 mod keep_warm;
@@ -4105,6 +4209,8 @@ mod warm;
 
 #[cfg(test)]
 mod billing_tests;
+#[cfg(test)]
+mod class_tests;
 #[cfg(test)]
 mod collect_tests;
 #[cfg(test)]

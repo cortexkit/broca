@@ -3,8 +3,7 @@
 // broca adds vault credential resolution, frozen session scope, and non-empty claim checks.
 
 //! The catalog → live provider bridge: resolve a model id + auth into a runnable
-//! `Box<dyn Provider>`. Shared by every harness that builds a live provider (the
-//! `broca-run` CLI and the `broca-module-serve` module binary) so the resolution logic
+//! `Box<dyn Provider>`. Shared by the module and developer probes so the resolution logic
 //! (catalog lookup, base_url override, and auth shaping)
 //! lives in ONE place — a harness can't drift from another on how a model resolves.
 //!

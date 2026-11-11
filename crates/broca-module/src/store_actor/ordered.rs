@@ -460,6 +460,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             send_id,
             identity,
             manifest,
+            session_class,
             message_marks,
             prepared: run_prepared,
             ..
@@ -526,6 +527,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             })
             .map(|queued| queued.submission_id);
         let receipt = queue::Receipt {
+            session_class: session_class.filter(|_| self.frozen_session_class().is_none()),
             conversation_key,
             // The input's sender as the session shows it: the plan-named sender, else the
             // principal the send came under.

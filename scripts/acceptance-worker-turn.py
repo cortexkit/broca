@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import re
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -147,6 +148,110 @@ def scan_workers(state_root, after_ms, cache):
     return summaries, unavailable
 
 
+def store_addresses(state_root, after_ms):
+    addresses = set()
+    # Appending to an existing log changes the file mtime, not its folder's mtime.
+    # Stat both; neither the encrypted head nor log bytes belong in this observer.
+    for folder in ("session-store", "session-store-durable", "session-store-ephemeral"):
+        logs = state_root / folder / "logs"
+        if not logs.exists():
+            continue
+        for path in logs.iterdir():
+            if not ADDRESS.fullmatch(path.name) or not path.is_dir():
+                continue
+            if not (state_root / folder / "heads" / path.name / "head").is_file():
+                continue
+            if (path.stat().st_mtime_ns // 1_000_000 >= after_ms
+                    or any(log.stat().st_mtime_ns // 1_000_000 >= after_ms for log in path.iterdir()
+                           if re.fullmatch(r"[0-9a-f]{32}", log.name) and log.is_file())):
+                addresses.add(path.name)
+    return addresses
+
+
+def store_summary(admission, status, after_ms):
+    timestamp, session_class = admission["started_at_ms"], admission.get("session_class")
+    if not isinstance(timestamp, int) or isinstance(timestamp, bool) or admission["storage"] != "store":
+        raise ValueError("invalid store admission")
+    if timestamp <= after_ms or session_class not in WORKER_CLASSES:
+        return None
+    fetches = admission["fetches"]
+    if not isinstance(fetches, list) or not all(isinstance(fetch, dict) for fetch in fetches):
+        raise ValueError("invalid store fetches")
+    aft = [fetch for fetch in fetches if fetch.get("provider") == "aft"]
+    error = None
+    if aft and not all(isinstance(fetch.get("declarations_frozen"), dict)
+                       and (fetch["declarations_frozen"].get("late_results") is True
+                            or fetch["declarations_frozen"].get("result_formats")) for fetch in aft):
+        error = "RunStart AFT fetch has no frozen result formats or late_results declaration"
+    reason = status["state"]
+    if reason in ("active", "paused"):
+        reason = None
+    elif not isinstance(reason, str) or reason not in FINISH_REASONS:
+        reason = "unclassified_terminal"
+    # The store has a record schema rather than WAL feature requirements or a WAL sequence.
+    return {"ts_ms": timestamp, "seq": "store", "class": session_class,
+            "candidate": bool(aft), "reason": reason, "error": error}
+
+
+def scan_store_workers(state_root, after_ms, session_bin, subc, deadline):
+    summaries = {}
+    try:
+        addresses = store_addresses(state_root, after_ms)
+    except OSError:
+        return summaries, {"unreadable_store_layout"}
+    if not addresses:
+        return summaries, set()
+    try:
+        # mode=ro refuses missing databases and never creates or migrates inventory tables.
+        db = sqlite3.connect((state_root / "run-index.db").resolve().as_uri() + "?mode=ro", timeout=1)
+        try:
+            for address in sorted(addresses):
+                binds = db.execute("SELECT DISTINCT project_root,harness,session FROM agent_data_session_ref "
+                                   "WHERE address=?", (address,)).fetchall()
+                if len(binds) != 1 or not all(isinstance(part, str) for part in binds[0]):
+                    return summaries, {"unreadable_store_inventory"}
+                project, harness, session = binds[0]
+                base = [str(session_bin), "--subc", str(subc), "--project-root", project,
+                        "--harness", harness, "--session", session]
+                # The run index is a WAL projection; new-storage runs never appear in it. Ask the
+                # daemon for the session's latest run instead. A log also changes without a new
+                # run (idle warm-ups, seals, cleanup), and run.admission's start time then rules
+                # that run out as a candidate.
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return summaries, {"store_observation_timeout"}
+                head = json.loads(invoke(base + ["raw", "--op", "session.head", "--params", "{}"],
+                                         min(30, remaining)))["result"]
+                latest = (head.get("last_run_state") or {}).get("run_id")
+                if latest is None:
+                    continue
+                if not isinstance(latest, str):
+                    return summaries, {"unreadable_store_run_inventory"}
+                for run_id in (latest,):
+                    params = json.dumps({"run_id": run_id})
+                    replies = []
+                    for op in ("run.admission", "run.status"):
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            return summaries, {"store_observation_timeout"}
+                        replies.append(json.loads(invoke(base + ["raw", "--op", op, "--params", params],
+                                                         min(30, remaining)))["result"])
+                    admission, status = replies
+                    if admission["run_id"] != run_id:
+                        return summaries, {"unverified_store_admission"}
+                    summary = store_summary(admission, status, after_ms)
+                    if summary is not None:
+                        summaries[(address, run_id)] = summary
+        finally:
+            db.close()
+    except sqlite3.Error:
+        return summaries, {"unreadable_store_inventory"}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, subprocess.TimeoutExpired):
+        # Client errors can contain session content or connection details; print only our reason.
+        return summaries, {"unreadable_store_client"}
+    return summaries, set()
+
+
 def worker_counts(observed):
     candidates = [summary for summary in observed.values() if summary["candidate"]]
     classes = Counter(summary["class"] for summary in candidates)
@@ -155,20 +260,28 @@ def worker_counts(observed):
     class_counts = ",".join(f"{name}:{classes[name]}" for name in WORKER_CLASSES)
     ignored_counts = ",".join(f"{name}:{ignored[name]}" for name in WORKER_CLASSES)
     terminal_counts = ",".join(f"{reason}:{reasons[reason]}" for reason in sorted(set(reasons) | {"completed"}))
+    storages = Counter(summary["storage"] for summary in observed.values())
     return (f"classes={','.join(WORKER_CLASSES)} candidates={len(candidates)} "
             f"class_counts={class_counts} pending={len(candidates) - sum(reasons.values())} "
-            f"terminal_counts={terminal_counts} ignored_counts={ignored_counts}")
+            f"terminal_counts={terminal_counts} ignored_counts={ignored_counts} "
+            f"storage_counts=wal:{storages['wal']},store:{storages['store']}")
 
 
-def wait_for_worker(state_root, after_ms, timeout=600, poll=5):
+def wait_for_worker(state_root, after_ms, timeout=600, poll=5, *, session_bin=None, subc=None):
     deadline = time.monotonic() + timeout
     cache, observed = {}, {}
     while True:
         summaries, unavailable = scan_workers(state_root, after_ms, cache)
         for path, candidates in summaries.items():
             for summary in candidates:
-                key = (path.stem, summary["seq"], summary["ts_ms"])
-                observed[key] = dict(summary, address=path.stem)
+                key = ("wal", path.stem, summary["seq"], summary["ts_ms"])
+                observed[key] = dict(summary, address=path.stem, storage="wal")
+        # A zero wait still takes one snapshot, including bounded daemon reads.
+        store_deadline = deadline if timeout else time.monotonic() + 30
+        store, store_unavailable = scan_store_workers(state_root, after_ms, session_bin, subc, store_deadline)
+        unavailable |= store_unavailable
+        for key, summary in store.items():
+            observed[("store", *key)] = dict(summary, address=key[0], storage="store")
         counts = worker_counts(observed)
         # Validate every candidate that fetched the aft tool provider before passing.
         # A long-running worker need not finish, but a bad later start cannot hide
@@ -181,17 +294,20 @@ def wait_for_worker(state_root, after_ms, timeout=600, poll=5):
                 return 1
         completed = next((summary for summary in observed.values()
                           if summary["candidate"] and summary["reason"] == "completed"), None)
-        if completed is not None:
+        if completed is not None and not store_unavailable:
+            contract = (f"RunStarted requires {', '.join(REQUIRED)}" if completed["storage"] == "wal"
+                        else "RunStart frozen declarations verified via run.admission")
             print(f"acceptance-worker-turn: PASS -- admitted, completed; session={completed['address']} "
-                  f"class={completed['class']} start_seq={completed['seq']}; "
-                  f"RunStarted requires {', '.join(REQUIRED)}; {counts}", flush=True)
+                   f"class={completed['class']} start_seq={completed['seq']}; "
+                   f"{contract}; {counts}", flush=True)
             return 0
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
         time.sleep(min(poll, remaining))
     has_candidates = any(summary["candidate"] for summary in observed.values())
-    failure = "worker_completion_timeout" if has_candidates else "no_worker_candidate"
+    failure = (",".join(sorted(store_unavailable)) if store_unavailable
+               else "worker_completion_timeout" if has_candidates else "no_worker_candidate")
     evidence = f"; evidence={','.join(sorted(unavailable))}" if unavailable else ""
     print(f"acceptance-worker-turn: FAILED -- {failure}; no completed post-restart AFT candidate "
           f"within {timeout:g}s; {worker_counts(observed)}{evidence}", file=sys.stderr)
@@ -209,7 +325,7 @@ def observe_worker(args, state_root):
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         raise ValueError("project-free worker acceptance requires a valid placement report "
                          "restart boundary and a timeout between 0 and 600 seconds") from None
-    return wait_for_worker(state_root, after_ms, timeout)
+    return wait_for_worker(state_root, after_ms, timeout, session_bin=args.session_bin, subc=args.subc)
 
 
 class ClientFailure(ValueError):

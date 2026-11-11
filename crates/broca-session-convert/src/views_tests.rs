@@ -249,13 +249,16 @@ fn applied(step: u64, view: &View) -> WalRecord {
 /// through the session's first message, and marks the cut; then view 2, handed over by the
 /// provider after that run and accepted without a step applying it yet. Returns the WAL and the
 /// body of the second run's request.
-fn compacted(root: &Path) -> (Vec<FramedRecord>, Option<WalLineageId>, Vec<u8>) {
+fn compacted(
+    root: &Path,
+    applied_by: Option<&str>,
+) -> (Vec<FramedRecord>, Option<WalLineageId>, Vec<u8>) {
     let mut log = Log::open(root);
     log.append(run_started("r1", 1_000, "Hello."));
     log.step("r1", 1, 1_000, Vec::new(), "One.");
     log.finish(1_000);
     log.append(run_started("r2", 2_000, "Again."));
-    let first = View::seal(
+    let first = View::seal_with_policy(
         1,
         vec![Edit::new(
             1,
@@ -263,6 +266,8 @@ fn compacted(root: &Path) -> (Vec<FramedRecord>, Option<WalLineageId>, Vec<u8>) 
                 through: log.mid(0),
             },
         )],
+        Some(log.mid(1)),
+        Some("strip".into()),
     );
     let marker = WalRecord::CompactionMarker {
         harness: "runner".into(),
@@ -276,7 +281,11 @@ fn compacted(root: &Path) -> (Vec<FramedRecord>, Option<WalLineageId>, Vec<u8>) 
         "r2",
         2,
         2_000,
-        vec![accepted(None, &first, None), applied(2, &first), marker],
+        vec![
+            accepted(None, &first, applied_by),
+            applied(2, &first),
+            marker,
+        ],
         "Two.",
     );
     log.finish(2_000);
@@ -314,7 +323,11 @@ struct Compacted {
 }
 
 fn staged(root: &Path) -> Compacted {
-    let (records, lineage, body) = compacted(root);
+    staged_with_applier(root, None)
+}
+
+fn staged_with_applier(root: &Path, applied_by: Option<&str>) -> Compacted {
+    let (records, lineage, body) = compacted(root, applied_by);
     assert_eq!(crate::preconditions::wal_refusal(&records, lineage), None);
     let lineage_text = lineage.map(|id| id.to_string());
     let prepared = crate::stage::prepare(&records, lineage_text.as_deref(), None).unwrap();
@@ -414,6 +427,39 @@ fn a_compacted_session_moves_with_its_views_and_renders_alike() {
     );
     drop(store);
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Verification compares the complete applied-view reply, including the recorded provider,
+/// rather than the provider of a newer accepted view. An absent provider remains absent.
+#[test]
+fn a_converted_applied_view_matches_todays_read_with_build_metadata_and_applier() {
+    for applied_by in [Some("original-compactor"), None] {
+        let root = scratch(if applied_by.is_some() {
+            "applier"
+        } else {
+            "no-applier"
+        });
+        let compacted = staged_with_applier(&root, applied_by);
+        let store = load(&compacted.staging);
+        let records = block_on(store.open_log_records()).unwrap();
+        let state =
+            broca_session_loop::compaction::restore(&records, &session(), &store.operations)
+                .unwrap();
+        let view = state.applied().unwrap();
+        let through = broca_core::message_mid(
+            true,
+            compacted.lineage.map(|id| id.to_string()).as_deref(),
+            1,
+        )
+        .unwrap();
+        assert_eq!(view.built_through.as_deref(), Some(through.as_str()));
+        assert_eq!(view.new_signed.as_deref(), Some("strip"));
+        assert_eq!(state.applied_by(), applied_by);
+        assert_eq!(state.accepted_by(), Some(PROVIDER));
+        drop(store);
+        verify_offline(&root, &compacted);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
 
 /// The new storage's first seal of a converted compacted session moves the stored views out of

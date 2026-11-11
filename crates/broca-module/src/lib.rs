@@ -31,6 +31,7 @@ mod plan_episode;
 pub mod registry;
 pub mod retention;
 pub mod retention_withdrawals;
+mod run_admission;
 mod send_fate;
 mod sender_admission;
 pub mod serve;

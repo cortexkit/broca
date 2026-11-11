@@ -721,6 +721,14 @@ impl Engine {
                 Ok(())
             }
             Err(error) if background && error.class == "deferred_no_identity" => {
+                self.step_with_detail(
+                    source,
+                    &row.step,
+                    row.outcome.as_deref(),
+                    row.refusal.as_deref(),
+                    Some(&error.message),
+                )
+                .map_err(|error| error.message)?;
                 self.health
                     .write()
                     .unwrap_or_else(|p| p.into_inner())
@@ -855,7 +863,10 @@ impl Engine {
         }
         let unidentified = |error: Failure| {
             if background {
-                Failure::failed("deferred_no_identity", error.message)
+                Failure::failed(
+                    "deferred_no_identity",
+                    format!("{}: {}", error.class, error.message),
+                )
             } else {
                 error
             }
@@ -870,12 +881,19 @@ impl Engine {
             .ok_or_else(|| {
                 unidentified(Failure::refused("damaged", "source contains no RunStarted"))
             })?;
-        if broca_core::session_addr(&session) != address {
-            return Err(unidentified(Failure::refused(
-                "damaged",
-                "source address differs from its session identity",
-            )));
-        }
+        let session = broca_session_convert::identity::effective_identity(
+            &session,
+            &address,
+            self.source_index
+                .as_ref()
+                .map(|index| index as &dyn broca_core::SessionRefResolver),
+        )
+        .map_err(|error| match error {
+            broca_session_convert::identity::IdentityError::Unresolved(detail) => {
+                unidentified(Failure::refused("identity_unresolved", detail))
+            }
+            broca_session_convert::identity::IdentityError::Inventory(detail) => io(detail),
+        })?;
         let leases = broca_core::FileLeaseStore::new(self.root.join("leases"));
         let _idle_fence = if background {
             let registry =

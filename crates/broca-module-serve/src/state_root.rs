@@ -224,8 +224,8 @@ pub fn refuse_stranded_legacy_state(
 }
 
 /// The state root a launching binary must use: resolved, then checked for stranded state at the
-/// old default. Both `ck-broca` and `broca-run` call this, so they cannot disagree about where
-/// the shared state lives.
+/// old default. `ck-broca` checks before opening storage so an old state directory cannot
+/// silently strand sessions when the configured root changes.
 pub fn resolve_for_launch_with(
     env: impl Fn(&str) -> Option<OsString>,
     connection_file: &Path,

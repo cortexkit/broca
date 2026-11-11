@@ -7,6 +7,9 @@
 
 use crate::catalog_refresh::CATALOG_POLL_INTERVAL;
 use crate::consumer_routes::ConsumerRoutes;
+use broca_catalog::live::WireFamilyId;
+use cortexkit_role_routing::declarations::{ConsumerDeclarations, RunnerDeclaration, RunnerPair};
+use std::collections::BTreeMap;
 use subc_protocol::manifest::Concurrency;
 use subc_protocol::manifest::{
     Bindings, CapabilityDeclarations, IdentityBinding, IdentityScope, LaunchNonceSource,
@@ -37,6 +40,7 @@ pub const OP_MOVE_TO_STORE: &str = "session.move_to_store";
 pub const OP_RESTORE_FROM_BACKUP: &str = "session.restore_from_backup";
 pub const OP_CANCEL: &str = "run.cancel";
 pub const OP_STATUS: &str = "run.status";
+pub const OP_RUN_ADMISSION: &str = "run.admission";
 pub const OP_RUN_EVENT_GET: &str = "run.event.get";
 pub const OP_READ: &str = "session.read";
 /// Daemon-scoped read of the credential vault's listing under broca's grants.
@@ -259,6 +263,11 @@ pub(crate) fn management_operations() -> Vec<ManagementOperation> {
             ),
         },
         ManagementOperation {
+            name: OP_RUN_ADMISSION.to_string(),
+            kind: ManagementOperationKind::Query,
+            description: Some("Read one run's frozen admission metadata without session content.".to_string()),
+        },
+        ManagementOperation {
             name: OP_RUN_EVENT_GET.to_string(),
             kind: ManagementOperationKind::Query,
             description: Some(
@@ -412,6 +421,73 @@ pub(crate) fn observability_surfaces() -> Vec<ObservabilitySurface> {
         name: OP_SUBSCRIBE.to_string(),
         kind: ObservabilityKind::Stream,
     }]
+}
+
+struct RoutingRunnerPair {
+    pair: RunnerPair,
+    opens_through_catalog_endpoint: bool,
+}
+
+fn routing_wire_api(family: WireFamilyId) -> &'static str {
+    match family {
+        WireFamilyId::AnthropicMessages => "anthropic.messages",
+        WireFamilyId::OpenAiResponses => "openai.responses",
+        WireFamilyId::OpenAiChat => "openai.chat_completions",
+        WireFamilyId::OpenAiResponsesChatgpt => "openai.chatgpt_responses",
+        WireFamilyId::Gemini => "google.generate_content",
+        WireFamilyId::GoogleCodeAssist => "google.code_assist",
+        WireFamilyId::BedrockConverse => "aws.bedrock_converse",
+    }
+}
+
+fn routing_runner_pairs() -> Vec<RoutingRunnerPair> {
+    let mut pairs = BTreeMap::new();
+    for method in crate::auth_routing::DEFAULT_METHOD_ORDER {
+        let mut insert = |family, catalog_endpoint| {
+            pairs
+                .entry((routing_wire_api(family), method.as_token()))
+                .and_modify(|all_catalog: &mut bool| *all_catalog &= catalog_endpoint)
+                .or_insert(catalog_endpoint);
+        };
+        if let Some(family) = crate::auth_routing::family_for_method(method) {
+            insert(family, false);
+        } else {
+            for family in broca_catalog::family::catalog_wire_families() {
+                insert(family, true);
+            }
+        }
+        // A family shared with a credential persona cannot require a catalog endpoint:
+        // routing's pair union must admit every provider broca can open through that pair.
+        for family in broca_catalog::family::credential_persona_families(method.as_token()) {
+            insert(family, false);
+        }
+    }
+    pairs
+        .into_iter()
+        .map(
+            |((wire_api, auth_method), opens_through_catalog_endpoint)| RoutingRunnerPair {
+                pair: RunnerPair::new(wire_api, auth_method),
+                opens_through_catalog_endpoint,
+            },
+        )
+        .collect()
+}
+
+fn routing_declarations() -> ConsumerDeclarations {
+    let pairs = routing_runner_pairs()
+        .into_iter()
+        .map(|pair| {
+            pair.pair
+                .with_requires_wire_api(pair.opens_through_catalog_endpoint)
+        })
+        .collect();
+    let mut runner = RunnerDeclaration::new(pairs);
+    runner.follows_account_choice = true;
+    let declarations = ConsumerDeclarations::new().with_runner(runner);
+    declarations
+        .validate()
+        .expect("broca's routing declaration is valid");
+    declarations
 }
 
 /// The manifest for a fully configured process: the archive timer's configuration shapes
@@ -630,7 +706,147 @@ pub fn manifest_configured(
     // this list does not name, and the list cannot enumerate them, because callers choose
     // them at request time.
     .consumes(consumer_routes.consumer_roles())
+    .role_declarations(BTreeMap::from([(
+        cortexkit_role_routing::ROLE_DECLARATIONS_KEY.to_string(),
+        serde_json::to_value(routing_declarations())
+            .expect("routing declaration serializes")
+            .as_object()
+            .expect("routing declaration is an object")
+            .clone(),
+    )]))
     .build()
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+    use cortexkit_role_routing::declarations::parse_consumer_declarations;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn runner_pairs_and_endpoint_sources_follow_admission_authorities() {
+        let pairs = routing_runner_pairs();
+        let actual: BTreeSet<_> = pairs
+            .iter()
+            .map(|pair| {
+                (
+                    pair.pair.wire_api.as_str(),
+                    pair.pair.auth_method.as_str(),
+                    pair.opens_through_catalog_endpoint,
+                )
+            })
+            .collect();
+        // auth_routing::family_for_method preserves catalog families for API key/OAuth;
+        // live.rs:1348-1406 opens those through catalog.resolve_route's wire.api, except
+        // credential_persona_route in family.rs, which gives OAuth/Responses its own base.
+        // live.rs:1167-1214 builds BOTH method overrides from family defaults instead:
+        // neither ChatGPT nor Code Assist requires a catalog endpoint.
+        let expected = BTreeSet::from([
+            ("anthropic.messages", "apikey", true),
+            ("anthropic.messages", "oauth", true),
+            ("aws.bedrock_converse", "apikey", true),
+            ("aws.bedrock_converse", "oauth", true),
+            ("google.code_assist", "antigravity", false),
+            ("google.generate_content", "apikey", true),
+            ("google.generate_content", "oauth", true),
+            ("openai.chat_completions", "apikey", true),
+            ("openai.chat_completions", "oauth", true),
+            ("openai.chatgpt_responses", "chatgpt", false),
+            ("openai.responses", "apikey", true),
+            ("openai.responses", "oauth", false),
+        ]);
+        assert_eq!(actual, expected);
+        assert_eq!(pairs.len(), expected.len(), "no duplicate pairs");
+        assert!(actual.contains(&("google.code_assist", "antigravity", false)));
+
+        // The contract vocabulary pins the external tokens; WireFamilyId's serde names
+        // are not routing's wire_api spellings.
+        assert_eq!(
+            actual
+                .iter()
+                .map(|(wire, _, _)| *wire)
+                .collect::<BTreeSet<_>>(),
+            cortexkit_role_routing::spellings::WIRE_APIS
+                .iter()
+                .copied()
+                .collect()
+        );
+        assert_eq!(
+            crate::auth_routing::DEFAULT_METHOD_ORDER
+                .iter()
+                .map(|method| method.as_token())
+                .collect::<BTreeSet<_>>(),
+            cortexkit_role_routing::spellings::AUTH_METHODS
+                .iter()
+                .copied()
+                .collect()
+        );
+    }
+
+    #[test]
+    fn hello_routing_slot_passes_the_whole_slot_parser() {
+        let manifest = serde_json::to_value(manifest("broca")).unwrap();
+        let slot = &manifest["role_declarations"][cortexkit_role_routing::ROLE_DECLARATIONS_KEY];
+        let parsed = parse_consumer_declarations(slot).expect("the entire routing slot validates");
+        assert!(parsed.consumers.is_empty());
+        let runner = parsed.runner.as_ref().expect("broca declares its runner");
+        assert!(runner.follows_account_choice);
+        assert!(!runner.requires_wire_api());
+        assert!(!slot["runner"]
+            .as_object()
+            .unwrap()
+            .contains_key("requires_wire_api"));
+        assert_eq!(runner.pairs.len(), 12);
+        let sources = routing_runner_pairs();
+        for (pair, source) in runner.pairs.iter().zip(&sources) {
+            assert_eq!(pair.wire_api, source.pair.wire_api);
+            assert_eq!(pair.auth_method, source.pair.auth_method);
+            assert_eq!(
+                pair.requires_wire_api,
+                Some(source.opens_through_catalog_endpoint)
+            );
+            assert_eq!(
+                runner.requires_wire_api_for_pair(pair),
+                source.opens_through_catalog_endpoint
+            );
+            assert_eq!(
+                runner.admits_pair_row(pair, false),
+                !source.opens_through_catalog_endpoint
+            );
+            assert!(runner.admits_pair_row(pair, true));
+        }
+        assert_eq!(
+            runner
+                .pairs
+                .iter()
+                .filter(|pair| runner.requires_wire_api_for_pair(pair))
+                .count(),
+            9
+        );
+        // The pair field is Option<bool>: Some(false) is explicit, not omitted like
+        // the runner-level false. Pin the real manifest bytes, including that distinction.
+        let expected = concat!(
+            r#"{"runner":{"follows_account_choice":true,"pairs":["#,
+            r#"{"auth_method":"apikey","requires_wire_api":true,"wire_api":"anthropic.messages"},"#,
+            r#"{"auth_method":"oauth","requires_wire_api":true,"wire_api":"anthropic.messages"},"#,
+            r#"{"auth_method":"apikey","requires_wire_api":true,"wire_api":"aws.bedrock_converse"},"#,
+            r#"{"auth_method":"oauth","requires_wire_api":true,"wire_api":"aws.bedrock_converse"},"#,
+            r#"{"auth_method":"antigravity","requires_wire_api":false,"wire_api":"google.code_assist"},"#,
+            r#"{"auth_method":"apikey","requires_wire_api":true,"wire_api":"google.generate_content"},"#,
+            r#"{"auth_method":"oauth","requires_wire_api":true,"wire_api":"google.generate_content"},"#,
+            r#"{"auth_method":"apikey","requires_wire_api":true,"wire_api":"openai.chat_completions"},"#,
+            r#"{"auth_method":"oauth","requires_wire_api":true,"wire_api":"openai.chat_completions"},"#,
+            r#"{"auth_method":"chatgpt","requires_wire_api":false,"wire_api":"openai.chatgpt_responses"},"#,
+            r#"{"auth_method":"apikey","requires_wire_api":true,"wire_api":"openai.responses"},"#,
+            r#"{"auth_method":"oauth","requires_wire_api":false,"wire_api":"openai.responses"}]}}"#,
+        );
+        assert_eq!(serde_json::to_string(slot).unwrap(), expected);
+        assert_eq!(serde_json::to_value(parsed).unwrap(), *slot);
+        println!(
+            "routing/v1 HELLO slot: {}",
+            serde_json::to_string(slot).unwrap()
+        );
+    }
 }
 
 #[cfg(test)]
@@ -668,6 +884,7 @@ mod provenance_tests {
                 "module_version",
                 "protocol_ver",
                 "provides",
+                "role_declarations",
                 "self_signals",
                 "trust_tier",
             ],
@@ -1050,12 +1267,11 @@ mod consumes_tests {
         );
     }
 
-    /// broca never opens a route to routing without the vault (the mock providers resolve no
-    /// accounts), so it declares none then, and always declares it with the vault. The removed
-    /// `legacy_static` switch cannot turn the route off any more: the config that set it is
-    /// refused.
+    /// Only an explicit routing id can be named at boot; a catalog-discovered provider is not
+    /// known yet. Without the vault, mock providers resolve no accounts and need no routing id.
+    /// The removed `legacy_static` switch remains refused.
     #[test]
-    fn the_routing_module_is_declared_exactly_alongside_the_vault() {
+    fn only_explicit_routing_modules_are_declared_alongside_the_vault() {
         assert!(crate::account_routing::AccountSelectionConfig::parse(
             r#"{"account_selection":{"routing_module":"routing-b","legacy_static":true}}"#,
         )
@@ -1069,10 +1285,14 @@ mod consumes_tests {
 
         let (_, services) =
             declared(&ConsumerRoutes::resolve(None, true).with_account_selection(&active));
-        assert_eq!(
-            services,
-            vec!["fusiform", "claustrum", "prefrontal-routing", "striatum"]
-        );
+        assert_eq!(services, vec!["fusiform", "claustrum"]);
+
+        let explicit = crate::account_routing::AccountSelectionConfig {
+            routing_module: Some("routing-b".into()),
+        };
+        let (_, services) =
+            declared(&ConsumerRoutes::resolve(None, false).with_account_selection(&explicit));
+        assert_eq!(services, vec!["fusiform"]);
     }
 
     /// Each configuration-dependent entry appears and disappears with its knob.

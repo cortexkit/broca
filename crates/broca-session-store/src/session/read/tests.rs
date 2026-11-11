@@ -31,6 +31,7 @@ cipher_tests!(
     a_held_assistant_message_reads_last_at_its_reserved_ordinal,
     records_from_a_seq_read_both_streams_sealed_and_open,
     a_ledger_record_reads_back_by_its_seq_from_the_open_log_and_sealed_history,
+    ledger_tail_stops_before_older_segments_and_reads_the_open_log_once,
 );
 
 fn triple() -> SessionTriple {
@@ -568,5 +569,106 @@ fn records_from_a_seq_read_both_streams_sealed_and_open(cipher: Cipher) {
                 appended.iter().filter(|(seq, _)| *seq >= first).collect();
             assert_eq!(ours, expected, "from {first}");
         }
+    });
+}
+
+fn ledger_tail_stops_before_older_segments_and_reads_the_open_log_once(cipher: Cipher) {
+    let backend = MemoryBackend::default();
+    block_on(async {
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(cipher), false)
+            .await
+            .unwrap();
+        let mut older = Vec::new();
+        let mut newest = Vec::new();
+        let mut answers = Vec::new();
+        for n in 0..30 {
+            let mut cut = None;
+            for (part, batch) in round(n).into_iter().enumerate() {
+                let seq = session.append(&batch, true).await.unwrap();
+                if part == 0 && (n == 12 || n == 24) {
+                    cut = Some(seq);
+                }
+            }
+            if n == 5 || n == 18 || n == 28 {
+                let record = Record::Event(crate::record::Event {
+                    name: format!("tail_answer_{n}"),
+                    run_id: Some("r".into()),
+                    body: None,
+                });
+                let seq = session
+                    .append(std::slice::from_ref(&record), true)
+                    .await
+                    .unwrap();
+                if n != 5 {
+                    answers.push((seq, record));
+                }
+            }
+            if let Some(cut) = cut {
+                session.seal(Some(cut), 0).await.unwrap();
+                let segments: Vec<_> = backend
+                    .object_names(&addr())
+                    .into_iter()
+                    .filter(|name| name.ends_with("/l"))
+                    .collect();
+                if n == 12 {
+                    older = segments;
+                } else {
+                    newest = segments
+                        .into_iter()
+                        .filter(|name| !older.contains(name))
+                        .collect();
+                }
+            }
+        }
+        assert_eq!(older.len(), 1);
+        assert_eq!(newest.len(), 1);
+        session.close().await.unwrap();
+        let loaded = Session::load(&backend, addr(), &triple(), &deployment(cipher))
+            .await
+            .unwrap();
+        for name in older {
+            backend.set_object(&addr(), &name, b"unreadable old segment".to_vec());
+        }
+        let logs = backend.log_reads();
+        let objects = backend.object_reads();
+        let open = loaded
+            .ledger_tail_until(|record| record == &answers[1].1)
+            .await
+            .unwrap();
+        assert_eq!(open.last(), Some(&answers[1]));
+        assert_eq!(
+            backend.object_reads() - objects,
+            0,
+            "an open-log answer fetches no sealed object"
+        );
+        assert!(
+            backend.log_reads() - logs <= 1,
+            "at most one open-log fallback read"
+        );
+
+        let logs = backend.log_reads();
+        let objects = backend.object_reads();
+        let sealed = loaded
+            .ledger_tail_until(|record| record == &answers[0].1)
+            .await
+            .unwrap();
+        assert_eq!(sealed.last(), Some(&answers[0]));
+        assert!(sealed.windows(2).all(|pair| pair[0].0 > pair[1].0));
+        let directory_pages = loaded.head().ledger_dir.as_ref().unwrap().level as usize + 1;
+        assert_eq!(
+            backend.object_reads() - objects,
+            directory_pages + 1,
+            "only directory pages and the newest ledger segment are fetched"
+        );
+        assert!(
+            backend.log_reads() - logs <= 1,
+            "the sealed search does not reread the open log"
+        );
+        // The counted segment is indispensable, not a cache or a synthesized answer.
+        backend.set_object(&addr(), &newest[0], b"unreadable newest segment".to_vec());
+        assert!(loaded
+            .ledger_tail_until(|record| record == &answers[0].1)
+            .await
+            .is_err());
     });
 }

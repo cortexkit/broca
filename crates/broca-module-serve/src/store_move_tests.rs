@@ -1408,6 +1408,7 @@ mod cutover {
     use broca_module::ServeHandler;
 
     mod background;
+    mod rekey;
 
     fn engine(rig: &Rig, archives: bool, live: bool) -> Engine {
         let backup = rig.dir.with_extension("converted-sources");

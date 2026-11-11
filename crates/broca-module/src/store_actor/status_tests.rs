@@ -214,6 +214,112 @@ fn reply<T: serde::Serialize>(reply: Result<T, crate::serve::ServeError>) -> Val
     }
 }
 
+async fn admission_case(store: bool) {
+    let side = side(store, vec![text_step("answer", "done")], None).await;
+    let manifest: broca_wal::PlanManifest = serde_json::from_value(json!({
+        "plan": "{}", "plan_identity": "admission-plan", "composition_digest": "composition",
+        "tools": [], "system_text": "private system text", "system_digest": "system",
+        "join_version": 1, "role_versions": {}, "declarations": [],
+        "fetches": [{"provider": "aft", "catalog_digest": "catalog", "tools": [],
+                     "declarations_frozen": {"late_results": true, "result_formats": {"read": "text"}}}]
+    })).unwrap();
+    let key = SendKey::Minted;
+    let mut request = request("private input");
+    request.tools = None;
+    request.policy_allowed = Default::default();
+    let request = side.caller.shape("admitted", &key, request);
+    let outcome = side
+        .registry
+        .route_submission_with_order(
+            &side.key,
+            RunId("admitted".into()),
+            request,
+            RunKind::FreshOrResume,
+            key,
+            false,
+            broca_protocol::Delivery::Queue,
+            Some(crate::actor::SendPlan {
+                identity: "admission-plan".into(),
+                manifest: Some(Arc::new(manifest)),
+                model_check: None,
+            }),
+            None,
+            None,
+            None,
+            Some("sidekick".into()),
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(outcome, SendOutcome::Active { .. }), "{outcome:?}");
+    side.closed().await;
+    assert_eq!(side.in_store(), store);
+    let admission = side
+        .registry
+        .run_admission(&side.key, RunId("admitted".into()))
+        .await
+        .unwrap()
+        .expect("the run has a start");
+    assert_eq!(admission.run_id, "admitted");
+    assert_eq!(admission.session_class.as_deref(), Some("sidekick"));
+    assert!(admission.started_at_ms > 0);
+    assert_eq!(
+        admission.storage,
+        if store {
+            broca_wire::RunAdmissionStorage::Store
+        } else {
+            broca_wire::RunAdmissionStorage::Wal
+        }
+    );
+    let value = serde_json::to_value(admission).unwrap();
+    assert_eq!(
+        value["fetches"],
+        json!([{ "provider": "aft", "declarations_frozen": {
+            "late_results": true, "result_formats": {"read": "text"}
+        }}])
+    );
+    assert!(value.get("requires").is_none());
+    assert!(!value.to_string().contains("private"));
+}
+
+#[tokio::test]
+async fn run_admission_wal_freezes_class_and_aft_declarations() {
+    admission_case(false).await;
+}
+
+#[tokio::test]
+async fn run_admission_store_freezes_class_and_aft_declarations() {
+    admission_case(true).await;
+}
+
+#[tokio::test]
+async fn run_admission_unknown_is_absent_on_both_storages() {
+    for store in [false, true] {
+        let side = side(store, vec![text_step("answer", "done")], None).await;
+        side.send("known", "hello").await;
+        side.closed().await;
+        assert!(side
+            .registry
+            .run_admission(&side.key, RunId("unknown".into()))
+            .await
+            .unwrap()
+            .is_none());
+        let known = side
+            .registry
+            .run_admission(&side.key, RunId("known".into()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(known.session_class.is_none());
+        assert!(known.fetches.is_empty());
+        assert!(serde_json::to_value(known)
+            .unwrap()
+            .get("session_class")
+            .is_none());
+    }
+}
+
 fn masked(mut value: Value) -> Value {
     fn walk(value: &mut Value) {
         match value {

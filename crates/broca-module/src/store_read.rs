@@ -185,8 +185,8 @@ async fn read_page_with_facts<B: SessionBackend>(
         .then(|| entries.pop())
         .flatten();
     let latest = session.operations.run.as_ref();
-    let older_send_ids = if include_display_facts {
-        session.older_entry_send_ids(&entries).await?
+    let send_ids = if include_display_facts {
+        session.entry_send_ids(&entries).await?
     } else {
         BTreeMap::new()
     };
@@ -203,9 +203,9 @@ async fn read_page_with_facts<B: SessionBackend>(
         messages.push(page_message(entry, next, latest)?);
         turns.push(crate::store_calls::TurnOf::of(entry));
         let mut served = display_facts(entry).served();
-        served.send_id = served
-            .send_id
-            .or_else(|| older_send_ids.get(&entry.ordinal).cloned());
+        if let Some(id) = send_ids.get(&entry.ordinal) {
+            served.send_id = id.clone();
+        }
         served.notices.extend(
             imported_notices(
                 session,
@@ -685,7 +685,7 @@ pub fn latest_tools<B: SessionBackend>(
         .ok_or_else(|| StoreReadError::Setup(format!("run {} has no start", run.run_id)))?;
     let (config, _) = broca_session_loop::run::run_config_members(
         start,
-        |part| parts.get(part).map_err(StoreReadError::Setup),
+        |part| broca_session_loop::parts::value(parts, part).map_err(StoreReadError::Setup),
         || StoreReadError::Setup("a run's frozen choices aren't an object".into()),
     )?;
     let tools: Vec<broca_protocol::request::Tool> = match config.get("tools") {

@@ -47,10 +47,11 @@ const VAULT_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const OPENAI_DECISIONS_SERVED: bool = false;
 
 /// Session classes whose new sessions start in the new session storage, when the creating send
-/// asks only for what it serves (other sends still start on today's storage). New sessions move
-/// over one class at a time; heads always start there. Sidekicks go first: they are short-lived,
-/// carry a retention policy, and a failure surfaces as one answer the asking agent retries.
-const NEW_STORAGE_SESSION_CLASSES: &[&str] = &["sidekick"];
+/// asks only for what it serves (other sends still start on today's storage). Heads always start
+/// there. These are every class core sends for its workers and seats: masons, one-shot calls,
+/// Athena consult seats and spec seats, besides sidekicks. A send naming no class still starts on
+/// today's storage until the cutover converts it.
+const NEW_STORAGE_SESSION_CLASSES: &[&str] = &["sidekick", "mason", "oneshot", "consult", "spec"];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     broca_module::diagnostics::initialize();
@@ -3844,7 +3845,7 @@ mod executor {
                 {
                     routing_decision_error = Some(serde_json::from_value::<ProviderError>(serde_json::json!({
                         "class":"permanent", "provider_code":"routing_decision_refused",
-                        "provider": self.routing.as_ref().map(|routing| routing.config().routing_module.as_deref().unwrap_or(broca_module_serve::account_routing::DEFAULT_ROUTING_MODULE)).unwrap_or("routing"),
+                        "provider": self.routing.as_ref().map(|routing| routing.config().routing_module.as_deref().unwrap_or(cortexkit_role_routing::PROVIDES)).unwrap_or("routing"),
                         "reason":"unknown_decision", "message":"Routing refused the caller's unknown or expired decision; no model request was sent."
                     })).expect("routing refusal is a provider error"));
                     AccountChoice::NotApplicable
@@ -4486,6 +4487,32 @@ mod executor {
                     .await
                     .map_err(StoreRunError::Loop);
             }
+            if mode == StoreRunMode::Resume
+                && control
+                    .cancel
+                    .as_ref()
+                    .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+            {
+                // A caller may cancel because sign-in or provider access is unavailable. Closing
+                // the existing run must not depend on admitting another model call first.
+                let provider = broca_core::provider::StubProvider::new(Vec::new());
+                let seams = store_seams(
+                    &provider,
+                    tools,
+                    req,
+                    out,
+                    &control,
+                    held.as_deref(),
+                    None,
+                    &now,
+                    None,
+                    None,
+                    self.max_same_account_wait,
+                );
+                return Box::pin(broca_session_loop::resume(writer, parts, &seams))
+                    .await
+                    .map_err(StoreRunError::Loop);
+            }
             let stored = store_history(writer, parts).map_err(StoreRunError::Loop)?;
             let last_config = stored.prior_run.as_ref().map(|prior| prior.config.clone());
             let history = EpisodeHistory {
@@ -4529,15 +4556,7 @@ mod executor {
                      otherwise"
                 ))));
             }
-            // A resume whose cancel is already tripped only ends its paused run, with no model
-            // call (`broca_session_loop::resume`), so a credential still waiting for sign-in
-            // doesn't stop it: an interrupt ends a run paused for sign-in this way.
-            let ends_paused_run = mode == StoreRunMode::Resume
-                && control
-                    .cancel
-                    .as_ref()
-                    .is_some_and(tokio_util::sync::CancellationToken::is_cancelled);
-            if routing_decision_error.is_none() && resolution.pause.is_some() && !ends_paused_run {
+            if routing_decision_error.is_none() && resolution.pause.is_some() {
                 return Err(StoreRunError::Admission(RunError::Config(
                     "a run that starts paused for sign-in isn't served on the new session \
                      storage yet"
@@ -6144,6 +6163,7 @@ mod executor {
         include!("provider_override_tests.rs");
         include!("recorded_resume_tests.rs");
         include!("store_run_tests.rs");
+        include!("store_run_cancel_tests.rs");
         include!("tool_name_alias_tests.rs");
         include!("queued_service_tier_tests.rs");
         include!("service_tier_writer_tests.rs");

@@ -136,6 +136,68 @@ fn ids(ids: &[&str]) -> Vec<ToolCallId> {
 }
 
 #[test]
+fn session_class_adoption_is_first_label_only_and_checkpoint_compatible() {
+    use crate::codec::Message as _;
+    let labelled = |class: &str| {
+        let Record::RunStart(mut start) = start() else {
+            unreachable!()
+        };
+        start.session_class = Some(class.into());
+        Record::RunStart(start)
+    };
+    let operations = fold(&[start(), labelled("head"), labelled("mason")]).unwrap();
+    assert_eq!(
+        operations.owner.adopted_session_class.as_deref(),
+        Some("head")
+    );
+    assert!(operations
+        .owner
+        .first_start
+        .as_ref()
+        .unwrap()
+        .session_class
+        .is_none());
+    let mut checkpoint = crate::checkpoint::Checkpoint {
+        covers_through: 3,
+        next_seq: 4,
+        conversation: crate::fold::conversation::Conversation::new(false),
+        operational: operations,
+        transcript_base: None,
+        ledger_base: None,
+        activity_ms: None,
+    };
+    let decoded = crate::checkpoint::Checkpoint::decode(&checkpoint.encode()).unwrap();
+    assert_eq!(
+        decoded.operational.owner.adopted_session_class.as_deref(),
+        Some("head")
+    );
+    assert!(
+        crate::codec::Fields::new(&decoded.operational.owner.encode(), "Owner")
+            .any(|field| field.unwrap().number == 7)
+    );
+    checkpoint.operational.owner.adopted_session_class = None;
+    assert!(
+        !crate::codec::Fields::new(&checkpoint.operational.owner.encode(), "Owner")
+            .any(|field| field.unwrap().number == 7)
+    );
+    let decoded = crate::checkpoint::Checkpoint::decode(&checkpoint.encode()).unwrap();
+    assert_eq!(decoded.operational.owner.adopted_session_class, None);
+    let field = super::Owner::SCHEMA
+        .iter()
+        .find(|field| field.name == "adopted_session_class")
+        .unwrap();
+    assert_eq!(field.reset, "never");
+    assert_eq!(field.bound, crate::fold::Bound::Fixed);
+    assert_eq!(
+        fold(&[labelled("head"), labelled("mason")])
+            .unwrap()
+            .owner
+            .adopted_session_class,
+        None
+    );
+}
+
+#[test]
 fn a_call_with_an_intent_and_no_outcome_interrupts_the_run() {
     let records = [
         start(),

@@ -397,8 +397,7 @@ fn frozen_media(
     else {
         return Ok(None);
     };
-    let config = parts
-        .get(part)
+    let config = broca_session_loop::parts::shared::<serde_json::Value, _>(parts, part)
         .map_err(|error| StoreHeadError::Setup(format!("run {}: {error}", start.run_id)))?;
     Ok(config.get("media").cloned())
 }

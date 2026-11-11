@@ -29,13 +29,41 @@ cipher_tests!(
     mismatched_recorded_digest_never_warms
 );
 
+mod idle;
+
 #[derive(Default)]
 struct Warming {
     sent: Arc<Mutex<Vec<Vec<u8>>>>,
+    clock: Option<Arc<std::sync::atomic::AtomicU64>>,
+    no_cache: bool,
+    fail: bool,
+    store: Option<crate::store_actor::tests::LoopExecutor>,
 }
 
 #[async_trait]
 impl RunExecutor for Warming {
+    async fn execute_on_store(
+        &self,
+        job: crate::executor::StoreRunJob,
+        out: mpsc::Sender<OutputEvent>,
+    ) -> crate::executor::StoreRunEnd {
+        self.store
+            .as_ref()
+            .expect("a real-run test installs a loop")
+            .execute_on_store(job, out)
+            .await
+    }
+    fn warm_costs(
+        &self,
+        _: &broca_wal::RunConfig,
+        _: u64,
+        _: u64,
+    ) -> Result<broca_core::keep_warm::WarmCosts, String> {
+        Ok(broca_core::keep_warm::WarmCosts {
+            warm: 0.4,
+            bust: 1.0,
+        })
+    }
     async fn execute(
         &self,
         _: RunJob,
@@ -45,6 +73,9 @@ impl RunExecutor for Warming {
     }
 
     async fn warm(&self, job: WarmJob) -> Result<broca_core::WarmSent, WarmError> {
+        if self.fail {
+            return Err(WarmError::Unavailable("test refusal".into()));
+        }
         let frozen = serde_json::from_value(job.config.frozen_render_config.clone()).unwrap();
         let probe = Probe {
             live: broca_provider::LiveProvider::new(
@@ -54,7 +85,14 @@ impl RunExecutor for Warming {
             ),
             sent: Arc::clone(&self.sent),
         };
-        crate::executor::send_warm(&probe, job.base).await
+        let mut sent = crate::executor::send_warm(&probe, job.base).await?;
+        if let Some(clock) = &self.clock {
+            sent.sent_at_ms = clock.load(std::sync::atomic::Ordering::SeqCst);
+        }
+        if self.no_cache {
+            sent.usage.cached_input_tokens = Some(0);
+        }
+        Ok(sent)
     }
 }
 

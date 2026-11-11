@@ -364,7 +364,14 @@ pub(crate) fn run(args: &Args) {
         report.applied_views += 1;
         report.with_applied_view += u64::from(state.applied().is_some());
         let applied = match state.applied_received() {
-            Some(view) => json!({ "ok": { "view": view } }),
+            Some(view) => {
+                let mut answer = json!({ "ok": { "view": view } });
+                // The WAL-backed session.applied_view returns the provider recorded for this view.
+                if let Some(module) = state.applied_by() {
+                    answer["ok"]["applied_by"] = json!(module);
+                }
+                answer
+            }
             None => json!({ "ok": {} }),
         };
         if report.compare(

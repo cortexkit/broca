@@ -790,6 +790,10 @@ fn shape(reply: StoreReadReply) -> String {
         value
     }
     match reply {
+        StoreReadReply::RunAdmission(reply) => match reply {
+            Ok(reply) => serde_json::to_value(reply).unwrap().to_string(),
+            Err(error) => format!("{error:?}"),
+        },
         StoreReadReply::RunStatus(reply) => match reply {
             Ok(reply) => without_step(serde_json::to_value(reply).unwrap()).to_string(),
             Err(error) => format!("{error:?}"),
