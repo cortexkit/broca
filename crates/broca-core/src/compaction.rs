@@ -37,7 +37,7 @@ mod stored;
 pub(crate) use released::{ReleasedHistory, ReleasedMessages, ReleasedNeeds};
 pub use runtime::{
     apply_idle_view, CompactionConfig, CompactionPlane, CompactionUnavailable, CompactionViews,
-    ViewReadyInbox,
+    ProviderCapabilities, ViewReadyInbox,
 };
 pub(crate) use stored::{OriginalMessages, StoredTranscript};
 pub(crate) mod runtime;

@@ -2341,9 +2341,9 @@ impl broca_core::CompactionPlane for AttributingCompactor {
         Err(broca_core::CompactionUnavailable)
     }
 
-    async fn provider_capabilities(&self, provider: &str) -> Option<Vec<String>> {
+    async fn provider_capabilities(&self, provider: &str) -> broca_core::ProviderCapabilities {
         assert_eq!(provider, "provider");
-        Some(vec![
+        broca_core::ProviderCapabilities::Declared(vec![
             "compaction-provider/v2".into(),
             broca_core::compaction_v2::protocol::COMPACTION_ENTRY_SPEAKS_FOR_PROVIDES.into(),
         ])

@@ -167,6 +167,8 @@ pub enum EntryAttribution {
     /// What the session's actor found in the provider's catalog entry at the latest Setup it
     /// sent, or learned since.
     Known(bool),
+    /// No successful catalog read has established the declaration yet. Entries must wait.
+    Unknown,
     /// Nothing is known here, as for a session no actor holds: the provider's catalog entry is
     /// read through this plane when the read is served. A provider can't withdraw the
     /// declaration without restarting, and a restarted provider is sent Setup again, so the
@@ -178,6 +180,7 @@ impl std::fmt::Debug for EntryAttribution {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Known(declared) => f.debug_tuple("Known").field(declared).finish(),
+            Self::Unknown => f.write_str("Unknown"),
             Self::Catalog(plane) => f
                 .debug_tuple("Catalog")
                 .field(&plane.as_ref().map(|_| "plane"))
@@ -188,20 +191,26 @@ impl std::fmt::Debug for EntryAttribution {
 
 impl EntryAttribution {
     /// Whether `provider` declared entry attribution.
-    pub async fn declared(&self, provider: &str) -> bool {
+    pub async fn declared(
+        &self,
+        provider: &str,
+    ) -> broca_core::compaction_v2::runtime::AttributionDeclaration {
+        use broca_core::compaction_v2::runtime::AttributionDeclaration;
         match self {
-            Self::Known(declared) => *declared,
-            Self::Catalog(Some(plane)) => tokio::time::timeout(
-                broca_core::compaction_v2::runtime::CALL_DEADLINE,
-                plane.provider_capabilities(provider),
-            )
-            .await
-            .ok()
-            .flatten()
-            .is_some_and(|provides| {
-                broca_core::compaction_v2::protocol::provides_entry_speaks_for(&provides)
-            }),
-            Self::Catalog(None) => false,
+            Self::Known(declared) => AttributionDeclaration::known(*declared),
+            Self::Unknown => AttributionDeclaration::Unknown,
+            Self::Catalog(Some(plane)) => match plane.provider_capabilities(provider).await {
+                broca_core::ProviderCapabilities::Declared(provides) => {
+                    AttributionDeclaration::known(
+                        broca_core::compaction_v2::protocol::provides_entry_speaks_for(&provides),
+                    )
+                }
+                broca_core::ProviderCapabilities::NotInCatalog => {
+                    AttributionDeclaration::NotDeclared
+                }
+                broca_core::ProviderCapabilities::Unknown => AttributionDeclaration::Unknown,
+            },
+            Self::Catalog(None) => AttributionDeclaration::NotDeclared,
         }
     }
 }
@@ -260,7 +269,13 @@ pub async fn serve_compaction<B: SessionBackend>(
             // Admission let only the provider the plan in force names through, so the caller
             // is that provider.
             let declared = match caller {
-                Some(provider) => attribution.declared(provider).await,
+                Some(provider) => attribution.declared(provider).await.value().ok_or_else(|| {
+                    Refusal::new(
+                        "projection_not_ready",
+                        "compaction entry attribution is unknown because the provider catalog could not be read",
+                        Some(serde_json::json!({"class": broca_protocol::ErrorClass::Transient.shared_class()})),
+                    )
+                })?,
                 None => false,
             };
             broca_core::compaction_v2::entries::gate_speaks_for(&mut page.entries, declared);

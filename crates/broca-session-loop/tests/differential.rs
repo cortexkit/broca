@@ -1914,8 +1914,8 @@ impl broca_core::CompactionPlane for CompactionSpy {
     }
 
     /// The provider reads the signed floor, so both loops must report the same one.
-    async fn provider_capabilities(&self, _: &str) -> Option<Vec<String>> {
-        Some(vec![
+    async fn provider_capabilities(&self, _: &str) -> broca_core::ProviderCapabilities {
+        broca_core::ProviderCapabilities::Declared(vec![
             cortexkit_role_compaction::COMPACTION_SIGNED_FLOOR_PROVIDES.into(),
         ])
     }
@@ -9837,7 +9837,7 @@ impl broca_core::CompactionPlane for SetupFailsOnce {
             .await
     }
 
-    async fn provider_capabilities(&self, module: &str) -> Option<Vec<String>> {
+    async fn provider_capabilities(&self, module: &str) -> broca_core::ProviderCapabilities {
         self.inner.provider_capabilities(module).await
     }
 }

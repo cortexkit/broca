@@ -729,7 +729,7 @@ impl CompactionPlane for Attributing {
         Ok(serde_json::value::to_raw_value(&answer).unwrap())
     }
 
-    async fn provider_capabilities(&self, provider: &str) -> Option<Vec<String>> {
+    async fn provider_capabilities(&self, provider: &str) -> broca_core::ProviderCapabilities {
         assert_eq!(
             provider, "provider",
             "the catalog entry read is the plan's provider's"
@@ -741,7 +741,7 @@ impl CompactionPlane for Attributing {
                 broca_core::compaction_v2::protocol::COMPACTION_ENTRY_SPEAKS_FOR_PROVIDES.into(),
             );
         }
-        Some(provides)
+        broca_core::ProviderCapabilities::Declared(provides)
     }
 }
 
