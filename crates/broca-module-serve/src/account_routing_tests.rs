@@ -1893,9 +1893,9 @@ fn routing_config_preserves_explicit_ids_including_the_legacy_default() {
     for text in ["{}", r#"{"account_selection":{}}"#] {
         let config = AccountSelectionConfig::parse(text).unwrap();
         assert_eq!(config.routing_module, None);
-        assert_eq!(
-            config.routing_modules(),
-            vec!["prefrontal-routing", "striatum"]
+        assert!(
+            config.routing_modules().is_empty(),
+            "the default is discovered, not named"
         );
     }
     for id in ["prefrontal-routing", "striatum", "routing-b", " routing-b "] {

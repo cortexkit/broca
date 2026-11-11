@@ -55,10 +55,6 @@ use serde_json::{json, Map, Value};
 
 use crate::auth_routing::{AuthMethod, CredentialId};
 
-/// The routing module broca asks when `broca.jsonc` names none.
-pub const DEFAULT_ROUTING_MODULE: &str = "prefrontal-routing";
-/// The fallback routing module, tried only when no module id was configured.
-pub const ROUTING_MODULE_FALLBACK: &str = "striatum";
 /// Choose the account for one admission.
 pub const ACCOUNT_FOR_OP: &str = "route.account_for";
 /// Report admission, attempt and run-end evidence for an admission.
@@ -111,8 +107,9 @@ const RUNNER: &str = "broca";
 /// below, so a leftover setting fails the load instead of silently doing nothing.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AccountSelectionConfig {
-    /// An explicit routing module id. Unset tries `DEFAULT_ROUTING_MODULE`, then
-    /// `ROUTING_MODULE_FALLBACK`.
+    /// An explicit routing module id, used as-is without discovery or fallback. Unset resolves
+    /// the sole nonce-verified `routing/v1` provider from the daemon catalog. The provider is
+    /// cached and resolved again once if an open reports that the module is gone or unavailable.
     pub routing_module: Option<String>,
 }
 
@@ -173,13 +170,7 @@ impl AccountSelectionConfig {
     }
 
     pub fn routing_modules(&self) -> Vec<String> {
-        match &self.routing_module {
-            Some(module) => vec![module.clone()],
-            None => vec![
-                DEFAULT_ROUTING_MODULE.into(),
-                ROUTING_MODULE_FALLBACK.into(),
-            ],
-        }
+        self.routing_module.iter().cloned().collect()
     }
 }
 
@@ -316,53 +307,93 @@ enum RouteSlot {
     Ready(broca_subc::RouteHandle),
 }
 
-/// Probe both default module ids before waiting, so a reserved or warming first module cannot
-/// hide the fallback. Single-attempt opens retain subc's shared availability gates: a cached
-/// refusal has the same code as the original open and needs the same fall-through decision.
-async fn open_routing_route<'a, F, Fut, T>(
-    configured: Option<&'a str>,
+/// Only the daemon's launch-nonce attestation makes a catalog claim eligible: an unverified
+/// process registering the same capability must never receive account choices or reports.
+async fn resolve_routing_module(conn: &broca_subc::SubcConnection) -> Result<String, String> {
+    let mut providers = conn
+        .catalog_list()
+        .await
+        .map_err(|error| format!("routing catalog: {error}"))?
+        .into_iter()
+        .filter(|entry| {
+            entry.nonce_verified
+                && entry.capabilities.as_ref().is_some_and(|capabilities| {
+                    capabilities
+                        .provides
+                        .iter()
+                        .any(|role| role == cortexkit_role_routing::PROVIDES)
+                })
+        })
+        .map(|entry| entry.module_id)
+        .collect::<Vec<_>>();
+    providers.sort();
+    providers.dedup();
+    match providers.as_slice() {
+        [module] => Ok(module.clone()),
+        [] => Err("routing_provider_unavailable: no nonce-verified routing/v1 provider".into()),
+        _ => Err(format!(
+            "routing_provider_ambiguous: multiple nonce-verified routing/v1 providers: {}",
+            providers.join(", ")
+        )),
+    }
+}
+
+/// Cache discovery independently of the route. A disappeared provider gets one fresh catalog
+/// read per open, never an id fallback. Warming keeps the existing bounded backoff instead.
+async fn open_routing_route(
+    conn: &broca_subc::SubcConnection,
+    configured: Option<&str>,
+    resolved: &Mutex<Option<String>>,
+    identity: &BindIdentity,
     retry: broca_subc::RouteOpenRetry,
-    mut attempt: F,
-) -> Result<T, broca_subc::ConnError>
-where
-    F: FnMut(&'a str, broca_subc::RouteOpenRetry) -> Fut,
-    Fut: std::future::Future<Output = Result<T, broca_subc::ConnError>>,
-{
+) -> Result<broca_subc::RouteHandle, String> {
     if let Some(module) = configured {
-        return attempt(module, retry).await;
+        return conn
+            .route_open_management_within(module, identity, retry)
+            .await
+            .map_err(|error| format!("route.open to routing module '{module}': {error}"));
     }
     let deadline = tokio::time::Instant::now() + retry.budget;
     let mut interval = broca_subc::ROUTE_OPEN_RETRY_INTERVAL.min(retry.max_interval);
-    // In broca-subc a zero budget still admits one cold open, but never retries a refusal.
+    let cached = resolved.lock().unwrap().clone();
+    let mut module = match cached {
+        Some(module) => module,
+        None => resolve_routing_module(conn).await?,
+    };
+    *resolved.lock().unwrap() = Some(module.clone());
+    let mut refreshed = false;
+    // Keep disappearance refusals visible here instead of retrying an obsolete id in subc.
     let once = broca_subc::RouteOpenRetry::within(Duration::ZERO, Duration::ZERO);
     loop {
-        for module in [DEFAULT_ROUTING_MODULE, ROUTING_MODULE_FALLBACK] {
-            match attempt(module, once).await {
-                Ok(route) => return Ok(route),
-                Err(error)
-                    if matches!(
-                        error.code(),
-                        Some("unknown_module" | "target_unavailable" | "module_warming")
-                    ) =>
-                {
-                    if module == ROUTING_MODULE_FALLBACK {
-                        let remaining =
-                            deadline.saturating_duration_since(tokio::time::Instant::now());
-                        if remaining.is_zero() {
-                            return Err(error);
-                        }
-                        tokio::time::sleep(interval.min(remaining)).await;
-                        // No new pair starts after the budget, including when the sleep used
-                        // its last remaining time. In-flight attempts keep subc's own timeout.
-                        if tokio::time::Instant::now() >= deadline {
-                            return Err(error);
-                        }
-                        interval = interval.saturating_mul(2).min(retry.max_interval);
-                    }
+        let error = match conn
+            .route_open_management_within(&module, identity, once)
+            .await
+        {
+            Ok(route) => return Ok(route),
+            Err(error) => error,
+        };
+        if matches!(
+            error.code(),
+            Some("unknown_module" | "target_unavailable" | "module_removed")
+        ) {
+            *resolved.lock().unwrap() = None;
+            if !refreshed {
+                refreshed = true;
+                module = resolve_routing_module(conn).await?;
+                *resolved.lock().unwrap() = Some(module.clone());
+                continue;
+            }
+        } else if error.code() == Some("module_warming") {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if !remaining.is_zero() {
+                tokio::time::sleep(interval.min(remaining)).await;
+                if tokio::time::Instant::now() < deadline {
+                    interval = interval.saturating_mul(2).min(retry.max_interval);
+                    continue;
                 }
-                Err(error) => return Err(error),
             }
         }
+        return Err(format!("route.open to routing module '{module}': {error}"));
     }
 }
 
@@ -374,6 +405,7 @@ where
 pub struct SubcRoutingTransport {
     conn: Arc<broca_subc::SubcConnection>,
     module_id: Option<String>,
+    resolved_module: Arc<Mutex<Option<String>>>,
     identity: BindIdentity,
     route: Arc<Mutex<RouteSlot>>,
     capabilities: tokio::sync::Mutex<Option<(broca_subc::RouteHandle, Vec<String>)>>,
@@ -390,6 +422,7 @@ impl SubcRoutingTransport {
         Self {
             conn,
             module_id,
+            resolved_module: Arc::new(Mutex::new(None)),
             identity,
             route: Arc::new(Mutex::new(RouteSlot::Empty)),
             capabilities: tokio::sync::Mutex::new(None),
@@ -409,23 +442,18 @@ impl SubcRoutingTransport {
                     *slot = RouteSlot::Opening(rx.clone());
                     let conn = Arc::clone(&self.conn);
                     let module_id = self.module_id.clone();
+                    let resolved_module = Arc::clone(&self.resolved_module);
                     let identity = self.identity.clone();
                     let route = Arc::clone(&self.route);
                     tokio::spawn(async move {
                         let opened = open_routing_route(
+                            &conn,
                             module_id.as_deref(),
+                            &resolved_module,
+                            &identity,
                             broca_subc::RouteOpenRetry::default_patience(),
-                            |id, retry| conn.route_open_management_within(id, &identity, retry),
                         )
-                        .await
-                        .map_err(|error| {
-                            format!(
-                                "route.open to routing module '{}': {error}",
-                                module_id
-                                    .as_deref()
-                                    .unwrap_or("prefrontal-routing or striatum")
-                            )
-                        });
+                        .await;
                         *route.lock().unwrap() = match &opened {
                             Ok(handle) => RouteSlot::Ready(*handle),
                             Err(_) => RouteSlot::Empty,
@@ -546,7 +574,7 @@ impl RoutingTransport for SubcRoutingTransport {
                 "routing module '{}': {error}",
                 self.module_id
                     .as_deref()
-                    .unwrap_or("prefrontal-routing or striatum")
+                    .unwrap_or(cortexkit_role_routing::PROVIDES)
             )
         })
         .await

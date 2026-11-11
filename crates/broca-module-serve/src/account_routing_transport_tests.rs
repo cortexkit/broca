@@ -1,5 +1,5 @@
 use super::*;
-use subc_control::{ClientControlRequest, ClientControlResponse};
+use subc_control::{CatalogEntry, ClientControlRequest, ClientControlResponse};
 use subc_protocol::{Flags, Frame, FrameType, Priority};
 use subc_transport::{read_frame, write_frame};
 
@@ -8,6 +8,8 @@ struct RoutingDaemon {
     requests: Arc<Mutex<Vec<Vec<u8>>>>,
     opens: Arc<AtomicUsize>,
     opened_modules: Arc<Mutex<Vec<String>>>,
+    catalog: Arc<Mutex<Vec<CatalogEntry>>>,
+    catalog_reads: Arc<AtomicUsize>,
     hang_reopens: Arc<std::sync::atomic::AtomicBool>,
     server: tokio::task::JoinHandle<()>,
 }
@@ -59,11 +61,15 @@ impl RoutingDaemon {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let opens = Arc::new(AtomicUsize::new(0));
         let opened_modules = Arc::new(Mutex::new(Vec::new()));
+        let catalog = Arc::new(Mutex::new(vec![routing_provider("routing-provider", true)]));
+        let catalog_reads = Arc::new(AtomicUsize::new(0));
         let hang_reopens = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let server = {
             let requests = Arc::clone(&requests);
             let opens = Arc::clone(&opens);
             let opened_modules = Arc::clone(&opened_modules);
+            let catalog = Arc::clone(&catalog);
+            let catalog_reads = Arc::clone(&catalog_reads);
             let hang_reopens = Arc::clone(&hang_reopens);
             tokio::spawn(async move {
                 let (mut stream, _) = listener.accept().await.unwrap();
@@ -82,8 +88,27 @@ impl RoutingDaemon {
                         (0, FrameType::Request) => {
                             let request: ClientControlRequest =
                                 serde_json::from_slice(&frame.body).unwrap();
+                            if matches!(request, ClientControlRequest::CatalogList { .. }) {
+                                catalog_reads.fetch_add(1, Ordering::SeqCst);
+                                let response = ClientControlResponse::CatalogList {
+                                    generation: 1,
+                                    modules: catalog.lock().unwrap().clone(),
+                                    subc_ops: Vec::new(),
+                                };
+                                let response = Frame::build(
+                                    FrameType::Response,
+                                    Flags::new(false, Priority::Interactive, false),
+                                    frame.header.channel,
+                                    frame.header.epoch,
+                                    frame.header.corr,
+                                    serde_json::to_vec(&response).unwrap(),
+                                )
+                                .unwrap();
+                                write_frame(&mut stream, &response).await.unwrap();
+                                continue;
+                            }
                             let ClientControlRequest::RouteOpen { target, .. } = request else {
-                                panic!("expected route.open");
+                                panic!("expected catalog.list or route.open");
                             };
                             let subc_protocol::RouteTarget::ManagementSurface { module_id } =
                                 target
@@ -154,6 +179,8 @@ impl RoutingDaemon {
             requests,
             opens,
             opened_modules,
+            catalog,
+            catalog_reads,
             hang_reopens,
             server,
         }
@@ -174,6 +201,16 @@ impl RoutingDaemon {
     }
 }
 
+fn routing_provider(module: &str, verified: bool) -> CatalogEntry {
+    CatalogEntry::new(module, Vec::new(), Vec::new())
+        .with_capabilities(Some(subc_protocol::manifest::CapabilityDeclarations {
+            provides: vec!["routing/v1".into()],
+            requires: Vec::new(),
+            must_never_reach: Vec::new(),
+        }))
+        .with_nonce_verified(verified)
+}
+
 fn chosen_reply() -> Result<Vec<u8>, Vec<u8>> {
     let routing = FakeRouting::choosing("acct-b", "oauth:anthropic:acct-b");
     let reply = routing.reply.lock().unwrap().clone().unwrap().unwrap();
@@ -181,14 +218,16 @@ fn chosen_reply() -> Result<Vec<u8>, Vec<u8>> {
 }
 
 #[tokio::test]
-async fn routing_default_legacy_cold_open_makes_one_attempt_and_keeps_the_route() {
-    let daemon = RoutingDaemon::start_with_opens(
-        chosen_reply(),
-        false,
-        vec![(DEFAULT_ROUTING_MODULE, None)],
-        None,
-    )
-    .await;
+async fn routing_sole_verified_provider_resolves_and_caches_route_and_module() {
+    let daemon = RoutingDaemon::start(chosen_reply(), false).await;
+    // Unverified claimants and unrelated verified modules cannot become routing targets.
+    let unrelated =
+        CatalogEntry::new("other-role", Vec::new(), Vec::new()).with_nonce_verified(true);
+    daemon
+        .catalog
+        .lock()
+        .unwrap()
+        .extend([routing_provider("unverified-claimant", false), unrelated]);
     for _ in 0..2 {
         let choice = choose(
             &daemon.client(),
@@ -202,49 +241,172 @@ async fn routing_default_legacy_cold_open_makes_one_attempt_and_keeps_the_route(
     }
     assert_eq!(
         *daemon.opened_modules.lock().unwrap(),
-        vec!["prefrontal-routing"]
+        vec!["routing-provider"]
     );
-    assert_eq!(daemon.request_bodies().len(), 2);
+    assert_eq!(daemon.catalog_reads.load(Ordering::SeqCst), 1);
+    daemon.stale_cached_route().await;
+    assert!(daemon
+        .transport
+        .request(b"report".to_vec())
+        .await
+        .unwrap()
+        .is_ok());
+    assert_eq!(
+        daemon.catalog_reads.load(Ordering::SeqCst),
+        1,
+        "a stale handle alone does not invalidate the provider"
+    );
+    assert_eq!(daemon.request_bodies().len(), 3);
 }
 
 #[tokio::test]
-async fn routing_default_striatum_only_falls_through_unknown_module_and_keeps_the_route() {
-    let daemon = RoutingDaemon::start_with_opens(
-        chosen_reply(),
-        false,
-        vec![
-            (DEFAULT_ROUTING_MODULE, Some("unknown_module")),
-            (ROUTING_MODULE_FALLBACK, None),
-        ],
-        None,
-    )
-    .await;
-    for _ in 0..2 {
-        let choice = choose(
+async fn routing_provider_rename_re_resolves_once_for_each_disappearance_code() {
+    for code in ["unknown_module", "target_unavailable", "module_removed"] {
+        let daemon = RoutingDaemon::start_with_opens(
+            chosen_reply(),
+            false,
+            vec![
+                ("routing-provider", None),
+                ("routing-provider", Some(code)),
+                ("renamed-provider", None),
+            ],
+            None,
+        )
+        .await;
+        assert!(daemon
+            .transport
+            .request(b"first".to_vec())
+            .await
+            .unwrap()
+            .is_ok());
+        daemon.stale_cached_route().await;
+        *daemon.catalog.lock().unwrap() = vec![routing_provider("renamed-provider", true)];
+        for body in [b"second".to_vec(), b"third".to_vec()] {
+            assert!(daemon.transport.request(body).await.unwrap().is_ok());
+        }
+        assert_eq!(
+            *daemon.opened_modules.lock().unwrap(),
+            vec!["routing-provider", "routing-provider", "renamed-provider"],
+            "{code}"
+        );
+        assert_eq!(daemon.catalog_reads.load(Ordering::SeqCst), 2, "{code}");
+        assert_eq!(
+            daemon.request_bodies(),
+            vec![b"first".to_vec(), b"second".to_vec(), b"third".to_vec()]
+        );
+    }
+}
+
+#[tokio::test]
+async fn routing_missing_or_unverified_provider_refuses_routing_unavailable() {
+    for catalog in [Vec::new(), vec![routing_provider("self-registered", false)]] {
+        let daemon = RoutingDaemon::start(chosen_reply(), false).await;
+        *daemon.catalog.lock().unwrap() = catalog;
+        let error = daemon.transport.route().await.unwrap_err();
+        assert!(error.contains("routing_provider_unavailable"), "{error}");
+        let refusal = choose(
             &daemon.client(),
             "oauth:anthropic",
             false,
             Some(two_accounts()),
         )
         .await
-        .unwrap();
-        assert!(matches!(choice, AccountChoice::Routed { .. }));
+        .expect_err("no verified routing provider must refuse admission");
+        assert_eq!(
+            refusal,
+            ChoiceRefusal::Unavailable(RoutingUnavailable::unreachable())
+        );
+        assert_eq!(
+            broca_core::RunError::from(refusal).admission_error_class(),
+            ErrorClass::Transient
+        );
+        assert_eq!(daemon.opens.load(Ordering::SeqCst), 0);
+        assert!(daemon.request_bodies().is_empty());
     }
-    assert_eq!(
-        *daemon.opened_modules.lock().unwrap(),
-        vec!["prefrontal-routing", "striatum"]
-    );
-    assert_eq!(daemon.request_bodies().len(), 2);
 }
 
 #[tokio::test]
-async fn routing_default_warming_legacy_falls_through_to_striatum_at_once() {
+async fn routing_two_verified_providers_refuse_with_distinct_diagnostic() {
+    let daemon = RoutingDaemon::start(chosen_reply(), false).await;
+    daemon
+        .catalog
+        .lock()
+        .unwrap()
+        .push(routing_provider("second-provider", true));
+    let error = daemon.transport.route().await.unwrap_err();
+    assert!(error.contains("routing_provider_ambiguous"), "{error}");
+    assert!(
+        error.contains("routing-provider, second-provider"),
+        "{error}"
+    );
+    let refusal = choose(
+        &daemon.client(),
+        "oauth:anthropic",
+        false,
+        Some(two_accounts()),
+    )
+    .await
+    .expect_err("ambiguous providers must not choose an account");
+    assert_eq!(
+        refusal,
+        ChoiceRefusal::Unavailable(RoutingUnavailable::unreachable())
+    );
+    assert_eq!(daemon.opens.load(Ordering::SeqCst), 0);
+    assert!(daemon.request_bodies().is_empty());
+}
+
+#[tokio::test]
+async fn routing_explicit_id_is_used_as_is_without_catalog_or_fallback() {
+    for refusal in [None, Some("unknown_module")] {
+        let daemon = RoutingDaemon::start_with_opens(
+            chosen_reply(),
+            false,
+            vec![(" explicit-id ", refusal)],
+            Some(" explicit-id ".into()),
+        )
+        .await;
+        let result = daemon.transport.route().await;
+        if refusal.is_some() {
+            assert!(result.unwrap_err().contains("unknown_module"));
+        } else {
+            result.unwrap();
+        }
+        assert_eq!(
+            *daemon.opened_modules.lock().unwrap(),
+            vec![" explicit-id "]
+        );
+        assert_eq!(daemon.catalog_reads.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn routing_disappearance_re_resolves_at_most_once_before_refusing() {
+    for code in ["unknown_module", "target_unavailable", "module_removed"] {
+        let daemon = RoutingDaemon::start_with_opens(
+            chosen_reply(),
+            false,
+            vec![("gone-provider", Some(code)), ("gone-provider", Some(code))],
+            None,
+        )
+        .await;
+        *daemon.catalog.lock().unwrap() = vec![routing_provider("gone-provider", true)];
+        let error = daemon.transport.route().await.unwrap_err();
+        assert!(error.contains(code), "{error}");
+        assert_eq!(daemon.catalog_reads.load(Ordering::SeqCst), 2, "{code}");
+        assert!(daemon.opens.load(Ordering::SeqCst) <= 2, "{code}");
+        assert!(daemon.transport.resolved_module.lock().unwrap().is_none());
+        assert!(daemon.request_bodies().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn routing_warming_provider_retries_without_re_resolving() {
     let daemon = RoutingDaemon::start_with_opens(
         chosen_reply(),
         false,
         vec![
-            (DEFAULT_ROUTING_MODULE, Some("module_warming")),
-            (ROUTING_MODULE_FALLBACK, None),
+            ("routing-provider", Some("module_warming")),
+            ("routing-provider", None),
         ],
         None,
     )
@@ -252,196 +414,59 @@ async fn routing_default_warming_legacy_falls_through_to_striatum_at_once() {
     daemon.transport.route().await.unwrap();
     assert_eq!(
         *daemon.opened_modules.lock().unwrap(),
-        vec!["prefrontal-routing", "striatum"]
+        vec!["routing-provider", "routing-provider"]
     );
+    assert_eq!(daemon.catalog_reads.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
-async fn routing_default_both_warming_retry_the_pair_until_legacy_registers() {
+async fn routing_warming_retries_stop_at_the_deadline() {
     let daemon = RoutingDaemon::start_with_opens(
         chosen_reply(),
         false,
-        vec![
-            (DEFAULT_ROUTING_MODULE, Some("module_warming")),
-            (ROUTING_MODULE_FALLBACK, Some("module_warming")),
-            (DEFAULT_ROUTING_MODULE, None),
-        ],
+        vec![("routing-provider", Some("module_warming"))],
         None,
     )
     .await;
-    let choice = choose(
-        &daemon.client(),
-        "oauth:anthropic",
-        false,
-        Some(two_accounts()),
-    )
-    .await
-    .unwrap();
-    assert!(matches!(choice, AccountChoice::Routed { .. }));
-    assert_eq!(
-        *daemon.opened_modules.lock().unwrap(),
-        vec!["prefrontal-routing", "striatum", "prefrontal-routing"]
-    );
-}
-
-#[tokio::test]
-async fn routing_default_final_refusal_surfaces_without_fallback_or_message_matching() {
-    let daemon = RoutingDaemon::start_with_opens(
-        chosen_reply(),
-        false,
-        vec![(DEFAULT_ROUTING_MODULE, Some("access_denied"))],
-        None,
-    )
-    .await;
-    let error = daemon.transport.route().await.unwrap_err();
-    assert!(error.contains("access_denied"), "{error}");
-    assert_eq!(
-        *daemon.opened_modules.lock().unwrap(),
-        vec!["prefrontal-routing"]
-    );
-    assert!(daemon.request_bodies().is_empty());
-}
-
-#[tokio::test]
-async fn routing_explicit_legacy_id_never_falls_back() {
-    let daemon = RoutingDaemon::start_with_opens(
-        chosen_reply(),
-        false,
-        vec![(DEFAULT_ROUTING_MODULE, Some("unknown_module"))],
-        Some(DEFAULT_ROUTING_MODULE.into()),
-    )
-    .await;
-    let error = daemon.transport.route().await.unwrap_err();
-    assert!(error.contains("unknown_module"), "{error}");
-    assert_eq!(
-        *daemon.opened_modules.lock().unwrap(),
-        vec!["prefrontal-routing"]
-    );
-}
-
-fn open_refusal(code: &str) -> broca_subc::ConnError {
-    broca_subc::ConnError::Rejected(
-        broca_subc::connection::RejectedMessage::from_error_frame_body_for_test(
-            &serde_json::to_vec(&json!({"code":code,"message":"misleading unknown_module"}))
-                .unwrap(),
-        ),
-    )
-}
-
-#[tokio::test(start_paused = true)]
-async fn routing_cached_unknown_module_falls_through_without_another_wire_open() {
-    let mut wire_opens = Vec::new();
-    let result = open_routing_route(
-        None,
-        broca_subc::RouteOpenRetry::default_patience(),
-        |id, retry| {
-            assert_eq!(retry.budget, Duration::ZERO);
-            std::future::ready(if id == DEFAULT_ROUTING_MODULE {
-                // The injected attempt callback returns a cached refusal without an open request.
-                Err(open_refusal("unknown_module"))
-            } else {
-                wire_opens.push(id);
-                Ok(7)
-            })
-        },
-    )
-    .await
-    .unwrap();
-    assert_eq!(result, 7);
-    assert_eq!(wire_opens, vec!["striatum"]);
-}
-
-#[tokio::test(start_paused = true)]
-async fn routing_cached_warming_pairs_back_off_then_use_new_registration_within_deadline() {
     let start = tokio::time::Instant::now();
-    let mut attempts = Vec::new();
-    let result = open_routing_route(
+    let error = open_routing_route(
+        &daemon.transport.conn,
         None,
-        broca_subc::RouteOpenRetry::default_patience(),
-        |id, retry| {
-            assert_eq!(retry.budget, Duration::ZERO);
-            attempts.push((id, tokio::time::Instant::now() - start));
-            std::future::ready(if attempts.len() == 6 {
-                Ok(7)
-            } else {
-                Err(open_refusal("module_warming"))
-            })
-        },
-    )
-    .await
-    .unwrap();
-    assert_eq!(result, 7);
-    assert_eq!(
-        attempts,
-        vec![
-            ("prefrontal-routing", Duration::ZERO),
-            ("striatum", Duration::ZERO),
-            ("prefrontal-routing", Duration::from_millis(100)),
-            ("striatum", Duration::from_millis(100)),
-            ("prefrontal-routing", Duration::from_millis(300)),
-            ("striatum", Duration::from_millis(300)),
-        ]
-    );
-    assert!(tokio::time::Instant::now() - start < broca_subc::ROUTE_OPEN_RETRY_DEADLINE);
-}
-
-#[tokio::test(start_paused = true)]
-async fn routing_retry_pairs_stop_at_the_deadline_with_the_last_refusal_code() {
-    let start = tokio::time::Instant::now();
-    let mut attempts = Vec::new();
-    let error = open_routing_route::<_, _, ()>(
-        None,
-        broca_subc::RouteOpenRetry::within(Duration::from_millis(250), Duration::from_secs(1)),
-        |id, _| {
-            attempts.push((id, tokio::time::Instant::now() - start));
-            std::future::ready(Err(open_refusal("target_unavailable")))
-        },
+        &daemon.transport.resolved_module,
+        &session(),
+        broca_subc::RouteOpenRetry::within(Duration::from_millis(50), Duration::from_secs(1)),
     )
     .await
     .unwrap_err();
-    assert_eq!(error.code(), Some("target_unavailable"));
-    assert_eq!(
-        tokio::time::Instant::now() - start,
-        Duration::from_millis(250)
-    );
-    assert_eq!(attempts.len(), 4);
+    assert!(error.contains("module_warming"), "{error}");
+    assert!(tokio::time::Instant::now() - start >= Duration::from_millis(50));
+    assert_eq!(daemon.opens.load(Ordering::SeqCst), 1);
+    assert_eq!(daemon.catalog_reads.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
-async fn routing_non_fallthrough_codes_are_final_on_either_id() {
+async fn routing_other_open_codes_are_final_without_message_matching() {
     for terminal in [
         "access_denied",
         "module_reloading",
         "module_timeout",
         "scope_changed",
     ] {
-        for final_on in [DEFAULT_ROUTING_MODULE, ROUTING_MODULE_FALLBACK] {
-            let mut attempts = Vec::new();
-            let error = open_routing_route::<_, _, ()>(
-                None,
-                broca_subc::RouteOpenRetry::default_patience(),
-                |id, _| {
-                    attempts.push(id);
-                    std::future::ready(Err(open_refusal(if id == final_on {
-                        terminal
-                    } else {
-                        "unknown_module"
-                    })))
-                },
-            )
-            .await
-            .unwrap_err();
-            assert_eq!(error.code(), Some(terminal));
-            assert_eq!(attempts.last(), Some(&final_on));
-            assert_eq!(
-                attempts.len(),
-                if final_on == DEFAULT_ROUTING_MODULE {
-                    1
-                } else {
-                    2
-                }
-            );
-        }
+        let daemon = RoutingDaemon::start_with_opens(
+            chosen_reply(),
+            false,
+            vec![("routing-provider", Some(terminal))],
+            None,
+        )
+        .await;
+        let error = daemon.transport.route().await.unwrap_err();
+        assert!(error.contains(terminal), "{error}");
+        assert_eq!(
+            *daemon.opened_modules.lock().unwrap(),
+            vec!["routing-provider"]
+        );
+        assert_eq!(daemon.catalog_reads.load(Ordering::SeqCst), 1);
+        assert!(daemon.request_bodies().is_empty());
     }
 }
 

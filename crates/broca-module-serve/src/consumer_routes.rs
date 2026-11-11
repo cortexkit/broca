@@ -56,9 +56,9 @@ impl ConsumerRoutes {
         }
     }
 
-    /// Name the routing module `account_selection` configures, when this configuration opens a
-    /// route to it: always alongside the vault, and never without it (a mock provider resolves
-    /// no accounts).
+    /// Name an explicitly configured routing module alongside the vault. With no override the
+    /// provider is discovered at request time, so the boot manifest cannot name it. A mock
+    /// provider uses no vault and resolves no accounts.
     pub fn with_account_selection(
         mut self,
         config: &crate::account_routing::AccountSelectionConfig,
