@@ -406,7 +406,6 @@ pub struct SubcRoutingTransport {
     resolved_module: Arc<Mutex<Option<String>>>,
     identity: BindIdentity,
     route: Arc<Mutex<RouteSlot>>,
-    capabilities: tokio::sync::Mutex<Option<(broca_subc::RouteHandle, Vec<String>)>>,
     capability_reader: crate::routing_capabilities::RoutingCapabilities,
     #[cfg(test)]
     stale_opens_for_test: std::sync::atomic::AtomicUsize,
@@ -424,7 +423,6 @@ impl SubcRoutingTransport {
             resolved_module: Arc::new(Mutex::new(None)),
             identity,
             route: Arc::new(Mutex::new(RouteSlot::Empty)),
-            capabilities: tokio::sync::Mutex::new(None),
             capability_reader: Default::default(),
             #[cfg(test)]
             stale_opens_for_test: std::sync::atomic::AtomicUsize::new(0),
@@ -544,36 +542,6 @@ impl SubcRoutingTransport {
             })?;
         Ok((route, reply))
     }
-
-    async fn supports(&self, capability: &str) -> Result<bool, String> {
-        let route = self.route().await?;
-        let mut cached = self.capabilities.lock().await;
-        if let Some((known, capabilities)) = cached.as_ref() {
-            if *known == route {
-                return Ok(capabilities.iter().any(|name| name == capability));
-            }
-        }
-        let (route, response) = self
-            .request_on_cached_route(
-                serde_json::to_vec(&json!({"method":"role.describe","params":{}}))
-                    .expect("describe JSON"),
-                |error| error.to_string(),
-            )
-            .await?;
-        let capabilities = match response {
-            Ok(body) => serde_json::from_slice::<Value>(&body)
-                .ok()
-                .and_then(|value| value["result"]["capabilities"].as_array().cloned())
-                .unwrap_or_default()
-                .iter()
-                .filter_map(|name| name.as_str().map(str::to_owned))
-                .collect::<Vec<_>>(),
-            Err(_) => vec![],
-        };
-        let supported = capabilities.iter().any(|name| name == capability);
-        *cached = Some((route, capabilities));
-        Ok(supported)
-    }
 }
 
 #[async_trait::async_trait]
@@ -582,13 +550,19 @@ impl RoutingTransport for SubcRoutingTransport {
         self.capability_reader.read(self, name).await
     }
     async fn service_tier_supported(&self) -> Result<bool, String> {
-        self.supports("service_tier").await
+        self.capability("service_tier")
+            .await
+            .into_result("service_tier")
     }
     async fn observe_backoff_supported(&self) -> Result<bool, String> {
-        self.supports("observe_backoff").await
+        self.capability("observe_backoff")
+            .await
+            .into_result("observe_backoff")
     }
     async fn observe_credential_refused_supported(&self) -> Result<bool, String> {
-        self.supports("observe_credential_refused").await
+        self.capability("observe_credential_refused")
+            .await
+            .into_result("observe_credential_refused")
     }
     async fn request(&self, body: Vec<u8>) -> RoutingReply {
         self.request_on_cached_route(body, |error| {
