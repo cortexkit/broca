@@ -2177,6 +2177,8 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         // This library-only rig publishes no new-storage slot or deployment key. The metric
         // remains present as null, without degrading the healthy process.
         "store",
+        // No converter engine is published by this rig; its health remains present and idle.
+        "session_conversion",
         "catalog_age_ms",
         "catalog_source",
         // Runs executing right now, as opposed to open session slots. Shipped in v0.3.27 for
@@ -2338,6 +2340,19 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         metrics["store"],
         serde_json::Value::Null,
         "a process without a published new-storage slot reports no deployment-key state"
+    );
+    assert_eq!(
+        metrics["session_conversion"],
+        serde_json::json!({
+            "live_converting": false,
+            "live_background_converted": 0,
+            "live_skipped_busy": 0,
+            "live_remaining": 0,
+            "deferred_no_identity": 0,
+            "progress": {"sources": 0, "steps": {}, "outcomes": {}, "refusals": {}},
+            "error": null
+        }),
+        "a process without a converter engine reports idle conversion health"
     );
     assert_eq!(
         metrics["usage_observe"],
