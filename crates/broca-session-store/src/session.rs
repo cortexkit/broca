@@ -1037,6 +1037,7 @@ mod enrollment;
 pub use enrollment::EnrollmentOverlay;
 
 mod read;
+mod tail;
 pub use read::{served_window, window_entries, StoredEntry};
 mod stored;
 pub use stored::{LogFrom, StoredRecords};

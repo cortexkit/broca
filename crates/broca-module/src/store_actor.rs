@@ -712,6 +712,16 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 Some((&life.registry, life.gen)),
             )
             .await;
+        let stop_reason = match &exit {
+            Exit::Idle => None,
+            Exit::Expired(_) => Some("expired"),
+            Exit::Cut(_) => Some("released_or_moving"),
+            Exit::Closed => Some("released"),
+            Exit::Stop => Some("shutdown"),
+        };
+        if let Some(reason) = stop_reason {
+            life.registry.stop_idle_warm(&self.key, reason);
+        }
         let close = match &exit {
             Exit::Idle | Exit::Expired(_) | Exit::Cut(_) => {
                 life.registry.begin_close(&self.key, life.gen)
@@ -801,6 +811,13 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         let seal = seal.unwrap_or(&never);
         self.seal = seal.clone();
         self.recover().await;
+        if !self
+            .registry
+            .as_ref()
+            .is_some_and(|registry| registry.has_idle_warm(&self.key))
+        {
+            self.arm_idle_warm().await;
+        }
         // Deletions that came due while the session was closed run once the actor is idle, so
         // they never hold up a command or a run.
         self.collect_due = true;
@@ -1794,11 +1811,15 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 false
             }
             LineageCmd::IdleTick => self.idle_holds().is_empty(),
-            LineageCmd::Warm { lineage_id, reply } => {
+            LineageCmd::Warm {
+                lineage_id,
+                reply,
+                idle_auto,
+            } => {
                 if self.stopping {
                     let _ = reply.send(crate::actor::WarmOutcome::Reopen);
                 } else {
-                    self.warm(lineage_id, reply).await;
+                    self.warm(lineage_id, reply, idle_auto).await;
                 }
                 false
             }
@@ -1860,6 +1881,15 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         mode: StoreRunMode,
         cancel: CancellationToken,
     ) {
+        if self.warm.as_ref().is_some_and(|warm| warm.idle_auto) {
+            let pending = self.warm.as_mut().expect("idle warm exists");
+            pending.task.abort();
+            let result = (&mut pending.task).await;
+            self.finish_warm(result).await;
+        }
+        if let Some(registry) = &self.registry {
+            registry.stop_idle_warm(&self.key, "real_run");
+        }
         let mut media = match mode {
             StoreRunMode::Seal(_) => None,
             _ => Some(self.run_media().await),
@@ -2111,6 +2141,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     /// timer aren't recovered on this storage yet, so nothing is written for them.
     async fn recover(&mut self) {
         self.bill_owed().await;
+        self.bill_recorded_idle_warms().await;
         if self.park_held().await {
             return;
         }
@@ -2985,6 +3016,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             }
         }
         self.drain().await;
+        self.arm_idle_warm().await;
     }
 
     /// Ends the session's latest run `run_id`, whose loop stopped with `message` without writing
@@ -4091,6 +4123,7 @@ mod admission;
 mod apply_view;
 mod expiry;
 mod held;
+mod idle_warm;
 mod import;
 mod inline_import;
 mod keep_warm;

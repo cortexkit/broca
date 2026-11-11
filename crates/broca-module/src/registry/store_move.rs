@@ -290,6 +290,7 @@ impl LineageRegistry {
     /// owns the session: its read proofs, run-state and dispatch facts, sender, ownership and
     /// notice caches, and its idle transport.
     pub fn forget_moved_session(&self, key: &LineageKey) {
+        self.handle().stop_idle_warm(key, "moved");
         self.inner.opener.retire_session_transport(key);
         self.inner.read_only_lineages.lock().unwrap().remove(key);
         self.invalidate_history_caches_for_move(key);

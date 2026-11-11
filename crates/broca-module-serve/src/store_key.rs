@@ -202,6 +202,18 @@ impl KeyLoader {
              storage are served"
         );
         let refused = self.slot.take_refused();
+        // Encrypted heads could not be inspected before the deployment key arrived. Enumerate
+        // their held heads now, including finished runs whose idle cache timers need restoring.
+        match registry.recover_store_crash_orphans().await {
+            Ok(sweep) => {
+                for error in sweep.failed {
+                    tracing::warn!(target: "cache_warm", %error, "could not restore a store session after key load");
+                }
+            }
+            Err(error) => {
+                tracing::warn!(target: "cache_warm", %error, "could not enumerate idle heads after key load")
+            }
+        }
         if refused.is_empty() {
             return;
         }

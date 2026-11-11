@@ -27,6 +27,7 @@ use crate::executor::{WarmBase, WarmError, WarmJob};
 
 /// A warm whose request the executor is sending: what records it, and its caller.
 pub(super) struct PendingStoreWarm {
+    pub(super) idle_auto: bool,
     reply: oneshot::Sender<WarmOutcome>,
     run_id: String,
     step_id: u64,
@@ -54,6 +55,7 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> St
         &mut self,
         lineage_id: Option<String>,
         reply: oneshot::Sender<WarmOutcome>,
+        idle_auto: bool,
     ) {
         // At most one warm per session at a time, as today: a second would only repeat the
         // first's effect and cost.
@@ -63,9 +65,23 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> St
             )));
             return;
         }
-        let prepared = match self.prepare_warm(lineage_id).await {
+        if idle_auto {
+            if let Err(reason) = self.idle_warm_due().await {
+                if let Some(registry) = &self.registry {
+                    registry.stop_idle_warm(&self.key, &reason);
+                }
+                let _ = reply.send(WarmOutcome::Error(reason));
+                return;
+            }
+        }
+        let prepared = match self.prepare_warm(lineage_id, idle_auto).await {
             Ok(prepared) => prepared,
             Err(outcome) => {
+                if idle_auto {
+                    if let Some(registry) = &self.registry {
+                        registry.stop_idle_warm(&self.key, "warm_refused");
+                    }
+                }
                 let _ = reply.send(*outcome);
                 return;
             }
@@ -83,6 +99,7 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> St
                 })
         });
         self.warm = Some(PendingStoreWarm {
+            idle_auto,
             reply,
             run_id: prepared.run_id,
             step_id: prepared.step_id,
@@ -95,14 +112,18 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> St
 
     /// Decides every refusal, in today's order, and builds the request to warm. Nothing is sent
     /// or written here.
-    async fn prepare_warm(&self, lineage_id: Option<String>) -> Result<Prepared, Box<WarmOutcome>> {
+    async fn prepare_warm(
+        &mut self,
+        lineage_id: Option<String>,
+        idle_auto: bool,
+    ) -> Result<Prepared, Box<WarmOutcome>> {
         use broca_wire::WarmRefusalDetail as Refusal;
         let refuse = |detail| {
             Err(Box::new(WarmOutcome::Refused(
                 broca_wire::WarmRefusal::new(detail),
             )))
         };
-        let now_ms = crate::actor::epoch_ms();
+        let now_ms = (self.now_ms)();
         // A session in the new storage has no write-ahead log, so it has no lineage: a warm
         // naming one names a history this session isn't, as today's actor refuses a warm naming
         // a lineage its log doesn't have.
@@ -195,6 +216,48 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> St
                 },
             )))
         };
+        if idle_auto {
+            let request = self.recorded_warm_request().await.map_err(unavailable)?;
+            let records = self.idle_warm_records().await.map_err(unavailable)?;
+            let headers = records
+                .iter()
+                .find_map(|(_, record)| match record {
+                    Record::Warmed(warm) => warm.ratelimit_headers.clone(),
+                    Record::Attempt(attempt) => attempt
+                        .telemetry
+                        .as_ref()
+                        .and_then(|t| t.get("account_observation"))
+                        .and_then(|t| t.get("ratelimit_headers"))
+                        .cloned(),
+                    _ => None,
+                })
+                .and_then(|value| serde_json::from_value(value).ok())
+                .unwrap_or_default();
+            if let Err(reason) = self.executor.warm_quota(&request.config, &headers).await {
+                return refuse(Refusal::WarmUnsupported { reason });
+            }
+            // A quota query may outlast the prefix it was meant to protect.
+            self.idle_warm_due().await.map_err(unavailable)?;
+            let mut media = Some(self.run_media().await);
+            let renderer =
+                super::recorded_warm::media(&mut media, &request.config).map_err(unavailable)?;
+            return Ok(Prepared {
+                run_id: request.run_id.0.clone(),
+                step_id: request.step_id.0,
+                request_body_sha256: request.request_body_sha256.clone(),
+                ttl_ms: ttl_ms.unwrap_or_default(),
+                requested_ttl_ms,
+                job: WarmJob {
+                    session: self.key.clone(),
+                    config: request.config.clone(),
+                    base: WarmBase::RecordedMedia {
+                        request: Box::new(request),
+                        renderer,
+                    },
+                    attempt_hook: None,
+                },
+            });
+        }
         let opts = broca_session_loop::run::offline_request(
             &self.session,
             &self.parts,
@@ -260,6 +323,11 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> St
         let sent = match result {
             Ok(sent) => sent,
             Err(error) => {
+                if pending.idle_auto {
+                    if let Some(registry) = &self.registry {
+                        registry.stop_idle_warm(&self.key, "warm_failed");
+                    }
+                }
                 let _ = pending.reply.send(crate::actor::warm_error_outcome(
                     error,
                     pending.request_body_sha256,
@@ -268,6 +336,66 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> St
             }
         };
         let expires_at_ms = sent.sent_at_ms.saturating_add(pending.ttl_ms);
+        if pending.idle_auto {
+            let record = match super::keep_warm::warmed(
+                &broca_protocol::RunId(pending.run_id.clone()),
+                pending.step_id,
+                &pending.request_body_sha256,
+                &sent,
+                pending.ttl_ms,
+                pending.requested_ttl_ms,
+            ) {
+                Ok(record) => Record::Warmed(record),
+                Err(error) => {
+                    let _ = pending.reply.send(WarmOutcome::Error(error));
+                    return;
+                }
+            };
+            let (durable, written) = oneshot::channel();
+            self.record_kept_warm(super::keep_warm::WarmRecord {
+                record,
+                finished_at_ms: (self.now_ms)(),
+                request_body_bytes: sent.request_body_bytes,
+                durable,
+            })
+            .await;
+            if let Err(error) = written
+                .await
+                .unwrap_or_else(|_| Err("warm writer closed".into()))
+            {
+                if let Some(registry) = &self.registry {
+                    registry.stop_idle_warm(&self.key, "record_failed");
+                }
+                let _ = pending.reply.send(WarmOutcome::Error(error));
+                return;
+            }
+            if let Some(billing) = &self.billing {
+                if let Err(error) = billing
+                    .insert(&self.session, &self.key, &self.parts, &pending.run_id)
+                    .await
+                {
+                    if let Some(registry) = &self.registry {
+                        registry.stop_idle_warm(&self.key, "billing_failed");
+                    }
+                    let _ = pending.reply.send(WarmOutcome::Error(error));
+                    return;
+                }
+            }
+            self.arm_idle_warm().await;
+            let _ = pending
+                .reply
+                .send(WarmOutcome::Warmed(broca_wire::WarmReply {
+                    request_body_sha256: pending.request_body_sha256,
+                    warm_body_sha256: sent.warm_body_sha256,
+                    cache_read_tokens: sent.usage.cached_input_tokens,
+                    cache_write_tokens: sent.usage.cache_write_tokens,
+                    input_tokens: sent.usage.input_tokens,
+                    ttl_ms: pending.ttl_ms,
+                    expires_at_ms,
+                    expiry_basis: broca_wire::EXPIRY_BASIS_ESTIMATED.into(),
+                }));
+            return;
+        }
         let digest =
             |hex: &str| sha256_digest(hex).ok_or_else(|| format!("{hex} is not a SHA-256 digest"));
         let headers: std::collections::BTreeMap<String, String> =

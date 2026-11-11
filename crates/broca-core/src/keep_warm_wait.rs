@@ -13,6 +13,25 @@ pub struct WarmTiming {
     pub after_send_ms: Option<u64>,
 }
 
+impl WarmTiming {
+    /// Warming between turns and warming while a run waits for tools share the lead time
+    /// and send interval.
+    pub fn for_ttl(ttl_ms: u64, after_send_ms: Option<u64>) -> Self {
+        Self {
+            ttl_ms,
+            lead_ms: 30_000.min(ttl_ms / 2),
+            after_send_ms,
+        }
+    }
+
+    pub fn next_due_ms(self, sent_at_ms: u64) -> u64 {
+        sent_at_ms.saturating_add(
+            self.after_send_ms
+                .unwrap_or_else(|| self.ttl_ms.saturating_sub(self.lead_ms)),
+        )
+    }
+}
+
 pub enum WarmTick {
     Sent,
     SentWithCost {
@@ -109,11 +128,8 @@ fn now_ms() -> u64 {
 
 fn delay<C: ?Sized + Sync>(driver: &dyn KeepWarmDriver<C>, timing: WarmTiming) -> Option<Duration> {
     let sent = driver.last_sent_at_ms()?;
-    let interval = timing
-        .after_send_ms
-        .unwrap_or_else(|| timing.ttl_ms.saturating_sub(timing.lead_ms));
     Some(Duration::from_millis(
-        sent.saturating_add(interval).saturating_sub(now_ms()),
+        timing.next_due_ms(sent).saturating_sub(now_ms()),
     ))
 }
 

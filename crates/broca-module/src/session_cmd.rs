@@ -228,6 +228,8 @@ pub enum LineageCmd {
     /// generate nothing. `lineage_id`, when given, must name the session's current lineage.
     Warm {
         lineage_id: Option<String>,
+        /// Internal cache maintenance; never set by the public `session.warm` route.
+        idle_auto: bool,
         reply: oneshot::Sender<WarmOutcome>,
     },
     /// Internal: a warm's task ended (sent on the dedicated completion channel, like `RunFinished`).

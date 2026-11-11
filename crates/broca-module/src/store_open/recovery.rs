@@ -12,8 +12,12 @@ pub struct StoreRecoverySweep {
 
 impl crate::registry::LineageRegistry {
     /// Opens unfinished store sessions under the ordinary lease before serving begins. The
-    /// actor's open-time recovery seals crash orphans, parks held calls, and completes owed
-    /// batch barriers before it answers the status command. Finished sessions stay closed.
+    /// actor's open-time recovery seals crash orphans, parks held calls, and finishes pending
+    /// durable tool-batch writes before it answers the status command. Finished automatic heads also open
+    /// once to rebuild their idle cache timers; their actors close on the ordinary idle deadline.
+    /// The flag that closes a one-shot session immediately after its run is not durable. Core
+    /// never gives those sessions the long-lived `head` class; if a caller did, a restart would
+    /// re-arm that head too, still bounded by the durable auto warm cap.
     pub async fn recover_store_crash_orphans(&self) -> Result<StoreRecoverySweep, String> {
         let Some(runtime) = self.store_runtime() else {
             return Ok(StoreRecoverySweep::default());
@@ -50,11 +54,14 @@ impl crate::registry::LineageRegistry {
                     .await
                     {
                         Ok(view)
-                            if !view
-                                .operations
-                                .run
-                                .as_ref()
-                                .is_some_and(|run| run.finished.is_none()) =>
+                            if !view.operations.run.as_ref().is_some_and(|run| {
+                                run.finished.is_none()
+                                    || run.start.as_ref().is_some_and(|start| {
+                                        start.session_class.as_deref() == Some("head")
+                                            && start.keep_warm.as_ref()
+                                                == Some(&serde_json::json!("auto"))
+                                    })
+                            }) =>
                         {
                             return Ok(())
                         }

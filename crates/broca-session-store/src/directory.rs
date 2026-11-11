@@ -547,6 +547,30 @@ impl<B: SessionBackend> Pages<'_, B> {
         }
     }
 
+    /// The newest segment starting at or before `seq`, including across gaps between segments.
+    pub(crate) async fn last_at_or_before(
+        &self,
+        root: Option<&PageRef>,
+        seq: u64,
+    ) -> Result<Option<DirEntry>, DirectoryError> {
+        let Some(root) = root.filter(|root| root.first_seq <= seq) else {
+            return Ok(None);
+        };
+        let mut page = self.read(root).await?;
+        loop {
+            if page.level == 0 {
+                return Ok(page
+                    .entries
+                    .into_iter()
+                    .rfind(|entry| entry.first_seq <= seq));
+            }
+            let Some(child) = page.children.iter().rfind(|child| child.first_seq <= seq) else {
+                return Ok(None);
+            };
+            page = self.read(child).await?;
+        }
+    }
+
     /// Every entry whose segment holds a record at or after `seq`, in seq order. Walks only the
     /// pages whose range reaches `seq`.
     pub async fn entries_from(
