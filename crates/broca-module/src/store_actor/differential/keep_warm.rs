@@ -216,6 +216,7 @@ async fn side_events(
                 gate: None,
                 render_config,
                 notes_sends: true,
+                hold: None,
             },
             wal: Arc::clone(&wal),
             planes,

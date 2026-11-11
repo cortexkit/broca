@@ -3464,6 +3464,9 @@ async fn model_step<W: Writer, P: Provider, T>(
         .keep_warm
         .as_ref()
         .and_then(|driver| driver.step_seal());
+    // The call's options, shared with the provider. The published progress names them weakly,
+    // so the session's owner can size the request in flight without keeping it.
+    let opts = Arc::new(opts);
     if let Some(progress) = &seams.step_progress {
         let now = (seams.now_ms)();
         *progress.lock().unwrap() = Some(broca_protocol::provider::InFlightStep {
@@ -3474,6 +3477,7 @@ async fn model_step<W: Writer, P: Provider, T>(
             last_content_at_ms: None,
             max_content_gap_ms: None,
             max_content_gap_ended_at_ms: None,
+            request: broca_protocol::provider::InFlightRequest::of(&opts),
         });
     }
     if let Some(ready) = &seams.model_call_ready {
@@ -3501,7 +3505,7 @@ async fn model_step<W: Writer, P: Provider, T>(
         _ = seams.cancel.cancelled() => return Ok(Err(StepFailure::Cancelled)),
         events = seams
             .provider
-            .step_with_runtime(StepId(step_id), Arc::new(opts), runtime) => events,
+            .step_with_runtime(StepId(step_id), opts, runtime) => events,
     };
     let mut message = None;
     // The provider's `StepFinished` usage wins; its final `Finished` fills it only when the
@@ -5971,12 +5975,15 @@ async fn compaction_ctx<W: Writer, P, T>(
     }
     let has_view = session.state.lock().await.applied().is_some();
     session.runtime.begin_send(has_view).await;
+    // The run keeps one transcript for its life; its owner gets a weak handle on it, once.
+    let window = crate::compaction::WindowTranscript::default();
+    writer.share_window(window.downgrade());
     Ok(Some(crate::compaction::Ctx {
         earlier: crate::compaction::earlier_context(writer, admission, parts).await?,
         session,
         provider,
         preset,
-        window: Default::default(),
+        window,
     }))
 }
 

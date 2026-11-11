@@ -1624,6 +1624,15 @@ macro_rules! records {
             }
         }
 
+        impl crate::held::HeldBytes for Record {
+            fn heap_bytes(&self) -> usize {
+                match self {
+                    $( Record::$tvar(record) => crate::held::HeldBytes::heap_bytes(record), )*
+                    $( Record::$lvar(record) => crate::held::HeldBytes::heap_bytes(record), )*
+                }
+            }
+        }
+
         /// The stream of a known kind number.
         pub fn kind_stream(kind: u32) -> Option<Stream> {
             match kind {

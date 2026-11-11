@@ -2333,6 +2333,11 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 let _ = reply.send(self.status());
                 false
             }
+            // Today's storage isn't sized by the memory report; it counts this session only.
+            LineageCmd::MemoryReport { reply } => {
+                let _ = reply.send(crate::memory_report::MemoryAnswer::Legacy);
+                false
+            }
             LineageCmd::RunState { run_id, reply } => {
                 let _ = reply.send(self.resolve_run_state(&run_id).await);
                 false
@@ -2523,6 +2528,10 @@ impl<W: WalStore + 'static> LineageActor<W> {
             }
             LineageCmd::RunState { reply, .. } => {
                 let _ = reply.send(Err(format!("session writer is poisoned: {error}")));
+            }
+            // Today's storage isn't sized by the memory report; it counts this session only.
+            LineageCmd::MemoryReport { reply } => {
+                let _ = reply.send(crate::memory_report::MemoryAnswer::Legacy);
             }
             LineageCmd::Subscribe { reply, .. } => {
                 let _ = reply.send(if error == "expired" {
@@ -8672,6 +8681,9 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 LineageCmd::Status { reply } => {
                     let _ = reply.send(LineageStatus::Closing);
                 }
+                LineageCmd::MemoryReport { reply } => {
+                    let _ = reply.send(crate::memory_report::MemoryAnswer::Legacy);
+                }
                 LineageCmd::RunState { run_id, reply } => {
                     // Even while closing, a run-state lookup can be answered (it reads the
                     // index + WAL, not the live run state) — so a status racing close still
@@ -9639,6 +9651,10 @@ impl<W: WalStore + 'static> LineageActor<W> {
             LineageCmd::Warm { reply, .. } => {
                 let _ = reply.send(WarmOutcome::Reopen);
             }
+            LineageCmd::MemoryReport { reply } => {
+                let _ = reply.send(crate::memory_report::MemoryAnswer::Legacy);
+            }
+
             LineageCmd::WarmFinished { warm } => {
                 let _ = warm.0.reply.send(WarmOutcome::Reopen);
             }

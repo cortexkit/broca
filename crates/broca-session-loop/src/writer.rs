@@ -175,6 +175,11 @@ pub trait Writer {
     fn media(&self) -> Option<std::sync::Arc<dyn broca_core::tool_media::MediaCapture>> {
         None
     }
+
+    /// Hands the session's owner a weak handle on the transcript a run keeps, once, when the run
+    /// starts, so the owner's memory report can size it while the run holds it. A writer whose
+    /// owner reports nothing ignores it.
+    fn share_window(&self, _window: crate::compaction::WeakWindow) {}
 }
 
 impl<B: SessionBackend> Writer for Session<B> {

@@ -254,6 +254,9 @@ struct ActiveRun {
     tool_media: Arc<broca_session_loop::PendingMedia>,
     /// The actor's end of the run's keep-warm, for a run that keeps its cache warm.
     warming: Option<keep_warm::RunWarming>,
+    /// Where the run leaves a weak handle on the compaction transcript it keeps, which the
+    /// memory report sizes while the run holds it.
+    window: broca_session_loop::shared::RunWindow,
 }
 
 /// A run to start: the send's request and what the run's start records about the send.
@@ -1734,6 +1737,12 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 }
                 false
             }
+            LineageCmd::MemoryReport { reply } => {
+                let _ = reply.send(crate::memory_report::MemoryAnswer::Store(Box::new(
+                    self.memory(),
+                )));
+                false
+            }
             LineageCmd::Status { reply } => {
                 let status = match &self.run {
                     Some(active) => LineageStatus::Active {
@@ -1982,10 +1991,12 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             ..Default::default()
         };
         let tool_media = Arc::new(broca_session_loop::PendingMedia::default());
+        let window = broca_session_loop::shared::RunWindow::default();
         let (writer, link) = ActorWriter::new(
             &self.session,
             Some(Arc::clone(&tool_media) as Arc<dyn broca_core::tool_media::MediaCapture>),
         );
+        let writer = writer.sharing_window(Arc::clone(&window));
         let parts: Box<dyn Parts> = Box::new(self.parts.clone());
         let executor = Arc::clone(&self.executor);
         let (out, mut events) = mpsc::channel(256);
@@ -2033,6 +2044,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             step,
             tool_media,
             warming,
+            window,
         });
     }
 
@@ -4062,6 +4074,10 @@ fn reopen(command: LineageCmd) {
         LineageCmd::RunState { reply, .. } => {
             let _ = reply.send(Err(CLOSING.into()));
         }
+        // A closing actor's session is about to go; the report counts it as unanswered.
+        LineageCmd::MemoryReport { reply } => {
+            let _ = reply.send(crate::memory_report::MemoryAnswer::Closing);
+        }
         LineageCmd::Subscribe { reply, .. } => {
             let _ = reply.send(crate::actor::SubscribeOutcome::Reopen);
         }
@@ -4120,6 +4136,10 @@ fn refuse(command: LineageCmd) {
         LineageCmd::RunState { reply, .. } => {
             let _ = reply.send(Err(unserved("run.status")));
         }
+        // Served by `handle`; never refused here.
+        LineageCmd::MemoryReport { reply } => {
+            let _ = reply.send(crate::memory_report::MemoryAnswer::Closing);
+        }
         LineageCmd::Subscribe { reply, .. } => {
             let _ = reply.send(crate::actor::SubscribeOutcome::Error(unserved("subscribe")));
         }
@@ -4170,6 +4190,7 @@ mod idle_warm;
 mod import;
 mod inline_import;
 mod keep_warm;
+mod memory;
 mod ordered;
 mod pauses;
 mod recorded_warm;
@@ -4195,6 +4216,8 @@ mod key_tests;
 mod loop_error_tests;
 #[cfg(test)]
 mod media_wait_tests;
+#[cfg(test)]
+mod memory_tests;
 #[cfg(test)]
 mod new_heads_tests;
 #[cfg(test)]

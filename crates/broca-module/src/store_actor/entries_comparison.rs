@@ -327,6 +327,7 @@ async fn side_with(
     let scripted = || Gated {
         render_config: None,
         notes_sends: false,
+        hold: None,
         inner: provider.clone(),
         gate: gate.clone(),
     };

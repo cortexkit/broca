@@ -45,6 +45,8 @@ pub const OP_RUN_EVENT_GET: &str = "run.event.get";
 pub const OP_READ: &str = "session.read";
 /// Daemon-scoped read of the credential vault's listing under broca's grants.
 pub const OP_VAULT_AUDIT: &str = "vault.audit";
+/// Daemon-scoped, operator-only read of what the open sessions and caches hold in memory.
+pub const OP_MEMORY_REPORT: &str = "memory.report";
 /// The held-open stream observability surface.
 pub const OP_SUBSCRIBE: &str = "session.subscribe";
 /// The `llm-runner/v1` operations broca exposes: role discovery, session head and baseline, run
@@ -391,6 +393,14 @@ pub(crate) fn management_operations() -> Vec<ManagementOperation> {
             kind: ManagementOperationKind::Query,
             description: Some(
                 "List the vault credentials broca's grants cover, and name every configured credential the vault did not list."
+                    .to_string(),
+            ),
+        },
+        ManagementOperation {
+            name: OP_MEMORY_REPORT.to_string(),
+            kind: ManagementOperationKind::Query,
+            description: Some(
+                "Report, for the operator, the estimated bytes each open session and shared cache holds in memory: sizes and counts only."
                     .to_string(),
             ),
         },

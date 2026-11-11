@@ -1822,6 +1822,20 @@ impl LineageRegistry {
             .collect()
     }
 
+    /// The command channels of every open actor, for a report that asks each of them.
+    pub(crate) fn open_actor_senders(&self) -> Vec<mpsc::Sender<crate::actor::LineageCmd>> {
+        self.inner
+            .slots
+            .lock()
+            .unwrap()
+            .values()
+            .filter_map(|entry| match entry {
+                Entry::Open { handle, .. } => Some(handle.tx.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// In-memory actor identities for route ownership diagnostics; never included in health JSON.
     pub fn open_sessions(&self) -> Vec<LineageKey> {
         self.inner

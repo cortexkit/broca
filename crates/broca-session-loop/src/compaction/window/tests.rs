@@ -347,3 +347,63 @@ async fn a_runs_requests_share_one_episode_list() {
         );
     }
 }
+
+/// The memory report's estimate of a run's kept transcript is within 15% of what the allocator
+/// measured for it, built over a synthetic session shaped like production ones. Its weak handle
+/// keeps nothing: once the run drops the transcript, the handle finds nothing, and the drop
+/// freed the entries although the handle still exists.
+#[test]
+fn a_kept_transcripts_estimate_matches_the_allocator_and_its_handle_keeps_nothing() {
+    use broca_session_store::synthetic::{write, Shape};
+    use broca_test_support::alloc::{installed, measure};
+
+    assert!(
+        installed(),
+        "the crate's tests count with the counting allocator"
+    );
+    let backend = MemoryBackend::default();
+    let session = futures::executor::block_on(async {
+        let mut session = Session::create(
+            &backend,
+            SessionAddr("0123456789abcdef".into()),
+            SessionTriple {
+                project_root: "/project".into(),
+                harness: "window".into(),
+                session: "s1".into(),
+            },
+            &DeploymentKey::new(1, &[7; 32]),
+            false,
+        )
+        .await
+        .unwrap();
+        write(&mut session, &Shape::production(1_000))
+            .await
+            .unwrap();
+        session
+    });
+    let (window, built) = measure(|| {
+        let window = super::WindowTranscript::default();
+        window
+            .update(session.session_id(), &session.conversation, None)
+            .unwrap();
+        window
+    });
+    let handle = window.downgrade();
+    let estimated = handle.held_bytes().expect("the run holds its transcript");
+    let measured = built.held.max(0) as usize;
+    eprintln!("a kept transcript: estimated {estimated}, measured {measured}");
+    assert!(
+        estimated.abs_diff(measured) * 100 <= measured * 15,
+        "a kept transcript: estimated {estimated} bytes, measured {measured}, off by more than 15%"
+    );
+    let ((), dropped) = measure(|| drop(window));
+    assert!(
+        handle.held_bytes().is_none(),
+        "a dropped transcript is found"
+    );
+    let freed = dropped.held.unsigned_abs();
+    assert!(
+        freed * 100 >= measured * 95,
+        "dropping the transcript freed {freed} of its {measured} bytes while a handle remained"
+    );
+}

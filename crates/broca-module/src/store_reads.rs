@@ -624,6 +624,26 @@ impl<V> ViewCache<V> {
         (inner.entries.len(), inner.bytes)
     }
 
+    /// What the cache holds, with its caps: the bytes it counts against its byte cap (each
+    /// view's open-log length times [`ViewCache::BYTES_PER_LOG_BYTE`]), and the bytes each loaded
+    /// view holds as `estimate` walks it.
+    pub fn memory(&self, estimate: impl Fn(&V) -> usize) -> broca_wire::MemoryCache {
+        let inner = self.inner.lock().unwrap();
+        let estimated = inner
+            .entries
+            .values()
+            .filter_map(|entry| entry.cell.get())
+            .map(|view| estimate(view))
+            .sum::<usize>();
+        broca_wire::MemoryCache {
+            entries: inner.entries.len() as u64,
+            max_entries: self.max_entries as u64,
+            counted_bytes: Some(inner.bytes),
+            max_bytes: Some(self.max_bytes),
+            estimated_bytes: estimated as u64,
+        }
+    }
+
     pub(crate) fn token_counts(
         &self,
         addr: &str,

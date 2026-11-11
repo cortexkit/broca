@@ -812,3 +812,9 @@ impl OpenIds {
 
 #[cfg(test)]
 mod tests;
+
+impl crate::held::HeldBytes for OpenIds {
+    fn heap_bytes(&self) -> usize {
+        self.ids.heap_bytes() + self.records.heap_bytes()
+    }
+}

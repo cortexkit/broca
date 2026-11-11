@@ -215,6 +215,7 @@ async fn registry_at(
                 gate: None,
                 render_config,
                 notes_sends: false,
+                hold: None,
             },
             wal: Arc::clone(&wal),
             planes: Default::default(),

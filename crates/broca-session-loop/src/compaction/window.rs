@@ -171,7 +171,60 @@ thread_local! {
     pub(super) static CHECKED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// A handle on a run's kept transcript that doesn't keep it: the session's owner sizes it for a
+/// memory report while the run holds it, and finds nothing once the run has dropped it.
+#[derive(Clone, Default)]
+pub struct WeakWindow(std::sync::Weak<Mutex<Kept>>);
+
+impl WeakWindow {
+    /// What the run's kept transcript holds (see `broca_session_store::held`), or `None` once
+    /// the run has dropped it. Holds it, and the lock each of the run's reads takes, only for
+    /// the length of the walk.
+    pub fn held_bytes(&self) -> Option<usize> {
+        let kept = self.0.upgrade()?;
+        let held = kept.lock().ok().map(|kept| kept.held_bytes());
+        held
+    }
+}
+
+impl Kept {
+    /// The compaction entries and what they were projected from. Entries are the compaction
+    /// contract's type, sized by their serialized walk (`held::serde_heap_bytes`); the sealed
+    /// entries' ride envelopes and what decided them count at their inline size.
+    fn held_bytes(&self) -> usize {
+        use broca_session_store::held::{serde_heap_bytes, HeldBytes};
+        let entries = 2 * std::mem::size_of::<usize>()
+            + std::mem::size_of::<Vec<Entry>>()
+            + self.entries.capacity() * std::mem::size_of::<Entry>()
+            + self.entries.iter().map(serde_heap_bytes).sum::<usize>();
+        let states = self.states.capacity() * std::mem::size_of::<KeptMessage>()
+            + self
+                .states
+                .iter()
+                .map(|kept| kept.state.heap_bytes())
+                .sum::<usize>();
+        let key = self.key.as_ref().map_or(0, |key| key.session.heap_bytes());
+        let open = self.open.as_ref().map_or(0, |open| {
+            std::mem::size_of::<OpenRides>() + open.mid.heap_bytes() + open.delivered.heap_bytes()
+        });
+        std::mem::size_of::<Self>()
+            + entries
+            + states
+            + key
+            + open
+            + self.sealed_messages.heap_bytes()
+            + self.sealed_delivered.heap_bytes()
+            + 2 * std::mem::size_of::<usize>()
+            + std::mem::size_of::<RideEnvelopes>()
+    }
+}
+
 impl WindowTranscript {
+    /// A handle on what this transcript keeps that doesn't keep it (see [`WeakWindow`]).
+    pub fn downgrade(&self) -> WeakWindow {
+        WeakWindow(Arc::downgrade(&self.0))
+    }
+
     /// Brings the window's entries up to `conversation`, read through session `session` under
     /// `enrollment`: projects the messages placed since the last read, and again any whose entry
     /// changed (see the module's notes).

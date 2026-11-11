@@ -17,6 +17,9 @@ pub use broca_wire::{
     SessionReadLineageState, SessionReadMessage, SessionReadResponse, StatusParams, SubscribeEvent,
     SubscribeParams, VaultAuditMissing, VaultAuditParams, VaultAuditResponse, VaultAuditRow,
 };
+pub use broca_wire::{
+    MemoryCache, MemoryHolders, MemoryReport, MemoryReportParams, MemorySession, MemorySetupPart,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImportParams {

@@ -214,3 +214,15 @@ impl<B: SessionBackend> Session<B> {
         Ok(found)
     }
 }
+
+impl crate::held::HeldBytes for SendIdIndex {
+    fn heap_bytes(&self) -> usize {
+        self.conversation.heap_bytes()
+            + self.idle_starts.heap_bytes()
+            + self.run.heap_bytes()
+            + self.queued.heap_bytes()
+            + self.receipts.heap_bytes()
+            + self.entries.heap_bytes()
+            + self.steers.heap_bytes()
+    }
+}

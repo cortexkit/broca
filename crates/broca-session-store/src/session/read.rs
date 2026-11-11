@@ -829,5 +829,27 @@ impl<B: SessionBackend> Session<B> {
     }
 }
 
+impl crate::held::HeldBytes for StoredEntry {
+    fn heap_bytes(&self) -> usize {
+        let StoredEntry {
+            ordinal: _,
+            message,
+            next,
+            state,
+            open: _,
+        } = self;
+        message.heap_bytes() + next.heap_bytes() + state.heap_bytes()
+    }
+}
+
+impl SealedCaches {
+    /// What the session keeps of its sealed history, estimated by walking it (see
+    /// `crate::held`). A reader's derived value is opaque here, so only its pointer counts.
+    pub(super) fn held_bytes(&self) -> usize {
+        use crate::held::HeldBytes;
+        self.entries.heap_bytes() + self.send_ids.heap_bytes()
+    }
+}
+
 #[cfg(test)]
 mod tests;

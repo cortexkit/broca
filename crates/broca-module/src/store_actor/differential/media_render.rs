@@ -480,6 +480,7 @@ async fn registry(
             gate,
             render_config: Some(image_render_config()),
             notes_sends: false,
+            hold: None,
         }),
         wal: Arc::clone(&wal),
         sent: Arc::clone(sent),
