@@ -36,6 +36,10 @@ struct ReadyProvider;
 
 #[async_trait]
 impl broca_core::CompactionPlane for ReadyProvider {
+    async fn provider_capabilities(&self, _: &str) -> broca_core::ProviderCapabilities {
+        broca_core::ProviderCapabilities::Declared(vec![])
+    }
+
     async fn setup(
         &self,
         _: &str,

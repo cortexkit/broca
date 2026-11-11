@@ -699,9 +699,12 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         let Some(provider) = provider else {
             return EntryAttribution::Known(false);
         };
-        let declared = EntryAttribution::Catalog(self.executor.compaction_plane())
+        let declaration = EntryAttribution::Catalog(self.executor.compaction_plane())
             .declared(&provider)
             .await;
+        let Some(declared) = declaration.value() else {
+            return EntryAttribution::Unknown;
+        };
         runtime.learn_entry_speaks_for(declared);
         EntryAttribution::Known(runtime.entry_speaks_for().unwrap_or(declared))
     }
