@@ -47,10 +47,11 @@ const VAULT_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const OPENAI_DECISIONS_SERVED: bool = false;
 
 /// Session classes whose new sessions start in the new session storage, when the creating send
-/// asks only for what it serves (other sends still start on today's storage). New sessions move
-/// over one class at a time; heads always start there. Sidekicks go first: they are short-lived,
-/// carry a retention policy, and a failure surfaces as one answer the asking agent retries.
-const NEW_STORAGE_SESSION_CLASSES: &[&str] = &["sidekick"];
+/// asks only for what it serves (other sends still start on today's storage). Heads always start
+/// there. These are every class core sends for its workers and seats: masons, one-shot calls,
+/// Athena consult seats and spec seats, besides sidekicks. A send naming no class still starts on
+/// today's storage until the cutover converts it.
+const NEW_STORAGE_SESSION_CLASSES: &[&str] = &["sidekick", "mason", "oneshot", "consult", "spec"];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     broca_module::diagnostics::initialize();
