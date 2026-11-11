@@ -177,12 +177,13 @@ broca specifics:
 
   | Code | Class | Detail |
   |---|---|---|
-  | `variant_unsupported` | `permanent` | `{model, variant, defined}` |
+  | `variant_unsupported` | `permanent` | `{model, variant, defined, class: "permanent"}` |
   | `tool_alias_invalid` | `permanent` | `{tool, class: "permanent"}` |
   | `wal_newer_writer` | `permanent` | `{kind: "newer_writer", missing: [<feature names>]}` |
   | `agent_run_scopes_unsupported` | `permanent` | `{<session scope>}` |
   | `session_log_missing` | `detail.class: permanent` | `{class, session, harness}`; a writer would recreate historical content or a read would falsely report empty history; existing named refusals and valid index answers keep precedence; stop broca and inspect `store-maintenance repair-session-root` |
   | `projection_not_ready` | `detail.class: transient` | `{class}`; the compaction entry projection is incomplete, so `session.entries` or the entry read for `session.apply_view` may succeed after the projection is rebuilt |
+  | `transient` | `detail.class: transient` | `{class}`; a dependency the request needs has not answered or loaded yet (for a send: the model catalog, a credential lookup), so the same request may succeed on retry |
 
 - Principal-specific admission refusals `flow_scope_required` and `sender_not_owner` carry a
   top-level `class: "permanent"` beside `code`, `message`, and `detail: {kind, principal}`.
@@ -265,7 +266,9 @@ broca specifics:
 
   `open_failed` carries optional `detail.class` in the four-class shared vocabulary.
   Admission and run-resolution causes use `RunError::admission_error_class`, never message
-  matching. Typed temporary WAL I/O (`Interrupted`, `WouldBlock`, `TimedOut`) is transient:
+  matching. A send refused before its run starts gets the same typed refusal (its own code,
+  detail and class) whichever storage keeps the session and whether or not it carries a fetch
+  plan; a run task that panicked or was aborted before its start stays unclassified. Typed temporary WAL I/O (`Interrupted`, `WouldBlock`, `TimedOut`) is transient:
   the same read can succeed on retry. Unsupported handler operations are permanent.
   Opaque storage/write/replay/lifecycle errors remain unclassified, including corruption;
   neither a generic WAL error nor replay failure establishes retryability. A newer writer

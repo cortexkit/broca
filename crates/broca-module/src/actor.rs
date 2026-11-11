@@ -813,6 +813,55 @@ pub(crate) fn steer_delivery(records: &[WalRecord], send_id: &str) -> Option<Del
     None
 }
 
+/// The answer to a send whose run was refused before it durably started. Each refusal keeps its
+/// own typed outcome, so the caller gets the same code, detail and class whichever storage the
+/// session is kept in; any other admission error is answered with the class its `RunError`
+/// states.
+pub(crate) fn admission_refusal_outcome(error: RunError) -> SendOutcome {
+    match error {
+        RunError::MediaUnsupported(message) => {
+            crate::person_media::outcome(RunError::MediaUnsupported(message))
+        }
+        RunError::MediaTooLarge(detail) => SendOutcome::MediaTooLarge(detail),
+        RunError::Upload(error) => SendOutcome::Upload(error),
+        RunError::Transient(message) => SendOutcome::Transient(message),
+        RunError::SendIdReuse { differing } => SendOutcome::SendIdReuse { differing },
+        RunError::VariantUnsupported(e) => SendOutcome::VariantUnsupported(e),
+        RunError::ToolAliasInvalid(e) => SendOutcome::ToolAliasInvalid(e),
+        error @ RunError::CompactionContextLimitMissing => SendOutcome::DeliveryRefused {
+            code: "invalid_params",
+            field: "context_limit",
+            message: error.to_string(),
+        },
+        RunError::AccountSelectionRefused(refusal) => SendOutcome::AccountSelectionRefused(refusal),
+        RunError::RoutingUnavailable(unavailable) => SendOutcome::RoutingUnavailable(unavailable),
+        RunError::CredentialsUnavailable => SendOutcome::CredentialsUnavailable,
+        RunError::CredentialAmbiguous {
+            credential,
+            candidate_ids,
+        } => SendOutcome::CredentialAmbiguous {
+            credential,
+            candidate_ids,
+        },
+        RunError::SessionTooLarge { max_bytes } => SendOutcome::SessionTooLarge { max_bytes },
+        RunError::RetainedSessionTooLarge { max_bytes } => {
+            SendOutcome::RetainedSessionTooLarge { max_bytes }
+        }
+        RunError::NewerWriter { missing } => {
+            // The same text the generic arm below renders for this refusal.
+            let reason = RunError::NewerWriter {
+                missing: missing.clone(),
+            }
+            .to_string();
+            SendOutcome::NewerWriter { missing, reason }
+        }
+        error => SendOutcome::ClassifiedError {
+            class: error.admission_error_class(),
+            reason: error.to_string(),
+        },
+    }
+}
+
 fn permanent_queued_refusal(message: String, provider_code: &'static str) -> ProviderError {
     ProviderError {
         provider_details: None,
@@ -4477,69 +4526,8 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 Err(StartRunFailure::Expired) => SendOutcome::Reopen,
                 Err(StartRunFailure::PlanRefused(refusal)) => SendOutcome::PlanRefused(refusal),
                 Err(StartRunFailure::ContextCeiling(detail)) => SendOutcome::ContextCeiling(detail),
-                Err(StartRunFailure::Admission(RunError::MediaUnsupported(message))) => {
-                    crate::person_media::outcome(RunError::MediaUnsupported(message))
-                }
-                Err(StartRunFailure::Admission(RunError::MediaTooLarge(detail))) => {
-                    SendOutcome::MediaTooLarge(detail)
-                }
-                Err(StartRunFailure::Admission(RunError::Upload(error))) => {
-                    SendOutcome::Upload(error)
-                }
-                Err(StartRunFailure::Admission(RunError::Transient(message))) => {
-                    SendOutcome::Transient(message)
-                }
-                Err(StartRunFailure::Admission(RunError::SendIdReuse { differing })) => {
-                    SendOutcome::SendIdReuse { differing }
-                }
-                Err(StartRunFailure::Admission(RunError::VariantUnsupported(e))) => {
-                    SendOutcome::VariantUnsupported(e)
-                }
-                Err(StartRunFailure::Admission(RunError::ToolAliasInvalid(e))) => {
-                    SendOutcome::ToolAliasInvalid(e)
-                }
-                Err(StartRunFailure::Admission(
-                    error @ RunError::CompactionContextLimitMissing,
-                )) => SendOutcome::DeliveryRefused {
-                    code: "invalid_params",
-                    field: "context_limit",
-                    message: error.to_string(),
-                },
-                Err(StartRunFailure::Admission(RunError::AccountSelectionRefused(refusal))) => {
-                    SendOutcome::AccountSelectionRefused(refusal)
-                }
-                Err(StartRunFailure::Admission(RunError::RoutingUnavailable(unavailable))) => {
-                    SendOutcome::RoutingUnavailable(unavailable)
-                }
-                Err(StartRunFailure::Admission(RunError::CredentialsUnavailable)) => {
-                    SendOutcome::CredentialsUnavailable
-                }
-                Err(StartRunFailure::Admission(RunError::CredentialAmbiguous {
-                    credential,
-                    candidate_ids,
-                })) => SendOutcome::CredentialAmbiguous {
-                    credential,
-                    candidate_ids,
-                },
-                Err(StartRunFailure::Admission(RunError::SessionTooLarge { max_bytes })) => {
-                    SendOutcome::SessionTooLarge { max_bytes }
-                }
-                Err(StartRunFailure::Admission(RunError::RetainedSessionTooLarge {
-                    max_bytes,
-                })) => SendOutcome::RetainedSessionTooLarge { max_bytes },
-                Err(StartRunFailure::Admission(RunError::NewerWriter { missing })) => {
-                    // The same text the generic arm below renders for this refusal.
-                    let reason = RunError::NewerWriter {
-                        missing: missing.clone(),
-                    }
-                    .to_string();
-                    SendOutcome::NewerWriter { missing, reason }
-                }
                 Err(StartRunFailure::Scope(refusal)) => SendOutcome::ScopeRefused(refusal),
-                Err(StartRunFailure::Admission(error)) => SendOutcome::ClassifiedError {
-                    class: error.admission_error_class(),
-                    reason: error.to_string(),
-                },
+                Err(StartRunFailure::Admission(error)) => admission_refusal_outcome(error),
                 // Infrastructure strings include replay failures, so retryability is unknown.
                 Err(error) => SendOutcome::Error(error.to_string()),
             },

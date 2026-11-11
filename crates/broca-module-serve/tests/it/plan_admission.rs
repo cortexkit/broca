@@ -102,7 +102,7 @@ async fn a_plan_less_session_keeps_its_bytes() {
 /// normally use delivery_rig::Rig without a compaction plane, so remove the compaction item
 /// and set system-text model selectors to its scripted fake/fake model. Model-mismatch
 /// refusals are tested separately rather than through this fixture adaptation.
-fn vector(relative: &str) -> Value {
+pub(super) fn vector(relative: &str) -> Value {
     let mut plan = raw_vector(relative);
     plan.as_object_mut().unwrap().remove("compaction_item");
     for item in plan["system_text_items"]

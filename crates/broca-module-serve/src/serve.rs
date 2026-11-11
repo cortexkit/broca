@@ -7634,7 +7634,7 @@ mod tests {
         .unwrap();
         let frame = rx.recv().await.unwrap();
         assert_eq!(frame.header.ty, FrameType::Error);
-        assert_eq!(frame.body.as_slice(), br#"{"code":"variant_unsupported","message":"open failed: run resolution failed: model 'anthropic/claude-opus-5' does not define variant 'max'; its variants are [none, low, medium, high]","detail":{"defined":["none","low","medium","high"],"model":"anthropic/claude-opus-5","variant":"max"}}"#);
+        assert_eq!(frame.body.as_slice(), br#"{"code":"variant_unsupported","message":"open failed: run resolution failed: model 'anthropic/claude-opus-5' does not define variant 'max'; its variants are [none, low, medium, high]","detail":{"class":"permanent","defined":["none","low","medium","high"],"model":"anthropic/claude-opus-5","variant":"max"}}"#);
     }
 
     #[tokio::test]

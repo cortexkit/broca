@@ -88,11 +88,16 @@ pub fn admission_refusal(error: &ServeError) -> Option<AdmissionRefusal> {
             "open_failed",
             class.map(|class| json!({"class": class.shared_class()})),
         ),
-        ServeError::Transient(_) => ("transient", None),
+        // The cause clears by itself (a catalog or credential listing not loaded yet, a
+        // dependency that did not answer), so the same send may be admitted on retry.
+        ServeError::Transient(_) => ("transient", Some(json!({"class": "transient"}))),
         ServeError::VariantUnsupported(refusal) => (
             "variant_unsupported",
+            // Resending the same variant to the same model cannot succeed until the catalog
+            // changes, so the refusal states it is permanent.
             Some(json!({
                 "model": refusal.model, "variant": refusal.variant, "defined": refusal.defined,
+                "class": "permanent",
             })),
         ),
         ServeError::ToolAliasInvalid(refusal) => (

@@ -1191,7 +1191,8 @@ async fn a_variant_send_renders_its_mapped_parameters_and_an_undefined_one_is_re
         Some(serde_json::json!({
             "model": "anthropic/claude-opus-5",
             "variant": "max",
-            "defined": ["none", "low", "medium", "high"]
+            "defined": ["none", "low", "medium", "high"],
+            "class": "permanent"
         }))
     );
     assert_eq!(error.message,
