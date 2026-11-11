@@ -11,6 +11,8 @@ struct RoutingDaemon {
     catalog: Arc<Mutex<Vec<CatalogEntry>>>,
     catalog_reads: Arc<AtomicUsize>,
     hang_reopens: Arc<std::sync::atomic::AtomicBool>,
+    reply: Arc<Mutex<Result<Vec<u8>, Vec<u8>>>>,
+    goodbyes: tokio::sync::mpsc::UnboundedSender<broca_subc::RouteHandle>,
     server: tokio::task::JoinHandle<()>,
 }
 
@@ -64,7 +66,11 @@ impl RoutingDaemon {
         let catalog = Arc::new(Mutex::new(vec![routing_provider("routing-provider", true)]));
         let catalog_reads = Arc::new(AtomicUsize::new(0));
         let hang_reopens = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reply = Arc::new(Mutex::new(reply));
+        let (goodbyes, mut goodbye_rx) =
+            tokio::sync::mpsc::unbounded_channel::<broca_subc::RouteHandle>();
         let server = {
+            let reply = Arc::clone(&reply);
             let requests = Arc::clone(&requests);
             let opens = Arc::clone(&opens);
             let opened_modules = Arc::clone(&opened_modules);
@@ -82,7 +88,22 @@ impl RoutingDaemon {
                 )
                 .await
                 .unwrap();
-                while let Some(frame) = read_frame(&mut stream).await.unwrap() {
+                loop {
+                    let frame = tokio::select! {
+                        frame = read_frame(&mut stream) => match frame.unwrap() {
+                            Some(frame) => frame,
+                            None => break,
+                        },
+                        Some(route) = goodbye_rx.recv() => {
+                            let goodbye = Frame::build(
+                                FrameType::Goodbye,
+                                Flags::new(false, Priority::Interactive, false),
+                                route.channel, route.epoch, 0, Vec::new(),
+                            ).unwrap();
+                            write_frame(&mut stream, &goodbye).await.unwrap();
+                            continue;
+                        }
+                    };
                     let (ty, body) = match (frame.header.channel, frame.header.ty) {
                         (0, FrameType::Ping) => (FrameType::Pong, Vec::new()),
                         (0, FrameType::Request) => {
@@ -147,7 +168,7 @@ impl RoutingDaemon {
                             if close_after_request {
                                 (FrameType::Goodbye, Vec::new())
                             } else {
-                                match &reply {
+                                match &*reply.lock().unwrap() {
                                     Ok(body) => (FrameType::Response, body.clone()),
                                     Err(body) => (FrameType::Error, body.clone()),
                                 }
@@ -182,6 +203,8 @@ impl RoutingDaemon {
             catalog,
             catalog_reads,
             hang_reopens,
+            reply,
+            goodbyes,
             server,
         }
     }
@@ -199,6 +222,138 @@ impl RoutingDaemon {
     fn request_bodies(&self) -> Vec<Vec<u8>> {
         self.requests.lock().unwrap().clone()
     }
+}
+
+fn capability_reply(declared: bool) -> Result<Vec<u8>, Vec<u8>> {
+    let mut describe = cortexkit_role_routing::describe::RoleDescribe::new(vec![], false);
+    if declared {
+        describe = describe.with_capability(cortexkit_role_routing::capabilities::ACCOUNT_CONTINUE);
+    }
+    Ok(serde_json::to_vec(&json!({"result": describe})).unwrap())
+}
+
+#[tokio::test]
+async fn routing_capabilities_declared_and_cached_across_names() {
+    use crate::routing_capabilities::CapabilitySupport::*;
+    let daemon = RoutingDaemon::start(capability_reply(true), false).await;
+    let client = daemon.client();
+    assert_eq!(client.capability("account_continue").await, Declared);
+    assert_eq!(client.capability("account_continue").await, Declared);
+    assert_eq!(client.capability("not_a_group").await, NotDeclared);
+    assert_eq!(
+        daemon.request_bodies(),
+        vec![br#"{"method":"role.describe","params":{}}"#.to_vec()]
+    );
+    assert_eq!(daemon.catalog_reads.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn routing_capabilities_not_declared_is_distinct_from_unknown() {
+    let daemon = RoutingDaemon::start(capability_reply(false), false).await;
+    assert_eq!(
+        daemon.client().capability("account_continue").await,
+        crate::routing_capabilities::CapabilitySupport::NotDeclared
+    );
+}
+
+#[tokio::test]
+async fn routing_capabilities_unreachable_and_unresolved_are_unknown() {
+    use crate::routing_capabilities::CapabilitySupport::Unknown;
+    let daemon = RoutingDaemon::start(capability_reply(true), true).await;
+    assert_eq!(
+        daemon.client().capability("account_continue").await,
+        Unknown
+    );
+    assert_eq!(
+        daemon.client().capability("account_continue").await,
+        Unknown
+    );
+    assert_eq!(
+        daemon.request_bodies().len(),
+        1,
+        "unreachable answer is cached"
+    );
+    let daemon = RoutingDaemon::start(capability_reply(true), false).await;
+    daemon.catalog.lock().unwrap().clear();
+    assert_eq!(
+        daemon.client().capability("account_continue").await,
+        Unknown
+    );
+    assert_eq!(
+        daemon.client().capability("account_continue").await,
+        Unknown
+    );
+    assert_eq!(daemon.catalog_reads.load(Ordering::SeqCst), 1);
+    assert!(daemon.request_bodies().is_empty());
+}
+
+#[tokio::test]
+async fn routing_capabilities_undecodable_or_refused_describe_is_unknown() {
+    use crate::routing_capabilities::CapabilitySupport::Unknown;
+    for reply in [
+        Ok(b"not JSON".to_vec()),
+        Ok(br#"{"result":{"capabilities":["account_continue"]}}"#.to_vec()),
+        Err(br#"{"code":"invalid_request"}"#.to_vec()),
+    ] {
+        let daemon = RoutingDaemon::start(reply, false).await;
+        assert_eq!(
+            daemon.client().capability("account_continue").await,
+            Unknown
+        );
+        assert_eq!(
+            daemon.client().capability("account_continue").await,
+            Unknown
+        );
+        assert_eq!(daemon.request_bodies().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn routing_capabilities_reregistration_goodbye_drops_cached_description() {
+    use crate::routing_capabilities::CapabilitySupport::*;
+    let daemon = RoutingDaemon::start(capability_reply(true), false).await;
+    assert_eq!(
+        daemon.client().capability("account_continue").await,
+        Declared
+    );
+    let route = daemon.transport.route().await.unwrap();
+    *daemon.reply.lock().unwrap() = capability_reply(false);
+    daemon.goodbyes.send(route).unwrap();
+    broca_test_support::wait_until("routing re-registration closes its old route", || async {
+        (!daemon.transport.conn.route_is_open(&route))
+            .then_some(())
+            .ok_or_else(|| "old routing route is still open".to_owned())
+    })
+    .await;
+    assert_eq!(
+        daemon.client().capability("account_continue").await,
+        NotDeclared
+    );
+    assert_eq!(daemon.request_bodies().len(), 2);
+    assert_eq!(daemon.opens.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn routing_capabilities_age_bound_recovers_an_unknown_provider() {
+    use crate::routing_capabilities::CapabilitySupport::*;
+    let daemon = RoutingDaemon::start(capability_reply(true), false).await;
+    daemon.catalog.lock().unwrap().clear();
+    assert_eq!(
+        daemon.client().capability("account_continue").await,
+        Unknown
+    );
+    *daemon.catalog.lock().unwrap() = vec![routing_provider("routing-provider", true)];
+    assert_eq!(
+        daemon.client().capability("account_continue").await,
+        Unknown
+    );
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(60)).await;
+    tokio::time::resume();
+    assert_eq!(
+        daemon.client().capability("account_continue").await,
+        Declared
+    );
 }
 
 fn routing_provider(module: &str, verified: bool) -> CatalogEntry {

@@ -289,6 +289,9 @@ pub type RoutingReply = Result<Result<Vec<u8>, Vec<u8>>, String>;
 /// Error frame's body, and `Err(cause)` means no reply arrived.
 #[async_trait::async_trait]
 pub trait RoutingTransport: Send + Sync {
+    async fn capability(&self, _name: &str) -> crate::routing_capabilities::CapabilitySupport {
+        crate::routing_capabilities::CapabilitySupport::Unknown
+    }
     async fn service_tier_supported(&self) -> Result<bool, String> {
         Ok(false)
     }
@@ -404,6 +407,7 @@ pub struct SubcRoutingTransport {
     identity: BindIdentity,
     route: Arc<Mutex<RouteSlot>>,
     capabilities: tokio::sync::Mutex<Option<(broca_subc::RouteHandle, Vec<String>)>>,
+    capability_reader: crate::routing_capabilities::RoutingCapabilities,
     #[cfg(test)]
     stale_opens_for_test: std::sync::atomic::AtomicUsize,
 }
@@ -421,6 +425,7 @@ impl SubcRoutingTransport {
             identity,
             route: Arc::new(Mutex::new(RouteSlot::Empty)),
             capabilities: tokio::sync::Mutex::new(None),
+            capability_reader: Default::default(),
             #[cfg(test)]
             stale_opens_for_test: std::sync::atomic::AtomicUsize::new(0),
         }
@@ -491,6 +496,25 @@ impl SubcRoutingTransport {
         }
     }
 
+    pub(crate) fn capability_route_is_open(&self, route: broca_subc::RouteHandle) -> bool {
+        self.conn.route_is_open(&route)
+    }
+
+    pub(crate) async fn describe_for_capabilities(
+        &self,
+    ) -> Result<(broca_subc::RouteHandle, Result<Vec<u8>, Vec<u8>>), String> {
+        let route = self.route().await?;
+        if !self.conn.route_is_open(&route) {
+            self.forget(route);
+        }
+        self.request_on_cached_route(
+            serde_json::to_vec(&json!({"method":"role.describe","params":{}}))
+                .expect("describe JSON"),
+            |error| error.to_string(),
+        )
+        .await
+    }
+
     async fn request_on_cached_route(
         &self,
         body: Vec<u8>,
@@ -554,6 +578,9 @@ impl SubcRoutingTransport {
 
 #[async_trait::async_trait]
 impl RoutingTransport for SubcRoutingTransport {
+    async fn capability(&self, name: &str) -> crate::routing_capabilities::CapabilitySupport {
+        self.capability_reader.read(self, name).await
+    }
     async fn service_tier_supported(&self) -> Result<bool, String> {
         self.supports("service_tier").await
     }
@@ -1264,6 +1291,11 @@ impl RoutingClient {
 
     pub fn config(&self) -> &AccountSelectionConfig {
         &self.config
+    }
+
+    /// Read an optional routing group without treating discovery failure as absence.
+    pub async fn capability(&self, name: &str) -> crate::routing_capabilities::CapabilitySupport {
+        self.transport.capability(name).await
     }
 
     /// Ask routing for an account, giving up at `deadline`.
