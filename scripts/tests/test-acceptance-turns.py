@@ -586,6 +586,9 @@ class StoreWorkerTrafficTests(WorkerTrafficFixture):
     def reply(self, command, timeout):
         self.commands.append(command)
         op = command[command.index("--op") + 1]
+        if op == "session.head":
+            return json.dumps({"result": {"last_run_state": {"run_id": self.admission["run_id"],
+                                                              "state": "completed"}}})
         if op == "run.admission":
             return json.dumps({"result": self.admission})
         self.assertEqual(op, "run.status")
@@ -600,7 +603,7 @@ class StoreWorkerTrafficTests(WorkerTrafficFixture):
                 self.assertEqual(status, 0, output)
                 self.assertIn("class=sidekick", output)
                 self.assertIn("storage_counts=wal:0,store:1", output)
-                self.assertEqual(len(self.commands), 2)
+                self.assertEqual(len(self.commands), 3)
                 self.commands.clear()
 
     def test_store_missing_frozen_declarations_fails_beside_wal_success(self):
@@ -641,17 +644,33 @@ class StoreWorkerTrafficTests(WorkerTrafficFixture):
         self.assertIn("no_worker_candidate", output)
         invoke.assert_not_called()
 
+    def test_store_runs_come_from_the_daemon_not_the_wal_run_index(self):
+        # New-storage runs never appear in run_index, a WAL projection.
+        self.store()
+        with sqlite3.connect(self.root / "run-index.db") as db:
+            db.execute("DELETE FROM run_index")
+        with patch.object(self.worker, "invoke", side_effect=self.reply):
+            status, output = self.wait()
+        self.assertEqual(status, 0, output)
+        self.assertIn("storage_counts=wal:0,store:1", output)
+
     def test_store_log_written_without_a_new_run_is_not_a_candidate_or_a_failure(self):
         # A head's idle warm-up appends to its log after the restart but starts no run.
         self.store()
-        with sqlite3.connect(self.root / "run-index.db") as db:
-            db.execute("UPDATE run_index SET state_changed_ms=99")
+        self.admission["started_at_ms"] = 99
         self.write()
-        with patch.object(self.worker, "invoke") as invoke:
+        with patch.object(self.worker, "invoke", side_effect=self.reply):
             status, output = self.wait()
         self.assertEqual(status, 0, output)
         self.assertIn("storage_counts=wal:1,store:0", output)
-        invoke.assert_not_called()
+
+    def test_store_session_with_no_run_yet_is_skipped(self):
+        self.store()
+        self.write()
+        with patch.object(self.worker, "invoke", return_value=json.dumps({"result": {}})):
+            status, output = self.wait()
+        self.assertEqual(status, 0, output)
+        self.assertIn("storage_counts=wal:1,store:0", output)
 
     def test_missing_store_inventory_is_named_and_is_not_created(self):
         self.store()
@@ -676,8 +695,10 @@ class StoreWorkerTrafficTests(WorkerTrafficFixture):
     def test_store_noncompleted_status_cannot_certify_admission(self):
         self.store()
         for state in ("active", "paused", "error", "interrupted", "DO-NOT-PRINT-STATUS"):
+            head = {"last_run_state": {"run_id": self.admission["run_id"], "state": state}}
             with self.subTest(state=state), patch.object(self.worker, "invoke", side_effect=[
-                    json.dumps({"result": self.admission}), json.dumps({"result": {"state": state}})]):
+                    json.dumps({"result": head}), json.dumps({"result": self.admission}),
+                    json.dumps({"result": {"state": state}})]):
                 status, output = self.wait()
             self.assertEqual(status, 1, output)
             self.assertIn("worker_completion_timeout", output)
