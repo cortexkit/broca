@@ -30,6 +30,7 @@ pub mod hook_plane;
 pub mod late_results;
 pub mod plan_fetch;
 pub mod private_content;
+mod provider_catalog;
 mod role_route;
 mod role_route_diagnostics;
 mod route_close;
@@ -60,6 +61,7 @@ pub use late_results::{late_entry_tool_result, LateResultsError, LateResultsFeed
 pub use plan_fetch::{SubcPlanAdmitter, SubcPlanFetcher};
 pub use private_content::{ImageResolveError, ResolvedImage};
 pub use private_content::{PrivateContent, PrivateContentClient, PrivateContentError, SourceKind};
+pub use provider_catalog::catalog_entry_provides;
 pub use role_route_diagnostics::scoped_role_route_refusals;
 pub use scope_describe::{DescribedScope, ModuleScopeDescriber, ScopeDescriber};
 pub use session_door::{DoorCoverage, DoorRead, SessionDoorClient, SessionDoorError};

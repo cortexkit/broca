@@ -320,7 +320,7 @@ pub struct RouteHandle {
     pub(crate) call_keepalive: bool,
     /// The route was opened declaring `tool-provider: v1`.
     pub(crate) tool_provider_v1: bool,
-    /// The route binds the session's own harness, not the tool-module `runner`.
+    /// The provider also serves a compaction or hook role for this session.
     pub(crate) session_identity: bool,
 }
 
@@ -335,41 +335,54 @@ pub(crate) struct RouteShape {
     /// Declare `tool-provider: v1` when the daemon manifest lists that role.
     pub(crate) tool_provider_v1: bool,
     /// Bind the session's own harness and session, as its compaction and hook routes do,
-    /// because this provider also serves one of those roles for the session. Other tool modules get
-    /// the `runner` harness (see [`TOOL_MODULE_HARNESS`]). Without it, the provider would key
-    /// the tool calls to a different session than the one it compacts, and answer notes and
-    /// expansions from an empty session.
+    /// because this provider also serves one of those roles for the session. Other tool modules
+    /// normally get the `runner` harness (see [`TOOL_MODULE_HARNESS`]). Without it, the provider
+    /// would key the tool calls to a different session than the one it compacts, and answer
+    /// notes and expansions from an empty session.
     pub(crate) session_identity: bool,
 }
 
 /// Role declaration and bind policy shared by all of a session's tool-provider routes.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct ToolProviderRoutePolicy {
     pub(crate) declares_role: bool,
     pub(crate) session_identity: bool,
+    pub(crate) aft_harness: Option<Arc<crate::provider_catalog::AftHarness>>,
 }
 
 impl ToolProviderRoutePolicy {
     pub(crate) fn for_provider(
-        catalog: &[CatalogEntry],
+        catalog: &crate::provider_catalog::ProviderCatalog,
         provider: &str,
         session_identity: bool,
     ) -> Self {
         Self {
             declares_role: catalog.iter().any(|entry| {
                 entry.module_id == provider
-                    && entry.capabilities.as_ref().is_some_and(|caps| {
-                        caps.provides
-                            .iter()
-                            .any(|role| role == cortexkit_role_tool_provider::PROVIDES)
-                    })
+                    && crate::catalog_entry_provides(entry, cortexkit_role_tool_provider::PROVIDES)
             }),
             session_identity,
+            aft_harness: Some(Arc::clone(&catalog.aft_harness)),
         }
     }
 
-    fn bind(self, identity: &BindIdentity) -> SubcBindIdentity {
-        let harness = if self.session_identity {
+    fn forwards_aft_harness(&self, module_id: &str, identity: &BindIdentity) -> bool {
+        !self.session_identity
+            && module_id == "aft"
+            && identity.harness == "broca"
+            && self
+                .aft_harness
+                .as_ref()
+                .is_some_and(|state| state.accepts_broca())
+    }
+
+    fn bind(&self, module_id: &str, identity: &BindIdentity) -> SubcBindIdentity {
+        // AFT sends background-command completion notices back to the session, so it needs
+        // the real harness. Only a catalog snapshot declaring scope-background-tasks/v1
+        // permits broca; missing declarations or a successful fallback retain runner.
+        // This changes only the bind identity, not the attested principal or scope selector.
+        let aft_session_harness = self.forwards_aft_harness(module_id, identity);
+        let harness = if self.session_identity || aft_session_harness {
             identity.harness.as_str()
         } else {
             TOOL_MODULE_HARNESS
@@ -377,7 +390,7 @@ impl ToolProviderRoutePolicy {
         SubcBindIdentity::new(harness, identity.session.clone())
     }
 
-    fn role_versions(self) -> Option<std::collections::BTreeMap<String, String>> {
+    fn role_versions(&self) -> Option<std::collections::BTreeMap<String, String>> {
         self.declares_role
             .then(|| std::collections::BTreeMap::from([("tool-provider".into(), "v1".into())]))
     }
@@ -886,6 +899,7 @@ enum LateGoodbyeHandoffStage {
 type LateGoodbyeHandoffHook = Arc<dyn Fn(LateGoodbyeHandoffStage) + Send + Sync>;
 
 struct ConnectionShared {
+    aft_harness_answer: Mutex<Option<bool>>,
     #[cfg(test)]
     late_goodbye_handoff: Mutex<Option<LateGoodbyeHandoffHook>>,
     route_closer: std::sync::OnceLock<Arc<crate::route_close::RouteCloser>>,
@@ -1045,6 +1059,7 @@ impl SubcConnection {
         let (runtime, write_rx) = new_runtime();
         let (reconnect_tx, reconnect_rx) = mpsc::unbounded_channel();
         let shared = Arc::new(ConnectionShared {
+            aft_harness_answer: Mutex::new(None),
             #[cfg(test)]
             late_goodbye_handoff: Mutex::new(None),
             route_closer: std::sync::OnceLock::new(),
@@ -1487,6 +1502,7 @@ impl SubcConnection {
         scope: Option<&subc_protocol::scope::ScopeSelector>,
         shape: RouteShape,
         provider_held_installed: bool,
+        aft_harness: Option<Arc<crate::provider_catalog::AftHarness>>,
     ) -> ConnResult<RouteHandle> {
         let RouteShape {
             tool_result_v1,
@@ -1512,16 +1528,14 @@ impl SubcConnection {
         let policy = ToolProviderRoutePolicy {
             declares_role: tool_provider_v1,
             session_identity,
-        };
-        let target = RouteTarget::ToolProvider {
-            module_id: module_id.into(),
+            aft_harness,
         };
         let mut handle = self
-            .route_open_wire_target(
-                target,
-                policy.bind(identity),
+            .route_open_tool_with_fallback(
+                module_id,
+                identity,
                 scope.cloned(),
-                policy.role_versions(),
+                &policy,
                 capabilities,
             )
             .await?;
@@ -1544,6 +1558,7 @@ impl SubcConnection {
             ToolProviderRoutePolicy {
                 declares_role: true,
                 session_identity: false,
+                aft_harness: None,
             },
         )
         .await
@@ -1573,15 +1588,7 @@ impl SubcConnection {
             GateAdmission::Retired => None,
         };
         let outcome = self
-            .route_open_wire_target(
-                RouteTarget::ToolProvider {
-                    module_id: module_id.to_string(),
-                },
-                policy.bind(identity),
-                scope,
-                policy.role_versions(),
-                None,
-            )
+            .route_open_tool_with_fallback(module_id, identity, scope, &policy, None)
             .await
             .map(|mut handle| {
                 handle.session_identity = policy.session_identity;
@@ -1870,6 +1877,70 @@ impl SubcConnection {
             consumer_capabilities,
         )
         .await
+    }
+
+    async fn route_open_tool_with_fallback(
+        &self,
+        module_id: &str,
+        identity: &BindIdentity,
+        scope: Option<subc_protocol::scope::ScopeSelector>,
+        policy: &ToolProviderRoutePolicy,
+        capabilities: Option<Vec<String>>,
+    ) -> ConnResult<RouteHandle> {
+        let forwards_broca = policy.forwards_aft_harness(module_id, identity);
+        if module_id == "aft" && identity.harness == "broca" && !policy.session_identity {
+            let mut previous = self.shared.aft_harness_answer.lock().unwrap();
+            if *previous != Some(forwards_broca) {
+                tracing::info!(target: "subc", module_id, forwards_broca,
+                    "AFT tool-route harness decision changed");
+                *previous = Some(forwards_broca);
+            }
+        }
+        let target = RouteTarget::ToolProvider {
+            module_id: module_id.into(),
+        };
+        let first = self
+            .route_open_wire_target(
+                target.clone(),
+                policy.bind(module_id, identity),
+                scope.clone(),
+                policy.role_versions(),
+                capabilities.clone(),
+            )
+            .await;
+        let Err(ConnError::Rejected(ref refusal)) = first else {
+            return first;
+        };
+        if !forwards_broca || !is_target_bind_refusal(refusal) {
+            return first;
+        }
+        // A refused bind created no route. Retry only that proof of non-delivery, with the
+        // old runner identity; transport failures and temporary daemon refusals stay with
+        // the existing retry policy. Preserve the original refusal if runner also fails.
+        let fallback = self
+            .route_open_wire_target(
+                target,
+                SubcBindIdentity::new(TOOL_MODULE_HARNESS, identity.session.clone()),
+                scope,
+                policy.role_versions(),
+                capabilities,
+            )
+            .await;
+        match fallback {
+            Ok(handle) => {
+                if policy
+                    .aft_harness
+                    .as_ref()
+                    .is_some_and(|state| state.remember_runner())
+                {
+                    tracing::warn!(target: "subc", module_id, code = refusal.code(),
+                        "AFT refused the session harness; using runner until the catalog refreshes");
+                    *self.shared.aft_harness_answer.lock().unwrap() = Some(false);
+                }
+                Ok(handle)
+            }
+            Err(_) => first,
+        }
     }
 
     async fn route_open_wire_target(
@@ -3942,6 +4013,28 @@ fn route_open_is_retryable(code: &str) -> bool {
     subc_protocol::error_codes::is_retryable_route_open(code)
 }
 
+/// These refusals describe the route or its authority, not the target's harness parser.
+/// The wire has no refusal-origin marker, so an unknown non-retryable code is treated as
+/// the target's. Retrying that refused bind with runner is safe: it is the ordinary tool
+/// identity, grants no new authority, and a failed fallback returns the first refusal.
+const DAEMON_PERMANENT_OPEN_REFUSALS: &[&str] = &[
+    "unknown_module",
+    "module_removed",
+    "permission_denied",
+    "scope_not_live",
+    "scope_unsupported",
+    "scope_bind_proof_required",
+    "scope_bind_proof_invalid",
+    "scope_bind_proof_mismatch",
+    "session_address_ambiguous",
+];
+
+fn is_target_bind_refusal(refusal: &RejectedMessage) -> bool {
+    !refusal.code().is_empty()
+        && !route_open_is_retryable(refusal.code())
+        && !DAEMON_PERMANENT_OPEN_REFUSALS.contains(&refusal.code())
+}
+
 /// The retry loop itself, drawing each backoff wait with `jitter` ([`full_jitter`] outside
 /// tests, so that a test can make the schedule exact). With `outage`, `retry.budget` is the
 /// outage patience and is measured as [`OutageWait`] describes.
@@ -4679,7 +4772,8 @@ pub fn supervised_consumer_identity() -> Option<subc_control::ConsumerIdentity> 
 ///
 /// Tool modules accept only a fixed set of harness values at bind (opencode, pi, runner, mcp:*,
 /// fed:*) and reject anything else, so every `RouteTarget::ToolProvider` bind that does not
-/// declare a session-keyed compaction or step-transform role presents `runner`.
+/// declare a session-keyed compaction or step-transform role normally presents `runner`.
+/// AFT is the exception: it accepts `broca` so completion notices can address the real session.
 ///
 /// Broca's own `BindIdentity.harness` cannot simply be that value: it is an opaque key component,
 /// joined into WAL, lease, store and idempotency keys, so it partitions durable state and broca
@@ -4736,7 +4830,7 @@ fn to_subc_bind(
     let harness = match target {
         // Session-keyed compaction and step-transform roles use the caller's real harness;
         // only tool-provider routes need the closed-enum `runner` translation.
-        RouteTarget::ToolProvider { .. }
+        RouteTarget::ToolProvider { module_id }
             if declares_compaction_provider(role_versions)
                 || role_versions.is_some_and(|roles| {
                     roles
@@ -4749,12 +4843,13 @@ fn to_subc_bind(
             return ToolProviderRoutePolicy {
                 declares_role: false,
                 session_identity: true,
+                aft_harness: None,
             }
-            .bind(identity);
+            .bind(module_id, identity);
         }
-        // Tool modules run a closed enum and reject anything else at bind.
-        RouteTarget::ToolProvider { .. } => {
-            return ToolProviderRoutePolicy::default().bind(identity)
+        // Without a catalog snapshot the tool-module identity remains runner.
+        RouteTarget::ToolProvider { module_id } => {
+            return ToolProviderRoutePolicy::default().bind(module_id, identity)
         }
         // Management and internal surfaces do not constrain the field -- subc-protocol carries
         // a free String -- so the caller's own value travels. Verified with both consumers
@@ -4856,6 +4951,7 @@ impl SubcConnection {
         let (reconnect_tx, _reconnect_rx) = mpsc::unbounded_channel();
         let conn = SubcConnection {
             shared: Arc::new(ConnectionShared {
+                aft_harness_answer: Mutex::new(None),
                 #[cfg(test)]
                 late_goodbye_handoff: Mutex::new(None),
                 route_closer: std::sync::OnceLock::new(),
@@ -4995,6 +5091,9 @@ impl InProcessModuleEnd {
 
 #[cfg(test)]
 mod tests {
+    mod aft_harness {
+        include!("connection/aft_harness_tests.rs");
+    }
     include!("connection/project_identity_tests.rs");
     include!("connection/route_close_followup_tests.rs");
     include!("connection/call_keepalive_tests.rs");
@@ -5119,6 +5218,7 @@ mod tests {
                 ..RouteShape::default()
             },
             false,
+            None,
         );
         tokio::pin!(open);
         let request = tokio::select! {
@@ -5138,8 +5238,7 @@ mod tests {
     }
 
     /// The route to the session's own compaction provider binds the session's harness and
-    /// session, exactly as its compaction route does, with the role and the scope unchanged. Any
-    /// other tool module still sees the `runner` harness.
+    /// session, exactly as its compaction route does, with the role and the scope unchanged.
     #[tokio::test]
     async fn the_compaction_providers_tool_route_binds_the_sessions_own_harness() {
         let (conn, mut write_rx, pending) = route_open_test_connection();
@@ -5158,6 +5257,7 @@ mod tests {
                 ..RouteShape::default()
             },
             false,
+            None,
         );
         tokio::pin!(open);
         let request = tokio::select! {
@@ -5180,44 +5280,64 @@ mod tests {
 
     #[tokio::test]
     async fn every_session_tool_route_uses_one_provider_identity() {
-        let (conn, mut write_rx, pending) = route_open_test_connection();
+        let (mut conn, mut write_rx, pending) = route_open_test_connection();
+        Arc::get_mut(&mut conn.shared).unwrap().consumer_identity =
+            Some(subc_control::ConsumerIdentity {
+                module_id: "broca".into(),
+                launch_nonce: "test".into(),
+            });
+        let scope = subc_protocol::scope::ScopeSelector::new(
+            subc_protocol::Principal::Reserved {
+                module_id: "scope-owner".into(),
+            },
+            "session-scope",
+            Some(3),
+        );
         let mut catalog = Vec::new();
-        for module in ["compactor", "aft"] {
+        for module in ["compactor", "hooks", "aft", "other"] {
             let mut entry = CatalogEntry::new(module, Vec::new(), Vec::new());
             entry.capabilities = Some(
                 serde_json::from_value(serde_json::json!({
-                    "provides": ["tool-provider/v1"]
+                    "provides": if module == "aft" { vec!["tool-provider/v1", "scope-background-tasks/v1"] } else { vec!["tool-provider/v1"] }
                 }))
                 .unwrap(),
             );
             catalog.push(entry);
         }
+        let catalog = crate::provider_catalog::ProviderCatalog::from(catalog);
         for session in ["session-one", "session-two"] {
-            let identity = BindIdentity::new("/project", "broca", session);
-            for provider in ["compactor", "aft"] {
-                let policy = ToolProviderRoutePolicy::for_provider(
-                    &catalog,
-                    provider,
-                    provider == "compactor",
-                );
+            for (provider, harness, session_identity, expected_harness) in [
+                ("compactor", "broca", true, "broca"),
+                ("hooks", "custom", true, "custom"),
+                ("aft", "broca", false, "broca"),
+                ("aft", "custom", false, "runner"),
+                ("other", "broca", false, "runner"),
+            ] {
+                let identity = BindIdentity::new("/project", harness, session);
+                let policy =
+                    ToolProviderRoutePolicy::for_provider(&catalog, provider, session_identity);
                 for kind in ["catalog", "dispatch", "withdraw", "user_command.invoke"] {
                     let open = async {
                         if matches!(kind, "dispatch" | "user_command.invoke") {
                             conn.route_open_dispatch_single_attempt(
                                 provider,
                                 &identity,
-                                None,
+                                Some(&scope),
                                 RouteShape {
                                     tool_provider_v1: policy.declares_role,
                                     session_identity: policy.session_identity,
                                     ..RouteShape::default()
                                 },
                                 false,
+                                policy.aft_harness.clone(),
                             )
                             .await
                         } else {
                             conn.route_open_tool_provider_with_policy(
-                                provider, &identity, None, policy,
+                                provider,
+                                &identity,
+                                Some(scope.clone()),
+                                policy.clone(),
                             )
                             .await
                         }
@@ -5231,7 +5351,7 @@ mod tests {
                     assert_eq!(
                         raw["identity"],
                         serde_json::json!({
-                            "harness": if provider == "compactor" { "broca" } else { "runner" },
+                            "harness": expected_harness,
                             "session": session,
                         }),
                         "{kind} to {provider}"
@@ -5240,8 +5360,13 @@ mod tests {
                         raw["role_versions"],
                         serde_json::json!({"tool-provider":"v1"})
                     );
+                    assert_eq!(raw["scope"], serde_json::to_value(&scope).unwrap());
+                    assert_eq!(
+                        raw["consumer_identity"],
+                        serde_json::json!({"module_id": "broca", "launch_nonce": "test"})
+                    );
                     answer_route_open(&pending, &request, 7);
-                    open.await.unwrap();
+                    assert_eq!(open.await.unwrap().session_identity, session_identity);
                 }
             }
         }
@@ -5334,6 +5459,7 @@ mod tests {
                     ..RouteShape::default()
                 },
                 installed,
+                None,
             );
             tokio::pin!(open);
             let request = tokio::select! {
@@ -5974,7 +6100,7 @@ mod tests {
             let outbound = to_subc_bind(
                 &identity,
                 &RouteTarget::ToolProvider {
-                    module_id: "aft".to_string(),
+                    module_id: "other".to_string(),
                 },
                 None,
             );
@@ -5985,6 +6111,62 @@ mod tests {
             );
             // The session still carries the caller's identity; scope supplies project attribution.
             assert_eq!(outbound.session, identity.session);
+        }
+    }
+
+    #[test]
+    fn aft_tool_bind_forwards_only_accepted_session_harnesses() {
+        let catalog = aft_harness::catalog(true);
+        for (caller_harness, expected_harness) in [
+            ("broca", "broca"),
+            ("runner", "runner"),
+            ("opencode", "runner"),
+            ("pi", "runner"),
+            ("conformance", "runner"),
+            ("mcp:client", "runner"),
+            ("fed:client", "runner"),
+            ("Broca", "runner"),
+            ("broca-custom", "runner"),
+            ("anything-a-caller-picks", "runner"),
+        ] {
+            let identity = BindIdentity::new("/project", caller_harness, "alfonso:bg_x");
+            let target = RouteTarget::ToolProvider {
+                module_id: "aft".into(),
+            };
+            let outbound = ToolProviderRoutePolicy::for_provider(&catalog, "aft", false)
+                .bind("aft", &identity);
+            assert_eq!(outbound.harness, expected_harness, "{caller_harness}");
+            assert_eq!(outbound.session, "alfonso:bg_x");
+            assert_eq!(
+                to_subc_bind(&identity, &target, None).harness,
+                "runner",
+                "an opener without a catalog snapshot retains the old identity"
+            );
+
+            // The session's own compaction and hook providers keep their existing policy,
+            // even when that provider is AFT and the harness is outside the callback allowlist.
+            assert_eq!(
+                ToolProviderRoutePolicy {
+                    declares_role: true,
+                    session_identity: true,
+                    aft_harness: None,
+                }
+                .bind("aft", &identity)
+                .harness,
+                caller_harness,
+            );
+            for (role, version) in [
+                (broca_core::compaction_provider::ROLE, "v1"),
+                (
+                    cortexkit_role_step_transform_provider::ROLE,
+                    cortexkit_role_step_transform_provider::VERSION,
+                ),
+            ] {
+                let roles = std::collections::BTreeMap::from([(role.to_owned(), version.into())]);
+                let role_bind = to_subc_bind(&identity, &target, Some(&roles));
+                assert_eq!(role_bind.harness, caller_harness, "{role}");
+                assert_eq!(role_bind.session, "alfonso:bg_x");
+            }
         }
     }
 
@@ -6132,6 +6314,7 @@ mod tests {
         let (reconnect_tx, _reconnect_rx) = mpsc::unbounded_channel();
         SubcConnection {
             shared: Arc::new(ConnectionShared {
+                aft_harness_answer: Mutex::new(None),
                 #[cfg(test)]
                 late_goodbye_handoff: Mutex::new(None),
                 route_closer: std::sync::OnceLock::new(),
@@ -8005,6 +8188,7 @@ mod tests {
         });
         let (reconnect_tx, reconnect_rx) = mpsc::unbounded_channel();
         let shared = Arc::new(ConnectionShared {
+            aft_harness_answer: Mutex::new(None),
             #[cfg(test)]
             late_goodbye_handoff: Mutex::new(None),
             route_closer: std::sync::OnceLock::new(),

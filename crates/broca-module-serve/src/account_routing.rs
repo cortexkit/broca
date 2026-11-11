@@ -317,12 +317,7 @@ async fn resolve_routing_module(conn: &broca_subc::SubcConnection) -> Result<Str
         .into_iter()
         .filter(|entry| {
             entry.nonce_verified
-                && entry.capabilities.as_ref().is_some_and(|capabilities| {
-                    capabilities
-                        .provides
-                        .iter()
-                        .any(|role| role == cortexkit_role_routing::PROVIDES)
-                })
+                && broca_subc::catalog_entry_provides(entry, cortexkit_role_routing::PROVIDES)
         })
         .map(|entry| entry.module_id)
         .collect::<Vec<_>>();

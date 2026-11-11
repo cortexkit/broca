@@ -30,7 +30,10 @@ const TRANSIENT: &str = "transient";
 const FETCH_REPLY_TIMEOUT: Duration = broca_fetch_plan::ADMISSION_DEADLINE;
 
 type CatalogSnapshot = futures::future::Shared<
-    futures::future::BoxFuture<'static, Result<Arc<Vec<subc_control::CatalogEntry>>, FetchError>>,
+    futures::future::BoxFuture<
+        'static,
+        Result<Arc<crate::provider_catalog::ProviderCatalog>, FetchError>,
+    >,
 >;
 
 /// Fetches one session's plan over a subc consumer connection.
@@ -99,7 +102,9 @@ impl SubcPlanFetcher {
         }
     }
 
-    async fn catalog_snapshot(&self) -> Result<Arc<Vec<subc_control::CatalogEntry>>, FetchError> {
+    async fn catalog_snapshot(
+        &self,
+    ) -> Result<Arc<crate::provider_catalog::ProviderCatalog>, FetchError> {
         use futures::FutureExt;
         let snapshot = self
             .catalog_snapshot
@@ -112,7 +117,7 @@ impl SubcPlanFetcher {
                 async move {
                     conn.catalog_list()
                         .await
-                        .map(Arc::new)
+                        .map(|entries| Arc::new(entries.into()))
                         .map_err(|error| FetchError::Lost(error.to_string()))
                 }
                 .boxed()
@@ -410,13 +415,57 @@ mod carrier_catalog_tests {
     use super::*;
     use serde_json::json;
 
+    #[tokio::test]
+    async fn failed_catalog_read_loses_aft_and_other_fetches_without_opening_routes() {
+        let mut errors = Vec::new();
+        for provider in ["aft", "other"] {
+            let (conn, _, mut daemon) = SubcConnection::in_process_for_test(1, 1);
+            let fetcher = SubcPlanFetcher::new(
+                Arc::new(conn),
+                BindIdentity::new("/project", "broca", "catalog-failure"),
+                None,
+            );
+            let call = fetcher.call(provider, CATALOG_OP, json!({}));
+            tokio::pin!(call);
+            let request = tokio::select! {
+                result = &mut call => panic!("fetch finished before catalog read: {result:?}"),
+                request = daemon.next_request() => request,
+            };
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(body["op"], "catalog.list");
+            assert!(daemon.refuse(&request, "module_timeout"));
+            let error = tokio::select! {
+                result = &mut call => result.unwrap_err(),
+                request = daemon.next_request() => panic!(
+                    "{provider} sent a request after its catalog read failed: {}",
+                    String::from_utf8_lossy(&request.body),
+                ),
+            };
+            assert!(
+                matches!(&error, FetchError::Lost(_)),
+                "{provider}: {error:?}"
+            );
+            assert!(daemon.take_written_for_test().is_empty());
+            errors.push(error);
+        }
+        assert_eq!(
+            errors[0], errors[1],
+            "AFT must preserve the same lost-fetch error as other providers"
+        );
+    }
+
     fn inventory(providers: &[&str]) -> Vec<u8> {
         let modules: Vec<_> = providers
             .iter()
             .map(|provider| {
                 let mut entry = subc_control::CatalogEntry::new(*provider, Vec::new(), Vec::new());
+                let provides = if *provider == "aft" {
+                    vec!["tool-provider/v1", "scope-background-tasks/v1"]
+                } else {
+                    vec!["tool-provider/v1"]
+                };
                 entry.capabilities =
-                    Some(serde_json::from_value(json!({"provides":["tool-provider/v1"]})).unwrap());
+                    Some(serde_json::from_value(json!({"provides": provides})).unwrap());
                 entry
             })
             .collect();
@@ -440,7 +489,7 @@ mod carrier_catalog_tests {
         .with_compaction_provider(Some("compactor".into()))
         .with_hook_providers(["hook".into()]);
         let fetch = async {
-            for provider in ["compactor", "hook", "aft"] {
+            for provider in ["compactor", "hook", "aft", "other"] {
                 fetcher.call(provider, CATALOG_OP, json!({})).await.unwrap();
             }
         };
@@ -450,14 +499,14 @@ mod carrier_catalog_tests {
                 serde_json::from_slice::<Value>(&request.body).unwrap()["op"],
                 "catalog.list"
             );
-            daemon.reply(&request, inventory(&["compactor", "hook", "aft"]));
-            for provider in ["compactor", "hook", "aft"] {
+            daemon.reply(&request, inventory(&["compactor", "hook", "aft", "other"]));
+            for provider in ["compactor", "hook", "aft", "other"] {
                 let open = daemon.next_request().await;
                 let body: Value = serde_json::from_slice(&open.body).unwrap();
                 assert_eq!(
                     body["identity"],
                     json!({
-                        "harness": if provider == "aft" { "runner" } else { "broca" },
+                        "harness": if provider == "other" { "runner" } else { "broca" },
                         "session": "session",
                     })
                 );

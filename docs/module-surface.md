@@ -318,6 +318,20 @@ A consumer can be both. The surface is **session-centric**: consumers address
   unscoped. Neither storage roots nor the namespace are sent as wire bind projects.
   Tool routes to the plan's compaction or step-transform providers bind the session's own
   harness and session; other tool modules bind `runner` with the unchanged session string.
+  AFT (`module_id: aft`) additionally receives the real harness `broca` only when its daemon
+  catalog manifest declares `scope-background-tasks/v1`, so background-command completion
+  notices can address that session. The existing catalog snapshot supplies this decision;
+  no entry, no readable snapshot, or no capability means `runner`, with no discovery call per
+  route. If a stale snapshot permits `broca` but the target refuses that bind, Broca tries
+  `runner` once. A successful fallback is remembered until the snapshot refreshes; if it
+  fails too, the first refusal is returned unchanged. Transport/decoding failures and the
+  daemon's own routing, scope and permission refusals do not trigger this fallback; temporary
+  refusals retain their existing retry policy. Snapshots refresh after a route is invalidated
+  because it is no longer live, or once when batch routing cannot resolve a provider; there
+  is no timer. Each plan fetcher uses a separate catalog snapshot, shared by that admission's
+  provider lookups. Existing routes keep their bind.
+  Other harnesses still become `runner`; this exception changes neither the attested
+  principal, the frozen scope, nor the session string.
   Keeping one `(harness, session)` bind pair per session at a provider relies on the session
   string being unique per consumer and provider, which every caller today satisfies
   (Core names each session with its own task id).
