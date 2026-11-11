@@ -4885,9 +4885,23 @@ pub async fn end_run_with_error<W: Writer>(
     error: &ProviderError,
     now_ms: u64,
 ) -> Result<Finished, LoopError> {
+    end_run_with_error_and_interrupt_reason(writer, run_id, reason, error, now_ms, None).await
+}
+
+/// [`end_run_with_error`] with the recorded interruption reason the actor's seal selected, so
+/// callers read the same cause whether the loop or its actor wrote the interrupted end.
+pub async fn end_run_with_error_and_interrupt_reason<W: Writer>(
+    writer: &mut W,
+    run_id: &str,
+    reason: RunFinishReason,
+    error: &ProviderError,
+    now_ms: u64,
+    interrupt_reason: Option<String>,
+) -> Result<Finished, LoopError> {
     let mut record = run_end(writer, run_id, reason, now_ms);
     if let Record::RunEnd(end) = &mut record {
         end.error = Some(serde_json::to_value(error).map_err(|e| LoopError::Parts(e.to_string()))?);
+        end.interrupt_reason = interrupt_reason;
     }
     append_end(writer, run_id, vec![record]).await?;
     Ok(finished(writer, reason))

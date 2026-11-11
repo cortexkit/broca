@@ -104,6 +104,7 @@ pub struct StoreActor<B: SessionBackend> {
     held_resume_owed: bool,
     restart_admitting: bool,
     restart_waiters: Vec<oneshot::Sender<Result<(), String>>>,
+    account_limit_timer: Option<account_limit_pause::TimedPause>,
     /// Set once the module stops the session: no queued send starts after it.
     stopping: bool,
     /// Where the session's spend facts are written. Without it, a run that ends stays owed
@@ -242,6 +243,7 @@ struct ActiveRun {
     restart_from_seq: Option<u64>,
     run_id: RunId,
     one_shot: bool,
+    account_limit_resume: bool,
     /// The actor's end of the run's writer.
     link: RunLink,
     /// Set once the run dropped its writer: it appends nothing more, and its end follows.
@@ -353,6 +355,7 @@ enum Event {
     IdleDeadline,
     /// The session is idle and may hold deletions that have come due.
     Collect,
+    AccountLimit(account_limit_pause::TimedPause),
 }
 
 /// The next record of a warm the active run's keep-warm sent, or never when it keeps none.
@@ -400,6 +403,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             held_resume_owed: false,
             restart_admitting: false,
             restart_waiters: Vec::new(),
+            account_limit_timer: None,
             stopping: false,
             billing: None,
             compaction_session: Arc::default(),
@@ -573,8 +577,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     }
 
     /// What keeps the session from closing idle, under the names today's actor gives the
-    /// registry: a run, a warm being sent, or a subscriber still attached. A subscriber keeps a
-    /// session open for as long as it holds its stream, as on today's storage, so a caller
+    /// registry: a run, a warm being sent, an account-limit timer, or a subscriber still attached.
+    /// A subscriber keeps a session open for as long as it holds its stream, as on today's
+    /// storage, so a caller
     /// watching an idle session isn't cut off at its idle deadline; the first idle tick after
     /// the last one has gone closes it. Empty when the session may close.
     fn idle_holds(&mut self) -> Vec<&'static str> {
@@ -584,6 +589,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         }
         if self.warm.is_some() {
             holds.push("manual_warm");
+        }
+        if self.account_limit_timer.is_some() {
+            holds.push("account_limit_pause");
         }
         if self
             .fanout
@@ -972,6 +980,12 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 }
             }
             let built = media_built(&mut self.media_build);
+            let timed_pause = self.account_limit_timer.clone().filter(|_| {
+                self.registry.as_ref().is_none_or(|registry| {
+                    registry.restart_resume_ready() && !registry.is_stopping()
+                })
+            });
+            let account_deadline = timed_pause.as_ref().map(|pause| pause.resume_not_before_ms);
             let collect_due = self.collect_due;
             // A warm the executor is sending ends whatever else the actor waits on.
             let has_warm = self.warm.is_some();
@@ -1006,6 +1020,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                     result = warmed, if has_warm => Event::Warmed(result),
                     built = built => Event::MediaBuilt(built),
                     command = commands.recv() => Event::Command(command),
+                    _ = expiry::wait(account_deadline, &clock) => {
+                        Event::AccountLimit(timed_pause.expect("an account-limit timer is armed"))
+                    },
                     // Only once no command is waiting: the session is idle.
                     () = std::future::ready(()), if collect_due => Event::Collect,
                     _ = async {
@@ -1036,6 +1053,11 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 Event::Warmed(result) => self.finish_warm(result).await,
                 Event::KeptWarm(record) => self.record_kept_warm(*record).await,
                 Event::Collect => self.collect_unreferenced().await,
+                Event::AccountLimit(pause) => {
+                    if let Err(error) = self.wake_account_limit(pause).await {
+                        tracing::warn!(target: "broca.store_actor", %error, "account-limit wake could not be recovered");
+                    }
+                }
                 Event::Command(None) => return Exit::Closed,
                 Event::Command(Some(command)) => {
                     idle_deadline = idle_after(tokio::time::Instant::now());
@@ -1192,7 +1214,11 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 Event::Done(end) => return self.finish_run(end).await,
                 Event::MediaBuilt(built) => self.media_built(built).await,
                 Event::KeptWarm(record) => self.record_kept_warm(*record).await,
-                Event::Command(_) | Event::Warmed(_) | Event::IdleDeadline | Event::Collect => {
+                Event::Command(_)
+                | Event::Warmed(_)
+                | Event::IdleDeadline
+                | Event::Collect
+                | Event::AccountLimit(_) => {
                     unreachable!("no command is read here, and no idle deadline is waited on")
                 }
             }
@@ -2018,6 +2044,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             tracing::error!(target: "lifecycle", %error, "run refused before its recovery registration was durable");
             return;
         }
+        // A run is starting, so a timer armed for an account-limit pause no longer applies. A
+        // run refused above leaves it armed: the pause it was built from still stands.
+        self.account_limit_timer = None;
         if self.warm.as_ref().is_some_and(|warm| warm.idle_auto) {
             let pending = self.warm.as_mut().expect("idle warm exists");
             pending.task.abort();
@@ -2158,6 +2187,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         self.run = Some(ActiveRun {
             restart_from_seq: self.restart_admitting.then(|| self.session.next_seq()),
             one_shot: one_shot || self.one_shot_runs.contains(&run_id),
+            account_limit_resume: false,
             run_id,
             link,
             writer_gone: false,
@@ -2276,7 +2306,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     /// queued behind it, as today's held-call recovery does. A sign-in pause waits for its retry,
     /// unless an interrupt was queued before the process stopped: it ends the paused run now,
     /// as today's drain does (`end_paused`). A restart pause resumes after dependency routes
-    /// register. The account-limit pause timer is not recovered on this storage yet.
+    /// register. An account-limit pause rebuilds its timer from its durable evidence.
     async fn recover(&mut self) {
         self.bill_owed().await;
         self.bill_recorded_idle_warms().await;
@@ -2301,6 +2331,10 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             None => {
                 if self.interrupt_waits_on_pause() {
                     return self.end_paused().await;
+                }
+                if run.paused == Some(broca_protocol::PauseReason::AccountLimit) {
+                    self.arm_account_limit().await;
+                    return;
                 }
                 if !matches!(run.paused, Some(broca_protocol::PauseReason::AuthRequired)) {
                     tracing::warn!(
@@ -3108,6 +3142,16 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         } else {
             None
         };
+        if active.account_limit_resume {
+            if let Err(error) = &result {
+                if let Err(error) = self
+                    .refuse_account_limit_resume(&active.run_id, format!("{error:?}"))
+                    .await
+                {
+                    tracing::error!(target: "broca.store_actor", %error, "could not end a refused account-limit resume");
+                }
+            }
+        }
         let started = self
             .session
             .operations()
@@ -3226,6 +3270,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             }
         }
         self.drain().await;
+        self.arm_account_limit().await;
         self.arm_idle_warm().await;
     }
 
@@ -4044,6 +4089,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             // them after its Cancelled end is durable. Neither cancel point waits for a result.
             let cancel = CancellationToken::new();
             cancel.cancel();
+            self.account_limit_timer = None;
             self.start_run_under(start, None, None, StoreRunMode::Resume, cancel)
                 .await;
             return CancelOutcome::Ack;
@@ -4408,6 +4454,7 @@ fn refuse(command: LineageCmd) {
     }
 }
 
+mod account_limit_pause;
 mod admission;
 mod apply_view;
 mod expiry;

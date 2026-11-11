@@ -1256,8 +1256,12 @@ const HARNESS_TIME_MS: u64 = 1;
 
 /// The time the new loop reads: today's loop reads the wall clock, so a comparison whose result
 /// depends on it does too; every other comparison reads [`HARNESS_TIME_MS`] and normalizes the
-/// times recorded.
+/// times recorded. A scoped account clock overrides both loops' time for a comparison that must
+/// remain on one side of a reset regardless of how long it takes to run.
 fn harness_now() -> u64 {
+    if let Ok(now) = ACCOUNT_CLOCK.try_with(|clock| clock.now_ms()) {
+        return now;
+    }
     if cache() || account().is_some() || fallback().is_some() {
         broca_core::clock::Clock::default().now_ms()
     } else {
@@ -1443,6 +1447,8 @@ tokio::task_local! {
     /// The provider account a comparison routes, with the boot cap on same-account waits.
     /// `None` routes no account, and no run may pause on one.
     static ACCOUNT: Option<AccountScript>;
+    /// A frozen clock for comparisons that must stay before the account's reset under load.
+    static ACCOUNT_CLOCK: broca_core::Clock;
 }
 
 #[derive(Clone)]
@@ -5315,6 +5321,7 @@ async fn compare_auth_pause_in_once(
                     _ => account_selection(),
                 },
                 account_limit_pause: account().is_some(),
+                clock: ACCOUNT_CLOCK.try_with(Clone::clone).ok(),
                 max_same_account_wait: account()
                     .map_or_else(Default::default, |script| script.wait),
                 new_log_compaction_plan_version: layout(),
@@ -8557,15 +8564,28 @@ fn tool_then_limited(limited: Vec<NormalizedEvent>) -> Scenario {
 /// Asked to resume before the account resets, both loops leave the run paused and send nothing.
 #[tokio::test]
 async fn an_account_limit_pause_stays_paused_before_the_reset() {
-    compare_routed(
-        AccountScript {
-            selection: routed("acct-1"),
-            wait: broca_core::SameAccountWait::default(),
-            wait_for_reset: false,
-        },
-        compare_auth_pause(tool_then_limited(account_limited())),
-    )
-    .await;
+    let dir = broca_test_support::scratch_root().join(format!(
+        "account-clock-{}-{}",
+        std::process::id(),
+        rand_suffix()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("test-clock"), br#"{"now_ms":1000000}"#).unwrap();
+    let clock = broca_core::Clock::for_state_root(&dir).unwrap();
+    ACCOUNT_CLOCK
+        .scope(
+            clock,
+            compare_routed(
+                AccountScript {
+                    selection: routed("acct-1"),
+                    wait: broca_core::SameAccountWait::default(),
+                    wait_for_reset: false,
+                },
+                compare_auth_pause(tool_then_limited(account_limited())),
+            ),
+        )
+        .await;
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 /// A resume whose requests can't be rendered until it waited for something (as a store run's
