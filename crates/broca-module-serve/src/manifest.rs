@@ -40,6 +40,7 @@ pub const OP_MOVE_TO_STORE: &str = "session.move_to_store";
 pub const OP_RESTORE_FROM_BACKUP: &str = "session.restore_from_backup";
 pub const OP_CANCEL: &str = "run.cancel";
 pub const OP_STATUS: &str = "run.status";
+pub const OP_RUN_ADMISSION: &str = "run.admission";
 pub const OP_RUN_EVENT_GET: &str = "run.event.get";
 pub const OP_READ: &str = "session.read";
 /// Daemon-scoped read of the credential vault's listing under broca's grants.
@@ -260,6 +261,11 @@ pub(crate) fn management_operations() -> Vec<ManagementOperation> {
                 "Point-read one run's state and terminal outcome, scoped to the owning session."
                     .to_string(),
             ),
+        },
+        ManagementOperation {
+            name: OP_RUN_ADMISSION.to_string(),
+            kind: ManagementOperationKind::Query,
+            description: Some("Read one run's frozen admission metadata without session content.".to_string()),
         },
         ManagementOperation {
             name: OP_RUN_EVENT_GET.to_string(),

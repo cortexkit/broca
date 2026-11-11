@@ -452,7 +452,8 @@ impl StoreRuntime {
     ) -> Result<Option<crate::store_reads::StoreReadReply>, crate::serve::ServeError> {
         use crate::store_reads::{execute, ReadContext, StoreReadOutcome};
         let run = match &request {
-            crate::store_reads::StoreReadRequest::RunStatus(run)
+            crate::store_reads::StoreReadRequest::RunAdmission(run)
+            | crate::store_reads::StoreReadRequest::RunStatus(run)
             | crate::store_reads::StoreReadRequest::RunStatusReply(run)
             | crate::store_reads::StoreReadRequest::RunResult(run) => Some(run.0.as_str()),
             _ => None,

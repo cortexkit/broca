@@ -59,7 +59,7 @@ use tokio_util::sync::CancellationToken;
 use crate::manifest::{
     OP_BASELINE, OP_CANCEL, OP_FLUSH_PREFIX, OP_HEAD, OP_IMPORT, OP_INSTALL_VIEW, OP_MOVE_TO_STORE,
     OP_READ, OP_REFRESH, OP_REFRESH_POLICY, OP_RESTORE_FROM_BACKUP, OP_RETRACT, OP_ROLE_DESCRIBE,
-    OP_RUN_EVENT_GET, OP_RUN_RESULT, OP_RUN_TOOL_CALLS, OP_SEND, OP_SEND_STATUS,
+    OP_RUN_ADMISSION, OP_RUN_EVENT_GET, OP_RUN_RESULT, OP_RUN_TOOL_CALLS, OP_SEND, OP_SEND_STATUS,
     OP_SESSION_SEND_STATUS, OP_STATUS, OP_SUBSCRIBE, OP_VAULT_AUDIT, OP_WARM,
 };
 use crate::wire::{
@@ -2844,7 +2844,7 @@ where
             OP_SEND | OP_WARM | OP_IMPORT | OP_INSTALL_VIEW | OP_CANCEL | OP_RETRACT | OP_REFRESH | OP_REFRESH_POLICY | OP_FLUSH_PREFIX
         );
         let write = write || matches!(method, "session.upload_begin" | "session.upload_append" | "session.upload_commit");
-        let session_read = matches!(method, OP_READ | OP_HEAD | OP_RUN_RESULT | OP_RUN_TOOL_CALLS | OP_RUN_EVENT_GET | OP_STATUS | OP_SUBSCRIBE | OP_BASELINE | "session.upload_status" | cortexkit_role_llm_runner::ops::SESSION_HISTORY | cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REFS | cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REF_READ)
+        let session_read = matches!(method, OP_READ | OP_HEAD | OP_RUN_RESULT | OP_RUN_TOOL_CALLS | OP_RUN_EVENT_GET | OP_STATUS | OP_RUN_ADMISSION | OP_SUBSCRIBE | OP_BASELINE | "session.upload_status" | cortexkit_role_llm_runner::ops::SESSION_HISTORY | cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REFS | cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REF_READ)
             || method == cortexkit_role_llm_runner::ops::SESSION_MEDIA_READ;
         if write || session_read {
             if let Err(error) = handler.check_migration(&session, write).await {
@@ -3973,6 +3973,44 @@ where
             {
                 Ok(resp) => send_json_response(writer, ver, channel, epoch, corr, &resp).await,
                 Err(e) => send_serve_error(writer, ver, channel, epoch, corr, &e).await,
+            }
+        }
+        OP_RUN_ADMISSION => {
+            let params: broca_wire::RunAdmissionParams =
+                match serde_json::from_value(req.params.clone()) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        return send_invalid_params(
+                            writer,
+                            ver,
+                            channel,
+                            epoch,
+                            corr,
+                            Some("run_id".into()),
+                            &error.to_string(),
+                        )
+                        .await
+                    }
+                };
+            match handler
+                .run_admission(session, broca_protocol::RunId(params.run_id))
+                .await
+            {
+                Ok(Some(response)) => {
+                    send_json_response(writer, ver, channel, epoch, corr, &response).await
+                }
+                Ok(None) => {
+                    send_json_response(
+                        writer,
+                        ver,
+                        channel,
+                        epoch,
+                        corr,
+                        &broca_wire::RunStatusResponse::Unknown,
+                    )
+                    .await
+                }
+                Err(error) => send_serve_error(writer, ver, channel, epoch, corr, &error).await,
             }
         }
         OP_STATUS => {
@@ -5298,7 +5336,9 @@ pub(crate) fn served_on_new_storage(method: &str, _params: &serde_json::Value) -
         OP_SUBSCRIBE => true,
         // Run and send facts built from the store's own records (`store_status`), and a run's
         // calls (`store_tool_calls`).
-        OP_STATUS | OP_RUN_RESULT | OP_SEND_STATUS | OP_SESSION_SEND_STATUS => true,
+        OP_STATUS | OP_RUN_ADMISSION | OP_RUN_RESULT | OP_SEND_STATUS | OP_SESSION_SEND_STATUS => {
+            true
+        }
         OP_RUN_TOOL_CALLS => true,
         // The store actor serves sends, cancels and retractions.
         OP_SEND | OP_CANCEL | OP_RETRACT => true,

@@ -966,6 +966,78 @@ pub struct StatusParams {
     pub run_id: Option<String>,
 }
 
+/// `run.admission` reads one run's frozen start, never its session's latest admission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunAdmissionParams {
+    pub run_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunAdmissionStorage {
+    Wal,
+    Store,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunAdmissionFetch {
+    pub provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declarations_frozen: Option<serde_json::Value>,
+}
+
+/// Admission metadata only: no messages, tool arguments, system text or credentials.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunAdmissionResponse {
+    pub run_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_class: Option<String>,
+    pub started_at_ms: u64,
+    pub storage: RunAdmissionStorage,
+    pub fetches: Vec<RunAdmissionFetch>,
+}
+
+#[cfg(test)]
+mod run_admission_tests {
+    use super::*;
+
+    #[test]
+    fn run_admission_requires_a_run_id_and_refuses_unknown_params() {
+        assert!(serde_json::from_str::<RunAdmissionParams>(r#"{}"#).is_err());
+        assert!(
+            serde_json::from_str::<RunAdmissionParams>(r#"{"run_id":"r","runId":"other"}"#)
+                .is_err()
+        );
+        assert_eq!(
+            serde_json::from_str::<RunAdmissionParams>(r#"{"run_id":"r"}"#)
+                .unwrap()
+                .run_id,
+            "r"
+        );
+    }
+
+    #[test]
+    fn run_admission_absent_metadata_stays_absent() {
+        let response = RunAdmissionResponse {
+            run_id: "r".into(),
+            session_class: None,
+            started_at_ms: 123,
+            storage: RunAdmissionStorage::Store,
+            fetches: vec![RunAdmissionFetch {
+                provider: "aft".into(),
+                declarations_frozen: None,
+            }],
+        };
+        assert_eq!(
+            serde_json::to_value(response).unwrap(),
+            serde_json::json!({
+                "run_id":"r", "started_at_ms":123, "storage":"store", "fetches":[{"provider":"aft"}]
+            })
+        );
+    }
+}
+
 /// A durable control-stream position shared by `session.read` and `session.subscribe`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct CursorWire {

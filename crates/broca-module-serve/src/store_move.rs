@@ -77,6 +77,7 @@ pub const REQUIRED_OPERATIONS: &[&str] = &[
     crate::manifest::OP_SEND_STATUS,
     crate::manifest::OP_SESSION_SEND_STATUS,
     crate::manifest::OP_STATUS,
+    crate::manifest::OP_RUN_ADMISSION,
     crate::manifest::OP_RUN_RESULT,
     crate::manifest::OP_RUN_TOOL_CALLS,
     cortexkit_role_llm_runner::ops::SESSION_MEDIA_READ,

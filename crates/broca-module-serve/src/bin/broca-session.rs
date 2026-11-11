@@ -504,6 +504,11 @@ enum Cmd {
         #[arg(long)]
         source_ref: Option<String>,
     },
+    /// `run.admission`: print the requested run's frozen admission metadata as JSON.
+    Admission {
+        #[arg(long)]
+        run_id: String,
+    },
     /// `run.status`: report the session state, or use `--run-id` to report one run's lifecycle
     /// status. `--raw` with `--run-id` writes the daemon's exact reply bytes to stdout and their
     /// count and SHA-256 to stderr.
@@ -877,6 +882,7 @@ async fn run(args: Args) -> Result<i32, String> {
         &args.cmd,
         Cmd::Status { raw: true, .. }
             | Cmd::Raw { .. }
+            | Cmd::Admission { .. }
             | Cmd::Result { raw: true, .. }
             | Cmd::Describe { .. }
             | Cmd::EventGet { .. }
@@ -1123,6 +1129,18 @@ async fn run(args: Args) -> Result<i32, String> {
                 &mut std::io::stdout().lock(),
                 &mut std::io::stderr().lock(),
             )?;
+            Ok(exit)
+        }
+        Cmd::Admission { run_id } => {
+            let reply = client
+                .management_raw("run.admission", &serde_json::json!({"run_id": run_id}))
+                .await
+                .map_err(|error| format!("admission transport: {error}"))?;
+            let (body, exit) = match reply {
+                Ok(body) => (body, 0),
+                Err(body) => (body, 1),
+            };
+            write_raw_reply(&body)?;
             Ok(exit)
         }
         Cmd::Status { run_id, raw } => {
@@ -2690,6 +2708,32 @@ mod tests {
         cache_params, decode_observed_event, load_plan, observed_event, parse_subscribe_cursor,
         read_page_event, run, Args, Cmd, PathBuf,
     };
+
+    #[test]
+    fn run_admission_command_requires_and_preserves_run_id() {
+        use clap::Parser;
+        let args = Args::try_parse_from([
+            "broca-session",
+            "--subc",
+            "unused",
+            "--session",
+            "s",
+            "admission",
+            "--run-id",
+            "r",
+        ])
+        .unwrap();
+        assert!(matches!(args.cmd, Cmd::Admission { run_id } if run_id == "r"));
+        assert!(Args::try_parse_from([
+            "broca-session",
+            "--subc",
+            "unused",
+            "--session",
+            "s",
+            "admission",
+        ])
+        .is_err());
+    }
 
     #[test]
     fn generic_raw_command_preserves_json_params() {
