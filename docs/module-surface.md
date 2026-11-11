@@ -2750,6 +2750,44 @@ The command prints one line per session (`--json-events`: one JSON object, the l
   can do without; nothing changed;
 - `refused`, `busy`, `key_unavailable` or `failed`: why it wasn't restored; nothing changed.
 
+### Part number map
+
+`session.tag_map` (operator only: only a direct operator connection may call it, and it is
+not one of the runner role's operations) names, for a session
+kept in the new storage, which message and part each part number belongs to: the number broca
+renders in front of a numbered part, as the model is shown it. No caller-facing read carries
+these rows. Another caller is refused `operator_required` before anything reads the session.
+A session today's storage keeps is refused `not_served_on_old_storage`, by name; an unknown
+session answers as `session.read` reads it, an empty transcript that numbers nothing.
+
+Request: `{"after_ordinal": <u64, optional>, "limit": <u64, optional>}`. `limit` counts
+messages, not rows, so a message's parts are never split across pages; it defaults to 500 and
+is held between 1 and 2000. An unknown field is refused `invalid_params`. Reply:
+
+```json
+{"numbered": true,
+ "rows": [{"tag": 12, "mid": "<message id>", "ordinal": 7, "part": 0, "role": "user"}],
+ "next_after_ordinal": 7}
+```
+
+One row per numbered part, in transcript order, sealed history included. `mid` and `ordinal`
+are the message's id and ordinal (from 1) as `session.read` and `session.entries` serve them,
+`part` is the zero-based index of the part's block within its message (its id in
+`session.entries`), and `role` is the message's role. `next_after_ordinal` is present only
+when more messages follow. `numbered` is false, with no rows, for a session that shows the
+model no numbers. Ids and numbers only: the reply carries no content.
+
+On the current compaction contract a part takes the number `session.entries` serves it with;
+off it, the number its run's own tag rules gave it. Both are read from what was recorded when
+each message was placed, so a page costs work for its own messages only. The read uses a
+read-only view of the session as stored: it never takes the session's lease or occupies its
+actor, and with an actor open it sees what the actor has made durable.
+
+```sh
+broca-session --subc <connection file> --project-root <root> --harness <harness> \
+  --session <session> tag-map --out map.json   # {"session": "<session>", "rows": [...]}
+```
+
 ## External session and call identities
 
 New external session references use the llm-runner v2 derivation over

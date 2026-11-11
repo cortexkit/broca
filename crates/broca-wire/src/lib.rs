@@ -9,6 +9,7 @@ pub mod diagnostics;
 pub mod head_import;
 pub mod role;
 pub use role::*;
+pub mod tag_map;
 pub mod warm;
 pub use warm::*;
 

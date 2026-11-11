@@ -60,7 +60,7 @@ use crate::manifest::{
     OP_BASELINE, OP_CANCEL, OP_FLUSH_PREFIX, OP_HEAD, OP_IMPORT, OP_INSTALL_VIEW, OP_MOVE_TO_STORE,
     OP_READ, OP_REFRESH, OP_REFRESH_POLICY, OP_RESTORE_FROM_BACKUP, OP_RETRACT, OP_ROLE_DESCRIBE,
     OP_RUN_ADMISSION, OP_RUN_EVENT_GET, OP_RUN_RESULT, OP_RUN_TOOL_CALLS, OP_SEND, OP_SEND_STATUS,
-    OP_SESSION_SEND_STATUS, OP_STATUS, OP_SUBSCRIBE, OP_VAULT_AUDIT, OP_WARM,
+    OP_SESSION_SEND_STATUS, OP_STATUS, OP_SUBSCRIBE, OP_TAG_MAP, OP_VAULT_AUDIT, OP_WARM,
 };
 use crate::wire::{
     CancelParams, FromWireExt, ImportParams, ImportResult, RetractParams, RouteRequest, SendParams,
@@ -2806,6 +2806,20 @@ where
             PreparedRouteRequest::Request(req) => &req.params,
             PreparedRouteRequest::Subscribe { params, .. } => params,
         };
+        // Only the operator's own connection reads a session's tag map, refused before anything
+        // reads the session and before the request is counted.
+        if method == OP_TAG_MAP && !matches!(bind.principal, Some(broca_protocol::BindPrincipal::Direct)) {
+            return send_error(
+                &writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "operator_required",
+                "session.tag_map is for the operator only",
+            )
+            .await;
+        }
         if let Some((converting, reason)) = handler.conversion_refusal(&session) {
             let body = ErrorBody::new(
                 if converting { "session_converting" } else { "session_unconverted" },
@@ -2844,7 +2858,7 @@ where
             OP_SEND | OP_WARM | OP_IMPORT | OP_INSTALL_VIEW | OP_CANCEL | OP_RETRACT | OP_REFRESH | OP_REFRESH_POLICY | OP_FLUSH_PREFIX
         );
         let write = write || matches!(method, "session.upload_begin" | "session.upload_append" | "session.upload_commit");
-        let session_read = matches!(method, OP_READ | OP_HEAD | OP_RUN_RESULT | OP_RUN_TOOL_CALLS | OP_RUN_EVENT_GET | OP_STATUS | OP_RUN_ADMISSION | OP_SUBSCRIBE | OP_BASELINE | "session.upload_status" | cortexkit_role_llm_runner::ops::SESSION_HISTORY | cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REFS | cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REF_READ)
+        let session_read = matches!(method, OP_READ | OP_HEAD | OP_RUN_RESULT | OP_RUN_TOOL_CALLS | OP_RUN_EVENT_GET | OP_STATUS | OP_RUN_ADMISSION | OP_SUBSCRIBE | OP_BASELINE | OP_TAG_MAP | "session.upload_status" | cortexkit_role_llm_runner::ops::SESSION_HISTORY | cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REFS | cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REF_READ)
             || method == cortexkit_role_llm_runner::ops::SESSION_MEDIA_READ;
         if write || session_read {
             if let Err(error) = handler.check_migration(&session, write).await {
@@ -3796,6 +3810,57 @@ where
                     }
                     send_error_body(writer, ver, channel, epoch, corr, body).await
                 }
+            }
+        }
+        OP_TAG_MAP => {
+            // Checked again here so no path reaches the read without the operator's own
+            // connection.
+            if !matches!(bind.principal, Some(broca_protocol::BindPrincipal::Direct)) {
+                return send_error(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    "operator_required",
+                    "session.tag_map is for the operator only",
+                )
+                .await;
+            }
+            let params: broca_wire::tag_map::TagMapParams = if req.params.is_null() {
+                Default::default()
+            } else {
+                match serde_json::from_value(req.params) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        return send_error(
+                            writer,
+                            ver,
+                            channel,
+                            epoch,
+                            corr,
+                            "invalid_params",
+                            &error.to_string(),
+                        )
+                        .await
+                    }
+                }
+            };
+            match handler.tag_map(session, &params).await {
+                Ok(Some(reply)) => send_json_response(writer, ver, channel, epoch, corr, &reply).await,
+                Ok(None) => {
+                    send_error(
+                        writer,
+                        ver,
+                        channel,
+                        epoch,
+                        corr,
+                        NOT_SERVED_ON_OLD_STORAGE,
+                        "session.tag_map serves sessions kept in the new storage only, and this session is kept on today's storage",
+                    )
+                    .await
+                }
+                Err(error) => send_serve_error(writer, ver, channel, epoch, corr, &error).await,
             }
         }
         OP_INSTALL_VIEW => {
@@ -5318,6 +5383,10 @@ fn restore_all(params: &serde_json::Value) -> Result<bool, String> {
 /// The refusal of an op that has no implementation yet for a session kept in the new storage.
 const NOT_SERVED_ON_NEW_STORAGE: &str = "not_served_on_new_storage";
 
+/// The refusal of an op that serves only sessions kept in the new storage, for a session today's
+/// storage keeps. Permanent while the session stays there.
+const NOT_SERVED_ON_OLD_STORAGE: &str = "not_served_on_old_storage";
+
 /// Whether `method` is served for a session kept in the new storage. Every other op is refused
 /// `not_served_on_new_storage` for such a session, so none can fall through to today's WAL
 /// reads. An op joins this list in the change that gives it a store implementation.
@@ -5350,6 +5419,8 @@ pub(crate) fn served_on_new_storage(method: &str, _params: &serde_json::Value) -
         OP_INSTALL_VIEW => true,
         // Restore repairs the new storage's own files (`store_restore`).
         OP_RESTORE_FROM_BACKUP => true,
+        // The tag map reads the store's own entry facts (`store_tag_map`).
+        OP_TAG_MAP => true,
         // The store actor warms the request its loop would send next, dated by the store's own
         // cache clock (`store_actor::warm`).
         OP_WARM => true,
