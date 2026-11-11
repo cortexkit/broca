@@ -228,6 +228,23 @@ any handle or reading a credential, and use the same dev-tools handle map
 (`BROCA_DEVTOOLS_HANDLES` or `~/.config/cortexkit/broca/dev-tools-handles.json`).
 `BROCA_LIVE_SUBC` or `SUBC_SOCKET` can select their subc connection file.
 
+### 1c. Routing provider discovery
+
+`account_selection.routing_module` in `broca.jsonc` is an optional explicit module id. When
+set, broca opens exactly that id, without catalog discovery or an id fallback. When unset,
+all routing calls use the daemon catalog's sole provider of the `routing/v1` capability.
+Only entries with `nonce_verified: true` count: the daemon sets that field after verifying
+the supervised module's launch nonce, so a self-registered process cannot claim routing.
+
+Broca caches the discovered module id separately from its management route. An open refused
+with `unknown_module`, `target_unavailable` or `module_removed` clears the id and re-reads
+the catalog once; another disappearance refusal ends that open. A warming provider retains
+bounded backoff without another catalog read. A stale route handle alone reopens the cached
+provider, and requests are retried only when the stale handle proves non-delivery.
+No verified provider gives the existing transient `routing_unavailable` admission refusal.
+Multiple verified providers also refuse without opening either, with the distinct logged
+diagnostic `routing_provider_ambiguous` and the same transient `routing_unavailable` refusal.
+
 ## 2. Two consumer roles
 
 - **Drivers** start or steer work and inject prompts.

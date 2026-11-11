@@ -1261,12 +1261,11 @@ mod consumes_tests {
         );
     }
 
-    /// broca never opens a route to routing without the vault (the mock providers resolve no
-    /// accounts), so it declares none then, and always declares it with the vault. The removed
-    /// `legacy_static` switch cannot turn the route off any more: the config that set it is
-    /// refused.
+    /// Only an explicit routing id can be named at boot; a catalog-discovered provider is not
+    /// known yet. Without the vault, mock providers resolve no accounts and need no routing id.
+    /// The removed `legacy_static` switch remains refused.
     #[test]
-    fn the_routing_module_is_declared_exactly_alongside_the_vault() {
+    fn only_explicit_routing_modules_are_declared_alongside_the_vault() {
         assert!(crate::account_routing::AccountSelectionConfig::parse(
             r#"{"account_selection":{"routing_module":"routing-b","legacy_static":true}}"#,
         )
@@ -1280,10 +1279,14 @@ mod consumes_tests {
 
         let (_, services) =
             declared(&ConsumerRoutes::resolve(None, true).with_account_selection(&active));
-        assert_eq!(
-            services,
-            vec!["fusiform", "claustrum", "prefrontal-routing", "striatum"]
-        );
+        assert_eq!(services, vec!["fusiform", "claustrum"]);
+
+        let explicit = crate::account_routing::AccountSelectionConfig {
+            routing_module: Some("routing-b".into()),
+        };
+        let (_, services) =
+            declared(&ConsumerRoutes::resolve(None, false).with_account_selection(&explicit));
+        assert_eq!(services, vec!["fusiform"]);
     }
 
     /// Each configuration-dependent entry appears and disappears with its knob.

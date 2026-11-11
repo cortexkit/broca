@@ -3844,7 +3844,7 @@ mod executor {
                 {
                     routing_decision_error = Some(serde_json::from_value::<ProviderError>(serde_json::json!({
                         "class":"permanent", "provider_code":"routing_decision_refused",
-                        "provider": self.routing.as_ref().map(|routing| routing.config().routing_module.as_deref().unwrap_or(broca_module_serve::account_routing::DEFAULT_ROUTING_MODULE)).unwrap_or("routing"),
+                        "provider": self.routing.as_ref().map(|routing| routing.config().routing_module.as_deref().unwrap_or(cortexkit_role_routing::PROVIDES)).unwrap_or("routing"),
                         "reason":"unknown_decision", "message":"Routing refused the caller's unknown or expired decision; no model request was sent."
                     })).expect("routing refusal is a provider error"));
                     AccountChoice::NotApplicable

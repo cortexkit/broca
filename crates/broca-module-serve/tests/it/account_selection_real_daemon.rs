@@ -23,7 +23,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const MODEL: &str = "claude-opus-4-8";
-const ROUTING: &str = "prefrontal-routing";
+const ROUTING: &str = "routing-stand-in";
 const VAULT: &str = "claustrum";
 
 fn sibling_bin(name: &str, env_key: &str) -> PathBuf {
@@ -1030,7 +1030,10 @@ impl Rig {
         let upstream = Arc::new(Upstream::default());
         let upstream_url = serve_upstream(Arc::clone(&upstream)).await;
         let broca_config_path = root.join("broca.jsonc");
+        // This in-process stand-in has no supervisor launch nonce. Name it explicitly rather
+        // than claiming to exercise discovery of a supervised routing provider.
         let mut broca_settings = json!({
+            "account_selection": { "routing_module": routing_id },
             "providers": {
                 "anthropic": { "base_url": upstream_url },
                 "xai": { "base_url": upstream_url },
@@ -1833,9 +1836,8 @@ fn event(params: &Value) -> (String, u64) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn striatum_only_selects_accounts_and_receives_reports_through_the_real_daemon() {
-    // Leave account_selection unset: naming striatum in broca.jsonc would not test fallback.
-    let Some(rig) = Rig::start_with_routing_id(json!({}), "striatum").await else {
+async fn explicit_routing_id_selects_accounts_and_receives_reports_through_the_real_daemon() {
+    let Some(rig) = Rig::start_with_routing_id(json!({}), "configured-routing").await else {
         return;
     };
     let client = rig.client("renamed-routing").await;
