@@ -18,7 +18,7 @@ use broca_session_store::keys::DeploymentKey;
 use broca_session_store::record::{Moved, Record};
 use broca_session_store::session::{NewInputMedia, NewMedia, Session};
 use broca_session_store::setup::SetupStore;
-use broca_wal::FramedRecord;
+use broca_wal::{FramedRecord, WalRecord};
 use serde_json::Value;
 
 use crate::Converted;
@@ -35,6 +35,7 @@ pub struct Stage<'a> {
     /// move-check rehearsal uses an existing row, otherwise the registry's no-source fallback
     /// (`u64::from(has_log)`), which can differ from a row allocation's wall-clock floor.
     pub source_history_version: u64,
+    /// The effective serving identity, which may differ from historical run provenance after a re-key.
     pub session: &'a BindIdentity,
     pub deployment: &'a DeploymentKey,
     /// The new storage's root (`<state root>/session-store`), whose setup store takes the
@@ -403,6 +404,39 @@ pub async fn write(stage: &Stage<'_>, prepared: Prepared) -> Result<Staged, Stag
     write_with_progress(stage, prepared, None).await
 }
 
+pub(crate) fn retain_run_identities(
+    converted: &mut Converted,
+    records: &[FramedRecord],
+    effective: &BindIdentity,
+) -> Result<(), StageError> {
+    // The head follows the serving address. Keep a re-keyed run's historical identity in
+    // run_choices["record"]["session"], without changing runs started under the effective identity.
+    let identities: BTreeMap<_, _> = records
+        .iter()
+        .filter_map(|frame| match &frame.record {
+            WalRecord::RunStarted {
+                run_id, session, ..
+            } => Some((&run_id.0, session)),
+            _ => None,
+        })
+        .collect();
+    for record in &mut converted.records {
+        if let Record::RunStart(start) = record {
+            if let Some(recorded) = identities
+                .get(&start.run_id)
+                .filter(|recorded| **recorded != effective)
+            {
+                let choices = start
+                    .run_choices
+                    .get_or_insert_with(|| serde_json::json!({}));
+                choices["record"]["session"] = serde_json::to_value(recorded)
+                    .map_err(|error| StageError::Failed(format!("encode run identity: {error}")))?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// As `write`, with fallible progress notifications for construction of the unpublished tree.
 pub async fn write_with_progress(
     stage: &Stage<'_>,
@@ -414,6 +448,7 @@ pub async fn write_with_progress(
         appends_in_conversation,
         media,
     } = prepared;
+    retain_run_identities(&mut converted, stage.records, stage.session)?;
     let failed = |what: &str| {
         let what = what.to_owned();
         move |error: broca_session_store::session::SessionError| {

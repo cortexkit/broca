@@ -15,6 +15,8 @@
 //! The report counts the logs verified, and the refusals and first mismatches by reason, then
 //! every log that wouldn't move by class, and how long reading, staging and verifying took. A
 //! mismatch's reason is its check and where the answers first differ, never a value.
+//! With `--inventory-root`, re-keyed logs use that root's authoritative inventory and served
+//! history versions, opened read-only; without it the first run's identity remains the default.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -64,7 +66,7 @@ struct MoveCheckReport {
     mismatches: BTreeMap<String, u64>,
     /// Every log that wouldn't move, by class: `unreadable`, `no_run`, each `not_movable`
     /// reason (`media_missing` among them), `conversion_lossy`, `stage_failed` and
-    /// `verification_failed`. With `verified`, they add up to `logs`.
+    /// `verification_failed`, `identity_unresolved` and `io_failed`. With `verified`, they add up to `logs`.
     refused: BTreeMap<String, u64>,
     /// The `unsupported_feature` refusals by the feature refused: `approval_questions`,
     /// `input_token_budget` or `first_protocol_compaction`.
@@ -231,6 +233,10 @@ pub(super) fn run(args: &Args) {
 
 fn check(args: &Args) -> MoveCheckReport {
     let started = Instant::now();
+    let inventory = args.inventory_root.as_ref().map(|root| {
+        broca_store::SqliteStore::open_read_only(root.join("run-index.db"))
+            .map_err(|error| error.to_string())
+    });
     let scratch = args
         .dir
         .clone()
@@ -292,6 +298,39 @@ fn check(args: &Args) -> MoveCheckReport {
             report.refuse("no_run");
             return;
         };
+        let session = if let Some(inventory) = &inventory {
+            let inventory = match inventory {
+                Ok(inventory) => inventory,
+                Err(error) => {
+                    report.refuse("io_failed");
+                    report.example(error, &name);
+                    return;
+                }
+            };
+            let address = name
+                .rsplit_once('#')
+                .map(|(_, member)| member)
+                .or_else(|| old.source.file_stem().and_then(|stem| stem.to_str()));
+            let Some(address) = address else {
+                report.refuse("identity_unresolved");
+                report.example("source has no session address", &name);
+                return;
+            };
+            match broca_session_convert::identity::effective_identity(
+                &session,
+                address,
+                Some(inventory),
+            ) {
+                Ok(session) => session,
+                Err(error) => {
+                    report.refuse(error.class());
+                    report.example(&error.to_string(), &name);
+                    return;
+                }
+            }
+        } else {
+            session
+        };
         let staging_started = Instant::now();
         let staged = (|| {
             if let Some(refusal) =
@@ -335,11 +374,15 @@ fn check(args: &Args) -> MoveCheckReport {
                 source_activity_ms: todays_updated_at,
             };
             let stage = Stage {
-                source_history_version: source_history_version(
-                    &old.source,
-                    &session,
-                    !old.records.is_empty(),
-                )
+                source_history_version: match &inventory {
+                    Some(Ok(index)) => {
+                        use broca_core::ServedHistory;
+                        index
+                            .history_read_version(&broca_core::session_addr(&session))
+                            .map(|version| version.unwrap_or(u64::from(!old.records.is_empty())))
+                    }
+                    _ => source_history_version(&old.source, &session, !old.records.is_empty()),
+                }
                 .map_err(StageError::Failed)?,
                 records: &old.records,
                 lineage: old.lineage.as_deref(),

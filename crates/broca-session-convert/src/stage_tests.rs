@@ -134,6 +134,44 @@ fn written(root: &Path) -> (Vec<FramedRecord>, Option<WalLineageId>) {
     (records.to_vec(), read.lineage_id)
 }
 
+#[test]
+fn staging_retains_only_mismatched_run_identity_provenance() {
+    let root = scratch("run-session-provenance");
+    let (mut records, lineage) = written(&root);
+    let historical = BindIdentity::new("/historical-project", "runner", "s");
+    let mut starts = records
+        .iter_mut()
+        .filter_map(|frame| match &mut frame.record {
+            WalRecord::RunStarted { session, .. } => Some(session),
+            _ => None,
+        });
+    *starts.nth(1).unwrap() = historical.clone();
+    let staged = staged(&root, &records, lineage);
+    let starts: Vec<_> = staged
+        .converted
+        .records
+        .iter()
+        .filter_map(|record| match record {
+            broca_session_store::record::Record::RunStart(start) => Some(start),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(starts.len(), 2);
+    let provenance = |start: &broca_session_store::record::RunStart| {
+        start
+            .run_choices
+            .as_ref()
+            .and_then(|choices| choices.pointer("/record/session"))
+            .cloned()
+    };
+    assert_eq!(provenance(starts[0]), None);
+    assert_eq!(
+        provenance(starts[1]),
+        Some(serde_json::to_value(historical).unwrap())
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 fn staged(root: &Path, records: &[FramedRecord], lineage: Option<WalLineageId>) -> Staged {
     staged_in(root, records, lineage, &deployment())
 }

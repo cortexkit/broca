@@ -216,9 +216,10 @@ fn usage() -> ! {
          session-convert billing [--dir SCRATCH] [--out FILE] [--limit N] PATH...\n       \
          session-convert subscribe [--dir SCRATCH] [--out FILE] [--limit N] PATH...\n       \
          session-convert subscribe-cost --dir SCRATCH [--out FILE] PATH...\n       \
-         session-convert move-check --dir SCRATCH [--all-steps] [--every N] [--out FILE] PATH...\n\
+         session-convert move-check --dir SCRATCH [--inventory-root ROOT] [--all-steps] [--every N] [--out FILE] PATH...\n\
          Any command takes --plain: store in the plain mode instead of encrypted.\n\
          move-check reads an existing served-history version without writing the source.\n\
+         --inventory-root resolves re-keyed addresses and history versions from ROOT read-only.\n\
          Without a row it uses 1 for a log (0 without one), not a publishing read's clock-floor allocation."
     );
     std::process::exit(64);
@@ -240,6 +241,8 @@ struct Args {
     every: usize,
     /// `move-check`: verify in the offline mode, which rebuilds every recorded model request.
     all_steps: bool,
+    /// `move-check`: resolve re-keyed identities from this state root's read-only inventory.
+    inventory_root: Option<PathBuf>,
     dir: Option<PathBuf>,
     files: Vec<PathBuf>,
 }
@@ -257,6 +260,7 @@ fn parse_args() -> Args {
         max_records: None,
         every: 1,
         all_steps: false,
+        inventory_root: None,
         dir: None,
         files: Vec::new(),
     };
@@ -275,6 +279,9 @@ fn parse_args() -> Args {
             "--sample" => parsed.sample = number(),
             "--prefixes" => parsed.prefixes = true,
             "--all-steps" => parsed.all_steps = true,
+            "--inventory-root" => {
+                parsed.inventory_root = Some(PathBuf::from(args.next().unwrap_or_else(|| usage())))
+            }
             "--max-records" => parsed.max_records = Some(number()),
             "--every" => parsed.every = number().max(1),
             "--only" => parsed.only = Some(args.next().unwrap_or_else(|| usage())),
@@ -288,6 +295,10 @@ fn parse_args() -> Args {
             }
             _ => paths.push(PathBuf::from(arg)),
         }
+    }
+    if parsed.inventory_root.is_some() && parsed.command != "move-check" {
+        eprintln!("--inventory-root is only supported by move-check");
+        std::process::exit(2);
     }
     for path in &paths {
         if let Err(e) = collect(path, &mut parsed.files) {
