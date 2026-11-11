@@ -813,14 +813,10 @@ async fn a_store_session_refuses_unbuilt_ops_by_name_and_checks_owners_from_the_
     // once the import's own run has ended.
     let idle = rig.result(1, "run.status", serde_json::json!({})).await;
     assert_eq!(idle, serde_json::json!({"state": "idle"}));
-    // An import carrying its messages inline is today's import, which writes a WAL.
+    // Moving a session to the store is not served when the session is already kept there.
     assert_eq!(
-        rig.refused(
-            1,
-            "session.import",
-            serde_json::json!({"import_id": "inline", "messages": []})
-        )
-        .await,
+        rig.refused(1, "session.move_to_store", serde_json::json!({}))
+            .await,
         "not_served_on_new_storage"
     );
     let describe = rig
