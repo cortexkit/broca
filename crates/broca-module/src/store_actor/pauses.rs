@@ -36,13 +36,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     /// for anything but calls a provider holds: that run has to end before the interrupt runs.
     /// Interrupts drain ahead of every other send, so one waiting is first in the queue.
     pub(super) fn interrupt_waits_on_pause(&self) -> bool {
-        let operations = &self.session.operations;
-        self.paused()
-            .is_some_and(|(_, reason)| reason != PauseReason::ToolHeld)
-            && operations
-                .queue
-                .first()
-                .is_some_and(|first| first.interrupt)
+        super::pause_interrupt_waits(&self.session.operations)
     }
 
     /// Ends the session's paused run `Cancelled`, as today's actor ends one for an interrupt:

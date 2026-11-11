@@ -56,8 +56,13 @@ pub trait RetentionIndex: Send + Sync {
     fn live_inventory(&self) -> Result<Option<Vec<RetentionLineageRow>>, String> {
         Ok(None)
     }
+    /// `Some` is a maintained inventory: add before an incomplete tombstone is published,
+    /// clear only after its completion is durable. `None` requires disk discovery.
     fn pending_deletions(&self) -> Result<Option<Vec<BindIdentity>>, String> {
         Ok(None)
+    }
+    fn deletion_inventory_id(&self) -> Option<String> {
+        None
     }
     fn deletion_pending(
         &self,
@@ -100,6 +105,9 @@ pub trait RetentionIndex: Send + Sync {
 macro_rules! impl_retention_index {
     ($store:ty) => {
         impl RetentionIndex for $store {
+            fn deletion_inventory_id(&self) -> Option<String> {
+                Some(self.source_instance_id().to_owned())
+            }
             fn live_inventory(&self) -> Result<Option<Vec<RetentionLineageRow>>, String> {
                 self.retention_live_inventory()
                     .map(Some)
@@ -692,7 +700,7 @@ pub struct RetentionService {
     relocation_incomplete: std::sync::atomic::AtomicU64,
     overhaul_deferred: std::sync::atomic::AtomicU64,
     enrollment: Mutex<Enrollment>,
-    deletion_recovery: Mutex<(bool, std::collections::HashSet<BindIdentity>)>,
+    deletion_recovery: Mutex<std::collections::HashSet<BindIdentity>>,
     archived_expiry: Mutex<ArchivedExpiry>,
     #[cfg(test)]
     file_work: std::sync::atomic::AtomicUsize,
@@ -2371,11 +2379,7 @@ impl RetentionService {
             None => self.known_sessions()?,
         };
         let mut keys: std::collections::HashSet<_> = pending.into_iter().collect();
-        if !recovery.0 {
-            keys.extend(self.known_sessions()?);
-            recovery.0 = true;
-        }
-        keys.extend(std::mem::take(&mut recovery.1));
+        keys.extend(std::mem::take(&mut *recovery));
         let mut completed = Vec::new();
         for key in keys {
             let result = (|| {
@@ -2410,11 +2414,51 @@ impl RetentionService {
                 Err(_) => {
                     tracing::warn!(target: "retention", session = %broca_core::session_addr(&key),
                     "deletion recovery deferred");
-                    recovery.1.insert(key);
+                    recovery.insert(key);
                 }
             }
         }
         Ok(completed)
+    }
+
+    /// Older roots may have tombstones from before the pending-work ledger existed. Repair
+    /// that inventory once, off the serving path. Tie its completeness marker to the index's
+    /// database identity, so replacing the index forces this inventory to be rebuilt.
+    pub(crate) fn rebuild_deletion_inventory(&self) -> Result<(), String> {
+        if self.defer_overhaul() {
+            return Ok(());
+        }
+        let Some(identity) = self.index.deletion_inventory_id() else {
+            return Ok(());
+        };
+        let root = self
+            .wal
+            .root()
+            .parent()
+            .ok_or("retention state root missing")?;
+        let path = root.join("retention-deletion-inventory.json");
+        let bytes = serde_json::to_vec(&identity).map_err(|error| error.to_string())?;
+        if fs::read(&path).is_ok_and(|stored| stored == bytes) {
+            return Ok(());
+        }
+        for key in self.known_sessions()? {
+            for stone in self.tombstones(&key)? {
+                if stone.completed_at_ms.is_none() {
+                    self.index.deletion_pending(&stone.lineage_id, &key, true)?;
+                }
+            }
+        }
+        let temp = path.with_extension("tmp");
+        let mut file = broca_owner_only::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&temp)
+            .map_err(|error| error.to_string())?;
+        file.write_all(&bytes).map_err(|error| error.to_string())?;
+        file.sync_all().map_err(|error| error.to_string())?;
+        fs::rename(temp, path).map_err(|error| error.to_string())?;
+        sync_dir(root)
     }
 
     fn known_sessions(&self) -> Result<Vec<BindIdentity>, String> {

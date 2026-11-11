@@ -188,13 +188,23 @@ async fn the_single_folder_tree_becomes_the_durable_root_intact() {
     .await
     .unwrap();
 
-    // A second start finds the durable root and changes nothing.
+    // Opening the runtime prepared the new ordinary class root's recovery directory.
+    // A second start must leave both that root and the migrated durable files unchanged.
     let durable_files = files(&durable);
     let moves_files = files(&moves);
+    let ordinary_entries: Vec<_> = std::fs::read_dir(&single)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(
+        ordinary_entries,
+        vec![std::ffi::OsString::from("recovery-candidates")]
+    );
     assert_eq!(class_single_folder_tree(&state).unwrap(), Layout::Unchanged);
     assert_eq!(files(&durable), durable_files);
     assert_eq!(files(&moves), moves_files);
-    assert!(!single.exists());
+    assert!(single.join("recovery-candidates").is_dir());
+    assert_eq!(std::fs::read_dir(&single).unwrap().count(), 1);
     let _ = std::fs::remove_dir_all(&state);
 }
 

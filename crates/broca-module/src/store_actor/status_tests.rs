@@ -726,10 +726,9 @@ async fn crash_with_a_queued_send(dir: std::path::PathBuf, store: bool) {
 }
 
 /// A run a crash cut off, with a send queued behind it, on a session no actor holds. Today's
-/// `run.status` opens the session, which seals the run; the new storage's reads it without an
-/// actor, as the seal the next open writes: interrupted by the crash. The session's own status
-/// then opens it, which seals the run and runs the queued send, and every answer read before
-/// stays the same.
+/// `run.status` opens the session on either storage, sealing the run and draining the queued
+/// send before any read observes the recovered state. The interrupted terminal is stable
+/// across later reads and completion of the queued run.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_crashed_run_reads_as_its_seal_and_status_recovers_the_session() {
     let today_dir = scratch();
@@ -748,7 +747,7 @@ async fn a_crashed_run_reads_as_its_seal_and_status_recovers_the_session() {
         store.run_result("r1").await,
         store.run_status("r2").await,
     ];
-    assert!(store.registry.slot_state(&store.key).is_none());
+    assert!(store.registry.slot_state(&store.key).is_some());
     assert_eq!(before[0]["state"], json!("interrupted"), "{}", before[0]);
     assert_eq!(before[0]["reason"], json!("runner_crash"), "{}", before[0]);
     assert_eq!(
@@ -757,7 +756,7 @@ async fn a_crashed_run_reads_as_its_seal_and_status_recovers_the_session() {
         "{}",
         before[0]
     );
-    assert_eq!(before[2]["state"], json!("pending"), "{}", before[2]);
+    assert_eq!(before[2]["state"], json!("active"), "{}", before[2]);
     // Today's answers once its read sealed the run.
     same(
         &today.run_status("r1").await,

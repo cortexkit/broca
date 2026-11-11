@@ -824,6 +824,154 @@ pub(super) fn texts(session: &Session<&'static MemoryBackend>) -> Vec<String> {
         .collect()
 }
 
+#[cfg(feature = "test-clock")]
+#[tokio::test]
+async fn recovery_registration_syncs_once_across_three_runs_in_one_actor() {
+    use crate::store_open::recovery_index as index;
+    let root = broca_test_support::scratch_root()
+        .join(format!("store-registration-cost-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let live = root.join("live");
+    index::prepare_complete_for_test(&live).unwrap();
+    let backend: &'static MemoryBackend = Box::leak(Box::default());
+    let session = Session::create(
+        backend,
+        SessionAddr(ADDR.into()),
+        triple(),
+        &deployment(),
+        false,
+    )
+    .await
+    .unwrap();
+    let gate = Arc::new(Notify::new());
+    let actor = StoreActor::new(
+        bind(),
+        session,
+        Arc::new(executor(
+            vec![
+                text_step("a1", "one"),
+                text_step("a2", "two"),
+                text_step("a3", "three"),
+            ],
+            Some(gate.clone()),
+        )),
+        Box::new(MemoryParts::default()),
+    )
+    .with_recovery_index(live.clone())
+    .with_readers(Arc::new(move || backend));
+    let (sender, receiver) = mpsc::unbounded_channel();
+    let commands = Commands::over(sender, backend);
+    let served = tokio::spawn(actor.serve(receiver));
+    let addr = SessionAddr(broca_core::session_addr(&bind()));
+    let mut syncs = Vec::new();
+    for n in 1..=3 {
+        let before = index::sync_counts_for_test();
+        assert!(matches!(
+            send(&commands, &format!("r{n}"), "hello").await,
+            SendOutcome::Active { .. }
+        ));
+        if n == 1 {
+            // Capture the durable index while the first model step is held, with its start
+            // already acknowledged. Discovery after a crash cannot depend on the actor field.
+            let cut = root.join("cut");
+            let directory = "recovery-candidates";
+            std::fs::create_dir_all(cut.join(directory)).unwrap();
+            for name in ["complete", addr.0.as_str()] {
+                std::fs::copy(
+                    live.join(directory).join(name),
+                    cut.join(directory).join(name),
+                )
+                .unwrap();
+            }
+            assert_eq!(
+                index::members_for_test(&cut).unwrap().unwrap(),
+                vec![addr.clone()]
+            );
+        }
+        gate.notify_one();
+        broca_test_support::wait_until("the registered actor finishes its run", || async {
+            match status(&commands).await {
+                LineageStatus::Idle => Ok(()),
+                other => Err(format!("{other:?}")),
+            }
+        })
+        .await;
+        let after = index::sync_counts_for_test();
+        syncs.push((after.0 - before.0, after.1 - before.1));
+    }
+    assert_eq!(
+        syncs,
+        [(1, 1), (0, 0), (0, 0)],
+        "only the first run may sync the recovery member and its directory"
+    );
+    assert_eq!(index::members_for_test(&live).unwrap().unwrap(), vec![addr]);
+    let before_close = index::sync_counts_for_test();
+    drop(commands);
+    served.await.unwrap();
+    assert!(index::members_for_test(&live).unwrap().unwrap().is_empty());
+    assert_eq!(
+        index::sync_counts_for_test(),
+        before_close,
+        "retirement needs no durable unlink"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn restart_admission_keeps_immutable_authorization_reads_available() {
+    fn owner(outcome: crate::store_reads::StoreReadOutcome) -> serde_json::Value {
+        let crate::store_reads::StoreReadOutcome::Served(reply) = outcome else {
+            panic!("authorization must remain answerable during restart admission")
+        };
+        let crate::store_reads::StoreReadReply::AuthorizationOwnership(value) = *reply else {
+            panic!("the ownership request must return ownership")
+        };
+        serde_json::to_value(value.unwrap()).unwrap()
+    }
+    let parts = SharedParts::new(Box::new(MemoryParts::default()));
+    let (commands, served, backend) =
+        actor_with(executor(vec![text_step("a1", "done")], None), parts.clone()).await;
+    assert!(matches!(
+        send(&commands, "r1", "hello").await,
+        SendOutcome::Active { .. }
+    ));
+    broca_test_support::wait_until("the seed run completes", || async {
+        match status(&commands).await {
+            LineageStatus::Idle => Ok(()),
+            other => Err(format!("{other:?}")),
+        }
+    })
+    .await;
+    drop(commands);
+    served.await.unwrap();
+    let session = Session::load(backend, SessionAddr(ADDR.into()), &triple(), &deployment())
+        .await
+        .unwrap();
+    let mut actor = StoreActor::new(
+        bind(),
+        session,
+        Arc::new(executor(Vec::new(), None)),
+        Box::new(parts),
+    )
+    .with_readers(Arc::new(move || backend));
+    let request = crate::store_reads::StoreReadRequest::AuthorizationOwnership;
+    let expected = owner(actor.store_read(&request).await);
+    let before = actor.session.next_seq();
+    actor.restart_admitting = true;
+    assert_eq!(owner(actor.store_read(&request).await), expected);
+    assert_eq!(
+        actor.session.next_seq(),
+        before,
+        "authorization must not flush or append"
+    );
+    assert!(matches!(
+        actor
+            .store_read(&crate::store_reads::StoreReadRequest::Head)
+            .await,
+        crate::store_reads::StoreReadOutcome::Refused(_)
+    ));
+}
+
 /// A send on an idle session is answered `active` once its run's start is in the session, and
 /// the run, written through the actor, finishes there. A second send then runs on the same
 /// session, after the first.

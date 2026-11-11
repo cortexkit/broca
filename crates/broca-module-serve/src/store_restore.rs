@@ -4,7 +4,8 @@
 //! reads, so the restore runs in the daemon.
 //!
 //! Each session asked for is first checked without holding it. A session whose head and
-//! everything it names are there is reported kept and never held or written. A session that
+//! everything it names are there is reported kept and its session data is never written. An
+//! unfinished kept session is registered for background recovery. A session that
 //! lacks a file is held with the fence a move into the new storage takes
 //! ([`LineageRegistry::fence_store_move`]): an idle actor serving it closes, a busy one refuses,
 //! and no other owner holds its lease. Then it is restored, which checks it again. Normal loading
@@ -104,20 +105,47 @@ impl StoreRestore {
             Ok(None) => return report.refused("the session has no head"),
             Err(error) => return report.failed(format!("its head couldn't be read: {error:?}")),
         };
-        let bind = match broca_session_store::head::stored_triple(&head.0) {
-            Ok(triple) => BindIdentity::new(
-                PathBuf::from(triple.project_root),
-                triple.harness,
-                triple.session,
-            ),
+        let triple = match broca_session_store::head::stored_triple(&head.0) {
+            Ok(triple) => triple,
             Err(error) => return report.refused(format!("its head doesn't decode: {error:?}")),
         };
+        let bind = BindIdentity::new(
+            PathBuf::from(&triple.project_root),
+            &triple.harness,
+            &triple.session,
+        );
         report.session(&bind);
         if broca_core::session_addr(&bind) != addr.0 {
             return report.refused("its head names another session than its address");
         }
         match restore::check(&store, addr, deployment).await {
-            Ok(None) => return report.restored(Restored::Kept { version: head.1 }),
+            Ok(None) => {
+                let view = broca_session_store::session::Session::view(
+                    LocalBackend::new(class.store_root(&self.state_root)),
+                    addr.clone(),
+                    &triple,
+                    deployment,
+                )
+                .await;
+                let pending = view.map_or(true, |view| {
+                    view.operations
+                        .run
+                        .as_ref()
+                        .is_some_and(|run| run.finished.is_none())
+                        || !view.operations.queue.is_empty()
+                        || !view.operations.billing_owed.is_empty()
+                });
+                if pending {
+                    if let Err(error) = broca_module::store_open::recovery::register_candidate(
+                        &class.store_root(&self.state_root),
+                        addr,
+                    ) {
+                        return report
+                            .failed(format!("its recovery could not be registered: {error}"));
+                    }
+                }
+                return report.restored(Restored::Kept { version: head.1 });
+            }
             Ok(Some(Finding::Refused(reason))) => {
                 return report.restored(Restored::Refused { reason })
             }
@@ -151,6 +179,12 @@ impl StoreRestore {
         // daemon never name the same file.
         let now_ms =
             broca_module::head_time::epoch_ms(std::time::SystemTime::now()).unwrap_or_default();
+        if let Err(error) = broca_module::store_open::recovery::register_candidate(
+            &class.store_root(&self.state_root),
+            addr,
+        ) {
+            return report.failed(format!("its recovery could not be registered: {error}"));
+        }
         let restored = restore::restore(&store, addr, deployment, now_ms).await;
         drop(fence);
         match restored {

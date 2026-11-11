@@ -1143,6 +1143,78 @@ async fn every_read_equals_a_fresh_views_at_every_step() {
         .await;
 }
 
+#[tokio::test]
+async fn store_read_future_keeps_recovery_off_the_callers_stack() {
+    let m = module(Vec::new()).await;
+    let runtime = m.runtime();
+    let read = runtime.read(&m.registry, &m.key, StoreReadRequest::Head);
+    assert!(
+        std::mem::size_of_val(&read) < 4096,
+        "composed request futures must not inline the actor-opening recovery future: {} bytes",
+        std::mem::size_of_val(&read)
+    );
+    drop(read);
+    assert!(m.registry.stop_and_seal().await);
+}
+
+#[tokio::test]
+async fn paused_session_reads_stay_in_the_view_without_opening_an_actor() {
+    for reason in [
+        broca_protocol::PauseReason::AuthRequired,
+        broca_protocol::PauseReason::AccountLimit,
+    ] {
+        let m = module(vec![text_step("a1", "seed")]).await;
+        active(m.send("r1", "seed").await);
+        m.gate.notify_one();
+        m.ended("r1", "completed").await;
+        m.close().await;
+        let mut writer = m.writer().await;
+        let mut start = writer
+            .operations
+            .run
+            .as_ref()
+            .unwrap()
+            .start
+            .clone()
+            .unwrap();
+        start.run_id = "paused".into();
+        start.submission_id = None;
+        start.send_id = None;
+        writer
+            .append(
+                &[
+                    Record::RunStart(Box::new(start)),
+                    Record::Pause(broca_session_store::record::Pause {
+                        run_id: "paused".into(),
+                        reason,
+                        ts_ms: None,
+                        error: None,
+                        account_limit: None,
+                    }),
+                ],
+                true,
+            )
+            .await
+            .unwrap();
+        writer.close().await.unwrap();
+        let before = m.backend().read_stored_head(&m.addr()).unwrap();
+        for request in [
+            StoreReadRequest::Head,
+            StoreReadRequest::RunStatusReply(RunId("paused".into())),
+        ] {
+            let expected = shape(m.fresh(&request).await);
+            let actual = shape(m.served(&request).await);
+            assert_eq!(actual, expected, "{reason:?}: {request:?}");
+            assert!(
+                m.registry.slot_state(&m.key).is_none(),
+                "{reason:?} reads must not open an actor"
+            );
+        }
+        assert_eq!(m.backend().read_stored_head(&m.addr()).unwrap(), before);
+        assert!(m.registry.stop_and_seal().await);
+    }
+}
+
 /// A session deleted and created again with the same history reads as the new session: its kept
 /// view is never served for it, though the new session's head versions and log length can equal
 /// the old one's, since the new session's log is another log.
