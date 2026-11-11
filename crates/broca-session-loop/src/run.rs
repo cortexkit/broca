@@ -1731,6 +1731,27 @@ fn frozen_render_tags(admission: &Admission) -> bool {
             .is_some_and(broca_core::tags::plan_renders_tags)
 }
 
+/// Whether `admission`'s requests show each ride as its own text block after the tool turn's
+/// results, which then hold only the tools' own output: its frozen render config says
+/// `ride_placement: after_results` on an Anthropic Messages route. Every other run renders each
+/// ride inside its carrying result, as before.
+///
+/// Probe only, for measuring how models treat the two placements; removed or replaced once the
+/// placement question is decided. The member is frozen at admission, so a resumed or rebuilt
+/// step of the run decides alike.
+pub(crate) fn rides_after_results(admission: &Admission) -> bool {
+    let config = &*admission.render_config;
+    config.get("family_id").and_then(Value::as_str)
+        == Some(broca_protocol::tags::ANTHROPIC_MESSAGES_FAMILY)
+        && config
+            .get(broca_provider::wire::RidePlacement::MEMBER)
+            .cloned()
+            .and_then(|member| {
+                serde_json::from_value::<broca_provider::wire::RidePlacement>(member).ok()
+            })
+            == Some(broca_provider::wire::RidePlacement::AfterResults)
+}
+
 /// The request the latest run's step `step_id` sends, built from the session's state exactly as
 /// the run loop builds it before sending, without any provider or tool plane: for checking
 /// requests rebuilt from stored sessions against the bytes that were sent. A run whose plan names
@@ -3289,7 +3310,11 @@ fn call_options<W: Writer>(
             // Off the compaction contract a ride renders into its result's copy here, before
             // anything else edits the results, where today's replay joins it as it reads the
             // ride's record. On the contract the entries render it.
-            crate::entries::render_rides(&mut prompt, writer.conversation());
+            crate::entries::render_rides(
+                &mut prompt,
+                writer.conversation(),
+                rides_after_results(admission),
+            );
             repetition_guidance(
                 &mut prompt,
                 episodes,
@@ -3406,7 +3431,8 @@ fn call_options<W: Writer>(
     .map(crate::entries::project)
     .collect::<Result<Vec<_>, _>>()
     .map_err(LoopError::Parts)?;
-    let rides = crate::entries::ride_envelopes(conversation);
+    let mut rides = crate::entries::ride_envelopes(conversation);
+    rides.set_after_results(rides_after_results(admission));
     let mut prompt = broca_core::compaction_v2::render::deliveries_only_with_rides(
         &opts.prompt,
         &entries,

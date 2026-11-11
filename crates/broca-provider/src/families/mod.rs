@@ -645,6 +645,7 @@ pub fn resolve_frozen(
         // config's family and wire model are final; until then the config renders as before.
         media: None,
         refusal_fallback: None,
+        ride_placement: None,
     })
 }
 
@@ -738,6 +739,7 @@ fn frozen_from_family_defaults(
         opencode_go_long_cache_retention_unsupported: false,
         media: None,
         refusal_fallback: None,
+        ride_placement: None,
     }
 }
 

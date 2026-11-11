@@ -2711,6 +2711,9 @@ mod executor {
         queued_service_tier: &'a mut Option<String>,
         media_profile: &'a Option<Box<broca_provider::media_profile::MediaProfile>>,
         clock: Option<&'a broca_core::Clock>,
+        /// Whether the session is kept in the new session storage, whose fresh runs may be
+        /// selected for a probe placement of rides (see `broca_module_serve::experiments`).
+        new_storage: bool,
     }
 
     /// What a run's admission reads from the session's history.
@@ -4136,6 +4139,23 @@ mod executor {
                         job.req.model.model_id.as_str(),
                     )
                     .filter(|_| fresh_episode),
+                // Probe only, for measuring where models trust a ride's text: a fresh episode on
+                // the new session storage whose project folder the state root's
+                // `experiments.json` lists. Read here, at each such admission, so an edit needs
+                // no restart; the catalog freezes it only on Anthropic Messages, and a resume
+                // keeps what its run froze. Removed or replaced once the placement is decided.
+                ride_placement: if fresh_episode && job.new_storage {
+                    broca_module_serve::experiments::ride_placement(
+                        self.wal_store
+                            .file_store()
+                            .root()
+                            .parent()
+                            .unwrap_or(self.wal_store.file_store().root()),
+                        &job.req.session.project_root,
+                    )
+                } else {
+                    None
+                },
             };
             let chatgpt_wire = broca_module_serve::chatgpt_identity::for_episode(
                 family_override.filter(|_| fresh_episode),
@@ -4531,6 +4551,7 @@ mod executor {
                         queued_service_tier: &mut queued_service_tier,
                         media_profile: &None,
                         clock: control.clock.as_ref(),
+                        new_storage: true,
                     },
                     &history,
                 )
@@ -5807,6 +5828,7 @@ mod executor {
                         queued_service_tier: &mut job.queued_service_tier,
                         media_profile: &job.media_profile,
                         clock: job.control.clock.as_ref(),
+                        new_storage: false,
                     },
                     &history,
                 )
@@ -6686,6 +6708,7 @@ mod executor {
                     frozen_account_ref: None,
                     clock: None,
                     refusal_fallback_model: None,
+                    ride_placement: None,
                     quota_observer: None,
                 },
             );
@@ -6719,6 +6742,7 @@ mod executor {
                 frozen_account_ref: None,
                 clock: None,
                 refusal_fallback_model: None,
+                ride_placement: None,
                 quota_observer: None,
             };
             let paused = AuthResolution {

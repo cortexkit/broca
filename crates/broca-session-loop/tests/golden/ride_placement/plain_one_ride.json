@@ -1,0 +1,36 @@
+{
+  "after_results": {
+    "content": [
+      {
+        "content": "file contents",
+        "is_error": false,
+        "tool_use_id": "c1",
+        "type": "tool_result"
+      },
+      {
+        "cache_control": {
+          "ttl": "5m",
+          "type": "ephemeral"
+        },
+        "text": "note q1",
+        "type": "text"
+      }
+    ],
+    "role": "user"
+  },
+  "in_result": {
+    "content": [
+      {
+        "cache_control": {
+          "ttl": "5m",
+          "type": "ephemeral"
+        },
+        "content": "file contents\n\nnote q1",
+        "is_error": false,
+        "tool_use_id": "c1",
+        "type": "tool_result"
+      }
+    ],
+    "role": "user"
+  }
+}

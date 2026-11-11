@@ -608,15 +608,31 @@ pub async fn offline_prompt<W: Writer>(
     };
     let transcript = transcript(writer, &ctx).await?;
     let opts = with_sealed(opts, &transcript);
+    let rides = placed_rides(&transcript.rides, admission);
     let prompt = v2::render::prompt_with_rides(
         &opts.prompt,
         &transcript.entries,
-        &transcript.rides,
+        &rides,
         view.as_ref().map_or(&[][..], |view| view.edits.as_slice()),
         |_| Err("a compaction view's inserted images aren't stored yet".into()),
     )
     .map_err(LoopError::Parts)?;
     finish(&opts, prompt, admission).map_err(LoopError::Parts)
+}
+
+/// The ride envelopes a request of `admission`'s run renders with: the window's own, or, for a
+/// run whose rides go after the turn's results (a probe placement, see
+/// `crate::run::rides_after_results`), a copy that says so.
+fn placed_rides(
+    rides: &Arc<v2::entries::RideEnvelopes>,
+    admission: &Admission,
+) -> Arc<v2::entries::RideEnvelopes> {
+    if !crate::run::rides_after_results(admission) {
+        return Arc::clone(rides);
+    }
+    let mut placed = (**rides).clone();
+    placed.set_after_results(true);
+    Arc::new(placed)
 }
 
 /// Seals the session's ledger with no cut, carrying copies of its compaction views, as a seal
@@ -919,7 +935,7 @@ pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
     let journal = StoreJournal::new(writer, &seams.bind);
     // A ride renders by its envelope, as today's loop renders a ride recorded with one; text
     // delivered before envelopes existed renders the way it always did.
-    let rides = Arc::clone(&transcript_rides);
+    let rides = placed_rides(&transcript_rides, admission);
     #[cfg(test)]
     let rendered_before = rendered.rendered();
     ctx.session

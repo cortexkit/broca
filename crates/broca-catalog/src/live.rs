@@ -167,6 +167,10 @@ pub struct ResolveOptions<'a> {
     /// resume keeps whatever its recorded config froze. `None` freezes nothing, so the episode's
     /// config and request bytes are exactly what they would be without the fallback.
     pub refusal_fallback_model: Option<&'a str>,
+    /// The ride placement a fresh episode on the new session storage was selected for (probe
+    /// only, see `FrozenRenderConfig::ride_placement`). Frozen only on Anthropic Messages;
+    /// `None` freezes nothing, and a resume keeps whatever its recorded config froze.
+    pub ride_placement: Option<broca_provider::wire::RidePlacement>,
 }
 
 fn freeze_tool_aliases(
@@ -1506,6 +1510,13 @@ fn resolve_provider_inner(
             .filter(|profile| profile.modalities.supports_media());
     }
     let mut frozen = freeze_tool_aliases(episode_render.apply(frozen), opts)?;
+    // Probe only, for measuring where models trust a ride's text: a fresh episode the module
+    // selected shows its rides after the turn's results, frozen so every step and resume of it
+    // renders alike. Only Anthropic Messages renders that placement, so any other family's
+    // config never carries the member. Removed or replaced once the placement is decided.
+    if family == WireFamilyId::AnthropicMessages {
+        frozen.ride_placement = opts.ride_placement;
+    }
     if let Some(fallback_model) = opts.refusal_fallback_model {
         match freeze_refusal_fallback(
             &frozen,
@@ -2850,6 +2861,68 @@ mod tests {
         });
     }
 
+    /// A ride placement offered to a fresh episode is frozen on Anthropic Messages only, and a
+    /// resume keeps the one its episode recorded even when none is offered any more (the probe's
+    /// selection file changed or went away): the resumed provider reports the recorded config
+    /// exactly, so the resume's render-identity check passes and its requests render alike.
+    #[test]
+    fn a_ride_placement_is_frozen_on_anthropic_only_and_kept_on_resume() {
+        use broca_provider::wire::RidePlacement;
+        fn resolve(
+            model: &str,
+            offered: Option<RidePlacement>,
+            render: EpisodeRenderConfig<'_>,
+        ) -> serde_json::Value {
+            let resolved = resolve_catalog_episode_with_client(
+                model,
+                Some(2048),
+                &AuthMode::Secret("test-secret".to_string()),
+                &ResolveOptions {
+                    auth_method: Some(AuthMethod::ApiKey),
+                    ride_placement: offered,
+                    ..ResolveOptions::default()
+                },
+                broca_provider::build_provider_http_client(),
+                render,
+            )
+            .unwrap_or_else(|error| panic!("resolve {model}: {error}"));
+            resolved.provider.render_config_blob()
+        }
+        let catalog = catalog_stating_server_side_fallback(&[("claude-fable-5-1", None)]);
+        with_test_catalog(&catalog, || {
+            let model = "anthropic/claude-fable-5-1";
+            let fresh = resolve(
+                model,
+                Some(RidePlacement::AfterResults),
+                EpisodeRenderConfig::default(),
+            );
+            assert_eq!(fresh["ride_placement"], "after_results");
+            let unselected = resolve(model, None, EpisodeRenderConfig::default());
+            assert!(unselected.get("ride_placement").is_none());
+            let mut without = fresh.clone();
+            without.as_object_mut().unwrap().remove("ride_placement");
+            assert_eq!(without, unselected, "the member is the only difference");
+            let recorded: FrozenRenderConfig = serde_json::from_value(fresh.clone()).unwrap();
+            let resumed = resolve(
+                model,
+                None,
+                EpisodeRenderConfig {
+                    recorded_config: Some(&recorded),
+                    ..EpisodeRenderConfig::default()
+                },
+            );
+            assert_eq!(resumed, fresh);
+        });
+        seed_catalog_for_resolution();
+        let other = resolve(
+            "openai/gpt-5.5-pro",
+            Some(RidePlacement::AfterResults),
+            EpisodeRenderConfig::default(),
+        );
+        assert_ne!(other["family_id"], "anthropic_messages");
+        assert!(other.get("ride_placement").is_none(), "{other}");
+    }
+
     /// The opt-in is set for exactly one shape: an OAuth (identity-lead) run of an `anthropic`
     /// model whose catalog row states the capability, with the operator switch on. Every other
     /// combination leaves it unset and the request bytes unchanged — the default-off switch is
@@ -3076,6 +3149,7 @@ mod tests {
                 cache_policy: Some(cache),
                 prompt_cache_key: Some("scope"),
                 refusal_fallback_model: fallback,
+                ride_placement: None,
                 ..ResolveOptions::default()
             },
             broca_provider::build_provider_http_client(),
