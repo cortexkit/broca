@@ -1025,6 +1025,9 @@ Broca also declares `send_ids`: those module-send entries carry their caller's `
 beside `sender`, or the returned `submission_id` for an unkeyed queued send. A direct
 unkeyed send or steer that returned no submission id has none. These facts never enter
 message bodies, content digests or `history_version`, and default reads omit them.
+An unkeyed ordered `idle_start` admitted while idle also omits the field; if admission
+failed transiently and answered pending before a later drain, that send serves no `send_id`
+though its reply carried one, because the recorded facts cannot distinguish those replies.
 Historical ids are recovered only from exact stored send receipts. Older imports that
 discarded the source id, and converted steers without a stored send id, remain unknown
 and omit the field. Builds before `dabddee12` wrote converted steer receipts one record
