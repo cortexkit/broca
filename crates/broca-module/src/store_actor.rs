@@ -2792,7 +2792,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         let abandon = async move {
             tokio::select! {
                 biased;
-                _ = seal.cancelled() => SendOutcome::Transient("module is stopping".into()),
+                _ = seal.cancelled() => SendOutcome::ModuleStopping(crate::serve::StoppingAt::Admission),
                 _ = reply.closed() => SendOutcome::Transient("send cancelled".into()),
             }
         };
@@ -3167,6 +3167,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         // Whatever the run's start stored of its send's media is the session's now; a run that
         // never wrote its start leaves nothing for the next one.
         self.held.clear();
+        // A run task that panicked or was aborted says nothing about whether the send could be
+        // admitted, so its answer below stays unclassified.
+        let task_failed = end.is_err();
         let result = match end {
             Ok(end) => end.result,
             Err(error) => Err(StoreRunError::Admission(broca_core::RunError::Config(
@@ -3243,7 +3246,15 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         } else if let Some(reply) = active.admitting {
             let _ = reply.send(match result {
                 Ok(_) => SendOutcome::Error("the run ended without writing its start".into()),
-                Err(StoreRunError::Admission(error)) => SendOutcome::Error(error.to_string()),
+                Err(StoreRunError::Admission(error)) if task_failed => {
+                    SendOutcome::Error(error.to_string())
+                }
+                // Refused before its start: answered with the refusal's own code, detail and
+                // class, as a session in today's storage answers it (`crate::actor`), never as an
+                // unclassified open failure.
+                Err(StoreRunError::Admission(error)) => {
+                    crate::actor::admission_refusal_outcome(error)
+                }
                 Err(StoreRunError::Loop(error)) => SendOutcome::Error(format!("{error:?}")),
             });
         } else if let Err(error) = result {

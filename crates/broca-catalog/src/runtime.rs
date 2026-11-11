@@ -2218,8 +2218,9 @@ impl CatalogCache {
                         }
                     }
                 }
-                // Same version, so the facts cannot have changed and the existing index is
-                // still correct — but only if the response is COMPLETE. A truncated or
+                // Same version, so the facts of the rows the index already holds are taken as
+                // unchanged and the existing index is reused — but only if the response is
+                // COMPLETE. A truncated or
                 // degraded response can carry the version of the document it was truncated
                 // from, and this path persists the LKG, so accepting one here would write a
                 // short catalog to disk for the next restart to load. The in-memory index
@@ -2241,11 +2242,23 @@ impl CatalogCache {
                         resolved_at_ms: response.resolved_at_ms,
                     });
                 }
+                // An equal version can still GAIN rows. Fusiform compiles some model data into
+                // its own build, and a deploy that adds such a row does not move
+                // catalog_version. Reusing the index there would leave the new model unknown, so
+                // every send naming it would be refused for lacking a row until some unrelated
+                // change minted a new version. Taken like a newly carried fact: rebuild and
+                // install. Decided on the identity set alone, like the completeness check above,
+                // so an unchanged poll still pays no materialization.
+                let gains_rows = response
+                    .models
+                    .keys()
+                    .any(|identity| !current.model_identities.contains(identity));
                 // `loaded` rejects responses with withheld or uncertain facts. Keep that check
                 // ahead of the version fast path: persisting a rejected response would leave an
                 // LKG that `open` refuses after restart, even while the in-memory catalog keeps
                 // serving its last accepted snapshot.
-                if response_carries_output_limits(&response) != current.carries_output_limits
+                if gains_rows
+                    || response_carries_output_limits(&response) != current.carries_output_limits
                     || response_carries_image_counts(&response) != current.carries_image_counts
                     || response_carries_image_dimensions(&response)
                         != current.carries_image_dimensions
@@ -5445,6 +5458,152 @@ mod tests {
             500,
             "the refusal must leave the previously installed document in place"
         );
+    }
+
+    /// A model row added without a catalog_version move, the way fusiform ships data compiled
+    /// into its own build.
+    fn new_row() -> (String, BTreeMap<String, Value>) {
+        (
+            "anthropic/claude-added-in-place".into(),
+            BTreeMap::from([
+                ("existence".into(), serde_json::json!("present")),
+                ("limit.context".into(), serde_json::json!(100000)),
+            ]),
+        )
+    }
+
+    /// An equal-version response that gains a row installs it, in memory and on disk.
+    ///
+    /// Reusing the index there leaves the new model without a row, so every send naming it is
+    /// refused until fusiform happens to mint a new version for some unrelated change.
+    #[test]
+    fn an_equal_version_response_that_gains_a_row_installs_it() {
+        let path = temp_lkg("equal-version-gains-row");
+        let cache = CatalogCache::open(&path);
+        cache.refresh(response(100)).expect("first install");
+        let before = cache.snapshot().expect("installed");
+        assert!(
+            before
+                .model_for_serving("anthropic", "claude-added-in-place")
+                .is_none(),
+            "the fixture's new row must not be present before the poll that adds it"
+        );
+
+        let mut grown = response(200);
+        grown.catalog_version = before.catalog_version();
+        let (identity, facts) = new_row();
+        grown.models.insert(identity.clone(), facts);
+        cache
+            .refresh(grown)
+            .expect("a grown equal-version response");
+
+        let after = cache.snapshot().expect("installed");
+        assert!(
+            !after.shares_index_with(&before),
+            "a gained row requires a new serving index"
+        );
+        assert_eq!(after.catalog_version(), before.catalog_version());
+        assert_eq!(after.resolved_at_ms(), 200);
+        let (_, model) = after
+            .model_for_serving("anthropic", "claude-added-in-place")
+            .expect("the gained row must resolve");
+        assert_eq!(model.limits.context, Some(100000));
+        assert!(
+            after
+                .model_for_serving("anthropic", "claude-sonnet-4-5")
+                .is_some(),
+            "the rows already installed keep resolving"
+        );
+
+        let saved = load_lkg(&path)
+            .expect("the saved copy reads")
+            .expect("the saved copy exists");
+        assert!(
+            saved.models.contains_key(&identity),
+            "the saved copy must hold the gained row"
+        );
+        let reopened = CatalogCache::open(&path);
+        assert!(
+            reopened
+                .snapshot()
+                .expect("the saved copy loads")
+                .model_for_serving("anthropic", "claude-added-in-place")
+                .is_some(),
+            "the gained row must survive a restart"
+        );
+    }
+
+    /// An equal-version response with the same identities keeps reusing the index, and its
+    /// saved copy holds the same rows.
+    #[test]
+    fn an_equal_version_response_with_the_same_rows_reuses_the_index_and_saves_them() {
+        let path = temp_lkg("equal-version-same-rows");
+        let cache = CatalogCache::open(&path);
+        let mut first = response(100);
+        let (identity, facts) = new_row();
+        first.models.insert(identity.clone(), facts);
+        cache.refresh(first.clone()).expect("first install");
+        let before = cache.snapshot().expect("installed");
+
+        let mut again = first;
+        again.resolved_at_ms = 200;
+        cache.refresh(again).expect("same-version refresh");
+        let after = cache.snapshot().expect("installed");
+        assert!(
+            before.shares_index_with(&after),
+            "an equal-version poll with no new identity must republish the SAME index"
+        );
+        assert_eq!(after.resolved_at_ms(), 200);
+
+        let saved = load_lkg(&path)
+            .expect("the saved copy reads")
+            .expect("the saved copy exists");
+        assert_eq!(saved.resolved_at_ms, 200, "the reuse path still saves");
+        assert!(saved.models.contains_key(&identity));
+    }
+
+    /// An equal-version response that gains a row but lacks an installed one is still refused
+    /// as incomplete: the gained row does not buy a truncated response a way past the check.
+    #[test]
+    fn an_equal_version_response_that_gains_and_loses_rows_is_refused_as_incomplete() {
+        let path = temp_lkg("equal-version-gains-and-loses");
+        let cache = CatalogCache::open(&path);
+        cache.refresh(response(100)).expect("first install");
+        let before = cache.snapshot().expect("installed");
+
+        let mut swapped = response(200);
+        swapped.catalog_version = before.catalog_version();
+        swapped.models.remove("anthropic/claude-retired");
+        let (identity, facts) = new_row();
+        swapped.models.insert(identity.clone(), facts);
+        let error = cache
+            .refresh(swapped)
+            .expect_err("a response lacking an installed row must be refused");
+        assert!(
+            matches!(
+                error,
+                CatalogRefreshError::Incomplete {
+                    missing_count: 1,
+                    ..
+                }
+            ),
+            "expected Incomplete, got {error}"
+        );
+
+        let after = cache.snapshot().expect("still installed");
+        assert!(after.shares_index_with(&before));
+        assert_eq!(after.resolved_at_ms(), 100);
+        assert!(
+            after
+                .model_for_serving("anthropic", "claude-added-in-place")
+                .is_none(),
+            "a refused response must not install its gained row"
+        );
+        let saved = load_lkg(&path)
+            .expect("the saved copy reads")
+            .expect("the saved copy exists");
+        assert_eq!(saved.resolved_at_ms, 100, "a refusal must not save");
+        assert!(!saved.models.contains_key(&identity));
     }
 
     /// An older response must not replace a newer one, and the identity check cannot catch it.

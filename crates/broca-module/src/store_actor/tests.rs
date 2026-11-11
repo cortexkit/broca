@@ -1032,8 +1032,12 @@ async fn a_refused_send_writes_nothing() {
             reply,
         })
         .unwrap();
+    // The refusal is permanent: resending the same request cannot change the result.
     match answer.await.unwrap() {
-        SendOutcome::Error(message) => assert!(message.contains("step_count"), "{message}"),
+        SendOutcome::ClassifiedError { reason, class } => {
+            assert!(reason.contains("step_count"), "{reason}");
+            assert_eq!(class, broca_protocol::ErrorClass::Permanent);
+        }
         other => panic!("expected the refusal: {other:?}"),
     }
     assert_eq!(status(&commands).await, LineageStatus::Idle);

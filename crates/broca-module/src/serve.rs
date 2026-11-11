@@ -2240,6 +2240,16 @@ pub(crate) fn run_status_response_with_reader_policy(
     }
 }
 
+/// Where a request refused because the module is stopping was turned away. The refusal body is
+/// the same either way; each place keeps the message it has always answered with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoppingAt {
+    /// A session actor refused to admit the send.
+    Admission,
+    /// The session could not be opened, or its run could not be started.
+    Open,
+}
+
 /// An error from the serve surface (distinct from a successful per-request outcome). Opening
 /// failures describe lease or store problems; `SendIdReuse` is a typed request rejection.
 #[derive(Debug, Clone)]
@@ -2273,6 +2283,10 @@ pub enum ServeError {
     SessionHeld(String),
     /// Opening or admission failed. The optional class is set only from a known cause.
     Open(String, Option<broca_protocol::ErrorClass>),
+    /// broca refused this request because it is stopping. This request did nothing; repeat it
+    /// after the restart. It says nothing about whether an earlier request with the same send
+    /// id was admitted: a keyed resend is answered from the record once broca serves again.
+    ModuleStopping(StoppingAt),
     /// The store proves history exists, but neither live nor archived WAL can cover it.
     HistoryUnreachable {
         session_ref: String,
@@ -2426,6 +2440,7 @@ impl From<OpenError> for ServeError {
             OpenError::HistoryChanged => ServeError::HistoryChanged,
             OpenError::HistoryRewriting => ServeError::HistoryRewriting,
             OpenError::Open(s) => ServeError::Open(s, None),
+            OpenError::ModuleStopping => ServeError::ModuleStopping(StoppingAt::Open),
             OpenError::Classified { reason, class } => ServeError::Open(reason, Some(class)),
             OpenError::HistoryUnreachable {
                 session_ref,
@@ -2492,6 +2507,13 @@ impl std::fmt::Display for ServeError {
                 "send_id was already used with different {differing}; retries must be byte-identical"
             ),
             ServeError::Transient(s) => write!(f, "transient admission failure: {s}"),
+            // Each place keeps the message it has always answered this refusal with.
+            ServeError::ModuleStopping(StoppingAt::Admission) => {
+                f.write_str("transient admission failure: module is stopping")
+            }
+            ServeError::ModuleStopping(StoppingAt::Open) => {
+                f.write_str("open failed: module is stopping")
+            }
             ServeError::TagsAwaitSetup => f.write_str(
                 "the running run's tag numbers wait for its compaction Setup answer; retry shortly",
             ),
@@ -3783,6 +3805,7 @@ impl ServeHandler for crate::LineageRegistry {
             SendOutcome::ClassifiedError { reason, class } => {
                 Err(ServeError::Open(reason, Some(class)))
             }
+            SendOutcome::ModuleStopping(at) => Err(ServeError::ModuleStopping(at)),
             SendOutcome::SessionTooLarge { max_bytes } => {
                 Err(ServeError::SessionTooLarge { max_bytes })
             }
