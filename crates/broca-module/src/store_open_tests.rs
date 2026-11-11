@@ -106,6 +106,39 @@ async fn create_in(root: &Path, class: StorageClass, key: &BindIdentity) {
     );
 }
 
+#[tokio::test]
+async fn a_finished_administrative_install_retires_its_recovery_candidate() {
+    let root = state_root("installed-candidate");
+    let runtime = runtime(&root).await;
+    let (_, registry) = module(
+        &root,
+        Arc::new(FileWalStore::new(root.join("wal"))),
+        runtime,
+    );
+    registry.recover_store_crash_orphans().await.unwrap();
+    let key = key(&root, "installed");
+    let class = StorageClass::Ordinary;
+    crate::store_open::recovery::register_candidate(
+        &class.store_root(&root),
+        &SessionAddr(broca_core::session_addr(&key)),
+    )
+    .unwrap();
+    create_in(&root, class, &key).await;
+    let sweep = registry.recover_store_crash_orphans().await.unwrap();
+    assert!(sweep.failed.is_empty(), "{sweep:?}");
+    assert_eq!(sweep.recovered, 1);
+    assert_eq!(
+        registry
+            .recover_store_crash_orphans()
+            .await
+            .unwrap()
+            .inspected,
+        0
+    );
+    assert!(registry.stop_and_seal().await);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 /// Both storages place a new session by one rule: a retention policy places it in the
 /// ephemeral class whatever its label, a label in `backup_classes` (`head` by default) in the
 /// durable class, and anything else in the ordinary class. The new storage creates it in that

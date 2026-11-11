@@ -557,6 +557,9 @@ async fn periodic_sweep_repairs_stale_discovery_without_new_wal_bytes() {
 /// past this window instead of waiting for it.
 const RETAINED_SECONDS: u64 = 3600;
 
+#[path = "retention_tests/startup.rs"]
+mod startup;
+
 struct Rig<I = SqliteStore> {
     root: PathBuf,
     key: BindIdentity,

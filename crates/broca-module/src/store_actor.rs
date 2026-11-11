@@ -91,6 +91,7 @@ pub struct StoreActor<B: SessionBackend> {
     /// Where setup parts are stored durably before any record names them: the deployment's
     /// setup store. `None` keeps them in memory only, as tests do.
     storage: Option<broca_session_loop::durable::SetupParts<B>>,
+    recovery_index: Option<std::path::PathBuf>,
     run: Option<ActiveRun>,
     /// Non-durable one-shot hints, retained for queued sends and same-process pause resumes.
     /// Reopening loses the hints, as it does in the WAL actor.
@@ -382,6 +383,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             executor,
             parts: SharedParts::new(parts),
             storage: None,
+            recovery_index: None,
             run: None,
             one_shot_runs: Default::default(),
             one_shot_submissions: Default::default(),
@@ -411,6 +413,44 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             admission: Default::default(),
             now_ms: Arc::new(|| broca_core::clock::epoch_millis().unwrap_or(0)),
             retention_clock: None,
+        }
+    }
+
+    pub(crate) fn with_recovery_index(mut self, root: std::path::PathBuf) -> Self {
+        self.recovery_index = Some(root);
+        self
+    }
+
+    fn track_recovery(&self) -> Result<(), String> {
+        let Some(root) = &self.recovery_index else {
+            return Ok(());
+        };
+        crate::store_open::recovery_index::insert(
+            root,
+            &broca_session_store::backend::SessionAddr(broca_core::session_addr(&self.key)),
+        )
+        .map_err(|error| format!("cannot register session recovery: {error}"))
+    }
+
+    fn retire_recovery(&self) {
+        let operations = self.session.operations();
+        if self.run.is_some()
+            || operations
+                .run
+                .as_ref()
+                .is_some_and(|run| run.finished.is_none())
+            || !operations.queue.is_empty()
+            || (self.billing.is_some() && !operations.billing_owed.is_empty())
+        {
+            return;
+        }
+        if let Some(root) = &self.recovery_index {
+            if let Err(error) = crate::store_open::recovery_index::remove(
+                root,
+                &broca_session_store::backend::SessionAddr(broca_core::session_addr(&self.key)),
+            ) {
+                tracing::warn!(target: "lifecycle", %error, "could not retire session recovery candidate");
+            }
         }
     }
 
@@ -537,6 +577,20 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         &mut self,
         request: &crate::store_reads::StoreReadRequest,
     ) -> crate::store_reads::StoreReadOutcome {
+        if self.run.is_none()
+            && self
+                .session
+                .operations()
+                .run
+                .as_ref()
+                .is_some_and(|run| run.finished.is_none() && recovery_mode(run).is_some())
+        {
+            return crate::store_reads::StoreReadOutcome::Refused(crate::serve::ServeError::Open(
+                "session_needs_recovery: the unfinished run could not be recovered before reading"
+                    .into(),
+                Some(broca_protocol::ErrorClass::Transient),
+            ));
+        }
         if !request.is_authorization() {
             // Flush before caller reads so their subscribe cursor includes the durable controls
             // projected from every returned record.
@@ -671,6 +725,16 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         records: &[Record],
         staged: &[crate::person_media::StagedMedia],
     ) -> Result<Vec<Record>, SessionError> {
+        if records
+            .iter()
+            .any(|record| matches!(record, Record::QueuedSend(_)))
+        {
+            self.track_recovery().map_err(|error| {
+                SessionError::Backend(broca_session_store::backend::BackendError::Io(
+                    std::io::Error::other(error),
+                ))
+            })?;
+        }
         let mut media = broca_session_loop::HeldInputMedia::default();
         for item in staged {
             media.hold(&item.reference, Arc::clone(&item.bytes));
@@ -757,6 +821,11 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         .await;
         let key = self.key.clone();
         let untouched = self.created_and_untouched() && !matches!(exit, Exit::Cut(_));
+        // Paused cancellation and queue retraction can finish without a run task returning.
+        // Retire their registration while the lease is still held, only from durable state.
+        if !self.session.unsynced() {
+            self.retire_recovery();
+        }
         // Everything but the session is dropped here, before the lease, as the whole actor was.
         let session = self.into_session();
         if untouched {
@@ -813,6 +882,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         let seal = seal.unwrap_or(&never);
         self.seal = seal.clone();
         self.recover().await;
+        self.retire_recovery();
         if !self
             .registry
             .as_ref()
@@ -1883,6 +1953,13 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         mode: StoreRunMode,
         cancel: CancellationToken,
     ) {
+        if let Err(error) = self.track_recovery() {
+            if let Some(reply) = reply {
+                let _ = reply.send(SendOutcome::Error(error.clone()));
+            }
+            tracing::error!(target: "lifecycle", %error, "run refused before its recovery registration was durable");
+            return;
+        }
         if self.warm.as_ref().is_some_and(|warm| warm.idle_auto) {
             let pending = self.warm.as_mut().expect("idle warm exists");
             pending.task.abort();
@@ -3018,6 +3095,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 .run
                 .as_ref()
                 .is_some_and(|run| run.run_id == active.run_id.0 && run.finished.is_some());
+        self.retire_recovery();
         if std::mem::take(&mut self.held_resume_owed) {
             if let Err(error) = self.resume_held().await {
                 tracing::error!(target: "broca.store_actor", %error, "could not resume a held run after its task parked");

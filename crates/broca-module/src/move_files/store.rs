@@ -324,6 +324,11 @@ impl FileCutArtifacts {
                         }
                     }
                 }
+                crate::store_open::recovery::register_candidate(
+                    &class.store_root(&self.state_root),
+                    &addr,
+                )
+                .map_err(unavailable)?;
                 export
                     .activate(
                         &self.store_staged(cut, plan),

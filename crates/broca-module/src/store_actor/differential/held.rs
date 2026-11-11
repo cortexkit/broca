@@ -753,6 +753,278 @@ async fn boot_sweep_seals_store_orphans_without_a_run_index(cipher: Cipher) {
     }
 }
 
+#[tokio::test]
+async fn startup_read_is_served_while_background_recovery_is_pending() {
+    use broca_session_store::backend::{LocalBackend, SessionAddr};
+    use broca_wal::StorageClass;
+
+    let dir = scratch_dir();
+    let key = BindIdentity::new(dir.join("project"), "startup-recovery", "orphan");
+    let original = Side::at(
+        dir,
+        key,
+        true,
+        Cipher::None,
+        vec![super::super::tests::text_step("m1", "never sent")],
+        Arc::default(),
+        Some(Arc::default()),
+    )
+    .await;
+    // Establish coverage as a previous successful startup would, before a run starts.
+    assert_eq!(
+        original
+            .registry
+            .recover_store_crash_orphans()
+            .await
+            .unwrap()
+            .inspected,
+        0
+    );
+    original.send().await;
+    let restarted = original.restarted().await;
+    let deployment = DeploymentKey::new(1, &[7; 32]).creating(Cipher::None);
+    let root = StorageClass::Ordinary.store_root(&restarted.dir);
+    let mut idle = None;
+    for n in 0..8 {
+        let key = BindIdentity::new(
+            restarted.dir.join("project"),
+            "startup-recovery",
+            format!("idle-{n}"),
+        );
+        drop(
+            Session::create(
+                LocalBackend::new(&root),
+                SessionAddr(broca_core::session_addr(&key)),
+                crate::store_open::triple(&key),
+                &deployment,
+                false,
+            )
+            .await
+            .unwrap(),
+        );
+        idle = Some(key);
+    }
+    let started = std::time::Instant::now();
+    let mut sweep = Box::pin(restarted.registry.recover_store_crash_orphans());
+    assert!(
+        futures::poll!(sweep.as_mut()).is_pending(),
+        "the background pass yields to requests"
+    );
+    let runtime = restarted.registry.store_runtime().unwrap();
+    assert!(
+        runtime
+            .read(
+                &restarted.registry,
+                &idle.unwrap(),
+                crate::store_reads::StoreReadRequest::Head
+            )
+            .await
+            .unwrap()
+            .is_some(),
+        "another session is readable while recovery is pending"
+    );
+    let sweep = sweep.await.unwrap();
+    eprintln!(
+        "synthetic startup: idle_sessions=8 inspected={} recovered={} recovery_ms={}",
+        sweep.inspected,
+        sweep.recovered,
+        started.elapsed().as_millis()
+    );
+    assert!(sweep.failed.is_empty(), "{sweep:?}");
+    assert_eq!(
+        sweep.inspected, 1,
+        "idle sessions must add no recovery work: {sweep:?}"
+    );
+    assert_eq!(
+        sweep.recovered, 1,
+        "an untouched orphan is recovered in the background"
+    );
+    assert_eq!(restarted.status().await["state"], "interrupted");
+    assert_eq!(restarted.executor.provider.inner.calls().len(), 0);
+    let again = restarted
+        .registry
+        .recover_store_crash_orphans()
+        .await
+        .unwrap();
+    assert_eq!(
+        again.inspected, 0,
+        "the durable terminal retires its candidate: {again:?}"
+    );
+    assert!(restarted.registry.stop_and_seal().await);
+    original
+        .executor
+        .provider
+        .gate
+        .as_ref()
+        .unwrap()
+        .notify_one();
+    assert!(original.registry.stop_and_seal().await);
+}
+
+/// Valid in-memory sessions avoid making a work-bound assertion depend on thousands of
+/// physical durability barriers. The production selector must neither list idle heads nor
+/// load their logs, at either inventory size.
+#[tokio::test]
+async fn startup_recovery_work_ignores_idle_store_sessions() {
+    use broca_session_store::backend::{MemoryBackend, SessionAddr};
+    use broca_session_store::record::{Record, RunStart};
+    use broca_wal::StorageClass;
+
+    let mut work = Vec::new();
+    for size in [64, 3000] {
+        let backend = MemoryBackend::default();
+        let deployment = DeploymentKey::new(1, &[7; 32]).creating(Cipher::None);
+        let mut sessions = std::collections::HashMap::new();
+        for n in 0..=size {
+            let key = BindIdentity::new("/project", "startup-recovery", format!("session-{n}"));
+            let addr = SessionAddr(broca_core::session_addr(&key));
+            let mut session = Session::create(
+                &backend,
+                addr.clone(),
+                crate::store_open::triple(&key),
+                &deployment,
+                false,
+            )
+            .await
+            .unwrap();
+            if n == size {
+                session
+                    .append(
+                        &[Record::RunStart(Box::new(RunStart {
+                            named_speaker: None,
+                            imported_ids: None,
+                            message_marks: None,
+                            run_id: "orphan".into(),
+                            model: broca_protocol::ModelHandle::new("stub", "m"),
+                            setup: Vec::new(),
+                            renderer_version: 1,
+                            submission_id: None,
+                            send_id: None,
+                            request_identity_digest: None,
+                            ts_ms: None,
+                            written_at_ms: None,
+                            session_class: None,
+                            retention_secs: None,
+                            title: None,
+                            context_limit: None,
+                            service_tier: None,
+                            route_decision_id: None,
+                            compaction_plan_version: None,
+                            auth_selection: None,
+                            run_choices: None,
+                            origin: None,
+                            principal: None,
+                            scope: None,
+                            hooks: None,
+                            keep_warm: None,
+                            on_restart: None,
+                            seeded: None,
+                            refusal_schedule: None,
+                        }))],
+                        true,
+                    )
+                    .await
+                    .unwrap();
+            }
+            sessions.insert(addr, key);
+        }
+        let orphan = BindIdentity::new("/project", "startup-recovery", format!("session-{size}"));
+        let candidate = SessionAddr(broca_core::session_addr(&orphan));
+        let mut listed_heads = 0;
+        let addresses = crate::store_open::recovery::candidate_addresses(
+            Some(vec![candidate]),
+            StorageClass::Ordinary,
+            || {
+                listed_heads += sessions.len();
+                Ok(sessions.keys().cloned().collect())
+            },
+        )
+        .unwrap();
+        let before = (backend.log_reads(), backend.object_reads());
+        let mut inspected = 0;
+        let mut unfinished = 0;
+        for addr in addresses {
+            inspected += 1;
+            let key = &sessions[&addr];
+            let view = Session::view(&backend, addr, &crate::store_open::triple(key), &deployment)
+                .await
+                .unwrap();
+            if let Some(run) = view
+                .operations
+                .run
+                .as_ref()
+                .filter(|run| run.finished.is_none())
+            {
+                assert!(matches!(
+                    crate::store_actor::recovery_mode(run),
+                    Some(StoreRunMode::Seal(broca_core::seal::SealCause::CrashOrphan))
+                ));
+                unfinished += 1;
+            }
+        }
+        let counts = (
+            inspected,
+            backend.log_reads() - before.0,
+            backend.object_reads() - before.1,
+            listed_heads,
+        );
+        eprintln!("startup work: idle_sessions={size} inspected={} log_reads={} object_reads={} listed_heads={}",
+            counts.0, counts.1, counts.2, counts.3);
+        assert_eq!(unfinished, 1);
+        assert_eq!(
+            (counts.0, counts.2, counts.3),
+            (1, 0, 0),
+            "only the candidate is inspected, without listing idle heads or loading objects"
+        );
+        assert!(counts.1 > 0, "the candidate's real log must be read");
+        work.push(counts);
+    }
+    assert_eq!(work[0], work[1]);
+}
+
+#[tokio::test]
+async fn startup_read_recovers_its_own_orphan_without_global_sweep() {
+    let original = Side::at(
+        scratch_dir(),
+        BindIdentity::new("/project", "startup-recovery", "read-orphan"),
+        true,
+        Cipher::None,
+        vec![super::super::tests::text_step("m1", "never sent")],
+        Arc::default(),
+        Some(Arc::default()),
+    )
+    .await;
+    original.send().await;
+    let reboot = original.restarted().await;
+    assert!(reboot.registry.slot_state(&reboot.key).is_none());
+    let runtime = reboot.registry.store_runtime().unwrap();
+    runtime
+        .read(
+            &reboot.registry,
+            &reboot.key,
+            crate::store_reads::StoreReadRequest::Head,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let view = runtime.current_view(&reboot.key).await.unwrap().unwrap();
+    assert_eq!(
+        view.operations.run.as_ref().unwrap().finished,
+        Some(broca_protocol::RunFinishReason::Interrupted)
+    );
+    assert_eq!(reboot.status().await["state"], "interrupted");
+    assert_eq!(reboot.executor.provider.inner.calls().len(), 0);
+    assert!(reboot.registry.stop_and_seal().await);
+    original
+        .executor
+        .provider
+        .gate
+        .as_ref()
+        .unwrap()
+        .notify_one();
+    assert!(original.registry.stop_and_seal().await);
+}
+
 cipher_tests!(held_record_boundary_cuts_rejoin_without_redispatch);
 
 async fn held_record_boundary_cuts_rejoin_without_redispatch(cipher: Cipher) {

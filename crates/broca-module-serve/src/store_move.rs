@@ -1038,6 +1038,9 @@ pub(crate) async fn publish_head_at(
     address: &str,
 ) -> Result<u64, Stop> {
     let addr = SessionAddr(address.to_owned());
+    broca_module::store_open::recovery::register_candidate(store, &addr).map_err(io_failed(
+        "the installed session's recovery couldn't be registered",
+    ))?;
     let staged = LocalBackend::new(staging);
     let (bytes, version) = staged
         .read_head(&addr)

@@ -3390,7 +3390,7 @@ impl LineageRegistry {
         self.actor_for_mode(key, retention, None, false).await
     }
 
-    async fn actor_for_mode(
+    pub(crate) async fn actor_for_mode(
         &self,
         key: &LineageKey,
         retention: Option<u64>,
@@ -8270,8 +8270,27 @@ impl LineageRegistry {
     }
 
     pub async fn boot_retention(&self) -> Result<usize, OpenError> {
+        self.rebuild_retention_deletion_inventory().await?;
+        self.boot_retention_deletions().await?;
+        self.enroll_retention().await
+    }
+
+    pub async fn rebuild_retention_deletion_inventory(&self) -> Result<(), OpenError> {
         let Some(service) = self.inner.retention.get().cloned() else {
-            return Ok(0);
+            return Ok(());
+        };
+        tokio::task::spawn_blocking(move || service.rebuild_deletion_inventory())
+            .await
+            .map_err(|error| OpenError::Open(error.to_string()))?
+            .map_err(OpenError::Open)?;
+        self.boot_retention_deletions().await
+    }
+
+    /// Complete content deletions before serving; enrollment can run later because every
+    /// keyed read checks its own WAL policy and tombstones, even without an indexed summary.
+    pub async fn boot_retention_deletions(&self) -> Result<(), OpenError> {
+        let Some(service) = self.inner.retention.get().cloned() else {
+            return Ok(());
         };
         let recovered = tokio::task::spawn_blocking({
             let service = service.clone();
@@ -8283,6 +8302,13 @@ impl LineageRegistry {
         for key in recovered {
             self.evict_retention_caches(&key);
         }
+        Ok(())
+    }
+
+    pub async fn enroll_retention(&self) -> Result<usize, OpenError> {
+        let Some(service) = self.inner.retention.get().cloned() else {
+            return Ok(0);
+        };
         let enrolled = tokio::task::spawn_blocking(move || service.recover_enrollment())
             .await
             .map_err(|e| OpenError::Open(e.to_string()))?

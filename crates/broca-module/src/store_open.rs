@@ -125,6 +125,8 @@ impl StoreRuntime {
         let mut roots = Vec::with_capacity(StorageClass::ALL.len());
         for class in StorageClass::ALL {
             let backend = LocalBackend::new(class.store_root(state_root));
+            recovery_index::prepare(&class.store_root(state_root))
+                .map_err(|error| format!("prepare {class} recovery candidates: {error}"))?;
             let loaded = SetupStore::new(&backend, &plain)
                 .load_all()
                 .await
@@ -386,7 +388,7 @@ impl StoreRuntime {
         key: &BindIdentity,
     ) -> Result<Option<Arc<SessionView<LocalBackend>>>, OpenError> {
         match self.class_of(key)? {
-            Some(class) => self.current_view_in(key, class).await,
+            Some(class) => self.current_view_in(key, class).await.map_err(view_error),
             None => Ok(None),
         }
     }
@@ -396,7 +398,7 @@ impl StoreRuntime {
         &self,
         key: &BindIdentity,
         class: StorageClass,
-    ) -> Result<Option<Arc<SessionView<LocalBackend>>>, OpenError> {
+    ) -> Result<Option<Arc<SessionView<LocalBackend>>>, SessionError> {
         let addr = SessionAddr(broca_core::session_addr(key));
         let backend = self.backend(class);
         for _ in 0..POSITION_TRIES {
@@ -404,20 +406,20 @@ impl StoreRuntime {
             {
                 Ok(Some(position)) => position,
                 Ok(None) => return Ok(None),
-                Err(error) => return Err(view_error(error)),
+                Err(error) => return Err(error),
             };
             match self.view_at(key, class, position).await {
                 // A writer moved the head between the probe and the load: probe again.
                 Err(SessionError::Moved) => continue,
                 Err(SessionError::Missing) => return Ok(None),
-                other => return other.map(Some).map_err(view_error),
+                other => return other.map(Some),
             }
         }
         // Still moving: read it as it is, without keeping the view.
         match Session::view(backend, addr, &triple(key), self.deployment()).await {
             Ok(view) => Ok(Some(Arc::new(view))),
             Err(SessionError::Missing) => Ok(None),
-            Err(error) => Err(view_error(error)),
+            Err(error) => Err(error),
         }
     }
 
@@ -450,6 +452,17 @@ impl StoreRuntime {
         key: &BindIdentity,
         request: crate::store_reads::StoreReadRequest,
     ) -> Result<Option<crate::store_reads::StoreReadReply>, crate::serve::ServeError> {
+        // Recovery can open an actor. Keep that large future off every caller's stack,
+        // including callers that compose several reads into one request future.
+        Box::pin(self.read_inner(registry, key, request)).await
+    }
+
+    async fn read_inner(
+        &self,
+        registry: &crate::LineageRegistry,
+        key: &BindIdentity,
+        request: crate::store_reads::StoreReadRequest,
+    ) -> Result<Option<crate::store_reads::StoreReadReply>, crate::serve::ServeError> {
         use crate::store_reads::{execute, ReadContext, StoreReadOutcome};
         let run = match &request {
             crate::store_reads::StoreReadRequest::RunAdmission(run)
@@ -465,6 +478,19 @@ impl StoreRuntime {
         let Some(class) = self.class_of(key)? else {
             return Ok(None);
         };
+        if !request.is_authorization() && registry.open_handle(key).is_none() {
+            let needs_actor = match self.current_view_in(key, class).await {
+                Ok(Some(view)) => recovery_changes_reads(&view),
+                Ok(None) => return Ok(None),
+                Err(SessionError::NeedsRecovery) => true,
+                Err(error) => return Err(view_error(error).into()),
+            };
+            if needs_actor {
+                // The background inventory is only a liveness aid. This session's actor
+                // must recover before any read can observe state that recovery would change.
+                Box::pin(registry.actor_for_mode(key, None, None, true)).await?;
+            }
+        }
         // A read resolves setup parts in the root and mode of the session it reads.
         let context = |view: &SessionView<LocalBackend>,
                        held: bool,
@@ -517,9 +543,14 @@ impl StoreRuntime {
                 Some(StoreReadOutcome::Reopen) | None => break,
             }
         }
-        let Some(view) = self.current_view_in(key, class).await? else {
+        let Some(view) = self.current_view_in(key, class).await.map_err(view_error)? else {
             return Ok(None);
         };
+        if !request.is_authorization() && recovery_changes_reads(&view) {
+            // The actor closed before answering. Refuse rather than serve a pre-recovery
+            // snapshot; a later read will reopen it through the same barrier.
+            return Err(view_error(SessionError::NeedsRecovery).into());
+        }
         let slot = registry.slot_state(key);
         // No actor answered, so none holds a Setup: a compaction read asks the catalog.
         let attribution =
@@ -607,6 +638,7 @@ impl StoreRuntime {
             Arc::clone(&self.executor),
             Box::new(self.parts_for(class, cipher).clone()),
         )
+        .with_recovery_index(class.store_root(&self.state_root))
         .with_storage(storage)
         .with_settled(Arc::clone(&self.settled))
         // A send's attachments are uploaded beside the session, under the state root, whichever
@@ -920,6 +952,14 @@ fn head_class(state_root: &Path, key: &BindIdentity) -> Result<Option<StorageCla
 /// an append, so a second probe nearly always holds.
 const POSITION_TRIES: usize = 3;
 
+fn recovery_changes_reads(view: &SessionView<LocalBackend>) -> bool {
+    view.operations
+        .run
+        .as_ref()
+        .is_some_and(|run| run.finished.is_none())
+        || !view.operations.queue.is_empty()
+}
+
 /// A view that couldn't be loaded, as the opener reports it.
 fn view_error(error: SessionError) -> OpenError {
     match error {
@@ -984,6 +1024,7 @@ fn open_error(error: SessionError, create: bool) -> OpenError {
 }
 
 pub mod recovery;
+pub(crate) mod recovery_index;
 
 #[cfg(test)]
 #[path = "store_open_tests.rs"]

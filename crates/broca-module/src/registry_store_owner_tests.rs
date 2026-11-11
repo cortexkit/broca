@@ -256,7 +256,13 @@ async fn a_read_that_meets_a_head_published_meanwhile_is_served_from_the_new_sto
     // Publish between the read's head check and its read of today's storage.
     let (from, to) = (staged.join("session-store"), root.join("session-store"));
     *registry.inner.store_owner_probe.lock().unwrap() = Some(Box::new(move || {
-        std::fs::rename(from, to).unwrap();
+        // The destination already holds its recovery index. Publish only session data,
+        // as the mover does, rather than replacing the whole class root.
+        for entry in std::fs::read_dir(&from).unwrap() {
+            let entry = entry.unwrap();
+            std::fs::rename(entry.path(), to.join(entry.file_name())).unwrap();
+        }
+        std::fs::remove_dir(from).unwrap();
     }));
     let served = registry
         .read(SessionReadRequest::new(key.clone(), None, None))

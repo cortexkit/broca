@@ -355,7 +355,6 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     // finished from its journal before anything sweeps the state root or opens a session.
     let mut unsettled_moves =
         broca_module_serve::store_move::recover_at_startup(&state_root).refused;
-    start_media_sweep(&state_root);
     // The catalog only guides external backup capture; a filesystem refusal must not take
     // session service offline.
     if let Err(error) = write_engram_catalog(&state_root) {
@@ -429,6 +428,14 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     // connection, because the daemon answers it only on a registered module's connection. The
     // serve loop below attaches the describer once that connection has registered.
     let scope_describer = Arc::new(broca_subc::ModuleScopeDescriber::new());
+    let _media_sweep = {
+        let ready = scope_describer.clone();
+        let root = state_root.clone();
+        tokio::spawn(async move {
+            ready.wait_registered().await;
+            start_media_sweep(&root);
+        })
+    };
     plane.set_scope_describer(scope_describer.clone());
     let index = Arc::new(
         broca_store::SqliteStore::open_boot_legacy(
@@ -546,7 +553,10 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     let catch_up_wal = wal_store.clone();
     let catch_up_resolver = charge_basis_table.clone();
     let _export_catch_up = {
-        spawn_blocking(JobKind::Recovery, move || {
+        let ready = scope_describer.clone();
+        tokio::spawn(async move {
+            ready.wait_registered().await;
+            spawn_blocking(JobKind::Recovery, move || {
             let Some(catch_up_index) = catch_up_index else {
                 return;
             };
@@ -577,6 +587,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
                     tracing::warn!(target: "export", "usage-export startup catch-up failed: {error}")
                 }
             }
+        }).await
         })
     };
     // Build the archive membership cache now, off the send path. Otherwise the first NEW
@@ -926,15 +937,22 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // The deployment key is read off the startup path: the module serves today's sessions at
     // once, and sessions kept in the new storage from when the key loads.
-    let _store_key = tokio::spawn(
-        broca_module_serve::store_key::KeyLoader {
-            source: store_key_source,
-            slot: Arc::clone(&store_slot),
-            setup: store_setup,
-            backoff: Default::default(),
-        }
-        .run(registry.as_ref().clone()),
-    );
+    let _store_key = {
+        let ready = scope_describer.clone();
+        let registry = registry.as_ref().clone();
+        let slot = Arc::clone(&store_slot);
+        tokio::spawn(async move {
+            ready.wait_registered().await;
+            broca_module_serve::store_key::KeyLoader {
+                source: store_key_source,
+                slot,
+                setup: store_setup,
+                backoff: Default::default(),
+            }
+            .run(registry)
+            .await;
+        })
+    };
     held_runtime.bind_stopping_signal(registry.stopping_signal());
     registry.set_tool_route_health(Arc::new(move |open| {
         tool_route_health_plane.tool_routes_health(open)
@@ -1092,21 +1110,41 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             door,
         )
     });
+    let phase_started = std::time::Instant::now();
     agent_data
         .reconcile_boot()
         .await
         .map_err(|error| ServeIoError(format!("agent-data boot recovery: {}", error.message)))?;
+    tracing::info!(target: "lifecycle", elapsed_ms = phase_started.elapsed().as_millis() as u64,
+        "agent-data boot recovery complete");
+    let phase_started = std::time::Instant::now();
     let _history_rewrites = registry
         .finish_history_rewrites_at_boot()
         .await
         .map_err(|error| ServeIoError(format!("finish fenced history recovery: {error}")))?;
+    tracing::info!(target: "lifecycle", elapsed_ms = phase_started.elapsed().as_millis() as u64,
+        "fenced history boot recovery complete");
+    let phase_started = std::time::Instant::now();
     registry
-        .boot_retention()
+        .boot_retention_deletions()
         .await
         .map_err(|error| ServeIoError(format!("retention boot recovery: {error}")))?;
+    tracing::info!(target: "lifecycle", elapsed_ms = phase_started.elapsed().as_millis() as u64,
+        "retention deletion boot recovery complete");
     let retention_sweep = Some({
         let registry = registry.clone();
+        let ready = scope_describer.clone();
         tokio::spawn(async move {
+            ready.wait_registered().await;
+            if let Err(error) = registry.rebuild_retention_deletion_inventory().await {
+                tracing::warn!(target: "retention", %error, "retention deletion inventory repair deferred");
+            }
+            let phase_started = std::time::Instant::now();
+            if let Err(error) = registry.enroll_retention().await {
+                tracing::warn!(target: "retention", %error, "retention enrollment recovery deferred");
+            }
+            tracing::info!(target: "lifecycle", elapsed_ms = phase_started.elapsed().as_millis() as u64,
+                "retention enrollment boot recovery complete");
             if registry.run_retention_sweeper().await.is_err() {
                 tracing::warn!(target: "retention", "retention sweep stopped; durable recovery required");
             }
@@ -1137,11 +1175,19 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         broca_module_serve::cache_warm::ProviderCacheDeclarer,
     ));
     let recovery: Arc<dyn broca_core::RecoveryDiscovery> = run_index.as_ref().unwrap().clone();
-    let store_recovery = registry
-        .recover_store_crash_orphans()
-        .await
-        .map_err(|error| ServeIoError(format!("store crash-orphan recovery: {error}")))?;
-    tracing::warn!(target: "lifecycle", ?store_recovery, "store crash-orphan recovery complete");
+    let _store_recovery = {
+        let registry = registry.clone();
+        let ready = scope_describer.clone();
+        tokio::spawn(async move {
+            ready.wait_registered().await;
+            match registry.recover_store_crash_orphans().await {
+                Ok(store_recovery) => tracing::warn!(target: "lifecycle", ?store_recovery,
+                    "store crash-orphan recovery complete"),
+                Err(error) => tracing::warn!(target: "lifecycle", %error,
+                    "store crash-orphan recovery deferred"),
+            }
+        })
+    };
     let crash_orphans = mark_crash_orphans(
         &registry,
         recovery.clone(),
@@ -8290,6 +8336,8 @@ fn create_state_directories(state_root: &std::path::Path) -> Result<(), ServeIoE
         }
     }
 
+    broca_module::store_open::recovery::prepare_directories(state_root)
+        .map_err(|error| ServeIoError(format!("create recovery candidate directories: {error}")))?;
     broca_core::media_store::create_media_directories(state_root)
         .map_err(|error| ServeIoError(error.to_string()))?;
     // Cutover-only device-local recovery state must exist even with conversion disabled:
@@ -8570,11 +8618,18 @@ mod state_directory_tests {
                     & 0o777;
                 assert_eq!(mode, 0o700, "portable entry {entry_id} must be owner-only");
             }
+            let mut actual: Vec<_> = std::fs::read_dir(&path)
+                .expect("read newly created portable directory")
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            actual.sort();
+            let expected: &[&str] = match relative_path {
+                "media-durable" => &["objects", "refs"],
+                broca_wal::SESSION_STORAGE_DURABLE_DIR => &["recovery-candidates"],
+                _ => &[],
+            };
             assert_eq!(
-                std::fs::read_dir(&path)
-                    .expect("read newly created portable directory")
-                    .count(),
-                if relative_path == "media-durable" { 2 } else { 0 },
+                actual, expected.iter().map(|name| std::ffi::OsString::from(*name)).collect::<Vec<_>>(),
                 "boot must create {entry_id} and only its structural subdirectories before any session writes a WAL"
             );
         }
@@ -8585,9 +8640,9 @@ mod state_directory_tests {
         let _ = std::fs::remove_dir_all(&state_root);
     }
 
-    /// The new storage's three class roots and its moves folder exist, owner-only and empty,
-    /// before any session is placed, and the descriptor names each with its backup class: only
-    /// the durable root is captured.
+    /// The class roots contain only their empty recovery-candidate directories before any
+    /// session is placed. They and the empty moves folder are owner-only, and the descriptor
+    /// names each with its backup class: only the durable root is captured.
     #[test]
     fn session_store_class_roots_exist_before_catalog_and_match_backup_classes() {
         let state_root = fresh_root("session-store-classes");
@@ -8606,7 +8661,21 @@ mod state_directory_tests {
             let folder = state_root.join(path);
             assert!(folder.is_dir(), "startup must create {}", folder.display());
             broca_owner_only::validate(&folder).unwrap();
-            assert_eq!(std::fs::read_dir(&folder).unwrap().count(), 0, "{path}");
+            if path == broca_wal::SESSION_STORAGE_MOVES_DIR {
+                assert_eq!(std::fs::read_dir(&folder).unwrap().count(), 0, "{path}");
+            } else {
+                let children: Vec<_> = std::fs::read_dir(&folder)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().file_name())
+                    .collect();
+                assert_eq!(
+                    children,
+                    vec![std::ffi::OsString::from("recovery-candidates")]
+                );
+                let candidates = folder.join("recovery-candidates");
+                broca_owner_only::validate(&candidates).unwrap();
+                assert_eq!(std::fs::read_dir(candidates).unwrap().count(), 0);
+            }
             let matching: Vec<_> = entries
                 .iter()
                 .filter(|entry| entry["path"] == path)

@@ -1143,6 +1143,20 @@ async fn every_read_equals_a_fresh_views_at_every_step() {
         .await;
 }
 
+#[tokio::test]
+async fn store_read_future_keeps_recovery_off_the_callers_stack() {
+    let m = module(Vec::new()).await;
+    let runtime = m.runtime();
+    let read = runtime.read(&m.registry, &m.key, StoreReadRequest::Head);
+    assert!(
+        std::mem::size_of_val(&read) < 4096,
+        "composed request futures must not inline the actor-opening recovery future: {} bytes",
+        std::mem::size_of_val(&read)
+    );
+    drop(read);
+    assert!(m.registry.stop_and_seal().await);
+}
+
 /// A session deleted and created again with the same history reads as the new session: its kept
 /// view is never served for it, though the new session's head versions and log length can equal
 /// the old one's, since the new session's log is another log.
