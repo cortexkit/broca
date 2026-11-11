@@ -12,7 +12,60 @@ cipher_tests!(
     idle_warm_failure_and_no_cache_read_stop,
     idle_warm_never_arms_off_non_head_or_one_shot,
     idle_real_run_cancels_timer_and_end_rearms,
+    idle_warm_recognises_an_adopted_head,
 );
+
+async fn idle_warm_recognises_an_adopted_head(cipher: Cipher) {
+    let side = super::super::side(false, cipher).await;
+    let mut records = finished_head();
+    if let WalRecord::RunStarted { session_class, .. } = &mut records[0] {
+        *session_class = None;
+    }
+    let mut actor = head(
+        &side,
+        cipher,
+        Arc::new(Warming::default()),
+        &records,
+        Arc::new(AtomicU64::new(crate::actor::epoch_ms())),
+    )
+    .await
+    .with_class_placement(broca_wal::StorageClass::Durable, vec!["head".into()]);
+    assert_eq!(actor.idle_warm_due().await.unwrap_err(), "not_auto_head");
+    let mut start = actor
+        .session
+        .operations()
+        .owner
+        .first_start
+        .clone()
+        .unwrap();
+    start.run_id = "adopting".into();
+    start.session_class = actor.session_class(Some("head")).unwrap();
+    let end = broca_session_store::record::RunEnd {
+        run_id: "adopting".into(),
+        reason: broca_protocol::RunFinishReason::Completed,
+        usage: None,
+        ts_ms: None,
+        retries_used: 0,
+        interrupt_reason: None,
+        error: None,
+    };
+    actor
+        .session
+        .append(
+            &[Record::RunStart(Box::new(start)), Record::RunEnd(end)],
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(actor.frozen_session_class().as_deref(), Some("head"));
+    // The adopted head and its route's declared cache lifetime pass eligibility. Only the
+    // new run's missing prefix-token usage keeps idle warming from arming.
+    assert_eq!(
+        actor.idle_warm_due().await.unwrap_err(),
+        "prefix_tokens_unavailable"
+    );
+    side.registry.stop_and_seal().await;
+}
 
 fn finished_head() -> Vec<WalRecord> {
     let mut records = history(true);

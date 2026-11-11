@@ -46,6 +46,26 @@ fn addr() -> SessionAddr {
     SessionAddr("0123456789abcdef".into())
 }
 
+#[test]
+fn storage_change_futures_stay_small() {
+    fn size<'a, T: 'a, Fut>(_: impl FnOnce(&'a mut T) -> Fut) -> usize {
+        std::mem::size_of::<Fut>()
+    }
+    let seal = size(|session: &mut Session<crate::backend::LocalBackend>| session.seal(None, 0));
+    let revert = size(|session: &mut Session<crate::backend::LocalBackend>| {
+        session.revert("target", Vec::new(), None, 0)
+    });
+    eprintln!("storage change future bytes: seal={seal}, revert={revert}");
+    assert!(
+        seal <= 16 * 1024,
+        "seal carries {seal} bytes; keep folded states on the heap"
+    );
+    assert!(
+        revert <= 16 * 1024,
+        "revert carries {revert} bytes; keep folded states on the heap"
+    );
+}
+
 fn model() -> ModelHandle {
     serde_json::from_value(serde_json::json!({"provider_module_id": "p", "model_id": "m"})).unwrap()
 }

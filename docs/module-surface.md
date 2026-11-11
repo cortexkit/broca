@@ -2653,9 +2653,15 @@ their existing format (`reason: "auth_required"`, without `pause_reason`).
 `session.send.session_class` is an optional top-level opaque label beside `send_id`
 and `retention`. Its grammar is `[a-z0-9_-]{1,32}`; explicit null, non-string values,
 uppercase, whitespace and all other characters are refused as `invalid_params`,
-naming `session_class`. The first send freezes the label, including its absence.
-Later sends may omit it or repeat the same label, but cannot add or change it.
-The label is recorded on `RunStarted`, not sent to model providers.
+naming `session_class`. The first send freezes the label. Later sends may omit it
+or repeat the same label, but cannot change it. On WAL storage, absence on the first
+send stays frozen too. On the session-store backend, an unlabelled session adopts
+the first later run start's label only if that label would place it in the folder
+already holding the session; otherwise the label is ignored. Adoption never moves
+files or changes the class labels recorded for earlier runs. A queued send adopts
+when its run starts.
+The label is recorded on the run's start (`RunStarted` on WAL or `RunStart` on the
+session-store backend), not sent to model providers.
 
 The daemon reads `backup_classes` from `broca.jsonc`, defaulting to `["head"]`.
 `role.describe.capabilities` includes `session_class`, and its

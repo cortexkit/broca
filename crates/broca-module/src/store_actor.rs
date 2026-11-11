@@ -166,6 +166,9 @@ pub struct StoreActor<B: SessionBackend> {
     /// clock its runs stamp their seals with.
     now_ms: Arc<dyn Fn() -> u64 + Send + Sync>,
     retention_clock: Option<broca_core::clock::Clock>,
+    /// The authoritative folder and the opener's backup selection rule. Without placement
+    /// information an unlabelled session cannot safely adopt a class.
+    class_placement: Option<(broca_wal::StorageClass, Vec<String>)>,
 }
 
 /// How an actor lives in the module's registry. Tests serve an actor without one.
@@ -411,7 +414,17 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             admission: Default::default(),
             now_ms: Arc::new(|| broca_core::clock::epoch_millis().unwrap_or(0)),
             retention_clock: None,
+            class_placement: None,
         }
+    }
+
+    pub(crate) fn with_class_placement(
+        mut self,
+        class: broca_wal::StorageClass,
+        backup_classes: Vec<String>,
+    ) -> Self {
+        self.class_placement = Some((class, backup_classes));
+        self
     }
 
     /// Reads the time the session's deletions come due by from `now_ms`, in place of the wall
@@ -2276,38 +2289,45 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         })
     }
 
-    /// The label the session's first run froze; `None` for a session created unlabelled.
+    /// The first class a run recorded, including a later adoption on an unlabelled session.
     fn frozen_session_class(&self) -> Option<String> {
-        self.session
-            .operations()
-            .owner
+        let owner = &self.session.operations().owner;
+        owner
             .first_start
             .as_ref()
             .and_then(|start| start.session_class.clone())
+            .or_else(|| owner.adopted_session_class.clone())
     }
 
-    /// The label a send's run records, by today's rule (`crate::session_class::admit`): the
-    /// session's first run freezes the label its send names, a later send may only repeat it,
-    /// and a session created unlabelled stays unlabelled whatever a later send names.
+    /// An unlabelled session may adopt a class only in its existing folder. Labelled sessions
+    /// use the shared admission rule, without changing their class or placement.
     fn session_class(&self, requested: Option<&str>) -> Result<Option<String>, SendOutcome> {
-        let frozen = self
-            .session
-            .operations()
-            .owner
-            .first_start
-            .as_ref()
-            .map(|start| start.session_class.as_deref());
+        let class = self.frozen_session_class();
+        let first = self.session.operations().owner.first_start.as_ref();
+        let frozen = first.map(|_| class.as_deref());
         let Some(requested) = requested else {
             return Ok(frozen.flatten().map(str::to_owned));
         };
         match crate::session_class::admit(Some(requested), frozen) {
             Ok(crate::session_class::Admitted::Class(class)) => Ok(class),
             Ok(crate::session_class::Admitted::IgnoredOnUnlabelled(label)) => {
+                if self
+                    .class_placement
+                    .as_ref()
+                    .is_some_and(|(folder, backups)| {
+                        broca_wal::placement(
+                            first.is_some_and(|start| start.retention_secs.is_some()),
+                            broca_wal::selected_for_backup(Some(&label), backups),
+                        ) == *folder
+                    })
+                {
+                    return Ok(Some(label));
+                }
                 tracing::info!(
                     target: "broca.session_class",
                     session = %self.key.session,
                     label = %label,
-                    "session_class ignored: the session was created unlabelled"
+                    "session_class ignored: its storage folder differs or is unknown"
                 );
                 Ok(None)
             }
@@ -3173,7 +3193,12 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             .drained_start(&first.submission_id, own_admission)
             .await
         {
-            Ok((mut start, mut drained)) => match self.freeze_plan(&mut start) {
+            Ok((mut start, mut drained)) => match self
+                .session_class(start.session_class.as_deref())
+                .and_then(|class| {
+                    start.session_class = class;
+                    self.freeze_plan(&mut start)
+                }) {
                 Ok(()) => {
                     start.prepared.hooks = crate::actor::pre_user::drained_hooks(
                         drained.hooks.take(),
@@ -3188,7 +3213,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                         .await
                 }
                 Err(outcome) => {
-                    // The send can't start under the session's plan: it ends with the refusal,
+                    // The send can't start under the session's class or plan: it ends with the refusal,
                     // as a drained send refused at admission ends, and the next one is tried.
                     let error = broca_core::RunError::Config(format!("{outcome:?}"));
                     match self
@@ -3281,7 +3306,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 self.ownership()?.scope
             },
             manifest: self.frozen_manifest()?,
-            session_class: self.frozen_session_class(),
+            session_class: queue::receipt_field(&send, "session_class")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
             prepared: Prepared {
                 retention: queue::receipt_field(&send, "retention")
                     .and_then(serde_json::Value::as_u64),
@@ -3663,7 +3690,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             // A queued send keeps its request as sent; the plan is frozen into it when it
             // drains, as today's queue freezes it at the episode's start.
             manifest: _,
-            session_class: _,
+            session_class,
             prepared: start_prepared,
             message_marks,
         } = start;
@@ -3723,6 +3750,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         }
         request.staged_uploads = None;
         let receipt = queue::Receipt {
+            session_class: session_class.filter(|_| self.frozen_session_class().is_none()),
             conversation_key,
             sent_by,
             principal: request.principal.clone(),
@@ -4181,6 +4209,8 @@ mod warm;
 
 #[cfg(test)]
 mod billing_tests;
+#[cfg(test)]
+mod class_tests;
 #[cfg(test)]
 mod collect_tests;
 #[cfg(test)]

@@ -158,6 +158,18 @@ impl<B: SessionBackend> Session<B> {
     pub async fn revert(
         &mut self,
         target: &str,
+        resend: Vec<Record>,
+        tag_high: Option<u64>,
+        now_ms: u64,
+    ) -> Result<Reverted, SessionError> {
+        // Rebuilding the branch holds multiple folded states. Keep that future on the heap
+        // rather than embedding it in every caller's async frame.
+        Box::pin(self.revert_inner(target, resend, tag_high, now_ms)).await
+    }
+
+    async fn revert_inner(
+        &mut self,
+        target: &str,
         mut resend: Vec<Record>,
         tag_high: Option<u64>,
         now_ms: u64,

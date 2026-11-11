@@ -168,7 +168,8 @@ impl<B: SessionBackend> Session<B> {
         } else {
             ChangeKind::LedgerSeal
         };
-        self.seal_read(kind, cut, false, carry, open, now_ms).await
+        // Sealing owns several copies of folded state; keep that future off callers' stacks.
+        Box::pin(self.seal_read(kind, cut, false, carry, open, now_ms)).await
     }
 
     /// [`Session::seal_carrying`] at or before the open-log entry with ordinal `ordinal`: the
