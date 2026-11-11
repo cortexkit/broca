@@ -1190,8 +1190,13 @@ fn run_send_facts(
         send_id: start
             .send_id
             .clone()
-            .or_else(|| queued.and_then(|send| send.send_id.clone()))
-            .or_else(|| start.submission_id.clone()),
+            // Ordered sends need the read-time admission index to distinguish an immediate
+            // idle start (no public submission id) from a send that answered Pending.
+            .or_else(|| {
+                queued
+                    .filter(|send| !send.ordered)
+                    .and_then(|send| send.send_id.clone())
+            }),
         sender: queued.and_then(|send| send.sender.clone()).or(module),
         client_message_id: queued
             .and_then(|send| send.request_identity_digest.as_deref())

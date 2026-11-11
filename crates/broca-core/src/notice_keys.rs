@@ -3,7 +3,7 @@ use broca_protocol::BindPrincipal;
 use broca_wal::{FramedRecord, WalRecord};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NoticeSendKeys {
@@ -15,6 +15,10 @@ pub struct NoticeSendKeys {
     submissions: HashMap<String, (Option<String>, Option<String>)>,
     #[serde(default)]
     collision: bool,
+    #[serde(default)]
+    running: bool,
+    #[serde(default)]
+    idle_starts: HashSet<String>,
 }
 
 fn sender(principal: Option<&BindPrincipal>) -> String {
@@ -49,10 +53,17 @@ impl NoticeSendKeys {
 
     pub fn origin(&self, submission: &str) -> Option<(String, Option<String>)> {
         let (id, sender) = self.submissions.get(submission)?;
+        if id.is_none() && self.idle_starts.contains(submission) {
+            return None;
+        }
         Some((
             id.clone().unwrap_or_else(|| submission.to_owned()),
             sender.clone(),
         ))
+    }
+
+    pub fn submission_sender(&self, submission: &str) -> Option<String> {
+        self.submissions.get(submission)?.1.clone()
     }
 
     pub fn observe(&mut self, frames: &[FramedRecord]) {
@@ -70,8 +81,14 @@ impl NoticeSendKeys {
                 WalRecord::DeliveryOrdered {
                     submission_id,
                     sent_by,
-                    ..
+                    order,
                 } => {
+                    // An ordered idle start answers Active without a submission id. If admission
+                    // failed transiently and answered Pending before a later drain, its send_id
+                    // is conservatively omitted too: the log cannot distinguish those replies.
+                    if !self.running && order.starts_runs() {
+                        self.idle_starts.insert(submission_id.0.clone());
+                    }
                     self.ordered_senders
                         .insert(submission_id.0.clone(), sent_by.clone());
                 }
@@ -124,6 +141,13 @@ impl NoticeSendKeys {
                         );
                     }
                 }
+                _ => {}
+            }
+            match &frame.record {
+                WalRecord::RunStarted { .. } | WalRecord::ResumeStarted { .. } => {
+                    self.running = true
+                }
+                WalRecord::RunFinished { .. } | WalRecord::RunPaused { .. } => self.running = false,
                 _ => {}
             }
         }

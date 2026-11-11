@@ -823,6 +823,43 @@ async fn an_idle_start_send_starts_a_run_alike(cipher: Cipher) {
         .await;
     assert!(matches!(outcome, SendOutcome::Active { .. }), "{outcome:?}");
     pair.idle().await;
+    let outcome = pair
+        .alike(
+            "q3",
+            from(module(MC), "keyed wake up"),
+            Some(json!({"modes": ["idle_start"]})),
+            Some("idle-key"),
+        )
+        .await;
+    assert!(matches!(outcome, SendOutcome::Active { .. }), "{outcome:?}");
+    pair.idle().await;
+    use crate::serve::ServeHandler;
+    let read = pair
+        .today
+        .registry
+        .read(super::opted_request(
+            &pair.today.key,
+            (Some(1), Some(100)),
+            (true, false, false),
+        ))
+        .await
+        .unwrap();
+    for (text, id) in [
+        ("wake up", None),
+        ("go on", None),
+        ("keyed wake up", Some("idle-key")),
+    ] {
+        let entry = read
+            .messages
+            .iter()
+            .find(|entry| {
+                entry.message.content.iter().any(
+                    |part| matches!(part, ContentBlock::Text { text: actual } if actual == text),
+                )
+            })
+            .unwrap();
+        assert_eq!(entry.send_id.as_deref(), id, "{text}");
+    }
     pair.assert_alike().await;
 }
 

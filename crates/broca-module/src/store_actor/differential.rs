@@ -1878,6 +1878,109 @@ mod warm;
 mod held;
 
 #[tokio::test]
+async fn unkeyed_direct_start_omits_send_id_on_both_storages() {
+    use crate::serve::ServeHandler;
+
+    let mut observed = Vec::new();
+    for on in [false, true] {
+        let module = module(on, hello()).await;
+        let mut direct = request("unkeyed direct input");
+        from_core(&mut direct);
+        let outcome = module.send_request("unkeyed-direct", direct, None).await;
+        assert!(matches!(outcome, SendOutcome::Active { .. }), "{outcome:?}");
+        module.closed().await;
+
+        let mut request = request("unkeyed ordered idle start");
+        from_core(&mut request);
+        request.tools = None;
+        request.policy_allowed = Default::default();
+        let outcome = module
+            .registry
+            .route_submission_with_order(
+                &module.key,
+                RunId("unkeyed-ordered".into()),
+                request,
+                RunKind::FreshOrResume,
+                SendKey::Minted,
+                false,
+                broca_protocol::Delivery::Queue,
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+                Some(serde_json::from_value(serde_json::json!({"modes": ["idle_start"]})).unwrap()),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(outcome, SendOutcome::Active { .. }), "{outcome:?}");
+        module.closed().await;
+
+        let read = module
+            .registry
+            .read(opted_request(
+                &module.key,
+                (Some(1), Some(100)),
+                (true, false, false),
+            ))
+            .await
+            .unwrap();
+        let history = crate::history::read(
+            &module.registry,
+            &module.key,
+            &serde_json::from_value(serde_json::json!({"form": "raw"})).unwrap(),
+        )
+        .await
+        .unwrap();
+        let inputs: Vec<_> = read
+            .messages
+            .iter()
+            .filter(|entry| entry.sender.is_some())
+            .collect();
+        assert_eq!(inputs.len(), 2);
+        let raw: Vec<_> = history["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["sender"] == "prefrontal-core")
+            .collect();
+        assert_eq!(raw.len(), 2);
+        for (input, raw) in inputs.into_iter().zip(raw) {
+            assert_eq!(input.sender.as_deref(), Some("prefrontal-core"));
+            observed.push((on, input.send_id.clone(), raw.get("send_id").cloned()));
+        }
+        if on {
+            let session = module.load().await;
+            let mut entries = session.entries(1, 100).await.unwrap();
+            for entry in &mut entries {
+                if let Some(facts) = entry
+                    .state
+                    .facts
+                    .as_mut()
+                    .filter(|facts| facts.sender.is_some())
+                {
+                    facts.send_id = Some("older-writer-internal-id".into());
+                }
+            }
+            let ids = session.entry_send_ids(&entries).await.unwrap();
+            assert_eq!(ids.len(), 2);
+            assert!(ids.values().all(Option::is_none), "{ids:?}");
+        }
+        assert!(module.registry.stop_and_seal().await);
+    }
+    assert_eq!(
+        observed,
+        vec![
+            (false, None, None),
+            (false, None, None),
+            (true, None, None),
+            (true, None, None)
+        ]
+    );
+}
+
+#[tokio::test]
 async fn send_ids_equal_the_admitted_keys_and_unkeyed_submission_on_both_storages() {
     use crate::serve::ServeHandler;
 

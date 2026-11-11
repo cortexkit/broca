@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::placement::{AppendKind, Placement, PlacementAction};
 
-pub const DISPLAY_FACTS_VERSION: u32 = 7;
+pub const DISPLAY_FACTS_VERSION: u32 = 8;
 
 /// Exact response-only outputs by zero-based message ordinal and content part.
 pub type NativeToolOutputs = BTreeMap<u64, BTreeMap<u32, broca_protocol::ToolOutput>>;
@@ -169,9 +169,7 @@ impl DisplayFactsSeed {
                         .insert(submission_id.0.clone(), message_marks.clone());
                     self.queued_senders.insert(
                         submission_id.0.clone(),
-                        self.send_keys
-                            .origin(&submission_id.0)
-                            .and_then(|(_, sender)| sender),
+                        self.send_keys.submission_sender(&submission_id.0),
                     );
                     self.queued.insert(
                         submission_id.0.clone(),
