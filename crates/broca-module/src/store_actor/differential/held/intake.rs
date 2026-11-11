@@ -1,7 +1,10 @@
 //! Exercise the provider feed all the way through classification, slots and the store actor.
 
+use super::cancel::{cancelled, position, terminal, Withdrawals};
 use super::*;
+use crate::actor::CancelOutcome;
 use crate::held_slots::SlotDelivery;
+use crate::held_withdrawals::HeldWithdrawals;
 use crate::late_results_puller::{
     FeedError, FeedReply, HeldDelivery, LateResultsFeed, LateResultsIntake,
 };
@@ -9,6 +12,7 @@ use crate::late_results_store::LateResultsStore;
 use broca_core::tool_plane::{LateResultRegistration, LateResultsIntake as _};
 use cortexkit_role_tool_provider::late_results::{Cursor, LateEntry};
 use std::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
 struct Feed {
     entries: Mutex<Vec<LateEntry>>,
@@ -224,6 +228,183 @@ async fn new_storage_feed_resumes_held_run_and_duplicate_is_noop(cipher: Cipher)
 
 async fn legacy_storage_feed_resumes_held_run(cipher: Cipher) {
     resumes(false, cipher).await;
+}
+
+#[tokio::test]
+async fn encrypted_cancelled_held_run_settles_late_feed_without_delivery_alike() {
+    use broca_session_store::record::{Record, Stream};
+    use broca_wal::WalRecord;
+
+    let mut observations = Vec::new();
+    for store in [false, true] {
+        let side = Side::new(
+            store,
+            Cipher::XChaCha20Poly1305,
+            vec![super::super::super::tests::read_step("m1")],
+        )
+        .await;
+        side.send().await;
+        side.idle().await;
+        assert_eq!(side.status().await["state"], "active");
+        let rig = Intake::new(&side).await;
+        let entries = std::mem::take(&mut *rig.feed.entries.lock().unwrap());
+        let entry = entries.into_iter().next().unwrap();
+        let transport = Arc::new(Withdrawals::default());
+        let withdrawals = HeldWithdrawals::new(
+            rig.store.clone(),
+            side.executor.wal.clone(),
+            transport.clone(),
+        );
+        withdrawals.bind_stopping_signal(CancellationToken::new());
+        withdrawals.with_store_runtime(side.registry.store_runtime().unwrap());
+        side.executor.slots.with_withdrawals(withdrawals.clone());
+
+        assert_eq!(
+            side.registry
+                .route_cancel(&side.key, RunId("r1".into()))
+                .await
+                .unwrap(),
+            CancelOutcome::Ack
+        );
+        cancelled(&side).await;
+        broca_test_support::wait_until(
+            "held withdrawal completes before the late answer",
+            || async {
+                let state = rig.store.withdrawal_state("tools", &rig.key).unwrap();
+                if state == Some(("done".into(), 1)) {
+                    Ok(())
+                } else {
+                    Err(format!("{state:?}: {}", withdrawals.health()))
+                }
+            },
+        )
+        .await;
+        assert_eq!(
+            transport.0.lock().unwrap().as_slice(),
+            [(rig.key.clone(), false)]
+        );
+        assert!(rig.store.registration("tools", &rig.key).unwrap().is_some());
+        let before = (
+            side.status().await,
+            side.result().await,
+            terminal(&side).await,
+        );
+        assert_eq!(before.0["state"], "cancelled");
+        assert_eq!(before.1["state"], "cancelled");
+        assert_eq!(before.2 .0, "cancelled");
+        assert_eq!(
+            before.2 .1,
+            [json!({"outcome": "interrupted", "reason": "provider_held_cancelled"})]
+        );
+        if store {
+            let view = side
+                .registry
+                .store_runtime()
+                .unwrap()
+                .current_view(&side.key)
+                .await
+                .unwrap()
+                .unwrap();
+            let records = view.records_from(0).await.unwrap();
+            assert_eq!(
+                records
+                    .iter()
+                    .filter(|(_, record)| matches!(record, Record::BatchEnd(_)))
+                    .count(),
+                1
+            );
+            let end = records
+                .iter()
+                .rposition(
+                    |(_, record)| matches!(record, Record::RunEnd(end) if end.run_id == "r1"),
+                )
+                .expect("cancelled run has a durable end");
+            let tail: Vec<_> = records[end + 1..]
+                .iter()
+                .map(|(seq, record)| (*seq, record.name(), record.stream()))
+                .collect();
+            eprintln!("new-storage records after RunEnd for r1: {tail:?}");
+            // Entry and turn facts summarize the transcript, not new run events.
+            assert!(
+                records[end + 1..].iter().all(|(_, record)| matches!(
+                    record,
+                    Record::EntryFacts(_) | Record::TurnFacts(_)
+                )),
+                "only derived transcript facts may follow RunEnd for r1; tail={tail:?}"
+            );
+            let last_ledger = records
+                .iter()
+                .rfind(|(_, record)| record.stream() == Stream::Ledger);
+            assert!(
+                matches!(last_ledger, Some((_, Record::RunEnd(end))) if end.run_id == "r1"),
+                "last ledger record must be RunEnd for r1; tail={tail:?}"
+            );
+        } else {
+            let records = side.executor.wal.read_records(&side.key).unwrap();
+            assert_eq!(
+                records
+                    .iter()
+                    .filter(|frame| matches!(frame.record, WalRecord::ToolBatchFinished { .. }))
+                    .count(),
+                1
+            );
+            assert!(matches!(
+                records.last().map(|frame| &frame.record),
+                Some(WalRecord::RunFinished { .. })
+            ));
+        }
+        let before_feed = position(&side).await;
+
+        // Publish the late answer only after the run is sealed and the provider has
+        // acknowledged tool.withdraw for the held call.
+        rig.feed.entries.lock().unwrap().push(entry);
+        let ((), logs) = broca_test_support::capture_logs(rig.tick()).await;
+        if store {
+            assert!(
+                logs.iter().any(|event| {
+                    event.target == "late_results"
+                        && event.fields.get("call_key") == Some(&rig.key)
+                        && matches!(
+                            event.message(),
+                            "late-results entry settled without delivery: run_cancelling"
+                                | "late-results entry settled without delivery: already_terminal"
+                        )
+                }),
+                "{logs:?}"
+            );
+        }
+        side.idle().await;
+        assert_eq!(rig.delivery.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            rig.feed.acks.lock().unwrap().as_slice(),
+            [Cursor {
+                provider_incarnation: "provider".into(),
+                seq: 1,
+            }]
+        );
+        assert_eq!(
+            position(&side).await,
+            before_feed,
+            "no record after the run end"
+        );
+        assert_eq!(
+            (
+                side.status().await,
+                side.result().await,
+                terminal(&side).await,
+            ),
+            before
+        );
+        assert!(side.executor.slots.is_empty());
+        assert_eq!(side.executor.tools.0.load(Ordering::SeqCst), 1);
+        assert_eq!(side.executor.provider.inner.calls().len(), 1);
+        rig.intake.sweep_registrations().await.unwrap();
+        assert!(rig.store.registration_rows().unwrap().is_empty());
+        assert!(!rig.intake.module_needs_feed("tools").await.unwrap());
+        observations.push((before, rig.delivery.calls.load(Ordering::SeqCst)));
+        assert!(side.registry.stop_and_seal().await);
+    }
+    assert_eq!(observations[1], observations[0]);
 }
 
 async fn new_storage_ended_run_does_not_deliver_into_later_run(cipher: Cipher) {

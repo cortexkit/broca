@@ -19,7 +19,7 @@ cipher_tests!(
 );
 
 #[derive(Default)]
-struct Withdrawals(Mutex<Vec<(String, bool)>>);
+pub(super) struct Withdrawals(pub(super) Mutex<Vec<(String, bool)>>);
 
 #[async_trait]
 impl WithdrawTransport for Withdrawals {
@@ -36,7 +36,7 @@ impl WithdrawTransport for Withdrawals {
     }
 }
 
-async fn terminal(side: &Side) -> (Value, Vec<Value>) {
+pub(super) async fn terminal(side: &Side) -> (Value, Vec<Value>) {
     if side.store {
         let view = side
             .registry
@@ -76,7 +76,7 @@ async fn terminal(side: &Side) -> (Value, Vec<Value>) {
     }
 }
 
-async fn cancelled(side: &Side) {
+pub(super) async fn cancelled(side: &Side) {
     broca_test_support::wait_until("parked run cancellation finishes", || async {
         let status = side.status().await;
         if status["state"] == "cancelled" {
@@ -89,7 +89,7 @@ async fn cancelled(side: &Side) {
     side.idle().await;
 }
 
-async fn position(side: &Side) -> u64 {
+pub(super) async fn position(side: &Side) -> u64 {
     if side.store {
         side.registry
             .store_runtime()
