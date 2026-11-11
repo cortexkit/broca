@@ -866,3 +866,139 @@ async fn warm_reaches_the_store_through_serve() {
         "warm_unsupported"
     );
 }
+
+/// Writes `body` as `name` into the folder `TAG_MAP_SAMPLES_DIR` names, when it names one: the
+/// bytes the serve path sent, kept as samples of the operation's wire form.
+fn tag_map_sample(name: &str, body: &[u8]) {
+    if let Some(dir) = std::env::var_os("TAG_MAP_SAMPLES_DIR") {
+        let dir = PathBuf::from(dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(name), body).unwrap();
+    }
+}
+
+/// `session.tag_map` reaches the store through the serve path on the operator's own route only:
+/// another caller is refused `operator_required` before anything reads the session. The operator
+/// pages the map, a message at a time if asked, and its numbers are the ones the compaction
+/// provider's `session.entries` serves. An option the operation doesn't have is refused.
+#[tokio::test]
+async fn tag_map_reaches_the_store_for_the_operator_only() {
+    let mut rig = Rig::start(
+        "tag-map",
+        vec![text_step("a1", "hello"), text_step("a2", "again")],
+    )
+    .await;
+    rig.send("r1", "first", Some(compacting_plan())).await;
+    rig.send(
+        "r2",
+        "second",
+        Some(SendPlan {
+            manifest: None,
+            ..compacting_plan()
+        }),
+    )
+    .await;
+    rig.assert_store_only();
+
+    rig.bind_session(1, core()).await;
+    let refused = rig
+        .request(1, json!({"method": "session.tag_map", "params": {}}))
+        .await;
+    assert_eq!(refused.header.ty, FrameType::Error);
+    let body: Value = serde_json::from_slice(&refused.body).unwrap();
+    assert_eq!(body["code"], "operator_required", "{body}");
+    tag_map_sample("refused-not-operator.json", &refused.body);
+
+    rig.bind_session(2, Principal::Direct).await;
+    let request = json!({"method": "session.tag_map", "params": {"limit": 2}});
+    tag_map_sample("request.json", &serde_json::to_vec(&request).unwrap());
+    let first = rig.request(2, request).await;
+    assert_eq!(
+        first.header.ty,
+        FrameType::Response,
+        "{}",
+        String::from_utf8_lossy(&first.body)
+    );
+    tag_map_sample("reply.json", &first.body);
+    let first: Value = serde_json::from_slice::<Value>(&first.body).unwrap()["result"].clone();
+    assert_eq!(first["numbered"], true, "{first}");
+    assert_eq!(first["next_after_ordinal"], 2, "{first}");
+    let last = rig
+        .result(
+            2,
+            "session.tag_map",
+            json!({"after_ordinal": 2, "limit": 2}),
+        )
+        .await;
+    assert!(last.get("next_after_ordinal").is_none(), "{last}");
+    let rows: Vec<Value> = [&first, &last]
+        .iter()
+        .flat_map(|page| page["rows"].as_array().unwrap().clone())
+        .collect();
+    let ordinals: Vec<u64> = rows
+        .iter()
+        .map(|row| row["ordinal"].as_u64().unwrap())
+        .collect();
+    assert_eq!(ordinals, [1, 2, 3, 4], "{rows:?}");
+    // Ids and numbers only.
+    for row in &rows {
+        let mut keys: Vec<&str> = row
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["mid", "ordinal", "part", "role", "tag"], "{row}");
+    }
+
+    let compaction = Some(BTreeMap::from([(
+        "compaction-runner".to_owned(),
+        "v1".to_owned(),
+    )]));
+    let bound = rig.bind(3, provider(), compaction).await;
+    assert_eq!(bound.header.ty, FrameType::Response);
+    let entries = rig
+        .answered(
+            3,
+            "session.entries",
+            json!({"select": {"by": "after"}, "detail": "full"}),
+        )
+        .await;
+    let served: Vec<(String, u64, u64)> = entries["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|entry| {
+            entry["parts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|part| {
+                    Some((
+                        entry["mid"].as_str()?.to_owned(),
+                        part["id"].as_str()?.parse().ok()?,
+                        part["tag"].as_u64()?,
+                    ))
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let mapped: Vec<(String, u64, u64)> = rows
+        .iter()
+        .map(|row| {
+            (
+                row["mid"].as_str().unwrap().to_owned(),
+                row["part"].as_u64().unwrap(),
+                row["tag"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(mapped, served, "the map names session.entries' numbers");
+
+    assert_eq!(
+        rig.refused(2, "session.tag_map", json!({"content": true}))
+            .await,
+        "invalid_params"
+    );
+}

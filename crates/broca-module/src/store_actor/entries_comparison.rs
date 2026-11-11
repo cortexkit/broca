@@ -2574,3 +2574,6 @@ async fn a_part_tag_template_renders_the_number_the_next_request_shows_alike(
         }
     );
 }
+
+/// `session.tag_map` over the sessions these scenarios build.
+mod tag_map_tests;

@@ -2738,6 +2738,17 @@ pub trait ServeHandler: Send + Sync {
         None
     }
 
+    /// `session.tag_map`: which message and part each part number of the session belongs to
+    /// (see `store_tag_map`). `None` for a session today's storage keeps, which the operation
+    /// doesn't serve; a handler without the new storage keeps every session there.
+    async fn tag_map(
+        &self,
+        _session: &LineageKey,
+        _params: &broca_wire::tag_map::TagMapParams,
+    ) -> Result<Option<broca_wire::tag_map::TagMapResponse>, ServeError> {
+        Ok(None)
+    }
+
     /// `session.restore_from_backup`: restores the session, or with `all` every session kept in
     /// the new storage, from the files the store holds after a backup came back (see
     /// `registry::store_restore`). A handler without the new storage refuses by name.
@@ -3988,6 +3999,26 @@ impl ServeHandler for crate::LineageRegistry {
         all: bool,
     ) -> Result<serde_json::Value, crate::registry::store_move::MoveRefusal> {
         crate::LineageRegistry::restore_from_backup(self, session, all).await
+    }
+
+    async fn tag_map(
+        &self,
+        session: &LineageKey,
+        params: &broca_wire::tag_map::TagMapParams,
+    ) -> Result<Option<broca_wire::tag_map::TagMapResponse>, ServeError> {
+        if let Some(store) = self.store_holding(session)? {
+            return crate::store_tag_map::serve(self, &store, session, params)
+                .await
+                .map(Some);
+        }
+        // No storage holds a session with no WAL and no head in the new storage: it reads as
+        // `session.read` reads it, an empty transcript, which numbers nothing, unless its
+        // history is known to be missing. Any other session is kept on today's storage.
+        if self.wal_written(session) == Some(false) {
+            self.check_session_log(session).await?;
+            return Ok(Some(broca_wire::tag_map::TagMapResponse::unnumbered()));
+        }
+        Ok(None)
     }
 
     async fn import(&self, req: SessionImportRequest) -> Result<SessionImportResponse, ServeError> {

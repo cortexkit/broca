@@ -38,6 +38,9 @@ pub const OP_MOVE_TO_STORE: &str = "session.move_to_store";
 /// holds after a backup came back. Only the operator calls it, through `broca-session
 /// restore-from-backup`.
 pub const OP_RESTORE_FROM_BACKUP: &str = "session.restore_from_backup";
+/// Read which message and part each part number of a session kept in the new storage belongs
+/// to. Only the operator calls it, through `broca-session tag-map`; it is outside the runner role.
+pub const OP_TAG_MAP: &str = broca_wire::tag_map::OP_SESSION_TAG_MAP;
 pub const OP_CANCEL: &str = "run.cancel";
 pub const OP_STATUS: &str = "run.status";
 pub const OP_RUN_ADMISSION: &str = "run.admission";
@@ -228,6 +231,14 @@ pub(crate) fn management_operations() -> Vec<ManagementOperation> {
             kind: ManagementOperationKind::Mutate,
             description: Some(
                 "Restore a session kept in the new storage, or every such session, after its files came back from a backup; operator only."
+                    .to_string(),
+            ),
+        },
+        ManagementOperation {
+            name: OP_TAG_MAP.to_string(),
+            kind: ManagementOperationKind::Query,
+            description: Some(
+                "Page which message and part each part number of a session kept in the new storage belongs to, ids and numbers only; operator only."
                     .to_string(),
             ),
         },
