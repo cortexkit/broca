@@ -608,6 +608,7 @@ impl StoreRuntime {
             Box::new(self.parts_for(class, cipher).clone()),
         )
         .with_storage(storage)
+        .with_class_placement(class, registry.backup_classes())
         .with_settled(Arc::clone(&self.settled))
         // A send's attachments are uploaded beside the session, under the state root, whichever
         // storage keeps it.

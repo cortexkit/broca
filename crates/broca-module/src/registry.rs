@@ -8627,6 +8627,10 @@ impl RegistryHandle {
     pub(crate) fn store_runtime(&self) -> Option<Arc<crate::store_open::StoreRuntime>> {
         self.inner.opener.store_runtime()
     }
+
+    pub(crate) fn backup_classes(&self) -> Vec<String> {
+        self.inner.opener.backup_classes()
+    }
     pub(crate) fn repair_retention(&self, key: &LineageKey) {
         self.inner.repairs.insert(key);
     }

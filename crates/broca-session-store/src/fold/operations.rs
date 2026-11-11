@@ -1404,6 +1404,14 @@ state! {
             reset: "never",
             bound: Bound::Fixed,
         },
+        /// The first later run's class when the first start recorded none. On rollback, older
+        /// readers skip this field and see the session as unlabelled again without changing
+        /// its folder.
+        7 opt pub adopted_session_class: String => {
+            owner: "admission",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
     }
 }
 
@@ -1416,6 +1424,14 @@ impl Owner {
         if self.episodes == 0 {
             self.first_principal = principal.cloned();
             self.first_start = Some(start.clone());
+        }
+        if self.adopted_session_class.is_none()
+            && self
+                .first_start
+                .as_ref()
+                .is_some_and(|first| first.session_class.is_none())
+        {
+            self.adopted_session_class = start.session_class.clone();
         }
         self.episodes = self.episodes.saturating_add(1);
         match principal {
