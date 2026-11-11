@@ -37,6 +37,8 @@ use crate::store_status::SettledRuns;
 /// A read of a session kept in the new storage.
 #[derive(Debug, Clone)]
 pub enum StoreReadRequest {
+    /// `run.admission` for one run's frozen start.
+    RunAdmission(RunId),
     /// `run.status` for one run.
     RunStatus(RunId),
     /// `run.status` as the wire answers a run id, which may name a queued send.
@@ -149,6 +151,7 @@ pub struct PageAnswer {
 
 /// The answer to a [`StoreReadRequest`] of the same name.
 pub enum StoreReadReply {
+    RunAdmission(Result<Option<broca_wire::RunAdmissionResponse>, ServeError>),
     RunStatus(Result<broca_wire::RunStatusResponse, ServeError>),
     RunStatusReply(Result<broca_wire::RunStatusReply, ServeError>),
     RunResult(Result<broca_wire::RunResultResponse, ServeError>),
@@ -283,6 +286,9 @@ pub async fn execute<B: SessionBackend>(
 ) -> StoreReadReply {
     let reader = ctx.reader();
     match request {
+        StoreReadRequest::RunAdmission(run_id) => {
+            StoreReadReply::RunAdmission(reader.run_admission(session, run_id).await)
+        }
         StoreReadRequest::RunStatus(run_id) => {
             StoreReadReply::RunStatus(reader.run_status(session, run_id).await)
         }

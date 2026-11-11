@@ -85,12 +85,13 @@ pub(crate) fn principal_label(principal: Option<&broca_protocol::BindPrincipal>)
 }
 
 /// Every operation the census records readers of.
-pub(crate) const OPERATIONS: [&str; 10] = [
+pub(crate) const OPERATIONS: [&str; 11] = [
     "session.read",
     "session.history",
     "session.head",
     "session.subscribe",
     "run.status",
+    "run.admission",
     "run.result",
     "run.tool_calls",
     "send.status",

@@ -6,7 +6,9 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
+import sqlite3
 import struct
 import sys
 import tempfile
@@ -260,7 +262,7 @@ else:
         self.assertFalse(contract.tool_results_pass(output, True))
 
 
-class WorkerTrafficTests(unittest.TestCase):
+class WorkerTrafficFixture(unittest.TestCase):
     def setUp(self):
         self.worker = load("worker_traffic_fixture", "scripts/acceptance-worker-turn.py")
         scratch = ROOT / "target/scratch"
@@ -290,6 +292,7 @@ class WorkerTrafficTests(unittest.TestCase):
         self.assertNotIn("DO-NOT-PRINT", out.getvalue())
         return status, out.getvalue()
 
+class WorkerTrafficTests(WorkerTrafficFixture):
     def test_completed_declaring_worker_in_every_live_folder_passes(self):
         for folder in ("wal", "wal-durable", "wal-ephemeral"):
             for session_class in ("mason", "sidekick"):
@@ -549,6 +552,143 @@ class WorkerTrafficTests(unittest.TestCase):
         self.assertEqual(status, 0, output)
 
 
+class StoreWorkerTrafficTests(WorkerTrafficFixture):
+    def setUp(self):
+        super().setUp()
+        self.admission = {"run_id": "DO-NOT-PRINT-RUN-ID", "session_class": "sidekick",
+                          "started_at_ms": 101, "storage": "store",
+                          "fetches": self.start["manifest"]["fetches"]}
+        self.commands = []
+
+    def store(self, folder="session-store", address=None, changed_ms=101):
+        address = address or self.address
+        root = self.root / folder
+        (root / "heads" / address).mkdir(parents=True)
+        (root / "heads" / address / "head").write_bytes(b"DO-NOT-READ-ENCRYPTED-HEAD")
+        log = root / "logs" / address / ("0" * 32)
+        log.parent.mkdir(parents=True)
+        log.write_bytes(b"DO-NOT-READ-ENCRYPTED-LOG")
+        timestamp = changed_ms * 1_000_000
+        os.utime(log, ns=(timestamp, timestamp))
+        os.utime(log.parent, ns=(timestamp, timestamp))
+        with sqlite3.connect(self.root / "run-index.db") as db:
+            db.execute("CREATE TABLE IF NOT EXISTS agent_data_session_ref "
+                       "(session_ref TEXT, address TEXT, project_root TEXT, harness TEXT, session TEXT)")
+            db.execute("INSERT INTO agent_data_session_ref VALUES (?, ?, ?, ?, ?)",
+                       ("f" * 32, address, "broca-unscoped-v1", "core", "DO-NOT-PRINT-SESSION"))
+            db.execute("CREATE TABLE IF NOT EXISTS run_index "
+                       "(run_id TEXT PRIMARY KEY, session TEXT, state TEXT, state_changed_ms INTEGER)")
+            bind = {"project_root": "broca-unscoped-v1", "harness": "core", "session": "DO-NOT-PRINT-SESSION"}
+            db.execute("INSERT OR REPLACE INTO run_index VALUES (?, ?, ?, ?)",
+                       (self.admission["run_id"], json.dumps(bind, separators=(",", ":")), "completed", 102))
+        return log
+
+    def reply(self, command, timeout):
+        self.commands.append(command)
+        op = command[command.index("--op") + 1]
+        if op == "run.admission":
+            return json.dumps({"result": self.admission})
+        self.assertEqual(op, "run.status")
+        return json.dumps({"result": {"state": "completed"}})
+
+    def test_store_completed_sidekick_passes_in_every_storage_class(self):
+        for folder in ("session-store", "session-store-durable", "session-store-ephemeral"):
+            with self.subTest(folder=folder):
+                self.store(folder)
+                with patch.object(self.worker, "invoke", side_effect=self.reply):
+                    status, output = self.wait()
+                self.assertEqual(status, 0, output)
+                self.assertIn("class=sidekick", output)
+                self.assertIn("storage_counts=wal:0,store:1", output)
+                self.assertEqual(len(self.commands), 2)
+                self.commands.clear()
+
+    def test_store_missing_frozen_declarations_fails_beside_wal_success(self):
+        self.store()
+        self.write()
+        self.admission["fetches"] = [{"provider": "aft"}]
+        with patch.object(self.worker, "invoke", side_effect=self.reply):
+            status, output = self.wait()
+        self.assertEqual(status, 1, output)
+        self.assertIn("AFT fetch has no frozen result formats or late_results declaration", output)
+        self.assertIn("storage_counts=wal:1,store:1", output)
+
+    def test_unreadable_store_client_never_falls_through_to_wal_success(self):
+        self.store()
+        self.write()
+        for error in (FileNotFoundError("DO-NOT-PRINT-CLIENT"),
+                      ValueError("DO-NOT-PRINT-DAEMON-REFUSAL")):
+            with self.subTest(error=type(error).__name__), \
+                    patch.object(self.worker, "invoke", side_effect=error):
+                status, output = self.wait()
+            self.assertEqual(status, 1, output)
+            self.assertIn("unreadable_store_client", output)
+            self.assertNotIn("PASS", output)
+
+    def test_store_log_append_is_seen_even_when_folder_mtime_predates_restart(self):
+        log = self.store()
+        os.utime(log.parent, ns=(99_000_000, 99_000_000))
+        with patch.object(self.worker, "invoke", side_effect=self.reply):
+            status, output = self.wait()
+        self.assertEqual(status, 0, output)
+
+    def test_stale_store_logs_do_not_need_a_client_or_database(self):
+        self.store(changed_ms=99)
+        (self.root / "run-index.db").unlink()
+        with patch.object(self.worker, "invoke") as invoke:
+            status, output = self.wait()
+        self.assertEqual(status, 1, output)
+        self.assertIn("no_worker_candidate", output)
+        invoke.assert_not_called()
+
+    def test_missing_store_inventory_is_named_and_is_not_created(self):
+        self.store()
+        (self.root / "run-index.db").unlink()
+        self.write()
+        status, output = self.wait()
+        self.assertEqual(status, 1, output)
+        self.assertIn("unreadable_store_inventory", output)
+        self.assertFalse((self.root / "run-index.db").exists())
+
+    def test_store_start_boundary_and_class_are_checked_not_inferred_from_log_activity(self):
+        self.store()
+        for update in ({"started_at_ms": 100}, {"session_class": "head"}, {"session_class": None}):
+            with self.subTest(update=update), patch.object(self.worker, "invoke", side_effect=self.reply):
+                original = self.admission.copy()
+                self.admission.update(update)
+                status, output = self.wait()
+                self.admission = original
+            self.assertEqual(status, 1, output)
+            self.assertIn("no_worker_candidate", output)
+
+    def test_store_noncompleted_status_cannot_certify_admission(self):
+        self.store()
+        for state in ("active", "paused", "error", "interrupted", "DO-NOT-PRINT-STATUS"):
+            with self.subTest(state=state), patch.object(self.worker, "invoke", side_effect=[
+                    json.dumps({"result": self.admission}), json.dumps({"result": {"state": state}})]):
+                status, output = self.wait()
+            self.assertEqual(status, 1, output)
+            self.assertIn("worker_completion_timeout", output)
+
+    def test_store_aft_declarations_cannot_be_borrowed_from_another_provider(self):
+        self.store()
+        self.admission["fetches"] = [{"provider": "other", "declarations_frozen": {"late_results": True}},
+                                     {"provider": "aft"}]
+        with patch.object(self.worker, "invoke", side_effect=self.reply):
+            status, output = self.wait()
+        self.assertEqual(status, 1, output)
+        self.assertIn("AFT fetch has no frozen", output)
+
+    def test_store_planless_worker_is_counted_but_does_not_certify_a_turn(self):
+        self.store()
+        self.admission["fetches"] = []
+        with patch.object(self.worker, "invoke", side_effect=self.reply):
+            status, output = self.wait()
+        self.assertEqual(status, 1, output)
+        self.assertIn("no_worker_candidate", output)
+        self.assertIn("ignored_counts=mason:0,sidekick:1 storage_counts=wal:0,store:1", output)
+
+
 class WorkerAddressTests(unittest.TestCase):
     def setUp(self):
         suite = load("worker_address_fixture", "scripts/test-acceptance-worker-turn.py")
@@ -638,7 +778,9 @@ class WorkerAddressTests(unittest.TestCase):
             result, output, invoke, _ = self.fixture.run_main(['{"result":{}}'], no_project=True,
                 extra_args=("--placement-report", str(report)))
         self.assertEqual(result, 1, output)
-        wait.assert_called_once_with(Path(self.fixture.tmp.name), 100, 600)
+        wait.assert_called_once_with(Path(self.fixture.tmp.name), 100, 600,
+                                     session_bin=ROOT / "target/release/broca-session",
+                                     subc=Path.home() / ".local/share/cortexkit/run/subc-connection.json")
         self.assertEqual(invoke.call_args.args[1], 120)
 
 

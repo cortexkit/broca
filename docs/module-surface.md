@@ -5,6 +5,39 @@ model, and coordinator invariants.
 
 ## Session inspection CLI
 
+`broca-session --subc CONNECTION --project-root ROOT --harness HARNESS --session NAME
+admission --run-id RUN` prints the daemon's `run.admission` JSON reply without reading
+encrypted session files in the client. It uses the same session authorization as
+`run.status`. This is a read-only management query; it does not admit a turn.
+
+### Frozen run admission
+
+`run.admission {"run_id":"…"}` reads the requested run's own start, on either storage,
+not the latest baseline of its session. A known run returns:
+
+```json
+{"run_id":"…","session_class":"sidekick","started_at_ms":123,"storage":"store","fetches":[{"provider":"aft","declarations_frozen":{"late_results":true}}]}
+```
+
+`storage` is `wal` or `store`. `session_class` and each fetch's
+`declarations_frozen` are omitted when absent in the recorded admission; absence
+is not replaced by an empty value. `fetches` contains only provider names and
+their frozen declarations, not tools, messages, system text or credentials. A
+run admitted without a fetch plan has an empty `fetches` array. An unknown run
+returns `{"state":"unknown"}`, as `run.status` does. The required `run_id` is
+scoped to the bound session; unknown parameter keys are refused.
+An older start without a recorded timestamp is unreadable through this query,
+not assigned a fabricated start time.
+
+On new storage the query uses the run-id index to find `RunStart` and resolves
+the setup parts it froze, without a transcript walk. On WAL storage it reads
+the run's `RunStarted`. WAL envelope feature lists are not exposed by this op;
+the deployment acceptance script still verifies those features directly from
+WAL frames. New storage has a record schema, not a WAL feature list.
+The worker acceptance summary's `storage_counts=wal:N,store:N` counts observed
+post-restart worker runs, including workers without an AFT fetch that are counted
+separately in `ignored_counts`. Only AFT-fetching workers can certify acceptance.
+
 `broca-session trajectory <id> [--transcript] [--out FILE]` exports JSONL directly
 from the recorded WAL, without a daemon connection. Without `--out`, JSONL goes
 to stdout. Output files are created owner-only and must not already exist. It uses
@@ -519,7 +552,7 @@ wait for the queue lock or insula IO. A failed batch is discarded, not requeued.
 `health.check.metrics.session_readers` is a process-wide, in-memory census of authorized
 read attempts, separate from the legacy numeric `metrics.session_reads`. Its `entries` array
 contains `{principal, op, owner, count, last_ms}` for `session.read`, `session.history`,
-`session.head`, `session.subscribe`, `run.status`, `run.result`, `run.tool_calls`, `send.status`,
+`session.head`, `session.subscribe`, `run.status`, `run.admission`, `run.result`, `run.tool_calls`, `send.status`,
 `session.send_status` and `session.media_read`. Authorization and migration refusals are excluded;
 later parameter or handler errors still count. Subscriptions count once when opened, not once per frame.
 The principal is rendered from the daemon's route stamp (`reserved:<module_id>`, `direct`,

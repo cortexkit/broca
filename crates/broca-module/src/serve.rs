@@ -2947,6 +2947,15 @@ pub trait ServeHandler: Send + Sync {
         self.run_status(session, run_id).await.map(Into::into)
     }
 
+    /// The run's own frozen start; `None` has the same unknown meaning as `run.status`.
+    async fn run_admission(
+        &self,
+        _session: &LineageKey,
+        _run_id: broca_protocol::RunId,
+    ) -> Result<Option<broca_wire::RunAdmissionResponse>, ServeError> {
+        Ok(None)
+    }
+
     /// The two facts that spell a live event's public message ids: whether the log is a mode-3
     /// log, and its lineage. A live subscription asks for these once, so it reads only the
     /// newest page and the log's first run, never the head's media, run or spend facts.
@@ -5427,6 +5436,63 @@ impl ServeHandler for crate::LineageRegistry {
                 Some(store) => {
                     crate::store_status::StoreRead::new(&store, session, self)
                         .run_status(&again)
+                        .await
+                }
+                None => Err(error),
+            },
+            served => served,
+        }
+    }
+
+    async fn run_admission(
+        &self,
+        session: &LineageKey,
+        run_id: broca_protocol::RunId,
+    ) -> Result<Option<broca_wire::RunAdmissionResponse>, ServeError> {
+        if let Some(store) = self.store_holding(session)? {
+            return crate::store_status::StoreRead::new(&store, session, self)
+                .run_admission(&run_id)
+                .await;
+        }
+        let today = async {
+            if matches!(
+                self.run_status(session, run_id.clone()).await?,
+                RunStatusResponse::Unknown
+            ) {
+                return Ok(None);
+            }
+            let (records, _) = self.read_durable_wal(session).await?;
+            for frame in records {
+                if let broca_wal::WalRecord::RunStarted {
+                    run_id: own,
+                    session_class,
+                    ts_ms,
+                    manifest,
+                    ..
+                } = frame.record
+                {
+                    if own == run_id {
+                        return crate::run_admission::response(
+                            &own.0,
+                            session_class,
+                            ts_ms.ok_or_else(|| {
+                                ServeError::Open("the run's start has no timestamp".into(), None)
+                            })?,
+                            broca_wire::RunAdmissionStorage::Wal,
+                            manifest.as_deref(),
+                        )
+                        .map(Some);
+                    }
+                }
+            }
+            Ok(None)
+        }
+        .await;
+        match today {
+            Err(error) => match self.store_after_refusal(session, &error)? {
+                Some(store) => {
+                    crate::store_status::StoreRead::new(&store, session, self)
+                        .run_admission(&run_id)
                         .await
                 }
                 None => Err(error),

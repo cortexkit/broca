@@ -1057,6 +1057,22 @@ impl<'a> StoreRead<'a> {
 }
 
 impl StoreRead<'_> {
+    /// `run.admission` reads the requested run, not the session's latest baseline.
+    pub async fn run_admission(
+        &self,
+        run_id: &RunId,
+    ) -> Result<Option<broca_wire::RunAdmissionResponse>, crate::serve::ServeError> {
+        use crate::store_reads::{StoreReadReply, StoreReadRequest};
+        match self
+            .read(StoreReadRequest::RunAdmission(run_id.clone()))
+            .await?
+        {
+            Some(StoreReadReply::RunAdmission(answer)) => answer,
+            None => Ok(None),
+            _ => unreachable!("run admission read answered another request"),
+        }
+    }
+
     async fn read(
         &self,
         request: crate::store_reads::StoreReadRequest,
@@ -1208,6 +1224,33 @@ pub struct Reader<'a> {
 }
 
 impl Reader<'_> {
+    /// Point-read the run's start through its run-id index; no transcript walk is needed.
+    pub async fn run_admission<B: SessionBackend>(
+        &self,
+        session: &Session<B>,
+        run_id: &RunId,
+    ) -> Result<Option<broca_wire::RunAdmissionResponse>, crate::serve::ServeError> {
+        let Some(start) = session
+            .find_run_start(&run_id.0)
+            .await
+            .map_err(StatusError::from)?
+        else {
+            return Ok(None);
+        };
+        let admission = broca_session_loop::run::admission_of_start(&start, self.parts)
+            .map_err(|error| damaged(format!("the run's admission: {error:?}")))?;
+        crate::run_admission::response(
+            &start.run_id,
+            start.session_class.clone(),
+            start
+                .ts_ms
+                .ok_or_else(|| damaged("the run's start has no timestamp"))?,
+            broca_wire::RunAdmissionStorage::Store,
+            admission.manifest.as_deref(),
+        )
+        .map(Some)
+    }
+
     async fn facts<B: SessionBackend>(
         &self,
         session: &Session<B>,

@@ -74,6 +74,7 @@ async fn serve_counts_attested_readers_and_keeps_cold_ownership_unknown() {
         "session.history",
         "session.head",
         "run.status",
+        "run.admission",
         "run.result",
         "run.tool_calls",
         "send.status",
@@ -83,7 +84,9 @@ async fn serve_counts_attested_readers_and_keeps_cold_ownership_unknown() {
     for channel in [7, 8] {
         for op in ops {
             let params = match op {
-                "run.status" | "run.result" | "run.tool_calls" => json!({"run_id":run}),
+                "run.status" | "run.admission" | "run.result" | "run.tool_calls" => {
+                    json!({"run_id":run})
+                }
                 "send.status" | "session.send_status" => json!({"send_id":"reader-send"}),
                 _ => json!({}),
             };
