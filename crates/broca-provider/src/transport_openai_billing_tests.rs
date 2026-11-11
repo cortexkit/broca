@@ -229,7 +229,10 @@ async fn xai_subscription_spending_limit_reaches_the_caller_as_an_untimed_accoun
     assert_eq!(outcome.live.status, Some(403));
     assert_eq!(outcome.live.resets_at_ms, None);
     assert_eq!(outcome.live.resets_at_source, None);
-    assert_eq!(outcome.live.limit_window, None);
+    assert_eq!(
+        outcome.live.limit_window,
+        Some(broca_protocol::error::AccountLimitWindow::Credit)
+    );
     assert_eq!(outcome.live.account_ref.as_deref(), Some("acct-x"));
     assert_eq!(outcome.live.credential_id.as_deref(), Some("oauth:xai"));
     let status = serde_json::json!({

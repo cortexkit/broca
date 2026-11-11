@@ -4834,7 +4834,7 @@ mod tests {
         );
         assert_eq!(
             format!("{:x}", Sha256::digest(bytes)),
-            "17977619c4af25c127814338769d1d1a4ca2f6f3e54c8992e17e471c5617291f"
+            "f1b8dec3553a345d56d4c4b31ca1fbe3b97927ee16a9d3e0407c29585503c368"
         );
         let status: RunStatusResponse = serde_json::from_slice(bytes).unwrap();
         assert_eq!(
@@ -4848,6 +4848,7 @@ mod tests {
         assert_eq!(value["error"]["status"], 403);
         assert_eq!(value["error"]["account_ref"], "acct-x");
         assert_eq!(value["error"]["credential_id"], "oauth:xai");
+        assert_eq!(value["error"]["limit_window"], "credit");
         assert!(value["error"].get("resets_at_ms").is_none());
         assert_eq!(value["retries_used"], 0);
     }

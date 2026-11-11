@@ -199,6 +199,51 @@ pub struct GoogleRpcRetryInfo {
     pub retry_delay: Option<String>,
 }
 
+/// An account spending wall or the provider's open-ended name for a quota window.
+/// Both retain the existing string representation on the wire and in stored errors.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "String", into = "String")]
+pub enum AccountLimitWindow {
+    Credit,
+    Quota(String),
+}
+
+impl From<String> for AccountLimitWindow {
+    fn from(value: String) -> Self {
+        if value == "credit" {
+            Self::Credit
+        } else {
+            Self::Quota(value)
+        }
+    }
+}
+
+impl From<&str> for AccountLimitWindow {
+    fn from(value: &str) -> Self {
+        value.to_owned().into()
+    }
+}
+
+impl From<AccountLimitWindow> for String {
+    fn from(value: AccountLimitWindow) -> Self {
+        match value {
+            AccountLimitWindow::Credit => "credit".to_owned(),
+            AccountLimitWindow::Quota(window) => window,
+        }
+    }
+}
+
+impl std::ops::Deref for AccountLimitWindow {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        match self {
+            Self::Credit => "credit",
+            Self::Quota(window) => window,
+        }
+    }
+}
+
 // No `Eq`: `retry_after_secs` is an `f64`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProviderError {
@@ -242,11 +287,11 @@ pub struct ProviderError {
     /// deadline derived from a relative wait hint. Absent without a reset or on older records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resets_at_source: Option<String>,
-    /// The provider's name for the exhausted usage window (Anthropic sends e.g. `seven_day` or
-    /// `five_hour`), when the provider named one. Set only on an [`ACCOUNT_LIMIT_EXHAUSTED`]
-    /// error.
+    /// The exhausted quota window (Anthropic sends e.g. `seven_day` or `five_hour`), or a
+    /// positively identified subscription spending wall. Set only on an
+    /// [`ACCOUNT_LIMIT_EXHAUSTED`] error.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub limit_window: Option<String>,
+    pub limit_window: Option<AccountLimitWindow>,
     /// The provider account whose limit is exhausted: the run's frozen
     /// `auth_selection.account_ref`. Set only on an [`ACCOUNT_LIMIT_EXHAUSTED`] error, and only
     /// when the run's selection named an account; the provider never reports it, the run
@@ -485,5 +530,26 @@ mod refusal_bytes_tests {
         assert!(!serde_json::to_string(&error)
             .unwrap()
             .contains("provider_detail_code"));
+    }
+}
+
+#[cfg(test)]
+mod account_limit_window_tests {
+    use super::*;
+
+    #[test]
+    fn account_limit_window_preserves_quota_strings_and_types_credit() {
+        for window in [
+            "seven_day",
+            "five_hour",
+            "5 hour",
+            "future_window",
+            "credit",
+        ] {
+            let bytes = format!("\"{window}\"");
+            let typed: AccountLimitWindow = serde_json::from_str(&bytes).unwrap();
+            assert_eq!(serde_json::to_string(&typed).unwrap(), bytes);
+            assert_eq!(typed == AccountLimitWindow::Credit, window == "credit");
+        }
     }
 }

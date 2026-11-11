@@ -321,10 +321,10 @@ pub struct AttemptAccountLimit {
     pub observed_at_ms: u64,
     pub resets_at_ms: Option<u64>,
     pub resets_at_source: Option<String>,
-    pub limit_window: Option<String>,
+    pub limit_window: Option<crate::error::AccountLimitWindow>,
 }
 
-/// A producer's positive identification of an account-scoped, self-resetting usage limit.
+/// A producer's positive identification of an account-scoped quota or spending limit.
 /// Status codes and provider-detail strings alone never authorize account-specific recovery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountLimitDisposition {

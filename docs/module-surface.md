@@ -852,6 +852,13 @@ and never includes `retry_at_ms`. It is sent only when the router declares
 `observe_credential_refused` and its prerequisite `observe_backoff`; resettable account limits
 and transient rate limits keep their existing reports.
 
+An exactly identified subscription spending or credit wall is instead reported through
+`route.account_observe` as `account_limit_exhausted` with `limit_window: "credit"`.
+Broca includes reset timing only when the provider supplied it; no reset is invented for a
+top-up. A credit wall does not start an account-limit continuation, even with a retry hint.
+Prepaid API-key balance refusals retain the `credential_refused` path above. Timed quotas
+keep their existing window and reset evidence, and `route.report` has no `limit_window`.
+
 Broca sends the effective `service_tier` on `route.account_for` only when the router's
 `role.describe` declares `service_tier`. A tier-aware answer's `service_tier_chosen` must be a
 known level, must be present for an explicit request, and cannot upgrade it. An unbound
