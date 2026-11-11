@@ -804,6 +804,10 @@ fn previous<W: Writer>(
 /// session that enrolled in the current compaction contract, the messages placed before it
 /// report no usage, so until a step on the contract reports its own, the session's fill is the
 /// prompt size the newest step before the enrollment reported (`crate::enroll::last_prompt_tokens`).
+///
+/// Each reading names the view its request was rendered under (`last_prompt_view`), so the
+/// provider can tell a reading taken before its newest view applied from one taken under it
+/// ([`prompt_view`]).
 fn conditions_for<W: Writer>(
     writer: &W,
     admission: &Admission,
@@ -811,12 +815,58 @@ fn conditions_for<W: Writer>(
     chained: bool,
     signed_floor: Option<u64>,
 ) -> Result<cortexkit_role_compaction::notice::Conditions, String> {
-    let mut conditions =
-        v2::host::conditions_of(&frozen(admission), entries, chained, None, signed_floor)?;
-    if conditions.last_prompt_tokens.is_none() && writer.operations().enrolled.is_some() {
-        conditions.last_prompt_tokens = crate::enroll::last_prompt_tokens(writer.operations());
+    let conversation = writer.conversation();
+    let operations = writer.operations();
+    let mut conditions = v2::host::conditions_of(
+        &frozen(admission),
+        entries,
+        chained,
+        None,
+        signed_floor,
+        &|entry| prompt_view(conversation, operations, entry),
+    )?;
+    if conditions.last_prompt_tokens.is_none() && operations.enrolled.is_some() {
+        conditions.last_prompt_tokens = crate::enroll::last_prompt_tokens(operations);
+        // That step ran before the session was on the contract, when no compaction view
+        // applied, so its request carried none.
+        conditions.last_prompt_view = conditions.last_prompt_tokens.map(|_| 0);
     }
     Ok(conditions)
+}
+
+/// The version of the view the request that `entry` reports the usage of was rendered under,
+/// `0` when it was rendered under none. The step that wrote the message recorded that view in
+/// the message's entry facts (`generated_under`, `crate::entries::written_under`), from the
+/// view applied when the message was placed: the step's own `ViewApplied` goes in before its
+/// request is sent, and no later step's can come before the message, so it is the view that
+/// request carried. A converted message's facts carry today's projection of the same rule,
+/// which names a view whenever one applied before the step.
+///
+/// A message with no view recorded was written under none, unless broca didn't write it: only
+/// an import places messages that carry usage broca didn't measure (another runner's, under
+/// views this session never numbered), and it records no view for them. On an imported
+/// session such a message is told apart by its facts (`native`), which the window holds; one
+/// the window no longer holds can't be tied to a view, so it names none (`None`).
+fn prompt_view(
+    conversation: &broca_session_store::fold::conversation::Conversation,
+    operations: &broca_session_store::fold::operations::Operations,
+    entry: &cortexkit_role_compaction::read::Entry,
+) -> Option<u64> {
+    if let Some(view) = &entry.generated_under {
+        return Some(view.version);
+    }
+    // `Operations::imported_ids` is set exactly on a session an import seeded.
+    if operations.imported_ids.is_none() {
+        return Some(0);
+    }
+    conversation
+        .entries
+        .iter()
+        .chain(conversation.open_entry.iter())
+        .filter_map(|state| state.facts.as_ref())
+        .find(|facts| facts.mid == entry.mid)?
+        .native
+        .then_some(0)
 }
 
 /// `prompt` with the run's settings, the rendering inputs and the system text above it, as
