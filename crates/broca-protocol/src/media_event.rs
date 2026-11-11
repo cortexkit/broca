@@ -223,6 +223,14 @@ pub enum MediaEvent {
     StepEnd,
     /// The run's media limits change inside the run.
     LimitsChanged { limits: MediaLimits },
+    /// The transcript is cut back to its first `len` messages, at ordinals `0..len`: an undo
+    /// to an earlier message, or a storage recovery that removed the messages after a damaged
+    /// point. The media of the removed messages are forgotten, with their aging, and so is
+    /// every accepted message not yet placed. The cut also ends the run's state: the open
+    /// batch, and the protection of the current step's media. A medium that had aged out and
+    /// whose message remains stays aged, so the request prefix already cached keeps its
+    /// bytes.
+    Truncated { len: u64 },
 }
 
 #[cfg(test)]
