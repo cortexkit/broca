@@ -13,6 +13,7 @@ import unittest
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 from lib.seal_readback import (
+    CALLER_CANCELLED,
     CANCELLED,
     PAUSED,
     SEALED,
@@ -65,6 +66,34 @@ class SealReadbackTests(unittest.TestCase):
             {"type": "run_finished", "reason": "cancelled"},
         )
         self.assertEqual(classify_run(self.wal, "run-cancelled"), CANCELLED)
+
+    def test_a_cancel_before_the_drain_cutoff_is_a_caller_cancel(self) -> None:
+        self.write_records(
+            {"type": "run_started", "run_id": "run-held"},
+            {"type": "run_paused", "reason": "tool_held", "ts_ms": 1000},
+            {"type": "run_finished", "reason": "cancelled", "ts_ms": 1999},
+            {"type": "run_started", "run_id": "run-after"},
+            {"type": "run_finished", "reason": "cancelled", "ts_ms": 2001},
+        )
+        self.assertEqual(classify_run(self.wal, "run-held", drain_started_ms=2000), CALLER_CANCELLED)
+
+    def test_a_cancel_at_or_after_the_drain_cutoff_is_a_failure(self) -> None:
+        for timestamp in (2000, 2001):
+            with self.subTest(timestamp=timestamp):
+                self.write_records(
+                    {"type": "run_started", "run_id": "run-cancelled"},
+                    {"type": "run_finished", "reason": "cancelled", "ts_ms": timestamp},
+                )
+                self.assertEqual(classify_run(self.wal, "run-cancelled", drain_started_ms=2000), CANCELLED)
+
+    def test_a_cancel_without_a_valid_timestamp_stays_a_failure(self) -> None:
+        for timestamp in ({}, {"ts_ms": None}, {"ts_ms": True}, {"ts_ms": "1999"}):
+            with self.subTest(timestamp=timestamp):
+                self.write_records(
+                    {"type": "run_started", "run_id": "run-cancelled"},
+                    {"type": "run_finished", "reason": "cancelled", **timestamp},
+                )
+                self.assertEqual(classify_run(self.wal, "run-cancelled", drain_started_ms=2000), CANCELLED)
 
     def test_auth_pause_does_not_confirm_a_restart_seal(self) -> None:
         self.write_records(

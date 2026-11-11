@@ -8,6 +8,7 @@ from .archive_read import read_records
 SEALED = "sealed"
 UNCONFIRMED = "unconfirmed"
 CANCELLED = "cancelled"
+CALLER_CANCELLED = "caller_cancelled"
 # Paused before the restart and still paused (waiting on a held tool call, a sign-in or an account
 # reset): no step was running, so the shutdown had nothing to seal, and none was expected.
 PAUSED = "paused"
@@ -41,7 +42,7 @@ def active_run_id(wal: pathlib.Path) -> str | None:
     return None
 
 
-def classify_run(wal: pathlib.Path, run_id: str) -> str:
+def classify_run(wal: pathlib.Path, run_id: str, *, drain_started_ms: int | None = None) -> str:
     """Classify one captured run, ignoring any run started later in its session."""
     episode = next(
         (records for candidate, records in reversed(_episodes(wal)) if candidate == run_id),
@@ -55,11 +56,20 @@ def classify_run(wal: pathlib.Path, run_id: str) -> str:
         if record.get("type") == "run_finished"
         or (record.get("type") == "run_paused" and record.get("reason") == "restart")
     ]
-    if any(
-        record.get("type") == "run_finished"
-        and (record.get("reason") == "cancelled" or record.get("state") == "cancelled")
+    cancellations = [
+        record
         for record in terminals
-    ):
+        if record.get("type") == "run_finished"
+        and (record.get("reason") == "cancelled" or record.get("state") == "cancelled")
+    ]
+    if cancellations:
+        # Only a timestamp strictly before the pre-signal cutoff rules out the drain.
+        # A missing timestamp cannot establish that the cancellation preceded the drain.
+        if drain_started_ms is not None and all(
+            type(record.get("ts_ms")) is int and record["ts_ms"] < drain_started_ms
+            for record in cancellations
+        ):
+            return CALLER_CANCELLED
         return CANCELLED
     if terminals:
         return SEALED

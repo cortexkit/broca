@@ -135,6 +135,7 @@ source "$REPO_ROOT/scripts/release-clients.sh"
 source "$REPO_ROOT/scripts/nonshipping-markers.sh"
 GATE_LOG="$(mktemp "${TMPDIR:-/tmp}/place-gate.XXXXXX")"
 ACTIVE_RUNS_FILE="$(mktemp "${TMPDIR:-/tmp}/place-runs.XXXXXX")"
+DRAIN_STARTED_MS=""
 TMP=""
 TMP_DSYM=""
 TMP_DSYM_PARENT=""
@@ -185,15 +186,16 @@ gate_reason() {
 
 write_report() {
   [ -n "$REPORT" ] || return 0
-  python3 - "$REPORT" "${BACKUP:-}" "${1:-}" "$GATE_LOG" "$REPO_ROOT/scripts" "$ACTIVE_RUNS_FILE" "${CLIENT_BACKUPS[0]}" <<'PY'
+  python3 - "$REPORT" "${BACKUP:-}" "${1:-}" "$GATE_LOG" "$REPO_ROOT/scripts" "$ACTIVE_RUNS_FILE" "${CLIENT_BACKUPS[0]}" "$DRAIN_STARTED_MS" <<'PY'
 import json, pathlib, sys
-path, backup, pid, gate, scripts, active_runs_file, session_backup = sys.argv[1:]
+path, backup, pid, gate, scripts, active_runs_file, session_backup, drain_started_ms = sys.argv[1:]
+drain_started_ms = int(drain_started_ms) if drain_started_ms else None
 snapshot = pathlib.Path(gate).read_text() if pathlib.Path(gate).exists() else ""
 sessions = [line.split()[1] for line in snapshot.splitlines() if line.startswith("  live  ")]
 sys.path.insert(0, scripts)
 from lib import state_root
 from lib.archive_read import logical_wals
-from lib.seal_readback import CANCELLED, PAUSED, SEALED, UNCONFIRMED, active_run_id, classify_run
+from lib.seal_readback import CALLER_CANCELLED, CANCELLED, PAUSED, SEALED, UNCONFIRMED, active_run_id, classify_run
 
 active_path = pathlib.Path(active_runs_file)
 seal_error = ""
@@ -205,7 +207,7 @@ if pid:
     except Exception as error:
         active_runs = [{"session": name, "run_id": None} for name in sessions]
         errors = [f"cannot read pre-restart run snapshot: {error}"]
-    statuses = {SEALED: [], UNCONFIRMED: [], CANCELLED: [], PAUSED: [], "idle": []}
+    statuses = {SEALED: [], UNCONFIRMED: [], CANCELLED: [], CALLER_CANCELLED: [], PAUSED: [], "idle": []}
     try:
         wals = {
             wal.name: wal
@@ -228,7 +230,7 @@ if pid:
             wal = wals.get(name)
             if wal is not None:
                 try:
-                    status = classify_run(wal, run_id)
+                    status = classify_run(wal, run_id, drain_started_ms=drain_started_ms)
                 except Exception as error:
                     errors.append(str(error))
         statuses[status].append({"session": name, "run_id": run_id})
@@ -253,16 +255,18 @@ else:
         errors.append(str(error))
     seal_error = "; ".join(errors)
     active_path.write_text(json.dumps({"runs": active_runs, "error": seal_error}))
-    statuses = {SEALED: [], UNCONFIRMED: [], CANCELLED: [], PAUSED: [], "idle": []}
+    statuses = {SEALED: [], UNCONFIRMED: [], CANCELLED: [], CALLER_CANCELLED: [], PAUSED: [], "idle": []}
 
 runs_sealed = statuses[SEALED]
 sessions_paused = [run["session"] for run in statuses[PAUSED]]
 sessions_idle = [run["session"] for run in statuses["idle"]]
 runs_unconfirmed = statuses[UNCONFIRMED]
 runs_cancelled = statuses[CANCELLED]
+runs_caller_cancelled = statuses[CALLER_CANCELLED]
 sessions_sealed = [run["session"] for run in runs_sealed]
 sessions_unconfirmed = [run["session"] for run in runs_unconfirmed]
 sessions_cancelled = [run["session"] for run in runs_cancelled]
+sessions_caller_cancelled = [run["session"] for run in runs_caller_cancelled]
 for run in runs_cancelled:
     print(
         f"place-release: FAILURE -- shutdown drain cancelled run {run['run_id']} "
@@ -273,12 +277,15 @@ pathlib.Path(path).write_text(json.dumps({"backup": backup, "pid": pid or None,
                                         "client_backups": {"broca-session": session_backup},
                                        "sessions_at_restart": sessions,
                                        "active_runs_at_restart": active_runs,
+                                       "drain_started_ms": drain_started_ms,
                                        "runs_sealed": runs_sealed,
                                        "runs_unconfirmed": runs_unconfirmed,
                                        "runs_cancelled": runs_cancelled,
+                                       "runs_caller_cancelled": runs_caller_cancelled,
                                        "sessions_sealed": sessions_sealed,
                                        "sessions_unconfirmed": sessions_unconfirmed,
                                        "sessions_cancelled": sessions_cancelled,
+                                       "sessions_caller_cancelled": sessions_caller_cancelled,
                                        "sessions_idle": sessions_idle,
                                        "sessions_paused": sessions_paused,
                                        "seal_error": seal_error,
@@ -378,6 +385,8 @@ restart_and_wait() {
     return 2
   fi
   save_health_before_restart "$old_pid"
+  # Capture a lower bound before signalling: an uncertain cancel must still blame the drain.
+  DRAIN_STARTED_MS="$(python3 -c 'import time; print(time.time_ns() // 1_000_000)')"
   "${PLACE_RELEASE_CK:-ck}" module restart broca
   wait_seconds="${PLACE_RELEASE_WAIT_SECONDS:-90}"
   poll_seconds="${PLACE_RELEASE_POLL_SECONDS:-1}"
