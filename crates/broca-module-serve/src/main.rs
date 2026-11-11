@@ -4486,6 +4486,32 @@ mod executor {
                     .await
                     .map_err(StoreRunError::Loop);
             }
+            if mode == StoreRunMode::Resume
+                && control
+                    .cancel
+                    .as_ref()
+                    .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+            {
+                // A caller may cancel because sign-in or provider access is unavailable. Closing
+                // the existing run must not depend on admitting another model call first.
+                let provider = broca_core::provider::StubProvider::new(Vec::new());
+                let seams = store_seams(
+                    &provider,
+                    tools,
+                    req,
+                    out,
+                    &control,
+                    held.as_deref(),
+                    None,
+                    &now,
+                    None,
+                    None,
+                    self.max_same_account_wait,
+                );
+                return Box::pin(broca_session_loop::resume(writer, parts, &seams))
+                    .await
+                    .map_err(StoreRunError::Loop);
+            }
             let stored = store_history(writer, parts).map_err(StoreRunError::Loop)?;
             let last_config = stored.prior_run.as_ref().map(|prior| prior.config.clone());
             let history = EpisodeHistory {
@@ -4529,15 +4555,7 @@ mod executor {
                      otherwise"
                 ))));
             }
-            // A resume whose cancel is already tripped only ends its paused run, with no model
-            // call (`broca_session_loop::resume`), so a credential still waiting for sign-in
-            // doesn't stop it: an interrupt ends a run paused for sign-in this way.
-            let ends_paused_run = mode == StoreRunMode::Resume
-                && control
-                    .cancel
-                    .as_ref()
-                    .is_some_and(tokio_util::sync::CancellationToken::is_cancelled);
-            if routing_decision_error.is_none() && resolution.pause.is_some() && !ends_paused_run {
+            if routing_decision_error.is_none() && resolution.pause.is_some() {
                 return Err(StoreRunError::Admission(RunError::Config(
                     "a run that starts paused for sign-in isn't served on the new session \
                      storage yet"
@@ -6144,6 +6162,7 @@ mod executor {
         include!("provider_override_tests.rs");
         include!("recorded_resume_tests.rs");
         include!("store_run_tests.rs");
+        include!("store_run_cancel_tests.rs");
         include!("tool_name_alias_tests.rs");
         include!("queued_service_tier_tests.rs");
         include!("service_tier_writer_tests.rs");

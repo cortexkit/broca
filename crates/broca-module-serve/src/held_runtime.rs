@@ -294,6 +294,9 @@ impl HeldRuntime {
     /// module whose feed is still needed.
     pub async fn recover(self: Arc<Self>, registry: Arc<broca_module::registry::LineageRegistry>) {
         if let Some(runtime) = registry.store_runtime() {
+            // Withdrawals of cancelled held calls read new-storage sessions the same way intake
+            // classifies their late results.
+            self.withdrawals.with_store_runtime(runtime.clone());
             self.intake.set_session_store(runtime);
         }
         let stopping = registry.stopping_signal();

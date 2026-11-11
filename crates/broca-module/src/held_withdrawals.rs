@@ -43,6 +43,7 @@ pub struct HeldWithdrawals {
     health: Mutex<Value>,
     stopping: std::sync::OnceLock<tokio_util::sync::CancellationToken>,
     sweep: Mutex<SweepProgress>,
+    store_runtime: std::sync::OnceLock<std::sync::Weak<crate::store_open::StoreRuntime>>,
 }
 
 #[derive(Default)]
@@ -65,7 +66,13 @@ impl HeldWithdrawals {
             health: Mutex::new(json!({"failed": 0, "pending": 0, "scope_gone": 0})),
             stopping: std::sync::OnceLock::new(),
             sweep: Mutex::default(),
+            store_runtime: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Read cancellation evidence from the session's own storage before withdrawing its call.
+    pub fn with_store_runtime(&self, runtime: Arc<crate::store_open::StoreRuntime>) {
+        let _ = self.store_runtime.set(Arc::downgrade(&runtime));
     }
 
     pub fn health(&self) -> Value {
@@ -156,6 +163,25 @@ impl HeldWithdrawals {
                     _ = tokio::time::sleep(RECOVERY_BATCH_INTERVAL) => {}
                 }
             }
+            if self
+                .store_runtime
+                .get()
+                .and_then(std::sync::Weak::upgrade)
+                .map(|runtime| runtime.holds(&bind).map_err(|error| error.to_string()))
+                .transpose()?
+                .unwrap_or(false)
+            {
+                sessions_read += 1;
+                for (call, _, attempts) in &rows {
+                    match self.drive(call.clone(), *attempts, None).await {
+                        Ok(sent) => withdrawals_sent += sent,
+                        Err(error) => failure = Some(error),
+                    }
+                }
+                self.sweep.lock().expect("withdrawal sweep").rows_remaining -= rows.len();
+                tokio::task::yield_now().await;
+                continue;
+            }
             // One immutable WAL snapshot serves every row in the session, including cleanup.
             // Never let the number of old inline calls multiply whole-log decoding at boot.
             match self.wal.read_records(&bind) {
@@ -242,21 +268,9 @@ impl HeldWithdrawals {
         attempts = attempts.max(durable_attempts);
         // Live callers arrive only after sync. Recovery reads the same sealed log: an open
         // hold, a shutdown pause, or an interrupted restart is never a withdrawal intent.
-        let records;
-        let records = match snapshot {
-            Some(records) => records,
-            None => {
-                records = self
-                    .wal
-                    .read_records(&call.bind)
-                    .map_err(|error| error.to_string())?;
-                &records
-            }
-        };
-        if !cancelled_hold(records, &call.call_key) {
+        let Some(session_identity) = self.cancellation_identity(&call, snapshot).await? else {
             return Ok(0);
-        }
-        let session_identity = withdrawal_uses_session_identity(records, &call)?;
+        };
         let mut sent = 0;
         while attempts < MAX_ATTEMPTS {
             if stopping.is_cancelled() {
@@ -324,7 +338,39 @@ impl HeldWithdrawals {
         self.refresh_health();
         Ok(sent)
     }
+
+    async fn cancellation_identity(
+        &self,
+        call: &LateResultRegistration,
+        snapshot: Option<&[FramedRecord]>,
+    ) -> Result<Option<bool>, String> {
+        if let Some(runtime) = self.store_runtime.get().and_then(std::sync::Weak::upgrade) {
+            if runtime
+                .holds(&call.bind)
+                .map_err(|error| error.to_string())?
+            {
+                return store::cancellation_identity(&runtime, call).await;
+            }
+        }
+        let records;
+        let records = match snapshot {
+            Some(records) => records,
+            None => {
+                records = self
+                    .wal
+                    .read_records(&call.bind)
+                    .map_err(|error| error.to_string())?;
+                &records
+            }
+        };
+        if !cancelled_hold(records, &call.call_key) {
+            return Ok(None);
+        }
+        withdrawal_uses_session_identity(records, call).map(Some)
+    }
 }
+
+mod store;
 
 struct SweepGuard<'a>(&'a Mutex<SweepProgress>);
 

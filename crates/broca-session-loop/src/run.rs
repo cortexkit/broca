@@ -525,17 +525,25 @@ where
         return Ok(finished(writer, reason));
     }
     let resolution = run.resolution();
+    let cancelling_held = seams.cancel.is_cancelled()
+        && run
+            .open_batch
+            .as_ref()
+            .is_some_and(|batch| batch.calls.iter().any(|call| call.held.is_some()));
     // A cancel tripped before a paused run resumes ends it `Cancelled` before anything else a
     // resume does, as today's loop lets a cancel while paused win: nothing is refrozen, no
     // resume is recorded, an account limit isn't waited on, and no model is called. A session's
     // actor ends a paused run this way for an interrupt queued behind it.
-    if matches!(resolution, Resolution::Paused(_)) && seams.cancel.is_cancelled() {
+    if matches!(resolution, Resolution::Paused(_))
+        && seams.cancel.is_cancelled()
+        && !cancelling_held
+    {
         return finish(writer, seams, &admission.run_id, RunFinishReason::Cancelled).await;
     }
     // A run paused on its account's limit resumes on that same account, and only once the
     // account has reset, as today's resume decides it. Until then nothing is written and the
     // run stays paused; on another account it ends interrupted, saying why.
-    if resolution == Resolution::Paused(PauseReason::AccountLimit) {
+    if resolution == Resolution::Paused(PauseReason::AccountLimit) && !cancelling_held {
         let frozen = admission.auth_selection.as_ref();
         if seams.auth_selection.as_ref().is_some_and(|current| {
             !broca_core::account_limit_pause::same_selection(current, frozen)
@@ -563,6 +571,7 @@ where
     // run's requests byte for byte, as today's does: a changed renderer or render config would
     // bust the prompt cache, or make the conversation invalid for the provider.
     let drift = match resolution {
+        _ if cancelling_held => None,
         Resolution::Resume | Resolution::ProviderHeld(_) | Resolution::Paused(_) => {
             broca_core::provider_errors::render_identity_error(
                 seams.provider,
@@ -645,7 +654,7 @@ where
     };
     let mut resumed = resumed_record(writer, &resolution);
     // A resume that ends the run instead of redoing anything records nothing to redo.
-    if submit.is_some() || drift.is_some() {
+    if submit.is_some() || drift.is_some() || cancelling_held {
         resumed.redone.clear();
     }
     // A held call's provider may already have answered: the batch closes with what it holds,
@@ -685,6 +694,41 @@ where
         Some(run) if barrier => frozen_admission(run, parts)?,
         _ => admission,
     };
+    if cancelling_held {
+        // Closing a held obligation needs neither a renderer nor model admission. Use the
+        // frozen transcript rules to place its synthetic result, then withdraw after the end.
+        let ctx = BatchCtx {
+            batch_id: BatchId(
+                run_state(writer)
+                    .open_batch
+                    .as_ref()
+                    .expect("a held batch is open")
+                    .batch_id
+                    .clone(),
+            ),
+            bind: seams.bind.clone(),
+            run_id: RunId(admission.run_id.clone()),
+            scope: admission.send.scope.clone(),
+            media_capture: writer.media(),
+        };
+        let now = (seams.now_ms)();
+        let (mut records, withdrawn) =
+            open_batch_close_out(writer, &admission.run_id, now, RunFinishReason::Cancelled);
+        records.push(run_end(
+            writer,
+            &admission.run_id,
+            RunFinishReason::Cancelled,
+            now,
+        ));
+        append_end(writer, &admission.run_id, records).await?;
+        if let Some(lifecycle) = seams.held {
+            for reply in &withdrawn {
+                lifecycle.terminal_synced(&ctx, &reply.tool_call_id).await;
+            }
+        }
+        withdraw(seams, &withdrawn).await;
+        return Ok(finished(writer, RunFinishReason::Cancelled));
+    }
     if let Some((frozen, pending)) = submit {
         return submitted(writer, seams, &admission.run_id, &frozen, &pending).await;
     }
@@ -732,7 +776,8 @@ async fn close_interrupted<W: Writer, P, T>(
     refused: Option<(&ProviderError, Resumed)>,
 ) -> Result<Finished, LoopError> {
     let now = (seams.now_ms)();
-    let (mut records, withdrawn) = open_batch_close_out(writer, run_id, now);
+    let (mut records, withdrawn) =
+        open_batch_close_out(writer, run_id, now, RunFinishReason::Interrupted);
     let mut end = run_end(writer, run_id, RunFinishReason::Interrupted, now);
     if let Some((error, resumed)) = refused {
         if let Record::RunEnd(end) = &mut end {
@@ -747,7 +792,7 @@ async fn close_interrupted<W: Writer, P, T>(
     Ok(finished(writer, RunFinishReason::Interrupted))
 }
 
-/// The records that close the run's open batch after a crash, sending nothing: an
+/// The records that close the run's open batch after an interruption or cancellation, sending nothing: an
 /// `outcome_unknown` result for each call that was sent with no result recorded, a not-run
 /// result for each planned call that never left, a provider-held call's close result, and the
 /// batch's end. Also the held calls whose providers must be asked to withdraw once the run's end
@@ -756,6 +801,7 @@ fn open_batch_close_out<W: Writer>(
     writer: &W,
     run_id: &str,
     now: u64,
+    reason: RunFinishReason,
 ) -> (Vec<Record>, Vec<ProviderHeldReply>) {
     let mut records = Vec::new();
     let mut withdrawn = Vec::new();
@@ -780,10 +826,8 @@ fn open_batch_close_out<W: Writer>(
                     None,
                 ),
                 Some(CallState::ProviderHeld) => {
-                    let (result, _, code) = broca_core::tool_results::provider_held_close_result(
-                        id,
-                        RunFinishReason::Interrupted,
-                    );
+                    let (result, _, code) =
+                        broca_core::tool_results::provider_held_close_result(id, reason);
                     let position = (0..batch.calls.len())
                         .find(|position| batch.id(*position) == id)
                         .expect("a held call is planned");
@@ -885,7 +929,8 @@ where
     }
     // As today's seal chooses: an open batch closes, whatever its calls' state; only with no
     // open batch is a never-dispatched tool turn kept.
-    let (close_out, withdrawn) = open_batch_close_out(writer, &run_id, now);
+    let (close_out, withdrawn) =
+        open_batch_close_out(writer, &run_id, now, RunFinishReason::Interrupted);
     if close_out.is_empty() {
         records.extend(never_dispatched_close_out(writer, &run_id, now));
     } else {
