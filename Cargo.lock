@@ -647,6 +647,7 @@ dependencies = [
  "cortexkit-role-compaction",
  "cortexkit-role-llm-runner 0.8.36",
  "futures",
+ "rusqlite",
  "serde",
  "serde_jcs",
  "serde_json",

@@ -39,6 +39,7 @@ use sha2::{Digest as _, Sha256};
 pub mod billing;
 pub mod counting;
 pub mod entry_facts;
+pub mod identity;
 /// The inverse lives with the new run loop, where a session's media fold reads it too.
 pub use broca_session_loop::inverse;
 pub mod measure;
@@ -1404,7 +1405,8 @@ fn run_started(f: &mut Fields, state: &mut State, out: &mut Converted) -> Result
     let written_at = f.u64("written_at_ms");
     let submission_id = f.string("submission_id");
     let input: Vec<Message> = f.parse("input")?.unwrap_or_default();
-    // The session identity lives in the head, not in each run start.
+    // The head carries the serving identity. Staging separately retains historical identities
+    // for re-keyed runs in run_choices["record"]["session"].
     for key in ["session", "project_id"] {
         if let Some(value) = f.take(key) {
             tally(
