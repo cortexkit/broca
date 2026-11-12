@@ -48,9 +48,9 @@ pub trait Plane: Send + Sync {
     async fn provides_entry_speaks_for(&self) -> bool {
         false
     }
-    /// Whether the provider's catalog entry lists `compaction-signed-floor/v1` (compaction
-    /// contract W3.5). A plane that can't read the catalog answers false, so the provider is
-    /// sent no floor it may not understand.
+    /// Whether the provider's catalog entry lists `compaction-signed-floor/v1`. A plane that
+    /// can't read the catalog answers false, so the provider is sent no floor it may not
+    /// understand.
     async fn provides_signed_floor(&self) -> bool {
         false
     }

@@ -15,6 +15,54 @@ fn fixture(tag: &str) -> (std::path::PathBuf, Connection) {
     (root, connection)
 }
 
+/// OpenCode's own schema gives `session` a foreign key to `project`, a table the extract
+/// doesn't copy. The extract must still copy the session's rows rather than refuse them.
+#[test]
+fn opencode1_extract_copies_rows_whose_foreign_keys_name_tables_it_leaves_out() {
+    let root = broca_test_support::scratch_root()
+        .join(format!("opencode1-foreign-keys-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let source = Connection::open(root.join("source.db")).unwrap();
+    source
+        .execute_batch(
+            "PRAGMA foreign_keys=ON;
+             CREATE TABLE project (id text PRIMARY KEY);
+             CREATE TABLE session (id text PRIMARY KEY, project_id text NOT NULL,
+                 CONSTRAINT fk_session_project FOREIGN KEY (project_id) REFERENCES project(id)
+                 ON DELETE CASCADE);
+             CREATE TABLE message (id text PRIMARY KEY, session_id text NOT NULL,
+                 time_created integer NOT NULL, data text NOT NULL,
+                 FOREIGN KEY (session_id) REFERENCES session(id) ON DELETE CASCADE);
+             CREATE TABLE part (id text PRIMARY KEY, message_id text NOT NULL,
+                 session_id text NOT NULL, time_created integer NOT NULL, data text NOT NULL,
+                 FOREIGN KEY (message_id) REFERENCES message(id) ON DELETE CASCADE);
+             INSERT INTO project VALUES ('prj_1');
+             INSERT INTO session VALUES ('ses_fk', 'prj_1');
+             INSERT INTO message VALUES ('msg_1', 'ses_fk', 1, '{}');
+             INSERT INTO part VALUES ('prt_1', 'msg_1', 'ses_fk', 1, '{}');",
+        )
+        .unwrap();
+    let extracted =
+        crate::opencode_extract::extract(&root.join("source.db"), "ses_fk", &root.join("out"))
+            .unwrap();
+    assert_eq!(
+        (extracted.messages, extracted.newest_mid.as_deref()),
+        (1, Some("msg_1"))
+    );
+    let copy = Connection::open(&extracted.path).unwrap();
+    let count = |table: &str| {
+        copy.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+            row.get::<_, u64>(0)
+        })
+        .unwrap()
+    };
+    assert_eq!(
+        (count("session"), count("message"), count("part")),
+        (1, 1, 1)
+    );
+}
+
 #[test]
 fn opencode1_extract_preserves_schema_and_only_selected_rows_then_projects_history() {
     let (root, source) = fixture("projection");

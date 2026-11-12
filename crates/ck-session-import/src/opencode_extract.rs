@@ -60,7 +60,12 @@ pub fn extract(db: &Path, session: &str, out_dir: &Path) -> Result<Extracted> {
     drop(file);
     let result = (|| {
         let mut target = Connection::open(&temp)?;
-        target.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;")?;
+        // The extract keeps three tables, and their foreign keys name tables it leaves out
+        // (OpenCode's `session.project_id` references `project`). Enforced here, those keys
+        // would refuse every copied row; the source database enforced them when it wrote them.
+        target.execute_batch(
+            "PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA foreign_keys=OFF;",
+        )?;
         let transaction = target.transaction()?;
         for (table, predicate) in [
             ("session", "id"),
