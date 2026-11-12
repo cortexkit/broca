@@ -713,7 +713,10 @@ reports `live_background_converted` and `live_skipped_busy` since process start,
 `live_remaining` as of the latest pass (including deferred or failed live sources), and
 `deferred_no_identity` counting identity-less live files deferred across passes. Failed and
 refused ledger rows retain the error message; verification details name the mismatched check
-and first differing response field or message ordinal. Each failed attempt logs a WARN with source path, class
+and first differing response field or message ordinal. A session conversion panic uses the same
+failure path, with refusal class `panic` and its panic message in the detail; the other workers
+continue. Failed sessions are retried on later passes or restart, while final rows are skipped.
+Each failed attempt logs a WARN with source path, class
 and detail. The standalone `--convert-clone` command, which tests conversion on an
 operator-supplied state-root copy without starting the daemon, writes these warnings to stderr.
 
