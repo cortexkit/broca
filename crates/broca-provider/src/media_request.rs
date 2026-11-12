@@ -12,8 +12,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use broca_core::media_request::{MediaBinding, MediaChange, MediaId, MediaLocation, SessionMedia};
 use broca_protocol::{
-    content::media_not_shown_marker, ContentBlock, MediaKind, MediaMarkerReason, MediaRef, Message,
-    ToolOutput, ToolOutputPart,
+    content::media_not_shown_marker, media_event::MediaEvent, ContentBlock, MediaKind,
+    MediaMarkerReason, MediaRef, Message, ToolOutput, ToolOutputPart,
 };
 
 use crate::media_profile::{MediaCarrier, MediaProfile};
@@ -224,6 +224,65 @@ impl MediaAging {
             _ => {}
         }
         Ok(())
+    }
+
+    /// [`Self::fold_wal_record`] for a content-free event instead of an old record: the
+    /// session applies the event, new media limits restart aging under the new costs, the
+    /// session's changes are folded, and the end of an attempt or a step is an aging boundary.
+    /// Feeding a record's events here one by one leaves the state that record leaves there.
+    /// After a transcript cut, the media it removed leave the aging state.
+    pub fn fold_media_event(
+        &mut self,
+        active: &mut MediaProfile,
+        session: &mut SessionMedia,
+        event: &MediaEvent,
+    ) -> Result<(), String> {
+        session.apply(event)?;
+        let limits = match event {
+            MediaEvent::RunStart {
+                limits: Some(limits),
+                ..
+            }
+            | MediaEvent::LimitsChanged { limits } => Some(limits),
+            _ => None,
+        };
+        let next: Option<MediaProfile> = limits
+            .map(|limits| {
+                serde_json::from_value(limits.0.clone())
+                    .map_err(|error| format!("invalid frozen media profile: {error}"))
+            })
+            .transpose()?;
+        if let Some(next) = next.filter(|next| next != active) {
+            *active = next;
+            *self = Self::default();
+            self.reconcile_view(active, &session.selected_bindings());
+            session.take_changes();
+        } else {
+            self.fold_changes(active, session.take_changes());
+        }
+        if matches!(event, MediaEvent::AttemptEnd | MediaEvent::StepEnd) {
+            self.apply(active, AgingEvent::Boundary);
+        }
+        if matches!(event, MediaEvent::Truncated { .. }) {
+            self.forget(|capture| !session.holds(capture));
+        }
+        Ok(())
+    }
+
+    /// Forget every occurrence of the captures `gone` names, as when a transcript cut removed
+    /// them: their costs leave the totals and the oldest-first queue, and they are no longer
+    /// counted as aged.
+    fn forget(&mut self, gone: impl Fn(MediaId) -> bool) {
+        let occurrences: Vec<_> = self
+            .shown
+            .keys()
+            .filter(|id| gone(id.capture))
+            .copied()
+            .collect();
+        for id in occurrences {
+            self.remove(id);
+        }
+        self.aged.retain(|id| !gone(id.capture));
     }
 
     pub fn replay(profile: &MediaProfile, events: impl IntoIterator<Item = AgingEvent>) -> Self {
