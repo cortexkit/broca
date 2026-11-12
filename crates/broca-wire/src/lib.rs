@@ -4117,8 +4117,14 @@ mod wal_newer_writer_golden {
 }
 
 /// The error code refusing a send because the routing module would not choose a provider
-/// account for it.
+/// account for it, for a refusal that may clear by itself (a transient class).
 pub const ACCOUNT_SELECTION_REFUSED: &str = "account_selection_refused";
+
+/// The error code refusing a send because the routing module refused the account choice in a
+/// way waiting can't change (a permanent class): an operator policy excluding the request, a
+/// request routing can't accept, or a refusal code broca does not know. A caller that decides
+/// an account wait by the outer code alone must not wait on it.
+pub const ACCOUNT_SELECTION_FINAL: &str = "account_selection_final";
 
 /// The error body for [`ACCOUNT_SELECTION_REFUSED`]. Nothing was written: the run never
 /// started. Callers branch on `detail.routing_code` and `detail.class`, never on the message.
@@ -4128,7 +4134,8 @@ pub const ACCOUNT_SELECTION_REFUSED: &str = "account_selection_refused";
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AccountSelectionRefused {
     /// [`broca_protocol::error::ACCOUNT_LIMIT_EXHAUSTED`] for exhausted or reserve-limited
-    /// pools, holds or unknown quota; otherwise [`ACCOUNT_SELECTION_REFUSED`].
+    /// pools, holds or unknown quota; [`ACCOUNT_SELECTION_FINAL`] for a permanent refusal;
+    /// otherwise [`ACCOUNT_SELECTION_REFUSED`].
     pub code: String,
     /// Human-readable; derived from `detail`, never parsed.
     pub message: String,
@@ -4189,6 +4196,8 @@ impl AccountSelectionRefused {
         );
         let code = if account_limit {
             broca_protocol::error::ACCOUNT_LIMIT_EXHAUSTED
+        } else if class == broca_protocol::ErrorClass::Permanent {
+            ACCOUNT_SELECTION_FINAL
         } else {
             ACCOUNT_SELECTION_REFUSED
         };
@@ -4368,6 +4377,8 @@ mod account_selection_refused_golden {
 
     #[test]
     fn permanent_admission_conflict_refusal_bytes_are_pinned() {
+        // A permanent refusal goes out as `account_selection_final`, so a caller deciding an
+        // account wait by the outer code never waits on it.
         assert_golden(
             AccountSelectionRefused::new(
                 "admission_conflict".into(),
@@ -4375,7 +4386,7 @@ mod account_selection_refused_golden {
                 None,
                 Some("acd-0456".into()),
             ),
-            "account_selection_refused.admission_conflict.json",
+            "account_selection_final.admission_conflict.json",
             ADMISSION_CONFLICT_SHA256,
         );
     }
@@ -4383,7 +4394,7 @@ mod account_selection_refused_golden {
     const POOL_EXHAUSTED_SHA256: &str =
         "b2782d4a2ecc703e07f3590660b254e8cca95e440d8b8c526e286b37a712a776";
     const ADMISSION_CONFLICT_SHA256: &str =
-        "dd54e79088fd3443de13d848f3949d7ad4c1743f7b9b9cc436d4d923d8533780";
+        "7e1f17810b8cce76fe487bc02d40ea62713012d9d9e072bd5a83b841eedb2197";
 }
 
 #[cfg(test)]

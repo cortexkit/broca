@@ -195,7 +195,8 @@ broca specifics:
 
   | Code | Class | Detail |
   |---|---|---|
-  | `account_selection_refused` | `detail.class`: `transient`, `permanent` or `auth_required` | `{routing_code, class, retry_after_s?, retry_after_secs?, decision_id?, resets_at_ms?, routing_detail?}` |
+  | `account_selection_refused` | `detail.class`: `transient` or `auth_required` | `{routing_code, class, retry_after_s?, retry_after_secs?, decision_id?, resets_at_ms?, routing_detail?}` |
+  | `account_selection_final` | `detail.class`: always `permanent` | same fields as `account_selection_refused`; no `provider_code` |
   | `account_limit_exhausted` | `detail.class`: `transient` | same fields, plus `provider_code: "account_limit_exhausted"` |
   | `routing_unavailable` | `detail.class`: always `transient` | `{reason, class, budget_ms?}` |
 
@@ -216,12 +217,20 @@ broca specifics:
   `pin_generation_conflict`, `store_error` and `internal_error`, with `retry_after_secs` set
   from routing's wait when it gave one; `permanent` for `admission_conflict`, `invalid_request`,
   `unknown_decision`, `unscoped_caller`, `account_not_authorized` and
-  `account_selection_unsupported`. An authorization refusal
+  `account_selection_unsupported`, and for every routing code broca does not know: until broca
+  learns a code it can't tell that waiting would clear it, and holding a send forever on a
+  refusal that can't clear is the worse failure (routing's own contract classes every untimed
+  refusal as permanent except `account_selection_unavailable`). An authorization refusal
   means operator policy excludes the request's credentials; logging in cannot fix it.
   `account_selection_unsupported` means the account cannot serve the requested provider;
   it is a permanent refusal, not a static-credential fallback.
-  Unknown refusal codes remain verbatim and transient,
-  never `routing_unavailable`. Pool exhaustion, reserve limits, account holds and unknown quota use `account_limit_exhausted`
+  A permanent refusal goes out with the outer code `account_selection_final`: routing refused
+  the account choice and waiting can't change it, so a caller deciding an account wait by the
+  outer code alone never waits on it. Its `detail` is the same as `account_selection_refused`'s.
+  A queued send refused this way ends with `provider_code: "account_selection_final"` and class
+  `permanent` on its run's `error`. Refusal codes, known or not, stay verbatim in
+  `routing_code` and are never `routing_unavailable`. Pool exhaustion, reserve limits, account
+  holds and unknown quota use `account_limit_exhausted`
   instead of `account_selection_refused`, so callers wait or reroute rather than hot-retrying.
   Routing's `reset_at_ms` is carried as `resets_at_ms`; when no wait was supplied it also yields a
   `retry_after_secs` hint rounded up to the next second. Holds prefer `until_ms` (Unix
@@ -235,10 +244,13 @@ broca specifics:
   module-wide off-switch: that answer admits the send on the configured static credential,
   records an account decision with path `disabled`, and logs the literal routing code
   `account_selection_disabled`. It is not an account or provider refusal. The undeclared aliases
-  `disabled` and `unsupported` remain transient pass-through refusals, not fallbacks.
+  `disabled` and `unsupported` are routing codes broca does not know, so they are permanent
+  `account_selection_final` refusals, not fallbacks. A send that carries an account hint while
+  routing answers `account_selection_disabled` is refused the same way.
   Callers branch on structured fields,
   never on the message. The bodies are pinned by
-  `crates/broca-wire/tests/golden/account_selection_refused.*.json`.
+  `crates/broca-wire/tests/golden/account_selection_refused.*.json` and
+  `crates/broca-wire/tests/golden/account_selection_final.*.json`.
 
   `routing_unavailable` means broca got no usable account decision from the routing module
   for a send that needs one: nothing was written and broca did not pick an account itself.

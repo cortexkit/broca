@@ -863,6 +863,12 @@ For a listed method, `auth.pool` is sent as `route.account_for.pool`, and option
 may overrule. Either hint requires routing even with a single candidate. If the vault cannot
 provide its candidate credential list, or routing answers `account_selection_disabled`, broca
 refuses rather than using the configured default credential without honoring the hints.
+A routing refusal reaches the caller with an outer code that says whether to wait:
+`account_limit_exhausted` for an exhausted pool, a hold or unknown quota,
+`account_selection_refused` for another refusal that may clear, and `account_selection_final`
+for a permanent one (including every routing code broca does not know, and the hinted
+`account_selection_disabled` refusal above), which waiting can't change. See the
+[error class contract](error-class-contract.md).
 Both hints are ignored for unlisted methods before request storage and identity comparison.
 A strict `auth.account` pin cannot be combined with either hint for a listed method:
 `invalid_params` names `auth.account` before storage or any routing request. A pin without
