@@ -608,7 +608,8 @@ pub(super) async fn serve_websocket(
         // ChatGPT step must see the request arrive and stay unanswered until it releases it.
         let gate = (!warm)
             .then(|| shared.model_holds.lock().unwrap().get(&session).cloned())
-            .flatten();
+            .flatten()
+            .filter(|gate| gate.claim());
         if let Some(gate) = gate {
             HoldGate::set(&gate.arrived, &gate.arrived_wake);
             tokio::select! {

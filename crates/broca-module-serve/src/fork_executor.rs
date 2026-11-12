@@ -270,6 +270,8 @@ async fn fork_step(
     let mut usage = RunUsage::default();
     let mut step_usage = None;
     let mut step_tier: Option<String> = None;
+    let mut raw_finish: Option<String> = None;
+    let mut streamed = StreamedText::default();
     let report_usage = |value: &broca_protocol::Usage,
                         service_tier_used: Option<&String>,
                         finish_reason: Option<FinishReason>| {
@@ -300,6 +302,7 @@ async fn fork_step(
     };
     while let Some(event) = events.recv().await {
         match event {
+            NormalizedEvent::Display(display) => streamed.observe(&display),
             NormalizedEvent::Control(ProviderControl::AssistantMessage { message: reply }) => {
                 message = Some(reply)
             }
@@ -307,11 +310,13 @@ async fn fork_step(
                 usage: value,
                 finish_reason,
                 service_tier_used,
+                raw_finish_reason,
                 ..
             }) => {
                 usage = report_usage(&value, service_tier_used.as_ref(), Some(finish_reason));
                 step_tier = service_tier_used;
                 step_usage = Some(value);
+                raw_finish = raw_finish_reason;
             }
             NormalizedEvent::Control(ProviderControl::Finished {
                 usage: value,
@@ -327,41 +332,13 @@ async fn fork_step(
                 let Some(message) = message else {
                     break;
                 };
-                let mut answer = String::new();
-                let mut tool = false;
-                for block in message.content {
-                    match block {
-                        broca_protocol::content::ContentBlock::Text { text } => {
-                            answer.push_str(&text)
-                        }
-                        broca_protocol::content::ContentBlock::ToolCall(_) => {
-                            tool = true;
-                            break;
-                        }
-                        _ => {}
-                    }
-                }
-                let finish = if tool {
-                    "tool_call_refused"
-                } else {
-                    match finish_reason {
-                        FinishReason::Stop => "end_turn",
-                        FinishReason::Length => "max_tokens",
-                        _ => {
-                            return ForkCallOutcome::ModelFailed {
-                                usage,
-                                error: format!(
-                                    "provider ended the fork step with {finish_reason:?}"
-                                ),
-                            }
-                        }
-                    }
-                };
-                return ForkCallOutcome::Answered {
-                    answer,
-                    finish: finish.into(),
+                return fork_reply(
+                    &message,
+                    finish_reason,
+                    raw_finish.as_deref(),
+                    &streamed,
                     usage,
-                };
+                );
             }
             NormalizedEvent::Control(ProviderControl::Error { error, .. }) => {
                 return ForkCallOutcome::ModelFailed {
@@ -375,5 +352,129 @@ async fn fork_step(
     ForkCallOutcome::ModelFailed {
         usage,
         error: "provider stream ended without an assistant message and Finished control".into(),
+    }
+}
+
+/// The assistant text of a fork's reply as it streamed, split at its first tool call.
+///
+/// Some wire formats assemble a reply's text into one block ahead of its tool calls: OpenAI
+/// Chat streams `content` and `tool_calls` side by side, so text the model wrote after a call
+/// lands in the same block as text before it. The stream's display events keep the order the
+/// model wrote in, which is what "the text before the tool call" means.
+#[derive(Default)]
+struct StreamedText {
+    /// Text streamed before the first tool call's input.
+    before_tool: String,
+    /// Every text the reply streamed, in order.
+    all: String,
+    tool_started: bool,
+    /// Display frames were dropped, so the order above may be incomplete.
+    gap: bool,
+}
+
+impl StreamedText {
+    fn observe(&mut self, event: &broca_protocol::display::DisplayEvent) {
+        use broca_protocol::display::DisplayEvent;
+        match event {
+            DisplayEvent::TextDelta {
+                delta,
+                tool_call_id: None,
+                ..
+            } => {
+                self.all.push_str(delta);
+                if !self.tool_started {
+                    self.before_tool.push_str(delta);
+                }
+            }
+            DisplayEvent::ToolInputDelta { .. } => self.tool_started = true,
+            DisplayEvent::DisplayGap { .. } => self.gap = true,
+            _ => {}
+        }
+    }
+}
+
+/// A fork's answer to a reply that ended with `finish_reason` (and the provider's own token
+/// `raw_finish`), as llm-runner `fork_answer` finishes it.
+fn fork_reply(
+    message: &broca_protocol::content::AssistantMessage,
+    finish_reason: broca_protocol::FinishReason,
+    raw_finish: Option<&str>,
+    streamed: &StreamedText,
+    usage: cortexkit_role_llm_runner::usage::RunUsage,
+) -> broca_module::executor::ForkCallOutcome {
+    use broca_module::executor::ForkCallOutcome;
+    use broca_protocol::content::ContentBlock;
+    let text = |blocks: &mut dyn Iterator<Item = &ContentBlock>| {
+        blocks
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>()
+    };
+    let tool = message
+        .content
+        .iter()
+        .any(|block| matches!(block, ContentBlock::ToolCall(_)));
+    if tool {
+        // The per-call gate refuses the call; the answer is what the model wrote before it.
+        // The streamed order is used when the stream carried every text of the reply in order;
+        // otherwise the assembled message's text ahead of its first call.
+        let assembled_before = text(
+            &mut message
+                .content
+                .iter()
+                .take_while(|block| !matches!(block, ContentBlock::ToolCall(_))),
+        );
+        let ordered = !streamed.gap
+            && streamed.tool_started
+            && streamed.all == text(&mut message.content.iter());
+        return ForkCallOutcome::Answered {
+            answer: if ordered {
+                streamed.before_tool.clone()
+            } else {
+                assembled_before
+            },
+            finish: "tool_call_refused".into(),
+            usage,
+        };
+    }
+    match fork_finish(finish_reason, raw_finish) {
+        Some(finish) => ForkCallOutcome::Answered {
+            answer: text(&mut message.content.iter()),
+            finish: finish.into(),
+            usage,
+        },
+        None => ForkCallOutcome::ModelFailed {
+            usage,
+            error: format!(
+                "provider ended the fork step with {finish_reason:?} ({})",
+                raw_finish.unwrap_or("no reason given")
+            ),
+        },
+    }
+}
+
+/// The `finish` of a fork answer that holds no tool call, or `None` when the reply is a failed
+/// model call (`model_error`).
+fn fork_finish(finish_reason: broca_protocol::FinishReason, raw: Option<&str>) -> Option<&'static str> {
+    use broca_protocol::FinishReason;
+    match finish_reason {
+        FinishReason::Stop => Some("end_turn"),
+        FinishReason::Length => Some("max_tokens"),
+        // `Other` is a provider reason none of the named ones match, or no reason at all. A
+        // head's run takes such a reply as a completed answer (its loop keys on the message,
+        // not the reason), so a fork does too. The few provider tokens that land in `Other`
+        // although the call failed or was refused are named here instead: a Responses
+        // response that failed or was cancelled, and a Gemini image safety stop.
+        FinishReason::Other => match raw {
+            Some(
+                "failed" | "cancelled" | "IMAGE_SAFETY" | "IMAGE_PROHIBITED_CONTENT"
+                | "IMAGE_RECITATION",
+            ) => None,
+            _ => Some("end_turn"),
+        },
+        // A refusal, a provider error, or a tool-call finish without a call is a failed call.
+        FinishReason::ContentFilter | FinishReason::Error | FinishReason::ToolCalls => None,
     }
 }

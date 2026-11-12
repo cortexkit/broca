@@ -506,6 +506,8 @@ struct Shared {
 /// rather than waiting for a wakeup that already happened.
 #[derive(Default)]
 struct HoldGate {
+    /// Taken by the one request a model hold applies to.
+    claimed: std::sync::atomic::AtomicBool,
     arrived: std::sync::atomic::AtomicBool,
     arrived_wake: Notify,
     released: std::sync::atomic::AtomicBool,
@@ -513,6 +515,13 @@ struct HoldGate {
 }
 
 impl HoldGate {
+    /// True for the first caller only. A model hold holds the next request of its session,
+    /// not every request made while it is held: a fork's ask runs while its head's step is
+    /// held, and must not wait behind it.
+    fn claim(&self) -> bool {
+        !self.claimed.swap(true, std::sync::atomic::Ordering::SeqCst)
+    }
+
     fn set(flag: &std::sync::atomic::AtomicBool, wake: &Notify) {
         flag.store(true, std::sync::atomic::Ordering::SeqCst);
         wake.notify_waiters();
@@ -1001,8 +1010,17 @@ async fn serve_model_request(
         stream.write_all(response.as_bytes()).await?;
         return Ok(());
     }
-    let model_gate = shared.model_holds.lock().unwrap().get(&session).cloned();
-    let stream_parts = shared.stream_holds.lock().unwrap().remove(&session);
+    let model_gate = shared
+        .model_holds
+        .lock()
+        .unwrap()
+        .get(&session)
+        .cloned()
+        .filter(|gate| gate.claim());
+    // A stream hold belongs to the request its model hold holds.
+    let stream_parts = model_gate
+        .as_ref()
+        .and_then(|_| shared.stream_holds.lock().unwrap().remove(&session));
     if let Some(gate) = model_gate.as_ref().filter(|_| stream_parts.is_none()) {
         HoldGate::set(&gate.arrived, &gate.arrived_wake);
         tokio::select! {
@@ -1421,6 +1439,14 @@ impl Drop for FixtureRegistration {
             entries.live.retain(|(id, _)| *id != self.id);
         }
     }
+}
+
+#[test]
+fn a_model_hold_holds_only_the_request_that_claims_it() {
+    let gate = HoldGate::default();
+    assert!(gate.claim(), "the next request is held");
+    assert!(!gate.claim(), "a request made while it is held passes");
+    assert!(!gate.claim());
 }
 
 #[test]
@@ -3145,6 +3171,9 @@ impl LlmRunnerSubject for BrocaSubject {
             // role.describe declares session_class. Its cases drive ordinary sends and need no
             // subject hook.
             Capability::SessionClass,
+            // role.describe declares plan_view. Its cases read session.plan_view through
+            // ordinary routes and need nothing more from the subject.
+            Capability::PlanView,
         ]
         .into_iter()
         .collect();
@@ -3935,7 +3964,11 @@ impl LlmRunnerSubject for BrocaSubject {
 
     async fn install_script(&self, session: &str, script: Script) -> Result<(), HarnessError> {
         *self.shared.default_text_module.lock().unwrap() = None;
-        if script.turns.iter().any(|turn| turn.model_failure.is_some()) {
+        // Turns are otherwise matched by the assistant messages a request carries. A fork's
+        // asks all extend the head's last request, so they are matched by requests served.
+        if script.turns.iter().any(|turn| turn.model_failure.is_some())
+            || fork_answer::fixture_session(session)
+        {
             self.shared
                 .failure_turns
                 .lock()
@@ -6498,6 +6531,15 @@ async fn ck_broca_boot_completes_incomplete_tombstones_before_serving() {
             }
             _ => {}
         }
+        // A kill at any of these cuts also leaves the deletion in the index's pending
+        // deletions: the runner lists it before writing the incomplete tombstone and removes it
+        // only once the completed tombstone is synced. Boot finishes the deletions listed there
+        // before serving; an unlisted tombstone is found only by the inventory repair that runs
+        // after the module registers.
+        broca_store::SqliteStore::open(state.join("run-index.db"))
+            .unwrap()
+            .retention_deletion_pending(&lineage.to_string(), &key, true)
+            .unwrap();
         cuts.push((key, live_path, deleting_path, stone_path));
     }
     let live = subject.start(&root).await.unwrap();
