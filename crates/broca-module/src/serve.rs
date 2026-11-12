@@ -5532,6 +5532,8 @@ impl ServeHandler for crate::LineageRegistry {
                     session_class,
                     ts_ms,
                     manifest,
+                    principal,
+                    scope,
                     ..
                 } = frame.record
                 {
@@ -5544,6 +5546,8 @@ impl ServeHandler for crate::LineageRegistry {
                             })?,
                             broca_wire::RunAdmissionStorage::Wal,
                             manifest.as_deref(),
+                            principal.as_ref(),
+                            scope.as_ref(),
                         )
                         .map(Some);
                     }

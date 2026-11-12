@@ -16,7 +16,7 @@ encrypted session files in the client. It uses the same session authorization as
 not the latest baseline of its session. A known run returns:
 
 ```json
-{"run_id":"…","session_class":"sidekick","started_at_ms":123,"storage":"store","fetches":[{"provider":"aft","declarations_frozen":{"late_results":true}}]}
+{"run_id":"…","session_class":"sidekick","started_at_ms":123,"storage":"store","fetches":[{"provider":"aft","declarations_frozen":{"late_results":true}}],"scope":{"owner":{"kind":"reserved","module_id":"core"},"ref":"worker-1","epoch":1,"principal":{"kind":"reserved","module_id":"core"}}}
 ```
 
 `storage` is `wal` or `store`. `session_class` and each fetch's
@@ -28,6 +28,17 @@ returns `{"state":"unknown"}`, as `run.status` does. The required `run_id` is
 scoped to the bound session; unknown parameter keys are refused.
 An older start without a recorded timestamp is unreadable through this query,
 not assigned a fabricated start time.
+
+`scope` is omitted for an unscoped start, preserving its existing reply bytes. For a
+scoped start, `scope.owner`, `scope.ref` and `scope.epoch` project the recorded scope's
+owner principal, reference and `scope_epoch`; `scope.principal` is the recorded driving
+principal, omitted when the start did not record one. These fields come from the
+requested run's own start on either storage, never from the caller's current bind or
+the session's latest ownership. They expose no tool arguments, transcript or credentials;
+adding scope metadata does not change which callers may read `run.admission`. A worker
+class or a fetch from the `aft` tool provider alone does not establish a scope.
+Write-ahead log (WAL) readers still verify `scope/v1` on the original frame;
+new storage records the scope in its typed start schema rather than a WAL feature list.
 
 On new storage the query uses the run-id index to find `RunStart` and resolves
 the setup parts it froze, without a transcript walk. On WAL storage it reads
