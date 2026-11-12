@@ -163,6 +163,18 @@ impl RunExecutor for FailingExecutor {
     }
 }
 
+fn scratch_dir() -> std::path::PathBuf {
+    use std::sync::atomic::AtomicU64;
+    static N: AtomicU64 = AtomicU64::new(0);
+    let dir = broca_test_support::scratch_root().join(format!(
+        "store-loop-error-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::SeqCst)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
+}
+
 /// A module over a scratch folder whose new sessions start in the new session storage
 /// (`broca_session_store`), run by `executor`.
 struct Side {
@@ -180,14 +192,17 @@ impl Drop for Side {
 
 impl Side {
     async fn new(executor: Arc<FailingExecutor>) -> Self {
-        use std::sync::atomic::AtomicU64;
-        static N: AtomicU64 = AtomicU64::new(0);
-        let dir = broca_test_support::scratch_root().join(format!(
-            "store-loop-error-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::SeqCst)
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = scratch_dir();
+        let key = BindIdentity::new(dir.join("project"), "store-actor", "s1");
+        Self::at(dir, key, executor).await
+    }
+
+    /// A module over the state root `dir`, whose session is `key`.
+    async fn at(
+        dir: std::path::PathBuf,
+        key: BindIdentity,
+        executor: Arc<FailingExecutor>,
+    ) -> Self {
         let executor: Arc<dyn RunExecutor> = executor;
         let wal = Arc::new(FileWalStore::new(dir.join("wal")));
         let runtime = crate::store_open::StoreRuntime::open(
@@ -212,7 +227,6 @@ impl Side {
             None,
         )
         .with_store_new_sessions();
-        let key = BindIdentity::new(dir.join("project"), "store-actor", "s1");
         Self {
             dir,
             registry,
@@ -436,4 +450,151 @@ async fn a_temporary_admission_failure_keeps_the_pause_for_a_later_resume() {
         1
     );
     assert!(side.registry.stop_and_seal().await);
+}
+
+/// Copies the state root `from` to `to` as a stopped process leaves it: every file but the
+/// leases, which name the stopped process.
+fn copy_state(from: &std::path::Path, to: &std::path::Path) {
+    fn copy(from: &std::path::Path, to: &std::path::Path) {
+        if std::fs::metadata(from).unwrap().is_dir() {
+            std::fs::create_dir_all(to).unwrap();
+            for entry in std::fs::read_dir(from).unwrap() {
+                let entry = entry.unwrap();
+                copy(&entry.path(), &to.join(entry.file_name()));
+            }
+        } else {
+            std::fs::copy(from, to).unwrap();
+        }
+    }
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_name() != "leases" {
+            copy(&entry.path(), &to.join(entry.file_name()));
+        }
+    }
+}
+
+/// A run already started, with its caller's cancel recorded for its next boundary and no end:
+/// its process stopped while the run's model call ran. The session's next open resumes the run,
+/// and here the executor refuses that resume at admission, `temporary`ly or not. The run isn't
+/// paused, so either way it ends with the refusal, and only then does the send waiting behind it
+/// start its run: a session never starts a run over one that hasn't ended.
+async fn a_refused_resume_of_a_started_run_ends_it_before_the_next_run(temporary: bool) {
+    use broca_session_store::record::Record;
+    let original = Arc::new(FailingExecutor {
+        script: Arc::new(StubProvider::new(Vec::new())),
+        fails_next: AtomicBool::new(true),
+        temporarily_refuse_resume: AtomicBool::new(false),
+        fail: Notify::new(),
+    });
+    let mut side = Side::new(Arc::clone(&original)).await;
+    let sent = side.send("r1", "first").await;
+    assert!(matches!(sent, SendOutcome::Active { .. }), "{sent:?}");
+    side.registry
+        .route_cancel_at(
+            &side.key,
+            RunId("r1".into()),
+            broca_wal::record::RunCancelAt::StepBoundary,
+        )
+        .await
+        .expect("the cancel is routed");
+    let runtime = side.registry.store_runtime().unwrap();
+    broca_test_support::wait_until("the cancel is recorded", || async {
+        let records = runtime
+            .current_view(&side.key)
+            .await
+            .unwrap()
+            .unwrap()
+            .records_from(0)
+            .await
+            .unwrap();
+        if records
+            .iter()
+            .any(|(_, record)| matches!(record, Record::CancelRequest(_)))
+        {
+            Ok(())
+        } else {
+            Err("no cancel yet".to_owned())
+        }
+    })
+    .await;
+    // The process stops here, with r1's model call still running: its state root as it lies.
+    let stopped = scratch_dir();
+    copy_state(&side.dir, &stopped);
+    original.fail.notify_one();
+    side.until_state("r1", "error").await;
+    assert!(side.registry.stop_and_seal().await);
+
+    let resumed = Arc::new(FailingExecutor {
+        script: Arc::new(StubProvider::new(vec![text_step("a2", "next answer")])),
+        fails_next: AtomicBool::new(!temporary),
+        temporarily_refuse_resume: AtomicBool::new(temporary),
+        fail: Notify::new(),
+    });
+    let mut restarted = Side::at(stopped, side.key.clone(), Arc::clone(&resumed)).await;
+    // The same caller sends on: its later sends leave out the tools its first send froze into
+    // the session, which a send from a new caller would declare again and be refused for.
+    restarted.caller = std::mem::take(&mut side.caller);
+    let next = restarted.send("r2", "next").await;
+    assert!(
+        matches!(
+            next,
+            SendOutcome::Active { .. } | SendOutcome::Pending { .. }
+        ),
+        "{next:?}"
+    );
+    let failed = restarted.until_state("r1", "error").await;
+    assert_eq!(failed["error"]["provider_code"], "runner_error", "{failed}");
+    if !temporary {
+        assert!(
+            failed["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("resume admission failed"),
+            "{failed}"
+        );
+    }
+    restarted.until_state("r2", "completed").await;
+    let runtime = restarted.registry.store_runtime().unwrap();
+    let records = runtime
+        .current_view(&restarted.key)
+        .await
+        .unwrap()
+        .unwrap()
+        .records_from(0)
+        .await
+        .unwrap();
+    let mut open: Option<String> = None;
+    let mut starts = 0;
+    for (seq, record) in &records {
+        match record {
+            Record::RunStart(start) => {
+                assert!(
+                    open.is_none(),
+                    "run {} starts at seq {seq} while run {open:?} hasn't ended",
+                    start.run_id
+                );
+                open = Some(start.run_id.clone());
+                starts += 1;
+            }
+            Record::RunEnd(end) => {
+                assert_eq!(open.as_deref(), Some(end.run_id.as_str()), "seq {seq}");
+                open = None;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!((starts, open), (2, None), "r1 ended, then r2 ran and ended");
+    assert!(restarted.registry.stop_and_seal().await);
+}
+
+#[tokio::test]
+async fn a_permanently_refused_resume_of_a_started_run_ends_it_before_the_next_run() {
+    a_refused_resume_of_a_started_run_ends_it_before_the_next_run(false).await;
+}
+
+#[tokio::test]
+async fn a_temporarily_refused_resume_of_a_started_run_ends_it_before_the_next_run() {
+    a_refused_resume_of_a_started_run_ends_it_before_the_next_run(true).await;
 }
