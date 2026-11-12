@@ -5,8 +5,8 @@
 //! nothing under `ROOT` is written.
 //!
 //! The command reads no deployment key. The daemon reads it from the vault (record
-//! `opaque:broca-deployment:<id>`) over its subc connection, as the module `broca` the subc daemon
-//! spawned, and the vault grants that read to that module only; a command run from a shell has no
+//! `opaque:broca-deployment:<id>`) over its connection to the CortexKit module daemon (subc), as
+//! the module `broca` that daemon spawned, and the vault grants that read to that module only; a command run from a shell has no
 //! such identity, and the key is never written to a file. Plain sessions are checked whole; an
 //! encrypted session is listed under `key_unavailable` and never counted as agreeing.
 //!
