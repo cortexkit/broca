@@ -319,6 +319,46 @@ pub fn moved_at_a_wall(run_id: &str, records: &[(u64, Record)]) -> bool {
     })
 }
 
+/// The accounts that refused step `step_id` of run `run_id` at a quota wall and that the run
+/// moved away from, read from its records: for each move at a wall (an `AuthRefrozen` no
+/// resume wrote, see [`moved_at_a_wall`]), the account that served the run's latest attempt
+/// before it, when that attempt belongs to the step. The wall being handled is added by the
+/// caller.
+pub fn refused_in_step(records: &[(u64, Record)], run_id: &str, step_id: u64) -> Vec<String> {
+    let resumes: Vec<(u64, u64)> = records
+        .iter()
+        .filter_map(|(seq, record)| match record {
+            Record::Resumed(resumed) if resumed.run_id == run_id => {
+                Some((resumed.resumed_from_seq, *seq))
+            }
+            _ => None,
+        })
+        .collect();
+    let mut refused = Vec::new();
+    let mut latest: Option<(u64, Option<String>)> = None;
+    for (seq, record) in records {
+        match record {
+            Record::Attempt(attempt) if attempt.run_id == run_id => {
+                latest = Some((attempt.step_id, attempt.served_account_ref.clone()));
+            }
+            Record::AuthRefrozen(refrozen)
+                if refrozen.run_id == run_id
+                    && !resumes
+                        .iter()
+                        .any(|(from, resumed)| from < seq && seq < resumed) =>
+            {
+                if let Some((step, Some(account))) = &latest {
+                    if *step == step_id && !refused.contains(account) {
+                        refused.push(account.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    refused
+}
+
 /// Whether a resume of `run` can durably record a change of account before it calls the
 /// provider: the run is paused for a sign-in or for a restart, whose resume writes the account
 /// and the config that names it together with its `Resumed` record. Every other resume (a run

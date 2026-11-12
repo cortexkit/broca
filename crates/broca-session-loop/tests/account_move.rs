@@ -2440,3 +2440,125 @@ async fn a_stop_while_the_move_is_written_pauses_before_the_new_account_is_sent_
         "nothing went to B before the pause; the resume sends step 2 there"
     );
 }
+
+/// A run that moved from A to B at step 2 and paused for a restart before sending there resumes
+/// with that step's refusals read from its log: when B walls too and routing offers A, the offer
+/// is refused, so the step never goes back to an account that already refused it.
+#[tokio::test]
+async fn a_resumed_step_never_moves_back_to_an_account_that_refused_it() {
+    let backend = MemoryBackend::default();
+    let mut session = session(&backend).await;
+    let mut parts = MemoryParts::default();
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let log: Log = Arc::default();
+    let stop = tokio_util::sync::CancellationToken::new();
+    let provider: Box<dyn Provider> =
+        Box::new(Account::new("A", vec![Reply::Tool, wall()], &sent, &log));
+    let first_routing = Routing {
+        answers: Mutex::new(vec![Scripted::OfferThenStop("B", stop.clone())].into()),
+        providers: Mutex::new(HashMap::from([(
+            "B".to_owned(),
+            Box::new(Account::new("B", Vec::new(), &sent, &log)) as Box<dyn Provider>,
+        )])),
+        asked: Default::default(),
+        adopted: Default::default(),
+    };
+    let a = routed("A", "decision-A");
+    let mut request = request();
+    request.on_restart = Some(broca_protocol::request::OnRestart::Resume);
+    let control = broca_core::RunControl {
+        cancel: Some(Default::default()),
+        auth_selection: Some(a.clone()),
+        ..Default::default()
+    };
+    let now = || NOW;
+    let admission = broca_session_loop::admit::admission(
+        &mut request,
+        &control,
+        &provider,
+        Writer::operations(&session),
+        Some(now()),
+    )
+    .unwrap();
+    let tools = StubToolPlane::new().with_canned_text("read", "fn main() {}");
+    let first = seams(
+        &provider,
+        &tools,
+        &now,
+        Some(&first_routing),
+        &log,
+        a,
+        Default::default(),
+        stop.clone(),
+    );
+    let mut writer = Logging {
+        session: &mut session,
+        log: Arc::clone(&log),
+        refuse_moves: false,
+        stop_after_batches: None,
+    };
+    let paused = broca_session_loop::run::run(&mut writer, &mut parts, admission, &first)
+        .await
+        .unwrap();
+    assert_eq!(
+        paused.paused,
+        Some(broca_protocol::caller::PauseReason::Restart)
+    );
+    drop(first);
+    assert_eq!(
+        broca_session_loop::account_move::refused_in_step(
+            &writer.session.open_log_records().await.unwrap(),
+            RUN,
+            2
+        ),
+        vec!["A".to_owned()]
+    );
+
+    // The resume sends step 2 on B, which walls too; routing offers A.
+    let on_b: Box<dyn Provider> = Box::new(Account::new("B", vec![wall()], &sent, &log));
+    let second_routing = Routing {
+        answers: Mutex::new(
+            vec![Scripted::Offer {
+                account: "A",
+                valid_until_ms: NOW + OFFER_VALID_MS,
+                persona: true,
+            }]
+            .into(),
+        ),
+        providers: Mutex::new(HashMap::from([(
+            "A".to_owned(),
+            Box::new(Account::new("A", vec![Reply::Answer], &sent, &log)) as Box<dyn Provider>,
+        )])),
+        asked: Default::default(),
+        adopted: Default::default(),
+    };
+    let second = seams(
+        &on_b,
+        &tools,
+        &now,
+        Some(&second_routing),
+        &log,
+        routed("B", "decision-B"),
+        Default::default(),
+        Default::default(),
+    );
+    let finished = broca_session_loop::resume(&mut writer, &parts, &second)
+        .await
+        .unwrap();
+    drop(second);
+    assert_eq!(finished.reason, RunFinishReason::Error);
+    let asked = second_routing.asked.lock().unwrap().clone();
+    assert_eq!(asked.len(), 1);
+    assert_eq!(asked[0].refused, vec!["A".to_owned(), "B".to_owned()]);
+    let steps: Vec<_> = sent
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|sent| (sent.account.clone(), sent.step))
+        .collect();
+    assert_eq!(
+        steps,
+        vec![("A".into(), 1), ("A".into(), 2), ("B".into(), 2)],
+        "step 2 never went back to A"
+    );
+}

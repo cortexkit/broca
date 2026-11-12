@@ -2876,10 +2876,17 @@ where
                 // error the run ends with.
                 let mut error = error;
                 if let Some(limited) = limited.as_deref() {
-                    let mut refused = entering
-                        .as_ref()
-                        .map(|entering| entering.refused.clone())
-                        .unwrap_or_default();
+                    // The accounts that already refused this step: carried across a move in
+                    // this process, else read from the run's records, since a run paused or
+                    // crashed after a move resumes the step with nothing in memory.
+                    let mut refused = match entering.as_ref() {
+                        Some(entering) => entering.refused.clone(),
+                        None => crate::account_move::refused_in_step(
+                            &writer.open_log_records().await?,
+                            &admission.run_id,
+                            step_id,
+                        ),
+                    };
                     match crate::account_move::at_wall(
                         writer,
                         parts,
