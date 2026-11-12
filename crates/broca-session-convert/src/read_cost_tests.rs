@@ -491,6 +491,60 @@ fn shared_conversion_pages_are_byte_equal_in_every_read_mode() {
     }
 }
 
+#[test]
+fn conversion_history_walks_open_the_log_a_constant_number_of_times() {
+    use broca_session_store::session::Session;
+    use futures::executor::block_on;
+
+    let lineage = Some("0b3c3c1e-1f2a-4c1d-9e57-5a0e5f0c0001");
+    for messages in [64, 512] {
+        let old = synthetic_log(1, messages, true, false);
+        let stored = crate::read_cost::store_unsealed(&old, lineage, "history-walk").unwrap();
+        assert_eq!(stored.messages, messages as u64);
+        block_on(async {
+            stored.backend.take();
+            let view = Session::view(
+                &stored.backend,
+                stored.addr.clone(),
+                &stored.triple,
+                &stored.deployment,
+            )
+            .await
+            .unwrap();
+            let handler = crate::stored_history::StoredHistoryWalk::new(&view, &stored.parts)
+                .await
+                .unwrap();
+            let head = view.head();
+            let today = broca_module::store_read::history_sides::TodaysHistory::new(
+                &old,
+                lineage,
+                broca_session_store::codec::hex(&head.incarnation.0),
+                broca_module::store_exposure::served_history_version(head.history_version),
+            )
+            .unwrap();
+            let key = broca_protocol::BindIdentity::new("/read-cost", "read-cost", "history-walk");
+            for (form, newest) in crate::verify::HISTORY_WALKS {
+                let pages = crate::verify::history_pages(&handler, &key, form, newest).await;
+                assert!(pages.len() >= messages / crate::verify::PAGE as usize);
+                assert!(pages.iter().all(|page| page.get("refused").is_none()));
+                assert_eq!(
+                    pages,
+                    crate::verify::history_pages(&today, &key, form, newest).await,
+                    "{messages} messages, {form}, newest={newest}"
+                );
+            }
+            let reads = stored.backend.take();
+            // One load of the view and one projection of its shared stream head, regardless
+            // of the number of pages or the direction and form of the four history walks.
+            assert_eq!(reads.log_reads, 2, "{messages} messages: {reads:?}");
+            eprintln!(
+                "messages={messages} history_walks=4 log_reads={} log_bytes={}",
+                reads.log_reads, reads.log_bytes
+            );
+        });
+    }
+}
+
 /// Run explicitly to compare the old per-page projection with the shared reader on synthetic
 /// unsealed conversions. Timing is printed, not asserted: machine load is not a read contract.
 #[test]
