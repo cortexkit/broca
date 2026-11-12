@@ -47,6 +47,9 @@ pub struct Wall<'a> {
     /// `five_hour` or `seven_day`.
     pub limit_window: &'a str,
     pub resets_at_ms: Option<u64>,
+    /// The provider's own retry-after on the refused attempt's error, in whole seconds rounded
+    /// up, when it gave one.
+    pub retry_after_s: Option<u64>,
     pub observed_at_ms: u64,
     /// The seq of the refused attempt's record: it names this wall, so an id derived from it is
     /// the same however often the question is sent.
@@ -146,6 +149,7 @@ pub(crate) struct Moving<P> {
 /// decision to continue), and the session's executor can ask. `None` when it may not, so the
 /// run ends exactly as before. `refused` gains the walled account; an offer of any account in
 /// it is refused here.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn at_wall<W: Writer, P, T>(
     writer: &mut W,
     parts: &dyn crate::parts::Parts,
@@ -153,6 +157,7 @@ pub(crate) async fn at_wall<W: Writer, P, T>(
     admission: &Admission,
     step_id: u64,
     limited: &FailedAccountLimitAttempt,
+    retry_after_secs: Option<f64>,
     refused: &mut Vec<String>,
 ) -> Result<Option<AtWall<P>>, LoopError> {
     let Some(continuer) = seams.account_continue else {
@@ -201,6 +206,7 @@ pub(crate) async fn at_wall<W: Writer, P, T>(
         account: &account,
         limit_window: window,
         resets_at_ms: limit.resets_at_ms,
+        retry_after_s: retry_after_seconds(retry_after_secs),
         observed_at_ms: limit.observed_at_ms,
         attempt_seq: limited.seq,
         refused_accounts: refused,
@@ -274,6 +280,13 @@ pub(crate) async fn at_wall<W: Writer, P, T>(
     }
     continuer.adopted(&moved.selection);
     Ok(Some(AtWall::Moved(moved)))
+}
+
+/// A provider's retry-after in whole seconds, rounded up, as routing's continue request takes
+/// it. A value that isn't a finite, non-negative number of seconds is left out.
+fn retry_after_seconds(secs: Option<f64>) -> Option<u64> {
+    let secs = secs?.ceil();
+    (secs.is_finite() && secs >= 0.0 && secs < u64::MAX as f64).then_some(secs as u64)
 }
 
 /// Whether run `run_id` moved to another account at a quota wall, read from its records.
@@ -395,6 +408,19 @@ mod tests {
             renderer_version: 1,
             render_config: json!({}),
         })
+    }
+
+    /// The provider's retry-after goes to routing in whole seconds, rounded up; an unusable
+    /// value is left out.
+    #[test]
+    fn a_retry_after_is_sent_in_whole_seconds_rounded_up() {
+        assert_eq!(retry_after_seconds(None), None);
+        assert_eq!(retry_after_seconds(Some(604_800.0)), Some(604_800));
+        assert_eq!(retry_after_seconds(Some(1.2)), Some(2));
+        assert_eq!(retry_after_seconds(Some(0.0)), Some(0));
+        assert_eq!(retry_after_seconds(Some(-1.0)), None);
+        assert_eq!(retry_after_seconds(Some(f64::NAN)), None);
+        assert_eq!(retry_after_seconds(Some(f64::INFINITY)), None);
     }
 
     /// A refreeze a resume wrote with its `Resumed` is not a move; one written on its own, as

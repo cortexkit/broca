@@ -3254,6 +3254,7 @@ fn continue_wall<'a>(
         account: "acct-a",
         limit_window: "seven_day",
         resets_at_ms: Some(NOW as u64 + 3_600_000),
+        retry_after_s: None,
         observed_at_ms: NOW as u64,
         attempt_seq: 41,
         refused_accounts: refused,
@@ -3336,6 +3337,14 @@ fn a_continue_request_is_built_from_the_wall_and_the_runs_selection() {
     )
     .unwrap();
     assert!(parsed.same_question(&request));
+    // The provider's own retry-after, when the refused error gave one, goes with the evidence.
+    let mut with_retry = continue_wall(&selection, &config, &refused, false);
+    with_retry.retry_after_s = Some(604_800);
+    let request = continue_request(&with_retry).unwrap();
+    assert_eq!(
+        serde_json::to_value(&request).unwrap()["exhausted"]["retry_after_s"],
+        604_800
+    );
 }
 
 #[test]

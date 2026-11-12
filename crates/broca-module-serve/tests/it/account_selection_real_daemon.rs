@@ -1910,7 +1910,6 @@ async fn send(
 /// that run, and observe the offered account after moving credentials. The exhausted reset is
 /// deliberately distant, so this run cannot take a same-account timed pause instead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "waits for new-storage quota-wall continuation and offered-account observations in the run loop/executor"]
 async fn account_continue_request_bytes_and_offered_account_observations_through_real_daemon() {
     use cortexkit_role_routing::account_continue::{
         parse_continue_request, ContinueAnswer, ContinueOffer, ContinueRequest, ExhaustedAccount,

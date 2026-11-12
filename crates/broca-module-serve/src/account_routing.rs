@@ -2590,6 +2590,9 @@ pub fn continue_request(
     if let Some(resets_at_ms) = wall.resets_at_ms {
         exhausted = exhausted.with_resets_at_ms(resets_at_ms);
     }
+    if let Some(retry_after_s) = wall.retry_after_s {
+        exhausted = exhausted.with_retry_after_s(retry_after_s);
+    }
     Some(ContinueRequest::new(
         wall.run_id,
         decision.admission_id.as_deref()?,
