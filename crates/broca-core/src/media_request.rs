@@ -191,6 +191,47 @@ pub struct MediaFacts {
 /// ids it holds in their own order.
 pub type FactsLookup<K> = Vec<(K, Vec<MediaId>)>;
 
+/// The engine's whole state as content-free data, for saving it with a session and restoring it
+/// later ([`SessionMedia::index_state`], [`SessionMedia::from_index_state`]). The lookups that
+/// answer `bindings` are left out: a restore rebuilds them from the captures, in id order, as the
+/// old storage's media checkpoint does. So are the old placement state and the record counter,
+/// which only `fold` reads, and the compaction state, which a saved selection stands for.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct MediaIndexState {
+    /// The step counter.
+    pub boundary: u64,
+    /// The latest step started in the current run, whose repeated start is a retry.
+    pub last_step: Option<StepId>,
+    /// The latest tool batch's calls in planned order. A call planned twice holds its last
+    /// position; the position its earlier plan held holds a call planned later.
+    pub batch: Vec<ToolCallId>,
+    /// Every capture, in id order.
+    pub captures: Vec<CaptureFacts>,
+    /// Captures waiting for their first step.
+    pub pending: Vec<MediaId>,
+    /// Accepted messages not placed yet, one entry of capture ids per message, in the order
+    /// accepted.
+    pub held: Vec<Vec<MediaId>>,
+    /// Captures protected from aging for the current step.
+    pub protected: Vec<MediaId>,
+    /// The text-free copies of placed messages, by ordinal.
+    pub skeleton: Vec<(u64, MediaMessage)>,
+    /// Accepted messages not placed yet that hold media, by (record, position in the record).
+    pub held_messages: Vec<((u64, usize), MediaMessage)>,
+    /// Media a first-protocol compaction put in its replacement messages, with the ordinals
+    /// the replacement covers.
+    pub replacements: Vec<(Vec<MediaRef>, u64, u64)>,
+    /// The media shown, when a first-protocol compaction decided them: such a selection can't
+    /// be computed again without that compaction's records, so it is saved as it stands and
+    /// grows with each medium shown after it. `None` when the selection follows from the
+    /// skeletons alone.
+    pub selection: Option<Vec<MediaBinding>>,
+    /// The last ordinal a first-protocol compaction covers.
+    pub covered: Option<u64>,
+    /// A first-protocol compaction view was in force.
+    pub has_view: bool,
+}
+
 /// Metadata-only projection paired with one session's media store. Live callers retain
 /// the session lease; offline readers verify afresh and refuse objects reclaimed meanwhile.
 #[derive(Debug, Clone)]
@@ -751,6 +792,104 @@ impl SessionMedia {
                     .map(|((call, part), ids)| ((call.0.clone(), *part), ids.clone())),
             ),
         }
+    }
+
+    /// The engine's state as data, to save with the session (see [`MediaIndexState`]).
+    pub fn index_state(&self) -> MediaIndexState {
+        let facts = self.facts();
+        // A call planned twice holds only its last position, so a position before it can be
+        // empty: it takes a call whose own position comes later, which that position then
+        // overwrites when the batch is ordered again.
+        let mut batch: Vec<Option<ToolCallId>> = Vec::new();
+        for (call, position) in &facts.batch_order {
+            if batch.len() <= *position {
+                batch.resize(position + 1, None);
+            }
+            batch[*position] = Some(call.clone());
+        }
+        let mut later = None;
+        for slot in batch.iter_mut().rev() {
+            match slot {
+                Some(call) => later = Some(call.clone()),
+                None => slot.clone_from(&later),
+            }
+        }
+        let decided = self.restored_selection.is_some()
+            || self.compaction.view.is_some()
+            || self.compaction.applied.is_some();
+        MediaIndexState {
+            boundary: facts.boundary,
+            last_step: facts.last_step,
+            batch: batch.into_iter().flatten().collect(),
+            captures: facts.captures,
+            pending: facts.pending,
+            held: facts.held,
+            protected: facts.protected,
+            skeleton: facts.skeleton,
+            held_messages: facts.held_messages,
+            replacements: facts.replacements,
+            selection: decided.then_some(facts.selected),
+            covered: facts.covered,
+            has_view: self.compaction.view.is_some() || self.restored_view,
+        }
+    }
+
+    /// An engine holding a saved state (see [`MediaIndexState`]), reading media bytes from
+    /// `store`. It continues from that state through either entry point; a saved selection is
+    /// used as it stands until a first-protocol compaction record arrives through `fold`.
+    /// Refused when a skeleton names a block past its message's last, or an id names no capture.
+    pub fn from_index_state(
+        state: MediaIndexState,
+        store: impl MediaBytes + 'static,
+    ) -> Result<Self, String> {
+        let mut session = Self::new(store);
+        session.boundary = state.boundary;
+        session.last_step = state.last_step;
+        session.order_batch(state.batch.into_iter());
+        for capture in state.captures {
+            if session.captures.contains_key(&capture.id) {
+                return Err(format!("the capture {:?} repeats", capture.id));
+            }
+            session.compaction.captured.insert(&capture.reference);
+            session.insert(
+                Capture {
+                    id: capture.id,
+                    reference: capture.reference,
+                    ordinal: capture.ordinal,
+                    tool_call: capture.tool_call,
+                    first_step: capture.first_step,
+                    person: capture.person,
+                },
+                false,
+            );
+        }
+        let named = state
+            .pending
+            .iter()
+            .chain(&state.protected)
+            .chain(state.held.iter().flatten())
+            .chain(state.selection.iter().flatten().map(|binding| &binding.id));
+        for id in named {
+            if !session.captures.contains_key(id) {
+                return Err(format!("{id:?} names no capture"));
+            }
+        }
+        session.pending = state.pending;
+        session.steers = state.held;
+        session.protected = state.protected;
+        for (ordinal, skeleton) in state.skeleton {
+            let mut message = skeleton.to_message()?;
+            message.ordinal = Some(ordinal);
+            session.skeleton.insert(ordinal, message);
+        }
+        for (key, skeleton) in state.held_messages {
+            session.held_messages.insert(key, skeleton.to_message()?);
+        }
+        session.replacements = state.replacements;
+        session.restored_selection = state.selection;
+        session.restored_covered = state.covered;
+        session.restored_view = state.has_view;
+        Ok(session)
     }
 
     fn covered(&self) -> Option<u64> {

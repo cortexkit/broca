@@ -38,6 +38,7 @@ pub mod enroll;
 pub mod entries;
 pub mod inverse;
 pub mod media;
+pub mod media_index;
 pub mod output;
 pub mod owner;
 pub mod parts;
