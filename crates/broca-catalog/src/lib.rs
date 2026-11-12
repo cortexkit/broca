@@ -626,6 +626,9 @@ fn provider_quirks(provider_id: &str, family: WireFamilyId, base_url: &str) -> Q
     }
     if family == WireFamilyId::OpenAiChat {
         quirks.reasoning_echo = reasoning_echo_for_route(provider_id, base_url);
+        // Every Moonshot route resolves to OpenAI Chat, the one renderer that applies this
+        // flag; setting it on another family would freeze a promise no renderer keeps.
+        quirks.moonshot_schema_types = is_moonshot_route(provider_id, base_url);
     }
     quirks
 }
@@ -638,26 +641,33 @@ fn reasoning_echo_for_route(
     if is_deepseek_route(provider_id, base_url) {
         return Some(ReasoningEchoPolicy::DEEPSEEK);
     }
-    let host = url_host(base_url);
     // Kimi: "retain the reasoning_content from every historical assistant message".
     // https://platform.kimi.ai/docs/api/chat (thinking.keep); no last-user cutoff.
     // Its applicability to api.kimi.ai/coding/v1 is inferred from the platform API rule;
     // the renamed-tool-id live probe validates acceptance there, not retention inside the model.
-    if matches!(
-        provider_id,
-        "kimi-code-plan-global" | "kimi-code-plan-cn" | "moonshotai" | "moonshotai-cn"
-    ) || host.as_deref().is_some_and(|h| {
-        matches!(
-            h,
-            "api.kimi.ai" | "api.kimi.com" | "api.moonshot.ai" | "api.moonshot.cn"
-        )
-    }) {
+    if is_moonshot_route(provider_id, base_url) {
         return Some(ReasoningEchoPolicy::KIMI);
     }
-    if provider_id == "openrouter" || host.as_deref() == Some("openrouter.ai") {
+    if provider_id == "openrouter" || url_host(base_url).as_deref() == Some("openrouter.ai") {
         return Some(ReasoningEchoPolicy::OPENROUTER);
     }
     None
+}
+
+/// Whether a route is served by Moonshot's own API, which serves Kimi: one of the Kimi or
+/// Moonshot providers, or any provider whose base URL host is one of that API's hosts (a renamed
+/// or user-added provider pointing at it). Providers that merely serve a Kimi model through
+/// their own API are not matched.
+pub(crate) fn is_moonshot_route(provider_id: &str, base_url: &str) -> bool {
+    matches!(
+        provider_id,
+        "kimi-code-plan-global" | "kimi-code-plan-cn" | "moonshotai" | "moonshotai-cn"
+    ) || url_host(base_url).as_deref().is_some_and(|host| {
+        matches!(
+            host,
+            "api.kimi.ai" | "api.kimi.com" | "api.moonshot.ai" | "api.moonshot.cn"
+        )
+    })
 }
 
 /// Whether a route is served by DeepSeek's own API: the `deepseek` provider, or any provider
@@ -2232,10 +2242,14 @@ mod tests {
                 // This fixture does not opt in to server-side fallback, so the free version is
                 // the one admission would record for it: v2 on Anthropic, the current version
                 // elsewhere. `resolve_frozen` takes the version as an input rather than
-                // deriving it, so the opt-in rule has to be applied here.
+                // deriving it, so the opt-in rule has to be applied here. Likewise OpenAI Chat
+                // freezes v5 without the Moonshot schema flag, which this provider lacks.
                 match family {
                     WireFamilyId::AnthropicMessages => {
                         broca_provider::families::anthropic_renderer_version(false)
+                    }
+                    WireFamilyId::OpenAiChat => {
+                        broca_provider::families::openai_chat_renderer_version(false)
                     }
                     _ => renderer_version_for(family),
                 },
@@ -2289,7 +2303,9 @@ mod tests {
             &provider_spec,
             &model_spec,
             2048,
-            renderer_version_for(WireFamilyId::OpenAiChat),
+            // The version admission records for an OpenAI Chat config without the Moonshot
+            // schema flag.
+            broca_provider::families::openai_chat_renderer_version(false),
         )
         .expect("synthetic catalog fixtures publish known capability flags");
         let family_default = helper(WireFamilyId::OpenAiChat, model_id);
@@ -2473,6 +2489,112 @@ mod tests {
         )
         .reasoning_echo
         .is_none());
+    }
+
+    /// Moonshot's API refuses a tool schema with a typeless `enum`, so its routes freeze the
+    /// flag that types them; it is recognised exactly as the Kimi reasoning echo is, and only
+    /// on OpenAI Chat, the one family whose renderer applies it.
+    #[test]
+    fn moonshot_schema_typing_is_scoped_to_moonshot_routes_on_openai_chat() {
+        for (id, url) in [
+            ("kimi-code-plan-global", ""),
+            ("kimi-code-plan-cn", ""),
+            ("moonshotai", ""),
+            ("moonshotai-cn", ""),
+            ("custom", "https://api.kimi.ai/coding/v1"),
+            ("custom", "https://api.kimi.com/coding/v1"),
+            ("custom", "https://api.moonshot.ai/v1"),
+            ("custom", "https://api.moonshot.cn/v1"),
+        ] {
+            assert!(
+                provider_quirks(id, WireFamilyId::OpenAiChat, url).moonshot_schema_types,
+                "{id} {url}"
+            );
+        }
+        for (id, url) in [
+            ("openai", "https://api.openai.com/v1"),
+            ("deepseek", "https://api.deepseek.com"),
+            ("openrouter", "https://openrouter.ai/api/v1"),
+            ("302ai", "https://api.302.ai/v1"),
+            ("custom", "https://api.kimi.ai.evil.test/v1"),
+            ("custom", "https://api.kimi.ai@evil.test/v1"),
+            ("custom", "https://evil.test/api.moonshot.ai"),
+        ] {
+            assert!(
+                !provider_quirks(id, WireFamilyId::OpenAiChat, url).moonshot_schema_types,
+                "{id} {url}"
+            );
+        }
+        assert!(
+            !provider_quirks(
+                "kimi-code-plan-global",
+                WireFamilyId::AnthropicMessages,
+                "https://api.kimi.ai/coding"
+            )
+            .moonshot_schema_types
+        );
+    }
+
+    /// Every catalog Moonshot route renders as OpenAI Chat and freezes the flag; a provider that
+    /// serves Kimi through another family would need that family's renderer to type its schemas
+    /// first, so this fails until it does.
+    #[cfg(feature = "bundled-catalog")]
+    #[test]
+    fn bundled_moonshot_routes_render_as_openai_chat_and_freeze_schema_typing() {
+        for provider_id in [
+            "kimi-code-plan-global",
+            "kimi-code-plan-cn",
+            "moonshotai",
+            "moonshotai-cn",
+        ] {
+            let provider = catalog()
+                .provider(provider_id)
+                .unwrap_or_else(|| panic!("{provider_id} is in the bundled catalog"));
+            assert_eq!(
+                provider.wire_family,
+                WireFamilyId::OpenAiChat,
+                "{provider_id}"
+            );
+            assert!(provider.quirks.moonshot_schema_types, "{provider_id}");
+            let model_ids: Vec<String> = provider.raw["models"]
+                .as_object()
+                .map(|models| models.keys().cloned().collect())
+                .unwrap_or_default();
+            assert!(!model_ids.is_empty(), "{provider_id} lists models");
+            for model_id in model_ids {
+                let Some((served, model)) = catalog().model(provider_id, &model_id) else {
+                    continue;
+                };
+                assert_eq!(
+                    served.wire_family,
+                    WireFamilyId::OpenAiChat,
+                    "{provider_id}/{model_id}"
+                );
+                let frozen = broca_provider::families::resolve_frozen(
+                    &served,
+                    &model,
+                    2048,
+                    broca_provider::families::OPENAI_CHAT_RENDERER_VERSION,
+                )
+                .expect("Moonshot model freezes");
+                assert!(frozen.moonshot_schema_types, "{provider_id}/{model_id}");
+            }
+        }
+        let opted_in = catalog()
+            .provider_ids()
+            .filter_map(|id| catalog().provider(id))
+            .filter(|provider| provider.quirks.moonshot_schema_types)
+            .map(|provider| provider.id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            opted_in,
+            vec![
+                "kimi-code-plan-cn",
+                "kimi-code-plan-global",
+                "moonshotai",
+                "moonshotai-cn"
+            ]
+        );
     }
 
     #[test]

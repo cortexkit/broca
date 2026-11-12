@@ -44,6 +44,11 @@ pub struct Quirks {
     /// provider with neither gets the conservative profile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media: Option<crate::media_profile::MediaQuirk>,
+    /// Whether the provider's API requires a `type` on every tool schema node with an `enum`
+    /// (Moonshot's, which serves the Kimi routes). Frozen into
+    /// `FrozenRenderConfig::moonshot_schema_types`. DEFAULT OFF.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub moonshot_schema_types: bool,
 }
 
 /// Which assistant turns carry continuation state. Neither scope trims history at a user turn.
