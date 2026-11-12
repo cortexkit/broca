@@ -2680,8 +2680,9 @@ async fn websocket_upgrade_usage_limit_body_is_reported_without_https() {
 
 /// A usage limit stated by the refused upgrade takes its window from the upgrade response's
 /// quota headers, here the captured weekly 429's (`broca-module-serve/tests/fixtures/
-/// usage-observe/codex-quota-capture-2026-11-02.json`), so a ChatGPT run on the WebSocket
-/// transport asks routing to continue at such a wall as an HTTPS run does.
+/// usage-observe/codex-quota-capture-2026-11-02.json`). So when its account's usage window is
+/// spent, a ChatGPT run on the WebSocket transport can ask routing for another account to go on
+/// with, as an HTTPS run can.
 #[tokio::test]
 async fn websocket_upgrade_usage_limit_takes_its_window_from_the_upgrade_headers() {
     let capture: Value = serde_json::from_str(include_str!(

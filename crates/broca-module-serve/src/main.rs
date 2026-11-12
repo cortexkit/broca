@@ -4517,8 +4517,10 @@ mod executor {
             };
             // A resolve supplies today's token evidence, not a replacement for frozen billing facts.
             // A moved run's resume that routing gave another credential is a credential change:
-            // the recorded facts belong to the old one, so it keeps what the resolve read for the
-            // new one, as an auth-recovery credential change freezes them.
+            // the recorded `billing_vault_facts` (the vault's billing metadata for the credential,
+            // which usage export bills by) describe the old credential, so the selection keeps the
+            // facts this resolve read from the vault for the new one. A credential changed after a
+            // sign-in is handled the same way: its facts are taken fresh, not copied.
             let recorded_selection = prior_run
                 .as_ref()
                 .and_then(|prior| prior.config.auth_selection.as_ref());

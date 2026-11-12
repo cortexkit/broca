@@ -2779,10 +2779,11 @@ impl RoutingClient {
 
 /// Reads one continue reply: `result` is the tagged answer. An error body under one of the
 /// codes routing's contract names for its own refusals (`RefusalCode`) is routing refusing the
-/// question, read as a refusal under that code. Any other error body (one the message plane or
-/// broca's side of the route wrote, such as `target_unavailable`, or a code this build doesn't
-/// know) says routing wasn't reached or can't be read, so it is `Unreachable`: no move, and no
-/// routing answer on the run's error.
+/// question, read as a refusal under that code. Any other error body says routing wasn't reached
+/// or can't be read, so it is `Unreachable`: no move, and no routing answer on the run's error.
+/// Such bodies are written by the daemon for a route it couldn't serve (`target_unavailable`,
+/// `module_warming`, `unknown_module`), by broca when it finds no single routing provider
+/// (`routing_unavailable`, `routing_ambiguous`), or carry a code this build doesn't know.
 pub fn classify_continue_reply(reply: Result<Vec<u8>, Vec<u8>>) -> ContinueOutcome {
     use cortexkit_role_routing::account_continue::{ContinueAnswer, ContinueRefusal};
     match reply {

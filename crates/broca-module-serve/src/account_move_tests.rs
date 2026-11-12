@@ -236,7 +236,8 @@ fn a_refrozen_persona_reaches_the_refusal_fallbacks_config() {
     assert_eq!(plain, serde_json::json!({"claude_code_persona": new}));
 }
 
-/// Routing that declares both continuation capabilities and offers one account at every wall.
+/// Routing that declares `account_continue` and `account_continue_resume`, and offers the same
+/// account whenever a run asks to continue after its account's usage window was spent.
 struct OffersAccount {
     credential_id: &'static str,
     account: &'static str,
@@ -433,7 +434,7 @@ impl broca_module_serve::account_routing::RoutingTransport for AnswersAdmission 
 
 /// Admits the resume of a ChatGPT run that moved to `chatgpt-a` at a wall and is paused for a
 /// restart (or, with `records_change` false, resumes where it can't record a change), against
-/// routing that declares both continuation capabilities and answers `reply`. The vault serves
+/// routing that declares `account_continue` and `account_continue_resume` and answers `reply`. The vault serves
 /// tokens for `vault_account`. The admitted selection and how often routing was asked.
 async fn a_moved_chatgpt_resume(
     label: &str,
