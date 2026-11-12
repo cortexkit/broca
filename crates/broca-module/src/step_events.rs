@@ -17,32 +17,6 @@ use std::sync::{
 
 const QUEUE_CAPACITY: usize = 128;
 
-/// Whether a fork attempt's step event carries its `fork_id` (llm-runner `fork_answer.spend`).
-/// Off until the event's readers decode the member: without it a fork attempt's event is an
-/// ordinary step event of the fork's own session and run.
-pub const FORK_ID_EMITTED: bool = false;
-
-/// The bytes published for `event`: its JSON, with `fork_id` added as its last member when the
-/// event is a fork attempt's and `emit_fork_id` is set. Every other member keeps its bytes and
-/// order. `None` when the event doesn't encode.
-pub fn step_event_body(
-    event: &StepFinished,
-    fork_id: Option<&str>,
-    emit_fork_id: bool,
-) -> Option<Vec<u8>> {
-    let mut body = serde_json::to_vec(event).ok()?;
-    if let (Some(fork_id), true) = (fork_id, emit_fork_id) {
-        // The event is a JSON object, so its encoding ends with the object's closing brace.
-        if body.pop()? != b'}' {
-            return None;
-        }
-        body.extend_from_slice(b",\"fork_id\":");
-        body.extend_from_slice(&serde_json::to_vec(fork_id).ok()?);
-        body.push(b'}');
-    }
-    Some(body)
-}
-
 pub(crate) type WarmStops = Arc<std::sync::Mutex<std::collections::BTreeMap<String, String>>>;
 
 /// A plain live publish, never a stream, durable outbox or billing acknowledgement.
@@ -59,7 +33,6 @@ pub trait StepEventPublisher: Send + Sync + 'static {
 pub struct StepEvents {
     tx: tokio::sync::mpsc::Sender<DurableAttempt>,
     store_tx: tokio::sync::mpsc::Sender<StepFinished>,
-    fork_tx: tokio::sync::mpsc::Sender<(StepFinished, String)>,
     dropped: Arc<AtomicU64>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -96,24 +69,20 @@ impl StepEvents {
         let runner = runner.to_owned();
         let (tx, mut rx) = tokio::sync::mpsc::channel(QUEUE_CAPACITY);
         let (store_tx, mut store_rx) = tokio::sync::mpsc::channel(QUEUE_CAPACITY);
-        let (fork_tx, mut fork_rx) =
-            tokio::sync::mpsc::channel::<(StepFinished, String)>(QUEUE_CAPACITY);
         let dropped = Arc::new(AtomicU64::new(0));
         let task_dropped = dropped.clone();
         let task = tokio::spawn(async move {
             let mut last_warning = None;
             loop {
-                let body = tokio::select! {
-                    Some(attempt) = rx.recv() => event(&runner, &attempt)
-                        .and_then(|event| step_event_body(&event, None, false)),
-                    Some(event) = store_rx.recv() => step_event_body(&event, None, false),
-                    Some((event, fork_id)) = fork_rx.recv() => {
-                        step_event_body(&event, Some(&fork_id), FORK_ID_EMITTED)
-                    }
+                let event = tokio::select! {
+                    Some(attempt) = rx.recv() => event(&runner, &attempt),
+                    Some(event) = store_rx.recv() => Some(event),
                     else => break,
                 };
                 let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-                    let body = body.ok_or("invalid step event evidence")?;
+                    let body = event
+                        .and_then(|event| serde_json::to_vec(&event).ok())
+                        .ok_or("invalid step event evidence")?;
                     let subject = match &subject {
                         Some(subject) => subject.clone(),
                         None => publisher.live_subject(&runner).await?,
@@ -137,16 +106,16 @@ impl StepEvents {
         Self {
             tx,
             store_tx,
-            fork_tx,
             dropped,
             task,
         }
     }
 
     /// Publishes the step event of a fork attempt's model call, best effort as every step event
-    /// is: `fork_id` names the fork (see [`FORK_ID_EMITTED`]).
-    pub(crate) fn publish_fork(&self, event: StepFinished, fork_id: &str) {
-        if event.check().is_err() || self.fork_tx.try_send((event, fork_id.to_owned())).is_err() {
+    /// is. It is an ordinary event of the fork's own session and the attempt's own run, which
+    /// keep it apart from the head's steps.
+    pub(crate) fn publish_fork(&self, event: StepFinished) {
+        if event.check().is_err() || self.store_tx.try_send(event).is_err() {
             self.dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -331,7 +300,7 @@ fn cache_report(
 
 /// A fork attempt's model call, as its step event reports it (see [`fork_step_event`]).
 pub struct ForkStep<'a> {
-    /// The fork's own session, and its head's incarnation.
+    /// The fork's own session, and the incarnation of its log.
     pub session: &'a broca_protocol::BindIdentity,
     pub incarnation: [u8; 16],
     /// The seq of the fork record that stored the attempt's end.
@@ -875,7 +844,7 @@ mod tests {
     }
 
     #[test]
-    fn a_fork_step_event_names_its_fork_only_once_its_readers_decode_it() {
+    fn a_fork_step_event_is_an_ordinary_event_of_the_fork_session_and_attempt_run() {
         let (fork, ordinary) = fork_and_ordinary();
         assert_eq!(
             fork.session,
@@ -896,49 +865,24 @@ mod tests {
             (Some(1200), Some(40))
         );
         fork.check().unwrap();
-        const { assert!(!FORK_ID_EMITTED) };
-        // As published now, a fork's event is an ordinary step event the contract's decoder
-        // reads: it carries no fork_id.
-        let published = step_event_body(
-            &fork,
-            Some("fork-72f6bdfa7eb7fb4cdf456d38c4d99623"),
-            FORK_ID_EMITTED,
-        )
-        .unwrap();
-        let decoded: StepFinished = serde_json::from_slice(&published).unwrap();
+        // The bytes are the ones the event's readers accepted: the members an ordinary event
+        // has, and nothing that names the fork beyond its session and run.
+        let body = serde_json::to_vec(&fork).unwrap();
+        assert_eq!(
+            std::str::from_utf8(&body).unwrap(),
+            r#"{"runner":"broca","session_ref":"90c94fcf081d2e49c645072abad2426e","log_incarnation":"07070707070707070707070707070707","seq":5,"run_id":"fork:1c5eb44ba863f5575b157804a784d72aee9e330ad3e7d5d8806e99272eabd6a0","step_id":"1","attempt":1,"terminal_status":"completed","attempt_id":"fork-1c5eb44ba863f5575b157804a784d72aee9e330ad3e7d5d8806e99272eabd6a0","harness":"runner","session":"head:fork:fork-72f6bdfa7eb7fb4cdf456d38c4d99623","provider":"anthropic","model":"claude-opus-4-8","input_tokens":1200,"cached_input_tokens":1000,"output_tokens":40,"finish_reason":"stop","started_at_ms":1790000000000,"finished_at_ms":1790000001500}"#
+        );
+        let decoded: StepFinished = serde_json::from_slice(&body).unwrap();
         assert_eq!(decoded, fork);
-        // With the member, the contract's own decoder refuses the event, which is why the member
-        // waits until every reader decodes it.
-        let named =
-            step_event_body(&fork, Some("fork-72f6bdfa7eb7fb4cdf456d38c4d99623"), true).unwrap();
-        let value: Value = serde_json::from_slice(&named).unwrap();
-        assert_eq!(value["fork_id"], "fork-72f6bdfa7eb7fb4cdf456d38c4d99623");
-        // The member is appended: every other byte is what this build publishes now.
-        assert_eq!(
-            &named[..published.len() - 1],
-            &published[..published.len() - 1]
-        );
-        assert!(serde_json::from_slice::<StepFinished>(&named).is_err());
-        // An ordinary event never carries the member.
-        let ordinary_named = step_event_body(&ordinary, None, true).unwrap();
-        assert_eq!(ordinary_named, serde_json::to_vec(&ordinary).unwrap());
-        assert_eq!(
-            step_event_body(&ordinary, None, false).unwrap(),
-            ordinary_named
-        );
-
-        // `BROCA_FORK_SPEND_SAMPLES` names a folder: the step events for their readers, before
-        // and after the member is emitted.
-        if let Some(dir) = std::env::var_os("BROCA_FORK_SPEND_SAMPLES") {
-            let dir = std::path::PathBuf::from(dir).join("step-events");
-            std::fs::create_dir_all(&dir).unwrap();
-            for (name, body) in [
-                ("step-finished.ordinary.json", ordinary_named),
-                ("step-finished.fork.before.json", published),
-                ("step-finished.fork.after.json", named),
-            ] {
-                std::fs::write(dir.join(name), body).unwrap();
-            }
-        }
+        let members = |event: &StepFinished| -> Vec<String> {
+            serde_json::to_value(event)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect()
+        };
+        assert_eq!(members(&fork), members(&ordinary));
     }
 }

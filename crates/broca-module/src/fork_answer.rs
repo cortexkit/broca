@@ -1091,7 +1091,7 @@ impl ForkManager {
                     finished_at_ms: facts.finished_at_ms,
                 };
                 match crate::step_events::fork_step_event(&step) {
-                    Some(event) => events.publish_fork(event, &fork_id),
+                    Some(event) => events.publish_fork(event),
                     None => tracing::warn!(target: "fork", fork = %fork_id,
                         "a fork attempt's step event could not be built"),
                 }

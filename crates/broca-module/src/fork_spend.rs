@@ -8,7 +8,8 @@
 //! (`ForkCallJob::run_id`) and the fork's own session. Nothing names the head's runs or session,
 //! so billing never pairs the fact with them. The run's config is the head's config at the
 //! fork's base, so the charge basis and the account come from the credential the fork is pinned
-//! to. The fact carries no `fork_id`: the step events carry that.
+//! to. Neither the fact nor the attempt's step event names the fork: its own session and run
+//! keep its spend apart.
 
 use broca_core::billing::{compute_segments_for_run, SpendSegment};
 use broca_core::ChargeBasisResolver;
@@ -253,7 +254,7 @@ mod tests {
         );
         assert_eq!(segment.usage.input_tokens, Some(1200));
         assert_eq!(segment.usage.output_tokens, Some(40));
-        // The fact names no fork id: only the step event does.
+        // The fact names no fork id: the fork's session and the attempt's run identify it.
         let encoded = serde_json::to_value(segment).unwrap();
         assert!(encoded.get("fork_id").is_none(), "{encoded}");
 
