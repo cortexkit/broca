@@ -215,3 +215,78 @@ fn the_estimates_of_a_loaded_session_match_the_allocator() {
         );
     }
 }
+
+/// Messages of the session whose entries fill the sealed-entry cache: more than twice what the
+/// cache may keep of them.
+const SEALED_MESSAGES: usize = 4_000;
+
+/// A session keeps at most [`SEALED_ENTRIES_MAX_BYTES`] of the sealed entries it reads by id, as
+/// the allocator measures them: entries of more than twice the cap in all, each a copy of its
+/// own as an entry read back from sealed history is, leave no more than the cap kept, the most
+/// recently read ones, and the cache counts what it keeps.
+#[test]
+fn sealed_entries_read_by_id_hold_no_more_than_their_cap() {
+    use std::sync::Arc;
+
+    use broca_protocol::content::Message;
+
+    use super::read::SealedEntryCache;
+    use super::{window_entries, StoredEntry, SEALED_ENTRIES_MAX_BYTES};
+    use crate::held::held_bytes;
+
+    assert!(
+        installed(),
+        "the crate's tests count with the counting allocator"
+    );
+    let backend = MemoryBackend::default();
+    // The session stays open while the cache is measured, so the values its facts intern stay
+    // held by it, as they are by the session a sealed entry is read from.
+    let session = block_on(async {
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(), false)
+            .await
+            .unwrap();
+        write(&mut session, &Shape::production(SEALED_MESSAGES))
+            .await
+            .unwrap();
+        session
+    });
+    let own = |message: &Arc<Message>| Arc::new(Message::clone(message));
+    let entries: Vec<(String, StoredEntry)> = window_entries(&session.conversation, 1, usize::MAX)
+        .into_iter()
+        .map(|entry| {
+            let mid = entry.state.facts.as_ref().unwrap().mid.clone();
+            let mut state = entry.state.clone();
+            state.facts = state.facts.map(|facts| Arc::new((*facts).clone()));
+            state.turn = state.turn.map(|turn| Arc::new((*turn).clone()));
+            let copy = StoredEntry {
+                ordinal: entry.ordinal,
+                message: own(&entry.message),
+                next: entry.next.as_ref().map(own),
+                state,
+                open: entry.open,
+            };
+            (mid, copy)
+        })
+        .collect();
+    let read: usize = entries.iter().map(|(_, entry)| held_bytes(entry)).sum();
+    assert!(read > 2 * SEALED_ENTRIES_MAX_BYTES, "only {read} bytes");
+    let (first, last) = (entries[0].0.clone(), entries[entries.len() - 1].0.clone());
+    let mut cache = SealedEntryCache::default();
+    for (mid, entry) in entries {
+        cache.insert(&mid, entry);
+    }
+    assert!(cache.get(&last).is_some());
+    assert!(cache.get(&first).is_none());
+    let (kept, counted) = (cache.len(), cache.held_bytes());
+    // What the cache holds is what dropping it frees.
+    let ((), counts) = measure(|| drop(cache));
+    let held = counts.held.unsigned_abs();
+    eprintln!("read {read} bytes; kept {kept} entries, counted {counted}, held {held}");
+    assert!(counted <= SEALED_ENTRIES_MAX_BYTES);
+    assert!(
+        held <= SEALED_ENTRIES_MAX_BYTES,
+        "the cache holds {held} bytes of sealed entries, over their cap of \
+         {SEALED_ENTRIES_MAX_BYTES}"
+    );
+    drop(session);
+}

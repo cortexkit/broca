@@ -649,7 +649,7 @@ async fn measure(built: &Built, parts: &SharedParts, sealed: bool, written: Dura
         percentiles(loads),
         resident_view as f64 / 1e6,
         resident_view as f64 / log_len.max(1) as f64,
-        if log_len.saturating_mul(ViewCache::BYTES_PER_LOG_BYTE) <= ViewCache::MAX_BYTES {
+        if resident_view <= ViewCache::MAX_BYTES {
             "keeps"
         } else {
             "never keeps"

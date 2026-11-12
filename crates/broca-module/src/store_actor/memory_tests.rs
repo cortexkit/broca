@@ -490,3 +490,51 @@ fn the_report_of_a_synthetic_store_carries_sizes_and_counts_only() {
     drop(deliveries);
     drop(actor);
 }
+
+/// The closed-session view cache holds no more than its byte cap, as the allocator measures the
+/// views it keeps: five synthetic sessions' views loaded into a cache capped at two and a half
+/// views' walked size keep two, and the cache counts what they hold.
+#[test]
+fn the_view_cache_holds_no_more_than_its_byte_cap() {
+    use crate::store_reads::{CachedBytes, ViewCache};
+    use broca_session_store::session::SessionView;
+    use broca_test_support::alloc::measure;
+
+    assert!(
+        installed(),
+        "the crate's tests count with the counting allocator"
+    );
+    let addr = || SessionAddr(ADDR.into());
+    let (triple, deployment) = (triple(), deployment());
+    let backends: Vec<&'static MemoryBackend> = (0..5).map(|_| synthetic().0).collect();
+    let per_view =
+        futures::executor::block_on(Session::view(backends[0], addr(), &triple, &deployment))
+            .unwrap()
+            .loaded_bytes();
+    let cap = per_view * 5 / 2;
+    let cache: ViewCache<SessionView<&'static MemoryBackend>> = ViewCache::new(64, cap);
+    let ((), counts) = measure(|| {
+        futures::executor::block_on(async {
+            for (n, backend) in backends.iter().enumerate() {
+                let position = Session::stored_position(backend, &addr(), &deployment)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let load = Session::view_at(*backend, addr(), &triple, &deployment, &position);
+                cache.view(&format!("s{n}"), position, load).await.unwrap();
+            }
+        })
+    });
+    let (kept, counted) = cache.usage();
+    eprintln!(
+        "one view {per_view}, cap {cap}, held {}, counted {counted}, kept {kept}",
+        counts.held
+    );
+    assert_eq!(kept, 2);
+    assert!(counted <= cap);
+    assert!(
+        counts.held.max(0) as u64 <= cap,
+        "the view cache holds {} bytes, over its cap of {cap}",
+        counts.held
+    );
+}

@@ -143,16 +143,44 @@ impl RunFacts {
 /// except through a revert, which can take a finished run's final message out of the transcript:
 /// a revert moves the session's history version, which is part of the key, as is the session's
 /// incarnation, which a session deleted and created again under the same id doesn't share.
-/// Bounded: the oldest entry makes room for a new one.
+/// Bounded by [`SettledRuns::CAPACITY`] runs and [`SettledRuns::MAX_BYTES`] of their walked size:
+/// the oldest entry makes room for a new one.
 pub struct SettledRuns {
     inner: Mutex<SettledInner>,
     capacity: usize,
+    max_bytes: usize,
 }
 
 #[derive(Default)]
 struct SettledInner {
-    facts: HashMap<SettledKey, RunFacts>,
+    facts: HashMap<SettledKey, Settled>,
     order: VecDeque<SettledKey>,
+    /// The walked size of every entry kept.
+    bytes: usize,
+}
+
+/// One run's facts, with their walked size (see [`settled_bytes`]).
+struct Settled {
+    facts: RunFacts,
+    bytes: usize,
+}
+
+/// What one kept entry holds, walked (see `broca_session_store::held`): its key and its slot in
+/// the order, the heap its facts own, and its final message as the serde walk sizes it.
+fn settled_bytes(key: &SettledKey, facts: &RunFacts) -> usize {
+    use broca_session_store::held::HeldBytes;
+    let (address, _, _, run_id) = key;
+    let key_heap = address.heap_bytes() + run_id.heap_bytes();
+    let message = match &facts.final_message {
+        Some(Ok(message)) => broca_session_store::held::serde_heap_bytes(message),
+        Some(Err(FinalError::Damaged(why))) => why.heap_bytes(),
+        _ => 0,
+    };
+    std::mem::size_of::<(SettledKey, Settled)>()
+        + std::mem::size_of::<SettledKey>()
+        + 2 * key_heap
+        + facts.interrupt_reason.heap_bytes()
+        + message
 }
 
 /// The session's address, its incarnation, its history version, and the run id.
@@ -162,27 +190,48 @@ impl SettledRuns {
     /// How many finished runs a module keeps the facts of.
     pub const CAPACITY: usize = 4096;
 
+    /// What the kept facts hold together, by their walked size: 64 MiB. Most of it is final
+    /// messages. A finished run whose facts were dropped has its status read from its records
+    /// again at its next poll.
+    pub const MAX_BYTES: usize = 64 * 1024 * 1024;
+
     pub fn new(capacity: usize) -> Self {
+        Self::with_bytes(capacity, Self::MAX_BYTES)
+    }
+
+    /// A cache of at most `capacity` runs' facts and `max_bytes` of their walked size.
+    pub fn with_bytes(capacity: usize, max_bytes: usize) -> Self {
         Self {
             inner: Mutex::new(SettledInner::default()),
             capacity: capacity.max(1),
+            max_bytes,
         }
     }
 
     fn get(&self, key: &SettledKey) -> Option<RunFacts> {
-        self.inner.lock().ok()?.facts.get(key).cloned()
+        Some(self.inner.lock().ok()?.facts.get(key)?.facts.clone())
     }
 
     fn put(&self, key: SettledKey, facts: RunFacts) {
         let Ok(mut inner) = self.inner.lock() else {
             return;
         };
-        if inner.facts.insert(key.clone(), facts).is_none() {
-            inner.order.push_back(key);
+        let bytes = settled_bytes(&key, &facts);
+        inner.bytes += bytes;
+        match inner.facts.insert(key.clone(), Settled { facts, bytes }) {
+            Some(replaced) => inner.bytes -= replaced.bytes,
+            None => inner.order.push_back(key),
         }
-        while inner.order.len() > self.capacity {
-            if let Some(oldest) = inner.order.pop_front() {
-                inner.facts.remove(&oldest);
+        // The walked size leaves out the table's spare buckets, about 2% measured, so it is kept
+        // a thirty-second below the cap and the real size stays under it.
+        while inner.order.len() > self.capacity
+            || inner.bytes > self.max_bytes - self.max_bytes / 32
+        {
+            let Some(oldest) = inner.order.pop_front() else {
+                break;
+            };
+            if let Some(dropped) = inner.facts.remove(&oldest) {
+                inner.bytes -= dropped.bytes;
             }
         }
     }
@@ -193,46 +242,26 @@ impl SettledRuns {
     }
 
     /// What the cache holds, estimated by walking it when asked (see
-    /// `broca_session_store::held`), with its cap. A final message counts by its compact JSON,
-    /// which stands in for its heap.
+    /// `broca_session_store::held`), with its caps: the bytes it counts against its byte cap,
+    /// and those with the table's spare buckets and the order's spare room.
     pub fn memory(&self) -> broca_wire::MemoryCache {
-        use broca_session_store::held::HeldBytes;
         let Ok(inner) = self.inner.lock() else {
             return broca_wire::MemoryCache::default();
         };
-        let key_heap =
-            |(address, _, _, run_id): &SettledKey| address.heap_bytes() + run_id.heap_bytes();
-        // The table's buckets, each a slot and a control byte.
-        let slot = std::mem::size_of::<SettledKey>() + std::mem::size_of::<RunFacts>();
+        // The table's buckets beyond the entries, each a slot and a control byte.
+        let slot = std::mem::size_of::<(SettledKey, Settled)>();
         let buckets = match inner.facts.capacity() {
             0 => 0,
             capacity => (capacity * 8 / 7).next_power_of_two(),
         };
-        let facts: usize = inner
-            .facts
-            .iter()
-            .map(|(key, facts)| {
-                key_heap(key)
-                    + facts.interrupt_reason.heap_bytes()
-                    + facts
-                        .final_message
-                        .as_ref()
-                        .map_or(0, |message| match message {
-                            Ok(message) => {
-                                serde_json::to_vec(message).map_or(0, |bytes| bytes.len())
-                            }
-                            Err(_) => 0,
-                        })
-            })
-            .sum();
-        let order = inner.order.capacity() * std::mem::size_of::<SettledKey>()
-            + inner.order.iter().map(key_heap).sum::<usize>();
+        let spare = buckets.saturating_sub(inner.facts.len()) * (slot + 1)
+            + (inner.order.capacity() - inner.order.len()) * std::mem::size_of::<SettledKey>();
         broca_wire::MemoryCache {
             entries: inner.facts.len() as u64,
             max_entries: self.capacity as u64,
-            counted_bytes: None,
-            max_bytes: None,
-            estimated_bytes: (buckets * (slot + 1) + facts + order) as u64,
+            counted_bytes: Some(inner.bytes as u64),
+            max_bytes: Some(self.max_bytes as u64),
+            estimated_bytes: (inner.bytes + spare) as u64,
         }
     }
 
@@ -2112,3 +2141,6 @@ impl Reader<'_> {
 }
 
 mod held;
+
+#[cfg(test)]
+mod cap_tests;
