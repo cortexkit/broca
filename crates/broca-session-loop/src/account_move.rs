@@ -265,6 +265,36 @@ pub(crate) async fn at_wall<W: Writer, P, T>(
     Ok(Some(AtWall::Moved(moved)))
 }
 
+/// Whether run `run_id` moved to another account at a quota wall, read from its records.
+///
+/// Two writers record `AuthRefrozen` for a run: a move at a wall, and the resume of a paused
+/// run that routing gave another account than the one it froze. A resume writes its refreezes
+/// in one append together with its `Resumed` record, whose `resumed_from_seq` is the seq just
+/// before that append, so a refreeze inside a resume's append lies after some `Resumed`'s
+/// `resumed_from_seq` and before that `Resumed`. A move writes no `Resumed`. So an
+/// `AuthRefrozen` of the run that no `Resumed` encloses this way is a move at a wall.
+///
+/// `records` must hold the run's records, as the open log of a session holds an unfinished
+/// run's. A move that is not among them reads as no move: the run then keeps the account it
+/// recorded rather than asking routing again.
+pub fn moved_at_a_wall(run_id: &str, records: &[(u64, Record)]) -> bool {
+    let resumes: Vec<(u64, u64)> = records
+        .iter()
+        .filter_map(|(seq, record)| match record {
+            Record::Resumed(resumed) if resumed.run_id == run_id => {
+                Some((resumed.resumed_from_seq, *seq))
+            }
+            _ => None,
+        })
+        .collect();
+    records.iter().any(|(seq, record)| {
+        matches!(record, Record::AuthRefrozen(refrozen) if refrozen.run_id == run_id)
+            && !resumes
+                .iter()
+                .any(|(from, resumed)| from < seq && seq < resumed)
+    })
+}
+
 /// Stores routing's answer in `account_continue` on the error that ends a run whose account
 /// spent its usage window and which routing didn't move. A hold that names when an account
 /// should have room (`until_ms`) also tells the caller when to try again: `retry_after_secs`
@@ -292,6 +322,66 @@ mod tests {
     use serde_json::json;
 
     const NOW: u64 = 1_000_000;
+
+    fn refrozen(run_id: &str) -> Record {
+        Record::AuthRefrozen(AuthRefrozen {
+            run_id: run_id.into(),
+            ts_ms: None,
+            auth_selection: json!({"credential_id": "c"}),
+        })
+    }
+
+    fn resumed(run_id: &str, resumed_from_seq: u64) -> Record {
+        Record::Resumed(broca_session_store::record::Resumed {
+            run_id: run_id.into(),
+            resumed_from_seq,
+            messages: 0,
+            model_steps: 0,
+            tool_results: 0,
+            redone: Vec::new(),
+            indeterminate: Vec::new(),
+        })
+    }
+
+    fn config_refrozen(run_id: &str) -> Record {
+        Record::ConfigRefrozen(ConfigRefrozen {
+            run_id: run_id.into(),
+            ts_ms: None,
+            renderer_version: 1,
+            render_config: json!({}),
+        })
+    }
+
+    /// A refreeze a resume wrote with its `Resumed` is not a move; one written on its own, as
+    /// a move at a wall writes it, is, also when a later resume of the moved run follows it.
+    #[test]
+    fn only_a_refreeze_outside_a_resume_is_a_move_at_a_wall() {
+        // A sign-in pause's resume on another account: the refreezes ride the resume's append.
+        let resumed_on_another = vec![
+            (10, config_refrozen("run")),
+            (11, refrozen("run")),
+            (12, resumed("run", 9)),
+        ];
+        assert!(!moved_at_a_wall("run", &resumed_on_another));
+        // A move at a wall, then a restart pause's resume with no refreeze, its batch starting
+        // right after the move.
+        let moved_then_resumed = vec![
+            (20, config_refrozen("run")),
+            (21, refrozen("run")),
+            (22, resumed("run", 21)),
+        ];
+        assert!(moved_at_a_wall("run", &moved_then_resumed));
+        // A move followed by a resume that refroze again: the run did move at a wall.
+        let moved_then_refrozen = vec![
+            (30, refrozen("run")),
+            (40, refrozen("run")),
+            (41, resumed("run", 39)),
+        ];
+        assert!(moved_at_a_wall("run", &moved_then_refrozen));
+        // Another run's records say nothing about this one.
+        assert!(!moved_at_a_wall("other", &moved_then_resumed));
+        assert!(!moved_at_a_wall("run", &[]));
+    }
 
     fn limit_error(retry_after_secs: Option<f64>) -> broca_protocol::ProviderError {
         let mut error = json!({

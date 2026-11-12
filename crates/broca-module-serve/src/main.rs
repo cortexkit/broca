@@ -2968,11 +2968,22 @@ mod executor {
         moved && routing_serves_continuation
     }
 
-    fn store_history(
+    async fn store_history(
         writer: &broca_session_loop::shared::ActorWriter,
         parts: &dyn broca_session_loop::parts::Parts,
     ) -> Result<StoreHistory, broca_session_loop::LoopError> {
         use broca_session_loop::writer::Writer as _;
+        // A refreeze of the account marks a move at a quota wall only when no resume wrote it
+        // (see `moved_at_a_wall`). An unfinished run's records are all in the open log; one that
+        // can't be read counts as no move, so the run keeps the account it recorded.
+        let moved = match writer.operations().run.as_ref() {
+            Some(run) if run.refrozen_auth.is_some() && run.finished.is_none() => {
+                writer.open_log_records().await.is_ok_and(|records| {
+                    broca_session_loop::account_move::moved_at_a_wall(&run.run_id, &records)
+                })
+            }
+            _ => false,
+        };
         let prior_run = match writer.operations().run.as_ref() {
             Some(run) => {
                 let start = run.start.as_ref().ok_or_else(|| {
@@ -2985,7 +2996,7 @@ mod executor {
                     run_id: broca_protocol::RunId(run.run_id.clone()),
                     config: store_prior_config(run, start, parts)?,
                     idle: run.finished.is_some(),
-                    moved: run.refrozen_auth.is_some(),
+                    moved,
                 })
             }
             None => None,
@@ -5024,7 +5035,9 @@ mod executor {
                     .await
                     .map_err(StoreRunError::Loop);
             }
-            let stored = store_history(writer, parts).map_err(StoreRunError::Loop)?;
+            let stored = store_history(writer, parts)
+                .await
+                .map_err(StoreRunError::Loop)?;
             // Whether a moved run's resume may ask routing for its account: only when routing
             // serves continuation (see `resume_asks_routing`). Routing's description is read only
             // for such a resume, so no other run waits on it.
