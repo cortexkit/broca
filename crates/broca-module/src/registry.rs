@@ -3918,10 +3918,10 @@ impl LineageRegistry {
     }
 
     /// Route a command only the new storage serves to the session's store actor. An import may
-    /// create its session there; nothing else creates one. An import is refused by name unless
-    /// the registry creates sessions in the new storage (`with_store_new_sessions`); any other
-    /// command is refused so unless the new storage already keeps the session, as it keeps a
-    /// head, whose compaction provider applies its views through here.
+    /// create its session there; nothing else creates one. An imported session is a head, and a
+    /// head starts in the new storage whenever the opener has one, so an import needs only the
+    /// store runtime. Any other command is refused by name unless the new storage already keeps
+    /// the session, as it keeps a head, whose compaction provider applies its views through here.
     pub async fn route_store_command(
         &self,
         key: &LineageKey,
@@ -3930,8 +3930,12 @@ impl LineageRegistry {
         use crate::actor::LineageCmd;
         use crate::store_import::{ImportRefusal, StoreCommand, StoreOutcome};
         let creates = matches!(command, StoreCommand::Import(_));
-        let served = self.inner.store_new_sessions.load(Ordering::SeqCst)
-            || (!creates && self.store_holding(key)?.is_some());
+        let served = if creates {
+            self.store_runtime().is_some()
+        } else {
+            self.inner.store_new_sessions.load(Ordering::SeqCst)
+                || self.store_holding(key)?.is_some()
+        };
         if !served {
             return Ok(StoreOutcome::Refused(ImportRefusal::new(
                 "new_storage_unavailable",

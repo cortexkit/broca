@@ -260,8 +260,8 @@ fn run_end(run_id: &str) -> Record {
     })
 }
 
-/// An imported history: a prompt, a reply that calls a tool, the call's result with a ride on
-/// it, and a last reply.
+/// An imported history: a prompt, a reply that calls a tool, the call's result with a note
+/// appended to it (a `ResultAppend`), and a last reply.
 fn imported_messages() -> Vec<Message> {
     let call = broca_protocol::content::ToolCall {
         tool_call_id: broca_protocol::ToolCallId("call_1".into()),
@@ -302,7 +302,8 @@ fn imported_messages() -> Vec<Message> {
 }
 
 /// An import's seeded run as `session.import` lays it out: its start, each message with its
-/// facts after it (a turn's call facts and the rides on its results between them), its end.
+/// facts after it (a turn's call facts and the notes appended to its results between them),
+/// its end.
 fn import_batch(run_id: &str) -> Vec<Record> {
     let messages = imported_messages();
     let mut records = vec![Record::RunStart(Box::new(import_start(run_id)))];
@@ -353,8 +354,8 @@ fn import_batch(run_id: &str) -> Vec<Record> {
 
 /// An import's seeded run inverts to what today's import seed is: one `run_started` holding
 /// every imported message in order, with the import's origin, then the run's end. Its facts
-/// records and rides are taken in, and nothing is left waiting for a record to claim it. A run
-/// after it, in a later batch, inverts as any run does.
+/// records and appended notes are taken in, and nothing is left waiting for a record to claim
+/// it. A run after it, in a later batch, inverts as any run does.
 #[test]
 fn an_imports_seeded_run_inverts_to_one_run_started_holding_every_message() {
     let batch = import_batch("seed");
@@ -436,8 +437,9 @@ fn an_imported_message_outside_its_whole_seeded_run_is_refused() {
     ];
     assert!(Inverse::new().push(1, &loose, &no_parts).is_err());
 
-    // A seeded start whose inputs are placed as a run's own, as a converted import seed and an
-    // inline import lay it out, inverts as any run does: its inputs follow it directly.
+    // A seeded start whose inputs are placed as ordinary run inputs (`Placement::RunInput`, as
+    // the converter and an import of inline messages write them) inverts as any run does: its
+    // inputs follow it directly.
     let converted = [
         Record::RunStart(Box::new(import_start("seed"))),
         input_record("seed", Placement::RunInput, user("Look.")),

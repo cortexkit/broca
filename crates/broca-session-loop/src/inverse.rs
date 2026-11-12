@@ -9,7 +9,8 @@
 //! transcript record is left unclaimed or claimed by the wrong anchor.
 //!
 //! An import's seeded run (`session.import`) is laid out its own way: each imported message is
-//! followed by its facts records and the rides on its results, through the run's end. Its start
+//! followed by its facts records and the notes delivered on its tool results (`ResultAppend`
+//! records: a sent message appended to a finished tool result), through the run's end. Its start
 //! claims every imported message up to that end, so it inverts to what today's import seed is:
 //! one `run_started` holding the whole imported history, then the run's end.
 //!
@@ -411,9 +412,9 @@ fn imports_seed(start: &RunStart, next: Option<&Record>) -> bool {
 /// start; the run's end; and how many records of `rest` the run takes, its end included.
 /// Today's import seed holds every imported message in its one `run_started`, so they are all
 /// claimed by the start. Between them `session.import` writes each message's facts, a turn's
-/// call facts and the rides on its results: none of them is a record of today's log or moves a
-/// message, so they are passed over. The whole run is written in one batch, so its end must be
-/// in `rest`.
+/// call facts and the notes appended to its tool results: none of them is a record of today's
+/// log or moves a message, so they are passed over. The whole run is written in one batch, so
+/// its end must be in `rest`.
 fn import_seed<'a>(
     start: &RunStart,
     rest: &'a [Record],

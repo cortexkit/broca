@@ -28,7 +28,8 @@ contains only that session's `session`, `message` and `part` rows with their ori
 schemas and indexes, including committed WAL data in one read-only snapshot. A changed or torn
 snapshot is reported as retryable. Pass this file to scoped `session.import` as harness
 `opencode1`; unlike the legacy transcript command above, the head move preserves ids, times,
-media and the plugin move list. Broca deletes the source only after the import is durable.
+media, and the list of messages the OpenCode 1 compaction plugin had summarized, which
+Magic Context reads to rebuild its view. Broca deletes the source only after the import is durable.
 The owner's first `session.send` must carry its plan; `session.install_view` may precede it.
 
 Check an extract before sending it to broca:

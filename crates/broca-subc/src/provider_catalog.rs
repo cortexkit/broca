@@ -53,7 +53,8 @@ impl AftHarness {
         self.0.load(Ordering::Acquire)
     }
 
-    /// Only a successful runner fallback establishes that the old identity still works.
+    /// Only a successful fallback to the `runner` harness establishes that binding as `runner`
+    /// still works.
     pub(crate) fn remember_runner(&self) -> bool {
         self.0.swap(false, Ordering::AcqRel)
     }

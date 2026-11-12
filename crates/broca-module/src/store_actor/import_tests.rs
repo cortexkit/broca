@@ -714,7 +714,8 @@ async fn a_later_run_renders_the_imported_history_without_reasoning_payloads() {
 }
 
 /// Through the registry: an import creates its session in the new storage, never on today's,
-/// and a retry is answered from it; with the new storage off, an import is refused by name.
+/// and a retry is answered from it. Like any head, it needs only the store runtime: the switch
+/// that starts every new session there stays off, as in production.
 #[tokio::test]
 async fn the_registry_creates_an_imported_session_in_the_new_storage() {
     use broca_core::{FileLeaseStore, FileWalStore, WalStore};
@@ -740,26 +741,12 @@ async fn the_registry_creates_an_imported_session_in_the_new_storage() {
         )
     };
     let key = broca_protocol::BindIdentity::new(dir.join("project"), "broca", "alfonso:head:a1");
-    let off = crate::registry::LineageRegistry::new_with_reader(
-        opener(Arc::clone(&runtime)),
-        wal.clone(),
-        None,
-    );
-    assert_eq!(
-        refused(
-            off.route_store_command(&key, source.import(source.params("imp-1")))
-                .await
-                .unwrap()
-        ),
-        "new_storage_unavailable"
-    );
     assert!(!runtime.holds(&key).unwrap());
     let registry = crate::registry::LineageRegistry::new_with_reader(
         opener(Arc::clone(&runtime)),
         wal.clone(),
         None,
-    )
-    .with_store_new_sessions();
+    );
     let reply = imported(
         registry
             .route_store_command(&key, source.import(source.params("imp-1")))
