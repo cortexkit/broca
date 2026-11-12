@@ -178,13 +178,9 @@ fn profile_directory(binary: &Path) -> PathBuf {
     let parent = source
         .parent()
         .expect("binary must have a parent directory");
-    // Cargo's test executables live in <profile>/deps, including cross-target builds and
-    // custom CARGO_TARGET_DIRs. A staged fixture simply uses its own parent directory.
-    if parent.file_name().is_some_and(|name| name == "deps") {
-        parent.parent().expect("deps must have a parent").to_owned()
-    } else {
-        parent.to_owned()
-    }
+    // Cargo test executables can live under deps/ or build/. Staged fixtures and
+    // ordinary workspace binaries use their own parent when neither layout applies.
+    crate::cargo_profile_dir_of(&source).unwrap_or_else(|| parent.to_owned())
 }
 
 fn publish_binaries(binaries: &[(&Path, OsString)]) -> Vec<PathBuf> {
@@ -973,6 +969,25 @@ mod tests {
         assert_eq!(profile_directory(&staged), scratch.join("rigs"));
     }
 
+    #[test]
+    fn cargo_profile_lookup_finds_sibling_binary_in_both_layouts() {
+        let scratch = fixture("cargo-profile-lookup");
+        let profile = scratch.join("target/debug");
+        let sibling = source(
+            &profile,
+            &format!("rig-helper{}", std::env::consts::EXE_SUFFIX),
+            b"helper",
+        );
+
+        assert!(!profile.join("deps").exists());
+        for relative_exe in ["build/test-package/hash/out/test-exe", "deps/test-exe"] {
+            let exe = source(&profile, relative_exe, b"test");
+            let found = profile_directory(&exe).join(sibling.file_name().unwrap());
+            assert_eq!(found, sibling);
+            assert_eq!(fs::read(found).unwrap(), b"helper");
+        }
+    }
+
     /// Published executables stay outside Cargo's build tree and removable volumes.
     #[cfg(target_os = "macos")]
     #[test]
@@ -1007,12 +1022,10 @@ mod tests {
         assert!(published.starts_with(selected_root.join("ckdev-exec")));
 
         let resolved_published = fs::canonicalize(&published).unwrap();
-        let executable = fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
         let target_dir = fs::canonicalize(
-            executable
-                .ancestors()
-                .nth(3)
-                .expect("test executable lives below Cargo's target directory"),
+            crate::cargo_profile_dir()
+                .parent()
+                .expect("Cargo profile lives below its target directory"),
         )
         .unwrap();
         assert!(

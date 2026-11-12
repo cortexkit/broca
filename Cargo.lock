@@ -761,6 +761,7 @@ dependencies = [
  "broca-protocol",
  "broca-store",
  "broca-wal",
+ "cortexkit-test-support",
  "libproc",
  "nix",
  "sha2",
@@ -1447,9 +1448,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-test-support"
-version = "0.1.11"
+version = "0.1.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fb4eba382b1030104f05ba3c09746bb8b8d30dfaeacc80fdc71adc30c0d5fd07"
+checksum = "50773b2a265a84af63d31ed52653cf07cf5690a85b0b23d65a3d8f1e776ef2e9"
 dependencies = [
  "file-id",
  "rustix",

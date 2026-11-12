@@ -637,14 +637,30 @@ fn fake_surface_bin() -> PathBuf {
 /// A path under the shared build directory, for the stand-in's own build only. Nothing is ever
 /// launched from here: the rig runs the published copy `fake_surface_bin` returns.
 fn build_dir(relative: &str) -> PathBuf {
-    std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
+    build_dir_from_exe(relative, &std::env::current_exe().unwrap())
+}
+
+fn build_dir_from_exe(relative: &str, exe: &std::path::Path) -> PathBuf {
+    broca_test_support::cargo_profile_dir_of(exe)
+        .expect("the test binary is inside a Cargo profile")
         .join("fake-surface")
         .join(relative)
+}
+
+#[test]
+fn build_dir_finds_fixture_in_cargo_build_layout() {
+    let profile = broca_test_support::scratch_root().join("private-content-build-dir/debug");
+    let exe = profile.join("build/broca-module-serve/hash/out/test-exe");
+    std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+    std::fs::write(&exe, b"test").unwrap();
+    let fixture = profile.join("fake-surface/fixture");
+    std::fs::create_dir_all(fixture.parent().unwrap()).unwrap();
+    std::fs::write(&fixture, b"surface").unwrap();
+
+    assert!(!profile.join("deps").exists());
+    let found = build_dir_from_exe("fixture", &exe);
+    assert_eq!(found, fixture);
+    assert_eq!(std::fs::read(found).unwrap(), b"surface");
 }
 
 /// The workspaces the stand-in's build could resolve against. They must pin the same crate
