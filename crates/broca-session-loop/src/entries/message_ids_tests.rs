@@ -7,12 +7,12 @@ fn multi_message_batch() -> Vec<Record> {
         Record::Input(Input {
             run_id: "synthetic-run".into(),
             placement: Placement::RunInput,
-            message: Message::new(
+            message: std::sync::Arc::new(Message::new(
                 Role::User,
                 vec![ContentBlock::Text {
                     text: "input".into(),
                 }],
-            ),
+            )),
             written_at_ms: Some(10),
             submission_id: None,
             notice: None,
@@ -25,7 +25,7 @@ fn multi_message_batch() -> Vec<Record> {
             run_id: "synthetic-run".into(),
             step_id: 4,
             provider_message_id: broca_protocol::MessageId("provider-id-not-mid".into()),
-            message: Message::new(
+            message: std::sync::Arc::new(Message::new(
                 Role::Assistant,
                 vec![ContentBlock::ToolCall(ToolCall {
                     thought_signature: None,
@@ -33,7 +33,7 @@ fn multi_message_batch() -> Vec<Record> {
                     tool_name: "read".into(),
                     input: serde_json::json!({}),
                 })],
-            ),
+            )),
             usage: None,
             written_at_ms: Some(11),
             last_content_at_ms: None,

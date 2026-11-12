@@ -24,28 +24,33 @@ const MESSAGES: usize = 1_000;
 
 // Limits on what a loaded session holds, in thousandths of `W` (4.56 MB here). Today's measure
 // was taken on the synthetic session at 1,000 messages.
-/// The whole session. Today: 3.063. Target: the design's idle budget, about 1,288 at this
+/// The whole session. Today: 1.634. Target: the design's idle budget, about 1,288 at this
 /// session's 4.5 KB per message (1.2 x W + 400 B x messages).
-const TOTAL: u64 = 3_370;
-/// The window's messages. Today: 1.114. Target: about 1,000, content held at its sent size.
+const TOTAL: u64 = 1_798;
+/// The window's messages, the latest run's ones the kept records share included. Today: 1.155;
+/// measure plus 10% would be above the limit of 1.226 set before, so the limit stays 1.226.
+/// Target: about 1,000, content held at its sent size.
 const HELD_MESSAGES: u64 = 1_226;
-/// The window messages' entry states. Today: 0.254 (1,160 bytes per message). Target: 250
-/// bytes per message, about 55.
-const ENTRY_FACTS: u64 = 280;
-/// The kept records' contents. Today: 0.371. Target: their own small fields only, once they
-/// share content with the folds.
-const KEPT_RECORDS: u64 = 408;
-/// The kept records' buffer beyond its records. Today: 0.992. Target: none, a buffer sized for
+/// The window messages' entry states, the facts the kept records share included. Today: 0.168
+/// (765 bytes per message). Target: 250 bytes per message, about 55.
+const ENTRY_FACTS: u64 = 185;
+/// The kept records' contents beyond what they share with the conversation. Today: 0.269, most
+/// of it the latest run's tool results: the conversation's tool message holds its own copy of
+/// each result until a message's text and JSON can be shared between holders. Target: their own
+/// small fields only.
+const KEPT_RECORDS: u64 = 296;
+/// The kept records' buffer beyond its records. Today: 0.023. Target: none, a buffer sized for
 /// the latest run.
-const KEPT_SPARE: u64 = 1_092;
-/// The id index. Today: 0.323. Target: positions only, a few bytes per id.
-const ID_INDEX: u64 = 356;
-/// Everything else. Today: 0.008 (38 KB). Target: a small share of the idle budget. Rounded up
-/// to the next thousandth.
+const KEPT_SPARE: u64 = 26;
+/// The id index. Today: 0.012. Target: positions only, a few bytes per id. Rounded up to the
+/// next thousandth.
+const ID_INDEX: u64 = 14;
+/// Everything else, the session's interned values included. Today: 0.008 (39 KB). Target: a
+/// small share of the idle budget. Rounded up to the next thousandth.
 const REST: u64 = 10;
-/// Bytes allocated while loading, freed or not. Today: 10.032. Target: none set by the design;
+/// Bytes allocated while loading, freed or not. Today: 6.916. Target: none set by the design;
 /// opening folds the log record by record and never holds it whole.
-const ALLOCATED_DURING_LOAD: u64 = 11_037;
+const ALLOCATED_DURING_LOAD: u64 = 7_608;
 
 /// How far an estimate may be from what the allocator measured for the same holder, in percent.
 const ESTIMATE_TOLERANCE: usize = 15;
@@ -82,7 +87,9 @@ fn freed<T>(value: T) -> u64 {
 }
 
 /// Writes the synthetic session, then loads it under the counting allocator and takes each
-/// holder apart, measuring what dropping it frees.
+/// holder apart, measuring what dropping it frees. The kept records go first: what they share
+/// with the conversation (its messages and their facts) is freed with the conversation's
+/// holders, which the memory report counts it under.
 fn loaded() -> Measured {
     assert!(
         installed(),
@@ -102,10 +109,10 @@ fn loaded() -> Measured {
     let mut session = Box::new(session);
     let w = window_bytes(&session.conversation);
     let estimated = session.held_bytes();
-    let messages = freed(std::mem::take(&mut session.conversation.messages));
-    let entry_facts = freed(std::mem::take(&mut session.conversation.entries));
     let kept_spare = estimated.kept_capacity as u64;
     let kept = freed(std::mem::take(&mut session.kept));
+    let messages = freed(std::mem::take(&mut session.conversation.messages));
+    let entry_facts = freed(std::mem::take(&mut session.conversation.entries));
     let id_index = freed(std::mem::replace(
         &mut session.open_ids,
         crate::idindex::OpenIds::new([0; 32]),

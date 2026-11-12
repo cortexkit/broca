@@ -47,7 +47,10 @@ fn input(text: &str) -> Record {
         media: Vec::new(),
         run_id: "r".into(),
         placement: Placement::RunInput,
-        message: Message::new(Role::User, vec![ContentBlock::Text { text: text.into() }]),
+        message: std::sync::Arc::new(Message::new(
+            Role::User,
+            vec![ContentBlock::Text { text: text.into() }],
+        )),
         written_at_ms: None,
         submission_id: None,
         notice: None,
@@ -140,7 +143,9 @@ fn unpublished_staging_has_byte_identical_final_artifacts() {
                 let Record::Input(mut photo) = input("look") else {
                     unreachable!()
                 };
-                photo.message.content.push(ContentBlock::Media(reference));
+                std::sync::Arc::make_mut(&mut photo.message)
+                    .content
+                    .push(ContentBlock::Media(reference));
                 session
                     .append_input_media(
                         &[Record::Input(photo)],
@@ -342,7 +347,7 @@ fn a_deleted_session_keeps_no_file_and_a_moved_head_refuses(cipher: Cipher) {
     std::fs::remove_dir_all(&root).unwrap();
 }
 
-fn texts(messages: &[Message]) -> Vec<String> {
+fn texts(messages: &[std::sync::Arc<Message>]) -> Vec<String> {
     messages
         .iter()
         .flat_map(|m| &m.content)

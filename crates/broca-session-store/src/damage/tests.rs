@@ -35,7 +35,10 @@ fn input(text: &str) -> Record {
         media: Vec::new(),
         run_id: "r".into(),
         placement: Placement::RunInput,
-        message: Message::new(Role::User, vec![ContentBlock::Text { text: text.into() }]),
+        message: std::sync::Arc::new(Message::new(
+            Role::User,
+            vec![ContentBlock::Text { text: text.into() }],
+        )),
         written_at_ms: None,
         submission_id: None,
         notice: None,

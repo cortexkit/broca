@@ -298,7 +298,7 @@ fn facts(seed: &Seed) -> Vec<&broca_session_store::record::EntryFacts> {
     seed.records
         .iter()
         .filter_map(|record| match record {
-            Record::EntryFacts(facts) => Some(facts),
+            Record::EntryFacts(facts) => Some(&**facts),
             _ => None,
         })
         .collect()
@@ -527,7 +527,10 @@ fn call_keys_rides_and_send_facts_are_recorded() {
         Some("cm-magic-context")
     );
     assert_eq!(all[2].sender.as_deref(), Some("magic-context"));
-    assert_eq!(all[2].marks, Some(serde_json::json!({"notice": true})));
+    assert_eq!(
+        all[2].marks.as_deref(),
+        Some(&serde_json::json!({"notice": true}))
+    );
     assert_eq!(all[3].usage.unwrap().prompt_tokens, Some(10));
     assert_eq!(all[4].delivery_mode.as_deref(), Some("tool_result"));
     assert_eq!(all[4].delivery_tool_call_id.as_deref(), Some("c1"));
@@ -601,7 +604,7 @@ fn call_side_file_facts_are_stored_without_import_time_defaults() {
             let row = &expected["calls"][index];
             assert_eq!(call.call_key, row["call_key"].as_str().unwrap());
             assert_eq!(call.carrier.as_deref(), Some("thalamus-harness"));
-            assert_eq!(call.schema_pin.as_ref(), row.get("schema_pin"));
+            assert_eq!(call.schema_pin.as_deref(), row.get("schema_pin"));
             assert_eq!(call.dispatched_at_ms, row["started_at"].as_u64());
             assert_eq!(call.finished_at_ms, row["finished_at"].as_u64());
             assert_eq!(call.unanswered, None);

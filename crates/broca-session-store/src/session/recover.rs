@@ -446,12 +446,12 @@ impl<B: SessionBackend> Session<B> {
                 media: Vec::new(),
                 run_id: latest_run.unwrap_or_default(),
                 placement: Placement::DamageNotice,
-                message: Message::new(
+                message: std::sync::Arc::new(Message::new(
                     Role::User,
                     vec![ContentBlock::Text {
                         text: notice_text(&lost_parts),
                     }],
-                ),
+                )),
                 written_at_ms: Some(now_ms),
                 submission_id: None,
                 notice: None,
@@ -536,6 +536,7 @@ impl<B: SessionBackend> Session<B> {
             memory_only: Default::default(),
             memory_refused: Default::default(),
             retired_tag_floor: 1,
+            interner: Default::default(),
         };
         let checkpoint_body = Checkpoint {
             covers_through: intent_seq,
@@ -768,6 +769,7 @@ fn transcript_calls(conversation: &Conversation) -> BTreeSet<String> {
     conversation
         .messages
         .iter()
+        .map(|message| &**message)
         .chain(conversation.open_tool_turn())
         .flat_map(call_ids)
         .map(|id| id.0)

@@ -692,7 +692,7 @@ fn conversion_rebasing_keeps_legacy_views_at_their_storage_sequences() {
     else {
         unreachable!()
     };
-    facts.legacy_view_seq = Some(view_seq);
+    std::sync::Arc::make_mut(facts).legacy_view_seq = Some(view_seq);
     for (first, expected) in [
         (crate::FIRST_SEQ, view_seq),
         (crate::FIRST_SEQ + 7, view_seq + 7),

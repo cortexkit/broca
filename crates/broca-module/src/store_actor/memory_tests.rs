@@ -34,22 +34,24 @@ use crate::memory_report::MemoryAnswer;
 /// Window messages of the measured session.
 const MESSAGES: usize = 1_000;
 
-/// What an idle actor with one live subscriber holds, in thousandths of `W`. Today: 3.080.
+/// What an idle actor with one live subscriber holds, in thousandths of `W`. Today: 1.648.
 /// Target: about 1,288 at this session's 4.5 KB per message (1.2 x W + 400 B x messages). The
 /// failure names the holders by the memory report's estimate, which a test below holds to the
 /// allocator's total.
-const IDLE_TOTAL: u64 = 3_389;
+const IDLE_TOTAL: u64 = 1_814;
 
 // Limits on what an actor holds inside a provider call, beyond the idle actor, in thousandths of
 // `W`.
-/// Today: 8.354, of which the request's bytes are 1.000 (the test's provider holds the request
-/// as JSON, standing in for a transport's body). Target: the request's bytes and nothing else on
-/// a session without compaction entries, about 1,000.
-const IN_CALL_ABOVE_IDLE: u64 = 9_191;
+/// Today: 4.281, of which the request's bytes are 1.000 (the test's provider holds the request
+/// as JSON, standing in for a transport's body) and the request's options, which hold one copy of
+/// the window, 1.115. Target: the request's bytes and nothing else on a session without
+/// compaction entries, about 1,000.
+const IN_CALL_ABOVE_IDLE: u64 = 4_710;
 
 /// Decoded copies of one plan's tool list held by `PLAN_SESSIONS` idle sessions on it: each
-/// session's first episode decodes its own. Today: 4, one per session. Target: 1.
-const PLAN_TOOL_COPIES: u64 = 4;
+/// session's first episode would decode its own, but the decoded setup parts are shared through
+/// the process. Today: 1. Target: 1.
+const PLAN_TOOL_COPIES: u64 = 1;
 /// Sessions in the shared-setup measure.
 const PLAN_SESSIONS: usize = 4;
 
@@ -289,8 +291,8 @@ fn an_actor_inside_a_provider_call_holds_no_more_than_its_budget() {
     runtime.block_on(async { drop(served.await) });
 }
 
-/// Idle sessions on one plan each hold a decoded copy of its tool list today: the report counts
-/// the copies, and the count stays within its budget.
+/// Idle sessions on one plan share one decoded copy of its tool list: the report counts the
+/// copies, and the count stays within its budget.
 #[test]
 fn sessions_on_one_plan_hold_no_more_copies_of_its_tool_list_than_the_budget() {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -401,7 +403,12 @@ fn the_estimates_of_a_projection_a_media_fold_and_a_request_match_the_allocator(
     });
     let (request, built) = measure(|| {
         Box::new(broca_protocol::request::CallOptions::new(
-            session.conversation.messages.clone(),
+            session
+                .conversation
+                .messages
+                .iter()
+                .map(|message| broca_protocol::Message::clone(message))
+                .collect(),
         ))
     });
     let rows = [

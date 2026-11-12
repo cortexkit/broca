@@ -952,7 +952,7 @@ async fn entry_of(session: &Session<LocalBackend>, text: &str) -> (u64, String) 
                 matches!(block, broca_protocol::content::ContentBlock::Text { text: at } if at == text)
             })
         })
-        .and_then(|entry| Some((entry.ordinal, entry.state.facts?.mid)))
+        .and_then(|entry| Some((entry.ordinal, entry.state.facts?.mid.clone())))
         .expect("the message has an id")
 }
 
@@ -1131,7 +1131,7 @@ async fn every_read_equals_a_fresh_views_at_every_step() {
         .into_iter()
         .find_map(|(_, record)| match record {
             Record::EntryFacts(mut facts) => {
-                facts.run_id = Some("r9".into());
+                std::sync::Arc::make_mut(&mut facts).run_id = Some("r9".into());
                 Some(facts)
             }
             _ => None,
@@ -1362,7 +1362,7 @@ async fn the_served_history_version_is_the_stored_one_past_the_exposure_epoch() 
         .iter()
         .find_map(|(_, record)| match record {
             Record::EntryFacts(facts) if facts.ordinal == ordinal => {
-                let mut facts = facts.clone();
+                let mut facts = (**facts).clone();
                 facts.run_id = Some("r9".into());
                 Some(facts)
             }
@@ -1375,7 +1375,7 @@ async fn the_served_history_version_is_the_stored_one_past_the_exposure_epoch() 
             vec![
                 Record::RunStart(start),
                 Record::Input(input),
-                Record::EntryFacts(facts),
+                Record::EntryFacts(std::sync::Arc::new(facts)),
             ],
             None,
             2,

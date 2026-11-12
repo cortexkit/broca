@@ -350,7 +350,7 @@ async fn an_import_writes_the_history_and_answers_its_retry_from_the_receipt() {
     assert_eq!(user.sender.as_deref(), Some("prefrontal-core"));
     assert_eq!(user.send_id.as_deref(), Some("s1"));
     let mut older = entries.clone();
-    older[0].state.facts.as_mut().unwrap().send_id = None;
+    std::sync::Arc::make_mut(older[0].state.facts.as_mut().unwrap()).send_id = None;
     assert!(
         !session
             .older_entry_send_ids(&older)
@@ -1589,7 +1589,7 @@ async fn mids_at(session: &Session<&'static MemoryBackend>, ordinals: &[u64]) ->
     let mut mids = Vec::new();
     for ordinal in ordinals {
         let entry = session.entries(*ordinal, 1).await.unwrap().remove(0);
-        mids.push(entry.state.facts.unwrap().mid);
+        mids.push(entry.state.facts.unwrap().mid.clone());
     }
     mids
 }

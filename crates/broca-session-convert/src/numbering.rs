@@ -248,7 +248,7 @@ pub(super) fn run(args: &Args) {
             else {
                 continue;
             };
-            let mut numbered = entry.message.clone();
+            let mut numbered = broca_protocol::content::Message::clone(&entry.message);
             let rules = broca_protocol::tags::ComputedRules {
                 render: facts.render_tags,
                 clean: facts.clean_reply,

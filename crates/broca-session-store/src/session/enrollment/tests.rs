@@ -101,7 +101,7 @@ fn input(run: &str, message: Message) -> Record {
         media: Vec::new(),
         run_id: run.into(),
         placement: Placement::RunInput,
-        message,
+        message: std::sync::Arc::new(message),
         written_at_ms: None,
         submission_id: None,
         notice: None,
@@ -120,7 +120,7 @@ fn answer(run: &str, content: Vec<ContentBlock>) -> Record {
         run_id: run.into(),
         step_id: 1,
         provider_message_id: MessageId(format!("m-{run}")),
-        message: Message::assistant_from(content, model()),
+        message: std::sync::Arc::new(Message::assistant_from(content, model())),
         usage: None,
         written_at_ms: None,
         last_content_at_ms: None,
@@ -133,7 +133,7 @@ fn answer(run: &str, content: Vec<ContentBlock>) -> Record {
 /// Off-contract facts, as a run outside the contract records them: part numbers from 0, and the
 /// message's own time, which `written_at` gives when it has one.
 fn facts(ordinal: u64, mid: String, written_at: Option<u64>) -> Record {
-    Record::EntryFacts(EntryFacts {
+    Record::EntryFacts(std::sync::Arc::new(EntryFacts {
         send_id: None,
         named_speaker: None,
         client_message_id: None,
@@ -159,7 +159,7 @@ fn facts(ordinal: u64, mid: String, written_at: Option<u64>) -> Record {
         created_at_ms: None,
         delivery_mode: None,
         delivery_tool_call_id: None,
-    })
+    }))
 }
 
 /// Appends `records`, each placed message followed by its facts, and returns the ids given.

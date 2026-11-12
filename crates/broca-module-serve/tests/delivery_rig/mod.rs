@@ -774,7 +774,13 @@ impl RunExecutor for CoreExec {
             let holds_media = req
                 .input
                 .iter()
-                .chain(writer.conversation().messages.iter())
+                .chain(
+                    writer
+                        .conversation()
+                        .messages
+                        .iter()
+                        .map(|message| &**message),
+                )
                 .any(|message| !broca_session_store::session::message_media(message).is_empty());
             let frozen = self.script.media_frozen.lock().unwrap().clone();
             let mut model_call_ready = None;

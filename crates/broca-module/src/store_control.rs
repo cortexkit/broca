@@ -122,8 +122,9 @@ impl CallIdentity {
 /// Units that wait for the `EntryFacts` naming the message they speak of.
 #[derive(Debug, Clone)]
 enum Waiting {
-    /// An input message placed but not yet named.
-    Input(Message),
+    /// An input message placed whose message id its entry facts haven't given yet, shared with
+    /// the record that placed it.
+    Input(std::sync::Arc<Message>),
     /// A budget firing whose reminder message this is.
     Budget(ControlUnit),
     /// A step's end whose assistant message had no announced id.
@@ -624,7 +625,7 @@ impl StoreControl {
             if input.placement != Placement::BudgetNudge {
                 self.waiting.push((
                     self.conversation.placed,
-                    Waiting::Input(input.message.clone()),
+                    Waiting::Input(std::sync::Arc::clone(&input.message)),
                 ));
             }
         }

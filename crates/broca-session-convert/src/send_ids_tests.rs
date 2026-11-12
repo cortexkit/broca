@@ -350,7 +350,7 @@ fn older_send_ids_are_exact_cached_and_do_not_change_content_digests() {
     let older = bodies(|records| {
         for record in records {
             if let Record::EntryFacts(facts) = record {
-                facts.send_id = None;
+                std::sync::Arc::make_mut(facts).send_id = None;
             }
         }
     });

@@ -173,7 +173,7 @@ async fn runner_rows<B: SessionBackend>(
             runs.insert(run_id.to_owned(), rules);
         }
         let Some(rules) = runs[run_id] else { continue };
-        let mut message = stored.message.clone();
+        let mut message = broca_protocol::Message::clone(&stored.message);
         let mut high = base;
         broca_protocol::tags::number_message(&mut message, rules, &mut high).map_err(|_| {
             damaged(format!(

@@ -485,6 +485,7 @@ impl<B: SessionBackend> Session<B> {
         let generation = hex(&self.head.generation.0);
         for (offset, record) in resend.iter_mut().enumerate() {
             if let Record::EntryFacts(facts) = record {
+                let facts = std::sync::Arc::make_mut(facts);
                 facts.ordinal = ordinal;
                 facts.mid = format!("g{}.{}", &generation[..16], first + offset as u64);
             }

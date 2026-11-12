@@ -592,7 +592,10 @@ mod tests {
             media: Vec::new(),
             run_id: "r".into(),
             placement: Placement::RunInput,
-            message: Message::new(Role::User, vec![ContentBlock::Text { text: text.into() }]),
+            message: std::sync::Arc::new(Message::new(
+                Role::User,
+                vec![ContentBlock::Text { text: text.into() }],
+            )),
             written_at_ms: None,
             submission_id: None,
             notice: None,
@@ -793,7 +796,12 @@ mod tests {
         let entries = session.entries(1, usize::MAX).await.unwrap();
         assert_eq!(entries.len(), 1);
         for entry in entries {
-            let mid = entry.state.facts.expect("placed with its facts").mid;
+            let mid = entry
+                .state
+                .facts
+                .expect("placed with its facts")
+                .mid
+                .clone();
             assert_eq!(
                 session.find_message(&mid).await.unwrap(),
                 Some(entry.ordinal),

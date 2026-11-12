@@ -61,7 +61,7 @@ struct Kept {
     open: Option<OpenRides>,
     /// What decided which sealed entries are in front; `None` when there are none.
     sealed_for: Option<BuiltFor>,
-    sealed_messages: Arc<Vec<(u64, Message)>>,
+    sealed_messages: crate::compaction::SealedMessages,
     sealed_delivered: Arc<Vec<(String, Vec<Delivered>)>>,
     /// The ride envelopes of the sealed entries and the served window entries, rebuilt from them
     /// when `rides_stale` is set.
@@ -307,7 +307,7 @@ impl WindowTranscript {
         &self,
         key: Option<BuiltFor>,
         entries: Vec<Entry>,
-        messages: Vec<(u64, Message)>,
+        messages: Vec<(u64, Arc<Message>)>,
         delivered: Vec<(String, Vec<Delivered>)>,
     ) {
         let mut kept = self.0.lock().expect("window transcript");

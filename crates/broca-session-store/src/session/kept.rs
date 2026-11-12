@@ -318,17 +318,41 @@ mod tests;
 impl KeptRecords {
     /// What the kept records hold, estimated by walking them (see `crate::held`): their
     /// contents, each slot of the buffer they fill included, and the buffer's slots beyond them.
-    pub(crate) fn held_bytes(&self) -> (usize, usize) {
+    /// A message or a message's facts a record shares with the conversation fold is the fold's
+    /// to count, so `in_fold` (the addresses of what the fold holds behind its `Arc`s) leaves
+    /// it out here.
+    pub(crate) fn held_bytes(&self, in_fold: &std::collections::HashSet<usize>) -> (usize, usize) {
         use crate::held::HeldBytes;
         let slot = std::mem::size_of::<(u64, Record)>();
         let contents = self.records.len() * slot
             + self
                 .records
                 .iter()
-                .map(|(_, record)| record.heap_bytes())
+                .map(|(_, record)| record.heap_bytes() - shared_with_fold(record, in_fold))
                 .sum::<usize>()
             + self.latest_start.heap_bytes();
         let spare = (self.records.capacity() - self.records.len()) * slot;
         (contents, spare)
+    }
+}
+
+/// The heap of `record` that it shares with the conversation fold: its message or its facts,
+/// when the fold holds the same `Arc` (`in_fold` holds the addresses the fold's `Arc`s point to).
+fn shared_with_fold(record: &Record, in_fold: &std::collections::HashSet<usize>) -> usize {
+    use crate::held::HeldBytes;
+    use std::sync::Arc;
+    fn held<T: HeldBytes>(value: &Arc<T>, in_fold: &std::collections::HashSet<usize>) -> usize {
+        if in_fold.contains(&(Arc::as_ptr(value) as usize)) {
+            value.heap_bytes()
+        } else {
+            0
+        }
+    }
+    match record {
+        Record::Input(input) => held(&input.message, in_fold),
+        Record::Assistant(assistant) => held(&assistant.message, in_fold),
+        Record::EntryFacts(facts) => held(facts, in_fold),
+        Record::TurnFacts(turn) => held(turn, in_fold),
+        _ => 0,
     }
 }

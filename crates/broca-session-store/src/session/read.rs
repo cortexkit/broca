@@ -19,6 +19,7 @@
 //! Also here: finding the ledger records that name an id (see `idindex`).
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use broca_protocol::content::Message;
 
@@ -33,13 +34,14 @@ use super::{Session, SessionError};
 
 mod send_ids;
 
-/// One message as `session.entries` reads it.
+/// One message as `session.entries` reads it. A window entry shares its message and facts with
+/// the conversation, so serving it copies no content.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StoredEntry {
     pub ordinal: u64,
-    pub message: Message,
+    pub message: Arc<Message>,
     /// For an assistant message that called tools: the tool message with their results.
-    pub next: Option<Message>,
+    pub next: Option<Arc<Message>>,
     pub state: EntryState,
     /// An assistant message still waiting for its tool results, at its reserved ordinal.
     pub open: bool,
@@ -72,7 +74,7 @@ pub fn served_window(conversation: &Conversation) -> Vec<StoredEntry> {
     if let Some((ordinal, message, state)) = conversation.open_entry() {
         entries.push(StoredEntry {
             ordinal,
-            message: message.clone(),
+            message: Arc::clone(message),
             next: None,
             state: state.clone(),
             open: true,
@@ -98,7 +100,7 @@ pub fn window_entries(conversation: &Conversation, from: u64, limit: usize) -> V
                 .filter(|next| called && next.role == broca_protocol::content::Role::Tool);
             Some(StoredEntry {
                 ordinal,
-                message: message.clone(),
+                message: Arc::clone(message),
                 next: next.cloned(),
                 state: state.clone(),
                 open: false,
@@ -570,13 +572,13 @@ impl<B: SessionBackend> Session<B> {
     }
 
     /// The message with `ordinal` (counting from 1 over the whole conversation), or `None` when
-    /// the conversation has placed no such message.
-    pub async fn message(&self, ordinal: u64) -> Result<Option<Message>, SessionError> {
+    /// the conversation has placed no such message. A window message is shared, not copied.
+    pub async fn message(&self, ordinal: u64) -> Result<Option<Arc<Message>>, SessionError> {
         if ordinal == 0 || ordinal > self.conversation.placed {
             return Ok(None);
         }
         if let Some(message) = self.conversation.window_message(ordinal) {
-            return Ok(Some(message.clone()));
+            return Ok(Some(Arc::clone(message)));
         }
         self.storage_read()?;
         let key = self.key.frame_key();

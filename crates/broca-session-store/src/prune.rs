@@ -119,11 +119,11 @@ pub fn prune_record(record: &mut crate::record::Record, key: &[u8; 32]) {
     use crate::record::Record;
     match record {
         Record::Assistant(assistant) => {
-            let stubs = prune(&mut assistant.message, key);
+            let stubs = prune(std::sync::Arc::make_mut(&mut assistant.message), key);
             assistant.pruned.extend(stubs);
         }
         Record::Input(input) => {
-            let stubs = prune(&mut input.message, key);
+            let stubs = prune(std::sync::Arc::make_mut(&mut input.message), key);
             input.pruned.extend(stubs);
         }
         _ => {}

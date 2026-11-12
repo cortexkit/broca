@@ -69,6 +69,7 @@ pub mod fuzzing;
 pub mod head;
 pub mod held;
 pub mod idindex;
+pub mod interned;
 pub mod keys;
 pub mod log;
 pub mod metrics;

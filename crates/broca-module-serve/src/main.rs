@@ -2955,7 +2955,10 @@ mod executor {
         {
             None => (None, false),
             Some(ordinal) => match conversation.window_message(ordinal) {
-                Some(message) => (Some(message.clone()), false),
+                Some(message) => (
+                    Some(broca_protocol::content::Message::clone(message)),
+                    false,
+                ),
                 None => (None, true),
             },
         };
@@ -4634,7 +4637,13 @@ mod executor {
             let holds_media = req
                 .input
                 .iter()
-                .chain(writer.conversation().messages.iter())
+                .chain(
+                    writer
+                        .conversation()
+                        .messages
+                        .iter()
+                        .map(|message| &**message),
+                )
                 .any(|message| !broca_session_store::session::message_media(message).is_empty());
             let mut model_call_ready = None;
             if resolved.provider.supports_media_renderer() && (holds_media || !req.tools.is_empty())

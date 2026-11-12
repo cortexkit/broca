@@ -298,7 +298,7 @@ async fn cursors_resume_across_a_revert() {
     start.send_id = Some("k3".into());
     let mut resent_input = input;
     resent_input.run_id = "r3".into();
-    let mut facts = input_facts.1.clone();
+    let mut facts = (*input_facts.1).clone();
     facts.ordinal = 0;
     facts.mid = String::new();
     session
@@ -307,7 +307,7 @@ async fn cursors_resume_across_a_revert() {
             vec![
                 Record::RunStart(start),
                 Record::Input(resent_input),
-                Record::EntryFacts(facts),
+                Record::EntryFacts(std::sync::Arc::new(facts)),
             ],
             None,
             2,

@@ -342,9 +342,17 @@ where
         admission.global_system = Arc::new(global_system(writer, parts, &mut input, &admission)?);
     } else if let Some(previous) = writer.operations().run.as_ref() {
         // A later run outside the contract: its system messages must repeat the session's.
+        // Only the window's system messages are compared, so only they are copied out of it.
+        let systems: Vec<Message> = writer
+            .conversation()
+            .messages
+            .iter()
+            .filter(|message| message.role == Role::System)
+            .map(|message| Message::clone(message))
+            .collect();
         broca_core::fresh_start::append_system_messages(
             &mut input,
-            &writer.conversation().messages,
+            &systems,
             previous_is_import(previous)?,
         )
         .map_err(LoopError::Refused)?;
@@ -2098,7 +2106,7 @@ where
                         .iter()
                         .rev()
                         .find_map(|pending| pending.messages.last())
-                        .or(conversation.messages.last())
+                        .or(conversation.messages.last().map(|message| &**message))
                         .cloned();
                     let last_user = queued.iter().rposition(|(_, send)| {
                         !send.order.expired_at(now)
@@ -2140,7 +2148,7 @@ where
                                 media: send.media_of(message),
                                 run_id: run_id.clone(),
                                 placement,
-                                message: message.clone(),
+                                message: Arc::new(message.clone()),
                                 written_at_ms: send.written_at_ms,
                                 submission_id: Some(pending.submission_id.clone()),
                                 notice: None,
@@ -2344,15 +2352,16 @@ where
         };
         let mut route =
             crate::refusal::Route::decide(writer, seams.provider, step_id, own_estimate)?;
-        let prepared = opts;
-        let mut opts = match reserve_for(
-            writer, seams, admission, step_id, &prepared, &route, call_ready,
-        )
-        .await?
-        {
-            Some(opts) => opts,
-            None => return Ok(finished(writer, RunFinishReason::Error)),
-        };
+        // The step holds one copy of its request's options, which every attempt's call shares.
+        // Reserving the output cap changes only the target model and the step context, so a
+        // re-reserve for the fallback model starts from these again rather than from a second
+        // copy of the whole request kept for it.
+        let prepared = (opts.target_model.clone(), opts.step_context.clone());
+        let mut opts =
+            match reserve_for(writer, seams, admission, step_id, opts, &route, call_ready).await? {
+                Some(opts) => Arc::new(opts),
+                None => return Ok(finished(writer, RunFinishReason::Error)),
+            };
         // The step a timed account pause resumes is sent again only if it renders the request
         // the provider refused, byte for byte, as today's resume checks it: anything else ends
         // the run interrupted rather than send a request the pause wasn't for.
@@ -2392,7 +2401,7 @@ where
                 seams,
                 &admission.run_id,
                 step_id,
-                opts.clone(),
+                Arc::clone(&opts),
                 requested_cache_ttl(admission),
                 admission.account_limit_pause,
             )
@@ -2468,12 +2477,14 @@ where
                         .await?;
                     refusal_retries = step.retries_used;
                     route.reroute(seams.provider);
+                    let mut again = Arc::unwrap_or_clone(opts);
+                    (again.target_model, again.step_context) = prepared.clone();
                     opts = match reserve_for(
-                        writer, seams, admission, step_id, &prepared, &route, call_ready,
+                        writer, seams, admission, step_id, again, &route, call_ready,
                     )
                     .await?
                     {
-                        Some(opts) => opts,
+                        Some(opts) => Arc::new(opts),
                         None => return Ok(finished(writer, RunFinishReason::Error)),
                     };
                     continue;
@@ -2652,7 +2663,7 @@ where
                         run_id: admission.run_id.clone(),
                         step_id,
                         provider_message_id: step.message.message_id.clone(),
-                        message: assistant,
+                        message: Arc::new(assistant),
                         usage: Some(whole),
                         written_at_ms: Some(now),
                         last_content_at_ms: None,
@@ -3058,7 +3069,7 @@ async fn admit<W: Writer>(
             media: Vec::new(),
             run_id: admission.run_id.clone(),
             placement: Placement::RunInput,
-            message: message.clone(),
+            message: Arc::new(message.clone()),
             written_at_ms: admission.written_at_ms,
             submission_id: None,
             notice: None,
@@ -3145,7 +3156,7 @@ async fn shown_high<W: Writer>(writer: &W, parts: &dyn Parts) -> Result<u64, Loo
             .rev()
             .find(|(first, _, _)| *first <= index)
             .map_or((false, false), |(_, render, clean)| (*render, *clean));
-        let mut numbered = message.clone();
+        let mut numbered = Message::clone(message);
         broca_protocol::tags::number_message(
             &mut numbered,
             ComputedRules { render, clean },
@@ -3306,7 +3317,13 @@ fn call_options<W: Writer>(
             crate::compaction::prompt::contract_prompt(writer.conversation(), episodes, enrollment)?
         }
         None => {
-            let mut prompt = writer.conversation().messages.clone();
+            // The request's one copy of the window, which the render inputs below are written into.
+            let mut prompt: Vec<Message> = writer
+                .conversation()
+                .messages
+                .iter()
+                .map(|message| Message::clone(message))
+                .collect();
             // Off the compaction contract a ride renders into its result's copy here, before
             // anything else edits the results, where today's replay joins it as it reads the
             // ride's record. On the contract the entries render it.
@@ -3634,7 +3651,7 @@ async fn model_step<W: Writer, P: Provider, T>(
     seams: &Seams<'_, P, T>,
     run_id: &str,
     step_id: u64,
-    opts: CallOptions,
+    opts: Arc<CallOptions>,
     requested_ttl_ms: Option<u64>,
     account_limit_pause: bool,
 ) -> Result<Result<Step, StepFailure>, LoopError> {
@@ -3656,9 +3673,8 @@ async fn model_step<W: Writer, P: Provider, T>(
         .keep_warm
         .as_ref()
         .and_then(|driver| driver.step_seal());
-    // The call's options, shared with the provider. The published progress names them weakly,
-    // so the session's owner can size the request in flight without keeping it.
-    let opts = Arc::new(opts);
+    // The call's options are shared with the provider. The published progress names them
+    // weakly, so the session's owner can size the request in flight without keeping it.
     if let Some(progress) = &seams.step_progress {
         let now = (seams.now_ms)();
         *progress.lock().unwrap() = Some(broca_protocol::provider::InFlightStep {
@@ -4843,11 +4859,10 @@ async fn reserve_for<W: Writer, P: Provider, T>(
     seams: &Seams<'_, P, T>,
     admission: &Admission,
     step_id: u64,
-    prepared: &CallOptions,
+    mut opts: CallOptions,
     route: &crate::refusal::Route,
     renders: bool,
 ) -> Result<Option<CallOptions>, LoopError> {
-    let mut opts = prepared.clone();
     let mut context_limit = admission.context_limit;
     if route.route == broca_core::refusal_fallback::StepRoute::Fallback {
         // A fallback step tells the renderer which model it renders for.
@@ -6396,7 +6411,7 @@ fn placed_copies(operations: &Operations, run_id: &str) -> Vec<Record> {
                         media: pending.media_at(index),
                         run_id: run_id.to_string(),
                         placement: pending.placement,
-                        message: message.clone(),
+                        message: Arc::new(message.clone()),
                         written_at_ms: pending.written_at_ms,
                         submission_id: pending.submission_id.clone(),
                         notice: None,

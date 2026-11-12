@@ -84,7 +84,10 @@ pub fn window_whole(conversation: &Conversation) -> bool {
 /// Whether any message of the window is a global system message (`systems::is_global`): one
 /// the session's runs repeated into their input, which an enrollment suppresses.
 pub fn carries_global_system(conversation: &Conversation) -> bool {
-    conversation.messages.iter().any(is_global)
+    conversation
+        .messages
+        .iter()
+        .any(|message| is_global(message))
 }
 
 /// The session-state rules an enrollment by a plan is checked against, in this order: the window
@@ -368,15 +371,16 @@ mod tests {
         let mut conversation = Conversation::new(false);
         assert!(window_whole(&conversation));
         conversation.messages = vec![
-            message(Role::System, "a note for this turn", true),
-            message(Role::User, "hi", false),
+            std::sync::Arc::new(message(Role::System, "a note for this turn", true)),
+            std::sync::Arc::new(message(Role::User, "hi", false)),
         ];
         conversation.placed = 2;
         assert!(!carries_global_system(&conversation));
         assert_eq!(check(true, false, false), Ok(()));
-        conversation
-            .messages
-            .insert(0, message(Role::System, "you are terse", false));
+        conversation.messages.insert(
+            0,
+            std::sync::Arc::new(message(Role::System, "you are terse", false)),
+        );
         conversation.placed = 3;
         assert!(carries_global_system(&conversation));
         assert_eq!(check(true, true, false), Err(Refusal::NoSystemText));

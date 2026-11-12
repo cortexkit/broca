@@ -145,6 +145,8 @@ struct Folds {
     open_ids: OpenIds,
     window: OpenLogIndex,
     kept: kept::KeptRecords,
+    /// What the log's facts repeat, held once (see `crate::interned`).
+    interner: crate::interned::Interner,
 }
 
 impl Folds {
@@ -159,12 +161,15 @@ impl Folds {
             operations: checkpoint.operational,
             open_ids: OpenIds::new(hash_key),
             kept: kept::KeptRecords::loading(per_run),
+            interner: Default::default(),
         })
     }
 
     /// Folds the log's next record, at `seq` with its frame at `place`, and keeps it if the
     /// session keeps it. A ledger record the checkpoint already covers is only kept.
-    fn fold(&mut self, seq: u64, record: Record, place: FramePlace) -> Result<(), String> {
+    fn fold(&mut self, seq: u64, mut record: Record, place: FramePlace) -> Result<(), String> {
+        // Interned before the fold and the kept records share it.
+        self.interner.record(&mut record);
         self.window.note(seq, &record);
         let ledger = record.stream() == Stream::Ledger;
         let mut from_memory = false;
@@ -405,6 +410,8 @@ pub struct Session<B: SessionBackend> {
     /// Set when a read refused for needing storage while reads came from memory only.
     memory_refused: std::sync::atomic::AtomicBool,
     retired_tag_floor: u64,
+    /// What the session's facts repeat, held once (see `crate::interned`).
+    interner: crate::interned::Interner,
 }
 
 /// Where a session stood when it was read: the head version, the open log, and how many of the
@@ -621,6 +628,7 @@ impl<B: SessionBackend> Session<B> {
             memory_only: Default::default(),
             memory_refused: Default::default(),
             retired_tag_floor: 1,
+            interner: Default::default(),
         })
     }
 
@@ -810,6 +818,7 @@ impl<B: SessionBackend> Session<B> {
             open_ids,
             window,
             mut kept,
+            interner,
             ..
         } = *folds;
         let next_seq = head
@@ -838,6 +847,7 @@ impl<B: SessionBackend> Session<B> {
             memory_only: Default::default(),
             memory_refused: Default::default(),
             retired_tag_floor: 1,
+            interner,
         };
         Ok(Loaded::Open {
             session: Box::new(session),
@@ -963,8 +973,20 @@ impl<B: SessionBackend> Session<B> {
         }
         let encoded = self.encoder.batch(records)?;
         let first = encoded.first_seq.expect("a batch holds records");
+        // The fold and the kept records hold the batch's facts with what they repeat interned:
+        // a copy of each facts record, as the caller's are borrowed.
+        let interned: Vec<Option<Record>> = records
+            .iter()
+            .map(|record| self.interner.interned(record))
+            .collect();
+        let records_held = || {
+            records
+                .iter()
+                .zip(&interned)
+                .map(|(record, interned)| interned.as_ref().unwrap_or(record))
+        };
         self.poisoned = true;
-        for (position, record) in records.iter().enumerate() {
+        for (position, record) in records_held().enumerate() {
             check_announced_mid(&self.conversation, &self.operations, record)
                 .map_err(SessionError::Fold)?;
             apply(
@@ -992,7 +1014,7 @@ impl<B: SessionBackend> Session<B> {
         if barrier {
             self.encoder.synced();
         }
-        for ((position, record), place) in records.iter().enumerate().zip(encoded.places(batch_at))
+        for ((position, record), place) in records_held().enumerate().zip(encoded.places(batch_at))
         {
             let seq = first + position as u64;
             // A run start drops the kept records of the run before it; the id index takes over
@@ -1219,7 +1241,7 @@ impl<B: SessionBackend> Session<B> {
         let conversation = &self.conversation;
         let messages = conversation.messages.heap_bytes() + conversation.open_heap_bytes();
         let entry_facts = conversation.entries.heap_bytes() + conversation.open_entry.heap_bytes();
-        let (kept_records, kept_capacity) = self.kept.held_bytes();
+        let (kept_records, kept_capacity) = self.kept.held_bytes(&conversation.shared_addresses());
         let sealed_entries = self
             .sealed_entries
             .lock()
@@ -1239,7 +1261,8 @@ impl<B: SessionBackend> Session<B> {
             + self.head.heap_bytes()
             + self.encoder.heap_bytes()
             + imported
-            + enrollment;
+            + enrollment
+            + self.interner.heap_bytes();
         SessionHeld {
             messages,
             entry_facts,

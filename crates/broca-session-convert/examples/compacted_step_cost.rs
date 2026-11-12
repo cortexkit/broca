@@ -1306,10 +1306,14 @@ fn moved(record: &Record, run: &str, ordinal_shift: i64, mid: &str) -> Record {
     let shift = |ordinal: u64| u64::try_from(ordinal as i64 + ordinal_shift).unwrap();
     match &mut record {
         Record::EntryFacts(facts) => {
+            let facts = std::sync::Arc::make_mut(facts);
             facts.ordinal = shift(facts.ordinal);
             facts.mid = mid.to_owned();
         }
-        Record::TurnFacts(turn) => turn.ordinal = shift(turn.ordinal),
+        Record::TurnFacts(turn) => {
+            let turn = std::sync::Arc::make_mut(turn);
+            turn.ordinal = shift(turn.ordinal);
+        }
         // Each message is named by the seq of its own facts, so no step or batch start
         // announces an id.
         Record::StepStart(start) => start.mid = None,

@@ -56,7 +56,10 @@ fn one_of_each() -> Vec<Record> {
             media: Vec::new(),
             run_id: "run-1".into(),
             placement: Placement::RunInput,
-            message: Message::new(Role::User, vec![ContentBlock::Text { text: "hi".into() }]),
+            message: std::sync::Arc::new(Message::new(
+                Role::User,
+                vec![ContentBlock::Text { text: "hi".into() }],
+            )),
             written_at_ms: Some(1),
             submission_id: Some("sub".into()),
             notice: Some(Notice {
@@ -71,10 +74,10 @@ fn one_of_each() -> Vec<Record> {
             run_id: "run-1".into(),
             step_id: 1,
             provider_message_id: MessageId("msg_1".into()),
-            message: Message::assistant_from(
+            message: std::sync::Arc::new(Message::assistant_from(
                 vec![ContentBlock::Text { text: "OK".into() }],
                 model(),
-            ),
+            )),
             usage: Some(usage),
             written_at_ms: Some(2),
             last_content_at_ms: None,

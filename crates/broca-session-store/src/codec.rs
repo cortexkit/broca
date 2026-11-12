@@ -943,3 +943,22 @@ impl<T: Value> Value for Box<T> {
         T::missing().map(Box::new)
     }
 }
+
+/// A value shared between holders in memory (a message the conversation and the kept records
+/// both hold) is written and read exactly as the value itself: sharing never changes the bytes.
+impl<T: Value> Value for std::sync::Arc<T> {
+    const WIRE: Wire = T::WIRE;
+    const NAME: &'static str = T::NAME;
+    fn write(&self, out: &mut Vec<u8>) {
+        (**self).write(out);
+    }
+    fn read(raw: Raw<'_>) -> Result<Self, DecodeError> {
+        T::read(raw).map(std::sync::Arc::new)
+    }
+    fn is_default(&self) -> bool {
+        (**self).is_default()
+    }
+    fn missing() -> Option<Self> {
+        T::missing().map(std::sync::Arc::new)
+    }
+}

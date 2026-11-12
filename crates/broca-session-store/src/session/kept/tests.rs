@@ -102,7 +102,10 @@ fn input(run: &str, text: &str) -> Record {
         media: Vec::new(),
         run_id: run.into(),
         placement: Placement::RunInput,
-        message: Message::new(Role::User, vec![ContentBlock::Text { text: text.into() }]),
+        message: std::sync::Arc::new(Message::new(
+            Role::User,
+            vec![ContentBlock::Text { text: text.into() }],
+        )),
         written_at_ms: None,
         submission_id: None,
         notice: None,
@@ -543,7 +546,7 @@ fn queued(submission: &str) -> Record {
 
 /// The entry facts of the message at `ordinal`.
 fn facts(ordinal: u64) -> Record {
-    Record::EntryFacts(EntryFacts {
+    Record::EntryFacts(std::sync::Arc::new(EntryFacts {
         send_id: None,
         named_speaker: None,
         client_message_id: None,
@@ -569,7 +572,7 @@ fn facts(ordinal: u64) -> Record {
         delivery_mode: None,
         delivery_tool_call_id: None,
         notices: Vec::new(),
-    })
+    }))
 }
 
 fn assistant(run: &str, step: u64, content: Vec<ContentBlock>) -> Record {
@@ -577,7 +580,7 @@ fn assistant(run: &str, step: u64, content: Vec<ContentBlock>) -> Record {
         run_id: run.into(),
         step_id: step,
         provider_message_id: MessageId(format!("{run}-m{step}")),
-        message: Message::assistant_from(content, model()),
+        message: std::sync::Arc::new(Message::assistant_from(content, model())),
         usage: None,
         written_at_ms: None,
         last_content_at_ms: None,

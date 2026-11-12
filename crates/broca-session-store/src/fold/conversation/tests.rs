@@ -16,7 +16,10 @@ fn input(text: &str, placement: Placement) -> Record {
         media: Vec::new(),
         run_id: "r".into(),
         placement,
-        message: Message::new(Role::User, vec![ContentBlock::Text { text: text.into() }]),
+        message: std::sync::Arc::new(Message::new(
+            Role::User,
+            vec![ContentBlock::Text { text: text.into() }],
+        )),
         written_at_ms: None,
         submission_id: None,
         notice: None,
@@ -48,7 +51,7 @@ fn assistant(calls: &[&str]) -> Record {
         run_id: "r".into(),
         step_id: 1,
         provider_message_id: MessageId("m".into()),
-        message: Message::assistant_from(content, model()),
+        message: std::sync::Arc::new(Message::assistant_from(content, model())),
         usage: None,
         written_at_ms: None,
         last_content_at_ms: None,
@@ -175,9 +178,11 @@ fn a_budget_finalize_step_enters_at_once_without_its_calls() {
     let Record::Assistant(mut step) = assistant(&["a"]) else {
         unreachable!()
     };
-    step.message.content.push(ContentBlock::Text {
-        text: "summary".into(),
-    });
+    std::sync::Arc::make_mut(&mut step.message)
+        .content
+        .push(ContentBlock::Text {
+            text: "summary".into(),
+        });
     step.budget_finalize = Some(true);
     let conversation = fold(&[Record::Assistant(step)], false).unwrap();
     assert!(conversation.open_tool_turn().is_none());
@@ -258,7 +263,7 @@ fn a_ride_is_kept_beside_its_call_in_both_layouts() {
 }
 
 fn facts(ordinal: u64, tag_base: u64) -> Record {
-    Record::EntryFacts(EntryFacts {
+    Record::EntryFacts(std::sync::Arc::new(EntryFacts {
         send_id: None,
         named_speaker: None,
         client_message_id: None,
@@ -284,7 +289,7 @@ fn facts(ordinal: u64, tag_base: u64) -> Record {
         delivery_mode: None,
         delivery_tool_call_id: None,
         notices: Vec::new(),
-    })
+    }))
 }
 
 fn tag_base(conversation: &Conversation, ordinal: u64) -> Option<u64> {

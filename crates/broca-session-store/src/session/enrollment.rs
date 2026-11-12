@@ -79,10 +79,11 @@ impl EnrollmentOverlay {
         let Some(decided) = self.entry(stored.ordinal) else {
             return stored;
         };
-        if let Some(facts) = stored.state.facts.as_mut() {
+        // The served facts are this read's own copy: the conversation's stay as recorded.
+        if let Some(facts) = stored.state.facts.as_mut().map(std::sync::Arc::make_mut) {
             facts.tag_base = decided.tag_base;
             facts.written_at_ms = Some(decided.written_at_ms);
-            facts.notice.clone_from(&decided.notice);
+            facts.notice = decided.notice.clone().map(Into::into);
             if decided.suppressed {
                 // Nothing that could give the empty entry a notice origin, a speaker or usage.
                 facts.sender = None;
@@ -92,7 +93,9 @@ impl EnrollmentOverlay {
             }
         }
         if decided.suppressed {
-            stored.message.content.clear();
+            std::sync::Arc::make_mut(&mut stored.message)
+                .content
+                .clear();
             stored.next = None;
             stored.state.delivered.clear();
             stored.state.turn = None;

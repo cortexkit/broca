@@ -191,7 +191,7 @@ impl Writer {
                 media: Vec::new(),
                 run_id: run_id.clone(),
                 placement: Placement::RunInput,
-                message: input,
+                message: input.into(),
                 written_at_ms: Some(self.now()),
                 submission_id: Some(format!("sub-{run:04}")),
                 notice: None,
@@ -199,7 +199,7 @@ impl Writer {
                 receipt_seq: None,
                 pruned: Vec::new(),
             }),
-            Record::EntryFacts(self.facts(&run_id, false)),
+            Record::EntryFacts(self.facts(&run_id, false).into()),
         ]);
         self.written.messages += 1;
         // Tool steps take two messages each; the input and the answer take the other two.
@@ -254,7 +254,7 @@ impl Writer {
             render_tags: true,
             clean_reply: true,
             mid: Self::mid(self.ordinal),
-            run_id: Some(run_id.to_owned()),
+            run_id: Some(run_id.into()),
             created_at_ms: Some(self.now()),
             delivery_mode: None,
             delivery_tool_call_id: None,
@@ -322,7 +322,7 @@ impl Writer {
             run_id: run_id.to_owned(),
             step_id,
             provider_message_id: MessageId(format!("prov-{run_id}-{step_id}")),
-            message: Message::assistant_from(content, model()),
+            message: Message::assistant_from(content, model()).into(),
             usage: Some(usage()),
             written_at_ms: Some(self.now()),
             last_content_at_ms: Some(self.now()),
@@ -394,7 +394,7 @@ impl Writer {
         let end = Self::step_end(run_id, step_id, calls as u32, FinishReason::ToolCalls);
         // The assistant message is held for its results at its reserved ordinal.
         self.ordinal = assistant_ordinal;
-        let assistant_facts = Record::EntryFacts(self.facts(run_id, true));
+        let assistant_facts = Record::EntryFacts(self.facts(run_id, true).into());
         self.ordinal = assistant_ordinal - 1;
         let mut dispatch = vec![Record::BatchStart(BatchStart {
             run_id: run_id.to_owned(),
@@ -452,7 +452,7 @@ impl Writer {
             call_facts.push(CallFacts {
                 tool_call_id: id.clone(),
                 call_key: key,
-                schema_pin: Some(Self::schema_pin(name)),
+                schema_pin: Some(Self::schema_pin(name).into()),
                 carrier: None,
                 dispatched_to: Some("synthetic.tools".into()),
                 dispatched_at_ms: Some(self.now()),
@@ -465,11 +465,14 @@ impl Writer {
             run_id: run_id.to_owned(),
             batch_id,
         }));
-        answers.push(Record::EntryFacts(self.facts(run_id, true)));
-        answers.push(Record::TurnFacts(TurnFacts {
-            ordinal: assistant_ordinal,
-            calls: call_facts,
-        }));
+        answers.push(Record::EntryFacts(self.facts(run_id, true).into()));
+        answers.push(Record::TurnFacts(
+            TurnFacts {
+                ordinal: assistant_ordinal,
+                calls: call_facts,
+            }
+            .into(),
+        ));
         self.written.messages += 2;
         self.written.calls += calls;
         vec![
@@ -491,7 +494,7 @@ impl Writer {
         let text = self.text.words(self.shape.assistant_text_bytes * 2);
         let assistant = self.assistant(run_id, step_id, vec![ContentBlock::Text { text }]);
         self.ordinal = ordinal;
-        let facts = Record::EntryFacts(self.facts(run_id, true));
+        let facts = Record::EntryFacts(self.facts(run_id, true).into());
         self.written.messages += 1;
         vec![vec![
             step_start,

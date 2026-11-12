@@ -53,7 +53,7 @@ fn entry_facts(marks: serde_json::Value) -> EntryFacts {
         delivery_tool_call_id: None,
         client_message_id: None,
         sender: Some("core".into()),
-        marks: Some(marks),
+        marks: Some(marks.into()),
         no_display_facts: None,
         reasoning_summaries: Vec::new(),
         rich_ui: None,
@@ -89,7 +89,7 @@ fn marked() -> Vec<Record> {
             written_at_ms: Some(4),
             ride: Some(ride()),
         }),
-        Record::EntryFacts(entry_facts(marks.clone())),
+        Record::EntryFacts(std::sync::Arc::new(entry_facts(marks.clone()))),
         Record::RunStart(Box::new(RunStart {
             named_speaker: None,
             imported_ids: None,
@@ -342,8 +342,12 @@ fn named_records() -> Vec<Record> {
                 Record::ResultAppend(append)
             }
             Record::EntryFacts(mut facts) => {
-                facts.marks = facts.marks.take().map(named);
-                facts.named_speaker = marks_name_speaker(facts.marks.as_ref());
+                let facts_mut = std::sync::Arc::make_mut(&mut facts);
+                facts_mut.marks = facts_mut
+                    .marks
+                    .take()
+                    .map(|marks| named(marks.to_value()).into());
+                facts_mut.named_speaker = marks_name_speaker(facts_mut.marks.as_deref());
                 Record::EntryFacts(facts)
             }
             Record::RunStart(mut start) => {
@@ -466,7 +470,7 @@ fn nested_named_speakers_carry_their_own_flag() {
     let notice = &mut facts.notices[0];
     notice.speaks_for = notice.speaks_for.take().map(named);
     notice.named_speaker = named_speaker(notice.speaks_for.as_ref());
-    let body = Record::EntryFacts(facts).encode_body();
+    let body = Record::EntryFacts(std::sync::Arc::new(facts)).encode_body();
     assert_eq!(must_bit(payload(&body, 23), 7), Some(true));
     // The marks themselves are unnamed, so the message's own flag stays unwritten.
     assert_eq!(must_bit(&body, 24), None);

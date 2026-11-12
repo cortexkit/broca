@@ -115,7 +115,10 @@ fn input(run: &str, text: &str) -> Record {
         media: Vec::new(),
         run_id: run.into(),
         placement: Placement::RunInput,
-        message: Message::new(Role::User, vec![ContentBlock::Text { text: text.into() }]),
+        message: std::sync::Arc::new(Message::new(
+            Role::User,
+            vec![ContentBlock::Text { text: text.into() }],
+        )),
         written_at_ms: None,
         submission_id: None,
         notice: None,
@@ -130,7 +133,7 @@ fn assistant(run: &str, content: Vec<ContentBlock>) -> Record {
         run_id: run.into(),
         step_id: 1,
         provider_message_id: MessageId(format!("m-{run}")),
-        message: Message::assistant_from(content, model()),
+        message: std::sync::Arc::new(Message::assistant_from(content, model())),
         usage: None,
         written_at_ms: None,
         last_content_at_ms: None,
@@ -148,7 +151,7 @@ fn call(id: &str) -> ContentBlock {
 }
 
 fn facts(ordinal: u64, mid: String) -> Record {
-    Record::EntryFacts(EntryFacts {
+    Record::EntryFacts(std::sync::Arc::new(EntryFacts {
         send_id: None,
         named_speaker: None,
         client_message_id: None,
@@ -174,7 +177,7 @@ fn facts(ordinal: u64, mid: String) -> Record {
         delivery_mode: None,
         delivery_tool_call_id: None,
         notices: Vec::new(),
-    })
+    }))
 }
 
 /// A tool result with a text part, then one media part per image.
@@ -498,7 +501,9 @@ fn a_named_medium_is_found_by_digest_in_sealed_history_and_the_open_log(cipher: 
         let Record::Input(mut unstored) = input("r2", "look") else {
             unreachable!()
         };
-        unstored.message.content.push(ContentBlock::Media(image(c)));
+        std::sync::Arc::make_mut(&mut unstored.message)
+            .content
+            .push(ContentBlock::Media(image(c)));
         let mid = session.message_id(2);
         session
             .append(
@@ -650,7 +655,7 @@ fn a_sends_media_are_stored_under_its_record_and_its_copies_point_at_them(cipher
         let Record::Input(mut copy) = input("r0", "") else {
             unreachable!()
         };
-        copy.message = photo_message("queued look", &[a]);
+        copy.message = std::sync::Arc::new(photo_message("queued look", &[a]));
         let (_, placed) = session
             .append_input_media(&[Record::Input(copy)], blocks(0, 0, &[a]), true)
             .await
