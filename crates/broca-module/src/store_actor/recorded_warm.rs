@@ -10,30 +10,38 @@ use broca_session_store::record::Record;
 use broca_session_store::record::Stream;
 use broca_session_store::session::{Carry, EnrollmentOverlay, SessionError, StoredEntry};
 
-/// Build from a snapshot: the actor and the running loop must keep the complete conversation.
-pub(super) async fn request<W: Writer>(
+/// Build the request of run `run_id`'s last recorded attempt, or of its last attempt for step
+/// `step` when one is named, from a snapshot: the actor and the running loop must keep the
+/// complete conversation. `writer` is the session as it stands now; `records` must reach from
+/// the run's start through that attempt.
+pub(crate) async fn request<W: Writer>(
     writer: &W,
     records: &[(u64, Record)],
     parts: &dyn Parts,
     bind: &BindIdentity,
+    run_id: &str,
+    step: Option<u64>,
 ) -> Result<RecordedRequest, String> {
-    let run = writer.operations().run.as_ref().ok_or("no recorded run")?;
     let (attempt_at, attempt) = records
         .iter()
         .enumerate()
         .rev()
         .find_map(|(at, (_, record))| match record {
-            Record::Attempt(attempt) if attempt.run_id == run.run_id => Some((at, attempt)),
+            Record::Attempt(attempt)
+                if attempt.run_id == run_id && step.is_none_or(|step| attempt.step_id == step) =>
+            {
+                Some((at, attempt))
+            }
             _ => None,
         })
-        .ok_or("the run's last request has no recorded attempt")?;
+        .ok_or("the run's request has no recorded attempt")?;
     let step = attempt.step_id;
     let (start_at, mid) = records[..attempt_at]
         .iter()
         .enumerate()
         .rev()
         .find_map(|(at, (_, record))| match record {
-            Record::StepStart(start) if start.run_id == run.run_id && start.step_id == step => {
+            Record::StepStart(start) if start.run_id == run_id && start.step_id == step => {
                 start.mid.as_deref().map(|mid| (at, mid))
             }
             _ => None,
@@ -55,7 +63,7 @@ pub(super) async fn request<W: Writer>(
     let run_at = records[..=attempt_at]
         .iter()
         .rposition(
-            |(_, record)| matches!(record, Record::RunStart(start) if start.run_id == run.run_id),
+            |(_, record)| matches!(record, Record::RunStart(start) if start.run_id == run_id),
         )
         .ok_or("the recorded run's start is outside the readable history")?;
     let mut prefix = Operations::default();
@@ -99,7 +107,7 @@ pub(super) async fn request<W: Writer>(
     let route = records[attempt_at..]
         .iter()
         .find_map(|(_, record)| match record {
-            Record::StepEnd(end) if end.run_id == run.run_id && end.step_id == step => {
+            Record::StepEnd(end) if end.run_id == run_id && end.step_id == step => {
                 end.fallback.as_ref()
             }
             _ => None,
@@ -126,6 +134,47 @@ pub(super) async fn request<W: Writer>(
     })
 }
 
+/// The request `session` last sent for run `run_id` (for its step `step`, when one is named),
+/// rebuilt from the session's records: its open log when that holds the run's start and the
+/// attempt, else its whole history read through `readers`, the backend of the root holding its
+/// sealed logs. Writes nothing.
+pub(crate) async fn recorded_request<B, R>(
+    session: &broca_session_store::session::Session<B>,
+    readers: Option<R>,
+    parts: &dyn Parts,
+    bind: &BindIdentity,
+    run_id: &str,
+    step: Option<u64>,
+) -> Result<RecordedRequest, String>
+where
+    B: broca_session_store::backend::SessionBackend,
+    R: broca_session_store::backend::SessionBackend,
+{
+    let mut records = session
+        .open_log_records()
+        .await
+        .map_err(|error| format!("read the recorded request: {error:?}"))?;
+    let attempted = |records: &[(u64, Record)]| {
+        records.iter().any(|(_, record)| {
+            matches!(record, Record::Attempt(attempt)
+                if attempt.run_id == run_id && step.is_none_or(|step| attempt.step_id == step))
+        })
+    };
+    if !attempted(&records)
+        || !records
+            .iter()
+            .any(|(_, record)| matches!(record, Record::RunStart(start) if start.run_id == run_id))
+    {
+        let readers = readers.ok_or("the recorded request's sealed history cannot be read")?;
+        records = session
+            .stored_records(readers)
+            .records_between(1, session.next_seq().saturating_sub(1))
+            .await
+            .map_err(|error| format!("read the recorded request's history: {error:?}"))?;
+    }
+    request(session, &records, parts, bind, run_id, step).await
+}
+
 impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> super::StoreActor<B> {
     /// Called while the first attempt is finishing, before that attempt is appended. A
     /// diagnostic read needs only the newest attempted run and the setup recorded for it.
@@ -148,11 +197,6 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> su
     }
 
     pub(super) async fn recorded_warm_request(&self) -> Result<RecordedRequest, String> {
-        let mut records = self
-            .session
-            .open_log_records()
-            .await
-            .map_err(|error| format!("read the recorded request: {error:?}"))?;
         let run_id = self
             .session
             .operations
@@ -160,25 +204,16 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> su
             .as_ref()
             .ok_or("no recorded run")?
             .run_id
-            .as_str();
-        if !records.iter().any(
-            |(_, record)| matches!(record, Record::Attempt(attempt) if attempt.run_id == run_id),
-        ) || !records
-            .iter()
-            .any(|(_, record)| matches!(record, Record::RunStart(start) if start.run_id == run_id))
-        {
-            let readers = self
-                .readers
-                .as_ref()
-                .ok_or("the recorded request's sealed history cannot be read")?;
-            records = self
-                .session
-                .stored_records(readers())
-                .records_between(1, self.session.next_seq().saturating_sub(1))
-                .await
-                .map_err(|error| format!("read the recorded request's history: {error:?}"))?;
-        }
-        request(&self.session, &records, &self.parts, &self.key).await
+            .clone();
+        recorded_request(
+            &self.session,
+            self.readers.as_ref().map(|readers| readers()),
+            &self.parts,
+            &self.key,
+            &run_id,
+            None,
+        )
+        .await
     }
 }
 
@@ -217,7 +252,15 @@ async fn predecessor<W: Writer>(
         conversation: writer.conversation().clone(),
         operations,
     };
-    let request = request(&snapshot, &records[start..], parts, bind).await?;
+    let request = request(
+        &snapshot,
+        &records[start..],
+        parts,
+        bind,
+        &attempt.run_id,
+        None,
+    )
+    .await?;
     Ok(Some(broca_core::provider::CachePredecessor {
         request,
         sent_at_ms: attempt.sent_at_ms,

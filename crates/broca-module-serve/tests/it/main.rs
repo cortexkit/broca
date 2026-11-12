@@ -48,6 +48,8 @@ mod captured_replay_e2e;
 mod chatgpt_websocket_live;
 mod early_args_boot;
 mod engram_descriptor;
+mod fork_answer_serve;
+mod fork_request_render;
 mod graceful_stop_real_daemon;
 mod head_import_serve;
 mod input_token_cap;

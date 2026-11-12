@@ -465,6 +465,21 @@ pub fn broca_role_describe_with_writers(
     if retention_writer {
         capabilities.push(cortexkit_role_llm_runner::capabilities::RETENTION.into());
     }
+    let mut ops = ops;
+    if broca_protocol::FORK_ANSWER_SERVED {
+        // Served for heads kept in the new storage (`broca_session_store`), where heads are
+        // created; a head not yet converted from a write-ahead log refuses each op with
+        // fork_unsupported.
+        ops.extend(
+            [
+                cortexkit_role_llm_runner::ops::SESSION_FORK_PREPARE,
+                cortexkit_role_llm_runner::ops::SESSION_FORK_ASK,
+                cortexkit_role_llm_runner::ops::SESSION_FORK_END,
+            ]
+            .map(String::from),
+        );
+        capabilities.push(cortexkit_role_llm_runner::capabilities::FORK_ANSWER.into());
+    }
     let mut describe = cortexkit_role_llm_runner::describe::RoleDescribe::new(
         vec![Major {
             version: LLM_RUNNER_V1.into(),
@@ -492,6 +507,9 @@ pub fn broca_role_describe_with_writers(
     .with_steer_receipt(steer_receipt::GUARANTEED)
     .with_run_cancel(vec!["now".into(), "step_boundary".into()])
     .with_routed_accounts(vec!["oauth".into(), "chatgpt".into(), "apikey".into()]);
+    if broca_protocol::FORK_ANSWER_SERVED {
+        describe = describe.with_fork_idle_s(broca_protocol::FORK_IDLE_S);
+    }
     describe.step_events = Some(cortexkit_role_llm_runner::step_events::StepEvents::new(
         "per_attempt",
         "step_ref",
@@ -1243,9 +1261,16 @@ mod pinned_reply_bytes {
             ] {
                 assert!(checked.declares(group), "{group}");
             }
+            assert_eq!(
+                checked.declares("fork_answer"),
+                broca_protocol::FORK_ANSWER_SERVED
+            );
+            assert_eq!(
+                checked.fork_idle_s,
+                broca_protocol::FORK_ANSWER_SERVED.then_some(broca_protocol::FORK_IDLE_S)
+            );
             for group in [
                 "adopt_open",
-                "fork_answer",
                 "call_yield",
                 "stop_all",
                 "cache_policy",
@@ -1375,7 +1400,7 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "20dc5ad4db04533cebbbf36d9758910ef7f13349bd6efd9c927e872c42538421",
+            "5d994cccd65229db47db132ca879b03e5f261d872392e619140eb127e9172126",
         );
     }
 
@@ -1571,7 +1596,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "711ad0574402899354aaf3471e05c90f53324cb6e41658a7e142c1ba2d5e2b26";
+        "40e0ff125f45702f0c564b710231c43b9f030a9916c5018e7f8618df244eebad";
     const RUN_TOOL_CALLS_PAGE_SHA256: &str =
         "6978763bd48c30edffbf61a4b4a0966d7efdfc146b94023f4a36cca4bda0881d";
     const DELIVERED_STEP_SHA256: &str =

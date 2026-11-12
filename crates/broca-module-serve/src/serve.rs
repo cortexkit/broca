@@ -2857,6 +2857,16 @@ async fn spawn_vault_audit_request<H: ServeHandler + 'static>(
     Ok(())
 }
 
+/// Whether `method` is one of the `fork_answer` operations (llm-runner §9.20).
+fn is_fork_operation(method: &str) -> bool {
+    matches!(
+        method,
+        cortexkit_role_llm_runner::ops::SESSION_FORK_PREPARE
+            | cortexkit_role_llm_runner::ops::SESSION_FORK_ASK
+            | cortexkit_role_llm_runner::ops::SESSION_FORK_END
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn spawn_route_request<H>(
     prepared: PreparedRouteRequest,
@@ -2882,6 +2892,8 @@ where
     let conn_cancel = conn_cancel.clone();
     let describe =
         matches!(&prepared, PreparedRouteRequest::Request(req) if req.method == OP_ROLE_DESCRIBE);
+    let fork_operation =
+        matches!(&prepared, PreparedRouteRequest::Request(req) if is_fork_operation(&req.method));
 
     request_tasks.spawn(reply_on_panic(writer.clone(), (ver, channel, epoch, corr), async move {
         let method = match &prepared {
@@ -2897,7 +2909,11 @@ where
         log_served_request(&operation, &session, caller_module(&bind), phase, async {
         // Authorization can read durable history, and permits can be held by slow calls.
         // Neither wait belongs on the frame reader: it must still answer PING and GOODBYE.
-        let _turn = dispatch_ticket.wait().await;
+        let turn = dispatch_ticket.wait().await;
+        // A fork operation reads its head without waiting on it and may hold a model call for
+        // seconds: it gives the session's turn back once it has started, so the head's own
+        // requests, and the fork's other operations, are never queued behind it.
+        let _turn = (!fork_operation).then_some(turn);
         let _permit = request_slots.acquire_owned().await
             .map_err(|_| ServeIoError("request concurrency limiter closed".into()))?;
         if describe {
@@ -4720,6 +4736,69 @@ where
                 Err(e) => send_serve_error(writer, ver, channel, epoch, corr, &e).await,
             }
         }
+        cortexkit_role_llm_runner::ops::SESSION_FORK_PREPARE => {
+            type Request = cortexkit_role_llm_runner::fork_answer::ForkPrepareRequest;
+            if let Err((field, message)) = decode_params::<Request>(&req.params) {
+                return send_invalid_params(writer, ver, channel, epoch, corr, field, &message)
+                    .await;
+            }
+            match handler.fork_prepare(session, bind.principal.as_ref()).await {
+                Ok(reply) => send_json_response(writer, ver, channel, epoch, corr, &reply).await,
+                Err(error) => send_fork_error(writer, ver, channel, epoch, corr, &error).await,
+            }
+        }
+        cortexkit_role_llm_runner::ops::SESSION_FORK_ASK => {
+            type Request = cortexkit_role_llm_runner::fork_answer::ForkAskRequest;
+            let request: Request = match serde_json::from_value(req.params.clone()) {
+                Ok(request) => request,
+                Err(error) => {
+                    let field = broca_wire::failing_field::<Request>(&req.params, &error);
+                    return send_invalid_params(
+                        writer,
+                        ver,
+                        channel,
+                        epoch,
+                        corr,
+                        field,
+                        &error.to_string(),
+                    )
+                    .await;
+                }
+            };
+            match handler
+                .fork_ask(session, bind.principal.as_ref(), request)
+                .await
+            {
+                Ok(reply) => send_json_response(writer, ver, channel, epoch, corr, &reply).await,
+                Err(error) => send_fork_error(writer, ver, channel, epoch, corr, &error).await,
+            }
+        }
+        cortexkit_role_llm_runner::ops::SESSION_FORK_END => {
+            type Request = cortexkit_role_llm_runner::fork_answer::ForkEndRequest;
+            let request: Request = match serde_json::from_value(req.params.clone()) {
+                Ok(request) => request,
+                Err(error) => {
+                    let field = broca_wire::failing_field::<Request>(&req.params, &error);
+                    return send_invalid_params(
+                        writer,
+                        ver,
+                        channel,
+                        epoch,
+                        corr,
+                        field,
+                        &error.to_string(),
+                    )
+                    .await;
+                }
+            };
+            match handler
+                .fork_end(session, bind.principal.as_ref(), request)
+                .await
+            {
+                Ok(reply) => send_json_response(writer, ver, channel, epoch, corr, &reply).await,
+                Err(error) => send_fork_error(writer, ver, channel, epoch, corr, &error).await,
+            }
+        }
         cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REFS => {
             type Request = cortexkit_role_llm_runner::output_refs::ListRequest;
             let request: Request = match serde_json::from_value(req.params.clone()) {
@@ -5616,6 +5695,11 @@ pub(crate) fn served_on_new_storage(method: &str, _params: &serde_json::Value) -
         // The store actor warms the request its loop would send next, dated by the store's own
         // cache clock (`store_actor::warm`).
         OP_WARM => true,
+        // Forks of a head read it without an actor and write only their own sessions
+        // (`broca_module::fork_answer`); a session on today's storage refuses them by name.
+        cortexkit_role_llm_runner::ops::SESSION_FORK_PREPARE
+        | cortexkit_role_llm_runner::ops::SESSION_FORK_ASK
+        | cortexkit_role_llm_runner::ops::SESSION_FORK_END => true,
         // Describes the module, not the session.
         OP_ROLE_DESCRIBE => true,
         // Media the store's own records name, read from the objects they stored
@@ -6470,6 +6554,22 @@ async fn send_output_ref_refusal(
             .await
         }
     }
+}
+
+/// A fork operation's refusal (llm-runner `fork_answer`) under its code and detail.
+async fn send_fork_error(
+    writer: &EgressSender<Frame>,
+    ver: u8,
+    channel: u16,
+    epoch: u32,
+    corr: u64,
+    error: &broca_module::fork_answer::ForkError,
+) -> Result<(), ServeIoError> {
+    let mut body = ErrorBody::new(error.code(), error.message());
+    if let Some(detail) = error.detail() {
+        body = body.with_detail(detail);
+    }
+    send_error_body(writer, ver, channel, epoch, corr, body).await
 }
 
 async fn send_error(

@@ -1790,6 +1790,25 @@ impl BrocaSubject {
         session: &str,
         milliseconds: u64,
     ) -> Result<(), HarnessError> {
+        self.advance_session_clock(session, milliseconds, true)
+            .await
+    }
+
+    pub(super) async fn advance_fork_time(
+        &self,
+        session: &str,
+        milliseconds: u64,
+    ) -> Result<(), HarnessError> {
+        self.advance_session_clock(session, milliseconds, false)
+            .await
+    }
+
+    async fn advance_session_clock(
+        &self,
+        session: &str,
+        milliseconds: u64,
+        retained: bool,
+    ) -> Result<(), HarnessError> {
         let state = self
             .shared
             .session_roots
@@ -1815,11 +1834,15 @@ impl BrocaSubject {
             .ok_or_else(|| HarnessError::new("retention clock overflow"))?;
         let key = self.bind_identity(session);
         let wal = wal_store(&state);
-        let records = broca_wal::replay_file(
-            wal.ephemeral_wal_path(&key),
-            broca_wal::DEFAULT_MAX_READ_BYTES,
-        )
-        .map_err(|error| HarnessError::new(error.to_string()))?;
+        let records = if retained {
+            broca_wal::replay_file(
+                wal.ephemeral_wal_path(&key),
+                broca_wal::DEFAULT_MAX_READ_BYTES,
+            )
+            .map_err(|error| HarnessError::new(error.to_string()))?
+        } else {
+            Vec::new()
+        };
         let due = broca_module::retention::policy(&records)
             .and_then(|(_, _, deadline)| deadline)
             .is_some_and(|deadline| deadline <= target);

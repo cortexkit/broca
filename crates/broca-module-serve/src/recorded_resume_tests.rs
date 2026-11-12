@@ -16,6 +16,10 @@ impl Drop for ResumeHttpFixture {
 }
 
 async fn resume_http_fixture() -> ResumeHttpFixture {
+    resume_http_fixture_with_body(None).await
+}
+
+async fn resume_http_fixture_with_body(script: Option<&'static str>) -> ResumeHttpFixture {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/v1", listener.local_addr().unwrap());
@@ -44,7 +48,9 @@ async fn resume_http_fixture() -> ResumeHttpFixture {
             }
             let anthropic = headers.lines().next().unwrap().contains("/messages ");
             captured.lock().unwrap().push(CapturedResumeRequest { headers, body: bytes[split..split + length].to_vec() });
-            let body = if anthropic {
+            let body = if let Some(script) = script {
+                script
+            } else if anthropic {
                 "data: {\"type\":\"message_start\",\"message\":{\"id\":\"resume\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":1}}}\n\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"done\"}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\ndata: {\"type\":\"message_stop\"}\n\n"
             } else {
                 "data: {\"id\":\"resume\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"done\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"resume\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\ndata: [DONE]\n\n"

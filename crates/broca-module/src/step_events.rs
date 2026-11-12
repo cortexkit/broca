@@ -111,6 +111,15 @@ impl StepEvents {
         }
     }
 
+    /// Publishes the step event of a fork attempt's model call, best effort as every step event
+    /// is. It is an ordinary event of the fork's own session and the attempt's own run, which
+    /// keep it apart from the head's steps.
+    pub(crate) fn publish_fork(&self, event: StepFinished) {
+        if event.check().is_err() || self.store_tx.try_send(event).is_err() {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     pub fn observe(&self, observer: RecordObserver) -> RecordObserver {
         observer.with_step_events(self.tx.clone(), self.dropped.clone())
     }
@@ -287,6 +296,69 @@ fn cache_report(
         None => None,
     };
     Some(report)
+}
+
+/// A fork attempt's model call, as its step event reports it (see [`fork_step_event`]).
+pub struct ForkStep<'a> {
+    /// The fork's own session, and the incarnation of its log.
+    pub session: &'a broca_protocol::BindIdentity,
+    pub incarnation: [u8; 16],
+    /// The seq of the fork record that stored the attempt's end.
+    pub seq: u64,
+    /// The attempt's own run identity, which also names the event's attempt id.
+    pub run_id: &'a str,
+    /// The attempt's number for its ask, counted from 1.
+    pub attempt: u64,
+    pub provider: &'a str,
+    pub model: &'a str,
+    pub usage: broca_protocol::Usage,
+    pub finish_reason: Option<broca_protocol::content::FinishReason>,
+    pub failed: bool,
+    pub started_at_ms: u64,
+    pub finished_at_ms: u64,
+}
+
+/// The step event of a fork attempt's model call: one step of the attempt's own run, in the
+/// fork's own session, with the usage the provider reported.
+pub fn fork_step_event(step: &ForkStep<'_>) -> Option<StepFinished> {
+    // A fork attempt's run id (`fork:` and a digest) identifies the attempt, but an attempt id
+    // holds only letters, digits, `_` and `-`.
+    let attempt_id = step.run_id.replace(':', "-");
+    let incarnation: String = step
+        .incarnation
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let event = Facts {
+        position: StepRef::new(
+            "broca",
+            broca_core::agent_session_ref(step.session),
+            &incarnation,
+            step.seq,
+        ),
+        run_id: step.run_id,
+        step_id: 1,
+        attempt: u32::try_from(step.attempt.checked_sub(1)?).ok()?,
+        status: if step.failed { "failed" } else { "completed" },
+        harness: &step.session.harness,
+        session: &step.session.session,
+        provider: step.provider,
+        model: step.model,
+        started_at_ms: step.started_at_ms,
+        finished_at_ms: step.finished_at_ms,
+        attempt_id: &attempt_id,
+    }
+    .build()?;
+    let envelope = broca_wal::record::AttemptEnvelope {
+        usage: Some(step.usage),
+        finish_reason: step.finish_reason,
+        // Usage is canonical: recorded reasoning is a subset of output, not extra output.
+        reasoning_included_in_output: step.usage.reasoning_tokens.map(|_| true),
+        ..Default::default()
+    };
+    let event = finish(event, &envelope, false);
+    event.check().ok()?;
+    Some(event)
 }
 
 /// Both storages use the same usage projection. Missing or interrupted evidence stays absent.
@@ -716,5 +788,101 @@ mod tests {
         })
         .await;
         assert!(inbox.try_recv().is_err());
+    }
+
+    /// A fork attempt's step event and an ordinary run's, as this build publishes them.
+    fn fork_and_ordinary() -> (StepFinished, StepFinished) {
+        let fork_session = broca_protocol::BindIdentity::new(
+            "/synthetic/project",
+            "runner",
+            "head:fork:fork-72f6bdfa7eb7fb4cdf456d38c4d99623",
+        );
+        let usage = broca_protocol::Usage {
+            input_tokens: Some(1200),
+            cached_input_tokens: Some(1000),
+            output_tokens: Some(40),
+            ..Default::default()
+        };
+        let fork = fork_step_event(&ForkStep {
+            session: &fork_session,
+            incarnation: [7; 16],
+            seq: 5,
+            run_id: "fork:1c5eb44ba863f5575b157804a784d72aee9e330ad3e7d5d8806e99272eabd6a0",
+            attempt: 1,
+            provider: "anthropic",
+            model: "claude-opus-4-8",
+            usage,
+            finish_reason: Some(broca_protocol::content::FinishReason::Stop),
+            failed: false,
+            started_at_ms: 1_790_000_000_000,
+            finished_at_ms: 1_790_000_001_500,
+        })
+        .expect("a fork step event");
+        let head = broca_protocol::BindIdentity::new("/synthetic/project", "runner", "head");
+        let ordinary = Facts {
+            position: StepRef::new("broca", broca_core::agent_session_ref(&head), "0707", 9),
+            run_id: "run-head-1",
+            step_id: 1,
+            attempt: 0,
+            status: "completed",
+            harness: &head.harness,
+            session: &head.session,
+            provider: "anthropic",
+            model: "claude-opus-4-8",
+            started_at_ms: 1_789_999_990_000,
+            finished_at_ms: 1_789_999_991_000,
+            attempt_id: "attempt-head-1",
+        }
+        .build()
+        .unwrap();
+        let envelope = broca_wal::record::AttemptEnvelope {
+            usage: Some(usage),
+            finish_reason: Some(broca_protocol::content::FinishReason::Stop),
+            ..Default::default()
+        };
+        (fork, finish(ordinary, &envelope, false))
+    }
+
+    #[test]
+    fn a_fork_step_event_is_an_ordinary_event_of_the_fork_session_and_attempt_run() {
+        let (fork, ordinary) = fork_and_ordinary();
+        assert_eq!(
+            fork.session,
+            "head:fork:fork-72f6bdfa7eb7fb4cdf456d38c4d99623"
+        );
+        assert_eq!(
+            fork.run_id,
+            "fork:1c5eb44ba863f5575b157804a784d72aee9e330ad3e7d5d8806e99272eabd6a0"
+        );
+        assert_eq!(
+            fork.attempt_id.as_deref(),
+            Some("fork-1c5eb44ba863f5575b157804a784d72aee9e330ad3e7d5d8806e99272eabd6a0")
+        );
+        assert_eq!(fork.attempt.get(), 1);
+        assert_eq!(fork.terminal_status, "completed");
+        assert_eq!(
+            (fork.input_tokens, fork.output_tokens),
+            (Some(1200), Some(40))
+        );
+        fork.check().unwrap();
+        // The bytes are the ones the event's readers accepted: the members an ordinary event
+        // has, and nothing that names the fork beyond its session and run.
+        let body = serde_json::to_vec(&fork).unwrap();
+        assert_eq!(
+            std::str::from_utf8(&body).unwrap(),
+            r#"{"runner":"broca","session_ref":"90c94fcf081d2e49c645072abad2426e","log_incarnation":"07070707070707070707070707070707","seq":5,"run_id":"fork:1c5eb44ba863f5575b157804a784d72aee9e330ad3e7d5d8806e99272eabd6a0","step_id":"1","attempt":1,"terminal_status":"completed","attempt_id":"fork-1c5eb44ba863f5575b157804a784d72aee9e330ad3e7d5d8806e99272eabd6a0","harness":"runner","session":"head:fork:fork-72f6bdfa7eb7fb4cdf456d38c4d99623","provider":"anthropic","model":"claude-opus-4-8","input_tokens":1200,"cached_input_tokens":1000,"output_tokens":40,"finish_reason":"stop","started_at_ms":1790000000000,"finished_at_ms":1790000001500}"#
+        );
+        let decoded: StepFinished = serde_json::from_slice(&body).unwrap();
+        assert_eq!(decoded, fork);
+        let members = |event: &StepFinished| -> Vec<String> {
+            serde_json::to_value(event)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect()
+        };
+        assert_eq!(members(&fork), members(&ordinary));
     }
 }

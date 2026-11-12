@@ -3092,6 +3092,47 @@ pub trait ServeHandler: Send + Sync {
         ))
     }
 
+    /// `session.fork_prepare` (llm-runner `fork_answer`) on `session`, for the route's attested
+    /// `principal`. The default serves no fork.
+    async fn fork_prepare(
+        &self,
+        _session: &LineageKey,
+        _principal: Option<&broca_protocol::BindPrincipal>,
+    ) -> Result<
+        cortexkit_role_llm_runner::fork_answer::ForkPrepareReply,
+        crate::fork_answer::ForkError,
+    > {
+        Err(crate::fork_answer::ForkError::Unsupported(
+            "this runner serves no fork".into(),
+        ))
+    }
+
+    /// `session.fork_ask` on a fork of `session`.
+    async fn fork_ask(
+        &self,
+        _session: &LineageKey,
+        _principal: Option<&broca_protocol::BindPrincipal>,
+        _request: cortexkit_role_llm_runner::fork_answer::ForkAskRequest,
+    ) -> Result<cortexkit_role_llm_runner::fork_answer::ForkAskReply, crate::fork_answer::ForkError>
+    {
+        Err(crate::fork_answer::ForkError::Unsupported(
+            "this runner serves no fork".into(),
+        ))
+    }
+
+    /// `session.fork_end` on a fork of `session`.
+    async fn fork_end(
+        &self,
+        _session: &LineageKey,
+        _principal: Option<&broca_protocol::BindPrincipal>,
+        _request: cortexkit_role_llm_runner::fork_answer::ForkEndRequest,
+    ) -> Result<cortexkit_role_llm_runner::fork_answer::ForkEndReply, crate::fork_answer::ForkError>
+    {
+        Err(crate::fork_answer::ForkError::Unsupported(
+            "this runner serves no fork".into(),
+        ))
+    }
+
     /// `run.result{run_id}` — a run's state and, once it completed, its final message.
     async fn run_result(
         &self,
@@ -3424,6 +3465,38 @@ impl ServeHandler for crate::LineageRegistry {
         self.authorize_session(session, access.principal.as_ref())
             .await
     }
+
+    async fn fork_prepare(
+        &self,
+        session: &LineageKey,
+        principal: Option<&broca_protocol::BindPrincipal>,
+    ) -> Result<
+        cortexkit_role_llm_runner::fork_answer::ForkPrepareReply,
+        crate::fork_answer::ForkError,
+    > {
+        self.fork_manager()?.prepare(session, principal).await
+    }
+
+    async fn fork_ask(
+        &self,
+        session: &LineageKey,
+        principal: Option<&broca_protocol::BindPrincipal>,
+        request: cortexkit_role_llm_runner::fork_answer::ForkAskRequest,
+    ) -> Result<cortexkit_role_llm_runner::fork_answer::ForkAskReply, crate::fork_answer::ForkError>
+    {
+        self.fork_manager()?.ask(session, principal, request).await
+    }
+
+    async fn fork_end(
+        &self,
+        session: &LineageKey,
+        principal: Option<&broca_protocol::BindPrincipal>,
+        request: cortexkit_role_llm_runner::fork_answer::ForkEndRequest,
+    ) -> Result<cortexkit_role_llm_runner::fork_answer::ForkEndReply, crate::fork_answer::ForkError>
+    {
+        self.fork_manager()?.end(session, principal, request).await
+    }
+
     async fn check_plan_selection(
         &self,
         plan: &serde_json::Value,

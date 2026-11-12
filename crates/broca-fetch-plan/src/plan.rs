@@ -378,6 +378,23 @@ pub enum CompactionSupport {
     Supported,
 }
 
+pub use broca_protocol::FORK_ANSWER_SERVED;
+
+/// Refuses a `fork_callers` member that is not a list of distinct non-empty strings, naming
+/// `plan.fork_callers`, when `served`. Checked at admission and at refresh, before anything is
+/// fetched or written.
+pub fn check_fork_callers(
+    plan: &serde_json::Map<String, Value>,
+    served: bool,
+) -> Result<(), &'static str> {
+    let declared: &[&str] = if served {
+        &[cortexkit_role_llm_runner::capabilities::FORK_ANSWER]
+    } else {
+        &[]
+    };
+    cortexkit_role_llm_runner::fork_answer::check_plan(plan, declared)
+}
+
 /// Read and check `plan`, the `plan` member of a send, before anything is fetched.
 ///
 /// Refuses `invalid_params` naming the field for a malformed plan, and then
@@ -406,6 +423,7 @@ pub fn parse_plan_with(
             &[cortexkit_role_llm_runner::capabilities::SENDER_SUCCESSION],
         )
         .map_err(Refusal::invalid)?;
+        check_fork_callers(object, FORK_ANSWER_SERVED).map_err(Refusal::invalid)?;
     }
     check_output_refs(plan, output_refs)?;
     let object = plan.as_object().ok_or_else(|| Refusal::invalid("plan"))?;
@@ -595,6 +613,43 @@ mod sender_tests {
 
     fn senders(value: Value) -> Result<Vec<PlanSender>, Refusal> {
         plan_senders(json!({ "senders": value }).as_object().unwrap())
+    }
+
+    #[test]
+    fn fork_callers_are_checked_only_on_a_build_serving_forks() {
+        for malformed in [
+            json!(null),
+            json!("not a list"),
+            json!({}),
+            json!(["caller", 1]),
+            json!([""]),
+            json!(["duplicate", "duplicate"]),
+        ] {
+            let plan = json!({ "fork_callers": malformed });
+            assert_eq!(
+                check_fork_callers(plan.as_object().unwrap(), true),
+                Err("plan.fork_callers"),
+                "{plan}"
+            );
+            // Without the group the member is left as it is.
+            assert_eq!(check_fork_callers(plan.as_object().unwrap(), false), Ok(()));
+        }
+        let listed = json!({ "fork_callers": ["a", "b"] });
+        assert_eq!(
+            check_fork_callers(listed.as_object().unwrap(), true),
+            Ok(())
+        );
+        // Admission checks the member exactly when this build declares the group.
+        let refusal = parse_plan(
+            &json!({"fork_callers": [""]}),
+            CompactionSupport::Unsupported,
+        )
+        .unwrap_err();
+        assert_eq!(
+            refusal == Refusal::invalid("plan.fork_callers"),
+            FORK_ANSWER_SERVED,
+            "{refusal:?}"
+        );
     }
 
     #[test]

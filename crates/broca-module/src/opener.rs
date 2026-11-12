@@ -265,6 +265,9 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> LineageOpener for DefaultOp
     fn store_runtime(&self) -> Option<Arc<crate::store_open::StoreRuntime>> {
         self.store.as_ref().and_then(|slot| slot.runtime())
     }
+    fn step_events(&self) -> Option<Arc<crate::step_events::StepEvents>> {
+        self.step_events.clone()
+    }
     fn store_holding(
         &self,
         key: &LineageKey,

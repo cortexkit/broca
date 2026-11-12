@@ -505,13 +505,7 @@ pub(super) async fn serve_websocket(
                     }
                 }
             }
-            shared
-                .raw_bodies
-                .lock()
-                .unwrap()
-                .entry(session.clone())
-                .or_default()
-                .push(text_bytes(&wire));
+            shared.record_model_ingress(&session, response, &text_bytes(&wire));
             shared
                 .requests
                 .lock()
