@@ -481,6 +481,7 @@ pub(crate) struct SteerFrozen<'a> {
     pub model: &'a broca_protocol::request::ModelHandle,
     pub variant: Option<&'a str>,
     pub generation: &'a broca_protocol::request::GenerationConfig,
+    pub joining_temperature: Option<Option<f64>>,
     pub stop_when: &'a [broca_protocol::request::StopCondition],
     pub directives: Option<&'a [broca_protocol::request::DirectiveName]>,
     pub auth_selection: Option<&'a broca_wal::AuthSelection>,
@@ -492,6 +493,7 @@ impl<'a> From<&'a broca_wal::RunConfig> for SteerFrozen<'a> {
             model: &config.model,
             variant: config.variant.as_deref(),
             generation: &config.generation,
+            joining_temperature: None,
             stop_when: &config.stop_when,
             directives: config.turn_directives_v1.as_deref(),
             auth_selection: config.auth_selection.as_ref(),
@@ -515,12 +517,17 @@ pub(crate) fn steer_settings_conflict(
     }
     let generation = &request.generation;
     let frozen_generation = &frozen.generation;
+    let joining_temperature = if request.inherit_frozen.contains(&InheritedParam::Generation) {
+        generation.temperature
+    } else {
+        frozen.joining_temperature.unwrap_or(generation.temperature)
+    };
     if generation.max_output_tokens.is_some()
         && generation.max_output_tokens != frozen_generation.max_output_tokens
     {
         return Some("generation.max_output_tokens");
     }
-    if generation.temperature.is_some() && generation.temperature != frozen_generation.temperature {
+    if generation.temperature.is_some() && joining_temperature != frozen_generation.temperature {
         return Some("generation.temperature");
     }
     if generation.top_p.is_some() && generation.top_p != frozen_generation.top_p {
@@ -4868,9 +4875,23 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 "{}/{}",
                 episode.config.model.provider_module_id, episode.config.model.model_id
             );
-            if let Some(field) =
-                steer_settings_conflict(&request, (&episode.config).into(), stop_sequences_named)
-            {
+            let mut settings: SteerFrozen<'_> = (&episode.config).into();
+            settings.joining_temperature = request
+                .generation
+                .temperature
+                .filter(|_| {
+                    !request
+                        .inherit_frozen
+                        .contains(&broca_protocol::request::InheritedParam::Generation)
+                })
+                .and_then(|requested| {
+                    self.executor.joining_temperature(
+                        &episode.config.model,
+                        &episode.config.frozen_render_config,
+                        requested,
+                    )
+                });
+            if let Some(field) = steer_settings_conflict(&request, settings, stop_sequences_named) {
                 // The inbox lock linearizes this refusal against the run's decision to end.
                 // A closed inbox sends the message to a new turn instead, which can honour it.
                 if !inbox.is_closed() {
@@ -12292,6 +12313,22 @@ mod tests {
             steer_settings_conflict(&request, (&frozen).into(), false),
             None
         );
+    }
+
+    #[test]
+    fn temperature_join_inherited_generation_keeps_the_frozen_comparison() {
+        let mut config = min_config();
+        config.generation.temperature = Some(1.0);
+        let key = BindIdentity::new("/project", "runner", "inherited-temperature");
+        let mut request = text_req(&key, "joining").to_submission();
+        request.model = config.model.clone();
+        request.generation = config.generation.clone();
+        request
+            .inherit_frozen
+            .insert(broca_protocol::request::InheritedParam::Generation);
+        let mut frozen: SteerFrozen<'_> = (&config).into();
+        frozen.joining_temperature = Some(None);
+        assert_eq!(steer_settings_conflict(&request, frozen, false), None);
     }
 
     pub(super) fn min_config() -> broca_wal::RunConfig {

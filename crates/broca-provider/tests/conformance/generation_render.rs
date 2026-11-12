@@ -114,6 +114,160 @@ struct Case {
 }
 
 #[test]
+fn temperature_absent_request_bytes_remain_pinned_on_every_wire_family() {
+    let opts = base_request();
+    let mut codeassist = google_codeassist_frozen_config("gemini-2.5-flash");
+    codeassist.project_id = Some("proj-generation".into());
+    let cases: Vec<(&str, Box<dyn WireFamily>, FrozenRenderConfig)> = vec![
+        (
+            "anthropic_api_key",
+            Box::new(AnthropicMessages),
+            anthropic_apikey_frozen_config("claude-opus-4-8"),
+        ),
+        (
+            "anthropic_subscription",
+            Box::new(AnthropicMessages),
+            broca_provider::families::anthropic_frozen_config("claude-opus-4-8"),
+        ),
+        (
+            "openai_chat",
+            Box::new(OpenAiChat),
+            openai_chat_frozen_config("gpt-4o"),
+        ),
+        (
+            "openai_responses",
+            Box::new(OpenAiResponses),
+            openai_responses_frozen_config("gpt-4.1"),
+        ),
+        (
+            "chatgpt",
+            Box::new(OpenAiResponsesChatgpt),
+            openai_responses_chatgpt_frozen_config("gpt-5-codex"),
+        ),
+        (
+            "gemini",
+            Box::new(Gemini),
+            gemini_frozen_config("gemini-2.0-flash"),
+        ),
+        ("codeassist", Box::new(GoogleCodeAssist), codeassist),
+        (
+            "bedrock",
+            Box::new(BedrockConverse),
+            bedrock_frozen_config_with_region("anthropic.claude", "us-east-1"),
+        ),
+    ];
+    let requests: std::collections::BTreeMap<_, _> = cases
+        .into_iter()
+        .map(|(name, family, frozen)| {
+            (
+                name,
+                String::from_utf8(family.render(&frozen, &opts)).unwrap(),
+            )
+        })
+        .collect();
+    let bytes = serde_json::to_vec_pretty(&requests).unwrap();
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/temperature_absent_requests.json");
+    if std::env::var_os("BROCA_REGENERATE_TEMPERATURE_BASELINE").is_some() {
+        std::fs::write(&path, &bytes).unwrap();
+    }
+    assert_eq!(bytes, std::fs::read(path).unwrap());
+}
+
+#[cfg(feature = "live")]
+#[test]
+fn temperature_admission_reaches_every_response_and_preserves_the_output_cap() {
+    use broca_core::provider::{Provider, TemperaturePolicy};
+    for (policy, requested, expected) in [
+        (
+            TemperaturePolicy {
+                supported: Some(true),
+                min: Some(0.0),
+                max: Some(2.0),
+            },
+            0.0,
+            Some(0.0),
+        ),
+        (
+            TemperaturePolicy {
+                supported: Some(true),
+                min: Some(0.0),
+                max: Some(2.0),
+            },
+            0.25,
+            Some(0.25),
+        ),
+        (
+            TemperaturePolicy {
+                supported: Some(true),
+                min: Some(0.0),
+                max: Some(2.0),
+            },
+            2.0,
+            Some(2.0),
+        ),
+        (
+            TemperaturePolicy {
+                supported: Some(false),
+                ..Default::default()
+            },
+            0.1,
+            None,
+        ),
+        (TemperaturePolicy::default(), 2.0, Some(1.0)),
+        (
+            TemperaturePolicy {
+                supported: Some(true),
+                min: Some(0.25),
+                max: Some(1.5),
+            },
+            0.0,
+            Some(0.25),
+        ),
+        (
+            TemperaturePolicy {
+                supported: None,
+                min: Some(0.25),
+                max: Some(1.5),
+            },
+            2.0,
+            Some(1.5),
+        ),
+    ] {
+        let mut frozen = openai_chat_frozen_config("scripted-model");
+        frozen.max_output_tokens = 16;
+        let provider = broca_provider::transport::LiveProvider::new(
+            OpenAiChat,
+            frozen,
+            broca_provider::wire::AuthHandle::None,
+        )
+        .with_temperature_policy(policy);
+        let submission = serde_json::from_value(json!({
+            "model": {"provider_module_id": "scripted", "model_id": "scripted-model"},
+            "input": [], "generation": {"temperature": requested, "max_output_tokens": 16}
+        }))
+        .unwrap();
+        let mut request = broca_core::RunRequest::from_submission(
+            submission,
+            broca_protocol::RunId("temperature".into()),
+            broca_protocol::BindIdentity::new("/project", "test", "temperature"),
+            broca_protocol::SubmissionId("send".into()),
+        );
+        let admitted = broca_core::fresh_start::request_config(&mut request, &provider).unwrap();
+        assert_eq!(admitted.generation.temperature, expected);
+        assert_eq!(admitted.generation.max_output_tokens, Some(16));
+        for step in [0, 1] {
+            let mut opts = base_request();
+            opts.step_context.as_mut().unwrap().step_index = step;
+            opts.generation = admitted.generation.clone().into();
+            let body: Value = serde_json::from_slice(&provider.render_request(&opts)).unwrap();
+            assert_eq!(body.get("temperature").and_then(Value::as_f64), expected);
+            assert_eq!(body["max_tokens"], 16);
+        }
+    }
+}
+
+#[test]
 fn changed_families_render_generation_controls_with_exact_wire_spellings() {
     let with_generation = generation_request();
     let without_generation = base_request();

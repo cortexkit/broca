@@ -212,6 +212,29 @@ pub enum AuthMode {
     None,
 }
 
+/// Normalize only a joining send's compatibility check against a frozen run. Current facts
+/// may recognize an equivalent clamped or omitted request, but never change the run's setting.
+/// A missing model row keeps the actor's literal comparison instead.
+pub fn joining_temperature(
+    model: &broca_protocol::request::ModelHandle,
+    frozen_render_config: &serde_json::Value,
+    requested: f64,
+) -> Option<Option<f64>> {
+    let catalog = crate::catalog().ok()?;
+    if !catalog.contains_model(&model.provider_module_id, &model.model_id) {
+        return None;
+    }
+    let policy = catalog.temperature_policy(&model.provider_module_id, &model.model_id);
+    Some(
+        match serde_json::from_value::<FrozenRenderConfig>(frozen_render_config.clone()) {
+            Ok(frozen) => {
+                broca_provider::families::admit_temperature(&frozen, policy, Some(requested))
+            }
+            Err(_) => policy.apply(Some(requested)),
+        },
+    )
+}
+
 /// A resolved, runnable provider plus the secret-free descriptors a harness's run request
 /// and greppable/structured output need.
 pub struct ProviderResolution {
@@ -563,6 +586,7 @@ pub fn provider_for_recorded_config_with_quota_observer(
         resolved_auth.handle,
         ProviderOptions {
             quota_observer,
+            temperature_policy: Default::default(),
             refresher: resolved_auth.refresher,
             auth_method: resolved_auth
                 .auth_method
@@ -1001,8 +1025,15 @@ fn resolve_provider_inner(
             .clone()
             .unwrap_or_else(|| "<family default>".into());
         let wire_model = frozen.wire_model_id.clone();
-        let provider =
-            resolved_live_provider(http_client, frozen, handle, refresher, auth_method, opts)?;
+        let provider = resolved_live_provider(
+            http_client,
+            frozen,
+            handle,
+            refresher,
+            auth_method,
+            opts,
+            Default::default(),
+        )?;
         return Ok(ProviderResolution {
             provider,
             auth_method,
@@ -1097,8 +1128,15 @@ fn resolve_provider_inner(
         // Opaque endpoints share fresh-episode render rules with catalog routes.
         // Recorded episodes take the earlier recorded-config branch instead.
         let frozen = freeze_tool_aliases(episode_render.apply(frozen), opts)?;
-        let provider =
-            resolved_live_provider(http_client, frozen, handle, refresher, auth_method, opts)?;
+        let provider = resolved_live_provider(
+            http_client,
+            frozen,
+            handle,
+            refresher,
+            auth_method,
+            opts,
+            Default::default(),
+        )?;
         return Ok(ProviderResolution {
             provider,
             auth_method,
@@ -1322,8 +1360,15 @@ fn resolve_provider_inner(
         // Read back from the frozen config: on Code Assist a variant may have moved the wire id
         // to another tier, and this reports the id actually sent.
         let wire_model = frozen.wire_model_id.clone();
-        let provider =
-            resolved_live_provider(http_client, frozen, handle, refresher, auth_method, opts)?;
+        let provider = resolved_live_provider(
+            http_client,
+            frozen,
+            handle,
+            refresher,
+            auth_method,
+            opts,
+            catalog.temperature_policy(provider_id, catalog_model_id),
+        )?;
         return Ok(ProviderResolution {
             provider,
             auth_method,
@@ -1558,8 +1603,15 @@ fn resolve_provider_inner(
         .unwrap_or_else(|| "<family default>".to_string());
 
     let refresher = secret_refresher_for(auth, opts, &auth_kind, provider_id, auth_method);
-    let provider =
-        resolved_live_provider(http_client, frozen, handle, refresher, auth_method, opts)?;
+    let provider = resolved_live_provider(
+        http_client,
+        frozen,
+        handle,
+        refresher,
+        auth_method,
+        opts,
+        catalog.temperature_policy(provider_id, model_id),
+    )?;
     Ok(ProviderResolution {
         provider,
         auth_method,
@@ -2184,12 +2236,14 @@ fn resolved_live_provider(
     refresher: Option<Arc<dyn CredentialRefresher>>,
     auth_method: Option<AuthMethod>,
     opts: &ResolveOptions<'_>,
+    temperature_policy: broca_core::provider::TemperaturePolicy,
 ) -> Result<Box<dyn broca_core::provider::Provider>, String> {
     live_provider_with_options(
         http_client.cloned(),
         frozen,
         auth,
         ProviderOptions {
+            temperature_policy,
             quota_observer: opts.quota_observer.clone(),
             refresher,
             auth_method: auth_method.map(|method| method.as_token().to_owned()),
@@ -2406,6 +2460,81 @@ fn chatgpt_account_id(token: &str) -> Option<String> {
 
 #[cfg(all(test, feature = "live"))]
 mod tests {
+    #[test]
+    fn temperature_catalog_resolution_and_join_use_current_model_facts() {
+        use broca_protocol::request::ModelHandle;
+        let _held = crate::test_catalog_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        for (facts, requested, expected) in [
+            (
+                serde_json::json!({"capability.temperature": true, "limit.temperature_min": 0.0, "limit.temperature_max": 2.0}),
+                2.0,
+                Some(2.0),
+            ),
+            (
+                serde_json::json!({"capability.temperature": false}),
+                0.1,
+                None,
+            ),
+            (
+                serde_json::json!({"limit.temperature_min": 0.25, "limit.temperature_max": 1.5}),
+                0.0,
+                Some(0.25),
+            ),
+            (
+                serde_json::json!({"limit.temperature_min": 0.25, "limit.temperature_max": 1.5}),
+                2.0,
+                Some(1.5),
+            ),
+            (serde_json::json!({}), 2.0, Some(1.0)),
+        ] {
+            let mut facts = facts;
+            facts["existence"] = serde_json::json!("present");
+            facts["wire.npm"] =
+                serde_json::json!({"value": "@ai-sdk/openai-compatible", "from": "fixture"});
+            facts["wire.api"] =
+                serde_json::json!({"value": "https://temperature.invalid/v1", "from": "fixture"});
+            let response = serde_json::from_value(serde_json::json!({
+                "source": "models.dev", "resolved_at_ms": 100, "catalog_version": 100,
+                "models": {"xai/temperature-bounded": facts}, "withheld": [], "uncertain": []
+            }))
+            .unwrap();
+            let cache = std::sync::Arc::new(crate::CatalogCache::empty());
+            cache
+                .install_for_test(response, crate::CatalogSource::Fusiform)
+                .unwrap();
+            crate::install_global_catalog_cache(cache);
+            let resolved = resolve_provider(
+                "xai/temperature-bounded",
+                None,
+                2048,
+                &AuthMode::None,
+                &ResolveOptions::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                resolved.provider.admit_temperature(Some(requested)),
+                expected
+            );
+            assert_eq!(
+                joining_temperature(
+                    &ModelHandle::new("xai", "temperature-bounded"),
+                    &resolved.provider.render_config_blob(),
+                    requested
+                ),
+                Some(expected)
+            );
+            assert_eq!(
+                joining_temperature(
+                    &ModelHandle::new("xai", "missing-row"),
+                    &resolved.provider.render_config_blob(),
+                    requested
+                ),
+                None
+            );
+        }
+    }
     use super::*;
     use broca_protocol::content::{ContentBlock, Message, Role};
     use broca_protocol::request::CallOptions;

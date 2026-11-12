@@ -121,6 +121,10 @@ mod gated {
         ) -> Option<String> {
             fresh_admission_config_error(&self.frozen, generation, tool_choice)
         }
+
+        fn admit_temperature(&self, requested: Option<f64>) -> Option<f64> {
+            broca_provider::families::admit_temperature(&self.frozen, Default::default(), requested)
+        }
     }
 
     fn request(dir: &std::path::Path) -> RunRequest {
@@ -340,7 +344,7 @@ mod gated {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn anthropic_oauth_interleaved_thinking_refuses_non_one_temperature_at_fresh_admission() {
+    async fn anthropic_oauth_interleaved_thinking_omits_temperature_at_fresh_admission() {
         let dir = broca_test_support::scratch_root().join(format!(
             "broca-anthropic-temp-fresh-refusal-{}",
             std::process::id()
@@ -351,31 +355,21 @@ mod gated {
         let session = request.session.clone();
         let provider = FrozenProvider::new(anthropic_frozen_config("claude-opus-4-8"));
 
-        let error = drive_request(&dir, &provider, request)
+        let summary = drive_request(&dir, &provider, request)
             .await
-            .expect_err("the OAuth thinking conflict must fail fresh admission");
-
-        match error {
-            RunError::Config(message) => assert_eq!(
-                message,
-                "generation.temperature=0 conflicts with reasoning.mode='anthropic_interleaved': \
-                 the caller set generation.temperature, while the resolved Anthropic OAuth auth \
-                 method enabled thinking; Anthropic requires generation.temperature=1 when \
-                 thinking is enabled"
-            ),
-            other => panic!("expected typed Config error, got {other:?}"),
-        }
-        assert!(
-            provider.sent.lock().unwrap().is_empty(),
-            "a refused admission must not reach the provider"
-        );
-        assert!(
-            FileWalStore::new(dir.join("wal"))
-                .read_records(&session)
-                .expect("read refused run WAL")
-                .is_empty(),
-            "a refused fresh admission must not write RunStarted"
-        );
+            .expect("unsupported temperature must not refuse the run");
+        assert_eq!(summary.reason, RunFinishReason::Completed);
+        let sent = provider.sent.lock().unwrap();
+        let body: serde_json::Value = serde_json::from_slice(sent.get(&0).unwrap()).unwrap();
+        assert!(body.get("temperature").is_none());
+        let records = FileWalStore::new(dir.join("wal"))
+            .read_records(&session)
+            .unwrap();
+        let recorded = records.iter().find_map(|frame| match &frame.record {
+            WalRecord::RunStarted { config, .. } => Some(config.generation.temperature),
+            _ => None,
+        });
+        assert_eq!(recorded, Some(None));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

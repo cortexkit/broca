@@ -370,6 +370,7 @@ pub struct LiveProvider<F: WireFamily + 'static> {
     pub(crate) family: Arc<F>,
     pub(crate) frozen: Arc<FrozenRenderConfig>,
     subscription_auth: bool,
+    temperature_policy: broca_core::provider::TemperaturePolicy,
     grammar_downgraded: std::sync::atomic::AtomicBool,
     media_renderer: std::sync::RwLock<Option<Arc<broca_core::provider::MediaRequestRenderer>>>,
     media_render_tags: std::sync::atomic::AtomicBool,
@@ -1134,6 +1135,7 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
             route: std::sync::atomic::AtomicU8::new(ROUTE_SOURCE),
             frozen: Arc::new(frozen),
             subscription_auth: false,
+            temperature_policy: Default::default(),
             grammar_downgraded: std::sync::atomic::AtomicBool::new(false),
             media_renderer: std::sync::RwLock::new(None),
             media_render_tags: std::sync::atomic::AtomicBool::new(false),
@@ -1193,6 +1195,15 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
     /// prepaid API keys and replenishing subscriptions. Bearer headers alone cannot tell them apart.
     pub fn with_auth_method(mut self, method: Option<&str>) -> Self {
         self.subscription_auth = method.is_some_and(|method| method != "apikey");
+        self
+    }
+
+    /// Model facts are consumed only at admission; the loop persists the effective setting.
+    pub fn with_temperature_policy(
+        mut self,
+        policy: broca_core::provider::TemperaturePolicy,
+    ) -> Self {
+        self.temperature_policy = policy;
         self
     }
 
@@ -1673,6 +1684,10 @@ impl<F: WireFamily + 'static> Provider for LiveProvider<F> {
         tool_choice: &ToolChoice,
     ) -> Option<String> {
         fresh_admission_config_error(&self.frozen, generation, tool_choice)
+    }
+
+    fn admit_temperature(&self, requested: Option<f64>) -> Option<f64> {
+        crate::families::admit_temperature(&self.frozen, self.temperature_policy, requested)
     }
 
     /// The transport records every HTTP attempt, and on a cancel sends the in-flight

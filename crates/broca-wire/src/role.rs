@@ -421,6 +421,7 @@ pub fn broca_role_describe_with_writers(
         cortexkit_role_llm_runner::capabilities::STRUCTURED_OUTPUT,
         cortexkit_role_llm_runner::capabilities::SEND_STATUS,
         cortexkit_role_llm_runner::capabilities::MAX_STEPS,
+        cortexkit_role_llm_runner::capabilities::TEMPERATURE,
         cortexkit_role_llm_runner::capabilities::NO_TOOLS,
         RUN_TOOL_CALLS_GROUP,
         // A mid-session plan change: refresh, its policy and a prefix flush. All three
@@ -1186,6 +1187,7 @@ mod pinned_reply_bytes {
         for group in [
             capabilities::SEND_STATUS,
             capabilities::MAX_STEPS,
+            capabilities::TEMPERATURE,
             capabilities::NO_TOOLS,
         ] {
             assert!(role.declares(group), "{group}");
@@ -1315,6 +1317,23 @@ mod pinned_reply_bytes {
     }
 
     #[test]
+    fn temperature_describe_serializer_sample() {
+        let Some(dir) = std::env::var_os("BROCA_TEMPERATURE_SAMPLES") else {
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let phase =
+            std::env::var("BROCA_TEMPERATURE_SAMPLE_PHASE").unwrap_or_else(|_| "after".into());
+        let describe = broca_role_describe_with_writers("0.0.0-writer-golden", true, true, true);
+        std::fs::write(
+            dir.join(format!("role-describe-{phase}.json")),
+            serde_json::to_vec(&describe).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn run_tool_calls_group_and_operation_are_declared_together() {
         use cortexkit_role_llm_runner::describe::check_describe;
 
@@ -1356,7 +1375,7 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "721ce8b06f87007a6eb66ff2532084047a79cdcf62bf771305259c82f87705a9",
+            "20dc5ad4db04533cebbbf36d9758910ef7f13349bd6efd9c927e872c42538421",
         );
     }
 
@@ -1552,7 +1571,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "f136a3f6ec1808f8069bd82f04c0b8c62b33d0fd4c2f05ecbc757ebde35e82b0";
+        "711ad0574402899354aaf3471e05c90f53324cb6e41658a7e142c1ba2d5e2b26";
     const RUN_TOOL_CALLS_PAGE_SHA256: &str =
         "6978763bd48c30edffbf61a4b4a0966d7efdfc146b94023f4a36cca4bda0881d";
     const DELIVERED_STEP_SHA256: &str =

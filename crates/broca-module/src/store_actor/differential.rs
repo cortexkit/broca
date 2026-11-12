@@ -59,6 +59,14 @@ pub(super) struct TodayLoop {
 
 #[async_trait]
 impl RunExecutor for TodayLoop {
+    fn joining_temperature(
+        &self,
+        model: &broca_protocol::request::ModelHandle,
+        frozen: &serde_json::Value,
+        requested: f64,
+    ) -> Option<Option<f64>> {
+        temperature::current_temperature(model, frozen, requested)
+    }
     fn hook_plane(&self) -> Option<Arc<dyn broca_core::HookPlane>> {
         self.planes.hooks.clone()
     }
@@ -162,7 +170,7 @@ fn today_opened(
 ) -> Today {
     let dir = scratch_dir();
     let key = BindIdentity::new(dir.join("project"), "store-actor", "s1");
-    today_at(dir, key, steps, gate, planes, rides)
+    today_at(dir, key, steps, gate, planes, rides, None)
 }
 
 /// Today's module over a copy of `crashed`'s log as it stands, as a process that died now and
@@ -190,6 +198,7 @@ fn today_restarted(crashed: &Today, steps: Vec<Vec<NormalizedEvent>>) -> Today {
         None,
         super::tests::Planes::default(),
         true,
+        None,
     )
 }
 
@@ -200,11 +209,12 @@ fn today_at(
     gate: Option<Arc<Notify>>,
     planes: super::tests::Planes,
     rides: bool,
+    render_config: Option<serde_json::Value>,
 ) -> Today {
     let wal = Arc::new(FileWalStore::new(dir.join("wal")));
     let executor = Arc::new(TodayLoop {
         provider: Gated {
-            render_config: None,
+            render_config,
             notes_sends: false,
             hold: None,
             inner: broca_core::provider::StubProvider::new(steps),
@@ -432,16 +442,36 @@ async fn compare(
     gated: bool,
     steps: Vec<Step>,
 ) -> Vec<SendOutcome> {
+    compare_with_render(script, gated, steps, None).await
+}
+
+async fn compare_with_render(
+    script: Vec<Vec<NormalizedEvent>>,
+    gated: bool,
+    steps: Vec<Step>,
+    render_config: Option<serde_json::Value>,
+) -> Vec<SendOutcome> {
     let today_gate = gated.then(|| Arc::new(Notify::new()));
     let store_gate = gated.then(|| Arc::new(Notify::new()));
-    let today = today(script.clone(), today_gate.clone());
+    let dir = scratch_dir();
+    let key = BindIdentity::new(dir.join("project"), "store-actor", "s1");
+    let today = today_at(
+        dir,
+        key,
+        script.clone(),
+        today_gate.clone(),
+        super::tests::Planes::default(),
+        false,
+        render_config.clone(),
+    );
     // The store actor's setup parts, kept so its session's reads after the steps can name the
     // tools and plans its runs started with.
     let parts = broca_session_loop::parts::SharedParts::new(Box::new(
         broca_session_loop::parts::MemoryParts::default(),
     ));
-    let (commands, served, _) =
-        super::tests::actor_with(executor(script, store_gate.clone()), parts.clone()).await;
+    let mut store_executor = executor(script, store_gate.clone());
+    store_executor.provider.render_config = render_config;
+    let (commands, served, _) = super::tests::actor_with(store_executor, parts.clone()).await;
     // Both sides get the request one caller shapes.
     let caller = super::tests::Caller::default();
     let mut answers = Vec::new();
@@ -1876,6 +1906,8 @@ mod scopes;
 mod step_events;
 mod streams;
 mod warm;
+
+pub(super) mod temperature;
 
 #[cfg(feature = "test-clock")]
 mod account_limit_pause;

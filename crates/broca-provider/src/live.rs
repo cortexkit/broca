@@ -187,6 +187,10 @@ impl Provider for LiveAnthropicProvider {
             .fresh_admission_config_error(generation, tool_choice)
     }
 
+    fn admit_temperature(&self, requested: Option<f64>) -> Option<f64> {
+        self.inner.admit_temperature(requested)
+    }
+
     fn reports_attempt_evidence(&self) -> bool {
         self.inner.reports_attempt_evidence()
     }

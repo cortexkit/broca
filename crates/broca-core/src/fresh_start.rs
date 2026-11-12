@@ -44,6 +44,7 @@ pub fn request_config<P: Provider>(
     req: &mut RunRequest,
     provider: &P,
 ) -> Result<RequestConfig, RunError> {
+    req.generation = admitted_generation(&req.generation, provider)?;
     if req
         .stop_when
         .iter()
@@ -105,6 +106,26 @@ pub fn request_config<P: Provider>(
         response_format: ResponseFormat::default(),
         provider_options: serde_json::Value::Null,
     })
+}
+
+fn admitted_generation<P: Provider>(
+    generation: &GenerationConfig,
+    provider: &P,
+) -> Result<GenerationConfig, RunError> {
+    if generation
+        .temperature
+        .is_some_and(|value| !value.is_finite() || !(0.0..=2.0).contains(&value))
+    {
+        return Err(RunError::Config(
+            "generation.temperature must be a finite number from 0 to 2 inclusive".into(),
+        ));
+    }
+    let mut effective = generation.clone();
+    // Only the effective value belongs in the run's existing generation member. Catalog facts
+    // are admission inputs, not render inputs: resuming a run or rebuilding its provider
+    // request offline must not apply today's bounds again, including to older runs.
+    effective.temperature = provider.admit_temperature(generation.temperature);
+    Ok(effective)
 }
 
 /// Whether the caller declared its final message varies between requests. The refusal above is
