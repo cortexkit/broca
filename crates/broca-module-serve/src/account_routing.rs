@@ -1881,6 +1881,36 @@ pub fn attempt_body(
     attempt: &ModelAttempt,
     view_digest: Option<&str>,
 ) -> Value {
+    attempt_body_on(event_id, admission_id, attempt, view_digest, None)
+}
+
+/// The credential and account an attempt was sent on, as an attempt observation names them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServedOn {
+    pub credential_id: String,
+    pub account: Option<String>,
+}
+
+/// [`attempt_body`], naming the credential and account the attempt was sent on when `served`
+/// gives them. Routing reads them as the account that served the attempt. After a move at a
+/// quota wall that is how it learns which account the run uses even when the report of the move
+/// itself was lost.
+pub fn attempt_body_on(
+    event_id: &str,
+    admission_id: &str,
+    attempt: &ModelAttempt,
+    view_digest: Option<&str>,
+    served: Option<&ServedOn>,
+) -> Value {
+    let named = |mut body: serde_json::Map<String, Value>| {
+        if let Some(served) = served {
+            body.insert("credential_id".into(), json!(served.credential_id));
+            if let Some(account) = &served.account {
+                body.insert("served_account_id".into(), json!(account));
+            }
+        }
+        Value::Object(body)
+    };
     let observation = &attempt.account_observation;
     let headers = &observation.ratelimit_headers;
     if let Some(limit) = &observation.limit {
@@ -1899,13 +1929,13 @@ pub fn attempt_body(
             body.insert("upstream_origin".into(), json!("upstream"));
             body.insert("headers".into(), json!(headers));
         }
-        return Value::Object(body);
+        return named(body);
     }
     let mut body = report("attempt", event_id, admission_id);
     body.insert("upstream_origin".into(), json!("upstream"));
     if attempt_reached_no_upstream(attempt) {
         body.insert("terminal_reason".into(), json!("transport_failure"));
-        return Value::Object(body);
+        return named(body);
     }
     body.insert("observed_at_ms".into(), json!(attempt.ts_ms));
     if let Some(view_digest) = view_digest {
@@ -1914,7 +1944,7 @@ pub fn attempt_body(
     if !headers.is_empty() {
         body.insert("headers".into(), json!(headers));
     }
-    Value::Object(body)
+    named(body)
 }
 
 /// `run_finished`: the run's terminal is durable. Carries the latest rate-limit headers the
@@ -1979,6 +2009,7 @@ enum ReportEvent {
         lineage: Option<WalLineageId>,
         wal_seq: u64,
         attempt: Box<ModelAttempt>,
+        served: Option<ServedOn>,
     },
     Finished {
         lineage: Option<WalLineageId>,
@@ -2135,6 +2166,7 @@ impl RunReporter {
                         lineage,
                         wal_seq,
                         attempt,
+                        served,
                     } => {
                         last_failed_attempt_at_ms = None;
                         if !attempt.account_observation.ratelimit_headers.is_empty() {
@@ -2182,11 +2214,12 @@ impl RunReporter {
                         .then_some(attempt.account_observation.failure_received_at_ms)
                         .flatten();
                         client
-                            .observe(attempt_body(
+                            .observe(attempt_body_on(
                                 &id,
                                 &admission_id,
                                 &attempt,
                                 view_digest.as_deref(),
+                                served.as_ref(),
                             ))
                             .await;
                     }
@@ -2333,6 +2366,34 @@ impl broca_core::AccountReporter for RunReporter {
             lineage,
             wal_seq,
             attempt: Box::new(attempt.clone()),
+            served: None,
+        });
+    }
+}
+
+impl RunReporter {
+    /// An attempt's record, at `wal_seq`, sent on the credential `selection` names. The report
+    /// names that credential and the account that served the attempt: the one the attempt's own
+    /// record names, else the selection's.
+    pub fn attempt_recorded_on(
+        &self,
+        lineage: Option<WalLineageId>,
+        wal_seq: u64,
+        attempt: &ModelAttempt,
+        selection: Option<&broca_wal::AuthSelection>,
+    ) {
+        let served = selection.map(|selection| ServedOn {
+            credential_id: selection.credential_id.clone(),
+            account: attempt
+                .served_account_ref
+                .clone()
+                .or_else(|| selection.account_ref.clone()),
+        });
+        let _ = self.tx.send(ReportEvent::Attempt {
+            lineage,
+            wal_seq,
+            attempt: Box::new(attempt.clone()),
+            served,
         });
     }
 }

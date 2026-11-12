@@ -313,6 +313,20 @@ pub trait AccountReports: Send + Sync {
     fn run_started(&self, event_id: &str, seq: u64);
     /// A provider attempt's record was appended at `seq`.
     fn attempt_recorded(&self, event_id: &str, seq: u64, attempt: &ModelAttempt);
+    /// The same, with the selection the attempt was sent under: the run's account now, which
+    /// after a move at a quota wall is the account it moved to. A reporter that names the
+    /// attempt's credential and account to routing takes them from here, so every attempt names
+    /// the account that served it however the reports before it fared. The default forwards to
+    /// [`Self::attempt_recorded`].
+    fn attempt_recorded_on(
+        &self,
+        event_id: &str,
+        seq: u64,
+        attempt: &ModelAttempt,
+        _selection: Option<&broca_wal::AuthSelection>,
+    ) {
+        self.attempt_recorded(event_id, seq, attempt);
+    }
     /// The run moved to the account `selection` names at a quota wall, and the record that
     /// says so, at `seq`, is durable. Reported once per move, before any attempt on that
     /// account. The default reports nothing.
@@ -2687,6 +2701,7 @@ where
                 requested_cache_ttl(admission),
                 admission.account_limit_pause,
                 first_attempt,
+                run_selection(seams, admission),
             )
             .await?;
             if let Err(StepFailure::Error(error, retries_used, _)) = &outcome {
@@ -3983,6 +3998,7 @@ async fn model_step<W: Writer, P: Provider, T>(
     requested_ttl_ms: Option<u64>,
     account_limit_pause: bool,
     first_attempt: u32,
+    selection: Option<&broca_wal::AuthSelection>,
 ) -> Result<Result<Step, StepFailure>, LoopError> {
     let mut limited: Option<Box<FailedAccountLimitAttempt>> = None;
     // The step is in flight from here until the call's stream ends: published for the session's
@@ -4133,6 +4149,7 @@ async fn model_step<W: Writer, P: Provider, T>(
                     attempt,
                     requested_ttl_ms,
                     account_limit_pause,
+                    selection,
                 )
                 .await?;
             }
@@ -4173,6 +4190,7 @@ async fn model_step<W: Writer, P: Provider, T>(
                             attempt,
                             requested_ttl_ms,
                             account_limit_pause,
+                            selection,
                         )
                         .await?;
                     }
@@ -4193,6 +4211,7 @@ async fn model_step<W: Writer, P: Provider, T>(
 /// it after. A failed attempt is durable at once (it may have been billed and no step's end will
 /// follow it); a completed one rides the step's end. Returns the attempt, with its record's seq,
 /// when the provider refused it for the account's limit.
+#[allow(clippy::too_many_arguments)]
 async fn record_attempt<W: Writer, P: Provider, T>(
     writer: &mut W,
     seams: &Seams<'_, P, T>,
@@ -4201,6 +4220,7 @@ async fn record_attempt<W: Writer, P: Provider, T>(
     mut attempt: broca_protocol::ModelAttempt,
     requested_ttl_ms: Option<u64>,
     account_limit_pause: bool,
+    selection: Option<&broca_wal::AuthSelection>,
 ) -> Result<Option<Box<FailedAccountLimitAttempt>>, LoopError> {
     if let Some(warm) = &seams.keep_warm {
         warm.note_attempt(&attempt);
@@ -4231,7 +4251,7 @@ async fn record_attempt<W: Writer, P: Provider, T>(
         .provider
         .cache_attempt_recorded(Some(event_id(writer, seq)));
     if let Some(reports) = &seams.account_reports {
-        reports.attempt_recorded(&event_id(writer, seq), seq, &attempt);
+        reports.attempt_recorded_on(&event_id(writer, seq), seq, &attempt, selection);
     }
     Ok(attempt
         .account_observation

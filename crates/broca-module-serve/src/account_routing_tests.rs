@@ -3493,6 +3493,88 @@ async fn a_move_is_reported_once_in_order_under_the_original_admission() {
         .all(|body| body["admission_id"] == "adm-move"));
 }
 
+/// Every attempt observation of a store run names the credential it was sent on and the account
+/// that served it: the walled attempt names A, every attempt after the move names B, even when
+/// the report of the move itself never reaches routing. A limit observation names them too.
+#[tokio::test]
+async fn attempt_observations_name_the_account_each_attempt_was_sent_on() {
+    let routing = Arc::new(FakeRouting::default());
+    let client = Arc::new(client(&routing));
+    let reporter = RunReporter::start(
+        Arc::clone(&client),
+        "adm-move".into(),
+        "run-move".into(),
+        None,
+        Arc::new(AtomicU64::new(100)),
+    );
+    let lineage = lineage();
+    let mut on_a = continue_selection();
+    on_a.credential_id = "credential-a".into();
+    on_a.account_ref = Some("acct-a".into());
+    let wall = AttemptAccountObservation {
+        limit: Some(AttemptAccountLimit {
+            disposition: broca_protocol::provider::AccountLimitDisposition::ACCOUNT,
+            observed_at_ms: 1_000,
+            resets_at_ms: Some(9_000),
+            resets_at_source: None,
+            limit_window: Some("seven_day".into()),
+        }),
+        ..Default::default()
+    };
+    reporter.attempt_recorded_on(
+        Some(lineage),
+        4,
+        &attempt(Some(200), AttemptAccountObservation::default()),
+        Some(&on_a),
+    );
+    reporter.attempt_recorded_on(Some(lineage), 5, &attempt(Some(429), wall), Some(&on_a));
+    // The move's own report is not queued here: the attempts alone must name B.
+    let mut on_b = continue_selection();
+    on_b.credential_id = "credential-b".into();
+    on_b.account_ref = Some("acct-b".into());
+    let mut served_b = attempt(Some(200), AttemptAccountObservation::default());
+    served_b.served_account_ref = Some("acct-b".into());
+    reporter.attempt_recorded_on(Some(lineage), 7, &served_b, Some(&on_b));
+    reporter.finish(Some(lineage), 9, RunFinishReason::Completed);
+    settle(&routing, 4).await;
+    let observed = routing.observed();
+    let named: Vec<_> = observed
+        .iter()
+        .map(|body| {
+            (
+                body["kind"].clone(),
+                body["credential_id"].clone(),
+                body["served_account_id"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        named,
+        vec![
+            (json!("attempt"), json!("credential-a"), json!("acct-a")),
+            (
+                json!("account_limit_exhausted"),
+                json!("credential-a"),
+                json!("acct-a")
+            ),
+            (json!("attempt"), json!("credential-b"), json!("acct-b")),
+            (json!("run_finished"), Value::Null, Value::Null),
+        ]
+    );
+    // Routing's contract parses every one of them, with the account it names.
+    for body in &observed {
+        let parsed = cortexkit_role_routing::observe::parse_account_observe_request(body).unwrap();
+        assert_eq!(
+            parsed.served_account_id.as_deref(),
+            body["served_account_id"].as_str()
+        );
+        assert_eq!(
+            parsed.credential_id.as_deref(),
+            body["credential_id"].as_str()
+        );
+    }
+}
+
 /// A run moves only when routing is known to declare both `account_continue` and
 /// `account_continue_resume`. An unreadable description, or either one alone, sends nothing:
 /// no continue request, and so no move and no report of one.

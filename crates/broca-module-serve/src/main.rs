@@ -3055,6 +3055,16 @@ mod executor {
             broca_core::AccountReporter::attempt_recorded(&*self.0, None, seq, attempt);
         }
 
+        fn attempt_recorded_on(
+            &self,
+            _event_id: &str,
+            seq: u64,
+            attempt: &broca_protocol::ModelAttempt,
+            selection: Option<&broca_core::AuthSelection>,
+        ) {
+            self.0.attempt_recorded_on(None, seq, attempt, selection);
+        }
+
         fn account_moved(&self, _event_id: &str, seq: u64, selection: &broca_core::AuthSelection) {
             self.0.moved(None, seq, selection);
         }

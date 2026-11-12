@@ -459,6 +459,23 @@ impl AccountReports for Reports {
         ));
     }
 
+    /// The loop hands each attempt's report the selection it was sent under, which must name
+    /// the account that served it: after a move, the new one.
+    fn attempt_recorded_on(
+        &self,
+        event_id: &str,
+        seq: u64,
+        attempt: &ModelAttempt,
+        selection: Option<&broca_wal::AuthSelection>,
+    ) {
+        assert_eq!(
+            selection.and_then(|selection| selection.account_ref.as_deref()),
+            attempt.served_account_ref.as_deref(),
+            "an attempt's report names the selection it was sent under"
+        );
+        self.attempt_recorded(event_id, seq, attempt);
+    }
+
     fn account_moved(&self, _event_id: &str, _seq: u64, selection: &broca_wal::AuthSelection) {
         self.0.lock().unwrap().push(format!(
             "report moved {}",
