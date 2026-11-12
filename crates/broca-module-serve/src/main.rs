@@ -2983,23 +2983,33 @@ mod executor {
         moved && records_account_change && routing_serves_continuation
     }
 
-    /// What a resume that asked routing for its account goes on with. A moved run's resume
-    /// that gets no usable account from routing (no answer in the budget, routing unreachable,
-    /// a hold, a refusal or a conflict) keeps the account it recorded, as a resume that doesn't
-    /// ask does: when broca can't tell which account routing holds the run on, it keeps the one
-    /// it wrote down. `resume_asks` is cleared then, so nothing after this follows an account
-    /// routing didn't give. Any other answer, and a choice no resume asked for, pass unchanged.
+    /// What a resume that asked routing for its account goes on with. Only an account routing
+    /// chose (`AccountChoice::Routed`) is a usable answer. Anything else (no answer in the
+    /// budget, routing unreachable, a hold, a refusal, a conflict, every candidate needing a
+    /// sign-in, or a static pick when selection is off or one candidate is listed) leaves a moved
+    /// run's resume on the account and decision it recorded, as a resume that doesn't ask:
+    /// when broca can't tell which account routing holds the run on, it keeps the one it wrote
+    /// down. The usual sign-in and account checks then apply to that account. `resume_asks` is
+    /// cleared then, so nothing after this follows an account routing didn't give. A choice no
+    /// resume asked for passes unchanged.
     fn resumed_choice(
         chosen: Result<AccountChoice, RunError>,
         resume_asks: &mut bool,
         run_id: &broca_protocol::RunId,
     ) -> Result<AccountChoice, RunError> {
         match chosen {
-            Err(error) if *resume_asks => {
+            Ok(routed @ AccountChoice::Routed { .. }) => Ok(routed),
+            unusable if *resume_asks => {
+                let answer = match &unusable {
+                    Ok(AccountChoice::AuthRequired(_)) => "every candidate needs a sign-in".into(),
+                    Ok(AccountChoice::Static(_)) => "a static pick, not routing's choice".into(),
+                    Ok(_) => "no choice".into(),
+                    Err(error) => error.to_string(),
+                };
                 tracing::warn!(
                     target: "accounts",
                     run_id = %run_id.0,
-                    %error,
+                    answer = %answer,
                     "routing gave the resumed run no account; it keeps the account it recorded"
                 );
                 *resume_asks = false;
@@ -4405,7 +4415,7 @@ mod executor {
                 }
             };
             let chosen = resumed_choice(chosen, &mut resume_asks, &job.req.run_id);
-            let account_choice = match chosen {
+            let mut account_choice = match chosen {
                 Ok(choice) => choice,
                 Err(RunError::AccountSelectionRefused(refusal))
                     if job.req.route_decision_id.is_some()
@@ -4452,27 +4462,50 @@ mod executor {
                     in_run_refresh: None,
                 }
             } else {
-                match self
-                    .decide_auth_with_account(
-                        job.req.model.provider_module_id.as_str(),
-                        frozen_credential_id.as_deref(),
-                        frozen_auth_method.as_deref(),
-                        if fresh_episode {
-                            None
-                        } else {
-                            prior_run
-                                .as_ref()
-                                .and_then(|prior| prior.config.auth_selection.as_ref())
-                                .and_then(|selection| selection.resolved_credential_id.as_deref())
-                        },
-                        fresh_episode,
-                        pinned_method,
-                        pinned_account,
-                        &account_choice,
-                        frozen_decision.as_ref(),
-                    )
-                    .await
-                {
+                let recorded_resolved_id = if fresh_episode {
+                    None
+                } else {
+                    prior_run
+                        .as_ref()
+                        .and_then(|prior| prior.config.auth_selection.as_ref())
+                        .and_then(|selection| selection.resolved_credential_id.as_deref())
+                };
+                macro_rules! decide_auth {
+                    ($choice:expr) => {
+                        self.decide_auth_with_account(
+                            job.req.model.provider_module_id.as_str(),
+                            frozen_credential_id.as_deref(),
+                            frozen_auth_method.as_deref(),
+                            recorded_resolved_id,
+                            fresh_episode,
+                            pinned_method,
+                            pinned_account,
+                            $choice,
+                            frozen_decision.as_ref(),
+                        )
+                        .await
+                    };
+                }
+                let mut decided = decide_auth!(&account_choice);
+                // A moved run's resume whose routed account can't be admitted (the vault doesn't
+                // serve its credential here, or serves it for another account than routing
+                // named) keeps the account it recorded, as for any other unusable answer (see
+                // `resumed_choice`).
+                if resume_asks && matches!(account_choice, AccountChoice::Routed { .. }) {
+                    if let Err(error) = &decided {
+                        tracing::warn!(
+                            target: "accounts",
+                            run_id = %job.req.run_id.0,
+                            %error,
+                            "the account routing gave the resumed run can't be admitted; it keeps \
+                             the account it recorded"
+                        );
+                        resume_asks = false;
+                        account_choice = AccountChoice::NotApplicable;
+                        decided = decide_auth!(&account_choice);
+                    }
+                }
+                match decided {
                     Ok(v) => v,
                     Err(e) => {
                         self.provider_client

@@ -134,9 +134,11 @@ fn a_resumed_runs_persona_follows_the_account_routing_gave_it() {
     .is_err());
 }
 
-/// A moved run's resume that asked routing and got no usable answer (no answer in the budget,
-/// routing unreachable, a hold, a refusal or a conflict) keeps the account it recorded: the
-/// admission goes on as a resume that never asked. A fresh run's refusal still ends it.
+/// A moved run's resume that asked routing and got no account routing chose (no answer in the
+/// budget, routing unreachable, a hold, a refusal, a conflict, a sign-in for every candidate, or
+/// a static pick) keeps the account it recorded: the admission reads that account and its
+/// decision from the run's record, as a resume that doesn't ask routing does. A fresh run's
+/// refusal still ends it, and an account routing chose is taken.
 #[test]
 fn a_resume_routing_gives_no_account_keeps_the_recorded_one() {
     let run_id = broca_protocol::RunId("resumed".into());
@@ -169,12 +171,36 @@ fn a_resume_routing_gives_no_account_keeps_the_recorded_one() {
         resumed_choice(Err(refusal("account_pinned")), &mut fresh, &run_id),
         Err(RunError::AccountSelectionRefused(_))
     ));
+    let decision: broca_core::AccountDecision = serde_json::from_value(serde_json::json!({
+        "path": "routed", "admission_id": "resumed", "decision_id": "decision-b",
+    }))
+    .unwrap();
+    for unusable in [
+        AccountChoice::NotApplicable,
+        AccountChoice::Static(decision.clone()),
+        AccountChoice::AuthRequired(decision.clone()),
+    ] {
+        let mut asks = true;
+        assert!(matches!(
+            resumed_choice(Ok(unusable), &mut asks, &run_id),
+            Ok(AccountChoice::NotApplicable)
+        ));
+        assert!(!asks, "only an account routing chose is taken");
+    }
     let mut asks = true;
+    let routed = AccountChoice::Routed {
+        account_id: "chatgpt-b".into(),
+        credential_id: "chatgpt:openai:second".into(),
+        method: AuthMethod::Chatgpt,
+        decision,
+        view_digest: String::new(),
+        service_tier_chosen: None,
+    };
     assert!(matches!(
-        resumed_choice(Ok(AccountChoice::NotApplicable), &mut asks, &run_id),
-        Ok(AccountChoice::NotApplicable)
+        resumed_choice(Ok(routed), &mut asks, &run_id),
+        Ok(AccountChoice::Routed { .. })
     ));
-    assert!(asks, "an answer routing gave is taken");
+    assert!(asks, "an account routing chose is taken");
 }
 
 /// A move's recorded render config takes the new account's persona in its own
@@ -377,8 +403,8 @@ async fn the_executor_refuses_an_offer_whose_token_names_another_account() {
     ));
 }
 
-/// Routing answering a resumed run's repeated admission with `reply`, and counting the
-/// questions.
+/// Routing answering a resumed run's repeated admission with `reply`, and counting those
+/// questions (`route.account_for`); every other request is acknowledged.
 struct AnswersAdmission {
     reply: Result<serde_json::Value, serde_json::Value>,
     asked: std::sync::atomic::AtomicUsize,
@@ -390,7 +416,13 @@ impl broca_module_serve::account_routing::RoutingTransport for AnswersAdmission 
         broca_module_serve::routing_capabilities::CapabilitySupport::Declared
     }
 
-    async fn request(&self, _body: Vec<u8>) -> broca_module_serve::account_routing::RoutingReply {
+    async fn request(&self, body: Vec<u8>) -> broca_module_serve::account_routing::RoutingReply {
+        let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        if request["method"] != "route.account_for" {
+            // A report, such as the scoped not_found broca sends for a routed credential the
+            // vault doesn't serve.
+            return Ok(Ok(serde_json::to_vec(&serde_json::json!({"result": {}})).unwrap()));
+        }
         self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(match &self.reply {
             Ok(body) => Ok(serde_json::to_vec(body).unwrap()),
@@ -409,25 +441,42 @@ async fn a_moved_chatgpt_resume(
     records_change: bool,
     reply: Result<serde_json::Value, serde_json::Value>,
 ) -> (Result<broca_core::AuthSelection, String>, usize) {
+    a_moved_chatgpt_resume_with(label, vault_account, records_change, reply, None, true).await
+}
+
+/// [`a_moved_chatgpt_resume`], with the vault answering `not_found` for `missing`, and listing
+/// only the recorded account's credential unless `both_listed`.
+async fn a_moved_chatgpt_resume_with(
+    label: &str,
+    vault_account: &'static str,
+    records_change: bool,
+    reply: Result<serde_json::Value, serde_json::Value>,
+    missing: Option<&'static str>,
+    both_listed: bool,
+) -> (Result<broca_core::AuthSelection, String>, usize) {
     let root = fresh_vault_root(label);
     let daemon = CapturingVaultDaemon::start_expiring(
         &root,
         ExpiryScript {
             account_id: Some(vault_account),
+            missing_credential: missing,
             ..ExpiryScript::default()
         },
     )
     .await;
     let mut executor = executor_with_capturing_vault(&root, &daemon).await;
-    let listing = serde_json::from_value(serde_json::json!({
-        "credentials": [
-            {"id": "chatgpt:openai", "type": "chatgpt", "categories": ["openai"], "serves": ["openai"],
-             "state": "active", "record_version": 1, "operations": ["read"], "account_id": "chatgpt-a",
-             "auth_method": "chatgpt", "provider_ids": ["openai"]},
+    let mut credentials = vec![serde_json::json!(
+        {"id": "chatgpt:openai", "type": "chatgpt", "categories": ["openai"], "serves": ["openai"],
+         "state": "active", "record_version": 1, "operations": ["read"], "account_id": "chatgpt-a",
+         "auth_method": "chatgpt", "provider_ids": ["openai"]})];
+    if both_listed {
+        credentials.push(serde_json::json!(
             {"id": "chatgpt:openai:second", "type": "chatgpt", "categories": ["openai"], "serves": ["openai"],
              "state": "active", "record_version": 1, "operations": ["read"], "account_id": "chatgpt-b",
-             "auth_method": "chatgpt", "provider_ids": ["openai"]},
-        ],
+             "auth_method": "chatgpt", "provider_ids": ["openai"]}));
+    }
+    let listing = serde_json::from_value(serde_json::json!({
+        "credentials": credentials,
         "grants": 1, "grant_tuples": [], "view": "moved-resume",
     }))
     .unwrap();
@@ -516,7 +565,19 @@ async fn a_moved_chatgpt_resume(
         });
     let asked = routing.asked.load(std::sync::atomic::Ordering::SeqCst);
     drop(executor);
-    daemon.assert_healthy();
+    if missing.is_some() {
+        // A routed credential the vault doesn't serve has broca list the vault again, which
+        // this stand-in doesn't serve; nothing else may have gone wrong.
+        let errors = daemon.errors.lock().unwrap().clone();
+        assert!(
+            errors
+                .iter()
+                .all(|error| error == "unexpected route request: credential.list_scoped"),
+            "{errors:?}"
+        );
+    } else {
+        daemon.assert_healthy();
+    }
     (admitted, asked)
 }
 
@@ -575,4 +636,85 @@ async fn a_moved_runs_resume_that_cant_record_a_change_does_not_ask() {
     .await;
     assert_eq!(asked, 0);
     assert_eq!(selection.unwrap().account_ref.as_deref(), Some("chatgpt-a"));
+}
+
+/// The recorded account a moved run's resume keeps: chatgpt-a under the run's own routed
+/// decision, which a later wall continues from.
+fn kept_the_recorded_account(selection: &broca_core::AuthSelection) {
+    assert_eq!(selection.credential_id, "chatgpt:openai");
+    assert_eq!(selection.account_ref.as_deref(), Some("chatgpt-a"));
+    let decision = selection.account_decision.as_ref().unwrap();
+    assert_eq!(decision.path, broca_wal::ACCOUNT_DECISION_ROUTED);
+    assert_eq!(decision.admission_id.as_deref(), Some("chatgpt-run"));
+    assert_eq!(decision.decision_id.as_deref(), Some("decision-a"));
+}
+
+/// Through the executor's admission: routing answering a moved run's resume that every
+/// candidate needs a sign-in is not an account; the resume keeps the one it recorded.
+#[tokio::test]
+async fn a_moved_runs_resume_keeps_its_account_when_routing_says_sign_in() {
+    let (selection, asked) = a_moved_chatgpt_resume(
+        "moved-resume-auth-required",
+        "chatgpt-a",
+        true,
+        Err(serde_json::json!({"code": "auth_required", "message": "sign in", "detail": {}})),
+    )
+    .await;
+    assert_eq!(asked, 1);
+    kept_the_recorded_account(&selection.unwrap());
+}
+
+/// Through the executor's admission: a routed account whose credential the vault doesn't
+/// serve here, or serves for another account than routing named, can't be admitted; the
+/// moved run's resume keeps the account it recorded.
+#[tokio::test]
+async fn a_moved_runs_resume_keeps_its_account_when_the_routed_one_cant_be_admitted() {
+    let (selection, asked) = a_moved_chatgpt_resume_with(
+        "moved-resume-not-found",
+        "chatgpt-a",
+        true,
+        Ok(chosen("chatgpt-b", "chatgpt:openai:second")),
+        Some("chatgpt:openai:second"),
+        true,
+    )
+    .await;
+    assert_eq!(asked, 1);
+    kept_the_recorded_account(&selection.unwrap());
+    // The vault serves every token for chatgpt-a, so routing's chatgpt-b doesn't match.
+    let (selection, asked) = a_moved_chatgpt_resume(
+        "moved-resume-other-account",
+        "chatgpt-a",
+        true,
+        Ok(chosen("chatgpt-b", "chatgpt:openai:second")),
+    )
+    .await;
+    assert_eq!(asked, 1);
+    kept_the_recorded_account(&selection.unwrap());
+}
+
+/// Through the executor's admission: with only the recorded account's credential listed,
+/// routing isn't asked and the pick is static. A moved run's resume keeps its routed decision
+/// rather than taking the static one, which names no admission.
+#[tokio::test]
+async fn a_moved_runs_resume_keeps_its_routed_decision_on_a_static_pick() {
+    let (selection, _) = a_moved_chatgpt_resume_with(
+        "moved-resume-static",
+        "chatgpt-a",
+        true,
+        Ok(chosen("chatgpt-b", "chatgpt:openai:second")),
+        None,
+        false,
+    )
+    .await;
+    kept_the_recorded_account(&selection.unwrap());
+    // Routing's account selection switched off: also a static pick.
+    let (selection, asked) = a_moved_chatgpt_resume(
+        "moved-resume-disabled",
+        "chatgpt-a",
+        true,
+        Err(serde_json::json!({"code": "account_selection_disabled", "message": "off", "detail": {}})),
+    )
+    .await;
+    assert_eq!(asked, 1);
+    kept_the_recorded_account(&selection.unwrap());
 }
